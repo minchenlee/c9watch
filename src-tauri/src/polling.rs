@@ -201,6 +201,50 @@ pub fn detect_and_enrich_sessions() -> Result<Vec<Session>, String> {
     detect_and_enrich_sessions_with_detector(&mut detector)
 }
 
+/// Convert tracked subagents into virtual Session entries
+fn subagent_sessions() -> Vec<Session> {
+    let subagents = crate::session::read_active_subagents();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    subagents
+        .into_iter()
+        .map(|sa| {
+            let age_secs = (now_ms.saturating_sub(sa.started_at)) / 1000;
+            let status_label = if age_secs < 5 {
+                SessionStatus::Connecting
+            } else {
+                SessionStatus::Working
+            };
+
+            let started_dt: DateTime<Utc> = DateTime::from_timestamp_millis(sa.started_at as i64)
+                .unwrap_or_default();
+
+            Session {
+                id: sa.id.clone(),
+                pid: sa.parent_pid,
+                session_name: format!("⚡ {}", sa.name),
+                custom_title: None,
+                project_path: format!("subagent:{}", sa.agent_type),
+                git_branch: None,
+                first_prompt: if sa.description.is_empty() {
+                    sa.prompt.clone()
+                } else {
+                    sa.description.clone()
+                },
+                summary: Some(format!("Type: {} | Parent: {}", sa.agent_type, sa.parent_session_id)),
+                message_count: 1,
+                modified: started_dt.to_rfc3339(),
+                status: status_label,
+                latest_message: format!("Running for {}s", age_secs),
+                pending_tool_name: None,
+            }
+        })
+        .collect()
+}
+
 /// Detect sessions using an existing detector (avoids recreating System each call)
 fn detect_and_enrich_sessions_with_detector(
     detector: &mut SessionDetector,
@@ -341,6 +385,10 @@ fn detect_and_enrich_sessions_with_detector(
             pending_tool_name,
         });
     }
+
+    // Merge in subagent virtual sessions
+    let mut subagent_list = subagent_sessions();
+    sessions.append(&mut subagent_list);
 
     Ok(sessions)
 }
