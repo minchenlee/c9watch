@@ -5,17 +5,19 @@
 		conversation: Conversation | null;
 		scrollContainer: HTMLDivElement | null;
 		showTools?: boolean;
+		showThinking?: boolean;
 	}
 
-	let { conversation, scrollContainer, showTools = $bindable(true) }: Props = $props();
+	let { conversation, scrollContainer, showTools = $bindable(true), showThinking = $bindable(true) }: Props = $props();
 
-	// Filter for "milestone" messages - user messages and tool blocks
+	// Filter for "milestone" messages - user messages, tool blocks, and thinking steps
 	let items = $derived.by(() => {
 		if (!conversation) return [];
 		return conversation.messages
 			.map((msg, index) => ({ msg, index }))
 			.filter(({ msg }) =>
 				msg.messageType === 'User' ||
+				(showThinking && msg.messageType === 'Thinking') ||
 				(showTools && msg.messageType === 'ToolUse' && msg.content?.length > 0)
 			);
 	});
@@ -24,6 +26,8 @@
 		switch (message.messageType) {
 			case 'User':
 				return '→';
+			case 'Thinking':
+				return '◇';
 			case 'ToolUse':
 				return '⚙';
 			default:
@@ -35,6 +39,8 @@
 		switch (message.messageType) {
 			case 'User':
 				return 'var(--text-primary)';
+			case 'Thinking':
+				return 'var(--status-permission)';
 			case 'ToolUse':
 				return 'var(--status-input)';
 			default:
@@ -70,9 +76,10 @@
 		{#each items as { msg, index }}
 			<!-- svelte-ignore a11y_click_events_have_key_events -->
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
-			<div 
-				class="nav-item-descriptive" 
+			<div
+				class="nav-item-descriptive"
 				class:is-user={msg.messageType === 'User'}
+				class:is-thinking={msg.messageType === 'Thinking'}
 				style="--item-color: {getMessageColor(msg)}"
 				onclick={() => scrollToMessage(index)}
 			>
@@ -187,6 +194,15 @@
 
 	.is-user {
 		margin-bottom: 4px;
+	}
+
+	.is-thinking {
+		opacity: 0.8;
+		padding-left: calc(var(--space-lg) + var(--space-sm));
+	}
+
+	.is-thinking .nav-text {
+		font-style: italic;
 	}
 
 	/* Scrollbar for nav list */
