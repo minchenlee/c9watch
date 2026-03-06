@@ -24,6 +24,9 @@
 	import SessionHistory from '$lib/components/SessionHistory.svelte';
 	import CostTracker from '$lib/components/CostTracker.svelte';
 	import MemoryViewer from '$lib/components/MemoryViewer.svelte';
+	import FdaBanner from '$lib/components/FdaBanner.svelte';
+	import DebugConsole from '$lib/components/DebugConsole.svelte';
+	import type { DetectionDiagnostics } from '$lib/types';
 
 	let demoActive = $derived($isDemoMode);
 	let showQRModal = $state(false);
@@ -40,6 +43,8 @@
 	let isCompact = $state(false);
 
 	let activeTab = $state<'monitor' | 'history' | 'cost' | 'memory'>('monitor');
+	let fdaLikelyNeeded = $state(false);
+	let showDebugConsole = $state(false);
 
 	// Detect macOS native fullscreen to switch tab-bar padding.
 	// CSS `display-mode: fullscreen` does NOT fire for native macOS fullscreen.
@@ -79,6 +84,15 @@
 				}, 150);
 			});
 		})();
+
+		// Listen for detection diagnostics (FDA banner)
+		if (isTauri()) {
+			import('@tauri-apps/api/event').then(({ listen }) => {
+				listen<DetectionDiagnostics>('diagnostic-update', (event) => {
+					fdaLikelyNeeded = event.payload.fdaLikelyNeeded;
+				});
+			});
+		}
 
 		return () => {
 			unlisten?.();
@@ -226,6 +240,12 @@
 	}
 
 	function handleKeydown(e: KeyboardEvent) {
+		if (e.key === 'D' && e.shiftKey && (e.metaKey || e.ctrlKey)) {
+			e.preventDefault();
+			showDebugConsole = !showDebugConsole;
+			return;
+		}
+
 		const tag = (e.target as HTMLElement)?.tagName;
 		if (tag === 'INPUT' || tag === 'TEXTAREA') return;
 
@@ -262,6 +282,7 @@
 	<ConnectionScreen onconnected={() => (needsConnection = false)} />
 {:else}
 <div class="dashboard">
+	<FdaBanner {fdaLikelyNeeded} />
 	<div class="tab-bar" class:fullscreen={isFullscreen} data-tauri-drag-region>
 		<button
 			class="tab-btn"
@@ -571,6 +592,7 @@
 	{/if}
 
 	<ToastNotifications />
+	<DebugConsole visible={showDebugConsole} onclose={() => (showDebugConsole = false)} />
 </div>
 {/if}
 
