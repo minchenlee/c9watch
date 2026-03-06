@@ -5,7 +5,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { get } from 'svelte/store';
-import type { Session, Conversation, HistoryEntry, DeepSearchHit, CostData, ProjectMemory } from './types';
+import type { Session, Conversation, HistoryEntry, DeepSearchHit, CostData, ProjectMemory, LogEntry } from './types';
 import { isDemoMode } from './demo/mode';
 import { getDemoSessions, demoConversations } from './demo/data';
 import { wsClient, useWebSocket } from './ws';
@@ -138,4 +138,13 @@ export async function getMemoryFiles(): Promise<ProjectMemory[]> {
 export async function revealInFileManager(path: string): Promise<void> {
 	if (get(isDemoMode)) return;
 	await invoke<void>('reveal_in_file_manager', { path });
+}
+
+/**
+ * Get debug log entries from the ring buffer.
+ * (Desktop/Tauri only)
+ */
+export async function getDebugLogs(): Promise<LogEntry[]> {
+	if (useWebSocket()) return [];
+	return await invoke<LogEntry[]>('get_debug_logs');
 }
