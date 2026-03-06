@@ -11,6 +11,8 @@ pub mod auth;
 pub mod polling;
 #[cfg(not(mobile))]
 pub mod web_server;
+#[cfg(not(mobile))]
+pub mod debug_log;
 
 // Shared modules (types used by both desktop and mobile builds)
 pub mod session;
@@ -262,6 +264,12 @@ async fn get_server_info(info: tauri::State<'_, ServerInfo>) -> Result<ServerInf
     })
 }
 
+#[cfg(not(mobile))]
+#[tauri::command]
+async fn get_debug_logs() -> Result<Vec<debug_log::LogEntry>, String> {
+    Ok(debug_log::get_logs())
+}
+
 // ── NSPanel definition for macOS popover ────────────────────────────
 #[cfg(target_os = "macos")]
 tauri_panel! {
@@ -305,9 +313,7 @@ pub fn run() {
             let ws_url = format!("ws://{}:{}/ws?token={}", local_ip, port, token);
             let http_url = format!("http://{}:{}/?token={}", local_ip, port, token);
 
-            eprintln!("\n[c9watch] Mobile connection ready");
-            eprintln!("[c9watch] Token: {}", token);
-            eprintln!("[c9watch] URL:   {}\n", http_url);
+            debug_log::log_info(&format!("Mobile connection ready — URL: {}", http_url));
             qr2term::print_qr(&http_url).ok();
             eprintln!();
 
@@ -352,7 +358,7 @@ pub fn run() {
             if let Some(popover) = app.get_webview_window("popover") {
                 match popover.to_panel::<PopoverPanel>() {
                     Err(e) => {
-                        eprintln!("[c9watch] Failed to convert popover to NSPanel: {e}. Fullscreen support unavailable.");
+                        debug_log::log_warn(&format!("Failed to convert popover to NSPanel: {e}. Fullscreen support unavailable."));
                         // Do not return early — tray icon setup must still proceed below.
                     }
                     Ok(panel) => {
@@ -491,7 +497,8 @@ pub fn run() {
             rename_session,
             get_terminal_title,
             show_main_window,
-            get_server_info
+            get_server_info,
+            get_debug_logs
         ]);
 
     // Mobile: minimal shell (all communication via WebSocket from the frontend)
