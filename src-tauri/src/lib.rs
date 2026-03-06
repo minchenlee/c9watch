@@ -72,7 +72,7 @@ fn greet(name: &str) -> String {
 #[cfg(not(mobile))]
 #[tauri::command]
 async fn get_sessions() -> Result<Vec<Session>, String> {
-    polling::detect_and_enrich_sessions()
+    polling::detect_and_enrich_sessions().map(|(sessions, _)| sessions)
 }
 
 /// Core logic for getting conversation data (shared by Tauri command and WS handler)
@@ -179,7 +179,7 @@ async fn stop_session(app: AppHandle, pid: u32) -> Result<(), String> {
     stop_session_action(pid)?;
     std::thread::sleep(Duration::from_millis(300));
 
-    if let Ok(sessions) = detect_and_enrich_sessions() {
+    if let Ok((sessions, _)) = detect_and_enrich_sessions() {
         let _ = app.emit("sessions-updated", &sessions);
     }
     Ok(())
@@ -202,7 +202,7 @@ async fn rename_session(
     custom_titles.set(session_id, new_name);
     custom_titles.save()?;
 
-    if let Ok(sessions) = detect_and_enrich_sessions() {
+    if let Ok((sessions, _)) = detect_and_enrich_sessions() {
         let _ = app.emit("sessions-updated", &sessions);
     }
     Ok(())

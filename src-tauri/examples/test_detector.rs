@@ -14,7 +14,7 @@ fn main() {
 
     // Detect active sessions
     match detector.detect_sessions() {
-        Ok(sessions) => {
+        Ok((sessions, _diagnostics)) => {
             if sessions.is_empty() {
                 println!("No active Claude Code sessions found.");
             } else {

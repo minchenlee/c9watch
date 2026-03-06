@@ -56,7 +56,7 @@ pub fn start_polling(
         let mut detector = match SessionDetector::new() {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[polling] Failed to create session detector: {}", e);
+                crate::debug_log::log_error(&format!("Failed to create session detector: {}", e));
                 return;
             }
         };
@@ -74,10 +74,12 @@ pub fn start_polling(
         // Track if this is the first poll cycle
         let mut is_first_cycle = true;
 
+        let mut prev_diagnostics: Option<crate::session::DetectionDiagnostics> = None;
+
         loop {
             // Detect and enrich sessions
             match detect_and_enrich_sessions_with_detector(&mut detector) {
-                Ok(sessions) => {
+                Ok((sessions, diagnostics)) => {
                     // Track current session IDs to clean up stale entries
                     let current_session_ids: HashSet<String> =
                         sessions.iter().map(|s| s.id.clone()).collect();
@@ -147,7 +149,7 @@ pub fn start_polling(
                             last_notification_time.retain(|id, _| current_session_ids.contains(id));
                         }
                         Err(poisoned) => {
-                            eprintln!("[polling] Mutex poisoned, recovering...");
+                            crate::debug_log::log_error("Mutex poisoned, recovering...");
                             let mut prev_status_map = poisoned.into_inner();
                             prev_status_map.clear(); // Clear stale state
 
@@ -161,16 +163,37 @@ pub fn start_polling(
 
                     // Emit event to Tauri frontend
                     if let Err(e) = app_handle.emit("sessions-updated", &sessions) {
-                        eprintln!("Failed to emit sessions-updated event: {}", e);
+                        crate::debug_log::log_error(&format!("Failed to emit sessions-updated: {}", e));
                     }
 
                     // Broadcast to WebSocket clients
                     if let Ok(json) = serde_json::to_string(&sessions) {
                         let _ = sessions_tx.send(json);
                     }
+
+                    // Emit diagnostics only when changed
+                    let diag_changed = prev_diagnostics.as_ref().map_or(true, |prev| {
+                        prev.claude_processes_found != diagnostics.claude_processes_found
+                            || prev.processes_with_cwd != diagnostics.processes_with_cwd
+                    });
+                    if diag_changed {
+                        crate::debug_log::log_info(&format!(
+                            "Poll: found {} claude processes, {} with CWD",
+                            diagnostics.claude_processes_found, diagnostics.processes_with_cwd
+                        ));
+                        if diagnostics.fda_likely_needed {
+                            crate::debug_log::log_warn(
+                                "Full Disk Access likely needed: processes found but none have readable CWD",
+                            );
+                        }
+                        if let Err(e) = app_handle.emit("diagnostic-update", &diagnostics) {
+                            crate::debug_log::log_error(&format!("Failed to emit diagnostic-update: {}", e));
+                        }
+                        prev_diagnostics = Some(diagnostics);
+                    }
                 }
                 Err(e) => {
-                    eprintln!("Error detecting sessions: {}", e);
+                    crate::debug_log::log_error(&format!("Error detecting sessions: {}", e));
                     // Continue polling even on error
                 }
             }
@@ -195,7 +218,7 @@ fn is_file_recently_modified(path: &Path, seconds: u64) -> bool {
 }
 
 /// Detect sessions and enrich them with status and conversation data
-pub fn detect_and_enrich_sessions() -> Result<Vec<Session>, String> {
+pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, crate::session::DetectionDiagnostics), String> {
     let mut detector =
         SessionDetector::new().map_err(|e| format!("Failed to create session detector: {}", e))?;
     detect_and_enrich_sessions_with_detector(&mut detector)
@@ -204,8 +227,8 @@ pub fn detect_and_enrich_sessions() -> Result<Vec<Session>, String> {
 /// Detect sessions using an existing detector (avoids recreating System each call)
 fn detect_and_enrich_sessions_with_detector(
     detector: &mut SessionDetector,
-) -> Result<Vec<Session>, String> {
-    let detected_sessions = detector
+) -> Result<(Vec<Session>, crate::session::DetectionDiagnostics), String> {
+    let (detected_sessions, diagnostics) = detector
         .detect_sessions()
         .map_err(|e| format!("Failed to detect sessions: {}", e))?;
 
@@ -279,10 +302,10 @@ fn detect_and_enrich_sessions_with_detector(
         let entries = match parse_last_n_entries(&session_file_path, 20) {
             Ok(entries) => entries,
             Err(e) => {
-                eprintln!(
-                    "Failed to parse session file for {}: {}. Using fallback status.",
+                crate::debug_log::log_warn(&format!(
+                    "Failed to parse session file for {}: {}",
                     session_id, e
-                );
+                ));
                 vec![]
             }
         };
@@ -342,7 +365,7 @@ fn detect_and_enrich_sessions_with_detector(
         });
     }
 
-    Ok(sessions)
+    Ok((sessions, diagnostics))
 }
 
 /// Extract the first user prompt from a session JSONL file
@@ -518,7 +541,7 @@ fn fire_notification(
         .body(&body)
         .show()
     {
-        eprintln!("[notification] Failed to show notification: {}", e);
+        crate::debug_log::log_error(&format!("Failed to show notification: {}", e));
     }
 
     // Emit event with session metadata for click-to-focus handling
@@ -531,7 +554,7 @@ fn fire_notification(
     };
 
     if let Err(e) = app_handle.emit("notification-fired", &metadata) {
-        eprintln!("Failed to emit notification-fired event: {}", e);
+        crate::debug_log::log_error(&format!("Failed to emit notification-fired: {}", e));
     }
 
     // Broadcast to WebSocket clients for web notifications
@@ -554,7 +577,7 @@ mod tests {
     fn test_detect_and_enrich_sessions() {
         // This test will only work if there are active Claude sessions
         match detect_and_enrich_sessions() {
-            Ok(sessions) => {
+            Ok((sessions, _diagnostics)) => {
                 println!("Detected {} sessions", sessions.len());
                 for session in sessions {
                     println!(
