@@ -35,6 +35,15 @@ pub struct DetectedSession {
     pub project_name: String,
 }
 
+/// Diagnostics about the session detection process
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectionDiagnostics {
+    pub claude_processes_found: u32,
+    pub processes_with_cwd: u32,
+    pub fda_likely_needed: bool,
+}
+
 /// Session detector that finds running Claude processes and matches them to session files
 pub struct SessionDetector {
     system: System,
@@ -68,7 +77,7 @@ impl SessionDetector {
     }
 
     /// Detects all active Claude Code sessions
-    pub fn detect_sessions(&mut self) -> Result<Vec<DetectedSession>, SessionDetectorError> {
+    pub fn detect_sessions(&mut self) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
         // Refresh process information (only what we need: name, cwd, start_time)
         #[allow(unused_mut)]
         let mut process_refresh = ProcessRefreshKind::new()
@@ -89,9 +98,17 @@ impl SessionDetector {
         // Find all running Claude processes
         let claude_processes = self.find_claude_processes();
 
+        let total = claude_processes.len() as u32;
+        let with_cwd = claude_processes.iter().filter(|p| p.cwd.is_some()).count() as u32;
+        let diagnostics = DetectionDiagnostics {
+            claude_processes_found: total,
+            processes_with_cwd: with_cwd,
+            fda_likely_needed: total > 0 && with_cwd == 0,
+        };
+
         // If no Claude processes are running, return empty
         if claude_processes.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), diagnostics));
         }
 
         // Get all session project directories
@@ -101,7 +118,7 @@ impl SessionDetector {
         // and associate them with running processes
         let sessions = self.find_active_sessions(&claude_processes, &project_dirs);
 
-        Ok(sessions)
+        Ok((sessions, diagnostics))
     }
 
     /// Find sessions that are likely active based on running process count

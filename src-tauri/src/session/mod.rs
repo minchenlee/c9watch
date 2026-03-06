@@ -5,7 +5,7 @@ pub mod permissions;
 pub mod status;
 
 pub use custom_names::{CustomNames, CustomTitles};
-pub use detector::{DetectedSession, SessionDetector};
+pub use detector::{DetectedSession, DetectionDiagnostics, SessionDetector};
 pub use parser::{
     extract_messages, parse_all_entries, parse_last_n_entries, parse_sessions_index, ImageBlock,
     MessageContent, MessageType, SessionEntry, SessionIndexEntry, SessionsIndex,
