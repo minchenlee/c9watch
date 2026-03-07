@@ -307,7 +307,7 @@
 
 	{#if activeTab === 'history'}
 	<main class="grid-container history-main">
-		<SessionHistory />
+		<SessionHistory activeSessionIds={new Set(sessions.map(s => s.id))} />
 	</main>
 	{:else if activeTab === 'cost'}
 	<main class="grid-container history-main">

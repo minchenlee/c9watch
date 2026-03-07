@@ -5,6 +5,9 @@
 	import type { HistoryEntry, Conversation, DeepSearchHit } from '$lib/types';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
 
+	// ── Props ────────────────────────────────────────────────────────
+	let { activeSessionIds = new Set<string>() }: { activeSessionIds?: Set<string> } = $props();
+
 	// ── State ────────────────────────────────────────────────────────
 	let allEntries = $state<HistoryEntry[]>([]);
 	let loading = $state(true);
@@ -285,8 +288,13 @@
 							<button class="session-row" class:has-snippet={!!snippet} onclick={() => handleSelectEntry(entry)}>
 								<span class="row-number">{i + 1}</span>
 								<div class="row-content">
+									<div class="row-top">
+										<span class="row-meta">
+											{#if activeSessionIds.has(entry.sessionId)}<span class="active-badge">ACTIVE</span>{/if}
+											<span class="row-time">{relativeTime(entry.timestamp)}</span>
+										</span>
+									</div>
 									<span class="row-prompt">{@html highlight((snippet ?? entry.customTitle ?? entry.display) || '(no prompt)', query)}</span>
-									<span class="row-time">{relativeTime(entry.timestamp)}</span>
 								</div>
 							</button>
 						{/each}
@@ -301,7 +309,10 @@
 					<div class="row-content">
 						<div class="row-top">
 							<span class="row-project">{entry.projectName.toUpperCase()}</span>
-							<span class="row-time">{relativeTime(entry.timestamp)}</span>
+							<span class="row-meta">
+								{#if activeSessionIds.has(entry.sessionId)}<span class="active-badge">ACTIVE</span>{/if}
+								<span class="row-time">{relativeTime(entry.timestamp)}</span>
+							</span>
 						</div>
 						<span class="row-prompt">{@html highlight((snippet ?? entry.customTitle ?? entry.display) || '(no prompt)', query)}</span>
 					</div>
@@ -438,10 +449,31 @@
 		letter-spacing: 0.1em;
 	}
 
+	.row-meta {
+		display: flex;
+		align-items: center;
+		gap: var(--space-sm);
+		flex-shrink: 0;
+	}
+
 	.row-time {
 		font-family: var(--font-mono);
 		font-size: 11px;
 		color: var(--text-muted);
+	}
+
+	.active-badge {
+		font-family: var(--font-pixel);
+		font-size: 9px;
+		font-weight: 700;
+		color: var(--accent-green);
+		background: rgba(0, 255, 136, 0.1);
+		padding: 1px 5px;
+		border: 1px solid rgba(0, 255, 136, 0.3);
+		letter-spacing: 0.08em;
+		line-height: 1;
+		text-transform: uppercase;
+		flex-shrink: 0;
 	}
 
 	.row-prompt {
