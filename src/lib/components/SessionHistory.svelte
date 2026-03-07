@@ -87,7 +87,8 @@
 				(e) => {
 					const display = e.display.toLowerCase();
 					const project = e.projectName.toLowerCase();
-					return words.every((w) => display.includes(w) || project.includes(w));
+					const title = e.customTitle?.toLowerCase() ?? '';
+					return words.every((w) => display.includes(w) || project.includes(w) || title.includes(w));
 				}
 			);
 
@@ -284,7 +285,7 @@
 							<button class="session-row" class:has-snippet={!!snippet} onclick={() => handleSelectEntry(entry)}>
 								<span class="row-number">{i + 1}</span>
 								<div class="row-content">
-									<span class="row-prompt">{@html highlight((snippet ?? entry.display) || '(no prompt)', query)}</span>
+									<span class="row-prompt">{@html highlight((snippet ?? entry.customTitle ?? entry.display) || '(no prompt)', query)}</span>
 									<span class="row-time">{relativeTime(entry.timestamp)}</span>
 								</div>
 							</button>
@@ -302,7 +303,7 @@
 							<span class="row-project">{entry.projectName.toUpperCase()}</span>
 							<span class="row-time">{relativeTime(entry.timestamp)}</span>
 						</div>
-						<span class="row-prompt">{@html highlight((snippet ?? entry.display) || '(no prompt)', query)}</span>
+						<span class="row-prompt">{@html highlight((snippet ?? entry.customTitle ?? entry.display) || '(no prompt)', query)}</span>
 					</div>
 				</button>
 			{/each}

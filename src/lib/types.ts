@@ -131,6 +131,9 @@ export interface HistoryEntry {
 
   /** Last path segment of project, e.g. "myproject" */
   projectName: string;
+
+  /** Custom title override — if set, shown instead of the first prompt */
+  customTitle: string | null;
 }
 
 /**

@@ -25,6 +25,7 @@ pub struct HistoryEntry {
     pub timestamp: u64,
     pub project: String,
     pub project_name: String,
+    pub custom_title: Option<String>,
 }
 
 /// Parse JSONL text into deduplicated HistoryEntry vec, sorted newest first.
@@ -62,6 +63,7 @@ pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
                 timestamp: raw.timestamp,
                 project: raw.project,
                 project_name,
+                custom_title: None,
             }
         })
         .collect();
@@ -71,6 +73,7 @@ pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
 }
 
 /// Read ~/.claude/history.jsonl and return deduplicated entries sorted newest first.
+/// Custom titles from session-monitor-titles.json are applied when available.
 pub fn get_history() -> Result<Vec<HistoryEntry>, String> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
     let path = home_dir.join(".claude").join("history.jsonl");
@@ -82,7 +85,16 @@ pub fn get_history() -> Result<Vec<HistoryEntry>, String> {
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("Failed to read history.jsonl: {e}"))?;
 
-    Ok(parse_history_jsonl(&content))
+    let mut entries = parse_history_jsonl(&content);
+
+    let custom_titles = super::custom_names::CustomTitles::load();
+    for entry in &mut entries {
+        if let Some(title) = custom_titles.get(&entry.session_id) {
+            entry.custom_title = Some(title.clone());
+        }
+    }
+
+    Ok(entries)
 }
 
 /// A single deep-search hit: session ID + first matching snippet (truncated).
