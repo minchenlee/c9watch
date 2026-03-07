@@ -82,11 +82,13 @@
 		let entries = allEntries;
 
 		if (query.trim()) {
-			const q = query.toLowerCase();
+			const words = query.toLowerCase().split(/\s+/).filter(Boolean);
 			entries = entries.filter(
-				(e) =>
-					e.display.toLowerCase().includes(q) ||
-					e.projectName.toLowerCase().includes(q)
+				(e) => {
+					const display = e.display.toLowerCase();
+					const project = e.projectName.toLowerCase();
+					return words.every((w) => display.includes(w) || project.includes(w));
+				}
 			);
 
 			// If deep search has run, also include sessions that matched full content
@@ -159,12 +161,14 @@
 
 	// ── Helpers ──────────────────────────────────────────────────────
 
-	/** Wrap every occurrence of `kw` in `text` with <mark> tags (case-insensitive). */
+	/** Wrap every occurrence of each search word in `text` with <mark> tags (case-insensitive). */
 	function highlight(text: string, kw: string): string {
 		if (!kw.trim()) return escapeHtml(text);
+		const words = kw.split(/\s+/).filter(Boolean);
+		if (words.length === 0) return escapeHtml(text);
 		const escaped = escapeHtml(text);
-		const escapedKw = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-		return escaped.replace(new RegExp(escapedKw, 'gi'), (m) => `<mark>${m}</mark>`);
+		const pattern = words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+		return escaped.replace(new RegExp(pattern, 'gi'), (m) => `<mark>${m}</mark>`);
 	}
 
 	function escapeHtml(s: string): string {

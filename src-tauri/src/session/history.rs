@@ -94,16 +94,22 @@ pub struct DeepSearchHit {
     pub snippet: String,
 }
 
-/// Extract a short snippet from `text` centred around the first occurrence of `query_lower`.
+/// Extract a short snippet from `text` centred around the first occurrence of any query word.
+/// For multi-word queries, centres on the first word found.
 /// Returns at most 200 characters with the match roughly in the middle.
 fn extract_snippet(text: &str, query_lower: &str) -> String {
     let lower = text.to_lowercase();
-    let Some(pos) = lower.find(query_lower) else {
+    let words: Vec<&str> = query_lower.split_whitespace().filter(|w| !w.is_empty()).collect();
+    // Find the earliest occurrence of any word
+    let pos = words.iter()
+        .filter_map(|w| lower.find(w).map(|p| (p, w.len())))
+        .min_by_key(|(p, _)| *p);
+    let Some((pos, word_len)) = pos else {
         return text.chars().take(200).collect();
     };
     let half = 80usize;
     let start = pos.saturating_sub(half);
-    let end = (pos + query_lower.len() + half).min(text.len());
+    let end = (pos + word_len + half).min(text.len());
     // Align to char boundaries
     let start = text
         .char_indices()
@@ -183,6 +189,11 @@ pub fn deep_search(query: &str) -> Result<Vec<DeepSearchHit>, String> {
     }
 
     let query_lower = query.to_lowercase();
+    let query_words: Vec<String> = query_lower
+        .split_whitespace()
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_string())
+        .collect();
 
     // Collect all candidate JSONL file paths
     let mut candidates: Vec<(String, std::path::PathBuf)> = Vec::new();
@@ -212,26 +223,46 @@ pub fn deep_search(query: &str) -> Result<Vec<DeepSearchHit>, String> {
     use std::sync::{Arc, Mutex};
     let matched: Arc<Mutex<Vec<DeepSearchHit>>> = Arc::new(Mutex::new(Vec::new()));
     let query_lower = Arc::new(query_lower);
+    let query_words = Arc::new(query_words);
 
     let handles: Vec<_> = candidates
         .into_iter()
         .map(|(session_id, path)| {
             let matched = Arc::clone(&matched);
             let query_lower = Arc::clone(&query_lower);
+            let query_words = Arc::clone(&query_words);
             std::thread::spawn(move || {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     // Only search user/assistant message text — skip metadata entries
                     // (summary, file-history-snapshot, etc.) which contain fields like
                     // sessionId, cwd, gitBranch that would trivially match most queries.
-                    let snippet = content
+                    // For multi-word queries, ALL words must appear somewhere in the
+                    // session's messages (not necessarily in the same line).
+                    let messages: Vec<String> = content
                         .lines()
-                        .filter_map(|line| extract_message_text(line).map(|text| (line, text)))
-                        .find(|(_, text)| text.to_lowercase().contains(query_lower.as_str()))
-                        .map(|(_, text)| extract_snippet(&text, &query_lower))
-                        .unwrap_or_default();
-                    if !snippet.is_empty() {
-                        let mut guard = matched.lock().unwrap();
-                        guard.push(DeepSearchHit { session_id, snippet });
+                        .filter_map(|line| extract_message_text(line))
+                        .collect();
+                    // Join all messages and check each word with .contains().
+                    // Could be done in a single pass with a HashSet of remaining words,
+                    // but W is typically ≤5 and Rust's contains() is SIMD-optimized.
+                    let combined_lower: String = messages.iter()
+                        .map(|t| t.to_lowercase())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let all_match = query_words.iter().all(|w| combined_lower.contains(w.as_str()));
+                    if all_match {
+                        // Find the first message line containing any query word for snippet
+                        let snippet = messages.iter()
+                            .find(|text| {
+                                let lower = text.to_lowercase();
+                                query_words.iter().any(|w| lower.contains(w.as_str()))
+                            })
+                            .map(|text| extract_snippet(text, &query_lower))
+                            .unwrap_or_default();
+                        if !snippet.is_empty() {
+                            let mut guard = matched.lock().unwrap();
+                            guard.push(DeepSearchHit { session_id, snippet });
+                        }
                     }
                 }
             })
