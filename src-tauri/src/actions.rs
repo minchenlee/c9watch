@@ -215,20 +215,22 @@ fn activate_app_fallback(app_name: &str) -> Result<(), String> {
     //
     // Notes:
     // - Unminimizes ALL windows of the app, not just the target one.
-    // - Requires Accessibility permission; if denied, falls back to activate-only
-    //   (same behavior as before this change).
+    // - AXMinimized requires Accessibility permission and may throw;
+    //   wrapped in try/end try so `activate` always succeeds regardless.
     let script = format!(
         r#"
         tell application "{app}" to activate
-        tell application "System Events"
-            tell process "{app}"
-                repeat with w in windows
-                    if value of attribute "AXMinimized" of w is true then
-                        set value of attribute "AXMinimized" of w to false
-                    end if
-                end repeat
+        try
+            tell application "System Events"
+                tell process "{app}"
+                    repeat with w in windows
+                        if value of attribute "AXMinimized" of w is true then
+                            set value of attribute "AXMinimized" of w to false
+                        end if
+                    end repeat
+                end tell
             end tell
-        end tell
+        end try
         "#,
         app = app_name
     );
