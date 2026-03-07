@@ -275,25 +275,31 @@
 						<span class="group-count">{group.entries.length}</span>
 					</div>
 					{#if !collapsedProjects.has(group.project)}
-						{#each group.entries as entry (entry.sessionId)}
+						{#each group.entries as entry, i (entry.sessionId)}
 							{@const snippet = query.trim() ? (deepSearchResults?.get(entry.sessionId) ?? null) : null}
 							<button class="session-row" class:has-snippet={!!snippet} onclick={() => handleSelectEntry(entry)}>
-								<span class="row-prompt">{@html highlight((snippet ?? entry.display) || '(no prompt)', query)}</span>
-								<span class="row-time">{relativeTime(entry.timestamp)}</span>
+								<span class="row-number">{i + 1}</span>
+								<div class="row-content">
+									<span class="row-prompt">{@html highlight((snippet ?? entry.display) || '(no prompt)', query)}</span>
+									<span class="row-time">{relativeTime(entry.timestamp)}</span>
+								</div>
 							</button>
 						{/each}
 					{/if}
 				</div>
 			{/each}
 		{:else}
-			{#each filtered as entry (entry.sessionId)}
+			{#each filtered as entry, i (entry.sessionId)}
 				{@const snippet = query.trim() ? (deepSearchResults?.get(entry.sessionId) ?? null) : null}
 				<button class="session-row" class:has-snippet={!!snippet} onclick={() => handleSelectEntry(entry)}>
-					<div class="row-top">
-						<span class="row-project">{entry.projectName.toUpperCase()}</span>
-						<span class="row-time">{relativeTime(entry.timestamp)}</span>
+					<span class="row-number">{i + 1}</span>
+					<div class="row-content">
+						<div class="row-top">
+							<span class="row-project">{entry.projectName.toUpperCase()}</span>
+							<span class="row-time">{relativeTime(entry.timestamp)}</span>
+						</div>
+						<span class="row-prompt">{@html highlight((snippet ?? entry.display) || '(no prompt)', query)}</span>
 					</div>
-					<span class="row-prompt">{@html highlight((snippet ?? entry.display) || '(no prompt)', query)}</span>
 				</button>
 			{/each}
 		{/if}
@@ -402,8 +408,9 @@
 		padding: var(--space-md);
 		cursor: pointer;
 		display: flex;
-		flex-direction: column;
-		gap: var(--space-xs);
+		flex-direction: row;
+		align-items: flex-start;
+		gap: var(--space-md);
 		transition: border-color var(--transition-fast);
 	}
 
@@ -538,6 +545,27 @@
 		font-weight: 500;
 		line-height: 1;
 		color: var(--text-secondary);
+	}
+
+
+	.row-number {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		line-height: 1.6;
+		flex-shrink: 0;
+		min-width: 1.5em;
+		text-align: right;
+		user-select: none;
+		opacity: 0.5;
+	}
+
+	.row-content {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-xs);
 	}
 
 </style>
