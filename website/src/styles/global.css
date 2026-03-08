@@ -222,6 +222,17 @@ nav.sidebar a:hover {
     color: var(--text-primary) !important;
 }
 
+/* Heading anchor link icon — smaller, spaced from text, vertically centered */
+.sl-markdown-content .sl-heading-wrapper {
+    --sl-anchor-icon-size: 0.55em !important;
+    --sl-anchor-icon-gap: 0.4em !important;
+}
+
+.sl-markdown-content .sl-anchor-icon > svg {
+    vertical-align: middle !important;
+    transform: none !important;
+}
+
 /* ── Docs header — match landing page nav ── */
 
 /* Site title: 15px, 600 weight, white */
@@ -378,6 +389,10 @@ starlight-toc a[aria-current="true"]:hover {
 }
 
 /* Pagination links */
+.pagination-links a {
+    border-radius: 0 !important;
+}
+
 .pagination-links .link-title {
     font-size: 18px;
     font-weight: 600;
@@ -399,6 +414,11 @@ starlight-toc a[aria-current="true"]:hover {
     margin: 0 !important;
 }
 
+/* Reset terminal button-spacing so copy button doesn't leave a gap for the hidden header */
+.expressive-code .frame.is-terminal {
+    --button-spacing: 0rem !important;
+}
+
 .expressive-code figure {
     margin: 0 !important;
 }
@@ -410,9 +430,21 @@ starlight-toc a[aria-current="true"]:hover {
     padding: 1rem !important;
     font-family: var(--font-mono) !important;
     font-size: 14px !important;
+    /* Hide the horizontal scrollbar track that creates a visible gap below code */
+    scrollbar-width: none !important;
+    margin-bottom: 0px;
+}
+
+.expressive-code pre::-webkit-scrollbar {
+    display: none !important;
 }
 
 .expressive-code .frame::before,
 .expressive-code .frame::after {
     display: none !important;
+}
+
+/* Docs link color — exclude landing/splash page */
+:root:not([data-has-hero]) .sl-markdown-content a {
+    color: var(--accent-amber) !important;
 }
