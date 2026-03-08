@@ -238,26 +238,29 @@ pub fn deep_search(query: &str) -> Result<Vec<DeepSearchHit>, String> {
                     // sessionId, cwd, gitBranch that would trivially match most queries.
                     // For multi-word queries, ALL words must appear somewhere in the
                     // session's messages (not necessarily in the same line).
-                    let messages: Vec<String> = content
+                    // Collect (original, lowercased) pairs so we lowercase once.
+                    let messages: Vec<(String, String)> = content
                         .lines()
                         .filter_map(|line| extract_message_text(line))
+                        .map(|text| {
+                            let lower = text.to_lowercase();
+                            (text, lower)
+                        })
                         .collect();
-                    // Join all messages and check each word with .contains().
-                    // Could be done in a single pass with a HashSet of remaining words,
-                    // but W is typically ≤5 and Rust's contains() is SIMD-optimized.
+                    // Check each word against all messages joined.
+                    // W is typically ≤5 and Rust's contains() is SIMD-optimized.
                     let combined_lower: String = messages.iter()
-                        .map(|t| t.to_lowercase())
+                        .map(|(_, lower)| lower.as_str())
                         .collect::<Vec<_>>()
                         .join(" ");
                     let all_match = query_words.iter().all(|w| combined_lower.contains(w.as_str()));
                     if all_match {
                         // Find the first message line containing any query word for snippet
                         let snippet = messages.iter()
-                            .find(|text| {
-                                let lower = text.to_lowercase();
+                            .find(|(_, lower)| {
                                 query_words.iter().any(|w| lower.contains(w.as_str()))
                             })
-                            .map(|text| extract_snippet(text, &query_lower))
+                            .map(|(text, _)| extract_snippet(text, &query_lower))
                             .unwrap_or_default();
                         if !snippet.is_empty() {
                             let mut guard = matched.lock().unwrap();

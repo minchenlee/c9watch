@@ -45,13 +45,15 @@
 			if (!hasScrolledToBottom) {
 				tick().then(() => {
 					if (searchQuery) {
-						// Find the first user/assistant message whose content matches.
-						// Only search User and Assistant types to match what the Rust
-						// deep search scans (it skips Thinking, ToolUse, ToolResult).
-						const queryLower = searchQuery.toLowerCase();
+						// Find the first user/assistant message matching all query words.
+						// Uses multi-word AND to stay consistent with Rust deep_search.
+						const words = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
 						const matchIndex = conversation!.messages.findIndex(
-							(m) => (m.messageType === 'User' || m.messageType === 'Assistant') &&
-								m.content.toLowerCase().includes(queryLower)
+							(m) => {
+								if (m.messageType !== 'User' && m.messageType !== 'Assistant') return false;
+								const lower = m.content.toLowerCase();
+								return words.some((w) => lower.includes(w));
+							}
 						);
 						if (matchIndex >= 0) {
 							scrollToMessageIndex(matchIndex);
