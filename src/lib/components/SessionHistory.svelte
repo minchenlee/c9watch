@@ -467,9 +467,9 @@
 		font-size: 9px;
 		font-weight: 700;
 		color: var(--accent-green);
-		background: rgba(0, 255, 136, 0.1);
+		background: color-mix(in srgb, var(--accent-green) 10%, transparent);
 		padding: 1px 5px;
-		border: 1px solid rgba(0, 255, 136, 0.3);
+		border: 1px solid color-mix(in srgb, var(--accent-green) 30%, transparent);
 		letter-spacing: 0.08em;
 		line-height: 1;
 		text-transform: uppercase;
