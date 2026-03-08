@@ -220,12 +220,39 @@ nav.sidebar a:hover {
   color: var(--text-primary) !important;
 }
 
-/* Header site title and social icons — white not blue */
-.site-title a,
+/* ── Docs header — match landing page nav ── */
+
+/* Site title: 15px, 600 weight, white */
+.site-title {
+  gap: 0.5rem !important;
+  font-weight: 600 !important;
+  font-size: 15px !important;
+  color: var(--text-primary) !important;
+  text-decoration: none !important;
+}
+
 .site-title span {
   color: var(--text-primary) !important;
 }
 
+/* Logo image: constrain to 24px like landing nav */
+.site-title img {
+  width: 24px !important;
+  height: 24px !important;
+  border-radius: 6px;
+}
+
+/* Search bar: subtle styling */
+site-search button {
+  color: var(--text-secondary) !important;
+  font-size: 14px !important;
+}
+
+site-search button:hover {
+  color: var(--text-primary) !important;
+}
+
+/* Social icons: secondary color, white on hover */
 .social-icons a {
   color: var(--text-secondary) !important;
 }
