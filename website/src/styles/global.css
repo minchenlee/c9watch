@@ -180,6 +180,26 @@ starlight-theme-select {
   padding: 0 !important;
 }
 
+/* Docs sidebar: white text active state instead of blue highlight */
+nav.sidebar a[aria-current="page"],
+nav.sidebar a[aria-current="page"]:hover {
+  background: var(--bg-card) !important;
+  color: var(--text-primary) !important;
+  border-color: var(--text-primary) !important;
+}
+
+nav.sidebar a:hover {
+  color: var(--text-primary) !important;
+}
+
+/* Headings should be white, not blue */
+.sl-markdown-content h1,
+.sl-markdown-content h2,
+.sl-markdown-content h3,
+.sl-markdown-content h4 {
+  color: var(--text-primary) !important;
+}
+
 /* Docs page: images get a border */
 .sl-markdown-content img {
   border: 1px solid var(--border-default);
