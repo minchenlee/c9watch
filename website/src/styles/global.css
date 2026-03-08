@@ -225,6 +225,103 @@ starlight-toc a[aria-current="true"]:hover {
   color: var(--text-primary) !important;
 }
 
+/* ── Docs typography — match landing page / old Docs.astro ── */
+
+.sl-markdown-content {
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.sl-markdown-content h1 {
+  font-size: 2rem !important;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin-bottom: 1.5rem;
+}
+
+.sl-markdown-content h2 {
+  font-size: 1.35rem !important;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin-top: 2.5rem;
+  margin-bottom: 1rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.sl-markdown-content h3 {
+  font-size: 1.1rem !important;
+  font-weight: 600;
+  margin-top: 2rem;
+  margin-bottom: 0.75rem;
+}
+
+.sl-markdown-content p {
+  color: var(--text-secondary);
+  line-height: 1.7;
+  margin-bottom: 1rem;
+}
+
+.sl-markdown-content ul,
+.sl-markdown-content ol {
+  color: var(--text-secondary);
+  padding-left: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.sl-markdown-content li {
+  margin-bottom: 0.4rem;
+  line-height: 1.6;
+}
+
+.sl-markdown-content code:not(pre code) {
+  background: var(--bg-card);
+  padding: 0.15rem 0.4rem;
+  font-size: 0.875em;
+  font-family: var(--font-mono);
+  border: none;
+}
+
+.sl-markdown-content pre {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--border-default);
+  padding: 1rem;
+  margin-bottom: 1.5rem;
+  font-family: var(--font-mono);
+  font-size: 14px;
+}
+
+.sl-markdown-content strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.sl-markdown-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 1.5rem;
+}
+
+.sl-markdown-content th,
+.sl-markdown-content td {
+  text-align: left;
+  padding: 0.6rem 1rem;
+  border: 1px solid var(--border-muted);
+  font-size: 14px;
+}
+
+.sl-markdown-content th {
+  background: var(--bg-card);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.sl-markdown-content td {
+  color: var(--text-secondary);
+}
+
 /* Docs page: images get a border */
 .sl-markdown-content img {
   border: 1px solid var(--border-default);
