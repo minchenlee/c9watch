@@ -1,11 +1,8 @@
 ---
 // website/src/components/Hero.astro
-import DotGrid from './DotGrid.astro';
 ---
 
-<div class="hero-wrapper">
-  <DotGrid />
-  <section class="hero">
+<section class="hero">
   <img src="/icon.png" alt="c9watch" width="80" height="80" class="hero-icon" />
   <h1 class="hero-title">
     Monitor and control all your Claude Code sessions from one place.
@@ -34,7 +31,6 @@ import DotGrid from './DotGrid.astro';
     </video>
   </div>
   </section>
-</div>
 
 <script>
   const btn = document.querySelector('.copy-btn');
@@ -46,11 +42,6 @@ import DotGrid from './DotGrid.astro';
 </script>
 
 <style>
-  .hero-wrapper {
-    position: relative;
-    overflow: hidden;
-  }
-
   .hero {
     position: relative;
     z-index: 1;

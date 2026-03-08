@@ -1,4 +1,5 @@
 /* website/src/styles/global.css */
+/* Custom Vercel Noir overrides for Starlight */
 
 @font-face {
   font-family: 'Geist';
@@ -16,6 +17,7 @@
   font-display: swap;
 }
 
+/* Design tokens — used by custom landing page components */
 :root {
   --bg-base: #000000;
   --bg-elevated: #0a0a0a;
@@ -44,54 +46,60 @@
   --nav-height: 56px;
 }
 
-*, *::before, *::after {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
+/* Override Starlight dark theme to match Vercel Noir */
+:root[data-theme='dark'],
+:root {
+  --sl-color-bg: #000000;
+  --sl-color-bg-nav: #000000;
+  --sl-color-bg-sidebar: #000000;
+  --sl-color-hairline-shade: #222222;
+  --sl-color-hairline-light: #333333;
+  --sl-color-black: #000000;
+  --sl-color-gray-1: #eeeeee;
+  --sl-color-gray-2: #c0c0c0;
+  --sl-color-gray-3: #888888;
+  --sl-color-gray-4: #555555;
+  --sl-color-gray-5: #333333;
+  --sl-color-gray-6: #1a1a1a;
+  --sl-color-gray-7: #111111;
+  --sl-color-accent-low: #001a3d;
+  --sl-color-accent: #0070f3;
+  --sl-color-accent-high: #b3d4fc;
+  --sl-color-white: #ffffff;
+  --sl-color-text: #eeeeee;
+  --sl-color-text-accent: #b3d4fc;
+  --sl-font: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
+  --sl-font-mono: 'Geist Mono', 'SF Mono', Monaco, monospace;
 }
 
-html {
-  scroll-behavior: smooth;
+/* Force dark mode only */
+:root[data-theme='light'] {
+  --sl-color-bg: #000000;
+  --sl-color-bg-nav: #000000;
+  --sl-color-bg-sidebar: #000000;
+  --sl-color-hairline-shade: #222222;
+  --sl-color-hairline-light: #333333;
+  --sl-color-black: #000000;
+  --sl-color-gray-1: #eeeeee;
+  --sl-color-gray-2: #c0c0c0;
+  --sl-color-gray-3: #888888;
+  --sl-color-gray-4: #555555;
+  --sl-color-gray-5: #333333;
+  --sl-color-gray-6: #1a1a1a;
+  --sl-color-gray-7: #111111;
+  --sl-color-accent-low: #001a3d;
+  --sl-color-accent: #0070f3;
+  --sl-color-accent-high: #b3d4fc;
+  --sl-color-white: #ffffff;
+  --sl-color-text: #eeeeee;
+  --sl-color-text-accent: #b3d4fc;
+  --sl-font: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
+  --sl-font-mono: 'Geist Mono', 'SF Mono', Monaco, monospace;
 }
 
-body {
-  font-family: var(--font-sans);
-  font-size: 16px;
-  line-height: 1.6;
-  color: var(--text-primary);
-  background-color: var(--bg-base);
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
-
-h1, h2, h3, h4 {
-  font-weight: 600;
-  line-height: 1.2;
-  color: var(--text-primary);
-  letter-spacing: -0.02em;
-}
-
-a {
-  color: var(--accent-blue);
-  text-decoration: none;
-}
-
-a:hover {
-  text-decoration: underline;
-}
-
-code, pre {
-  font-family: var(--font-mono);
-}
-
-::selection {
-  background-color: var(--text-primary);
-  color: var(--bg-base);
-}
-
-img {
-  max-width: 100%;
-  height: auto;
+/* Hide theme toggle — dark only */
+starlight-theme-select {
+  display: none !important;
 }
 
 /* Custom scrollbar — Vercel Noir */
@@ -118,7 +126,7 @@ img {
   scrollbar-color: var(--border-default) transparent;
 }
 
-/* Scroll fade-in animation */
+/* Scroll fade-in animation (used by landing page) */
 .fade-in {
   opacity: 0;
   transform: translateY(32px);
@@ -128,4 +136,25 @@ img {
 .fade-in.visible {
   opacity: 1;
   transform: translateY(0);
+}
+
+/* Splash page: hide Starlight sidebar and header, go full-width */
+[data-has-hero] .content-panel {
+  max-width: 100%;
+  padding: 0;
+}
+
+[data-has-hero] .main-pane {
+  padding: 0;
+}
+
+/* Hide Starlight's built-in hero on splash page */
+[data-has-hero] .hero {
+  display: none;
+}
+
+/* Docs page: images get a border */
+.sl-markdown-content img {
+  border: 1px solid var(--border-default);
+  margin: 1rem 0;
 }

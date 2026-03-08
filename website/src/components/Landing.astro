@@ -1,15 +1,18 @@
 ---
-import Base from '../layouts/Base.astro';
-import Hero from '../components/Hero.astro';
-import Compatibility from '../components/Compatibility.astro';
-import Features from '../components/Features.astro';
-import TechStack from '../components/TechStack.astro';
-import InstallCTA from '../components/InstallCTA.astro';
-import Footer from '../components/Footer.astro';
+import Hero from './Hero.astro';
+import Compatibility from './Compatibility.astro';
+import Features from './Features.astro';
+import TechStack from './TechStack.astro';
+import InstallCTA from './InstallCTA.astro';
+import Footer from './Footer.astro';
+import DotGrid from './DotGrid.astro';
 ---
 
-<Base title="c9watch — Monitor all your Claude Code sessions">
-  <Hero />
+<div class="landing-wrapper">
+  <div class="hero-wrapper">
+    <DotGrid />
+    <Hero />
+  </div>
   <div class="glow-divider">
     <div class="glow-orb orb-1"></div>
   </div>
@@ -27,7 +30,7 @@ import Footer from '../components/Footer.astro';
   </div>
   <div class="fade-in"><InstallCTA /></div>
   <Footer />
-</Base>
+</div>
 
 <script>
   const observer = new IntersectionObserver(
@@ -46,6 +49,15 @@ import Footer from '../components/Footer.astro';
 </script>
 
 <style>
+  .landing-wrapper {
+    margin: 0 auto;
+  }
+
+  .hero-wrapper {
+    position: relative;
+    overflow: hidden;
+  }
+
   .glow-divider {
     position: relative;
     height: 1px;
@@ -60,7 +72,6 @@ import Footer from '../components/Footer.astro';
     border-radius: 50%;
   }
 
-  /* Each orb: unique color, size, offset, animation speed, and timing */
   .orb-1 {
     background: var(--accent-blue);
     width: 350px;
@@ -82,7 +93,7 @@ import Footer from '../components/Footer.astro';
   }
 
   .orb-3 {
-    background: var(--text-primary);
+    background: var(--text-primary, #fff);
     width: 280px;
     height: 70px;
     filter: blur(50px);
