@@ -395,6 +395,12 @@ starlight-toc a[aria-current="true"]:hover {
     border: 1px solid var(--border-default) !important;
     border-radius: 0 !important;
     box-shadow: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+}
+
+.expressive-code figure {
+    margin: 0 !important;
 }
 
 .expressive-code pre {
