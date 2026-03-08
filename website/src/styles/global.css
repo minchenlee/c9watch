@@ -144,12 +144,17 @@ starlight-theme-select {
 }
 
 [data-has-hero] .content-panel {
-  max-width: 100%;
-  padding: 0;
+  max-width: 100% !important;
+  padding: 0 !important;
 }
 
 [data-has-hero] .main-pane {
-  padding: 0;
+  padding: 0 !important;
+}
+
+[data-has-hero] .sl-container {
+  padding: 0 !important;
+  margin: 0 !important;
 }
 
 /* Hide Starlight header, sidebar, and TOC on splash page */
