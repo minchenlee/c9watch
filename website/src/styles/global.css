@@ -226,7 +226,7 @@ starlight-toc a[aria-current="true"]:hover {
 }
 
 /* Hide heading anchor link icons */
-.sl-markdown-content .heading-wrapper a.anchor-link {
+.sl-anchor-link {
   display: none !important;
 }
 
