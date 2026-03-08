@@ -180,6 +180,16 @@ starlight-theme-select {
   padding: 0 !important;
 }
 
+/* Remove any margin/padding Starlight adds around splash content */
+[data-has-hero] .sl-markdown-content {
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+[data-has-hero] .sl-markdown-content > :first-child {
+  margin-top: 0 !important;
+}
+
 /* Docs sidebar: white text active state instead of blue highlight */
 nav.sidebar a[aria-current="page"],
 nav.sidebar a[aria-current="page"]:hover {
@@ -223,21 +233,6 @@ starlight-toc a[aria-current="true"]:hover {
 
 .right-sidebar-panel h2 {
   color: var(--text-primary) !important;
-}
-
-/* Hide heading anchor link icons */
-.sl-anchor-link {
-  display: none !important;
-}
-
-/* Doc content links — use c9watch amber/orange */
-.sl-markdown-content a {
-  color: var(--accent-amber) !important;
-}
-
-.sl-markdown-content a:hover {
-  color: var(--accent-amber) !important;
-  opacity: 0.85;
 }
 
 /* ── Docs typography — match landing page / old Docs.astro ── */
