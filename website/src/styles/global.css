@@ -2,159 +2,161 @@
 /* Custom Vercel Noir overrides for Starlight */
 
 @font-face {
-  font-family: 'Geist';
-  src: url('/fonts/Geist-Variable.woff2') format('woff2');
-  font-weight: 100 900;
-  font-style: normal;
-  font-display: swap;
+    font-family: "Geist";
+    src: url("/fonts/Geist-Variable.woff2") format("woff2");
+    font-weight: 100 900;
+    font-style: normal;
+    font-display: swap;
 }
 
 @font-face {
-  font-family: 'Geist Mono';
-  src: url('/fonts/GeistMono-Variable.woff2') format('woff2');
-  font-weight: 100 900;
-  font-style: normal;
-  font-display: swap;
+    font-family: "Geist Mono";
+    src: url("/fonts/GeistMono-Variable.woff2") format("woff2");
+    font-weight: 100 900;
+    font-style: normal;
+    font-display: swap;
 }
 
 /* Design tokens — used by custom landing page components */
 :root {
-  --bg-base: #000000;
-  --bg-elevated: #0a0a0a;
-  --bg-card: #111111;
-  --bg-card-hover: #1a1a1a;
+    --bg-base: #000000;
+    --bg-elevated: #0a0a0a;
+    --bg-card: #111111;
+    --bg-card-hover: #1a1a1a;
 
-  --text-primary: #ffffff;
-  --text-secondary: #888888;
-  --text-muted: #666666;
+    --text-primary: #ffffff;
+    --text-secondary: #888888;
+    --text-muted: #666666;
 
-  --accent-blue: #0070f3;
-  --accent-green: #00ff88;
-  --accent-amber: #ff6600;
-  --accent-purple: #7928ca;
+    --accent-blue: #0070f3;
+    --accent-green: #00ff88;
+    --accent-amber: #ff6600;
+    --accent-purple: #7928ca;
 
-  --border-default: #333333;
-  --border-muted: #222222;
-  --border-focus: #ffffff;
+    --border-default: #333333;
+    --border-muted: #222222;
+    --border-focus: #ffffff;
 
-  --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
-  --font-mono: 'Geist Mono', 'SF Mono', Monaco, monospace;
+    --font-sans: "Geist", -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: "Geist Mono", "SF Mono", Monaco, monospace;
 
-  --transition-fast: 100ms linear;
-  --transition-normal: 150ms linear;
+    --transition-fast: 100ms linear;
+    --transition-normal: 150ms linear;
 
-  --nav-height: 56px;
+    --nav-height: 56px;
 }
 
 /* Override Starlight dark theme to match Vercel Noir */
-:root[data-theme='dark'],
+:root[data-theme="dark"],
 :root {
-  --sl-color-bg: #000000;
-  --sl-color-bg-nav: #000000;
-  --sl-color-bg-sidebar: #000000;
-  --sl-color-hairline-shade: #222222;
-  --sl-color-hairline-light: #333333;
-  --sl-color-black: #000000;
-  --sl-color-gray-1: #eeeeee;
-  --sl-color-gray-2: #c0c0c0;
-  --sl-color-gray-3: #888888;
-  --sl-color-gray-4: #555555;
-  --sl-color-gray-5: #333333;
-  --sl-color-gray-6: #1a1a1a;
-  --sl-color-gray-7: #111111;
-  --sl-color-accent-low: #001a3d;
-  --sl-color-accent: #0070f3;
-  --sl-color-accent-high: #b3d4fc;
-  --sl-color-white: #ffffff;
-  --sl-color-text: #eeeeee;
-  --sl-color-text-accent: #b3d4fc;
-  --sl-font: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
-  --sl-font-mono: 'Geist Mono', 'SF Mono', Monaco, monospace;
+    --sl-color-bg: #000000;
+    --sl-color-bg-nav: #000000;
+    --sl-color-bg-sidebar: #000000;
+    --sl-color-hairline-shade: #222222;
+    --sl-color-hairline-light: #333333;
+    --sl-color-black: #000000;
+    --sl-color-gray-1: #eeeeee;
+    --sl-color-gray-2: #c0c0c0;
+    --sl-color-gray-3: #888888;
+    --sl-color-gray-4: #555555;
+    --sl-color-gray-5: #333333;
+    --sl-color-gray-6: #1a1a1a;
+    --sl-color-gray-7: #111111;
+    --sl-color-accent-low: #001a3d;
+    --sl-color-accent: #0070f3;
+    --sl-color-accent-high: #b3d4fc;
+    --sl-color-white: #ffffff;
+    --sl-color-text: #eeeeee;
+    --sl-color-text-accent: #b3d4fc;
+    --sl-font: "Geist", -apple-system, BlinkMacSystemFont, sans-serif;
+    --sl-font-mono: "Geist Mono", "SF Mono", Monaco, monospace;
 }
 
 /* Force dark mode only */
-:root[data-theme='light'] {
-  --sl-color-bg: #000000;
-  --sl-color-bg-nav: #000000;
-  --sl-color-bg-sidebar: #000000;
-  --sl-color-hairline-shade: #222222;
-  --sl-color-hairline-light: #333333;
-  --sl-color-black: #000000;
-  --sl-color-gray-1: #eeeeee;
-  --sl-color-gray-2: #c0c0c0;
-  --sl-color-gray-3: #888888;
-  --sl-color-gray-4: #555555;
-  --sl-color-gray-5: #333333;
-  --sl-color-gray-6: #1a1a1a;
-  --sl-color-gray-7: #111111;
-  --sl-color-accent-low: #001a3d;
-  --sl-color-accent: #0070f3;
-  --sl-color-accent-high: #b3d4fc;
-  --sl-color-white: #ffffff;
-  --sl-color-text: #eeeeee;
-  --sl-color-text-accent: #b3d4fc;
-  --sl-font: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
-  --sl-font-mono: 'Geist Mono', 'SF Mono', Monaco, monospace;
+:root[data-theme="light"] {
+    --sl-color-bg: #000000;
+    --sl-color-bg-nav: #000000;
+    --sl-color-bg-sidebar: #000000;
+    --sl-color-hairline-shade: #222222;
+    --sl-color-hairline-light: #333333;
+    --sl-color-black: #000000;
+    --sl-color-gray-1: #eeeeee;
+    --sl-color-gray-2: #c0c0c0;
+    --sl-color-gray-3: #888888;
+    --sl-color-gray-4: #555555;
+    --sl-color-gray-5: #333333;
+    --sl-color-gray-6: #1a1a1a;
+    --sl-color-gray-7: #111111;
+    --sl-color-accent-low: #001a3d;
+    --sl-color-accent: #0070f3;
+    --sl-color-accent-high: #b3d4fc;
+    --sl-color-white: #ffffff;
+    --sl-color-text: #eeeeee;
+    --sl-color-text-accent: #b3d4fc;
+    --sl-font: "Geist", -apple-system, BlinkMacSystemFont, sans-serif;
+    --sl-font-mono: "Geist Mono", "SF Mono", Monaco, monospace;
 }
 
 /* Hide theme toggle — dark only */
 starlight-theme-select {
-  display: none !important;
+    display: none !important;
 }
 
 /* Custom scrollbar — Vercel Noir */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+    width: 8px;
+    height: 8px;
 }
 
 ::-webkit-scrollbar-track {
-  background: transparent;
+    background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--border-default);
-  border-radius: 4px;
+    background: var(--border-default);
+    border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--text-muted);
+    background: var(--text-muted);
 }
 
 * {
-  scrollbar-width: thin;
-  scrollbar-color: var(--border-default) transparent;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-default) transparent;
 }
 
 /* Scroll fade-in animation (used by landing page) */
 .fade-in {
-  opacity: 0;
-  transform: translateY(32px);
-  transition: opacity 0.7s cubic-bezier(0.16, 1, 0.3, 1), transform 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+    opacity: 0;
+    transform: translateY(32px);
+    transition:
+        opacity 0.7s cubic-bezier(0.16, 1, 0.3, 1),
+        transform 0.7s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .fade-in.visible {
-  opacity: 1;
-  transform: translateY(0);
+    opacity: 1;
+    transform: translateY(0);
 }
 
 /* Splash page: hide Starlight chrome, go full-width */
 [data-has-hero] .page {
-  background: var(--bg-base);
+    background: var(--bg-base);
 }
 
 [data-has-hero] .content-panel {
-  max-width: 100% !important;
-  padding: 0 !important;
+    max-width: 100% !important;
+    padding: 0 !important;
 }
 
 [data-has-hero] .main-pane {
-  padding: 0 !important;
+    padding: 0 !important;
 }
 
 [data-has-hero] .sl-container {
-  padding: 0 !important;
-  margin: 0 !important;
+    padding: 0 !important;
+    margin: 0 !important;
 }
 
 /* Hide Starlight header, sidebar, and TOC on splash page */
@@ -162,54 +164,54 @@ starlight-theme-select {
 [data-has-hero] nav.sidebar,
 [data-has-hero] .right-sidebar,
 [data-has-hero] .right-sidebar-panel {
-  display: none !important;
+    display: none !important;
 }
 
 [data-has-hero] {
-  --sl-nav-height: 0rem !important;
-  --sl-mobile-toc-height: 0rem !important;
+    --sl-nav-height: 0rem !important;
+    --sl-mobile-toc-height: 0rem !important;
 }
 
 /* Hide Starlight's built-in hero markup on splash page */
 [data-has-hero] .hero {
-  display: none !important;
+    display: none !important;
 }
 
 /* Full-width content on splash page — remove all Starlight spacing */
 [data-has-hero] .main-frame {
-  padding-top: 0 !important;
-  padding-inline-start: 0 !important;
+    padding-top: 0 !important;
+    padding-inline-start: 0 !important;
 }
 
 [data-has-hero] .sl-container,
 [data-has-hero] .content-panel {
-  max-width: 100% !important;
+    max-width: 100% !important;
 }
 
 [data-has-hero] main {
-  padding: 0 !important;
+    padding: 0 !important;
 }
 
 /* Remove any margin/padding Starlight adds around splash content */
 [data-has-hero] .sl-markdown-content {
-  margin: 0 !important;
-  padding: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
 }
 
 [data-has-hero] .sl-markdown-content > :first-child {
-  margin-top: 0 !important;
+    margin-top: 0 !important;
 }
 
 /* Docs sidebar: white text active state instead of blue highlight */
 nav.sidebar a[aria-current="page"],
 nav.sidebar a[aria-current="page"]:hover {
-  background: var(--bg-card) !important;
-  color: var(--text-primary) !important;
-  border-color: var(--text-primary) !important;
+    background: var(--bg-card) !important;
+    color: var(--text-primary) !important;
+    border-color: var(--text-primary) !important;
 }
 
 nav.sidebar a:hover {
-  color: var(--text-primary) !important;
+    color: var(--text-primary) !important;
 }
 
 /* Headings should be white, not blue */
@@ -217,160 +219,194 @@ nav.sidebar a:hover {
 .sl-markdown-content h2,
 .sl-markdown-content h3,
 .sl-markdown-content h4 {
-  color: var(--text-primary) !important;
+    color: var(--text-primary) !important;
 }
 
 /* ── Docs header — match landing page nav ── */
 
 /* Site title: 15px, 600 weight, white */
 .site-title {
-  gap: 0.5rem !important;
-  font-weight: 600 !important;
-  font-size: 15px !important;
-  color: var(--text-primary) !important;
-  text-decoration: none !important;
+    gap: 0.5rem !important;
+    font-weight: 600 !important;
+    font-size: 15px !important;
+    color: var(--text-primary) !important;
+    text-decoration: none !important;
 }
 
 .site-title span {
-  color: var(--text-primary) !important;
+    color: var(--text-primary) !important;
 }
 
 /* Logo image: constrain to 24px like landing nav */
 .site-title img {
-  width: 24px !important;
-  height: 24px !important;
-  border-radius: 6px;
+    width: 24px !important;
+    height: 24px !important;
+    border-radius: 6px;
 }
 
 /* Search bar: subtle styling */
 site-search button {
-  color: var(--text-secondary) !important;
-  font-size: 14px !important;
+    color: var(--text-secondary) !important;
+    font-size: 14px !important;
 }
 
 site-search button:hover {
-  color: var(--text-primary) !important;
+    color: var(--text-primary) !important;
 }
 
 /* Social icons: secondary color, white on hover */
 .social-icons a {
-  color: var(--text-secondary) !important;
+    color: var(--text-secondary) !important;
 }
 
 .social-icons a:hover {
-  color: var(--text-primary) !important;
+    color: var(--text-primary) !important;
 }
 
 /* Right sidebar (TOC) — white active state */
 starlight-toc a[aria-current="true"],
 starlight-toc a[aria-current="true"]:hover {
-  color: var(--text-primary) !important;
-  border-color: var(--text-primary) !important;
+    color: var(--text-primary) !important;
+    border-color: var(--text-primary) !important;
 }
 
 .right-sidebar-panel h2 {
-  color: var(--text-primary) !important;
+    color: var(--text-primary) !important;
 }
 
 /* ── Docs typography — match landing page / old Docs.astro ── */
 
 .sl-markdown-content {
-  font-family: var(--font-sans);
-  font-size: 16px;
-  line-height: 1.6;
-  -webkit-font-smoothing: antialiased;
+    font-family: var(--font-sans);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
 }
 
 .sl-markdown-content h1 {
-  font-size: 2rem !important;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  margin-bottom: 1.5rem;
+    font-size: 2rem !important;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    margin-bottom: 1.5rem;
 }
 
 .sl-markdown-content h2 {
-  font-size: 1.35rem !important;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  margin-top: 2.5rem;
-  margin-bottom: 1rem;
-  padding-bottom: 0.5rem;
-  border-bottom: 1px solid var(--border-muted);
+    font-size: 1.35rem !important;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    margin-top: 2.5rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border-muted);
 }
 
 .sl-markdown-content h3 {
-  font-size: 1.1rem !important;
-  font-weight: 600;
-  margin-top: 2rem;
-  margin-bottom: 0.75rem;
+    font-size: 1.1rem !important;
+    font-weight: 600;
+    margin-top: 2rem;
+    margin-bottom: 0.75rem;
 }
 
 .sl-markdown-content p {
-  color: var(--text-secondary);
-  line-height: 1.7;
-  margin-bottom: 1rem;
+    color: var(--text-secondary);
+    line-height: 1.7;
+    margin-bottom: 1rem;
 }
 
 .sl-markdown-content ul,
 .sl-markdown-content ol {
-  color: var(--text-secondary);
-  padding-left: 1.5rem;
-  margin-bottom: 1rem;
+    color: var(--text-secondary);
+    padding-left: 1.5rem;
+    margin-bottom: 1rem;
 }
 
 .sl-markdown-content li {
-  margin-bottom: 0.4rem;
-  line-height: 1.6;
+    margin-bottom: 0.4rem;
+    line-height: 1.6;
 }
 
 .sl-markdown-content code:not(pre code) {
-  background: var(--bg-card);
-  padding: 0.15rem 0.4rem;
-  font-size: 0.875em;
-  font-family: var(--font-mono);
-  border: none;
+    background: var(--bg-card);
+    padding: 0.15rem 0.4rem;
+    font-size: 0.875em;
+    font-family: var(--font-mono);
+    border: none;
 }
 
 .sl-markdown-content pre {
-  background: var(--bg-card) !important;
-  border: 1px solid var(--border-default);
-  padding: 1rem;
-  margin-bottom: 1.5rem;
-  font-family: var(--font-mono);
-  font-size: 14px;
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border-default);
+    padding: 1rem;
+    margin-bottom: 1.5rem;
+    font-family: var(--font-mono);
+    font-size: 14px;
 }
 
 .sl-markdown-content strong {
-  color: var(--text-primary);
-  font-weight: 600;
+    color: var(--text-primary);
+    font-weight: 600;
 }
 
 .sl-markdown-content table {
-  width: 100%;
-  border-collapse: collapse;
-  margin-bottom: 1.5rem;
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 1.5rem;
 }
 
 .sl-markdown-content th,
 .sl-markdown-content td {
-  text-align: left;
-  padding: 0.6rem 1rem;
-  border: 1px solid var(--border-muted);
-  font-size: 14px;
+    text-align: left;
+    padding: 0.6rem 1rem;
+    border: 1px solid var(--border-muted);
+    font-size: 14px;
 }
 
 .sl-markdown-content th {
-  background: var(--bg-card);
-  font-weight: 600;
-  color: var(--text-primary);
+    background: var(--bg-card);
+    font-weight: 600;
+    color: var(--text-primary);
 }
 
 .sl-markdown-content td {
-  color: var(--text-secondary);
+    color: var(--text-secondary);
 }
 
 /* Docs page: images get a border */
 .sl-markdown-content img {
-  border: 1px solid var(--border-default);
-  margin: 1rem 0;
+    border: 1px solid var(--border-default);
+    margin: 1rem 0;
+}
+
+/* Pagination links */
+.pagination-links .link-title {
+    font-size: 18px;
+    font-weight: 600;
+}
+
+/* ── Expressive Code — flat style matching old docs ── */
+
+/* Remove the three-dot terminal header */
+.expressive-code .header {
+    display: none !important;
+}
+
+/* Flat code block: card background, muted border, no rounded corners */
+.expressive-code .frame {
+    border: 1px solid var(--border-default) !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+}
+
+.expressive-code pre {
+    background: var(--bg-card) !important;
+    border: none !important;
+    border-radius: 0 !important;
+    padding: 1rem !important;
+    font-family: var(--font-mono) !important;
+    font-size: 14px !important;
+}
+
+.expressive-code .frame::before,
+.expressive-code .frame::after {
+    display: none !important;
 }
