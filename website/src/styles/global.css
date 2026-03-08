@@ -158,11 +158,16 @@ starlight-theme-select {
 }
 
 /* Hide Starlight header, sidebar, and TOC on splash page */
-[data-has-hero] header.header,
+[data-has-hero] .header,
 [data-has-hero] nav.sidebar,
 [data-has-hero] .right-sidebar,
 [data-has-hero] .right-sidebar-panel {
   display: none !important;
+}
+
+[data-has-hero] {
+  --sl-nav-height: 0rem !important;
+  --sl-mobile-toc-height: 0rem !important;
 }
 
 /* Hide Starlight's built-in hero markup on splash page */
