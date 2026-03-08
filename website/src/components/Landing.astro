@@ -9,6 +9,16 @@ import DotGrid from './DotGrid.astro';
 ---
 
 <div class="landing-wrapper">
+  <nav class="c9-nav">
+    <a href="/" class="c9-nav-logo">
+      <img src="/icon.png" alt="c9watch" width="24" height="24" />
+      <span>c9watch</span>
+    </a>
+    <div class="c9-nav-links">
+      <a href="/install/">Docs</a>
+      <a href="https://github.com/minchenlee/c9watch" target="_blank" rel="noopener">GitHub</a>
+    </div>
+  </nav>
   <div class="hero-wrapper">
     <DotGrid />
     <Hero />
@@ -51,6 +61,55 @@ import DotGrid from './DotGrid.astro';
 <style>
   .landing-wrapper {
     margin: 0 auto;
+  }
+
+  .c9-nav {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 56px;
+    padding: 0 1.5rem;
+    background: var(--bg-base);
+    border-bottom: 1px solid var(--border-muted);
+    backdrop-filter: blur(12px);
+  }
+
+  .c9-nav-logo {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--text-primary);
+    font-weight: 600;
+    font-size: 15px;
+    text-decoration: none;
+  }
+
+  .c9-nav-logo:hover {
+    text-decoration: none;
+  }
+
+  .c9-nav-logo img {
+    border-radius: 6px;
+  }
+
+  .c9-nav-links {
+    display: flex;
+    gap: 1.5rem;
+  }
+
+  .c9-nav-links a {
+    color: var(--text-secondary);
+    font-size: 14px;
+    text-decoration: none;
+    transition: color var(--transition-fast);
+  }
+
+  .c9-nav-links a:hover {
+    color: var(--text-primary);
+    text-decoration: none;
   }
 
   .hero-wrapper {

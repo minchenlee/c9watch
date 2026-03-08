@@ -2,17 +2,6 @@
 // website/src/components/Hero.astro
 ---
 
-<nav class="c9-nav">
-  <a href="/" class="c9-nav-logo">
-    <img src="/icon.png" alt="c9watch" width="32" height="32" />
-    <span>c9watch</span>
-  </a>
-  <div class="c9-nav-links">
-    <a href="/install/">Docs</a>
-    <a href="https://github.com/minchenlee/c9watch" target="_blank" rel="noopener">GitHub</a>
-  </div>
-</nav>
-
 <section class="c9-hero">
   <img src="/icon.png" alt="c9watch" width="80" height="80" class="hero-icon" />
   <h1 class="hero-title">
@@ -53,52 +42,6 @@
 </script>
 
 <style>
-  .c9-nav {
-    position: sticky;
-    top: 0;
-    z-index: 10;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    height: 64px;
-    margin-top: 0;
-    padding: 0 1.5rem;
-    background: var(--bg-base);
-    border-bottom: 1px solid var(--border-muted);
-    backdrop-filter: blur(12px);
-  }
-
-  .c9-nav-logo {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    color: var(--text-primary);
-    font-weight: 600;
-    font-size: 18px;
-    text-decoration: none;
-  }
-
-  .c9-nav-logo img {
-    border-radius: 6px;
-  }
-
-  .c9-nav-links {
-    display: flex;
-    gap: 1.5rem;
-  }
-
-  .c9-nav-links a {
-    color: var(--text-secondary);
-    font-size: 14px;
-    text-decoration: none;
-    transition: color var(--transition-fast);
-  }
-
-  .c9-nav-links a:hover {
-    color: var(--text-primary);
-    text-decoration: none;
-  }
-
   .c9-hero {
     position: relative;
     z-index: 1;
