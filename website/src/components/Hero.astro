@@ -3,172 +3,215 @@
 ---
 
 <section class="c9-hero">
-  <img src="/icon.png" alt="c9watch" width="80" height="80" class="hero-icon" />
-  <h1 class="hero-title">
-    Monitor and control all your Claude Code sessions from one place.
-  </h1>
-  <div class="hero-cta">
-    <div class="install-box">
-      <code>curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash</code>
-      <button class="copy-btn" aria-label="Copy install command">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <rect x="9" y="9" width="13" height="13" rx="0" />
-          <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
-        </svg>
-      </button>
+    <img
+        src="/icon.png"
+        alt="c9watch"
+        width="80"
+        height="80"
+        class="hero-icon"
+    />
+    <h1 class="hero-title">
+        Monitor and control all your Claude Code sessions from one place.
+    </h1>
+    <div class="hero-cta">
+        <div class="install-box">
+            <code
+                >curl -fsSL
+                https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh
+                | bash</code
+            >
+            <button class="copy-btn" aria-label="Copy install command">
+                <svg
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                >
+                    <rect x="9" y="9" width="13" height="13" rx="0"></rect>
+                    <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"
+                    ></path>
+                </svg>
+            </button>
+        </div>
+        <a
+            href="https://github.com/minchenlee/c9watch"
+            class="btn-github"
+            target="_blank"
+            rel="noopener"
+        >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <path
+                    d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"
+                ></path>
+            </svg>
+            GitHub
+        </a>
     </div>
-    <a href="https://github.com/minchenlee/c9watch" class="btn-github" target="_blank" rel="noopener">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-        <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z" />
-      </svg>
-      GitHub
-    </a>
-  </div>
-  <p class="hero-meta">macOS · MIT License · v0.4.0</p>
-  <div class="hero-demo">
-    <video autoplay loop muted playsinline>
-      <source src="/screenshots/demo.mp4" type="video/mp4" />
-    </video>
-  </div>
-  </section>
+    <p class="hero-meta">macOS · MIT License · v0.4.0</p>
+    <div class="hero-demo">
+        <video autoplay loop muted playsinline>
+            <source src="/screenshots/demo.mp4" type="video/mp4" />
+        </video>
+    </div>
+</section>
 
 <script>
-  const btn = document.querySelector('.copy-btn');
-  btn?.addEventListener('click', () => {
-    navigator.clipboard.writeText('curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash');
-    btn.setAttribute('aria-label', 'Copied!');
-    setTimeout(() => btn.setAttribute('aria-label', 'Copy install command'), 2000);
-  });
+    const btn = document.querySelector(".copy-btn");
+    btn?.addEventListener("click", () => {
+        navigator.clipboard.writeText(
+            "curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash",
+        );
+        btn.setAttribute("aria-label", "Copied!");
+        setTimeout(
+            () => btn.setAttribute("aria-label", "Copy install command"),
+            2000,
+        );
+    });
 </script>
 
 <style>
-  .c9-hero {
-    position: relative;
-    z-index: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 5rem 2rem 4rem;
-    text-align: center;
-    max-width: 800px;
-    margin: 0 auto;
-  }
+    .c9-hero {
+        position: relative;
+        z-index: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 5rem 2rem 4rem;
+        text-align: center;
+        max-width: 800px;
+        margin: 0 auto;
+    }
 
-  .hero-icon {
-    border-radius: 16px;
-    margin-bottom: 2rem;
-  }
+    .hero-icon {
+        border-radius: 16px;
+        margin-bottom: 2rem;
+        border: none !important;
+    }
 
-  .hero-title {
-    font-size: 2.5rem;
-    font-weight: 700;
-    letter-spacing: -0.03em;
-    line-height: 1.15;
-    max-width: 640px;
-    margin-bottom: 2.5rem;
-  }
-
-  .hero-cta {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 1rem;
-    margin-bottom: 1.5rem;
-  }
-
-  .install-box {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    background: var(--bg-card);
-    border: 1px solid var(--border-default);
-    padding: 0.75rem 1rem;
-    font-family: var(--font-mono);
-    font-size: 13px;
-    color: var(--text-secondary);
-    white-space: nowrap;
-  }
-
-  .copy-btn {
-    color: var(--text-muted);
-    cursor: pointer;
-    padding: 4px;
-    background: none;
-    border: none;
-    transition: color var(--transition-fast);
-  }
-
-  .copy-btn:hover {
-    color: var(--text-primary);
-  }
-
-  .btn-github {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.6rem 1.25rem;
-    border: 1px solid var(--border-default);
-    color: var(--text-primary);
-    font-size: 14px;
-    font-weight: 500;
-    text-decoration: none;
-    transition: border-color var(--transition-fast);
-  }
-
-  .btn-github:hover {
-    border-color: var(--border-focus);
-    text-decoration: none;
-  }
-
-  .hero-meta {
-    color: var(--text-muted);
-    font-size: 13px;
-    margin-bottom: 3rem;
-  }
-
-  .hero-demo {
-    position: relative;
-    width: 100%;
-    max-width: 720px;
-    border: 1px solid var(--border-default);
-  }
-
-  /* Animated gradient border on bottom edge */
-  .hero-demo::after {
-    content: '';
-    position: absolute;
-    bottom: -1px;
-    left: 0;
-    right: 0;
-    height: 2px;
-    background: linear-gradient(90deg,
-      transparent,
-      var(--accent-blue),
-      var(--accent-amber),
-      var(--accent-blue),
-      transparent
-    );
-    background-size: 200% 100%;
-    animation: shimmer-line 4s ease-in-out infinite;
-  }
-
-  @keyframes shimmer-line {
-    0% { background-position: 100% 0; }
-    100% { background-position: -100% 0; }
-  }
-
-  .hero-demo video {
-    width: 100%;
-    display: block;
-  }
-
-  @media (max-width: 640px) {
     .hero-title {
-      font-size: 1.75rem;
+        font-size: 2.5rem;
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        line-height: 1.15;
+        max-width: 640px;
+        margin-bottom: 2.5rem;
+    }
+
+    .hero-cta {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 1rem;
+        margin-bottom: 1.5rem;
     }
 
     .install-box {
-      font-size: 11px;
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        background: var(--bg-card);
+        border: 1px solid var(--border-default);
+        padding: 0.75rem 1rem;
+        font-family: var(--font-mono);
+        font-size: 13px;
+        color: var(--text-secondary);
+        white-space: nowrap;
+        max-width: 100%;
+        overflow-x: auto;
     }
-  }
+
+    .copy-btn {
+        color: var(--text-muted);
+        cursor: pointer;
+        padding: 4px;
+        background: none;
+        border: none;
+        transition: color var(--transition-fast);
+    }
+
+    .copy-btn:hover {
+        color: var(--text-primary);
+    }
+
+    .btn-github {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.6rem 1.25rem;
+        border: 1px solid var(--border-default);
+        color: var(--text-primary);
+        font-size: 14px;
+        font-weight: 500;
+        text-decoration: none;
+        transition: border-color var(--transition-fast);
+        backdrop-filter: blur(10px);
+    }
+
+    .btn-github:hover {
+        border-color: var(--border-focus);
+        text-decoration: none;
+    }
+
+    .hero-meta {
+        color: var(--text-muted);
+        font-size: 13px;
+        margin-bottom: 3rem;
+    }
+
+    .hero-demo {
+        position: relative;
+        width: 100%;
+        max-width: 720px;
+        border: 1px solid var(--border-default);
+    }
+
+    /* Animated gradient border on bottom edge */
+    .hero-demo::after {
+        content: "";
+        position: absolute;
+        bottom: -1px;
+        left: 0;
+        right: 0;
+        height: 2px;
+        background: linear-gradient(
+            90deg,
+            transparent,
+            var(--accent-blue),
+            var(--accent-amber),
+            var(--accent-blue),
+            transparent
+        );
+        background-size: 200% 100%;
+        animation: shimmer-line 4s ease-in-out infinite;
+    }
+
+    @keyframes shimmer-line {
+        0% {
+            background-position: 100% 0;
+        }
+        100% {
+            background-position: -100% 0;
+        }
+    }
+
+    .hero-demo video {
+        width: 100%;
+        display: block;
+    }
+
+    @media (max-width: 640px) {
+        .c9-hero {
+            padding: 3rem 1rem 3rem;
+        }
+
+        .hero-title {
+            font-size: 1.75rem;
+        }
+
+        .install-box {
+            font-size: 11px;
+        }
+    }
 </style>
