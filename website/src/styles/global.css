@@ -138,7 +138,11 @@ starlight-theme-select {
   transform: translateY(0);
 }
 
-/* Splash page: hide Starlight sidebar and header, go full-width */
+/* Splash page: hide Starlight chrome, go full-width */
+[data-has-hero] .page {
+  background: var(--bg-base);
+}
+
 [data-has-hero] .content-panel {
   max-width: 100%;
   padding: 0;
@@ -148,9 +152,22 @@ starlight-theme-select {
   padding: 0;
 }
 
-/* Hide Starlight's built-in hero on splash page */
+/* Hide Starlight header, sidebar, and TOC on splash page */
+[data-has-hero] header.header,
+[data-has-hero] nav.sidebar,
+[data-has-hero] .right-sidebar,
+[data-has-hero] .right-sidebar-panel {
+  display: none !important;
+}
+
+/* Hide Starlight's built-in hero markup on splash page */
 [data-has-hero] .hero {
-  display: none;
+  display: none !important;
+}
+
+/* Full-width content on splash page */
+[data-has-hero] .main-frame {
+  padding-inline-start: 0;
 }
 
 /* Docs page: images get a border */
