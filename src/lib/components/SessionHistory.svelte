@@ -557,7 +557,6 @@
 		min-width: 1.5em;
 		text-align: right;
 		user-select: none;
-		opacity: 0.5;
 	}
 
 	.row-content {
