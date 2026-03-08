@@ -225,6 +225,11 @@ starlight-toc a[aria-current="true"]:hover {
   color: var(--text-primary) !important;
 }
 
+/* Hide heading anchor link icons */
+.sl-markdown-content .heading-wrapper a.anchor-link {
+  display: none !important;
+}
+
 /* Doc content links — use c9watch amber/orange */
 .sl-markdown-content a {
   color: var(--accent-amber) !important;
