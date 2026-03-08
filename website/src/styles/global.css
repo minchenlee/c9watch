@@ -171,6 +171,15 @@ starlight-theme-select {
   padding-inline-start: 0 !important;
 }
 
+[data-has-hero] .sl-container,
+[data-has-hero] .content-panel {
+  max-width: 100% !important;
+}
+
+[data-has-hero] main {
+  padding: 0 !important;
+}
+
 /* Docs page: images get a border */
 .sl-markdown-content img {
   border: 1px solid var(--border-default);
