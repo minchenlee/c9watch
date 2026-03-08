@@ -47,6 +47,9 @@ export default defineConfig({
       ],
       pagination: true,
       tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 3 },
+      expressiveCode: {
+        themes: ['one-dark-pro'],
+      },
     }),
   ],
 });
