@@ -165,9 +165,10 @@ starlight-theme-select {
   display: none !important;
 }
 
-/* Full-width content on splash page */
+/* Full-width content on splash page — remove all Starlight spacing */
 [data-has-hero] .main-frame {
-  padding-inline-start: 0;
+  padding-top: 0 !important;
+  padding-inline-start: 0 !important;
 }
 
 /* Docs page: images get a border */
