@@ -200,6 +200,31 @@ nav.sidebar a:hover {
   color: var(--text-primary) !important;
 }
 
+/* Header site title and social icons — white not blue */
+.site-title a,
+.site-title span {
+  color: var(--text-primary) !important;
+}
+
+.social-icons a {
+  color: var(--text-secondary) !important;
+}
+
+.social-icons a:hover {
+  color: var(--text-primary) !important;
+}
+
+/* Right sidebar (TOC) — white active state */
+starlight-toc a[aria-current="true"],
+starlight-toc a[aria-current="true"]:hover {
+  color: var(--text-primary) !important;
+  border-color: var(--text-primary) !important;
+}
+
+.right-sidebar-panel h2 {
+  color: var(--text-primary) !important;
+}
+
 /* Docs page: images get a border */
 .sl-markdown-content img {
   border: 1px solid var(--border-default);
