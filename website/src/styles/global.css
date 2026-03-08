@@ -225,6 +225,25 @@ starlight-toc a[aria-current="true"]:hover {
   color: var(--text-primary) !important;
 }
 
+/* Links — use c9watch amber/orange */
+a {
+  color: var(--accent-amber);
+}
+
+a:hover {
+  color: var(--accent-amber);
+  opacity: 0.85;
+}
+
+.sl-markdown-content a {
+  color: var(--accent-amber) !important;
+}
+
+.sl-markdown-content a:hover {
+  color: var(--accent-amber) !important;
+  opacity: 0.85;
+}
+
 /* ── Docs typography — match landing page / old Docs.astro ── */
 
 .sl-markdown-content {
