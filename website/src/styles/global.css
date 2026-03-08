@@ -225,16 +225,7 @@ starlight-toc a[aria-current="true"]:hover {
   color: var(--text-primary) !important;
 }
 
-/* Links — use c9watch amber/orange */
-a {
-  color: var(--accent-amber);
-}
-
-a:hover {
-  color: var(--accent-amber);
-  opacity: 0.85;
-}
-
+/* Doc content links — use c9watch amber/orange */
 .sl-markdown-content a {
   color: var(--accent-amber) !important;
 }
