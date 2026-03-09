@@ -454,6 +454,7 @@
 		align-items: center;
 		gap: var(--space-sm);
 		flex-shrink: 0;
+		margin-left: auto;
 	}
 
 	.row-time {
