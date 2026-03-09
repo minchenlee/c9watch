@@ -6,9 +6,10 @@
 		scrollContainer: HTMLDivElement | null;
 		showTools?: boolean;
 		showThinking?: boolean;
+		onExpandToIndex?: (index: number) => void;
 	}
 
-	let { conversation, scrollContainer, showTools = $bindable(true), showThinking = $bindable(true) }: Props = $props();
+	let { conversation, scrollContainer, showTools = $bindable(true), showThinking = $bindable(true), onExpandToIndex }: Props = $props();
 
 	// Filter for "milestone" messages - user messages, tool blocks, and thinking steps
 	let items = $derived.by(() => {
@@ -57,6 +58,8 @@
 		const target = scrollContainer.querySelector(`[data-msg-index="${index}"]`) as HTMLElement | null;
 		if (target) {
 			target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+		} else if (onExpandToIndex) {
+			onExpandToIndex(index);
 		}
 	}
 
@@ -83,6 +86,7 @@
 				style="--item-color: {getMessageColor(msg)}"
 				onclick={() => scrollToMessage(index)}
 			>
+				<span class="nav-index">{index + 1}</span>
 				<span class="nav-icon">{getMessageIcon(msg)}</span>
 				<span class="nav-text">{truncateContent(msg.content)}</span>
 				<div class="nav-indicator"></div>
@@ -144,9 +148,9 @@
 	.nav-item-descriptive {
 		position: relative;
 		display: flex;
-		align-items: flex-start;
-		gap: var(--space-sm);
-		padding: 6px var(--space-lg);
+		align-items: baseline;
+		gap: 3px;
+		padding: 6px var(--space-sm) 6px var(--space-md);
 		cursor: pointer;
 		transition: all var(--transition-fast);
 		border: 1px solid transparent;
@@ -157,12 +161,21 @@
 		border-color: var(--border-muted);
 	}
 
+	.nav-index {
+		font-family: var(--font-mono);
+		font-size: 9px;
+		color: var(--text-muted);
+		opacity: 0.5;
+		flex-shrink: 0;
+		min-width: 1.8em;
+		text-align: right;
+	}
+
 	.nav-icon {
 		font-family: var(--font-mono);
 		font-size: 12px;
 		color: var(--item-color);
 		flex-shrink: 0;
-		margin-top: 1px;
 	}
 
 	.nav-text {

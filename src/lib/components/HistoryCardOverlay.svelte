@@ -5,6 +5,7 @@
 	import type { HistoryEntry, Conversation } from '$lib/types';
 	import MessageBubble from './MessageBubble.svelte';
 	import MessageNavMap from './MessageNavMap.svelte';
+	import { createSlidingWindow, BATCH_SIZE, MAX_VISIBLE } from '$lib/slidingWindow.svelte';
 
 	interface Props {
 		entry: HistoryEntry;
@@ -22,6 +23,13 @@
 	let navSheetOpen = $state(false);
 	let copied = $state(false);
 
+	const sw = createSlidingWindow();
+
+	let visibleMessages = $derived.by(() => {
+		if (!conversation) return [];
+		return sw.sliceMessages(conversation.messages);
+	});
+
 	function handleNavItemClick() {
 		// Close the bottom sheet on mobile after navigating
 		navSheetOpen = false;
@@ -38,12 +46,32 @@
 	});
 
 	function handleScroll() {
-		// No scroll position persisting needed for history viewer
+		if (!messagesContainer || !conversation) return;
+		sw.handleScroll(messagesContainer, conversation.messages.length);
+	}
+
+	async function onExpandToIndex(index: number) {
+		if (!messagesContainer || !conversation) return;
+		await sw.scrollToIndex(index, messagesContainer, conversation.messages.length);
 	}
 
 	$effect(() => {
 		if (conversation && conversation.messages.length > 0 && messagesContainer) {
 			if (!hasScrolledToBottom) {
+				if (searchQuery) {
+					const queryLower = searchQuery.toLowerCase();
+					const matchIndex = conversation!.messages.findIndex(
+						(m) => (m.messageType === 'User' || m.messageType === 'Assistant') &&
+							m.content.toLowerCase().includes(queryLower)
+					);
+					if (matchIndex >= 0) {
+						sw.reset(conversation.messages.length, Math.max(0, matchIndex - 10));
+					} else {
+						sw.reset(conversation.messages.length);
+					}
+				} else {
+					sw.reset(conversation.messages.length);
+				}
 				tick().then(() => {
 					if (searchQuery) {
 						// Find the first user/assistant message matching all query words.
@@ -70,8 +98,10 @@
 		}
 	});
 
-	function scrollToMessageIndex(index: number) {
-		if (!messagesContainer) return;
+	async function scrollToMessageIndex(index: number) {
+		if (!messagesContainer || !conversation) return;
+		sw.expandToIndex(index, conversation.messages.length);
+		await tick();
 		const target = messagesContainer.querySelector(`[data-msg-index="${index}"]`) as HTMLElement | null;
 		if (target) {
 			target.scrollIntoView({ block: 'center' });
@@ -84,7 +114,8 @@
 		}
 	}
 
-	function handleClose() {
+	async function handleClose() {
+		await sw.clearBeforeClose(conversation?.messages.length ?? 0);
 		onclose();
 	}
 
@@ -127,7 +158,7 @@
 							<h2 id="overlay-title" class="project-name">{entry.projectName.toUpperCase()}</h2>
 						</div>
 						<div class="header-meta">
-							<span class="message-count">{conversation?.messages.length ?? 0} messages</span>
+							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
 						</div>
 					</div>
 				</div>
@@ -189,9 +220,14 @@
 					</div>
 				{:else}
 					<div class="messages">
-						{#each conversation.messages as message, index (index)}
+						{#if sw.startIndex > 0}
+							<div class="load-more-indicator">
+								{sw.startIndex} earlier messages
+							</div>
+						{/if}
+						{#each visibleMessages as message, i (sw.startIndex + i)}
 							{#if (showTools || (message.messageType !== 'ToolUse' && message.messageType !== 'ToolResult')) && (showThinking || message.messageType !== 'Thinking')}
-								<div data-msg-index={index}>
+								<div data-msg-index={sw.startIndex + i}>
 									<MessageBubble {message} />
 								</div>
 							{/if}
@@ -218,7 +254,7 @@
 
 		<!-- Desktop: sidebar nav -->
 		<div class="nav-map-side nav-desktop" in:scale={{ start: 0.95, duration: 300, easing: quintOut }}>
-			<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking />
+			<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking {onExpandToIndex} />
 		</div>
 
 		<!-- Mobile: bottom sheet nav -->
@@ -231,7 +267,7 @@
 			<div class="nav-sheet-handle">
 				<div class="handle-bar"></div>
 			</div>
-			<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking />
+			<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking {onExpandToIndex} />
 		</div>
 	</div>
 </div>
@@ -451,6 +487,17 @@
 	.messages {
 		display: flex;
 		flex-direction: column;
+	}
+
+	.load-more-indicator {
+		text-align: center;
+		padding: var(--space-md) 0;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		opacity: 0.6;
 	}
 
 	/* Flash highlight for the matched search result message.
