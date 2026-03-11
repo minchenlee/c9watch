@@ -192,7 +192,7 @@ impl SessionDetector {
 
             // Encode the process cwd for matching
             let cwd_str = proc_cwd.to_string_lossy();
-            let encoded_cwd = cwd_str.replace(['/', '_'], "-");
+            let encoded_cwd = cwd_str.replace(['/', '_', '.'], "-");
 
             // Helper closure to check if a session matches the process path
             let path_matches =
