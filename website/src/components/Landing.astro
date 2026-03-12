@@ -4,6 +4,7 @@ import Compatibility from './Compatibility.astro';
 import Features from './Features.astro';
 import TechStack from './TechStack.astro';
 import InstallCTA from './InstallCTA.astro';
+import FAQ from './FAQ.astro';
 import Footer from './Footer.astro';
 import DotGrid from './DotGrid.astro';
 ---
@@ -64,6 +65,10 @@ import DotGrid from './DotGrid.astro';
     <div class="glow-orb orb-4"></div>
   </div>
   <div class="fade-in"><InstallCTA /></div>
+  <div class="glow-divider">
+    <div class="glow-orb orb-5"></div>
+  </div>
+  <div class="fade-in"><FAQ /></div>
   <Footer />
 </div>
 
@@ -219,5 +224,15 @@ import DotGrid from './DotGrid.astro';
     25% { opacity: 0.25; transform: translate(-50%, -50%) scale(1.2); }
     55% { opacity: 0.12; transform: translate(-50%, -50%) scale(1.05); }
     80% { opacity: 0.3; transform: translate(-50%, -50%) scale(1.15); }
+  }
+
+  .orb-5 {
+    background: var(--accent-green);
+    width: 320px;
+    height: 80px;
+    filter: blur(60px);
+    left: 50%;
+    transform: translate(-50%, -50%);
+    animation: pulse-1 7s ease-in-out 1s infinite;
   }
 </style>

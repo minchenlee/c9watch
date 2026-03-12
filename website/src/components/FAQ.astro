@@ -1,0 +1,121 @@
+---
+const faqs = [
+  {
+    question: "What is c9watch?",
+    answer: "c9watch is a free, open-source macOS app that provides a real-time dashboard for monitoring all your Claude Code sessions across different projects. It auto-discovers sessions, tracks costs, stores history, and lets you preview conversations — all from one place."
+  },
+  {
+    question: "How does c9watch detect Claude Code sessions?",
+    answer: "c9watch scans your running processes to find Claude Code instances, then matches them to session data files in ~/.claude/projects/. No plugins, extensions, or configuration needed — it works automatically with any terminal or IDE."
+  },
+  {
+    question: "Does c9watch work with VS Code, Cursor, and terminal apps?",
+    answer: "Yes. c9watch detects Claude Code sessions from any environment — VS Code, Cursor, Zed, Warp, iTerm2, Ghostty, Terminal.app, tmux, and 13+ JetBrains IDEs including IntelliJ IDEA, WebStorm, and PyCharm."
+  },
+  {
+    question: "Is c9watch free?",
+    answer: "Yes, c9watch is completely free and open-source under the MIT license. You can install it, use it, and contribute to it at no cost."
+  },
+  {
+    question: "How do I install c9watch?",
+    answer: "Run this one-liner in your terminal: curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash. You can also download the .dmg directly from GitHub Releases or build from source."
+  }
+];
+
+const faqSchema = {
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": faqs.map(faq => ({
+    "@type": "Question",
+    "name": faq.question,
+    "acceptedAnswer": {
+      "@type": "Answer",
+      "text": faq.answer
+    }
+  }))
+};
+---
+
+<section class="faq-section">
+  <script type="application/ld+json" set:html={JSON.stringify(faqSchema)} />
+  <h2 class="faq-title">Frequently Asked Questions</h2>
+  <div class="faq-list">
+    {faqs.map((faq) => (
+      <details class="faq-item">
+        <summary class="faq-question">{faq.question}</summary>
+        <p class="faq-answer">{faq.answer}</p>
+      </details>
+    ))}
+  </div>
+</section>
+
+<style>
+  .faq-section {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 4rem 1.5rem;
+  }
+
+  .faq-title {
+    font-family: var(--font-sans);
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    letter-spacing: -0.02em;
+    margin-bottom: 2rem;
+    text-align: center;
+  }
+
+  .faq-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .faq-item {
+    border-top: 1px solid var(--border-muted);
+  }
+
+  .faq-item:last-child {
+    border-bottom: 1px solid var(--border-muted);
+  }
+
+  .faq-question {
+    font-family: var(--font-sans);
+    font-size: 15px;
+    font-weight: 500;
+    color: var(--text-primary);
+    padding: 1rem 0;
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .faq-question::-webkit-details-marker {
+    display: none;
+  }
+
+  .faq-question::after {
+    content: '+';
+    font-size: 1.25rem;
+    color: var(--text-muted);
+    transition: transform 200ms linear;
+    flex-shrink: 0;
+    margin-left: 1rem;
+  }
+
+  .faq-item[open] .faq-question::after {
+    content: '−';
+  }
+
+  .faq-answer {
+    font-family: var(--font-sans);
+    font-size: 14px;
+    color: var(--text-secondary);
+    line-height: 1.7;
+    padding: 0 0 1rem 0;
+    margin: 0;
+  }
+</style>
