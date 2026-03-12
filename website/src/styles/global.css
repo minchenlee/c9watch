@@ -382,6 +382,16 @@ starlight-toc a[aria-current="true"]:hover {
     color: var(--text-secondary);
 }
 
+/* TLDR aside — match dark theme */
+.sl-markdown-content .starlight-aside--note {
+    border-color: var(--border-default);
+    background: var(--bg-card);
+}
+
+.sl-markdown-content .starlight-aside--note .starlight-aside__title {
+    color: var(--text-primary);
+}
+
 /* Docs page: images get a border */
 .sl-markdown-content img {
     border: 1px solid var(--border-default);

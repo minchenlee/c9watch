@@ -8,6 +8,10 @@ head:
     content: '{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"https://c9watch.mclee.dev"},{"@type":"ListItem","position":2,"name":"How It Works","item":"https://c9watch.mclee.dev/how-it-works/"}]}'
 ---
 
+:::note[TL;DR]
+c9watch scans your running processes to find Claude Code sessions, matches them to session data files in `~/.claude/projects/`, and displays live status updates through a lightweight Tauri desktop app.
+:::
+
 c9watch is a native macOS desktop app built with Tauri (Rust + Svelte). It monitors Claude Code sessions by reading local files and scanning OS processes — no network calls, no API keys, no telemetry.
 
 ## Architecture overview

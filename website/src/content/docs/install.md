@@ -8,6 +8,10 @@ head:
     content: '{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"https://c9watch.mclee.dev"},{"@type":"ListItem","position":2,"name":"Install","item":"https://c9watch.mclee.dev/install/"}]}'
 ---
 
+:::note[TL;DR]
+c9watch can be installed in one command: `curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash`. Also available as a `.dmg` download from [GitHub Releases](https://github.com/minchenlee/c9watch/releases) or build from source.
+:::
+
 c9watch is a native macOS desktop app. There are three ways to install it.
 
 ## Quick install

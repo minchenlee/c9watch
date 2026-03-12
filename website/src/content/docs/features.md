@@ -8,6 +8,10 @@ head:
     content: '{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"https://c9watch.mclee.dev"},{"@type":"ListItem","position":2,"name":"Features","item":"https://c9watch.mclee.dev/features/"}]}'
 ---
 
+:::note[TL;DR]
+c9watch monitors all Claude Code sessions on your Mac in real-time — auto-discovery, session history, cost tracking, conversation viewer, and tray popover. No plugins or configuration needed.
+:::
+
 c9watch gives you a real-time dashboard of every Claude Code session running on your machine. Here's everything it can do.
 
 ## Zero-integration setup
