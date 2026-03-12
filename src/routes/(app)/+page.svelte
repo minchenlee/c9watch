@@ -598,6 +598,9 @@
 		   titleBarStyle: Overlay windows. Right padding matches. */
 		padding: 0 var(--space-md) 0 80px;
 		transition: padding-left 0.35s ease;
+		/* Make the whole bar draggable (including the 80px padding over the
+		   traffic lights). Child buttons opt out via -webkit-app-region: no-drag. */
+		-webkit-app-region: drag;
 	}
 
 	/* Fills the right portion of the tab bar — draggable window handle area.
@@ -1029,7 +1032,10 @@
 	/* ── Mobile Responsive ─────────────────────────────────────── */
 	@media (max-width: 768px) {
 		.tab-bar {
-			height: 0;
+			height: 28px;
+		}
+
+		.tab-btn {
 			display: none;
 		}
 
