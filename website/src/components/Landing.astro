@@ -9,6 +9,31 @@ import DotGrid from './DotGrid.astro';
 ---
 
 <div class="landing-wrapper">
+  <script type="application/ld+json" set:html={JSON.stringify({
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "c9watch",
+    "description": "A free, open-source macOS desktop app that provides a real-time dashboard for monitoring all your Claude Code sessions across different projects.",
+    "url": "https://c9watch.mclee.dev",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "macOS",
+    "license": "https://opensource.org/licenses/MIT",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "author": {
+      "@type": "Person",
+      "name": "Min-Chen Lee",
+      "url": "https://github.com/minchenlee"
+    },
+    "sameAs": [
+      "https://github.com/minchenlee/c9watch"
+    ],
+    "downloadUrl": "https://github.com/minchenlee/c9watch/releases",
+    "screenshot": "https://c9watch.mclee.dev/og-image.png"
+  })} />
   <nav class="c9-nav">
     <a href="/" class="c9-nav-logo">
       <img src="/icon.png" alt="c9watch" width="24" height="24" />
