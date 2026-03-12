@@ -1,6 +1,11 @@
 ---
 title: Features
-description: Everything c9watch can do — real-time monitoring, session history, cost tracking, and more.
+description: Everything c9watch can do — real-time Claude Code session monitoring, session history, cost tracking, and more.
+head:
+  - tag: script
+    attrs:
+      type: application/ld+json
+    content: '{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"https://c9watch.mclee.dev"},{"@type":"ListItem","position":2,"name":"Features","item":"https://c9watch.mclee.dev/features/"}]}'
 ---
 
 c9watch gives you a real-time dashboard of every Claude Code session running on your machine. Here's everything it can do.

@@ -1,6 +1,11 @@
 ---
 title: Changelog
-description: All notable changes to c9watch.
+description: All notable changes to c9watch — release notes, new features, and bug fixes.
+head:
+  - tag: script
+    attrs:
+      type: application/ld+json
+    content: '{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"https://c9watch.mclee.dev"},{"@type":"ListItem","position":2,"name":"Changelog","item":"https://c9watch.mclee.dev/changelog/"}]}'
 ---
 
 All notable changes to c9watch are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).

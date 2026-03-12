@@ -1,6 +1,11 @@
 ---
 title: How It Works
-description: Architecture and internals of c9watch — process scanning, JSONL parsing, IDE detection, and more.
+description: How c9watch monitors Claude Code sessions — process scanning, JSONL parsing, IDE detection, and Tauri architecture.
+head:
+  - tag: script
+    attrs:
+      type: application/ld+json
+    content: '{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"https://c9watch.mclee.dev"},{"@type":"ListItem","position":2,"name":"How It Works","item":"https://c9watch.mclee.dev/how-it-works/"}]}'
 ---
 
 c9watch is a native macOS desktop app built with Tauri (Rust + Svelte). It monitors Claude Code sessions by reading local files and scanning OS processes — no network calls, no API keys, no telemetry.

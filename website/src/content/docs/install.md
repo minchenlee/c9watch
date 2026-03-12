@@ -1,6 +1,11 @@
 ---
 title: Install
-description: How to install c9watch on macOS.
+description: How to install c9watch on macOS — one-command install, DMG download, or build from source.
+head:
+  - tag: script
+    attrs:
+      type: application/ld+json
+    content: '{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"https://c9watch.mclee.dev"},{"@type":"ListItem","position":2,"name":"Install","item":"https://c9watch.mclee.dev/install/"}]}'
 ---
 
 c9watch is a native macOS desktop app. There are three ways to install it.
