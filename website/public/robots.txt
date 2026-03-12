@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://c9watch.mclee.dev/sitemap-index.xml
