@@ -22,6 +22,7 @@
 	let isThinking = $derived(message.messageType === 'Thinking');
 	let isToolUse = $derived(message.messageType === 'ToolUse');
 	let isToolResult = $derived(message.messageType === 'ToolResult');
+	let isSystem = $derived(message.messageType === 'System');
 
 	let roleLabel = $derived.by(() => {
 		switch (message.messageType) {
@@ -35,6 +36,8 @@
 				return 'Tool';
 			case 'ToolResult':
 				return 'Result';
+			case 'System':
+				return 'System';
 			default:
 				return 'Unknown';
 		}
@@ -52,6 +55,8 @@
 				return '⚙';
 			case 'ToolResult':
 				return '↩';
+			case 'System':
+				return '◈';
 			default:
 				return '•';
 		}
@@ -97,6 +102,7 @@
 	class:thinking={isThinking}
 	class:tool-use={isToolUse}
 	class:tool-result={isToolResult}
+	class:system={isSystem}
 >
 	<div class="message-header">
 		<span class="message-icon">{roleIcon}</span>
@@ -163,6 +169,12 @@
 		opacity: 0.6;
 	}
 
+	.message-bubble.system {
+		border-left: 1px solid var(--accent-purple);
+		background: rgba(121, 40, 202, 0.03);
+		opacity: 0.7;
+	}
+
 	.message-header {
 		display: flex;
 		align-items: center;
@@ -195,6 +207,10 @@
 
 	.message-bubble.tool-use .message-role {
 		color: var(--status-input);
+	}
+
+	.message-bubble.system .message-role {
+		color: var(--accent-purple);
 	}
 
 	.message-time {
@@ -364,6 +380,12 @@
 
 	.message-bubble.user .message-content {
 		color: var(--text-primary);
+	}
+
+	.message-bubble.system .message-content {
+		color: var(--text-muted);
+		font-family: var(--font-mono);
+		font-size: 13px;
 	}
 
 	.message-bubble.tool-use .message-content,

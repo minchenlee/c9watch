@@ -24,6 +24,14 @@
 	let showTools = $state(true);
 	let showThinking = $state(true);
 	let navSheetOpen = $state(false);
+	let idCopied = $state(false);
+	let tooltipText = $state('');
+	let tooltipX = $state(0);
+	let tooltipY = $state(0);
+
+	function tipEnter(text: string) { tooltipText = text; }
+	function tipLeave() { tooltipText = ''; }
+	function tipMove(e: MouseEvent) { tooltipX = e.clientX + 12; tooltipY = e.clientY + 12; }
 
 	const sw = createSlidingWindow();
 
@@ -119,6 +127,15 @@
 		onclose?.();
 	}
 
+	async function copySessionId() {
+		try {
+			await navigator.clipboard.writeText(session.id);
+			idCopied = true;
+			tooltipText = 'Copied!';
+			setTimeout(() => { idCopied = false; tooltipText = ''; }, 1500);
+		} catch { /* clipboard API may fail */ }
+	}
+
 	function handleBackdropClick(e: MouseEvent) {
 		if (e.target === e.currentTarget) {
 			handleClose();
@@ -150,7 +167,30 @@
 
 					<div class="header-info">
 						<div class="header-title">
-							<h2 id="overlay-title" class="project-name">{session.summary || session.firstPrompt || 'New Session'}</h2>
+							<!-- svelte-ignore a11y_no_static_element_interactions -->
+							<h2
+								id="overlay-title"
+								class="project-name"
+								onmouseenter={() => tipEnter(session.id)}
+								onmouseleave={tipLeave}
+								onmousemove={tipMove}
+							>{session.summary || session.firstPrompt || 'New Session'}</h2>
+							<!-- svelte-ignore a11y_click_events_have_key_events -->
+							<!-- svelte-ignore a11y_no_static_element_interactions -->
+							<span
+								class="copy-id-btn"
+								class:copied={idCopied}
+								onclick={copySessionId}
+								onmouseenter={() => tipEnter('Copy session ID')}
+								onmouseleave={tipLeave}
+								onmousemove={tipMove}
+							>
+								{#if idCopied}
+									<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12" /></svg>
+								{:else}
+									<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+								{/if}
+							</span>
 						</div>
 						<div class="header-meta">
 							<span class="status-label" style="color: {getStatusColor()}">{getStatusLabel()}</span>
@@ -213,6 +253,12 @@
 					</button>
 				</div>
 			</header>
+
+			{#if tooltipText}
+				<div class="id-tooltip" style="left: {tooltipX}px; top: {tooltipY}px;">
+					{tooltipText}
+				</div>
+			{/if}
 
 			<!-- Conversation Area -->
 			<div class="conversation-area" bind:this={messagesContainer} onscroll={handleScroll}>
@@ -360,7 +406,52 @@
 	.header-title {
 		display: flex;
 		align-items: center;
-		gap: var(--space-md);
+		gap: var(--space-sm);
+	}
+
+	.copy-id-btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		width: 20px;
+		height: 20px;
+		color: var(--text-muted);
+		cursor: pointer;
+		opacity: 0;
+		transition: opacity var(--transition-fast), color var(--transition-fast);
+	}
+
+	.header-title:hover .copy-id-btn {
+		opacity: 0.6;
+	}
+
+	.copy-id-btn:hover {
+		opacity: 1 !important;
+		color: var(--text-primary);
+	}
+
+	.copy-id-btn.copied {
+		opacity: 1 !important;
+		color: var(--status-input);
+	}
+
+	/* Cursor-following tooltip */
+	.id-tooltip {
+		position: fixed;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-primary);
+		background: var(--bg-elevated);
+		border: 1px solid var(--border-default);
+		padding: 4px 8px;
+		white-space: nowrap;
+		pointer-events: none;
+		z-index: 9999;
+		letter-spacing: 0.02em;
+		text-transform: none;
+		font-weight: 400;
+		box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
 	}
 
 	.project-name {

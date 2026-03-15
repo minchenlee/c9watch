@@ -59,7 +59,7 @@ export interface Session {
 /**
  * Message type in conversation
  */
-export type MessageType = 'User' | 'Assistant' | 'Thinking' | 'ToolUse' | 'ToolResult';
+export type MessageType = 'User' | 'Assistant' | 'Thinking' | 'ToolUse' | 'ToolResult' | 'System';
 
 /**
  * A base64-encoded image attached to a message

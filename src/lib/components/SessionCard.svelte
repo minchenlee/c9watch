@@ -29,6 +29,13 @@
 	let tempTitle = $state('');
 	let terminalTitleHint = $state<string | null>(null);
 	let optimisticTitle = $state<string | null>(null);
+	let tooltipText = $state('');
+	let tooltipX = $state(0);
+	let tooltipY = $state(0);
+
+	function tipEnter(text: string) { tooltipText = text; }
+	function tipLeave() { tooltipText = ''; }
+	function tipMove(e: MouseEvent) { tooltipX = e.clientX + 12; tooltipY = e.clientY + 12; }
 
 	let cardTitle = $derived(optimisticTitle || session.customTitle || session.summary || session.firstPrompt);
 
@@ -166,6 +173,18 @@
 		}
 	}
 
+	let idCopied = $state(false);
+
+	async function copySessionId(e: MouseEvent) {
+		e.stopPropagation();
+		try {
+			await navigator.clipboard.writeText(session.id);
+			idCopied = true;
+			tooltipText = 'Copied!';
+			setTimeout(() => { idCopied = false; tooltipText = ''; }, 1500);
+		} catch { /* clipboard API may fail in some contexts */ }
+	}
+
 	function autofocus(node: HTMLElement) {
 		node.focus();
 		if (node instanceof HTMLInputElement) {
@@ -202,9 +221,40 @@
 					onclick={(e) => e.stopPropagation()}
 				/>
 			{:else}
-				<h3 class="card-main-title" ondblclick={() => startEditing()}>{cardTitle}</h3>
+				<!-- svelte-ignore a11y_no_static_element_interactions -->
+				<h3
+					class="card-main-title"
+					ondblclick={() => startEditing()}
+					onmouseenter={() => tipEnter(session.id)}
+					onmouseleave={tipLeave}
+					onmousemove={tipMove}
+				>
+					{cardTitle}
+				</h3>
+				<!-- svelte-ignore a11y_click_events_have_key_events -->
+				<!-- svelte-ignore a11y_no_static_element_interactions -->
+				<span
+					class="copy-id-btn"
+					class:copied={idCopied}
+					onclick={copySessionId}
+					onmouseenter={() => tipEnter('Copy session ID')}
+					onmouseleave={tipLeave}
+					onmousemove={tipMove}
+				>
+					{#if idCopied}
+						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12" /></svg>
+					{:else}
+						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+					{/if}
+				</span>
 			{/if}
 		</div>
+
+		{#if tooltipText}
+			<div class="id-tooltip" style="left: {tooltipX}px; top: {tooltipY}px;">
+				{tooltipText}
+			</div>
+		{/if}
 
 		<!-- Project & Stats Row -->
 		<div class="stats-row">
@@ -344,7 +394,52 @@
 		-webkit-line-clamp: 2;
 		line-clamp: 2;
 		-webkit-box-orient: vertical;
-		cursor: text;
+		cursor: default;
+	}
+
+	.copy-id-btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		width: 20px;
+		height: 20px;
+		color: var(--text-muted);
+		cursor: pointer;
+		opacity: 0;
+		transition: opacity var(--transition-fast), color var(--transition-fast);
+	}
+
+	.card-header:hover .copy-id-btn {
+		opacity: 0.6;
+	}
+
+	.copy-id-btn:hover {
+		opacity: 1 !important;
+		color: var(--text-primary);
+	}
+
+	.copy-id-btn.copied {
+		opacity: 1 !important;
+		color: var(--status-input);
+	}
+
+	/* Cursor-following tooltip */
+	.id-tooltip {
+		position: fixed;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-primary);
+		background: var(--bg-elevated);
+		border: 1px solid var(--border-default);
+		padding: 4px 8px;
+		white-space: nowrap;
+		pointer-events: none;
+		z-index: 9999;
+		letter-spacing: 0.02em;
+		text-transform: none;
+		font-weight: 400;
+		box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
 	}
 
 	.title-input {

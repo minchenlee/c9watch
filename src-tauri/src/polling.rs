@@ -265,13 +265,24 @@ fn detect_and_enrich_sessions_with_detector(
         });
 
         let (first_prompt, summary, message_count, modified, git_branch) = match session_entry {
-            Some(entry) => (
-                entry.first_prompt.clone(),
-                entry.summary.clone(),
-                entry.message_count,
-                entry.modified.clone(),
-                Some(entry.git_branch.clone()),
-            ),
+            Some(entry) => {
+                // Guard: if sessions-index first_prompt is a system command, try JSONL fallback
+                let fp = if crate::session::parser::is_system_content(&entry.first_prompt) {
+                    let session_file_path =
+                        detected.project_path.join(format!("{}.jsonl", session_id));
+                    get_first_prompt_from_jsonl(&session_file_path)
+                        .unwrap_or_else(|| entry.first_prompt.clone())
+                } else {
+                    entry.first_prompt.clone()
+                };
+                (
+                    fp,
+                    entry.summary.clone(),
+                    entry.message_count,
+                    entry.modified.clone(),
+                    Some(entry.git_branch.clone()),
+                )
+            }
             None => {
                 // Session not in index or index doesn't exist - use fallback values
                 let session_file_path = detected.project_path.join(format!("{}.jsonl", session_id));
@@ -381,7 +392,11 @@ fn get_first_prompt_from_jsonl(path: &Path) -> Option<String> {
                 if let Some(message) = value.get("message") {
                     if let Some(content) = message.get("content") {
                         // Content can be a string or array
+                        // Skip system-generated local command messages
                         if let Some(text) = content.as_str() {
+                            if crate::session::parser::is_system_content(text) {
+                                continue;
+                            }
                             return Some(truncate_string(text, 100));
                         } else if let Some(arr) = content.as_array() {
                             // Find the first text block
@@ -423,8 +438,10 @@ fn get_latest_message_from_entries(entries: &[crate::session::parser::SessionEnt
     for entry in entries.iter().rev() {
         match entry {
             crate::session::parser::SessionEntry::User { message, .. } => {
-                // Skip tool result entries - only show actual user prompts
-                if message.is_tool_result {
+                // Skip tool result entries and system-generated command messages
+                if message.is_tool_result
+                    || crate::session::parser::is_system_content(&message.content)
+                {
                     continue;
                 }
                 return truncate_string(&message.content, 200);

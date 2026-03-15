@@ -324,6 +324,118 @@ pub fn parse_all_entries<P: AsRef<Path>>(path: P) -> Result<Vec<SessionEntry>, S
     Ok(parse_jsonl_entries(lines))
 }
 
+/// Known XML tag prefixes that indicate system-generated (non-user) messages.
+/// Claude Code injects these into the JSONL as `type: "user"` entries.
+const SYSTEM_TAG_PREFIXES: &[&str] = &[
+    "<local-command-",     // /model, /bye, /rename output
+    "<command-name>",      // slash command entries (/exit, /clear, /model)
+    "<task-notification>", // background task completion
+    "<bash-input>",        // inline bash command + output
+    "<bash-stdout>",       // standalone bash stdout
+    "<bash-stderr>",       // standalone bash stderr
+    "<result",             // agent/subagent results
+];
+
+/// Public helper: check if content string is a system-generated message.
+/// Used by both the parser and polling to skip system messages in titles/previews.
+pub fn is_system_content(content: &str) -> bool {
+    let trimmed = content.trim();
+    SYSTEM_TAG_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+}
+
+/// Tags whose inner text should be suppressed (not displayed in conversation preview).
+const HIDDEN_TAGS: &[&str] = &[
+    "local-command-caveat", // internal system disclaimer
+    "command-args",         // raw args (redundant with command-message)
+    "bash-stderr",          // stderr noise
+    "tool-use-id",          // internal ID
+    "output-file",          // temp file path
+    "duration_ms",          // agent stats
+    "total_tokens",         // agent stats
+    "tool_uses",            // agent stats
+    "usage",                // agent usage block
+];
+
+/// Strip XML tags from system messages and return the inner text.
+/// Suppresses tags listed in `HIDDEN_TAGS`. Extracts meaningful content from the rest.
+fn clean_system_message(content: &str) -> String {
+    use std::fmt::Write;
+
+    let mut result = String::new();
+    let mut remaining = content.trim();
+
+    while !remaining.is_empty() {
+        // Skip any whitespace between tags
+        remaining = remaining.trim_start();
+        if remaining.is_empty() {
+            break;
+        }
+
+        // Find next opening tag
+        if let Some(tag_start) = remaining.find('<') {
+            // Find the end of the opening tag
+            if let Some(tag_end) = remaining[tag_start..].find('>') {
+                let tag_end_abs = tag_start + tag_end + 1;
+                // Extract tag name for matching closing tag
+                let tag_content = &remaining[tag_start + 1..tag_start + tag_end];
+                let tag_name = tag_content.split_whitespace().next().unwrap_or("");
+
+                // Skip if this doesn't look like a system tag
+                if tag_name.is_empty() || tag_name.starts_with('/') {
+                    break;
+                }
+
+                let closing_tag = format!("</{}>", tag_name);
+
+                if let Some(close_pos) = remaining[tag_end_abs..].find(&closing_tag) {
+                    let should_hide = HIDDEN_TAGS.iter().any(|&t| t == tag_name);
+
+                    if !should_hide {
+                        let inner = remaining[tag_end_abs..tag_end_abs + close_pos].trim();
+                        let clean = strip_ansi_codes(inner);
+                        if !clean.is_empty() {
+                            if !result.is_empty() {
+                                let _ = write!(result, "\n");
+                            }
+                            result.push_str(&clean);
+                        }
+                    }
+                    remaining = &remaining[tag_end_abs + close_pos + closing_tag.len()..];
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+
+    result
+}
+
+/// Strip ANSI escape codes from a string (e.g. \x1b[1m, \x1b[22m).
+fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' || c == '\u{001b}' {
+            // Skip until we find a letter (the terminator of the escape sequence)
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// Get all user and assistant messages from session entries.
 /// Returns tuples of (timestamp, message_type, content, images).
 pub fn extract_messages(
@@ -341,6 +453,16 @@ pub fn extract_messages(
                         message.content.clone(),
                         vec![],
                     ));
+                } else if is_system_content(&message.content) {
+                    let cleaned = clean_system_message(&message.content);
+                    if !cleaned.is_empty() {
+                        messages.push((
+                            base.timestamp.clone(),
+                            MessageType::System,
+                            cleaned,
+                            vec![],
+                        ));
+                    }
                 } else {
                     messages.push((
                         base.timestamp.clone(),
@@ -421,6 +543,7 @@ pub enum MessageType {
     Thinking,
     ToolUse,
     ToolResult,
+    System,
 }
 
 #[cfg(test)]
@@ -851,5 +974,133 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].1, MessageType::Assistant);
         assert_eq!(result[1].1, MessageType::ToolUse);
+    }
+
+    // ── System message tests ──────────────────────────────────────
+
+    #[test]
+    fn test_is_system_message_caveat() {
+        assert!(is_system_content("<local-command-caveat>Caveat: ...</local-command-caveat>"));
+    }
+
+    #[test]
+    fn test_is_system_message_stdout() {
+        assert!(is_system_content(
+            "<local-command-stdout>Set model to \x1b[1msonnet\x1b[22m</local-command-stdout>"
+        ));
+    }
+
+    #[test]
+    fn test_is_system_message_command_name() {
+        assert!(is_system_content(
+            "<command-name>/exit</command-name>\n<command-message>exit</command-message>"
+        ));
+    }
+
+    #[test]
+    fn test_is_system_message_task_notification() {
+        assert!(is_system_content(
+            "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"
+        ));
+    }
+
+    #[test]
+    fn test_is_system_message_bash() {
+        assert!(is_system_content("<bash-input>git status</bash-input>"));
+        assert!(is_system_content("<bash-stdout>On branch main</bash-stdout>"));
+    }
+
+    #[test]
+    fn test_is_system_message_regular_user() {
+        assert!(!is_system_content("Hello Claude"));
+        assert!(!is_system_content("check our backlog"));
+        assert!(!is_system_content("<p>HTML but not a system tag</p>"));
+    }
+
+    #[test]
+    fn test_clean_system_message_stdout_with_ansi() {
+        let content =
+            "<local-command-stdout>Set model to \x1b[1msonnet (claude-sonnet-4-5-20250929)\x1b[22m</local-command-stdout>";
+        assert_eq!(
+            clean_system_message(content),
+            "Set model to sonnet (claude-sonnet-4-5-20250929)"
+        );
+    }
+
+    #[test]
+    fn test_clean_system_message_caveat_hidden() {
+        let content = "<local-command-caveat>Caveat: DO NOT respond.</local-command-caveat>";
+        assert_eq!(clean_system_message(content), "");
+    }
+
+    #[test]
+    fn test_clean_system_message_caveat_plus_stdout() {
+        let content = "<local-command-caveat>Caveat</local-command-caveat><local-command-stdout>Bye!</local-command-stdout>";
+        assert_eq!(clean_system_message(content), "Bye!");
+    }
+
+    #[test]
+    fn test_clean_system_message_command_name() {
+        let content = "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>";
+        assert_eq!(clean_system_message(content), "/model\nmodel");
+    }
+
+    #[test]
+    fn test_clean_system_message_task_notification() {
+        let content = "<task-notification>\n<task-id>abc</task-id>\n<status>completed</status>\n<summary>Build finished</summary>\n</task-notification>";
+        let cleaned = clean_system_message(content);
+        assert!(cleaned.contains("completed"));
+        assert!(cleaned.contains("Build finished"));
+    }
+
+    #[test]
+    fn test_extract_messages_system_stdout() {
+        let entries = vec![SessionEntry::User {
+            base: make_base("2026-01-01T00:00:00Z"),
+            message: UserMessage {
+                role: "user".to_string(),
+                content: "<local-command-stdout>Session renamed to: my-task</local-command-stdout>"
+                    .to_string(),
+                is_tool_result: false,
+                images: vec![],
+            },
+        }];
+        let result = extract_messages(&entries);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1, MessageType::System);
+        assert_eq!(result[0].2, "Session renamed to: my-task");
+    }
+
+    #[test]
+    fn test_extract_messages_caveat_only_hidden() {
+        let entries = vec![SessionEntry::User {
+            base: make_base("2026-01-01T00:00:00Z"),
+            message: UserMessage {
+                role: "user".to_string(),
+                content: "<local-command-caveat>Caveat: DO NOT respond to these messages.</local-command-caveat>".to_string(),
+                is_tool_result: false,
+                images: vec![],
+            },
+        }];
+        let result = extract_messages(&entries);
+        assert_eq!(result.len(), 0, "Caveat-only messages should be hidden");
+    }
+
+    #[test]
+    fn test_extract_messages_command_name_hidden() {
+        // /exit command produces empty cleaned content (command-args is hidden)
+        let entries = vec![SessionEntry::User {
+            base: make_base("2026-01-01T00:00:00Z"),
+            message: UserMessage {
+                role: "user".to_string(),
+                content: "<command-name>/exit</command-name>\n<command-message>exit</command-message>\n<command-args></command-args>".to_string(),
+                is_tool_result: false,
+                images: vec![],
+            },
+        }];
+        let result = extract_messages(&entries);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1, MessageType::System);
+        assert!(result[0].2.contains("/exit"));
     }
 }

@@ -18,6 +18,7 @@
 			.map((msg, index) => ({ msg, index }))
 			.filter(({ msg }) =>
 				msg.messageType === 'User' ||
+				msg.messageType === 'System' ||
 				(showThinking && msg.messageType === 'Thinking') ||
 				(showTools && msg.messageType === 'ToolUse' && msg.content?.length > 0)
 			);
@@ -31,6 +32,8 @@
 				return '◇';
 			case 'ToolUse':
 				return '⚙';
+			case 'System':
+				return '◈';
 			default:
 				return '•';
 		}
@@ -44,6 +47,8 @@
 				return 'var(--status-permission)';
 			case 'ToolUse':
 				return 'var(--status-input)';
+			case 'System':
+				return 'var(--accent-purple)';
 			default:
 				return 'var(--text-muted)';
 		}
