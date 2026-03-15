@@ -103,7 +103,7 @@ pub fn start_polling(
                                             (prev_status, &session.status),
                                             (
                                                 SessionStatus::Working,
-                                                SessionStatus::NeedsPermission
+                                                SessionStatus::NeedsAttention
                                                     | SessionStatus::WaitingForInput,
                                             )
                                         );
@@ -504,7 +504,8 @@ fn get_latest_message_from_entries(entries: &[crate::session::parser::SessionEnt
     String::new()
 }
 
-/// Count user/assistant messages in a JSONL file
+/// Count user/assistant messages in a JSONL file.
+/// Skips system-injected user messages (local commands, slash commands, etc.)
 fn count_messages_in_jsonl(path: &Path) -> u32 {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -516,8 +517,24 @@ fn count_messages_in_jsonl(path: &Path) -> u32 {
     for line in reader.lines().map_while(Result::ok) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
             if let Some(msg_type) = value.get("type").and_then(|t| t.as_str()) {
-                if msg_type == "user" || msg_type == "assistant" {
-                    count += 1;
+                match msg_type {
+                    "assistant" => count += 1,
+                    "user" => {
+                        // Skip system-injected user messages
+                        if let Some(content) = value
+                            .get("message")
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_str())
+                        {
+                            if !crate::session::parser::is_system_content(content) {
+                                count += 1;
+                            }
+                        } else {
+                            // Array content (tool results) — still count them
+                            count += 1;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -568,9 +585,16 @@ fn fire_notification(
 
     // Build the body based on the status
     let body = match status {
-        SessionStatus::NeedsPermission => {
+        SessionStatus::NeedsAttention => {
             let tool_name = pending_tool_name.unwrap_or("unknown tool");
-            format!("🔐 {}: Needs permission for {}", session_name, tool_name)
+            match tool_name {
+                "Question" | "AskUserQuestion" => {
+                    format!("❓ {}: Waiting for your response", session_name)
+                }
+                _ => {
+                    format!("🔐 {}: Needs permission for {}", session_name, tool_name)
+                }
+            }
         }
         SessionStatus::WaitingForInput => {
             format!("✅ {}: Finished working", session_name)
