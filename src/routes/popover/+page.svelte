@@ -105,7 +105,7 @@
 
 	function getStatusColor(status: SessionStatus): string {
 		switch (status) {
-			case SessionStatus.NeedsPermission:
+			case SessionStatus.NeedsAttention:
 				return 'var(--status-permission)';
 			case SessionStatus.WaitingForInput:
 				return 'var(--status-input)';

@@ -57,11 +57,11 @@ export function showInAppNotification(title: string, body: string) {
 
 /**
  * Derived store: sessions sorted by attention priority
- * Priority: NeedsPermission > WaitingForInput > Working > Connecting
+ * Priority: NeedsAttention > WaitingForInput > Working > Connecting
  */
 export const sortedSessions = derived(sessions, ($sessions) => {
 	const priorityOrder: Record<SessionStatus, number> = {
-		[SessionStatus.NeedsPermission]: 0,
+		[SessionStatus.NeedsAttention]: 0,
 		[SessionStatus.WaitingForInput]: 1,
 		[SessionStatus.Working]: 2,
 		[SessionStatus.Connecting]: 3
@@ -82,7 +82,7 @@ export const sortedSessions = derived(sessions, ($sessions) => {
  */
 export const attentionCount = derived(sessions, ($sessions) => {
 	return $sessions.filter(
-		(s) => s.status === SessionStatus.NeedsPermission || s.status === SessionStatus.WaitingForInput
+		(s) => s.status === SessionStatus.NeedsAttention || s.status === SessionStatus.WaitingForInput
 	).length;
 });
 
@@ -94,7 +94,7 @@ export const statusSummary = derived(sessions, ($sessions) => {
 		(s) => s.status === SessionStatus.Working || s.status === SessionStatus.Connecting
 	).length;
 	const permission = $sessions.filter(
-		(s) => s.status === SessionStatus.NeedsPermission
+		(s) => s.status === SessionStatus.NeedsAttention
 	).length;
 	const input = $sessions.filter(
 		(s) => s.status === SessionStatus.WaitingForInput

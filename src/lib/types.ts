@@ -7,7 +7,7 @@
  */
 export enum SessionStatus {
   Working = 'Working',              // Executing tools/thinking
-  NeedsPermission = 'NeedsPermission', // Waiting for user approval
+  NeedsAttention = 'NeedsAttention',    // Waiting for user attention (approval, question, etc.)
   WaitingForInput = 'WaitingForInput', // Idle, ready for prompt
   Connecting = 'Connecting'            // Session starting up
 }
@@ -52,7 +52,7 @@ export interface Session {
   /** Content of the latest message */
   latestMessage: string;
 
-  /** Name of the tool currently awaiting user permission (if status is NeedsPermission) */
+  /** Name of the tool or reason awaiting attention (if status is NeedsAttention) */
   pendingToolName: string | null;
 }
 

@@ -15,7 +15,7 @@
 		switch (status) {
 			case SessionStatus.Working:
 				return '#3b82f6'; // blue
-			case SessionStatus.NeedsPermission:
+			case SessionStatus.NeedsAttention:
 				return '#f97316'; // orange
 			case SessionStatus.WaitingForInput:
 				return '#22c55e'; // green

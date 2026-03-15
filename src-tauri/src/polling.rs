@@ -103,7 +103,7 @@ pub fn start_polling(
                                             (prev_status, &session.status),
                                             (
                                                 SessionStatus::Working,
-                                                SessionStatus::NeedsPermission
+                                                SessionStatus::NeedsAttention
                                                     | SessionStatus::WaitingForInput,
                                             )
                                         );
@@ -517,9 +517,16 @@ fn fire_notification(
 
     // Build the body based on the status
     let body = match status {
-        SessionStatus::NeedsPermission => {
+        SessionStatus::NeedsAttention => {
             let tool_name = pending_tool_name.unwrap_or("unknown tool");
-            format!("🔐 {}: Needs permission for {}", session_name, tool_name)
+            match tool_name {
+                "Question" | "AskUserQuestion" => {
+                    format!("❓ {}: Waiting for your response", session_name)
+                }
+                _ => {
+                    format!("🔐 {}: Needs permission for {}", session_name, tool_name)
+                }
+            }
         }
         SessionStatus::WaitingForInput => {
             format!("✅ {}: Finished working", session_name)

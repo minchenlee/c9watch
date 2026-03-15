@@ -17,11 +17,11 @@
 	let { session, compact = false, onexpand, onstop, onopen }: Props = $props();
 
 	let needsAttention = $derived(
-		session.status === SessionStatus.NeedsPermission ||
+		session.status === SessionStatus.NeedsAttention ||
 			session.status === SessionStatus.WaitingForInput
 	);
 
-	let isPermission = $derived(session.status === SessionStatus.NeedsPermission);
+	let isPermission = $derived(session.status === SessionStatus.NeedsAttention);
 	let isWaitingInput = $derived(session.status === SessionStatus.WaitingForInput);
 	let isWorking = $derived(session.status === SessionStatus.Working);
 
@@ -43,7 +43,7 @@
 		switch (session.status) {
 			case SessionStatus.Working:
 				return 'var(--status-working)';
-			case SessionStatus.NeedsPermission:
+			case SessionStatus.NeedsAttention:
 				return 'var(--status-permission)';
 			case SessionStatus.WaitingForInput:
 				return 'var(--status-input)';
@@ -58,7 +58,10 @@
 		switch (session.status) {
 			case SessionStatus.Working:
 				return 'Working';
-			case SessionStatus.NeedsPermission:
+			case SessionStatus.NeedsAttention:
+				if (session.pendingToolName === 'Question' || session.pendingToolName === 'AskUserQuestion') {
+					return 'Waiting for Response';
+				}
 				return 'Approval Required';
 			case SessionStatus.WaitingForInput:
 				return 'Ready';

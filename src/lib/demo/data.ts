@@ -16,37 +16,37 @@ function minutesAgo(minutes: number): string {
 export const statusMessages: Record<string, Record<SessionStatus, string>> = {
 	'demo-1': {
 		[SessionStatus.Working]: 'Writing OAuth2 callback handler for Google provider...',
-		[SessionStatus.NeedsPermission]: 'I need to write to src/auth/providers.ts — may I proceed?',
+		[SessionStatus.NeedsAttention]: 'I need to write to src/auth/providers.ts — may I proceed?',
 		[SessionStatus.WaitingForInput]: 'OAuth2 providers are configured. Want me to add session persistence next?',
 		[SessionStatus.Connecting]: 'Starting session...'
 	},
 	'demo-2': {
 		[SessionStatus.Working]: 'Running the profiler on the VirtualizedTable component to identify the bottleneck...',
-		[SessionStatus.NeedsPermission]: 'I need to modify src/components/Table.tsx — allow?',
+		[SessionStatus.NeedsAttention]: 'I need to modify src/components/Table.tsx — allow?',
 		[SessionStatus.WaitingForInput]: 'Render time reduced from 340ms to 18ms. The fix is in the memoization of row components.',
 		[SessionStatus.Connecting]: 'Starting session...'
 	},
 	'demo-3': {
 		[SessionStatus.Working]: 'Implementing the token bucket algorithm with Redis MULTI/EXEC...',
-		[SessionStatus.NeedsPermission]: 'I need to run `npm install ioredis` — allow?',
+		[SessionStatus.NeedsAttention]: 'I need to run `npm install ioredis` — allow?',
 		[SessionStatus.WaitingForInput]: 'Rate limiter middleware is ready. Run `npm test` to verify.',
 		[SessionStatus.Connecting]: 'Starting session...'
 	},
 	'demo-4': {
 		[SessionStatus.Working]: 'Writing test case for subscription renewal webhook with idempotency check...',
-		[SessionStatus.NeedsPermission]: 'I need to run `npm test -- --watch payments` — allow?',
+		[SessionStatus.NeedsAttention]: 'I need to run `npm test -- --watch payments` — allow?',
 		[SessionStatus.WaitingForInput]: 'All 23 webhook test cases pass. Coverage is at 94%.',
 		[SessionStatus.Connecting]: 'Starting session...'
 	},
 	'demo-5': {
 		[SessionStatus.Working]: 'Adding validation rules for the project name prompt...',
-		[SessionStatus.NeedsPermission]: 'I need to write to src/commands/init.ts — allow?',
+		[SessionStatus.NeedsAttention]: 'I need to write to src/commands/init.ts — allow?',
 		[SessionStatus.WaitingForInput]: 'Done! The wizard is at src/commands/init.ts. Run `cli-tools init` to try it.',
 		[SessionStatus.Connecting]: 'Starting session...'
 	},
 	'demo-6': {
 		[SessionStatus.Working]: 'Migrating the `deploy` command handler to Result<T, E> pattern...',
-		[SessionStatus.NeedsPermission]: 'I need to modify src/commands/deploy.ts — allow?',
+		[SessionStatus.NeedsAttention]: 'I need to modify src/commands/deploy.ts — allow?',
 		[SessionStatus.WaitingForInput]: 'All 14 command handlers have been migrated to the Result pattern. Tests pass.',
 		[SessionStatus.Connecting]: 'Starting session...'
 	}
@@ -54,13 +54,13 @@ export const statusMessages: Record<string, Record<SessionStatus, string>> = {
 
 /**
  * Defines the possible transitions from each status.
- * Working can transition to NeedsPermission or WaitingForInput.
- * NeedsPermission transitions to Working (permission was granted).
+ * Working can transition to NeedsAttention or WaitingForInput.
+ * NeedsAttention transitions to Working (user responded).
  * WaitingForInput transitions to Working (user gave new input).
  */
 export const statusTransitions: Record<SessionStatus, SessionStatus[]> = {
-	[SessionStatus.Working]: [SessionStatus.Working, SessionStatus.Working, SessionStatus.NeedsPermission, SessionStatus.WaitingForInput],
-	[SessionStatus.NeedsPermission]: [SessionStatus.Working],
+	[SessionStatus.Working]: [SessionStatus.Working, SessionStatus.Working, SessionStatus.NeedsAttention, SessionStatus.WaitingForInput],
+	[SessionStatus.NeedsAttention]: [SessionStatus.Working],
 	[SessionStatus.WaitingForInput]: [SessionStatus.Working, SessionStatus.WaitingForInput],
 	[SessionStatus.Connecting]: [SessionStatus.Working]
 };
@@ -71,7 +71,7 @@ export const statusTransitions: Record<SessionStatus, SessionStatus[]> = {
  */
 export function getDemoSessions(): Session[] {
 	return [
-		// Project 1: web-app — NeedsPermission + Working
+		// Project 1: web-app — NeedsAttention + Working
 		{
 			id: 'demo-1',
 			pid: 90001,
@@ -83,7 +83,7 @@ export function getDemoSessions(): Session[] {
 			summary: 'Implementing OAuth2 authentication flow with multiple providers',
 			messageCount: 34,
 			modified: minutesAgo(2),
-			status: SessionStatus.NeedsPermission,
+			status: SessionStatus.NeedsAttention,
 			latestMessage: 'I need to write to src/auth/providers.ts — may I proceed?',
 			pendingToolName: 'Write'
 		},
@@ -103,7 +103,7 @@ export function getDemoSessions(): Session[] {
 			pendingToolName: null
 		},
 
-		// Project 2: api-server — NeedsPermission + Working
+		// Project 2: api-server — NeedsAttention + Working
 		{
 			id: 'demo-3',
 			pid: 90003,
@@ -115,7 +115,7 @@ export function getDemoSessions(): Session[] {
 			summary: 'Adding rate limiting with Redis-backed token bucket',
 			messageCount: 21,
 			modified: minutesAgo(1),
-			status: SessionStatus.NeedsPermission,
+			status: SessionStatus.NeedsAttention,
 			latestMessage: 'I need to run `npm install ioredis` — allow?',
 			pendingToolName: 'Bash'
 		},

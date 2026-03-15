@@ -18,8 +18,8 @@ pub enum SessionStatus {
     /// Claude is actively executing tools or thinking
     Working,
 
-    /// Waiting for user approval to execute tools
-    NeedsPermission,
+    /// Waiting for user attention (tool approval, question, etc.)
+    NeedsAttention,
 
     /// Idle, ready for next prompt
     WaitingForInput,
@@ -97,6 +97,16 @@ pub fn determine_status(entries: &[SessionEntry]) -> SessionStatus {
             // Analyze the assistant message content
             let raw_status = analyze_assistant_message(message);
 
+            // Check if the assistant is asking the user a question.
+            // - AskUserQuestion tool: trigger immediately (no recency delay)
+            // - Text ending with '?': only trigger after 20s (avoid flickering while streaming)
+            if has_pending_ask_user_question(&message.content) {
+                return SessionStatus::NeedsAttention;
+            }
+            if is_assistant_asking_question(message) && !is_entry_recent(&base.timestamp, 20) {
+                return SessionStatus::NeedsAttention;
+            }
+
             match raw_status {
                 SessionStatus::Working => {
                     // "Working" from analyze_assistant_message means either:
@@ -128,9 +138,9 @@ pub fn determine_status(entries: &[SessionEntry]) -> SessionStatus {
                         }
                     }
                 }
-                SessionStatus::NeedsPermission => {
+                SessionStatus::NeedsAttention => {
                     // Permission-needing tool - return immediately, no delay
-                    SessionStatus::NeedsPermission
+                    SessionStatus::NeedsAttention
                 }
                 _ => raw_status,
             }
@@ -152,6 +162,79 @@ fn is_entry_recent(timestamp: &str, seconds: i64) -> bool {
         // If we can't parse the timestamp, assume it's not recent
         false
     }
+}
+
+/// Checks if the message content has a pending AskUserQuestion tool use
+fn has_pending_ask_user_question(content: &[MessageContent]) -> bool {
+    let completed_ids: Vec<&str> = content
+        .iter()
+        .filter_map(|c| {
+            if let MessageContent::ToolResult { tool_use_id, .. } = c {
+                Some(tool_use_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    content.iter().any(|c| {
+        if let MessageContent::ToolUse { id, name, .. } = c {
+            name == "AskUserQuestion" && !completed_ids.contains(&id.as_str())
+        } else {
+            false
+        }
+    })
+}
+
+/// Checks if an assistant message is asking the user a question.
+///
+/// Detects two patterns:
+/// 1. The last text block ends with a question mark (e.g., "Want me to proceed?")
+/// 2. The message contains a pending `AskUserQuestion` tool use
+///
+/// Only triggers when the message has `stop_reason` of `end_turn` (for text questions)
+/// or when `AskUserQuestion` tool is pending, indicating Claude is waiting for user input.
+fn is_assistant_asking_question(message: &AssistantMessage) -> bool {
+    // Pattern 1: Check for pending AskUserQuestion tool use
+    let has_pending_ask = message.content.iter().any(|c| {
+        if let MessageContent::ToolUse { name, id, .. } = c {
+            if name == "AskUserQuestion" {
+                // Check if there's a corresponding tool result
+                return !message.content.iter().any(|r| {
+                    matches!(r, MessageContent::ToolResult { tool_use_id, .. } if tool_use_id == id)
+                });
+            }
+        }
+        false
+    });
+
+    if has_pending_ask {
+        return true;
+    }
+
+    // Pattern 2: Last text block ends with '?' and stop_reason is end_turn
+    if message.stop_reason.as_deref() == Some("end_turn") {
+        let last_text = message
+            .content
+            .iter()
+            .rev()
+            .find_map(|c| {
+                if let MessageContent::Text { text } = c {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            });
+
+        if let Some(text) = last_text {
+            let trimmed = text.trim();
+            if trimmed.ends_with('?') || trimmed.ends_with("?)") {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Analyzes an assistant message to determine status
@@ -186,7 +269,7 @@ fn analyze_assistant_message(message: &AssistantMessage) -> SessionStatus {
                 SessionStatus::Working
             } else {
                 // At least one pending tool needs user permission
-                SessionStatus::NeedsPermission
+                SessionStatus::NeedsAttention
             }
         }
     } else {
@@ -239,21 +322,13 @@ fn are_pending_tools_auto_approved(content: &[MessageContent]) -> bool {
     true
 }
 
-/// Gets the name of the first pending tool that needs permission
+/// Gets the name describing why the session needs attention.
 ///
-/// This function finds the last assistant message in the entries slice,
-/// and returns the name of the first tool use that:
-/// - Has no corresponding tool result (is pending)
-/// - Is not auto-approved (needs permission)
-///
-/// # Arguments
-/// * `entries` - Session entries to search through
-///
-/// # Returns
-/// The name of the first pending tool that needs permission, or None if:
-/// - No assistant messages found
-/// - No pending tools found
-/// - All pending tools are auto-approved
+/// Returns one of:
+/// - A tool name (e.g., "Bash", "Write") if a tool needs user permission
+/// - "AskUserQuestion" if Claude is asking the user a question via tool
+/// - "Question" if Claude's last text ends with a question mark
+/// - None if the session doesn't need attention
 pub fn get_pending_tool_name(entries: &[SessionEntry]) -> Option<String> {
     // Find the last assistant message entry
     let last_assistant = entries.iter().rev().find_map(|entry| {
@@ -279,7 +354,7 @@ pub fn get_pending_tool_name(entries: &[SessionEntry]) -> Option<String> {
         })
         .collect();
 
-    // Find the first pending tool that needs permission
+    // Find the first pending tool that needs permission or AskUserQuestion
     for item in &last_assistant.content {
         if let MessageContent::ToolUse { id, name, input } = item {
             // Skip if already completed
@@ -287,15 +362,23 @@ pub fn get_pending_tool_name(entries: &[SessionEntry]) -> Option<String> {
                 continue;
             }
 
+            // Pending AskUserQuestion → return it directly
+            if name == "AskUserQuestion" {
+                return Some("AskUserQuestion".to_string());
+            }
+
             // This tool is pending - check if it needs permission
             if !checker.is_auto_approved(name, input) {
-                // Found a tool that needs permission
                 return Some(name.clone());
             }
         }
     }
 
-    // No pending tools need permission
+    // Check if assistant is asking a text-based question
+    if is_assistant_asking_question(last_assistant) {
+        return Some("Question".to_string());
+    }
+
     None
 }
 
@@ -520,7 +603,7 @@ mod tests {
                 usage: None,
             },
         }];
-        assert_eq!(determine_status(&entries), SessionStatus::NeedsPermission);
+        assert_eq!(determine_status(&entries), SessionStatus::NeedsAttention);
     }
 
     #[test]
@@ -616,7 +699,7 @@ mod tests {
                 usage: None,
             },
         }];
-        assert_eq!(determine_status(&entries), SessionStatus::NeedsPermission);
+        assert_eq!(determine_status(&entries), SessionStatus::NeedsAttention);
     }
 
     #[test]
@@ -710,7 +793,7 @@ mod tests {
         let status = determine_status(&entries);
         assert_ne!(status, SessionStatus::WaitingForInput);
         // Bash with a dangerous command is never in any auto-approved list
-        assert_eq!(status, SessionStatus::NeedsPermission);
+        assert_eq!(status, SessionStatus::NeedsAttention);
     }
 
     #[test]
@@ -973,5 +1056,155 @@ mod tests {
             },
         }];
         assert_eq!(get_pending_tool_name(&entries), Some("Bash".to_string()));
+    }
+
+    #[test]
+    fn test_text_ending_with_question_mark_needs_attention() {
+        // Old assistant message ending with question mark should be NeedsAttention
+        let entries = vec![SessionEntry::Assistant {
+            base: create_old_base(),
+            message: AssistantMessage {
+                model: "claude-opus-4-5-20251101".to_string(),
+                id: "msg_test".to_string(),
+                role: "assistant".to_string(),
+                content: vec![MessageContent::Text {
+                    text: "Want me to proceed with the installation?".to_string(),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: None,
+            },
+        }];
+        assert_eq!(determine_status(&entries), SessionStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn test_text_ending_with_question_recent_not_yet_attention() {
+        // Recent assistant message ending with ? and end_turn:
+        // The question detection has a 20s grace period before marking NeedsAttention,
+        // so a recent message goes through normal analysis → WaitingForInput.
+        let entries = vec![SessionEntry::Assistant {
+            base: create_base(),
+            message: AssistantMessage {
+                model: "claude-opus-4-5-20251101".to_string(),
+                id: "msg_test".to_string(),
+                role: "assistant".to_string(),
+                content: vec![MessageContent::Text {
+                    text: "Should I continue?".to_string(),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: None,
+            },
+        }];
+        // Recent entry with end_turn → WaitingForInput (question check skipped due to recency)
+        assert_eq!(determine_status(&entries), SessionStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn test_text_not_ending_with_question_is_idle() {
+        // Old assistant message NOT ending with question mark should be WaitingForInput
+        let entries = vec![SessionEntry::Assistant {
+            base: create_old_base(),
+            message: AssistantMessage {
+                model: "claude-opus-4-5-20251101".to_string(),
+                id: "msg_test".to_string(),
+                role: "assistant".to_string(),
+                content: vec![MessageContent::Text {
+                    text: "Done! All tests pass.".to_string(),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: None,
+            },
+        }];
+        assert_eq!(determine_status(&entries), SessionStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn test_pending_ask_user_question_needs_attention() {
+        // Pending AskUserQuestion tool should be NeedsAttention immediately (even when recent)
+        let entries = vec![SessionEntry::Assistant {
+            base: create_base(),
+            message: AssistantMessage {
+                model: "claude-opus-4-5-20251101".to_string(),
+                id: "msg_test".to_string(),
+                role: "assistant".to_string(),
+                content: vec![MessageContent::ToolUse {
+                    id: "toolu_123".to_string(),
+                    name: "AskUserQuestion".to_string(),
+                    input: serde_json::json!({"question": "Which approach do you prefer?"}),
+                }],
+                stop_reason: Some("tool_use".to_string()),
+                stop_sequence: None,
+                usage: None,
+            },
+        }];
+        assert_eq!(determine_status(&entries), SessionStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn test_get_pending_tool_name_question() {
+        // Text ending with ? should return "Question"
+        let entries = vec![SessionEntry::Assistant {
+            base: create_old_base(),
+            message: AssistantMessage {
+                model: "claude-opus-4-5-20251101".to_string(),
+                id: "msg_test".to_string(),
+                role: "assistant".to_string(),
+                content: vec![MessageContent::Text {
+                    text: "Want me to proceed?".to_string(),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: None,
+            },
+        }];
+        assert_eq!(get_pending_tool_name(&entries), Some("Question".to_string()));
+    }
+
+    #[test]
+    fn test_get_pending_tool_name_ask_user_question() {
+        // Pending AskUserQuestion tool should return "AskUserQuestion"
+        let entries = vec![SessionEntry::Assistant {
+            base: create_old_base(),
+            message: AssistantMessage {
+                model: "claude-opus-4-5-20251101".to_string(),
+                id: "msg_test".to_string(),
+                role: "assistant".to_string(),
+                content: vec![MessageContent::ToolUse {
+                    id: "toolu_123".to_string(),
+                    name: "AskUserQuestion".to_string(),
+                    input: serde_json::json!({"question": "Which approach?"}),
+                }],
+                stop_reason: Some("tool_use".to_string()),
+                stop_sequence: None,
+                usage: None,
+            },
+        }];
+        assert_eq!(
+            get_pending_tool_name(&entries),
+            Some("AskUserQuestion".to_string())
+        );
+    }
+
+    #[test]
+    fn test_question_with_parenthesis() {
+        // Text ending with ?) should also be detected
+        let entries = vec![SessionEntry::Assistant {
+            base: create_old_base(),
+            message: AssistantMessage {
+                model: "claude-opus-4-5-20251101".to_string(),
+                id: "msg_test".to_string(),
+                role: "assistant".to_string(),
+                content: vec![MessageContent::Text {
+                    text: "This requires `bun` — do you have it installed?)".to_string(),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: None,
+            },
+        }];
+        assert_eq!(determine_status(&entries), SessionStatus::NeedsAttention);
     }
 }

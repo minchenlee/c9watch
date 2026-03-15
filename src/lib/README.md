@@ -80,4 +80,4 @@ A single message in a conversation, either from the user or Claude, optionally w
 Information about a tool being invoked, including input, output, and completion status.
 
 ### SessionStatus
-Enum representing the current state: Working, NeedsPermission, WaitingForInput, or Connecting.
+Enum representing the current state: Working, NeedsAttention, WaitingForInput, or Connecting.

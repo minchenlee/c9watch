@@ -148,7 +148,7 @@
 		};
 
 		sessions.forEach(session => {
-			if (session.status === SessionStatus.NeedsPermission) {
+			if (session.status === SessionStatus.NeedsAttention) {
 				groups.attention.push(session);
 			} else if (session.status === SessionStatus.WaitingForInput) {
 				groups.idle.push(session);
@@ -172,7 +172,7 @@
 			group.lastModified = modified;
 		}
 
-		if (session.status === SessionStatus.NeedsPermission) {
+		if (session.status === SessionStatus.NeedsAttention) {
 			group.attention.push(session);
 		} else if (session.status === SessionStatus.WaitingForInput) {
 			group.idle.push(session);
@@ -266,7 +266,7 @@
 		if (e.key === 'Tab' && !expandedId) {
 			// Find first session needing attention across all projects
 			const needsAction = sessions.filter(s =>
-				s.status === SessionStatus.NeedsPermission ||
+				s.status === SessionStatus.NeedsAttention ||
 				s.status === SessionStatus.WaitingForInput
 			);
 			if (needsAction.length > 0) {
