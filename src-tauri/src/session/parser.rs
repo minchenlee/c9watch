@@ -336,6 +336,7 @@ pub fn parse_all_entries<P: AsRef<Path>>(path: P) -> Result<Vec<SessionEntry>, S
 const SYSTEM_TAG_PREFIXES: &[&str] = &[
     "<local-command-",     // /model, /bye, /rename output
     "<command-name>",      // slash command entries (/exit, /clear, /model)
+    "<command-message>",   // slash command entries (alt ordering)
     "<task-notification>", // background task completion
     "<bash-input>",        // inline bash command + output
     "<bash-stdout>",       // standalone bash stdout
@@ -355,7 +356,8 @@ pub fn is_system_content(content: &str) -> bool {
 /// Tags whose inner text should be suppressed (not displayed in conversation preview).
 const HIDDEN_TAGS: &[&str] = &[
     "local-command-caveat", // internal system disclaimer
-    "command-args",         // raw args (redundant with command-message)
+    "command-message",      // redundant with command-name (same text without /)
+    "command-args",         // raw args (file paths, not useful to display)
     "bash-stderr",          // stderr noise
     "tool-use-id",          // internal ID
     "output-file",          // temp file path
@@ -1083,7 +1085,14 @@ mod tests {
     #[test]
     fn test_clean_system_message_command_name() {
         let content = "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>";
-        assert_eq!(clean_system_message(content), "/model\nmodel");
+        assert_eq!(clean_system_message(content), "/model");
+    }
+
+    #[test]
+    fn test_clean_system_message_command_message_first() {
+        // Some sessions have command-message before command-name
+        let content = "<command-message>plan-ceo-review</command-message>\n<command-name>/plan-ceo-review</command-name>\n<command-args> \"/some/path\"</command-args>";
+        assert_eq!(clean_system_message(content), "/plan-ceo-review");
     }
 
     #[test]
