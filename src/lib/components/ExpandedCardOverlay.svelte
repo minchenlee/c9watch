@@ -174,7 +174,7 @@
 								onmouseenter={() => tipEnter(session.id)}
 								onmouseleave={tipLeave}
 								onmousemove={tipMove}
-							>{session.summary || session.firstPrompt || 'New Session'}</h2>
+							>{session.customTitle || session.summary || session.firstPrompt || 'New Session'}</h2>
 							<!-- svelte-ignore a11y_click_events_have_key_events -->
 							<!-- svelte-ignore a11y_no_static_element_interactions -->
 							<span

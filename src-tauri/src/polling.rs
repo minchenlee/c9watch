@@ -356,8 +356,13 @@ fn detect_and_enrich_sessions_with_detector(
             .cloned()
             .unwrap_or(detected.project_name);
 
-        // Get custom title if available
-        let custom_title = custom_titles.get(&session_id).cloned();
+        // Get custom title: Claude Code native /rename takes priority over c9watch's own
+        let native_title =
+            crate::session::parser::get_native_custom_title(&entries).or_else(|| {
+                crate::session::parser::get_native_custom_title_from_file(&session_file_path)
+            });
+        let custom_title =
+            native_title.or_else(|| custom_titles.get(&session_id).cloned());
 
         sessions.push(Session {
             id: session_id,

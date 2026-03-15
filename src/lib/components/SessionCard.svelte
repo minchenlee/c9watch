@@ -1,10 +1,6 @@
 <script lang="ts">
 	import type { Session } from '$lib/types';
 	import { SessionStatus } from '$lib/types';
-	import { renameSession } from '$lib/api';
-	import { invoke } from '@tauri-apps/api/core';
-	import { isTauri } from '$lib/ws';
-
 
 	interface Props {
 		session: Session;
@@ -12,9 +8,10 @@
 		onexpand?: () => void;
 		onstop?: () => void;
 		onopen?: () => void;
+		onrename?: () => void;
 	}
 
-	let { session, compact = false, onexpand, onstop, onopen }: Props = $props();
+	let { session, compact = false, onexpand, onstop, onopen, onrename }: Props = $props();
 
 	let needsAttention = $derived(
 		session.status === SessionStatus.NeedsPermission ||
@@ -25,10 +22,6 @@
 	let isWaitingInput = $derived(session.status === SessionStatus.WaitingForInput);
 	let isWorking = $derived(session.status === SessionStatus.Working);
 
-	let isEditingTitle = $state(false);
-	let tempTitle = $state('');
-	let terminalTitleHint = $state<string | null>(null);
-	let optimisticTitle = $state<string | null>(null);
 	let tooltipText = $state('');
 	let tooltipX = $state(0);
 	let tooltipY = $state(0);
@@ -37,14 +30,7 @@
 	function tipLeave() { tooltipText = ''; }
 	function tipMove(e: MouseEvent) { tooltipX = e.clientX + 12; tooltipY = e.clientY + 12; }
 
-	let cardTitle = $derived(optimisticTitle || session.customTitle || session.summary || session.firstPrompt);
-
-	// Clear optimistic title once polling delivers the real update
-	$effect(() => {
-		if (optimisticTitle && session.customTitle === optimisticTitle) {
-			optimisticTitle = null;
-		}
-	});
+	let cardTitle = $derived(session.customTitle || session.summary || session.firstPrompt);
 
 	function getStatusColor(): string {
 		switch (session.status) {
@@ -93,11 +79,7 @@
 
 	function handleCardClick(e: MouseEvent) {
 		const target = e.target as HTMLElement;
-		if (
-			target.closest('.action-btn') ||
-			target.closest('.project-name-input') ||
-			target.closest('.title-input')
-		) {
+		if (target.closest('.action-btn')) {
 			return;
 		}
 		onexpand?.();
@@ -124,53 +106,9 @@
 		onopen?.();
 	}
 
-	let saving = false;
-	async function saveTitle() {
-		if (!isEditingTitle || saving) return;
-		saving = true;
-		isEditingTitle = false;
-		const currentTitle = session.customTitle || session.summary || session.firstPrompt;
-		if (tempTitle.trim() && tempTitle !== currentTitle) {
-			try {
-				await renameSession(session.id, tempTitle.trim());
-				optimisticTitle = tempTitle.trim();
-			} catch (err) {
-				console.error('Failed to rename session:', err);
-				optimisticTitle = null;
-			}
-		}
-		saving = false;
-	}
-
-	function handleTitleKeydown(e: KeyboardEvent) {
-		if (e.key === 'Enter') {
-			saveTitle();
-		} else if (e.key === 'Escape') {
-			tempTitle = session.customTitle || session.summary || session.firstPrompt;
-			isEditingTitle = false;
-		} else if (e.key === 'Tab' && terminalTitleHint && !tempTitle.trim()) {
-			e.preventDefault();
-			e.stopPropagation();
-			tempTitle = terminalTitleHint;
-			// Re-focus the input after Svelte re-renders
-			const input = e.target as HTMLInputElement;
-			requestAnimationFrame(() => input.focus());
-		}
-	}
-
-	async function startEditing(e?: MouseEvent) {
-		e?.stopPropagation();
-		tempTitle = session.customTitle || session.summary || session.firstPrompt;
-		isEditingTitle = true;
-		// Fetch terminal title (iTerm2) as rename hint (Tauri only)
-		if (isTauri()) {
-			try {
-				const title = await invoke<string | null>('get_terminal_title', { pid: session.pid });
-				terminalTitleHint = title;
-			} catch {
-				terminalTitleHint = null;
-			}
-		}
+	function handleRenameClick(e: MouseEvent) {
+		e.stopPropagation();
+		onrename?.();
 	}
 
 	let idCopied = $state(false);
@@ -185,12 +123,6 @@
 		} catch { /* clipboard API may fail in some contexts */ }
 	}
 
-	function autofocus(node: HTMLElement) {
-		node.focus();
-		if (node instanceof HTMLInputElement) {
-			node.select();
-		}
-	}
 </script>
 
 <div
@@ -209,45 +141,31 @@
 	<div class="card-body">
 		<!-- Header (Summary as Title) -->
 		<div class="card-header">
-			{#if isEditingTitle}
-				<input
-					type="text"
-					class="title-input"
-					bind:value={tempTitle}
-					placeholder={terminalTitleHint ?? ''}
-					onkeydown={handleTitleKeydown}
-					onblur={saveTitle}
-					use:autofocus
-					onclick={(e) => e.stopPropagation()}
-				/>
-			{:else}
-				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<h3
-					class="card-main-title"
-					ondblclick={() => startEditing()}
-					onmouseenter={() => tipEnter(session.id)}
-					onmouseleave={tipLeave}
-					onmousemove={tipMove}
-				>
-					{cardTitle}
-				</h3>
-				<!-- svelte-ignore a11y_click_events_have_key_events -->
-				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<span
-					class="copy-id-btn"
-					class:copied={idCopied}
-					onclick={copySessionId}
-					onmouseenter={() => tipEnter('Copy session ID')}
-					onmouseleave={tipLeave}
-					onmousemove={tipMove}
-				>
-					{#if idCopied}
-						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12" /></svg>
-					{:else}
-						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
-					{/if}
-				</span>
-			{/if}
+			<!-- svelte-ignore a11y_no_static_element_interactions -->
+			<h3
+				class="card-main-title"
+				onmouseenter={() => tipEnter(session.id)}
+				onmouseleave={tipLeave}
+				onmousemove={tipMove}
+			>
+				{cardTitle}
+			</h3>
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
+			<!-- svelte-ignore a11y_no_static_element_interactions -->
+			<span
+				class="copy-id-btn"
+				class:copied={idCopied}
+				onclick={copySessionId}
+				onmouseenter={() => tipEnter('Copy session ID')}
+				onmouseleave={tipLeave}
+				onmousemove={tipMove}
+			>
+				{#if idCopied}
+					<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12" /></svg>
+				{:else}
+					<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+				{/if}
+			</span>
 		</div>
 
 		{#if tooltipText}
@@ -306,7 +224,7 @@
 			<!-- Bottom Actions -->
 			<div class="card-actions-container">
 				<div class="card-actions">
-					<button type="button" class="action-btn" onclick={(e) => startEditing(e)} title="Rename">
+					<button type="button" class="action-btn" onclick={handleRenameClick} title="Rename">
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 							<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
 							<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
@@ -341,6 +259,8 @@
 			</div>
 		{/if}
 	</div>
+
+
 </div>
 
 <style>
@@ -440,26 +360,6 @@
 		text-transform: none;
 		font-weight: 400;
 		box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-	}
-
-	.title-input {
-		font-family: var(--font-pixel);
-		font-size: 15px;
-		font-weight: 600;
-		color: var(--text-primary);
-		background: var(--bg-base);
-		border: 1px solid var(--status-input);
-		padding: 4px 8px;
-		margin: -4px -8px;
-		letter-spacing: 0.05em;
-		text-transform: uppercase;
-		width: 100%;
-		outline: none;
-	}
-
-	.title-input::placeholder {
-		color: var(--text-muted);
-		opacity: 0.5;
 	}
 
 	.session-name-badge {

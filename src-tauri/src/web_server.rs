@@ -283,6 +283,9 @@ async fn handle_message(msg: ClientMsg) -> ServerMsg {
             session_id,
             new_name,
         } => {
+            // Write to Claude Code's native JSONL format
+            crate::write_native_custom_title(&session_id, &new_name);
+            // Also write to c9watch's own custom titles (fallback)
             let mut custom_titles = crate::session::CustomTitles::load();
             custom_titles.set(session_id, new_name);
             match custom_titles.save() {

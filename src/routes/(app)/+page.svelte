@@ -46,6 +46,7 @@
 	let activeTab = $state<'monitor' | 'history' | 'cost' | 'memory'>('monitor');
 	let fdaLikelyNeeded = $state(false);
 	let showDebugConsole = $state(false);
+	let showRenameHint = $state(false);
 
 	// Detect macOS native fullscreen to switch tab-bar padding.
 	// CSS `display-mode: fullscreen` does NOT fire for native macOS fullscreen.
@@ -487,6 +488,7 @@
 													onexpand={() => handleExpand(session)}
 													onstop={() => handleStop(session.pid)}
 													onopen={() => handleOpen(session.pid, session.projectPath)}
+													onrename={() => showRenameHint = true}
 												/>
 											</div>
 										{/each}
@@ -512,6 +514,7 @@
 													onexpand={() => handleExpand(session)}
 													onstop={() => handleStop(session.pid)}
 													onopen={() => handleOpen(session.pid, session.projectPath)}
+													onrename={() => showRenameHint = true}
 												/>
 											</div>
 										{/each}
@@ -537,6 +540,7 @@
 													onexpand={() => handleExpand(session)}
 													onstop={() => handleStop(session.pid)}
 													onopen={() => handleOpen(session.pid, session.projectPath)}
+													onrename={() => showRenameHint = true}
 												/>
 											</div>
 										{/each}
@@ -568,6 +572,7 @@
 											onexpand={() => handleExpand(session)}
 											onstop={() => handleStop(session.pid)}
 											onopen={() => handleOpen(session.pid, session.projectPath)}
+											onrename={() => showRenameHint = true}
 										/>
 									</div>
 								{/each}
@@ -596,6 +601,28 @@
 
 	<ToastNotifications />
 	<DebugConsole visible={showDebugConsole} onclose={() => (showDebugConsole = false)} />
+
+	{#if showRenameHint}
+		<!-- svelte-ignore a11y_click_events_have_key_events -->
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="rename-hint-backdrop" transition:fade={{ duration: 150 }} onclick={() => showRenameHint = false}>
+			<div class="rename-hint-modal" onclick={(e) => e.stopPropagation()}>
+				<div class="rename-hint-header">
+					<span class="rename-hint-icon">
+						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+							<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+							<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+						</svg>
+					</span>
+					<span class="rename-hint-title">Rename Session</span>
+				</div>
+				<p class="rename-hint-text">Use the <code>/rename</code> command in your Claude Code session to rename it.</p>
+				<div class="rename-hint-example">/rename my-task-name</div>
+				<p class="rename-hint-sub">The new name will automatically appear in c9watch.</p>
+				<button type="button" class="rename-hint-close" onclick={() => showRenameHint = false}>GOT IT</button>
+			</div>
+		</div>
+	{/if}
 </div>
 {/if}
 
@@ -1111,5 +1138,105 @@
 		.demo-toggle {
 			padding: 0 var(--space-xs);
 		}
+	}
+
+	/* ── Rename Hint Modal ───────────────────────────────────────── */
+	.rename-hint-backdrop {
+		position: fixed;
+		inset: 0;
+		background: var(--bg-overlay);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		z-index: 2000;
+	}
+
+	.rename-hint-modal {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: var(--space-md);
+		padding: var(--space-2xl) var(--space-2xl);
+		background: var(--bg-card);
+		border: 1px solid var(--border-default);
+		box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+		max-width: 380px;
+		width: 100%;
+	}
+
+	.rename-hint-header {
+		display: flex;
+		align-items: center;
+		gap: var(--space-sm);
+	}
+
+	.rename-hint-icon {
+		color: var(--text-muted);
+	}
+
+	.rename-hint-title {
+		font-family: var(--font-pixel);
+		font-size: 16px;
+		font-weight: 600;
+		color: var(--text-primary);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+	}
+
+	.rename-hint-text {
+		font-family: var(--font-mono);
+		font-size: 13px;
+		color: var(--text-secondary);
+		text-align: center;
+		margin: 0;
+		line-height: 1.5;
+	}
+
+	.rename-hint-text code {
+		font-family: var(--font-mono);
+		color: var(--text-primary);
+		background: var(--bg-elevated);
+		padding: 2px 6px;
+		border: 1px solid var(--border-default);
+	}
+
+	.rename-hint-example {
+		font-family: var(--font-mono);
+		font-size: 14px;
+		color: var(--status-input);
+		background: var(--bg-elevated);
+		padding: 8px 16px;
+		border: 1px solid var(--border-default);
+		letter-spacing: 0.02em;
+		width: 100%;
+		text-align: center;
+	}
+
+	.rename-hint-sub {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		text-align: center;
+		margin: 0;
+	}
+
+	.rename-hint-close {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		font-weight: 600;
+		color: var(--bg-base);
+		background: var(--text-primary);
+		border: 1px solid var(--text-primary);
+		padding: 6px 24px;
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		cursor: pointer;
+		transition: all var(--transition-fast);
+		margin-top: var(--space-xs);
+	}
+
+	.rename-hint-close:hover {
+		background: var(--text-secondary);
+		border-color: var(--text-secondary);
 	}
 </style>

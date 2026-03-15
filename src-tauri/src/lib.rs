@@ -216,6 +216,10 @@ async fn rename_session(
     session_id: String,
     new_name: String,
 ) -> Result<(), String> {
+    // Write to Claude Code's native JSONL format (primary)
+    write_native_custom_title(&session_id, &new_name);
+
+    // Also write to c9watch's own custom titles (fallback for history view)
     let mut custom_titles = session::CustomTitles::load();
     custom_titles.set(session_id, new_name);
     custom_titles.save()?;
@@ -224,6 +228,47 @@ async fn rename_session(
         let _ = app.emit("sessions-updated", &sessions);
     }
     Ok(())
+}
+
+/// Append a `custom-title` entry to the session's JSONL file in Claude Code's native format.
+/// This makes the rename visible to Claude Code itself (and persists across c9watch reinstalls).
+pub fn write_native_custom_title(session_id: &str, title: &str) {
+    use std::io::Write;
+
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
+    let projects_dir = home.join(".claude").join("projects");
+
+    // Search all project directories for the session JSONL
+    let entries = match std::fs::read_dir(&projects_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let jsonl_path = path.join(format!("{}.jsonl", session_id));
+        if jsonl_path.exists() {
+            // Append the custom-title entry
+            let entry = serde_json::json!({
+                "type": "custom-title",
+                "customTitle": title,
+                "sessionId": session_id,
+            });
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&jsonl_path)
+            {
+                let _ = writeln!(file, "{}", entry);
+            }
+            return;
+        }
+    }
 }
 
 /// Get the terminal title for a session (iTerm2 only, macOS)

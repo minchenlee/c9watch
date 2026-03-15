@@ -55,6 +55,13 @@ pub enum SessionEntry {
         #[serde(rename = "leafUuid")]
         leaf_uuid: String,
     },
+    #[serde(rename = "custom-title")]
+    CustomTitle {
+        #[serde(rename = "customTitle")]
+        custom_title: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -544,6 +551,40 @@ pub enum MessageType {
     ToolUse,
     ToolResult,
     System,
+}
+
+/// Extract the native custom title from Claude Code's JSONL entries.
+/// Reads from the end since `/rename` re-appends metadata after compaction.
+/// Returns the last `custom-title` entry's value, or None if not found.
+pub fn get_native_custom_title(entries: &[SessionEntry]) -> Option<String> {
+    for entry in entries.iter().rev() {
+        if let SessionEntry::CustomTitle { custom_title, .. } = entry {
+            return Some(custom_title.clone());
+        }
+    }
+    None
+}
+
+/// Extract the native custom title from a JSONL file.
+///
+/// Scans the file for lines containing `"custom-title"` and parses only those.
+/// Returns the last (most recent) custom title found.
+pub fn get_native_custom_title_from_file(path: &std::path::Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+
+    let mut last_title: Option<String> = None;
+    for line in reader.lines().map_while(Result::ok) {
+        if line.contains("\"custom-title\"") {
+            if let Ok(SessionEntry::CustomTitle { custom_title, .. }) =
+                serde_json::from_str::<SessionEntry>(&line)
+            {
+                last_title = Some(custom_title);
+            }
+        }
+    }
+    last_title
 }
 
 #[cfg(test)]
@@ -1102,5 +1143,51 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].1, MessageType::System);
         assert!(result[0].2.contains("/exit"));
+    }
+
+    // ── Custom title tests ────────────────────────────────────────
+
+    #[test]
+    fn test_parse_custom_title_entry() {
+        let json = r#"{"type":"custom-title","customTitle":"my-task","sessionId":"abc-123"}"#;
+        let entry: Result<SessionEntry, _> = serde_json::from_str(json);
+        assert!(entry.is_ok());
+        if let Ok(SessionEntry::CustomTitle {
+            custom_title,
+            session_id,
+        }) = entry
+        {
+            assert_eq!(custom_title, "my-task");
+            assert_eq!(session_id, "abc-123");
+        } else {
+            panic!("Expected CustomTitle entry");
+        }
+    }
+
+    #[test]
+    fn test_get_native_custom_title_found() {
+        let entries = vec![
+            SessionEntry::Unknown,
+            SessionEntry::CustomTitle {
+                custom_title: "old-name".to_string(),
+                session_id: "s1".to_string(),
+            },
+            SessionEntry::Unknown,
+            SessionEntry::CustomTitle {
+                custom_title: "latest-name".to_string(),
+                session_id: "s1".to_string(),
+            },
+        ];
+        // Should return the last one (reading from end)
+        assert_eq!(
+            get_native_custom_title(&entries),
+            Some("latest-name".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_native_custom_title_not_found() {
+        let entries = vec![SessionEntry::Unknown];
+        assert_eq!(get_native_custom_title(&entries), None);
     }
 }
