@@ -254,21 +254,35 @@ pub fn write_native_custom_title(session_id: &str, title: &str) {
         }
         let jsonl_path = path.join(format!("{}.jsonl", session_id));
         if jsonl_path.exists() {
-            // Append the custom-title entry
             let entry = serde_json::json!({
                 "type": "custom-title",
                 "customTitle": title,
                 "sessionId": session_id,
             });
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&jsonl_path)
-            {
-                let _ = writeln!(file, "{}", entry);
+            match std::fs::OpenOptions::new().append(true).open(&jsonl_path) {
+                Ok(mut file) => {
+                    if let Err(e) = writeln!(file, "{}", entry) {
+                        debug_log::log_warn(&format!(
+                            "Failed to write native custom-title for {}: {}",
+                            session_id, e
+                        ));
+                    }
+                }
+                Err(e) => {
+                    debug_log::log_warn(&format!(
+                        "Failed to open JSONL for native custom-title {}: {}",
+                        session_id, e
+                    ));
+                }
             }
             return;
         }
     }
+
+    debug_log::log_warn(&format!(
+        "Could not find JSONL file for session {} to write native custom-title",
+        session_id
+    ));
 }
 
 /// Get the terminal title for a session (iTerm2 only, macOS)

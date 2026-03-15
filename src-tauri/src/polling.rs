@@ -217,6 +217,37 @@ fn is_file_recently_modified(path: &Path, seconds: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Cache for native custom titles, keyed by file path.
+/// Stores (mtime_as_nanos, cached_title) to avoid re-scanning JSONL files every poll cycle.
+use std::sync::LazyLock;
+static NATIVE_TITLE_CACHE: LazyLock<Mutex<HashMap<std::path::PathBuf, (u64, Option<String>)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Look up the native custom title for a session JSONL, using a mtime-based cache.
+fn get_cached_native_title(path: &Path) -> Option<String> {
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+
+    if let Ok(mut cache) = NATIVE_TITLE_CACHE.lock() {
+        if let Some((cached_mtime, cached_title)) = cache.get(path) {
+            if *cached_mtime == mtime {
+                return cached_title.clone();
+            }
+        }
+        // Cache miss or stale — re-scan
+        let title = crate::session::parser::get_native_custom_title_from_file(path);
+        cache.insert(path.to_path_buf(), (mtime, title.clone()));
+        title
+    } else {
+        // Mutex poisoned — fallback to direct read
+        crate::session::parser::get_native_custom_title_from_file(path)
+    }
+}
+
 /// Detect sessions and enrich them with status and conversation data
 pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, crate::session::DetectionDiagnostics), String> {
     let mut detector =
@@ -356,11 +387,9 @@ fn detect_and_enrich_sessions_with_detector(
             .cloned()
             .unwrap_or(detected.project_name);
 
-        // Get custom title: Claude Code native /rename takes priority over c9watch's own
-        let native_title =
-            crate::session::parser::get_native_custom_title(&entries).or_else(|| {
-                crate::session::parser::get_native_custom_title_from_file(&session_file_path)
-            });
+        // Get custom title: Claude Code native /rename takes priority over c9watch's own.
+        // Uses a static cache keyed by (path, mtime) to avoid re-scanning the JSONL every cycle.
+        let native_title = get_cached_native_title(&session_file_path);
         let custom_title =
             native_title.or_else(|| custom_titles.get(&session_id).cloned());
 

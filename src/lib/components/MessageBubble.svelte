@@ -171,7 +171,7 @@
 
 	.message-bubble.system {
 		border-left: 1px solid var(--accent-purple);
-		background: rgba(121, 40, 202, 0.03);
+		background: color-mix(in srgb, var(--accent-purple) 3%, transparent);
 		opacity: 0.7;
 	}
 

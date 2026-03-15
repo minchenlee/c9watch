@@ -340,7 +340,7 @@ const SYSTEM_TAG_PREFIXES: &[&str] = &[
     "<bash-input>",        // inline bash command + output
     "<bash-stdout>",       // standalone bash stdout
     "<bash-stderr>",       // standalone bash stderr
-    "<result",             // agent/subagent results
+    "<result>",            // agent/subagent results
 ];
 
 /// Public helper: check if content string is a system-generated message.
@@ -425,7 +425,7 @@ fn strip_ansi_codes(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\x1b' || c == '\u{001b}' {
+        if c == '\x1b' {
             // Skip until we find a letter (the terminator of the escape sequence)
             if chars.peek() == Some(&'[') {
                 chars.next();
