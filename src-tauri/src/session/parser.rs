@@ -356,8 +356,6 @@ pub fn is_system_content(content: &str) -> bool {
 /// Tags whose inner text should be suppressed (not displayed in conversation preview).
 const HIDDEN_TAGS: &[&str] = &[
     "local-command-caveat", // internal system disclaimer
-    "command-message",      // redundant with command-name (same text without /)
-    "command-args",         // raw args (file paths, not useful to display)
     "bash-stderr",          // stderr noise
     "tool-use-id",          // internal ID
     "output-file",          // temp file path
@@ -367,31 +365,26 @@ const HIDDEN_TAGS: &[&str] = &[
     "usage",                // agent usage block
 ];
 
-/// Strip XML tags from system messages and return the inner text.
-/// Suppresses tags listed in `HIDDEN_TAGS`. Extracts meaningful content from the rest.
-fn clean_system_message(content: &str) -> String {
-    use std::fmt::Write;
+/// Tags that are part of slash command entries — handled specially by `format_command_tags`.
+const COMMAND_TAGS: &[&str] = &["command-name", "command-message", "command-args"];
 
-    let mut result = String::new();
+/// Extract all tag name→value pairs from a system message string.
+fn extract_tags(content: &str) -> Vec<(String, String)> {
+    let mut tags = Vec::new();
     let mut remaining = content.trim();
 
     while !remaining.is_empty() {
-        // Skip any whitespace between tags
         remaining = remaining.trim_start();
         if remaining.is_empty() {
             break;
         }
 
-        // Find next opening tag
         if let Some(tag_start) = remaining.find('<') {
-            // Find the end of the opening tag
             if let Some(tag_end) = remaining[tag_start..].find('>') {
                 let tag_end_abs = tag_start + tag_end + 1;
-                // Extract tag name for matching closing tag
                 let tag_content = &remaining[tag_start + 1..tag_start + tag_end];
                 let tag_name = tag_content.split_whitespace().next().unwrap_or("");
 
-                // Skip if this doesn't look like a system tag
                 if tag_name.is_empty() || tag_name.starts_with('/') {
                     break;
                 }
@@ -399,18 +392,9 @@ fn clean_system_message(content: &str) -> String {
                 let closing_tag = format!("</{}>", tag_name);
 
                 if let Some(close_pos) = remaining[tag_end_abs..].find(&closing_tag) {
-                    let should_hide = HIDDEN_TAGS.iter().any(|&t| t == tag_name);
-
-                    if !should_hide {
-                        let inner = remaining[tag_end_abs..tag_end_abs + close_pos].trim();
-                        let clean = strip_ansi_codes(inner);
-                        if !clean.is_empty() {
-                            if !result.is_empty() {
-                                let _ = write!(result, "\n");
-                            }
-                            result.push_str(&clean);
-                        }
-                    }
+                    let inner = remaining[tag_end_abs..tag_end_abs + close_pos].trim();
+                    let clean = strip_ansi_codes(inner);
+                    tags.push((tag_name.to_string(), clean));
                     remaining = &remaining[tag_end_abs + close_pos + closing_tag.len()..];
                     continue;
                 }
@@ -419,7 +403,55 @@ fn clean_system_message(content: &str) -> String {
         break;
     }
 
-    result
+    tags
+}
+
+/// Format extracted tags into a clean display string.
+/// Slash commands are formatted as `/command args`. Other tags are joined with newlines.
+fn format_system_tags(tags: &[(String, String)]) -> String {
+    use std::fmt::Write;
+
+    // Check if this is a slash command entry
+    let has_command_tags = tags.iter().any(|(name, _)| COMMAND_TAGS.contains(&name.as_str()));
+
+    if has_command_tags {
+        // Format as: /command-name args
+        let cmd_name = tags
+            .iter()
+            .find(|(name, _)| name == "command-name")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let args = tags
+            .iter()
+            .find(|(name, _)| name == "command-args")
+            .map(|(_, v)| v.trim())
+            .unwrap_or("");
+
+        if args.is_empty() {
+            cmd_name.to_string()
+        } else {
+            format!("{} {}", cmd_name, args)
+        }
+    } else {
+        // Generic: join non-hidden tags with newlines
+        let mut result = String::new();
+        for (name, value) in tags {
+            if HIDDEN_TAGS.contains(&name.as_str()) || value.is_empty() {
+                continue;
+            }
+            if !result.is_empty() {
+                let _ = write!(result, "\n");
+            }
+            result.push_str(value);
+        }
+        result
+    }
+}
+
+/// Strip XML tags from system messages and return clean display text.
+fn clean_system_message(content: &str) -> String {
+    let tags = extract_tags(content);
+    format_system_tags(&tags)
 }
 
 /// Strip ANSI escape codes from a string (e.g. \x1b[1m, \x1b[22m).
@@ -1083,16 +1115,18 @@ mod tests {
     }
 
     #[test]
-    fn test_clean_system_message_command_name() {
+    fn test_clean_system_message_command_no_args() {
         let content = "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>";
         assert_eq!(clean_system_message(content), "/model");
     }
 
     #[test]
-    fn test_clean_system_message_command_message_first() {
-        // Some sessions have command-message before command-name
-        let content = "<command-message>plan-ceo-review</command-message>\n<command-name>/plan-ceo-review</command-name>\n<command-args> \"/some/path\"</command-args>";
-        assert_eq!(clean_system_message(content), "/plan-ceo-review");
+    fn test_clean_system_message_command_with_args() {
+        let content = "<command-message>plan-ceo-review</command-message>\n<command-name>/plan-ceo-review</command-name>\n<command-args> \"/Users/me/docs/summary.md\"</command-args>";
+        assert_eq!(
+            clean_system_message(content),
+            "/plan-ceo-review \"/Users/me/docs/summary.md\""
+        );
     }
 
     #[test]
