@@ -14,29 +14,37 @@ struct ModelPricing {
 }
 
 /// Map model ID strings to their pricing. Handles both dated and undated variants.
-fn get_pricing(model: &str) -> Option<ModelPricing> {
+/// Pricing sourced from Claude Code v2.1.76 binary (2026-03-15).
+fn get_pricing(model: &str, speed: &str) -> Option<ModelPricing> {
     // Normalize: strip date suffixes like "-20250929"
     let base = if model.starts_with("claude-sonnet") {
         "sonnet"
+    } else if model.starts_with("claude-opus-4-5") || model.starts_with("claude-opus-4-6") {
+        "opus-new"
     } else if model.starts_with("claude-opus") {
-        "opus"
+        "opus-legacy"
+    } else if model.starts_with("claude-haiku-4-5") {
+        "haiku-new"
     } else if model.starts_with("claude-haiku") {
-        "haiku"
+        "haiku-legacy"
     } else {
         return None;
     };
 
     Some(match base {
         "sonnet" => ModelPricing { input: 3.0, cache_write: 3.75, cache_read: 0.30, output: 15.0 },
-        "opus" => ModelPricing { input: 15.0, cache_write: 18.75, cache_read: 1.50, output: 75.0 },
-        "haiku" => ModelPricing { input: 0.80, cache_write: 1.0, cache_read: 0.08, output: 4.0 },
+        "opus-new" if speed == "fast" => ModelPricing { input: 30.0, cache_write: 37.50, cache_read: 3.00, output: 150.0 },
+        "opus-new" => ModelPricing { input: 5.0, cache_write: 6.25, cache_read: 0.50, output: 25.0 },
+        "opus-legacy" => ModelPricing { input: 15.0, cache_write: 18.75, cache_read: 1.50, output: 75.0 },
+        "haiku-new" => ModelPricing { input: 1.0, cache_write: 1.25, cache_read: 0.10, output: 5.0 },
+        "haiku-legacy" => ModelPricing { input: 0.80, cache_write: 1.0, cache_read: 0.08, output: 4.0 },
         _ => return None,
     })
 }
 
-/// Calculate USD cost from token counts and a model ID.
-fn calculate_cost(model: &str, input_tokens: u64, output_tokens: u64, cache_creation: u64, cache_read: u64) -> f64 {
-    let Some(pricing) = get_pricing(model) else {
+/// Calculate USD cost from token counts, model ID, and speed mode.
+fn calculate_cost(model: &str, speed: &str, input_tokens: u64, output_tokens: u64, cache_creation: u64, cache_read: u64) -> f64 {
+    let Some(pricing) = get_pricing(model, speed) else {
         return 0.0;
     };
     (input_tokens as f64 * pricing.input
@@ -49,6 +57,7 @@ fn calculate_cost(model: &str, input_tokens: u64, output_tokens: u64, cache_crea
 /// Token usage extracted from a single assistant message line.
 struct UsageEntry {
     model: String,
+    speed: String,
     input_tokens: u64,
     output_tokens: u64,
     cache_creation_input_tokens: u64,
@@ -72,8 +81,11 @@ fn parse_usage_line(line: &str) -> Option<UsageEntry> {
     let usage = msg.get("usage")?;
     let model = msg.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
 
+    let speed = usage.get("speed").and_then(|v| v.as_str()).unwrap_or("standard");
+
     Some(UsageEntry {
         model: model.to_string(),
+        speed: speed.to_string(),
         input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
         output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
         cache_creation_input_tokens: usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -136,9 +148,15 @@ pub struct ModelCost {
     pub percentage: f64,
 }
 
+/// Bump this when pricing or token counting logic changes to force cache rebuild.
+const CACHE_VERSION: u32 = 2;
+
 /// Cache structure stored at ~/.claude/cost-cache.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CostCache {
+    /// Cache format version — mismatches trigger full rebuild
+    #[serde(default)]
+    version: u32,
     /// Per-file mtime (unix seconds) — used to skip unchanged files
     file_mtimes: HashMap<String, u64>,
     /// All session cost records
@@ -206,6 +224,7 @@ fn scan_file(path: &std::path::Path) -> Vec<SessionCostRecord> {
             for e in &entries {
                 let c = calculate_cost(
                     &e.model,
+                    &e.speed,
                     e.input_tokens,
                     e.output_tokens,
                     e.cache_creation_input_tokens,
@@ -249,11 +268,19 @@ pub fn get_cost_data() -> Result<CostData, String> {
     let projects_dir = home_dir.join(".claude").join("projects");
     let cache_path = home_dir.join(".claude").join("cost-cache.json");
 
-    // Load existing cache
+    // Load existing cache, rebuild if version mismatch (pricing/logic changed)
     let mut cache: CostCache = std::fs::read_to_string(&cache_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
+        .map(|c: CostCache| {
+            if c.version != CACHE_VERSION {
+                CostCache { version: CACHE_VERSION, file_mtimes: HashMap::new(), sessions: vec![] }
+            } else {
+                c
+            }
+        })
         .unwrap_or(CostCache {
+            version: CACHE_VERSION,
             file_mtimes: HashMap::new(),
             sessions: vec![],
         });
@@ -404,7 +431,7 @@ fn aggregate(sessions: &[SessionCostRecord]) -> CostData {
     }
     let mut model_costs: Vec<ModelCost> = by_model
         .into_iter()
-        .filter(|(m, _)| get_pricing(m).is_some()) // exclude unknown models
+        .filter(|(m, _)| get_pricing(m, "standard").is_some()) // exclude unknown models
         .map(|(model, cost)| {
             let pct = if total_cost > 0.0 { cost / total_cost * 100.0 } else { 0.0 };
             ModelCost {
@@ -426,25 +453,49 @@ mod tests {
 
     #[test]
     fn test_get_pricing_sonnet_variants() {
-        assert!(get_pricing("claude-sonnet-4-6").is_some());
-        assert!(get_pricing("claude-sonnet-4-5-20250929").is_some());
+        assert!(get_pricing("claude-sonnet-4-6", "standard").is_some());
+        assert!(get_pricing("claude-sonnet-4-5-20250929", "standard").is_some());
     }
 
     #[test]
     fn test_get_pricing_opus() {
-        assert!(get_pricing("claude-opus-4-6").is_some());
+        assert!(get_pricing("claude-opus-4-6", "standard").is_some());
+        assert!(get_pricing("claude-opus-4-1", "standard").is_some());
+    }
+
+    #[test]
+    fn test_get_pricing_opus_new_vs_legacy() {
+        let new = get_pricing("claude-opus-4-6", "standard").unwrap();
+        let legacy = get_pricing("claude-opus-4-1", "standard").unwrap();
+        assert!((new.input - 5.0).abs() < 1e-10, "Opus 4.6 input should be $5/MTok");
+        assert!((legacy.input - 15.0).abs() < 1e-10, "Opus 4.1 input should be $15/MTok");
+    }
+
+    #[test]
+    fn test_get_pricing_opus_fast_mode() {
+        let fast = get_pricing("claude-opus-4-6", "fast").unwrap();
+        let standard = get_pricing("claude-opus-4-6", "standard").unwrap();
+        assert!((fast.input - 30.0).abs() < 1e-10, "Opus 4.6 fast input should be $30/MTok");
+        assert!((standard.input - 5.0).abs() < 1e-10, "Opus 4.6 standard input should be $5/MTok");
     }
 
     #[test]
     fn test_get_pricing_haiku() {
-        assert!(get_pricing("claude-haiku-4-5-20251001").is_some());
+        assert!(get_pricing("claude-haiku-4-5-20251001", "standard").is_some());
+    }
+
+    #[test]
+    fn test_get_pricing_haiku_new_vs_legacy() {
+        let new = get_pricing("claude-haiku-4-5-20251001", "standard").unwrap();
+        assert!((new.input - 1.0).abs() < 1e-10, "Haiku 4.5 input should be $1/MTok");
+        assert!((new.output - 5.0).abs() < 1e-10, "Haiku 4.5 output should be $5/MTok");
     }
 
     #[test]
     fn test_get_pricing_unknown_returns_none() {
-        assert!(get_pricing("unknown").is_none());
-        assert!(get_pricing("<synthetic>").is_none());
-        assert!(get_pricing("").is_none());
+        assert!(get_pricing("unknown", "standard").is_none());
+        assert!(get_pricing("<synthetic>", "standard").is_none());
+        assert!(get_pricing("", "standard").is_none());
     }
 
     #[test]
@@ -453,14 +504,23 @@ mod tests {
         // 500 output tokens at $15/M = $0.0075
         // 2000 cache write at $3.75/M = $0.0075
         // 10000 cache read at $0.30/M = $0.003
-        let cost = calculate_cost("claude-sonnet-4-6", 1000, 500, 2000, 10000);
+        let cost = calculate_cost("claude-sonnet-4-6", "standard", 1000, 500, 2000, 10000);
         let expected = 0.003 + 0.0075 + 0.0075 + 0.003;
         assert!((cost - expected).abs() < 1e-10);
     }
 
     #[test]
+    fn test_calculate_cost_opus_new() {
+        // 1000 input at $5/M = $0.005
+        // 500 output at $25/M = $0.0125
+        let cost = calculate_cost("claude-opus-4-6", "standard", 1000, 500, 0, 0);
+        let expected = 0.005 + 0.0125;
+        assert!((cost - expected).abs() < 1e-10);
+    }
+
+    #[test]
     fn test_calculate_cost_unknown_model_returns_zero() {
-        let cost = calculate_cost("unknown", 1000, 500, 2000, 10000);
+        let cost = calculate_cost("unknown", "standard", 1000, 500, 2000, 10000);
         assert_eq!(cost, 0.0);
     }
 
