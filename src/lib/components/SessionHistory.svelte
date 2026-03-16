@@ -442,7 +442,7 @@
 	}
 
 	.row-project {
-		font-family: var(--font-pixel);
+		font-family: var(--font-sans);
 		font-size: 12px;
 		font-weight: 600;
 		color: var(--text-primary);
@@ -519,7 +519,7 @@
 	}
 
 	.group-name {
-		font-family: var(--font-pixel);
+		font-family: var(--font-sans);
 		font-size: 16px;
 		color: var(--text-primary);
 		letter-spacing: 0.1em;

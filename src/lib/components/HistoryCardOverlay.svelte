@@ -353,12 +353,12 @@
 	}
 
 	.project-name {
-		font-family: var(--font-pixel);
+		font-family: var(--font-sans);
 		font-size: 16px;
 		font-weight: 600;
 		color: var(--text-primary);
 		margin: 0;
-		letter-spacing: 0.02em;
+		letter-spacing: 0.05em;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
