@@ -1,6 +1,6 @@
 use crate::session::{
-    determine_status, get_pending_tool_name, parse_last_n_entries, parse_sessions_index,
-    SessionDetector, SessionStatus,
+    determine_status, get_pending_tool_input, get_pending_tool_name, parse_last_n_entries,
+    parse_sessions_index, SessionDetector, SessionStatus,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -26,6 +26,9 @@ pub struct Session {
     pub status: SessionStatus,
     pub latest_message: String,
     pub pending_tool_name: Option<String>,
+    /// The input/arguments of the pending tool (when status is NeedsPermission)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_tool_input: Option<serde_json::Value>,
 }
 
 /// Detect sessions and enrich them with status and conversation data
@@ -139,6 +142,7 @@ pub fn detect_and_enrich_sessions_with_detector(
 
         let latest_message = get_latest_message_from_entries(&entries);
         let pending_tool_name = get_pending_tool_name(&entries);
+        let pending_tool_input = get_pending_tool_input(&entries);
 
         // Skip empty sessions (0 messages)
         if message_count == 0 {
@@ -168,6 +172,7 @@ pub fn detect_and_enrich_sessions_with_detector(
             status,
             latest_message,
             pending_tool_name,
+            pending_tool_input,
         });
     }
 
@@ -188,8 +193,13 @@ pub fn is_file_recently_modified(path: &Path, seconds: u64) -> bool {
         .unwrap_or(false)
 }
 
-/// Extract the first user prompt from a session JSONL file
+/// Extract the first user prompt from a session JSONL file (truncated to 100 chars).
 pub fn get_first_prompt_from_jsonl(path: &Path) -> Option<String> {
+    get_first_prompt_from_jsonl_raw(path).map(|s| truncate_string(&s, 100))
+}
+
+/// Extract the first user prompt from a session JSONL file (full text, no truncation).
+pub fn get_first_prompt_from_jsonl_raw(path: &Path) -> Option<String> {
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
 
@@ -199,14 +209,14 @@ pub fn get_first_prompt_from_jsonl(path: &Path) -> Option<String> {
                 if let Some(message) = value.get("message") {
                     if let Some(content) = message.get("content") {
                         if let Some(text) = content.as_str() {
-                            return Some(truncate_string(text, 100));
+                            return Some(text.to_string());
                         } else if let Some(arr) = content.as_array() {
                             for item in arr {
                                 if item.get("type").and_then(|t| t.as_str()) == Some("text") {
                                     if let Some(text) =
                                         item.get("text").and_then(|t| t.as_str())
                                     {
-                                        return Some(truncate_string(text, 100));
+                                        return Some(text.to_string());
                                     }
                                 }
                             }

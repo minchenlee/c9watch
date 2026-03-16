@@ -382,6 +382,45 @@ pub fn get_pending_tool_name(entries: &[SessionEntry]) -> Option<String> {
     None
 }
 
+/// Gets the input of the first pending tool that needs permission.
+/// Returns the full tool_use JSON value so the agent knows what action is being requested.
+pub fn get_pending_tool_input(entries: &[SessionEntry]) -> Option<serde_json::Value> {
+    let last_assistant = entries.iter().rev().find_map(|entry| {
+        if let SessionEntry::Assistant { message, .. } = entry {
+            Some(message)
+        } else {
+            None
+        }
+    })?;
+
+    let checker = get_permission_checker();
+
+    let completed_ids: Vec<&str> = last_assistant
+        .content
+        .iter()
+        .filter_map(|c| {
+            if let MessageContent::ToolResult { tool_use_id, .. } = c {
+                Some(tool_use_id.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for item in &last_assistant.content {
+        if let MessageContent::ToolUse { id, name, input } = item {
+            if completed_ids.contains(&id.as_str()) {
+                continue;
+            }
+            if !checker.is_auto_approved(name, input) {
+                return Some(input.clone());
+            }
+        }
+    }
+
+    None
+}
+
 /// Checks if there are any pending (incomplete) tool uses
 fn has_pending_tool_uses(content: &[MessageContent]) -> bool {
     !check_all_tools_completed(content)

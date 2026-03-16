@@ -9,7 +9,7 @@ fn main() {
     // CLI mode: if there are arguments beyond the binary name and the first arg
     // looks like a known subcommand (not a Tauri internal flag starting with --)
     if args.len() > 1 && !args[1].starts_with('-') {
-        let known_commands = ["list", "view", "history", "search", "stop", "help"];
+        let known_commands = ["list", "view", "history", "search", "stop", "watch", "tasks", "help"];
         if known_commands.contains(&args[1].as_str()) {
             use clap::Parser;
             let cli = c9watch_lib::cli::Cli::parse();

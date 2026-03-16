@@ -450,6 +450,7 @@ dependencies = [
  "mime_guess",
  "qr2term",
  "rand 0.8.5",
+ "regex",
  "rust-embed",
  "serde",
  "serde_json",

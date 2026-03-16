@@ -40,6 +40,7 @@ rust-embed = "8"
 mime_guess = "2"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+regex = "1"
 
 [target."cfg(target_os = \"macos\")".dependencies]
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", rev = "da9c9a8d4eb7f0524a2508988df1a7d9585b4904" }

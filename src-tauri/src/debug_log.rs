@@ -1,9 +1,19 @@
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 const MAX_ENTRIES: usize = 500;
+
+/// When true, suppress all eprintln! output (used in CLI mode so agents
+/// don't get noise on stderr).
+static QUIET_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Enable quiet mode — suppresses stderr output from the debug log system.
+pub fn set_quiet(quiet: bool) {
+    QUIET_MODE.store(quiet, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -41,7 +51,9 @@ pub fn debug_log(level: LogLevel, message: &str) {
         message: message.to_string(),
     };
 
-    eprintln!("[c9watch][{}] {}", entry.level.as_str(), message);
+    if !QUIET_MODE.load(Ordering::Relaxed) {
+        eprintln!("[c9watch][{}] {}", entry.level.as_str(), message);
+    }
 
     let mut buffer = match LOG_BUFFER.lock() {
         Ok(b) => b,

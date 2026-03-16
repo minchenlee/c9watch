@@ -12,7 +12,8 @@ pub use parser::{
 };
 pub use permissions::PermissionChecker;
 pub use status::{
-    determine_status, determine_status_with_context, get_pending_tool_name, SessionStatus,
+    determine_status, determine_status_with_context, get_pending_tool_input, get_pending_tool_name,
+    SessionStatus,
 };
 
 pub mod history;
@@ -26,6 +27,9 @@ pub use memory::{get_memory_files, MemoryFile, ProjectMemory};
 
 pub mod enrichment;
 pub use enrichment::{detect_and_enrich_sessions, Session};
+
+pub mod sanitize;
+pub use sanitize::strip_system_tags;
 
 pub mod conversation;
 pub use conversation::{get_conversation_data, Conversation, ConversationMessage};
