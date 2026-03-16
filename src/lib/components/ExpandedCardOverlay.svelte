@@ -463,8 +463,7 @@
 		font-weight: 600;
 		color: var(--text-primary);
 		margin: 0;
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
+		letter-spacing: 0.02em;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;

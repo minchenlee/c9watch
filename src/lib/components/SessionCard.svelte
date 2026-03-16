@@ -311,8 +311,7 @@
 		margin: 0;
 		overflow: hidden;
 		text-overflow: ellipsis;
-		letter-spacing: 0.05em;
-		text-transform: uppercase;
+		letter-spacing: 0.02em;
 		display: -webkit-box;
 		-webkit-line-clamp: 2;
 		line-clamp: 2;
