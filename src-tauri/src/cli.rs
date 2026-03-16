@@ -25,6 +25,17 @@ pub enum Commands {
         /// Filter by project path (substring match)
         #[arg(long)]
         project: Option<String>,
+
+        /// Compact output: only id, status, projectPath, pid, pendingToolName
+        #[arg(long)]
+        compact: bool,
+    },
+
+    /// Aggregate status summary of all active sessions
+    Status {
+        /// Filter by project path (substring match)
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// View conversation for a session
@@ -48,6 +59,10 @@ pub enum Commands {
     Search {
         /// Search query
         query: String,
+
+        /// Filter by project path (substring match on encoded project dir name)
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// Stop a running Claude session
@@ -65,6 +80,14 @@ pub enum Commands {
         /// Filter by project path (substring match)
         #[arg(long)]
         project: Option<String>,
+
+        /// Compact output: only id, status, pendingToolName per event
+        #[arg(long)]
+        compact: bool,
+
+        /// Skip initial "started" burst, only emit changes and stops
+        #[arg(long)]
+        changes_only: bool,
     },
 
     /// Show tasks/todos for a session
@@ -75,18 +98,25 @@ pub enum Commands {
 }
 
 /// Run the CLI and return the exit code.
-/// Returns Ok(()) on success, Err on failure.
 pub fn run(cli: Cli) {
     // Suppress debug log stderr noise — agents shouldn't see warnings
     crate::debug_log::set_quiet(true);
 
     let result = match cli.command {
-        Commands::List { project } => cmd_list(project.as_deref(), cli.pretty),
+        Commands::List { project, compact } => cmd_list(project.as_deref(), compact, cli.pretty),
+        Commands::Status { project } => cmd_status(project.as_deref(), cli.pretty),
         Commands::View { session_id, last } => cmd_view(&session_id, last, cli.pretty),
         Commands::History { limit } => cmd_history(limit, cli.pretty),
-        Commands::Search { query } => cmd_search(&query, cli.pretty),
+        Commands::Search { query, project } => {
+            cmd_search(&query, project.as_deref(), cli.pretty)
+        }
         Commands::Stop { pid } => cmd_stop(pid, cli.pretty),
-        Commands::Watch { interval, project } => cmd_watch(interval, project.as_deref()),
+        Commands::Watch {
+            interval,
+            project,
+            compact,
+            changes_only,
+        } => cmd_watch(interval, project.as_deref(), compact, changes_only),
         Commands::Tasks { session_id } => cmd_tasks(&session_id, cli.pretty),
     };
 
@@ -108,20 +138,24 @@ fn print_json(value: &impl serde::Serialize, pretty: bool) -> Result<(), String>
     Ok(())
 }
 
-fn cmd_list(project_filter: Option<&str>, pretty: bool) -> Result<(), String> {
+// ── Commands ────────────────────────────────────────────────────────
+
+fn cmd_list(project_filter: Option<&str>, compact: bool, pretty: bool) -> Result<(), String> {
     let (sessions, diagnostics) = session::enrichment::detect_and_enrich_sessions()?;
 
-    // Sanitize text fields for agent consumption
     let sessions: Vec<serde_json::Value> = sessions
         .into_iter()
-        .filter(|s| {
-            if let Some(filter) = project_filter {
-                s.project_path.contains(filter)
+        .filter(|s| match project_filter {
+            Some(filter) => s.project_path.contains(filter),
+            None => true,
+        })
+        .map(|s| {
+            if compact {
+                compact_session(&s)
             } else {
-                true
+                full_session(s)
             }
         })
-        .map(|s| sanitize_session(s))
         .collect();
 
     let output = serde_json::json!({
@@ -131,8 +165,55 @@ fn cmd_list(project_filter: Option<&str>, pretty: bool) -> Result<(), String> {
     print_json(&output, pretty)
 }
 
+fn cmd_status(project_filter: Option<&str>, pretty: bool) -> Result<(), String> {
+    let (sessions, _) = session::enrichment::detect_and_enrich_sessions()?;
+
+    let filtered: Vec<_> = sessions
+        .iter()
+        .filter(|s| match project_filter {
+            Some(filter) => s.project_path.contains(filter),
+            None => true,
+        })
+        .collect();
+
+    let total = filtered.len();
+    let mut by_status = std::collections::HashMap::new();
+    let mut by_project = std::collections::HashMap::new();
+
+    for s in &filtered {
+        let status_str = serde_json::to_string(&s.status)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string();
+        *by_status.entry(status_str).or_insert(0u32) += 1;
+        *by_project
+            .entry(s.session_name.clone())
+            .or_insert(0u32) += 1;
+    }
+
+    // Find sessions needing attention
+    let needs_permission: Vec<serde_json::Value> = filtered
+        .iter()
+        .filter(|s| s.status == session::SessionStatus::NeedsPermission)
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "sessionName": s.session_name,
+                "pendingToolName": s.pending_tool_name,
+            })
+        })
+        .collect();
+
+    let output = serde_json::json!({
+        "total": total,
+        "byStatus": by_status,
+        "byProject": by_project,
+        "needsPermission": needs_permission,
+    });
+    print_json(&output, pretty)
+}
+
 fn cmd_view(session_id: &str, last: Option<usize>, pretty: bool) -> Result<(), String> {
-    // Resolve prefix by scanning JSONL filenames directly (no process detection)
     let resolved_id = resolve_session_id_lightweight(session_id)?;
     let mut conversation = session::conversation::get_conversation_data(&resolved_id)?;
 
@@ -143,7 +224,6 @@ fn cmd_view(session_id: &str, last: Option<usize>, pretty: bool) -> Result<(), S
         }
     }
 
-    // Sanitize message content
     for msg in &mut conversation.messages {
         msg.content = strip_system_tags(&msg.content);
     }
@@ -154,7 +234,6 @@ fn cmd_view(session_id: &str, last: Option<usize>, pretty: bool) -> Result<(), S
 fn cmd_history(limit: Option<usize>, pretty: bool) -> Result<(), String> {
     let entries = session::get_history()?;
 
-    // Enrich history entries with firstPrompt from JSONL and readable date
     let enriched: Vec<serde_json::Value> = entries
         .into_iter()
         .take(limit.unwrap_or(usize::MAX))
@@ -164,16 +243,23 @@ fn cmd_history(limit: Option<usize>, pretty: bool) -> Result<(), String> {
     print_json(&enriched, pretty)
 }
 
-fn cmd_search(query: &str, pretty: bool) -> Result<(), String> {
+fn cmd_search(query: &str, project_filter: Option<&str>, pretty: bool) -> Result<(), String> {
     if query.trim().is_empty() {
         return Err("Search query cannot be empty".to_string());
     }
     let hits = session::deep_search(query)?;
 
-    // Enrich search hits with project path and timestamp
     let enriched: Vec<serde_json::Value> = hits
         .into_iter()
         .map(|hit| enrich_search_hit(hit))
+        .filter(|hit| match project_filter {
+            Some(filter) => hit
+                .get("projectPath")
+                .and_then(|p| p.as_str())
+                .map(|p| p.contains(filter))
+                .unwrap_or(false),
+            None => true,
+        })
         .collect();
 
     let output = serde_json::json!({
@@ -192,16 +278,16 @@ fn cmd_stop(pid: u32, pretty: bool) -> Result<(), String> {
     print_json(&output, pretty)
 }
 
-/// Watch sessions and emit NDJSON events on status changes.
-/// Each line is a JSON object: {"event": "...", "session": {...}, "timestamp": "..."}
-/// Events: "started", "status_changed", "stopped"
-fn cmd_watch(interval_secs: u64, project_filter: Option<&str>) -> Result<(), String> {
+fn cmd_watch(
+    interval_secs: u64,
+    project_filter: Option<&str>,
+    compact: bool,
+    changes_only: bool,
+) -> Result<(), String> {
     use std::collections::HashMap;
     use std::io::Write;
 
     let interval = std::time::Duration::from_secs(interval_secs);
-
-    // Track previous state: session_id -> (status, pending_tool_name)
     let mut prev_state: HashMap<String, (String, Option<String>)> = HashMap::new();
 
     loop {
@@ -217,7 +303,6 @@ fn cmd_watch(interval_secs: u64, project_filter: Option<&str>) -> Result<(), Str
             std::collections::HashSet::new();
 
         for s in &sessions {
-            // Apply project filter
             if let Some(filter) = project_filter {
                 if !s.project_path.contains(filter) {
                     continue;
@@ -230,11 +315,15 @@ fn cmd_watch(interval_secs: u64, project_filter: Option<&str>) -> Result<(), Str
             let prev = prev_state.get(&s.id);
 
             let event = match prev {
-                None => Some("started"),
+                None => {
+                    if changes_only {
+                        None // Skip initial "started" burst
+                    } else {
+                        Some("started")
+                    }
+                }
                 Some((old_status, old_tool)) => {
-                    if *old_status != status_str
-                        || *old_tool != s.pending_tool_name
-                    {
+                    if *old_status != status_str || *old_tool != s.pending_tool_name {
                         Some("status_changed")
                     } else {
                         None
@@ -243,21 +332,21 @@ fn cmd_watch(interval_secs: u64, project_filter: Option<&str>) -> Result<(), Str
             };
 
             if let Some(event_name) = event {
-                let sanitized = sanitize_session(s.clone());
+                let session_data = if compact {
+                    compact_session(s)
+                } else {
+                    full_session(s.clone())
+                };
                 let line = serde_json::json!({
                     "event": event_name,
-                    "session": sanitized,
+                    "session": session_data,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 });
                 println!("{}", serde_json::to_string(&line).unwrap_or_default());
-                // Flush immediately so piping agents see events in real-time
                 let _ = std::io::stdout().flush();
             }
 
-            prev_state.insert(
-                s.id.clone(),
-                (status_str, s.pending_tool_name.clone()),
-            );
+            prev_state.insert(s.id.clone(), (status_str, s.pending_tool_name.clone()));
         }
 
         // Detect stopped sessions
@@ -282,7 +371,6 @@ fn cmd_watch(interval_secs: u64, project_filter: Option<&str>) -> Result<(), Str
     }
 }
 
-/// Show tasks/todos for a session from ~/.claude/tasks/<session-id>/
 fn cmd_tasks(session_id: &str, pretty: bool) -> Result<(), String> {
     let resolved_id = resolve_session_id_lightweight(session_id)?;
     let tasks = read_session_tasks(&resolved_id)?;
@@ -301,72 +389,115 @@ fn cmd_tasks(session_id: &str, pretty: bool) -> Result<(), String> {
     print_json(&output, pretty)
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
+// ── Session formatters ──────────────────────────────────────────────
 
-/// Sanitize a Session's text fields for agent output.
-/// Re-reads full first prompt from JSONL to avoid sanitizing truncated tags.
-fn sanitize_session(s: session::enrichment::Session) -> serde_json::Value {
-    // Re-read full first prompt so we can sanitize BEFORE truncation.
-    // Without this, truncation may cut mid-tag leaving unsanitizable fragments.
-    let first_prompt = find_first_prompt_raw_for_session(&s.id)
-        .map(|full| {
-            let clean = strip_system_tags(&full);
-            session::enrichment::truncate_string(&clean, 100)
-        })
-        .unwrap_or_else(|| strip_system_tags(&s.first_prompt));
-
-    // Include task summary if available
-    let task_summary = get_task_summary(&s.id);
-
+/// Compact session: minimal fields for status polling.
+fn compact_session(s: &session::enrichment::Session) -> serde_json::Value {
     let mut json = serde_json::json!({
         "id": s.id,
         "pid": s.pid,
-        "sessionName": s.session_name,
-        "customTitle": s.custom_title,
-        "projectPath": s.project_path,
-        "gitBranch": s.git_branch,
-        "firstPrompt": first_prompt,
-        "summary": s.summary,
-        "messageCount": s.message_count,
-        "modified": s.modified,
         "status": s.status,
-        "latestMessage": strip_system_tags(&s.latest_message),
-        "pendingToolName": s.pending_tool_name,
+        "projectPath": s.project_path,
+        "sessionName": s.session_name,
     });
 
-    // Add pendingToolInput only when there's a pending tool
-    if let Some(input) = s.pending_tool_input {
+    // Only include non-null optional fields
+    if let Some(ref tool) = s.pending_tool_name {
         json.as_object_mut()
             .unwrap()
-            .insert("pendingToolInput".to_string(), input);
-    }
-
-    // Add task summary if there are any tasks
-    if let Some(summary) = task_summary {
-        json.as_object_mut()
-            .unwrap()
-            .insert("taskProgress".to_string(), summary);
+            .insert("pendingToolName".to_string(), serde_json::json!(tool));
     }
 
     json
 }
 
-/// Enrich a history entry with firstPrompt from the JSONL file and ISO date.
+/// Full session: all fields, sanitized, with null fields omitted.
+fn full_session(s: session::enrichment::Session) -> serde_json::Value {
+    // Re-read full first prompt so we can sanitize BEFORE truncation.
+    let first_prompt = find_first_prompt_raw_for_session(&s.id)
+        .map(|full| {
+            let clean = strip_system_tags(&full);
+            let trimmed = clean.trim().to_string();
+            if trimmed.is_empty() {
+                // Fallback: use enrichment's version (from sessions-index)
+                s.first_prompt.clone()
+            } else {
+                session::enrichment::truncate_string(&trimmed, 100)
+            }
+        })
+        .unwrap_or_else(|| {
+            let cleaned = strip_system_tags(&s.first_prompt);
+            if cleaned.trim().is_empty() {
+                s.first_prompt.clone() // Keep original if sanitization empties it
+            } else {
+                cleaned
+            }
+        });
+
+    let latest_message = strip_system_tags(&s.latest_message);
+
+    let mut json = serde_json::json!({
+        "id": s.id,
+        "pid": s.pid,
+        "sessionName": s.session_name,
+        "projectPath": s.project_path,
+        "firstPrompt": first_prompt,
+        "messageCount": s.message_count,
+        "modified": s.modified,
+        "status": s.status,
+    });
+
+    let obj = json.as_object_mut().unwrap();
+
+    // Only include non-null/non-empty optional fields to save tokens
+    if let Some(ref title) = s.custom_title {
+        obj.insert("customTitle".to_string(), serde_json::json!(title));
+    }
+    if let Some(ref branch) = s.git_branch {
+        obj.insert("gitBranch".to_string(), serde_json::json!(branch));
+    }
+    if let Some(ref summary) = s.summary {
+        obj.insert("summary".to_string(), serde_json::json!(summary));
+    }
+    if !latest_message.trim().is_empty() {
+        obj.insert(
+            "latestMessage".to_string(),
+            serde_json::json!(latest_message),
+        );
+    }
+    if let Some(ref tool) = s.pending_tool_name {
+        obj.insert("pendingToolName".to_string(), serde_json::json!(tool));
+    }
+    if let Some(input) = s.pending_tool_input {
+        obj.insert("pendingToolInput".to_string(), input);
+    }
+    if let Some(summary) = get_task_summary(&s.id) {
+        obj.insert("taskProgress".to_string(), summary);
+    }
+
+    json
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
 fn enrich_history_entry(entry: session::HistoryEntry) -> serde_json::Value {
-    // Try to get the real first prompt from the JSONL file (full text, sanitize before truncation)
     let first_prompt = find_first_prompt_raw_for_session(&entry.session_id)
         .map(|full| {
             let clean = strip_system_tags(&full);
-            session::enrichment::truncate_string(&clean, 100)
+            let trimmed = clean.trim().to_string();
+            if trimmed.is_empty() {
+                strip_system_tags(&entry.display)
+            } else {
+                session::enrichment::truncate_string(&trimmed, 100)
+            }
         })
         .unwrap_or_else(|| strip_system_tags(&entry.display));
 
-    // Convert timestamp to ISO 8601
     let date = chrono::DateTime::from_timestamp_millis(entry.timestamp as i64)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default();
 
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "sessionId": entry.session_id,
         "firstPrompt": first_prompt,
         "display": strip_system_tags(&entry.display),
@@ -374,13 +505,23 @@ fn enrich_history_entry(entry: session::HistoryEntry) -> serde_json::Value {
         "timestamp": entry.timestamp,
         "project": entry.project,
         "projectName": entry.project_name,
-        "customTitle": entry.custom_title,
-    })
+    });
+
+    if let Some(title) = entry.custom_title {
+        json.as_object_mut()
+            .unwrap()
+            .insert("customTitle".to_string(), serde_json::json!(title));
+    }
+
+    json
 }
 
-/// Enrich a search hit with project path and timestamp from the JSONL file.
 fn enrich_search_hit(hit: session::DeepSearchHit) -> serde_json::Value {
-    let (project_path, modified) = find_session_metadata(&hit.session_id);
+    let (project_path_encoded, modified) = find_session_metadata(&hit.session_id);
+
+    // Decode the encoded project path back to a real filesystem path
+    // e.g. "-Users-liminchen-Documents-GitHub-c9watch" -> "/Users/liminchen/Documents/GitHub/c9watch"
+    let project_path = project_path_encoded.map(|encoded| decode_project_path(&encoded));
 
     serde_json::json!({
         "sessionId": hit.session_id,
@@ -390,8 +531,36 @@ fn enrich_search_hit(hit: session::DeepSearchHit) -> serde_json::Value {
     })
 }
 
-/// Find the first user prompt (full, unsanitized) from a session's JSONL file
-/// by searching all project directories. Avoids running process detection.
+/// Decode Claude Code's encoded project directory name back to a real path.
+/// Claude Code encodes paths by replacing every non-alphanumeric char with `-`.
+///
+/// Strategy: try sessions-index.json first (authoritative), then use the active
+/// session's CWD from enrichment data, then fall back to heuristic decoding.
+fn decode_project_path(encoded: &str) -> String {
+    // 1. Try sessions-index.json
+    if let Some(home_dir) = dirs::home_dir() {
+        let project_dir = home_dir.join(".claude").join("projects").join(encoded);
+        let index_path = project_dir.join("sessions-index.json");
+        if let Ok(index) = session::parse_sessions_index(&index_path) {
+            if let Some(entry) = index.entries.first() {
+                return entry.project_path.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    // 2. Heuristic: the encoded form is a path with non-alphanumeric chars replaced by `-`.
+    //    We can't perfectly reverse it, but common patterns work:
+    //    "-Users-liminchen-Documents-GitHub-c9watch" -> "/Users/liminchen/Documents/GitHub/c9watch"
+    //    This works because most path components are alphanumeric.
+    if encoded.starts_with('-') {
+        let decoded = encoded.replacen('-', "/", 1); // First `-` -> `/`
+        // Replace remaining `-` with `/`, but this is lossy for hyphenated dirs
+        return decoded.replace('-', "/");
+    }
+
+    encoded.to_string()
+}
+
 fn find_first_prompt_raw_for_session(session_id: &str) -> Option<String> {
     let home_dir = dirs::home_dir()?;
     let projects_dir = home_dir.join(".claude").join("projects");
@@ -410,7 +579,6 @@ fn find_first_prompt_raw_for_session(session_id: &str) -> Option<String> {
     None
 }
 
-/// Find project path and modification time for a session JSONL file.
 fn find_session_metadata(session_id: &str) -> (Option<String>, Option<String>) {
     let home_dir = match dirs::home_dir() {
         Some(h) => h,
@@ -431,7 +599,6 @@ fn find_session_metadata(session_id: &str) -> (Option<String>, Option<String>) {
         }
         let session_file = project_dir.join(&session_filename);
         if session_file.exists() {
-            // Derive project path from the encoded directory name
             let project_path = project_dir
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -451,7 +618,6 @@ fn find_session_metadata(session_id: &str) -> (Option<String>, Option<String>) {
     (None, None)
 }
 
-/// Read tasks from ~/.claude/tasks/<session-id>/*.json
 fn read_session_tasks(session_id: &str) -> Result<Vec<serde_json::Value>, String> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
     let tasks_dir = home_dir.join(".claude").join("tasks").join(session_id);
@@ -477,7 +643,6 @@ fn read_session_tasks(session_id: &str) -> Result<Vec<serde_json::Value>, String
         }
     }
 
-    // Sort by task ID numerically
     tasks.sort_by(|a, b| {
         let id_a = a
             .get("id")
@@ -495,8 +660,6 @@ fn read_session_tasks(session_id: &str) -> Result<Vec<serde_json::Value>, String
     Ok(tasks)
 }
 
-/// Get a compact task progress summary for inclusion in session listing.
-/// Returns something like "3/7 completed, 1 in_progress" or None if no tasks.
 fn get_task_summary(session_id: &str) -> Option<serde_json::Value> {
     let tasks = read_session_tasks(session_id).ok()?;
     if tasks.is_empty() {
@@ -513,7 +676,6 @@ fn get_task_summary(session_id: &str) -> Option<serde_json::Value> {
         .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress"))
         .count();
 
-    // Find the current task (first in_progress)
     let current_task = tasks.iter().find_map(|t| {
         if t.get("status").and_then(|s| s.as_str()) == Some("in_progress") {
             t.get("subject").and_then(|s| s.as_str()).map(String::from)
@@ -530,10 +692,7 @@ fn get_task_summary(session_id: &str) -> Option<serde_json::Value> {
     }))
 }
 
-/// Resolve a session ID prefix by scanning JSONL filenames directly.
-/// Much lighter than detect_and_enrich_sessions() — no process detection needed.
 fn resolve_session_id_lightweight(prefix: &str) -> Result<String, String> {
-    // Full UUID — use directly
     if prefix.len() >= 36 {
         return Ok(prefix.to_string());
     }
@@ -568,7 +727,7 @@ fn resolve_session_id_lightweight(prefix: &str) -> Result<String, String> {
     }
 
     match matches.len() {
-        0 => Ok(prefix.to_string()), // Fall through — might be a full ID
+        0 => Ok(prefix.to_string()),
         1 => Ok(matches.into_iter().next().unwrap()),
         n => Err(format!(
             "Ambiguous session ID prefix '{}' matches {} sessions",

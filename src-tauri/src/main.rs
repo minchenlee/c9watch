@@ -6,11 +6,17 @@ fn main() {
     // If so, run the CLI handler instead of launching the GUI.
     let args: Vec<String> = std::env::args().collect();
 
-    // CLI mode: if there are arguments beyond the binary name and the first arg
-    // looks like a known subcommand (not a Tauri internal flag starting with --)
-    if args.len() > 1 && !args[1].starts_with('-') {
-        let known_commands = ["list", "view", "history", "search", "stop", "watch", "tasks", "help"];
-        if known_commands.contains(&args[1].as_str()) {
+    // CLI mode: if the first arg is a known subcommand or --help/--version,
+    // route to the CLI handler instead of launching the GUI.
+    if args.len() > 1 {
+        let first = args[1].as_str();
+        let known_commands = ["list", "status", "view", "history", "search", "stop", "watch", "tasks", "help"];
+        let is_cli = known_commands.contains(&first)
+            || first == "--help"
+            || first == "-h"
+            || first == "--version"
+            || first == "-V";
+        if is_cli {
             use clap::Parser;
             let cli = c9watch_lib::cli::Cli::parse();
             c9watch_lib::cli::run(cli);
