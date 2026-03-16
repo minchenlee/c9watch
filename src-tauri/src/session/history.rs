@@ -28,10 +28,16 @@ pub struct HistoryEntry {
     pub custom_title: Option<String>,
 }
 
-/// Parse JSONL text into deduplicated HistoryEntry vec, sorted newest first.
-/// Keeps the entry with the highest timestamp for each sessionId.
+/// Accumulated state per session during dedup: first prompt text + last activity timestamp.
+struct SessionAccum {
+    first: RawHistoryLine,
+    last_timestamp: u64,
+}
+
+/// Parse JSONL text into deduplicated HistoryEntry vec, sorted by last activity (newest first).
+/// Keeps the first prompt's display text but uses the latest timestamp for sorting.
 pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
-    let mut by_session: HashMap<String, RawHistoryLine> = HashMap::new();
+    let mut by_session: HashMap<String, SessionAccum> = HashMap::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -42,26 +48,39 @@ pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
             if raw.session_id.is_empty() {
                 continue;
             }
-            let existing = by_session.get(&raw.session_id);
-            if existing.is_none_or(|e| raw.timestamp < e.timestamp) {
-                by_session.insert(raw.session_id.clone(), raw);
+            let ts = raw.timestamp;
+            match by_session.get_mut(&raw.session_id) {
+                Some(accum) => {
+                    if ts < accum.first.timestamp {
+                        accum.first = raw;
+                    } else if ts > accum.last_timestamp {
+                        accum.last_timestamp = ts;
+                    }
+                }
+                None => {
+                    let sid = raw.session_id.clone();
+                    by_session.insert(sid, SessionAccum {
+                        last_timestamp: ts,
+                        first: raw,
+                    });
+                }
             }
         }
     }
 
     let mut entries: Vec<HistoryEntry> = by_session
         .into_values()
-        .map(|raw| {
-            let project_name = PathBuf::from(&raw.project)
+        .map(|accum| {
+            let project_name = PathBuf::from(&accum.first.project)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown")
                 .to_string();
             HistoryEntry {
-                session_id: raw.session_id,
-                display: raw.display,
-                timestamp: raw.timestamp,
-                project: raw.project,
+                session_id: accum.first.session_id,
+                display: accum.first.display,
+                timestamp: accum.last_timestamp,
+                project: accum.first.project,
                 project_name,
                 custom_title: None,
             }
@@ -326,8 +345,9 @@ mod tests {
         );
         let result = parse_history_jsonl(jsonl);
         assert_eq!(result.len(), 1);
+        // Display shows first prompt, but timestamp reflects last activity
         assert_eq!(result[0].display, "First prompt");
-        assert_eq!(result[0].timestamp, 1000);
+        assert_eq!(result[0].timestamp, 2000);
     }
 
     #[test]
