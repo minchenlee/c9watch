@@ -64,10 +64,18 @@ pub enum Commands {
         /// Search query
         query: String,
 
-        /// Filter by project path (substring match on encoded project dir name)
+        /// Filter by project path (substring match)
         #[arg(long)]
         project: Option<String>,
+
+        /// Maximum number of results to return
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
     },
+
+    /// Identify this session (find the calling agent's own session by PID ancestry)
+    #[command(name = "self")]
+    SelfId,
 
     /// Stop a running Claude session
     Stop {
@@ -113,9 +121,12 @@ pub fn run(cli: Cli) {
         Commands::Status { project } => cmd_status(project.as_deref(), cli.pretty),
         Commands::View { session_id, last } => cmd_view(&session_id, last, cli.pretty),
         Commands::History { limit } => cmd_history(limit, cli.pretty),
-        Commands::Search { query, project } => {
-            cmd_search(&query, project.as_deref(), cli.pretty)
-        }
+        Commands::Search {
+            query,
+            project,
+            limit,
+        } => cmd_search(&query, project.as_deref(), limit, cli.pretty),
+        Commands::SelfId => cmd_self(cli.pretty),
         Commands::Stop { pid } => cmd_stop(pid, cli.pretty),
         Commands::Watch {
             interval,
@@ -262,7 +273,12 @@ fn cmd_history(limit: Option<usize>, pretty: bool) -> Result<(), String> {
     print_json(&enriched, pretty)
 }
 
-fn cmd_search(query: &str, project_filter: Option<&str>, pretty: bool) -> Result<(), String> {
+fn cmd_search(
+    query: &str,
+    project_filter: Option<&str>,
+    limit: usize,
+    pretty: bool,
+) -> Result<(), String> {
     if query.trim().is_empty() {
         return Err("Search query cannot be empty".to_string());
     }
@@ -279,13 +295,79 @@ fn cmd_search(query: &str, project_filter: Option<&str>, pretty: bool) -> Result
                 .unwrap_or(false),
             None => true,
         })
+        .take(limit)
         .collect();
 
     let output = serde_json::json!({
         "query": query,
         "hits": enriched,
+        "truncated": enriched.len() == limit,
     });
     print_json(&output, pretty)
+}
+
+/// Identify the calling agent's own session by walking up the PID tree
+/// to find a parent claude process, then matching it to an active session.
+fn cmd_self(pretty: bool) -> Result<(), String> {
+    let my_pid = std::process::id();
+
+    // Walk up the process tree to find a claude ancestor
+    let claude_pid = find_claude_ancestor(my_pid)
+        .ok_or("No claude parent process found — this command must be called from within a Claude Code session")?;
+
+    // Find the matching session
+    let (sessions, _) = session::enrichment::detect_and_enrich_sessions()?;
+    let session = sessions
+        .into_iter()
+        .find(|s| s.pid == claude_pid)
+        .ok_or(format!(
+            "Found claude process (PID {}) but no matching session",
+            claude_pid
+        ))?;
+
+    let output = full_session(session);
+    print_json(&output, pretty)
+}
+
+/// Walk up the process tree from `pid` to find the nearest ancestor that is a claude process.
+fn find_claude_ancestor(start_pid: u32) -> Option<u32> {
+    use sysinfo::System;
+
+    let mut sys = System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+    let mut current_pid = sysinfo::Pid::from_u32(start_pid);
+
+    // Walk up at most 20 levels to avoid infinite loops
+    for _ in 0..20 {
+        let process = sys.process(current_pid)?;
+        let parent_pid = process.parent()?;
+        let parent = sys.process(parent_pid)?;
+
+        let exe_name = parent
+            .exe()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        // Check if parent is a claude process
+        if exe_name == "claude" || exe_name.starts_with("claude-") {
+            return Some(parent_pid.as_u32());
+        }
+
+        // Also check command line for "claude" (handles node-based claude)
+        let cmd = parent.cmd();
+        if cmd.iter().any(|arg| {
+            let s = arg.to_string_lossy();
+            s.ends_with("/claude") || s.ends_with("\\claude") || s == "claude"
+        }) {
+            return Some(parent_pid.as_u32());
+        }
+
+        current_pid = parent_pid;
+    }
+
+    None
 }
 
 fn cmd_stop(pid: u32, pretty: bool) -> Result<(), String> {
@@ -747,7 +829,18 @@ fn resolve_session_id_lightweight(prefix: &str) -> Result<String, String> {
     }
 
     match matches.len() {
-        0 => Ok(prefix.to_string()),
+        0 => {
+            // If it looks like a full UUID, let it through (might be a valid ID
+            // in a project dir we couldn't enumerate). Otherwise, fail clearly.
+            if prefix.len() >= 32 {
+                Ok(prefix.to_string())
+            } else {
+                Err(format!(
+                    "No session found matching prefix '{}'",
+                    prefix
+                ))
+            }
+        }
         1 => Ok(matches.into_iter().next().unwrap()),
         n => Err(format!(
             "Ambiguous session ID prefix '{}' matches {} sessions",

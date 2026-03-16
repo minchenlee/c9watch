@@ -10,7 +10,7 @@ fn main() {
     // route to the CLI handler instead of launching the GUI.
     if args.len() > 1 {
         let first = args[1].as_str();
-        let known_commands = ["list", "status", "view", "history", "search", "stop", "watch", "tasks", "help"];
+        let known_commands = ["list", "status", "self", "view", "history", "search", "stop", "watch", "tasks", "help"];
         let is_cli = known_commands.contains(&first)
             || first == "--help"
             || first == "-h"
