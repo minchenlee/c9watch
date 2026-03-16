@@ -23,3 +23,9 @@ pub use cost::{get_cost_data, CostData};
 
 pub mod memory;
 pub use memory::{get_memory_files, MemoryFile, ProjectMemory};
+
+pub mod enrichment;
+pub use enrichment::{detect_and_enrich_sessions, Session};
+
+pub mod conversation;
+pub use conversation::{get_conversation_data, Conversation, ConversationMessage};

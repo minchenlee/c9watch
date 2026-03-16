@@ -1,39 +1,15 @@
-use crate::session::{
-    determine_status, get_pending_tool_name, parse_last_n_entries, parse_sessions_index,
-    SessionDetector, SessionStatus,
-};
-use chrono::{DateTime, Utc};
+use crate::session::enrichment::detect_and_enrich_sessions_with_detector;
+pub use crate::session::enrichment::{detect_and_enrich_sessions, truncate_string, Session};
+use crate::session::{SessionDetector, SessionStatus};
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
-
-/// Combined session information for the frontend
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Session {
-    pub id: String,
-    pub pid: u32,
-    pub session_name: String,
-    pub custom_title: Option<String>,
-    pub project_path: String,
-    pub git_branch: Option<String>,
-    pub first_prompt: String,
-    pub summary: Option<String>,
-    pub message_count: u32,
-    pub modified: String,
-    pub status: SessionStatus,
-    pub latest_message: String,
-    pub pending_tool_name: Option<String>,
-}
 
 /// Start the background polling loop
 ///
@@ -56,7 +32,10 @@ pub fn start_polling(
         let mut detector = match SessionDetector::new() {
             Ok(d) => d,
             Err(e) => {
-                crate::debug_log::log_error(&format!("Failed to create session detector: {}", e));
+                crate::debug_log::log_error(&format!(
+                    "Failed to create session detector: {}",
+                    e
+                ));
                 return;
             }
         };
@@ -97,7 +76,9 @@ pub fn start_polling(
                             } else {
                                 // Check for status transitions
                                 for session in &sessions {
-                                    if let Some(prev_status) = prev_status_map.get(&session.id) {
+                                    if let Some(prev_status) =
+                                        prev_status_map.get(&session.id)
+                                    {
                                         // Check for notification-worthy transitions
                                         let should_notify = matches!(
                                             (prev_status, &session.status),
@@ -113,7 +94,9 @@ pub fn start_polling(
                                             // from status flickering across poll cycles
                                             let on_cooldown = last_notification_time
                                                 .get(&session.id)
-                                                .map(|t| t.elapsed() < notification_cooldown)
+                                                .map(|t| {
+                                                    t.elapsed() < notification_cooldown
+                                                })
                                                 .unwrap_or(false);
 
                                             if !on_cooldown {
@@ -135,8 +118,10 @@ pub fn start_polling(
                                                         project_path: &session.project_path,
                                                     },
                                                 );
-                                                last_notification_time
-                                                    .insert(session.id.clone(), Instant::now());
+                                                last_notification_time.insert(
+                                                    session.id.clone(),
+                                                    Instant::now(),
+                                                );
                                             }
                                         }
                                     }
@@ -148,8 +133,10 @@ pub fn start_polling(
                             }
 
                             // Clean up disappeared sessions
-                            prev_status_map.retain(|id, _| current_session_ids.contains(id));
-                            last_notification_time.retain(|id, _| current_session_ids.contains(id));
+                            prev_status_map
+                                .retain(|id, _| current_session_ids.contains(id));
+                            last_notification_time
+                                .retain(|id, _| current_session_ids.contains(id));
                         }
                         Err(poisoned) => {
                             crate::debug_log::log_error("Mutex poisoned, recovering...");
@@ -158,7 +145,8 @@ pub fn start_polling(
 
                             // Seed the map with current sessions (no notifications after recovery)
                             for session in &sessions {
-                                prev_status_map.insert(session.id.clone(), session.status.clone());
+                                prev_status_map
+                                    .insert(session.id.clone(), session.status.clone());
                             }
                             is_first_cycle = false; // Mark as initialized
                         }
@@ -166,7 +154,10 @@ pub fn start_polling(
 
                     // Emit event to Tauri frontend
                     if let Err(e) = app_handle.emit("sessions-updated", &sessions) {
-                        crate::debug_log::log_error(&format!("Failed to emit sessions-updated: {}", e));
+                        crate::debug_log::log_error(&format!(
+                            "Failed to emit sessions-updated: {}",
+                            e
+                        ));
                     }
 
                     // Broadcast to WebSocket clients
@@ -189,14 +180,22 @@ pub fn start_polling(
                                 "Full Disk Access likely needed: processes found but none have readable CWD",
                             );
                         }
-                        if let Err(e) = app_handle.emit("diagnostic-update", &diagnostics) {
-                            crate::debug_log::log_error(&format!("Failed to emit diagnostic-update: {}", e));
+                        if let Err(e) =
+                            app_handle.emit("diagnostic-update", &diagnostics)
+                        {
+                            crate::debug_log::log_error(&format!(
+                                "Failed to emit diagnostic-update: {}",
+                                e
+                            ));
                         }
                         prev_diagnostics = Some(diagnostics);
                     }
                 }
                 Err(e) => {
-                    crate::debug_log::log_error(&format!("Error detecting sessions: {}", e));
+                    crate::debug_log::log_error(&format!(
+                        "Error detecting sessions: {}",
+                        e
+                    ));
                     // Continue polling even on error
                 }
             }
@@ -633,7 +632,10 @@ fn fire_notification(
     };
 
     if let Err(e) = app_handle.emit("notification-fired", &metadata) {
-        crate::debug_log::log_error(&format!("Failed to emit notification-fired: {}", e));
+        crate::debug_log::log_error(&format!(
+            "Failed to emit notification-fired: {}",
+            e
+        ));
     }
 
     // Broadcast to WebSocket clients for web notifications
