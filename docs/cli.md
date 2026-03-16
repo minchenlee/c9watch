@@ -48,10 +48,11 @@ When a session needs permission, `needsPermission` includes the session ID and p
 Full details on every running Claude Code session.
 
 ```bash
-c9watch list                        # All sessions
-c9watch list --project c9watch      # Filter by project path
-c9watch list --compact              # Minimal fields only
-c9watch list --compact --pretty     # Readable compact output
+c9watch list                                    # All sessions
+c9watch list --project c9watch                  # Filter by project path
+c9watch list --status Working                   # Filter by status
+c9watch list --status NeedsPermission --compact # Combine filters
+c9watch list --compact --pretty                 # Readable compact output
 ```
 
 **Full output fields:**
@@ -146,9 +147,9 @@ c9watch watch --compact --changes-only -i 1      # Optimal for agent polling
 | `status_changed` | Status or pendingToolName changed | Full or compact session data |
 | `stopped` | Session disappeared | `{sessionId}` only |
 
-Each event line:
+Each event line includes a top-level `sessionId` for easy filtering without parsing the nested session object:
 ```json
-{"event": "status_changed", "session": {...}, "timestamp": "2026-03-16T12:00:00+00:00"}
+{"event": "status_changed", "sessionId": "46fe2af3-...", "session": {...}, "timestamp": "2026-03-16T12:00:00+00:00"}
 ```
 
 **Tip:** Use `--changes-only` when you already have state from `list`. Use `--compact` to minimize context window usage.

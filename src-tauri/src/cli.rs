@@ -26,6 +26,10 @@ pub enum Commands {
         #[arg(long)]
         project: Option<String>,
 
+        /// Filter by session status (e.g. Working, WaitingForInput, NeedsPermission)
+        #[arg(long)]
+        status: Option<String>,
+
         /// Compact output: only id, status, projectPath, pid, pendingToolName
         #[arg(long)]
         compact: bool,
@@ -103,7 +107,9 @@ pub fn run(cli: Cli) {
     crate::debug_log::set_quiet(true);
 
     let result = match cli.command {
-        Commands::List { project, compact } => cmd_list(project.as_deref(), compact, cli.pretty),
+        Commands::List { project, status, compact } => {
+            cmd_list(project.as_deref(), status.as_deref(), compact, cli.pretty)
+        }
         Commands::Status { project } => cmd_status(project.as_deref(), cli.pretty),
         Commands::View { session_id, last } => cmd_view(&session_id, last, cli.pretty),
         Commands::History { limit } => cmd_history(limit, cli.pretty),
@@ -140,13 +146,26 @@ fn print_json(value: &impl serde::Serialize, pretty: bool) -> Result<(), String>
 
 // ── Commands ────────────────────────────────────────────────────────
 
-fn cmd_list(project_filter: Option<&str>, compact: bool, pretty: bool) -> Result<(), String> {
+fn cmd_list(
+    project_filter: Option<&str>,
+    status_filter: Option<&str>,
+    compact: bool,
+    pretty: bool,
+) -> Result<(), String> {
     let (sessions, diagnostics) = session::enrichment::detect_and_enrich_sessions()?;
 
     let sessions: Vec<serde_json::Value> = sessions
         .into_iter()
         .filter(|s| match project_filter {
             Some(filter) => s.project_path.contains(filter),
+            None => true,
+        })
+        .filter(|s| match status_filter {
+            Some(filter) => {
+                let status_str = serde_json::to_string(&s.status).unwrap_or_default();
+                let status_str = status_str.trim_matches('"');
+                status_str.eq_ignore_ascii_case(filter)
+            }
             None => true,
         })
         .map(|s| {
@@ -339,6 +358,7 @@ fn cmd_watch(
                 };
                 let line = serde_json::json!({
                     "event": event_name,
+                    "sessionId": s.id,
                     "session": session_data,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 });
