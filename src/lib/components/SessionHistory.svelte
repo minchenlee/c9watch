@@ -443,10 +443,10 @@
 
 	.row-project {
 		font-family: var(--font-sans);
-		font-size: 12px;
+		font-size: 13px;
 		font-weight: 600;
 		color: var(--text-primary);
-		letter-spacing: 0.1em;
+		letter-spacing: 0.05em;
 	}
 
 	.row-meta {
