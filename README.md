@@ -97,7 +97,7 @@ See your total token usage as a rice stack towering past real-world landmarks. S
 
 - **Zero-integration setup** -- Works with any terminal or IDE, no plugins or extensions required
 - **Auto-discovery** -- Detects all running Claude Code sessions by scanning processes at the OS level
-- **Real-time status** -- See at a glance which sessions are Working, Need Permission, or Idle
+- **Real-time status** -- See at a glance which sessions are Working, Need Attention (permission requests or user questions), or Idle
 - **Conversation viewer** -- Expand any session to view the full conversation with formatted markdown, code blocks, and inline images
 - **Session control** -- Stop sessions, open their parent terminal/IDE, or rename them for easier tracking
 - **Multi-project view** -- Sessions grouped by project with git branch info
@@ -107,14 +107,14 @@ See your total token usage as a rice stack towering past real-world landmarks. S
 - **Session history** -- Browse and search all past sessions with instant metadata filter and deep content search; click a result to scroll to and highlight the matching message
 - **Memory viewer** -- Browse and inspect Claude Code memory files with a two-panel layout and quick Claude command access
 - **Cost tracker** -- Track Claude Code spending with daily, per-project, and per-model breakdowns using cached JSONL scanning
-- **Token distance visualizer** -- See your token usage as a rice stack towering past 17 real-world landmarks, with animated stacking, native share sheet, and Instagram-ready PNG export
+- **Token distance visualizer** -- See your token usage as a rice stack towering past 22 real-world landmarks, with animated stacking, native share sheet, and Instagram-ready PNG export
 - **Debug console** -- Hidden diagnostic panel (`Cmd+Shift+D`) for troubleshooting session detection issues
 
 ## How it works
 
 **Live monitoring** -- A background thread polls every 2 seconds, scanning for running `claude` processes using `sysinfo`. Each process is matched to its session file in `~/.claude/projects/` via path encoding and timestamp correlation. The last N entries of each session's JSONL file are parsed to determine status:
 - **Working** -- Claude is generating a response or executing tools
-- **Needs Permission** -- A tool is pending that requires user approval
+- **Needs Attention** -- A tool requires user approval, or Claude is asking the user a question
 - **Idle** -- Session is waiting for your next prompt
 
 Status updates are pushed to the Svelte frontend via Tauri events. The UI reactively updates, sorting sessions by priority (permission requests surface first).
