@@ -58,6 +58,24 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "maxyharr",
+      "name": "Max Harris",
+      "avatar_url": "https://github.com/maxyharr.png",
+      "profile": "https://github.com/maxyharr",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "vladan-me",
+      "name": "Vladan",
+      "avatar_url": "https://github.com/vladan-me.png",
+      "profile": "https://github.com/vladan-me",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "contributorsPerLine": 7,

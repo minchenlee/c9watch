@@ -31,9 +31,16 @@ We appreciate all contributions, big and small. Thank you to the following peopl
 - **Grimmer Kang** ([@grimmerk](https://github.com/grimmerk)) - Reduce CPU usage by optimizing sysinfo process scanning ([#14](https://github.com/minchenlee/c9watch/pull/14))
 - **Grimmer Kang** ([@grimmerk](https://github.com/grimmerk)) - Sliding window rendering for large conversations ([#53](https://github.com/minchenlee/c9watch/pull/53))
 
+### UI/UX
+
+- **Max Harris** ([@maxyharr](https://github.com/maxyharr)) - Draggable title bar and mobile responsive styling ([#58](https://github.com/minchenlee/c9watch/pull/58))
+- **Grimmer Kang** ([@grimmerk](https://github.com/grimmerk)) - Remove forced uppercase on session titles ([#67](https://github.com/minchenlee/c9watch/pull/67))
+- **Grimmer Kang** ([@grimmerk](https://github.com/grimmerk)) - Sort history by last activity instead of creation time ([#68](https://github.com/minchenlee/c9watch/pull/68))
+
 ### Bug Fixes
 
 - **josh.dev** ([@josh-dev-cho](https://github.com/josh-dev-cho)) - Fix dot character in path encoding for session matching ([#57](https://github.com/minchenlee/c9watch/pull/57))
+- **Vladan** ([@vladan-me](https://github.com/vladan-me)) - Focus existing JetBrains window instead of opening new one ([#69](https://github.com/minchenlee/c9watch/pull/69))
 
 ---
 

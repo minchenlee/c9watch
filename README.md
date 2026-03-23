@@ -206,6 +206,8 @@ Thanks to these wonderful people who have contributed to c9watch:
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/grimmerk"><img src="https://github.com/grimmerk.png?s=100" width="100px;" alt="Grimmer Kang"/><br /><sub><b>Grimmer Kang</b></sub></a><br /><a href="#code-grimmerk" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/stanimir93"><img src="https://github.com/stanimir93.png?s=100" width="100px;" alt="Stanimir"/><br /><sub><b>Stanimir</b></sub></a><br /><a href="#code-stanimir93" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/josh-dev-cho"><img src="https://github.com/josh-dev-cho.png?s=100" width="100px;" alt="josh.dev"/><br /><sub><b>josh.dev</b></sub></a><br /><a href="#code-josh-dev-cho" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/maxyharr"><img src="https://github.com/maxyharr.png?s=100" width="100px;" alt="Max Harris"/><br /><sub><b>Max Harris</b></sub></a><br /><a href="#code-maxyharr" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/vladan-me"><img src="https://github.com/vladan-me.png?s=100" width="100px;" alt="Vladan"/><br /><sub><b>Vladan</b></sub></a><br /><a href="#code-vladan-me" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>
