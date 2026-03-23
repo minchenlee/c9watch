@@ -5,6 +5,23 @@ All notable changes to c9watch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-03-23
+
+### Added
+- Session metadata improvements — richer session info display ([#65](https://github.com/minchenlee/c9watch/pull/65))
+- NeedsPermission renamed to NeedsAttention with user question detection — sessions now surface when Claude asks the user a question, not just on permission requests ([#66](https://github.com/minchenlee/c9watch/pull/66))
+- Draggable title bar and mobile responsive styling improvements ([#58](https://github.com/minchenlee/c9watch/pull/58))
+- 5 new token distance milestones: Angel Falls, Mt. Vesuvius, Krubera Cave, Mt. Olympus, Mt. Etna ([#63](https://github.com/minchenlee/c9watch/pull/63))
+
+### Fixed
+- Cost pricing updated — Opus 4.5/4.6 corrected to $5/$25 (standard) and $30/$150 (fast), Haiku 4.5 to $1/$5; added cache versioning for automatic invalidation ([#64](https://github.com/minchenlee/c9watch/pull/64))
+- Session titles no longer forced to uppercase with pixel font — improves readability of custom titles and prompts ([#67](https://github.com/minchenlee/c9watch/pull/67))
+- History "newest" sort now uses last activity time instead of creation time ([#68](https://github.com/minchenlee/c9watch/pull/68))
+- JetBrains IDE "Open" action now focuses existing window instead of opening a new one ([#69](https://github.com/minchenlee/c9watch/pull/69))
+
+### Improved
+- Website SEO & AEO optimization ([#59](https://github.com/minchenlee/c9watch/pull/59))
+
 ## [0.5.0] - 2026-03-14
 
 ### Added
