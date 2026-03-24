@@ -585,7 +585,6 @@ fn fire_notification(
         pid,
         project_path,
     } = params;
-    // Use custom title (renamed session) if available, otherwise fall back to first prompt
     let title = truncate_string(custom_title.unwrap_or(first_prompt), 60);
 
     // Build the body based on the status
