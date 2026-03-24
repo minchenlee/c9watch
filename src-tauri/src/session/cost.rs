@@ -575,4 +575,131 @@ mod tests {
         let data = aggregate(&sessions);
         assert_eq!(data.total_tokens, 13000);
     }
+
+    #[test]
+    fn test_scan_file_splits_by_date() {
+        let dir = std::env::temp_dir().join("c9watch_test_split");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test-split.jsonl");
+
+        let content = [
+            r#"{"type":"assistant","sessionId":"sess-1","timestamp":"2026-03-20T10:00:00Z","cwd":"/tmp/proj","message":{"model":"claude-sonnet-4-6","role":"assistant","id":"m1","content":[],"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            r#"{"type":"assistant","sessionId":"sess-1","timestamp":"2026-03-20T14:00:00Z","cwd":"/tmp/proj","message":{"model":"claude-sonnet-4-6","role":"assistant","id":"m2","content":[],"usage":{"input_tokens":200,"output_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            r#"{"type":"assistant","sessionId":"sess-1","timestamp":"2026-03-21T09:00:00Z","cwd":"/tmp/proj","message":{"model":"claude-opus-4-6","role":"assistant","id":"m3","content":[],"usage":{"input_tokens":400,"output_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        ].join("\n");
+        std::fs::write(&file, &content).unwrap();
+
+        let records = scan_file(&file);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(records.len(), 2, "Should produce 2 records for 2 days");
+
+        let mut records = records;
+        records.sort_by(|a, b| a.date.cmp(&b.date));
+
+        // Day 1: Sonnet — 300 input + 150 output = 450 tokens
+        // Cost: (300 * 3.0 + 150 * 15.0) / 1_000_000 = 0.003150
+        assert_eq!(records[0].date, "2026-03-20");
+        assert_eq!(records[0].session_id, "sess-1");
+        assert_eq!(records[0].total_tokens, 450);
+        assert!((records[0].cost - 0.003150).abs() < 1e-10);
+        assert_eq!(records[0].model, "claude-sonnet-4-6");
+        assert_eq!(records[0].timestamp, "2026-03-20T10:00:00Z");
+        assert_eq!(records[0].project, "/tmp/proj");
+
+        // Day 2: Opus — 400 input + 200 output = 600 tokens
+        // Cost: (400 * 5.0 + 200 * 25.0) / 1_000_000 = 0.007000
+        assert_eq!(records[1].date, "2026-03-21");
+        assert_eq!(records[1].session_id, "sess-1");
+        assert_eq!(records[1].total_tokens, 600);
+        assert!((records[1].cost - 0.007000).abs() < 1e-10);
+        assert_eq!(records[1].model, "claude-opus-4-6");
+        assert_eq!(records[1].timestamp, "2026-03-21T09:00:00Z");
+        assert_eq!(records[1].project, "/tmp/proj");
+    }
+
+    #[test]
+    fn test_scan_file_single_day_unchanged() {
+        let dir = std::env::temp_dir().join("c9watch_test_single");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test-single.jsonl");
+
+        let content = [
+            r#"{"type":"assistant","sessionId":"sess-2","timestamp":"2026-03-20T10:00:00Z","cwd":"/tmp/proj","message":{"model":"claude-sonnet-4-6","role":"assistant","id":"m1","content":[],"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            r#"{"type":"assistant","sessionId":"sess-2","timestamp":"2026-03-20T14:00:00Z","cwd":"/tmp/proj","message":{"model":"claude-sonnet-4-6","role":"assistant","id":"m2","content":[],"usage":{"input_tokens":200,"output_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        ].join("\n");
+        std::fs::write(&file, &content).unwrap();
+
+        let records = scan_file(&file);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(records.len(), 1, "Single-day session should produce 1 record");
+        assert_eq!(records[0].date, "2026-03-20");
+        assert_eq!(records[0].total_tokens, 450);
+        assert!((records[0].cost - 0.003150).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cwd_shared_across_date_splits() {
+        let dir = std::env::temp_dir().join("c9watch_test_cwd");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test-cwd.jsonl");
+
+        let content = [
+            r#"{"type":"assistant","sessionId":"sess-3","timestamp":"2026-03-20T10:00:00Z","cwd":"/tmp/myproject","message":{"model":"claude-sonnet-4-6","role":"assistant","id":"m1","content":[],"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            r#"{"type":"assistant","sessionId":"sess-3","timestamp":"2026-03-21T09:00:00Z","cwd":"","message":{"model":"claude-sonnet-4-6","role":"assistant","id":"m2","content":[],"usage":{"input_tokens":200,"output_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        ].join("\n");
+        std::fs::write(&file, &content).unwrap();
+
+        let records = scan_file(&file);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(records.len(), 2);
+        let mut records = records;
+        records.sort_by(|a, b| a.date.cmp(&b.date));
+
+        assert_eq!(records[0].project, "/tmp/myproject");
+        assert_eq!(records[1].project, "/tmp/myproject");
+        assert_eq!(records[0].project_name, "myproject");
+        assert_eq!(records[1].project_name, "myproject");
+    }
+
+    #[test]
+    fn test_aggregate_date_split() {
+        let sessions = vec![
+            SessionCostRecord {
+                session_id: "s1".into(),
+                project: "/tmp/a".into(),
+                project_name: "a".into(),
+                model: "claude-sonnet-4-6".into(),
+                cost: 1.0,
+                total_tokens: 5000,
+                timestamp: "2026-03-20T10:00:00Z".into(),
+                date: "2026-03-20".into(),
+            },
+            SessionCostRecord {
+                session_id: "s1".into(),
+                project: "/tmp/a".into(),
+                project_name: "a".into(),
+                model: "claude-sonnet-4-6".into(),
+                cost: 2.0,
+                total_tokens: 8000,
+                timestamp: "2026-03-21T09:00:00Z".into(),
+                date: "2026-03-21".into(),
+            },
+        ];
+        let data = aggregate(&sessions);
+
+        assert_eq!(data.daily_costs.len(), 2, "Should have 2 daily buckets");
+        assert_eq!(data.total_cost, 3.0);
+        assert_eq!(data.total_tokens, 13000);
+
+        let day20 = data.daily_costs.iter().find(|d| d.date == "2026-03-20").unwrap();
+        let day21 = data.daily_costs.iter().find(|d| d.date == "2026-03-21").unwrap();
+        assert!((day20.cost - 1.0).abs() < 1e-10);
+        assert!((day21.cost - 2.0).abs() < 1e-10);
+    }
 }
