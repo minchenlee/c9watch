@@ -48,6 +48,7 @@ pub struct DetectionDiagnostics {
 pub struct SessionDetector {
     system: System,
     claude_projects_dir: PathBuf,
+    claude_sessions_dir: PathBuf,
 }
 
 impl SessionDetector {
@@ -56,6 +57,7 @@ impl SessionDetector {
         let home_dir = dirs::home_dir().ok_or(SessionDetectorError::HomeDirectoryNotFound)?;
 
         let claude_projects_dir = home_dir.join(".claude").join("projects");
+        let claude_sessions_dir = home_dir.join(".claude").join("sessions");
 
         Ok(Self {
             system: System::new_with_specifics(
@@ -66,6 +68,7 @@ impl SessionDetector {
                 ),
             ),
             claude_projects_dir,
+            claude_sessions_dir,
         })
     }
 
@@ -207,7 +210,32 @@ impl SessionDetector {
                 None => continue, // Skip processes without cwd
             };
 
-            // Encode the process cwd for matching against Claude's project directory names.
+            // Primary: try to resolve session ID from ~/.claude/sessions/<pid>.json
+            // This file is the authoritative source and is updated after /clear,
+            // so we always get the correct current session.
+            if let Some(meta) = self.read_session_metadata(proc.pid) {
+                if !used_session_ids.contains(&meta.session_id) {
+                    // Find the matching session file and project info
+                    if let Some((_, _, project_dir, _, project_name, _)) =
+                        session_files.iter().find(|(_, path, _, _, _, _)| {
+                            path.file_stem().and_then(|s| s.to_str()) == Some(&meta.session_id)
+                        })
+                    {
+                        used_session_ids.insert(meta.session_id.clone());
+                        sessions.push(DetectedSession {
+                            pid: proc.pid,
+                            cwd: proc_cwd.clone(),
+                            project_path: project_dir.clone(),
+                            session_id: Some(meta.session_id),
+                            project_name: project_name.clone(),
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // Fallback: heuristic matching by encoded CWD + modification time.
+            // Used when pid.json doesn't exist (e.g., older Claude Code versions).
             let cwd_str = proc_cwd.to_string_lossy();
             let encoded_cwd = encode_path_for_matching(&cwd_str);
 
@@ -290,99 +318,14 @@ impl SessionDetector {
             }
         }
 
-        // Deduplicate sessions from the same Claude instance after /clear.
-        // When Claude Code's /clear creates a new session, the parent wrapper process
-        // and its Node.js child process may each match a different session file.
-        // We detect related processes (parent-child or shared parent) and among those
-        // sharing the same CWD, keep only the session with the newest JSONL modification
-        // time. This preserves legitimately separate sessions in the same directory
-        // opened from different terminals.
-        {
-            // Build a PID → parent_pid map from the original processes list
-            let pid_to_ppid: std::collections::HashMap<u32, Option<u32>> = processes
-                .iter()
-                .map(|p| (p.pid, p.parent_pid))
-                .collect();
-
-            // Two processes are "related" if one is parent of the other, or they
-            // share the same parent PID (siblings in the same process tree).
-            let are_related = |pid_a: u32, pid_b: u32| -> bool {
-                let ppid_a = pid_to_ppid.get(&pid_a).copied().flatten();
-                let ppid_b = pid_to_ppid.get(&pid_b).copied().flatten();
-                // A is parent of B
-                ppid_b == Some(pid_a)
-                // B is parent of A
-                || ppid_a == Some(pid_b)
-                // Both share the same parent
-                || (ppid_a.is_some() && ppid_a == ppid_b)
-            };
-
-            // For each pair of sessions with the same CWD that belong to related
-            // processes, mark the one with the older JSONL modification time for removal.
-            let mut remove_indices: std::collections::HashSet<usize> =
-                std::collections::HashSet::new();
-
-            let get_mtime = |session_id: &str| -> std::time::SystemTime {
-                session_files
-                    .iter()
-                    .find(|(_, path, _, _, _, _)| {
-                        path.file_stem().and_then(|stem| stem.to_str()) == Some(session_id)
-                    })
-                    .map(|(mtime, _, _, _, _, _)| *mtime)
-                    .unwrap_or(std::time::UNIX_EPOCH)
-            };
-
-            for i in 0..sessions.len() {
-                if remove_indices.contains(&i) {
-                    continue;
-                }
-                for j in (i + 1)..sessions.len() {
-                    if remove_indices.contains(&j) {
-                        continue;
-                    }
-                    // Only deduplicate if same CWD AND processes are related
-                    if sessions[i].cwd != sessions[j].cwd {
-                        continue;
-                    }
-                    if !are_related(sessions[i].pid, sessions[j].pid) {
-                        continue;
-                    }
-
-                    // Keep the session with the newer JSONL modification time
-                    let mtime_i = sessions[i]
-                        .session_id
-                        .as_deref()
-                        .map(get_mtime)
-                        .unwrap_or(std::time::UNIX_EPOCH);
-                    let mtime_j = sessions[j]
-                        .session_id
-                        .as_deref()
-                        .map(get_mtime)
-                        .unwrap_or(std::time::UNIX_EPOCH);
-
-                    if mtime_i >= mtime_j {
-                        remove_indices.insert(j);
-                    } else {
-                        remove_indices.insert(i);
-                    }
-                }
-            }
-
-            if !remove_indices.is_empty() {
-                crate::debug_log::log_info(&format!(
-                    "Deduplicated {} stale session(s) from same Claude instance after /clear",
-                    remove_indices.len()
-                ));
-                let mut idx = 0;
-                sessions.retain(|_| {
-                    let keep = !remove_indices.contains(&idx);
-                    idx += 1;
-                    keep
-                });
-            }
-        }
-
         sessions
+    }
+
+    /// Reads session metadata from ~/.claude/sessions/<pid>.json if it exists.
+    fn read_session_metadata(&self, pid: u32) -> Option<PidSessionMeta> {
+        let meta_path = self.claude_sessions_dir.join(format!("{}.json", pid));
+        let content = fs::read_to_string(&meta_path).ok()?;
+        serde_json::from_str::<PidSessionMeta>(&content).ok()
     }
 
     /// Get project info from sessions-index.json for a given session ID
@@ -442,11 +385,8 @@ impl SessionDetector {
                 let cwd = process.cwd().map(|p| p.to_path_buf());
                 let start_time = process.start_time();
 
-                let parent_pid = process.parent().map(|p| p.as_u32());
-
                 processes.push(ClaudeProcess {
                     pid: pid.as_u32(),
-                    parent_pid,
                     cwd,
                     start_time,
                 });
@@ -500,9 +440,16 @@ pub(crate) fn encode_path_for_matching(path: &str) -> String {
 #[derive(Debug, Clone)]
 struct ClaudeProcess {
     pid: u32,
-    parent_pid: Option<u32>,
     cwd: Option<PathBuf>,
     start_time: u64, // Process start time (seconds since epoch)
+}
+
+/// Session metadata from ~/.claude/sessions/<pid>.json
+/// Written by Claude Code with the authoritative session ID for each process.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PidSessionMeta {
+    session_id: String,
 }
 
 /// Structure of sessions-index.json
