@@ -5,5 +5,9 @@ fn main() {
     if !build_dir.exists() {
         std::fs::create_dir_all(build_dir).ok();
     }
-    tauri_build::build()
+
+    // Only run tauri_build when the gui feature is enabled.
+    // CLI-only builds don't need Tauri's code generation.
+    #[cfg(feature = "gui")]
+    tauri_build::build();
 }
