@@ -511,7 +511,7 @@
 								</div>
 							</div>
 
-							{#each expandedProjects.has(proj.project) ? proj.sessions : proj.sessions.slice(0, 5) as session (session.sessionId)}
+							{#each expandedProjects.has(proj.project) ? proj.sessions : proj.sessions.slice(0, 5) as session (session.sessionId + '-' + session.date)}
 								<div class="session-detail">
 									<span class="detail-project">{session.projectName}</span>
 									<span class="detail-session-id" title={session.sessionId}>{session.sessionId.slice(0, 8)}</span>
