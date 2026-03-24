@@ -521,19 +521,15 @@ fn full_session(s: session::enrichment::Session) -> serde_json::Value {
             let clean = strip_system_tags(&full);
             let trimmed = clean.trim().to_string();
             if trimmed.is_empty() {
-                // Fallback: use enrichment's version (from sessions-index)
-                s.first_prompt.clone()
+                // First prompt was entirely a system tag — return empty
+                String::new()
             } else {
                 session::enrichment::truncate_string(&trimmed, 100)
             }
         })
         .unwrap_or_else(|| {
             let cleaned = strip_system_tags(&s.first_prompt);
-            if cleaned.trim().is_empty() {
-                s.first_prompt.clone() // Keep original if sanitization empties it
-            } else {
-                cleaned
-            }
+            cleaned.trim().to_string()
         });
 
     let latest_message = strip_system_tags(&s.latest_message);
