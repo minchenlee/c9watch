@@ -123,6 +123,9 @@ pub fn start_polling(
                                                     NotificationParams {
                                                         session_id: &session.id,
                                                         first_prompt: &session.first_prompt,
+                                                        custom_title: session
+                                                            .custom_title
+                                                            .as_deref(),
                                                         session_name: &session.session_name,
                                                         status: &session.status,
                                                         pending_tool_name: session
@@ -558,6 +561,7 @@ struct NotificationMetadata {
 struct NotificationParams<'a> {
     session_id: &'a str,
     first_prompt: &'a str,
+    custom_title: Option<&'a str>,
     session_name: &'a str,
     status: &'a SessionStatus,
     pending_tool_name: Option<&'a str>,
@@ -574,14 +578,15 @@ fn fire_notification(
     let NotificationParams {
         session_id,
         first_prompt,
+        custom_title,
         session_name,
         status,
         pending_tool_name,
         pid,
         project_path,
     } = params;
-    // Truncate title to 60 characters
-    let title = truncate_string(first_prompt, 60);
+    // Use custom title (renamed session) if available, otherwise fall back to first prompt
+    let title = truncate_string(custom_title.unwrap_or(first_prompt), 60);
 
     // Build the body based on the status
     let body = match status {
