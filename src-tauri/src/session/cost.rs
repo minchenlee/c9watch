@@ -190,14 +190,14 @@ fn date_from_timestamp(ts: &str) -> String {
     ts.get(..10).unwrap_or("unknown").to_string()
 }
 
-/// Scan a single JSONL file and return per-session cost records.
+/// Scan a single JSONL file and return per-(session, date) cost records.
 fn scan_file(path: &std::path::Path) -> Vec<SessionCostRecord> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return vec![],
     };
 
-    // Group usage entries by session_id
+    // Pass 1: group usage entries by session_id
     let mut by_session: HashMap<String, Vec<UsageEntry>> = HashMap::new();
     for line in content.lines() {
         if let Some(entry) = parse_usage_line(line) {
@@ -207,21 +207,34 @@ fn scan_file(path: &std::path::Path) -> Vec<SessionCostRecord> {
         }
     }
 
-    by_session
-        .into_iter()
-        .filter_map(|(session_id, entries)| {
-            if entries.is_empty() {
-                return None;
-            }
+    // Pass 2: sub-group by date, produce one record per (session, date)
+    let mut records = Vec::new();
 
-            // Sum cost per model within this session
+    for (session_id, entries) in by_session {
+        if entries.is_empty() {
+            continue;
+        }
+
+        // Resolve cwd from any entry in the session
+        let cwd = entries.iter()
+            .find(|e| !e.cwd.is_empty())
+            .map(|e| e.cwd.clone())
+            .unwrap_or_default();
+
+        // Sub-group entries by date
+        let mut by_date: HashMap<String, Vec<&UsageEntry>> = HashMap::new();
+        for entry in &entries {
+            let date = date_from_timestamp(&entry.timestamp);
+            by_date.entry(date).or_default().push(entry);
+        }
+
+        for (date, day_entries) in by_date {
             let mut cost_by_model: HashMap<String, f64> = HashMap::new();
             let mut total_cost = 0.0;
             let mut total_tokens: u64 = 0;
-            let mut earliest_ts = entries[0].timestamp.clone();
-            let mut cwd = entries[0].cwd.clone();
+            let mut earliest_ts = day_entries[0].timestamp.clone();
 
-            for e in &entries {
+            for e in &day_entries {
                 let c = calculate_cost(
                     &e.model,
                     &e.speed,
@@ -236,30 +249,28 @@ fn scan_file(path: &std::path::Path) -> Vec<SessionCostRecord> {
                 if e.timestamp < earliest_ts {
                     earliest_ts = e.timestamp.clone();
                 }
-                if cwd.is_empty() && !e.cwd.is_empty() {
-                    cwd = e.cwd.clone();
-                }
             }
 
-            // Primary model = highest cost contributor
             let primary_model = cost_by_model
                 .iter()
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(m, _)| m.clone())
                 .unwrap_or_default();
 
-            Some(SessionCostRecord {
-                session_id,
+            records.push(SessionCostRecord {
+                session_id: session_id.clone(),
                 project: cwd.clone(),
                 project_name: project_name_from_path(&cwd),
                 model: primary_model,
                 cost: total_cost,
                 total_tokens,
-                timestamp: earliest_ts.clone(),
-                date: date_from_timestamp(&earliest_ts),
-            })
-        })
-        .collect()
+                timestamp: earliest_ts,
+                date,
+            });
+        }
+    }
+
+    records
 }
 
 /// Load cache from disk, scan new/modified files, update cache, return aggregated CostData.
