@@ -290,57 +290,95 @@ impl SessionDetector {
             }
         }
 
-        // Deduplicate sessions sharing the same CWD.
-        // When Claude Code's /clear creates a new session, multiple Claude processes
-        // from the same terminal (parent wrapper + Node.js child) may each match a
-        // different session file in the same project directory. The stale session's
-        // JSONL file stops being written to after /clear, so we keep only the most
-        // recently modified session per CWD.
+        // Deduplicate sessions from the same Claude instance after /clear.
+        // When Claude Code's /clear creates a new session, the parent wrapper process
+        // and its Node.js child process may each match a different session file.
+        // We detect related processes (parent-child or shared parent) and among those
+        // sharing the same CWD, keep only the session with the newest JSONL modification
+        // time. This preserves legitimately separate sessions in the same directory
+        // opened from different terminals.
         {
-            let mut best_per_cwd: std::collections::HashMap<
-                PathBuf,
-                (String, std::time::SystemTime),
-            > = std::collections::HashMap::new();
+            // Build a PID → parent_pid map from the original processes list
+            let pid_to_ppid: std::collections::HashMap<u32, Option<u32>> = processes
+                .iter()
+                .map(|p| (p.pid, p.parent_pid))
+                .collect();
 
-            for s in &sessions {
-                let sid = match &s.session_id {
-                    Some(id) => id.clone(),
-                    None => continue,
-                };
+            // Two processes are "related" if one is parent of the other, or they
+            // share the same parent PID (siblings in the same process tree).
+            let are_related = |pid_a: u32, pid_b: u32| -> bool {
+                let ppid_a = pid_to_ppid.get(&pid_a).copied().flatten();
+                let ppid_b = pid_to_ppid.get(&pid_b).copied().flatten();
+                // A is parent of B
+                ppid_b == Some(pid_a)
+                // B is parent of A
+                || ppid_a == Some(pid_b)
+                // Both share the same parent
+                || (ppid_a.is_some() && ppid_a == ppid_b)
+            };
 
-                // Look up this session's JSONL modification time from session_files
-                let mtime = session_files
+            // For each pair of sessions with the same CWD that belong to related
+            // processes, mark the one with the older JSONL modification time for removal.
+            let mut remove_indices: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+
+            let get_mtime = |session_id: &str| -> std::time::SystemTime {
+                session_files
                     .iter()
                     .find(|(_, path, _, _, _, _)| {
-                        path.file_stem().and_then(|stem| stem.to_str()) == Some(sid.as_str())
+                        path.file_stem().and_then(|stem| stem.to_str()) == Some(session_id)
                     })
                     .map(|(mtime, _, _, _, _, _)| *mtime)
-                    .unwrap_or(std::time::UNIX_EPOCH);
+                    .unwrap_or(std::time::UNIX_EPOCH)
+            };
 
-                match best_per_cwd.get(&s.cwd) {
-                    Some((_, existing_mtime)) if mtime <= *existing_mtime => {
-                        // Current session is older, existing is better — skip
+            for i in 0..sessions.len() {
+                if remove_indices.contains(&i) {
+                    continue;
+                }
+                for j in (i + 1)..sessions.len() {
+                    if remove_indices.contains(&j) {
+                        continue;
                     }
-                    _ => {
-                        best_per_cwd.insert(s.cwd.clone(), (sid, mtime));
+                    // Only deduplicate if same CWD AND processes are related
+                    if sessions[i].cwd != sessions[j].cwd {
+                        continue;
+                    }
+                    if !are_related(sessions[i].pid, sessions[j].pid) {
+                        continue;
+                    }
+
+                    // Keep the session with the newer JSONL modification time
+                    let mtime_i = sessions[i]
+                        .session_id
+                        .as_deref()
+                        .map(get_mtime)
+                        .unwrap_or(std::time::UNIX_EPOCH);
+                    let mtime_j = sessions[j]
+                        .session_id
+                        .as_deref()
+                        .map(get_mtime)
+                        .unwrap_or(std::time::UNIX_EPOCH);
+
+                    if mtime_i >= mtime_j {
+                        remove_indices.insert(j);
+                    } else {
+                        remove_indices.insert(i);
                     }
                 }
             }
 
-            let before = sessions.len();
-            sessions.retain(|s| match &s.session_id {
-                Some(id) => best_per_cwd
-                    .get(&s.cwd)
-                    .map(|(best_id, _)| best_id == id)
-                    .unwrap_or(true),
-                None => true,
-            });
-
-            if sessions.len() < before {
+            if !remove_indices.is_empty() {
                 crate::debug_log::log_info(&format!(
-                    "Deduplicated {} stale session(s) sharing same CWD after /clear",
-                    before - sessions.len()
+                    "Deduplicated {} stale session(s) from same Claude instance after /clear",
+                    remove_indices.len()
                 ));
+                let mut idx = 0;
+                sessions.retain(|_| {
+                    let keep = !remove_indices.contains(&idx);
+                    idx += 1;
+                    keep
+                });
             }
         }
 
@@ -404,8 +442,11 @@ impl SessionDetector {
                 let cwd = process.cwd().map(|p| p.to_path_buf());
                 let start_time = process.start_time();
 
+                let parent_pid = process.parent().map(|p| p.as_u32());
+
                 processes.push(ClaudeProcess {
                     pid: pid.as_u32(),
+                    parent_pid,
                     cwd,
                     start_time,
                 });
@@ -459,6 +500,7 @@ pub(crate) fn encode_path_for_matching(path: &str) -> String {
 #[derive(Debug, Clone)]
 struct ClaudeProcess {
     pid: u32,
+    parent_pid: Option<u32>,
     cwd: Option<PathBuf>,
     start_time: u64, // Process start time (seconds since epoch)
 }
