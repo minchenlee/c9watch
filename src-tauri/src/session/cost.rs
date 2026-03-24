@@ -149,7 +149,7 @@ pub struct ModelCost {
 }
 
 /// Bump this when pricing or token counting logic changes to force cache rebuild.
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 /// Cache structure stored at ~/.claude/cost-cache.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
