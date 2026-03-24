@@ -290,6 +290,60 @@ impl SessionDetector {
             }
         }
 
+        // Deduplicate sessions sharing the same CWD.
+        // When Claude Code's /clear creates a new session, multiple Claude processes
+        // from the same terminal (parent wrapper + Node.js child) may each match a
+        // different session file in the same project directory. The stale session's
+        // JSONL file stops being written to after /clear, so we keep only the most
+        // recently modified session per CWD.
+        {
+            let mut best_per_cwd: std::collections::HashMap<
+                PathBuf,
+                (String, std::time::SystemTime),
+            > = std::collections::HashMap::new();
+
+            for s in &sessions {
+                let sid = match &s.session_id {
+                    Some(id) => id.clone(),
+                    None => continue,
+                };
+
+                // Look up this session's JSONL modification time from session_files
+                let mtime = session_files
+                    .iter()
+                    .find(|(_, path, _, _, _, _)| {
+                        path.file_stem().and_then(|stem| stem.to_str()) == Some(sid.as_str())
+                    })
+                    .map(|(mtime, _, _, _, _, _)| *mtime)
+                    .unwrap_or(std::time::UNIX_EPOCH);
+
+                match best_per_cwd.get(&s.cwd) {
+                    Some((_, existing_mtime)) if mtime <= *existing_mtime => {
+                        // Current session is older, existing is better — skip
+                    }
+                    _ => {
+                        best_per_cwd.insert(s.cwd.clone(), (sid, mtime));
+                    }
+                }
+            }
+
+            let before = sessions.len();
+            sessions.retain(|s| match &s.session_id {
+                Some(id) => best_per_cwd
+                    .get(&s.cwd)
+                    .map(|(best_id, _)| best_id == id)
+                    .unwrap_or(true),
+                None => true,
+            });
+
+            if sessions.len() < before {
+                crate::debug_log::log_info(&format!(
+                    "Deduplicated {} stale session(s) sharing same CWD after /clear",
+                    before - sessions.len()
+                ));
+            }
+        }
+
         sessions
     }
 
