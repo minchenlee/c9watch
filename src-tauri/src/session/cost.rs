@@ -197,77 +197,75 @@ fn scan_file(path: &std::path::Path) -> Vec<SessionCostRecord> {
         Err(_) => return vec![],
     };
 
-    // Pass 1: group usage entries by session_id
-    let mut by_session: HashMap<String, Vec<UsageEntry>> = HashMap::new();
+    // Group entries by (session_id, date) in a single pass
+    let mut by_key: HashMap<(String, String), Vec<UsageEntry>> = HashMap::new();
+    let mut cwd_by_session: HashMap<String, String> = HashMap::new();
+
     for line in content.lines() {
         if let Some(entry) = parse_usage_line(line) {
             if !entry.session_id.is_empty() {
-                by_session.entry(entry.session_id.clone()).or_default().push(entry);
+                let sid = entry.session_id.clone();
+                if !entry.cwd.is_empty() {
+                    cwd_by_session.entry(sid.clone())
+                        .or_insert_with(|| entry.cwd.clone());
+                }
+                let date = date_from_timestamp(&entry.timestamp);
+                by_key.entry((sid, date)).or_default().push(entry);
             }
         }
     }
 
-    // Pass 2: sub-group by date, produce one record per (session, date)
+    // Pre-compute project_name per session to avoid redundant path parsing
+    let name_by_session: HashMap<&str, String> = cwd_by_session.iter()
+        .map(|(sid, cwd)| (sid.as_str(), project_name_from_path(cwd)))
+        .collect();
+
     let mut records = Vec::new();
 
-    for (session_id, entries) in by_session {
-        if entries.is_empty() {
-            continue;
+    for ((session_id, date), day_entries) in by_key {
+        let cwd = cwd_by_session.get(&session_id).cloned().unwrap_or_default();
+        let project_name = name_by_session.get(session_id.as_str())
+            .cloned()
+            .unwrap_or_else(|| project_name_from_path(&cwd));
+
+        let mut cost_by_model: HashMap<String, f64> = HashMap::new();
+        let mut total_cost = 0.0;
+        let mut total_tokens: u64 = 0;
+        let mut earliest_ts = &day_entries[0].timestamp;
+
+        for e in &day_entries {
+            let c = calculate_cost(
+                &e.model,
+                &e.speed,
+                e.input_tokens,
+                e.output_tokens,
+                e.cache_creation_input_tokens,
+                e.cache_read_input_tokens,
+            );
+            total_cost += c;
+            total_tokens += e.input_tokens + e.output_tokens;
+            *cost_by_model.entry(e.model.clone()).or_default() += c;
+            if e.timestamp < *earliest_ts {
+                earliest_ts = &e.timestamp;
+            }
         }
 
-        // Resolve cwd from any entry in the session
-        let cwd = entries.iter()
-            .find(|e| !e.cwd.is_empty())
-            .map(|e| e.cwd.clone())
+        let primary_model = cost_by_model
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(m, _)| m.clone())
             .unwrap_or_default();
 
-        // Sub-group entries by date
-        let mut by_date: HashMap<String, Vec<&UsageEntry>> = HashMap::new();
-        for entry in &entries {
-            let date = date_from_timestamp(&entry.timestamp);
-            by_date.entry(date).or_default().push(entry);
-        }
-
-        for (date, day_entries) in by_date {
-            let mut cost_by_model: HashMap<String, f64> = HashMap::new();
-            let mut total_cost = 0.0;
-            let mut total_tokens: u64 = 0;
-            let mut earliest_ts = day_entries[0].timestamp.clone();
-
-            for e in &day_entries {
-                let c = calculate_cost(
-                    &e.model,
-                    &e.speed,
-                    e.input_tokens,
-                    e.output_tokens,
-                    e.cache_creation_input_tokens,
-                    e.cache_read_input_tokens,
-                );
-                total_cost += c;
-                total_tokens += e.input_tokens + e.output_tokens;
-                *cost_by_model.entry(e.model.clone()).or_default() += c;
-                if e.timestamp < earliest_ts {
-                    earliest_ts = e.timestamp.clone();
-                }
-            }
-
-            let primary_model = cost_by_model
-                .iter()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(m, _)| m.clone())
-                .unwrap_or_default();
-
-            records.push(SessionCostRecord {
-                session_id: session_id.clone(),
-                project: cwd.clone(),
-                project_name: project_name_from_path(&cwd),
-                model: primary_model,
-                cost: total_cost,
-                total_tokens,
-                timestamp: earliest_ts,
-                date,
-            });
-        }
+        records.push(SessionCostRecord {
+            session_id,
+            project: cwd,
+            project_name,
+            model: primary_model,
+            cost: total_cost,
+            total_tokens,
+            timestamp: earliest_ts.clone(),
+            date,
+        });
     }
 
     records
