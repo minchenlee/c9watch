@@ -224,7 +224,7 @@ fn cmd_status(project_filter: Option<&str>, pretty: bool) -> Result<(), String> 
     // Find sessions needing attention
     let needs_permission: Vec<serde_json::Value> = filtered
         .iter()
-        .filter(|s| s.status == session::SessionStatus::NeedsPermission)
+        .filter(|s| s.status == session::SessionStatus::NeedsAttention)
         .map(|s| {
             serde_json::json!({
                 "id": s.id,

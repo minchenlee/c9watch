@@ -1,5 +1,6 @@
-// Prevents additional console window on Windows in release, DO NOT REMOVE!!
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Prevents additional console window on Windows in release — GUI builds only.
+// CLI-only builds need the console for stdout/stderr output.
+#![cfg_attr(all(not(debug_assertions), feature = "gui"), windows_subsystem = "windows")]
 
 fn main() {
     // CLI mode: if the first arg is a known subcommand or --help/--version,
