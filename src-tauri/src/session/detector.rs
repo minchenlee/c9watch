@@ -64,6 +64,7 @@ impl SessionDetector {
                 RefreshKind::new().with_processes(
                     ProcessRefreshKind::new()
                         .with_exe(UpdateKind::OnlyIfNotSet)
+                        .with_cmd(UpdateKind::OnlyIfNotSet)
                         .with_cwd(UpdateKind::OnlyIfNotSet),
                 ),
             ),
@@ -80,6 +81,7 @@ impl SessionDetector {
             true,
             ProcessRefreshKind::new()
                 .with_exe(UpdateKind::OnlyIfNotSet)
+                .with_cmd(UpdateKind::OnlyIfNotSet)
                 .with_cwd(UpdateKind::OnlyIfNotSet),
         );
 
@@ -372,16 +374,31 @@ impl SessionDetector {
         None
     }
 
-    /// Finds all processes with name "claude"
+    /// Finds all processes with name "claude" or whose command-line args contain "claude".
+    /// On macOS, npm-installed Claude Code runs as "node" so we also check process.cmd().
     fn find_claude_processes(&self) -> Vec<ClaudeProcess> {
         let mut processes = Vec::new();
 
         for (pid, process) in self.system.processes() {
-            // Check if the process name is "claude"
             let name = process.name().to_string_lossy();
 
-            if name.contains("claude") && !name.contains("c9watch") {
-                // Get the current working directory of the process
+            // Skip our own process
+            if name.contains("c9watch") {
+                continue;
+            }
+
+            // Check process name first (works for direct installs)
+            let name_match = name.contains("claude");
+
+            // Also check command-line args (handles npm-installed Claude Code
+            // where process.name() returns "node")
+            let cmd_match = !name_match
+                && process.cmd().iter().any(|arg| {
+                    let a = arg.to_string_lossy();
+                    a.contains("claude") && !a.contains("c9watch")
+                });
+
+            if name_match || cmd_match {
                 let cwd = process.cwd().map(|p| p.to_path_buf());
                 let start_time = process.start_time();
 
