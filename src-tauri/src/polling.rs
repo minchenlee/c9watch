@@ -1,39 +1,15 @@
-use crate::session::{
-    determine_status, get_pending_tool_name, parse_last_n_entries, parse_sessions_index,
-    SessionDetector, SessionStatus,
-};
-use chrono::{DateTime, Utc};
+use crate::session::enrichment::detect_and_enrich_sessions_with_detector;
+pub use crate::session::enrichment::{detect_and_enrich_sessions, truncate_string, Session};
+use crate::session::{SessionDetector, SessionStatus};
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
-
-/// Combined session information for the frontend
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Session {
-    pub id: String,
-    pub pid: u32,
-    pub session_name: String,
-    pub custom_title: Option<String>,
-    pub project_path: String,
-    pub git_branch: Option<String>,
-    pub first_prompt: String,
-    pub summary: Option<String>,
-    pub message_count: u32,
-    pub modified: String,
-    pub status: SessionStatus,
-    pub latest_message: String,
-    pub pending_tool_name: Option<String>,
-}
 
 /// Start the background polling loop
 ///
@@ -56,7 +32,10 @@ pub fn start_polling(
         let mut detector = match SessionDetector::new() {
             Ok(d) => d,
             Err(e) => {
-                crate::debug_log::log_error(&format!("Failed to create session detector: {}", e));
+                crate::debug_log::log_error(&format!(
+                    "Failed to create session detector: {}",
+                    e
+                ));
                 return;
             }
         };
@@ -97,7 +76,9 @@ pub fn start_polling(
                             } else {
                                 // Check for status transitions
                                 for session in &sessions {
-                                    if let Some(prev_status) = prev_status_map.get(&session.id) {
+                                    if let Some(prev_status) =
+                                        prev_status_map.get(&session.id)
+                                    {
                                         // Check for notification-worthy transitions
                                         let should_notify = matches!(
                                             (prev_status, &session.status),
@@ -113,7 +94,9 @@ pub fn start_polling(
                                             // from status flickering across poll cycles
                                             let on_cooldown = last_notification_time
                                                 .get(&session.id)
-                                                .map(|t| t.elapsed() < notification_cooldown)
+                                                .map(|t| {
+                                                    t.elapsed() < notification_cooldown
+                                                })
                                                 .unwrap_or(false);
 
                                             if !on_cooldown {
@@ -135,8 +118,10 @@ pub fn start_polling(
                                                         project_path: &session.project_path,
                                                     },
                                                 );
-                                                last_notification_time
-                                                    .insert(session.id.clone(), Instant::now());
+                                                last_notification_time.insert(
+                                                    session.id.clone(),
+                                                    Instant::now(),
+                                                );
                                             }
                                         }
                                     }
@@ -148,8 +133,10 @@ pub fn start_polling(
                             }
 
                             // Clean up disappeared sessions
-                            prev_status_map.retain(|id, _| current_session_ids.contains(id));
-                            last_notification_time.retain(|id, _| current_session_ids.contains(id));
+                            prev_status_map
+                                .retain(|id, _| current_session_ids.contains(id));
+                            last_notification_time
+                                .retain(|id, _| current_session_ids.contains(id));
                         }
                         Err(poisoned) => {
                             crate::debug_log::log_error("Mutex poisoned, recovering...");
@@ -158,7 +145,8 @@ pub fn start_polling(
 
                             // Seed the map with current sessions (no notifications after recovery)
                             for session in &sessions {
-                                prev_status_map.insert(session.id.clone(), session.status.clone());
+                                prev_status_map
+                                    .insert(session.id.clone(), session.status.clone());
                             }
                             is_first_cycle = false; // Mark as initialized
                         }
@@ -166,7 +154,10 @@ pub fn start_polling(
 
                     // Emit event to Tauri frontend
                     if let Err(e) = app_handle.emit("sessions-updated", &sessions) {
-                        crate::debug_log::log_error(&format!("Failed to emit sessions-updated: {}", e));
+                        crate::debug_log::log_error(&format!(
+                            "Failed to emit sessions-updated: {}",
+                            e
+                        ));
                     }
 
                     // Broadcast to WebSocket clients
@@ -189,14 +180,22 @@ pub fn start_polling(
                                 "Full Disk Access likely needed: processes found but none have readable CWD",
                             );
                         }
-                        if let Err(e) = app_handle.emit("diagnostic-update", &diagnostics) {
-                            crate::debug_log::log_error(&format!("Failed to emit diagnostic-update: {}", e));
+                        if let Err(e) =
+                            app_handle.emit("diagnostic-update", &diagnostics)
+                        {
+                            crate::debug_log::log_error(&format!(
+                                "Failed to emit diagnostic-update: {}",
+                                e
+                            ));
                         }
                         prev_diagnostics = Some(diagnostics);
                     }
                 }
                 Err(e) => {
-                    crate::debug_log::log_error(&format!("Error detecting sessions: {}", e));
+                    crate::debug_log::log_error(&format!(
+                        "Error detecting sessions: {}",
+                        e
+                    ));
                     // Continue polling even on error
                 }
             }
@@ -204,346 +203,6 @@ pub fn start_polling(
             thread::sleep(poll_interval);
         }
     });
-}
-
-/// Checks if a file was modified within the last N seconds
-fn is_file_recently_modified(path: &Path, seconds: u64) -> bool {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .map(|modified| {
-            modified
-                .elapsed()
-                .map(|elapsed| elapsed.as_secs() < seconds)
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
-}
-
-/// Cache for native custom titles, keyed by file path.
-/// Stores (mtime_as_nanos, cached_title) to avoid re-scanning JSONL files every poll cycle.
-use std::sync::LazyLock;
-static NATIVE_TITLE_CACHE: LazyLock<Mutex<HashMap<std::path::PathBuf, (u64, Option<String>)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Look up the native custom title for a session JSONL, using a mtime-based cache.
-fn get_cached_native_title(path: &Path) -> Option<String> {
-    let mtime = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-
-    if let Ok(mut cache) = NATIVE_TITLE_CACHE.lock() {
-        if let Some((cached_mtime, cached_title)) = cache.get(path) {
-            if *cached_mtime == mtime {
-                return cached_title.clone();
-            }
-        }
-        // Cache miss or stale — re-scan
-        let title = crate::session::parser::get_native_custom_title_from_file(path);
-        cache.insert(path.to_path_buf(), (mtime, title.clone()));
-        title
-    } else {
-        // Mutex poisoned — fallback to direct read
-        crate::session::parser::get_native_custom_title_from_file(path)
-    }
-}
-
-/// Detect sessions and enrich them with status and conversation data
-pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, crate::session::DetectionDiagnostics), String> {
-    let mut detector =
-        SessionDetector::new().map_err(|e| format!("Failed to create session detector: {}", e))?;
-    detect_and_enrich_sessions_with_detector(&mut detector)
-}
-
-/// Detect sessions using an existing detector (avoids recreating System each call)
-fn detect_and_enrich_sessions_with_detector(
-    detector: &mut SessionDetector,
-) -> Result<(Vec<Session>, crate::session::DetectionDiagnostics), String> {
-    let (detected_sessions, diagnostics) = detector
-        .detect_sessions()
-        .map_err(|e| format!("Failed to detect sessions: {}", e))?;
-
-    let custom_names = crate::session::CustomNames::load();
-    let custom_titles = crate::session::CustomTitles::load();
-    let mut sessions = Vec::new();
-    let mut seen_ids: HashSet<String> = HashSet::new();
-
-    for detected in detected_sessions {
-        // Get session ID - if not found, skip this session
-        let session_id = match &detected.session_id {
-            Some(id) => id.clone(),
-            None => {
-                continue;
-            }
-        };
-
-        // Skip duplicate session IDs (same session can appear in multiple project dirs)
-        if seen_ids.contains(&session_id) {
-            continue;
-        }
-        seen_ids.insert(session_id.clone());
-
-        // Try to parse sessions-index.json to get basic info (optional)
-        let index_path = detected.project_path.join("sessions-index.json");
-        let sessions_index = parse_sessions_index(&index_path).ok();
-
-        // Find the matching entry in the index (if index exists)
-        let session_entry = sessions_index.as_ref().and_then(|index| {
-            index
-                .entries
-                .iter()
-                .find(|entry| entry.session_id == session_id)
-        });
-
-        let (first_prompt, summary, message_count, modified, git_branch) = match session_entry {
-            Some(entry) => {
-                // Guard: if sessions-index first_prompt is a system command, try JSONL fallback
-                let fp = if crate::session::parser::is_system_content(&entry.first_prompt) {
-                    let session_file_path =
-                        detected.project_path.join(format!("{}.jsonl", session_id));
-                    get_first_prompt_from_jsonl(&session_file_path)
-                        .unwrap_or_else(|| entry.first_prompt.clone())
-                } else {
-                    entry.first_prompt.clone()
-                };
-                (
-                    fp,
-                    entry.summary.clone(),
-                    entry.message_count,
-                    entry.modified.clone(),
-                    Some(entry.git_branch.clone()),
-                )
-            }
-            None => {
-                // Session not in index or index doesn't exist - use fallback values
-                let session_file_path = detected.project_path.join(format!("{}.jsonl", session_id));
-
-                // Try to get first prompt from JSONL file
-                let first_prompt = get_first_prompt_from_jsonl(&session_file_path)
-                    .unwrap_or_else(|| "(Active session)".to_string());
-
-                // Count messages in the file
-                let message_count = count_messages_in_jsonl(&session_file_path);
-
-                // Get file modification time
-                let modified = std::fs::metadata(&session_file_path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .map(|t| {
-                        let datetime: DateTime<Utc> = t.into();
-                        datetime.to_rfc3339()
-                    })
-                    .unwrap_or_default();
-
-                (first_prompt, None, message_count, modified, None)
-            }
-        };
-
-        // Parse the session JSONL file to determine status and get latest message
-        let session_file_path = detected.project_path.join(format!("{}.jsonl", session_id));
-        let entries = match parse_last_n_entries(&session_file_path, 20) {
-            Ok(entries) => entries,
-            Err(e) => {
-                crate::debug_log::log_warn(&format!(
-                    "Failed to parse session file for {}: {}",
-                    session_id, e
-                ));
-                vec![]
-            }
-        };
-
-        let status = if entries.is_empty() {
-            SessionStatus::Connecting
-        } else {
-            let raw_status = determine_status(&entries);
-            // Override WaitingForInput if the JSONL file was recently modified.
-            // This catches progress entries (bash_progress, thinking updates) that
-            // don't get parsed as meaningful entries but indicate active work.
-            //
-            // Why 8 seconds? Polling runs every 3.5s, Claude writes progress every 1-3s
-            // during active work. 8s provides buffer for gaps without delaying "Ready"
-            // transition when work truly finishes.
-            if raw_status == SessionStatus::WaitingForInput
-                && is_file_recently_modified(&session_file_path, 8)
-            {
-                SessionStatus::Working
-            } else {
-                raw_status
-            }
-        };
-
-        let latest_message = get_latest_message_from_entries(&entries);
-        let pending_tool_name = get_pending_tool_name(&entries);
-
-        // Skip empty sessions (0 messages) - these are likely sessions where user
-        // immediately used /resume to switch to a different session
-        if message_count == 0 {
-            continue;
-        }
-
-        // Use custom name if available, otherwise use detected project name
-        let session_name = custom_names
-            .get(&session_id)
-            .cloned()
-            .unwrap_or(detected.project_name);
-
-        // Get custom title: Claude Code native /rename takes priority over c9watch's own.
-        // Uses a static cache keyed by (path, mtime) to avoid re-scanning the JSONL every cycle.
-        let native_title = get_cached_native_title(&session_file_path);
-        let custom_title =
-            native_title.or_else(|| custom_titles.get(&session_id).cloned());
-
-        sessions.push(Session {
-            id: session_id,
-            pid: detected.pid,
-            session_name,
-            custom_title,
-            project_path: detected.cwd.to_string_lossy().to_string(),
-            git_branch,
-            first_prompt,
-            summary,
-            message_count,
-            modified,
-            status,
-            latest_message,
-            pending_tool_name,
-        });
-    }
-
-    Ok((sessions, diagnostics))
-}
-
-/// Extract the first user prompt from a session JSONL file
-fn get_first_prompt_from_jsonl(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
-    let reader = BufReader::new(file);
-
-    for line in reader.lines().map_while(Result::ok).take(50) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-            // Check if this is a user message
-            if value.get("type").and_then(|t| t.as_str()) == Some("user") {
-                // Try to get the message content
-                if let Some(message) = value.get("message") {
-                    if let Some(content) = message.get("content") {
-                        // Content can be a string or array
-                        // Skip system-generated local command messages
-                        if let Some(text) = content.as_str() {
-                            if crate::session::parser::is_system_content(text) {
-                                continue;
-                            }
-                            return Some(truncate_string(text, 100));
-                        } else if let Some(arr) = content.as_array() {
-                            // Find the first text block
-                            for item in arr {
-                                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                                        return Some(truncate_string(text, 100));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Truncate a string to a maximum length (character-safe for UTF-8)
-fn truncate_string(s: &str, max_chars: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max_chars {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_chars).collect();
-        format!("{}...", truncated)
-    }
-}
-
-/// Extract the latest message content from session entries
-fn get_latest_message_from_entries(entries: &[crate::session::parser::SessionEntry]) -> String {
-    if entries.is_empty() {
-        return String::new();
-    }
-
-    // Iterate backwards to find the last user or assistant message
-    for entry in entries.iter().rev() {
-        match entry {
-            crate::session::parser::SessionEntry::User { message, .. } => {
-                // Skip tool result entries and system-generated command messages
-                if message.is_tool_result
-                    || crate::session::parser::is_system_content(&message.content)
-                {
-                    continue;
-                }
-                return truncate_string(&message.content, 200);
-            }
-            crate::session::parser::SessionEntry::Assistant { message, .. } => {
-                // For assistant, try to find the last text block
-                for content in message.content.iter().rev() {
-                    match content {
-                        crate::session::parser::MessageContent::Text { text } => {
-                            return truncate_string(text, 200);
-                        }
-                        crate::session::parser::MessageContent::Thinking { thinking, .. } => {
-                            return truncate_string(thinking, 200);
-                        }
-                        crate::session::parser::MessageContent::ToolUse { name, .. } => {
-                            return format!("Executing {}...", name);
-                        }
-                        _ => continue,
-                    }
-                }
-            }
-            _ => continue,
-        }
-    }
-
-    String::new()
-}
-
-/// Count user/assistant messages in a JSONL file.
-/// Skips system-injected user messages (local commands, slash commands, etc.)
-fn count_messages_in_jsonl(path: &Path) -> u32 {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return 0,
-    };
-    let reader = BufReader::new(file);
-    let mut count = 0u32;
-
-    for line in reader.lines().map_while(Result::ok) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-            if let Some(msg_type) = value.get("type").and_then(|t| t.as_str()) {
-                match msg_type {
-                    "assistant" => count += 1,
-                    "user" => {
-                        // Skip system-injected user messages
-                        if let Some(content) = value
-                            .get("message")
-                            .and_then(|m| m.get("content"))
-                            .and_then(|c| c.as_str())
-                        {
-                            if !crate::session::parser::is_system_content(content) {
-                                count += 1;
-                            }
-                        } else {
-                            // Array content (tool results) — still count them
-                            count += 1;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    count
 }
 
 /// Notification metadata for click-to-focus
@@ -633,7 +292,10 @@ fn fire_notification(
     };
 
     if let Err(e) = app_handle.emit("notification-fired", &metadata) {
-        crate::debug_log::log_error(&format!("Failed to emit notification-fired: {}", e));
+        crate::debug_log::log_error(&format!(
+            "Failed to emit notification-fired: {}",
+            e
+        ));
     }
 
     // Broadcast to WebSocket clients for web notifications

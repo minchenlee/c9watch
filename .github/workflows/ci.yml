@@ -40,3 +40,13 @@ jobs:
 
       - name: Build frontend
         run: npm run build
+
+      - name: CLI-only build check
+        run: |
+          cargo check --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features cli
+
+      - name: CLI-only tests
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features cli

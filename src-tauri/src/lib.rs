@@ -2,139 +2,79 @@
 // which clippy flags as unused_unit. Suppress it since we cannot change the macro invocation.
 #![cfg_attr(target_os = "macos", allow(clippy::unused_unit))]
 
-// Desktop-only modules
-#[cfg(not(mobile))]
-pub mod actions;
-#[cfg(not(mobile))]
-pub mod auth;
-#[cfg(not(mobile))]
-pub mod polling;
-#[cfg(not(mobile))]
-pub mod web_server;
-#[cfg(not(mobile))]
-pub mod debug_log;
-
-// Shared modules (types used by both desktop and mobile builds)
+// ── Core modules (always compiled) ──────────────────────────────────
 pub mod session;
+pub mod debug_log;
+pub mod actions;
 
-#[cfg(not(mobile))]
+// ── GUI-only modules ────────────────────────────────────────────────
+#[cfg(all(not(mobile), feature = "gui"))]
+pub mod auth;
+#[cfg(all(not(mobile), feature = "gui"))]
+pub mod polling;
+#[cfg(all(not(mobile), feature = "gui"))]
+pub mod web_server;
+
+// ── CLI module ──────────────────────────────────────────────────────
+#[cfg(feature = "cli")]
+pub mod cli;
+
+#[cfg(feature = "gui")]
 use actions::{open_session as open_session_action, stop_session as stop_session_action};
-#[cfg(not(mobile))]
+#[cfg(feature = "gui")]
 use polling::{detect_and_enrich_sessions, start_polling, Session};
+#[cfg(feature = "gui")]
 use serde::Serialize;
-use session::{extract_messages, parse_all_entries, ImageBlock, MessageType};
-#[cfg(not(mobile))]
+#[cfg(feature = "gui")]
+use session::conversation::Conversation;
+// Re-export for web_server.rs which uses crate::get_conversation_data
+#[cfg(feature = "gui")]
+pub use session::conversation::get_conversation_data;
+#[cfg(feature = "gui")]
 use std::sync::Arc;
-#[cfg(not(mobile))]
+#[cfg(feature = "gui")]
 use std::time::Duration;
-#[cfg(not(mobile))]
+#[cfg(feature = "gui")]
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, PhysicalPosition,
 };
+#[cfg(feature = "gui")]
 use tauri::{AppHandle, Manager};
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "gui"))]
 use tauri_nspanel::{
     tauri_panel, CollectionBehavior, ManagerExt as PanelManagerExt, PanelLevel, StyleMask,
     WebviewWindowExt as PanelExt,
 };
 
-// ── Shared types ────────────────────────────────────────────────────
+// ── GUI-only: Tauri commands ─────────────────────────────────────────
 
-/// Conversation structure for the frontend
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Conversation {
-    pub session_id: String,
-    pub messages: Vec<ConversationMessage>,
-}
-
-/// Individual message in a conversation
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConversationMessage {
-    pub timestamp: String,
-    pub message_type: MessageType,
-    pub content: String,
-    /// Images attached to this message (screenshots pasted by the user)
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub images: Vec<ImageBlock>,
-}
-
-// ── Desktop-only commands ───────────────────────────────────────────
-
-#[cfg(not(mobile))]
+#[cfg(feature = "gui")]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
-#[cfg(not(mobile))]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_sessions() -> Result<Vec<Session>, String> {
     polling::detect_and_enrich_sessions().map(|(sessions, _)| sessions)
 }
 
-/// Core logic for getting conversation data (shared by Tauri command and WS handler)
-#[cfg(not(mobile))]
-pub fn get_conversation_data(session_id: &str) -> Result<Conversation, String> {
-    let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
-    let claude_projects_dir = home_dir.join(".claude").join("projects");
-
-    let entries = std::fs::read_dir(&claude_projects_dir)
-        .map_err(|e| format!("Failed to read projects directory: {}", e))?;
-
-    let session_filename = format!("{}.jsonl", session_id);
-
-    for entry in entries.flatten() {
-        let project_path = entry.path();
-        if !project_path.is_dir() {
-            continue;
-        }
-
-        let session_file = project_path.join(&session_filename);
-        if session_file.exists() {
-            let entries = parse_all_entries(&session_file)
-                .map_err(|e| format!("Failed to parse session file: {}", e))?;
-
-            let messages = extract_messages(&entries);
-
-            let conversation_messages: Vec<ConversationMessage> = messages
-                .into_iter()
-                .map(|(timestamp, msg_type, content, images)| ConversationMessage {
-                    timestamp,
-                    message_type: msg_type,
-                    content,
-                    images,
-                })
-                .collect();
-
-            return Ok(Conversation {
-                session_id: session_id.to_string(),
-                messages: conversation_messages,
-            });
-        }
-    }
-
-    Err(format!(
-        "Session {} not found in any project directory",
-        session_id
-    ))
-}
-
-#[cfg(not(mobile))]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_conversation(session_id: String) -> Result<Conversation, String> {
     get_conversation_data(&session_id)
 }
 
-#[cfg(not(mobile))]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_session_history() -> Result<Vec<session::HistoryEntry>, String> {
     session::get_history()
 }
 
-#[cfg(not(mobile))]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn deep_search_sessions(query: String) -> Result<Vec<session::DeepSearchHit>, String> {
     if query.trim().is_empty() {
@@ -143,13 +83,13 @@ async fn deep_search_sessions(query: String) -> Result<Vec<session::DeepSearchHi
     session::deep_search(&query)
 }
 
-#[cfg(not(mobile))]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_cost_data() -> Result<session::CostData, String> {
     session::get_cost_data()
 }
 
-#[cfg(not(mobile))]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_memory_files() -> Result<Vec<session::ProjectMemory>, String> {
     session::get_memory_files()
@@ -157,7 +97,7 @@ async fn get_memory_files() -> Result<Vec<session::ProjectMemory>, String> {
 
 /// Save base64-encoded PNG data to a temp file and return the path.
 /// Used by the token distance visualizer to share canvas screenshots.
-#[cfg(not(mobile))]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn save_temp_image(data: String) -> Result<String, String> {
     use std::fs;
@@ -181,7 +121,7 @@ async fn save_temp_image(data: String) -> Result<String, String> {
 }
 
 /// Open a directory in the system file manager (Finder on macOS)
-#[cfg(not(mobile))]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn reveal_in_file_manager(path: String) -> Result<(), String> {
     std::process::Command::new("open")
@@ -191,7 +131,7 @@ async fn reveal_in_file_manager(path: String) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(mobile))]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn stop_session(app: AppHandle, pid: u32) -> Result<(), String> {
     stop_session_action(pid)?;
@@ -203,13 +143,13 @@ async fn stop_session(app: AppHandle, pid: u32) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(mobile))]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn open_session(pid: u32, project_path: String) -> Result<(), String> {
     open_session_action(pid, project_path)
 }
 
-#[cfg(not(mobile))]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn rename_session(
     app: AppHandle,
@@ -286,6 +226,7 @@ pub fn write_native_custom_title(session_id: &str, title: &str) {
 }
 
 /// Get the terminal title for a session (iTerm2 only, macOS)
+#[cfg(feature = "gui")]
 #[tauri::command]
 async fn get_terminal_title(pid: u32) -> Result<Option<String>, String> {
     #[cfg(target_os = "macos")]
@@ -300,7 +241,7 @@ async fn get_terminal_title(pid: u32) -> Result<Option<String>, String> {
 }
 
 /// Show and focus the main application window
-#[cfg(not(mobile))]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn show_main_window(app: AppHandle) -> Result<(), String> {
     // On macOS the popover panel auto-hides via window_did_resign_key
@@ -320,8 +261,8 @@ async fn show_main_window(app: AppHandle) -> Result<(), String> {
 }
 
 /// Server connection info for the mobile client
-#[cfg(not(mobile))]
-#[derive(Debug, Clone, Serialize)]
+#[cfg(all(not(mobile), feature = "gui"))]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerInfo {
     pub token: String,
@@ -330,7 +271,7 @@ pub struct ServerInfo {
     pub ws_url: String,
 }
 
-#[cfg(not(mobile))]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_server_info(info: tauri::State<'_, ServerInfo>) -> Result<ServerInfo, String> {
     Ok(ServerInfo {
@@ -341,14 +282,14 @@ async fn get_server_info(info: tauri::State<'_, ServerInfo>) -> Result<ServerInf
     })
 }
 
-#[cfg(not(mobile))]
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_debug_logs() -> Result<Vec<debug_log::LogEntry>, String> {
     Ok(debug_log::get_logs())
 }
 
 // ── NSPanel definition for macOS popover ────────────────────────────
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "gui"))]
 tauri_panel! {
     panel!(PopoverPanel {
         config: {
@@ -362,8 +303,9 @@ tauri_panel! {
     })
 }
 
-// ── App entry point ─────────────────────────────────────────────────
+// ── App entry point (GUI only) ──────────────────────────────────────
 
+#[cfg(feature = "gui")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
