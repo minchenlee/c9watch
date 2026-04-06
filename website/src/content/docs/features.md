@@ -9,10 +9,10 @@ head:
 ---
 
 :::note[TL;DR]
-c9watch monitors all Claude Code sessions on your Mac in real-time — auto-discovery, session history, cost tracking, conversation viewer, tray popover, and a CLI for agent-to-agent monitoring. No plugins or configuration needed.
+c9watch monitors all Claude Code sessions in real-time — a desktop dashboard for you and a JSON CLI for your agents, both watching the same sessions. Auto-discovery, session history, cost tracking, conversation viewer, tray popover, and agent-to-agent coordination. No plugins or configuration needed.
 :::
 
-c9watch gives you a real-time dashboard of every Claude Code session running on your machine. Here's everything it can do.
+c9watch gives you and your agents a real-time view of every Claude Code session running on your machine. The desktop app is for you — the CLI is for your agents. Both share the same detection engine, so you're always looking at the same data. Here's everything it can do.
 
 ## Zero-integration setup
 
