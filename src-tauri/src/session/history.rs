@@ -106,11 +106,19 @@ pub fn get_history() -> Result<Vec<HistoryEntry>, String> {
 
     let mut entries = parse_history_jsonl(&content);
 
-    // Resolve native custom titles from Claude Code JSONL files (mtime-cached)
+    // Resolve native custom titles from Claude Code JSONL files (mtime-cached).
+    // Cache encoded project paths to avoid redundant encode_path_for_matching() calls —
+    // many entries share the same project.
     let projects_dir = home_dir.join(".claude").join("projects");
+    let mut encoded_cache: HashMap<String, PathBuf> = HashMap::new();
     for entry in &mut entries {
-        let encoded = super::detector::encode_path_for_matching(&entry.project);
-        let session_file = projects_dir.join(&encoded).join(format!("{}.jsonl", entry.session_id));
+        let project_dir = encoded_cache
+            .entry(entry.project.clone())
+            .or_insert_with(|| {
+                let encoded = super::detector::encode_path_for_matching(&entry.project);
+                projects_dir.join(encoded)
+            });
+        let session_file = project_dir.join(format!("{}.jsonl", entry.session_id));
         if let Some(title) = super::enrichment::get_cached_native_title(&session_file) {
             entry.custom_title = Some(title);
         }
