@@ -285,17 +285,14 @@
 					{#if !collapsedProjects.has(group.project)}
 						{#each group.entries as entry, i (entry.sessionId)}
 							{@const snippet = query.trim() ? (deepSearchResults?.get(entry.sessionId) ?? null) : null}
-							<button class="session-row" class:has-snippet={!!snippet} onclick={() => handleSelectEntry(entry)}>
+							<button class="session-row session-row-grid" class:has-snippet={!!snippet} onclick={() => handleSelectEntry(entry)}>
 								<span class="row-number">{i + 1}</span>
-								<div class="row-content">
-									<div class="row-top">
-										<span class="row-meta">
-											{#if activeSessionIds.has(entry.sessionId)}<span class="active-badge">ACTIVE</span>{/if}
-											<span class="row-time">{relativeTime(entry.timestamp)}</span>
-										</span>
-									</div>
-									<span class="row-prompt">{@html highlight((snippet ?? entry.customTitle ?? entry.display) || '(no prompt)', query)}</span>
-								</div>
+								<span class="row-prompt">
+									{#if entry.customTitle}<span class="row-title">{@html highlight(entry.customTitle, query)}</span>{/if}
+									<span class="row-display">{@html highlight((snippet ?? entry.display) || '(no prompt)', query)}</span>
+								</span>
+								<span class="row-badge-slot">{#if activeSessionIds.has(entry.sessionId)}<span class="active-badge">ACTIVE</span>{/if}</span>
+								<span class="row-time">{relativeTime(entry.timestamp)}</span>
 							</button>
 						{/each}
 					{/if}
@@ -304,17 +301,18 @@
 		{:else}
 			{#each filtered as entry, i (entry.sessionId)}
 				{@const snippet = query.trim() ? (deepSearchResults?.get(entry.sessionId) ?? null) : null}
-				<button class="session-row" class:has-snippet={!!snippet} onclick={() => handleSelectEntry(entry)}>
+				<button class="session-row session-row-flat" class:has-snippet={!!snippet} onclick={() => handleSelectEntry(entry)}>
 					<span class="row-number">{i + 1}</span>
 					<div class="row-content">
-						<div class="row-top">
+						<div class="row-top-grid">
 							<span class="row-project">{entry.projectName}</span>
-							<span class="row-meta">
-								{#if activeSessionIds.has(entry.sessionId)}<span class="active-badge">ACTIVE</span>{/if}
-								<span class="row-time">{relativeTime(entry.timestamp)}</span>
-							</span>
+							<span class="row-badge-slot">{#if activeSessionIds.has(entry.sessionId)}<span class="active-badge">ACTIVE</span>{/if}</span>
+							<span class="row-time">{relativeTime(entry.timestamp)}</span>
 						</div>
-						<span class="row-prompt">{@html highlight((snippet ?? entry.customTitle ?? entry.display) || '(no prompt)', query)}</span>
+						<span class="row-prompt">
+							{#if entry.customTitle}<span class="row-title">{@html highlight(entry.customTitle, query)}</span>{/if}
+							<span class="row-display">{@html highlight((snippet ?? entry.display) || '(no prompt)', query)}</span>
+						</span>
 					</div>
 				</button>
 			{/each}
@@ -435,10 +433,32 @@
 		background: var(--bg-card-hover);
 	}
 
-	.row-top {
-		display: flex;
-		justify-content: space-between;
+	.session-row-grid {
+		display: grid;
+		grid-template-columns: auto minmax(0, 1fr) auto minmax(70px, auto);
 		align-items: baseline;
+		overflow: hidden;
+	}
+
+	.session-row-grid .row-time {
+		text-align: right;
+	}
+
+	.row-top-grid {
+		display: grid;
+		grid-template-columns: 1fr auto minmax(70px, auto);
+		align-items: baseline;
+		gap: var(--space-md);
+	}
+
+	.row-top-grid .row-time {
+		text-align: right;
+	}
+
+	.row-badge-slot {
+		display: flex;
+		justify-content: flex-end;
+		min-width: 55px;
 	}
 
 	.row-project {
@@ -447,14 +467,6 @@
 		font-weight: 600;
 		color: var(--text-primary);
 		letter-spacing: 0.05em;
-	}
-
-	.row-meta {
-		display: flex;
-		align-items: center;
-		gap: var(--space-sm);
-		flex-shrink: 0;
-		margin-left: auto;
 	}
 
 	.row-time {
@@ -484,6 +496,15 @@
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
+	}
+
+	.row-title {
+		color: var(--accent-amber);
+		margin-right: var(--space-sm);
+	}
+
+	.row-display {
+		color: var(--text-muted);
 	}
 
 	/* When a deep-search snippet is shown, allow it to wrap for readability */
