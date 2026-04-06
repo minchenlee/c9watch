@@ -67,33 +67,84 @@ struct UsageEntry {
     cwd: String,
 }
 
-/// Parse an assistant JSONL line and extract usage data.
-/// Returns None for non-assistant lines or lines without usage.
-fn parse_usage_line(line: &str) -> Option<UsageEntry> {
+/// Result of parsing a single JSONL line — dispatched by entry type.
+enum ParsedLine {
+    Usage(UsageEntry),
+    Name(SessionNameInfo),
+}
+
+/// Session name extracted from a JSONL line.
+enum SessionNameInfo {
+    CustomTitle { session_id: String, title: String },
+    FirstUserMessage { session_id: String, content: String },
+}
+
+/// Parse a JSONL line once and extract either usage data or session name info.
+fn parse_line(line: &str) -> Option<ParsedLine> {
     use serde_json::Value;
     let obj: Value = serde_json::from_str(line).ok()?;
+    let entry_type = obj.get("type").and_then(|v| v.as_str())?;
 
-    if obj.get("type").and_then(|v| v.as_str()) != Some("assistant") {
-        return None;
+    match entry_type {
+        "assistant" => {
+            let msg = obj.get("message")?;
+            let usage = msg.get("usage")?;
+            let model = msg.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+            // Skip synthetic messages — they carry zero tokens and produce empty cost records
+            if model == "<synthetic>" {
+                return None;
+            }
+
+            let speed = usage.get("speed").and_then(|v| v.as_str()).unwrap_or("standard");
+
+            Some(ParsedLine::Usage(UsageEntry {
+                model: model.to_string(),
+                speed: speed.to_string(),
+                input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                cache_creation_input_tokens: usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                cache_read_input_tokens: usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                timestamp: obj.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                session_id: obj.get("sessionId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                cwd: obj.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            }))
+        }
+        "custom-title" => {
+            let title = obj.get("customTitle").and_then(|v| v.as_str())?.to_string();
+            let session_id = obj.get("sessionId").and_then(|v| v.as_str())?.to_string();
+            if title.is_empty() { return None; }
+            Some(ParsedLine::Name(SessionNameInfo::CustomTitle { session_id, title }))
+        }
+        "user" => {
+            let session_id = obj.get("sessionId").and_then(|v| v.as_str())?.to_string();
+            let msg = obj.get("message")?;
+            if msg.get("role").and_then(|v| v.as_str()) != Some("user") {
+                return None;
+            }
+            let content = match msg.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(arr)) => {
+                    arr.iter()
+                        .filter_map(|block| {
+                            if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+                                block.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }
+                _ => return None,
+            };
+            if super::parser::is_system_content(&content) { return None; }
+            let cleaned = super::sanitize::strip_system_tags(&content);
+            if cleaned.is_empty() { return None; }
+            Some(ParsedLine::Name(SessionNameInfo::FirstUserMessage { session_id, content: cleaned }))
+        }
+        _ => None,
     }
-
-    let msg = obj.get("message")?;
-    let usage = msg.get("usage")?;
-    let model = msg.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
-
-    let speed = usage.get("speed").and_then(|v| v.as_str()).unwrap_or("standard");
-
-    Some(UsageEntry {
-        model: model.to_string(),
-        speed: speed.to_string(),
-        input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        cache_creation_input_tokens: usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        cache_read_input_tokens: usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        timestamp: obj.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        session_id: obj.get("sessionId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        cwd: obj.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-    })
 }
 
 /// A single session's cost record (stored in cache).
@@ -109,6 +160,8 @@ pub struct SessionCostRecord {
     pub total_tokens: u64,    // input_tokens + output_tokens
     pub timestamp: String,    // ISO 8601 — earliest assistant message
     pub date: String,         // "2026-02-28" derived from timestamp
+    #[serde(default)]
+    pub session_name: String, // custom title or first user message
 }
 
 /// Aggregated cost data returned to the frontend.
@@ -149,7 +202,7 @@ pub struct ModelCost {
 }
 
 /// Bump this when pricing or token counting logic changes to force cache rebuild.
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 
 /// Cache structure stored at ~/.claude/cost-cache.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,21 +250,32 @@ fn scan_file(path: &std::path::Path) -> Vec<SessionCostRecord> {
         Err(_) => return vec![],
     };
 
-    // Group entries by (session_id, date) in a single pass
+    // Group entries by (session_id, date) in a single pass, and collect session name info
     let mut by_key: HashMap<(String, String), Vec<UsageEntry>> = HashMap::new();
     let mut cwd_by_session: HashMap<String, String> = HashMap::new();
+    let mut custom_titles: HashMap<String, String> = HashMap::new();
+    let mut first_user_msg: HashMap<String, String> = HashMap::new();
 
     for line in content.lines() {
-        if let Some(entry) = parse_usage_line(line) {
-            if !entry.session_id.is_empty() {
-                let sid = entry.session_id.clone();
-                if !entry.cwd.is_empty() {
-                    cwd_by_session.entry(sid.clone())
-                        .or_insert_with(|| entry.cwd.clone());
+        match parse_line(line) {
+            Some(ParsedLine::Usage(entry)) => {
+                if !entry.session_id.is_empty() {
+                    let sid = entry.session_id.clone();
+                    if !entry.cwd.is_empty() {
+                        cwd_by_session.entry(sid.clone())
+                            .or_insert_with(|| entry.cwd.clone());
+                    }
+                    let date = date_from_timestamp(&entry.timestamp);
+                    by_key.entry((sid, date)).or_default().push(entry);
                 }
-                let date = date_from_timestamp(&entry.timestamp);
-                by_key.entry((sid, date)).or_default().push(entry);
             }
+            Some(ParsedLine::Name(SessionNameInfo::CustomTitle { session_id, title })) => {
+                custom_titles.insert(session_id, title);
+            }
+            Some(ParsedLine::Name(SessionNameInfo::FirstUserMessage { session_id, content })) => {
+                first_user_msg.entry(session_id).or_insert(content);
+            }
+            None => {}
         }
     }
 
@@ -256,6 +320,19 @@ fn scan_file(path: &std::path::Path) -> Vec<SessionCostRecord> {
             .map(|(m, _)| m.clone())
             .unwrap_or_default();
 
+        // Resolve session name: custom title > first user message (truncated) > empty
+        let session_name = custom_titles.get(&session_id)
+            .cloned()
+            .or_else(|| first_user_msg.get(&session_id).map(|msg| {
+                let truncated: String = msg.chars().take(40).collect();
+                if truncated.len() < msg.len() {
+                    format!("{}…", truncated)
+                } else {
+                    truncated
+                }
+            }))
+            .unwrap_or_default();
+
         records.push(SessionCostRecord {
             session_id,
             project: cwd,
@@ -265,6 +342,7 @@ fn scan_file(path: &std::path::Path) -> Vec<SessionCostRecord> {
             total_tokens,
             timestamp: earliest_ts.clone(),
             date,
+            session_name,
         });
     }
 
@@ -534,27 +612,44 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_usage_line_assistant() {
+    fn test_parse_line_assistant() {
         let line = r#"{"type":"assistant","sessionId":"abc-123","timestamp":"2026-02-28T10:00:00Z","cwd":"/Users/you/proj","message":{"model":"claude-sonnet-4-6","role":"assistant","id":"m1","content":[],"usage":{"input_tokens":100,"output_tokens":200,"cache_creation_input_tokens":300,"cache_read_input_tokens":400}}}"#;
-        let entry = parse_usage_line(line).unwrap();
-        assert_eq!(entry.model, "claude-sonnet-4-6");
-        assert_eq!(entry.input_tokens, 100);
-        assert_eq!(entry.output_tokens, 200);
-        assert_eq!(entry.cache_creation_input_tokens, 300);
-        assert_eq!(entry.cache_read_input_tokens, 400);
-        assert_eq!(entry.session_id, "abc-123");
+        let parsed = parse_line(line).unwrap();
+        if let ParsedLine::Usage(entry) = parsed {
+            assert_eq!(entry.model, "claude-sonnet-4-6");
+            assert_eq!(entry.input_tokens, 100);
+            assert_eq!(entry.output_tokens, 200);
+            assert_eq!(entry.cache_creation_input_tokens, 300);
+            assert_eq!(entry.cache_read_input_tokens, 400);
+            assert_eq!(entry.session_id, "abc-123");
+        } else {
+            panic!("Expected ParsedLine::Usage");
+        }
     }
 
     #[test]
-    fn test_parse_usage_line_non_assistant_returns_none() {
-        let line = r#"{"type":"user","message":{"role":"user","content":"hello"}}"#;
-        assert!(parse_usage_line(line).is_none());
+    fn test_parse_line_user_returns_name() {
+        let line = r#"{"type":"user","sessionId":"abc-123","timestamp":"2026-02-28T10:00:00Z","message":{"role":"user","content":"hello world"}}"#;
+        let parsed = parse_line(line).unwrap();
+        assert!(matches!(parsed, ParsedLine::Name(SessionNameInfo::FirstUserMessage { .. })));
     }
 
     #[test]
-    fn test_parse_usage_line_no_usage_returns_none() {
+    fn test_parse_line_no_usage_returns_none() {
         let line = r#"{"type":"assistant","message":{"model":"claude-sonnet-4-6","role":"assistant","id":"m1","content":[]}}"#;
-        assert!(parse_usage_line(line).is_none());
+        assert!(parse_line(line).is_none());
+    }
+
+    #[test]
+    fn test_parse_line_synthetic_returns_none() {
+        let line = r#"{"type":"assistant","sessionId":"abc","timestamp":"2026-02-28T10:00:00Z","message":{"model":"<synthetic>","role":"assistant","content":[],"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#;
+        assert!(parse_line(line).is_none());
+    }
+
+    #[test]
+    fn test_parse_line_system_content_skipped() {
+        let line = r#"{"type":"user","sessionId":"abc","timestamp":"2026-02-28T10:00:00Z","message":{"role":"user","content":"<local-command-caveat>Caveat: system text</local-command-caveat>"}}"#;
+        assert!(parse_line(line).is_none());
     }
 
     #[test]
@@ -569,6 +664,7 @@ mod tests {
                 total_tokens: 5000,
                 timestamp: "2026-03-14T10:00:00Z".into(),
                 date: "2026-03-14".into(),
+                session_name: String::new(),
             },
             SessionCostRecord {
                 session_id: "s2".into(),
@@ -579,6 +675,7 @@ mod tests {
                 total_tokens: 8000,
                 timestamp: "2026-03-14T11:00:00Z".into(),
                 date: "2026-03-14".into(),
+                session_name: String::new(),
             },
         ];
         let data = aggregate(&sessions);
@@ -688,6 +785,7 @@ mod tests {
                 total_tokens: 5000,
                 timestamp: "2026-03-20T10:00:00Z".into(),
                 date: "2026-03-20".into(),
+                session_name: String::new(),
             },
             SessionCostRecord {
                 session_id: "s1".into(),
@@ -698,6 +796,7 @@ mod tests {
                 total_tokens: 8000,
                 timestamp: "2026-03-21T09:00:00Z".into(),
                 date: "2026-03-21".into(),
+                session_name: String::new(),
             },
         ];
         let data = aggregate(&sessions);

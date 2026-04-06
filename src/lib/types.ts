@@ -152,6 +152,8 @@ export interface SessionCostRecord {
   date: string;
   /** Total tokens (input + output) for this session */
   totalTokens: number;
+  /** Custom title or truncated first user message */
+  sessionName: string;
 }
 
 /**
