@@ -38,7 +38,7 @@ static NATIVE_TITLE_CACHE: LazyLock<Mutex<HashMap<std::path::PathBuf, (u64, Opti
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Look up the native custom title for a session JSONL, using a mtime-based cache.
-fn get_cached_native_title(path: &Path) -> Option<String> {
+pub(crate) fn get_cached_native_title(path: &Path) -> Option<String> {
     let mtime = std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()?

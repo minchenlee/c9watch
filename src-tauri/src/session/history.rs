@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// A raw line from ~/.claude/history.jsonl
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawHistoryLine {
     #[serde(default)]
@@ -28,14 +28,14 @@ pub struct HistoryEntry {
     pub custom_title: Option<String>,
 }
 
-/// Accumulated state per session during dedup: first prompt text + last activity timestamp.
+/// Accumulated state per session during dedup: earliest and latest prompt entries.
 struct SessionAccum {
     first: RawHistoryLine,
-    last_timestamp: u64,
+    last: RawHistoryLine,
 }
 
 /// Parse JSONL text into deduplicated HistoryEntry vec, sorted by last activity (newest first).
-/// Keeps the first prompt's display text but uses the latest timestamp for sorting.
+/// Shows the latest prompt's display text and uses the latest timestamp for sorting.
 pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
     let mut by_session: HashMap<String, SessionAccum> = HashMap::new();
 
@@ -53,14 +53,14 @@ pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
                 Some(accum) => {
                     if ts < accum.first.timestamp {
                         accum.first = raw;
-                    } else if ts > accum.last_timestamp {
-                        accum.last_timestamp = ts;
+                    } else if ts >= accum.last.timestamp {
+                        accum.last = raw;
                     }
                 }
                 None => {
                     let sid = raw.session_id.clone();
                     by_session.insert(sid, SessionAccum {
-                        last_timestamp: ts,
+                        last: raw.clone(),
                         first: raw,
                     });
                 }
@@ -78,8 +78,8 @@ pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
                 .to_string();
             HistoryEntry {
                 session_id: accum.first.session_id,
-                display: accum.first.display,
-                timestamp: accum.last_timestamp,
+                display: accum.last.display,
+                timestamp: accum.last.timestamp,
                 project: accum.first.project,
                 project_name,
                 custom_title: None,
@@ -106,10 +106,21 @@ pub fn get_history() -> Result<Vec<HistoryEntry>, String> {
 
     let mut entries = parse_history_jsonl(&content);
 
-    let custom_titles = super::custom_names::CustomTitles::load();
+    // Resolve native custom titles from Claude Code JSONL files (mtime-cached).
+    // Cache encoded project paths to avoid redundant encode_path_for_matching() calls —
+    // many entries share the same project.
+    let projects_dir = home_dir.join(".claude").join("projects");
+    let mut encoded_cache: HashMap<String, PathBuf> = HashMap::new();
     for entry in &mut entries {
-        if let Some(title) = custom_titles.get(&entry.session_id) {
-            entry.custom_title = Some(title.clone());
+        let project_dir = encoded_cache
+            .entry(entry.project.clone())
+            .or_insert_with(|| {
+                let encoded = super::detector::encode_path_for_matching(&entry.project);
+                projects_dir.join(encoded)
+            });
+        let session_file = project_dir.join(format!("{}.jsonl", entry.session_id));
+        if let Some(title) = super::enrichment::get_cached_native_title(&session_file) {
+            entry.custom_title = Some(title);
         }
     }
 
@@ -345,8 +356,8 @@ mod tests {
         );
         let result = parse_history_jsonl(jsonl);
         assert_eq!(result.len(), 1);
-        // Display shows first prompt, but timestamp reflects last activity
-        assert_eq!(result[0].display, "First prompt");
+        // Display shows latest prompt, timestamp reflects last activity
+        assert_eq!(result[0].display, "Second prompt");
         assert_eq!(result[0].timestamp, 2000);
     }
 
