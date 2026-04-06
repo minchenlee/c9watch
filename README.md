@@ -259,6 +259,9 @@ Thanks to these wonderful people who have contributed to c9watch:
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/maxyharr"><img src="https://github.com/maxyharr.png?s=100" width="100px;" alt="Max Harris"/><br /><sub><b>Max Harris</b></sub></a><br /><a href="#code-maxyharr" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/vladan-me"><img src="https://github.com/vladan-me.png?s=100" width="100px;" alt="Vladan"/><br /><sub><b>Vladan</b></sub></a><br /><a href="#code-vladan-me" title="Code">💻</a></td>
     </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/ajonesw"><img src="https://github.com/ajonesw.png?s=100" width="100px;" alt="Alex Jones-Wolsey"/><br /><sub><b>Alex Jones-Wolsey</b></sub></a><br /><a href="#code-ajonesw" title="Code">💻</a></td>
+    </tr>
   </tbody>
 </table>
 
