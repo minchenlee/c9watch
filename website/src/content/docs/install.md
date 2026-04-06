@@ -23,11 +23,18 @@ c9watch comes in two forms: a **desktop app** with a full GUI dashboard, and a *
 curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash
 ```
 
-This script downloads the latest `.dmg` from GitHub Releases, mounts it, copies `c9watch.app` to your `/Applications` folder, and cleans up. If c9watch is already installed, it will be replaced with the latest version.
+This script downloads the latest `.dmg` from GitHub Releases, installs `c9watch.app` to `/Applications`, and symlinks the CLI to `~/.local/bin/c9watch`. Both the desktop dashboard and CLI commands (`c9watch list`, `c9watch view`, etc.) work out of the box.
 
 ### Download manually
 
 Grab the latest `.dmg` from the [Releases](https://github.com/minchenlee/c9watch/releases) page. Open the `.dmg` and drag c9watch to your Applications folder.
+
+To also use the CLI, symlink the bundled binary:
+
+```bash
+mkdir -p ~/.local/bin
+ln -s /Applications/c9watch.app/Contents/MacOS/c9watch ~/.local/bin/c9watch
+```
 
 On first launch, macOS may show a security warning because the app is not notarized by Apple. Go to **System Settings → Privacy & Security** and click **"Open Anyway"**.
 

@@ -34,7 +34,9 @@ Built with **Tauri**, **Rust**, and **Svelte** -- not Electron. The app binary i
 curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash
 ```
 
-Or grab the latest `.dmg` from the [Releases](https://github.com/minchenlee/c9watch/releases) page.
+This installs the app to `/Applications` and symlinks the CLI to `~/.local/bin/c9watch`, so both the GUI and `c9watch list`, `c9watch view`, etc. work out of the box.
+
+Or grab the latest `.dmg` from the [Releases](https://github.com/minchenlee/c9watch/releases) page (you'll need to symlink the CLI manually: `ln -s /Applications/c9watch.app/Contents/MacOS/c9watch ~/.local/bin/c9watch`).
 
 ### CLI only (macOS & Linux)
 
