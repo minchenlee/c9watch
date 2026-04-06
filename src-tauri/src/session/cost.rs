@@ -149,7 +149,7 @@ pub struct ModelCost {
 }
 
 /// Bump this when pricing or token counting logic changes to force cache rebuild.
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 /// Cache structure stored at ~/.claude/cost-cache.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,76 +190,85 @@ fn date_from_timestamp(ts: &str) -> String {
     ts.get(..10).unwrap_or("unknown").to_string()
 }
 
-/// Scan a single JSONL file and return per-session cost records.
+/// Scan a single JSONL file and return per-(session, date) cost records.
 fn scan_file(path: &std::path::Path) -> Vec<SessionCostRecord> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return vec![],
     };
 
-    // Group usage entries by session_id
-    let mut by_session: HashMap<String, Vec<UsageEntry>> = HashMap::new();
+    // Group entries by (session_id, date) in a single pass
+    let mut by_key: HashMap<(String, String), Vec<UsageEntry>> = HashMap::new();
+    let mut cwd_by_session: HashMap<String, String> = HashMap::new();
+
     for line in content.lines() {
         if let Some(entry) = parse_usage_line(line) {
             if !entry.session_id.is_empty() {
-                by_session.entry(entry.session_id.clone()).or_default().push(entry);
+                let sid = entry.session_id.clone();
+                if !entry.cwd.is_empty() {
+                    cwd_by_session.entry(sid.clone())
+                        .or_insert_with(|| entry.cwd.clone());
+                }
+                let date = date_from_timestamp(&entry.timestamp);
+                by_key.entry((sid, date)).or_default().push(entry);
             }
         }
     }
 
-    by_session
-        .into_iter()
-        .filter_map(|(session_id, entries)| {
-            if entries.is_empty() {
-                return None;
+    // Pre-compute project_name per session to avoid redundant path parsing
+    let name_by_session: HashMap<&str, String> = cwd_by_session.iter()
+        .map(|(sid, cwd)| (sid.as_str(), project_name_from_path(cwd)))
+        .collect();
+
+    let mut records = Vec::new();
+
+    for ((session_id, date), day_entries) in by_key {
+        let cwd = cwd_by_session.get(&session_id).cloned().unwrap_or_default();
+        let project_name = name_by_session.get(session_id.as_str())
+            .cloned()
+            .unwrap_or_else(|| project_name_from_path(&cwd));
+
+        let mut cost_by_model: HashMap<String, f64> = HashMap::new();
+        let mut total_cost = 0.0;
+        let mut total_tokens: u64 = 0;
+        let mut earliest_ts = &day_entries[0].timestamp;
+
+        for e in &day_entries {
+            let c = calculate_cost(
+                &e.model,
+                &e.speed,
+                e.input_tokens,
+                e.output_tokens,
+                e.cache_creation_input_tokens,
+                e.cache_read_input_tokens,
+            );
+            total_cost += c;
+            total_tokens += e.input_tokens + e.output_tokens;
+            *cost_by_model.entry(e.model.clone()).or_default() += c;
+            if e.timestamp < *earliest_ts {
+                earliest_ts = &e.timestamp;
             }
+        }
 
-            // Sum cost per model within this session
-            let mut cost_by_model: HashMap<String, f64> = HashMap::new();
-            let mut total_cost = 0.0;
-            let mut total_tokens: u64 = 0;
-            let mut earliest_ts = entries[0].timestamp.clone();
-            let mut cwd = entries[0].cwd.clone();
+        let primary_model = cost_by_model
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default();
 
-            for e in &entries {
-                let c = calculate_cost(
-                    &e.model,
-                    &e.speed,
-                    e.input_tokens,
-                    e.output_tokens,
-                    e.cache_creation_input_tokens,
-                    e.cache_read_input_tokens,
-                );
-                total_cost += c;
-                total_tokens += e.input_tokens + e.output_tokens;
-                *cost_by_model.entry(e.model.clone()).or_default() += c;
-                if e.timestamp < earliest_ts {
-                    earliest_ts = e.timestamp.clone();
-                }
-                if cwd.is_empty() && !e.cwd.is_empty() {
-                    cwd = e.cwd.clone();
-                }
-            }
+        records.push(SessionCostRecord {
+            session_id,
+            project: cwd,
+            project_name,
+            model: primary_model,
+            cost: total_cost,
+            total_tokens,
+            timestamp: earliest_ts.clone(),
+            date,
+        });
+    }
 
-            // Primary model = highest cost contributor
-            let primary_model = cost_by_model
-                .iter()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(m, _)| m.clone())
-                .unwrap_or_default();
-
-            Some(SessionCostRecord {
-                session_id,
-                project: cwd.clone(),
-                project_name: project_name_from_path(&cwd),
-                model: primary_model,
-                cost: total_cost,
-                total_tokens,
-                timestamp: earliest_ts.clone(),
-                date: date_from_timestamp(&earliest_ts),
-            })
-        })
-        .collect()
+    records
 }
 
 /// Load cache from disk, scan new/modified files, update cache, return aggregated CostData.
@@ -574,5 +583,132 @@ mod tests {
         ];
         let data = aggregate(&sessions);
         assert_eq!(data.total_tokens, 13000);
+    }
+
+    #[test]
+    fn test_scan_file_splits_by_date() {
+        let dir = std::env::temp_dir().join("c9watch_test_split");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test-split.jsonl");
+
+        let content = [
+            r#"{"type":"assistant","sessionId":"sess-1","timestamp":"2026-03-20T10:00:00Z","cwd":"/tmp/proj","message":{"model":"claude-sonnet-4-6","role":"assistant","id":"m1","content":[],"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            r#"{"type":"assistant","sessionId":"sess-1","timestamp":"2026-03-20T14:00:00Z","cwd":"/tmp/proj","message":{"model":"claude-sonnet-4-6","role":"assistant","id":"m2","content":[],"usage":{"input_tokens":200,"output_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            r#"{"type":"assistant","sessionId":"sess-1","timestamp":"2026-03-21T09:00:00Z","cwd":"/tmp/proj","message":{"model":"claude-opus-4-6","role":"assistant","id":"m3","content":[],"usage":{"input_tokens":400,"output_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        ].join("\n");
+        std::fs::write(&file, &content).unwrap();
+
+        let records = scan_file(&file);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(records.len(), 2, "Should produce 2 records for 2 days");
+
+        let mut records = records;
+        records.sort_by(|a, b| a.date.cmp(&b.date));
+
+        // Day 1: Sonnet — 300 input + 150 output = 450 tokens
+        // Cost: (300 * 3.0 + 150 * 15.0) / 1_000_000 = 0.003150
+        assert_eq!(records[0].date, "2026-03-20");
+        assert_eq!(records[0].session_id, "sess-1");
+        assert_eq!(records[0].total_tokens, 450);
+        assert!((records[0].cost - 0.003150).abs() < 1e-10);
+        assert_eq!(records[0].model, "claude-sonnet-4-6");
+        assert_eq!(records[0].timestamp, "2026-03-20T10:00:00Z");
+        assert_eq!(records[0].project, "/tmp/proj");
+
+        // Day 2: Opus — 400 input + 200 output = 600 tokens
+        // Cost: (400 * 5.0 + 200 * 25.0) / 1_000_000 = 0.007000
+        assert_eq!(records[1].date, "2026-03-21");
+        assert_eq!(records[1].session_id, "sess-1");
+        assert_eq!(records[1].total_tokens, 600);
+        assert!((records[1].cost - 0.007000).abs() < 1e-10);
+        assert_eq!(records[1].model, "claude-opus-4-6");
+        assert_eq!(records[1].timestamp, "2026-03-21T09:00:00Z");
+        assert_eq!(records[1].project, "/tmp/proj");
+    }
+
+    #[test]
+    fn test_scan_file_single_day_unchanged() {
+        let dir = std::env::temp_dir().join("c9watch_test_single");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test-single.jsonl");
+
+        let content = [
+            r#"{"type":"assistant","sessionId":"sess-2","timestamp":"2026-03-20T10:00:00Z","cwd":"/tmp/proj","message":{"model":"claude-sonnet-4-6","role":"assistant","id":"m1","content":[],"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            r#"{"type":"assistant","sessionId":"sess-2","timestamp":"2026-03-20T14:00:00Z","cwd":"/tmp/proj","message":{"model":"claude-sonnet-4-6","role":"assistant","id":"m2","content":[],"usage":{"input_tokens":200,"output_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        ].join("\n");
+        std::fs::write(&file, &content).unwrap();
+
+        let records = scan_file(&file);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(records.len(), 1, "Single-day session should produce 1 record");
+        assert_eq!(records[0].date, "2026-03-20");
+        assert_eq!(records[0].total_tokens, 450);
+        assert!((records[0].cost - 0.003150).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cwd_shared_across_date_splits() {
+        let dir = std::env::temp_dir().join("c9watch_test_cwd");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test-cwd.jsonl");
+
+        let content = [
+            r#"{"type":"assistant","sessionId":"sess-3","timestamp":"2026-03-20T10:00:00Z","cwd":"/tmp/myproject","message":{"model":"claude-sonnet-4-6","role":"assistant","id":"m1","content":[],"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            r#"{"type":"assistant","sessionId":"sess-3","timestamp":"2026-03-21T09:00:00Z","cwd":"","message":{"model":"claude-sonnet-4-6","role":"assistant","id":"m2","content":[],"usage":{"input_tokens":200,"output_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        ].join("\n");
+        std::fs::write(&file, &content).unwrap();
+
+        let records = scan_file(&file);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(records.len(), 2);
+        let mut records = records;
+        records.sort_by(|a, b| a.date.cmp(&b.date));
+
+        assert_eq!(records[0].project, "/tmp/myproject");
+        assert_eq!(records[1].project, "/tmp/myproject");
+        assert_eq!(records[0].project_name, "myproject");
+        assert_eq!(records[1].project_name, "myproject");
+    }
+
+    #[test]
+    fn test_aggregate_date_split() {
+        let sessions = vec![
+            SessionCostRecord {
+                session_id: "s1".into(),
+                project: "/tmp/a".into(),
+                project_name: "a".into(),
+                model: "claude-sonnet-4-6".into(),
+                cost: 1.0,
+                total_tokens: 5000,
+                timestamp: "2026-03-20T10:00:00Z".into(),
+                date: "2026-03-20".into(),
+            },
+            SessionCostRecord {
+                session_id: "s1".into(),
+                project: "/tmp/a".into(),
+                project_name: "a".into(),
+                model: "claude-sonnet-4-6".into(),
+                cost: 2.0,
+                total_tokens: 8000,
+                timestamp: "2026-03-21T09:00:00Z".into(),
+                date: "2026-03-21".into(),
+            },
+        ];
+        let data = aggregate(&sessions);
+
+        assert_eq!(data.daily_costs.len(), 2, "Should have 2 daily buckets");
+        assert_eq!(data.total_cost, 3.0);
+        assert_eq!(data.total_tokens, 13000);
+
+        let day20 = data.daily_costs.iter().find(|d| d.date == "2026-03-20").unwrap();
+        let day21 = data.daily_costs.iter().find(|d| d.date == "2026-03-21").unwrap();
+        assert!((day20.cost - 1.0).abs() < 1e-10);
+        assert!((day21.cost - 2.0).abs() < 1e-10);
     }
 }
