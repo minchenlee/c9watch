@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getCostData } from '$lib/api';
-	import type { CostData } from '$lib/types';
+	import { getCostData, getConversation } from '$lib/api';
+	import type { CostData, HistoryEntry, Conversation } from '$lib/types';
 	import TokenDistanceVisualizer from './token-distance/TokenDistanceVisualizer.svelte';
+	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
 
 	type TimeScale = 'daily' | 'weekly' | 'monthly';
 
@@ -25,6 +26,13 @@
 	let hoveredBucket = $state<string | null>(null);
 	let expandedProjects = $state<Set<string>>(new Set());
 	let showVisualizer = $state(false);
+	let selectedEntry = $state<HistoryEntry | null>(null);
+	let conversation = $state<Conversation | null>(null);
+
+	type SortField = 'date' | 'cost';
+	type SortDir = 'asc' | 'desc';
+	let sessionSortField = $state<SortField>('date');
+	let sessionSortDir = $state<SortDir>('desc');
 
 	// ── Helpers ──────────────────────────────────────────────────────
 	function formatCost(n: number): string {
@@ -99,10 +107,51 @@
 		return `${date} ${time}`;
 	}
 
+	function toggleSort(field: SortField) {
+		if (sessionSortField === field) {
+			sessionSortDir = sessionSortDir === 'desc' ? 'asc' : 'desc';
+		} else {
+			sessionSortField = field;
+			sessionSortDir = 'desc';
+		}
+	}
+
+	function sortSessions(sessions: import('$lib/types').SessionCostRecord[]): import('$lib/types').SessionCostRecord[] {
+		const dir = sessionSortDir === 'desc' ? -1 : 1;
+		return [...sessions].sort((a, b) => {
+			if (sessionSortField === 'cost') return (a.cost - b.cost) * dir;
+			return a.timestamp.localeCompare(b.timestamp) * dir;
+		});
+	}
+
+	let loadingConversation = $state(false);
+
+	async function handleSessionClick(session: import('$lib/types').SessionCostRecord) {
+		if (loadingConversation) return;
+		loadingConversation = true;
+		selectedEntry = {
+			sessionId: session.sessionId,
+			display: session.sessionName || session.sessionId.slice(0, 8),
+			timestamp: new Date(session.timestamp).getTime(),
+			project: session.project,
+			projectName: session.projectName,
+			customTitle: session.sessionName || null,
+		};
+		conversation = null;
+		try {
+			conversation = await getConversation(session.sessionId);
+		} catch (e) {
+			console.error('Failed to load conversation:', e);
+		} finally {
+			loadingConversation = false;
+		}
+	}
+
 	function modelDisplayName(model: string): string {
 		if (model.startsWith('claude-sonnet')) return 'Sonnet';
 		if (model.startsWith('claude-opus')) return 'Opus';
 		if (model.startsWith('claude-haiku')) return 'Haiku';
+		if (model === '<synthetic>' || model === 'unknown') return '—';
 		return model;
 	}
 
@@ -480,6 +529,12 @@
 				<div class="sub-header-row">
 					<span class="sub-header">BY PROJECT</span>
 					<div class="sort-group">
+						<button class="option-btn" class:active={sessionSortField === 'date'} onclick={() => toggleSort('date')}>
+							DATE {sessionSortField === 'date' ? (sessionSortDir === 'desc' ? '↓' : '↑') : ''}
+						</button>
+						<button class="option-btn" class:active={sessionSortField === 'cost'} onclick={() => toggleSort('cost')}>
+							COST {sessionSortField === 'cost' ? (sessionSortDir === 'desc' ? '↓' : '↑') : ''}
+						</button>
 						<button class="option-btn" onclick={toggleAllProjects}>
 							{allCollapsed ? 'EXPAND ALL' : 'COLLAPSE ALL'}
 						</button>
@@ -498,7 +553,7 @@
 							aria-label={collapsedProjects.has(proj.project) ? 'Expand project' : 'Collapse project'}
 						>
 							<span class="collapse-toggle" aria-hidden="true">{collapsedProjects.has(proj.project) ? '▶' : '▼'}</span>
-							<span class="group-name">{proj.projectName.toUpperCase()}</span>
+							<span class="group-name">{proj.projectName.toUpperCase()} <span class="group-count">({proj.sessions.length})</span></span>
 							<span class="group-cost">{formatCost(proj.totalCost)}</span>
 						</div>
 
@@ -511,10 +566,14 @@
 								</div>
 							</div>
 
-							{#each expandedProjects.has(proj.project) ? proj.sessions : proj.sessions.slice(0, 5) as session (session.sessionId + '-' + session.date)}
-								<div class="session-detail">
-									<span class="detail-project">{session.projectName}</span>
+							<!-- svelte-ignore a11y_click_events_have_key_events -->
+							<!-- svelte-ignore a11y_no_static_element_interactions -->
+							{@const sorted = sortSessions(proj.sessions)}
+							{#each expandedProjects.has(proj.project) ? sorted : sorted.slice(0, 5) as session (session.sessionId + '-' + session.date)}
+								<div class="session-detail" onclick={() => handleSessionClick(session)}>
+									<span class="detail-name" title={session.sessionName || session.sessionId}>{session.sessionName || session.sessionId.slice(0, 8)}</span>
 									<span class="detail-session-id" title={session.sessionId}>{session.sessionId.slice(0, 8)}</span>
+									<span class="detail-spacer"></span>
 									<span class="detail-time">{formatDateTime(session.timestamp)}</span>
 									<span class="detail-model">{modelDisplayName(session.model)}</span>
 									<span class="detail-cost">{formatCost(session.cost)}</span>
@@ -556,6 +615,9 @@
 		})()}
 		onclose={() => showVisualizer = false}
 	/>
+{/if}
+{#if selectedEntry}
+	<HistoryCardOverlay entry={selectedEntry} {conversation} onclose={() => { selectedEntry = null; conversation = null; }} />
 {/if}
 </div>
 
@@ -911,17 +973,22 @@
 	}
 
 	.session-detail {
-		display: flex;
-		align-items: center;
+		display: grid;
+		grid-template-columns: minmax(100px, 300px) auto 1fr auto auto auto;
 		gap: var(--space-md);
+		align-items: center;
 		padding: var(--space-xs) var(--space-sm);
 		font-family: var(--font-mono);
 		font-size: 13px;
+		cursor: pointer;
 	}
 
-	.detail-project {
+	.session-detail:hover {
+		background: var(--bg-elevated);
+	}
+
+	.detail-name {
 		color: var(--text-primary);
-		flex: 1;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
@@ -929,25 +996,20 @@
 
 	.detail-session-id {
 		color: var(--text-muted);
-		flex-shrink: 0;
-		font-size: 12px;
-		opacity: 0.6;
+		font-size: 11px;
 	}
 
 	.detail-time {
 		color: var(--text-muted);
-		flex-shrink: 0;
 	}
 
 	.detail-model {
 		color: var(--text-muted);
-		flex-shrink: 0;
 		min-width: 50px;
 	}
 
 	.detail-cost {
 		color: var(--text-secondary);
-		flex-shrink: 0;
 		min-width: 50px;
 		text-align: right;
 	}
@@ -990,6 +1052,13 @@
 		flex: 1;
 	}
 
+	.group-count {
+		font-family: var(--font-mono);
+		font-size: 14px;
+		color: var(--text-muted);
+		letter-spacing: normal;
+	}
+
 	.group-cost {
 		font-family: var(--font-mono);
 		font-size: 13px;
@@ -1029,6 +1098,10 @@
 	.option-btn:hover {
 		color: var(--text-primary);
 		background: rgba(255, 255, 255, 0.1);
+	}
+
+	.option-btn.active {
+		color: var(--accent-amber);
 	}
 
 	.distance-btn {
