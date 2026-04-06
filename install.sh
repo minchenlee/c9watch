@@ -90,11 +90,34 @@ fi
 info "Installing to ${INSTALL_DIR}/${APP_BASENAME}..."
 cp -R "$APP_BUNDLE" "${INSTALL_DIR}/"
 
+# --- Symlink CLI ---
+
+CLI_DIR="${HOME}/.local/bin"
+CLI_BINARY="${INSTALL_DIR}/${APP_BASENAME}/Contents/MacOS/c9watch"
+
+if [ -x "$CLI_BINARY" ]; then
+  mkdir -p "$CLI_DIR"
+  ln -sf "$CLI_BINARY" "$CLI_DIR/c9watch"
+  info "CLI symlinked to ${CLI_DIR}/c9watch"
+
+  case ":${PATH}:" in
+    *":${CLI_DIR}:"*) ;;
+    *)
+      printf '\033[1;33m=>\033[0m %s\n' "${CLI_DIR} is not in your PATH. Add it with:"
+      echo ""
+      echo "    export PATH=\"${CLI_DIR}:\$PATH\""
+      echo ""
+      ;;
+  esac
+fi
+
 # --- Done ---
 
 echo ""
 info "c9watch has been installed to ${INSTALL_DIR}/${APP_BASENAME}"
-info "You can launch it from Spotlight or by running:"
+info "You can launch the app from Spotlight or by running:"
 echo ""
 echo "    open '${INSTALL_DIR}/${APP_BASENAME}'"
+echo ""
+info "CLI is available as 'c9watch' (e.g. c9watch list, c9watch --help)"
 echo ""
