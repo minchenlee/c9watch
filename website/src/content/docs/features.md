@@ -143,6 +143,12 @@ Install the CLI standalone (no GUI dependencies) on macOS or Linux:
 curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install-cli.sh | bash
 ```
 
+c9watch also ships with a **Claude Code skill** — install it to let Claude Code auto-discover and use the CLI:
+
+```bash
+ln -s /path/to/c9watch/skills/c9watch-cli ~/.claude/skills/c9watch-cli
+```
+
 ## FDA permission banner
 
 On macOS, c9watch needs Full Disk Access to read the working directory of Claude Code processes. If sessions are found but their paths can't be read, a dismissible banner appears with a direct link to System Settings > Privacy > Full Disk Access.

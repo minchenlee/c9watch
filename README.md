@@ -139,7 +139,13 @@ c9watch tasks abc123
 
 Use `--pretty` on any command for human-readable JSON. The `watch` command streams newline-delimited JSON events (`started`, `status_changed`, `stopped`) for real-time monitoring.
 
-For the full command reference (designed for LLM agents), see [SKILLS.md](SKILLS.md). Add it to your project's `CLAUDE.md` to give Claude Code the ability to monitor sibling sessions.
+c9watch ships with a [Claude Code skill](skills/c9watch-cli/SKILL.md) that teaches Claude how to use the CLI. Install it to let Claude Code monitor sibling sessions, search past work, and coordinate with other agents:
+
+```bash
+ln -s /path/to/c9watch/skills/c9watch-cli ~/.claude/skills/c9watch-cli
+```
+
+See [SKILLS.md](SKILLS.md) for more install options.
 
 ## Features
 
