@@ -10,6 +10,45 @@ head:
 
 All notable changes to c9watch are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.7.0 — 2026-04-06
+
+### Added
+
+- CLI for scriptable session management — `c9watch list`, `view`, `history`, `search`, `stop`, `watch`, `self`, `status`, `tasks` commands for agent-to-agent monitoring ([#75](https://github.com/minchenlee/c9watch/pull/75))
+- One-line CLI installer for macOS and Linux ([install-cli.sh](https://github.com/minchenlee/c9watch/blob/main/install-cli.sh))
+- Cost records split by date for accurate daily totals — sessions spanning midnight now attribute costs to the correct day ([#78](https://github.com/minchenlee/c9watch/pull/78))
+- Session names in cost tab — display custom title or first user message alongside session ID ([#79](https://github.com/minchenlee/c9watch/pull/79))
+- Conversation preview in cost tab — click any session row to open the conversation overlay ([#79](https://github.com/minchenlee/c9watch/pull/79))
+- DATE/COST sort toggles in cost tab with ascending/descending order ([#79](https://github.com/minchenlee/c9watch/pull/79))
+- History tab shows latest prompt text and native custom titles from JSONL files ([#80](https://github.com/minchenlee/c9watch/pull/80))
+
+### Fixed
+
+- Session detection on macOS now uses cmd args instead of binary path for more reliable process matching ([#77](https://github.com/minchenlee/c9watch/pull/77))
+- PID-to-session mapping after `/clear` now uses session metadata for accuracy ([#73](https://github.com/minchenlee/c9watch/pull/73))
+- Notification title now uses renamed session title instead of generic text ([#74](https://github.com/minchenlee/c9watch/pull/74))
+
+### Improved
+
+- History tab layout redesigned with CSS grid for better alignment ([#80](https://github.com/minchenlee/c9watch/pull/80))
+- Session count shown per project in cost tab ([#79](https://github.com/minchenlee/c9watch/pull/79))
+
+## 0.6.0 — 2026-03-23
+
+### Added
+
+- Session metadata improvements — richer session info display ([#65](https://github.com/minchenlee/c9watch/pull/65))
+- NeedsPermission renamed to NeedsAttention with user question detection ([#66](https://github.com/minchenlee/c9watch/pull/66))
+- Draggable title bar and mobile responsive styling improvements ([#58](https://github.com/minchenlee/c9watch/pull/58))
+- 5 new token distance milestones: Angel Falls, Mt. Vesuvius, Krubera Cave, Mt. Olympus, Mt. Etna ([#63](https://github.com/minchenlee/c9watch/pull/63))
+
+### Fixed
+
+- Cost pricing updated — Opus 4.5/4.6 corrected to $5/$25 (standard) and $30/$150 (fast), Haiku 4.5 to $1/$5 ([#64](https://github.com/minchenlee/c9watch/pull/64))
+- Session titles no longer forced to uppercase with pixel font ([#67](https://github.com/minchenlee/c9watch/pull/67))
+- History "newest" sort now uses last activity time instead of creation time ([#68](https://github.com/minchenlee/c9watch/pull/68))
+- JetBrains IDE "Open" action now focuses existing window instead of opening a new one ([#69](https://github.com/minchenlee/c9watch/pull/69))
+
 ## 0.5.0 — 2026-03-14
 
 ### Added

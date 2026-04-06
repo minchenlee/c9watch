@@ -4,9 +4,11 @@
 
 <h1 align="center">c9watch</h1>
 
-<p align="center">Monitor and control all your Claude Code sessions from one place.</p>
+<p align="center">Monitor and control all your Claude Code sessions — built for both humans and agents.</p>
 
-**c9watch** (short for **c**laude cod**e** watch, like k8s for Kubernetes) is a macOS desktop app that gives you a real-time dashboard of every Claude Code session running on your machine. No more switching between terminals to check which agent needs permission, which one is working, and which one is idle.
+**c9watch** (short for **c**laude cod**e** watch, like k8s for Kubernetes) gives you a real-time view of every Claude Code session running on your machine. A **desktop dashboard** for you, and a **JSON CLI** for your agents — both watching the same sessions at the same time.
+
+You see which agent needs permission, which one is working, and which one is idle. Your agents can do the same — querying session status, searching past work, and coordinating with each other — all through the same tool.
 
 ## Demo
 
@@ -26,15 +28,21 @@ Built with **Tauri**, **Rust**, and **Svelte** -- not Electron. The app binary i
 
 ## Install
 
-### Quick install
+### Desktop app (macOS)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash
 ```
 
-### Download
+Or grab the latest `.dmg` from the [Releases](https://github.com/minchenlee/c9watch/releases) page.
 
-Grab the latest `.dmg` from the [Releases](https://github.com/minchenlee/c9watch/releases) page.
+### CLI only (macOS & Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install-cli.sh | bash
+```
+
+Installs to `~/.local/bin` by default. Use `| bash -s -- --global` to install to `/usr/local/bin` instead.
 
 ### Build from source
 
@@ -44,10 +52,16 @@ Prerequisites: [Rust](https://rustup.rs/), [Node.js](https://nodejs.org/) (v18+)
 git clone https://github.com/minchenlee/c9watch.git
 cd c9watch
 npm install
-npm run tauri build
+npm run tauri build       # Desktop app → src-tauri/target/release/bundle/macos/
 ```
 
-The built `.app` will be in `src-tauri/target/release/bundle/macos/`.
+To build just the CLI (no Node.js or Tauri CLI needed):
+
+```bash
+cd src-tauri
+cargo build --release --no-default-features --features cli
+# Binary → target/release/c9watch
+```
 
 ## Screenshots
 
@@ -93,6 +107,48 @@ See your total token usage as a rice stack towering past real-world landmarks. S
 
 ![Token distance visualizer](docs/screenshots/token-distance-visualizer.png)
 
+## CLI
+
+The same `c9watch` binary doubles as a CLI for scriptable session management. All output is JSON, designed for piping into `jq` or consumption by other coding agents.
+
+```bash
+# List active sessions
+c9watch list
+c9watch list --project myapp --status Working --compact
+
+# Aggregate status summary
+c9watch status
+
+# View a conversation (prefix matching works)
+c9watch view abc123 --last 5 --pretty
+
+# Browse and search history
+c9watch history -n 20
+c9watch search "fix the auth bug" --project myapp
+
+# Identify the calling agent's own session
+c9watch self
+
+# Stop a session
+c9watch stop 12345
+
+# Watch for status changes (NDJSON stream)
+c9watch watch --interval 2 --compact --changes-only
+
+# View tasks/todos for a session
+c9watch tasks abc123
+```
+
+Use `--pretty` on any command for human-readable JSON. The `watch` command streams newline-delimited JSON events (`started`, `status_changed`, `stopped`) for real-time monitoring.
+
+c9watch ships with a [Claude Code skill](skills/c9watch-cli/SKILL.md) that teaches Claude how to use the CLI. Install it to let Claude Code monitor sibling sessions, search past work, and coordinate with other agents:
+
+```bash
+ln -s /path/to/c9watch/skills/c9watch-cli ~/.claude/skills/c9watch-cli
+```
+
+See [SKILLS.md](SKILLS.md) for more install options.
+
 ## Features
 
 - **Zero-integration setup** -- Works with any terminal or IDE, no plugins or extensions required
@@ -106,7 +162,8 @@ See your total token usage as a rice stack towering past real-world landmarks. S
 - **Mobile/Web client** -- Connect from any browser or mobile device via WebSocket; scan the QR code to monitor sessions remotely
 - **Session history** -- Browse and search all past sessions with instant metadata filter and deep content search; click a result to scroll to and highlight the matching message
 - **Memory viewer** -- Browse and inspect Claude Code memory files with a two-panel layout and quick Claude command access
-- **Cost tracker** -- Track Claude Code spending with daily, per-project, and per-model breakdowns using cached JSONL scanning
+- **Cost tracker** -- Track Claude Code spending with daily, per-project, and per-model breakdowns; click any session to preview the conversation; sort by date or cost
+- **CLI for agents** -- `c9watch list`, `view`, `history`, `search`, `stop`, `watch` commands for scriptable session management and agent-to-agent monitoring
 - **Token distance visualizer** -- See your token usage as a rice stack towering past 22 real-world landmarks, with animated stacking, native share sheet, and Instagram-ready PNG export
 - **Debug console** -- Hidden diagnostic panel (`Cmd+Shift+D`) for troubleshooting session detection issues
 
@@ -175,6 +232,9 @@ c9watch/
 │           ├── status.rs       # Status determination from JSONL entries
 │           ├── history.rs      # Session history index and deep search
 │           ├── cost.rs         # Cost aggregation with mtime caching
+│           ├── enrichment.rs   # Session metadata enrichment (titles, first prompt)
+│           ├── conversation.rs # Conversation loading and rendering
+│           ├── sanitize.rs     # Strip internal XML tags from messages
 │           ├── permissions.rs  # Auto-approval rule checking
 │           └── custom_names.rs # User-defined session titles
 ```
@@ -208,6 +268,9 @@ Thanks to these wonderful people who have contributed to c9watch:
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/josh-dev-cho"><img src="https://github.com/josh-dev-cho.png?s=100" width="100px;" alt="josh.dev"/><br /><sub><b>josh.dev</b></sub></a><br /><a href="#code-josh-dev-cho" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/maxyharr"><img src="https://github.com/maxyharr.png?s=100" width="100px;" alt="Max Harris"/><br /><sub><b>Max Harris</b></sub></a><br /><a href="#code-maxyharr" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/vladan-me"><img src="https://github.com/vladan-me.png?s=100" width="100px;" alt="Vladan"/><br /><sub><b>Vladan</b></sub></a><br /><a href="#code-vladan-me" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/ajonesw"><img src="https://github.com/ajonesw.png?s=100" width="100px;" alt="Alex Jones-Wolsey"/><br /><sub><b>Alex Jones-Wolsey</b></sub></a><br /><a href="#code-ajonesw" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>

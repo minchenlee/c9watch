@@ -76,6 +76,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "ajonesw",
+      "name": "Alex Jones-Wolsey",
+      "avatar_url": "https://github.com/ajonesw.png",
+      "profile": "https://github.com/ajonesw",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "contributorsPerLine": 7,

@@ -41,6 +41,7 @@ We appreciate all contributions, big and small. Thank you to the following peopl
 
 - **josh.dev** ([@josh-dev-cho](https://github.com/josh-dev-cho)) - Fix dot character in path encoding for session matching ([#57](https://github.com/minchenlee/c9watch/pull/57))
 - **Vladan** ([@vladan-me](https://github.com/vladan-me)) - Focus existing JetBrains window instead of opening new one ([#69](https://github.com/minchenlee/c9watch/pull/69))
+- **Alex Jones-Wolsey** ([@ajonesw](https://github.com/ajonesw)) - Detect claude processes by cmd args on macOS ([#77](https://github.com/minchenlee/c9watch/pull/77))
 
 ---
 
