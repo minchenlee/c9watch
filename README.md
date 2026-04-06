@@ -34,9 +34,13 @@ curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh 
 
 Or grab the latest `.dmg` from the [Releases](https://github.com/minchenlee/c9watch/releases) page.
 
-### CLI only
+### CLI only (macOS & Linux)
 
-The CLI binary is a standalone Rust binary with no GUI dependencies. Download the `c9watch-cli-*` tarball for your platform from the [Releases](https://github.com/minchenlee/c9watch/releases) page, extract it, and place the `c9watch` binary somewhere on your `$PATH`.
+```bash
+curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install-cli.sh | bash
+```
+
+Installs to `~/.local/bin` by default. Use `| bash -s -- --global` to install to `/usr/local/bin` instead.
 
 ### Build from source
 
