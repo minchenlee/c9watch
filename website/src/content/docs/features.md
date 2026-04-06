@@ -9,7 +9,7 @@ head:
 ---
 
 :::note[TL;DR]
-c9watch monitors all Claude Code sessions on your Mac in real-time — auto-discovery, session history, cost tracking, conversation viewer, and tray popover. No plugins or configuration needed.
+c9watch monitors all Claude Code sessions on your Mac in real-time — auto-discovery, session history, cost tracking, conversation viewer, tray popover, and a CLI for agent-to-agent monitoring. No plugins or configuration needed.
 :::
 
 c9watch gives you a real-time dashboard of every Claude Code session running on your machine. Here's everything it can do.
@@ -90,9 +90,11 @@ Click a deep search result to open the conversation viewer and automatically scr
 
 Track your Claude Code spending across all sessions with three views:
 
-- **Daily** — spending over time, bar chart with per-day breakdown
-- **By project** — total cost per project directory
+- **Daily** — spending over time, bar chart with per-day breakdown. Sessions spanning midnight are correctly split by date.
+- **By project** — total cost per project directory with session count, expandable session list showing session names (custom title or first user message), and DATE/COST sort toggles
 - **By model** — spending split by Claude model (Sonnet, Opus, Haiku)
+
+Click any session row to open a conversation preview overlay — the same viewer used in the history tab.
 
 Costs are computed by parsing assistant message metadata from JSONL files, using per-model pricing tables. Results are cached by file modification time so unchanged sessions aren't re-scanned.
 
@@ -115,6 +117,31 @@ Browse all your Claude Code memory files in a two-panel layout. The left panel l
 Quick access to Claude commands lets you jump into sessions directly from the memory view.
 
 ![Memory tab with two-panel viewer showing project memory files](/screenshots/memory-tab.png)
+
+## CLI for agents
+
+The same `c9watch` binary doubles as a command-line interface for scriptable session management. All output is JSON, designed for piping into `jq` or consumption by other coding agents.
+
+```bash
+c9watch list                          # List active sessions
+c9watch list --status Working         # Filter by status
+c9watch status                        # Aggregate status summary
+c9watch view <id> --last 5 --pretty   # View conversation
+c9watch history -n 20                 # Browse past sessions
+c9watch search "fix the auth bug"     # Deep search
+c9watch self                          # Identify calling agent's own session
+c9watch stop <pid>                    # Stop a session
+c9watch watch --compact               # Stream status changes (NDJSON)
+c9watch tasks <id>                    # View tasks/todos
+```
+
+The `self` command is designed for agent-to-agent workflows — a Claude Code session can identify itself by walking up the PID tree, then query its own status or tasks.
+
+Install the CLI standalone (no GUI dependencies) on macOS or Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install-cli.sh | bash
+```
 
 ## FDA permission banner
 

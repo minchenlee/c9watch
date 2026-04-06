@@ -41,6 +41,10 @@ const features = [
     description: 'Visualize your token usage as a rice stack towering past 17 real-world landmarks. Share as an Instagram-ready PNG.',
     image: '/screenshots/token-distance-visualizer.png',
   },
+  {
+    title: 'CLI for agents',
+    description: 'Scriptable session management with JSON output — list, view, search, watch, and stop sessions from other coding agents or scripts.',
+  },
 ];
 ---
 
@@ -51,9 +55,11 @@ const features = [
       <div class="feature-card">
         <h3 class="feature-title">{f.title}</h3>
         <p class="feature-desc">{f.description}</p>
-        <div class="feature-img">
-          <img src={f.image} alt={f.title} loading="lazy" />
-        </div>
+        {f.image && (
+          <div class="feature-img">
+            <img src={f.image} alt={f.title} loading="lazy" />
+          </div>
+        )}
       </div>
     ))}
   </div>

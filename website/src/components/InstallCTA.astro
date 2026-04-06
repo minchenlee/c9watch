@@ -13,6 +13,16 @@
       </svg>
     </button>
   </div>
+  <p class="cta-label">CLI only (macOS & Linux):</p>
+  <div class="cta-install-box cta-install-cli">
+    <code>curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install-cli.sh | bash</code>
+    <button class="cta-copy-btn-cli" aria-label="Copy CLI install command">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <rect x="9" y="9" width="13" height="13" rx="0" />
+        <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
+      </svg>
+    </button>
+  </div>
   <a href="https://github.com/minchenlee/c9watch/releases" class="cta-releases" target="_blank" rel="noopener">
     Or download from GitHub Releases
   </a>
@@ -24,6 +34,12 @@
     navigator.clipboard.writeText('curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash');
     btn.setAttribute('aria-label', 'Copied!');
     setTimeout(() => btn.setAttribute('aria-label', 'Copy install command'), 2000);
+  });
+  const btnCli = document.querySelector('.cta-copy-btn-cli');
+  btnCli?.addEventListener('click', () => {
+    navigator.clipboard.writeText('curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install-cli.sh | bash');
+    btnCli.setAttribute('aria-label', 'Copied!');
+    setTimeout(() => btnCli.setAttribute('aria-label', 'Copy CLI install command'), 2000);
   });
 </script>
 
@@ -103,6 +119,30 @@
   }
 
   .cta-copy-btn:hover {
+    color: var(--text-primary);
+  }
+
+  .cta-label {
+    color: var(--text-muted);
+    font-size: 13px;
+    margin-bottom: 0.5rem;
+    margin-top: 0.5rem;
+  }
+
+  .cta-install-cli {
+    margin-bottom: 1.5rem;
+  }
+
+  .cta-copy-btn-cli {
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 4px;
+    background: none;
+    border: none;
+    transition: color var(--transition-fast);
+  }
+
+  .cta-copy-btn-cli:hover {
     color: var(--text-primary);
   }
 
