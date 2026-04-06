@@ -89,7 +89,11 @@ pub fn log_error(message: &str) {
 mod tests {
     use super::*;
 
-    /// Clear the global buffer before each test to avoid cross-test pollution.
+    /// Serialize tests that share the global LOG_BUFFER to prevent races.
+    /// Both tests write to and read from the same static ring buffer, so
+    /// running them concurrently causes eviction-based flakiness.
+    static TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
     fn clear_buffer() {
         let mut buffer = LOG_BUFFER.lock().unwrap();
         buffer.clear();
@@ -97,8 +101,9 @@ mod tests {
 
     #[test]
     fn test_log_and_retrieve() {
-        // Use unique messages to avoid interference from parallel tests
-        // sharing the global buffer.
+        let _lock = TEST_MUTEX.lock().unwrap();
+        clear_buffer();
+
         log_info("test_lar_hello");
         log_error("test_lar_broke");
 
@@ -115,6 +120,7 @@ mod tests {
 
     #[test]
     fn test_ring_buffer_capacity() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         clear_buffer();
 
         let prefix = "cap_test_";
