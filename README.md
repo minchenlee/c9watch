@@ -26,15 +26,17 @@ Built with **Tauri**, **Rust**, and **Svelte** -- not Electron. The app binary i
 
 ## Install
 
-### Quick install
+### Desktop app (macOS)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash
 ```
 
-### Download
+Or grab the latest `.dmg` from the [Releases](https://github.com/minchenlee/c9watch/releases) page.
 
-Grab the latest `.dmg` from the [Releases](https://github.com/minchenlee/c9watch/releases) page.
+### CLI only
+
+The CLI binary is a standalone Rust binary with no GUI dependencies. Download the `c9watch-cli-*` tarball for your platform from the [Releases](https://github.com/minchenlee/c9watch/releases) page, extract it, and place the `c9watch` binary somewhere on your `$PATH`.
 
 ### Build from source
 
@@ -44,10 +46,16 @@ Prerequisites: [Rust](https://rustup.rs/), [Node.js](https://nodejs.org/) (v18+)
 git clone https://github.com/minchenlee/c9watch.git
 cd c9watch
 npm install
-npm run tauri build
+npm run tauri build       # Desktop app → src-tauri/target/release/bundle/macos/
 ```
 
-The built `.app` will be in `src-tauri/target/release/bundle/macos/`.
+To build just the CLI (no Node.js or Tauri CLI needed):
+
+```bash
+cd src-tauri
+cargo build --release --no-default-features --features cli
+# Binary → target/release/c9watch
+```
 
 ## Screenshots
 
@@ -92,6 +100,40 @@ View and inspect all Claude Code memory files in a two-panel layout with quick a
 See your total token usage as a rice stack towering past real-world landmarks. Share the result as an Instagram-ready PNG.
 
 ![Token distance visualizer](docs/screenshots/token-distance-visualizer.png)
+
+## CLI
+
+The same `c9watch` binary doubles as a CLI for scriptable session management. All output is JSON, designed for piping into `jq` or consumption by other coding agents.
+
+```bash
+# List active sessions
+c9watch list
+c9watch list --project myapp --status Working --compact
+
+# Aggregate status summary
+c9watch status
+
+# View a conversation (prefix matching works)
+c9watch view abc123 --last 5 --pretty
+
+# Browse and search history
+c9watch history -n 20
+c9watch search "fix the auth bug" --project myapp
+
+# Identify the calling agent's own session
+c9watch self
+
+# Stop a session
+c9watch stop 12345
+
+# Watch for status changes (NDJSON stream)
+c9watch watch --interval 2 --compact --changes-only
+
+# View tasks/todos for a session
+c9watch tasks abc123
+```
+
+Use `--pretty` on any command for human-readable JSON. The `watch` command streams newline-delimited JSON events (`started`, `status_changed`, `stopped`) for real-time monitoring.
 
 ## Features
 
