@@ -106,7 +106,8 @@ See your total token usage as a rice stack towering past real-world landmarks. S
 - **Mobile/Web client** -- Connect from any browser or mobile device via WebSocket; scan the QR code to monitor sessions remotely
 - **Session history** -- Browse and search all past sessions with instant metadata filter and deep content search; click a result to scroll to and highlight the matching message
 - **Memory viewer** -- Browse and inspect Claude Code memory files with a two-panel layout and quick Claude command access
-- **Cost tracker** -- Track Claude Code spending with daily, per-project, and per-model breakdowns using cached JSONL scanning
+- **Cost tracker** -- Track Claude Code spending with daily, per-project, and per-model breakdowns; click any session to preview the conversation; sort by date or cost
+- **CLI for agents** -- `c9watch list`, `view`, `history`, `search`, `stop`, `watch` commands for scriptable session management and agent-to-agent monitoring
 - **Token distance visualizer** -- See your token usage as a rice stack towering past 22 real-world landmarks, with animated stacking, native share sheet, and Instagram-ready PNG export
 - **Debug console** -- Hidden diagnostic panel (`Cmd+Shift+D`) for troubleshooting session detection issues
 
@@ -175,6 +176,9 @@ c9watch/
 │           ├── status.rs       # Status determination from JSONL entries
 │           ├── history.rs      # Session history index and deep search
 │           ├── cost.rs         # Cost aggregation with mtime caching
+│           ├── enrichment.rs   # Session metadata enrichment (titles, first prompt)
+│           ├── conversation.rs # Conversation loading and rendering
+│           ├── sanitize.rs     # Strip internal XML tags from messages
 │           ├── permissions.rs  # Auto-approval rule checking
 │           └── custom_names.rs # User-defined session titles
 ```
