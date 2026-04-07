@@ -374,28 +374,44 @@ impl SessionDetector {
         None
     }
 
-    /// Finds all processes with name "claude" or whose command-line args contain "claude".
-    /// On macOS, npm-installed Claude Code runs as "node" so we also check process.cmd().
+    /// Finds all processes that are actual `claude` binaries (or `node` running
+    /// the Claude Code CLI script).
+    ///
+    /// We match the process basename exactly, not by substring. Substring matching
+    /// would incorrectly include MCP servers and tools launched from `~/.claude/`
+    /// (whose executable paths contain "claude" as a directory component).
     fn find_claude_processes(&self) -> Vec<ClaudeProcess> {
         let mut processes = Vec::new();
 
         for (pid, process) in self.system.processes() {
-            let name = process.name().to_string_lossy();
+            let name_lossy = process.name().to_string_lossy();
+            let basename = std::path::Path::new(name_lossy.as_ref())
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(name_lossy.as_ref());
 
             // Skip our own process
-            if name.contains("c9watch") {
+            if basename.contains("c9watch") {
                 continue;
             }
 
-            // Check process name first (works for direct installs)
-            let name_match = name.contains("claude");
+            // Direct install: binary named exactly "claude"
+            let name_match = basename == "claude";
 
-            // Also check command-line args (handles npm-installed Claude Code
-            // where process.name() returns "node")
+            // npm-installed: binary is "node", and one of the cmd args is the
+            // claude CLI script (path ending in "/claude/cli.js" or similar).
             let cmd_match = !name_match
+                && basename == "node"
                 && process.cmd().iter().any(|arg| {
                     let a = arg.to_string_lossy();
-                    a.contains("claude") && !a.contains("c9watch")
+                    let arg_basename = std::path::Path::new(a.as_ref())
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    // claude CLI entry points
+                    arg_basename == "cli.js"
+                        || arg_basename == "claude"
+                        || arg_basename == "claude.js"
                 });
 
             if name_match || cmd_match {
