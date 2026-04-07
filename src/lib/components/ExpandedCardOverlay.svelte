@@ -4,6 +4,7 @@
 	import { quintOut } from 'svelte/easing';
 	import type { Session, Conversation } from '$lib/types';
 	import { SessionStatus } from '$lib/types';
+	import { canApproveReject as checkCanApproveReject } from '$lib/session-utils';
 	import MessageBubble from './MessageBubble.svelte';
 	import MessageNavMap from './MessageNavMap.svelte';
 	import { createSlidingWindow, BATCH_SIZE } from '$lib/slidingWindow.svelte';
@@ -14,9 +15,11 @@
 		onclose?: () => void;
 		onstop?: () => void;
 		onopen?: () => void;
+		onapprove?: () => void;
+		onreject?: () => void;
 	}
 
-	let { session, conversation, onclose, onstop, onopen }: Props = $props();
+	let { session, conversation, onclose, onstop, onopen, onapprove, onreject }: Props = $props();
 
 	let messagesContainer = $state<HTMLDivElement>(undefined!);
 	let isInitialLoad = $state(true);
@@ -91,6 +94,18 @@
 	let isPermission = $derived(session.status === SessionStatus.NeedsAttention);
 	let isWaitingInput = $derived(session.status === SessionStatus.WaitingForInput);
 	let isWorking = $derived(session.status === SessionStatus.Working);
+
+	let canApproveReject = $derived(checkCanApproveReject(session));
+
+	let approveLoading = $state(false);
+	let rejectLoading = $state(false);
+
+	// Reading session.status triggers reset when status changes (next poll cycle)
+	$effect(() => {
+		session.status;
+		approveLoading = false;
+		rejectLoading = false;
+	});
 
 	function getStatusColor(): string {
 		switch (session.status) {
@@ -217,6 +232,32 @@
 					</div>
 				</div>
 				<div class="header-actions">
+					{#if canApproveReject}
+						<button
+							type="button"
+							class="header-button approve-btn"
+							disabled={approveLoading || rejectLoading}
+							onclick={() => { approveLoading = true; onapprove?.(); }}
+							title="Approve"
+						>
+							<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+								<polyline points="20 6 9 17 4 12" />
+							</svg>
+						</button>
+						<button
+							type="button"
+							class="header-button reject-btn"
+							disabled={approveLoading || rejectLoading}
+							onclick={() => { rejectLoading = true; onreject?.(); }}
+							title="Reject"
+						>
+							<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+								<line x1="18" y1="6" x2="6" y2="18" />
+								<line x1="6" y1="6" x2="18" y2="18" />
+							</svg>
+						</button>
+						<div class="header-divider"></div>
+					{/if}
 					<button type="button" class="header-button" onclick={() => onstop?.()} title="Stop Session">
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 							<rect x="6" y="6" width="12" height="12" rx="1" />
@@ -539,6 +580,20 @@
 
 	.header-button:hover {
 		color: var(--text-primary);
+	}
+
+	.header-button.approve-btn:hover {
+		color: var(--status-input);
+	}
+
+	.header-button.reject-btn:hover {
+		color: var(--status-permission);
+	}
+
+	.header-button:disabled {
+		opacity: 0.4;
+		cursor: default;
+		pointer-events: none;
 	}
 
 	.header-button span {

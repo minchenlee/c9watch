@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { Session } from '$lib/types';
 	import { SessionStatus } from '$lib/types';
+	import { canApproveReject as checkCanApproveReject, getToolSummary as computeToolSummary } from '$lib/session-utils';
 
 	interface Props {
 		session: Session;
@@ -9,9 +10,11 @@
 		onstop?: () => void;
 		onopen?: () => void;
 		onrename?: () => void;
+		onapprove?: () => void;
+		onreject?: () => void;
 	}
 
-	let { session, compact = false, onexpand, onstop, onopen, onrename }: Props = $props();
+	let { session, compact = false, onexpand, onstop, onopen, onrename, onapprove, onreject }: Props = $props();
 
 	let needsAttention = $derived(
 		session.status === SessionStatus.NeedsAttention ||
@@ -21,6 +24,19 @@
 	let isPermission = $derived(session.status === SessionStatus.NeedsAttention);
 	let isWaitingInput = $derived(session.status === SessionStatus.WaitingForInput);
 	let isWorking = $derived(session.status === SessionStatus.Working);
+
+	let canApproveReject = $derived(checkCanApproveReject(session));
+	let toolSummary = $derived(computeToolSummary(session));
+
+	let approveLoading = $state(false);
+	let rejectLoading = $state(false);
+
+	// Reading session.status triggers reset when status changes (next poll cycle)
+	$effect(() => {
+		session.status;
+		approveLoading = false;
+		rejectLoading = false;
+	});
 
 	let tooltipText = $state('');
 	let tooltipX = $state(0);
@@ -112,6 +128,18 @@
 	function handleRenameClick(e: MouseEvent) {
 		e.stopPropagation();
 		onrename?.();
+	}
+
+	function handleApprove(e: MouseEvent) {
+		e.stopPropagation();
+		approveLoading = true;
+		onapprove?.();
+	}
+
+	function handleReject(e: MouseEvent) {
+		e.stopPropagation();
+		rejectLoading = true;
+		onreject?.();
 	}
 
 	let idCopied = $state(false);
@@ -217,6 +245,9 @@
 			<!-- Status Label -->
 			<div class="status-label" style="color: {getStatusColor()}">
 				{getStatusLabel()}
+				{#if toolSummary}
+					<span class="tool-summary"> — {toolSummary}</span>
+				{/if}
 			</div>
 		{/if}
 
@@ -227,6 +258,19 @@
 			<!-- Bottom Actions -->
 			<div class="card-actions-container">
 				<div class="card-actions">
+					{#if canApproveReject}
+						<button type="button" class="action-btn icon-only approve" onclick={handleApprove} disabled={approveLoading || rejectLoading} title="Approve">
+							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+								<polyline points="20 6 9 17 4 12" />
+							</svg>
+						</button>
+						<button type="button" class="action-btn icon-only danger" onclick={handleReject} disabled={approveLoading || rejectLoading} title="Reject">
+							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+								<line x1="18" y1="6" x2="6" y2="18" />
+								<line x1="6" y1="6" x2="18" y2="18" />
+							</svg>
+						</button>
+					{/if}
 					<button type="button" class="action-btn" onclick={handleRenameClick} title="Rename">
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 							<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
@@ -252,6 +296,19 @@
 			</div>
 		{:else}
 			<div class="compact-actions">
+				{#if canApproveReject}
+					<button type="button" class="action-btn icon-only approve" onclick={handleApprove} disabled={approveLoading || rejectLoading} title="Approve">
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+							<polyline points="20 6 9 17 4 12" />
+						</svg>
+					</button>
+					<button type="button" class="action-btn icon-only danger" onclick={handleReject} disabled={approveLoading || rejectLoading} title="Reject">
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+							<line x1="18" y1="6" x2="6" y2="18" />
+							<line x1="6" y1="6" x2="18" y2="18" />
+						</svg>
+					</button>
+				{/if}
 				<button type="button" class="action-btn icon-only" onclick={handleOpen} title="Open">
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 						<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
@@ -502,6 +559,17 @@
 		border-color: var(--status-permission);
 	}
 
+	.action-btn.approve:hover {
+		color: var(--status-input);
+		border-color: var(--status-input);
+	}
+
+	.action-btn:disabled {
+		opacity: 0.4;
+		cursor: default;
+		pointer-events: none;
+	}
+
 	.action-btn.primary {
 		background: var(--text-primary);
 		color: var(--bg-base);
@@ -515,6 +583,14 @@
 
 	.action-btn svg {
 		flex-shrink: 0;
+	}
+
+	.tool-summary {
+		font-size: 11px;
+		font-weight: 400;
+		color: var(--text-muted);
+		text-transform: none;
+		letter-spacing: 0.02em;
 	}
 
 	/* Compact Mode Styles */
@@ -564,6 +640,9 @@
 		right: var(--space-md);
 		top: 50%;
 		transform: translateY(-50%);
+		display: flex;
+		align-items: center;
+		gap: var(--space-xs);
 	}
 
 	.compact-actions .action-btn {

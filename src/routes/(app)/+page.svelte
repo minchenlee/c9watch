@@ -10,7 +10,7 @@
 		currentConversation,
 		statusSummary
 	} from '$lib/stores/sessions';
-	import { getConversation, stopSession, openSession } from '$lib/api';
+	import { getConversation, stopSession, openSession, approveSession, rejectSession } from '$lib/api';
 	import { isDemoMode, toggleDemoMode } from '$lib/demo';
 	import { isTauri } from '$lib/ws';
 	import StatusBar from '$lib/components/StatusBar.svelte';
@@ -238,6 +238,22 @@
 			await openSession(pid, projectPath);
 		} catch (error) {
 			console.error('Failed to open session:', error);
+		}
+	}
+
+	async function handleApprove(pid: number) {
+		try {
+			await approveSession(pid);
+		} catch (error) {
+			console.error('Failed to approve session:', error);
+		}
+	}
+
+	async function handleReject(pid: number) {
+		try {
+			await rejectSession(pid);
+		} catch (error) {
+			console.error('Failed to reject session:', error);
 		}
 	}
 
@@ -488,6 +504,8 @@
 													onexpand={() => handleExpand(session)}
 													onstop={() => handleStop(session.pid)}
 													onopen={() => handleOpen(session.pid, session.projectPath)}
+													onapprove={() => handleApprove(session.pid)}
+													onreject={() => handleReject(session.pid)}
 													onrename={() => showRenameHint = true}
 												/>
 											</div>
@@ -514,6 +532,8 @@
 													onexpand={() => handleExpand(session)}
 													onstop={() => handleStop(session.pid)}
 													onopen={() => handleOpen(session.pid, session.projectPath)}
+													onapprove={() => handleApprove(session.pid)}
+													onreject={() => handleReject(session.pid)}
 													onrename={() => showRenameHint = true}
 												/>
 											</div>
@@ -540,6 +560,8 @@
 													onexpand={() => handleExpand(session)}
 													onstop={() => handleStop(session.pid)}
 													onopen={() => handleOpen(session.pid, session.projectPath)}
+													onapprove={() => handleApprove(session.pid)}
+													onreject={() => handleReject(session.pid)}
 													onrename={() => showRenameHint = true}
 												/>
 											</div>
@@ -572,6 +594,8 @@
 											onexpand={() => handleExpand(session)}
 											onstop={() => handleStop(session.pid)}
 											onopen={() => handleOpen(session.pid, session.projectPath)}
+											onapprove={() => handleApprove(session.pid)}
+											onreject={() => handleReject(session.pid)}
 											onrename={() => showRenameHint = true}
 										/>
 									</div>
@@ -592,6 +616,8 @@
 			onclose={handleClose}
 			onstop={() => handleStop(expandedSession.pid)}
 			onopen={() => handleOpen(expandedSession.pid, expandedSession.projectPath)}
+			onapprove={() => handleApprove(expandedSession.pid)}
+			onreject={() => handleReject(expandedSession.pid)}
 		/>
 	{/if}
 

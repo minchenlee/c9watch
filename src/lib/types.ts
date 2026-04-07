@@ -54,6 +54,9 @@ export interface Session {
 
   /** Name of the tool or reason awaiting attention (if status is NeedsAttention) */
   pendingToolName: string | null;
+
+  /** Input/arguments of the pending tool (when status is NeedsAttention) */
+  pendingToolInput: Record<string, any> | null;
 }
 
 /**

@@ -53,6 +53,12 @@ enum ClientMsg {
         project_path: String,
     },
 
+    #[serde(rename = "approveSession")]
+    ApproveSession { pid: u32 },
+
+    #[serde(rename = "rejectSession")]
+    RejectSession { pid: u32 },
+
     #[serde(rename = "renameSession")]
     RenameSession {
         #[serde(rename = "sessionId")]
@@ -274,6 +280,20 @@ async fn handle_message(msg: ClientMsg) -> ServerMsg {
 
         ClientMsg::OpenSession { pid, project_path } => {
             match crate::actions::open_session(pid, project_path) {
+                Ok(()) => ServerMsg::Ok,
+                Err(e) => ServerMsg::Error { message: e },
+            }
+        }
+
+        ClientMsg::ApproveSession { pid } => {
+            match crate::actions::send_keystroke(pid, crate::actions::Keystroke::Approve) {
+                Ok(()) => ServerMsg::Ok,
+                Err(e) => ServerMsg::Error { message: e },
+            }
+        }
+
+        ClientMsg::RejectSession { pid } => {
+            match crate::actions::send_keystroke(pid, crate::actions::Keystroke::Reject) {
                 Ok(()) => ServerMsg::Ok,
                 Err(e) => ServerMsg::Error { message: e },
             }

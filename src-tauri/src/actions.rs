@@ -132,6 +132,10 @@ fn focus_iterm2_session(pid: u32) -> Result<(), String> {
         return Ok(());
     };
 
+    // Match full /dev/<tty> path to avoid substring collisions
+    // (e.g. "ttys15" matching both "/dev/ttys15" and "/dev/ttys115")
+    let full_tty = format!("/dev/{}", tty);
+
     // AppleScript: iterate all iTerm2 sessions, match by tty, focus it
     let script = format!(
         r#"
@@ -140,7 +144,7 @@ fn focus_iterm2_session(pid: u32) -> Result<(), String> {
             repeat with w in windows
                 repeat with t in tabs of w
                     repeat with s in sessions of t
-                        if tty of s ends with "{tty}" then
+                        if tty of s is "{full_tty}" then
                             select s
                             select t
                             set index of w to 1
@@ -152,7 +156,7 @@ fn focus_iterm2_session(pid: u32) -> Result<(), String> {
             return "not found"
         end tell
         "#,
-        tty = tty
+        full_tty = full_tty
     );
 
     let output = Command::new("osascript")
@@ -860,6 +864,210 @@ fn get_app_name(comm: &str) -> Option<&'static str> {
 /// Returns true if the app_name is a JetBrains IDE
 fn is_jetbrains_ide(app_name: &str) -> bool {
     jetbrains_url_scheme(app_name).is_some()
+}
+
+// ── Keystroke injection (approve/reject) ───────────────────────────
+
+/// The keystroke to inject into a terminal session
+pub enum Keystroke {
+    /// Send Enter to approve a tool-use permission prompt
+    Approve,
+    /// Send Escape to reject a tool-use permission prompt
+    Reject,
+}
+
+/// Send a keystroke (approve/reject) to the terminal hosting a Claude Code session.
+///
+/// Routing logic:
+/// 1. Detect terminal type via find_parent_app
+/// 2. Get TTY via get_session_tty
+/// 3. Try tmux first (works for any terminal)
+/// 4. Fall back to iTerm2 AppleScript if no tmux pane found
+/// 5. Error for unsupported terminals
+pub fn send_keystroke(pid: u32, keystroke: Keystroke) -> Result<(), String> {
+    let action_name = match &keystroke {
+        Keystroke::Approve => "approve",
+        Keystroke::Reject => "reject",
+    };
+
+    crate::debug_log::log_info(&format!(
+        "[send_keystroke] {} for PID: {}",
+        action_name, pid
+    ));
+
+    let app_name = find_parent_app(pid)?;
+    crate::debug_log::log_info(&format!(
+        "[send_keystroke] Terminal app: {}",
+        app_name
+    ));
+
+    // Get TTY — works on macOS and Linux (ps -o tty= is POSIX)
+    #[cfg(target_os = "macos")]
+    let tty = get_session_tty(pid);
+
+    #[cfg(not(target_os = "macos"))]
+    let tty = get_process_tty_portable(pid);
+
+    // Try tmux first — works on any platform, no focus needed
+    if let Some(ref tty_val) = tty {
+        crate::debug_log::log_info(&format!("[send_keystroke] TTY: {}", tty_val));
+
+        if let Some(pane_id) = check_tmux_pane(tty_val) {
+            crate::debug_log::log_info(&format!(
+                "[send_keystroke] Found tmux pane: {}", pane_id
+            ));
+            return send_keystroke_tmux(&pane_id, &keystroke);
+        }
+    }
+
+    // iTerm2 fallback (macOS only)
+    #[cfg(target_os = "macos")]
+    if let Some(ref tty_val) = tty {
+        if app_name == "iTerm" || app_name == "iTerm2" {
+            crate::debug_log::log_info("[send_keystroke] Using iTerm2 AppleScript adapter");
+            return send_keystroke_iterm2(tty_val, &keystroke);
+        }
+    }
+
+    Err(format!(
+        "Approve/reject not yet supported for {}. Supported: tmux, iTerm2",
+        app_name
+    ))
+}
+
+/// Get the controlling TTY of a process (non-macOS fallback).
+#[cfg(not(target_os = "macos"))]
+fn get_process_tty_portable(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-o", "tty=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if tty.is_empty() || tty == "?" || tty == "??" {
+        None
+    } else {
+        Some(tty)
+    }
+}
+
+fn check_tmux_pane(tty: &str) -> Option<String> {
+    let output = Command::new("tmux")
+        .args(["list-panes", "-a", "-F", "#{pane_tty}\t#{pane_id}"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        // tmux not running or not installed
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let mut parts = line.splitn(2, '\t');
+        if let (Some(pane_tty), Some(pane_id)) = (parts.next(), parts.next()) {
+            // ps reports tty as "ttys005", tmux reports "/dev/ttys005"
+            if pane_tty.ends_with(tty) {
+                return Some(pane_id.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn send_keystroke_tmux(pane_id: &str, keystroke: &Keystroke) -> Result<(), String> {
+    let key = match keystroke {
+        Keystroke::Approve => "Enter",
+        Keystroke::Reject => "Escape",
+    };
+
+    let output = Command::new("tmux")
+        .args(["send-keys", "-t", pane_id, key])
+        .output()
+        .map_err(|e| format!("Failed to execute tmux send-keys: {}", e))?;
+
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("tmux send-keys failed: {}", error));
+    }
+
+    crate::debug_log::log_info(&format!(
+        "[send_keystroke] Sent {} via tmux to pane {}",
+        key, pane_id
+    ));
+    Ok(())
+}
+
+/// Send a keystroke to an iTerm2 session matched by TTY.
+///
+/// Uses AppleScript to find the session with matching TTY and inject the keystroke.
+/// Does NOT activate iTerm2 — works entirely in the background without stealing focus.
+#[cfg(target_os = "macos")]
+fn send_keystroke_iterm2(tty: &str, keystroke: &Keystroke) -> Result<(), String> {
+    // Approve: write empty string — `write text` appends a newline by default,
+    //          so this sends just Enter, which selects the default option 1 "Yes".
+    // Reject: write the ESC byte with `newline no` — without `newline no`, an
+    //         implicit \n would follow ESC and immediately submit option 1.
+    let write_action = match keystroke {
+        Keystroke::Approve => r#"tell s to write text """#.to_string(),
+        Keystroke::Reject => {
+            r#"tell s to write text (ASCII character 27) newline no"#.to_string()
+        }
+    };
+
+    // Match full /dev/<tty> path to avoid substring collisions like
+    // "ttys15" matching both "/dev/ttys15" and "/dev/ttys115".
+    let full_tty = format!("/dev/{}", tty);
+
+    let script = format!(
+        r#"
+        tell application "iTerm2"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    repeat with s in sessions of t
+                        if tty of s is "{full_tty}" then
+                            {write_action}
+                            return "sent"
+                        end if
+                    end repeat
+                end repeat
+            end repeat
+            return "not found"
+        end tell
+        "#,
+        full_tty = full_tty,
+        write_action = write_action
+    );
+
+    crate::debug_log::log_info(&format!(
+        "[send_keystroke] iTerm2 script: {}", script
+    ));
+
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| format!("Failed to run AppleScript: {}", e))?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        crate::debug_log::log_error(&format!("[send_keystroke] iTerm2 stderr: {}", stderr));
+    }
+
+    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    crate::debug_log::log_info(&format!(
+        "[send_keystroke] iTerm2 result: {}",
+        result
+    ));
+
+    if result == "not found" {
+        return Err(format!(
+            "Could not find iTerm2 session with TTY {}",
+            tty
+        ));
+    }
+
+    Ok(())
 }
 
 /// Stop a session by sending SIGTERM to the process

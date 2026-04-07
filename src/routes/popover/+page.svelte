@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
 	import { sortedSessions, statusSummary, sessions as sessionsStore, initializeSessionListeners } from '$lib/stores/sessions';
-	import { openSession, getSessions } from '$lib/api';
+	import { openSession, getSessions, approveSession, rejectSession } from '$lib/api';
 	import { SessionStatus } from '$lib/types';
+	import { canApproveReject } from '$lib/session-utils';
 	import type { Session } from '$lib/types';
 	import { invoke } from '@tauri-apps/api/core';
 	import { listen } from '@tauri-apps/api/event';
@@ -124,6 +125,24 @@
 		}
 	}
 
+	async function handleApprove(e: Event, session: Session) {
+		e.stopPropagation();
+		try {
+			await approveSession(session.pid);
+		} catch (error) {
+			console.error('Failed to approve:', error);
+		}
+	}
+
+	async function handleReject(e: Event, session: Session) {
+		e.stopPropagation();
+		try {
+			await rejectSession(session.pid);
+		} catch (error) {
+			console.error('Failed to reject:', error);
+		}
+	}
+
 	async function openMainWindow() {
 		try {
 			await invoke('show_main_window');
@@ -166,6 +185,19 @@
 						<div class="card-top">
 							<span class="session-dot" style="background: {getStatusColor(session.status)}"></span>
 							<span class="session-project">{session.sessionName}</span>
+							{#if canApproveReject(session)}
+								<span class="popover-action approve" role="button" tabindex="0" onclick={(e) => handleApprove(e, session)} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleApprove(e, session); }} title="Approve">
+									<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+										<polyline points="20 6 9 17 4 12" />
+									</svg>
+								</span>
+								<span class="popover-action reject" role="button" tabindex="0" onclick={(e) => handleReject(e, session)} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleReject(e, session); }} title="Reject">
+									<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+										<line x1="18" y1="6" x2="6" y2="18" />
+										<line x1="6" y1="6" x2="18" y2="18" />
+									</svg>
+								</span>
+							{/if}
 							<svg aria-hidden="true" class="open-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 								<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
 								<polyline points="15 3 21 3 21 9" />
@@ -349,6 +381,34 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+
+	.popover-action {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		width: 20px;
+		height: 20px;
+		padding: 0;
+		border: none;
+		background: none;
+		color: var(--text-muted);
+		cursor: pointer;
+		opacity: 0;
+		transition: opacity var(--transition-fast), color var(--transition-fast);
+	}
+
+	.session-card:hover .popover-action {
+		opacity: 1;
+	}
+
+	.popover-action.approve:hover {
+		color: var(--status-input);
+	}
+
+	.popover-action.reject:hover {
+		color: var(--status-permission);
 	}
 
 	.open-icon {

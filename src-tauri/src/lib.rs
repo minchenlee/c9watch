@@ -20,7 +20,9 @@ pub mod web_server;
 pub mod cli;
 
 #[cfg(feature = "gui")]
-use actions::{open_session as open_session_action, stop_session as stop_session_action};
+use actions::{
+    open_session as open_session_action, stop_session as stop_session_action, Keystroke,
+};
 #[cfg(feature = "gui")]
 use polling::{detect_and_enrich_sessions, start_polling, Session};
 #[cfg(feature = "gui")]
@@ -147,6 +149,18 @@ async fn stop_session(app: AppHandle, pid: u32) -> Result<(), String> {
 #[tauri::command]
 async fn open_session(pid: u32, project_path: String) -> Result<(), String> {
     open_session_action(pid, project_path)
+}
+
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn approve_session(pid: u32) -> Result<(), String> {
+    actions::send_keystroke(pid, Keystroke::Approve)
+}
+
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn reject_session(pid: u32) -> Result<(), String> {
+    actions::send_keystroke(pid, Keystroke::Reject)
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -515,6 +529,8 @@ pub fn run() {
             reveal_in_file_manager,
             stop_session,
             open_session,
+            approve_session,
+            reject_session,
             rename_session,
             get_terminal_title,
             show_main_window,

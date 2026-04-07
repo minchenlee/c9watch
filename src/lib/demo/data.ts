@@ -85,7 +85,8 @@ export function getDemoSessions(): Session[] {
 			modified: minutesAgo(2),
 			status: SessionStatus.NeedsAttention,
 			latestMessage: 'I need to write to src/auth/providers.ts — may I proceed?',
-			pendingToolName: 'Write'
+			pendingToolName: 'Write',
+			pendingToolInput: { file_path: 'src/auth/providers.ts' }
 		},
 		{
 			id: 'demo-2',
@@ -100,7 +101,8 @@ export function getDemoSessions(): Session[] {
 			modified: minutesAgo(5),
 			status: SessionStatus.Working,
 			latestMessage: 'Running the profiler on the VirtualizedTable component to identify the bottleneck...',
-			pendingToolName: null
+			pendingToolName: null,
+			pendingToolInput: null
 		},
 
 		// Project 2: api-server — NeedsAttention + Working
@@ -117,7 +119,8 @@ export function getDemoSessions(): Session[] {
 			modified: minutesAgo(1),
 			status: SessionStatus.NeedsAttention,
 			latestMessage: 'I need to run `npm install ioredis` — allow?',
-			pendingToolName: 'Bash'
+			pendingToolName: 'Bash',
+			pendingToolInput: { command: 'npm install ioredis' }
 		},
 		{
 			id: 'demo-4',
@@ -132,7 +135,8 @@ export function getDemoSessions(): Session[] {
 			modified: minutesAgo(8),
 			status: SessionStatus.Working,
 			latestMessage: 'Writing test case for subscription renewal webhook with idempotency check...',
-			pendingToolName: null
+			pendingToolName: null,
+			pendingToolInput: null
 		},
 
 		// Project 3: cli-tools — WaitingForInput x2
@@ -149,7 +153,8 @@ export function getDemoSessions(): Session[] {
 			modified: minutesAgo(15),
 			status: SessionStatus.WaitingForInput,
 			latestMessage: 'Done! The wizard is at src/commands/init.ts. Run `cli-tools init` to try it.',
-			pendingToolName: null
+			pendingToolName: null,
+			pendingToolInput: null
 		},
 		{
 			id: 'demo-6',
@@ -164,7 +169,8 @@ export function getDemoSessions(): Session[] {
 			modified: minutesAgo(60),
 			status: SessionStatus.WaitingForInput,
 			latestMessage: 'All 14 command handlers have been migrated to the Result pattern. Tests pass.',
-			pendingToolName: null
+			pendingToolName: null,
+			pendingToolInput: null
 		}
 	];
 }

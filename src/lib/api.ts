@@ -50,6 +50,32 @@ export async function stopSession(pid: number): Promise<void> {
 }
 
 /**
+ * Approve a pending tool-use permission prompt
+ */
+export async function approveSession(pid: number): Promise<void> {
+	if (get(isDemoMode)) return;
+
+	if (useWebSocket()) {
+		await wsClient.request('approveSession', { pid });
+		return;
+	}
+	await invoke<void>('approve_session', { pid });
+}
+
+/**
+ * Reject a pending tool-use permission prompt
+ */
+export async function rejectSession(pid: number): Promise<void> {
+	if (get(isDemoMode)) return;
+
+	if (useWebSocket()) {
+		await wsClient.request('rejectSession', { pid });
+		return;
+	}
+	await invoke<void>('reject_session', { pid });
+}
+
+/**
  * Open the terminal or IDE window for a session
  */
 export async function openSession(pid: number, projectPath: string): Promise<void> {
