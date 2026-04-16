@@ -3,6 +3,7 @@ use crate::session::sanitize::strip_system_tags;
 use clap::{Parser, Subcommand};
 use std::process;
 
+pub mod pm_daemon;
 pub mod pm_fs;
 pub mod pm_rpc;
 pub mod pm_worker;
