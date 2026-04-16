@@ -3,6 +3,7 @@ use crate::session::sanitize::strip_system_tags;
 use clap::{Parser, Subcommand};
 use std::process;
 
+pub mod pm;
 pub mod pm_daemon;
 pub mod pm_fs;
 pub mod pm_rpc;
@@ -112,6 +113,49 @@ pub enum Commands {
         /// Session ID (UUID or unique prefix)
         session_id: String,
     },
+
+    /// Spawn a new worker session managed by c9watch
+    Spawn {
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        append_system_prompt: Option<String>,
+        #[arg(long)]
+        append_system_prompt_file: Option<String>,
+        #[arg(long, default_value = "bypassPermissions")]
+        permission_mode: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        add_dir: Vec<String>,
+    },
+
+    /// Send a message to a spawned worker session
+    Send {
+        session_id: String,
+        #[arg(long)]
+        message: Option<String>,
+        #[arg(long)]
+        stdin: bool,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        wait: bool,
+        #[arg(long, default_value = "300")]
+        timeout: u64,
+    },
+
+    /// List workers spawned by c9watch
+    Workers {
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// [hidden] Run the PM daemon
+    #[command(hide = true)]
+    Daemon,
 }
 
 /// Run the CLI and return the exit code.
@@ -140,6 +184,39 @@ pub fn run(cli: Cli) {
             changes_only,
         } => cmd_watch(interval, project.as_deref(), compact, changes_only),
         Commands::Tasks { session_id } => cmd_tasks(&session_id, cli.pretty),
+        Commands::Spawn {
+            cwd,
+            name,
+            append_system_prompt,
+            append_system_prompt_file,
+            permission_mode,
+            model,
+            add_dir,
+        } => pm::cmd_spawn(
+            cwd,
+            name,
+            append_system_prompt,
+            append_system_prompt_file,
+            permission_mode,
+            model,
+            add_dir,
+            cli.pretty,
+        ),
+        Commands::Send {
+            session_id,
+            message,
+            stdin,
+            file,
+            wait,
+            timeout,
+        } => pm::cmd_send(session_id, message, stdin, file, wait, timeout, cli.pretty),
+        Commands::Workers { all } => pm::cmd_workers(all, cli.pretty),
+        Commands::Daemon => {
+            match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt.block_on(pm_daemon::run_daemon()),
+                Err(e) => Err(format!("Failed to create tokio runtime: {}", e)),
+            }
+        }
     };
 
     if let Err(e) = result {
@@ -149,7 +226,7 @@ pub fn run(cli: Cli) {
     }
 }
 
-fn print_json(value: &impl serde::Serialize, pretty: bool) -> Result<(), String> {
+pub fn print_json(value: &impl serde::Serialize, pretty: bool) -> Result<(), String> {
     let output = if pretty {
         serde_json::to_string_pretty(value)
     } else {
