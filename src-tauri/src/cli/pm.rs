@@ -107,7 +107,25 @@ pub fn ensure_daemon() -> Result<(), String> {
 
 fn daemon_rpc(request: &RpcRequest, timeout: Duration) -> Result<serde_json::Value, String> {
     let sock_path = pm_fs::daemon_sock_path()?;
-    pm_rpc::rpc_call(&sock_path, request, timeout)
+    let response = pm_rpc::rpc_call(&sock_path, request, timeout)?;
+
+    // If the daemon returned ok:false, print the error JSON and exit 1
+    if response.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        let err_code = response
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UNKNOWN");
+        let details = response
+            .get("details")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if details.is_empty() {
+            return Err(err_code.to_string());
+        }
+        return Err(format!("{}: {}", err_code, details));
+    }
+
+    Ok(response)
 }
 
 // ── Subcommand handlers ───────────────────────────────────────────────
