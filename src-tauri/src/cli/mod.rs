@@ -5,6 +5,7 @@ use std::process;
 
 pub mod pm_fs;
 pub mod pm_rpc;
+pub mod pm_worker;
 
 #[derive(Parser)]
 #[command(
