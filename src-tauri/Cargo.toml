@@ -33,7 +33,7 @@ gui = [
     "dep:base64",
     "dep:tauri-nspanel",
 ]
-cli = ["dep:clap", "dep:regex"]
+cli = ["dep:clap", "dep:regex", "dep:tokio"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
@@ -48,6 +48,7 @@ thiserror = "1.0"
 dirs = "5.0"
 chrono = "0.4"
 libc = "0.2.180"
+uuid = { version = "1", features = ["v4"] }
 
 # ── GUI-only dependencies ────────────────────────────────────────────
 tauri = { version = "2", features = ["tray-icon"], optional = true }
@@ -57,7 +58,7 @@ tauri-plugin-updater = { version = "2", optional = true }
 tauri-plugin-process = { version = "2", optional = true }
 tauri-plugin-sharekit = { version = "0.3", optional = true }
 axum = { version = "0.7", features = ["ws"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "process", "signal", "fs", "time", "macros"], optional = true }
 rand = { version = "0.8", optional = true }
 qr2term = { version = "0.3", optional = true }
 rust-embed = { version = "8", optional = true }
