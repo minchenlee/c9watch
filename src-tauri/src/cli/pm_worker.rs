@@ -23,10 +23,14 @@ pub struct WorkerHandle {
     pub meta: WorkerMeta,
     child: Child,
     stdin_tx: mpsc::Sender<StdinMessage>,
-    result_rx: mpsc::Receiver<TurnResult>,
+    /// Wrapped in Option so it can be taken out while waiting without holding
+    /// the daemon state Mutex (fix C2: avoid blocking all RPCs during wait).
+    result_rx: Option<mpsc::Receiver<TurnResult>>,
     /// Held so the channel stays open as long as the handle lives.
     #[allow(dead_code)]
     result_tx: mpsc::Sender<TurnResult>,
+    /// Signals that the worker's stdout has produced its first line (fix I5).
+    ready_rx: Option<oneshot::Receiver<()>>,
 }
 
 // ── WorkerHandle impl ────────────────────────────────────────────────────────
@@ -104,6 +108,7 @@ impl WorkerHandle {
         // Channels
         let (stdin_tx, stdin_rx) = mpsc::channel::<StdinMessage>(32);
         let (result_tx, result_rx) = mpsc::channel::<TurnResult>(16);
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
 
         // Resolve log paths once (synchronous, cheap)
         let stdout_log_path = pm_fs::worker_stdout_log_path(&session_id)
@@ -117,6 +122,7 @@ impl WorkerHandle {
             child_stdout,
             stdout_log_path,
             result_tx.clone(),
+            Some(ready_tx),
         ));
         tokio::spawn(stderr_tee_task(child_stderr, stderr_log_path));
 
@@ -124,8 +130,9 @@ impl WorkerHandle {
             meta,
             child,
             stdin_tx,
-            result_rx,
+            result_rx: Some(result_rx),
             result_tx,
+            ready_rx: Some(ready_rx),
         })
     }
 
@@ -149,10 +156,39 @@ impl WorkerHandle {
     ///
     /// Returns `Err("WAIT_TIMEOUT")` if the timeout elapses before a result arrives.
     pub async fn wait_for_turn(&mut self, timeout: Duration) -> Result<TurnResult, String> {
-        tokio::time::timeout(timeout, self.result_rx.recv())
+        let rx = self
+            .result_rx
+            .as_mut()
+            .ok_or("result_rx not available — another --wait is pending".to_string())?;
+        tokio::time::timeout(timeout, rx.recv())
             .await
             .map_err(|_| "WAIT_TIMEOUT".to_string())?
             .ok_or("result channel closed — worker stdout tee task exited".to_string())
+    }
+
+    /// Take the result receiver so it can be awaited outside the daemon state lock.
+    /// Returns `None` if already taken (i.e., another `--wait` is in flight).
+    pub fn take_result_receiver(&mut self) -> Option<mpsc::Receiver<TurnResult>> {
+        self.result_rx.take()
+    }
+
+    /// Return the result receiver after awaiting outside the lock.
+    pub fn return_result_receiver(&mut self, rx: mpsc::Receiver<TurnResult>) {
+        self.result_rx = Some(rx);
+    }
+
+    /// Wait until the worker's stdout produces its first line (proof of life).
+    /// Returns `Err` if the timeout expires before the worker emits anything.
+    pub async fn wait_ready(&mut self, timeout: Duration) -> Result<(), String> {
+        let rx = match self.ready_rx.take() {
+            Some(r) => r,
+            // Already fired — worker was already ready
+            None => return Ok(()),
+        };
+        tokio::time::timeout(timeout, rx)
+            .await
+            .map_err(|_| "SPAWN_TIMEOUT: worker did not emit output within timeout".to_string())?
+            .map_err(|_| "SPAWN_FAILED: ready channel dropped before signal".to_string())
     }
 
     /// Returns `true` if the child process is still running.
@@ -221,10 +257,13 @@ async fn stdin_writer_task(
 
 /// Reads stdout line-by-line, appends to stdout.log, and sends TurnResults
 /// whenever a `"type":"result"` event is seen.
+///
+/// `ready_tx`: if `Some`, fired once on the first line of output (fix I5).
 async fn stdout_tee_task(
     stdout: tokio::process::ChildStdout,
     log_path: PathBuf,
     result_tx: mpsc::Sender<TurnResult>,
+    mut ready_tx: Option<oneshot::Sender<()>>,
 ) {
     use tokio::fs::OpenOptions;
 
@@ -257,6 +296,11 @@ async fn stdout_tee_task(
                 break;
             }
         };
+
+        // Signal readiness on first line of output (fix I5)
+        if let Some(tx) = ready_tx.take() {
+            let _ = tx.send(());
+        }
 
         // Append to log
         if let Some(ref mut f) = log_file {

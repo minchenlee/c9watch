@@ -219,6 +219,32 @@ async fn handle_spawn(
         st.workers.insert(session_id.clone(), worker);
     }
 
+    // Wait for worker readiness (first stdout event) before returning (fix I5).
+    // Lock briefly to call wait_ready, which only holds until the oneshot fires.
+    // We cannot hold the lock across the await, so we take a short-lived lock
+    // per poll — but wait_ready is a single async await, so we grab the lock,
+    // call the future, release the lock once it resolves.
+    //
+    // Because wait_ready uses a oneshot it completes in one await, so the lock
+    // is held only for the duration of that single .await.
+    let ready_result = {
+        let mut st = state.lock().await;
+        if let Some(worker) = st.workers.get_mut(&session_id) {
+            worker.wait_ready(Duration::from_secs(15)).await
+        } else {
+            Err("Worker disappeared immediately after insert".to_string())
+        }
+    };
+
+    if let Err(e) = ready_result {
+        // Worker failed to initialize — clean up
+        let mut st = state.lock().await;
+        if let Some(mut w) = st.workers.remove(&session_id) {
+            let _ = w.kill().await;
+        }
+        return serde_json::json!({ "ok": false, "error": format!("SPAWN_FAILED: {}", e) });
+    }
+
     serde_json::json!({
         "ok": true,
         "sessionId": session_id,
@@ -245,17 +271,35 @@ async fn handle_send(
         }
     };
 
-    // Send message (lock, send, release)
-    {
-        let st = state.lock().await;
-        let worker = match st.workers.get(&full_id) {
+    // Lock briefly: send the message and take the result receiver (fix C2).
+    // The receiver is taken out so we can await it WITHOUT holding the lock,
+    // which would block all other RPCs for up to `timeout_ms` milliseconds.
+    let (sent_ok, rx_opt) = {
+        let mut st = state.lock().await;
+        let worker = match st.workers.get_mut(&full_id) {
             Some(w) => w,
             None => return serde_json::json!({ "ok": false, "error": "WORKER_NOT_FOUND" }),
         };
-        if let Err(e) = worker.send_message(&text).await {
-            return serde_json::json!({ "ok": false, "error": e });
+        match worker.send_message(&text).await {
+            Err(e) => return serde_json::json!({ "ok": false, "error": e }),
+            Ok(()) => {}
         }
-    }
+        let rx = if wait && timeout_ms > 0 {
+            match worker.take_result_receiver() {
+                Some(r) => Some(r),
+                None => {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": "SEND_BUSY: another --wait is already pending for this worker",
+                    })
+                }
+            }
+        } else {
+            None
+        };
+        (true, rx)
+    };
+    let _ = sent_ok; // suppress unused warning
 
     if !wait || timeout_ms == 0 {
         return serde_json::json!({
@@ -265,16 +309,23 @@ async fn handle_send(
         });
     }
 
-    // Wait for turn — hold the lock across wait_for_turn (acceptable for Phase 1)
-    let timeout = Duration::from_millis(timeout_ms);
-    let mut st = state.lock().await;
-    let worker = match st.workers.get_mut(&full_id) {
-        Some(w) => w,
-        None => return serde_json::json!({ "ok": false, "error": "WORKER_NOT_FOUND" }),
-    };
+    // rx_opt is Some here because wait && timeout_ms > 0
+    let mut rx = rx_opt.expect("rx must be Some when wait && timeout_ms > 0");
 
-    match worker.wait_for_turn(timeout).await {
-        Ok(turn) => serde_json::json!({
+    // Await the turn result WITHOUT holding the state lock (fix C2)
+    let timeout = Duration::from_millis(timeout_ms);
+    let turn_result = tokio::time::timeout(timeout, rx.recv()).await;
+
+    // Return the receiver so the worker can be used for future --wait calls
+    {
+        let mut st = state.lock().await;
+        if let Some(worker) = st.workers.get_mut(&full_id) {
+            worker.return_result_receiver(rx);
+        }
+    }
+
+    match turn_result {
+        Ok(Some(turn)) => serde_json::json!({
             "ok": true,
             "sessionId": full_id,
             "sent": true,
@@ -282,13 +333,16 @@ async fn handle_send(
             "assistantText": turn.assistant_text,
             "endedAt": turn.ended_at,
         }),
-        Err(e) if e == "WAIT_TIMEOUT" => serde_json::json!({
+        Ok(None) => serde_json::json!({
+            "ok": false,
+            "error": "result channel closed — worker stdout tee task exited",
+        }),
+        Err(_timeout) => serde_json::json!({
             "ok": true,
             "sessionId": full_id,
             "sent": true,
             "turnCompleted": false,
         }),
-        Err(e) => serde_json::json!({ "ok": false, "error": e }),
     }
 }
 

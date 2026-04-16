@@ -6,28 +6,58 @@ use std::time::Duration;
 // ── Daemon lifecycle ──────────────────────────────────────────────────
 
 /// Ensure the PM daemon is running. Starts it if not already alive.
+///
+/// An exclusive advisory flock on `daemon.pid` serializes concurrent callers
+/// so that only one process ever forks the daemon (fix C1).
 pub fn ensure_daemon() -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+
+    // Ensure directories exist before opening the pid file
+    pm_fs::ensure_dirs()?;
+
     let pid_path = pm_fs::daemon_pid_path()?;
     let sock_path = pm_fs::daemon_sock_path()?;
 
-    // If PID file exists, check if the process is still alive
+    // Open (or create) the pid file and take an exclusive advisory lock.
+    // This serializes concurrent `c9watch spawn` calls so only one ever forks.
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .open(&pid_path)
+        .map_err(|e| format!("Failed to open daemon.pid for locking: {}", e))?;
+
+    let fd = lock_file.as_raw_fd();
+    let lock_result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+
+    if lock_result != 0 {
+        // Another process holds the lock — it is starting the daemon.
+        // Wait up to 3 s for the socket to appear, then return.
+        drop(lock_file);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if sock_path.exists() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        return Err("Daemon failed to start within 3 seconds (waited for another process)".to_string());
+    }
+
+    // We hold the exclusive lock. Check if a healthy daemon is already running.
     if pid_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&pid_path) {
             if let Ok(pid) = content.trim().parse::<libc::pid_t>() {
                 let alive = unsafe { libc::kill(pid, 0) } == 0;
                 if alive && sock_path.exists() {
-                    // Daemon is running
+                    // Daemon is running — release lock and return
                     return Ok(());
                 }
             }
         }
         // Stale PID file — clean up
-        let _ = std::fs::remove_file(&pid_path);
         let _ = std::fs::remove_file(&sock_path);
     }
-
-    // Ensure directories exist
-    pm_fs::ensure_dirs()?;
 
     // Get current executable path
     let exe = std::env::current_exe()
@@ -35,13 +65,13 @@ pub fn ensure_daemon() -> Result<(), String> {
 
     // Open log file for append
     let log_path = pm_fs::daemon_log_path()?;
-    let log_file = std::fs::OpenOptions::new()
+    let log_file_out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
         .map_err(|e| format!("Failed to open daemon log {:?}: {}", log_path, e))?;
 
-    let log_file2 = log_file
+    let log_file_err = log_file_out
         .try_clone()
         .map_err(|e| format!("Failed to clone log file handle: {}", e))?;
 
@@ -49,12 +79,16 @@ pub fn ensure_daemon() -> Result<(), String> {
     Command::new(&exe)
         .arg("daemon")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file2))
+        .stdout(Stdio::from(log_file_out))
+        .stderr(Stdio::from(log_file_err))
         .spawn()
         .map_err(|e| format!("Failed to spawn daemon process: {}", e))?;
 
-    // Wait up to 3 seconds for the socket to appear
+    // Wait up to 3 seconds for the socket to appear.
+    // The flock is released when `lock_file` drops at the end of this scope,
+    // which happens after we return — that's fine because by then the daemon
+    // has written its own PID and the socket exists, so other callers will
+    // take the fast path above.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
         if sock_path.exists() {
@@ -172,7 +206,17 @@ pub fn cmd_send(
     };
 
     let response = daemon_rpc(&request, rpc_timeout)?;
-    crate::cli::print_json(&response, pretty)
+    crate::cli::print_json(&response, pretty)?;
+
+    // Exit code 2 when --wait timed out: message was sent but the turn did not
+    // complete within the requested timeout (fix I1).
+    if wait {
+        if let Some(false) = response.get("turnCompleted").and_then(|v| v.as_bool()) {
+            std::process::exit(2);
+        }
+    }
+
+    Ok(())
 }
 
 pub fn cmd_workers(all: bool, pretty: bool) -> Result<(), String> {
