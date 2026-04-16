@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use std::process;
 
 pub mod pm_fs;
+pub mod pm_rpc;
 
 #[derive(Parser)]
 #[command(
