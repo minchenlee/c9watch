@@ -3,6 +3,8 @@ use crate::session::sanitize::strip_system_tags;
 use clap::{Parser, Subcommand};
 use std::process;
 
+pub mod pm_fs;
+
 #[derive(Parser)]
 #[command(
     name = "c9watch",
