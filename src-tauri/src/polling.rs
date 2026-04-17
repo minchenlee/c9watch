@@ -3,13 +3,69 @@ pub use crate::session::enrichment::{detect_and_enrich_sessions, truncate_string
 use crate::session::{SessionDetector, SessionStatus};
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap as StdHashMap;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
+
+/// Cached overlay: session_id -> spawnedBy (i.e. worker_of).
+/// Invalidated when the `~/.claude/c9watch/workers/` dir mtime changes.
+static WORKERS_OVERLAY: LazyLock<StdMutex<Option<WorkersCache>>> =
+    LazyLock::new(|| StdMutex::new(None));
+
+struct WorkersCache {
+    dir_mtime: SystemTime,
+    map: StdHashMap<String, String>,
+}
+
+fn load_workers_overlay() -> StdHashMap<String, String> {
+    let workers_dir = match dirs::home_dir() {
+        Some(h) => h.join(".claude").join("c9watch").join("workers"),
+        None => return StdHashMap::new(),
+    };
+
+    let dir_mtime = match std::fs::metadata(&workers_dir).and_then(|m| m.modified()) {
+        Ok(m) => m,
+        Err(_) => return StdHashMap::new(),
+    };
+
+    if let Ok(guard) = WORKERS_OVERLAY.lock() {
+        if let Some(cache) = guard.as_ref() {
+            if cache.dir_mtime == dir_mtime {
+                return cache.map.clone();
+            }
+        }
+    }
+
+    let mut map = StdHashMap::new();
+    if let Ok(entries) = std::fs::read_dir(&workers_dir) {
+        for entry in entries.flatten() {
+            let meta_path = entry.path().join("meta.json");
+            if let Ok(content) = std::fs::read_to_string(&meta_path) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let sid = val.get("sessionId").and_then(|v| v.as_str());
+                    let by = val.get("spawnedBy").and_then(|v| v.as_str());
+                    if let (Some(sid), Some(by)) = (sid, by) {
+                        map.insert(sid.to_string(), by.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(mut guard) = WORKERS_OVERLAY.lock() {
+        *guard = Some(WorkersCache {
+            dir_mtime,
+            map: map.clone(),
+        });
+    }
+    map
+}
 
 /// Start the background polling loop
 ///
@@ -58,7 +114,17 @@ pub fn start_polling(
         loop {
             // Detect and enrich sessions
             match detect_and_enrich_sessions_with_detector(&mut detector) {
-                Ok((sessions, diagnostics)) => {
+                Ok((mut sessions, diagnostics)) => {
+                    // Overlay worker_of from ~/.claude/c9watch/workers/*/meta.json
+                    let overlay = load_workers_overlay();
+                    if !overlay.is_empty() {
+                        for s in sessions.iter_mut() {
+                            if let Some(by) = overlay.get(&s.id) {
+                                s.worker_of = Some(by.clone());
+                            }
+                        }
+                    }
+
                     // Track current session IDs to clean up stale entries
                     let current_session_ids: HashSet<String> =
                         sessions.iter().map(|s| s.id.clone()).collect();
