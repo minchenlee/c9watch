@@ -47,7 +47,7 @@ else
         echo "FAIL: expected spawnedBy=$FAKE_SID, got $SPAWNED_BY"
         exit 1
     fi
-    $C9W send "$WORKER_ID" --stop >/dev/null 2>&1 || true
+    $C9W stop "$WORKER_ID" >/dev/null 2>&1 || true
 fi
 
 rm -f "$FAKE_SESSION_FILE"
