@@ -180,7 +180,13 @@
 		<!-- Project & Stats Row -->
 		<div class="stats-row">
 			<span class="session-name-badge">{session.sessionName}</span>
-			
+			{#if session.workerOf}
+				<span
+					class="worker-badge"
+					title="Worker of {session.workerOf.slice(0, 8)}…"
+				>WORKER</span>
+			{/if}
+
 			{#if !compact}
 				<div class="stats-group">
 					<span class="message-count">
@@ -380,6 +386,22 @@
 		display: inline-block;
 		vertical-align: middle;
 		max-width: 100%;
+	}
+
+	.worker-badge {
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		font-weight: 500;
+		color: var(--accent-amber);
+		background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
+		padding: 2px 6px;
+		border: 1px solid color-mix(in srgb, var(--accent-amber) 40%, transparent);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		display: inline-block;
+		vertical-align: middle;
+		margin-left: 4px;
+		cursor: help;
 	}
 
 	.git-branch {
