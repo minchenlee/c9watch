@@ -162,6 +162,8 @@ pub fn cmd_spawn(
             .to_string()
     };
 
+    let spawned_by = crate::cli::pm_caller::detect_caller_session_id_default();
+
     let request = RpcRequest::Spawn {
         cwd: resolved_cwd,
         name,
@@ -169,6 +171,7 @@ pub fn cmd_spawn(
         permission_mode,
         model,
         add_dirs,
+        spawned_by,
     };
 
     let response = daemon_rpc(&request, Duration::from_secs(30))?;

@@ -18,6 +18,8 @@ pub enum RpcRequest {
         permission_mode: String,
         model: Option<String>,
         add_dirs: Vec<String>,
+        #[serde(rename = "spawnedBy")]
+        spawned_by: Option<String>,
     },
     #[serde(rename = "send")]
     Send {
@@ -112,10 +114,12 @@ mod tests {
             permission_mode: "default".to_string(),
             model: None,
             add_dirs: vec![],
+            spawned_by: Some("pm-session-abc".to_string()),
         };
         let json = serde_json::to_string(&req).expect("serialize should succeed");
         assert!(json.contains("\"op\":\"spawn\""), "should contain op:spawn, got: {}", json);
         assert!(json.contains("/Users/me/project"), "should contain cwd, got: {}", json);
+        assert!(json.contains("\"spawnedBy\":\"pm-session-abc\""), "should contain spawnedBy, got: {}", json);
     }
 
     #[test]

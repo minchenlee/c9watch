@@ -113,6 +113,7 @@ async fn handle_connection(
             permission_mode,
             model,
             add_dirs,
+            spawned_by,
         } => {
             handle_spawn(
                 state,
@@ -122,6 +123,7 @@ async fn handle_connection(
                 permission_mode,
                 model,
                 add_dirs,
+                spawned_by,
                 max_workers,
             )
             .await
@@ -168,6 +170,7 @@ async fn handle_spawn(
     permission_mode: String,
     model: Option<String>,
     add_dirs: Vec<String>,
+    spawned_by: Option<String>,
     max_workers: usize,
 ) -> serde_json::Value {
     // Check worker limit
@@ -201,7 +204,7 @@ async fn handle_spawn(
         canonical_cwd.clone(),
         name.clone(),
         args,
-        Some("pm-daemon".to_string()),
+        spawned_by.clone(),
     )
     .await
     {
@@ -252,6 +255,7 @@ async fn handle_spawn(
         "name": worker_name,
         "cwd": canonical_cwd,
         "spawnedAt": spawned_at,
+        "spawnedBy": spawned_by,
     })
 }
 
@@ -359,6 +363,7 @@ async fn handle_list(state: Arc<Mutex<DaemonState>>) -> serde_json::Value {
                 "name": worker.meta.name,
                 "cwd": worker.meta.cwd,
                 "spawnedAt": worker.meta.spawned_at,
+                "spawnedBy": worker.meta.spawned_by,
                 "alive": alive,
             })
         })
