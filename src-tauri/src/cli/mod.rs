@@ -84,10 +84,11 @@ pub enum Commands {
     #[command(name = "self")]
     SelfId,
 
-    /// Stop a running Claude session
+    /// Stop a session — a PM worker (if arg is a session ID or prefix) or a regular
+    /// Claude session (if arg is a numeric PID).
     Stop {
-        /// PID of the session to stop
-        pid: u32,
+        /// PID (numeric) for regular sessions, or session ID/prefix for PM workers
+        target: String,
     },
 
     /// Watch sessions for status changes (streams NDJSON)
@@ -177,7 +178,7 @@ pub fn run(cli: Cli) {
             limit,
         } => cmd_search(&query, project.as_deref(), limit, cli.pretty),
         Commands::SelfId => cmd_self(cli.pretty),
-        Commands::Stop { pid } => cmd_stop(pid, cli.pretty),
+        Commands::Stop { target } => cmd_stop(&target, cli.pretty),
         Commands::Watch {
             interval,
             project,
@@ -453,13 +454,19 @@ fn find_claude_ancestor(start_pid: u32) -> Option<u32> {
     None
 }
 
-fn cmd_stop(pid: u32, pretty: bool) -> Result<(), String> {
-    crate::actions::stop_session(pid)?;
-    let output = serde_json::json!({
-        "stopped": true,
-        "pid": pid,
-    });
-    print_json(&output, pretty)
+fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
+    // If target parses as u32, treat as PID (old behavior for non-PM sessions).
+    if let Ok(pid) = target.parse::<u32>() {
+        crate::actions::stop_session(pid)?;
+        let output = serde_json::json!({
+            "stopped": true,
+            "pid": pid,
+        });
+        return print_json(&output, pretty);
+    }
+
+    // Otherwise dispatch to the PM daemon as a PM worker stop.
+    pm::cmd_stop(target.to_string(), pretty)
 }
 
 fn cmd_watch(

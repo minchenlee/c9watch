@@ -178,8 +178,11 @@ c9watch tasks <session-id>
 
 ### `stop` — Stop a Session
 
+Accepts either a PID (for regular Claude sessions) or a session ID / prefix (for PM workers spawned via `c9watch spawn`). Numeric args are treated as PIDs and dispatched to the session-kill path; non-numeric args are sent to the PM daemon as a worker stop.
+
 ```bash
-c9watch stop <pid>
+c9watch stop <pid>                   # regular Claude session (by PID)
+c9watch stop <session-id-or-prefix>  # PM worker (via daemon RPC)
 ```
 
 ### `spawn` — Start a Worker Session

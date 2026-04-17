@@ -240,6 +240,13 @@ pub fn cmd_send(
     Ok(())
 }
 
+pub fn cmd_stop(session_id: String, pretty: bool) -> Result<(), String> {
+    ensure_daemon()?;
+    let request = RpcRequest::Stop { session_id };
+    let response = daemon_rpc(&request, Duration::from_secs(10))?;
+    crate::cli::print_json(&response, pretty)
+}
+
 pub fn cmd_workers(all: bool, pretty: bool) -> Result<(), String> {
     ensure_daemon()?;
 
