@@ -23,6 +23,36 @@ else
   echo "PASS"
 fi
 
+echo "=== Test 5: spawnedBy in workers listing is not hardcoded ==="
+FAKE_PID=$$
+FAKE_SESSION_DIR="$HOME/.claude/sessions"
+mkdir -p "$FAKE_SESSION_DIR"
+FAKE_SESSION_FILE="$FAKE_SESSION_DIR/${FAKE_PID}.json"
+FAKE_SID="test-pm-session-$(uuidgen)"
+echo "{\"pid\":${FAKE_PID},\"sessionId\":\"${FAKE_SID}\",\"cwd\":\"/tmp\",\"startedAt\":0,\"kind\":\"interactive\",\"entrypoint\":\"cli\"}" \
+    > "$FAKE_SESSION_FILE"
+
+TMP_CWD=$(mktemp -d)
+SPAWN_OUT=$($C9W spawn --cwd "$TMP_CWD" --name smoke-badge 2>/dev/null || true)
+WORKER_ID=$(echo "$SPAWN_OUT" | jq -r .sessionId 2>/dev/null || echo "")
+
+if [ -z "$WORKER_ID" ] || [ "$WORKER_ID" = "null" ]; then
+    echo "SKIP (needs claude CLI for actual spawn)"
+else
+    META="$HOME/.claude/c9watch/workers/$WORKER_ID/meta.json"
+    SPAWNED_BY=$(jq -r .spawnedBy "$META")
+    if [ "$SPAWNED_BY" = "$FAKE_SID" ]; then
+        echo "PASS"
+    else
+        echo "FAIL: expected spawnedBy=$FAKE_SID, got $SPAWNED_BY"
+        exit 1
+    fi
+    $C9W send "$WORKER_ID" --stop >/dev/null 2>&1 || true
+fi
+
+rm -f "$FAKE_SESSION_FILE"
+rmdir "$TMP_CWD" 2>/dev/null || true
+
 echo ""
 echo "=== Basic smoke tests passed (no Claude API calls) ==="
 echo ""
