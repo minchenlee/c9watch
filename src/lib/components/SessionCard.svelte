@@ -32,6 +32,8 @@
 	function tipMove(e: MouseEvent) { tooltipX = e.clientX + 12; tooltipY = e.clientY + 12; }
 
 	let cardTitle = $derived(session.customTitle || session.summary || session.firstPrompt);
+	let workerTip = $derived(session.workerOf ? `Worker of ${session.workerOf}` : '');
+	let workerIdShort = $derived(session.workerOf?.slice(0, 8) ?? '');
 
 	function getStatusColor(): string {
 		switch (session.status) {
@@ -147,7 +149,7 @@
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div
 				class="pm-prefix"
-				onmouseenter={() => tipEnter(`Worker of ${session.workerOf}`)}
+				onmouseenter={() => tipEnter(workerTip)}
 				onmouseleave={tipLeave}
 				onmousemove={tipMove}
 			>
@@ -155,7 +157,7 @@
 					<path d="M12 2l3 7h7l-5.5 4.5L18 22l-6-4-6 4 1.5-8.5L2 9h7z" />
 				</svg>
 				<span class="pm-prefix-label">Worker of</span>
-				<span class="pm-prefix-id">{session.workerOf.slice(0, 8)}</span>
+				<span class="pm-prefix-id">{workerIdShort}</span>
 			</div>
 		{/if}
 
@@ -202,7 +204,7 @@
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<span
 						class="worker-badge"
-						onmouseenter={() => tipEnter(`Worker of ${session.workerOf}`)}
+						onmouseenter={() => tipEnter(workerTip)}
 						onmouseleave={tipLeave}
 						onmousemove={tipMove}
 					>WORKER</span>
