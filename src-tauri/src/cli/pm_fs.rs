@@ -79,6 +79,17 @@ pub fn inbox_worker_dir(worker_session_id: &str) -> Result<PathBuf, String> {
     Ok(inbox_dir()?.join(worker_session_id))
 }
 
+/// Returns `~/.claude/c9watch/adoptions/`.
+pub fn adoptions_dir() -> Result<PathBuf, String> {
+    Ok(c9watch_dir()?.join("adoptions"))
+}
+
+/// Returns `~/.claude/c9watch/adoptions/<pm-session-id>.json`.
+pub fn adoption_file(pm_session_id: &str) -> Result<PathBuf, String> {
+    validate_session_id(pm_session_id)?;
+    Ok(adoptions_dir()?.join(format!("{}.json", pm_session_id)))
+}
+
 // ── Structs ───────────────────────────────────────────────────────────
 
 /// Arguments used to spawn a worker session.
@@ -135,6 +146,9 @@ pub fn ensure_dirs() -> Result<(), String> {
     let inbox = inbox_dir()?;
     std::fs::create_dir_all(&inbox)
         .map_err(|e| format!("Failed to create inbox dir {:?}: {}", inbox, e))?;
+    let adoptions = adoptions_dir()?;
+    std::fs::create_dir_all(&adoptions)
+        .map_err(|e| format!("Failed to create adoptions dir {:?}: {}", adoptions, e))?;
     Ok(())
 }
 
@@ -361,6 +375,19 @@ mod inbox_path_tests {
     fn inbox_worker_dir_rejects_traversal() {
         assert!(inbox_worker_dir("../etc").is_err());
         assert!(inbox_worker_dir("").is_err());
+    }
+
+    #[test]
+    fn adoption_file_includes_pm_id() {
+        let f = adoption_file("pm-abc").unwrap();
+        assert!(f.ends_with("pm-abc.json"));
+        assert!(f.starts_with(adoptions_dir().unwrap()));
+    }
+
+    #[test]
+    fn adoption_file_rejects_traversal() {
+        assert!(adoption_file("../etc").is_err());
+        assert!(adoption_file("").is_err());
     }
 
     #[test]
