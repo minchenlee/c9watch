@@ -1,8 +1,9 @@
 //! Inbox: async completion events from workers to their PM session.
 //!
-//! Events are plain JSON files at `~/.claude/c9watch/inbox/<pm-session-id>/<event-id>.json`.
-//! Workers write events (via `stdout_tee_task` in `pm_worker`); PMs read with
-//! `c9watch inbox`. No daemon involvement on read — it's pure filesystem.
+//! Events are plain JSON files at `~/.claude/c9watch/inbox/<worker-session-id>/<event-id>.json`.
+//! Keying by worker (stable) instead of PM (unstable across `/clear` and CC
+//! restarts) means old events survive PM identity change for free. Ownership
+//! is resolved by the daemon via `meta.pm_pid` + the adoption sidecar.
 
 use crate::cli::pm_fs;
 use chrono::Utc;
@@ -60,18 +61,18 @@ pub fn new_event_id() -> String {
     format!("{}-{}", ts, suffix)
 }
 
-fn event_path(pm_session_id: &str, event_id: &str) -> Result<PathBuf, String> {
-    Ok(pm_fs::inbox_pm_dir(pm_session_id)?.join(format!("{}.json", event_id)))
+fn event_path(worker_session_id: &str, event_id: &str) -> Result<PathBuf, String> {
+    Ok(pm_fs::inbox_worker_dir(worker_session_id)?.join(format!("{}.json", event_id)))
 }
 
-/// Write an event to disk. Creates the PM's inbox dir if needed.
+/// Write an event to disk. Creates the worker's inbox dir if needed.
 pub fn write_event(ev: &InboxEvent) -> Result<(), String> {
     pm_fs::validate_session_id(&ev.spawned_by)?;
     pm_fs::validate_session_id(&ev.session_id)?;
-    let dir = pm_fs::inbox_pm_dir(&ev.spawned_by)?;
+    let dir = pm_fs::inbox_worker_dir(&ev.session_id)?;
     std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Failed to create inbox pm dir {:?}: {}", dir, e))?;
-    let path = event_path(&ev.spawned_by, &ev.event_id)?;
+        .map_err(|e| format!("Failed to create inbox worker dir {:?}: {}", dir, e))?;
+    let path = event_path(&ev.session_id, &ev.event_id)?;
     let tmp = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(ev)
         .map_err(|e| format!("Failed to serialize inbox event: {}", e))?;
@@ -82,9 +83,9 @@ pub fn write_event(ev: &InboxEvent) -> Result<(), String> {
     Ok(())
 }
 
-/// List events for a PM, newest first (by filename, which embeds an ISO timestamp).
-pub fn list(pm_session_id: &str) -> Result<Vec<InboxEvent>, String> {
-    Ok(list_with_paths(pm_session_id)?
+/// List events for a worker, newest first (by filename, which embeds an ISO timestamp).
+pub fn list(worker_session_id: &str) -> Result<Vec<InboxEvent>, String> {
+    Ok(list_with_paths(worker_session_id)?
         .into_iter()
         .map(|(_, ev)| ev)
         .collect())
@@ -93,8 +94,8 @@ pub fn list(pm_session_id: &str) -> Result<Vec<InboxEvent>, String> {
 /// Like `list`, but also returns the on-disk path for each event so callers
 /// (e.g. `consume`) can delete exactly the files they observed — avoiding the
 /// race where events written between `list()` and a bulk `clear()` are lost.
-pub fn list_with_paths(pm_session_id: &str) -> Result<Vec<(PathBuf, InboxEvent)>, String> {
-    let dir = pm_fs::inbox_pm_dir(pm_session_id)?;
+pub fn list_with_paths(worker_session_id: &str) -> Result<Vec<(PathBuf, InboxEvent)>, String> {
+    let dir = pm_fs::inbox_worker_dir(worker_session_id)?;
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -116,9 +117,9 @@ pub fn list_with_paths(pm_session_id: &str) -> Result<Vec<(PathBuf, InboxEvent)>
     Ok(out)
 }
 
-/// Delete all events for a PM. Returns count removed.
-pub fn clear(pm_session_id: &str) -> Result<usize, String> {
-    let dir = pm_fs::inbox_pm_dir(pm_session_id)?;
+/// Delete all events for a worker. Returns count removed.
+pub fn clear(worker_session_id: &str) -> Result<usize, String> {
+    let dir = pm_fs::inbox_worker_dir(worker_session_id)?;
     if !dir.exists() {
         return Ok(0);
     }
@@ -141,8 +142,8 @@ pub fn clear(pm_session_id: &str) -> Result<usize, String> {
 /// Only deletes the files observed by the initial `list_with_paths` call —
 /// events written between the listing and the deletes are left untouched so
 /// callers don't silently lose them.
-pub fn consume(pm_session_id: &str) -> Result<Vec<InboxEvent>, String> {
-    let listed = list_with_paths(pm_session_id)?;
+pub fn consume(worker_session_id: &str) -> Result<Vec<InboxEvent>, String> {
+    let listed = list_with_paths(worker_session_id)?;
     let mut events = Vec::with_capacity(listed.len());
     for (path, ev) in listed {
         match std::fs::remove_file(&path) {
@@ -165,15 +166,15 @@ mod tests {
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-    /// Use a unique PM id per test so tests don't interact via the real
+    /// Use a unique worker id per test so tests don't interact via the real
     /// `$HOME/.claude/c9watch/inbox/` dir. Cleans up after itself.
-    struct TestPm(String);
+    struct TestWorker(String);
 
-    impl TestPm {
+    impl TestWorker {
         fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
             let id = format!(
-                "test-pm-{}-{}",
+                "test-w-{}-{}",
                 std::process::id(),
                 n
             );
@@ -182,19 +183,19 @@ mod tests {
         fn id(&self) -> &str { &self.0 }
     }
 
-    impl Drop for TestPm {
+    impl Drop for TestWorker {
         fn drop(&mut self) {
             let _ = clear(&self.0);
-            if let Ok(dir) = pm_fs::inbox_pm_dir(&self.0) {
+            if let Ok(dir) = pm_fs::inbox_worker_dir(&self.0) {
                 let _ = std::fs::remove_dir(&dir);
             }
         }
     }
 
-    fn make_event(pm: &str, session: &str, status: EventStatus) -> InboxEvent {
+    fn make_event(pm: &str, worker: &str, status: EventStatus) -> InboxEvent {
         InboxEvent {
             event_id: new_event_id(),
-            session_id: session.to_string(),
+            session_id: worker.to_string(),
             spawned_by: pm.to_string(),
             status,
             finished_at: Utc::now().to_rfc3339(),
@@ -209,64 +210,57 @@ mod tests {
 
     #[test]
     fn write_then_list_returns_the_event() {
-        let pm = TestPm::new();
-        let ev = make_event(pm.id(), "worker-1", EventStatus::Done);
+        let w = TestWorker::new();
+        let ev = make_event("any-pm-ok", w.id(), EventStatus::Done);
         write_event(&ev).unwrap();
-        let listed = list(pm.id()).unwrap();
+        let listed = list(w.id()).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0], ev);
     }
 
     #[test]
     fn list_returns_newest_first() {
-        let pm = TestPm::new();
-        let e1 = make_event(pm.id(), "worker-1", EventStatus::Done);
+        let w = TestWorker::new();
+        let e1 = make_event("pm-1", w.id(), EventStatus::Done);
         write_event(&e1).unwrap();
-        // Sleep enough for the millisecond-resolution timestamp in the event_id
-        // to advance.
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let e2 = make_event(pm.id(), "worker-2", EventStatus::Done);
+        let e2 = make_event("pm-2", w.id(), EventStatus::Done);
         write_event(&e2).unwrap();
-        let listed = list(pm.id()).unwrap();
+        let listed = list(w.id()).unwrap();
         assert_eq!(listed.len(), 2);
-        assert_eq!(listed[0].session_id, "worker-2", "newest should come first");
-        assert_eq!(listed[1].session_id, "worker-1");
+        assert_eq!(listed[0].spawned_by, "pm-2", "newest should come first");
+        assert_eq!(listed[1].spawned_by, "pm-1");
     }
 
     #[test]
     fn consume_returns_and_removes() {
-        let pm = TestPm::new();
-        let ev = make_event(pm.id(), "worker-1", EventStatus::Done);
+        let w = TestWorker::new();
+        let ev = make_event("pm-x", w.id(), EventStatus::Done);
         write_event(&ev).unwrap();
-        let consumed = consume(pm.id()).unwrap();
+        let consumed = consume(w.id()).unwrap();
         assert_eq!(consumed.len(), 1);
-        assert_eq!(list(pm.id()).unwrap().len(), 0);
+        assert_eq!(list(w.id()).unwrap().len(), 0);
     }
 
     #[test]
     fn consume_preserves_events_written_after_list() {
-        // Regression test for the list-then-clear race: simulate a consume where
-        // the caller has observed 3 events via `list_with_paths`, then a 4th event
-        // arrives before the deletes happen. The 4th must NOT be wiped.
-        let pm = TestPm::new();
-        let e1 = make_event(pm.id(), "w1", EventStatus::Done);
-        let e2 = make_event(pm.id(), "w2", EventStatus::Done);
-        let e3 = make_event(pm.id(), "w3", EventStatus::Done);
+        // Regression test for the list-then-clear race.
+        let w = TestWorker::new();
+        let e1 = make_event("pm-a", w.id(), EventStatus::Done);
+        let e2 = make_event("pm-b", w.id(), EventStatus::Done);
+        let e3 = make_event("pm-c", w.id(), EventStatus::Done);
         write_event(&e1).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
         write_event(&e2).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
         write_event(&e3).unwrap();
 
-        // Take a snapshot like consume() does internally.
-        let listed = list_with_paths(pm.id()).unwrap();
+        let listed = list_with_paths(w.id()).unwrap();
         assert_eq!(listed.len(), 3);
 
-        // A 4th event arrives after the snapshot but before the deletes happen.
-        let e4 = make_event(pm.id(), "w4", EventStatus::Done);
+        let e4 = make_event("pm-d", w.id(), EventStatus::Done);
         write_event(&e4).unwrap();
 
-        // Mimic consume: only delete files we observed in the listing.
         for (path, _) in &listed {
             match std::fs::remove_file(path) {
                 Ok(()) => {}
@@ -275,23 +269,22 @@ mod tests {
             }
         }
 
-        // e4 must still be on disk.
-        let remaining = list(pm.id()).unwrap();
+        let remaining = list(w.id()).unwrap();
         assert_eq!(remaining.len(), 1, "e4 should survive consume of e1..e3");
-        assert_eq!(remaining[0].session_id, "w4");
+        assert_eq!(remaining[0].spawned_by, "pm-d");
     }
 
     #[test]
     fn clear_removes_all() {
-        let pm = TestPm::new();
-        write_event(&make_event(pm.id(), "w1", EventStatus::Done)).unwrap();
-        write_event(&make_event(pm.id(), "w2", EventStatus::Error)).unwrap();
-        assert_eq!(clear(pm.id()).unwrap(), 2);
-        assert_eq!(list(pm.id()).unwrap().len(), 0);
+        let w = TestWorker::new();
+        write_event(&make_event("pm-1", w.id(), EventStatus::Done)).unwrap();
+        write_event(&make_event("pm-2", w.id(), EventStatus::Error)).unwrap();
+        assert_eq!(clear(w.id()).unwrap(), 2);
+        assert_eq!(list(w.id()).unwrap().len(), 0);
     }
 
     #[test]
-    fn list_on_nonexistent_pm_returns_empty() {
+    fn list_on_nonexistent_worker_returns_empty() {
         let listed = list("definitely-does-not-exist-zzz").unwrap();
         assert!(listed.is_empty());
     }

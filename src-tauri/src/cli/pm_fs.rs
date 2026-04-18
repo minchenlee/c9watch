@@ -72,6 +72,13 @@ pub fn inbox_pm_dir(pm_session_id: &str) -> Result<PathBuf, String> {
     Ok(inbox_dir()?.join(pm_session_id))
 }
 
+/// Returns `~/.claude/c9watch/inbox/<worker-session-id>/`.
+/// Inbox is now keyed by worker (stable) not PM (unstable).
+pub fn inbox_worker_dir(worker_session_id: &str) -> Result<PathBuf, String> {
+    validate_session_id(worker_session_id)?;
+    Ok(inbox_dir()?.join(worker_session_id))
+}
+
 // ── Structs ───────────────────────────────────────────────────────────
 
 /// Arguments used to spawn a worker session.
@@ -341,6 +348,19 @@ mod inbox_path_tests {
         assert!(validate_session_id("foo bar").is_err());
         assert!(validate_session_id(".hidden").is_err());
         assert!(validate_session_id(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn inbox_worker_dir_includes_worker_id() {
+        let d = inbox_worker_dir("w-abc").unwrap();
+        assert!(d.ends_with("w-abc"));
+        assert!(d.starts_with(inbox_dir().unwrap()));
+    }
+
+    #[test]
+    fn inbox_worker_dir_rejects_traversal() {
+        assert!(inbox_worker_dir("../etc").is_err());
+        assert!(inbox_worker_dir("").is_err());
     }
 
     #[test]
