@@ -252,22 +252,27 @@ pub fn cmd_stop(session_id: String, pretty: bool) -> Result<(), String> {
 pub fn cmd_workers(all: bool, pretty: bool) -> Result<(), String> {
     ensure_daemon()?;
 
-    let request = RpcRequest::List;
+    let caller_pm_session_id = crate::cli::pm_caller::detect_caller_session_id_default();
+    let caller_pm_pid = crate::cli::pm_caller::detect_caller_pid_default();
+
+    let request = RpcRequest::WorkersAll {
+        caller_pm_session_id: caller_pm_session_id.clone(),
+        caller_pm_pid,
+    };
     let mut response = daemon_rpc(&request, Duration::from_secs(10))?;
 
-    // Filter to alive workers unless --all is specified
     if !all {
         if let Some(workers) = response.get("workers").and_then(|w| w.as_array()).cloned() {
-            let alive: Vec<serde_json::Value> = workers
+            let mine: Vec<serde_json::Value> = workers
                 .into_iter()
                 .filter(|w| {
-                    w.get("alive")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
+                    let alive = w.get("alive").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let status = w.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    alive && status == "OWNED_BY_YOU"
                 })
                 .collect();
             if let Some(obj) = response.as_object_mut() {
-                obj.insert("workers".to_string(), serde_json::json!(alive));
+                obj.insert("workers".to_string(), serde_json::json!(mine));
             }
         }
     }
@@ -276,47 +281,43 @@ pub fn cmd_workers(all: bool, pretty: bool) -> Result<(), String> {
 }
 
 pub fn cmd_inbox(
-    pm_id: Option<String>,
     consume: bool,
     clear: bool,
+    worker: Option<String>,
     pretty: bool,
 ) -> Result<(), String> {
-    use super::pm_inbox;
+    ensure_daemon()?;
+    let caller_pm_session_id = crate::cli::pm_caller::detect_caller_session_id_default()
+        .ok_or_else(|| {
+            "PM_SESSION_NOT_FOUND: run inside a Claude Code session".to_string()
+        })?;
+    let caller_pm_pid = crate::cli::pm_caller::detect_caller_pid_default();
 
-    // Resolve PM id: explicit > caller auto-detect
-    let pm = match pm_id {
-        Some(id) => id,
-        None => crate::cli::pm_caller::detect_caller_session_id_default()
-            .ok_or_else(|| {
-                "PM_SESSION_NOT_FOUND: pass --pm-id <session-id>, or run inside a Claude Code session".to_string()
-            })?,
+    let request = RpcRequest::InboxRead {
+        caller_pm_session_id,
+        caller_pm_pid,
+        consume,
+        clear,
+        worker_id: worker,
     };
+    let response = daemon_rpc(&request, Duration::from_secs(10))?;
+    crate::cli::print_json(&response, pretty)
+}
 
-    // Reject path-traversal / garbage input before any filesystem access.
-    super::pm_fs::validate_session_id(&pm)?;
+pub fn cmd_adopt(session_id: String, force: bool, pretty: bool) -> Result<(), String> {
+    ensure_daemon()?;
+    let caller_pm_session_id = crate::cli::pm_caller::detect_caller_session_id_default()
+        .ok_or_else(|| {
+            "PM_SESSION_NOT_FOUND: run inside a Claude Code session".to_string()
+        })?;
+    let caller_pm_pid = crate::cli::pm_caller::detect_caller_pid_default();
 
-    if clear {
-        let n = pm_inbox::clear(&pm)?;
-        let out = serde_json::json!({
-            "ok": true,
-            "cleared": n,
-            "pmSessionId": pm,
-        });
-        return crate::cli::print_json(&out, pretty);
-    }
-
-    let events = if consume {
-        pm_inbox::consume(&pm)?
-    } else {
-        pm_inbox::list(&pm)?
+    let request = RpcRequest::Adopt {
+        session_id,
+        force,
+        caller_pm_session_id,
+        caller_pm_pid,
     };
-
-    let out = serde_json::json!({
-        "ok": true,
-        "pmSessionId": pm,
-        "count": events.len(),
-        "consumed": consume,
-        "events": events,
-    });
-    crate::cli::print_json(&out, pretty)
+    let response = daemon_rpc(&request, Duration::from_secs(10))?;
+    crate::cli::print_json(&response, pretty)
 }

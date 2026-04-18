@@ -155,21 +155,31 @@ pub enum Commands {
 
     /// List workers spawned by c9watch
     Workers {
+        /// Include workers owned by other PMs (adds a status column per entry)
         #[arg(long)]
         all: bool,
     },
 
-    /// List callback events from workers spawned by this PM session
+    /// List callback events from workers owned by this PM session
     Inbox {
-        /// PM session id; defaults to the caller's detected session id
-        #[arg(long)]
-        pm_id: Option<String>,
         /// Remove events after listing
         #[arg(long)]
         consume: bool,
         /// Remove all events without printing them
         #[arg(long)]
         clear: bool,
+        /// Only touch this worker's inbox (must be owned by caller)
+        #[arg(long)]
+        worker: Option<String>,
+    },
+
+    /// Adopt an existing worker as owned by this PM session
+    Adopt {
+        /// Worker session id or unique prefix
+        session_id: String,
+        /// Force adoption even if worker is OWNED_BY_OTHER_PM
+        #[arg(long)]
+        force: bool,
     },
 
     /// [hidden] Run the PM daemon
@@ -230,9 +240,10 @@ pub fn run(cli: Cli) {
             timeout,
         } => pm::cmd_send(session_id, message, stdin, file, wait, timeout, cli.pretty),
         Commands::Workers { all } => pm::cmd_workers(all, cli.pretty),
-        Commands::Inbox { pm_id, consume, clear } => {
-            pm::cmd_inbox(pm_id, consume, clear, cli.pretty)
+        Commands::Inbox { consume, clear, worker } => {
+            pm::cmd_inbox(consume, clear, worker, cli.pretty)
         }
+        Commands::Adopt { session_id, force } => pm::cmd_adopt(session_id, force, cli.pretty),
         Commands::Daemon => {
             match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt.block_on(pm_daemon::run_daemon()),

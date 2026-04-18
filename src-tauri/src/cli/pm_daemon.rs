@@ -18,11 +18,11 @@ fn err_response(code: &str) -> serde_json::Value {
     serde_json::json!({ "ok": false, "error": code })
 }
 
-/// Display-friendly inbox dir hint for RPC responses (e.g.
-/// `~/.claude/c9watch/inbox/<pm>/`). Single source of truth for the hint
-/// format returned by spawn/send.
-fn callback_inbox_hint(spawned_by: Option<&str>) -> Option<String> {
-    spawned_by.map(|pm| format!("~/.claude/c9watch/inbox/{}/", pm))
+/// Display-friendly inbox dir hint for RPC responses. Events are keyed by
+/// worker session id, so the hint is the worker's dir. Callers list via
+/// `c9watch inbox`, which resolves across all owned workers.
+fn callback_inbox_hint(worker_session_id: &str) -> String {
+    format!("~/.claude/c9watch/inbox/{}/", worker_session_id)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -299,7 +299,7 @@ async fn handle_spawn(
         return err_response(&format!("SPAWN_FAILED: {}", e));
     }
 
-    let callback_inbox = callback_inbox_hint(spawned_by.as_deref());
+    let callback_inbox = callback_inbox_hint(&session_id);
 
     serde_json::json!({
         "ok": true,
@@ -340,7 +340,7 @@ async fn handle_send(
         if let Err(e) = worker.send_message(&text).await {
             return err_response(&e);
         }
-        let callback_inbox = callback_inbox_hint(worker.meta.spawned_by.as_deref());
+        let callback_inbox = callback_inbox_hint(&full_id);
         let rx = if wait && timeout_ms > 0 {
             match worker.take_result_receiver() {
                 Some(r) => Some(r),
