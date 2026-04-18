@@ -42,6 +42,39 @@ pub fn detect_caller_session_id_default() -> Option<String> {
     detect_caller_session_id(my_pid, 8, &sessions_dir, get_parent_pid)
 }
 
+/// Returns the OS PID of the Claude Code process in this caller's ancestor
+/// chain, or `None` if no ancestor within `max_depth` levels has a session
+/// file. Mirrors `detect_caller_session_id` but returns the PID instead of
+/// the session UUID.
+pub fn detect_caller_pid(
+    pid: u32,
+    max_depth: usize,
+    sessions_dir: &Path,
+    parent_of: impl Fn(u32) -> Option<u32>,
+) -> Option<u32> {
+    let mut current = pid;
+    for _ in 0..max_depth {
+        let session_file = sessions_dir.join(format!("{}.json", current));
+        if session_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&session_file) {
+                if serde_json::from_str::<SessionFile>(&content).is_ok() {
+                    return Some(current);
+                }
+            }
+        }
+        current = parent_of(current)?;
+    }
+    None
+}
+
+/// Production entry point: walks parent PIDs via `ps` and uses `~/.claude/sessions/`.
+pub fn detect_caller_pid_default() -> Option<u32> {
+    let home = dirs::home_dir()?;
+    let sessions_dir = home.join(".claude").join("sessions");
+    let my_pid = std::process::id();
+    detect_caller_pid(my_pid, 8, &sessions_dir, get_parent_pid)
+}
+
 #[cfg(unix)]
 fn get_parent_pid(pid: u32) -> Option<u32> {
     use std::process::Command;
@@ -149,6 +182,44 @@ mod tests {
         let result = detect_caller_session_id(100, 2, &dir, move |p| parents.get(&p).copied());
         assert_eq!(result, None);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_detect_caller_pid_returns_current_when_file_present() {
+        let dir = make_tmpdir();
+        std::fs::write(
+            dir.join("1000.json"),
+            r#"{"pid":1000,"sessionId":"abc-123","cwd":"/tmp","startedAt":0,"kind":"interactive","entrypoint":"cli"}"#,
+        )
+        .unwrap();
+        let result = detect_caller_pid(1000, 4, &dir, |_| None);
+        assert_eq!(result, Some(1000));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_detect_caller_pid_walks_parent_chain() {
+        let dir = make_tmpdir();
+        std::fs::write(
+            dir.join("200.json"),
+            r#"{"pid":200,"sessionId":"parent-session","cwd":"/tmp","startedAt":0,"kind":"interactive","entrypoint":"cli"}"#,
+        )
+        .unwrap();
+        let mut parents: HashMap<u32, u32> = HashMap::new();
+        parents.insert(100, 200);
+        let result = detect_caller_pid(100, 4, &dir, move |p| parents.get(&p).copied());
+        assert_eq!(result, Some(200));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_detect_caller_pid_none_when_chain_exhausted() {
+        let dir = make_tmpdir();
+        let mut parents: HashMap<u32, u32> = HashMap::new();
+        parents.insert(100, 200);
+        let result = detect_caller_pid(100, 4, &dir, move |p| parents.get(&p).copied());
+        assert_eq!(result, None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
