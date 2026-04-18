@@ -472,6 +472,10 @@ fn find_claude_ancestor(start_pid: u32) -> Option<u32> {
 }
 
 fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
+    if target.is_empty() {
+        return Err("stop target required (PID or worker session id/prefix)".to_string());
+    }
+
     // If target parses as u32, treat as PID (old behavior for non-PM sessions).
     if let Ok(pid) = target.parse::<u32>() {
         crate::actions::stop_session(pid)?;

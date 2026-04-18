@@ -432,24 +432,91 @@ fn resolve_worker_id(
     workers: &HashMap<String, WorkerHandle>,
     prefix: &str,
 ) -> Result<String, String> {
+    resolve_worker_id_from_keys(workers.keys().map(|k| k.as_str()), prefix)
+}
+
+/// Key-only variant of `resolve_worker_id`, factored out so it can be unit
+/// tested without constructing real `WorkerHandle`s.
+fn resolve_worker_id_from_keys<'a, I>(keys: I, prefix: &str) -> Result<String, String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    // Reject empty prefix — otherwise `"".starts_with("")` would match every
+    // worker and `c9watch send "" --message ...` would silently target the
+    // sole live worker (fix C4).
+    if prefix.is_empty() {
+        return Err("worker id/prefix required".to_string());
+    }
+
+    let keys: Vec<&str> = keys.into_iter().collect();
+
     // Exact match first
-    if workers.contains_key(prefix) {
+    if keys.iter().any(|k| *k == prefix) {
         return Ok(prefix.to_string());
     }
 
     // Prefix match
-    let matches: Vec<&String> = workers
-        .keys()
-        .filter(|k| k.starts_with(prefix))
-        .collect();
+    let matches: Vec<&&str> = keys.iter().filter(|k| k.starts_with(prefix)).collect();
 
     match matches.len() {
         0 => Err("WORKER_NOT_FOUND".to_string()),
-        1 => Ok(matches[0].clone()),
+        1 => Ok(matches[0].to_string()),
         _ => Err(format!(
             "AMBIGUOUS_SESSION_ID: prefix '{}' matches {} workers",
             prefix,
             matches.len()
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_worker_id_rejects_empty_prefix() {
+        let keys = ["abc-123", "def-456"];
+        let err = resolve_worker_id_from_keys(keys.iter().copied(), "").unwrap_err();
+        assert!(err.contains("required"), "got: {}", err);
+    }
+
+    #[test]
+    fn resolve_worker_id_empty_prefix_with_sole_worker() {
+        // Regression: `"".starts_with("")` is true, so without the guard this
+        // would match the lone worker. Must still error.
+        let keys = ["only-one"];
+        assert!(resolve_worker_id_from_keys(keys.iter().copied(), "").is_err());
+    }
+
+    #[test]
+    fn resolve_worker_id_exact_match_wins() {
+        let keys = ["abc-123", "abc-123-extra"];
+        assert_eq!(
+            resolve_worker_id_from_keys(keys.iter().copied(), "abc-123").unwrap(),
+            "abc-123"
+        );
+    }
+
+    #[test]
+    fn resolve_worker_id_unique_prefix() {
+        let keys = ["abc-123", "def-456"];
+        assert_eq!(
+            resolve_worker_id_from_keys(keys.iter().copied(), "abc").unwrap(),
+            "abc-123"
+        );
+    }
+
+    #[test]
+    fn resolve_worker_id_ambiguous() {
+        let keys = ["abc-123", "abc-456"];
+        let err = resolve_worker_id_from_keys(keys.iter().copied(), "abc").unwrap_err();
+        assert!(err.contains("AMBIGUOUS"), "got: {}", err);
+    }
+
+    #[test]
+    fn resolve_worker_id_not_found() {
+        let keys = ["abc-123"];
+        let err = resolve_worker_id_from_keys(keys.iter().copied(), "xyz").unwrap_err();
+        assert_eq!(err, "WORKER_NOT_FOUND");
     }
 }
