@@ -39,15 +39,18 @@ pub async fn run_daemon() -> Result<(), String> {
             .map_err(|e| format!("Failed to remove stale socket {:?}: {}", sock_path, e))?;
     }
 
-    // 3. Write PID file
+    // 3. Bind the Unix socket BEFORE writing the pid file. `ensure_daemon`
+    //    treats a live pid file as proof that the daemon is accepting RPCs, so
+    //    the socket must be listening first — otherwise a waiter can see the
+    //    pid, dial the socket, and hit ECONNREFUSED (fix C3).
+    let listener = UnixListener::bind(&sock_path)
+        .map_err(|e| format!("Failed to bind Unix socket {:?}: {}", sock_path, e))?;
+
+    // 4. Write PID file now that the socket is listening.
     let pid = std::process::id();
     let pid_path = pm_fs::daemon_pid_path()?;
     std::fs::write(&pid_path, pid.to_string())
         .map_err(|e| format!("Failed to write PID file {:?}: {}", pid_path, e))?;
-
-    // 4. Bind the Unix socket
-    let listener = UnixListener::bind(&sock_path)
-        .map_err(|e| format!("Failed to bind Unix socket {:?}: {}", sock_path, e))?;
 
     // 5. Read max_workers from env
     let max_workers: usize = std::env::var("C9WATCH_MAX_WORKERS")
@@ -372,13 +375,18 @@ async fn handle_send(
     let timeout = Duration::from_millis(timeout_ms);
     let turn_result = tokio::time::timeout(timeout, rx.recv()).await;
 
-    // Return the receiver so the worker can be used for future --wait calls
-    {
+    // Return the receiver (and peek worker liveness) so the worker can be used
+    // for future --wait calls, and so we can distinguish a genuine timeout
+    // from a worker crash (M2).
+    let still_alive = {
         let mut st = state.lock().await;
         if let Some(worker) = st.workers.get_mut(&full_id) {
             worker.return_result_receiver(rx);
+            worker.is_alive()
+        } else {
+            false
         }
-    }
+    };
 
     match turn_result {
         Ok(Some(turn)) => serde_json::json!({
@@ -394,6 +402,12 @@ async fn handle_send(
             "ok": false,
             "error": "result channel closed — worker stdout tee task exited",
         }),
+        Err(_timeout) if !still_alive => serde_json::json!({
+            "ok": false,
+            "error": "WORKER_CRASHED",
+            "sessionId": full_id,
+            "callbackInbox": callback_inbox,
+        }),
         Err(_timeout) => serde_json::json!({
             "ok": true,
             "sessionId": full_id,
@@ -406,6 +420,21 @@ async fn handle_send(
 
 async fn handle_list(state: Arc<Mutex<DaemonState>>) -> serde_json::Value {
     let mut st = state.lock().await;
+
+    // Reap dead workers (SIGKILL'd externally, crashed, etc.) before listing.
+    // Without this, the 16-worker cap fills up with zombies and further
+    // spawns fail (fix L4). We collect dead IDs first to avoid mutating the
+    // map while iterating.
+    let dead: Vec<String> = st
+        .workers
+        .iter_mut()
+        .filter_map(|(id, worker)| if worker.is_alive() { None } else { Some(id.clone()) })
+        .collect();
+    for id in dead {
+        st.workers.remove(&id);
+        cleanup_worker_dir(&id);
+    }
+
     let workers: Vec<serde_json::Value> = st
         .workers
         .iter_mut()
@@ -707,10 +736,13 @@ async fn handle_inbox_read(
     };
 
     let targets: Vec<String> = if let Some(wid) = &worker_id_filter {
-        if !owned.iter().any(|o| o == wid) {
-            return err_response("WORKER_NOT_OWNED");
+        // Accept exact id OR unambiguous prefix of an owned worker, matching
+        // the ergonomics of `send`/`stop`/`view`. Previously only exact UUIDs
+        // worked, which didn't match the rest of the CLI.
+        match resolve_worker_id_from_keys(owned.iter().map(|s| s.as_str()), wid) {
+            Ok(full) => vec![full],
+            Err(_) => return err_response("WORKER_NOT_OWNED"),
         }
-        vec![wid.clone()]
     } else {
         owned
     };

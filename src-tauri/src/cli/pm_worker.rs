@@ -324,7 +324,11 @@ async fn stdout_tee_task(
             }
         };
 
-        // Signal readiness on first line of output
+        // Signal readiness on first line of output. We considered waiting for
+        // the `system:init` event specifically (QA finding M1), but in
+        // practice SessionStart hooks run *before* the init event and can
+        // legitimately take 10+ seconds — longer than wait_ready's timeout.
+        // Any stream-json line out of the worker is proof-of-life enough.
         if let Some(tx) = ready_tx.take() {
             let _ = tx.send(());
         }

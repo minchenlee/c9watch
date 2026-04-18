@@ -142,8 +142,21 @@ pub fn cmd_spawn(
 ) -> Result<(), String> {
     ensure_daemon()?;
 
-    // Resolve system prompt: file takes precedence if both provided
+    // Resolve system prompt: file takes precedence if both provided.
+    // Cap file size at 64KB — the prompt is passed as a CLI argv flag, and
+    // platform ARG_MAX (~256KB on macOS, often smaller) would crash the spawn
+    // if we loaded a multi-megabyte file. 64KB is well under any ARG_MAX and
+    // still generous for a system prompt.
+    const PROMPT_FILE_MAX_BYTES: u64 = 64 * 1024;
     let prompt = if let Some(path) = append_system_prompt_file {
+        let meta = std::fs::metadata(&path)
+            .map_err(|e| format!("Failed to stat system prompt file {:?}: {}", path, e))?;
+        if meta.len() > PROMPT_FILE_MAX_BYTES {
+            return Err(format!(
+                "PROMPT_FILE_TOO_LARGE: {:?} is {} bytes (limit {} bytes)",
+                path, meta.len(), PROMPT_FILE_MAX_BYTES
+            ));
+        }
         Some(
             std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read system prompt file {:?}: {}", path, e))?,
@@ -286,6 +299,11 @@ pub fn cmd_inbox(
     worker: Option<String>,
     pretty: bool,
 ) -> Result<(), String> {
+    if consume && clear {
+        return Err(
+            "Specify at most one of --consume or --clear (they conflict)".to_string(),
+        );
+    }
     ensure_daemon()?;
     let caller_pm_session_id = crate::cli::pm_caller::detect_caller_session_id_default()
         .ok_or_else(|| {
