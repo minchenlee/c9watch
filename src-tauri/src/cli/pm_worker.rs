@@ -103,6 +103,7 @@ impl WorkerHandle {
             cwd: cwd.clone(),
             spawned_at: Utc::now().to_rfc3339(),
             spawned_by,
+            pm_pid: None,
             spawn_args: args,
             stopped_at: None,
         };

@@ -104,6 +104,11 @@ pub struct WorkerMeta {
     pub spawned_at: String,
     /// Identifier of who/what spawned the worker (e.g. "pm-daemon")
     pub spawned_by: Option<String>,
+    /// OS process ID of the PM's Claude Code process at spawn time. Used for
+    /// default ownership resolution after the PM's session UUID changes via
+    /// `/clear`. `None` only for workers spawned by non-Claude callers.
+    #[serde(default)]
+    pub pm_pid: Option<u32>,
     /// Arguments used to spawn the worker
     pub spawn_args: SpawnArgs,
     /// ISO-8601 timestamp when the worker stopped, if known
@@ -252,6 +257,7 @@ mod tests {
             cwd: "/Users/test/project".to_string(),
             spawned_at: "2026-04-16T00:00:00Z".to_string(),
             spawned_by: Some("pm-daemon".to_string()),
+            pm_pid: Some(55123),
             spawn_args: SpawnArgs {
                 append_system_prompt: Some("Be concise.".to_string()),
                 permission_mode: "default".to_string(),
@@ -275,6 +281,7 @@ mod tests {
         assert!(json.contains("appendSystemPrompt"));
         assert!(json.contains("permissionMode"));
         assert!(json.contains("addDirs"));
+        assert!(json.contains("pmPid"));
     }
 
     #[test]
