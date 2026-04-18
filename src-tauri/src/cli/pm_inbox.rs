@@ -133,5 +133,115 @@ pub fn consume(pm_session_id: &str) -> Result<Vec<InboxEvent>, String> {
 
 #[cfg(test)]
 mod tests {
-    // Placeholder — filled in by Task 2.
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// Use a unique PM id per test so tests don't interact via the real
+    /// `$HOME/.claude/c9watch/inbox/` dir. Cleans up after itself.
+    struct TestPm(String);
+
+    impl TestPm {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let id = format!(
+                "test-pm-{}-{}",
+                std::process::id(),
+                n
+            );
+            Self(id)
+        }
+        fn id(&self) -> &str { &self.0 }
+    }
+
+    impl Drop for TestPm {
+        fn drop(&mut self) {
+            let _ = clear(&self.0);
+            if let Ok(dir) = pm_fs::inbox_pm_dir(&self.0) {
+                let _ = std::fs::remove_dir(&dir);
+            }
+        }
+    }
+
+    fn make_event(pm: &str, session: &str, status: EventStatus) -> InboxEvent {
+        InboxEvent {
+            event_id: new_event_id(),
+            session_id: session.to_string(),
+            spawned_by: pm.to_string(),
+            status,
+            finished_at: Utc::now().to_rfc3339(),
+            duration_ms: Some(1234),
+            num_turns: Some(1),
+            stop_reason: Some("end_turn".to_string()),
+            total_cost_usd: Some(0.01),
+            result_excerpt: Some("ok".to_string()),
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn write_then_list_returns_the_event() {
+        let pm = TestPm::new();
+        let ev = make_event(pm.id(), "worker-1", EventStatus::Done);
+        write_event(&ev).unwrap();
+        let listed = list(pm.id()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], ev);
+    }
+
+    #[test]
+    fn list_returns_newest_first() {
+        let pm = TestPm::new();
+        let e1 = make_event(pm.id(), "worker-1", EventStatus::Done);
+        write_event(&e1).unwrap();
+        // Sleep enough for the millisecond-resolution timestamp in the event_id
+        // to advance.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let e2 = make_event(pm.id(), "worker-2", EventStatus::Done);
+        write_event(&e2).unwrap();
+        let listed = list(pm.id()).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].session_id, "worker-2", "newest should come first");
+        assert_eq!(listed[1].session_id, "worker-1");
+    }
+
+    #[test]
+    fn consume_returns_and_removes() {
+        let pm = TestPm::new();
+        let ev = make_event(pm.id(), "worker-1", EventStatus::Done);
+        write_event(&ev).unwrap();
+        let consumed = consume(pm.id()).unwrap();
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(list(pm.id()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn clear_removes_all() {
+        let pm = TestPm::new();
+        write_event(&make_event(pm.id(), "w1", EventStatus::Done)).unwrap();
+        write_event(&make_event(pm.id(), "w2", EventStatus::Error)).unwrap();
+        assert_eq!(clear(pm.id()).unwrap(), 2);
+        assert_eq!(list(pm.id()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn list_on_nonexistent_pm_returns_empty() {
+        let listed = list("definitely-does-not-exist-zzz").unwrap();
+        assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn truncate_excerpt_leaves_short_strings_alone() {
+        assert_eq!(truncate_excerpt("hello"), "hello");
+    }
+
+    #[test]
+    fn truncate_excerpt_caps_long_strings_with_ellipsis() {
+        let s = "a".repeat(EXCERPT_LIMIT + 100);
+        let t = truncate_excerpt(&s);
+        let char_count = t.chars().count();
+        assert_eq!(char_count, EXCERPT_LIMIT + 1); // +1 for the ellipsis
+        assert!(t.ends_with('…'));
+    }
 }
