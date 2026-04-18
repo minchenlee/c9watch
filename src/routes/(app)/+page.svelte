@@ -565,6 +565,7 @@
 												<SessionCard
 													{session}
 													compact={isCompact}
+													workersView={sessionFilter === 'workers'}
 													onexpand={() => handleExpand(session)}
 													onstop={() => handleStop(session.pid)}
 													onopen={() => handleOpen(session.pid, session.projectPath)}
@@ -591,6 +592,7 @@
 												<SessionCard
 													{session}
 													compact={isCompact}
+													workersView={sessionFilter === 'workers'}
 													onexpand={() => handleExpand(session)}
 													onstop={() => handleStop(session.pid)}
 													onopen={() => handleOpen(session.pid, session.projectPath)}
@@ -617,6 +619,7 @@
 												<SessionCard
 													{session}
 													compact={isCompact}
+													workersView={sessionFilter === 'workers'}
 													onexpand={() => handleExpand(session)}
 													onstop={() => handleStop(session.pid)}
 													onopen={() => handleOpen(session.pid, session.projectPath)}
@@ -649,6 +652,7 @@
 										<SessionCard
 											{session}
 											compact={isCompact}
+											workersView={sessionFilter === 'workers'}
 											onexpand={() => handleExpand(session)}
 											onstop={() => handleStop(session.pid)}
 											onopen={() => handleOpen(session.pid, session.projectPath)}
