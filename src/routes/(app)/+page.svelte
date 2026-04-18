@@ -416,6 +416,34 @@
 					<div class="header-spacer"></div>
 					<div class="view-toggle">
 						<button
+							type="button"
+							class="toggle-btn"
+							class:active={sessionFilter === 'humans'}
+							onclick={() => sessionFilter = 'humans'}
+							title="Show human sessions"
+						>
+							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+								<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+								<circle cx="12" cy="7" r="4" />
+							</svg>
+						</button>
+						<button
+							type="button"
+							class="toggle-btn"
+							class:active={sessionFilter === 'workers'}
+							onclick={() => sessionFilter = 'workers'}
+							title="Show PM workers"
+						>
+							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+								<rect x="4" y="6" width="16" height="12" rx="2" />
+								<circle cx="9" cy="12" r="1.5" />
+								<circle cx="15" cy="12" r="1.5" />
+								<path d="M12 2v4" />
+							</svg>
+						</button>
+					</div>
+					<div class="view-toggle">
+						<button
 							class="toggle-btn"
 							class:active={isCompact}
 							onclick={() => isCompact = !isCompact}
@@ -1023,6 +1051,14 @@
 		color: var(--text-primary);
 		background: rgba(255, 255, 255, 0.1);
 		border-color: var(--border-default);
+	}
+
+	/* Workers-filter active state gets an amber tint to reinforce the
+	   bot/worker visual language used by the WORKER badge on cards. */
+	.toggle-btn.active[title="Show PM workers"] {
+		color: var(--accent-amber);
+		background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
+		border-color: color-mix(in srgb, var(--accent-amber) 40%, transparent);
 	}
 
 	.all-sessions-grid {
