@@ -182,6 +182,23 @@ pub enum Commands {
         force: bool,
     },
 
+    /// Query session cost data
+    #[command(name = "cost", about = "Query session cost data")]
+    Cost {
+        /// Aggregate by day
+        #[arg(long)]
+        daily: bool,
+        /// Aggregate by ISO week (Monday start)
+        #[arg(long)]
+        weekly: bool,
+        /// Filter to a single project (matches the `project` field)
+        #[arg(long)]
+        project: Option<String>,
+        /// Lower bound on date (YYYY-MM-DD, inclusive)
+        #[arg(long)]
+        since: Option<String>,
+    },
+
     /// [hidden] Run the PM daemon
     #[command(hide = true)]
     Daemon,
@@ -244,6 +261,9 @@ pub fn run(cli: Cli) {
             pm::cmd_inbox(consume, clear, worker, cli.pretty)
         }
         Commands::Adopt { session_id, force } => pm::cmd_adopt(session_id, force, cli.pretty),
+        Commands::Cost { daily, weekly, project, since } => {
+            cmd_cost(daily, weekly, project.as_deref(), since.as_deref(), cli.pretty)
+        }
         Commands::Daemon => {
             match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt.block_on(pm_daemon::run_daemon()),
@@ -652,6 +672,128 @@ fn cmd_tasks(session_id: &str, pretty: bool) -> Result<(), String> {
             let status = t.get("status").and_then(|s| s.as_str()).unwrap_or("");
             status != "completed" && status != "in_progress"
         }).count(),
+    });
+    print_json(&output, pretty)
+}
+
+fn cmd_cost(
+    daily: bool,
+    weekly: bool,
+    project_filter: Option<&str>,
+    since: Option<&str>,
+    pretty: bool,
+) -> Result<(), String> {
+    if daily && weekly {
+        return Err("--daily and --weekly are mutually exclusive".to_string());
+    }
+
+    let since_date = match since {
+        Some(s) => Some(
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|e| format!("Invalid --since date '{}': {}", s, e))?,
+        ),
+        None => None,
+    };
+
+    let data = session::get_cost_data()?;
+
+    // Flatten to sessions, then apply filters. project_costs covers all sessions.
+    let mut sessions: Vec<session::cost::SessionCostRecord> = data
+        .project_costs
+        .iter()
+        .flat_map(|p| p.sessions.iter().cloned())
+        .collect();
+
+    if let Some(proj) = project_filter {
+        sessions.retain(|s| s.project == proj);
+    }
+    if let Some(since_d) = since_date {
+        sessions.retain(|s| {
+            chrono::NaiveDate::parse_from_str(&s.date, "%Y-%m-%d")
+                .map(|d| d >= since_d)
+                .unwrap_or(false)
+        });
+    }
+
+    if daily {
+        let mut by_date: std::collections::HashMap<String, (f64, u64, u32)> =
+            std::collections::HashMap::new();
+        for s in &sessions {
+            let e = by_date.entry(s.date.clone()).or_insert((0.0, 0, 0));
+            e.0 += s.cost;
+            e.1 += s.total_tokens;
+            e.2 += 1;
+        }
+        let mut rows: Vec<_> = by_date
+            .into_iter()
+            .map(|(date, (cost, tokens, count))| {
+                serde_json::json!({
+                    "date": date,
+                    "cost": cost,
+                    "totalTokens": tokens,
+                    "sessionCount": count,
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.get("date").and_then(|v| v.as_str()).cmp(&a.get("date").and_then(|v| v.as_str()))
+        });
+        return print_json(&rows, pretty);
+    }
+
+    if weekly {
+        let mut by_week: std::collections::HashMap<String, (f64, u64, u32)> =
+            std::collections::HashMap::new();
+        for s in &sessions {
+            let Ok(d) = chrono::NaiveDate::parse_from_str(&s.date, "%Y-%m-%d") else {
+                continue;
+            };
+            use chrono::Datelike;
+            let iso = d.iso_week();
+            let week_start = chrono::NaiveDate::from_isoywd_opt(
+                iso.year(),
+                iso.week(),
+                chrono::Weekday::Mon,
+            )
+            .unwrap_or(d);
+            let key = week_start.format("%Y-%m-%d").to_string();
+            let e = by_week.entry(key).or_insert((0.0, 0, 0));
+            e.0 += s.cost;
+            e.1 += s.total_tokens;
+            e.2 += 1;
+        }
+        let mut rows: Vec<_> = by_week
+            .into_iter()
+            .map(|(week_start, (cost, tokens, count))| {
+                serde_json::json!({
+                    "weekStart": week_start,
+                    "cost": cost,
+                    "totalTokens": tokens,
+                    "sessionCount": count,
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.get("weekStart")
+                .and_then(|v| v.as_str())
+                .cmp(&a.get("weekStart").and_then(|v| v.as_str()))
+        });
+        return print_json(&rows, pretty);
+    }
+
+    // Default: emit filtered CostData-shaped output if filters were applied,
+    // otherwise emit the full CostData from the GUI.
+    if project_filter.is_none() && since_date.is_none() {
+        return print_json(&data, pretty);
+    }
+
+    // Rebuild CostData-ish aggregation from filtered sessions.
+    let total_cost: f64 = sessions.iter().map(|s| s.cost).sum();
+    let total_tokens: u64 = sessions.iter().map(|s| s.total_tokens).sum();
+    let output = serde_json::json!({
+        "totalCost": total_cost,
+        "totalTokens": total_tokens,
+        "sessions": sessions,
     });
     print_json(&output, pretty)
 }
