@@ -82,6 +82,16 @@ pub fn write_event(ev: &InboxEvent) -> Result<(), String> {
 
 /// List events for a PM, newest first (by filename, which embeds an ISO timestamp).
 pub fn list(pm_session_id: &str) -> Result<Vec<InboxEvent>, String> {
+    Ok(list_with_paths(pm_session_id)?
+        .into_iter()
+        .map(|(_, ev)| ev)
+        .collect())
+}
+
+/// Like `list`, but also returns the on-disk path for each event so callers
+/// (e.g. `consume`) can delete exactly the files they observed — avoiding the
+/// race where events written between `list()` and a bulk `clear()` are lost.
+pub fn list_with_paths(pm_session_id: &str) -> Result<Vec<(PathBuf, InboxEvent)>, String> {
     let dir = pm_fs::inbox_pm_dir(pm_session_id)?;
     if !dir.exists() {
         return Ok(Vec::new());
@@ -99,7 +109,7 @@ pub fn list(pm_session_id: &str) -> Result<Vec<InboxEvent>, String> {
             .map_err(|e| format!("Failed to read inbox event {:?}: {}", p, e))?;
         let ev: InboxEvent = serde_json::from_str(&txt)
             .map_err(|e| format!("Failed to parse inbox event {:?}: {}", p, e))?;
-        out.push(ev);
+        out.push((p, ev));
     }
     Ok(out)
 }
@@ -124,10 +134,25 @@ pub fn clear(pm_session_id: &str) -> Result<usize, String> {
     Ok(removed)
 }
 
-/// List + clear in one call. Returns the events that were just removed.
+/// List + remove in one call. Returns the events that were just removed.
+///
+/// Only deletes the files observed by the initial `list_with_paths` call —
+/// events written between the listing and the deletes are left untouched so
+/// callers don't silently lose them.
 pub fn consume(pm_session_id: &str) -> Result<Vec<InboxEvent>, String> {
-    let events = list(pm_session_id)?;
-    clear(pm_session_id)?;
+    let listed = list_with_paths(pm_session_id)?;
+    let mut events = Vec::with_capacity(listed.len());
+    for (path, ev) in listed {
+        match std::fs::remove_file(&path) {
+            Ok(()) => events.push(ev),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Another consumer beat us to this file; skip it.
+            }
+            Err(e) => {
+                return Err(format!("Failed to remove inbox event {:?}: {}", path, e));
+            }
+        }
+    }
     Ok(events)
 }
 
@@ -214,6 +239,44 @@ mod tests {
         let consumed = consume(pm.id()).unwrap();
         assert_eq!(consumed.len(), 1);
         assert_eq!(list(pm.id()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn consume_preserves_events_written_after_list() {
+        // Regression test for the list-then-clear race: simulate a consume where
+        // the caller has observed 3 events via `list_with_paths`, then a 4th event
+        // arrives before the deletes happen. The 4th must NOT be wiped.
+        let pm = TestPm::new();
+        let e1 = make_event(pm.id(), "w1", EventStatus::Done);
+        let e2 = make_event(pm.id(), "w2", EventStatus::Done);
+        let e3 = make_event(pm.id(), "w3", EventStatus::Done);
+        write_event(&e1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        write_event(&e2).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        write_event(&e3).unwrap();
+
+        // Take a snapshot like consume() does internally.
+        let listed = list_with_paths(pm.id()).unwrap();
+        assert_eq!(listed.len(), 3);
+
+        // A 4th event arrives after the snapshot but before the deletes happen.
+        let e4 = make_event(pm.id(), "w4", EventStatus::Done);
+        write_event(&e4).unwrap();
+
+        // Mimic consume: only delete files we observed in the listing.
+        for (path, _) in &listed {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => panic!("unexpected error removing {:?}: {}", path, e),
+            }
+        }
+
+        // e4 must still be on disk.
+        let remaining = list(pm.id()).unwrap();
+        assert_eq!(remaining.len(), 1, "e4 should survive consume of e1..e3");
+        assert_eq!(remaining[0].session_id, "w4");
     }
 
     #[test]
