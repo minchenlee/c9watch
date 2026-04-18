@@ -134,6 +134,7 @@ async fn handle_connection(
             model,
             add_dirs,
             spawned_by,
+            pm_pid,
         } => {
             handle_spawn(
                 state,
@@ -144,6 +145,7 @@ async fn handle_connection(
                 model,
                 add_dirs,
                 spawned_by,
+                pm_pid,
                 max_workers,
             )
             .await
@@ -191,6 +193,7 @@ async fn handle_spawn(
     model: Option<String>,
     add_dirs: Vec<String>,
     spawned_by: Option<String>,
+    pm_pid: Option<u32>,
     max_workers: usize,
 ) -> serde_json::Value {
     // Check worker limit
@@ -225,6 +228,7 @@ async fn handle_spawn(
         name.clone(),
         args,
         spawned_by.clone(),
+        pm_pid,
     )
     .await
     {

@@ -60,6 +60,7 @@ impl WorkerHandle {
         name: Option<String>,
         args: SpawnArgs,
         spawned_by: Option<String>,
+        pm_pid: Option<u32>,
     ) -> Result<Self, String> {
         // Build the command
         let mut cmd = Command::new("claude");
@@ -103,7 +104,7 @@ impl WorkerHandle {
             cwd: cwd.clone(),
             spawned_at: Utc::now().to_rfc3339(),
             spawned_by,
-            pm_pid: None,
+            pm_pid,
             spawn_args: args,
             stopped_at: None,
         };
