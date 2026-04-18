@@ -386,7 +386,7 @@ async fn stdout_tee_task(
                 saw_terminal_result = true;
 
                 if let Some(ref ctx) = inbox {
-                    use crate::cli::pm_inbox::{self, InboxEvent, EventStatus};
+                    use crate::cli::pm_inbox::{self, EventStatus, InboxEvent, TurnResult};
                     let status = if is_error || subtype.as_deref().map(|s| s != "success").unwrap_or(false) {
                         EventStatus::Error
                     } else {
@@ -408,19 +408,19 @@ async fn stdout_tee_task(
                     } else {
                         None
                     };
-                    let ev = InboxEvent {
-                        event_id: pm_inbox::new_event_id(),
-                        session_id: ctx.session_id.clone(),
-                        spawned_by: ctx.spawned_by.clone(),
-                        status,
-                        finished_at: Utc::now().to_rfc3339(),
-                        duration_ms,
-                        num_turns,
-                        stop_reason,
-                        total_cost_usd,
-                        result_excerpt: excerpt,
-                        error_message: err_msg,
-                    };
+                    let ev = InboxEvent::from_turn_result(
+                        &ctx.session_id,
+                        &ctx.spawned_by,
+                        TurnResult {
+                            status,
+                            duration_ms,
+                            num_turns,
+                            stop_reason,
+                            total_cost_usd,
+                            result_excerpt: excerpt,
+                            error_message: err_msg,
+                        },
+                    );
                     if let Err(e) = pm_inbox::write_event(&ev) {
                         eprintln!("[pm_worker] Failed to write inbox event: {}", e);
                     }
@@ -434,20 +434,12 @@ async fn stdout_tee_task(
     // crashed or was killed mid-turn. Emit a Crashed event so the PM learns.
     if !saw_terminal_result {
         if let Some(ref ctx) = inbox {
-            use crate::cli::pm_inbox::{self, InboxEvent, EventStatus};
-            let ev = InboxEvent {
-                event_id: pm_inbox::new_event_id(),
-                session_id: ctx.session_id.clone(),
-                spawned_by: ctx.spawned_by.clone(),
-                status: EventStatus::Crashed,
-                finished_at: Utc::now().to_rfc3339(),
-                duration_ms: None,
-                num_turns: None,
-                stop_reason: None,
-                total_cost_usd: None,
-                result_excerpt: None,
-                error_message: Some("worker stdout closed without a terminal result event".to_string()),
-            };
+            use crate::cli::pm_inbox::{self, InboxEvent};
+            let ev = InboxEvent::crashed(
+                &ctx.session_id,
+                &ctx.spawned_by,
+                "worker stdout closed without a terminal result event".to_string(),
+            );
             if let Err(e) = pm_inbox::write_event(&ev) {
                 eprintln!("[pm_worker] Failed to write crash inbox event: {}", e);
             }

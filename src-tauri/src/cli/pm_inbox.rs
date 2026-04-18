@@ -40,6 +40,58 @@ pub enum EventStatus {
     Crashed,
 }
 
+/// Fields that vary between normal turn-end outcomes (success or error)
+/// reported by Claude's terminal `result` event.
+pub struct TurnResult {
+    pub status: EventStatus,
+    pub duration_ms: Option<u64>,
+    pub num_turns: Option<u64>,
+    pub stop_reason: Option<String>,
+    pub total_cost_usd: Option<f64>,
+    pub result_excerpt: Option<String>,
+    pub error_message: Option<String>,
+}
+
+impl InboxEvent {
+    /// Normal turn-end event from a `result` stream entry.
+    pub fn from_turn_result(
+        worker_session_id: &str,
+        spawned_by: &str,
+        tr: TurnResult,
+    ) -> Self {
+        Self {
+            event_id: new_event_id(),
+            session_id: worker_session_id.to_string(),
+            spawned_by: spawned_by.to_string(),
+            status: tr.status,
+            finished_at: Utc::now().to_rfc3339(),
+            duration_ms: tr.duration_ms,
+            num_turns: tr.num_turns,
+            stop_reason: tr.stop_reason,
+            total_cost_usd: tr.total_cost_usd,
+            result_excerpt: tr.result_excerpt,
+            error_message: tr.error_message,
+        }
+    }
+
+    /// Worker stdout closed without a terminal `result` event.
+    pub fn crashed(worker_session_id: &str, spawned_by: &str, error_message: String) -> Self {
+        Self {
+            event_id: new_event_id(),
+            session_id: worker_session_id.to_string(),
+            spawned_by: spawned_by.to_string(),
+            status: EventStatus::Crashed,
+            finished_at: Utc::now().to_rfc3339(),
+            duration_ms: None,
+            num_turns: None,
+            stop_reason: None,
+            total_cost_usd: None,
+            result_excerpt: None,
+            error_message: Some(error_message),
+        }
+    }
+}
+
 /// Max characters for `result_excerpt` to keep inbox reads cheap.
 pub const EXCERPT_LIMIT: usize = 500;
 
