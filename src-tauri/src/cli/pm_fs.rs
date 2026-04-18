@@ -3,6 +3,24 @@ use std::path::PathBuf;
 
 // ── Path helpers ──────────────────────────────────────────────────────
 
+/// Validate a session id before it is used as a filesystem path component.
+///
+/// Accepts UUIDs and UUID-like strings (ASCII alphanumerics plus `-`), 1..=64
+/// chars. Rejects anything that could traverse paths or escape the expected
+/// directory (e.g. `..`, `/`, empty string, overlong input).
+pub fn validate_session_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("invalid session id: empty".to_string());
+    }
+    if id.len() > 64 {
+        return Err(format!("invalid session id length: {}", id.len()));
+    }
+    if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(format!("invalid session id: {}", id));
+    }
+    Ok(())
+}
+
 /// Returns `~/.claude/c9watch/`
 pub fn c9watch_dir() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or("Failed to get home directory")?;
@@ -26,6 +44,7 @@ pub fn daemon_log_path() -> Result<PathBuf, String> {
 
 /// Returns `~/.claude/c9watch/workers/<session-id>/`
 pub fn worker_dir(session_id: &str) -> Result<PathBuf, String> {
+    validate_session_id(session_id)?;
     Ok(c9watch_dir()?.join("workers").join(session_id))
 }
 
@@ -49,6 +68,7 @@ pub fn inbox_dir() -> Result<PathBuf, String> {
 }
 
 pub fn inbox_pm_dir(pm_session_id: &str) -> Result<PathBuf, String> {
+    validate_session_id(pm_session_id)?;
     Ok(inbox_dir()?.join(pm_session_id))
 }
 
@@ -295,5 +315,36 @@ mod inbox_path_tests {
         let d = inbox_pm_dir("abc-123").unwrap();
         assert!(d.ends_with("abc-123"));
         assert!(d.starts_with(inbox_dir().unwrap()));
+    }
+
+    #[test]
+    fn validate_session_id_accepts_uuid_like() {
+        validate_session_id("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        validate_session_id("abc-123").unwrap();
+        validate_session_id("a").unwrap();
+    }
+
+    #[test]
+    fn validate_session_id_rejects_traversal_and_bad_chars() {
+        assert!(validate_session_id("").is_err());
+        assert!(validate_session_id("..").is_err());
+        assert!(validate_session_id("../../etc").is_err());
+        assert!(validate_session_id("foo/bar").is_err());
+        assert!(validate_session_id("foo\\bar").is_err());
+        assert!(validate_session_id("foo bar").is_err());
+        assert!(validate_session_id(".hidden").is_err());
+        assert!(validate_session_id(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn inbox_pm_dir_rejects_traversal() {
+        assert!(inbox_pm_dir("../etc").is_err());
+        assert!(inbox_pm_dir("").is_err());
+    }
+
+    #[test]
+    fn worker_dir_rejects_traversal() {
+        assert!(worker_dir("../etc").is_err());
+        assert!(worker_dir("").is_err());
     }
 }

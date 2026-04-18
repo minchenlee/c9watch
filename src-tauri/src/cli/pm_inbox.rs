@@ -66,6 +66,8 @@ fn event_path(pm_session_id: &str, event_id: &str) -> Result<PathBuf, String> {
 
 /// Write an event to disk. Creates the PM's inbox dir if needed.
 pub fn write_event(ev: &InboxEvent) -> Result<(), String> {
+    pm_fs::validate_session_id(&ev.spawned_by)?;
+    pm_fs::validate_session_id(&ev.session_id)?;
     let dir = pm_fs::inbox_pm_dir(&ev.spawned_by)?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create inbox pm dir {:?}: {}", dir, e))?;

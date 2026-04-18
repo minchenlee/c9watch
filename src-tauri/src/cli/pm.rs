@@ -290,6 +290,9 @@ pub fn cmd_inbox(
             })?,
     };
 
+    // Reject path-traversal / garbage input before any filesystem access.
+    super::pm_fs::validate_session_id(&pm)?;
+
     if clear {
         let n = pm_inbox::clear(&pm)?;
         let out = serde_json::json!({
