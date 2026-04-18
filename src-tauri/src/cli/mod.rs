@@ -537,16 +537,11 @@ fn try_resolve_worker(target: &str) -> Option<String> {
         .filter_map(|w| w.get("sessionId").and_then(|s| s.as_str()).map(String::from))
         .collect();
 
-    // Exact match first
-    if ids.iter().any(|id| id == target) {
-        return Some(target.to_string());
-    }
-    // Unique prefix match
-    let prefix_matches: Vec<&String> = ids.iter().filter(|id| id.starts_with(target)).collect();
-    if prefix_matches.len() == 1 {
-        return Some(prefix_matches[0].clone());
-    }
-    None
+    // Delegate matching to the shared helper in pm_daemon so exact/prefix/
+    // ambiguous rules stay in one place. An ambiguous prefix silently falls
+    // through to None: the caller will next try PID parsing, which fails for
+    // a uuid-shaped prefix, landing in the WORKER_NOT_FOUND path from PM.
+    pm_daemon::resolve_worker_id_from_keys(ids.iter().map(|s| s.as_str()), target).ok()
 }
 
 fn cmd_watch(
