@@ -44,6 +44,14 @@ pub fn worker_stderr_log_path(session_id: &str) -> Result<PathBuf, String> {
     Ok(worker_dir(session_id)?.join("stderr.log"))
 }
 
+pub fn inbox_dir() -> Result<PathBuf, String> {
+    Ok(c9watch_dir()?.join("inbox"))
+}
+
+pub fn inbox_pm_dir(pm_session_id: &str) -> Result<PathBuf, String> {
+    Ok(inbox_dir()?.join(pm_session_id))
+}
+
 // ── Structs ───────────────────────────────────────────────────────────
 
 /// Arguments used to spawn a worker session.
@@ -92,6 +100,9 @@ pub fn ensure_dirs() -> Result<(), String> {
     let workers = base.join("workers");
     std::fs::create_dir_all(&workers)
         .map_err(|e| format!("Failed to create workers dir {:?}: {}", workers, e))?;
+    let inbox = inbox_dir()?;
+    std::fs::create_dir_all(&inbox)
+        .map_err(|e| format!("Failed to create inbox dir {:?}: {}", inbox, e))?;
     Ok(())
 }
 
@@ -265,5 +276,24 @@ mod tests {
                 assert!(!id.is_empty());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod inbox_path_tests {
+    use super::*;
+
+    #[test]
+    fn inbox_dir_is_child_of_c9watch_dir() {
+        let d = inbox_dir().unwrap();
+        assert!(d.ends_with("inbox"));
+        assert!(d.starts_with(c9watch_dir().unwrap()));
+    }
+
+    #[test]
+    fn inbox_pm_dir_includes_pm_session_id() {
+        let d = inbox_pm_dir("abc-123").unwrap();
+        assert!(d.ends_with("abc-123"));
+        assert!(d.starts_with(inbox_dir().unwrap()));
     }
 }

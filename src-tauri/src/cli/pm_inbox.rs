@@ -1,0 +1,137 @@
+//! Inbox: async completion events from workers to their PM session.
+//!
+//! Events are plain JSON files at `~/.claude/c9watch/inbox/<pm-session-id>/<event-id>.json`.
+//! Workers write events (via `stdout_tee_task` in `pm_worker`); PMs read with
+//! `c9watch inbox`. No daemon involvement on read — it's pure filesystem.
+
+use crate::cli::pm_fs;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxEvent {
+    pub event_id: String,
+    pub session_id: String,
+    pub spawned_by: String,
+    pub status: EventStatus,
+    pub finished_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_turns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_excerpt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EventStatus {
+    Done,
+    Error,
+    Crashed,
+}
+
+/// Max characters for `result_excerpt` to keep inbox reads cheap.
+pub const EXCERPT_LIMIT: usize = 500;
+
+pub fn truncate_excerpt(s: &str) -> String {
+    if s.chars().count() <= EXCERPT_LIMIT {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(EXCERPT_LIMIT).collect();
+        out.push('…');
+        out
+    }
+}
+
+pub fn new_event_id() -> String {
+    // ISO-ish sortable prefix + short random suffix so filesystem listings sort FIFO
+    // but we display newest-first in `list()`.
+    let ts = Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+    let suffix: String = uuid::Uuid::new_v4().to_string().chars().take(8).collect();
+    format!("{}-{}", ts, suffix)
+}
+
+fn event_path(pm_session_id: &str, event_id: &str) -> Result<PathBuf, String> {
+    Ok(pm_fs::inbox_pm_dir(pm_session_id)?.join(format!("{}.json", event_id)))
+}
+
+/// Write an event to disk. Creates the PM's inbox dir if needed.
+pub fn write_event(ev: &InboxEvent) -> Result<(), String> {
+    let dir = pm_fs::inbox_pm_dir(&ev.spawned_by)?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create inbox pm dir {:?}: {}", dir, e))?;
+    let path = event_path(&ev.spawned_by, &ev.event_id)?;
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_string_pretty(ev)
+        .map_err(|e| format!("Failed to serialize inbox event: {}", e))?;
+    std::fs::write(&tmp, json)
+        .map_err(|e| format!("Failed to write inbox tmp {:?}: {}", tmp, e))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| format!("Failed to rename {:?} -> {:?}: {}", tmp, path, e))?;
+    Ok(())
+}
+
+/// List events for a PM, newest first (by filename, which embeds an ISO timestamp).
+pub fn list(pm_session_id: &str) -> Result<Vec<InboxEvent>, String> {
+    let dir = pm_fs::inbox_pm_dir(pm_session_id)?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("Failed to read inbox dir {:?}: {}", dir, e))?
+        .filter_map(|e| e.ok().map(|de| de.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    // Filename starts with an ISO-ish timestamp, so reverse-lex sort ≈ newest first.
+    paths.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        let txt = std::fs::read_to_string(&p)
+            .map_err(|e| format!("Failed to read inbox event {:?}: {}", p, e))?;
+        let ev: InboxEvent = serde_json::from_str(&txt)
+            .map_err(|e| format!("Failed to parse inbox event {:?}: {}", p, e))?;
+        out.push(ev);
+    }
+    Ok(out)
+}
+
+/// Delete all events for a PM. Returns count removed.
+pub fn clear(pm_session_id: &str) -> Result<usize, String> {
+    let dir = pm_fs::inbox_pm_dir(pm_session_id)?;
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("Failed to read inbox dir {:?}: {}", dir, e))?
+        .filter_map(|e| e.ok().map(|de| de.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    let mut removed = 0usize;
+    for p in entries {
+        if std::fs::remove_file(&p).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// List + clear in one call. Returns the events that were just removed.
+pub fn consume(pm_session_id: &str) -> Result<Vec<InboxEvent>, String> {
+    let events = list(pm_session_id)?;
+    clear(pm_session_id)?;
+    Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    // Placeholder — filled in by Task 2.
+}
