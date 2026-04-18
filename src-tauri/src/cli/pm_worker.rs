@@ -390,7 +390,15 @@ async fn stdout_tee_task(
                         .as_ref()
                         .map(|s| pm_inbox::truncate_excerpt(s));
                     let err_msg = if matches!(status, EventStatus::Error) {
-                        Some(stop_reason.clone().unwrap_or_else(|| "error".to_string()))
+                        // Prefer the result `subtype` (e.g. "error_during_execution",
+                        // "error_max_turns") since `stop_reason` is typically only
+                        // populated on success.
+                        Some(
+                            subtype
+                                .clone()
+                                .or_else(|| stop_reason.clone())
+                                .unwrap_or_else(|| "error".to_string()),
+                        )
                     } else {
                         None
                     };
