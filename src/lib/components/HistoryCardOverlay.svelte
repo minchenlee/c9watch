@@ -6,6 +6,8 @@
 	import MessageBubble from './MessageBubble.svelte';
 	import MessageNavMap from './MessageNavMap.svelte';
 	import { createSlidingWindow, BATCH_SIZE, MAX_VISIBLE } from '$lib/slidingWindow.svelte';
+	import { sessionCostMap, costMode } from '$lib/stores/cost';
+	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
 
 	interface Props {
 		entry: HistoryEntry;
@@ -24,6 +26,11 @@
 	let copied = $state(false);
 
 	const sw = createSlidingWindow();
+
+	let costRecord = $derived($sessionCostMap.get(entry.sessionId));
+	let primaryCostLabel = $derived(
+		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode) : null
+	);
 
 	let visibleMessages = $derived.by(() => {
 		if (!conversation) return [];
@@ -159,6 +166,18 @@
 						</div>
 						<div class="header-meta">
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
+							{#if costRecord}
+								<span class="separator">·</span>
+								<span class="cost-breakdown" title="Total cost: {formatCost(costRecord.cost)} · {formatTokens(costRecord.totalTokens)} tokens · {modelDisplayName(costRecord.model)}">
+									<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+										<line x1="12" y1="1" x2="12" y2="23" />
+										<path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+									</svg>
+									<span class="cost-primary">{primaryCostLabel}</span>
+									<span class="cost-secondary">· {$costMode === 'usd' ? formatTokens(costRecord.totalTokens) + ' tok' : formatCost(costRecord.cost)}</span>
+									<span class="cost-secondary">· {modelDisplayName(costRecord.model)}</span>
+								</span>
+							{/if}
 						</div>
 					</div>
 				</div>
@@ -376,6 +395,36 @@
 	}
 
 	.message-count {
+		color: var(--text-muted);
+	}
+
+	.separator {
+		color: var(--text-muted);
+	}
+
+	.cost-breakdown {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-muted);
+		letter-spacing: 0.05em;
+		text-transform: none;
+	}
+
+	.cost-breakdown svg {
+		flex-shrink: 0;
+		color: var(--accent-amber);
+		opacity: 0.8;
+	}
+
+	.cost-primary {
+		color: var(--accent-amber);
+		font-weight: 500;
+	}
+
+	.cost-secondary {
 		color: var(--text-muted);
 	}
 
