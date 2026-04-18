@@ -248,6 +248,8 @@ async fn handle_spawn(
         return serde_json::json!({ "ok": false, "error": format!("SPAWN_FAILED: {}", e) });
     }
 
+    let callback_inbox = spawned_by.as_deref().map(|pm| format!("~/.claude/c9watch/inbox/{}/", pm));
+
     serde_json::json!({
         "ok": true,
         "sessionId": session_id,
@@ -256,6 +258,7 @@ async fn handle_spawn(
         "cwd": canonical_cwd,
         "spawnedAt": spawned_at,
         "spawnedBy": spawned_by,
+        "callbackInbox": callback_inbox,
     })
 }
 
@@ -278,7 +281,7 @@ async fn handle_send(
     // Lock briefly: send the message and take the result receiver (fix C2).
     // The receiver is taken out so we can await it WITHOUT holding the lock,
     // which would block all other RPCs for up to `timeout_ms` milliseconds.
-    let (sent_ok, rx_opt) = {
+    let (sent_ok, rx_opt, callback_inbox) = {
         let mut st = state.lock().await;
         let worker = match st.workers.get_mut(&full_id) {
             Some(w) => w,
@@ -288,6 +291,7 @@ async fn handle_send(
             Err(e) => return serde_json::json!({ "ok": false, "error": e }),
             Ok(()) => {}
         }
+        let callback_inbox = worker.meta.spawned_by.as_deref().map(|pm| format!("~/.claude/c9watch/inbox/{}/", pm));
         let rx = if wait && timeout_ms > 0 {
             match worker.take_result_receiver() {
                 Some(r) => Some(r),
@@ -301,7 +305,7 @@ async fn handle_send(
         } else {
             None
         };
-        (true, rx)
+        (true, rx, callback_inbox)
     };
     let _ = sent_ok; // suppress unused warning
 
@@ -310,6 +314,7 @@ async fn handle_send(
             "ok": true,
             "sessionId": full_id,
             "sent": true,
+            "callbackInbox": callback_inbox,
         });
     }
 
@@ -336,6 +341,7 @@ async fn handle_send(
             "turnCompleted": true,
             "assistantText": turn.assistant_text,
             "endedAt": turn.ended_at,
+            "callbackInbox": callback_inbox,
         }),
         Ok(None) => serde_json::json!({
             "ok": false,
@@ -346,6 +352,7 @@ async fn handle_send(
             "sessionId": full_id,
             "sent": true,
             "turnCompleted": false,
+            "callbackInbox": callback_inbox,
         }),
     }
 }
