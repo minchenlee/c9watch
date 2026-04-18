@@ -1,6 +1,8 @@
 <script lang="ts">
 	import type { Session } from '$lib/types';
 	import { SessionStatus } from '$lib/types';
+	import { sessionCostMap, costMode } from '$lib/stores/cost';
+	import { formatCostOrTokens } from '$lib/cost-utils';
 
 	interface Props {
 		session: Session;
@@ -31,6 +33,11 @@
 	function tipMove(e: MouseEvent) { tooltipX = e.clientX + 12; tooltipY = e.clientY + 12; }
 
 	let cardTitle = $derived(session.customTitle || session.summary || session.firstPrompt);
+
+	let costRecord = $derived($sessionCostMap.get(session.id));
+	let costLabel = $derived(
+		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode) : null
+	);
 
 	function getStatusColor(): string {
 		switch (session.status) {
@@ -189,11 +196,23 @@
 						</svg>
 						{session.messageCount}
 					</span>
+					{#if costLabel}
+						<span class="cost-pill" title={$costMode === 'usd' ? 'Session cost' : 'Session tokens'}>
+							<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+								<line x1="12" y1="1" x2="12" y2="23" />
+								<path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+							</svg>
+							{costLabel}
+						</span>
+					{/if}
 					<span class="time-badge">{formatTimeSince(session.modified)}</span>
 				</div>
 			{/if}
 			
 			{#if compact}
+				{#if costLabel}
+					<span class="cost-pill compact-pill" title={$costMode === 'usd' ? 'Session cost' : 'Session tokens'}>{costLabel}</span>
+				{/if}
 				<div class="status-label" style="color: {getStatusColor()}">
 					{getStatusLabel()}
 				</div>
@@ -446,6 +465,27 @@
 		color: var(--text-muted);
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
+	}
+
+	.cost-pill {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		font-weight: 500;
+		color: var(--accent-amber);
+		letter-spacing: 0.05em;
+		white-space: nowrap;
+	}
+
+	.cost-pill svg {
+		flex-shrink: 0;
+		opacity: 0.8;
+	}
+
+	.cost-pill.compact-pill {
+		font-size: 10px;
 	}
 
 	/* Card Actions */
