@@ -156,6 +156,19 @@ pub enum Commands {
         all: bool,
     },
 
+    /// List callback events from workers spawned by this PM session
+    Inbox {
+        /// PM session id; defaults to the caller's detected session id
+        #[arg(long)]
+        pm_id: Option<String>,
+        /// Remove events after listing
+        #[arg(long)]
+        consume: bool,
+        /// Remove all events without printing them
+        #[arg(long)]
+        clear: bool,
+    },
+
     /// [hidden] Run the PM daemon
     #[command(hide = true)]
     Daemon,
@@ -214,6 +227,9 @@ pub fn run(cli: Cli) {
             timeout,
         } => pm::cmd_send(session_id, message, stdin, file, wait, timeout, cli.pretty),
         Commands::Workers { all } => pm::cmd_workers(all, cli.pretty),
+        Commands::Inbox { pm_id, consume, clear } => {
+            pm::cmd_inbox(pm_id, consume, clear, cli.pretty)
+        }
         Commands::Daemon => {
             match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt.block_on(pm_daemon::run_daemon()),

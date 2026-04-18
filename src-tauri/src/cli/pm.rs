@@ -272,3 +272,46 @@ pub fn cmd_workers(all: bool, pretty: bool) -> Result<(), String> {
 
     crate::cli::print_json(&response, pretty)
 }
+
+pub fn cmd_inbox(
+    pm_id: Option<String>,
+    consume: bool,
+    clear: bool,
+    pretty: bool,
+) -> Result<(), String> {
+    use super::pm_inbox;
+
+    // Resolve PM id: explicit > caller auto-detect
+    let pm = match pm_id {
+        Some(id) => id,
+        None => crate::cli::pm_caller::detect_caller_session_id_default()
+            .ok_or_else(|| {
+                "PM_SESSION_NOT_FOUND: pass --pm-id <session-id>, or run inside a Claude Code session".to_string()
+            })?,
+    };
+
+    if clear {
+        let n = pm_inbox::clear(&pm)?;
+        let out = serde_json::json!({
+            "ok": true,
+            "cleared": n,
+            "pmSessionId": pm,
+        });
+        return crate::cli::print_json(&out, pretty);
+    }
+
+    let events = if consume {
+        pm_inbox::consume(&pm)?
+    } else {
+        pm_inbox::list(&pm)?
+    };
+
+    let out = serde_json::json!({
+        "ok": true,
+        "pmSessionId": pm,
+        "count": events.len(),
+        "consumed": consume,
+        "events": events,
+    });
+    crate::cli::print_json(&out, pretty)
+}
