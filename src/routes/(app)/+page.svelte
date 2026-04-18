@@ -496,7 +496,7 @@
 				{/if}
 			</section>
 
-			{#if sessions.length === 0}
+			{#if filteredSessions.length === 0}
 				<div class="empty-state">
 					<div class="empty-visual">
 						<div class="empty-orb">
@@ -507,18 +507,33 @@
 						</div>
 					</div>
 					<div class="empty-content">
-						<h2>No Active Sessions</h2>
-						<p>Start a Claude Code session in your terminal or IDE</p>
-						<div class="empty-hint">
-							<span class="hint-icon">
-								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-									<circle cx="12" cy="12" r="10" />
-									<path d="M12 16v-4" />
-									<path d="M12 8h.01" />
-								</svg>
-							</span>
-							Sessions are detected automatically
-						</div>
+						{#if sessionFilter === 'workers'}
+							<h2>No Workers Spawned</h2>
+							<p>Spawn a worker from a Claude Code session with <code>c9watch spawn</code></p>
+							<div class="empty-hint">
+								<span class="hint-icon">
+									<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+										<circle cx="12" cy="12" r="10" />
+										<path d="M12 16v-4" />
+										<path d="M12 8h.01" />
+									</svg>
+								</span>
+								Workers appear here once they're spawned by a PM session
+							</div>
+						{:else}
+							<h2>No Active Sessions</h2>
+							<p>Start a Claude Code session in your terminal or IDE</p>
+							<div class="empty-hint">
+								<span class="hint-icon">
+									<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+										<circle cx="12" cy="12" r="10" />
+										<path d="M12 16v-4" />
+										<path d="M12 8h.01" />
+									</svg>
+								</span>
+								Sessions are detected automatically
+							</div>
+						{/if}
 					</div>
 				</div>
 			{:else}
