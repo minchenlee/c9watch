@@ -14,6 +14,17 @@ struct DaemonState {
     workers: HashMap<String, WorkerHandle>,
 }
 
+fn err_response(code: &str) -> serde_json::Value {
+    serde_json::json!({ "ok": false, "error": code })
+}
+
+/// Display-friendly inbox dir hint for RPC responses (e.g.
+/// `~/.claude/c9watch/inbox/<pm>/`). Single source of truth for the hint
+/// format returned by spawn/send.
+fn callback_inbox_hint(spawned_by: Option<&str>) -> Option<String> {
+    spawned_by.map(|pm| format!("~/.claude/c9watch/inbox/{}/", pm))
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Called by the CLI's `Daemon` subcommand. Starts the RPC server loop.
@@ -107,7 +118,7 @@ async fn handle_connection(
     let request: RpcRequest = match serde_json::from_str(line.trim()) {
         Ok(r) => r,
         Err(e) => {
-            let resp = serde_json::json!({ "ok": false, "error": format!("PARSE_ERROR: {}", e) });
+            let resp = err_response(&format!("PARSE_ERROR: {}", e));
             write_response(&mut write_half, &resp).await;
             return;
         }
@@ -186,7 +197,7 @@ async fn handle_spawn(
     {
         let st = state.lock().await;
         if st.workers.len() >= max_workers {
-            return serde_json::json!({ "ok": false, "error": "TOO_MANY_WORKERS" });
+            return err_response("TOO_MANY_WORKERS");
         }
     }
 
@@ -196,7 +207,7 @@ async fn handle_spawn(
     // Canonicalize cwd
     let canonical_cwd = match std::fs::canonicalize(&cwd) {
         Ok(p) => p.to_string_lossy().to_string(),
-        Err(_) => return serde_json::json!({ "ok": false, "error": "CWD_INVALID" }),
+        Err(_) => return err_response("CWD_INVALID"),
     };
 
     // Build SpawnArgs
@@ -218,7 +229,7 @@ async fn handle_spawn(
     .await
     {
         Ok(w) => w,
-        Err(e) => return serde_json::json!({ "ok": false, "error": e }),
+        Err(e) => return err_response(&e),
     };
 
     let pid = worker.meta.pid;
@@ -254,10 +265,10 @@ async fn handle_spawn(
         if let Some(mut w) = st.workers.remove(&session_id) {
             let _ = w.kill().await;
         }
-        return serde_json::json!({ "ok": false, "error": format!("SPAWN_FAILED: {}", e) });
+        return err_response(&format!("SPAWN_FAILED: {}", e));
     }
 
-    let callback_inbox = spawned_by.as_deref().map(|pm| format!("~/.claude/c9watch/inbox/{}/", pm));
+    let callback_inbox = callback_inbox_hint(spawned_by.as_deref());
 
     serde_json::json!({
         "ok": true,
@@ -283,40 +294,36 @@ async fn handle_send(
         let st = state.lock().await;
         match resolve_worker_id(&st.workers, &session_id) {
             Ok(id) => id,
-            Err(e) => return serde_json::json!({ "ok": false, "error": e }),
+            Err(e) => return err_response(&e),
         }
     };
 
-    // Lock briefly: send the message and take the result receiver (fix C2).
-    // The receiver is taken out so we can await it WITHOUT holding the lock,
-    // which would block all other RPCs for up to `timeout_ms` milliseconds.
-    let (sent_ok, rx_opt, callback_inbox) = {
+    // Send the message under the lock, then release it before awaiting the
+    // turn result so other RPCs aren't blocked for up to `timeout_ms`.
+    let (rx_opt, callback_inbox) = {
         let mut st = state.lock().await;
         let worker = match st.workers.get_mut(&full_id) {
             Some(w) => w,
-            None => return serde_json::json!({ "ok": false, "error": "WORKER_NOT_FOUND" }),
+            None => return err_response("WORKER_NOT_FOUND"),
         };
-        match worker.send_message(&text).await {
-            Err(e) => return serde_json::json!({ "ok": false, "error": e }),
-            Ok(()) => {}
+        if let Err(e) = worker.send_message(&text).await {
+            return err_response(&e);
         }
-        let callback_inbox = worker.meta.spawned_by.as_deref().map(|pm| format!("~/.claude/c9watch/inbox/{}/", pm));
+        let callback_inbox = callback_inbox_hint(worker.meta.spawned_by.as_deref());
         let rx = if wait && timeout_ms > 0 {
             match worker.take_result_receiver() {
                 Some(r) => Some(r),
                 None => {
-                    return serde_json::json!({
-                        "ok": false,
-                        "error": "SEND_BUSY: another --wait is already pending for this worker",
-                    })
+                    return err_response(
+                        "SEND_BUSY: another --wait is already pending for this worker",
+                    );
                 }
             }
         } else {
             None
         };
-        (true, rx, callback_inbox)
+        (rx, callback_inbox)
     };
-    let _ = sent_ok; // suppress unused warning
 
     if !wait || timeout_ms == 0 {
         return serde_json::json!({
@@ -393,7 +400,7 @@ async fn handle_stop(state: Arc<Mutex<DaemonState>>, session_id: String) -> serd
         let st = state.lock().await;
         match resolve_worker_id(&st.workers, &session_id) {
             Ok(id) => id,
-            Err(e) => return serde_json::json!({ "ok": false, "error": e }),
+            Err(e) => return err_response(&e),
         }
     };
 
@@ -434,8 +441,6 @@ fn cleanup_worker_dir(session_id: &str) {
 
 async fn handle_shutdown(state: Arc<Mutex<DaemonState>>) -> serde_json::Value {
     shutdown_daemon(state).await;
-    // shutdown_daemon calls exit(0), but satisfy the return type.
-    serde_json::json!({ "ok": true })
 }
 
 /// Kill all workers, clean up their on-disk dirs, then remove the daemon
