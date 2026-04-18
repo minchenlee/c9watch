@@ -214,8 +214,28 @@
 		});
 	}
 
-	let projectGroups = $derived(groupByProjectAndStatus(sessions));
-	let allStatusGroups = $derived(groupSessionsByStatus(sessions));
+	let filteredSessions = $derived(
+		sessions.filter((s) =>
+			sessionFilter === 'workers' ? !!s.workerOf : !s.workerOf
+		)
+	);
+
+	let projectGroups = $derived(groupByProjectAndStatus(filteredSessions));
+	let allStatusGroups = $derived(groupSessionsByStatus(filteredSessions));
+
+	let filteredSummary = $derived({
+		working: filteredSessions.filter(
+			(s) =>
+				s.status === SessionStatus.Working ||
+				s.status === SessionStatus.Connecting
+		).length,
+		permission: filteredSessions.filter(
+			(s) => s.status === SessionStatus.NeedsAttention
+		).length,
+		input: filteredSessions.filter(
+			(s) => s.status === SessionStatus.WaitingForInput
+		).length
+	});
 
 	let expandedSession = $derived(sessions.find((s) => s.id === expandedId) || null);
 
@@ -277,13 +297,13 @@
 		}
 		if (e.key >= '1' && e.key <= '9' && !expandedId) {
 			const index = parseInt(e.key) - 1;
-			if (index < sessions.length) {
-				handleExpand(sessions[index]);
+			if (index < filteredSessions.length) {
+				handleExpand(filteredSessions[index]);
 			}
 		}
 		if (e.key === 'Tab' && !expandedId) {
 			// Find first session needing attention across all projects
-			const needsAction = sessions.filter(s =>
+			const needsAction = filteredSessions.filter(s =>
 				s.status === SessionStatus.NeedsAttention ||
 				s.status === SessionStatus.WaitingForInput
 			);
@@ -441,9 +461,9 @@
 					</div>
 				</div>
 				
-				{#if sessions.length > 0}
+				{#if filteredSessions.length > 0}
 					<div class="system-status-container">
-						<StatusBar total={sessions.length} {summary} />
+						<StatusBar total={filteredSessions.length} summary={filteredSummary} />
 					</div>
 				{/if}
 			</section>
