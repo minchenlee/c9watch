@@ -206,6 +206,15 @@
 							<span class="status-label" style="color: {getStatusColor()}">{getStatusLabel()}</span>
 							<span class="separator">·</span>
 							<span class="session-name-badge">{session.sessionName}</span>
+							{#if session.workerOf}
+								<!-- svelte-ignore a11y_no_static_element_interactions -->
+								<span
+									class="worker-badge"
+									onmouseenter={() => tipEnter(`Worker of ${session.workerOf}`)}
+									onmouseleave={tipLeave}
+									onmousemove={tipMove}
+								>WORKER</span>
+							{/if}
 							<span class="separator">·</span>
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
 							{#if costRecord}
@@ -513,6 +522,18 @@
 
 	.cost-secondary {
 		color: var(--text-muted);
+	}
+
+	.worker-badge {
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		font-weight: 500;
+		color: var(--accent-amber);
+		background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
+		padding: 2px 6px;
+		border: 1px solid color-mix(in srgb, var(--accent-amber) 40%, transparent);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
 	}
 
 	.git-info {
