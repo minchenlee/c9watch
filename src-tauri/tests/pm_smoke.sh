@@ -53,6 +53,98 @@ fi
 rm -f "$FAKE_SESSION_FILE"
 rmdir "$TMP_CWD" 2>/dev/null || true
 
+echo "=== Test 6: inbox Done event end-to-end ==="
+FAKE_PID6=$$
+FAKE_SESSION_FILE6="$HOME/.claude/sessions/${FAKE_PID6}.json"
+FAKE_SID6="test-inbox-pm-$(uuidgen)"
+echo "{\"pid\":${FAKE_PID6},\"sessionId\":\"${FAKE_SID6}\",\"cwd\":\"/tmp\",\"startedAt\":0,\"kind\":\"interactive\",\"entrypoint\":\"cli\"}" \
+    > "$FAKE_SESSION_FILE6"
+
+# Clean any prior inbox for this fake PM
+$C9W inbox --pm-id "$FAKE_SID6" --clear >/dev/null 2>&1 || true
+
+TMP_CWD6=$(mktemp -d)
+SPAWN_OUT6=$($C9W spawn --cwd "$TMP_CWD6" --name smoke-inbox 2>/dev/null || true)
+WORKER_ID6=$(echo "$SPAWN_OUT6" | jq -r .sessionId 2>/dev/null || echo "")
+
+if [ -z "$WORKER_ID6" ] || [ "$WORKER_ID6" = "null" ]; then
+    echo "SKIP (needs claude CLI for actual spawn)"
+    rm -f "$FAKE_SESSION_FILE6"
+    rmdir "$TMP_CWD6" 2>/dev/null || true
+else
+    # Verify callbackInbox hint is present in spawn response
+    CB_HINT=$(echo "$SPAWN_OUT6" | jq -r .callbackInbox)
+    if [ "$CB_HINT" != "~/.claude/c9watch/inbox/${FAKE_SID6}/" ]; then
+        echo "FAIL Test 6: callbackInbox hint wrong: got '$CB_HINT'"
+        $C9W stop "$WORKER_ID6" >/dev/null 2>&1 || true
+        rm -f "$FAKE_SESSION_FILE6"
+        rmdir "$TMP_CWD6" 2>/dev/null || true
+        exit 1
+    fi
+
+    # Send a trivial message so the worker produces a result event
+    $C9W send "$WORKER_ID6" --message "Say ready then stop." --wait --timeout 60 >/dev/null 2>&1 || true
+
+    # Give the stdout tee a moment to flush the inbox file
+    sleep 1
+
+    INBOX_OUT=$($C9W inbox --pm-id "$FAKE_SID6")
+    COUNT=$(echo "$INBOX_OUT" | jq -r .count)
+    if [ "$COUNT" -lt 1 ]; then
+        echo "FAIL Test 6: expected at least 1 inbox event, got count=$COUNT"
+        echo "  inbox output: $INBOX_OUT"
+        $C9W stop "$WORKER_ID6" >/dev/null 2>&1 || true
+        rm -f "$FAKE_SESSION_FILE6"
+        rmdir "$TMP_CWD6" 2>/dev/null || true
+        exit 1
+    fi
+
+    STATUS=$(echo "$INBOX_OUT" | jq -r '.events[0].status')
+    EVENT_SID=$(echo "$INBOX_OUT" | jq -r '.events[0].sessionId')
+    if [ "$STATUS" != "done" ]; then
+        echo "FAIL Test 6: expected status=done, got '$STATUS'"
+        $C9W stop "$WORKER_ID6" >/dev/null 2>&1 || true
+        rm -f "$FAKE_SESSION_FILE6"
+        rmdir "$TMP_CWD6" 2>/dev/null || true
+        exit 1
+    fi
+    if [ "$EVENT_SID" != "$WORKER_ID6" ]; then
+        echo "FAIL Test 6: event sessionId '$EVENT_SID' != worker '$WORKER_ID6'"
+        $C9W stop "$WORKER_ID6" >/dev/null 2>&1 || true
+        rm -f "$FAKE_SESSION_FILE6"
+        rmdir "$TMP_CWD6" 2>/dev/null || true
+        exit 1
+    fi
+    echo "PASS"
+
+    echo "=== Test 7: inbox --consume clears the inbox ==="
+    CONSUME_OUT=$($C9W inbox --pm-id "$FAKE_SID6" --consume)
+    CONSUMED=$(echo "$CONSUME_OUT" | jq -r .consumed)
+    if [ "$CONSUMED" != "true" ]; then
+        echo "FAIL Test 7: response missing consumed=true"
+        $C9W stop "$WORKER_ID6" >/dev/null 2>&1 || true
+        rm -f "$FAKE_SESSION_FILE6"
+        rmdir "$TMP_CWD6" 2>/dev/null || true
+        exit 1
+    fi
+
+    AFTER_OUT=$($C9W inbox --pm-id "$FAKE_SID6")
+    AFTER_COUNT=$(echo "$AFTER_OUT" | jq -r .count)
+    if [ "$AFTER_COUNT" != "0" ]; then
+        echo "FAIL Test 7: after --consume, count=$AFTER_COUNT (expected 0)"
+        $C9W stop "$WORKER_ID6" >/dev/null 2>&1 || true
+        rm -f "$FAKE_SESSION_FILE6"
+        rmdir "$TMP_CWD6" 2>/dev/null || true
+        exit 1
+    fi
+    echo "PASS"
+
+    # Cleanup
+    $C9W stop "$WORKER_ID6" >/dev/null 2>&1 || true
+    rm -f "$FAKE_SESSION_FILE6"
+    rmdir "$TMP_CWD6" 2>/dev/null || true
+fi
+
 echo ""
 echo "=== Basic smoke tests passed (no Claude API calls) ==="
 echo ""
