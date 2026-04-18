@@ -36,6 +36,33 @@ pub enum RpcRequest {
     Stop { session_id: String },
     #[serde(rename = "shutdown")]
     Shutdown,
+    #[serde(rename = "adopt")]
+    Adopt {
+        session_id: String,
+        force: bool,
+        #[serde(rename = "callerPmSessionId")]
+        caller_pm_session_id: String,
+        #[serde(rename = "callerPmPid", default)]
+        caller_pm_pid: Option<u32>,
+    },
+    #[serde(rename = "workersAll")]
+    WorkersAll {
+        #[serde(rename = "callerPmSessionId", default)]
+        caller_pm_session_id: Option<String>,
+        #[serde(rename = "callerPmPid", default)]
+        caller_pm_pid: Option<u32>,
+    },
+    #[serde(rename = "inboxRead")]
+    InboxRead {
+        #[serde(rename = "callerPmSessionId")]
+        caller_pm_session_id: String,
+        #[serde(rename = "callerPmPid", default)]
+        caller_pm_pid: Option<u32>,
+        consume: bool,
+        clear: bool,
+        #[serde(rename = "workerId", default)]
+        worker_id: Option<String>,
+    },
 }
 
 // ── Client function ───────────────────────────────────────────────────
@@ -144,6 +171,42 @@ mod tests {
         let req = RpcRequest::List;
         let json = serde_json::to_string(&req).expect("serialize should succeed");
         assert!(json.contains("\"op\":\"list\""), "should contain op:list, got: {}", json);
+    }
+
+    #[test]
+    fn test_adopt_request_serializes() {
+        let req = RpcRequest::Adopt {
+            session_id: "w-1".to_string(),
+            force: true,
+            caller_pm_session_id: "pm-1".to_string(),
+            caller_pm_pid: Some(100),
+        };
+        let json = serde_json::to_string(&req).expect("serialize should succeed");
+        assert!(json.contains("\"op\":\"adopt\""), "got: {}", json);
+        assert!(json.contains("callerPmSessionId"), "got: {}", json);
+    }
+
+    #[test]
+    fn test_workers_all_request_serializes() {
+        let req = RpcRequest::WorkersAll {
+            caller_pm_session_id: Some("pm-1".to_string()),
+            caller_pm_pid: None,
+        };
+        let json = serde_json::to_string(&req).expect("serialize should succeed");
+        assert!(json.contains("\"op\":\"workersAll\""), "got: {}", json);
+    }
+
+    #[test]
+    fn test_inbox_read_request_serializes() {
+        let req = RpcRequest::InboxRead {
+            caller_pm_session_id: "pm-1".to_string(),
+            caller_pm_pid: None,
+            consume: false,
+            clear: false,
+            worker_id: None,
+        };
+        let json = serde_json::to_string(&req).expect("serialize should succeed");
+        assert!(json.contains("\"op\":\"inboxRead\""), "got: {}", json);
     }
 
     #[test]

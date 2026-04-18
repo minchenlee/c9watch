@@ -159,6 +159,33 @@ async fn handle_connection(
         RpcRequest::List => handle_list(state).await,
         RpcRequest::Stop { session_id } => handle_stop(state, session_id).await,
         RpcRequest::Shutdown => handle_shutdown(state).await,
+        RpcRequest::Adopt {
+            session_id,
+            force,
+            caller_pm_session_id,
+            caller_pm_pid,
+        } => handle_adopt(state, session_id, force, caller_pm_session_id, caller_pm_pid).await,
+        RpcRequest::WorkersAll {
+            caller_pm_session_id,
+            caller_pm_pid,
+        } => handle_workers_all(state, caller_pm_session_id, caller_pm_pid).await,
+        RpcRequest::InboxRead {
+            caller_pm_session_id,
+            caller_pm_pid,
+            consume,
+            clear,
+            worker_id,
+        } => {
+            handle_inbox_read(
+                state,
+                caller_pm_session_id,
+                caller_pm_pid,
+                consume,
+                clear,
+                worker_id,
+            )
+            .await
+        }
     };
 
     write_response(&mut write_half, &response).await;
@@ -391,6 +418,7 @@ async fn handle_list(state: Arc<Mutex<DaemonState>>) -> serde_json::Value {
                 "cwd": worker.meta.cwd,
                 "spawnedAt": worker.meta.spawned_at,
                 "spawnedBy": worker.meta.spawned_by,
+                "pmPid": worker.meta.pm_pid,
                 "alive": alive,
             })
         })
@@ -525,6 +553,198 @@ where
             matches.len()
         )),
     }
+}
+
+async fn handle_workers_all(
+    state: Arc<Mutex<DaemonState>>,
+    caller_pm_session_id: Option<String>,
+    caller_pm_pid: Option<u32>,
+) -> serde_json::Value {
+    let mut st = state.lock().await;
+    let workers: Vec<serde_json::Value> = st
+        .workers
+        .iter_mut()
+        .map(|(session_id, worker)| {
+            let alive = worker.is_alive();
+            let status = resolve_status(
+                &worker.meta,
+                caller_pm_pid,
+                caller_pm_session_id.as_deref(),
+            );
+            serde_json::json!({
+                "sessionId": session_id,
+                "pid": worker.meta.pid,
+                "name": worker.meta.name,
+                "cwd": worker.meta.cwd,
+                "spawnedAt": worker.meta.spawned_at,
+                "spawnedBy": worker.meta.spawned_by,
+                "pmPid": worker.meta.pm_pid,
+                "alive": alive,
+                "status": status.as_str(),
+            })
+        })
+        .collect();
+    serde_json::json!({ "ok": true, "workers": workers })
+}
+
+async fn handle_adopt(
+    state: Arc<Mutex<DaemonState>>,
+    target: String,
+    force: bool,
+    caller_pm_session_id: String,
+    caller_pm_pid: Option<u32>,
+) -> serde_json::Value {
+    if let Err(e) = pm_fs::validate_session_id(&caller_pm_session_id) {
+        return err_response(&format!("INVALID_CALLER_PM: {}", e));
+    }
+
+    let full_id = {
+        let st = state.lock().await;
+        if !st.workers.is_empty() {
+            match resolve_worker_id(&st.workers, &target) {
+                Ok(id) => id,
+                Err(e) => return err_response(&e),
+            }
+        } else {
+            match resolve_worker_id_from_disk(&target) {
+                Ok(id) => id,
+                Err(e) => return err_response(&e),
+            }
+        }
+    };
+
+    let meta = match pm_fs::read_worker_meta(&full_id) {
+        Ok(m) => m,
+        Err(e) => return err_response(&format!("WORKER_META_READ_FAILED: {}", e)),
+    };
+
+    let status = resolve_status(&meta, caller_pm_pid, Some(&caller_pm_session_id));
+    match status {
+        WorkerStatus::OwnedByYou => serde_json::json!({
+            "ok": true,
+            "adopted": full_id,
+            "pmSessionId": caller_pm_session_id,
+            "alreadyOwned": true,
+        }),
+        WorkerStatus::Orphaned => {
+            if let Err(e) = crate::cli::adoption::add(&caller_pm_session_id, &full_id) {
+                return err_response(&format!("ADOPTION_WRITE_FAILED: {}", e));
+            }
+            serde_json::json!({
+                "ok": true,
+                "adopted": full_id,
+                "pmSessionId": caller_pm_session_id,
+            })
+        }
+        WorkerStatus::OwnedByOtherPm => {
+            if !force {
+                return serde_json::json!({
+                    "ok": false,
+                    "error": "WORKER_OWNED_BY_OTHER_PM",
+                    "details": "pass --force to adopt anyway",
+                });
+            }
+            if let Err(e) = crate::cli::adoption::add(&caller_pm_session_id, &full_id) {
+                return err_response(&format!("ADOPTION_WRITE_FAILED: {}", e));
+            }
+            serde_json::json!({
+                "ok": true,
+                "adopted": full_id,
+                "pmSessionId": caller_pm_session_id,
+                "forced": true,
+            })
+        }
+    }
+}
+
+fn resolve_worker_id_from_disk(target: &str) -> Result<String, String> {
+    let ids = pm_fs::list_worker_ids()?;
+    resolve_worker_id_from_keys(ids.iter().map(|s| s.as_str()), target)
+}
+
+async fn handle_inbox_read(
+    state: Arc<Mutex<DaemonState>>,
+    caller_pm_session_id: String,
+    caller_pm_pid: Option<u32>,
+    consume: bool,
+    clear: bool,
+    worker_id_filter: Option<String>,
+) -> serde_json::Value {
+    if let Err(e) = pm_fs::validate_session_id(&caller_pm_session_id) {
+        return err_response(&format!("INVALID_CALLER_PM: {}", e));
+    }
+
+    let owned: Vec<String> = {
+        let st = state.lock().await;
+        if !st.workers.is_empty() {
+            st.workers
+                .iter()
+                .filter_map(|(id, w)| {
+                    let status = resolve_status(
+                        &w.meta,
+                        caller_pm_pid,
+                        Some(&caller_pm_session_id),
+                    );
+                    if status == WorkerStatus::OwnedByYou {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            let ids = pm_fs::list_worker_ids().unwrap_or_default();
+            ids.into_iter()
+                .filter(|id| match pm_fs::read_worker_meta(id) {
+                    Ok(m) => {
+                        resolve_status(&m, caller_pm_pid, Some(&caller_pm_session_id))
+                            == WorkerStatus::OwnedByYou
+                    }
+                    Err(_) => false,
+                })
+                .collect()
+        }
+    };
+
+    let targets: Vec<String> = if let Some(wid) = &worker_id_filter {
+        if !owned.iter().any(|o| o == wid) {
+            return err_response("WORKER_NOT_OWNED");
+        }
+        vec![wid.clone()]
+    } else {
+        owned
+    };
+
+    if clear {
+        let mut cleared = 0usize;
+        for wid in &targets {
+            cleared += crate::cli::pm_inbox::clear(wid).unwrap_or(0);
+        }
+        return serde_json::json!({
+            "ok": true,
+            "cleared": cleared,
+            "pmSessionId": caller_pm_session_id,
+        });
+    }
+
+    let mut all_events: Vec<crate::cli::pm_inbox::InboxEvent> = Vec::new();
+    for wid in &targets {
+        let evs = if consume {
+            crate::cli::pm_inbox::consume(wid).unwrap_or_default()
+        } else {
+            crate::cli::pm_inbox::list(wid).unwrap_or_default()
+        };
+        all_events.extend(evs);
+    }
+    all_events.sort_by(|a, b| b.finished_at.cmp(&a.finished_at));
+
+    serde_json::json!({
+        "ok": true,
+        "pmSessionId": caller_pm_session_id,
+        "count": all_events.len(),
+        "consumed": consume,
+        "events": all_events,
+    })
 }
 
 // ── Ownership resolver ────────────────────────────────────────────────────────
