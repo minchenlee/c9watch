@@ -1,6 +1,8 @@
 <script lang="ts">
 	import type { Session } from '$lib/types';
 	import { SessionStatus } from '$lib/types';
+	import { sessionCostMap, costMode } from '$lib/stores/cost';
+	import { formatCostOrTokens } from '$lib/cost-utils';
 
 	interface Props {
 		session: Session;
@@ -34,6 +36,11 @@
 	let cardTitle = $derived(session.customTitle || session.summary || session.firstPrompt);
 	let workerTip = $derived(session.workerOf ? `Worker of ${session.workerOf}` : '');
 	let workerIdShort = $derived(session.workerOf?.slice(0, 8) ?? '');
+
+	let costRecord = $derived($sessionCostMap.get(session.id));
+	let costLabel = $derived(
+		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode) : null
+	);
 
 	function getStatusColor(): string {
 		switch (session.status) {
@@ -219,11 +226,19 @@
 						</svg>
 						{session.messageCount}
 					</span>
+					{#if costLabel}
+						<span class="cost-pill" title={$costMode === 'usd' ? 'Session cost' : 'Session tokens'}>
+							{costLabel}
+						</span>
+					{/if}
 					<span class="time-badge">{formatTimeSince(session.modified)}</span>
 				</div>
 			{/if}
 			
 			{#if compact}
+				{#if costLabel}
+					<span class="cost-pill compact-pill" title={$costMode === 'usd' ? 'Session cost' : 'Session tokens'}>{costLabel}</span>
+				{/if}
 				<div class="status-label" style="color: {getStatusColor()}">
 					{getStatusLabel()}
 				</div>
@@ -527,6 +542,22 @@
 		color: var(--text-muted);
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
+	}
+
+	.cost-pill {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		white-space: nowrap;
+	}
+
+	.cost-pill.compact-pill {
+		font-size: 10px;
 	}
 
 	/* Card Actions */
