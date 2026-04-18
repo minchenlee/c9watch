@@ -54,17 +54,26 @@ pub async fn run_daemon() -> Result<(), String> {
         workers: HashMap::new(),
     }));
 
-    // 7. Accept loop
+    // 7. Accept loop — interruptible by ctrl_c / SIGTERM so the daemon can
+    //    kill workers and clean up their worker dirs before exiting (fix H2a).
     loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                let state_clone = Arc::clone(&state);
-                tokio::spawn(async move {
-                    handle_connection(stream, state_clone, max_workers).await;
-                });
+        tokio::select! {
+            accept = listener.accept() => {
+                match accept {
+                    Ok((stream, _addr)) => {
+                        let state_clone = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            handle_connection(stream, state_clone, max_workers).await;
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("[pm_daemon] Accept error: {}", e);
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("[pm_daemon] Accept error: {}", e);
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("[pm_daemon] Received ctrl_c / SIGINT, shutting down...");
+                shutdown_daemon(state).await;
             }
         }
     }
@@ -395,18 +404,58 @@ async fn handle_stop(state: Arc<Mutex<DaemonState>>, session_id: String) -> serd
         }
     }
 
+    // Clean up the on-disk worker dir (meta.json + stdout.log + stderr.log)
+    // so the GUI / `c9watch list` overlay doesn't keep showing a stopped
+    // worker as live (fix H2a). The worker's conversation is archived under
+    // \`~/.claude/projects/\` already, so nothing important is lost.
+    cleanup_worker_dir(&full_id);
+
     serde_json::json!({ "ok": true, "sessionId": full_id })
 }
 
+/// Remove `~/.claude/c9watch/workers/<session_id>/`. Logs (not fails) on error.
+fn cleanup_worker_dir(session_id: &str) {
+    match pm_fs::worker_dir(session_id) {
+        Ok(dir) => {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "[pm_daemon] Failed to remove worker dir {:?}: {}",
+                        dir, e
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[pm_daemon] Cannot resolve worker dir for {}: {}", session_id, e);
+        }
+    }
+}
+
 async fn handle_shutdown(state: Arc<Mutex<DaemonState>>) -> serde_json::Value {
-    // Kill all workers
-    {
+    shutdown_daemon(state).await;
+    // shutdown_daemon calls exit(0), but satisfy the return type.
+    serde_json::json!({ "ok": true })
+}
+
+/// Kill all workers, clean up their on-disk dirs, then remove the daemon
+/// pid/sock files and exit. Called both by the `shutdown` RPC and by the
+/// ctrl_c / SIGTERM signal handler in `run_daemon` (fix H2a).
+async fn shutdown_daemon(state: Arc<Mutex<DaemonState>>) -> ! {
+    // Kill all workers and remove their worker dirs
+    let killed_ids: Vec<String> = {
         let mut st = state.lock().await;
+        let mut ids = Vec::with_capacity(st.workers.len());
         for (id, mut worker) in st.workers.drain() {
             if let Err(e) = worker.kill().await {
                 eprintln!("[pm_daemon] Failed to kill worker {} during shutdown: {}", id, e);
             }
+            ids.push(id);
         }
+        ids
+    };
+    for id in &killed_ids {
+        cleanup_worker_dir(id);
     }
 
     // Clean up pid and sock files

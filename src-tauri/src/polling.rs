@@ -23,6 +23,24 @@ struct WorkersCache {
     map: StdHashMap<String, String>,
 }
 
+/// Cross-platform PID liveness check used to filter stale worker meta.json
+/// entries out of the overlay (fix H2b). On Unix, `kill(pid, 0)` returns 0
+/// if the process exists; `ESRCH` if it doesn't. On Windows we can't easily
+/// check without adding a dependency, so assume the meta.json is fresh —
+/// `stoppedAt` + the daemon cleanup on stop cover the common cases.
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
+}
+
 fn load_workers_overlay() -> StdHashMap<String, String> {
     let workers_dir = match dirs::home_dir() {
         Some(h) => h.join(".claude").join("c9watch").join("workers"),
@@ -50,6 +68,18 @@ fn load_workers_overlay() -> StdHashMap<String, String> {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                     let sid = val.get("sessionId").and_then(|v| v.as_str());
                     let by = val.get("spawnedBy").and_then(|v| v.as_str());
+                    // Skip entries whose stoppedAt is set or whose PID is no
+                    // longer alive (fix H2b): the daemon should clean up
+                    // worker dirs on stop/shutdown, but crashes or kill -9
+                    // can leave stale meta.json files behind.
+                    if val.get("stoppedAt").and_then(|v| v.as_str()).is_some() {
+                        continue;
+                    }
+                    if let Some(pid) = val.get("pid").and_then(|v| v.as_u64()) {
+                        if !pid_is_alive(pid as u32) {
+                            continue;
+                        }
+                    }
                     if let (Some(sid), Some(by)) = (sid, by) {
                         map.insert(sid.to_string(), by.to_string());
                     }
@@ -379,6 +409,24 @@ fn fire_notification(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_alive_detects_dead_pid() {
+        // PID 0 is never a real process.
+        assert!(!pid_is_alive(0));
+        // PID 999999 is extremely unlikely to be live (kernel default pid_max
+        // on macOS is 99999, and even on Linux systems with expanded range
+        // it's highly unlikely to hit this).
+        assert!(!pid_is_alive(999_999));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_alive_detects_live_pid() {
+        // Our own pid must be alive.
+        assert!(pid_is_alive(std::process::id()));
+    }
 
     #[test]
     fn test_detect_and_enrich_sessions() {
