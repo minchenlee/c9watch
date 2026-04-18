@@ -1,12 +1,10 @@
 use crate::session::enrichment::detect_and_enrich_sessions_with_detector;
 pub use crate::session::enrichment::{detect_and_enrich_sessions, truncate_string, Session};
 use crate::session::{SessionDetector, SessionStatus};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap as StdHashMap;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -15,19 +13,24 @@ use tauri_plugin_notification::NotificationExt;
 
 /// Cached overlay: session_id -> spawnedBy (i.e. worker_of).
 /// Invalidated when the `~/.claude/c9watch/workers/` dir mtime changes.
-static WORKERS_OVERLAY: LazyLock<StdMutex<Option<WorkersCache>>> =
-    LazyLock::new(|| StdMutex::new(None));
+static WORKERS_OVERLAY: LazyLock<Mutex<Option<WorkersCache>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 struct WorkersCache {
     dir_mtime: SystemTime,
-    map: StdHashMap<String, String>,
+    map: Arc<HashMap<String, String>>,
 }
 
-/// Cross-platform PID liveness check used to filter stale worker meta.json
-/// entries out of the overlay (fix H2b). On Unix, `kill(pid, 0)` returns 0
-/// if the process exists; `ESRCH` if it doesn't. On Windows we can't easily
-/// check without adding a dependency, so assume the meta.json is fresh —
-/// `stoppedAt` + the daemon cleanup on stop cover the common cases.
+/// Narrow view of worker meta.json — only the fields the overlay needs.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerMetaOverlay {
+    session_id: Option<String>,
+    spawned_by: Option<String>,
+    stopped_at: Option<String>,
+    pid: Option<u64>,
+}
+
 #[cfg(unix)]
 fn pid_is_alive(pid: u32) -> bool {
     if pid == 0 {
@@ -41,57 +44,50 @@ fn pid_is_alive(_pid: u32) -> bool {
     true
 }
 
-fn load_workers_overlay() -> StdHashMap<String, String> {
+fn load_workers_overlay() -> Arc<HashMap<String, String>> {
     let workers_dir = match dirs::home_dir() {
         Some(h) => h.join(".claude").join("c9watch").join("workers"),
-        None => return StdHashMap::new(),
+        None => return Arc::new(HashMap::new()),
     };
 
     let dir_mtime = match std::fs::metadata(&workers_dir).and_then(|m| m.modified()) {
         Ok(m) => m,
-        Err(_) => return StdHashMap::new(),
+        Err(_) => return Arc::new(HashMap::new()),
     };
 
     if let Ok(guard) = WORKERS_OVERLAY.lock() {
         if let Some(cache) = guard.as_ref() {
             if cache.dir_mtime == dir_mtime {
-                return cache.map.clone();
+                return Arc::clone(&cache.map);
             }
         }
     }
 
-    let mut map = StdHashMap::new();
+    let mut map = HashMap::new();
     if let Ok(entries) = std::fs::read_dir(&workers_dir) {
         for entry in entries.flatten() {
             let meta_path = entry.path().join("meta.json");
-            if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    let sid = val.get("sessionId").and_then(|v| v.as_str());
-                    let by = val.get("spawnedBy").and_then(|v| v.as_str());
-                    // Skip entries whose stoppedAt is set or whose PID is no
-                    // longer alive (fix H2b): the daemon should clean up
-                    // worker dirs on stop/shutdown, but crashes or kill -9
-                    // can leave stale meta.json files behind.
-                    if val.get("stoppedAt").and_then(|v| v.as_str()).is_some() {
-                        continue;
-                    }
-                    if let Some(pid) = val.get("pid").and_then(|v| v.as_u64()) {
-                        if !pid_is_alive(pid as u32) {
-                            continue;
-                        }
-                    }
-                    if let (Some(sid), Some(by)) = (sid, by) {
-                        map.insert(sid.to_string(), by.to_string());
-                    }
+            let Ok(content) = std::fs::read_to_string(&meta_path) else { continue };
+            let Ok(meta) = serde_json::from_str::<WorkerMetaOverlay>(&content) else { continue };
+            if meta.stopped_at.is_some() {
+                continue;
+            }
+            if let Some(pid) = meta.pid {
+                if !pid_is_alive(pid as u32) {
+                    continue;
                 }
+            }
+            if let (Some(sid), Some(by)) = (meta.session_id, meta.spawned_by) {
+                map.insert(sid, by);
             }
         }
     }
 
+    let map = Arc::new(map);
     if let Ok(mut guard) = WORKERS_OVERLAY.lock() {
         *guard = Some(WorkersCache {
             dir_mtime,
-            map: map.clone(),
+            map: Arc::clone(&map),
         });
     }
     map
@@ -140,6 +136,7 @@ pub fn start_polling(
         let mut is_first_cycle = true;
 
         let mut prev_diagnostics: Option<crate::session::DetectionDiagnostics> = None;
+        let mut prev_sessions_hash: Option<u64> = None;
 
         loop {
             // Detect and enrich sessions
@@ -147,11 +144,9 @@ pub fn start_polling(
                 Ok((mut sessions, diagnostics)) => {
                     // Overlay worker_of from ~/.claude/c9watch/workers/*/meta.json
                     let overlay = load_workers_overlay();
-                    if !overlay.is_empty() {
-                        for s in sessions.iter_mut() {
-                            if let Some(by) = overlay.get(&s.id) {
-                                s.worker_of = Some(by.clone());
-                            }
+                    for s in sessions.iter_mut() {
+                        if let Some(by) = overlay.get(&s.id) {
+                            s.worker_of = Some(by.clone());
                         }
                     }
 
@@ -248,17 +243,26 @@ pub fn start_polling(
                         }
                     }
 
-                    // Emit event to Tauri frontend
-                    if let Err(e) = app_handle.emit("sessions-updated", &sessions) {
-                        crate::debug_log::log_error(&format!(
-                            "Failed to emit sessions-updated: {}",
-                            e
-                        ));
-                    }
-
-                    // Broadcast to WebSocket clients
-                    if let Ok(json) = serde_json::to_string(&sessions) {
-                        let _ = sessions_tx.send(json);
+                    // Serialize once; skip emit/broadcast when payload is unchanged
+                    // so idle dashboards don't rerender every poll cycle.
+                    let serialized = serde_json::to_string(&sessions).ok();
+                    let current_hash = serialized.as_ref().map(|s| {
+                        let mut h = DefaultHasher::new();
+                        s.hash(&mut h);
+                        h.finish()
+                    });
+                    let changed = current_hash != prev_sessions_hash;
+                    if changed {
+                        if let Err(e) = app_handle.emit("sessions-updated", &sessions) {
+                            crate::debug_log::log_error(&format!(
+                                "Failed to emit sessions-updated: {}",
+                                e
+                            ));
+                        }
+                        if let Some(json) = serialized {
+                            let _ = sessions_tx.send(json);
+                        }
+                        prev_sessions_hash = current_hash;
                     }
 
                     // Emit diagnostics only when changed
