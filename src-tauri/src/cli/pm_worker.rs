@@ -28,6 +28,14 @@ pub struct TurnResult {
     pub result_text: Option<String>,
 }
 
+/// Info needed by `stdout_tee_task` to route inbox events to the spawning PM.
+/// `None` when the worker has no `spawnedBy` (human caller) — events are skipped.
+#[derive(Debug, Clone)]
+pub struct InboxContext {
+    pub session_id: String,
+    pub spawned_by: String,
+}
+
 pub struct WorkerHandle {
     pub meta: WorkerMeta,
     child: Child,
@@ -125,6 +133,11 @@ impl WorkerHandle {
         let stderr_log_path = pm_fs::worker_stderr_log_path(&session_id)
             .map_err(|e| format!("Failed to resolve stderr log path: {}", e))?;
 
+        let inbox_ctx = meta.spawned_by.as_ref().map(|pm| InboxContext {
+            session_id: session_id.clone(),
+            spawned_by: pm.clone(),
+        });
+
         // Spawn background tasks
         tokio::spawn(stdin_writer_task(stdin_rx, child_stdin));
         tokio::spawn(stdout_tee_task(
@@ -132,6 +145,7 @@ impl WorkerHandle {
             stdout_log_path,
             result_tx.clone(),
             Some(ready_tx),
+            inbox_ctx,
         ));
         tokio::spawn(stderr_tee_task(child_stderr, stderr_log_path));
 
@@ -273,6 +287,7 @@ async fn stdout_tee_task(
     log_path: PathBuf,
     result_tx: mpsc::Sender<TurnResult>,
     mut ready_tx: Option<oneshot::Sender<()>>,
+    inbox: Option<InboxContext>,
 ) {
     use tokio::fs::OpenOptions;
 
@@ -351,16 +366,49 @@ async fn stdout_tee_task(
                 let result = TurnResult {
                     assistant_text: std::mem::take(&mut assistant_buf),
                     ended_at: Utc::now().to_rfc3339(),
-                    subtype,
+                    subtype: subtype.clone(),
                     is_error,
                     duration_ms,
                     num_turns,
-                    stop_reason,
+                    stop_reason: stop_reason.clone(),
                     total_cost_usd,
-                    result_text,
+                    result_text: result_text.clone(),
                 };
                 // Non-blocking send: if receiver is gone, we just continue
                 let _ = result_tx.send(result).await;
+
+                if let Some(ref ctx) = inbox {
+                    use crate::cli::pm_inbox::{self, InboxEvent, EventStatus};
+                    let status = if is_error || subtype.as_deref().map(|s| s != "success").unwrap_or(false) {
+                        EventStatus::Error
+                    } else {
+                        EventStatus::Done
+                    };
+                    let excerpt = result_text
+                        .as_ref()
+                        .map(|s| pm_inbox::truncate_excerpt(s));
+                    let err_msg = if matches!(status, EventStatus::Error) {
+                        Some(stop_reason.clone().unwrap_or_else(|| "error".to_string()))
+                    } else {
+                        None
+                    };
+                    let ev = InboxEvent {
+                        event_id: pm_inbox::new_event_id(),
+                        session_id: ctx.session_id.clone(),
+                        spawned_by: ctx.spawned_by.clone(),
+                        status,
+                        finished_at: Utc::now().to_rfc3339(),
+                        duration_ms,
+                        num_turns,
+                        stop_reason,
+                        total_cost_usd,
+                        result_excerpt: excerpt,
+                        error_message: err_msg,
+                    };
+                    if let Err(e) = pm_inbox::write_event(&ev) {
+                        eprintln!("[pm_worker] Failed to write inbox event: {}", e);
+                    }
+                }
             }
             _ => {}
         }
