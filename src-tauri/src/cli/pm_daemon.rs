@@ -552,7 +552,7 @@ fn resolve_worker_id(
 
 /// Key-only variant of `resolve_worker_id`, factored out so it can be unit
 /// tested without constructing real `WorkerHandle`s.
-fn resolve_worker_id_from_keys<'a, I>(keys: I, prefix: &str) -> Result<String, String>
+pub(crate) fn resolve_worker_id_from_keys<'a, I>(keys: I, prefix: &str) -> Result<String, String>
 where
     I: IntoIterator<Item = &'a str>,
 {
