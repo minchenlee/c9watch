@@ -66,7 +66,7 @@ pub async fn run_daemon() -> Result<(), String> {
     }));
 
     // 7. Accept loop — interruptible by ctrl_c / SIGTERM so the daemon can
-    //    kill workers and clean up their worker dirs before exiting (fix H2a).
+    //    kill workers and clean up their worker dirs before exiting.
     loop {
         tokio::select! {
             accept = listener.accept() => {
@@ -242,7 +242,7 @@ async fn handle_spawn(
         st.workers.insert(session_id.clone(), worker);
     }
 
-    // Wait for worker readiness (first stdout event) before returning (fix I5).
+    // Wait for worker readiness (first stdout event) before returning.
     // Lock briefly to call wait_ready, which only holds until the oneshot fires.
     // We cannot hold the lock across the await, so we take a short-lived lock
     // per poll — but wait_ready is a single async await, so we grab the lock,
@@ -337,7 +337,7 @@ async fn handle_send(
     // rx_opt is Some here because wait && timeout_ms > 0
     let mut rx = rx_opt.expect("rx must be Some when wait && timeout_ms > 0");
 
-    // Await the turn result WITHOUT holding the state lock (fix C2)
+    // Await the turn result WITHOUT holding the state lock
     let timeout = Duration::from_millis(timeout_ms);
     let turn_result = tokio::time::timeout(timeout, rx.recv()).await;
 
@@ -413,7 +413,7 @@ async fn handle_stop(state: Arc<Mutex<DaemonState>>, session_id: String) -> serd
 
     // Clean up the on-disk worker dir (meta.json + stdout.log + stderr.log)
     // so the GUI / `c9watch list` overlay doesn't keep showing a stopped
-    // worker as live (fix H2a). The worker's conversation is archived under
+    // worker as live. The worker's conversation is archived under
     // \`~/.claude/projects/\` already, so nothing important is lost.
     cleanup_worker_dir(&full_id);
 
@@ -445,7 +445,7 @@ async fn handle_shutdown(state: Arc<Mutex<DaemonState>>) -> serde_json::Value {
 
 /// Kill all workers, clean up their on-disk dirs, then remove the daemon
 /// pid/sock files and exit. Called both by the `shutdown` RPC and by the
-/// ctrl_c / SIGTERM signal handler in `run_daemon` (fix H2a).
+/// ctrl_c / SIGTERM signal handler in `run_daemon`.
 async fn shutdown_daemon(state: Arc<Mutex<DaemonState>>) -> ! {
     // Kill all workers and remove their worker dirs
     let killed_ids: Vec<String> = {
@@ -497,7 +497,7 @@ where
 {
     // Reject empty prefix — otherwise `"".starts_with("")` would match every
     // worker and `c9watch send "" --message ...` would silently target the
-    // sole live worker (fix C4).
+    // sole live worker.
     if prefix.is_empty() {
         return Err("worker id/prefix required".to_string());
     }

@@ -41,12 +41,12 @@ pub struct WorkerHandle {
     child: Child,
     stdin_tx: mpsc::Sender<StdinMessage>,
     /// Wrapped in Option so it can be taken out while waiting without holding
-    /// the daemon state Mutex (fix C2: avoid blocking all RPCs during wait).
+    /// the daemon state Mutex.
     result_rx: Option<mpsc::Receiver<TurnResult>>,
     /// Held so the channel stays open as long as the handle lives.
     #[allow(dead_code)]
     result_tx: mpsc::Sender<TurnResult>,
-    /// Signals that the worker's stdout has produced its first line (fix I5).
+    /// Signals that the worker's stdout has produced its first line.
     ready_rx: Option<oneshot::Receiver<()>>,
 }
 
@@ -281,7 +281,7 @@ async fn stdin_writer_task(
 /// Reads stdout line-by-line, appends to stdout.log, and sends TurnResults
 /// whenever a `"type":"result"` event is seen.
 ///
-/// `ready_tx`: if `Some`, fired once on the first line of output (fix I5).
+/// `ready_tx`: if `Some`, fired once on the first line of output.
 async fn stdout_tee_task(
     stdout: tokio::process::ChildStdout,
     log_path: PathBuf,
@@ -322,7 +322,7 @@ async fn stdout_tee_task(
             }
         };
 
-        // Signal readiness on first line of output (fix I5)
+        // Signal readiness on first line of output
         if let Some(tx) = ready_tx.take() {
             let _ = tx.send(());
         }

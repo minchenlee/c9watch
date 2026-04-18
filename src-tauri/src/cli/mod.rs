@@ -478,7 +478,7 @@ fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
         return Err("stop target required (PID or worker session id/prefix)".to_string());
     }
 
-    // Worker-first dispatch (fix H1): worker session UUIDs routinely begin with
+    // Worker-first dispatch: worker session UUIDs routinely begin with
     // digits (e.g. `12345678-abcd-...`), so a prefix like `12345678` would
     // previously parse as PID and SIGKILL an arbitrary OS process. Ask the
     // daemon for a worker match first; only fall back to PID if no worker

@@ -8,7 +8,7 @@ use std::time::Duration;
 /// Ensure the PM daemon is running. Starts it if not already alive.
 ///
 /// An exclusive advisory flock on `daemon.pid` serializes concurrent callers
-/// so that only one process ever forks the daemon (fix C1).
+/// so that only one process ever forks the daemon.
 pub fn ensure_daemon() -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
 
@@ -230,7 +230,7 @@ pub fn cmd_send(
     crate::cli::print_json(&response, pretty)?;
 
     // Exit code 2 when --wait timed out: message was sent but the turn did not
-    // complete within the requested timeout (fix I1).
+    // complete within the requested timeout.
     if wait {
         if let Some(false) = response.get("turnCompleted").and_then(|v| v.as_bool()) {
             std::process::exit(2);
