@@ -56,6 +56,22 @@ export function showInAppNotification(title: string, body: string) {
 }
 
 /**
+ * Derived store: map of PM session ID → its managed worker sessions.
+ * Populated from `session.workerOf` — no new Rust data needed.
+ */
+export const workersByPm = derived(sessions, ($sessions) => {
+	const m = new Map<string, Session[]>();
+	for (const s of $sessions) {
+		if (s.workerOf) {
+			const arr = m.get(s.workerOf) ?? [];
+			arr.push(s);
+			m.set(s.workerOf, arr);
+		}
+	}
+	return m;
+});
+
+/**
  * Derived store: sessions sorted by attention priority
  * Priority: NeedsAttention > WaitingForInput > Working > Connecting
  */
