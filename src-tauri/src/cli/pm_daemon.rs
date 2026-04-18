@@ -527,6 +527,92 @@ where
     }
 }
 
+// ── Ownership resolver ────────────────────────────────────────────────────────
+
+/// Check whether a PID is alive via `kill(pid, 0)`.
+#[cfg(unix)]
+fn is_pid_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn is_pid_alive(_pid: u32) -> bool {
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerStatus {
+    OwnedByYou,
+    OwnedByOtherPm,
+    Orphaned,
+}
+
+impl WorkerStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            WorkerStatus::OwnedByYou => "OWNED_BY_YOU",
+            WorkerStatus::OwnedByOtherPm => "OWNED_BY_OTHER_PM",
+            WorkerStatus::Orphaned => "ORPHANED",
+        }
+    }
+}
+
+/// Classify `meta` against the caller's identity.
+fn resolve_status(
+    meta: &pm_fs::WorkerMeta,
+    caller_pm_pid: Option<u32>,
+    caller_pm_session_id: Option<&str>,
+) -> WorkerStatus {
+    // 1. PID-based OWNED_BY_YOU
+    if let (Some(mine), Some(theirs)) = (caller_pm_pid, meta.pm_pid) {
+        if mine == theirs {
+            return WorkerStatus::OwnedByYou;
+        }
+    }
+    // 2. Adoption-based OWNED_BY_YOU
+    if let Some(sid) = caller_pm_session_id {
+        if let Ok(Some(record)) = crate::cli::adoption::read_filter(sid) {
+            if record.worker_ids.iter().any(|w| w == &meta.session_id) {
+                return WorkerStatus::OwnedByYou;
+            }
+        }
+    }
+    // 3. meta.pm_pid alive and not ours → OWNED_BY_OTHER_PM
+    if let Some(owner_pid) = meta.pm_pid {
+        if is_pid_alive(owner_pid) {
+            return WorkerStatus::OwnedByOtherPm;
+        }
+    }
+    // 4. Is any *other* PM's adoption sidecar claiming this worker?
+    if let Ok(entries) = std::fs::read_dir(
+        pm_fs::adoptions_dir().unwrap_or_else(|_| std::path::PathBuf::from("/dev/null")),
+    ) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            if Some(stem) == caller_pm_session_id {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(rec) =
+                    serde_json::from_str::<crate::cli::adoption::AdoptionRecord>(&content)
+                {
+                    if rec.worker_ids.iter().any(|w| w == &meta.session_id) {
+                        return WorkerStatus::OwnedByOtherPm;
+                    }
+                }
+            }
+        }
+    }
+    WorkerStatus::Orphaned
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,5 +662,43 @@ mod tests {
         let keys = ["abc-123"];
         let err = resolve_worker_id_from_keys(keys.iter().copied(), "xyz").unwrap_err();
         assert_eq!(err, "WORKER_NOT_FOUND");
+    }
+
+    fn make_meta(wid: &str, pm_pid: Option<u32>) -> pm_fs::WorkerMeta {
+        pm_fs::WorkerMeta {
+            session_id: wid.to_string(),
+            pid: 1,
+            name: None,
+            cwd: "/tmp".to_string(),
+            spawned_at: "t".to_string(),
+            spawned_by: Some("pm-audit".to_string()),
+            pm_pid,
+            spawn_args: pm_fs::SpawnArgs {
+                append_system_prompt: None,
+                permission_mode: "default".to_string(),
+                model: None,
+                add_dirs: vec![],
+            },
+            stopped_at: None,
+        }
+    }
+
+    #[test]
+    fn resolve_status_owned_by_you_via_pid() {
+        let meta = make_meta("w-pid-owned", Some(99999));
+        assert_eq!(
+            resolve_status(&meta, Some(99999), Some("pm-uuid-1")),
+            WorkerStatus::OwnedByYou
+        );
+    }
+
+    #[test]
+    fn resolve_status_orphaned_when_pm_pid_dead_and_no_adoption() {
+        // 999_999_999 is a positive pid_t too large to ever be alive on this
+        // machine, so `kill(pid, 0)` returns ESRCH. u32::MAX would wrap to -1
+        // (broadcast "all processes") — do not use it here.
+        let meta = make_meta("w-orphan-unique-id-xyz", Some(999_999_999));
+        let status = resolve_status(&meta, Some(1), Some("pm-uuid-stranger-xyz"));
+        assert_eq!(status, WorkerStatus::Orphaned);
     }
 }
