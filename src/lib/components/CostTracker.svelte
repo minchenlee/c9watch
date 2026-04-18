@@ -1,9 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getCostData, getConversation } from '$lib/api';
-	import type { CostData, HistoryEntry, Conversation } from '$lib/types';
+	import { getConversation } from '$lib/api';
+	import type { HistoryEntry, Conversation } from '$lib/types';
 	import TokenDistanceVisualizer from './token-distance/TokenDistanceVisualizer.svelte';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
+	import { costData as costDataStore, costMode, refreshCostData } from '$lib/stores/cost';
+	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
 
 	type TimeScale = 'daily' | 'weekly' | 'monthly';
 
@@ -11,13 +13,19 @@
 		key: string;
 		label: string;
 		cost: number;
+		tokens: number;
 		sessions: import('$lib/types').SessionCostRecord[];
-		subBuckets?: { label: string; cost: number; sessions: import('$lib/types').SessionCostRecord[] }[];
+		subBuckets?: { label: string; cost: number; tokens: number; sessions: import('$lib/types').SessionCostRecord[] }[];
+	}
+
+	function sumTokens(sessions: import('$lib/types').SessionCostRecord[]): number {
+		return sessions.reduce((sum, s) => sum + (s.totalTokens || 0), 0);
 	}
 
 	// ── State ────────────────────────────────────────────────────────
-	let costData = $state<CostData | null>(null);
 	let loading = $state(true);
+	let costData = $derived($costDataStore);
+	let mode = $derived($costMode);
 	let collapsedProjects = $state<Set<string>>(new Set());
 	let modelTrackWidth = $state(0);
 	let projectTrackWidth = $state(0);
@@ -35,10 +43,6 @@
 	let sessionSortDir = $state<SortDir>('desc');
 
 	// ── Helpers ──────────────────────────────────────────────────────
-	function formatCost(n: number): string {
-		return '$' + n.toFixed(2);
-	}
-
 	/** Format a Date object as YYYY-MM-DD in local time */
 	function toLocalDateStr(d: Date): string {
 		return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -119,7 +123,9 @@
 	function sortSessions(sessions: import('$lib/types').SessionCostRecord[]): import('$lib/types').SessionCostRecord[] {
 		const dir = sessionSortDir === 'desc' ? -1 : 1;
 		return [...sessions].sort((a, b) => {
-			if (sessionSortField === 'cost') return (a.cost - b.cost) * dir;
+			if (sessionSortField === 'cost') {
+				return (mode === 'usd' ? (a.cost - b.cost) : (a.totalTokens - b.totalTokens)) * dir;
+			}
 			return a.timestamp.localeCompare(b.timestamp) * dir;
 		});
 	}
@@ -145,14 +151,6 @@
 		} finally {
 			loadingConversation = false;
 		}
-	}
-
-	function modelDisplayName(model: string): string {
-		if (model.startsWith('claude-sonnet')) return 'Sonnet';
-		if (model.startsWith('claude-opus')) return 'Opus';
-		if (model.startsWith('claude-haiku')) return 'Haiku';
-		if (model === '<synthetic>' || model === 'unknown') return '—';
-		return model;
 	}
 
 	/** Returns the date range [startInclusive, endExclusive) for current time scale window */
@@ -188,6 +186,7 @@
 				key: d.date,
 				label: formatDayLabel(d.date),
 				cost: d.cost,
+				tokens: sumTokens(d.sessions),
 				sessions: d.sessions
 			}));
 		}
@@ -216,10 +215,11 @@
 					key: wk,
 					label: formatWeekLabel(wk),
 					cost: data?.cost ?? 0,
+					tokens: data ? sumTokens(data.sessions) : 0,
 					sessions: data?.sessions ?? [],
 					subBuckets: data ? Array.from(data.dayBuckets.entries())
 						.sort(([a], [b]) => b.localeCompare(a))
-						.map(([date, d]) => ({ label: formatDayLabel(date), cost: d.cost, sessions: d.sessions })) : []
+						.map(([date, d]) => ({ label: formatDayLabel(date), cost: d.cost, tokens: sumTokens(d.sessions), sessions: d.sessions })) : []
 				};
 			});
 		}
@@ -250,10 +250,11 @@
 				key: mk,
 				label: formatMonthLabel(mk),
 				cost: data?.cost ?? 0,
+				tokens: data ? sumTokens(data.sessions) : 0,
 				sessions: data?.sessions ?? [],
 				subBuckets: data ? Array.from(data.weekBuckets.entries())
 					.sort(([a], [b]) => b.localeCompare(a))
-					.map(([wk, w]) => ({ label: formatWeekLabel(wk), cost: w.cost, sessions: w.sessions })) : []
+					.map(([wk, w]) => ({ label: formatWeekLabel(wk), cost: w.cost, tokens: sumTokens(w.sessions), sessions: w.sessions })) : []
 			};
 		});
 	});
@@ -266,53 +267,71 @@
 		return Math.max(...timeBuckets.map(b => b.cost));
 	});
 
+	let maxBucketTokens = $derived.by(() => {
+		if (timeBuckets.length === 0) return 0;
+		return Math.max(...timeBuckets.map(b => b.tokens));
+	});
+
+	let bucketScaleMax = $derived(mode === 'usd' ? maxBucketCost : maxBucketTokens);
+	let maxProjectTokens = $derived.by(() => {
+		if (filteredProjectCosts.length === 0) return 0;
+		return Math.max(...filteredProjectCosts.map(p => p.totalTokens));
+	});
+
 	let scaleLabel = $derived(
 		timeScale === 'daily' ? 'DAILY' : timeScale === 'weekly' ? 'WEEKLY' : 'MONTHLY'
 	);
 
-	let scaleSectionTitle = $derived(
-		timeScale === 'daily' ? 'DAILY COST' : timeScale === 'weekly' ? 'WEEKLY COST' : 'MONTHLY COST'
-	);
+	let scaleSectionTitle = $derived.by(() => {
+		const suffix = mode === 'usd' ? 'COST' : 'TOKENS';
+		const prefix = timeScale === 'daily' ? 'DAILY' : timeScale === 'weekly' ? 'WEEKLY' : 'MONTHLY';
+		return `${prefix} ${suffix}`;
+	});
 
 	/** Model costs filtered to the active time window */
-	let filteredModelCosts = $derived.by((): Array<{ model: string; displayName: string; cost: number; percentage: number }> => {
+	let filteredModelCosts = $derived.by((): Array<{ model: string; displayName: string; cost: number; tokens: number; percentage: number }> => {
 		if (!costData) return [];
 		const tw = getTimeWindow();
 
-		// Collect all sessions within the time window
 		const sessions = costData.dailyCosts
 			.filter(d => !tw || (d.date >= tw.start && d.date < tw.end))
 			.flatMap(d => d.sessions);
 
-		// Aggregate by model
-		const modelMap = new Map<string, number>();
+		const modelMap = new Map<string, { cost: number; tokens: number }>();
 		for (const s of sessions) {
-			modelMap.set(s.model, (modelMap.get(s.model) || 0) + s.cost);
+			const cur = modelMap.get(s.model) || { cost: 0, tokens: 0 };
+			cur.cost += s.cost;
+			cur.tokens += s.totalTokens || 0;
+			modelMap.set(s.model, cur);
 		}
 
-		const totalCost = Array.from(modelMap.values()).reduce((a, b) => a + b, 0);
+		const totalCost = Array.from(modelMap.values()).reduce((a, b) => a + b.cost, 0);
 		return Array.from(modelMap.entries())
-			.map(([model, cost]) => ({
+			.map(([model, v]) => ({
 				model,
 				displayName: modelDisplayName(model),
-				cost,
-				percentage: totalCost > 0 ? (cost / totalCost) * 100 : 0
+				cost: v.cost,
+				tokens: v.tokens,
+				percentage: totalCost > 0 ? (v.cost / totalCost) * 100 : 0
 			}))
 			.sort((a, b) => b.cost - a.cost);
 	});
 
 	/** Project costs filtered to the active time window */
 	let filteredProjectCosts = $derived.by(() => {
-		if (!costData) return [];
+		if (!costData) return [] as Array<{ project: string; projectName: string; totalCost: number; totalTokens: number; sessions: import('$lib/types').SessionCostRecord[] }>;
 		const tw = getTimeWindow();
-		if (!tw) return costData.projectCosts;
+		const source = !tw
+			? costData.projectCosts.map(p => ({ ...p, sessions: p.sessions }))
+			: null;
 
-		const projMap = new Map<string, { project: string; projectName: string; totalCost: number; sessions: import('$lib/types').SessionCostRecord[] }>();
+		const projMap = new Map<string, { project: string; projectName: string; totalCost: number; totalTokens: number; sessions: import('$lib/types').SessionCostRecord[] }>();
 		for (const proj of costData.projectCosts) {
-			const filtered = proj.sessions.filter(s => s.date >= tw.start && s.date < tw.end);
+			const filtered = tw ? proj.sessions.filter(s => s.date >= tw.start && s.date < tw.end) : proj.sessions;
 			if (filtered.length === 0) continue;
 			const cost = filtered.reduce((sum, s) => sum + s.cost, 0);
-			projMap.set(proj.project, { project: proj.project, projectName: proj.projectName, totalCost: cost, sessions: filtered });
+			const tokens = sumTokens(filtered);
+			projMap.set(proj.project, { project: proj.project, projectName: proj.projectName, totalCost: cost, totalTokens: tokens, sessions: filtered });
 		}
 		return Array.from(projMap.values()).sort((a, b) => b.totalCost - a.totalCost);
 	});
@@ -327,6 +346,16 @@
 			.reduce((sum, d) => sum + d.cost, 0);
 	});
 
+	/** Total tokens filtered to the active time window */
+	let filteredTotalTokens = $derived.by(() => {
+		if (!costData) return 0;
+		const tw = getTimeWindow();
+		if (!tw) return costData.totalTokens;
+		return costData.dailyCosts
+			.filter(d => d.date >= tw.start && d.date < tw.end)
+			.reduce((sum, d) => sum + sumTokens(d.sessions), 0);
+	});
+
 	let allCollapsed = $derived(
 		filteredProjectCosts.length > 0 &&
 		filteredProjectCosts.every(p => collapsedProjects.has(p.project))
@@ -336,6 +365,8 @@
 		if (filteredProjectCosts.length === 0) return 0;
 		return Math.max(...filteredProjectCosts.map(p => p.totalCost));
 	});
+
+	let projectScaleMax = $derived(mode === 'usd' ? maxProjectCost : maxProjectTokens);
 
 	// Grid-block helpers for inline bars
 	let modelBarColumns = $derived(Math.max(1, Math.floor((modelTrackWidth - 6) / 10)));
@@ -415,14 +446,9 @@
 
 	// ── Lifecycle ────────────────────────────────────────────────────
 	onMount(async () => {
-		try {
-			costData = await getCostData();
-			collapsedProjects = new Set();
-		} catch (e) {
-			console.error('Failed to load cost data:', e);
-		} finally {
-			loading = false;
-		}
+		await refreshCostData();
+		collapsedProjects = new Set();
+		loading = false;
 	});
 </script>
 
@@ -433,7 +459,21 @@
 	<div class="section-header">
 		<span class="section-title">COST TRACKER</span>
 		{#if costData}
-			<span class="section-total">{formatCost(filteredTotalCost)}</span>
+			<span class="section-total">{formatCostOrTokens(filteredTotalCost, filteredTotalTokens, mode)}</span>
+			<div class="mode-toggle" role="group" aria-label="Display mode">
+				<button
+					class="mode-btn"
+					class:active={mode === 'usd'}
+					onclick={() => costMode.set('usd')}
+					title="Show costs in USD"
+				>USD</button>
+				<button
+					class="mode-btn"
+					class:active={mode === 'tokens'}
+					onclick={() => costMode.set('tokens')}
+					title="Show totals in tokens"
+				>TOKENS</button>
+			</div>
 			<button class="distance-btn" onclick={() => showVisualizer = true}>
 				DISTANCE
 			</button>
@@ -481,7 +521,7 @@
 						<div class="model-legend-item">
 							<span class="dot {mc.model.startsWith('claude-opus') ? 'opus' : mc.model.startsWith('claude-sonnet') ? 'sonnet' : 'haiku'}"></span>
 							<span class="model-legend-label">{mc.displayName.toUpperCase()}</span>
-							<span class="model-legend-cost">{formatCost(mc.cost)}</span>
+							<span class="model-legend-cost">{formatCostOrTokens(mc.cost, mc.tokens, mode)}</span>
 							<span class="model-legend-pct">{mc.percentage.toFixed(0)}%</span>
 						</div>
 					{/each}
@@ -496,24 +536,25 @@
 
 				<div class="vchart-area">
 					{#each chronoBuckets as bucket (bucket.key)}
+						{@const barValue = mode === 'usd' ? bucket.cost : bucket.tokens}
 						<div
 							class="vchart-col"
 							onmouseenter={() => hoveredBucket = bucket.key}
 							onmouseleave={() => hoveredBucket = null}
 							role="img"
-							aria-label="{bucket.label}: {formatCost(bucket.cost)}"
+							aria-label="{bucket.label}: {formatCostOrTokens(bucket.cost, bucket.tokens, mode)}"
 						>
 							{#if hoveredBucket === bucket.key}
 								<div class="vchart-tooltip">
 									<span class="vchart-tooltip-label">{bucket.label}</span>
-									<span class="vchart-tooltip-cost">{formatCost(bucket.cost)}</span>
+									<span class="vchart-tooltip-cost">{formatCostOrTokens(bucket.cost, bucket.tokens, mode)}</span>
 								</div>
 							{/if}
 							<div class="vchart-bar-wrap">
 								<div
 									class="vchart-bar"
-									class:vchart-bar-empty={bucket.cost === 0}
-									style="height: {maxBucketCost > 0 ? (bucket.cost / maxBucketCost) * 100 : 0}%"
+									class:vchart-bar-empty={barValue === 0}
+									style="height: {bucketScaleMax > 0 ? (barValue / bucketScaleMax) * 100 : 0}%"
 								></div>
 							</div>
 							<span class="vchart-label">
@@ -554,13 +595,14 @@
 						>
 							<span class="collapse-toggle" aria-hidden="true">{collapsedProjects.has(proj.project) ? '▶' : '▼'}</span>
 							<span class="group-name">{proj.projectName.toUpperCase()} <span class="group-count">({proj.sessions.length})</span></span>
-							<span class="group-cost">{formatCost(proj.totalCost)}</span>
+							<span class="group-cost">{formatCostOrTokens(proj.totalCost, proj.totalTokens, mode)}</span>
 						</div>
 
 						{#if !collapsedProjects.has(proj.project)}
+							{@const projValue = mode === 'usd' ? proj.totalCost : proj.totalTokens}
 							<div class="grid-bar-track" bind:clientWidth={projectTrackWidth}>
 								<div class="grid-container" style="grid-template-columns: repeat({projectBarColumns}, 1fr);">
-									{#each buildBarBlocks(maxProjectCost > 0 ? (proj.totalCost / maxProjectCost) * 100 : 0, projectBarColumns, 'amber') as block}
+									{#each buildBarBlocks(projectScaleMax > 0 ? (projValue / projectScaleMax) * 100 : 0, projectBarColumns, 'amber') as block}
 										<div class="rect {block.type}"></div>
 									{/each}
 								</div>
@@ -576,7 +618,7 @@
 									<span class="detail-spacer"></span>
 									<span class="detail-time">{formatDateTime(session.timestamp)}</span>
 									<span class="detail-model">{modelDisplayName(session.model)}</span>
-									<span class="detail-cost">{formatCost(session.cost)}</span>
+									<span class="detail-cost">{formatCostOrTokens(session.cost, session.totalTokens, mode)}</span>
 								</div>
 							{/each}
 
@@ -1101,6 +1143,32 @@
 	}
 
 	.option-btn.active {
+		color: var(--accent-amber);
+	}
+
+	.mode-toggle {
+		display: flex;
+		border: 1px solid var(--border-default);
+	}
+
+	.mode-btn {
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		letter-spacing: 0.1em;
+		padding: 4px var(--space-sm);
+		background: transparent;
+		border: none;
+		color: var(--text-muted);
+		cursor: pointer;
+		text-transform: uppercase;
+	}
+
+	.mode-btn:hover {
+		color: var(--text-primary);
+		background: rgba(255, 255, 255, 0.08);
+	}
+
+	.mode-btn.active {
 		color: var(--accent-amber);
 	}
 
