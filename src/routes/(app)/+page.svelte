@@ -40,6 +40,7 @@
 	let conversation = $derived($currentConversation);
 
 	let viewMode = $state<'project' | 'all'>('project');
+	let sessionFilter = $state<'humans' | 'workers'>('humans');
 
 	let isCompact = $state(false);
 
@@ -63,6 +64,10 @@
 			const savedCompact = localStorage.getItem('sessionViewCompact');
 			if (savedCompact === 'true') {
 				isCompact = true;
+			}
+			const savedFilter = localStorage.getItem('sessionFilter');
+			if (savedFilter === 'humans' || savedFilter === 'workers') {
+				sessionFilter = savedFilter;
 			}
 		}
 
@@ -105,6 +110,18 @@
 	$effect(() => {
 		if (browser) {
 			localStorage.setItem('sessionViewCompact', String(isCompact));
+		}
+	});
+
+	$effect(() => {
+		if (browser) {
+			localStorage.setItem('sessionFilter', sessionFilter);
+		}
+	});
+
+	$effect(() => {
+		if (browser) {
+			localStorage.setItem('sessionViewMode', viewMode);
 		}
 	});
 
