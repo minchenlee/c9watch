@@ -2,6 +2,7 @@
 	import type { Session } from '$lib/types';
 	import { SessionStatus } from '$lib/types';
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
+	import { workersByPm } from '$lib/stores/sessions';
 	import { formatCostOrTokens } from '$lib/cost-utils';
 
 	interface Props {
@@ -36,6 +37,9 @@
 	let cardTitle = $derived(session.customTitle || session.summary || session.firstPrompt);
 	let workerTip = $derived(session.workerOf ? `Worker of ${session.workerOf}` : '');
 	let workerIdShort = $derived(session.workerOf?.slice(0, 8) ?? '');
+
+	let myWorkers = $derived($workersByPm.get(session.id) ?? []);
+	let isPm = $derived(myWorkers.length > 0);
 
 	let costRecord = $derived($sessionCostMap.get(session.id));
 	let costLabel = $derived(
@@ -215,6 +219,15 @@
 						onmouseleave={tipLeave}
 						onmousemove={tipMove}
 					>WORKER</span>
+				{/if}
+				{#if isPm}
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
+					<span
+						class="pm-badge"
+						onmouseenter={() => tipEnter(`Managing ${myWorkers.length} worker${myWorkers.length === 1 ? '' : 's'}`)}
+						onmouseleave={tipLeave}
+						onmousemove={tipMove}
+					>PM · {myWorkers.length}</span>
 				{/if}
 			</div>
 
@@ -446,6 +459,21 @@
 		letter-spacing: 0.1em;
 		display: inline-block;
 		vertical-align: middle;
+	}
+
+	.pm-badge {
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		font-weight: 500;
+		color: var(--accent-green);
+		background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+		padding: 2px 6px;
+		border: 1px solid color-mix(in srgb, var(--accent-green) 40%, transparent);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		display: inline-block;
+		vertical-align: middle;
+		white-space: nowrap;
 	}
 
 	/* Workers-only view: surface the PM relationship as a first-class prefix
