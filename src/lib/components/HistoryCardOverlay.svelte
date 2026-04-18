@@ -169,10 +169,6 @@
 							{#if costRecord}
 								<span class="separator">·</span>
 								<span class="cost-breakdown" title="Total cost: {formatCost(costRecord.cost)} · {formatTokens(costRecord.totalTokens)} tokens · {modelDisplayName(costRecord.model)}">
-									<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-										<line x1="12" y1="1" x2="12" y2="23" />
-										<path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
-									</svg>
 									<span class="cost-primary">{primaryCostLabel}</span>
 									<span class="cost-secondary">· {$costMode === 'usd' ? formatTokens(costRecord.totalTokens) + ' tok' : formatCost(costRecord.cost)}</span>
 									<span class="cost-secondary">· {modelDisplayName(costRecord.model)}</span>
@@ -413,15 +409,8 @@
 		text-transform: none;
 	}
 
-	.cost-breakdown svg {
-		flex-shrink: 0;
-		color: var(--accent-amber);
-		opacity: 0.8;
-	}
-
 	.cost-primary {
-		color: var(--accent-amber);
-		font-weight: 500;
+		color: var(--text-muted);
 	}
 
 	.cost-secondary {

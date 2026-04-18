@@ -198,10 +198,6 @@
 					</span>
 					{#if costLabel}
 						<span class="cost-pill" title={$costMode === 'usd' ? 'Session cost' : 'Session tokens'}>
-							<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-								<line x1="12" y1="1" x2="12" y2="23" />
-								<path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
-							</svg>
 							{costLabel}
 						</span>
 					{/if}
@@ -472,16 +468,11 @@
 		align-items: center;
 		gap: 4px;
 		font-family: var(--font-mono);
-		font-size: 11px;
-		font-weight: 500;
-		color: var(--accent-amber);
+		font-size: 12px;
+		color: var(--text-muted);
+		text-transform: uppercase;
 		letter-spacing: 0.05em;
 		white-space: nowrap;
-	}
-
-	.cost-pill svg {
-		flex-shrink: 0;
-		opacity: 0.8;
 	}
 
 	.cost-pill.compact-pill {
