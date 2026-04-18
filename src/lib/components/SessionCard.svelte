@@ -5,13 +5,14 @@
 	interface Props {
 		session: Session;
 		compact?: boolean;
+		workersView?: boolean;
 		onexpand?: () => void;
 		onstop?: () => void;
 		onopen?: () => void;
 		onrename?: () => void;
 	}
 
-	let { session, compact = false, onexpand, onstop, onopen, onrename }: Props = $props();
+	let { session, compact = false, workersView = false, onexpand, onstop, onopen, onrename }: Props = $props();
 
 	let needsAttention = $derived(
 		session.status === SessionStatus.NeedsAttention ||
@@ -142,6 +143,22 @@
 >
 	<!-- Card Content -->
 	<div class="card-body">
+		{#if workersView && session.workerOf}
+			<!-- svelte-ignore a11y_no_static_element_interactions -->
+			<div
+				class="pm-prefix"
+				onmouseenter={() => tipEnter(`Worker of ${session.workerOf}`)}
+				onmouseleave={tipLeave}
+				onmousemove={tipMove}
+			>
+				<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+					<path d="M12 2l3 7h7l-5.5 4.5L18 22l-6-4-6 4 1.5-8.5L2 9h7z" />
+				</svg>
+				<span class="pm-prefix-label">Worker of</span>
+				<span class="pm-prefix-id">{session.workerOf.slice(0, 8)}</span>
+			</div>
+		{/if}
+
 		<!-- Header (Summary as Title) -->
 		<div class="card-header">
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -179,13 +196,18 @@
 
 		<!-- Project & Stats Row -->
 		<div class="stats-row">
-			<span class="session-name-badge">{session.sessionName}</span>
-			{#if session.workerOf}
-				<span
-					class="worker-badge"
-					title="Worker of {session.workerOf.slice(0, 8)}…"
-				>WORKER</span>
-			{/if}
+			<div class="badge-group">
+				<span class="session-name-badge">{session.sessionName}</span>
+				{#if session.workerOf && !workersView}
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
+					<span
+						class="worker-badge"
+						onmouseenter={() => tipEnter(`Worker of ${session.workerOf}`)}
+						onmouseleave={tipLeave}
+						onmousemove={tipMove}
+					>WORKER</span>
+				{/if}
+			</div>
 
 			{#if !compact}
 				<div class="stats-group">
@@ -388,6 +410,13 @@
 		max-width: 100%;
 	}
 
+	.badge-group {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--space-xs);
+		min-width: 0;
+	}
+
 	.worker-badge {
 		font-family: var(--font-pixel);
 		font-size: 10px;
@@ -400,8 +429,36 @@
 		letter-spacing: 0.1em;
 		display: inline-block;
 		vertical-align: middle;
-		margin-left: 4px;
-		cursor: help;
+	}
+
+	/* Workers-only view: surface the PM relationship as a first-class prefix
+	   row above the title. Amber matches the WORKER badge visual language. */
+	.pm-prefix {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		font-family: var(--font-mono);
+		font-size: 10px;
+		font-weight: 500;
+		color: var(--accent-amber);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		margin-bottom: 2px;
+		width: fit-content;
+	}
+
+	.pm-prefix svg {
+		flex-shrink: 0;
+	}
+
+	.pm-prefix-label {
+		opacity: 0.75;
+	}
+
+	.pm-prefix-id {
+		font-weight: 600;
+		color: var(--accent-amber);
+		letter-spacing: 0.05em;
 	}
 
 	.git-branch {
