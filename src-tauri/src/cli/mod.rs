@@ -85,10 +85,12 @@ pub enum Commands {
     #[command(name = "self")]
     SelfId,
 
-    /// Stop a session — a PM worker (if arg is a session ID or prefix) or a regular
-    /// Claude session (if arg is a numeric PID).
+    /// Stop a session. Worker lookup wins over PID parsing: if the target
+    /// matches a live PM worker's session id (exact or unique prefix), the
+    /// worker is stopped. Otherwise, a numeric target is treated as a PID
+    /// and the corresponding Claude process is killed.
     Stop {
-        /// PID (numeric) for regular sessions, or session ID/prefix for PM workers
+        /// Worker session id/prefix (preferred) or numeric PID for regular sessions
         target: String,
     },
 
@@ -476,7 +478,16 @@ fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
         return Err("stop target required (PID or worker session id/prefix)".to_string());
     }
 
-    // If target parses as u32, treat as PID (old behavior for non-PM sessions).
+    // Worker-first dispatch (fix H1): worker session UUIDs routinely begin with
+    // digits (e.g. `12345678-abcd-...`), so a prefix like `12345678` would
+    // previously parse as PID and SIGKILL an arbitrary OS process. Ask the
+    // daemon for a worker match first; only fall back to PID if no worker
+    // matches AND the target parses as u32.
+    if let Some(worker_id) = try_resolve_worker(target) {
+        return pm::cmd_stop(worker_id, pretty);
+    }
+
+    // If target parses as u32, treat as PID (regular Claude session stop).
     if let Ok(pid) = target.parse::<u32>() {
         crate::actions::stop_session(pid)?;
         let output = serde_json::json!({
@@ -486,8 +497,44 @@ fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
         return print_json(&output, pretty);
     }
 
-    // Otherwise dispatch to the PM daemon as a PM worker stop.
+    // Not numeric, no worker match — fall through to PM so it can surface
+    // WORKER_NOT_FOUND (after starting the daemon if needed).
     pm::cmd_stop(target.to_string(), pretty)
+}
+
+/// If the PM daemon is already running and has exactly one worker whose
+/// session id matches `target` (exact or unique prefix), return that full
+/// session id. Returns `None` if the daemon is unreachable, if there's no
+/// match, or if the match is ambiguous — leaving the caller free to fall
+/// back to PID-based stop.
+///
+/// This function never starts the daemon: if the daemon isn't running there
+/// can't be any workers to match against, so PID-based stop is safe.
+fn try_resolve_worker(target: &str) -> Option<String> {
+    use std::time::Duration;
+    let sock_path = pm_fs::daemon_sock_path().ok()?;
+    if !sock_path.exists() {
+        return None;
+    }
+    let request = pm_rpc::RpcRequest::List;
+    let response =
+        pm_rpc::rpc_call(&sock_path, &request, Duration::from_secs(2)).ok()?;
+    let workers = response.get("workers").and_then(|w| w.as_array())?;
+    let ids: Vec<String> = workers
+        .iter()
+        .filter_map(|w| w.get("sessionId").and_then(|s| s.as_str()).map(String::from))
+        .collect();
+
+    // Exact match first
+    if ids.iter().any(|id| id == target) {
+        return Some(target.to_string());
+    }
+    // Unique prefix match
+    let prefix_matches: Vec<&String> = ids.iter().filter(|id| id.starts_with(target)).collect();
+    if prefix_matches.len() == 1 {
+        return Some(prefix_matches[0].clone());
+    }
+    None
 }
 
 fn cmd_watch(
