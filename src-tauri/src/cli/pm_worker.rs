@@ -13,10 +13,19 @@ struct StdinMessage {
     ack: oneshot::Sender<Result<(), String>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TurnResult {
     pub assistant_text: String,
     pub ended_at: String,
+    /// `result` event subtype: "success", "error_during_execution", "error_max_turns", etc.
+    pub subtype: Option<String>,
+    pub is_error: bool,
+    pub duration_ms: Option<u64>,
+    pub num_turns: Option<u64>,
+    pub stop_reason: Option<String>,
+    pub total_cost_usd: Option<f64>,
+    /// The `result` field from the stream-json result event (final assistant reply).
+    pub result_text: Option<String>,
 }
 
 pub struct WorkerHandle {
@@ -331,9 +340,24 @@ async fn stdout_tee_task(
                 }
             }
             "result" => {
+                let subtype = event.get("subtype").and_then(|v| v.as_str()).map(String::from);
+                let is_error = event.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                let duration_ms = event.get("duration_ms").and_then(|v| v.as_u64());
+                let num_turns = event.get("num_turns").and_then(|v| v.as_u64());
+                let stop_reason = event.get("stop_reason").and_then(|v| v.as_str()).map(String::from);
+                let total_cost_usd = event.get("total_cost_usd").and_then(|v| v.as_f64());
+                let result_text = event.get("result").and_then(|v| v.as_str()).map(String::from);
+
                 let result = TurnResult {
                     assistant_text: std::mem::take(&mut assistant_buf),
                     ended_at: Utc::now().to_rfc3339(),
+                    subtype,
+                    is_error,
+                    duration_ms,
+                    num_turns,
+                    stop_reason,
+                    total_cost_usd,
+                    result_text,
                 };
                 // Non-blocking send: if receiver is gone, we just continue
                 let _ = result_tx.send(result).await;
