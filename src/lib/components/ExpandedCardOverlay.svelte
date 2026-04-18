@@ -8,6 +8,7 @@
 	import MessageNavMap from './MessageNavMap.svelte';
 	import { createSlidingWindow, BATCH_SIZE } from '$lib/slidingWindow.svelte';
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
+	import { workersByPm, expandedSessionId } from '$lib/stores/sessions';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
 
 	interface Props {
@@ -98,6 +99,45 @@
 	let isPermission = $derived(session.status === SessionStatus.NeedsAttention);
 	let isWaitingInput = $derived(session.status === SessionStatus.WaitingForInput);
 	let isWorking = $derived(session.status === SessionStatus.Working);
+
+	let myWorkers = $derived($workersByPm.get(session.id) ?? []);
+	let isPm = $derived(myWorkers.length > 0);
+
+	function workerStatusColor(status: SessionStatus): string {
+		switch (status) {
+			case SessionStatus.Working: return 'var(--status-working)';
+			case SessionStatus.NeedsAttention: return 'var(--status-permission)';
+			case SessionStatus.WaitingForInput: return 'var(--status-input)';
+			case SessionStatus.Connecting: return 'var(--status-working)';
+			default: return 'var(--text-muted)';
+		}
+	}
+
+	function workerStatusLabel(status: SessionStatus): string {
+		switch (status) {
+			case SessionStatus.Working: return 'Working';
+			case SessionStatus.NeedsAttention: return 'Attention';
+			case SessionStatus.WaitingForInput: return 'Ready';
+			case SessionStatus.Connecting: return 'Connecting';
+			default: return 'Unknown';
+		}
+	}
+
+	function formatTimeSince(isoTimestamp: string): string {
+		const now = Date.now();
+		const then = new Date(isoTimestamp).getTime();
+		const diffMins = Math.floor((now - then) / 60000);
+		const diffHours = Math.floor((now - then) / 3600000);
+		const diffDays = Math.floor((now - then) / 86400000);
+		if (diffMins < 1) return 'now';
+		if (diffMins < 60) return `${diffMins}m`;
+		if (diffHours < 24) return `${diffHours}h`;
+		return `${diffDays}d`;
+	}
+
+	function openWorker(id: string) {
+		expandedSessionId.set(id);
+	}
 
 	function getStatusColor(): string {
 		switch (session.status) {
@@ -215,6 +255,15 @@
 									onmousemove={tipMove}
 								>WORKER</span>
 							{/if}
+							{#if isPm}
+								<!-- svelte-ignore a11y_no_static_element_interactions -->
+								<span
+									class="pm-badge"
+									onmouseenter={() => tipEnter(`Managing ${myWorkers.length} worker${myWorkers.length === 1 ? '' : 's'}`)}
+									onmouseleave={tipLeave}
+									onmousemove={tipMove}
+								>PM · {myWorkers.length}</span>
+							{/if}
 							<span class="separator">·</span>
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
 							{#if costRecord}
@@ -284,6 +333,26 @@
 			{#if tooltipText}
 				<div class="id-tooltip" style="left: {tooltipX}px; top: {tooltipY}px;">
 					{tooltipText}
+				</div>
+			{/if}
+
+			{#if isPm}
+				<div class="workers-panel">
+					<div class="section-header">
+						<div class="section-title">Workers</div>
+						<div class="section-count">{myWorkers.length}</div>
+					</div>
+					<div class="workers-list">
+						{#each myWorkers as w (w.id)}
+							<button type="button" class="worker-row" onclick={() => openWorker(w.id)}>
+								<span class="worker-name">{w.customTitle || w.summary || w.sessionName}</span>
+								<span class="worker-status" style="color: {workerStatusColor(w.status)}">
+									{workerStatusLabel(w.status)}
+								</span>
+								<span class="worker-time">{formatTimeSince(w.modified)}</span>
+							</button>
+						{/each}
+					</div>
 				</div>
 			{/if}
 
@@ -534,6 +603,95 @@
 		border: 1px solid color-mix(in srgb, var(--accent-amber) 40%, transparent);
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
+	}
+
+	.pm-badge {
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		font-weight: 500;
+		color: var(--accent-green);
+		background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+		padding: 2px 6px;
+		border: 1px solid color-mix(in srgb, var(--accent-green) 40%, transparent);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		white-space: nowrap;
+	}
+
+	.workers-panel {
+		padding: var(--space-md) var(--space-xl);
+		border-bottom: 1px solid var(--border-default);
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-sm);
+	}
+
+	.workers-panel .section-header {
+		display: flex;
+		align-items: baseline;
+		gap: var(--space-sm);
+	}
+
+	.workers-panel .section-title {
+		font-family: var(--font-pixel);
+		font-size: 22px;
+		color: var(--text-primary);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+	}
+
+	.workers-panel .section-count {
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+
+	.workers-list {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-xs);
+	}
+
+	.worker-row {
+		display: grid;
+		grid-template-columns: 1fr auto auto;
+		align-items: center;
+		gap: var(--space-md);
+		padding: var(--space-sm) var(--space-md);
+		background: var(--bg-elevated);
+		border: 1px solid var(--border-default);
+		color: var(--text-primary);
+		text-align: left;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		cursor: pointer;
+		transition: all 0.15s ease;
+	}
+
+	.worker-row:hover {
+		border-color: var(--accent-green);
+		background: color-mix(in srgb, var(--accent-green) 6%, var(--bg-elevated));
+	}
+
+	.worker-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		min-width: 0;
+	}
+
+	.worker-status {
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		font-weight: 500;
+	}
+
+	.worker-time {
+		color: var(--text-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
 	}
 
 	.git-info {
