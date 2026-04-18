@@ -310,6 +310,7 @@ async fn stdout_tee_task(
 
     // Accumulate assistant text between result events
     let mut assistant_buf = String::new();
+    let mut saw_terminal_result = false;
 
     loop {
         let line = match reader.next_line().await {
@@ -376,6 +377,7 @@ async fn stdout_tee_task(
                 };
                 // Non-blocking send: if receiver is gone, we just continue
                 let _ = result_tx.send(result).await;
+                saw_terminal_result = true;
 
                 if let Some(ref ctx) = inbox {
                     use crate::cli::pm_inbox::{self, InboxEvent, EventStatus};
@@ -411,6 +413,30 @@ async fn stdout_tee_task(
                 }
             }
             _ => {}
+        }
+    }
+
+    // If the stdout closed without a terminal `result` event, the worker likely
+    // crashed or was killed mid-turn. Emit a Crashed event so the PM learns.
+    if !saw_terminal_result {
+        if let Some(ref ctx) = inbox {
+            use crate::cli::pm_inbox::{self, InboxEvent, EventStatus};
+            let ev = InboxEvent {
+                event_id: pm_inbox::new_event_id(),
+                session_id: ctx.session_id.clone(),
+                spawned_by: ctx.spawned_by.clone(),
+                status: EventStatus::Crashed,
+                finished_at: Utc::now().to_rfc3339(),
+                duration_ms: None,
+                num_turns: None,
+                stop_reason: None,
+                total_cost_usd: None,
+                result_excerpt: None,
+                error_message: Some("worker stdout closed without a terminal result event".to_string()),
+            };
+            if let Err(e) = pm_inbox::write_event(&ev) {
+                eprintln!("[pm_worker] Failed to write crash inbox event: {}", e);
+            }
         }
     }
 }
