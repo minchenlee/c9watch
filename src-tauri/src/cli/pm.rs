@@ -1,5 +1,6 @@
 use super::pm_fs;
 use super::pm_rpc::{self, RpcRequest};
+use super::pm_worker::SpawnArgs;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -131,13 +132,8 @@ fn daemon_rpc(request: &RpcRequest, timeout: Duration) -> Result<serde_json::Val
 // ── Subcommand handlers ───────────────────────────────────────────────
 
 pub fn cmd_spawn(
-    cwd: Option<String>,
-    name: Option<String>,
-    append_system_prompt: Option<String>,
+    args: SpawnArgs,
     append_system_prompt_file: Option<String>,
-    permission_mode: String,
-    model: Option<String>,
-    add_dirs: Vec<String>,
     pretty: bool,
 ) -> Result<(), String> {
     ensure_daemon()?;
@@ -162,29 +158,19 @@ pub fn cmd_spawn(
                 .map_err(|e| format!("Failed to read system prompt file {:?}: {}", path, e))?,
         )
     } else {
-        append_system_prompt
-    };
-
-    // Resolve cwd: default to current directory
-    let resolved_cwd = if let Some(c) = cwd {
-        c
-    } else {
-        std::env::current_dir()
-            .map_err(|e| format!("Failed to get current directory: {}", e))?
-            .to_string_lossy()
-            .to_string()
+        args.append_system_prompt
     };
 
     let spawned_by = crate::cli::pm_caller::detect_caller_session_id_default();
     let pm_pid = crate::cli::pm_caller::detect_caller_pid_default();
 
     let request = RpcRequest::Spawn {
-        cwd: resolved_cwd,
-        name,
+        cwd: args.cwd,
+        name: args.name,
         append_system_prompt: prompt,
-        permission_mode,
-        model,
-        add_dirs,
+        permission_mode: args.permission_mode,
+        model: args.model,
+        add_dirs: args.add_dirs,
         spawned_by,
         pm_pid,
     };

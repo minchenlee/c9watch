@@ -1,6 +1,6 @@
-use crate::cli::pm_fs::{self, SpawnArgs};
+use crate::cli::pm_fs;
 use crate::cli::pm_rpc::RpcRequest;
-use crate::cli::pm_worker::WorkerHandle;
+use crate::cli::pm_worker::{SpawnArgs, SpawnContext, WorkerHandle};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -139,19 +139,16 @@ async fn handle_connection(
             spawned_by,
             pm_pid,
         } => {
-            handle_spawn(
-                state,
+            let args = SpawnArgs {
                 cwd,
                 name,
                 append_system_prompt,
                 permission_mode,
                 model,
                 add_dirs,
-                spawned_by,
-                pm_pid,
-                max_workers,
-            )
-            .await
+            };
+            let ctx = SpawnContext { spawned_by, pm_pid };
+            handle_spawn(state, args, ctx, max_workers).await
         }
         RpcRequest::Send {
             session_id,
@@ -213,17 +210,10 @@ async fn write_response(
 
 // ── RPC handlers ──────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_spawn(
     state: Arc<Mutex<DaemonState>>,
-    cwd: String,
-    name: Option<String>,
-    append_system_prompt: Option<String>,
-    permission_mode: String,
-    model: Option<String>,
-    add_dirs: Vec<String>,
-    spawned_by: Option<String>,
-    pm_pid: Option<u32>,
+    mut args: SpawnArgs,
+    ctx: SpawnContext,
     max_workers: usize,
 ) -> serde_json::Value {
     // Check worker limit
@@ -238,30 +228,16 @@ async fn handle_spawn(
     let session_id = uuid::Uuid::new_v4().to_string();
 
     // Canonicalize cwd
-    let canonical_cwd = match std::fs::canonicalize(&cwd) {
+    let canonical_cwd = match std::fs::canonicalize(&args.cwd) {
         Ok(p) => p.to_string_lossy().to_string(),
         Err(_) => return err_response("CWD_INVALID"),
     };
+    args.cwd = canonical_cwd.clone();
 
-    // Build SpawnArgs
-    let args = SpawnArgs {
-        append_system_prompt,
-        permission_mode,
-        model,
-        add_dirs,
-    };
+    let spawned_by = ctx.spawned_by.clone();
 
     // Spawn the worker
-    let worker = match WorkerHandle::spawn(
-        session_id.clone(),
-        canonical_cwd.clone(),
-        name.clone(),
-        args,
-        spawned_by.clone(),
-        pm_pid,
-    )
-    .await
-    {
+    let worker = match WorkerHandle::spawn(session_id.clone(), args, ctx).await {
         Ok(w) => w,
         Err(e) => return err_response(&e),
     };
@@ -925,7 +901,7 @@ mod tests {
             spawned_at: "t".to_string(),
             spawned_by: Some("pm-audit".to_string()),
             pm_pid,
-            spawn_args: pm_fs::SpawnArgs {
+            spawn_args: pm_fs::PersistedSpawnArgs {
                 append_system_prompt: None,
                 permission_mode: "default".to_string(),
                 model: None,

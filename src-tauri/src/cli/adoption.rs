@@ -141,7 +141,7 @@ mod tests {
             spawned_at: "2026-04-18T00:00:00Z".to_string(),
             spawned_by: None,
             pm_pid: None,
-            spawn_args: pm_fs::SpawnArgs {
+            spawn_args: pm_fs::PersistedSpawnArgs {
                 append_system_prompt: None,
                 permission_mode: "default".to_string(),
                 model: None,

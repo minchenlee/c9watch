@@ -92,10 +92,11 @@ pub fn adoption_file(pm_session_id: &str) -> Result<PathBuf, String> {
 
 // ── Structs ───────────────────────────────────────────────────────────
 
-/// Arguments used to spawn a worker session.
+/// Subset of spawn arguments persisted into `meta.json` for each worker.
+/// JSON field names are preserved for on-disk compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct SpawnArgs {
+pub struct PersistedSpawnArgs {
     /// System prompt text to append for this worker
     pub append_system_prompt: Option<String>,
     /// Permission mode (e.g. "default", "acceptEdits", "bypassPermissions")
@@ -128,7 +129,7 @@ pub struct WorkerMeta {
     #[serde(default)]
     pub pm_pid: Option<u32>,
     /// Arguments used to spawn the worker
-    pub spawn_args: SpawnArgs,
+    pub spawn_args: PersistedSpawnArgs,
     /// ISO-8601 timestamp when the worker stopped, if known
     pub stopped_at: Option<String>,
 }
@@ -279,7 +280,7 @@ mod tests {
             spawned_at: "2026-04-16T00:00:00Z".to_string(),
             spawned_by: Some("pm-daemon".to_string()),
             pm_pid: Some(55123),
-            spawn_args: SpawnArgs {
+            spawn_args: PersistedSpawnArgs {
                 append_system_prompt: Some("Be concise.".to_string()),
                 permission_mode: "default".to_string(),
                 model: Some("claude-opus-4-5".to_string()),

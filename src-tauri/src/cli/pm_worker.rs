@@ -1,4 +1,4 @@
-use crate::cli::pm_fs::{self, SpawnArgs, WorkerMeta};
+use crate::cli::pm_fs::{self, PersistedSpawnArgs, WorkerMeta};
 use chrono::Utc;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -7,6 +7,26 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
 // ── Types ────────────────────────────────────────────────────────────────────
+
+/// Caller-facing user options for spawning a worker: the set of flags a user
+/// passes to `c9watch spawn`. Collected on the CLI side and sent over RPC.
+#[derive(Debug, Clone)]
+pub struct SpawnArgs {
+    pub cwd: String,
+    pub name: Option<String>,
+    pub append_system_prompt: Option<String>,
+    pub permission_mode: String,
+    pub model: Option<String>,
+    pub add_dirs: Vec<String>,
+}
+
+/// Runtime/context values assembled by the daemon at spawn time — identity of
+/// the PM that requested the spawn, used for ownership and inbox routing.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnContext {
+    pub spawned_by: Option<String>,
+    pub pm_pid: Option<u32>,
+}
 
 struct StdinMessage {
     text: String,
@@ -56,11 +76,8 @@ impl WorkerHandle {
     /// Spawn a new Claude Code worker subprocess.
     pub async fn spawn(
         session_id: String,
-        cwd: String,
-        name: Option<String>,
         args: SpawnArgs,
-        spawned_by: Option<String>,
-        pm_pid: Option<u32>,
+        ctx: SpawnContext,
     ) -> Result<Self, String> {
         // Build the command
         let mut cmd = Command::new("claude");
@@ -83,7 +100,7 @@ impl WorkerHandle {
             cmd.arg("--add-dir").arg(dir);
         }
 
-        cmd.current_dir(&cwd)
+        cmd.current_dir(&args.cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -100,12 +117,17 @@ impl WorkerHandle {
         let meta = WorkerMeta {
             session_id: session_id.clone(),
             pid,
-            name,
-            cwd: cwd.clone(),
+            name: args.name,
+            cwd: args.cwd,
             spawned_at: Utc::now().to_rfc3339(),
-            spawned_by,
-            pm_pid,
-            spawn_args: args,
+            spawned_by: ctx.spawned_by,
+            pm_pid: ctx.pm_pid,
+            spawn_args: PersistedSpawnArgs {
+                append_system_prompt: args.append_system_prompt,
+                permission_mode: args.permission_mode,
+                model: args.model,
+                add_dirs: args.add_dirs,
+            },
             stopped_at: None,
         };
         pm_fs::write_worker_meta(&meta)?;

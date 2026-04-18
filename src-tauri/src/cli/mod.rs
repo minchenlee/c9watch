@@ -238,16 +238,24 @@ pub fn run(cli: Cli) {
             permission_mode,
             model,
             add_dir,
-        } => pm::cmd_spawn(
-            cwd,
-            name,
-            append_system_prompt,
-            append_system_prompt_file,
-            permission_mode,
-            model,
-            add_dir,
-            cli.pretty,
-        ),
+        } => (|| -> Result<(), String> {
+            let resolved_cwd = match cwd {
+                Some(c) => c,
+                None => std::env::current_dir()
+                    .map_err(|e| format!("Failed to get current directory: {}", e))?
+                    .to_string_lossy()
+                    .to_string(),
+            };
+            let args = pm_worker::SpawnArgs {
+                cwd: resolved_cwd,
+                name,
+                append_system_prompt,
+                permission_mode,
+                model,
+                add_dirs: add_dir,
+            };
+            pm::cmd_spawn(args, append_system_prompt_file, cli.pretty)
+        })(),
         Commands::Send {
             session_id,
             message,
