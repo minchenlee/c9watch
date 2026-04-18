@@ -6,6 +6,8 @@
 	import MessageBubble from './MessageBubble.svelte';
 	import MessageNavMap from './MessageNavMap.svelte';
 	import { createSlidingWindow, BATCH_SIZE, MAX_VISIBLE } from '$lib/slidingWindow.svelte';
+	import { sessionCostMap, costMode } from '$lib/stores/cost';
+	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
 
 	interface Props {
 		entry: HistoryEntry;
@@ -24,6 +26,11 @@
 	let copied = $state(false);
 
 	const sw = createSlidingWindow();
+
+	let costRecord = $derived($sessionCostMap.get(entry.sessionId));
+	let primaryCostLabel = $derived(
+		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode) : null
+	);
 
 	let visibleMessages = $derived.by(() => {
 		if (!conversation) return [];
@@ -159,6 +166,14 @@
 						</div>
 						<div class="header-meta">
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
+							{#if costRecord}
+								<span class="separator">·</span>
+								<span class="cost-breakdown" title="Total cost: {formatCost(costRecord.cost)} · {formatTokens(costRecord.totalTokens)} tokens · {modelDisplayName(costRecord.model)}">
+									<span class="cost-primary">{primaryCostLabel}</span>
+									<span class="cost-secondary">· {$costMode === 'usd' ? formatTokens(costRecord.totalTokens) + ' tok' : formatCost(costRecord.cost)}</span>
+									<span class="cost-secondary">· {modelDisplayName(costRecord.model)}</span>
+								</span>
+							{/if}
 						</div>
 					</div>
 				</div>
@@ -376,6 +391,29 @@
 	}
 
 	.message-count {
+		color: var(--text-muted);
+	}
+
+	.separator {
+		color: var(--text-muted);
+	}
+
+	.cost-breakdown {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-muted);
+		letter-spacing: 0.05em;
+		text-transform: none;
+	}
+
+	.cost-primary {
+		color: var(--text-muted);
+	}
+
+	.cost-secondary {
 		color: var(--text-muted);
 	}
 

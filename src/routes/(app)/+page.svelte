@@ -23,6 +23,7 @@
 	import { SessionStatus } from '$lib/types';
 	import SessionHistory from '$lib/components/SessionHistory.svelte';
 	import CostTracker from '$lib/components/CostTracker.svelte';
+	import { refreshCostData } from '$lib/stores/cost';
 	import MemoryViewer from '$lib/components/MemoryViewer.svelte';
 	import FdaBanner from '$lib/components/FdaBanner.svelte';
 	import DebugConsole from '$lib/components/DebugConsole.svelte';
@@ -65,6 +66,8 @@
 				isCompact = true;
 			}
 		}
+
+		refreshCostData();
 
 		if (!isTauri()) return;
 
