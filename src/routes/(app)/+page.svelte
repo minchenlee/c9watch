@@ -1,8 +1,7 @@
 <script lang="ts">
-	import { slide, fade } from 'svelte/transition';
+	import { fade } from 'svelte/transition';
 	import { flip } from 'svelte/animate';
-	import { quintOut } from 'svelte/easing';
-	import { fadeIn } from '$lib/transitions';
+	import { fadeIn, flyIn } from '$lib/transitions';
 	import { onMount } from 'svelte';
 	import { browser } from '$app/environment';
 	import {
@@ -386,7 +385,7 @@
 	{:else}
 	<main class="grid-container" in:fadeIn>
 		<div class="sections-container">
-			<section class="system-section">
+			<section class="system-section" in:flyIn={{ index: 0 }}>
 				<div class="project-header">
 					<span class="project-name">System status</span>
 					<span class="project-count">{sessions.length}</span>
@@ -543,8 +542,8 @@
 			{:else}
 
 				{#if viewMode === 'project'}
-					{#each projectGroups as group (group.path)}
-						<section class="project-section" animate:flip={{ duration: 400 }}>
+					{#each projectGroups as group, gi (group.path)}
+						<section class="project-section" in:flyIn={{ index: gi + 1 }} animate:flip={{ duration: 400 }}>
 							<div class="project-header">
 								<span class="project-name">{group.displayName}</span>
 								<span class="project-count">
@@ -560,10 +559,10 @@
 										<span class="status-count">{group.attention.length}</span>
 									</div>
 									<div class="session-grid">
-										{#each group.attention as session (session.id)}
+										{#each group.attention as session, i (session.id)}
 											<div
 												class="card-wrapper"
-												transition:slide={{ duration: 400, easing: quintOut }}
+												in:flyIn={{ index: i }}
 												animate:flip={{ duration: 400 }}
 											>
 												<SessionCard
@@ -587,10 +586,10 @@
 										<span class="status-count">{group.idle.length}</span>
 									</div>
 									<div class="session-grid">
-										{#each group.idle as session (session.id)}
+										{#each group.idle as session, i (session.id)}
 											<div
 												class="card-wrapper"
-												transition:slide={{ duration: 400, easing: quintOut }}
+												in:flyIn={{ index: i }}
 												animate:flip={{ duration: 400 }}
 											>
 												<SessionCard
@@ -614,10 +613,10 @@
 										<span class="status-count">{group.working.length}</span>
 									</div>
 									<div class="session-grid">
-										{#each group.working as session (session.id)}
+										{#each group.working as session, i (session.id)}
 											<div
 												class="card-wrapper"
-												transition:slide={{ duration: 400, easing: quintOut }}
+												in:flyIn={{ index: i }}
 												animate:flip={{ duration: 400 }}
 											>
 												<SessionCard
@@ -638,8 +637,8 @@
 						</section>
 					{/each}
 				{:else}
-					{#each allStatusGroups as group (group.id)}
-						<section class="project-section" animate:flip={{ duration: 400 }}>
+					{#each allStatusGroups as group, gi (group.id)}
+						<section class="project-section" in:flyIn={{ index: gi + 1 }} animate:flip={{ duration: 400 }}>
 							<div class="status-header all-view {group.type}">
 								<span class="status-indicator {group.type}" style="width: 8px; height: 8px;"></span>
 								<span class="project-name" style="font-size: 16px;">{group.label}</span>
@@ -647,10 +646,10 @@
 							</div>
 
 							<div class="all-sessions-grid" class:compact={isCompact}>
-								{#each group.sessions as session (session.id)}
+								{#each group.sessions as session, i (session.id)}
 									<div
 										class="card-wrapper"
-										transition:slide={{ duration: 400, easing: quintOut }}
+										in:flyIn={{ index: i }}
 										animate:flip={{ duration: 400 }}
 									>
 										<SessionCard

@@ -33,3 +33,22 @@ export function fadeIn(node: Element, params: FadeParams = {}) {
 	}
 	return fade(node, { duration: 180, easing: cubicOut, ...params });
 }
+
+// Staggered fly-in from the right (x-axis). Used for panels that slide in
+// from the edge, e.g. right-column panels in the expanded overlay.
+export function flyInX(
+	node: Element,
+	params: { index?: number; x?: number; duration?: number; stride?: number; base?: number } = {}
+) {
+	if (prefersReducedMotion()) {
+		return fade(node, { duration: 0 });
+	}
+	const { index = 0, x = 12, duration = 220, stride = 25, base = 0 } = params;
+	return fly(node, {
+		x,
+		duration,
+		delay: base + Math.min(index, 20) * stride,
+		easing: EXPO_OUT,
+		opacity: 0,
+	} satisfies FlyParams);
+}
