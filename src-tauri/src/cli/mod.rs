@@ -1,7 +1,30 @@
 use crate::session;
 use crate::session::sanitize::strip_system_tags;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::process;
+
+/// Sort field for the cost subcommand.
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+pub enum CostSortField {
+    Date,
+    Cost,
+}
+
+/// Sort direction for the cost subcommand.
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+pub enum CostSortDir {
+    Asc,
+    Desc,
+}
+
+pub mod adoption;
+pub mod pm;
+pub mod pm_caller;
+pub mod pm_daemon;
+pub mod pm_fs;
+pub mod pm_inbox;
+pub mod pm_rpc;
+pub mod pm_worker;
 
 #[derive(Parser)]
 #[command(
@@ -77,10 +100,13 @@ pub enum Commands {
     #[command(name = "self")]
     SelfId,
 
-    /// Stop a running Claude session
+    /// Stop a session. Worker lookup wins over PID parsing: if the target
+    /// matches a live PM worker's session id (exact or unique prefix), the
+    /// worker is stopped. Otherwise, a numeric target is treated as a PID
+    /// and the corresponding Claude process is killed.
     Stop {
-        /// PID of the session to stop
-        pid: u32,
+        /// Worker session id/prefix (preferred) or numeric PID for regular sessions
+        target: String,
     },
 
     /// Watch sessions for status changes (streams NDJSON)
@@ -107,6 +133,98 @@ pub enum Commands {
         /// Session ID (UUID or unique prefix)
         session_id: String,
     },
+
+    /// Spawn a new worker session managed by c9watch
+    Spawn {
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        append_system_prompt: Option<String>,
+        #[arg(long)]
+        append_system_prompt_file: Option<String>,
+        #[arg(long, default_value = "bypassPermissions")]
+        permission_mode: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        add_dir: Vec<String>,
+    },
+
+    /// Send a message to a spawned worker session
+    Send {
+        session_id: String,
+        #[arg(long)]
+        message: Option<String>,
+        #[arg(long)]
+        stdin: bool,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        wait: bool,
+        #[arg(long, default_value = "300")]
+        timeout: u64,
+    },
+
+    /// List workers spawned by c9watch
+    Workers {
+        /// Include workers owned by other PMs (adds a status column per entry)
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// List callback events from workers owned by this PM session
+    Inbox {
+        /// Remove events after listing
+        #[arg(long)]
+        consume: bool,
+        /// Remove all events without printing them
+        #[arg(long)]
+        clear: bool,
+        /// Only touch this worker's inbox (must be owned by caller)
+        #[arg(long)]
+        worker: Option<String>,
+    },
+
+    /// Adopt an existing worker as owned by this PM session
+    Adopt {
+        /// Worker session id or unique prefix
+        session_id: String,
+        /// Force adoption even if worker is OWNED_BY_OTHER_PM
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Query session cost data
+    #[command(name = "cost", about = "Query session cost data")]
+    Cost {
+        /// Aggregate by day
+        #[arg(long)]
+        daily: bool,
+        /// Aggregate by ISO week (Monday start)
+        #[arg(long)]
+        weekly: bool,
+        /// Filter to a single project (matches the `project` field)
+        #[arg(long)]
+        project: Option<String>,
+        /// Lower bound on date (YYYY-MM-DD, inclusive)
+        #[arg(long)]
+        since: Option<String>,
+        /// Sort field: date or cost
+        #[arg(long, value_enum, default_value_t = CostSortField::Date, help = "Sort rows by this field (date or cost)")]
+        sort: CostSortField,
+        /// Sort direction: asc or desc
+        #[arg(long, value_enum, default_value_t = CostSortDir::Desc, help = "Sort direction (asc = oldest/cheapest first, desc = newest/most expensive first)")]
+        sort_dir: CostSortDir,
+        /// Show cost breakdown for a single session (full UUID or 4+ char prefix). Incompatible with --daily/--weekly/--project.
+        #[arg(long)]
+        session: Option<String>,
+    },
+
+    /// [hidden] Run the PM daemon
+    #[command(hide = true)]
+    Daemon,
 }
 
 /// Run the CLI and return the exit code.
@@ -127,7 +245,7 @@ pub fn run(cli: Cli) {
             limit,
         } => cmd_search(&query, project.as_deref(), limit, cli.pretty),
         Commands::SelfId => cmd_self(cli.pretty),
-        Commands::Stop { pid } => cmd_stop(pid, cli.pretty),
+        Commands::Stop { target } => cmd_stop(&target, cli.pretty),
         Commands::Watch {
             interval,
             project,
@@ -135,6 +253,54 @@ pub fn run(cli: Cli) {
             changes_only,
         } => cmd_watch(interval, project.as_deref(), compact, changes_only),
         Commands::Tasks { session_id } => cmd_tasks(&session_id, cli.pretty),
+        Commands::Spawn {
+            cwd,
+            name,
+            append_system_prompt,
+            append_system_prompt_file,
+            permission_mode,
+            model,
+            add_dir,
+        } => (|| -> Result<(), String> {
+            let resolved_cwd = match cwd {
+                Some(c) => c,
+                None => std::env::current_dir()
+                    .map_err(|e| format!("Failed to get current directory: {}", e))?
+                    .to_string_lossy()
+                    .to_string(),
+            };
+            let args = pm_worker::SpawnArgs {
+                cwd: resolved_cwd,
+                name,
+                append_system_prompt,
+                permission_mode,
+                model,
+                add_dirs: add_dir,
+            };
+            pm::cmd_spawn(args, append_system_prompt_file, cli.pretty)
+        })(),
+        Commands::Send {
+            session_id,
+            message,
+            stdin,
+            file,
+            wait,
+            timeout,
+        } => pm::cmd_send(session_id, message, stdin, file, wait, timeout, cli.pretty),
+        Commands::Workers { all } => pm::cmd_workers(all, cli.pretty),
+        Commands::Inbox { consume, clear, worker } => {
+            pm::cmd_inbox(consume, clear, worker, cli.pretty)
+        }
+        Commands::Adopt { session_id, force } => pm::cmd_adopt(session_id, force, cli.pretty),
+        Commands::Cost { daily, weekly, project, since, sort, sort_dir, session } => {
+            cmd_cost(daily, weekly, project.as_deref(), since.as_deref(), sort, sort_dir, session.as_deref(), cli.pretty)
+        }
+        Commands::Daemon => {
+            match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt.block_on(pm_daemon::run_daemon()),
+                Err(e) => Err(format!("Failed to create tokio runtime: {}", e)),
+            }
+        }
     };
 
     if let Err(e) = result {
@@ -144,7 +310,7 @@ pub fn run(cli: Cli) {
     }
 }
 
-fn print_json(value: &impl serde::Serialize, pretty: bool) -> Result<(), String> {
+pub fn print_json(value: &impl serde::Serialize, pretty: bool) -> Result<(), String> {
     let output = if pretty {
         serde_json::to_string_pretty(value)
     } else {
@@ -370,13 +536,63 @@ fn find_claude_ancestor(start_pid: u32) -> Option<u32> {
     None
 }
 
-fn cmd_stop(pid: u32, pretty: bool) -> Result<(), String> {
-    crate::actions::stop_session(pid)?;
-    let output = serde_json::json!({
-        "stopped": true,
-        "pid": pid,
-    });
-    print_json(&output, pretty)
+fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
+    if target.is_empty() {
+        return Err("stop target required (PID or worker session id/prefix)".to_string());
+    }
+
+    // Worker-first dispatch: worker session UUIDs routinely begin with
+    // digits (e.g. `12345678-abcd-...`), so a prefix like `12345678` would
+    // previously parse as PID and SIGKILL an arbitrary OS process. Ask the
+    // daemon for a worker match first; only fall back to PID if no worker
+    // matches AND the target parses as u32.
+    if let Some(worker_id) = try_resolve_worker(target) {
+        return pm::cmd_stop(worker_id, pretty);
+    }
+
+    // If target parses as u32, treat as PID (regular Claude session stop).
+    if let Ok(pid) = target.parse::<u32>() {
+        crate::actions::stop_session(pid)?;
+        let output = serde_json::json!({
+            "stopped": true,
+            "pid": pid,
+        });
+        return print_json(&output, pretty);
+    }
+
+    // Not numeric, no worker match — fall through to PM so it can surface
+    // WORKER_NOT_FOUND (after starting the daemon if needed).
+    pm::cmd_stop(target.to_string(), pretty)
+}
+
+/// If the PM daemon is already running and has exactly one worker whose
+/// session id matches `target` (exact or unique prefix), return that full
+/// session id. Returns `None` if the daemon is unreachable, if there's no
+/// match, or if the match is ambiguous — leaving the caller free to fall
+/// back to PID-based stop.
+///
+/// This function never starts the daemon: if the daemon isn't running there
+/// can't be any workers to match against, so PID-based stop is safe.
+fn try_resolve_worker(target: &str) -> Option<String> {
+    use std::time::Duration;
+    let sock_path = pm_fs::daemon_sock_path().ok()?;
+    if !sock_path.exists() {
+        return None;
+    }
+    let request = pm_rpc::RpcRequest::List;
+    let response =
+        pm_rpc::rpc_call(&sock_path, &request, Duration::from_secs(2)).ok()?;
+    let workers = response.get("workers").and_then(|w| w.as_array())?;
+    let ids: Vec<String> = workers
+        .iter()
+        .filter_map(|w| w.get("sessionId").and_then(|s| s.as_str()).map(String::from))
+        .collect();
+
+    // Delegate matching to the shared helper in pm_daemon so exact/prefix/
+    // ambiguous rules stay in one place. An ambiguous prefix silently falls
+    // through to None: the caller will next try PID parsing, which fails for
+    // a uuid-shaped prefix, landing in the WORKER_NOT_FOUND path from PM.
+    pm_daemon::resolve_worker_id_from_keys(ids.iter().map(|s| s.as_str()), target).ok()
 }
 
 fn cmd_watch(
@@ -487,6 +703,300 @@ fn cmd_tasks(session_id: &str, pretty: bool) -> Result<(), String> {
             let status = t.get("status").and_then(|s| s.as_str()).unwrap_or("");
             status != "completed" && status != "in_progress"
         }).count(),
+    });
+    print_json(&output, pretty)
+}
+
+/// Resolve a session-id prefix against all sessions in cost data.
+/// Returns the full session_id, or an error if 0 or >1 matches.
+fn resolve_cost_session_id(
+    sessions: &[session::cost::SessionCostRecord],
+    prefix: &str,
+) -> Result<String, String> {
+    if prefix.len() < 4 {
+        return Err(format!(
+            "Session prefix '{}' is too short — must be at least 4 characters",
+            prefix
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for s in sessions {
+        if s.session_id.starts_with(prefix) {
+            seen.insert(s.session_id.clone());
+        }
+    }
+    match seen.len() {
+        0 => Err(format!("No session matching prefix '{}'", prefix)),
+        1 => Ok(seen.into_iter().next().unwrap()),
+        n => {
+            let mut ids: Vec<String> = seen.into_iter().collect();
+            ids.sort();
+            let shown = ids.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+            let suffix = if n > 5 { format!(" (and {} more)", n - 5) } else { String::new() };
+            Err(format!(
+                "Ambiguous prefix '{}' matches {} sessions: {}{}",
+                prefix, n, shown, suffix
+            ))
+        }
+    }
+}
+
+/// Per-session cost breakdown for `c9watch cost --session <prefix>`.
+fn cmd_cost_session(prefix: &str, since: Option<&str>, pretty: bool) -> Result<(), String> {
+    let since_date = match since {
+        Some(s) => Some(
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|e| format!("Invalid --since date '{}': {}", s, e))?,
+        ),
+        None => None,
+    };
+
+    let data = session::get_cost_data()?;
+    let all_sessions: Vec<session::cost::SessionCostRecord> = data
+        .project_costs
+        .iter()
+        .flat_map(|p| p.sessions.iter().cloned())
+        .collect();
+
+    let session_id = resolve_cost_session_id(&all_sessions, prefix)?;
+
+    // Collect all per-(session, date) records for this session, applying --since filter
+    let mut records: Vec<&session::cost::SessionCostRecord> = all_sessions
+        .iter()
+        .filter(|s| s.session_id == session_id)
+        .filter(|s| match since_date {
+            Some(since_d) => chrono::NaiveDate::parse_from_str(&s.date, "%Y-%m-%d")
+                .map(|d| d >= since_d)
+                .unwrap_or(false),
+            None => true,
+        })
+        .collect();
+
+    if records.is_empty() {
+        return Err(format!(
+            "No cost data for session '{}' in the given date range",
+            session_id
+        ));
+    }
+
+    records.sort_by(|a, b| a.date.cmp(&b.date));
+
+    let total_cost: f64 = records.iter().map(|s| s.cost).sum();
+    let total_tokens: u64 = records.iter().map(|s| s.total_tokens).sum();
+
+    // Unique models in order of first appearance
+    let mut seen_models = std::collections::HashSet::new();
+    let mut models: Vec<String> = Vec::new();
+    for s in &records {
+        if seen_models.insert(s.model.clone()) {
+            models.push(s.model.clone());
+        }
+    }
+
+    let first = records.first().unwrap();
+    let last = records.last().unwrap();
+    let date_range = if first.date == last.date {
+        first.date.clone()
+    } else {
+        format!("{} – {}", first.date, last.date)
+    };
+
+    let daily_breakdown: Vec<serde_json::Value> = records
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "date": s.date,
+                "cost": s.cost,
+                "totalTokens": s.total_tokens,
+                "model": s.model,
+            })
+        })
+        .collect();
+
+    let output = serde_json::json!({
+        "sessionId": session_id,
+        "sessionName": first.session_name,
+        "project": first.project,
+        "projectName": first.project_name,
+        "totalCost": total_cost,
+        "totalTokens": total_tokens,
+        "models": models,
+        "dateRange": date_range,
+        "dailyBreakdown": daily_breakdown,
+    });
+    print_json(&output, pretty)
+}
+
+fn cmd_cost(
+    daily: bool,
+    weekly: bool,
+    project_filter: Option<&str>,
+    since: Option<&str>,
+    sort: CostSortField,
+    sort_dir: CostSortDir,
+    session_prefix: Option<&str>,
+    pretty: bool,
+) -> Result<(), String> {
+    // Mutex: --session is incompatible with aggregation flags
+    if let Some(prefix) = session_prefix {
+        if daily || weekly || project_filter.is_some() {
+            return Err(
+                "--session cannot be combined with --daily, --weekly, or --project".to_string(),
+            );
+        }
+        return cmd_cost_session(prefix, since, pretty);
+    }
+
+    if daily && weekly {
+        return Err("--daily and --weekly are mutually exclusive".to_string());
+    }
+
+    let since_date = match since {
+        Some(s) => Some(
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|e| format!("Invalid --since date '{}': {}", s, e))?,
+        ),
+        None => None,
+    };
+
+    let data = session::get_cost_data()?;
+
+    // Flatten to sessions, then apply filters. project_costs covers all sessions.
+    let mut sessions: Vec<session::cost::SessionCostRecord> = data
+        .project_costs
+        .iter()
+        .flat_map(|p| p.sessions.iter().cloned())
+        .collect();
+
+    if let Some(proj) = project_filter {
+        sessions.retain(|s| s.project == proj);
+    }
+    if let Some(since_d) = since_date {
+        sessions.retain(|s| {
+            chrono::NaiveDate::parse_from_str(&s.date, "%Y-%m-%d")
+                .map(|d| d >= since_d)
+                .unwrap_or(false)
+        });
+    }
+
+    // Helper: apply sort to a rows vec that has a date key and a cost key.
+    // `date_key` is the JSON field name for the date string (ISO format, so
+    // lexicographic order equals chronological order).
+    let sort_rows = |rows: &mut Vec<serde_json::Value>, date_key: &str| {
+        rows.sort_by(|a, b| {
+            let ord = match sort {
+                CostSortField::Date => a
+                    .get(date_key)
+                    .and_then(|v| v.as_str())
+                    .cmp(&b.get(date_key).and_then(|v| v.as_str())),
+                CostSortField::Cost => {
+                    let ca = a.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let cb = b.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
+                }
+            };
+            // Flip for descending
+            if sort_dir == CostSortDir::Desc { ord.reverse() } else { ord }
+        });
+    };
+
+    if daily {
+        let mut by_date: std::collections::HashMap<String, (f64, u64, u32)> =
+            std::collections::HashMap::new();
+        for s in &sessions {
+            let e = by_date.entry(s.date.clone()).or_insert((0.0, 0, 0));
+            e.0 += s.cost;
+            e.1 += s.total_tokens;
+            e.2 += 1;
+        }
+        let mut rows: Vec<_> = by_date
+            .into_iter()
+            .map(|(date, (cost, tokens, count))| {
+                serde_json::json!({
+                    "date": date,
+                    "cost": cost,
+                    "totalTokens": tokens,
+                    "sessionCount": count,
+                })
+            })
+            .collect();
+        sort_rows(&mut rows, "date");
+        return print_json(&rows, pretty);
+    }
+
+    if weekly {
+        let mut by_week: std::collections::HashMap<String, (f64, u64, u32)> =
+            std::collections::HashMap::new();
+        for s in &sessions {
+            let Ok(d) = chrono::NaiveDate::parse_from_str(&s.date, "%Y-%m-%d") else {
+                continue;
+            };
+            use chrono::Datelike;
+            let iso = d.iso_week();
+            let week_start = chrono::NaiveDate::from_isoywd_opt(
+                iso.year(),
+                iso.week(),
+                chrono::Weekday::Mon,
+            )
+            .unwrap_or(d);
+            let key = week_start.format("%Y-%m-%d").to_string();
+            let e = by_week.entry(key).or_insert((0.0, 0, 0));
+            e.0 += s.cost;
+            e.1 += s.total_tokens;
+            e.2 += 1;
+        }
+        let mut rows: Vec<_> = by_week
+            .into_iter()
+            .map(|(week_start, (cost, tokens, count))| {
+                serde_json::json!({
+                    "weekStart": week_start,
+                    "cost": cost,
+                    "totalTokens": tokens,
+                    "sessionCount": count,
+                })
+            })
+            .collect();
+        sort_rows(&mut rows, "weekStart");
+        return print_json(&rows, pretty);
+    }
+
+    // Default: emit filtered CostData-shaped output if filters were applied,
+    // otherwise emit the full CostData from the GUI.
+    if project_filter.is_none() && since_date.is_none() {
+        // --sort date --project is nonsensical (no single date per project);
+        // silently fall back to cost sort in that case. Here there's no project
+        // aggregation at all, so just return raw CostData unchanged.
+        return print_json(&data, pretty);
+    }
+
+    // Project mode: --sort date is not meaningful (projects have no single date);
+    // silently fall back to cost sort and note it in a comment.
+    let effective_sort = if project_filter.is_some() && sort == CostSortField::Date {
+        // date sort doesn't apply to project aggregations — use cost instead
+        CostSortField::Cost
+    } else {
+        sort
+    };
+
+    // Rebuild CostData-ish aggregation from filtered sessions, sorting by session date or cost.
+    let total_cost: f64 = sessions.iter().map(|s| s.cost).sum();
+    let total_tokens: u64 = sessions.iter().map(|s| s.total_tokens).sum();
+
+    // Sort individual sessions in the filtered output
+    sessions.sort_by(|a, b| {
+        let ord = match effective_sort {
+            CostSortField::Date => a.date.cmp(&b.date),
+            CostSortField::Cost => {
+                a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        };
+        if sort_dir == CostSortDir::Desc { ord.reverse() } else { ord }
+    });
+
+    let output = serde_json::json!({
+        "totalCost": total_cost,
+        "totalTokens": total_tokens,
+        "sessions": sessions,
     });
     print_json(&output, pretty)
 }

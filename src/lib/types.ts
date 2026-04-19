@@ -54,6 +54,9 @@ export interface Session {
 
   /** Name of the tool or reason awaiting attention (if status is NeedsAttention) */
   pendingToolName: string | null;
+
+  /** Session ID of the PM that spawned this session (if it's a c9watch worker) */
+  workerOf?: string | null;
 }
 
 /**

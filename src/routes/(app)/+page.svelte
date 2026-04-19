@@ -41,6 +41,7 @@
 	let conversation = $derived($currentConversation);
 
 	let viewMode = $state<'project' | 'all'>('project');
+	let sessionFilter = $state<'humans' | 'workers'>('humans');
 
 	let isCompact = $state(false);
 
@@ -64,6 +65,10 @@
 			const savedCompact = localStorage.getItem('sessionViewCompact');
 			if (savedCompact === 'true') {
 				isCompact = true;
+			}
+			const savedFilter = localStorage.getItem('sessionFilter');
+			if (savedFilter === 'humans' || savedFilter === 'workers') {
+				sessionFilter = savedFilter;
 			}
 		}
 
@@ -108,6 +113,18 @@
 	$effect(() => {
 		if (browser) {
 			localStorage.setItem('sessionViewCompact', String(isCompact));
+		}
+	});
+
+	$effect(() => {
+		if (browser) {
+			localStorage.setItem('sessionFilter', sessionFilter);
+		}
+	});
+
+	$effect(() => {
+		if (browser) {
+			localStorage.setItem('sessionViewMode', viewMode);
 		}
 	});
 
@@ -200,8 +217,28 @@
 		});
 	}
 
-	let projectGroups = $derived(groupByProjectAndStatus(sessions));
-	let allStatusGroups = $derived(groupSessionsByStatus(sessions));
+	let filteredSessions = $derived(
+		sessions.filter((s) =>
+			sessionFilter === 'workers' ? !!s.workerOf : !s.workerOf
+		)
+	);
+
+	let projectGroups = $derived(groupByProjectAndStatus(filteredSessions));
+	let allStatusGroups = $derived(groupSessionsByStatus(filteredSessions));
+
+	let filteredSummary = $derived({
+		working: filteredSessions.filter(
+			(s) =>
+				s.status === SessionStatus.Working ||
+				s.status === SessionStatus.Connecting
+		).length,
+		permission: filteredSessions.filter(
+			(s) => s.status === SessionStatus.NeedsAttention
+		).length,
+		input: filteredSessions.filter(
+			(s) => s.status === SessionStatus.WaitingForInput
+		).length
+	});
 
 	let expandedSession = $derived(sessions.find((s) => s.id === expandedId) || null);
 
@@ -263,13 +300,13 @@
 		}
 		if (e.key >= '1' && e.key <= '9' && !expandedId) {
 			const index = parseInt(e.key) - 1;
-			if (index < sessions.length) {
-				handleExpand(sessions[index]);
+			if (index < filteredSessions.length) {
+				handleExpand(filteredSessions[index]);
 			}
 		}
 		if (e.key === 'Tab' && !expandedId) {
 			// Find first session needing attention across all projects
-			const needsAction = sessions.filter(s =>
+			const needsAction = filteredSessions.filter(s =>
 				s.status === SessionStatus.NeedsAttention ||
 				s.status === SessionStatus.WaitingForInput
 			);
@@ -382,6 +419,34 @@
 					<div class="header-spacer"></div>
 					<div class="view-toggle">
 						<button
+							type="button"
+							class="toggle-btn"
+							class:active={sessionFilter === 'humans'}
+							onclick={() => sessionFilter = 'humans'}
+							title="Show human sessions"
+						>
+							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+								<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+								<circle cx="12" cy="7" r="4" />
+							</svg>
+						</button>
+						<button
+							type="button"
+							class="toggle-btn"
+							class:active={sessionFilter === 'workers'}
+							onclick={() => sessionFilter = 'workers'}
+							title="Show PM workers"
+						>
+							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+								<rect x="4" y="6" width="16" height="12" rx="2" />
+								<circle cx="9" cy="12" r="1.5" />
+								<circle cx="15" cy="12" r="1.5" />
+								<path d="M12 2v4" />
+							</svg>
+						</button>
+					</div>
+					<div class="view-toggle">
+						<button
 							class="toggle-btn"
 							class:active={isCompact}
 							onclick={() => isCompact = !isCompact}
@@ -427,14 +492,14 @@
 					</div>
 				</div>
 				
-				{#if sessions.length > 0}
+				{#if filteredSessions.length > 0}
 					<div class="system-status-container">
-						<StatusBar total={sessions.length} {summary} />
+						<StatusBar total={filteredSessions.length} summary={filteredSummary} />
 					</div>
 				{/if}
 			</section>
 
-			{#if sessions.length === 0}
+			{#if filteredSessions.length === 0}
 				<div class="empty-state">
 					<div class="empty-visual">
 						<div class="empty-orb">
@@ -445,18 +510,33 @@
 						</div>
 					</div>
 					<div class="empty-content">
-						<h2>No Active Sessions</h2>
-						<p>Start a Claude Code session in your terminal or IDE</p>
-						<div class="empty-hint">
-							<span class="hint-icon">
-								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-									<circle cx="12" cy="12" r="10" />
-									<path d="M12 16v-4" />
-									<path d="M12 8h.01" />
-								</svg>
-							</span>
-							Sessions are detected automatically
-						</div>
+						{#if sessionFilter === 'workers'}
+							<h2>No Workers Spawned</h2>
+							<p>Spawn a worker from a Claude Code session with <code>c9watch spawn</code></p>
+							<div class="empty-hint">
+								<span class="hint-icon">
+									<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+										<circle cx="12" cy="12" r="10" />
+										<path d="M12 16v-4" />
+										<path d="M12 8h.01" />
+									</svg>
+								</span>
+								Workers appear here once they're spawned by a PM session
+							</div>
+						{:else}
+							<h2>No Active Sessions</h2>
+							<p>Start a Claude Code session in your terminal or IDE</p>
+							<div class="empty-hint">
+								<span class="hint-icon">
+									<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+										<circle cx="12" cy="12" r="10" />
+										<path d="M12 16v-4" />
+										<path d="M12 8h.01" />
+									</svg>
+								</span>
+								Sessions are detected automatically
+							</div>
+						{/if}
 					</div>
 				</div>
 			{:else}
@@ -488,6 +568,7 @@
 												<SessionCard
 													{session}
 													compact={isCompact}
+													workersView={sessionFilter === 'workers'}
 													onexpand={() => handleExpand(session)}
 													onstop={() => handleStop(session.pid)}
 													onopen={() => handleOpen(session.pid, session.projectPath)}
@@ -514,6 +595,7 @@
 												<SessionCard
 													{session}
 													compact={isCompact}
+													workersView={sessionFilter === 'workers'}
 													onexpand={() => handleExpand(session)}
 													onstop={() => handleStop(session.pid)}
 													onopen={() => handleOpen(session.pid, session.projectPath)}
@@ -540,6 +622,7 @@
 												<SessionCard
 													{session}
 													compact={isCompact}
+													workersView={sessionFilter === 'workers'}
 													onexpand={() => handleExpand(session)}
 													onstop={() => handleStop(session.pid)}
 													onopen={() => handleOpen(session.pid, session.projectPath)}
@@ -572,6 +655,7 @@
 										<SessionCard
 											{session}
 											compact={isCompact}
+											workersView={sessionFilter === 'workers'}
 											onexpand={() => handleExpand(session)}
 											onstop={() => handleStop(session.pid)}
 											onopen={() => handleOpen(session.pid, session.projectPath)}
@@ -989,6 +1073,14 @@
 		color: var(--text-primary);
 		background: rgba(255, 255, 255, 0.1);
 		border-color: var(--border-default);
+	}
+
+	/* Workers-filter active state gets an amber tint to reinforce the
+	   bot/worker visual language used by the WORKER badge on cards. */
+	.toggle-btn.active[title="Show PM workers"] {
+		color: var(--accent-amber);
+		background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
+		border-color: color-mix(in srgb, var(--accent-amber) 40%, transparent);
 	}
 
 	.all-sessions-grid {

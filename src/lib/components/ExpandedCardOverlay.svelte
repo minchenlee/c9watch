@@ -8,6 +8,7 @@
 	import MessageNavMap from './MessageNavMap.svelte';
 	import { createSlidingWindow, BATCH_SIZE } from '$lib/slidingWindow.svelte';
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
+	import { workersByPm, expandedSessionId } from '$lib/stores/sessions';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
 
 	interface Props {
@@ -30,6 +31,8 @@
 	let tooltipText = $state('');
 	let tooltipX = $state(0);
 	let tooltipY = $state(0);
+	let navCollapsed = $state(false);
+	let workersCollapsed = $state(false);
 
 	function tipEnter(text: string) { tooltipText = text; }
 	function tipLeave() { tooltipText = ''; }
@@ -98,6 +101,53 @@
 	let isPermission = $derived(session.status === SessionStatus.NeedsAttention);
 	let isWaitingInput = $derived(session.status === SessionStatus.WaitingForInput);
 	let isWorking = $derived(session.status === SessionStatus.Working);
+
+	// resolvedWorkers works for both PM (views own workers) and a worker
+	// (views siblings under the same PM). Highlights the current session in the list.
+	// When the session is a PM, workerOf is null, so we fall back to session.id
+	// and resolvedWorkers IS myWorkers; the PM badge shows when length > 0 and
+	// workerOf is null (i.e. this session is itself the PM).
+	let resolvedWorkers = $derived(
+		$workersByPm.get(session.workerOf ?? session.id) ?? []
+	);
+	let isPm = $derived(!session.workerOf && resolvedWorkers.length > 0);
+	let showWorkersPanel = $derived(resolvedWorkers.length > 0);
+
+	function workerStatusColor(status: SessionStatus): string {
+		switch (status) {
+			case SessionStatus.Working: return 'var(--status-working)';
+			case SessionStatus.NeedsAttention: return 'var(--status-permission)';
+			case SessionStatus.WaitingForInput: return 'var(--status-input)';
+			case SessionStatus.Connecting: return 'var(--status-working)';
+			default: return 'var(--text-muted)';
+		}
+	}
+
+	function workerStatusLabel(status: SessionStatus): string {
+		switch (status) {
+			case SessionStatus.Working: return 'Working';
+			case SessionStatus.NeedsAttention: return 'Attention';
+			case SessionStatus.WaitingForInput: return 'Ready';
+			case SessionStatus.Connecting: return 'Connecting';
+			default: return 'Unknown';
+		}
+	}
+
+	function formatTimeSince(isoTimestamp: string): string {
+		const now = Date.now();
+		const then = new Date(isoTimestamp).getTime();
+		const diffMins = Math.floor((now - then) / 60000);
+		const diffHours = Math.floor((now - then) / 3600000);
+		const diffDays = Math.floor((now - then) / 86400000);
+		if (diffMins < 1) return 'now';
+		if (diffMins < 60) return `${diffMins}m`;
+		if (diffHours < 24) return `${diffHours}h`;
+		return `${diffDays}d`;
+	}
+
+	function openWorker(id: string) {
+		expandedSessionId.set(id);
+	}
 
 	function getStatusColor(): string {
 		switch (session.status) {
@@ -185,6 +235,24 @@
 								onmouseleave={tipLeave}
 								onmousemove={tipMove}
 							>{session.customTitle || session.summary || session.firstPrompt || 'New Session'}</h2>
+							{#if session.workerOf}
+								<!-- svelte-ignore a11y_no_static_element_interactions -->
+								<span
+									class="worker-badge"
+									onmouseenter={() => tipEnter(`Worker of ${session.workerOf}`)}
+									onmouseleave={tipLeave}
+									onmousemove={tipMove}
+								>WORKER</span>
+							{/if}
+							{#if isPm}
+								<!-- svelte-ignore a11y_no_static_element_interactions -->
+								<span
+									class="pm-badge"
+									onmouseenter={() => tipEnter(`Managing ${resolvedWorkers.length} worker${resolvedWorkers.length === 1 ? '' : 's'}`)}
+									onmouseleave={tipLeave}
+									onmousemove={tipMove}
+								>PM · {resolvedWorkers.length}</span>
+							{/if}
 							<!-- svelte-ignore a11y_click_events_have_key_events -->
 							<!-- svelte-ignore a11y_no_static_element_interactions -->
 							<span
@@ -329,9 +397,62 @@
 			</button>
 		</div>
 
-		<!-- Desktop: sidebar nav -->
-		<div class="nav-map-side nav-desktop" in:scale={{ start: 0.95, duration: 300, easing: quintOut }}>
-			<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking {onExpandToIndex} />
+		<!-- Desktop: right column (nav + workers stacked) -->
+		<div class="right-column nav-desktop" in:scale={{ start: 0.95, duration: 300, easing: quintOut }}>
+			<!-- Navigation panel -->
+			<div class="nav-map-side" class:collapsed={navCollapsed}>
+				<button
+					type="button"
+					class="panel-header"
+					onclick={() => navCollapsed = !navCollapsed}
+					aria-expanded={!navCollapsed}
+				>
+					<span class="panel-chevron" class:rotated={navCollapsed}>▾</span>
+					<span class="panel-title">Navigation</span>
+				</button>
+				{#if !navCollapsed}
+					<div class="panel-body">
+						<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking {onExpandToIndex} />
+					</div>
+				{/if}
+			</div>
+
+			<!-- Workers panel (only when relevant) -->
+			{#if showWorkersPanel}
+				<div class="workers-side-panel" class:collapsed={workersCollapsed}>
+					<button
+						type="button"
+						class="panel-header"
+						onclick={() => workersCollapsed = !workersCollapsed}
+						aria-expanded={!workersCollapsed}
+					>
+						<span class="panel-chevron" class:rotated={workersCollapsed}>▾</span>
+						<span class="panel-title">Workers</span>
+						<span class="panel-count">{resolvedWorkers.length}</span>
+					</button>
+					{#if !workersCollapsed}
+						{#if session.workerOf}
+							<button class="back-to-pm" onclick={() => expandedSessionId.set(session.workerOf!)}>← Back to PM</button>
+						{/if}
+						<div class="workers-list">
+							{#each resolvedWorkers as w (w.id)}
+								<button
+									type="button"
+									class="worker-row"
+									class:active={w.id === session.id}
+									onclick={() => openWorker(w.id)}
+								>
+									<span class="worker-name">{w.customTitle || w.summary || w.sessionName}</span>
+									<span class="worker-status" style="color: {workerStatusColor(w.status)}">
+										{workerStatusLabel(w.status)}
+									</span>
+									<span class="worker-time">{formatTimeSince(w.modified)}</span>
+								</button>
+							{/each}
+						</div>
+					{/if}
+				</div>
+			{/if}
 		</div>
 
 		<!-- Mobile: bottom sheet nav -->
@@ -366,7 +487,7 @@
 		align-items: flex-start;
 		gap: var(--space-xl);
 		width: 100%;
-		max-width: 1100px;
+		max-width: 1400px;
 		height: 85vh;
 		max-height: 900px;
 		pointer-events: none; /* Allow clicks through empty layout area */
@@ -375,6 +496,7 @@
 	.overlay-card {
 		position: relative;
 		flex: 1; /* Take up remaining space */
+		min-width: 0; /* Allow flex to shrink below content width */
 		height: 100%;
 		background: var(--bg-card);
 		border: 1px solid var(--border-default);
@@ -385,12 +507,125 @@
 		box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
 	}
 
-	.nav-map-side.nav-desktop {
+	/* Right column: nav + workers stacked */
+	.right-column.nav-desktop {
 		flex-shrink: 0;
+		width: 240px;
 		height: 100%;
 		display: flex;
 		flex-direction: column;
+		gap: var(--space-md);
 		pointer-events: auto;
+		overflow-y: auto;
+	}
+
+	/* Shared panel card style */
+	.nav-map-side,
+	.workers-side-panel {
+		background: var(--bg-card);
+		border: 1px solid var(--border-default);
+		display: flex;
+		flex-direction: column;
+		flex-shrink: 0;
+	}
+
+	/* Nav panel takes remaining height when not collapsed */
+	.nav-map-side {
+		flex: 1;
+		min-height: 0;
+		overflow: hidden;
+	}
+
+	.nav-map-side.collapsed {
+		flex: none;
+	}
+
+	.nav-map-side .panel-body {
+		flex: 1;
+		min-height: 0;
+		overflow: hidden;
+		display: flex;
+		flex-direction: column;
+	}
+
+	/* Collapsible panel header (shared) */
+	.panel-header {
+		display: flex;
+		align-items: center;
+		gap: var(--space-sm);
+		width: 100%;
+		background: none;
+		border: none;
+		border-bottom: 1px solid var(--border-muted);
+		padding: var(--space-sm) var(--space-lg);
+		cursor: pointer;
+		text-align: left;
+		transition: background var(--transition-fast);
+	}
+
+	.panel-header:hover {
+		background: color-mix(in srgb, var(--text-muted) 6%, transparent);
+	}
+
+	.panel-chevron {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		transition: transform 0.2s ease;
+		display: inline-block;
+		flex-shrink: 0;
+	}
+
+	.panel-chevron.rotated {
+		transform: rotate(-90deg);
+	}
+
+	.panel-title {
+		font-family: var(--font-pixel);
+		font-size: 12px;
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		color: var(--text-muted);
+		flex: 1;
+	}
+
+	.panel-count {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		opacity: 0.5;
+	}
+
+	/* Collapsed panel: no bottom border on header since there's nothing below */
+	.nav-map-side.collapsed .panel-header,
+	.workers-side-panel.collapsed .panel-header {
+		border-bottom: none;
+	}
+
+	.workers-side-panel .workers-list {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		padding: var(--space-sm) 0;
+	}
+
+	.back-to-pm {
+		display: block;
+		width: 100%;
+		background: none;
+		border: none;
+		border-bottom: 1px solid var(--border-muted);
+		padding: var(--space-sm) var(--space-lg);
+		text-align: left;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		cursor: pointer;
+		transition: color var(--transition-fast);
+	}
+
+	.back-to-pm:hover {
+		color: var(--text-primary, #fff);
 	}
 
 	/* Mobile bottom sheet elements — hidden on desktop */
@@ -507,12 +742,76 @@
 		letter-spacing: 0.05em;
 	}
 
-	.cost-primary {
-		color: var(--text-muted);
+	.worker-badge {
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		font-weight: 500;
+		color: var(--accent-amber);
+		background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
+		padding: 2px 6px;
+		border: 1px solid color-mix(in srgb, var(--accent-amber) 40%, transparent);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
 	}
 
-	.cost-secondary {
+	.pm-badge {
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		font-weight: 500;
+		color: var(--accent-green);
+		background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+		padding: 2px 6px;
+		border: 1px solid color-mix(in srgb, var(--accent-green) 40%, transparent);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		white-space: nowrap;
+	}
+
+	.worker-row {
+		display: grid;
+		grid-template-columns: 1fr auto auto;
+		align-items: center;
+		gap: var(--space-sm);
+		padding: 6px var(--space-md);
+		background: transparent;
+		border: none;
+		border-left: 2px solid transparent;
+		color: var(--text-primary);
+		text-align: left;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		cursor: pointer;
+		transition: all 0.15s ease;
+		width: 100%;
+	}
+
+	.worker-row:hover {
+		background: color-mix(in srgb, var(--text-muted) 6%, transparent);
+		border-left-color: var(--border-muted);
+	}
+
+	.worker-row.active {
+		border-left-color: var(--accent-green);
+		background: color-mix(in srgb, var(--accent-green) 10%, transparent);
+	}
+
+	.worker-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		min-width: 0;
+	}
+
+	.worker-status {
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		font-weight: 500;
+	}
+
+	.worker-time {
 		color: var(--text-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
 	}
 
 	.git-info {
@@ -670,8 +969,8 @@
 			max-height: 100vh;
 		}
 
-		/* Hide the desktop sidebar nav on mobile */
-		.nav-map-side.nav-desktop {
+		/* Hide the desktop right column on mobile */
+		.right-column.nav-desktop {
 			display: none;
 		}
 

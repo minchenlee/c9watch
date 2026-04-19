@@ -2,18 +2,20 @@
 	import type { Session } from '$lib/types';
 	import { SessionStatus } from '$lib/types';
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
+	import { workersByPm } from '$lib/stores/sessions';
 	import { formatCostOrTokens } from '$lib/cost-utils';
 
 	interface Props {
 		session: Session;
 		compact?: boolean;
+		workersView?: boolean;
 		onexpand?: () => void;
 		onstop?: () => void;
 		onopen?: () => void;
 		onrename?: () => void;
 	}
 
-	let { session, compact = false, onexpand, onstop, onopen, onrename }: Props = $props();
+	let { session, compact = false, workersView = false, onexpand, onstop, onopen, onrename }: Props = $props();
 
 	let needsAttention = $derived(
 		session.status === SessionStatus.NeedsAttention ||
@@ -33,6 +35,11 @@
 	function tipMove(e: MouseEvent) { tooltipX = e.clientX + 12; tooltipY = e.clientY + 12; }
 
 	let cardTitle = $derived(session.customTitle || session.summary || session.firstPrompt);
+	let workerTip = $derived(session.workerOf ? `Worker of ${session.workerOf}` : '');
+	let workerIdShort = $derived(session.workerOf?.slice(0, 8) ?? '');
+
+	let myWorkers = $derived($workersByPm.get(session.id) ?? []);
+	let isPm = $derived(myWorkers.length > 0);
 
 	let costRecord = $derived($sessionCostMap.get(session.id));
 	let costLabel = $derived(
@@ -149,6 +156,22 @@
 >
 	<!-- Card Content -->
 	<div class="card-body">
+		{#if workersView && session.workerOf}
+			<!-- svelte-ignore a11y_no_static_element_interactions -->
+			<div
+				class="pm-prefix"
+				onmouseenter={() => tipEnter(workerTip)}
+				onmouseleave={tipLeave}
+				onmousemove={tipMove}
+			>
+				<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+					<path d="M12 2l3 7h7l-5.5 4.5L18 22l-6-4-6 4 1.5-8.5L2 9h7z" />
+				</svg>
+				<span class="pm-prefix-label">Worker of</span>
+				<span class="pm-prefix-id">{workerIdShort}</span>
+			</div>
+		{/if}
+
 		<!-- Header (Summary as Title) -->
 		<div class="card-header">
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -186,8 +209,28 @@
 
 		<!-- Project & Stats Row -->
 		<div class="stats-row">
-			<span class="session-name-badge">{session.sessionName}</span>
-			
+			<div class="badge-group">
+				<span class="session-name-badge">{session.sessionName}</span>
+				{#if session.workerOf && !workersView}
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
+					<span
+						class="worker-badge"
+						onmouseenter={() => tipEnter(workerTip)}
+						onmouseleave={tipLeave}
+						onmousemove={tipMove}
+					>WORKER</span>
+				{/if}
+				{#if isPm}
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
+					<span
+						class="pm-badge"
+						onmouseenter={() => tipEnter(`Managing ${myWorkers.length} worker${myWorkers.length === 1 ? '' : 's'}`)}
+						onmouseleave={tipLeave}
+						onmousemove={tipMove}
+					>PM · {myWorkers.length}</span>
+				{/if}
+			</div>
+
 			{#if !compact}
 				<div class="stats-group">
 					<span class="message-count">
@@ -395,6 +438,72 @@
 		display: inline-block;
 		vertical-align: middle;
 		max-width: 100%;
+	}
+
+	.badge-group {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--space-xs);
+		min-width: 0;
+	}
+
+	.worker-badge {
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		font-weight: 500;
+		color: var(--accent-amber);
+		background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
+		padding: 2px 6px;
+		border: 1px solid color-mix(in srgb, var(--accent-amber) 40%, transparent);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		display: inline-block;
+		vertical-align: middle;
+	}
+
+	.pm-badge {
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		font-weight: 500;
+		color: var(--accent-green);
+		background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+		padding: 2px 6px;
+		border: 1px solid color-mix(in srgb, var(--accent-green) 40%, transparent);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		display: inline-block;
+		vertical-align: middle;
+		white-space: nowrap;
+	}
+
+	/* Workers-only view: surface the PM relationship as a first-class prefix
+	   row above the title. Amber matches the WORKER badge visual language. */
+	.pm-prefix {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		font-family: var(--font-mono);
+		font-size: 10px;
+		font-weight: 500;
+		color: var(--accent-amber);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		margin-bottom: 2px;
+		width: fit-content;
+	}
+
+	.pm-prefix svg {
+		flex-shrink: 0;
+	}
+
+	.pm-prefix-label {
+		opacity: 0.75;
+	}
+
+	.pm-prefix-id {
+		font-weight: 600;
+		color: var(--accent-amber);
+		letter-spacing: 0.05em;
 	}
 
 	.git-branch {

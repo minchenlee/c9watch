@@ -1,15 +1,97 @@
 use crate::session::enrichment::detect_and_enrich_sessions_with_detector;
 pub use crate::session::enrichment::{detect_and_enrich_sessions, truncate_string, Session};
 use crate::session::{SessionDetector, SessionStatus};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
+
+/// Cached overlay: session_id -> spawnedBy (i.e. worker_of).
+/// Invalidated when the `~/.claude/c9watch/workers/` dir mtime changes.
+static WORKERS_OVERLAY: LazyLock<Mutex<Option<WorkersCache>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+struct WorkersCache {
+    dir_mtime: SystemTime,
+    map: Arc<HashMap<String, String>>,
+}
+
+/// Narrow view of worker meta.json — only the fields the overlay needs.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerMetaOverlay {
+    session_id: Option<String>,
+    spawned_by: Option<String>,
+    stopped_at: Option<String>,
+    pid: Option<u64>,
+}
+
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
+}
+
+fn load_workers_overlay() -> Arc<HashMap<String, String>> {
+    let workers_dir = match dirs::home_dir() {
+        Some(h) => h.join(".claude").join("c9watch").join("workers"),
+        None => return Arc::new(HashMap::new()),
+    };
+
+    let dir_mtime = match std::fs::metadata(&workers_dir).and_then(|m| m.modified()) {
+        Ok(m) => m,
+        Err(_) => return Arc::new(HashMap::new()),
+    };
+
+    if let Ok(guard) = WORKERS_OVERLAY.lock() {
+        if let Some(cache) = guard.as_ref() {
+            if cache.dir_mtime == dir_mtime {
+                return Arc::clone(&cache.map);
+            }
+        }
+    }
+
+    let mut map = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(&workers_dir) {
+        for entry in entries.flatten() {
+            let meta_path = entry.path().join("meta.json");
+            let Ok(content) = std::fs::read_to_string(&meta_path) else { continue };
+            let Ok(meta) = serde_json::from_str::<WorkerMetaOverlay>(&content) else { continue };
+            if meta.stopped_at.is_some() {
+                continue;
+            }
+            if let Some(pid) = meta.pid {
+                if !pid_is_alive(pid as u32) {
+                    continue;
+                }
+            }
+            if let (Some(sid), Some(by)) = (meta.session_id, meta.spawned_by) {
+                map.insert(sid, by);
+            }
+        }
+    }
+
+    let map = Arc::new(map);
+    if let Ok(mut guard) = WORKERS_OVERLAY.lock() {
+        *guard = Some(WorkersCache {
+            dir_mtime,
+            map: Arc::clone(&map),
+        });
+    }
+    map
+}
 
 /// Start the background polling loop
 ///
@@ -54,11 +136,20 @@ pub fn start_polling(
         let mut is_first_cycle = true;
 
         let mut prev_diagnostics: Option<crate::session::DetectionDiagnostics> = None;
+        let mut prev_sessions_hash: Option<u64> = None;
 
         loop {
             // Detect and enrich sessions
             match detect_and_enrich_sessions_with_detector(&mut detector) {
-                Ok((sessions, diagnostics)) => {
+                Ok((mut sessions, diagnostics)) => {
+                    // Overlay worker_of from ~/.claude/c9watch/workers/*/meta.json
+                    let overlay = load_workers_overlay();
+                    for s in sessions.iter_mut() {
+                        if let Some(by) = overlay.get(&s.id) {
+                            s.worker_of = Some(by.clone());
+                        }
+                    }
+
                     // Track current session IDs to clean up stale entries
                     let current_session_ids: HashSet<String> =
                         sessions.iter().map(|s| s.id.clone()).collect();
@@ -152,17 +243,26 @@ pub fn start_polling(
                         }
                     }
 
-                    // Emit event to Tauri frontend
-                    if let Err(e) = app_handle.emit("sessions-updated", &sessions) {
-                        crate::debug_log::log_error(&format!(
-                            "Failed to emit sessions-updated: {}",
-                            e
-                        ));
-                    }
-
-                    // Broadcast to WebSocket clients
-                    if let Ok(json) = serde_json::to_string(&sessions) {
-                        let _ = sessions_tx.send(json);
+                    // Serialize once; skip emit/broadcast when payload is unchanged
+                    // so idle dashboards don't rerender every poll cycle.
+                    let serialized = serde_json::to_string(&sessions).ok();
+                    let current_hash = serialized.as_ref().map(|s| {
+                        let mut h = DefaultHasher::new();
+                        s.hash(&mut h);
+                        h.finish()
+                    });
+                    let changed = current_hash != prev_sessions_hash;
+                    if changed {
+                        if let Err(e) = app_handle.emit("sessions-updated", &sessions) {
+                            crate::debug_log::log_error(&format!(
+                                "Failed to emit sessions-updated: {}",
+                                e
+                            ));
+                        }
+                        if let Some(json) = serialized {
+                            let _ = sessions_tx.send(json);
+                        }
+                        prev_sessions_hash = current_hash;
                     }
 
                     // Emit diagnostics only when changed
@@ -313,6 +413,24 @@ fn fire_notification(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_alive_detects_dead_pid() {
+        // PID 0 is never a real process.
+        assert!(!pid_is_alive(0));
+        // PID 999999 is extremely unlikely to be live (kernel default pid_max
+        // on macOS is 99999, and even on Linux systems with expanded range
+        // it's highly unlikely to hit this).
+        assert!(!pid_is_alive(999_999));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_alive_detects_live_pid() {
+        // Our own pid must be alive.
+        assert!(pid_is_alive(std::process::id()));
+    }
 
     #[test]
     fn test_detect_and_enrich_sessions() {

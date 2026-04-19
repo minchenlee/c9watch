@@ -178,8 +178,55 @@ c9watch tasks <session-id>
 
 ### `stop` — Stop a Session
 
+Accepts either a PID (for regular Claude sessions) or a session ID / prefix (for PM workers spawned via `c9watch spawn`). Numeric args are treated as PIDs and dispatched to the session-kill path; non-numeric args are sent to the PM daemon as a worker stop.
+
 ```bash
-c9watch stop <pid>
+c9watch stop <pid>                   # regular Claude session (by PID)
+c9watch stop <session-id-or-prefix>  # PM worker (via daemon RPC)
+```
+
+### `spawn` — Start a Worker Session
+
+Spawn a new Claude Code session managed by c9watch. The worker is a real session that appears in `c9watch list`.
+
+```bash
+c9watch spawn --name researcher --cwd /path/to/project
+c9watch spawn --name writer --append-system-prompt "You are a technical writer."
+c9watch spawn --cwd . --permission-mode plan --model sonnet
+```
+
+```json
+{"ok":true,"sessionId":"abc-1234-...","pid":54321,"name":"researcher"}
+```
+
+Options: `--cwd`, `--name`, `--append-system-prompt`, `--append-system-prompt-file`, `--permission-mode` (default: bypassPermissions), `--model`, `--add-dir`
+
+### `send` — Message a Worker
+
+Send a message to a spawned worker session.
+
+```bash
+# Fire-and-forget
+c9watch send abc-1234 --message "Research topic X"
+
+# Wait for reply
+c9watch send abc-1234 --message "Summarize findings" --wait
+
+# Send from file
+c9watch send abc-1234 --file instructions.md --wait --timeout 120
+```
+
+Exit codes: 0 (success), 1 (error), 2 (`--wait` timed out, message was sent)
+
+### `workers` — List Managed Workers
+
+```bash
+c9watch workers
+c9watch workers --all --pretty
+```
+
+```json
+{"ok":true,"workers":[{"sessionId":"...","pid":54321,"name":"researcher","cwd":"/path","spawnedAt":"...","alive":true}]}
 ```
 
 ## Global Flags
@@ -233,4 +280,4 @@ c9watch search "database migration" --project myapp
 - **All output is JSON** on stdout. Errors go to stderr as `{"error": "..."}` with exit code 1.
 - **No stderr noise** — debug warnings are suppressed in CLI mode.
 - **System XML tags** (e.g., `<local-command-caveat>`, `<system-reminder>`) are stripped from all text fields.
-- **Read-only** — the CLI cannot send input to running sessions or start new ones. Claude Code's stdin is owned by the terminal process that launched it.
+- **Write path** — `spawn` starts new managed worker sessions; `send` delivers messages to them. All other commands are read-only. Claude Code's stdin for sessions not managed by c9watch is owned by the terminal process that launched them.
