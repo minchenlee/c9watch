@@ -1,7 +1,7 @@
 <script lang="ts">
-	import { slide, fade } from 'svelte/transition';
+	import { fade } from 'svelte/transition';
 	import { flip } from 'svelte/animate';
-	import { quintOut } from 'svelte/easing';
+	import { fadeIn, flyIn } from '$lib/transitions';
 	import { onMount } from 'svelte';
 	import { browser } from '$app/environment';
 	import {
@@ -24,6 +24,7 @@
 	import SessionHistory from '$lib/components/SessionHistory.svelte';
 	import CostTracker from '$lib/components/CostTracker.svelte';
 	import { refreshCostData } from '$lib/stores/cost';
+	import { refreshSessionHistory } from '$lib/stores/history';
 	import MemoryViewer from '$lib/components/MemoryViewer.svelte';
 	import FdaBanner from '$lib/components/FdaBanner.svelte';
 	import DebugConsole from '$lib/components/DebugConsole.svelte';
@@ -73,6 +74,7 @@
 		}
 
 		refreshCostData();
+		refreshSessionHistory();
 
 		if (!isTauri()) return;
 
@@ -226,6 +228,29 @@
 	let projectGroups = $derived(groupByProjectAndStatus(filteredSessions));
 	let allStatusGroups = $derived(groupSessionsByStatus(filteredSessions));
 
+	// Running-offset arrays so entry animations share a single index namespace
+	// per tab (like CostTracker). Each group's starting index is the cumulative
+	// count of everything that came before it. Inside a group the header takes
+	// `offset + 0` and inner items continue from `offset + 1`.
+	let projectOffsets = $derived.by(() => {
+		const offsets: number[] = [];
+		let acc = 0;
+		for (const g of projectGroups) {
+			offsets.push(acc);
+			acc += 1 + g.attention.length + g.idle.length + g.working.length;
+		}
+		return offsets;
+	});
+	let allGroupOffsets = $derived.by(() => {
+		const offsets: number[] = [];
+		let acc = 0;
+		for (const g of allStatusGroups) {
+			offsets.push(acc);
+			acc += 1 + g.sessions.length;
+		}
+		return offsets;
+	});
+
 	let filteredSummary = $derived({
 		working: filteredSessions.filter(
 			(s) =>
@@ -371,21 +396,21 @@
 	</div>
 
 	{#if activeTab === 'history'}
-	<main class="grid-container history-main">
+	<main class="grid-container history-main" in:fadeIn>
 		<SessionHistory {activeSessionIds} />
 	</main>
 	{:else if activeTab === 'cost'}
-	<main class="grid-container history-main">
+	<main class="grid-container history-main" in:fadeIn>
 		<CostTracker />
 	</main>
 	{:else if activeTab === 'memory'}
-	<main class="grid-container history-main">
+	<main class="grid-container history-main" in:fadeIn>
 		<MemoryViewer />
 	</main>
 	{:else}
-	<main class="grid-container">
+	<main class="grid-container" in:fadeIn>
 		<div class="sections-container">
-			<section class="system-section">
+			<section class="system-section" in:flyIn|global={{ index: 0 }}>
 				<div class="project-header">
 					<span class="project-name">System status</span>
 					<span class="project-count">{sessions.length}</span>
@@ -542,8 +567,9 @@
 			{:else}
 
 				{#if viewMode === 'project'}
-					{#each projectGroups as group (group.path)}
-						<section class="project-section" animate:flip={{ duration: 400 }}>
+					{#each projectGroups as group, gi (group.path)}
+						{@const baseIdx = projectOffsets[gi] ?? 0}
+						<section class="project-section" in:flyIn|global={{ index: baseIdx }} animate:flip={{ duration: 400 }}>
 							<div class="project-header">
 								<span class="project-name">{group.displayName}</span>
 								<span class="project-count">
@@ -559,10 +585,10 @@
 										<span class="status-count">{group.attention.length}</span>
 									</div>
 									<div class="session-grid">
-										{#each group.attention as session (session.id)}
+										{#each group.attention as session, i (session.id)}
 											<div
 												class="card-wrapper"
-												transition:slide={{ duration: 400, easing: quintOut }}
+												in:flyIn|global={{ index: baseIdx + 1 + i }}
 												animate:flip={{ duration: 400 }}
 											>
 												<SessionCard
@@ -586,10 +612,10 @@
 										<span class="status-count">{group.idle.length}</span>
 									</div>
 									<div class="session-grid">
-										{#each group.idle as session (session.id)}
+										{#each group.idle as session, i (session.id)}
 											<div
 												class="card-wrapper"
-												transition:slide={{ duration: 400, easing: quintOut }}
+												in:flyIn|global={{ index: baseIdx + 1 + group.attention.length + i }}
 												animate:flip={{ duration: 400 }}
 											>
 												<SessionCard
@@ -613,10 +639,10 @@
 										<span class="status-count">{group.working.length}</span>
 									</div>
 									<div class="session-grid">
-										{#each group.working as session (session.id)}
+										{#each group.working as session, i (session.id)}
 											<div
 												class="card-wrapper"
-												transition:slide={{ duration: 400, easing: quintOut }}
+												in:flyIn|global={{ index: baseIdx + 1 + group.attention.length + group.idle.length + i }}
 												animate:flip={{ duration: 400 }}
 											>
 												<SessionCard
@@ -637,8 +663,9 @@
 						</section>
 					{/each}
 				{:else}
-					{#each allStatusGroups as group (group.id)}
-						<section class="project-section" animate:flip={{ duration: 400 }}>
+					{#each allStatusGroups as group, gi (group.id)}
+						{@const baseIdx = allGroupOffsets[gi] ?? 0}
+						<section class="project-section" in:flyIn|global={{ index: baseIdx }} animate:flip={{ duration: 400 }}>
 							<div class="status-header all-view {group.type}">
 								<span class="status-indicator {group.type}" style="width: 8px; height: 8px;"></span>
 								<span class="project-name" style="font-size: 16px;">{group.label}</span>
@@ -646,10 +673,10 @@
 							</div>
 
 							<div class="all-sessions-grid" class:compact={isCompact}>
-								{#each group.sessions as session (session.id)}
+								{#each group.sessions as session, i (session.id)}
 									<div
 										class="card-wrapper"
-										transition:slide={{ duration: 400, easing: quintOut }}
+										in:flyIn|global={{ index: baseIdx + 1 + i }}
 										animate:flip={{ duration: 400 }}
 									>
 										<SessionCard
@@ -787,7 +814,7 @@
 		font-family: var(--font-pixel);
 		font-size: 10px;
 		letter-spacing: 0.08em;
-		transition: color var(--transition-fast);
+		transition: color 80ms ease-out, border-bottom-color 80ms ease-out;
 		-webkit-app-region: no-drag;
 	}
 

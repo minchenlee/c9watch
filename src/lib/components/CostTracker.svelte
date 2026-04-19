@@ -6,6 +6,7 @@
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
 	import { costData as costDataStore, costMode, refreshCostData } from '$lib/stores/cost';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
+	import { flyIn, fadeIn } from '$lib/transitions';
 
 	type TimeScale = 'daily' | 'weekly' | 'monthly';
 
@@ -459,8 +460,8 @@
 	<div class="section-header">
 		<span class="section-title">COST TRACKER</span>
 		{#if costData}
-			<span class="section-total">{formatCostOrTokens(filteredTotalCost, filteredTotalTokens, mode)}</span>
-			<div class="mode-toggle" role="group" aria-label="Display mode">
+			<span class="section-total" in:flyIn={{ index: 0, stride: 40 }}>{formatCostOrTokens(filteredTotalCost, filteredTotalTokens, mode)}</span>
+			<div class="mode-toggle" role="group" aria-label="Display mode" in:flyIn={{ index: 1, stride: 40 }}>
 				<button
 					class="mode-btn"
 					class:active={mode === 'usd'}
@@ -474,7 +475,7 @@
 					title="Show totals in tokens"
 				>TOKENS</button>
 			</div>
-			<button class="distance-btn" onclick={() => showVisualizer = true}>
+			<button class="distance-btn" onclick={() => showVisualizer = true} in:flyIn={{ index: 2, stride: 40 }}>
 				DISTANCE
 			</button>
 		{/if}
@@ -505,7 +506,7 @@
 	{:else}
 		<div class="list-area">
 			<!-- ── BY MODEL ───────────────────────────────────────── -->
-			<div class="model-status-bar">
+			<div class="model-status-bar" in:flyIn={{ index: 0, duration: 650, stride: 90 }}>
 				<div class="sub-header">BY MODEL</div>
 
 				<div class="progress-track" bind:clientWidth={modelTrackWidth}>
@@ -531,7 +532,7 @@
 			</div>
 
 			<!-- ── TIME-BASED COST ────────────────────────────────── -->
-			<div class="cost-section">
+			<div class="cost-section" in:flyIn={{ index: 1, duration: 650, stride: 90 }}>
 				<div class="sub-header">{scaleSectionTitle}</div>
 
 				<div class="vchart-area">
@@ -566,7 +567,7 @@
 			</div>
 
 			<!-- ── BY PROJECT ─────────────────────────────────────── -->
-			<div class="cost-section">
+			<div class="cost-section" in:flyIn={{ index: 2, duration: 650, stride: 90 }}>
 				<div class="sub-header-row">
 					<span class="sub-header">BY PROJECT</span>
 					<div class="sort-group">
@@ -582,8 +583,8 @@
 					</div>
 				</div>
 
-				{#each filteredProjectCosts as proj (proj.project)}
-					<div class="project-group">
+				{#each filteredProjectCosts as proj, i (proj.project)}
+					<div class="project-group" in:flyIn={{ index: i, duration: 650, stride: 90 }}>
 						<!-- svelte-ignore a11y_click_events_have_key_events -->
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<div

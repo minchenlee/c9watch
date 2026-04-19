@@ -34,6 +34,7 @@
 	import { onMount, tick } from 'svelte';
 	import { fade, scale } from 'svelte/transition';
 	import { quintOut } from 'svelte/easing';
+	import { flyIn, flyInX, fadeIn } from '$lib/transitions';
 	import { invoke } from '@tauri-apps/api/core';
 	import type { Session, Conversation } from '$lib/types';
 	import { SessionStatus } from '$lib/types';
@@ -70,6 +71,9 @@
 	let tooltipY = $state(0);
 	let navCollapsed = $state(false);
 	let workersCollapsed = $state(false);
+	// Only stagger the first batch of messages when the overlay mounts;
+	// subsequent streaming/polling of new messages should NOT animate.
+	let initialStaggerDone = $state(false);
 
 	function tipEnter(text: string) { tooltipText = text; }
 	function tipLeave() { tooltipText = ''; }
@@ -92,6 +96,13 @@
 		).length;
 	});
 
+	// Stagger messages only on the overlay's first render. After that,
+	// streaming/polling appends new messages — those should appear instantly.
+	function messageIn(node: Element, params: { index: number }) {
+		if (initialStaggerDone) return fade(node, { duration: 0 });
+		return flyIn(node, { index: params.index, y: 6, stride: 20, duration: 200 });
+	}
+
 	function handleNavItemClick() {
 		// Close the bottom sheet on mobile after navigating
 		navSheetOpen = false;
@@ -99,6 +110,10 @@
 
 	onMount(() => {
 		isInitialLoad = false;
+
+		// Give the first paint of visible messages time to stagger in,
+		// then disable the animation so new streamed messages just appear.
+		setTimeout(() => { initialStaggerDone = true; }, 600);
 
 		const handleKeydown = (e: KeyboardEvent) => {
 			if (e.key === 'Escape') {
@@ -496,7 +511,7 @@
 						{/if}
 						{#each visibleMessages as message, i (sw.startIndex + i)}
 							{#if (showTools || (message.messageType !== 'ToolUse' && message.messageType !== 'ToolResult')) && (showThinking || message.messageType !== 'Thinking')}
-								<div data-msg-index={sw.startIndex + i}>
+								<div data-msg-index={sw.startIndex + i} in:messageIn={{ index: Math.min(i, 15) }}>
 									<MessageBubble {message} />
 								</div>
 							{/if}
@@ -522,9 +537,9 @@
 		</div>
 
 		<!-- Desktop: right column (nav + workers stacked) -->
-		<div class="right-column nav-desktop" in:scale={{ start: 0.95, duration: 300, easing: quintOut }}>
+		<div class="right-column nav-desktop">
 			<!-- Navigation panel -->
-			<div class="nav-map-side" class:collapsed={navCollapsed}>
+			<div class="nav-map-side" class:collapsed={navCollapsed} in:flyInX|global={{ index: 0, base: 200 }}>
 				<button
 					type="button"
 					class="panel-header"
@@ -544,7 +559,7 @@
 
 			<!-- Workers panel (only when relevant) -->
 			{#if showWorkersPanel}
-				<div class="workers-side-panel" class:collapsed={workersCollapsed}>
+				<div class="workers-side-panel" class:collapsed={workersCollapsed} in:flyInX|global={{ index: 1, base: 200 }}>
 					<button
 						type="button"
 						class="panel-header"

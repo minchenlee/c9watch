@@ -1,17 +1,19 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { browser } from '$app/environment';
-	import { getSessionHistory, deepSearchSessions, getConversation } from '$lib/api';
+	import { deepSearchSessions, getConversation } from '$lib/api';
 	import type { HistoryEntry, Conversation, DeepSearchHit } from '$lib/types';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
+	import { flyIn } from '$lib/transitions';
+	import { historyEntries, historyLoading, historyError, refreshSessionHistory } from '$lib/stores/history';
 
 	// ── Props ────────────────────────────────────────────────────────
 	let { activeSessionIds = new Set<string>() }: { activeSessionIds?: Set<string> } = $props();
 
 	// ── State ────────────────────────────────────────────────────────
-	let allEntries = $state<HistoryEntry[]>([]);
-	let loading = $state(true);
-	let error = $state<string | null>(null);
+	let allEntries = $derived($historyEntries);
+	let loading = $derived($historyLoading);
+	let error = $derived($historyError);
 
 	let query = $state('');
 	let sortOrder = $state<'newest' | 'oldest'>('newest');
@@ -26,21 +28,16 @@
 	let selectedEntry = $state<HistoryEntry | null>(null);
 	let conversation = $state<Conversation | null>(null);
 	// ── Persistence ──────────────────────────────────────────────────
-	onMount(async () => {
+	onMount(() => {
 		if (browser) {
 			const savedSort = localStorage.getItem('historySort');
 			if (savedSort === 'newest' || savedSort === 'oldest') sortOrder = savedSort;
 			const savedGroup = localStorage.getItem('historyGroup');
 			if (savedGroup === 'true') groupByProject = true;
 		}
-
-		try {
-			allEntries = await getSessionHistory();
-		} catch (e) {
-			error = String(e);
-		} finally {
-			loading = false;
-		}
+		// History data is preloaded at app startup (see +page.svelte onMount);
+		// this refresh picks up anything new if the tab was reopened later.
+		refreshSessionHistory();
 	});
 
 	$effect(() => {
@@ -128,6 +125,22 @@
 		return [...map.values()];
 	});
 
+	// Running-offset array so entry animations share a single index namespace
+	// when grouped by project. Each group's starting index is the cumulative
+	// count of everything before it. Group header is at `offset + 0`; inner
+	// rows continue from `offset + 1`. Collapsed groups skip row contributions.
+	let groupOffsets = $derived.by(() => {
+		if (!groups) return [] as number[];
+		const offsets: number[] = [];
+		let acc = 0;
+		for (const g of groups) {
+			offsets.push(acc);
+			const rowCount = collapsedProjects.has(g.project) ? 0 : g.entries.length;
+			acc += 1 + rowCount;
+		}
+		return offsets;
+	});
+
 	// ── Collapse state ───────────────────────────────────────────────
 	$effect(() => {
 		if (!groupByProject) collapsedProjects = new Set();
@@ -197,12 +210,12 @@
 <!-- ── Search bar & controls ──────────────────────────────────────── -->
 <div class="history-container">
 	<div class="controls">
-		<div class="section-header">
+		<div class="section-header" in:flyIn|global={{ index: 0, duration: 350, stride: 25 }}>
 			<span class="section-title">SESSION HISTORY</span>
 			<span class="section-count">{allEntries.length}</span>
 		</div>
 
-		<div class="search-row">
+		<div class="search-row" in:flyIn|global={{ index: 1, duration: 350, stride: 25 }}>
 			<input
 				class="search-input"
 				type="text"
@@ -211,7 +224,7 @@
 			/>
 		</div>
 
-		<div class="options-row">
+		<div class="options-row" in:flyIn|global={{ index: 2, duration: 350, stride: 25 }}>
 			<div class="sort-group">
 				<button
 					class="option-btn"
@@ -267,8 +280,9 @@
 		{:else if filtered.length === 0}
 			<div class="state-msg">No sessions found.</div>
 		{:else if groupByProject && groups}
-			{#each groups as group}
-				<div class="project-group">
+			{#each groups as group, gi (group.project)}
+				{@const baseIdx = (groupOffsets[gi] ?? 0) + 3}
+				<div class="project-group" in:flyIn|global={{ index: baseIdx, duration: 350, stride: 25 }}>
 					<!-- svelte-ignore a11y_click_events_have_key_events -->
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
@@ -285,7 +299,12 @@
 					{#if !collapsedProjects.has(group.project)}
 						{#each group.entries as entry, i (entry.sessionId)}
 							{@const snippet = query.trim() ? (deepSearchResults?.get(entry.sessionId) ?? null) : null}
-							<button class="session-row session-row-grid" class:has-snippet={!!snippet} onclick={() => handleSelectEntry(entry)}>
+							<button
+								class="session-row session-row-grid"
+								class:has-snippet={!!snippet}
+								onclick={() => handleSelectEntry(entry)}
+								in:flyIn|global={{ index: baseIdx + 1 + i, duration: 350, stride: 25 }}
+							>
 								<span class="row-number">{i + 1}</span>
 								<span class="row-prompt">
 									{#if entry.customTitle}<span class="row-title">{@html highlight(entry.customTitle, query)}</span>{/if}
@@ -301,7 +320,12 @@
 		{:else}
 			{#each filtered as entry, i (entry.sessionId)}
 				{@const snippet = query.trim() ? (deepSearchResults?.get(entry.sessionId) ?? null) : null}
-				<button class="session-row session-row-flat" class:has-snippet={!!snippet} onclick={() => handleSelectEntry(entry)}>
+				<button
+					class="session-row session-row-flat"
+					class:has-snippet={!!snippet}
+					onclick={() => handleSelectEntry(entry)}
+					in:flyIn|global={{ index: i + 3, duration: 350, stride: 25 }}
+				>
 					<span class="row-number">{i + 1}</span>
 					<div class="row-content">
 						<div class="row-top-grid">
