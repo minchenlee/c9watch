@@ -5,6 +5,25 @@ All notable changes to c9watch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-04-20
+
+### Added
+- **PM orchestration CLI** — spawn, send messages to, and manage child Claude Code worker sessions from a parent "PM" session. New commands: `c9watch spawn`, `send`, `workers`, `stop`, `adopt`, `inbox`, `tasks`. Workers show a "WORKER" badge on session cards; PMs show a "PM" badge with a Workers panel in the expanded overlay. ([#84](https://github.com/minchenlee/c9watch/pull/84))
+- **Subagent visibility** — detect and display Task-tool subagents spawned inside any session. 2-row card layout with click-to-preview transcript and async completion resolution. ([#92](https://github.com/minchenlee/c9watch/pull/92))
+- **Entry animations** — three-tier cascade pacing across MONITOR, HISTORY, MEMORY, and COST tabs plus overlay panel fly-ins. History preloaded at startup to avoid tab-switch lag. ([#93](https://github.com/minchenlee/c9watch/pull/93))
+- **Cost per session** — new `c9watch cost --session <id>` and `--session-prefix <any>` CLI flags for per-session breakdown in JSON. ([#94](https://github.com/minchenlee/c9watch/pull/94))
+- **USD/TOKENS toggle** in cost tab plus per-card cost pill on SessionCard and overlay charts. ([#85](https://github.com/minchenlee/c9watch/pull/85))
+- **CLI auto-symlink** — installing the desktop app now symlinks the `c9watch` CLI into `~/.local/bin/` automatically. ([#83](https://github.com/minchenlee/c9watch/pull/83))
+
+### Fixed
+- **App icon padding** — added ~100px inset to `icon.png` master so macOS Sequoia no longer oversizes it in the Dock. Master restored to 1024×1024 after Tauri CLI downscale. ([#97](https://github.com/minchenlee/c9watch/pull/97))
+- **debug_log test races** — serialized ring-buffer tests to prevent flaky CI. ([#82](https://github.com/minchenlee/c9watch/pull/82))
+
+### Improved
+- **Pink agent accent + de-duped nav header** — agent sessions now use pink for visual distinction; overlay navigation header consolidated. ([#90](https://github.com/minchenlee/c9watch/pull/90))
+- **Shared UI utilities** — extracted `time-utils.ts`, `status-utils.ts`, unified preview state, and usage-stats helper from PR #92 for reuse across cards and overlay. ([#96](https://github.com/minchenlee/c9watch/pull/96))
+- **Removed leaked internal planning docs** — repo now ignores `docs/superpowers/` by default. ([#89](https://github.com/minchenlee/c9watch/pull/89))
+
 ## [0.7.0] - 2026-04-06
 
 ### Added

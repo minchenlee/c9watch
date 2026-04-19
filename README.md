@@ -139,6 +139,17 @@ c9watch watch --interval 2 --compact --changes-only
 
 # View tasks/todos for a session
 c9watch tasks abc123
+
+# Cost breakdown, including per-session lookup
+c9watch cost --daily
+c9watch cost --session abc12345 --pretty
+c9watch cost --session-prefix abc
+
+# PM orchestration: spawn and manage child worker sessions
+c9watch spawn --name my-worker --cwd ../my-worktree --append-system-prompt "..."
+c9watch send <session-id> --message "do this task"
+c9watch workers
+c9watch inbox --pretty
 ```
 
 Use `--pretty` on any command for human-readable JSON. The `watch` command streams newline-delimited JSON events (`started`, `status_changed`, `stopped`) for real-time monitoring.
@@ -165,7 +176,10 @@ See [SKILLS.md](SKILLS.md) for more install options.
 - **Session history** -- Browse and search all past sessions with instant metadata filter and deep content search; click a result to scroll to and highlight the matching message
 - **Memory viewer** -- Browse and inspect Claude Code memory files with a two-panel layout and quick Claude command access
 - **Cost tracker** -- Track Claude Code spending with daily, per-project, and per-model breakdowns; click any session to preview the conversation; sort by date or cost
-- **CLI for agents** -- `c9watch list`, `view`, `history`, `search`, `stop`, `watch` commands for scriptable session management and agent-to-agent monitoring
+- **CLI for agents** -- `c9watch list`, `view`, `history`, `search`, `stop`, `watch`, `cost` commands for scriptable session management and agent-to-agent monitoring
+- **PM orchestration** -- Spawn, message, and manage child Claude Code "worker" sessions from a parent "PM" session via `c9watch spawn`, `send`, `workers`, `adopt`, `inbox`, `tasks`. WORKER and PM badges visible on session cards; PMs show a Workers panel in the overlay
+- **Subagent visibility** -- Detect and display Task-tool subagents spawned inside any session, with click-to-preview transcripts
+- **Entry animations** -- Staggered cascade transitions across tabs and overlay panels for fluid navigation
 - **Token distance visualizer** -- See your token usage as a rice stack towering past 22 real-world landmarks, with animated stacking, native share sheet, and Instagram-ready PNG export
 - **Debug console** -- Hidden diagnostic panel (`Cmd+Shift+D`) for troubleshooting session detection issues
 
