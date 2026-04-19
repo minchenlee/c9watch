@@ -459,7 +459,7 @@
 		align-items: flex-start;
 		gap: var(--space-xl);
 		width: 100%;
-		max-width: 1300px;
+		max-width: 1500px;
 		height: 85vh;
 		max-height: 900px;
 		pointer-events: none; /* Allow clicks through empty layout area */
@@ -468,6 +468,7 @@
 	.overlay-card {
 		position: relative;
 		flex: 1; /* Take up remaining space */
+		min-width: 0; /* Allow flex to shrink below content width */
 		height: 100%;
 		background: var(--bg-card);
 		border: 1px solid var(--border-default);
@@ -489,18 +490,57 @@
 	.workers-side-panel.workers-desktop {
 		flex-shrink: 0;
 		width: 200px;
-		height: 100%;
+		height: fit-content;
+		max-height: 100%;
 		display: flex;
 		flex-direction: column;
+		gap: var(--space-md);
+		padding: var(--space-lg) 0;
+		background: var(--bg-card);
+		border: 1px solid var(--border-default);
 		pointer-events: auto;
+		overflow-y: auto;
 	}
 
-	/* Override the horizontal layout inside the side panel */
+	/* Match workers side-panel header to NavMap's .nav-header style */
 	.workers-side-panel .workers-panel {
 		border-bottom: none;
-		padding: var(--space-md);
-		height: 100%;
-		overflow-y: auto;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0;
+	}
+
+	.workers-side-panel .section-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		padding-bottom: var(--space-sm);
+		border-bottom: 1px solid var(--border-muted);
+		margin: 0 var(--space-lg);
+	}
+
+	.workers-side-panel .section-title {
+		font-family: var(--font-pixel);
+		font-size: 12px;
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		color: var(--text-muted);
+	}
+
+	.workers-side-panel .section-count {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		opacity: 0.5;
+	}
+
+	.workers-side-panel .workers-list {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		margin-top: var(--space-sm);
+		padding: 0;
 	}
 
 	/* Mobile bottom sheet elements — hidden on desktop */
@@ -690,26 +730,28 @@
 		display: grid;
 		grid-template-columns: 1fr auto auto;
 		align-items: center;
-		gap: var(--space-md);
-		padding: var(--space-sm) var(--space-md);
-		background: var(--bg-elevated);
-		border: 1px solid var(--border-default);
+		gap: var(--space-sm);
+		padding: 6px var(--space-md);
+		background: transparent;
+		border: none;
+		border-left: 2px solid transparent;
 		color: var(--text-primary);
 		text-align: left;
 		font-family: var(--font-mono);
 		font-size: 12px;
 		cursor: pointer;
 		transition: all 0.15s ease;
+		width: 100%;
 	}
 
 	.worker-row:hover {
-		border-color: var(--accent-green);
-		background: color-mix(in srgb, var(--accent-green) 6%, var(--bg-elevated));
+		background: color-mix(in srgb, var(--text-muted) 6%, transparent);
+		border-left-color: var(--border-muted);
 	}
 
 	.worker-row.active {
-		border-color: color-mix(in srgb, var(--accent-green) 40%, transparent);
-		background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+		border-left-color: var(--accent-green);
+		background: color-mix(in srgb, var(--accent-green) 10%, transparent);
 	}
 
 	.worker-name {
