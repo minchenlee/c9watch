@@ -94,7 +94,7 @@
 				class:is-thinking={msg.messageType === 'Thinking'}
 				style="--item-color: {getMessageColor(msg)}"
 				onclick={() => scrollToMessage(index)}
-				in:flyIn={{ index: i, y: 4, stride: 12, duration: 150 }}
+				in:flyIn|global={{ index: i, y: 4, stride: 12, duration: 150 }}
 			>
 				<span class="nav-index">{index + 1}</span>
 				<span class="nav-icon">{getMessageIcon(msg)}</span>

@@ -286,7 +286,7 @@
 		{:else if groupByProject && groups}
 			{#each groups as group, gi (group.project)}
 				{@const baseIdx = groupOffsets[gi] ?? 0}
-				<div class="project-group" in:flyIn={{ index: baseIdx, stride: 30 }}>
+				<div class="project-group" in:flyIn|global={{ index: baseIdx, stride: 30 }}>
 					<!-- svelte-ignore a11y_click_events_have_key_events -->
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
@@ -307,7 +307,7 @@
 								class="session-row session-row-grid"
 								class:has-snippet={!!snippet}
 								onclick={() => handleSelectEntry(entry)}
-								in:flyIn={{ index: baseIdx + 1 + i, stride: 30 }}
+								in:flyIn|global={{ index: baseIdx + 1 + i, stride: 30 }}
 							>
 								<span class="row-number">{i + 1}</span>
 								<span class="row-prompt">
@@ -328,7 +328,7 @@
 					class="session-row session-row-flat"
 					class:has-snippet={!!snippet}
 					onclick={() => handleSelectEntry(entry)}
-					in:flyIn={{ index: i }}
+					in:flyIn|global={{ index: i }}
 				>
 					<span class="row-number">{i + 1}</span>
 					<div class="row-content">

@@ -425,7 +425,7 @@
 		<!-- Desktop: right column (nav + workers stacked) -->
 		<div class="right-column nav-desktop">
 			<!-- Navigation panel -->
-			<div class="nav-map-side" class:collapsed={navCollapsed} in:flyInX={{ index: 0, base: 200 }}>
+			<div class="nav-map-side" class:collapsed={navCollapsed} in:flyInX|global={{ index: 0, base: 200 }}>
 				<button
 					type="button"
 					class="panel-header"
@@ -445,7 +445,7 @@
 
 			<!-- Workers panel (only when relevant) -->
 			{#if showWorkersPanel}
-				<div class="workers-side-panel" class:collapsed={workersCollapsed} in:flyInX={{ index: 1, base: 200 }}>
+				<div class="workers-side-panel" class:collapsed={workersCollapsed} in:flyInX|global={{ index: 1, base: 200 }}>
 					<button
 						type="button"
 						class="panel-header"
