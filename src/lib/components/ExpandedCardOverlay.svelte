@@ -9,6 +9,7 @@
 	import { createSlidingWindow, BATCH_SIZE } from '$lib/slidingWindow.svelte';
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
 	import { workersByPm, expandedSessionId } from '$lib/stores/sessions';
+	import { visibleSubagentsBySession, type SubagentInfo } from '$lib/stores/subagents';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
 
 	interface Props {
@@ -122,6 +123,18 @@
 	);
 	let isPm = $derived(!session.workerOf && resolvedWorkers.length > 0);
 	let showWorkersPanel = $derived(resolvedWorkers.length > 0);
+
+	let mySubagents = $derived($visibleSubagentsBySession.get(session.id) ?? []);
+	let hasSubagents = $derived(mySubagents.length > 0);
+	let subagentsCollapsed = $state(false);
+
+	function subagentStatusColor(status: SubagentInfo['status']): string {
+		return status === 'running' ? 'var(--status-working)' : 'var(--text-muted)';
+	}
+
+	function subagentStatusLabel(status: SubagentInfo['status']): string {
+		return status === 'running' ? 'Running' : 'Completed';
+	}
 
 	function workerStatusColor(status: SessionStatus): string {
 		switch (status) {
@@ -464,6 +477,41 @@
 					{/if}
 				</div>
 			{/if}
+
+			<!-- Subagents panel (CC internal Agent tool calls; separate from c9watch workers) -->
+			{#if hasSubagents}
+				<div class="subagents-side-panel" class:collapsed={subagentsCollapsed}>
+					<button
+						type="button"
+						class="panel-header"
+						onclick={() => subagentsCollapsed = !subagentsCollapsed}
+						aria-expanded={!subagentsCollapsed}
+					>
+						<span class="panel-chevron" class:rotated={subagentsCollapsed}>▾</span>
+						<span class="panel-title">Subagents</span>
+						<span class="panel-count">{mySubagents.length}</span>
+					</button>
+					{#if !subagentsCollapsed}
+						<div class="subagents-list">
+							{#each mySubagents as sa (sa.id)}
+								<div class="subagent-row">
+									<span class="subagent-icon" aria-hidden="true">⚡</span>
+									<span class="subagent-name" title={sa.description}>
+										<span class="subagent-type">{sa.agentType}</span>
+										{#if sa.description}
+											<span class="subagent-desc">· {sa.description}</span>
+										{/if}
+									</span>
+									<span class="subagent-status" style="color: {subagentStatusColor(sa.status)}">
+										{subagentStatusLabel(sa.status)}
+									</span>
+									<span class="subagent-time">{formatTimeSince(sa.startedAt)}</span>
+								</div>
+							{/each}
+						</div>
+					{/if}
+				</div>
+			{/if}
 		</div>
 
 		<!-- Mobile: bottom sheet nav -->
@@ -609,7 +657,8 @@
 
 	/* Collapsed panel: no bottom border on header since there's nothing below */
 	.nav-map-side.collapsed .panel-header,
-	.workers-side-panel.collapsed .panel-header {
+	.workers-side-panel.collapsed .panel-header,
+	.subagents-side-panel.collapsed .panel-header {
 		border-bottom: none;
 	}
 
@@ -820,6 +869,67 @@
 	}
 
 	.worker-time {
+		color: var(--text-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+
+	.subagents-side-panel {
+		background: var(--bg-card);
+		border: 1px solid var(--border-default);
+		display: flex;
+		flex-direction: column;
+		flex-shrink: 0;
+	}
+
+	.subagents-side-panel .subagents-list {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		padding: var(--space-sm) 0;
+	}
+
+	.subagent-row {
+		display: grid;
+		grid-template-columns: auto 1fr auto auto;
+		align-items: center;
+		gap: var(--space-md);
+		padding: var(--space-sm) var(--space-lg);
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-primary);
+	}
+
+	.subagent-icon {
+		color: var(--text-muted);
+		font-size: 12px;
+		line-height: 1;
+	}
+
+	.subagent-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		min-width: 0;
+	}
+
+	.subagent-type {
+		color: var(--text-primary);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+
+	.subagent-desc {
+		color: var(--text-muted);
+	}
+
+	.subagent-status {
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		font-weight: 500;
+	}
+
+	.subagent-time {
 		color: var(--text-muted);
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
