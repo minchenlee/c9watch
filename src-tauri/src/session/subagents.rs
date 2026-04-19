@@ -224,8 +224,11 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
     subagent_id: &str,
 ) -> Option<SubagentTranscript> {
     use std::io::{BufRead, BufReader};
+
+    // Read all raw lines once so we can do two passes without reopening.
     let file = fs::File::open(path.as_ref()).ok()?;
     let reader = BufReader::new(file);
+    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
 
     let mut agent_type = String::new();
     let mut description = String::new();
@@ -233,18 +236,22 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
     let mut started_at = String::new();
     let mut found_tool_use = false;
 
-    let mut result_text: Option<String> = None;
-    let mut completed_at: Option<String> = None;
+    // "Immediate" result from the tool_result block / toolUseResult sibling —
+    // for async Agent/Task launches this is just a launch stub, but for
+    // synchronous tool calls this is the final result.
+    let mut immediate_result_text: Option<String> = None;
+    let mut immediate_completed_at: Option<String> = None;
     let mut agent_id: Option<String> = None;
     let mut total_tokens: Option<u64> = None;
     let mut tool_uses: Option<u64> = None;
     let mut duration_ms: Option<u64> = None;
 
-    for line in reader.lines().map_while(Result::ok) {
+    // ── Pass 1: locate tool_use + immediate tool_result for this subagent_id.
+    for line in &lines {
         if line.trim().is_empty() || !line.contains(subagent_id) {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
         let entry_type = value.get("type").and_then(Value::as_str).unwrap_or("");
         let timestamp = value
             .get("timestamp")
@@ -256,7 +263,6 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
             .and_then(|m| m.get("content"))
             .and_then(Value::as_array);
 
-        // Assistant turn with tool_use matching the id.
         if entry_type == "assistant" {
             if let Some(blocks) = content {
                 for block in blocks {
@@ -292,8 +298,6 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
             }
         }
 
-        // tool_result can appear in user-role content OR assistant-role content.
-        // Prefer the top-level `toolUseResult` sibling when present (richer stats).
         let is_result_here = content
             .map(|blocks| {
                 blocks.iter().any(|b| {
@@ -304,9 +308,8 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
             .unwrap_or(false);
 
         if is_result_here {
-            completed_at = Some(timestamp.clone());
+            immediate_completed_at = Some(timestamp.clone());
 
-            // Try toolUseResult sibling first — richest shape.
             if let Some(tur) = value.get("toolUseResult") {
                 if let Some(a) = tur.get("agentId").and_then(Value::as_str) {
                     agent_id = Some(a.to_string());
@@ -323,13 +326,12 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
                 if let Some(blocks) = tur.get("content").and_then(Value::as_array) {
                     let text = collect_text_blocks(blocks);
                     if !text.is_empty() {
-                        result_text = Some(text);
+                        immediate_result_text = Some(text);
                     }
                 }
             }
 
-            // Fall back to tool_result block content.
-            if result_text.is_none() {
+            if immediate_result_text.is_none() {
                 if let Some(blocks) = content {
                     for b in blocks {
                         if b.get("type").and_then(Value::as_str) != Some("tool_result")
@@ -341,10 +343,10 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
                         if let Some(arr) = inner.and_then(Value::as_array) {
                             let text = collect_text_blocks(arr);
                             if !text.is_empty() {
-                                result_text = Some(text);
+                                immediate_result_text = Some(text);
                             }
                         } else if let Some(s) = inner.and_then(Value::as_str) {
-                            result_text = Some(s.to_string());
+                            immediate_result_text = Some(s.to_string());
                         }
                     }
                 }
@@ -355,6 +357,77 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
     if !found_tool_use {
         return None;
     }
+
+    // If the immediate result looks like an async-launch stub, it will embed
+    // the real agentId. Parse it so we can find the real final report later.
+    if agent_id.is_none() {
+        if let Some(text) = immediate_result_text.as_deref() {
+            if let Some(parsed) = parse_agent_id_from_stub(text) {
+                agent_id = Some(parsed);
+            }
+        }
+    }
+
+    // ── Pass 2: if we have an agent_id, look for the latest async result.
+    // Async final reports arrive as separate user-role messages (often
+    // `<task-notification>` framing) whose text references the agentId.
+    let mut async_result: Option<(String, String)> = None; // (timestamp, text)
+    if let Some(aid) = agent_id.as_deref() {
+        for line in &lines {
+            if line.trim().is_empty() || !line.contains(aid) {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
+            let entry_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+            // Only consider user-role messages — assistant turns and the
+            // launch tool_result are what we want to skip.
+            if entry_type != "user" {
+                continue;
+            }
+            // Skip the launch tool_result itself: it has a tool_result block
+            // with our subagent_id (tool_use_id). Those are the stub.
+            let content = value
+                .get("message")
+                .and_then(|m| m.get("content"));
+            let is_launch_stub = content
+                .and_then(Value::as_array)
+                .map(|blocks| {
+                    blocks.iter().any(|b| {
+                        b.get("type").and_then(Value::as_str) == Some("tool_result")
+                            && b.get("tool_use_id").and_then(Value::as_str)
+                                == Some(subagent_id)
+                    })
+                })
+                .unwrap_or(false);
+            if is_launch_stub {
+                continue;
+            }
+            let text = extract_user_message_text(content);
+            if text.is_empty() || !text.contains(aid) {
+                continue;
+            }
+            let timestamp = value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            async_result = match async_result {
+                Some((prev_ts, prev_text)) => {
+                    if timestamp >= prev_ts {
+                        Some((timestamp, text))
+                    } else {
+                        Some((prev_ts, prev_text))
+                    }
+                }
+                None => Some((timestamp, text)),
+            };
+        }
+    }
+
+    let (result_text, completed_at) = match async_result {
+        Some((ts, text)) => (Some(text), Some(ts)),
+        None => (immediate_result_text, immediate_completed_at),
+    };
 
     let status = if completed_at.is_some() {
         SubagentStatus::Completed
@@ -377,6 +450,59 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
         tool_uses,
         duration_ms,
     })
+}
+
+/// Parse `agentId: <hex>` out of an async-launch stub tool_result body.
+/// Accepts the common forms: `agentId: abc123`, `agent_id: abc123`,
+/// `"agentId":"abc123"`. Returns the first hex-ish run after the key.
+fn parse_agent_id_from_stub(text: &str) -> Option<String> {
+    const KEYS: &[&str] = &["agentId", "agent_id"];
+    for key in KEYS {
+        let mut search_from = 0usize;
+        while let Some(rel) = text[search_from..].find(key) {
+            let idx = search_from + rel + key.len();
+            // Advance past any quote/colon/space/equals chars.
+            let rest = text[idx..].trim_start_matches(|c: char| {
+                matches!(c, ':' | '=' | ' ' | '\t' | '"' | '\'')
+            });
+            let candidate: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit() || *c == '-' || *c == '_')
+                .collect();
+            // Minimum 6 chars of hex-like id to reduce false positives.
+            if candidate.chars().filter(|c| c.is_ascii_hexdigit()).count() >= 6 {
+                return Some(candidate);
+            }
+            search_from = idx;
+        }
+    }
+    None
+}
+
+/// Concatenate user-message text content. Handles both plain string form
+/// (`content: "..."`) and structured block form (`content: [{type:text, text:"..."}]`).
+fn extract_user_message_text(content: Option<&Value>) -> String {
+    let Some(content) = content else { return String::new() };
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(blocks) = content.as_array() {
+        let mut out = String::new();
+        for b in blocks {
+            // Skip tool_result blocks — those are handled separately.
+            if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+                continue;
+            }
+            if let Some(t) = b.get("text").and_then(Value::as_str) {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(t);
+            }
+        }
+        return out;
+    }
+    String::new()
 }
 
 fn collect_text_blocks(blocks: &[Value]) -> String {
@@ -578,6 +704,46 @@ mod tests {
         let f = write_jsonl(&[assistant]);
         let tr = extract_transcript_from_file(f.path(), "s1", "toolu_missing");
         assert!(tr.is_none());
+    }
+
+    #[test]
+    fn extract_transcript_uses_later_async_notification_over_launch_stub() {
+        // Pattern for async Task/Agent: immediate tool_result is a launch
+        // stub with "agentId: <hex>", then later a user-role message arrives
+        // with the real final report referencing that agentId.
+        let assistant = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"toolu_async","name":"Task","input":{"subagent_type":"general-purpose","description":"long job","prompt":"go"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        // Launch stub — agentId embedded in the text.
+        let launch_stub = r#"{"type":"user","uuid":"u2","timestamp":"2026-01-01T00:00:01Z","sessionId":"s1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_async","content":"Async agent launched successfully.\nagentId: abc123def456"}]}}"#;
+        let unrelated = r#"{"type":"assistant","uuid":"u3","timestamp":"2026-01-01T00:00:30Z","sessionId":"s1","message":{"id":"m2","role":"assistant","model":"claude","content":[{"type":"text","text":"meanwhile"}],"stop_reason":null,"stop_sequence":null}}"#;
+        // Final report — plain user message, text references agentId.
+        let final_report = r#"{"type":"user","uuid":"u4","timestamp":"2026-01-01T00:05:00Z","sessionId":"s1","message":{"role":"user","content":[{"type":"text","text":"<task-notification>agent abc123def456 completed: here is the final report content.</task-notification>"}]}}"#;
+        let f = write_jsonl(&[assistant, launch_stub, unrelated, final_report]);
+        let tr = extract_transcript_from_file(f.path(), "s1", "toolu_async").unwrap();
+        assert_eq!(tr.status, SubagentStatus::Completed);
+        assert_eq!(tr.agent_id.as_deref(), Some("abc123def456"));
+        let result = tr.result.as_deref().unwrap_or("");
+        assert!(
+            result.contains("final report content"),
+            "expected final report, got: {result}"
+        );
+        assert!(
+            !result.starts_with("Async agent launched"),
+            "should not use launch stub, got: {result}"
+        );
+        assert_eq!(tr.completed_at.as_deref(), Some("2026-01-01T00:05:00Z"));
+    }
+
+    #[test]
+    fn parse_agent_id_from_stub_variants() {
+        assert_eq!(
+            parse_agent_id_from_stub("Async agent launched successfully.\nagentId: abc123def"),
+            Some("abc123def".to_string())
+        );
+        assert_eq!(
+            parse_agent_id_from_stub("\"agentId\":\"deadbeef\""),
+            Some("deadbeef".to_string())
+        );
+        assert_eq!(parse_agent_id_from_stub("no id here"), None);
     }
 
     #[test]
