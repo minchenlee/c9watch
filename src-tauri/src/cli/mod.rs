@@ -743,11 +743,7 @@ fn resolve_cost_session_id(
     }
 
     let mut matches = std::collections::BTreeSet::new();
-    let mut exact = false;
     for s in sessions {
-        if s.session_id == needle {
-            exact = true;
-        }
         if s.session_id.starts_with(needle) {
             matches.insert(s.session_id.clone());
         }
@@ -755,7 +751,7 @@ fn resolve_cost_session_id(
 
     // For `--session`, a full-id exact match wins even if other sessions share
     // the same prefix (vanishingly rare, but deterministic).
-    if exact && kind == SessionLookupKind::Session {
+    if kind == SessionLookupKind::Session && matches.contains(needle) {
         return Ok(needle.to_string());
     }
 
