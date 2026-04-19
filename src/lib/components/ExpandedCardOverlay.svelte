@@ -45,6 +45,16 @@
 		return sw.sliceMessages(conversation.messages);
 	});
 
+	let navItemCount = $derived.by(() => {
+		if (!conversation) return 0;
+		return conversation.messages.filter(msg =>
+			msg.messageType === 'User' ||
+			msg.messageType === 'System' ||
+			(showThinking && msg.messageType === 'Thinking') ||
+			(showTools && msg.messageType === 'ToolUse' && (msg.content?.length ?? 0) > 0)
+		).length;
+	});
+
 	function handleNavItemClick() {
 		// Close the bottom sheet on mobile after navigating
 		navSheetOpen = false;
@@ -409,10 +419,11 @@
 				>
 					<span class="panel-chevron" class:rotated={navCollapsed}>▾</span>
 					<span class="panel-title">Navigation</span>
+					<span class="panel-count">{navItemCount}</span>
 				</button>
 				{#if !navCollapsed}
 					<div class="panel-body">
-						<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking {onExpandToIndex} />
+						<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking {onExpandToIndex} hideHeader />
 					</div>
 				{/if}
 			</div>
@@ -746,10 +757,10 @@
 		font-family: var(--font-pixel);
 		font-size: 10px;
 		font-weight: 500;
-		color: var(--accent-amber);
-		background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
+		color: var(--accent-pink);
+		background: color-mix(in srgb, var(--accent-pink) 12%, transparent);
 		padding: 2px 6px;
-		border: 1px solid color-mix(in srgb, var(--accent-amber) 40%, transparent);
+		border: 1px solid color-mix(in srgb, var(--accent-pink) 40%, transparent);
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
 	}
@@ -758,10 +769,10 @@
 		font-family: var(--font-pixel);
 		font-size: 10px;
 		font-weight: 500;
-		color: var(--accent-green);
-		background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+		color: var(--accent-pink);
+		background: color-mix(in srgb, var(--accent-pink) 12%, transparent);
 		padding: 2px 6px;
-		border: 1px solid color-mix(in srgb, var(--accent-green) 40%, transparent);
+		border: 1px solid color-mix(in srgb, var(--accent-pink) 40%, transparent);
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
 		white-space: nowrap;
