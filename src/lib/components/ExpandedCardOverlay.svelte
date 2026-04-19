@@ -466,9 +466,6 @@
 			<div class="conversation-area" bind:this={messagesContainer} onscroll={handleScroll}>
 				{#if previewedSubagent}
 					<div class="subagent-preview">
-						<button type="button" class="subagent-back" onclick={closeSubagentPreview}>
-							← Back to conversation
-						</button>
 						<div class="subagent-preview-header">
 							<div class="subagent-preview-title">
 								{previewedSubagent.description || previewedSubagent.agentType}
@@ -647,6 +644,9 @@
 						<span class="panel-count">{mySubagents.length}</span>
 					</button>
 					{#if !subagentsCollapsed}
+						{#if previewedSubagent}
+							<button class="back-to-pm" onclick={closeSubagentPreview}>← Back to conversation</button>
+						{/if}
 						<div class="subagents-list">
 							{#each mySubagents as sa (sa.id)}
 								<button
@@ -1121,25 +1121,6 @@
 		flex-direction: column;
 		gap: var(--space-lg);
 		padding: var(--space-lg);
-	}
-
-	.subagent-back {
-		align-self: flex-start;
-		background: transparent;
-		border: 1px solid var(--border-default);
-		color: var(--text-muted);
-		font-family: var(--font-mono);
-		font-size: 11px;
-		text-transform: uppercase;
-		letter-spacing: 0.1em;
-		padding: 6px var(--space-md);
-		cursor: pointer;
-		transition: all 0.15s ease;
-	}
-
-	.subagent-back:hover {
-		color: var(--text-primary);
-		border-color: var(--accent-purple, #b98cff);
 	}
 
 	.subagent-preview-header {
