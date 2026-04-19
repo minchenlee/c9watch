@@ -1,7 +1,21 @@
 use crate::session;
 use crate::session::sanitize::strip_system_tags;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::process;
+
+/// Sort field for the cost subcommand.
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+pub enum CostSortField {
+    Date,
+    Cost,
+}
+
+/// Sort direction for the cost subcommand.
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+pub enum CostSortDir {
+    Asc,
+    Desc,
+}
 
 pub mod adoption;
 pub mod pm;
@@ -197,6 +211,15 @@ pub enum Commands {
         /// Lower bound on date (YYYY-MM-DD, inclusive)
         #[arg(long)]
         since: Option<String>,
+        /// Sort field: date or cost
+        #[arg(long, value_enum, default_value_t = CostSortField::Date, help = "Sort rows by this field (date or cost)")]
+        sort: CostSortField,
+        /// Sort direction: asc or desc
+        #[arg(long, value_enum, default_value_t = CostSortDir::Desc, help = "Sort direction (asc = oldest/cheapest first, desc = newest/most expensive first)")]
+        sort_dir: CostSortDir,
+        /// Show cost breakdown for a single session (full UUID or 4+ char prefix). Incompatible with --daily/--weekly/--project.
+        #[arg(long)]
+        session: Option<String>,
     },
 
     /// [hidden] Run the PM daemon
@@ -269,8 +292,8 @@ pub fn run(cli: Cli) {
             pm::cmd_inbox(consume, clear, worker, cli.pretty)
         }
         Commands::Adopt { session_id, force } => pm::cmd_adopt(session_id, force, cli.pretty),
-        Commands::Cost { daily, weekly, project, since } => {
-            cmd_cost(daily, weekly, project.as_deref(), since.as_deref(), cli.pretty)
+        Commands::Cost { daily, weekly, project, since, sort, sort_dir, session } => {
+            cmd_cost(daily, weekly, project.as_deref(), since.as_deref(), sort, sort_dir, session.as_deref(), cli.pretty)
         }
         Commands::Daemon => {
             match tokio::runtime::Runtime::new() {
@@ -684,13 +707,146 @@ fn cmd_tasks(session_id: &str, pretty: bool) -> Result<(), String> {
     print_json(&output, pretty)
 }
 
+/// Resolve a session-id prefix against all sessions in cost data.
+/// Returns the full session_id, or an error if 0 or >1 matches.
+fn resolve_cost_session_id(
+    sessions: &[session::cost::SessionCostRecord],
+    prefix: &str,
+) -> Result<String, String> {
+    if prefix.len() < 4 {
+        return Err(format!(
+            "Session prefix '{}' is too short — must be at least 4 characters",
+            prefix
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for s in sessions {
+        if s.session_id.starts_with(prefix) {
+            seen.insert(s.session_id.clone());
+        }
+    }
+    match seen.len() {
+        0 => Err(format!("No session matching prefix '{}'", prefix)),
+        1 => Ok(seen.into_iter().next().unwrap()),
+        n => {
+            let mut ids: Vec<String> = seen.into_iter().collect();
+            ids.sort();
+            let shown = ids.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+            let suffix = if n > 5 { format!(" (and {} more)", n - 5) } else { String::new() };
+            Err(format!(
+                "Ambiguous prefix '{}' matches {} sessions: {}{}",
+                prefix, n, shown, suffix
+            ))
+        }
+    }
+}
+
+/// Per-session cost breakdown for `c9watch cost --session <prefix>`.
+fn cmd_cost_session(prefix: &str, since: Option<&str>, pretty: bool) -> Result<(), String> {
+    let since_date = match since {
+        Some(s) => Some(
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|e| format!("Invalid --since date '{}': {}", s, e))?,
+        ),
+        None => None,
+    };
+
+    let data = session::get_cost_data()?;
+    let all_sessions: Vec<session::cost::SessionCostRecord> = data
+        .project_costs
+        .iter()
+        .flat_map(|p| p.sessions.iter().cloned())
+        .collect();
+
+    let session_id = resolve_cost_session_id(&all_sessions, prefix)?;
+
+    // Collect all per-(session, date) records for this session, applying --since filter
+    let mut records: Vec<&session::cost::SessionCostRecord> = all_sessions
+        .iter()
+        .filter(|s| s.session_id == session_id)
+        .filter(|s| match since_date {
+            Some(since_d) => chrono::NaiveDate::parse_from_str(&s.date, "%Y-%m-%d")
+                .map(|d| d >= since_d)
+                .unwrap_or(false),
+            None => true,
+        })
+        .collect();
+
+    if records.is_empty() {
+        return Err(format!(
+            "No cost data for session '{}' in the given date range",
+            session_id
+        ));
+    }
+
+    records.sort_by(|a, b| a.date.cmp(&b.date));
+
+    let total_cost: f64 = records.iter().map(|s| s.cost).sum();
+    let total_tokens: u64 = records.iter().map(|s| s.total_tokens).sum();
+
+    // Unique models in order of first appearance
+    let mut seen_models = std::collections::HashSet::new();
+    let mut models: Vec<String> = Vec::new();
+    for s in &records {
+        if seen_models.insert(s.model.clone()) {
+            models.push(s.model.clone());
+        }
+    }
+
+    let first = records.first().unwrap();
+    let last = records.last().unwrap();
+    let date_range = if first.date == last.date {
+        first.date.clone()
+    } else {
+        format!("{} – {}", first.date, last.date)
+    };
+
+    let daily_breakdown: Vec<serde_json::Value> = records
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "date": s.date,
+                "cost": s.cost,
+                "totalTokens": s.total_tokens,
+                "model": s.model,
+            })
+        })
+        .collect();
+
+    let output = serde_json::json!({
+        "sessionId": session_id,
+        "sessionName": first.session_name,
+        "project": first.project,
+        "projectName": first.project_name,
+        "totalCost": total_cost,
+        "totalTokens": total_tokens,
+        "models": models,
+        "dateRange": date_range,
+        "dailyBreakdown": daily_breakdown,
+    });
+    print_json(&output, pretty)
+}
+
 fn cmd_cost(
     daily: bool,
     weekly: bool,
     project_filter: Option<&str>,
     since: Option<&str>,
+    sort: CostSortField,
+    sort_dir: CostSortDir,
+    session_prefix: Option<&str>,
     pretty: bool,
 ) -> Result<(), String> {
+    // Mutex: --session is incompatible with aggregation flags
+    if let Some(prefix) = session_prefix {
+        if daily || weekly || project_filter.is_some() {
+            return Err(
+                "--session cannot be combined with --daily, --weekly, or --project".to_string(),
+            );
+        }
+        return cmd_cost_session(prefix, since, pretty);
+    }
+
     if daily && weekly {
         return Err("--daily and --weekly are mutually exclusive".to_string());
     }
@@ -723,6 +879,27 @@ fn cmd_cost(
         });
     }
 
+    // Helper: apply sort to a rows vec that has a date key and a cost key.
+    // `date_key` is the JSON field name for the date string (ISO format, so
+    // lexicographic order equals chronological order).
+    let sort_rows = |rows: &mut Vec<serde_json::Value>, date_key: &str| {
+        rows.sort_by(|a, b| {
+            let ord = match sort {
+                CostSortField::Date => a
+                    .get(date_key)
+                    .and_then(|v| v.as_str())
+                    .cmp(&b.get(date_key).and_then(|v| v.as_str())),
+                CostSortField::Cost => {
+                    let ca = a.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let cb = b.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
+                }
+            };
+            // Flip for descending
+            if sort_dir == CostSortDir::Desc { ord.reverse() } else { ord }
+        });
+    };
+
     if daily {
         let mut by_date: std::collections::HashMap<String, (f64, u64, u32)> =
             std::collections::HashMap::new();
@@ -743,9 +920,7 @@ fn cmd_cost(
                 })
             })
             .collect();
-        rows.sort_by(|a, b| {
-            b.get("date").and_then(|v| v.as_str()).cmp(&a.get("date").and_then(|v| v.as_str()))
-        });
+        sort_rows(&mut rows, "date");
         return print_json(&rows, pretty);
     }
 
@@ -781,23 +956,43 @@ fn cmd_cost(
                 })
             })
             .collect();
-        rows.sort_by(|a, b| {
-            b.get("weekStart")
-                .and_then(|v| v.as_str())
-                .cmp(&a.get("weekStart").and_then(|v| v.as_str()))
-        });
+        sort_rows(&mut rows, "weekStart");
         return print_json(&rows, pretty);
     }
 
     // Default: emit filtered CostData-shaped output if filters were applied,
     // otherwise emit the full CostData from the GUI.
     if project_filter.is_none() && since_date.is_none() {
+        // --sort date --project is nonsensical (no single date per project);
+        // silently fall back to cost sort in that case. Here there's no project
+        // aggregation at all, so just return raw CostData unchanged.
         return print_json(&data, pretty);
     }
 
-    // Rebuild CostData-ish aggregation from filtered sessions.
+    // Project mode: --sort date is not meaningful (projects have no single date);
+    // silently fall back to cost sort and note it in a comment.
+    let effective_sort = if project_filter.is_some() && sort == CostSortField::Date {
+        // date sort doesn't apply to project aggregations — use cost instead
+        CostSortField::Cost
+    } else {
+        sort
+    };
+
+    // Rebuild CostData-ish aggregation from filtered sessions, sorting by session date or cost.
     let total_cost: f64 = sessions.iter().map(|s| s.cost).sum();
     let total_tokens: u64 = sessions.iter().map(|s| s.total_tokens).sum();
+
+    // Sort individual sessions in the filtered output
+    sessions.sort_by(|a, b| {
+        let ord = match effective_sort {
+            CostSortField::Date => a.date.cmp(&b.date),
+            CostSortField::Cost => {
+                a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        };
+        if sort_dir == CostSortDir::Desc { ord.reverse() } else { ord }
+    });
+
     let output = serde_json::json!({
         "totalCost": total_cost,
         "totalTokens": total_tokens,
