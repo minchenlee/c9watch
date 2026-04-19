@@ -874,7 +874,7 @@ fn build_session_breakdown(
 }
 
 fn breakdown_to_json(b: &SessionCostBreakdown) -> serde_json::Value {
-    let daily: Vec<serde_json::Value> = b
+    let by_day: Vec<serde_json::Value> = b
         .daily
         .iter()
         .map(|d| {
@@ -893,48 +893,12 @@ fn breakdown_to_json(b: &SessionCostBreakdown) -> serde_json::Value {
         "projectName": b.project_name,
         "totalCost": b.total_cost,
         "totalTokens": b.total_tokens,
+        "turns": b.daily.len(),
         "models": b.models,
         "earliest": b.earliest,
         "latest": b.latest,
-        "dailyBreakdown": daily,
+        "byDay": by_day,
     })
-}
-
-fn breakdown_to_text(b: &SessionCostBreakdown) -> String {
-    let mut out = String::new();
-    use std::fmt::Write;
-    let _ = writeln!(out, "Session       {}", b.session_id);
-    if !b.session_name.is_empty() {
-        let _ = writeln!(out, "Name          {}", b.session_name);
-    }
-    if !b.project_name.is_empty() {
-        let _ = writeln!(out, "Project       {}", b.project_name);
-    }
-    if !b.project.is_empty() {
-        let _ = writeln!(out, "Path          {}", b.project);
-    }
-    let _ = writeln!(out, "Total cost    ${:.4}", b.total_cost);
-    let _ = writeln!(out, "Total tokens  {}", b.total_tokens);
-    let _ = writeln!(out, "Turns         {}", b.daily.len());
-    let _ = writeln!(out, "Earliest      {}", b.earliest);
-    let _ = writeln!(out, "Latest        {}", b.latest);
-    if !b.models.is_empty() {
-        let _ = writeln!(out, "Models        {}", b.models.join(", "));
-    }
-    out.push('\n');
-    let _ = writeln!(
-        out,
-        "{:<12}  {:>10}  {:>12}  {}",
-        "DATE", "COST", "TOKENS", "MODEL"
-    );
-    for d in &b.daily {
-        let _ = writeln!(
-            out,
-            "{:<12}  ${:>9.4}  {:>12}  {}",
-            d.date, d.cost, d.total_tokens, d.model
-        );
-    }
-    out
 }
 
 /// Per-session cost breakdown for `c9watch cost --session <id>` / `--session-prefix <prefix>`.
@@ -962,12 +926,7 @@ fn cmd_cost_session(
     let session_id = resolve_cost_session_id(&all_sessions, needle, kind)?;
     let breakdown = build_session_breakdown(&all_sessions, &session_id, since_date)?;
 
-    if pretty {
-        print_json(&breakdown_to_json(&breakdown), pretty)
-    } else {
-        print!("{}", breakdown_to_text(&breakdown));
-        Ok(())
-    }
+    print_json(&breakdown_to_json(&breakdown), pretty)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1653,10 +1612,11 @@ mod cost_session_tests {
             "projectName",
             "totalCost",
             "totalTokens",
+            "turns",
             "models",
             "earliest",
             "latest",
-            "dailyBreakdown",
+            "byDay",
         ] {
             assert!(v.get(key).is_some(), "missing key {} in {}", key, v);
         }
@@ -1664,9 +1624,10 @@ mod cost_session_tests {
             v["sessionId"],
             "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee"
         );
-        let daily = v["dailyBreakdown"].as_array().unwrap();
-        assert_eq!(daily.len(), 2);
-        for row in daily {
+        assert_eq!(v["turns"], 2);
+        let by_day = v["byDay"].as_array().unwrap();
+        assert_eq!(by_day.len(), 2);
+        for row in by_day {
             for key in ["date", "cost", "totalTokens", "model"] {
                 assert!(row.get(key).is_some(), "missing {} in {}", key, row);
             }
@@ -1674,7 +1635,7 @@ mod cost_session_tests {
     }
 
     #[test]
-    fn text_output_contains_totals_and_daily_rows() {
+    fn json_compact_is_single_line() {
         let sessions = fixtures();
         let b = build_session_breakdown(
             &sessions,
@@ -1682,11 +1643,29 @@ mod cost_session_tests {
             None,
         )
         .unwrap();
-        let text = breakdown_to_text(&b);
-        assert!(text.contains("Total cost    $2.0000"), "got: {}", text);
-        assert!(text.contains("2026-04-10"));
-        assert!(text.contains("2026-04-11"));
-        assert!(text.contains("sonnet"));
+        let v = breakdown_to_json(&b);
+        let compact = serde_json::to_string(&v).unwrap();
+        assert!(!compact.contains('\n'), "compact output must be single-line: {}", compact);
+        let parsed: serde_json::Value = serde_json::from_str(&compact).unwrap();
+        assert_eq!(parsed["sessionId"], "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee");
+    }
+
+    #[test]
+    fn json_pretty_is_indented_and_valid() {
+        let sessions = fixtures();
+        let b = build_session_breakdown(
+            &sessions,
+            "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
+            None,
+        )
+        .unwrap();
+        let v = breakdown_to_json(&b);
+        let pretty = serde_json::to_string_pretty(&v).unwrap();
+        assert!(pretty.contains('\n'), "pretty output must be multi-line");
+        assert!(pretty.contains("  "), "pretty output must be indented");
+        let parsed: serde_json::Value = serde_json::from_str(&pretty).unwrap();
+        assert_eq!(parsed["sessionId"], "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee");
+        assert_eq!(parsed["byDay"].as_array().unwrap().len(), 2);
     }
 
     #[test]
