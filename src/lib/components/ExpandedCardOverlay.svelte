@@ -712,36 +712,6 @@
 		white-space: nowrap;
 	}
 
-	.workers-panel {
-		padding: var(--space-md) var(--space-xl);
-		border-bottom: 1px solid var(--border-default);
-		display: flex;
-		flex-direction: column;
-		gap: var(--space-sm);
-	}
-
-	.workers-panel .section-header {
-		display: flex;
-		align-items: baseline;
-		gap: var(--space-sm);
-	}
-
-	.workers-panel .section-title {
-		font-family: var(--font-pixel);
-		font-size: 22px;
-		color: var(--text-primary);
-		text-transform: uppercase;
-		letter-spacing: 0.1em;
-	}
-
-	.workers-panel .section-count {
-		font-family: var(--font-mono);
-		font-size: 12px;
-		color: var(--text-muted);
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-	}
-
 	.workers-list {
 		display: flex;
 		flex-direction: column;
