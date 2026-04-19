@@ -7,9 +7,10 @@
 		showTools?: boolean;
 		showThinking?: boolean;
 		onExpandToIndex?: (index: number) => void;
+		hideHeader?: boolean;
 	}
 
-	let { conversation, scrollContainer, showTools = $bindable(true), showThinking = $bindable(true), onExpandToIndex }: Props = $props();
+	let { conversation, scrollContainer, showTools = $bindable(true), showThinking = $bindable(true), onExpandToIndex, hideHeader = false }: Props = $props();
 
 	// Filter for "milestone" messages - user messages, tool blocks, and thinking steps
 	let items = $derived.by(() => {
@@ -76,10 +77,12 @@
 </script>
 
 <div class="nav-map-floating" class:hidden={!items.length}>
-	<div class="nav-header">
-		<span class="nav-title">Navigation</span>
-		<span class="nav-count">{items.length} items</span>
-	</div>
+	{#if !hideHeader}
+		<div class="nav-header">
+			<span class="nav-title">Navigation</span>
+			<span class="nav-count">{items.length} items</span>
+		</div>
+	{/if}
 	<div class="nav-list">
 		{#each items as { msg, index }}
 			<!-- svelte-ignore a11y_click_events_have_key_events -->

@@ -1075,12 +1075,12 @@
 		border-color: var(--border-default);
 	}
 
-	/* Workers-filter active state gets an amber tint to reinforce the
-	   bot/worker visual language used by the WORKER badge on cards. */
+	/* Workers-filter active state gets a pink tint to reinforce the
+	   agent visual language used by the WORKER/PM badges on cards. */
 	.toggle-btn.active[title="Show PM workers"] {
-		color: var(--accent-amber);
-		background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
-		border-color: color-mix(in srgb, var(--accent-amber) 40%, transparent);
+		color: var(--accent-pink);
+		background: color-mix(in srgb, var(--accent-pink) 12%, transparent);
+		border-color: color-mix(in srgb, var(--accent-pink) 40%, transparent);
 	}
 
 	.all-sessions-grid {

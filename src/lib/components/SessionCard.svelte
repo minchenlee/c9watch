@@ -164,9 +164,6 @@
 				onmouseleave={tipLeave}
 				onmousemove={tipMove}
 			>
-				<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-					<path d="M12 2l3 7h7l-5.5 4.5L18 22l-6-4-6 4 1.5-8.5L2 9h7z" />
-				</svg>
 				<span class="pm-prefix-label">Worker of</span>
 				<span class="pm-prefix-id">{workerIdShort}</span>
 			</div>
@@ -451,10 +448,10 @@
 		font-family: var(--font-pixel);
 		font-size: 10px;
 		font-weight: 500;
-		color: var(--accent-amber);
-		background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
+		color: var(--accent-pink);
+		background: color-mix(in srgb, var(--accent-pink) 12%, transparent);
 		padding: 2px 6px;
-		border: 1px solid color-mix(in srgb, var(--accent-amber) 40%, transparent);
+		border: 1px solid color-mix(in srgb, var(--accent-pink) 40%, transparent);
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
 		display: inline-block;
@@ -465,10 +462,10 @@
 		font-family: var(--font-pixel);
 		font-size: 10px;
 		font-weight: 500;
-		color: var(--accent-green);
-		background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+		color: var(--accent-pink);
+		background: color-mix(in srgb, var(--accent-pink) 12%, transparent);
 		padding: 2px 6px;
-		border: 1px solid color-mix(in srgb, var(--accent-green) 40%, transparent);
+		border: 1px solid color-mix(in srgb, var(--accent-pink) 40%, transparent);
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
 		display: inline-block;
@@ -477,7 +474,7 @@
 	}
 
 	/* Workers-only view: surface the PM relationship as a first-class prefix
-	   row above the title. Amber matches the WORKER badge visual language. */
+	   row above the title. Pink matches the agent visual language. */
 	.pm-prefix {
 		display: inline-flex;
 		align-items: center;
@@ -485,15 +482,11 @@
 		font-family: var(--font-mono);
 		font-size: 10px;
 		font-weight: 500;
-		color: var(--accent-amber);
+		color: var(--accent-pink);
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
 		margin-bottom: 2px;
 		width: fit-content;
-	}
-
-	.pm-prefix svg {
-		flex-shrink: 0;
 	}
 
 	.pm-prefix-label {
@@ -502,7 +495,7 @@
 
 	.pm-prefix-id {
 		font-weight: 600;
-		color: var(--accent-amber);
+		color: var(--accent-pink);
 		letter-spacing: 0.05em;
 	}
 
