@@ -103,6 +103,13 @@
 	let myWorkers = $derived($workersByPm.get(session.id) ?? []);
 	let isPm = $derived(myWorkers.length > 0);
 
+	// resolvedWorkers: works for both PM (views own workers) and a worker
+	// (views siblings under the same PM). Highlights the current session in the list.
+	let resolvedWorkers = $derived(
+		$workersByPm.get(session.workerOf ?? session.id) ?? []
+	);
+	let showWorkersPanel = $derived(resolvedWorkers.length > 0);
+
 	function workerStatusColor(status: SessionStatus): string {
 		switch (status) {
 			case SessionStatus.Working: return 'var(--status-working)';
@@ -205,6 +212,34 @@
 	transition:fade={{ duration: 200 }}
 >
 	<div class="overlay-layout">
+		{#if showWorkersPanel}
+			<!-- Desktop: left workers side-panel -->
+			<div class="workers-side-panel workers-desktop" in:scale={{ start: 0.95, duration: 300, easing: quintOut }}>
+				<div class="workers-panel">
+					<div class="section-header">
+						<div class="section-title">Workers</div>
+						<div class="section-count">{resolvedWorkers.length}</div>
+					</div>
+					<div class="workers-list">
+						{#each resolvedWorkers as w (w.id)}
+							<button
+								type="button"
+								class="worker-row"
+								class:active={w.id === session.id}
+								onclick={() => openWorker(w.id)}
+							>
+								<span class="worker-name">{w.customTitle || w.summary || w.sessionName}</span>
+								<span class="worker-status" style="color: {workerStatusColor(w.status)}">
+									{workerStatusLabel(w.status)}
+								</span>
+								<span class="worker-time">{formatTimeSince(w.modified)}</span>
+							</button>
+						{/each}
+					</div>
+				</div>
+			</div>
+		{/if}
+
 		<div
 			class="overlay-card"
 			class:permission={isPermission}
@@ -336,26 +371,6 @@
 				</div>
 			{/if}
 
-			{#if isPm}
-				<div class="workers-panel">
-					<div class="section-header">
-						<div class="section-title">Workers</div>
-						<div class="section-count">{myWorkers.length}</div>
-					</div>
-					<div class="workers-list">
-						{#each myWorkers as w (w.id)}
-							<button type="button" class="worker-row" onclick={() => openWorker(w.id)}>
-								<span class="worker-name">{w.customTitle || w.summary || w.sessionName}</span>
-								<span class="worker-status" style="color: {workerStatusColor(w.status)}">
-									{workerStatusLabel(w.status)}
-								</span>
-								<span class="worker-time">{formatTimeSince(w.modified)}</span>
-							</button>
-						{/each}
-					</div>
-				</div>
-			{/if}
-
 			<!-- Conversation Area -->
 			<div class="conversation-area" bind:this={messagesContainer} onscroll={handleScroll}>
 				{#if !conversation}
@@ -444,7 +459,7 @@
 		align-items: flex-start;
 		gap: var(--space-xl);
 		width: 100%;
-		max-width: 1100px;
+		max-width: 1300px;
 		height: 85vh;
 		max-height: 900px;
 		pointer-events: none; /* Allow clicks through empty layout area */
@@ -469,6 +484,23 @@
 		display: flex;
 		flex-direction: column;
 		pointer-events: auto;
+	}
+
+	.workers-side-panel.workers-desktop {
+		flex-shrink: 0;
+		width: 200px;
+		height: 100%;
+		display: flex;
+		flex-direction: column;
+		pointer-events: auto;
+	}
+
+	/* Override the horizontal layout inside the side panel */
+	.workers-side-panel .workers-panel {
+		border-bottom: none;
+		padding: var(--space-md);
+		height: 100%;
+		overflow-y: auto;
 	}
 
 	/* Mobile bottom sheet elements — hidden on desktop */
@@ -675,6 +707,11 @@
 		background: color-mix(in srgb, var(--accent-green) 6%, var(--bg-elevated));
 	}
 
+	.worker-row.active {
+		border-color: color-mix(in srgb, var(--accent-green) 40%, transparent);
+		background: color-mix(in srgb, var(--accent-green) 12%, transparent);
+	}
+
 	.worker-name {
 		overflow: hidden;
 		text-overflow: ellipsis;
@@ -849,8 +886,9 @@
 			max-height: 100vh;
 		}
 
-		/* Hide the desktop sidebar nav on mobile */
-		.nav-map-side.nav-desktop {
+		/* Hide the desktop sidebar nav and workers panel on mobile */
+		.nav-map-side.nav-desktop,
+		.workers-side-panel.workers-desktop {
 			display: none;
 		}
 
