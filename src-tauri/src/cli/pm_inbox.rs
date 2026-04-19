@@ -106,10 +106,11 @@ pub fn truncate_excerpt(s: &str) -> String {
 }
 
 pub fn new_event_id() -> String {
-    // ISO-ish sortable prefix + short random suffix so filesystem listings sort FIFO
-    // but we display newest-first in `list()`.
+    // ISO-ish sortable prefix + full UUID suffix so filesystem listings sort FIFO
+    // but we display newest-first in `list()`. Full UUID eliminates birthday
+    // collisions that the previous 8-char (32-bit) truncation risked at scale (H3).
     let ts = Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
-    let suffix: String = uuid::Uuid::new_v4().to_string().chars().take(8).collect();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
     format!("{}-{}", ts, suffix)
 }
 
