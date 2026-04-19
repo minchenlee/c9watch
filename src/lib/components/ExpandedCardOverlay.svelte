@@ -102,16 +102,16 @@
 	let isWaitingInput = $derived(session.status === SessionStatus.WaitingForInput);
 	let isWorking = $derived(session.status === SessionStatus.Working);
 
-	let myWorkers = $derived($workersByPm.get(session.id) ?? []);
-	let isPm = $derived(myWorkers.length > 0);
-
-	// resolvedWorkers: works for both PM (views own workers) and a worker
+	// resolvedWorkers works for both PM (views own workers) and a worker
 	// (views siblings under the same PM). Highlights the current session in the list.
+	// When the session is a PM, workerOf is null, so we fall back to session.id
+	// and resolvedWorkers IS myWorkers; the PM badge shows when length > 0 and
+	// workerOf is null (i.e. this session is itself the PM).
 	let resolvedWorkers = $derived(
 		$workersByPm.get(session.workerOf ?? session.id) ?? []
 	);
+	let isPm = $derived(!session.workerOf && resolvedWorkers.length > 0);
 	let showWorkersPanel = $derived(resolvedWorkers.length > 0);
-	let pmSessionId = $derived(session.workerOf);
 
 	function workerStatusColor(status: SessionStatus): string {
 		switch (status) {
@@ -248,10 +248,10 @@
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<span
 									class="pm-badge"
-									onmouseenter={() => tipEnter(`Managing ${myWorkers.length} worker${myWorkers.length === 1 ? '' : 's'}`)}
+									onmouseenter={() => tipEnter(`Managing ${resolvedWorkers.length} worker${resolvedWorkers.length === 1 ? '' : 's'}`)}
 									onmouseleave={tipLeave}
 									onmousemove={tipMove}
-								>PM · {myWorkers.length}</span>
+								>PM · {resolvedWorkers.length}</span>
 							{/if}
 							<!-- svelte-ignore a11y_click_events_have_key_events -->
 							<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -431,8 +431,8 @@
 						<span class="panel-count">{resolvedWorkers.length}</span>
 					</button>
 					{#if !workersCollapsed}
-						{#if pmSessionId}
-							<button class="back-to-pm" onclick={() => expandedSessionId.set(pmSessionId)}>← Back to PM</button>
+						{#if session.workerOf}
+							<button class="back-to-pm" onclick={() => expandedSessionId.set(session.workerOf!)}>← Back to PM</button>
 						{/if}
 						<div class="workers-list">
 							{#each resolvedWorkers as w (w.id)}
@@ -546,11 +546,6 @@
 		overflow: hidden;
 		display: flex;
 		flex-direction: column;
-	}
-
-	/* Workers panel grows to fit content */
-	.workers-side-panel {
-		flex-shrink: 0;
 	}
 
 	/* Collapsible panel header (shared) */
@@ -745,14 +740,6 @@
 		font-size: 12px;
 		color: var(--text-muted);
 		letter-spacing: 0.05em;
-	}
-
-	.cost-primary {
-		color: var(--text-muted);
-	}
-
-	.cost-secondary {
-		color: var(--text-muted);
 	}
 
 	.worker-badge {
