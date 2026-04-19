@@ -198,7 +198,7 @@ impl SessionDetector {
 
         // Process-centric approach: for each process, find its matching session
         // This ensures we only show sessions that have actual running processes
-        let mut sessions = Vec::new();
+        let mut sessions: Vec<DetectedSession> = Vec::new();
         let mut used_session_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
@@ -319,6 +319,16 @@ impl SessionDetector {
                 ));
             }
         }
+
+        // Drop sessions that correspond to c9watch workers we know are dead.
+        // A worker is considered dead if its meta.json records `stoppedAt` or
+        // its recorded pid is no longer alive. If no meta.json exists, we
+        // cannot classify the session as a worker — leave it alone so regular
+        // Claude Code sessions are untouched.
+        sessions.retain(|s| match &s.session_id {
+            Some(id) => !is_stale_worker(id),
+            None => true,
+        });
 
         sessions
     }
@@ -445,6 +455,78 @@ impl Default for SessionDetector {
     }
 }
 
+/// Minimal view of `~/.claude/c9watch/workers/<id>/meta.json` — only the
+/// fields needed to decide whether a worker is stale.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerMetaProbe {
+    pid: Option<u32>,
+    stopped_at: Option<String>,
+}
+
+#[cfg(unix)]
+fn worker_pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // Safety: `kill(pid, 0)` doesn't send a signal; it only probes existence.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn worker_pid_is_alive(_pid: u32) -> bool {
+    // On non-Unix we can't cheaply probe; assume alive to avoid false drops.
+    true
+}
+
+/// Returns the c9watch workers directory: `~/.claude/c9watch/workers/`.
+fn workers_base_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude").join("c9watch").join("workers"))
+}
+
+/// Returns `true` if `session_id` names a c9watch worker meta file AND the
+/// worker is known-dead (`stoppedAt` set, or recorded `pid` is not alive).
+/// Returns `false` when no meta file exists — the caller cannot classify the
+/// session as a c9watch worker and should leave it in the active list.
+fn is_stale_worker(session_id: &str) -> bool {
+    match workers_base_dir() {
+        Some(base) => is_stale_worker_in(&base, session_id),
+        None => false,
+    }
+}
+
+fn is_stale_worker_in(workers_base: &Path, session_id: &str) -> bool {
+    // Guard against traversal: session_id is used as a directory name.
+    if session_id.is_empty()
+        || session_id.len() > 64
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return false;
+    }
+
+    let meta_path = workers_base.join(session_id).join("meta.json");
+    let content = match fs::read_to_string(&meta_path) {
+        Ok(c) => c,
+        Err(_) => return false, // no meta → not a known worker
+    };
+    let probe: WorkerMetaProbe = match serde_json::from_str(&content) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    if probe.stopped_at.is_some() {
+        return true;
+    }
+    if let Some(pid) = probe.pid {
+        if !worker_pid_is_alive(pid) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Encodes a path the same way Claude Code does for its project directory names:
 /// every non-alphanumeric character is replaced with a dash.
 pub(crate) fn encode_path_for_matching(path: &str) -> String {
@@ -524,6 +606,96 @@ mod tests {
         if let Ok(dirs) = result {
             println!("Found {} project directories", dirs.len());
         }
+    }
+
+    fn make_temp_workers_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "c9watch-detector-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_worker_meta(workers_base: &Path, session_id: &str, meta_json: &str) {
+        let dir = workers_base.join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("meta.json"), meta_json).unwrap();
+    }
+
+    #[test]
+    fn is_stale_worker_returns_false_when_meta_missing() {
+        let base = make_temp_workers_dir("no-meta");
+        // No directory created for this id → not a known worker → not stale.
+        assert!(!is_stale_worker_in(&base, "abc-123"));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn is_stale_worker_true_when_stopped_at_set() {
+        let base = make_temp_workers_dir("stopped-at");
+        let meta = format!(
+            r#"{{"sessionId":"w1","pid":{},"cwd":"/tmp","spawnedAt":"2026-01-01T00:00:00Z","spawnArgs":{{"permissionMode":"default","addDirs":[]}},"stoppedAt":"2026-01-01T00:01:00Z"}}"#,
+            std::process::id()
+        );
+        write_worker_meta(&base, "w1", &meta);
+        assert!(is_stale_worker_in(&base, "w1"));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn is_stale_worker_true_when_pid_dead() {
+        let base = make_temp_workers_dir("pid-dead");
+        // PID 0 is treated as not-alive by worker_pid_is_alive.
+        let meta = r#"{"sessionId":"w2","pid":0,"cwd":"/tmp","spawnedAt":"2026-01-01T00:00:00Z","spawnArgs":{"permissionMode":"default","addDirs":[]}}"#;
+        write_worker_meta(&base, "w2", meta);
+        assert!(is_stale_worker_in(&base, "w2"));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn is_stale_worker_false_when_pid_alive_and_not_stopped() {
+        let base = make_temp_workers_dir("alive");
+        let meta = format!(
+            r#"{{"sessionId":"w3","pid":{},"cwd":"/tmp","spawnedAt":"2026-01-01T00:00:00Z","spawnArgs":{{"permissionMode":"default","addDirs":[]}}}}"#,
+            std::process::id()
+        );
+        write_worker_meta(&base, "w3", &meta);
+        assert!(!is_stale_worker_in(&base, "w3"));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn is_stale_worker_true_when_meta_dir_removed_after_stop() {
+        // Simulates `c9watch stop`: meta dir exists, then is removed.
+        // After removal, is_stale_worker returns false (no meta = unknown),
+        // BUT the detector's process-centric loop will also no longer emit
+        // the session because the worker process is killed. This test
+        // documents the contract: meta-gone alone is "unknown", not "stale".
+        let base = make_temp_workers_dir("removed");
+        let meta = r#"{"sessionId":"w4","pid":0,"cwd":"/tmp","spawnedAt":"2026-01-01T00:00:00Z","spawnArgs":{"permissionMode":"default","addDirs":[]}}"#;
+        write_worker_meta(&base, "w4", meta);
+        assert!(is_stale_worker_in(&base, "w4"));
+
+        // Now remove the meta dir (what `c9watch stop` does).
+        fs::remove_dir_all(base.join("w4")).unwrap();
+        assert!(!is_stale_worker_in(&base, "w4"));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn is_stale_worker_rejects_invalid_session_id() {
+        let base = make_temp_workers_dir("invalid");
+        assert!(!is_stale_worker_in(&base, ""));
+        assert!(!is_stale_worker_in(&base, "../etc"));
+        assert!(!is_stale_worker_in(&base, "a/b"));
+        fs::remove_dir_all(&base).ok();
     }
 
     #[test]
