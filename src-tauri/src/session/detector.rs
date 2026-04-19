@@ -48,7 +48,6 @@ pub struct DetectionDiagnostics {
 pub struct SessionDetector {
     system: System,
     claude_projects_dir: PathBuf,
-    claude_sessions_dir: PathBuf,
 }
 
 impl SessionDetector {
@@ -57,7 +56,6 @@ impl SessionDetector {
         let home_dir = dirs::home_dir().ok_or(SessionDetectorError::HomeDirectoryNotFound)?;
 
         let claude_projects_dir = home_dir.join(".claude").join("projects");
-        let claude_sessions_dir = home_dir.join(".claude").join("sessions");
 
         Ok(Self {
             system: System::new_with_specifics(
@@ -69,19 +67,17 @@ impl SessionDetector {
                 ),
             ),
             claude_projects_dir,
-            claude_sessions_dir,
         })
     }
 
-    /// Test-only constructor that points the detector at caller-supplied
-    /// projects and sessions directories. Keeps `find_active_sessions` and
-    /// `read_session_metadata` unit-testable without touching `~/.claude`.
+    /// Test-only constructor that points the detector at a caller-supplied
+    /// projects directory. Keeps `find_active_sessions` unit-testable without
+    /// touching `~/.claude`.
     #[cfg(test)]
-    fn new_with_dirs(claude_projects_dir: PathBuf, claude_sessions_dir: PathBuf) -> Self {
+    fn new_with_dirs(claude_projects_dir: PathBuf, _claude_sessions_dir: PathBuf) -> Self {
         Self {
             system: System::new(),
             claude_projects_dir,
-            claude_sessions_dir,
         }
     }
 
@@ -209,32 +205,15 @@ impl SessionDetector {
                 None => continue, // Skip processes without cwd
             };
 
-            // Primary: try to resolve session ID from ~/.claude/sessions/<pid>.json
-            // This file is the authoritative source and is updated after /clear,
-            // so we always get the correct current session.
-            if let Some(meta) = self.read_session_metadata(proc.pid) {
-                if !used_session_ids.contains(&meta.session_id) {
-                    // Find the matching session file and project info
-                    if let Some((_, project_dir, _, project_name, _)) =
-                        session_files.iter().find(|(path, _, _, _, _)| {
-                            path.file_stem().and_then(|s| s.to_str()) == Some(&meta.session_id)
-                        })
-                    {
-                        used_session_ids.insert(meta.session_id.clone());
-                        sessions.push(DetectedSession {
-                            pid: proc.pid,
-                            cwd: proc_cwd.clone(),
-                            project_path: project_dir.clone(),
-                            session_id: Some(meta.session_id),
-                            project_name: project_name.clone(),
-                        });
-                        continue;
-                    }
-                }
-            }
+            // NOTE: ~/.claude/sessions/<pid>.json is written ONCE at process
+            // startup and is NOT refreshed after /clear. Its sessionId field
+            // is therefore unreliable as a source of truth for the current
+            // session — trusting it blindly would keep the dashboard pinned
+            // to the stale pre-/clear JSONL. Instead we always go through the
+            // cwd + internal-timestamp path below and let the newest JSONL
+            // win.
 
-            // Fallback: heuristic matching by encoded CWD + internal event timestamp.
-            // Used when pid.json doesn't exist (e.g., older Claude Code versions).
+            // Heuristic matching by encoded CWD + internal event timestamp.
             let cwd_str = proc_cwd.to_string_lossy();
             let encoded_cwd = encode_path_for_matching(&cwd_str);
 
@@ -311,13 +290,6 @@ impl SessionDetector {
         }
 
         sessions
-    }
-
-    /// Reads session metadata from ~/.claude/sessions/<pid>.json if it exists.
-    fn read_session_metadata(&self, pid: u32) -> Option<PidSessionMeta> {
-        let meta_path = self.claude_sessions_dir.join(format!("{}.json", pid));
-        let content = fs::read_to_string(&meta_path).ok()?;
-        serde_json::from_str::<PidSessionMeta>(&content).ok()
     }
 
     /// Get project info from sessions-index.json for a given session ID
@@ -485,14 +457,6 @@ struct ClaudeProcess {
     start_time: u64, // Process start time (seconds since epoch)
 }
 
-/// Session metadata from ~/.claude/sessions/<pid>.json
-/// Written by Claude Code with the authoritative session ID for each process.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PidSessionMeta {
-    session_id: String,
-}
-
 /// Structure of sessions-index.json
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -627,14 +591,17 @@ mod tests {
         let detector = SessionDetector::new_with_dirs(projects_dir, sessions_dir.clone());
         let project_dirs = detector.enumerate_project_directories().unwrap();
 
-        // Case A: pid.json present and points at the new session (the path
-        // Claude Code takes on modern versions — this is the authoritative
-        // fix from PR #73).
+        // Case A: pid.json present but points at the STALE (old) session.
+        // This is the real-world bug: pid.json is written once at process
+        // start and is not updated after /clear, so its sessionId field
+        // still points at the pre-/clear session while the active JSONL
+        // is the new one. The detector must NOT trust pid.json here and
+        // must pick the newer JSONL via internal-timestamp comparison.
         let pid = 424242_u32;
         let meta = format!(
             "{{\"pid\":{},\"sessionId\":\"{}\",\"cwd\":\"{}\"}}",
             pid,
-            new_sid,
+            old_sid,
             cwd.display()
         );
         fs::write(sessions_dir.join(format!("{}.json", pid)), meta).unwrap();
@@ -649,19 +616,19 @@ mod tests {
         assert_eq!(
             sessions[0].session_id.as_deref(),
             Some(new_sid),
-            "after /clear the detector must resolve to the new session id via pid.json, not the stale one"
+            "even when pid.json points at the stale old session, the detector must pick the newer JSONL via internal-timestamp comparison"
         );
 
-        // Case B: pid.json absent — fall back to heuristic matching.
-        // The fallback must use internal timestamps to distinguish old vs new,
-        // not file mtime (which is identical).
+        // Case B: pid.json absent — same codepath, same outcome.
+        // Heuristic picks the JSONL with the latest internal event timestamp,
+        // not file mtime (which is identical between the two JSONLs here).
         fs::remove_file(sessions_dir.join(format!("{}.json", pid))).unwrap();
         let sessions = detector.find_active_sessions(&processes, &project_dirs);
         assert_eq!(sessions.len(), 1);
         assert_eq!(
             sessions[0].session_id.as_deref(),
             Some(new_sid),
-            "fallback heuristic must prefer JSONL with latest internal event timestamp"
+            "heuristic must prefer JSONL with latest internal event timestamp"
         );
 
         fs::remove_dir_all(&root).ok();
