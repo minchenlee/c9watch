@@ -192,6 +192,238 @@ pub fn active_subagents_for_path<P: AsRef<Path>>(
     subagents
 }
 
+/// Full transcript of a single subagent invocation — the prompt (Agent tool
+/// input), the final result text, and usage stats when available.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentTranscript {
+    pub id: String,
+    pub agent_type: String,
+    pub description: String,
+    pub parent_session_id: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub status: SubagentStatus,
+    /// Prompt sent to the subagent (from the Agent tool_use input).
+    pub prompt: String,
+    /// Final result text from the subagent, if completed. Concatenation of
+    /// text blocks in the matching tool_result content array, preferring
+    /// `toolUseResult.content[].text` when present.
+    pub result: Option<String>,
+    /// Internal agent id from `toolUseResult.agentId` (CC sub-agent handle).
+    pub agent_id: Option<String>,
+    pub total_tokens: Option<u64>,
+    pub tool_uses: Option<u64>,
+    pub duration_ms: Option<u64>,
+}
+
+/// Extract the prompt + result for a specific Agent tool_use id in a JSONL.
+fn extract_transcript_from_file<P: AsRef<Path>>(
+    path: P,
+    parent_session_id: &str,
+    subagent_id: &str,
+) -> Option<SubagentTranscript> {
+    use std::io::{BufRead, BufReader};
+    let file = fs::File::open(path.as_ref()).ok()?;
+    let reader = BufReader::new(file);
+
+    let mut agent_type = String::new();
+    let mut description = String::new();
+    let mut prompt = String::new();
+    let mut started_at = String::new();
+    let mut found_tool_use = false;
+
+    let mut result_text: Option<String> = None;
+    let mut completed_at: Option<String> = None;
+    let mut agent_id: Option<String> = None;
+    let mut total_tokens: Option<u64> = None;
+    let mut tool_uses: Option<u64> = None;
+    let mut duration_ms: Option<u64> = None;
+
+    for line in reader.lines().map_while(Result::ok) {
+        if line.trim().is_empty() || !line.contains(subagent_id) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
+        let entry_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let timestamp = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let content = value
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array);
+
+        // Assistant turn with tool_use matching the id.
+        if entry_type == "assistant" {
+            if let Some(blocks) = content {
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                        continue;
+                    }
+                    if block.get("id").and_then(Value::as_str) != Some(subagent_id) {
+                        continue;
+                    }
+                    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                    if !SUBAGENT_TOOL_NAMES.contains(&name) {
+                        continue;
+                    }
+                    let input = block.get("input").cloned().unwrap_or(Value::Null);
+                    agent_type = input
+                        .get("subagent_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("subagent")
+                        .to_string();
+                    description = input
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    prompt = input
+                        .get("prompt")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    started_at = timestamp.clone();
+                    found_tool_use = true;
+                }
+            }
+        }
+
+        // tool_result can appear in user-role content OR assistant-role content.
+        // Prefer the top-level `toolUseResult` sibling when present (richer stats).
+        let is_result_here = content
+            .map(|blocks| {
+                blocks.iter().any(|b| {
+                    b.get("type").and_then(Value::as_str) == Some("tool_result")
+                        && b.get("tool_use_id").and_then(Value::as_str) == Some(subagent_id)
+                })
+            })
+            .unwrap_or(false);
+
+        if is_result_here {
+            completed_at = Some(timestamp.clone());
+
+            // Try toolUseResult sibling first — richest shape.
+            if let Some(tur) = value.get("toolUseResult") {
+                if let Some(a) = tur.get("agentId").and_then(Value::as_str) {
+                    agent_id = Some(a.to_string());
+                }
+                if let Some(n) = tur.get("totalTokens").and_then(Value::as_u64) {
+                    total_tokens = Some(n);
+                }
+                if let Some(n) = tur.get("totalToolUseCount").and_then(Value::as_u64) {
+                    tool_uses = Some(n);
+                }
+                if let Some(n) = tur.get("totalDurationMs").and_then(Value::as_u64) {
+                    duration_ms = Some(n);
+                }
+                if let Some(blocks) = tur.get("content").and_then(Value::as_array) {
+                    let text = collect_text_blocks(blocks);
+                    if !text.is_empty() {
+                        result_text = Some(text);
+                    }
+                }
+            }
+
+            // Fall back to tool_result block content.
+            if result_text.is_none() {
+                if let Some(blocks) = content {
+                    for b in blocks {
+                        if b.get("type").and_then(Value::as_str) != Some("tool_result")
+                            || b.get("tool_use_id").and_then(Value::as_str) != Some(subagent_id)
+                        {
+                            continue;
+                        }
+                        let inner = b.get("content");
+                        if let Some(arr) = inner.and_then(Value::as_array) {
+                            let text = collect_text_blocks(arr);
+                            if !text.is_empty() {
+                                result_text = Some(text);
+                            }
+                        } else if let Some(s) = inner.and_then(Value::as_str) {
+                            result_text = Some(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !found_tool_use {
+        return None;
+    }
+
+    let status = if completed_at.is_some() {
+        SubagentStatus::Completed
+    } else {
+        SubagentStatus::Running
+    };
+
+    Some(SubagentTranscript {
+        id: subagent_id.to_string(),
+        agent_type,
+        description,
+        parent_session_id: parent_session_id.to_string(),
+        started_at,
+        completed_at,
+        status,
+        prompt,
+        result: result_text,
+        agent_id,
+        total_tokens,
+        tool_uses,
+        duration_ms,
+    })
+}
+
+fn collect_text_blocks(blocks: &[Value]) -> String {
+    let mut out = String::new();
+    for b in blocks {
+        if b.get("type").and_then(Value::as_str) == Some("text") {
+            if let Some(t) = b.get("text").and_then(Value::as_str) {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(t);
+            }
+        }
+    }
+    out
+}
+
+/// Locate a parent session's JSONL under `~/.claude/projects/*/` and extract
+/// the transcript for the named subagent tool_use id.
+pub fn get_subagent_transcript(
+    parent_session_id: &str,
+    subagent_id: &str,
+) -> Option<SubagentTranscript> {
+    let home = dirs::home_dir()?;
+    let projects_dir = home.join(".claude").join("projects");
+    let project_iter = fs::read_dir(&projects_dir).ok()?;
+    for project_entry in project_iter.flatten() {
+        let project_path = project_entry.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+        let Ok(file_iter) = fs::read_dir(&project_path) else { continue };
+        for file_entry in file_iter.flatten() {
+            let path = file_entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            if stem != parent_session_id {
+                continue;
+            }
+            return extract_transcript_from_file(&path, parent_session_id, subagent_id);
+        }
+    }
+    None
+}
+
 /// Build a map of parent_session_id -> subagents for all sessions found under
 /// `~/.claude/projects/`. Caller filters/joins as needed.
 pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
@@ -294,6 +526,58 @@ mod tests {
             subs.iter().map(|s| (s.id.as_str(), s)).collect();
         assert_eq!(by_id["a1"].status, SubagentStatus::Completed);
         assert_eq!(by_id["a2"].status, SubagentStatus::Running);
+    }
+
+    #[test]
+    fn extract_transcript_completed_with_tool_use_result_stats() {
+        // Assistant turn: Agent tool_use with prompt + description + subagent_type.
+        let assistant = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"toolu_t","name":"Agent","input":{"subagent_type":"Explore","description":"find it","prompt":"go look for X"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        // User turn: tool_result block + rich toolUseResult sibling with stats.
+        let user = r#"{"type":"user","uuid":"u2","timestamp":"2026-01-01T00:02:00Z","sessionId":"s1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_t","content":[{"type":"text","text":"found X at file.rs"}]}]},"toolUseResult":{"status":"completed","agentId":"agent_abc","content":[{"type":"text","text":"found X at file.rs"}],"totalTokens":1234,"totalToolUseCount":5,"totalDurationMs":9876}}"#;
+        let f = write_jsonl(&[assistant, user]);
+        let tr = extract_transcript_from_file(f.path(), "s1", "toolu_t").unwrap();
+        assert_eq!(tr.id, "toolu_t");
+        assert_eq!(tr.agent_type, "Explore");
+        assert_eq!(tr.description, "find it");
+        assert_eq!(tr.prompt, "go look for X");
+        assert_eq!(tr.status, SubagentStatus::Completed);
+        assert_eq!(tr.result.as_deref(), Some("found X at file.rs"));
+        assert_eq!(tr.agent_id.as_deref(), Some("agent_abc"));
+        assert_eq!(tr.total_tokens, Some(1234));
+        assert_eq!(tr.tool_uses, Some(5));
+        assert_eq!(tr.duration_ms, Some(9876));
+        assert_eq!(tr.completed_at.as_deref(), Some("2026-01-01T00:02:00Z"));
+    }
+
+    #[test]
+    fn extract_transcript_running_has_no_result() {
+        let assistant = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"toolu_r","name":"Agent","input":{"subagent_type":"general-purpose","description":"running","prompt":"please do"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        let f = write_jsonl(&[assistant]);
+        let tr = extract_transcript_from_file(f.path(), "s1", "toolu_r").unwrap();
+        assert_eq!(tr.status, SubagentStatus::Running);
+        assert!(tr.result.is_none());
+        assert!(tr.completed_at.is_none());
+        assert_eq!(tr.prompt, "please do");
+    }
+
+    #[test]
+    fn extract_transcript_falls_back_to_tool_result_block_when_no_sibling() {
+        let assistant = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"toolu_fallback","name":"Agent","input":{"subagent_type":"x","description":"d","prompt":"p"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        // No toolUseResult sibling; content is a string.
+        let user = r#"{"type":"user","uuid":"u2","timestamp":"2026-01-01T00:01:00Z","sessionId":"s1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fallback","content":"plain string result"}]}}"#;
+        let f = write_jsonl(&[assistant, user]);
+        let tr = extract_transcript_from_file(f.path(), "s1", "toolu_fallback").unwrap();
+        assert_eq!(tr.result.as_deref(), Some("plain string result"));
+        assert_eq!(tr.status, SubagentStatus::Completed);
+        assert!(tr.total_tokens.is_none());
+    }
+
+    #[test]
+    fn extract_transcript_returns_none_for_unknown_id() {
+        let assistant = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"toolu_present","name":"Agent","input":{"subagent_type":"x","description":"d","prompt":"p"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        let f = write_jsonl(&[assistant]);
+        let tr = extract_transcript_from_file(f.path(), "s1", "toolu_missing");
+        assert!(tr.is_none());
     }
 
     #[test]
