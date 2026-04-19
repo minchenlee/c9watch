@@ -73,3 +73,6 @@ regex = { version = "1", optional = true }
 # tauri-nspanel provides NSPanel support for the popover (above fullscreen apps).
 # It depends on tauri, so it must be optional and gated behind the gui feature.
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", rev = "da9c9a8d4eb7f0524a2508988df1a7d9585b4904", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

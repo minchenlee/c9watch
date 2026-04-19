@@ -33,3 +33,8 @@ pub use sanitize::strip_system_tags;
 
 pub mod conversation;
 pub use conversation::{get_conversation_data, Conversation, ConversationMessage};
+
+pub mod subagents;
+pub use subagents::{
+    active_subagents_for_path, all_subagents_by_session, SubagentInfo, SubagentStatus,
+};
