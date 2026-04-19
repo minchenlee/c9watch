@@ -73,6 +73,18 @@ impl SessionDetector {
         })
     }
 
+    /// Test-only constructor that points the detector at caller-supplied
+    /// projects and sessions directories. Keeps `find_active_sessions` and
+    /// `read_session_metadata` unit-testable without touching `~/.claude`.
+    #[cfg(test)]
+    fn new_with_dirs(claude_projects_dir: PathBuf, claude_sessions_dir: PathBuf) -> Self {
+        Self {
+            system: System::new(),
+            claude_projects_dir,
+            claude_sessions_dir,
+        }
+    }
+
     /// Detects all active Claude Code sessions
     pub fn detect_sessions(&mut self) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
         // Refresh process information (only what we need: name, cwd, start_time)
@@ -524,6 +536,105 @@ mod tests {
         if let Ok(dirs) = result {
             println!("Found {} project directories", dirs.len());
         }
+    }
+
+    /// Creates a unique temp dir for a test and returns its path.
+    /// Caller is responsible for cleanup via `fs::remove_dir_all`.
+    fn make_tempdir(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "c9watch-detector-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    /// Writes a jsonl file at `path` with the given modification time
+    /// (seconds since UNIX_EPOCH). Uses `File::set_modified` (std, stable).
+    fn write_jsonl(path: &Path, mtime_secs: u64) {
+        fs::write(path, b"{\"type\":\"user\"}\n").unwrap();
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs);
+        let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(mtime).unwrap();
+    }
+
+    /// Regression test for /clear: a Claude Code session's `/clear` keeps
+    /// the same process pid but mints a new session uuid, writing a fresh
+    /// JSONL alongside the old one in the same project dir. The detector
+    /// must pick the newer JSONL so the dashboard stops showing the stale
+    /// pre-/clear session card.
+    #[test]
+    fn test_after_clear_detector_returns_new_session_not_stale() {
+        // Arrange: synthetic projects/sessions dirs.
+        let root = make_tempdir("clear");
+        let projects_dir = root.join("projects");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&projects_dir).unwrap();
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Simulated cwd of the running Claude process.
+        let cwd = PathBuf::from("/tmp/fake-proj");
+        let encoded = encode_path_for_matching(&cwd.to_string_lossy());
+        let project_dir = projects_dir.join(&encoded);
+        fs::create_dir_all(&project_dir).unwrap();
+
+        // Two JSONLs: old (pre-/clear) + new (post-/clear). Both in the
+        // same project dir, both owned by the same live pid.
+        let old_sid = "11111111-1111-1111-1111-111111111111";
+        let new_sid = "22222222-2222-2222-2222-222222222222";
+        let old_jsonl = project_dir.join(format!("{}.jsonl", old_sid));
+        let new_jsonl = project_dir.join(format!("{}.jsonl", new_sid));
+        let proc_start = 1_000_000_u64;
+        // Old jsonl modified shortly after process start (pre-/clear history).
+        write_jsonl(&old_jsonl, proc_start + 10);
+        // New jsonl modified more recently (post-/clear).
+        write_jsonl(&new_jsonl, proc_start + 100);
+
+        let detector = SessionDetector::new_with_dirs(projects_dir, sessions_dir.clone());
+        let project_dirs = detector.enumerate_project_directories().unwrap();
+
+        // Case A: pid.json present and points at the new session (the path
+        // Claude Code takes on modern versions — this is the authoritative
+        // fix from PR #73).
+        let pid = 424242_u32;
+        let meta = format!(
+            "{{\"pid\":{},\"sessionId\":\"{}\",\"cwd\":\"{}\"}}",
+            pid,
+            new_sid,
+            cwd.display()
+        );
+        fs::write(sessions_dir.join(format!("{}.json", pid)), meta).unwrap();
+
+        let processes = vec![ClaudeProcess {
+            pid,
+            cwd: Some(cwd.clone()),
+            start_time: proc_start,
+        }];
+        let sessions = detector.find_active_sessions(&processes, &project_dirs);
+        assert_eq!(sessions.len(), 1, "expected exactly one live session");
+        assert_eq!(
+            sessions[0].session_id.as_deref(),
+            Some(new_sid),
+            "after /clear the detector must resolve to the new session id via pid.json, not the stale one"
+        );
+
+        // Case B: pid.json absent — fall back to heuristic matching.
+        // The fallback sorts by mtime desc, so the newer JSONL must win.
+        fs::remove_file(sessions_dir.join(format!("{}.json", pid))).unwrap();
+        let sessions = detector.find_active_sessions(&processes, &project_dirs);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].session_id.as_deref(),
+            Some(new_sid),
+            "fallback heuristic must prefer the most recently modified JSONL for a given pid+cwd"
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
