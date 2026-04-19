@@ -268,8 +268,8 @@
 		{:else if filtered.length === 0}
 			<div class="state-msg">No sessions found.</div>
 		{:else if groupByProject && groups}
-			{#each groups as group}
-				<div class="project-group">
+			{#each groups as group, gi (group.project)}
+				<div class="project-group" in:flyIn={{ index: gi, stride: 30 }}>
 					<!-- svelte-ignore a11y_click_events_have_key_events -->
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
