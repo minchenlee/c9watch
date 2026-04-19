@@ -18,12 +18,16 @@
 		durationMs: number | null;
 	}
 
+	interface PreviewState {
+		selection: SubagentInfo | null;
+		transcript: SubagentTranscript | null;
+		loading: boolean;
+		error: string | null;
+	}
+
 	// Per-parent-session preview state. Module-scoped so re-renders triggered
 	// by store updates (new JSONL events) don't reset what the user had open.
-	const previewSelectionBySession = new SvelteMap<string, SubagentInfo>();
-	const previewTranscriptBySession = new SvelteMap<string, SubagentTranscript>();
-	const previewLoadingBySession = new SvelteMap<string, boolean>();
-	const previewErrorBySession = new SvelteMap<string, string>();
+	const previewStateBySession = new SvelteMap<string, PreviewState>();
 </script>
 
 <script lang="ts">
@@ -40,6 +44,8 @@
 	import { workersByPm, expandedSessionId } from '$lib/stores/sessions';
 	import { visibleSubagentsBySession } from '$lib/stores/subagents';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
+	import { formatTimeSince, formatDurationMs } from '$lib/time-utils';
+	import { getSessionStatusColor, getSessionStatusLabel, getSubagentStatusColor, getSubagentStatusLabel, getWorkerStatusColor, getWorkerStatusLabel } from '$lib/status-utils';
 	import { isTauri } from '$lib/ws';
 
 	interface Props {
@@ -166,22 +172,38 @@
 	// that re-renders triggered by store updates (new JSONL events arriving)
 	// do NOT reset the preview. Switching sessions naturally shows a fresh
 	// (empty) preview because the key changes.
-	let previewedSubagent = $derived(previewSelectionBySession.get(session.id) ?? null);
-	let previewTranscript = $derived(previewTranscriptBySession.get(session.id) ?? null);
-	let previewLoading = $derived(previewLoadingBySession.get(session.id) ?? false);
-	let previewError = $derived(previewErrorBySession.get(session.id) ?? null);
+	let previewState = $derived(
+		previewStateBySession.get(session.id) ?? {
+			selection: null,
+			transcript: null,
+			loading: false,
+			error: null,
+		}
+	);
+	let previewedSubagent = $derived(previewState.selection);
+	let previewTranscript = $derived(previewState.transcript);
+	let previewLoading = $derived(previewState.loading);
+	let previewError = $derived(previewState.error);
 
 	async function openSubagentPreview(sa: SubagentInfo) {
 		const sid = session.id;
-		previewSelectionBySession.set(sid, sa);
-		previewTranscriptBySession.delete(sid);
-		previewErrorBySession.delete(sid);
-		previewLoadingBySession.set(sid, true);
+		const initialState: PreviewState = {
+			selection: sa,
+			transcript: null,
+			loading: true,
+			error: null,
+		};
+		previewStateBySession.set(sid, initialState);
+
 		if (!isTauri()) {
-			previewLoadingBySession.set(sid, false);
-			previewErrorBySession.set(sid, 'Subagent preview is only available in the desktop app.');
+			previewStateBySession.set(sid, {
+				...initialState,
+				loading: false,
+				error: 'Subagent preview is only available in the desktop app.',
+			});
 			return;
 		}
+
 		try {
 			const tr = await invoke<SubagentTranscript>('get_subagent_transcript', {
 				parentSessionId: sid,
@@ -189,114 +211,41 @@
 			});
 			// Guard: user may have switched to a different selection before
 			// this resolved. Only commit if the selection is still this one.
-			if (previewSelectionBySession.get(sid)?.id === sa.id) {
-				previewTranscriptBySession.set(sid, tr);
+			const current = previewStateBySession.get(sid);
+			if (current?.selection?.id === sa.id) {
+				previewStateBySession.set(sid, {
+					...current,
+					transcript: tr,
+				});
 			}
 		} catch (err) {
-			if (previewSelectionBySession.get(sid)?.id === sa.id) {
-				previewErrorBySession.set(sid, String(err));
+			const current = previewStateBySession.get(sid);
+			if (current?.selection?.id === sa.id) {
+				previewStateBySession.set(sid, {
+					...current,
+					error: String(err),
+				});
 			}
 		} finally {
-			if (previewSelectionBySession.get(sid)?.id === sa.id) {
-				previewLoadingBySession.set(sid, false);
+			const current = previewStateBySession.get(sid);
+			if (current?.selection?.id === sa.id) {
+				previewStateBySession.set(sid, {
+					...current,
+					loading: false,
+				});
 			}
 		}
 	}
 
 	function closeSubagentPreview() {
 		const sid = session.id;
-		previewSelectionBySession.delete(sid);
-		previewTranscriptBySession.delete(sid);
-		previewErrorBySession.delete(sid);
-		previewLoadingBySession.delete(sid);
-	}
-
-	function formatDurationMs(ms: number | null | undefined): string {
-		if (ms == null) return '';
-		if (ms < 1000) return `${ms}ms`;
-		const s = ms / 1000;
-		if (s < 60) return `${s.toFixed(1)}s`;
-		const m = Math.floor(s / 60);
-		const rs = Math.round(s - m * 60);
-		return `${m}m ${rs}s`;
-	}
-
-	function subagentStatusColor(status: SubagentInfo['status']): string {
-		return status === 'running' ? 'var(--status-working)' : 'var(--text-muted)';
-	}
-
-	function subagentStatusLabel(status: SubagentInfo['status']): string {
-		return status === 'running' ? 'Running' : 'Completed';
-	}
-
-	function workerStatusColor(status: SessionStatus): string {
-		switch (status) {
-			case SessionStatus.Working: return 'var(--status-working)';
-			case SessionStatus.NeedsAttention: return 'var(--status-permission)';
-			case SessionStatus.WaitingForInput: return 'var(--status-input)';
-			case SessionStatus.Connecting: return 'var(--status-working)';
-			default: return 'var(--text-muted)';
-		}
-	}
-
-	function workerStatusLabel(status: SessionStatus): string {
-		switch (status) {
-			case SessionStatus.Working: return 'Working';
-			case SessionStatus.NeedsAttention: return 'Attention';
-			case SessionStatus.WaitingForInput: return 'Ready';
-			case SessionStatus.Connecting: return 'Connecting';
-			default: return 'Unknown';
-		}
-	}
-
-	function formatTimeSince(isoTimestamp: string): string {
-		const now = Date.now();
-		const then = new Date(isoTimestamp).getTime();
-		const diffMins = Math.floor((now - then) / 60000);
-		const diffHours = Math.floor((now - then) / 3600000);
-		const diffDays = Math.floor((now - then) / 86400000);
-		if (diffMins < 1) return 'now';
-		if (diffMins < 60) return `${diffMins}m`;
-		if (diffHours < 24) return `${diffHours}h`;
-		return `${diffDays}d`;
+		previewStateBySession.delete(sid);
 	}
 
 	function openWorker(id: string) {
 		expandedSessionId.set(id);
 	}
 
-	function getStatusColor(): string {
-		switch (session.status) {
-			case SessionStatus.Working:
-				return 'var(--status-working)';
-			case SessionStatus.NeedsAttention:
-				return 'var(--status-permission)';
-			case SessionStatus.WaitingForInput:
-				return 'var(--status-input)';
-			case SessionStatus.Connecting:
-				return 'var(--status-working)';
-			default:
-				return 'var(--status-working)';
-		}
-	}
-
-	function getStatusLabel(): string {
-		switch (session.status) {
-			case SessionStatus.Working:
-				return 'Working';
-			case SessionStatus.NeedsAttention:
-				if (session.pendingToolName === 'Question' || session.pendingToolName === 'AskUserQuestion') {
-					return 'Waiting for Response';
-				}
-				return 'Approval Required';
-			case SessionStatus.WaitingForInput:
-				return 'Ready';
-			case SessionStatus.Connecting:
-				return 'Connecting';
-			default:
-				return 'Unknown';
-		}
-	}
 
 	async function handleClose() {
 		await sw.clearBeforeClose(conversation?.messages.length ?? 0);
@@ -387,7 +336,7 @@
 							</span>
 						</div>
 						<div class="header-meta">
-							<span class="status-label" style="color: {getStatusColor()}">{getStatusLabel()}</span>
+							<span class="status-label" style="color: {getSessionStatusColor(session.status)}">{getSessionStatusLabel(session.status, session.pendingToolName)}</span>
 							<span class="separator">·</span>
 							<span class="session-name-badge">{session.sessionName}</span>
 							<span class="separator">·</span>
@@ -473,8 +422,8 @@
 							<div class="subagent-preview-meta">
 								<span class="subagent-type">{previewedSubagent.agentType}</span>
 								<span class="subagent-sep">·</span>
-								<span class="subagent-status" style="color: {subagentStatusColor(previewedSubagent.status)}">
-									{subagentStatusLabel(previewedSubagent.status)}
+								<span class="subagent-status" style="color: {getSubagentStatusColor(previewedSubagent.status)}">
+									{getSubagentStatusLabel(previewedSubagent.status)}
 								</span>
 								<span class="subagent-sep">·</span>
 								<span class="subagent-time">{formatTimeSince(previewedSubagent.startedAt)}</span>
@@ -619,8 +568,8 @@
 									onclick={() => openWorker(w.id)}
 								>
 									<span class="worker-name">{w.customTitle || w.summary || w.sessionName}</span>
-									<span class="worker-status" style="color: {workerStatusColor(w.status)}">
-										{workerStatusLabel(w.status)}
+									<span class="worker-status" style="color: {getWorkerStatusColor(w.status)}">
+										{getWorkerStatusLabel(w.status)}
 									</span>
 									<span class="worker-time">{formatTimeSince(w.modified)}</span>
 								</button>
@@ -662,8 +611,8 @@
 									<span class="subagent-row-meta">
 										<span class="subagent-type">{sa.agentType}</span>
 										<span class="subagent-sep">·</span>
-										<span class="subagent-status" style="color: {subagentStatusColor(sa.status)}">
-											{subagentStatusLabel(sa.status)}
+										<span class="subagent-status" style="color: {getSubagentStatusColor(sa.status)}">
+											{getSubagentStatusLabel(sa.status)}
 										</span>
 										<span class="subagent-sep">·</span>
 										<span class="subagent-time">{formatTimeSince(sa.startedAt)}</span>

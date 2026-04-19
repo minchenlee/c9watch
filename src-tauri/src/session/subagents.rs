@@ -16,6 +16,19 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+// JSONL entry type constants
+const ENTRY_TYPE_TOOL_USE: &str = "tool_use";
+const ENTRY_TYPE_TOOL_RESULT: &str = "tool_result";
+const ENTRY_TYPE_QUEUE_OPERATION: &str = "queue-operation";
+const ENTRY_TYPE_USER: &str = "user";
+
+// Tag name constants
+const TAG_TASK_ID: &str = "task-id";
+const TAG_TOOL_USE_ID: &str = "tool-use-id";
+const TAG_RESULT: &str = "result";
+const TAG_USAGE: &str = "usage";
+const TAG_NOTIFICATION: &str = "task-notification";
+
 /// Status of a detected subagent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -422,20 +435,15 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
                 }
                 // Populate stats from `<usage>` block.
                 if let Some(usage) = extract_tag(content_str, "usage") {
-                    if let Some(n) = extract_tag(&usage, "total_tokens")
-                        .and_then(|s| s.parse::<u64>().ok())
-                    {
-                        total_tokens = Some(n);
+                    let (tt, tu, dm) = extract_usage_stats(&usage);
+                    if tt.is_some() {
+                        total_tokens = tt;
                     }
-                    if let Some(n) = extract_tag(&usage, "tool_uses")
-                        .and_then(|s| s.parse::<u64>().ok())
-                    {
-                        tool_uses = Some(n);
+                    if tu.is_some() {
+                        tool_uses = tu;
                     }
-                    if let Some(n) = extract_tag(&usage, "duration_ms")
-                        .and_then(|s| s.parse::<u64>().ok())
-                    {
-                        duration_ms = Some(n);
+                    if dm.is_some() {
+                        duration_ms = dm;
                     }
                 }
                 async_result = match async_result {
@@ -481,20 +489,15 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
                 (text, None)
             };
             if let Some(usage) = usage_from_tag {
-                if let Some(n) =
-                    extract_tag(&usage, "total_tokens").and_then(|s| s.parse::<u64>().ok())
-                {
-                    total_tokens = Some(n);
+                let (tt, tu, dm) = extract_usage_stats(&usage);
+                if tt.is_some() {
+                    total_tokens = tt;
                 }
-                if let Some(n) =
-                    extract_tag(&usage, "tool_uses").and_then(|s| s.parse::<u64>().ok())
-                {
-                    tool_uses = Some(n);
+                if tu.is_some() {
+                    tool_uses = tu;
                 }
-                if let Some(n) =
-                    extract_tag(&usage, "duration_ms").and_then(|s| s.parse::<u64>().ok())
-                {
-                    duration_ms = Some(n);
+                if dm.is_some() {
+                    duration_ms = dm;
                 }
             }
             async_result = match async_result {
@@ -612,6 +615,16 @@ fn collect_text_blocks(blocks: &[Value]) -> String {
         }
     }
     out
+}
+
+fn extract_usage_stats(usage_str: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let total_tokens = extract_tag(usage_str, "total_tokens")
+        .and_then(|s| s.parse::<u64>().ok());
+    let tool_uses = extract_tag(usage_str, "tool_uses")
+        .and_then(|s| s.parse::<u64>().ok());
+    let duration_ms = extract_tag(usage_str, "duration_ms")
+        .and_then(|s| s.parse::<u64>().ok());
+    (total_tokens, tool_uses, duration_ms)
 }
 
 /// Locate a parent session's JSONL under `~/.claude/projects/*/` and extract
