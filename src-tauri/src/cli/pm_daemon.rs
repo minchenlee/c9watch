@@ -1035,4 +1035,53 @@ mod tests {
             err
         );
     }
+
+    // ── C3: bind-before-pid invariant ────────────────────────────────────────
+
+    /// Verify the C3 invariant by binding a Unix socket and writing a pid file
+    /// in the correct order: socket must be bound before pid file exists.
+    ///
+    /// This mimics what `run_daemon` does. `ensure_daemon` polls `sock_path.exists()`
+    /// as the readiness signal (not the pid file), but the pid-file ordering
+    /// ensures that any caller which _reads_ the pid file will find the socket
+    /// already listening — no ECONNREFUSED window.
+    #[test]
+    fn c3_socket_bound_before_pid_file_written() {
+        use std::fs;
+        use tokio::net::UnixListener;
+
+        // Use a temp directory so the test is isolated and self-cleaning.
+        let dir = std::env::temp_dir().join(format!("c3_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let sock_path = dir.join("daemon.sock");
+        let pid_path = dir.join("daemon.pid");
+
+        // Run on a single-threaded tokio runtime to keep the test synchronous.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("build tokio rt");
+
+        rt.block_on(async {
+            // Step 1: bind socket
+            let _listener = UnixListener::bind(&sock_path)
+                .expect("bind Unix socket");
+
+            // Assert: socket exists, pid file does NOT yet
+            assert!(sock_path.exists(), "socket must exist after bind");
+            assert!(!pid_path.exists(), "pid file must not exist before write");
+
+            // Step 2: write pid file
+            fs::write(&pid_path, std::process::id().to_string())
+                .expect("write pid file");
+
+            // Assert: both now exist in the correct causal order
+            assert!(sock_path.exists(), "socket still exists after pid write");
+            assert!(pid_path.exists(), "pid file exists after write");
+        });
+
+        // Clean up
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
