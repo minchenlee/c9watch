@@ -129,16 +129,9 @@ impl SessionDetector {
         processes: &[ClaudeProcess],
         project_dirs: &[PathBuf],
     ) -> Vec<DetectedSession> {
-        // Collect all session files with their modification times and project path
-        // Tuple: (modified_time, jsonl_path, project_dir, project_path, project_name, has_reliable_path)
-        let mut session_files: Vec<(
-            std::time::SystemTime,
-            PathBuf,
-            PathBuf,
-            PathBuf,
-            String,
-            bool,
-        )> = Vec::new();
+        // Collect all session files with their project path info
+        // Tuple: (jsonl_path, project_dir, project_path, project_name, has_reliable_path)
+        let mut session_files: Vec<(PathBuf, PathBuf, PathBuf, String, bool)> = Vec::new();
 
         for project_dir in project_dirs {
             if let Ok(entries) = fs::read_dir(project_dir) {
@@ -154,59 +147,51 @@ impl SessionDetector {
                             }
                         }
 
-                        if let Ok(metadata) = fs::metadata(&path) {
-                            if let Ok(modified) = metadata.modified() {
-                                // Get session ID and project info
-                                if let Some(session_id) = path
-                                    .file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .map(|s| s.to_string())
-                                {
-                                    // Try to get project info from sessions-index.json
-                                    // This is the ONLY reliable source of project path
-                                    let (project_path, project_name, has_reliable_path) = match self
-                                        .get_project_info_from_index(project_dir, &session_id)
-                                    {
-                                        Some((path, name)) => (path, name, true),
-                                        None => {
-                                            // No reliable path available - use directory name as display only
-                                            // Don't try to decode it (decoding is ambiguous due to dashes)
-                                            let dir_name = project_dir
-                                                .file_name()
-                                                .and_then(|n| n.to_str())
-                                                .unwrap_or("unknown");
+                        // Get session ID and project info
+                        if let Some(session_id) = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string())
+                        {
+                            // Try to get project info from sessions-index.json
+                            // This is the ONLY reliable source of project path
+                            let (project_path, project_name, has_reliable_path) = match self
+                                .get_project_info_from_index(project_dir, &session_id)
+                            {
+                                Some((path, name)) => (path, name, true),
+                                None => {
+                                    // No reliable path available - use directory name as display only
+                                    // Don't try to decode it (decoding is ambiguous due to dashes)
+                                    let dir_name = project_dir
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("unknown");
 
-                                            // Just use the last segment after splitting on dash as a rough name
-                                            // This is for display only, not for matching
-                                            let name = dir_name
-                                                .rsplit('-')
-                                                .next()
-                                                .unwrap_or("unknown")
-                                                .to_string();
+                                    // Just use the last segment after splitting on dash as a rough name
+                                    // This is for display only, not for matching
+                                    let name = dir_name
+                                        .rsplit('-')
+                                        .next()
+                                        .unwrap_or("unknown")
+                                        .to_string();
 
-                                            // Use the project_dir as a placeholder (will use fallback PID assignment)
-                                            (project_dir.clone(), name, false)
-                                        }
-                                    };
-
-                                    session_files.push((
-                                        modified,
-                                        path,
-                                        project_dir.clone(),
-                                        project_path,
-                                        project_name,
-                                        has_reliable_path,
-                                    ));
+                                    // Use the project_dir as a placeholder (will use fallback PID assignment)
+                                    (project_dir.clone(), name, false)
                                 }
-                            }
+                            };
+
+                            session_files.push((
+                                path,
+                                project_dir.clone(),
+                                project_path,
+                                project_name,
+                                has_reliable_path,
+                            ));
                         }
                     }
                 }
             }
         }
-
-        // Sort by modification time (most recent first)
-        session_files.sort_by(|a, b| b.0.cmp(&a.0));
 
         // Process-centric approach: for each process, find its matching session
         // This ensures we only show sessions that have actual running processes
@@ -230,8 +215,8 @@ impl SessionDetector {
             if let Some(meta) = self.read_session_metadata(proc.pid) {
                 if !used_session_ids.contains(&meta.session_id) {
                     // Find the matching session file and project info
-                    if let Some((_, _, project_dir, _, project_name, _)) =
-                        session_files.iter().find(|(_, path, _, _, _, _)| {
+                    if let Some((_, project_dir, _, project_name, _)) =
+                        session_files.iter().find(|(path, _, _, _, _)| {
                             path.file_stem().and_then(|s| s.to_str()) == Some(&meta.session_id)
                         })
                     {
@@ -248,7 +233,7 @@ impl SessionDetector {
                 }
             }
 
-            // Fallback: heuristic matching by encoded CWD + modification time.
+            // Fallback: heuristic matching by encoded CWD + internal event timestamp.
             // Used when pid.json doesn't exist (e.g., older Claude Code versions).
             let cwd_str = proc_cwd.to_string_lossy();
             let encoded_cwd = encode_path_for_matching(&cwd_str);
@@ -282,33 +267,26 @@ impl SessionDetector {
                 }
             };
 
-            // Find session with activity after process start
-            // Only match sessions that were modified AFTER the process started
-            // This prevents matching a new Claude instance (with no session file yet)
-            // to an older session from the same project directory
-            let matching_session = session_files.iter().find(
-                |(modified, path, project_dir, project_path, _, has_reliable_path)| {
-                    if !session_available(path) {
-                        return false;
-                    }
+            // Find all candidate sessions matching this process's cwd
+            let mut candidates: Vec<&(PathBuf, PathBuf, PathBuf, String, bool)> = session_files
+                .iter()
+                .filter(|(path, project_dir, project_path, _, has_reliable_path)| {
+                    session_available(path) && path_matches(project_dir, project_path, *has_reliable_path)
+                })
+                .collect();
 
-                    // Check if the session was modified after the process started
-                    let session_active_after_proc_start =
-                        match modified.duration_since(std::time::UNIX_EPOCH) {
-                            Ok(duration) => {
-                                let session_modified_secs = duration.as_secs();
-                                // Session must have been modified at or after process start (with 5s buffer)
-                                session_modified_secs + 5 >= proc.start_time
-                            }
-                            Err(_) => false,
-                        };
+            // If multiple candidates (e.g., post-/clear when both old and new JSONL exist),
+            // pick the one with the latest internal event timestamp.
+            // This ensures we match the active session, not a stale pre-/clear JSONL.
+            if candidates.len() > 1 {
+                candidates.sort_by(|a, b| {
+                    let ts_a = last_event_timestamp(&a.0);
+                    let ts_b = last_event_timestamp(&b.0);
+                    ts_b.cmp(&ts_a) // Descending: newer timestamps first
+                });
+            }
 
-                    session_active_after_proc_start
-                        && path_matches(project_dir, project_path, *has_reliable_path)
-                },
-            );
-
-            if let Some((_, path, project_dir, _, project_name, _)) = matching_session {
+            if let Some((path, project_dir, _, project_name, _)) = candidates.first() {
                 if let Some(session_id) = path
                     .file_stem()
                     .and_then(|s| s.to_str())
@@ -465,6 +443,40 @@ pub(crate) fn encode_path_for_matching(path: &str) -> String {
         .collect()
 }
 
+/// Seeks to the end of a JSONL file and finds the last meaningful event,
+/// extracting its "timestamp" field. Returns None if the file is empty,
+/// unreadable, or has no valid JSON events.
+///
+/// Skips synthetic event types (progress, file-history-snapshot, etc.)
+/// that don't represent user/assistant activity.
+fn last_event_timestamp(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+
+    // Walk lines from end to start, skipping empty lines
+    for line in content.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            // Skip synthetic event types; we want user/assistant/custom-title activity
+            if matches!(event_type, "" | "progress" | "file-history-snapshot") {
+                continue;
+            }
+
+            // Extract timestamp if present
+            if let Some(ts) = event.get("timestamp").and_then(|t| t.as_str()) {
+                return Some(ts.to_string());
+            }
+        }
+    }
+
+    None
+}
+
 /// Internal representation of a Claude process
 #[derive(Debug, Clone)]
 struct ClaudeProcess {
@@ -512,6 +524,7 @@ struct SessionEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn test_detector_creation() {
@@ -554,20 +567,26 @@ mod tests {
         base
     }
 
-    /// Writes a jsonl file at `path` with the given modification time
-    /// (seconds since UNIX_EPOCH). Uses `File::set_modified` (std, stable).
-    fn write_jsonl(path: &Path, mtime_secs: u64) {
-        fs::write(path, b"{\"type\":\"user\"}\n").unwrap();
-        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs);
+    /// Writes a jsonl file with specific event timestamps. Both old and new
+    /// JSONLs will have the same file mtime, but different internal timestamps.
+    fn write_jsonl_with_timestamps(path: &Path, old_ts: &str, new_ts: &str) {
+        let content = format!(
+            "{{\"type\":\"user\",\"timestamp\":\"{}\"}}\n{{\"type\":\"assistant\",\"timestamp\":\"{}\"}}\n",
+            old_ts, new_ts
+        );
+        fs::write(path, content).unwrap();
+        // Set file mtime to same second to simulate the bug scenario
+        let mtime = UNIX_EPOCH + std::time::Duration::from_secs(2000000);
         let f = fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_modified(mtime).unwrap();
     }
 
     /// Regression test for /clear: a Claude Code session's `/clear` keeps
     /// the same process pid but mints a new session uuid, writing a fresh
-    /// JSONL alongside the old one in the same project dir. The detector
-    /// must pick the newer JSONL so the dashboard stops showing the stale
-    /// pre-/clear session card.
+    /// JSONL alongside the old one. Both JSONLs may have identical file mtimes
+    /// (1-second resolution), but differ in their internal event timestamps.
+    /// The detector must pick the newer JSONL (via internal timestamp) so the
+    /// dashboard stops showing the stale pre-/clear session card.
     #[test]
     fn test_after_clear_detector_returns_new_session_not_stale() {
         // Arrange: synthetic projects/sessions dirs.
@@ -590,10 +609,20 @@ mod tests {
         let old_jsonl = project_dir.join(format!("{}.jsonl", old_sid));
         let new_jsonl = project_dir.join(format!("{}.jsonl", new_sid));
         let proc_start = 1_000_000_u64;
-        // Old jsonl modified shortly after process start (pre-/clear history).
-        write_jsonl(&old_jsonl, proc_start + 10);
-        // New jsonl modified more recently (post-/clear).
-        write_jsonl(&new_jsonl, proc_start + 100);
+
+        // Old jsonl: last event ~19s before /clear
+        // New jsonl: last event ~19s after /clear
+        // Both have identical file mtime (simulating the bug scenario)
+        write_jsonl_with_timestamps(
+            &old_jsonl,
+            "2026-04-19T07:07:39Z",
+            "2026-04-19T07:07:39Z",
+        );
+        write_jsonl_with_timestamps(
+            &new_jsonl,
+            "2026-04-19T07:07:58Z",
+            "2026-04-19T07:07:58Z",
+        );
 
         let detector = SessionDetector::new_with_dirs(projects_dir, sessions_dir.clone());
         let project_dirs = detector.enumerate_project_directories().unwrap();
@@ -624,14 +653,15 @@ mod tests {
         );
 
         // Case B: pid.json absent — fall back to heuristic matching.
-        // The fallback sorts by mtime desc, so the newer JSONL must win.
+        // The fallback must use internal timestamps to distinguish old vs new,
+        // not file mtime (which is identical).
         fs::remove_file(sessions_dir.join(format!("{}.json", pid))).unwrap();
         let sessions = detector.find_active_sessions(&processes, &project_dirs);
         assert_eq!(sessions.len(), 1);
         assert_eq!(
             sessions[0].session_id.as_deref(),
             Some(new_sid),
-            "fallback heuristic must prefer the most recently modified JSONL for a given pid+cwd"
+            "fallback heuristic must prefer JSONL with latest internal event timestamp"
         );
 
         fs::remove_dir_all(&root).ok();
