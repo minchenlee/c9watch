@@ -210,52 +210,34 @@ async fn write_response(
 
 // ── RPC handlers ──────────────────────────────────────────────────────────────
 
+/// Canonicalize a directory argument and return a user-facing error tagged with
+/// the flag name (e.g. "--cwd") if the path does not exist or is not a directory.
+fn validate_dir_arg(flag: &str, raw: &str) -> Result<String, String> {
+    match std::fs::canonicalize(raw) {
+        Ok(p) if p.is_dir() => Ok(p.to_string_lossy().to_string()),
+        Ok(_) => Err(format!("{} '{}' is not a directory", flag, raw)),
+        Err(_) => Err(format!("{} '{}' does not exist", flag, raw)),
+    }
+}
+
 async fn handle_spawn(
     state: Arc<Mutex<DaemonState>>,
     mut args: SpawnArgs,
     ctx: SpawnContext,
     max_workers: usize,
 ) -> serde_json::Value {
-    // Validate and canonicalize --cwd before acquiring the workers lock so we
-    // fail fast without touching shared state.
-    let canonical_cwd = match std::fs::canonicalize(&args.cwd) {
-        Ok(p) => {
-            if !p.is_dir() {
-                return serde_json::json!({
-                    "ok": false,
-                    "error": format!("--cwd '{}' is not a directory", args.cwd),
-                });
-            }
-            p.to_string_lossy().to_string()
-        }
-        Err(_) => {
-            return serde_json::json!({
-                "ok": false,
-                "error": format!("--cwd '{}' does not exist", args.cwd),
-            });
-        }
+    // Validate and canonicalize --cwd + each --add-dir before acquiring the
+    // workers lock so we fail fast without touching shared state.
+    args.cwd = match validate_dir_arg("--cwd", &args.cwd) {
+        Ok(p) => p,
+        Err(e) => return serde_json::json!({ "ok": false, "error": e }),
     };
-    args.cwd = canonical_cwd.clone();
 
-    // Validate and canonicalize each --add-dir entry.
     let mut canonical_add_dirs: Vec<String> = Vec::with_capacity(args.add_dirs.len());
     for dir in &args.add_dirs {
-        match std::fs::canonicalize(dir) {
-            Ok(p) => {
-                if !p.is_dir() {
-                    return serde_json::json!({
-                        "ok": false,
-                        "error": format!("--add-dir '{}' is not a directory", dir),
-                    });
-                }
-                canonical_add_dirs.push(p.to_string_lossy().to_string());
-            }
-            Err(_) => {
-                return serde_json::json!({
-                    "ok": false,
-                    "error": format!("--add-dir '{}' does not exist", dir),
-                });
-            }
+        match validate_dir_arg("--add-dir", dir) {
+            Ok(p) => canonical_add_dirs.push(p),
+            Err(e) => return serde_json::json!({ "ok": false, "error": e }),
         }
     }
     args.add_dirs = canonical_add_dirs;
@@ -269,6 +251,7 @@ async fn handle_spawn(
     let session_id = uuid::Uuid::new_v4().to_string();
 
     let spawned_by = ctx.spawned_by.clone();
+    let canonical_cwd = args.cwd.clone();
 
     // Spawn the worker
     let worker = match WorkerHandle::spawn(session_id.clone(), args, ctx).await {
@@ -973,18 +956,8 @@ mod tests {
 
     // ── H5: path validation helpers ──────────────────────────────────────────
 
-    /// Validate a --cwd path: returns Ok(canonical_string) or a user-facing
-    /// error message. Mirrors the logic in handle_spawn so it can be unit tested.
     fn validate_cwd(raw: &str) -> Result<String, String> {
-        match std::fs::canonicalize(raw) {
-            Ok(p) => {
-                if !p.is_dir() {
-                    return Err(format!("--cwd '{}' is not a directory", raw));
-                }
-                Ok(p.to_string_lossy().to_string())
-            }
-            Err(_) => Err(format!("--cwd '{}' does not exist", raw)),
-        }
+        super::validate_dir_arg("--cwd", raw)
     }
 
     #[test]
