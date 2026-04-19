@@ -95,6 +95,17 @@ async fn get_memory_files() -> Result<Vec<session::ProjectMemory>, String> {
     session::get_memory_files()
 }
 
+/// Returns a map of parent_session_id -> subagent invocations detected by
+/// parsing each session's JSONL transcript for Agent/Task tool_use entries.
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn get_subagents() -> Result<
+    std::collections::HashMap<String, Vec<session::SubagentInfo>>,
+    String,
+> {
+    Ok(session::all_subagents_by_session())
+}
+
 /// Save base64-encoded PNG data to a temp file and return the path.
 /// Used by the token distance visualizer to share canvas screenshots.
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -511,6 +522,7 @@ pub fn run() {
             deep_search_sessions,
             get_cost_data,
             get_memory_files,
+            get_subagents,
             save_temp_image,
             reveal_in_file_manager,
             stop_session,
