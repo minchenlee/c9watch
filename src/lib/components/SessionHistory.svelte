@@ -4,6 +4,7 @@
 	import { getSessionHistory, deepSearchSessions, getConversation } from '$lib/api';
 	import type { HistoryEntry, Conversation, DeepSearchHit } from '$lib/types';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
+	import { flyIn } from '$lib/transitions';
 
 	// ── Props ────────────────────────────────────────────────────────
 	let { activeSessionIds = new Set<string>() }: { activeSessionIds?: Set<string> } = $props();
@@ -285,7 +286,12 @@
 					{#if !collapsedProjects.has(group.project)}
 						{#each group.entries as entry, i (entry.sessionId)}
 							{@const snippet = query.trim() ? (deepSearchResults?.get(entry.sessionId) ?? null) : null}
-							<button class="session-row session-row-grid" class:has-snippet={!!snippet} onclick={() => handleSelectEntry(entry)}>
+							<button
+								class="session-row session-row-grid"
+								class:has-snippet={!!snippet}
+								onclick={() => handleSelectEntry(entry)}
+								in:flyIn={{ index: i }}
+							>
 								<span class="row-number">{i + 1}</span>
 								<span class="row-prompt">
 									{#if entry.customTitle}<span class="row-title">{@html highlight(entry.customTitle, query)}</span>{/if}
@@ -301,7 +307,12 @@
 		{:else}
 			{#each filtered as entry, i (entry.sessionId)}
 				{@const snippet = query.trim() ? (deepSearchResults?.get(entry.sessionId) ?? null) : null}
-				<button class="session-row session-row-flat" class:has-snippet={!!snippet} onclick={() => handleSelectEntry(entry)}>
+				<button
+					class="session-row session-row-flat"
+					class:has-snippet={!!snippet}
+					onclick={() => handleSelectEntry(entry)}
+					in:flyIn={{ index: i }}
+				>
 					<span class="row-number">{i + 1}</span>
 					<div class="row-content">
 						<div class="row-top-grid">

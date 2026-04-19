@@ -2,6 +2,7 @@
 	import { slide, fade } from 'svelte/transition';
 	import { flip } from 'svelte/animate';
 	import { quintOut } from 'svelte/easing';
+	import { fadeIn } from '$lib/transitions';
 	import { onMount } from 'svelte';
 	import { browser } from '$app/environment';
 	import {
@@ -371,19 +372,19 @@
 	</div>
 
 	{#if activeTab === 'history'}
-	<main class="grid-container history-main">
+	<main class="grid-container history-main" in:fadeIn>
 		<SessionHistory {activeSessionIds} />
 	</main>
 	{:else if activeTab === 'cost'}
-	<main class="grid-container history-main">
+	<main class="grid-container history-main" in:fadeIn>
 		<CostTracker />
 	</main>
 	{:else if activeTab === 'memory'}
-	<main class="grid-container history-main">
+	<main class="grid-container history-main" in:fadeIn>
 		<MemoryViewer />
 	</main>
 	{:else}
-	<main class="grid-container">
+	<main class="grid-container" in:fadeIn>
 		<div class="sections-container">
 			<section class="system-section">
 				<div class="project-header">

@@ -6,6 +6,7 @@
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
 	import { costData as costDataStore, costMode, refreshCostData } from '$lib/stores/cost';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
+	import { flyIn } from '$lib/transitions';
 
 	type TimeScale = 'daily' | 'weekly' | 'monthly';
 
@@ -582,8 +583,8 @@
 					</div>
 				</div>
 
-				{#each filteredProjectCosts as proj (proj.project)}
-					<div class="project-group">
+				{#each filteredProjectCosts as proj, i (proj.project)}
+					<div class="project-group" in:flyIn={{ index: i }}>
 						<!-- svelte-ignore a11y_click_events_have_key_events -->
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<div

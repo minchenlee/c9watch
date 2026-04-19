@@ -4,6 +4,7 @@
 	import DOMPurify from 'dompurify';
 	import { getMemoryFiles, revealInFileManager } from '$lib/api';
 	import type { ProjectMemory } from '$lib/types';
+	import { flyIn } from '$lib/transitions';
 
 	let projects = $state<ProjectMemory[]>([]);
 	let loading = $state(true);
@@ -75,6 +76,7 @@
 						class="project-item"
 						class:selected={i === selectedIndex}
 						onclick={() => (selectedIndex = i)}
+						in:flyIn={{ index: i }}
 					>
 						<span class="project-item-name">{project.projectName}</span>
 						<span class="project-item-count">{project.files.length}</span>
@@ -100,8 +102,8 @@
 							<span class="cmd-copy">{copied ? '✓ Copied' : 'Copy'}</span>
 						</button>
 					</div>
-					{#each selectedProject.files as file}
-						<div class="file-section">
+					{#each selectedProject.files as file, i}
+						<div class="file-section" in:flyIn={{ index: i }}>
 							<div class="file-header">{file.filename}</div>
 							<div class="markdown-body">
 								{@html renderMarkdown(file.content)}
