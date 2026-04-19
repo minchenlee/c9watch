@@ -225,6 +225,24 @@
 								onmouseleave={tipLeave}
 								onmousemove={tipMove}
 							>{session.customTitle || session.summary || session.firstPrompt || 'New Session'}</h2>
+							{#if session.workerOf}
+								<!-- svelte-ignore a11y_no_static_element_interactions -->
+								<span
+									class="worker-badge"
+									onmouseenter={() => tipEnter(`Worker of ${session.workerOf}`)}
+									onmouseleave={tipLeave}
+									onmousemove={tipMove}
+								>WORKER</span>
+							{/if}
+							{#if isPm}
+								<!-- svelte-ignore a11y_no_static_element_interactions -->
+								<span
+									class="pm-badge"
+									onmouseenter={() => tipEnter(`Managing ${myWorkers.length} worker${myWorkers.length === 1 ? '' : 's'}`)}
+									onmouseleave={tipLeave}
+									onmousemove={tipMove}
+								>PM · {myWorkers.length}</span>
+							{/if}
 							<!-- svelte-ignore a11y_click_events_have_key_events -->
 							<!-- svelte-ignore a11y_no_static_element_interactions -->
 							<span
@@ -246,24 +264,6 @@
 							<span class="status-label" style="color: {getStatusColor()}">{getStatusLabel()}</span>
 							<span class="separator">·</span>
 							<span class="session-name-badge">{session.sessionName}</span>
-							{#if session.workerOf}
-								<!-- svelte-ignore a11y_no_static_element_interactions -->
-								<span
-									class="worker-badge"
-									onmouseenter={() => tipEnter(`Worker of ${session.workerOf}`)}
-									onmouseleave={tipLeave}
-									onmousemove={tipMove}
-								>WORKER</span>
-							{/if}
-							{#if isPm}
-								<!-- svelte-ignore a11y_no_static_element_interactions -->
-								<span
-									class="pm-badge"
-									onmouseenter={() => tipEnter(`Managing ${myWorkers.length} worker${myWorkers.length === 1 ? '' : 's'}`)}
-									onmouseleave={tipLeave}
-									onmousemove={tipMove}
-								>PM · {myWorkers.length}</span>
-							{/if}
 							<span class="separator">·</span>
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
 							{#if costRecord}
