@@ -310,7 +310,13 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
         if is_result_here {
             immediate_completed_at = Some(timestamp.clone());
 
+            let mut is_async_launch = false;
             if let Some(tur) = value.get("toolUseResult") {
+                if tur.get("isAsync").and_then(Value::as_bool) == Some(true)
+                    || tur.get("status").and_then(Value::as_str) == Some("async_launched")
+                {
+                    is_async_launch = true;
+                }
                 if let Some(a) = tur.get("agentId").and_then(Value::as_str) {
                     agent_id = Some(a.to_string());
                 }
@@ -329,6 +335,11 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
                         immediate_result_text = Some(text);
                     }
                 }
+            }
+            // For async launches, the immediate "completed_at" is just the
+            // launch moment — don't treat it as the true completion.
+            if is_async_launch {
+                immediate_completed_at = None;
             }
 
             if immediate_result_text.is_none() {
@@ -369,8 +380,10 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
     }
 
     // ── Pass 2: if we have an agent_id, look for the latest async result.
-    // Async final reports arrive as separate user-role messages (often
-    // `<task-notification>` framing) whose text references the agentId.
+    // Async final reports arrive either as `queue-operation` events whose
+    // `content` is a `<task-notification>` XML-ish block, or (less commonly)
+    // as plain user-role messages containing the same block. Prefer
+    // queue-operation events — they carry `<usage>` stats too.
     let mut async_result: Option<(String, String)> = None; // (timestamp, text)
     if let Some(aid) = agent_id.as_deref() {
         for line in &lines {
@@ -379,16 +392,67 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
             }
             let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
             let entry_type = value.get("type").and_then(Value::as_str).unwrap_or("");
-            // Only consider user-role messages — assistant turns and the
-            // launch tool_result are what we want to skip.
+            let timestamp = value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+
+            // 2a. queue-operation events: content is a string containing
+            //     `<task-notification>…</task-notification>`.
+            if entry_type == "queue-operation" {
+                let Some(content_str) = value.get("content").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !content_str.contains("<task-notification>") {
+                    continue;
+                }
+                let matches_id = extract_tag(content_str, "task-id")
+                    .map(|v| v == aid)
+                    .unwrap_or(false)
+                    || extract_tag(content_str, "tool-use-id")
+                        .map(|v| v == subagent_id)
+                        .unwrap_or(false);
+                if !matches_id {
+                    continue;
+                }
+                let result_body = extract_tag(content_str, "result").unwrap_or_default();
+                if result_body.is_empty() {
+                    continue;
+                }
+                // Populate stats from `<usage>` block.
+                if let Some(usage) = extract_tag(content_str, "usage") {
+                    if let Some(n) = extract_tag(&usage, "total_tokens")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        total_tokens = Some(n);
+                    }
+                    if let Some(n) = extract_tag(&usage, "tool_uses")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        tool_uses = Some(n);
+                    }
+                    if let Some(n) = extract_tag(&usage, "duration_ms")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        duration_ms = Some(n);
+                    }
+                }
+                async_result = match async_result {
+                    Some((prev_ts, prev_text)) if prev_ts > timestamp => {
+                        Some((prev_ts, prev_text))
+                    }
+                    _ => Some((timestamp.clone(), result_body)),
+                };
+                continue;
+            }
+
+            // 2b. user-role messages that embed the notification text.
             if entry_type != "user" {
                 continue;
             }
-            // Skip the launch tool_result itself: it has a tool_result block
-            // with our subagent_id (tool_use_id). Those are the stub.
-            let content = value
-                .get("message")
-                .and_then(|m| m.get("content"));
+            let content = value.get("message").and_then(|m| m.get("content"));
+            // Skip the launch tool_result itself.
             let is_launch_stub = content
                 .and_then(Value::as_array)
                 .map(|blocks| {
@@ -406,20 +470,38 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
             if text.is_empty() || !text.contains(aid) {
                 continue;
             }
-            let timestamp = value
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            async_result = match async_result {
-                Some((prev_ts, prev_text)) => {
-                    if timestamp >= prev_ts {
-                        Some((timestamp, text))
-                    } else {
-                        Some((prev_ts, prev_text))
-                    }
+
+            // If the text contains a task-notification block, extract the
+            // `<result>` body + usage stats. Otherwise fall back to the raw text.
+            let (result_text, usage_from_tag) = if text.contains("<task-notification>") {
+                let body = extract_tag(&text, "result").unwrap_or_else(|| text.clone());
+                let usage = extract_tag(&text, "usage");
+                (body, usage)
+            } else {
+                (text, None)
+            };
+            if let Some(usage) = usage_from_tag {
+                if let Some(n) =
+                    extract_tag(&usage, "total_tokens").and_then(|s| s.parse::<u64>().ok())
+                {
+                    total_tokens = Some(n);
                 }
-                None => Some((timestamp, text)),
+                if let Some(n) =
+                    extract_tag(&usage, "tool_uses").and_then(|s| s.parse::<u64>().ok())
+                {
+                    tool_uses = Some(n);
+                }
+                if let Some(n) =
+                    extract_tag(&usage, "duration_ms").and_then(|s| s.parse::<u64>().ok())
+                {
+                    duration_ms = Some(n);
+                }
+            }
+            async_result = match async_result {
+                Some((prev_ts, prev_text)) if prev_ts > timestamp => {
+                    Some((prev_ts, prev_text))
+                }
+                _ => Some((timestamp.clone(), result_text)),
             };
         }
     }
@@ -503,6 +585,18 @@ fn extract_user_message_text(content: Option<&Value>) -> String {
         return out;
     }
     String::new()
+}
+
+/// Extract the inner body of the first `<tag>…</tag>` found in `haystack`.
+/// Non-greedy: stops at the first matching close tag. Returns `None` if the
+/// tag is not present or unclosed.
+fn extract_tag(haystack: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = haystack.find(&open)? + open.len();
+    let rest = &haystack[start..];
+    let end = rest.find(&close)?;
+    Some(rest[..end].to_string())
 }
 
 fn collect_text_blocks(blocks: &[Value]) -> String {
@@ -744,6 +838,71 @@ mod tests {
             Some("deadbeef".to_string())
         );
         assert_eq!(parse_agent_id_from_stub("no id here"), None);
+    }
+
+    #[test]
+    fn extract_transcript_async_queue_operation_final_report() {
+        // Async launch: stub carries isAsync:true + agentId in toolUseResult.
+        let assistant = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"toolu_01MzKTSB","name":"Task","input":{"subagent_type":"general-purpose","description":"long","prompt":"go"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        let launch_stub = r#"{"type":"user","uuid":"u2","timestamp":"2026-01-01T00:00:01Z","sessionId":"s1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01MzKTSB","content":[{"type":"text","text":"Async agent launched successfully.\nagentId: a106ed7b5288e9506"}]}]},"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"a106ed7b5288e9506","description":"long","prompt":"go","outputFile":"/tmp/x","canReadOutputFile":true}}"#;
+        let unrelated = r#"{"type":"assistant","uuid":"u3","timestamp":"2026-01-01T00:00:30Z","sessionId":"s1","message":{"id":"m2","role":"assistant","model":"claude","content":[{"type":"text","text":"meanwhile"}],"stop_reason":null,"stop_sequence":null}}"#;
+        let queue_op = r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-01-01T00:05:00Z","sessionId":"s1","content":"<task-notification>\n<task-id>a106ed7b5288e9506</task-id>\n<tool-use-id>toolu_01MzKTSB</tool-use-id>\n<output-file>/tmp/x</output-file>\n<status>completed</status>\n<summary>done</summary>\n<result>FINAL REPORT HERE</result>\n<usage><total_tokens>47440</total_tokens><tool_uses>0</tool_uses><duration_ms>28873</duration_ms></usage>\n</task-notification>"}"#;
+        let f = write_jsonl(&[assistant, launch_stub, unrelated, queue_op]);
+        let tr = extract_transcript_from_file(f.path(), "s1", "toolu_01MzKTSB").unwrap();
+        assert_eq!(tr.agent_id.as_deref(), Some("a106ed7b5288e9506"));
+        assert_eq!(tr.result.as_deref(), Some("FINAL REPORT HERE"));
+        assert_eq!(tr.total_tokens, Some(47440));
+        assert_eq!(tr.tool_uses, Some(0));
+        assert_eq!(tr.duration_ms, Some(28873));
+        assert_eq!(tr.status, SubagentStatus::Completed);
+        assert_eq!(tr.completed_at.as_deref(), Some("2026-01-01T00:05:00Z"));
+    }
+
+    #[test]
+    fn extract_transcript_async_stub_only_is_still_running() {
+        // Launch stub present, no completion event yet → Running + no stats.
+        let assistant = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"toolu_01MzKTSB","name":"Task","input":{"subagent_type":"general-purpose","description":"long","prompt":"go"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        let launch_stub = r#"{"type":"user","uuid":"u2","timestamp":"2026-01-01T00:00:01Z","sessionId":"s1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01MzKTSB","content":[{"type":"text","text":"Async agent launched successfully.\nagentId: a106ed7b5288e9506"}]}]},"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"a106ed7b5288e9506"}}"#;
+        let f = write_jsonl(&[assistant, launch_stub]);
+        let tr = extract_transcript_from_file(f.path(), "s1", "toolu_01MzKTSB").unwrap();
+        assert_eq!(tr.agent_id.as_deref(), Some("a106ed7b5288e9506"));
+        assert_eq!(tr.status, SubagentStatus::Running);
+        assert!(tr.completed_at.is_none());
+        assert!(tr.total_tokens.is_none());
+        // Still exposes the launch stub text as a provisional result.
+        let result = tr.result.as_deref().unwrap_or("");
+        assert!(result.contains("Async agent launched"));
+    }
+
+    #[test]
+    fn extract_transcript_async_user_message_with_task_notification() {
+        // Event 3 pattern: completion arrives as a type:"user" message whose
+        // text contains the full <task-notification> block.
+        let assistant = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"toolu_async","name":"Task","input":{"subagent_type":"general-purpose","description":"long","prompt":"go"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        let launch_stub = r#"{"type":"user","uuid":"u2","timestamp":"2026-01-01T00:00:01Z","sessionId":"s1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_async","content":"Async agent launched successfully.\nagentId: abc123def456"}]},"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"abc123def456"}}"#;
+        let user_with_tn = r#"{"type":"user","uuid":"u3","timestamp":"2026-01-01T00:06:00Z","sessionId":"s1","message":{"role":"user","content":[{"type":"text","text":"<task-notification>\n<task-id>abc123def456</task-id>\n<tool-use-id>toolu_async</tool-use-id>\n<status>completed</status>\n<result>USER-ROUTED REPORT</result>\n<usage><total_tokens>100</total_tokens><tool_uses>2</tool_uses><duration_ms>5000</duration_ms></usage>\n</task-notification>"}]}}"#;
+        let f = write_jsonl(&[assistant, launch_stub, user_with_tn]);
+        let tr = extract_transcript_from_file(f.path(), "s1", "toolu_async").unwrap();
+        assert_eq!(tr.agent_id.as_deref(), Some("abc123def456"));
+        assert_eq!(tr.result.as_deref(), Some("USER-ROUTED REPORT"));
+        assert_eq!(tr.total_tokens, Some(100));
+        assert_eq!(tr.tool_uses, Some(2));
+        assert_eq!(tr.duration_ms, Some(5000));
+        assert_eq!(tr.status, SubagentStatus::Completed);
+    }
+
+    #[test]
+    fn extract_tag_helper() {
+        assert_eq!(
+            extract_tag("<a>foo</a>", "a"),
+            Some("foo".to_string())
+        );
+        assert_eq!(
+            extract_tag("x<result>multi\nline\nbody</result>y", "result"),
+            Some("multi\nline\nbody".to_string())
+        );
+        assert_eq!(extract_tag("<a>foo", "a"), None);
+        assert_eq!(extract_tag("nothing here", "a"), None);
     }
 
     #[test]
