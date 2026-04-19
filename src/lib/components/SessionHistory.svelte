@@ -129,6 +129,22 @@
 		return [...map.values()];
 	});
 
+	// Running-offset array so entry animations share a single index namespace
+	// when grouped by project. Each group's starting index is the cumulative
+	// count of everything before it. Group header is at `offset + 0`; inner
+	// rows continue from `offset + 1`. Collapsed groups skip row contributions.
+	let groupOffsets = $derived.by(() => {
+		if (!groups) return [] as number[];
+		const offsets: number[] = [];
+		let acc = 0;
+		for (const g of groups) {
+			offsets.push(acc);
+			const rowCount = collapsedProjects.has(g.project) ? 0 : g.entries.length;
+			acc += 1 + rowCount;
+		}
+		return offsets;
+	});
+
 	// ── Collapse state ───────────────────────────────────────────────
 	$effect(() => {
 		if (!groupByProject) collapsedProjects = new Set();
@@ -269,7 +285,8 @@
 			<div class="state-msg">No sessions found.</div>
 		{:else if groupByProject && groups}
 			{#each groups as group, gi (group.project)}
-				<div class="project-group" in:flyIn={{ index: gi, stride: 30 }}>
+				{@const baseIdx = groupOffsets[gi] ?? 0}
+				<div class="project-group" in:flyIn={{ index: baseIdx, stride: 30 }}>
 					<!-- svelte-ignore a11y_click_events_have_key_events -->
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
@@ -290,7 +307,7 @@
 								class="session-row session-row-grid"
 								class:has-snippet={!!snippet}
 								onclick={() => handleSelectEntry(entry)}
-								in:flyIn={{ index: i }}
+								in:flyIn={{ index: baseIdx + 1 + i, stride: 30 }}
 							>
 								<span class="row-number">{i + 1}</span>
 								<span class="row-prompt">

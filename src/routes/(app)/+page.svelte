@@ -226,6 +226,29 @@
 	let projectGroups = $derived(groupByProjectAndStatus(filteredSessions));
 	let allStatusGroups = $derived(groupSessionsByStatus(filteredSessions));
 
+	// Running-offset arrays so entry animations share a single index namespace
+	// per tab (like CostTracker). Each group's starting index is the cumulative
+	// count of everything that came before it. Inside a group the header takes
+	// `offset + 0` and inner items continue from `offset + 1`.
+	let projectOffsets = $derived.by(() => {
+		const offsets: number[] = [];
+		let acc = 0;
+		for (const g of projectGroups) {
+			offsets.push(acc);
+			acc += 1 + g.attention.length + g.idle.length + g.working.length;
+		}
+		return offsets;
+	});
+	let allGroupOffsets = $derived.by(() => {
+		const offsets: number[] = [];
+		let acc = 0;
+		for (const g of allStatusGroups) {
+			offsets.push(acc);
+			acc += 1 + g.sessions.length;
+		}
+		return offsets;
+	});
+
 	let filteredSummary = $derived({
 		working: filteredSessions.filter(
 			(s) =>
@@ -543,7 +566,8 @@
 
 				{#if viewMode === 'project'}
 					{#each projectGroups as group, gi (group.path)}
-						<section class="project-section" in:flyIn={{ index: gi + 1 }} animate:flip={{ duration: 400 }}>
+						{@const baseIdx = projectOffsets[gi] ?? 0}
+						<section class="project-section" in:flyIn={{ index: baseIdx }} animate:flip={{ duration: 400 }}>
 							<div class="project-header">
 								<span class="project-name">{group.displayName}</span>
 								<span class="project-count">
@@ -562,7 +586,7 @@
 										{#each group.attention as session, i (session.id)}
 											<div
 												class="card-wrapper"
-												in:flyIn={{ index: i }}
+												in:flyIn={{ index: baseIdx + 1 + i }}
 												animate:flip={{ duration: 400 }}
 											>
 												<SessionCard
@@ -589,7 +613,7 @@
 										{#each group.idle as session, i (session.id)}
 											<div
 												class="card-wrapper"
-												in:flyIn={{ index: i }}
+												in:flyIn={{ index: baseIdx + 1 + group.attention.length + i }}
 												animate:flip={{ duration: 400 }}
 											>
 												<SessionCard
@@ -616,7 +640,7 @@
 										{#each group.working as session, i (session.id)}
 											<div
 												class="card-wrapper"
-												in:flyIn={{ index: i }}
+												in:flyIn={{ index: baseIdx + 1 + group.attention.length + group.idle.length + i }}
 												animate:flip={{ duration: 400 }}
 											>
 												<SessionCard
@@ -638,7 +662,8 @@
 					{/each}
 				{:else}
 					{#each allStatusGroups as group, gi (group.id)}
-						<section class="project-section" in:flyIn={{ index: gi + 1 }} animate:flip={{ duration: 400 }}>
+						{@const baseIdx = allGroupOffsets[gi] ?? 0}
+						<section class="project-section" in:flyIn={{ index: baseIdx }} animate:flip={{ duration: 400 }}>
 							<div class="status-header all-view {group.type}">
 								<span class="status-indicator {group.type}" style="width: 8px; height: 8px;"></span>
 								<span class="project-name" style="font-size: 16px;">{group.label}</span>
@@ -649,7 +674,7 @@
 								{#each group.sessions as session, i (session.id)}
 									<div
 										class="card-wrapper"
-										in:flyIn={{ index: i }}
+										in:flyIn={{ index: baseIdx + 1 + i }}
 										animate:flip={{ duration: 400 }}
 									>
 										<SessionCard
