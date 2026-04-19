@@ -31,6 +31,8 @@
 	let tooltipText = $state('');
 	let tooltipX = $state(0);
 	let tooltipY = $state(0);
+	let navCollapsed = $state(false);
+	let workersCollapsed = $state(false);
 
 	function tipEnter(text: string) { tooltipText = text; }
 	function tipLeave() { tooltipText = ''; }
@@ -213,37 +215,6 @@
 	transition:fade={{ duration: 200 }}
 >
 	<div class="overlay-layout">
-		{#if showWorkersPanel}
-			<!-- Desktop: left workers side-panel -->
-			<div class="workers-side-panel workers-desktop" in:scale={{ start: 0.95, duration: 300, easing: quintOut }}>
-				<div class="workers-panel">
-					{#if pmSessionId}
-						<button class="back-to-pm" onclick={() => expandedSessionId.set(pmSessionId)}>← Back to PM</button>
-					{/if}
-					<div class="section-header">
-						<span class="section-title">Workers</span>
-						<div class="section-count">{resolvedWorkers.length}</div>
-					</div>
-					<div class="workers-list">
-						{#each resolvedWorkers as w (w.id)}
-							<button
-								type="button"
-								class="worker-row"
-								class:active={w.id === session.id}
-								onclick={() => openWorker(w.id)}
-							>
-								<span class="worker-name">{w.customTitle || w.summary || w.sessionName}</span>
-								<span class="worker-status" style="color: {workerStatusColor(w.status)}">
-									{workerStatusLabel(w.status)}
-								</span>
-								<span class="worker-time">{formatTimeSince(w.modified)}</span>
-							</button>
-						{/each}
-					</div>
-				</div>
-			</div>
-		{/if}
-
 		<div
 			class="overlay-card"
 			class:permission={isPermission}
@@ -426,9 +397,62 @@
 			</button>
 		</div>
 
-		<!-- Desktop: sidebar nav -->
-		<div class="nav-map-side nav-desktop" in:scale={{ start: 0.95, duration: 300, easing: quintOut }}>
-			<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking {onExpandToIndex} />
+		<!-- Desktop: right column (nav + workers stacked) -->
+		<div class="right-column nav-desktop" in:scale={{ start: 0.95, duration: 300, easing: quintOut }}>
+			<!-- Navigation panel -->
+			<div class="nav-map-side" class:collapsed={navCollapsed}>
+				<button
+					type="button"
+					class="panel-header"
+					onclick={() => navCollapsed = !navCollapsed}
+					aria-expanded={!navCollapsed}
+				>
+					<span class="panel-chevron" class:rotated={navCollapsed}>▾</span>
+					<span class="panel-title">Navigation</span>
+				</button>
+				{#if !navCollapsed}
+					<div class="panel-body">
+						<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking {onExpandToIndex} />
+					</div>
+				{/if}
+			</div>
+
+			<!-- Workers panel (only when relevant) -->
+			{#if showWorkersPanel}
+				<div class="workers-side-panel" class:collapsed={workersCollapsed}>
+					{#if pmSessionId}
+						<button class="back-to-pm" onclick={() => expandedSessionId.set(pmSessionId)}>← Back to PM</button>
+					{/if}
+					<button
+						type="button"
+						class="panel-header"
+						onclick={() => workersCollapsed = !workersCollapsed}
+						aria-expanded={!workersCollapsed}
+					>
+						<span class="panel-chevron" class:rotated={workersCollapsed}>▾</span>
+						<span class="panel-title">Workers</span>
+						<span class="panel-count">{resolvedWorkers.length}</span>
+					</button>
+					{#if !workersCollapsed}
+						<div class="workers-list">
+							{#each resolvedWorkers as w (w.id)}
+								<button
+									type="button"
+									class="worker-row"
+									class:active={w.id === session.id}
+									onclick={() => openWorker(w.id)}
+								>
+									<span class="worker-name">{w.customTitle || w.summary || w.sessionName}</span>
+									<span class="worker-status" style="color: {workerStatusColor(w.status)}">
+										{workerStatusLabel(w.status)}
+									</span>
+									<span class="worker-time">{formatTimeSince(w.modified)}</span>
+								</button>
+							{/each}
+						</div>
+					{/if}
+				</div>
+			{/if}
 		</div>
 
 		<!-- Mobile: bottom sheet nav -->
@@ -463,7 +487,7 @@
 		align-items: flex-start;
 		gap: var(--space-xl);
 		width: 100%;
-		max-width: 1500px;
+		max-width: 1400px;
 		height: 85vh;
 		max-height: 900px;
 		pointer-events: none; /* Allow clicks through empty layout area */
@@ -483,67 +507,111 @@
 		box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
 	}
 
-	.nav-map-side.nav-desktop {
+	/* Right column: nav + workers stacked */
+	.right-column.nav-desktop {
 		flex-shrink: 0;
+		width: 240px;
 		height: 100%;
 		display: flex;
 		flex-direction: column;
-		pointer-events: auto;
-	}
-
-	.workers-side-panel.workers-desktop {
-		flex-shrink: 0;
-		width: 200px;
-		height: fit-content;
-		max-height: 100%;
-		display: flex;
-		flex-direction: column;
 		gap: var(--space-md);
-		padding: var(--space-lg) 0;
-		background: var(--bg-card);
-		border: 1px solid var(--border-default);
 		pointer-events: auto;
 		overflow-y: auto;
 	}
 
-	/* Match workers side-panel header to NavMap's .nav-header style */
-	.workers-side-panel .workers-panel {
-		border-bottom: none;
-		padding: 0;
+	/* Shared panel card style */
+	.nav-map-side,
+	.workers-side-panel {
+		background: var(--bg-card);
+		border: 1px solid var(--border-default);
 		display: flex;
 		flex-direction: column;
-		gap: 0;
+		flex-shrink: 0;
 	}
 
-	.workers-side-panel .section-header {
+	/* Nav panel takes remaining height when not collapsed */
+	.nav-map-side {
+		flex: 1;
+		min-height: 0;
+		overflow: hidden;
+	}
+
+	.nav-map-side.collapsed {
+		flex: none;
+	}
+
+	.nav-map-side .panel-body {
+		flex: 1;
+		min-height: 0;
+		overflow: hidden;
+		display: flex;
+		flex-direction: column;
+	}
+
+	/* Workers panel grows to fit content */
+	.workers-side-panel {
+		flex-shrink: 0;
+	}
+
+	/* Collapsible panel header (shared) */
+	.panel-header {
 		display: flex;
 		align-items: center;
-		justify-content: space-between;
-		padding-bottom: var(--space-sm);
+		gap: var(--space-sm);
+		width: 100%;
+		background: none;
+		border: none;
 		border-bottom: 1px solid var(--border-muted);
-		margin: 0 var(--space-lg);
+		padding: var(--space-sm) var(--space-lg);
+		cursor: pointer;
+		text-align: left;
+		transition: background var(--transition-fast);
 	}
 
-	.workers-side-panel .section-title {
+	.panel-header:hover {
+		background: color-mix(in srgb, var(--text-muted) 6%, transparent);
+	}
+
+	.panel-chevron {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		transition: transform 0.2s ease;
+		display: inline-block;
+		flex-shrink: 0;
+	}
+
+	.panel-chevron.rotated {
+		transform: rotate(-90deg);
+	}
+
+	.panel-title {
 		font-family: var(--font-pixel);
 		font-size: 12px;
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
 		color: var(--text-muted);
+		flex: 1;
 	}
 
-	.workers-side-panel .section-count {
+	.panel-count {
 		font-family: var(--font-mono);
 		font-size: 11px;
 		color: var(--text-muted);
 		opacity: 0.5;
 	}
 
+	/* Collapsed panel: no bottom border on header since there's nothing below */
+	.nav-map-side.collapsed .panel-header,
+	.workers-side-panel.collapsed .panel-header {
+		border-bottom: none;
+	}
+
 	.workers-side-panel .workers-list {
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
-		padding: 0;
+		padding: var(--space-sm) 0;
 	}
 
 	.back-to-pm {
@@ -710,12 +778,6 @@
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
 		white-space: nowrap;
-	}
-
-	.workers-list {
-		display: flex;
-		flex-direction: column;
-		gap: var(--space-xs);
 	}
 
 	.worker-row {
@@ -920,9 +982,8 @@
 			max-height: 100vh;
 		}
 
-		/* Hide the desktop sidebar nav and workers panel on mobile */
-		.nav-map-side.nav-desktop,
-		.workers-side-panel.workers-desktop {
+		/* Hide the desktop right column on mobile */
+		.right-column.nav-desktop {
 			display: none;
 		}
 
