@@ -420,9 +420,6 @@
 			<!-- Workers panel (only when relevant) -->
 			{#if showWorkersPanel}
 				<div class="workers-side-panel" class:collapsed={workersCollapsed}>
-					{#if pmSessionId}
-						<button class="back-to-pm" onclick={() => expandedSessionId.set(pmSessionId)}>← Back to PM</button>
-					{/if}
 					<button
 						type="button"
 						class="panel-header"
@@ -434,6 +431,9 @@
 						<span class="panel-count">{resolvedWorkers.length}</span>
 					</button>
 					{#if !workersCollapsed}
+						{#if pmSessionId}
+							<button class="back-to-pm" onclick={() => expandedSessionId.set(pmSessionId)}>← Back to PM</button>
+						{/if}
 						<div class="workers-list">
 							{#each resolvedWorkers as w (w.id)}
 								<button
