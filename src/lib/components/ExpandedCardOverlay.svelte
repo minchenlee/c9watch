@@ -2,6 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import { fade, scale } from 'svelte/transition';
 	import { quintOut } from 'svelte/easing';
+	import { invoke } from '@tauri-apps/api/core';
 	import type { Session, Conversation } from '$lib/types';
 	import { SessionStatus } from '$lib/types';
 	import MessageBubble from './MessageBubble.svelte';
@@ -11,6 +12,23 @@
 	import { workersByPm, expandedSessionId } from '$lib/stores/sessions';
 	import { visibleSubagentsBySession, type SubagentInfo } from '$lib/stores/subagents';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
+	import { isTauri } from '$lib/ws';
+
+	interface SubagentTranscript {
+		id: string;
+		agentType: string;
+		description: string;
+		parentSessionId: string;
+		startedAt: string;
+		completedAt: string | null;
+		status: 'running' | 'completed';
+		prompt: string;
+		result: string | null;
+		agentId: string | null;
+		totalTokens: number | null;
+		toolUses: number | null;
+		durationMs: number | null;
+	}
 
 	interface Props {
 		session: Session;
@@ -127,6 +145,65 @@
 	let mySubagents = $derived($visibleSubagentsBySession.get(session.id) ?? []);
 	let hasSubagents = $derived(mySubagents.length > 0);
 	let subagentsCollapsed = $state(false);
+
+	// Subagent preview: when set, the conversation area renders a synthesized
+	// transcript (prompt + result) for the clicked subagent instead of the
+	// parent session's messages.
+	let previewedSubagent = $state<SubagentInfo | null>(null);
+	let previewTranscript = $state<SubagentTranscript | null>(null);
+	let previewLoading = $state(false);
+	let previewError = $state<string | null>(null);
+
+	async function openSubagentPreview(sa: SubagentInfo) {
+		previewedSubagent = sa;
+		previewTranscript = null;
+		previewError = null;
+		previewLoading = true;
+		if (!isTauri()) {
+			previewLoading = false;
+			previewError = 'Subagent preview is only available in the desktop app.';
+			return;
+		}
+		try {
+			const tr = await invoke<SubagentTranscript>('get_subagent_transcript', {
+				parentSessionId: session.id,
+				subagentId: sa.id,
+			});
+			previewTranscript = tr;
+		} catch (err) {
+			previewError = String(err);
+		} finally {
+			previewLoading = false;
+		}
+	}
+
+	function closeSubagentPreview() {
+		previewedSubagent = null;
+		previewTranscript = null;
+		previewError = null;
+		previewLoading = false;
+	}
+
+	function formatDurationMs(ms: number | null | undefined): string {
+		if (ms == null) return '';
+		if (ms < 1000) return `${ms}ms`;
+		const s = ms / 1000;
+		if (s < 60) return `${s.toFixed(1)}s`;
+		const m = Math.floor(s / 60);
+		const rs = Math.round(s - m * 60);
+		return `${m}m ${rs}s`;
+	}
+
+	// Closing the preview when switching to a different session (e.g., opening
+	// a worker) avoids stale overlay state.
+	$effect(() => {
+		// Depend on session.id; when it changes, reset preview.
+		void session.id;
+		previewedSubagent = null;
+		previewTranscript = null;
+		previewError = null;
+		previewLoading = false;
+	});
 
 	function subagentStatusColor(status: SubagentInfo['status']): string {
 		return status === 'running' ? 'var(--status-working)' : 'var(--text-muted)';
@@ -371,7 +448,69 @@
 
 			<!-- Conversation Area -->
 			<div class="conversation-area" bind:this={messagesContainer} onscroll={handleScroll}>
-				{#if !conversation}
+				{#if previewedSubagent}
+					<div class="subagent-preview">
+						<button type="button" class="subagent-back" onclick={closeSubagentPreview}>
+							← Back to conversation
+						</button>
+						<div class="subagent-preview-header">
+							<div class="subagent-preview-title">
+								{previewedSubagent.description || previewedSubagent.agentType}
+							</div>
+							<div class="subagent-preview-meta">
+								<span class="subagent-type">{previewedSubagent.agentType}</span>
+								<span class="subagent-sep">·</span>
+								<span class="subagent-status" style="color: {subagentStatusColor(previewedSubagent.status)}">
+									{subagentStatusLabel(previewedSubagent.status)}
+								</span>
+								<span class="subagent-sep">·</span>
+								<span class="subagent-time">{formatTimeSince(previewedSubagent.startedAt)}</span>
+							</div>
+						</div>
+						{#if previewLoading}
+							<div class="loading-state"><p>Loading subagent transcript...</p></div>
+						{:else if previewError}
+							<div class="empty-state"><p>{previewError}</p></div>
+						{:else if previewTranscript}
+							<div class="subagent-messages">
+								<div class="subagent-msg subagent-msg-user">
+									<div class="subagent-msg-role">Prompt</div>
+									<pre class="subagent-msg-body">{previewTranscript.prompt || '(no prompt recorded)'}</pre>
+								</div>
+								{#if previewTranscript.result}
+									<div class="subagent-msg subagent-msg-assistant">
+										<div class="subagent-msg-role">Result</div>
+										<pre class="subagent-msg-body">{previewTranscript.result}</pre>
+									</div>
+								{:else}
+									<div class="subagent-msg subagent-msg-assistant pending">
+										<div class="subagent-msg-role">Result</div>
+										<p class="subagent-msg-pending">Still running — no result yet.</p>
+									</div>
+								{/if}
+								{#if previewTranscript.totalTokens != null || previewTranscript.toolUses != null || previewTranscript.durationMs != null}
+									<div class="subagent-stats">
+										{#if previewTranscript.totalTokens != null}
+											<span>{formatTokens(previewTranscript.totalTokens)} tokens</span>
+										{/if}
+										{#if previewTranscript.toolUses != null}
+											<span class="subagent-sep">·</span>
+											<span>{previewTranscript.toolUses} tool uses</span>
+										{/if}
+										{#if previewTranscript.durationMs != null}
+											<span class="subagent-sep">·</span>
+											<span>{formatDurationMs(previewTranscript.durationMs)}</span>
+										{/if}
+										{#if previewTranscript.agentId}
+											<span class="subagent-sep">·</span>
+											<span class="subagent-agent-id" title="Agent handle">{previewTranscript.agentId}</span>
+										{/if}
+									</div>
+								{/if}
+							</div>
+						{/if}
+					</div>
+				{:else if !conversation}
 					<div class="loading-state">
 
 						<p>Loading conversation...</p>
@@ -494,19 +633,26 @@
 					{#if !subagentsCollapsed}
 						<div class="subagents-list">
 							{#each mySubagents as sa (sa.id)}
-								<div class="subagent-row">
-									<span class="subagent-icon" aria-hidden="true">⚡</span>
-									<span class="subagent-name" title={sa.description}>
+								<button
+									type="button"
+									class="subagent-row"
+									class:active={previewedSubagent?.id === sa.id}
+									onclick={() => openSubagentPreview(sa)}
+									title={sa.description || sa.agentType}
+								>
+									<span class="subagent-row-title">
+										{sa.description || sa.agentType}
+									</span>
+									<span class="subagent-row-meta">
 										<span class="subagent-type">{sa.agentType}</span>
-										{#if sa.description}
-											<span class="subagent-desc">· {sa.description}</span>
-										{/if}
+										<span class="subagent-sep">·</span>
+										<span class="subagent-status" style="color: {subagentStatusColor(sa.status)}">
+											{subagentStatusLabel(sa.status)}
+										</span>
+										<span class="subagent-sep">·</span>
+										<span class="subagent-time">{formatTimeSince(sa.startedAt)}</span>
 									</span>
-									<span class="subagent-status" style="color: {subagentStatusColor(sa.status)}">
-										{subagentStatusLabel(sa.status)}
-									</span>
-									<span class="subagent-time">{formatTimeSince(sa.startedAt)}</span>
-								</div>
+								</button>
 							{/each}
 						</div>
 					{/if}
@@ -890,37 +1036,51 @@
 	}
 
 	.subagent-row {
-		display: grid;
-		grid-template-columns: auto 1fr auto auto;
-		align-items: center;
-		gap: var(--space-md);
-		padding: var(--space-sm) var(--space-lg);
-		font-family: var(--font-mono);
-		font-size: 11px;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		padding: 6px var(--space-md);
+		background: transparent;
+		border: none;
+		border-left: 2px solid transparent;
 		color: var(--text-primary);
-	}
-
-	.subagent-icon {
-		color: var(--text-muted);
+		text-align: left;
+		font-family: var(--font-mono);
 		font-size: 12px;
-		line-height: 1;
+		cursor: pointer;
+		transition: all 0.15s ease;
+		width: 100%;
 	}
 
-	.subagent-name {
+	.subagent-row:hover {
+		background: color-mix(in srgb, var(--text-muted) 6%, transparent);
+		border-left-color: var(--border-muted);
+	}
+
+	.subagent-row.active {
+		border-left-color: var(--accent-purple, #b98cff);
+		background: color-mix(in srgb, var(--accent-purple, #b98cff) 10%, transparent);
+	}
+
+	.subagent-row-title {
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
-		min-width: 0;
+		color: var(--text-primary);
+	}
+
+	.subagent-row-meta {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 10px;
+		color: var(--text-muted);
 	}
 
 	.subagent-type {
-		color: var(--text-primary);
+		color: var(--accent-purple, #b98cff);
 		text-transform: uppercase;
-		letter-spacing: 0.05em;
-	}
-
-	.subagent-desc {
-		color: var(--text-muted);
+		letter-spacing: 0.1em;
 	}
 
 	.subagent-status {
@@ -933,6 +1093,130 @@
 		color: var(--text-muted);
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
+	}
+
+	.subagent-sep {
+		color: var(--text-muted);
+		opacity: 0.5;
+	}
+
+	.subagent-preview {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-lg);
+		padding: var(--space-lg);
+	}
+
+	.subagent-back {
+		align-self: flex-start;
+		background: transparent;
+		border: 1px solid var(--border-default);
+		color: var(--text-muted);
+		font-family: var(--font-mono);
+		font-size: 11px;
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		padding: 6px var(--space-md);
+		cursor: pointer;
+		transition: all 0.15s ease;
+	}
+
+	.subagent-back:hover {
+		color: var(--text-primary);
+		border-color: var(--accent-purple, #b98cff);
+	}
+
+	.subagent-preview-header {
+		border-left: 2px solid var(--accent-purple, #b98cff);
+		padding-left: var(--space-md);
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.subagent-preview-title {
+		font-family: var(--font-pixel);
+		font-size: 18px;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+		color: var(--text-primary);
+	}
+
+	.subagent-preview-meta {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+	}
+
+	.subagent-messages {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-md);
+	}
+
+	.subagent-msg {
+		background: var(--bg-card);
+		border: 1px solid var(--border-default);
+		padding: var(--space-md);
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.subagent-msg-assistant {
+		border-left: 2px solid var(--accent-purple, #b98cff);
+	}
+
+	.subagent-msg-user {
+		border-left: 2px solid var(--text-muted);
+	}
+
+	.subagent-msg-role {
+		font-family: var(--font-mono);
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.15em;
+		color: var(--text-muted);
+	}
+
+	.subagent-msg-body {
+		margin: 0;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		line-height: 1.55;
+		color: var(--text-primary);
+		white-space: pre-wrap;
+		word-break: break-word;
+	}
+
+	.subagent-msg-pending {
+		margin: 0;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-muted);
+		font-style: italic;
+	}
+
+	.subagent-stats {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px;
+		padding: var(--space-sm) var(--space-md);
+		background: var(--bg-elevated);
+		border: 1px solid var(--border-default);
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+
+	.subagent-agent-id {
+		color: var(--accent-purple, #b98cff);
 	}
 
 	.git-info {
