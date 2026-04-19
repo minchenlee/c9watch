@@ -58,7 +58,7 @@
 </script>
 
 <div class="memory-viewer">
-	<div class="section-header" in:flyIn|global={{ index: 0 }}>
+	<div class="section-header" in:flyIn|global={{ index: 0, duration: 350, stride: 25 }}>
 		<span class="section-title">Memory</span>
 		<span class="section-count">{projects.length}</span>
 	</div>
@@ -76,7 +76,7 @@
 						class="project-item"
 						class:selected={i === selectedIndex}
 						onclick={() => (selectedIndex = i)}
-						in:flyIn|global={{ index: i + 1 }}
+						in:flyIn|global={{ index: i + 1, duration: 350, stride: 25 }}
 					>
 						<span class="project-item-name">{project.projectName}</span>
 						<span class="project-item-count">{project.files.length}</span>
@@ -86,30 +86,32 @@
 
 			<div class="memory-content">
 				{#if selectedProject}
-					<div class="content-header" in:flyIn|global={{ index: 0 }}>
-						<div class="content-path-row">
-							<span class="content-path">{selectedProject.projectPath}</span>
-							<button class="reveal-btn" onclick={handleReveal} title="Reveal in Finder">
-								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-									<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-									<polyline points="15 3 21 3 21 9" />
-									<line x1="10" y1="14" x2="21" y2="3" />
-								</svg>
+					{#key selectedProject.projectPath}
+						<div class="content-header" in:flyIn|global={{ index: 0, duration: 800, stride: 120 }}>
+							<div class="content-path-row">
+								<span class="content-path">{selectedProject.projectPath}</span>
+								<button class="reveal-btn" onclick={handleReveal} title="Reveal in Finder">
+									<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+										<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+										<polyline points="15 3 21 3 21 9" />
+										<line x1="10" y1="14" x2="21" y2="3" />
+									</svg>
+								</button>
+							</div>
+							<button class="claude-cmd" onclick={copyClaudeCommand} title="Copy command to discuss memory with Claude Code">
+								<span class="cmd-text">claude "Review my memory files" --project-dir {selectedProject.projectPath}</span>
+								<span class="cmd-copy">{copied ? '✓ Copied' : 'Copy'}</span>
 							</button>
 						</div>
-						<button class="claude-cmd" onclick={copyClaudeCommand} title="Copy command to discuss memory with Claude Code">
-							<span class="cmd-text">claude "Review my memory files" --project-dir {selectedProject.projectPath}</span>
-							<span class="cmd-copy">{copied ? '✓ Copied' : 'Copy'}</span>
-						</button>
-					</div>
-					{#each selectedProject.files as file, i}
-						<div class="file-section" in:flyIn|global={{ index: i + 1 }}>
-							<div class="file-header">{file.filename}</div>
-							<div class="markdown-body">
-								{@html renderMarkdown(file.content)}
+						{#each selectedProject.files as file, i (file.filename)}
+							<div class="file-section" in:flyIn|global={{ index: i + 1, duration: 800, stride: 120 }}>
+								<div class="file-header">{file.filename}</div>
+								<div class="markdown-body">
+									{@html renderMarkdown(file.content)}
+								</div>
 							</div>
-						</div>
-					{/each}
+						{/each}
+					{/key}
 				{/if}
 			</div>
 		</div>

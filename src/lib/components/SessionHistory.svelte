@@ -210,12 +210,12 @@
 <!-- ── Search bar & controls ──────────────────────────────────────── -->
 <div class="history-container">
 	<div class="controls">
-		<div class="section-header" in:flyIn|global={{ index: 0 }}>
+		<div class="section-header" in:flyIn|global={{ index: 0, duration: 350, stride: 25 }}>
 			<span class="section-title">SESSION HISTORY</span>
 			<span class="section-count">{allEntries.length}</span>
 		</div>
 
-		<div class="search-row" in:flyIn|global={{ index: 1 }}>
+		<div class="search-row" in:flyIn|global={{ index: 1, duration: 350, stride: 25 }}>
 			<input
 				class="search-input"
 				type="text"
@@ -224,7 +224,7 @@
 			/>
 		</div>
 
-		<div class="options-row" in:flyIn|global={{ index: 2 }}>
+		<div class="options-row" in:flyIn|global={{ index: 2, duration: 350, stride: 25 }}>
 			<div class="sort-group">
 				<button
 					class="option-btn"
@@ -282,7 +282,7 @@
 		{:else if groupByProject && groups}
 			{#each groups as group, gi (group.project)}
 				{@const baseIdx = (groupOffsets[gi] ?? 0) + 3}
-				<div class="project-group" in:flyIn|global={{ index: baseIdx, stride: 30 }}>
+				<div class="project-group" in:flyIn|global={{ index: baseIdx, duration: 350, stride: 25 }}>
 					<!-- svelte-ignore a11y_click_events_have_key_events -->
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
@@ -303,7 +303,7 @@
 								class="session-row session-row-grid"
 								class:has-snippet={!!snippet}
 								onclick={() => handleSelectEntry(entry)}
-								in:flyIn|global={{ index: baseIdx + 1 + i, stride: 30 }}
+								in:flyIn|global={{ index: baseIdx + 1 + i, duration: 350, stride: 25 }}
 							>
 								<span class="row-number">{i + 1}</span>
 								<span class="row-prompt">
@@ -324,7 +324,7 @@
 					class="session-row session-row-flat"
 					class:has-snippet={!!snippet}
 					onclick={() => handleSelectEntry(entry)}
-					in:flyIn|global={{ index: i + 3 }}
+					in:flyIn|global={{ index: i + 3, duration: 350, stride: 25 }}
 				>
 					<span class="row-number">{i + 1}</span>
 					<div class="row-content">
