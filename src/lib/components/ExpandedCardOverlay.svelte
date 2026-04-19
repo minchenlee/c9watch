@@ -109,6 +109,7 @@
 		$workersByPm.get(session.workerOf ?? session.id) ?? []
 	);
 	let showWorkersPanel = $derived(resolvedWorkers.length > 0);
+	let pmSessionId = $derived(session.workerOf);
 
 	function workerStatusColor(status: SessionStatus): string {
 		switch (status) {
@@ -216,8 +217,11 @@
 			<!-- Desktop: left workers side-panel -->
 			<div class="workers-side-panel workers-desktop" in:scale={{ start: 0.95, duration: 300, easing: quintOut }}>
 				<div class="workers-panel">
+					{#if pmSessionId}
+						<button class="back-to-pm" onclick={() => expandedSessionId.set(pmSessionId)}>← Back to PM</button>
+					{/if}
 					<div class="section-header">
-						<div class="section-title">Workers</div>
+						<span class="section-title">Workers</span>
 						<div class="section-count">{resolvedWorkers.length}</div>
 					</div>
 					<div class="workers-list">
@@ -539,8 +543,26 @@
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
-		margin-top: var(--space-sm);
 		padding: 0;
+	}
+
+	.back-to-pm {
+		display: block;
+		width: 100%;
+		background: none;
+		border: none;
+		border-bottom: 1px solid var(--border-muted);
+		padding: var(--space-sm) var(--space-lg);
+		text-align: left;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		cursor: pointer;
+		transition: color var(--transition-fast);
+	}
+
+	.back-to-pm:hover {
+		color: var(--text-primary, #fff);
 	}
 
 	/* Mobile bottom sheet elements — hidden on desktop */
