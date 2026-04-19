@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { Conversation, Message } from '$lib/types';
+	import { flyIn } from '$lib/transitions';
 
 	interface Props {
 		conversation: Conversation | null;
@@ -84,7 +85,7 @@
 		</div>
 	{/if}
 	<div class="nav-list">
-		{#each items as { msg, index }}
+		{#each items as { msg, index }, i (index)}
 			<!-- svelte-ignore a11y_click_events_have_key_events -->
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div
@@ -93,6 +94,7 @@
 				class:is-thinking={msg.messageType === 'Thinking'}
 				style="--item-color: {getMessageColor(msg)}"
 				onclick={() => scrollToMessage(index)}
+				in:flyIn={{ index: i, y: 4, stride: 12, duration: 150 }}
 			>
 				<span class="nav-index">{index + 1}</span>
 				<span class="nav-icon">{getMessageIcon(msg)}</span>
