@@ -1,18 +1,19 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { browser } from '$app/environment';
-	import { getSessionHistory, deepSearchSessions, getConversation } from '$lib/api';
+	import { deepSearchSessions, getConversation } from '$lib/api';
 	import type { HistoryEntry, Conversation, DeepSearchHit } from '$lib/types';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
 	import { flyIn } from '$lib/transitions';
+	import { historyEntries, historyLoading, historyError, refreshSessionHistory } from '$lib/stores/history';
 
 	// ── Props ────────────────────────────────────────────────────────
 	let { activeSessionIds = new Set<string>() }: { activeSessionIds?: Set<string> } = $props();
 
 	// ── State ────────────────────────────────────────────────────────
-	let allEntries = $state<HistoryEntry[]>([]);
-	let loading = $state(true);
-	let error = $state<string | null>(null);
+	let allEntries = $derived($historyEntries);
+	let loading = $derived($historyLoading);
+	let error = $derived($historyError);
 
 	let query = $state('');
 	let sortOrder = $state<'newest' | 'oldest'>('newest');
@@ -27,21 +28,16 @@
 	let selectedEntry = $state<HistoryEntry | null>(null);
 	let conversation = $state<Conversation | null>(null);
 	// ── Persistence ──────────────────────────────────────────────────
-	onMount(async () => {
+	onMount(() => {
 		if (browser) {
 			const savedSort = localStorage.getItem('historySort');
 			if (savedSort === 'newest' || savedSort === 'oldest') sortOrder = savedSort;
 			const savedGroup = localStorage.getItem('historyGroup');
 			if (savedGroup === 'true') groupByProject = true;
 		}
-
-		try {
-			allEntries = await getSessionHistory();
-		} catch (e) {
-			error = String(e);
-		} finally {
-			loading = false;
-		}
+		// History data is preloaded at app startup (see +page.svelte onMount);
+		// this refresh picks up anything new if the tab was reopened later.
+		refreshSessionHistory();
 	});
 
 	$effect(() => {
@@ -214,12 +210,12 @@
 <!-- ── Search bar & controls ──────────────────────────────────────── -->
 <div class="history-container">
 	<div class="controls">
-		<div class="section-header">
+		<div class="section-header" in:flyIn|global={{ index: 0 }}>
 			<span class="section-title">SESSION HISTORY</span>
 			<span class="section-count">{allEntries.length}</span>
 		</div>
 
-		<div class="search-row">
+		<div class="search-row" in:flyIn|global={{ index: 1 }}>
 			<input
 				class="search-input"
 				type="text"
@@ -228,7 +224,7 @@
 			/>
 		</div>
 
-		<div class="options-row">
+		<div class="options-row" in:flyIn|global={{ index: 2 }}>
 			<div class="sort-group">
 				<button
 					class="option-btn"
@@ -285,7 +281,7 @@
 			<div class="state-msg">No sessions found.</div>
 		{:else if groupByProject && groups}
 			{#each groups as group, gi (group.project)}
-				{@const baseIdx = groupOffsets[gi] ?? 0}
+				{@const baseIdx = (groupOffsets[gi] ?? 0) + 3}
 				<div class="project-group" in:flyIn|global={{ index: baseIdx, stride: 30 }}>
 					<!-- svelte-ignore a11y_click_events_have_key_events -->
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -328,7 +324,7 @@
 					class="session-row session-row-flat"
 					class:has-snippet={!!snippet}
 					onclick={() => handleSelectEntry(entry)}
-					in:flyIn|global={{ index: i }}
+					in:flyIn|global={{ index: i + 3 }}
 				>
 					<span class="row-number">{i + 1}</span>
 					<div class="row-content">

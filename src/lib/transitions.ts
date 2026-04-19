@@ -8,6 +8,11 @@ function prefersReducedMotion(): boolean {
 
 const EXPO_OUT = (t: number) => 1 - Math.pow(2, -10 * t);
 
+// Cap cascade at this index. Past it, elements appear instantly — this keeps
+// long lists (e.g. HISTORY's hundreds of rows) from scheduling hundreds of
+// transitions on mount, which stalls the main thread and lags tab switches.
+const CASCADE_CAP = 20;
+
 // Staggered fly-in for list items. `i` is the index; delay is base + i * stride.
 export function flyIn(
 	node: Element,
@@ -16,11 +21,14 @@ export function flyIn(
 	if (prefersReducedMotion()) {
 		return fade(node, { duration: 0 });
 	}
-	const { index = 0, y = 8, duration = 220, stride = 25, base = 0 } = params;
+	const { index = 0, y = 8, duration = 400, stride = 60, base = 0 } = params;
+	if (index > CASCADE_CAP) {
+		return fade(node, { duration: 0 });
+	}
 	return fly(node, {
 		y,
 		duration,
-		delay: base + Math.min(index, 20) * stride,
+		delay: base + index * stride,
 		easing: EXPO_OUT,
 		opacity: 0,
 	} satisfies FlyParams);
@@ -31,7 +39,7 @@ export function fadeIn(node: Element, params: FadeParams = {}) {
 	if (prefersReducedMotion()) {
 		return fade(node, { duration: 0 });
 	}
-	return fade(node, { duration: 180, easing: cubicOut, ...params });
+	return fade(node, { duration: 320, easing: cubicOut, ...params });
 }
 
 // Staggered fly-in from the right (x-axis). Used for panels that slide in
@@ -43,11 +51,14 @@ export function flyInX(
 	if (prefersReducedMotion()) {
 		return fade(node, { duration: 0 });
 	}
-	const { index = 0, x = 12, duration = 220, stride = 25, base = 0 } = params;
+	const { index = 0, x = 12, duration = 400, stride = 60, base = 0 } = params;
+	if (index > CASCADE_CAP) {
+		return fade(node, { duration: 0 });
+	}
 	return fly(node, {
 		x,
 		duration,
-		delay: base + Math.min(index, 20) * stride,
+		delay: base + index * stride,
 		easing: EXPO_OUT,
 		opacity: 0,
 	} satisfies FlyParams);

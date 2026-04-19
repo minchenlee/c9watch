@@ -506,7 +506,7 @@
 	{:else}
 		<div class="list-area">
 			<!-- ── BY MODEL ───────────────────────────────────────── -->
-			<div class="model-status-bar" in:flyIn={{ index: 0 }}>
+			<div class="model-status-bar" in:flyIn={{ index: 0, duration: 800, stride: 120 }}>
 				<div class="sub-header">BY MODEL</div>
 
 				<div class="progress-track" bind:clientWidth={modelTrackWidth}>
@@ -532,7 +532,7 @@
 			</div>
 
 			<!-- ── TIME-BASED COST ────────────────────────────────── -->
-			<div class="cost-section" in:flyIn={{ index: 1 }}>
+			<div class="cost-section" in:flyIn={{ index: 1, duration: 800, stride: 120 }}>
 				<div class="sub-header">{scaleSectionTitle}</div>
 
 				<div class="vchart-area">
@@ -567,7 +567,7 @@
 			</div>
 
 			<!-- ── BY PROJECT ─────────────────────────────────────── -->
-			<div class="cost-section" in:flyIn={{ index: 2 }}>
+			<div class="cost-section" in:flyIn={{ index: 2, duration: 800, stride: 120 }}>
 				<div class="sub-header-row">
 					<span class="sub-header">BY PROJECT</span>
 					<div class="sort-group">
@@ -584,7 +584,7 @@
 				</div>
 
 				{#each filteredProjectCosts as proj, i (proj.project)}
-					<div class="project-group" in:flyIn={{ index: i }}>
+					<div class="project-group" in:flyIn={{ index: i, duration: 800, stride: 120 }}>
 						<!-- svelte-ignore a11y_click_events_have_key_events -->
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<div

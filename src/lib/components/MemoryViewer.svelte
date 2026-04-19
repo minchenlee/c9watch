@@ -58,7 +58,7 @@
 </script>
 
 <div class="memory-viewer">
-	<div class="section-header">
+	<div class="section-header" in:flyIn|global={{ index: 0 }}>
 		<span class="section-title">Memory</span>
 		<span class="section-count">{projects.length}</span>
 	</div>
@@ -76,7 +76,7 @@
 						class="project-item"
 						class:selected={i === selectedIndex}
 						onclick={() => (selectedIndex = i)}
-						in:flyIn={{ index: i }}
+						in:flyIn|global={{ index: i + 1 }}
 					>
 						<span class="project-item-name">{project.projectName}</span>
 						<span class="project-item-count">{project.files.length}</span>
@@ -86,7 +86,7 @@
 
 			<div class="memory-content">
 				{#if selectedProject}
-					<div class="content-header">
+					<div class="content-header" in:flyIn|global={{ index: 0 }}>
 						<div class="content-path-row">
 							<span class="content-path">{selectedProject.projectPath}</span>
 							<button class="reveal-btn" onclick={handleReveal} title="Reveal in Finder">
@@ -103,7 +103,7 @@
 						</button>
 					</div>
 					{#each selectedProject.files as file, i}
-						<div class="file-section" in:flyIn={{ index: i }}>
+						<div class="file-section" in:flyIn|global={{ index: i + 1 }}>
 							<div class="file-header">{file.filename}</div>
 							<div class="markdown-body">
 								{@html renderMarkdown(file.content)}

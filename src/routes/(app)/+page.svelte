@@ -24,6 +24,7 @@
 	import SessionHistory from '$lib/components/SessionHistory.svelte';
 	import CostTracker from '$lib/components/CostTracker.svelte';
 	import { refreshCostData } from '$lib/stores/cost';
+	import { refreshSessionHistory } from '$lib/stores/history';
 	import MemoryViewer from '$lib/components/MemoryViewer.svelte';
 	import FdaBanner from '$lib/components/FdaBanner.svelte';
 	import DebugConsole from '$lib/components/DebugConsole.svelte';
@@ -73,6 +74,7 @@
 		}
 
 		refreshCostData();
+		refreshSessionHistory();
 
 		if (!isTauri()) return;
 
@@ -812,7 +814,7 @@
 		font-family: var(--font-pixel);
 		font-size: 10px;
 		letter-spacing: 0.08em;
-		transition: color var(--transition-fast);
+		transition: color 80ms ease-out, border-bottom-color 80ms ease-out;
 		-webkit-app-region: no-drag;
 	}
 
