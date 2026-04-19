@@ -230,14 +230,14 @@ async fn handle_spawn(
     // workers lock so we fail fast without touching shared state.
     args.cwd = match validate_dir_arg("--cwd", &args.cwd) {
         Ok(p) => p,
-        Err(e) => return serde_json::json!({ "ok": false, "error": e }),
+        Err(e) => return err_response(&e),
     };
 
     let mut canonical_add_dirs: Vec<String> = Vec::with_capacity(args.add_dirs.len());
     for dir in &args.add_dirs {
         match validate_dir_arg("--add-dir", dir) {
             Ok(p) => canonical_add_dirs.push(p),
-            Err(e) => return serde_json::json!({ "ok": false, "error": e }),
+            Err(e) => return err_response(&e),
         }
     }
     args.add_dirs = canonical_add_dirs;
