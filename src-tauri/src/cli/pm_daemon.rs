@@ -216,23 +216,57 @@ async fn handle_spawn(
     ctx: SpawnContext,
     max_workers: usize,
 ) -> serde_json::Value {
-    // Check worker limit
-    {
-        let st = state.lock().await;
-        if st.workers.len() >= max_workers {
-            return err_response("TOO_MANY_WORKERS");
+    // Validate and canonicalize --cwd before acquiring the workers lock so we
+    // fail fast without touching shared state.
+    let canonical_cwd = match std::fs::canonicalize(&args.cwd) {
+        Ok(p) => {
+            if !p.is_dir() {
+                return serde_json::json!({
+                    "ok": false,
+                    "error": format!("--cwd '{}' is not a directory", args.cwd),
+                });
+            }
+            p.to_string_lossy().to_string()
+        }
+        Err(_) => {
+            return serde_json::json!({
+                "ok": false,
+                "error": format!("--cwd '{}' does not exist", args.cwd),
+            });
+        }
+    };
+    args.cwd = canonical_cwd.clone();
+
+    // Validate and canonicalize each --add-dir entry.
+    let mut canonical_add_dirs: Vec<String> = Vec::with_capacity(args.add_dirs.len());
+    for dir in &args.add_dirs {
+        match std::fs::canonicalize(dir) {
+            Ok(p) => {
+                if !p.is_dir() {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": format!("--add-dir '{}' is not a directory", dir),
+                    });
+                }
+                canonical_add_dirs.push(p.to_string_lossy().to_string());
+            }
+            Err(_) => {
+                return serde_json::json!({
+                    "ok": false,
+                    "error": format!("--add-dir '{}' does not exist", dir),
+                });
+            }
         }
     }
+    args.add_dirs = canonical_add_dirs;
+
+    eprintln!(
+        "[pm_daemon] spawn: cwd={:?} add_dirs={:?}",
+        args.cwd, args.add_dirs
+    );
 
     // Generate session ID
     let session_id = uuid::Uuid::new_v4().to_string();
-
-    // Canonicalize cwd
-    let canonical_cwd = match std::fs::canonicalize(&args.cwd) {
-        Ok(p) => p.to_string_lossy().to_string(),
-        Err(_) => return err_response("CWD_INVALID"),
-    };
-    args.cwd = canonical_cwd.clone();
 
     let spawned_by = ctx.spawned_by.clone();
 
@@ -246,9 +280,16 @@ async fn handle_spawn(
     let worker_name = worker.meta.name.clone();
     let spawned_at = worker.meta.spawned_at.clone();
 
-    // Insert into state
+    // Insert into state while holding the lock across the cap check so two
+    // concurrent spawns cannot both read "count < max" and both proceed (H4).
     {
         let mut st = state.lock().await;
+        if st.workers.len() >= max_workers {
+            // Worker process is already running — kill it before returning.
+            let mut w = worker;
+            let _ = w.kill().await;
+            return err_response("TOO_MANY_WORKERS");
+        }
         st.workers.insert(session_id.clone(), worker);
     }
 
@@ -928,5 +969,70 @@ mod tests {
         let meta = make_meta("w-orphan-unique-id-xyz", Some(999_999_999));
         let status = resolve_status(&meta, Some(1), Some("pm-uuid-stranger-xyz"));
         assert_eq!(status, WorkerStatus::Orphaned);
+    }
+
+    // ── H5: path validation helpers ──────────────────────────────────────────
+
+    /// Validate a --cwd path: returns Ok(canonical_string) or a user-facing
+    /// error message. Mirrors the logic in handle_spawn so it can be unit tested.
+    fn validate_cwd(raw: &str) -> Result<String, String> {
+        match std::fs::canonicalize(raw) {
+            Ok(p) => {
+                if !p.is_dir() {
+                    return Err(format!("--cwd '{}' is not a directory", raw));
+                }
+                Ok(p.to_string_lossy().to_string())
+            }
+            Err(_) => Err(format!("--cwd '{}' does not exist", raw)),
+        }
+    }
+
+    #[test]
+    fn h5_cwd_nonexistent_gives_clean_error() {
+        let err = validate_cwd("/this/path/definitely/does/not/exist/h5test").unwrap_err();
+        assert!(
+            err.contains("does not exist"),
+            "expected 'does not exist', got: {}",
+            err
+        );
+        assert!(err.contains("/this/path/definitely/does/not/exist/h5test"), "path should appear in error: {}", err);
+    }
+
+    #[test]
+    fn h5_cwd_existing_dir_succeeds() {
+        // /tmp is guaranteed to exist and be a directory on macOS/Linux.
+        let result = validate_cwd("/tmp");
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+    }
+
+    #[test]
+    fn h5_cwd_file_is_rejected() {
+        // Create a temp file and confirm it's rejected as "not a directory".
+        let dir = std::env::temp_dir();
+        let file_path = dir.join("h5_cwd_file_test.txt");
+        std::fs::write(&file_path, b"x").expect("write temp file");
+        let raw = file_path.to_string_lossy().to_string();
+        let err = validate_cwd(&raw).unwrap_err();
+        std::fs::remove_file(&file_path).ok();
+        assert!(
+            err.contains("is not a directory"),
+            "expected 'is not a directory', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn h5_cwd_deleted_after_creation_gives_does_not_exist() {
+        // Create a temp dir, delete it, then try to use it as --cwd.
+        let dir = std::env::temp_dir().join("h5_deleted_dir_test");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+        let raw = dir.to_string_lossy().to_string();
+        let err = validate_cwd(&raw).unwrap_err();
+        assert!(
+            err.contains("does not exist"),
+            "expected 'does not exist', got: {}",
+            err
+        );
     }
 }
