@@ -1,20 +1,8 @@
-<script lang="ts">
-	import { onMount, tick } from 'svelte';
-	import { fade, scale } from 'svelte/transition';
-	import { quintOut } from 'svelte/easing';
-	import { invoke } from '@tauri-apps/api/core';
-	import type { Session, Conversation } from '$lib/types';
-	import { SessionStatus } from '$lib/types';
-	import MessageBubble from './MessageBubble.svelte';
-	import MessageNavMap from './MessageNavMap.svelte';
-	import { createSlidingWindow, BATCH_SIZE } from '$lib/slidingWindow.svelte';
-	import { sessionCostMap, costMode } from '$lib/stores/cost';
-	import { workersByPm, expandedSessionId } from '$lib/stores/sessions';
-	import { visibleSubagentsBySession, type SubagentInfo } from '$lib/stores/subagents';
-	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
-	import { isTauri } from '$lib/ws';
+<script module lang="ts">
+	import { SvelteMap } from 'svelte/reactivity';
+	import type { SubagentInfo } from '$lib/stores/subagents';
 
-	interface SubagentTranscript {
+	export interface SubagentTranscript {
 		id: string;
 		agentType: string;
 		description: string;
@@ -29,6 +17,30 @@
 		toolUses: number | null;
 		durationMs: number | null;
 	}
+
+	// Per-parent-session preview state. Module-scoped so re-renders triggered
+	// by store updates (new JSONL events) don't reset what the user had open.
+	const previewSelectionBySession = new SvelteMap<string, SubagentInfo>();
+	const previewTranscriptBySession = new SvelteMap<string, SubagentTranscript>();
+	const previewLoadingBySession = new SvelteMap<string, boolean>();
+	const previewErrorBySession = new SvelteMap<string, string>();
+</script>
+
+<script lang="ts">
+	import { onMount, tick } from 'svelte';
+	import { fade, scale } from 'svelte/transition';
+	import { quintOut } from 'svelte/easing';
+	import { invoke } from '@tauri-apps/api/core';
+	import type { Session, Conversation } from '$lib/types';
+	import { SessionStatus } from '$lib/types';
+	import MessageBubble from './MessageBubble.svelte';
+	import MessageNavMap from './MessageNavMap.svelte';
+	import { createSlidingWindow, BATCH_SIZE } from '$lib/slidingWindow.svelte';
+	import { sessionCostMap, costMode } from '$lib/stores/cost';
+	import { workersByPm, expandedSessionId } from '$lib/stores/sessions';
+	import { visibleSubagentsBySession } from '$lib/stores/subagents';
+	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
+	import { isTauri } from '$lib/ws';
 
 	interface Props {
 		session: Session;
@@ -149,39 +161,54 @@
 	// Subagent preview: when set, the conversation area renders a synthesized
 	// transcript (prompt + result) for the clicked subagent instead of the
 	// parent session's messages.
-	let previewedSubagent = $state<SubagentInfo | null>(null);
-	let previewTranscript = $state<SubagentTranscript | null>(null);
-	let previewLoading = $state(false);
-	let previewError = $state<string | null>(null);
+	//
+	// State is keyed by parent session id in a module-level Svelte rune map so
+	// that re-renders triggered by store updates (new JSONL events arriving)
+	// do NOT reset the preview. Switching sessions naturally shows a fresh
+	// (empty) preview because the key changes.
+	let previewedSubagent = $derived(previewSelectionBySession.get(session.id) ?? null);
+	let previewTranscript = $derived(previewTranscriptBySession.get(session.id) ?? null);
+	let previewLoading = $derived(previewLoadingBySession.get(session.id) ?? false);
+	let previewError = $derived(previewErrorBySession.get(session.id) ?? null);
 
 	async function openSubagentPreview(sa: SubagentInfo) {
-		previewedSubagent = sa;
-		previewTranscript = null;
-		previewError = null;
-		previewLoading = true;
+		const sid = session.id;
+		previewSelectionBySession.set(sid, sa);
+		previewTranscriptBySession.delete(sid);
+		previewErrorBySession.delete(sid);
+		previewLoadingBySession.set(sid, true);
 		if (!isTauri()) {
-			previewLoading = false;
-			previewError = 'Subagent preview is only available in the desktop app.';
+			previewLoadingBySession.set(sid, false);
+			previewErrorBySession.set(sid, 'Subagent preview is only available in the desktop app.');
 			return;
 		}
 		try {
 			const tr = await invoke<SubagentTranscript>('get_subagent_transcript', {
-				parentSessionId: session.id,
+				parentSessionId: sid,
 				subagentId: sa.id,
 			});
-			previewTranscript = tr;
+			// Guard: user may have switched to a different selection before
+			// this resolved. Only commit if the selection is still this one.
+			if (previewSelectionBySession.get(sid)?.id === sa.id) {
+				previewTranscriptBySession.set(sid, tr);
+			}
 		} catch (err) {
-			previewError = String(err);
+			if (previewSelectionBySession.get(sid)?.id === sa.id) {
+				previewErrorBySession.set(sid, String(err));
+			}
 		} finally {
-			previewLoading = false;
+			if (previewSelectionBySession.get(sid)?.id === sa.id) {
+				previewLoadingBySession.set(sid, false);
+			}
 		}
 	}
 
 	function closeSubagentPreview() {
-		previewedSubagent = null;
-		previewTranscript = null;
-		previewError = null;
-		previewLoading = false;
+		const sid = session.id;
+		previewSelectionBySession.delete(sid);
+		previewTranscriptBySession.delete(sid);
+		previewErrorBySession.delete(sid);
+		previewLoadingBySession.delete(sid);
 	}
 
 	function formatDurationMs(ms: number | null | undefined): string {
@@ -193,17 +220,6 @@
 		const rs = Math.round(s - m * 60);
 		return `${m}m ${rs}s`;
 	}
-
-	// Closing the preview when switching to a different session (e.g., opening
-	// a worker) avoids stale overlay state.
-	$effect(() => {
-		// Depend on session.id; when it changes, reset preview.
-		void session.id;
-		previewedSubagent = null;
-		previewTranscript = null;
-		previewError = null;
-		previewLoading = false;
-	});
 
 	function subagentStatusColor(status: SubagentInfo['status']): string {
 		return status === 'running' ? 'var(--status-working)' : 'var(--text-muted)';
