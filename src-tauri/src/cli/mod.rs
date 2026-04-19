@@ -217,9 +217,12 @@ pub enum Commands {
         /// Sort direction: asc or desc
         #[arg(long, value_enum, default_value_t = CostSortDir::Desc, help = "Sort direction (asc = oldest/cheapest first, desc = newest/most expensive first)")]
         sort_dir: CostSortDir,
-        /// Show cost breakdown for a single session (full UUID or 4+ char prefix). Incompatible with --daily/--weekly/--project.
-        #[arg(long)]
+        /// Show cost breakdown for a single session by full id or an 8+ char prefix. Use --session-prefix for shorter prefixes. Incompatible with --daily/--weekly/--project.
+        #[arg(long, conflicts_with_all = ["daily", "weekly", "project", "session_prefix"])]
         session: Option<String>,
+        /// Show cost breakdown for a single session by id prefix (any length, must be unique). Incompatible with --daily/--weekly/--project.
+        #[arg(long, conflicts_with_all = ["daily", "weekly", "project", "session"])]
+        session_prefix: Option<String>,
     },
 
     /// [hidden] Run the PM daemon
@@ -292,8 +295,8 @@ pub fn run(cli: Cli) {
             pm::cmd_inbox(consume, clear, worker, cli.pretty)
         }
         Commands::Adopt { session_id, force } => pm::cmd_adopt(session_id, force, cli.pretty),
-        Commands::Cost { daily, weekly, project, since, sort, sort_dir, session } => {
-            cmd_cost(daily, weekly, project.as_deref(), since.as_deref(), sort, sort_dir, session.as_deref(), cli.pretty)
+        Commands::Cost { daily, weekly, project, since, sort, sort_dir, session, session_prefix } => {
+            cmd_cost(daily, weekly, project.as_deref(), since.as_deref(), sort, sort_dir, session.as_deref(), session_prefix.as_deref(), cli.pretty)
         }
         Commands::Daemon => {
             match tokio::runtime::Runtime::new() {
@@ -707,60 +710,96 @@ fn cmd_tasks(session_id: &str, pretty: bool) -> Result<(), String> {
     print_json(&output, pretty)
 }
 
-/// Resolve a session-id prefix against all sessions in cost data.
-/// Returns the full session_id, or an error if 0 or >1 matches.
+/// Minimum length for `--session` values when treated as a prefix. Use
+/// `--session-prefix` for anything shorter.
+const SESSION_MIN_LEN: usize = 8;
+
+/// How a session lookup value was provided — controls min-length enforcement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SessionLookupKind {
+    /// `--session`: full id or ≥8-char prefix. Exact matches win outright.
+    Session,
+    /// `--session-prefix`: any length; must match exactly one id.
+    Prefix,
+}
+
+/// Resolve a session identifier (full id or prefix) against all known sessions.
+///
+/// Returns the full `session_id`, or an error if the input is empty, too short
+/// for the chosen kind, or matches zero/multiple sessions.
 fn resolve_cost_session_id(
     sessions: &[session::cost::SessionCostRecord],
-    prefix: &str,
+    needle: &str,
+    kind: SessionLookupKind,
 ) -> Result<String, String> {
-    if prefix.len() < 4 {
+    if needle.is_empty() {
+        return Err("Session id must not be empty".to_string());
+    }
+    if kind == SessionLookupKind::Session && needle.len() < SESSION_MIN_LEN {
         return Err(format!(
-            "Session prefix '{}' is too short — must be at least 4 characters",
-            prefix
+            "--session value '{}' is too short — must be at least {} characters, or use --session-prefix for shorter prefixes",
+            needle, SESSION_MIN_LEN
         ));
     }
-    let mut seen = std::collections::HashSet::new();
+
+    let mut matches = std::collections::BTreeSet::new();
     for s in sessions {
-        if s.session_id.starts_with(prefix) {
-            seen.insert(s.session_id.clone());
+        if s.session_id.starts_with(needle) {
+            matches.insert(s.session_id.clone());
         }
     }
-    match seen.len() {
-        0 => Err(format!("No session matching prefix '{}'", prefix)),
-        1 => Ok(seen.into_iter().next().unwrap()),
+
+    // For `--session`, a full-id exact match wins even if other sessions share
+    // the same prefix (vanishingly rare, but deterministic).
+    if kind == SessionLookupKind::Session && matches.contains(needle) {
+        return Ok(needle.to_string());
+    }
+
+    match matches.len() {
+        0 => Err(format!("No session matching '{}'", needle)),
+        1 => Ok(matches.into_iter().next().unwrap()),
         n => {
-            let mut ids: Vec<String> = seen.into_iter().collect();
-            ids.sort();
+            let ids: Vec<String> = matches.into_iter().collect();
             let shown = ids.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
             let suffix = if n > 5 { format!(" (and {} more)", n - 5) } else { String::new() };
             Err(format!(
-                "Ambiguous prefix '{}' matches {} sessions: {}{}",
-                prefix, n, shown, suffix
+                "Ambiguous '{}' matches {} sessions: {}{}",
+                needle, n, shown, suffix
             ))
         }
     }
 }
 
-/// Per-session cost breakdown for `c9watch cost --session <prefix>`.
-fn cmd_cost_session(prefix: &str, since: Option<&str>, pretty: bool) -> Result<(), String> {
-    let since_date = match since {
-        Some(s) => Some(
-            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                .map_err(|e| format!("Invalid --since date '{}': {}", s, e))?,
-        ),
-        None => None,
-    };
+/// Rows returned by filtering cost data down to a single session.
+#[derive(Debug)]
+struct SessionCostBreakdown {
+    session_id: String,
+    session_name: String,
+    project: String,
+    project_name: String,
+    total_cost: f64,
+    total_tokens: u64,
+    models: Vec<String>,
+    earliest: String,
+    latest: String,
+    daily: Vec<DailyRow>,
+}
 
-    let data = session::get_cost_data()?;
-    let all_sessions: Vec<session::cost::SessionCostRecord> = data
-        .project_costs
-        .iter()
-        .flat_map(|p| p.sessions.iter().cloned())
-        .collect();
+#[derive(Debug)]
+struct DailyRow {
+    date: String,
+    cost: f64,
+    total_tokens: u64,
+    model: String,
+}
 
-    let session_id = resolve_cost_session_id(&all_sessions, prefix)?;
-
-    // Collect all per-(session, date) records for this session, applying --since filter
+/// Build a per-session breakdown from raw session records. Factored out so
+/// tests can exercise filtering + aggregation without touching disk.
+fn build_session_breakdown(
+    all_sessions: &[session::cost::SessionCostRecord],
+    session_id: &str,
+    since_date: Option<chrono::NaiveDate>,
+) -> Result<SessionCostBreakdown, String> {
     let mut records: Vec<&session::cost::SessionCostRecord> = all_sessions
         .iter()
         .filter(|s| s.session_id == session_id)
@@ -779,54 +818,114 @@ fn cmd_cost_session(prefix: &str, since: Option<&str>, pretty: bool) -> Result<(
         ));
     }
 
-    records.sort_by(|a, b| a.date.cmp(&b.date));
+    records.sort_by(|a, b| a.date.cmp(&b.date).then(a.timestamp.cmp(&b.timestamp)));
 
     let total_cost: f64 = records.iter().map(|s| s.cost).sum();
     let total_tokens: u64 = records.iter().map(|s| s.total_tokens).sum();
 
-    // Unique models in order of first appearance
     let mut seen_models = std::collections::HashSet::new();
     let mut models: Vec<String> = Vec::new();
     for s in &records {
-        if seen_models.insert(s.model.clone()) {
+        if !s.model.is_empty() && seen_models.insert(s.model.clone()) {
             models.push(s.model.clone());
         }
     }
 
-    let first = records.first().unwrap();
-    let last = records.last().unwrap();
-    let date_range = if first.date == last.date {
-        first.date.clone()
-    } else {
-        format!("{} – {}", first.date, last.date)
-    };
-
-    let daily_breakdown: Vec<serde_json::Value> = records
+    let earliest = records
         .iter()
-        .map(|s| {
-            serde_json::json!({
-                "date": s.date,
-                "cost": s.cost,
-                "totalTokens": s.total_tokens,
-                "model": s.model,
-            })
+        .map(|s| &s.timestamp)
+        .min()
+        .cloned()
+        .unwrap_or_default();
+    let latest = records
+        .iter()
+        .map(|s| &s.timestamp)
+        .max()
+        .cloned()
+        .unwrap_or_default();
+
+    let daily = records
+        .iter()
+        .map(|s| DailyRow {
+            date: s.date.clone(),
+            cost: s.cost,
+            total_tokens: s.total_tokens,
+            model: s.model.clone(),
         })
         .collect();
 
-    let output = serde_json::json!({
-        "sessionId": session_id,
-        "sessionName": first.session_name,
-        "project": first.project,
-        "projectName": first.project_name,
-        "totalCost": total_cost,
-        "totalTokens": total_tokens,
-        "models": models,
-        "dateRange": date_range,
-        "dailyBreakdown": daily_breakdown,
-    });
-    print_json(&output, pretty)
+    let first = records.first().unwrap();
+    Ok(SessionCostBreakdown {
+        session_id: session_id.to_string(),
+        session_name: first.session_name.clone(),
+        project: first.project.clone(),
+        project_name: first.project_name.clone(),
+        total_cost,
+        total_tokens,
+        models,
+        earliest,
+        latest,
+        daily,
+    })
 }
 
+fn breakdown_to_json(b: &SessionCostBreakdown) -> serde_json::Value {
+    let by_day: Vec<serde_json::Value> = b
+        .daily
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "date": d.date,
+                "cost": d.cost,
+                "totalTokens": d.total_tokens,
+                "model": d.model,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "sessionId": b.session_id,
+        "sessionName": b.session_name,
+        "project": b.project,
+        "projectName": b.project_name,
+        "totalCost": b.total_cost,
+        "totalTokens": b.total_tokens,
+        "turns": b.daily.len(),
+        "models": b.models,
+        "earliest": b.earliest,
+        "latest": b.latest,
+        "byDay": by_day,
+    })
+}
+
+/// Per-session cost breakdown for `c9watch cost --session <id>` / `--session-prefix <prefix>`.
+fn cmd_cost_session(
+    needle: &str,
+    kind: SessionLookupKind,
+    since: Option<&str>,
+    pretty: bool,
+) -> Result<(), String> {
+    let since_date = match since {
+        Some(s) => Some(
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|e| format!("Invalid --since date '{}': {}", s, e))?,
+        ),
+        None => None,
+    };
+
+    let data = session::get_cost_data()?;
+    let all_sessions: Vec<session::cost::SessionCostRecord> = data
+        .project_costs
+        .iter()
+        .flat_map(|p| p.sessions.iter().cloned())
+        .collect();
+
+    let session_id = resolve_cost_session_id(&all_sessions, needle, kind)?;
+    let breakdown = build_session_breakdown(&all_sessions, &session_id, since_date)?;
+
+    print_json(&breakdown_to_json(&breakdown), pretty)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_cost(
     daily: bool,
     weekly: bool,
@@ -834,17 +933,29 @@ fn cmd_cost(
     since: Option<&str>,
     sort: CostSortField,
     sort_dir: CostSortDir,
+    session: Option<&str>,
     session_prefix: Option<&str>,
     pretty: bool,
 ) -> Result<(), String> {
-    // Mutex: --session is incompatible with aggregation flags
+    // clap `conflicts_with_all` already blocks mixing these flags, but keep a
+    // belt-and-braces check in case the function is called programmatically.
+    if let Some(needle) = session {
+        if daily || weekly || project_filter.is_some() || session_prefix.is_some() {
+            return Err(
+                "--session cannot be combined with --daily, --weekly, --project, or --session-prefix"
+                    .to_string(),
+            );
+        }
+        return cmd_cost_session(needle, SessionLookupKind::Session, since, pretty);
+    }
     if let Some(prefix) = session_prefix {
         if daily || weekly || project_filter.is_some() {
             return Err(
-                "--session cannot be combined with --daily, --weekly, or --project".to_string(),
+                "--session-prefix cannot be combined with --daily, --weekly, or --project"
+                    .to_string(),
             );
         }
-        return cmd_cost_session(prefix, since, pretty);
+        return cmd_cost_session(prefix, SessionLookupKind::Prefix, since, pretty);
     }
 
     if daily && weekly {
@@ -1352,5 +1463,246 @@ fn resolve_session_id_lightweight(prefix: &str) -> Result<String, String> {
             "Ambiguous session ID prefix '{}' matches {} sessions",
             prefix, n
         )),
+    }
+}
+
+#[cfg(test)]
+mod cost_session_tests {
+    use super::*;
+    use crate::session::cost::SessionCostRecord;
+
+    fn rec(session_id: &str, date: &str, cost: f64, tokens: u64, model: &str) -> SessionCostRecord {
+        SessionCostRecord {
+            session_id: session_id.to_string(),
+            project: "/tmp/proj".to_string(),
+            project_name: "proj".to_string(),
+            model: model.to_string(),
+            cost,
+            total_tokens: tokens,
+            timestamp: format!("{}T00:00:00Z", date),
+            date: date.to_string(),
+            session_name: "sample session".to_string(),
+        }
+    }
+
+    fn fixtures() -> Vec<SessionCostRecord> {
+        vec![
+            rec("aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee", "2026-04-10", 1.25, 1000, "sonnet"),
+            rec("aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee", "2026-04-11", 0.75, 500, "sonnet"),
+            rec("aaaa2222-bbbb-cccc-dddd-ffffffffffff", "2026-04-10", 0.50, 200, "haiku"),
+            rec("bbbb3333-cccc-dddd-eeee-000000000000", "2026-04-11", 2.00, 5000, "opus"),
+        ]
+    }
+
+    #[test]
+    fn session_exact_full_id_match() {
+        let sessions = fixtures();
+        let full = "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let got = resolve_cost_session_id(&sessions, full, SessionLookupKind::Session).unwrap();
+        assert_eq!(got, full);
+    }
+
+    #[test]
+    fn session_prefix_unambiguous() {
+        let sessions = fixtures();
+        let got = resolve_cost_session_id(&sessions, "bbbb3333", SessionLookupKind::Session).unwrap();
+        assert_eq!(got, "bbbb3333-cccc-dddd-eeee-000000000000");
+    }
+
+    #[test]
+    fn session_prefix_too_short_for_session_flag() {
+        let sessions = fixtures();
+        let err = resolve_cost_session_id(&sessions, "aaaa", SessionLookupKind::Session)
+            .unwrap_err();
+        assert!(err.contains("too short"), "got: {}", err);
+        assert!(err.contains("--session-prefix"), "got: {}", err);
+    }
+
+    #[test]
+    fn session_prefix_kind_allows_short_unique() {
+        let sessions = fixtures();
+        let got = resolve_cost_session_id(&sessions, "bbbb", SessionLookupKind::Prefix).unwrap();
+        assert_eq!(got, "bbbb3333-cccc-dddd-eeee-000000000000");
+    }
+
+    #[test]
+    fn session_prefix_ambiguous_lists_candidates() {
+        let sessions = fixtures();
+        let err = resolve_cost_session_id(&sessions, "aaaa", SessionLookupKind::Prefix)
+            .unwrap_err();
+        assert!(err.contains("Ambiguous"), "got: {}", err);
+        assert!(err.contains("aaaa1111-"), "got: {}", err);
+        assert!(err.contains("aaaa2222-"), "got: {}", err);
+    }
+
+    #[test]
+    fn session_prefix_no_match_errors() {
+        let sessions = fixtures();
+        let err = resolve_cost_session_id(&sessions, "zzzzzzzz", SessionLookupKind::Prefix)
+            .unwrap_err();
+        assert!(err.contains("No session matching"), "got: {}", err);
+    }
+
+    #[test]
+    fn session_empty_errors() {
+        let sessions = fixtures();
+        let err = resolve_cost_session_id(&sessions, "", SessionLookupKind::Prefix).unwrap_err();
+        assert!(err.contains("must not be empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn build_breakdown_sums_across_days() {
+        let sessions = fixtures();
+        let b = build_session_breakdown(
+            &sessions,
+            "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
+            None,
+        )
+        .unwrap();
+        assert!((b.total_cost - 2.00).abs() < 1e-9);
+        assert_eq!(b.total_tokens, 1500);
+        assert_eq!(b.daily.len(), 2);
+        assert_eq!(b.daily[0].date, "2026-04-10");
+        assert_eq!(b.daily[1].date, "2026-04-11");
+        assert_eq!(b.models, vec!["sonnet".to_string()]);
+        assert_eq!(b.earliest, "2026-04-10T00:00:00Z");
+        assert_eq!(b.latest, "2026-04-11T00:00:00Z");
+    }
+
+    #[test]
+    fn build_breakdown_since_filter_drops_earlier_days() {
+        let sessions = fixtures();
+        let since = chrono::NaiveDate::parse_from_str("2026-04-11", "%Y-%m-%d").unwrap();
+        let b = build_session_breakdown(
+            &sessions,
+            "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
+            Some(since),
+        )
+        .unwrap();
+        assert_eq!(b.daily.len(), 1);
+        assert_eq!(b.daily[0].date, "2026-04-11");
+        assert!((b.total_cost - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn build_breakdown_empty_for_missing_session() {
+        let sessions = fixtures();
+        let err = build_session_breakdown(&sessions, "nonexistent", None).unwrap_err();
+        assert!(err.contains("No cost data"), "got: {}", err);
+    }
+
+    #[test]
+    fn json_output_shape_has_expected_fields() {
+        let sessions = fixtures();
+        let b = build_session_breakdown(
+            &sessions,
+            "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
+            None,
+        )
+        .unwrap();
+        let v = breakdown_to_json(&b);
+        for key in [
+            "sessionId",
+            "sessionName",
+            "project",
+            "projectName",
+            "totalCost",
+            "totalTokens",
+            "turns",
+            "models",
+            "earliest",
+            "latest",
+            "byDay",
+        ] {
+            assert!(v.get(key).is_some(), "missing key {} in {}", key, v);
+        }
+        assert_eq!(
+            v["sessionId"],
+            "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee"
+        );
+        assert_eq!(v["turns"], 2);
+        let by_day = v["byDay"].as_array().unwrap();
+        assert_eq!(by_day.len(), 2);
+        for row in by_day {
+            for key in ["date", "cost", "totalTokens", "model"] {
+                assert!(row.get(key).is_some(), "missing {} in {}", key, row);
+            }
+        }
+    }
+
+    #[test]
+    fn json_compact_is_single_line() {
+        let sessions = fixtures();
+        let b = build_session_breakdown(
+            &sessions,
+            "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
+            None,
+        )
+        .unwrap();
+        let v = breakdown_to_json(&b);
+        let compact = serde_json::to_string(&v).unwrap();
+        assert!(!compact.contains('\n'), "compact output must be single-line: {}", compact);
+        let parsed: serde_json::Value = serde_json::from_str(&compact).unwrap();
+        assert_eq!(parsed["sessionId"], "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee");
+    }
+
+    #[test]
+    fn json_pretty_is_indented_and_valid() {
+        let sessions = fixtures();
+        let b = build_session_breakdown(
+            &sessions,
+            "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
+            None,
+        )
+        .unwrap();
+        let v = breakdown_to_json(&b);
+        let pretty = serde_json::to_string_pretty(&v).unwrap();
+        assert!(pretty.contains('\n'), "pretty output must be multi-line");
+        assert!(pretty.contains("  "), "pretty output must be indented");
+        let parsed: serde_json::Value = serde_json::from_str(&pretty).unwrap();
+        assert_eq!(parsed["sessionId"], "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee");
+        assert_eq!(parsed["byDay"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn clap_rejects_session_with_daily() {
+        use clap::Parser;
+        let res = Cli::try_parse_from([
+            "c9watch",
+            "cost",
+            "--session",
+            "aaaa1111-bbbb",
+            "--daily",
+        ]);
+        assert!(res.is_err(), "expected clap to reject --session + --daily");
+    }
+
+    #[test]
+    fn clap_rejects_session_with_session_prefix() {
+        use clap::Parser;
+        let res = Cli::try_parse_from([
+            "c9watch",
+            "cost",
+            "--session",
+            "aaaa1111-bbbb",
+            "--session-prefix",
+            "aa",
+        ]);
+        assert!(
+            res.is_err(),
+            "expected clap to reject --session + --session-prefix"
+        );
+    }
+
+    #[test]
+    fn clap_accepts_session_alone() {
+        use clap::Parser;
+        let res = Cli::try_parse_from([
+            "c9watch",
+            "cost",
+            "--session",
+            "aaaa1111-bbbb",
+        ]);
+        assert!(res.is_ok(), "parse failed: {:?}", res.err());
     }
 }
