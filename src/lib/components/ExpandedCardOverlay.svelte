@@ -40,6 +40,7 @@
 	import { SessionStatus } from '$lib/types';
 	import MessageBubble from './MessageBubble.svelte';
 	import MessageNavMap from './MessageNavMap.svelte';
+	import TodoPanel from './TodoPanel.svelte';
 	import { createSlidingWindow, BATCH_SIZE } from '$lib/slidingWindow.svelte';
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
 	import { workersByPm, expandedSessionId } from '$lib/stores/sessions';
@@ -70,6 +71,7 @@
 	let tooltipX = $state(0);
 	let tooltipY = $state(0);
 	let navCollapsed = $state(false);
+	let tasksCollapsed = $state(false);
 	let workersCollapsed = $state(false);
 	// Only stagger the first batch of messages when the overlay mounts;
 	// subsequent streaming/polling of new messages should NOT animate.
@@ -556,6 +558,13 @@
 					</div>
 				{/if}
 			</div>
+
+			<!-- TODOs panel (only when the session has tasks) -->
+			<TodoPanel
+				{session}
+				collapsed={tasksCollapsed}
+				onToggle={() => (tasksCollapsed = !tasksCollapsed)}
+			/>
 
 			<!-- Workers panel (only when relevant) -->
 			{#if showWorkersPanel}
