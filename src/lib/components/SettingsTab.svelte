@@ -76,14 +76,14 @@
 
 	<div class="content">
 		<div class="group" in:flyIn|global={{ index: 1, duration: 350, stride: 25 }}>
-			<div class="group-title">Version</div>
+			<div class="group-title group-title--lg">Version</div>
 			<div class="group-body">
 				<span class="mono">c9watch {version || '—'}</span>
 			</div>
 		</div>
 
 		<div class="group" in:flyIn|global={{ index: 2, duration: 350, stride: 25 }}>
-			<div class="group-title">Updates</div>
+			<div class="group-title group-title--lg">Updates</div>
 			<div class="group-body">
 				<div class="status-line">
 					{#if update}
@@ -98,10 +98,46 @@
 					{:else}
 						<span class="status-text status-text--dim">—</span>
 					{/if}
-					<button class="btn-ghost" onclick={handleCheck} disabled={checking}>
-						{checking ? 'Checking…' : 'Check now'}
-					</button>
+					{#if update}
+						<button class="btn-primary" onclick={handleInstall} disabled={installing}>
+							{installing ? 'Installing…' : 'Download and install'}
+						</button>
+					{:else}
+						<button class="btn-ghost" onclick={handleCheck} disabled={checking}>
+							{checking ? 'Checking…' : 'Check now'}
+						</button>
+					{/if}
 				</div>
+
+				{#if update && dlState === 'downloading'}
+					<div class="progress-block">
+						<div class="progress-label">
+							Downloading
+							{#if progress.total}
+								<span class="progress-bytes">
+									{formatBytes(progress.received)} / {formatBytes(progress.total)}
+								</span>
+							{:else}
+								<span class="progress-bytes">{formatBytes(progress.received)}</span>
+							{/if}
+						</div>
+						<div class="progress-track">
+							<div
+								class="progress-fill"
+								style:width={progressPct != null ? `${progressPct}%` : '100%'}
+								class:indeterminate={progressPct == null}
+							></div>
+						</div>
+					</div>
+				{:else if update && dlState === 'ready'}
+					<div class="state-line state-line--ok">Download ready — installing…</div>
+				{:else if update && dlState === 'installing'}
+					<div class="state-line state-line--ok">Installing — c9watch will relaunch.</div>
+				{:else if update && dlState === 'error'}
+					<div class="state-line state-line--err">
+						Install failed{error ? ` · ${error}` : ''}
+					</div>
+				{/if}
 			</div>
 		</div>
 
@@ -116,45 +152,6 @@
 					{:else}
 						<div class="notes-state">Release notes unavailable.</div>
 					{/if}
-				</div>
-			</div>
-
-			<div class="group" in:flyIn|global={{ index: 4, duration: 350, stride: 25 }}>
-				<div class="group-title">Install</div>
-				<div class="group-body">
-					{#if dlState === 'downloading'}
-						<div class="progress-block">
-							<div class="progress-label">
-								Downloading
-								{#if progress.total}
-									<span class="progress-bytes">
-										{formatBytes(progress.received)} / {formatBytes(progress.total)}
-									</span>
-								{:else}
-									<span class="progress-bytes">{formatBytes(progress.received)}</span>
-								{/if}
-							</div>
-							<div class="progress-track">
-								<div
-									class="progress-fill"
-									style:width={progressPct != null ? `${progressPct}%` : '100%'}
-									class:indeterminate={progressPct == null}
-								></div>
-							</div>
-						</div>
-					{:else if dlState === 'ready'}
-						<div class="state-line state-line--ok">Download ready — installing…</div>
-					{:else if dlState === 'installing'}
-						<div class="state-line state-line--ok">Installing — c9watch will relaunch.</div>
-					{:else if dlState === 'error'}
-						<div class="state-line state-line--err">
-							Install failed{error ? ` · ${error}` : ''}
-						</div>
-					{/if}
-
-					<button class="btn-primary" onclick={handleInstall} disabled={installing}>
-						{installing ? 'Installing…' : 'Download and install'}
-					</button>
 				</div>
 			</div>
 		{/if}
@@ -213,6 +210,13 @@
 		color: var(--text-muted);
 		padding-bottom: var(--space-xs);
 		border-bottom: 1px solid var(--border-default);
+	}
+
+	.group-title--lg {
+		font-size: 14px;
+		letter-spacing: 0.1em;
+		color: var(--text-primary);
+		padding-bottom: var(--space-sm);
 	}
 
 	.group-body {
@@ -274,8 +278,11 @@
 		font-weight: 600;
 	}
 
-	.btn-ghost {
+	.status-line > button {
 		margin-left: auto;
+	}
+
+	.btn-ghost {
 		background: transparent;
 		border: 1px solid var(--border-default);
 		color: var(--text-primary);
@@ -300,7 +307,6 @@
 	}
 
 	.btn-primary {
-		align-self: flex-start;
 		background: transparent;
 		border: 1px solid color-mix(in srgb, var(--accent-amber) 40%, transparent);
 		color: var(--accent-amber);
