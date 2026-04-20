@@ -404,8 +404,8 @@
 
 	.markdown-body {
 		font-family: var(--font-sans);
-		font-size: 13px;
-		line-height: 1.6;
+		font-size: 15px;
+		line-height: 1.65;
 		color: var(--text-primary);
 	}
 
@@ -417,9 +417,9 @@
 		color: var(--text-primary);
 	}
 
-	.markdown-body :global(h1) { font-size: 16px; }
-	.markdown-body :global(h2) { font-size: 14px; }
-	.markdown-body :global(h3) { font-size: 13px; }
+	.markdown-body :global(h1) { font-size: 20px; }
+	.markdown-body :global(h2) { font-size: 17px; }
+	.markdown-body :global(h3) { font-size: 15px; }
 
 	.markdown-body :global(p) {
 		margin: var(--space-sm) 0;
@@ -439,7 +439,7 @@
 		background: rgba(255, 255, 255, 0.06);
 		padding: 2px 5px;
 		border-radius: 3px;
-		font-size: 12px;
+		font-size: 13px;
 		font-family: var(--font-mono);
 	}
 
@@ -467,8 +467,8 @@
 		margin: 0;
 		padding: var(--space-md);
 		overflow-x: auto;
-		font-size: 12px;
-		line-height: 1.5;
+		font-size: 13px;
+		line-height: 1.55;
 	}
 
 	.markdown-body :global(pre code) {
@@ -503,7 +503,7 @@
 		width: 100%;
 		border-collapse: collapse;
 		margin: var(--space-md) 0;
-		font-size: 12px;
+		font-size: 14px;
 	}
 
 	.markdown-body :global(th),
