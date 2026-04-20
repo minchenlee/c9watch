@@ -74,86 +74,91 @@
 		<span class="section-title">Settings</span>
 	</div>
 
-	<section class="block" in:flyIn|global={{ index: 1, duration: 350, stride: 25 }}>
-		<div class="block-title">Application</div>
-		<div class="row">
-			<span class="row-label">Version</span>
-			<span class="row-value">{version || '—'}</span>
-		</div>
-	</section>
-
-	<section class="block" in:flyIn|global={{ index: 2, duration: 350, stride: 25 }}>
-		<div class="block-title">Updates</div>
-
-		<div class="status-row">
-			<div class="status-left">
-				{#if update}
-					<span class="status-label status-label--amber">Update available</span>
-					<span class="version-row">
-						<span class="version-old">{update.currentVersion}</span>
-						<span class="version-arrow">→</span>
-						<span class="version-new">{update.version}</span>
-					</span>
-				{:else if justChecked}
-					<span class="status-label">You're on the latest version</span>
-				{:else}
-					<span class="status-label status-label--dim">Not checked yet</span>
-				{/if}
+	<div class="content">
+		<div class="group" in:flyIn|global={{ index: 1, duration: 350, stride: 25 }}>
+			<div class="group-title">Version</div>
+			<div class="group-body">
+				<span class="mono">c9watch {version || '—'}</span>
 			</div>
-			<button class="btn btn-ghost btn-sm" onclick={handleCheck} disabled={checking}>
-				{checking ? 'Checking…' : 'Check for updates'}
-			</button>
+		</div>
+
+		<div class="group" in:flyIn|global={{ index: 2, duration: 350, stride: 25 }}>
+			<div class="group-title">Updates</div>
+			<div class="group-body">
+				<div class="status-line">
+					{#if update}
+						<span class="status-text status-text--amber">Update available</span>
+						<span class="version-diff">
+							<span class="ver-old">{update.currentVersion}</span>
+							<span class="ver-arrow">→</span>
+							<span class="ver-new">{update.version}</span>
+						</span>
+					{:else if justChecked}
+						<span class="status-text">Up to date</span>
+					{:else}
+						<span class="status-text status-text--dim">—</span>
+					{/if}
+					<button class="btn-ghost" onclick={handleCheck} disabled={checking}>
+						{checking ? 'Checking…' : 'Check now'}
+					</button>
+				</div>
+			</div>
 		</div>
 
 		{#if update}
-			<div class="release-notes">
-				<div class="notes-title">Release notes · {update.version}</div>
-				{#if notesLoading}
-					<div class="notes-body notes-body--state">Loading release notes…</div>
-				{:else if notes}
-					<div class="notes-body markdown-body">{@html renderMarkdown(notes)}</div>
-				{:else}
-					<div class="notes-body notes-body--state">Release notes unavailable.</div>
-				{/if}
+			<div class="group" in:flyIn|global={{ index: 3, duration: 350, stride: 25 }}>
+				<div class="group-title">Release notes · {update.version}</div>
+				<div class="notes-surface">
+					{#if notesLoading}
+						<div class="notes-state">Loading…</div>
+					{:else if notes}
+						<div class="markdown-body">{@html renderMarkdown(notes)}</div>
+					{:else}
+						<div class="notes-state">Release notes unavailable.</div>
+					{/if}
+				</div>
 			</div>
 
-			{#if dlState === 'downloading'}
-				<div class="progress-block">
-					<div class="progress-label">
-						Downloading…
-						{#if progress.total}
-							<span class="row-dim">
-								{formatBytes(progress.received)} / {formatBytes(progress.total)}
-							</span>
-						{:else}
-							<span class="row-dim">{formatBytes(progress.received)}</span>
-						{/if}
-					</div>
-					<div class="progress-track">
-						<div
-							class="progress-fill"
-							style:width={progressPct != null ? `${progressPct}%` : '100%'}
-							class:indeterminate={progressPct == null}
-						></div>
-					</div>
-				</div>
-			{:else if dlState === 'ready'}
-				<div class="state-msg state-msg--ok">Download ready. Installing…</div>
-			{:else if dlState === 'installing'}
-				<div class="state-msg state-msg--ok">Installing — c9watch will relaunch.</div>
-			{:else if dlState === 'error'}
-				<div class="state-msg state-msg--err">
-					Install failed{error ? `: ${error}` : ''}
-				</div>
-			{/if}
+			<div class="group" in:flyIn|global={{ index: 4, duration: 350, stride: 25 }}>
+				<div class="group-title">Install</div>
+				<div class="group-body">
+					{#if dlState === 'downloading'}
+						<div class="progress-block">
+							<div class="progress-label">
+								Downloading
+								{#if progress.total}
+									<span class="progress-bytes">
+										{formatBytes(progress.received)} / {formatBytes(progress.total)}
+									</span>
+								{:else}
+									<span class="progress-bytes">{formatBytes(progress.received)}</span>
+								{/if}
+							</div>
+							<div class="progress-track">
+								<div
+									class="progress-fill"
+									style:width={progressPct != null ? `${progressPct}%` : '100%'}
+									class:indeterminate={progressPct == null}
+								></div>
+							</div>
+						</div>
+					{:else if dlState === 'ready'}
+						<div class="state-line state-line--ok">Download ready — installing…</div>
+					{:else if dlState === 'installing'}
+						<div class="state-line state-line--ok">Installing — c9watch will relaunch.</div>
+					{:else if dlState === 'error'}
+						<div class="state-line state-line--err">
+							Install failed{error ? ` · ${error}` : ''}
+						</div>
+					{/if}
 
-			<div class="install-row">
-				<button class="btn btn-primary" onclick={handleInstall} disabled={installing}>
-					{installing ? 'Installing…' : 'Download and install'}
-				</button>
+					<button class="btn-primary" onclick={handleInstall} disabled={installing}>
+						{installing ? 'Installing…' : 'Download and install'}
+					</button>
+				</div>
 			</div>
 		{/if}
-	</section>
+	</div>
 </div>
 
 <style>
@@ -161,9 +166,7 @@
 		display: flex;
 		flex-direction: column;
 		height: 100%;
-		overflow-y: auto;
-		gap: var(--space-xl);
-		padding-bottom: var(--space-xl);
+		overflow: hidden;
 	}
 
 	.section-header {
@@ -172,7 +175,7 @@
 		gap: var(--space-md);
 		padding-bottom: var(--space-md);
 		border-bottom: 1px solid var(--text-primary);
-		margin-bottom: var(--space-md);
+		margin-bottom: var(--space-lg);
 		flex-shrink: 0;
 	}
 
@@ -186,129 +189,104 @@
 		line-height: 1;
 	}
 
-	.block {
+	.content {
+		flex: 1;
+		overflow-y: auto;
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-md);
-		padding: var(--space-lg);
-		background: var(--bg-card);
-		border: 1px solid var(--border-default);
+		gap: var(--space-lg);
+		padding-bottom: var(--space-xl);
 	}
 
-	.block-title {
+	.group {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-sm);
+	}
+
+	.group-title {
 		font-family: var(--font-pixel);
-		font-size: 11px;
+		font-size: 10px;
 		font-weight: 600;
 		text-transform: uppercase;
-		letter-spacing: 0.1em;
+		letter-spacing: 0.12em;
 		color: var(--text-muted);
-		padding-bottom: var(--space-sm);
+		padding-bottom: var(--space-xs);
 		border-bottom: 1px solid var(--border-default);
 	}
 
-	.row {
+	.group-body {
 		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: var(--space-md);
-		font-family: var(--font-mono);
-		font-size: 13px;
+		flex-direction: column;
+		gap: var(--space-sm);
+		padding-top: var(--space-xs);
 	}
 
-	.row-label {
-		color: var(--text-muted);
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		font-size: 11px;
-	}
-
-	.row-value {
-		color: var(--text-primary);
-	}
-
-	.row-dim {
-		color: var(--text-muted);
-		font-size: 12px;
-	}
-
-	.status-row {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: var(--space-md);
-		flex-wrap: wrap;
-	}
-
-	.status-left {
-		display: inline-flex;
-		align-items: center;
-		gap: var(--space-md);
-		flex-wrap: wrap;
-	}
-
-	.status-label {
+	.mono {
 		font-family: var(--font-mono);
 		font-size: 13px;
 		color: var(--text-primary);
 		letter-spacing: 0.02em;
 	}
 
-	.status-label--amber {
-		color: var(--accent-amber);
-		font-weight: 600;
+	.status-line {
+		display: flex;
+		align-items: center;
+		gap: var(--space-md);
+		flex-wrap: wrap;
 	}
 
-	.status-label--dim {
+	.status-text {
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-primary);
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+	}
+
+	.status-text--amber {
+		color: var(--accent-amber);
+	}
+
+	.status-text--dim {
 		color: var(--text-muted);
 	}
 
-	.version-row {
+	.version-diff {
 		display: inline-flex;
 		align-items: center;
 		gap: var(--space-xs);
 		font-family: var(--font-mono);
-		font-size: 13px;
+		font-size: 12px;
 	}
 
-	.version-old {
+	.ver-old {
 		color: var(--text-muted);
 		text-decoration: line-through;
 	}
 
-	.version-arrow {
+	.ver-arrow {
 		color: var(--text-muted);
 	}
 
-	.version-new {
+	.ver-new {
 		color: var(--accent-amber);
 		font-weight: 600;
 	}
 
-	.btn {
-		font-family: var(--font-mono);
-		font-size: 12px;
+	.btn-ghost {
+		margin-left: auto;
+		background: transparent;
+		border: 1px solid var(--border-default);
+		color: var(--text-primary);
+		font-family: var(--font-pixel);
+		font-size: 10px;
 		font-weight: 600;
 		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		padding: 8px 14px;
+		letter-spacing: 0.1em;
+		padding: 5px 10px;
 		cursor: pointer;
 		transition: all var(--transition-fast);
-		border: 1px solid var(--border-default);
-	}
-
-	.btn-sm {
-		padding: 6px 12px;
-		font-size: 11px;
-	}
-
-	.btn:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	.btn-ghost {
-		background: transparent;
-		color: var(--text-primary);
 	}
 
 	.btn-ghost:hover:not(:disabled) {
@@ -316,64 +294,48 @@
 		border-color: var(--text-secondary);
 	}
 
+	.btn-ghost:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
 	.btn-primary {
-		background: color-mix(in srgb, var(--accent-amber) 15%, transparent);
-		border-color: color-mix(in srgb, var(--accent-amber) 40%, transparent);
+		align-self: flex-start;
+		background: transparent;
+		border: 1px solid color-mix(in srgb, var(--accent-amber) 40%, transparent);
 		color: var(--accent-amber);
-	}
-
-	.btn-primary:hover:not(:disabled) {
-		background: color-mix(in srgb, var(--accent-amber) 25%, transparent);
-		border-color: color-mix(in srgb, var(--accent-amber) 60%, transparent);
-	}
-
-	.release-notes {
-		display: flex;
-		flex-direction: column;
-		gap: var(--space-sm);
-	}
-
-	.notes-title {
 		font-family: var(--font-pixel);
 		font-size: 10px;
 		font-weight: 600;
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
-		color: var(--text-muted);
+		padding: 6px 12px;
+		cursor: pointer;
+		transition: all var(--transition-fast);
 	}
 
-	.notes-body {
-		padding: var(--space-sm) var(--space-md);
-		background: var(--bg-elevated);
+	.btn-primary:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
+		border-color: color-mix(in srgb, var(--accent-amber) 60%, transparent);
+	}
+
+	.btn-primary:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.notes-surface {
 		border: 1px solid var(--border-default);
 	}
 
-	.notes-body--state {
+	.notes-state {
 		font-family: var(--font-mono);
 		font-size: 12px;
 		color: var(--text-muted);
-		font-style: italic;
-	}
-
-	.state-msg {
-		font-family: var(--font-mono);
-		font-size: 12px;
-		color: var(--text-muted);
-		padding: var(--space-sm) 0;
-	}
-
-	.state-msg--ok {
-		color: var(--text-primary);
-	}
-
-	.state-msg--err {
-		color: var(--status-permission, #ff4444);
-	}
-
-	.install-row {
-		display: flex;
-		gap: var(--space-sm);
-		flex-wrap: wrap;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		padding: var(--space-md);
+		text-align: center;
 	}
 
 	.markdown-body {
@@ -381,8 +343,9 @@
 		font-size: 13px;
 		line-height: 1.6;
 		color: var(--text-primary);
-		max-height: 280px;
+		max-height: 320px;
 		overflow-y: auto;
+		padding: var(--space-md) var(--space-lg);
 	}
 
 	.markdown-body :global(h1),
@@ -390,10 +353,21 @@
 	.markdown-body :global(h3) {
 		font-family: var(--font-pixel);
 		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		font-size: 13px;
+		letter-spacing: 0.08em;
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--text-muted);
 		margin: var(--space-md) 0 var(--space-xs);
-		color: var(--text-primary);
+	}
+
+	.markdown-body :global(h1):first-child,
+	.markdown-body :global(h2):first-child,
+	.markdown-body :global(h3):first-child {
+		margin-top: 0;
+	}
+
+	.markdown-body :global(p) {
+		margin: var(--space-xs) 0;
 	}
 
 	.markdown-body :global(ul),
@@ -403,15 +377,30 @@
 	}
 
 	.markdown-body :global(li) {
-		margin: 2px 0;
+		margin: 3px 0;
 	}
 
 	.markdown-body :global(code) {
 		font-family: var(--font-mono);
-		font-size: 12px;
+		font-size: 11px;
 		background: var(--bg-base);
 		padding: 1px 5px;
 		border: 1px solid var(--border-default);
+		color: var(--text-primary);
+	}
+
+	.markdown-body :global(pre) {
+		background: var(--bg-base);
+		border: 1px solid var(--border-default);
+		padding: var(--space-sm);
+		overflow-x: auto;
+		margin: var(--space-xs) 0;
+	}
+
+	.markdown-body :global(pre code) {
+		background: transparent;
+		border: none;
+		padding: 0;
 	}
 
 	.markdown-body :global(a) {
@@ -421,6 +410,17 @@
 
 	.markdown-body :global(a):hover {
 		text-decoration: underline;
+	}
+
+	.markdown-body :global(strong) {
+		color: var(--text-primary);
+		font-weight: 600;
+	}
+
+	.markdown-body :global(hr) {
+		border: none;
+		border-top: 1px solid var(--border-default);
+		margin: var(--space-md) 0;
 	}
 
 	.progress-block {
@@ -440,8 +440,12 @@
 		letter-spacing: 0.05em;
 	}
 
+	.progress-bytes {
+		color: var(--text-secondary);
+	}
+
 	.progress-track {
-		height: 6px;
+		height: 4px;
 		background: var(--bg-base);
 		border: 1px solid var(--border-default);
 		overflow: hidden;
@@ -455,6 +459,22 @@
 
 	.progress-fill.indeterminate {
 		animation: pulse 1.5s ease-in-out infinite;
+	}
+
+	.state-line {
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+
+	.state-line--ok {
+		color: var(--text-primary);
+	}
+
+	.state-line--err {
+		color: var(--status-permission, #ff4444);
 	}
 
 	@keyframes pulse {

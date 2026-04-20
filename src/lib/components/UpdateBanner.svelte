@@ -13,79 +13,84 @@
 
 {#if visible && update}
 	<div class="banner" role="status">
-		<div class="banner-content">
-			<div class="banner-icon">
-				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-					<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-					<polyline points="7 10 12 15 17 10" />
-					<line x1="12" y1="15" x2="12" y2="3" />
-				</svg>
-			</div>
-			<div class="banner-text">
-				<div class="banner-title">Version {update.version} is available</div>
-				<div class="banner-description">A new release of c9watch is ready to install.</div>
-			</div>
-			<button class="banner-button" onclick={onViewDetails}>View details</button>
+		<div class="banner-left">
+			<span class="banner-label">Update</span>
+			<span class="banner-version">
+				<span class="banner-old">{update.currentVersion}</span>
+				<span class="banner-arrow">→</span>
+				<span class="banner-new">{update.version}</span>
+			</span>
 		</div>
+		<button class="banner-button" onclick={onViewDetails}>View details</button>
 	</div>
 {/if}
 
 <style>
 	.banner {
-		background: color-mix(in srgb, var(--accent-amber) 8%, transparent);
-		border-bottom: 1px solid color-mix(in srgb, var(--accent-amber) 20%, transparent);
-		padding: var(--space-sm) var(--space-md);
-	}
-
-	.banner-content {
 		display: flex;
 		align-items: center;
+		justify-content: space-between;
 		gap: var(--space-md);
+		padding: var(--space-xs) var(--space-md);
+		background: color-mix(in srgb, var(--accent-amber) 6%, transparent);
+		border-bottom: 1px solid color-mix(in srgb, var(--accent-amber) 25%, transparent);
 	}
 
-	.banner-icon {
-		color: var(--accent-amber);
-		flex-shrink: 0;
-		display: flex;
-	}
-
-	.banner-text {
-		flex: 1;
+	.banner-left {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--space-md);
 		min-width: 0;
 	}
 
-	.banner-title {
-		font-family: var(--font-mono);
-		font-size: 13px;
+	.banner-label {
+		font-family: var(--font-pixel);
+		font-size: 11px;
 		font-weight: 600;
-		color: var(--text-primary);
-		margin-bottom: 2px;
-		letter-spacing: 0.02em;
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		color: var(--accent-amber);
 	}
 
-	.banner-description {
+	.banner-version {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--space-xs);
 		font-family: var(--font-mono);
 		font-size: 12px;
+	}
+
+	.banner-old {
+		color: var(--text-muted);
+		text-decoration: line-through;
+	}
+
+	.banner-arrow {
 		color: var(--text-muted);
 	}
 
+	.banner-new {
+		color: var(--accent-amber);
+		font-weight: 600;
+	}
+
 	.banner-button {
-		background: color-mix(in srgb, var(--accent-amber) 15%, transparent);
+		background: transparent;
 		border: 1px solid color-mix(in srgb, var(--accent-amber) 35%, transparent);
 		color: var(--accent-amber);
-		padding: 6px 14px;
-		font-family: var(--font-mono);
-		font-size: 12px;
+		padding: 4px 10px;
+		font-family: var(--font-pixel);
+		font-size: 10px;
 		font-weight: 600;
 		text-transform: uppercase;
-		letter-spacing: 0.05em;
+		letter-spacing: 0.1em;
 		cursor: pointer;
 		transition: all var(--transition-fast);
 		white-space: nowrap;
 	}
 
 	.banner-button:hover {
-		background: color-mix(in srgb, var(--accent-amber) 25%, transparent);
+		background: color-mix(in srgb, var(--accent-amber) 15%, transparent);
 		border-color: color-mix(in srgb, var(--accent-amber) 55%, transparent);
 	}
 </style>
