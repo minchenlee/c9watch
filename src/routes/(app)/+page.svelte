@@ -139,7 +139,8 @@
 			'1': 'monitor',
 			'2': 'history',
 			'3': 'cost',
-			'4': 'memory'
+			'4': 'memory',
+			'5': 'settings'
 		};
 
 		const handler = (e: KeyboardEvent) => {
@@ -419,14 +420,6 @@
 			<span class="tab-icon">◆</span>
 			<span class="tab-label">MEMORY</span>
 		</button>
-		<button
-			class="tab-btn"
-			class:active={activeTab === 'settings'}
-			onclick={() => (activeTab = 'settings')}
-		>
-			<span class="tab-icon">⚙</span>
-			<span class="tab-label">SETTINGS</span>
-		</button>
 		<!-- Drag handle: fills remaining space. The grip dots are absolutely
 		     centered in the whole tab bar so they appear at the window midpoint.
 		     Hidden in fullscreen where window dragging is unavailable. -->
@@ -435,6 +428,14 @@
 				<span class="drag-dots" transition:fade={{ duration: 250 }}>⠿ ⠿ ⠿</span>
 			{/if}
 		</div>
+		<button
+			class="tab-btn"
+			class:active={activeTab === 'settings'}
+			onclick={() => (activeTab = 'settings')}
+		>
+			<span class="tab-icon">⚙</span>
+			<span class="tab-label">SETTINGS</span>
+		</button>
 	</div>
 
 	{#if activeTab === 'history'}
