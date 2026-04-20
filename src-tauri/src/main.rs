@@ -12,7 +12,7 @@ fn main() {
             let first = args[1].as_str();
             let known_commands = [
                 "list", "status", "self", "view", "history", "search", "stop", "watch", "tasks",
-                "spawn", "send", "workers", "daemon",
+                "spawn", "send", "workers", "inbox", "adopt", "cost", "daemon",
                 "help",
             ];
             let is_cli = known_commands.contains(&first)

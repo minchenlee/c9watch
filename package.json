@@ -1,6 +1,6 @@
 {
   "name": "c9watch",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Monitor and control all your Claude Code sessions from one place",
   "type": "module",
   "scripts": {

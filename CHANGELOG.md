@@ -5,6 +5,11 @@ All notable changes to c9watch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-04-20
+
+### Fixed
+- **`c9watch inbox`, `cost`, `adopt` launched the GUI instead of the CLI** — `src-tauri/src/main.rs` kept a hardcoded allowlist of subcommand names for dispatching to the CLI handler. The three subcommands added in v0.8.0 (`inbox`, `adopt`) and v0.7.0 extension (`cost`) weren't added to the list, so running them on a GUI-inclusive build fell through and launched the Tauri desktop app. Added all three to the allowlist.
+
 ## [0.8.0] - 2026-04-20
 
 ### Added
