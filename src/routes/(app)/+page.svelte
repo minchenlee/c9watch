@@ -26,7 +26,9 @@
 	import { refreshCostData } from '$lib/stores/cost';
 	import { refreshSessionHistory } from '$lib/stores/history';
 	import MemoryViewer from '$lib/components/MemoryViewer.svelte';
+	import SettingsTab from '$lib/components/SettingsTab.svelte';
 	import FdaBanner from '$lib/components/FdaBanner.svelte';
+	import UpdateBanner from '$lib/components/UpdateBanner.svelte';
 	import DebugConsole from '$lib/components/DebugConsole.svelte';
 	import type { DetectionDiagnostics } from '$lib/types';
 
@@ -46,7 +48,7 @@
 
 	let isCompact = $state(false);
 
-	let activeTab = $state<'monitor' | 'history' | 'cost' | 'memory'>('monitor');
+	let activeTab = $state<'monitor' | 'history' | 'cost' | 'memory' | 'settings'>('monitor');
 	let fdaLikelyNeeded = $state(false);
 	let showDebugConsole = $state(false);
 	let showRenameHint = $state(false);
@@ -137,7 +139,8 @@
 			'1': 'monitor',
 			'2': 'history',
 			'3': 'cost',
-			'4': 'memory'
+			'4': 'memory',
+			'5': 'settings'
 		};
 
 		const handler = (e: KeyboardEvent) => {
@@ -424,7 +427,17 @@
 				<span class="drag-dots" transition:fade={{ duration: 250 }}>⠿ ⠿ ⠿</span>
 			{/if}
 		</div>
+		<button
+			class="tab-btn"
+			class:active={activeTab === 'settings'}
+			onclick={() => (activeTab = 'settings')}
+		>
+			<span class="tab-icon">⚙</span>
+			<span class="tab-label">SETTINGS</span>
+		</button>
 	</div>
+
+	<UpdateBanner onViewDetails={() => (activeTab = 'settings')} />
 
 	{#if activeTab === 'history'}
 	<main class="grid-container history-main" in:fadeIn>
@@ -437,6 +450,10 @@
 	{:else if activeTab === 'memory'}
 	<main class="grid-container history-main" in:fadeIn>
 		<MemoryViewer />
+	</main>
+	{:else if activeTab === 'settings'}
+	<main class="grid-container history-main" in:fadeIn>
+		<SettingsTab />
 	</main>
 	{:else}
 	<main class="grid-container" in:fadeIn>

@@ -5,7 +5,7 @@
 	import { initializeTasksPolling } from '$lib/stores/tasks';
 	import { getSessions } from '$lib/api';
 	import { loadDemoDataIfActive } from '$lib/demo';
-	import { checkForUpdates } from '$lib/updater';
+	import { runStartupCheck } from '$lib/stores/updater';
 	import { isTauri } from '$lib/ws';
 
 	onMount(async () => {
@@ -24,7 +24,7 @@
 				sessions.set(initialSessions);
 			}
 
-			checkForUpdates();
+			runStartupCheck();
 		}
 	});
 </script>
