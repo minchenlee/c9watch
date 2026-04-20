@@ -19,6 +19,21 @@
 
 	let copied = $state(false);
 
+	let expanded = $state<Record<string, boolean>>({});
+
+	$effect(() => {
+		if (!selectedProject) return;
+		const next: Record<string, boolean> = {};
+		selectedProject.files.forEach((f, i) => {
+			next[f.filename] = i === 0;
+		});
+		expanded = next;
+	});
+
+	function toggleFile(filename: string) {
+		expanded = { ...expanded, [filename]: !expanded[filename] };
+	}
+
 	function copyClaudeCommand() {
 		if (!selectedProject) return;
 		const cmd = `claude "Review my memory files and suggest improvements" --project-dir ${selectedProject.projectPath}`;
@@ -105,10 +120,20 @@
 						</div>
 						{#each selectedProject.files as file, i (file.filename)}
 							<div class="file-section" in:flyIn|global={{ index: i + 1, duration: 800, stride: 120 }}>
-								<div class="file-header">{file.filename}</div>
-								<div class="markdown-body">
-									{@html renderMarkdown(file.content)}
-								</div>
+								<button
+									class="file-header"
+									class:expanded={expanded[file.filename]}
+									onclick={() => toggleFile(file.filename)}
+									aria-expanded={expanded[file.filename] ? 'true' : 'false'}
+								>
+									<span class="file-header-name">{file.filename}</span>
+									<span class="file-header-chevron">{expanded[file.filename] ? '▾' : '▸'}</span>
+								</button>
+								{#if expanded[file.filename]}
+									<div class="markdown-body">
+										{@html renderMarkdown(file.content)}
+									</div>
+								{/if}
 							</div>
 						{/each}
 					{/key}
@@ -329,19 +354,50 @@
 	/* ── File sections ───────────────────────────────────────────── */
 
 	.file-section {
-		margin-bottom: var(--space-xl);
+		margin-bottom: var(--space-md);
 	}
 
 	.file-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		width: 100%;
 		font-family: var(--font-pixel);
-		font-size: 11px;
+		font-size: 13px;
 		font-weight: 600;
 		text-transform: uppercase;
-		letter-spacing: 0.05em;
+		letter-spacing: 0.1em;
 		color: var(--accent);
-		margin-bottom: var(--space-md);
-		padding: var(--space-xs) 0;
+		margin: 0;
+		padding: var(--space-sm) 0;
+		background: none;
+		border: none;
 		border-bottom: 1px solid var(--border-default);
+		cursor: pointer;
+		text-align: left;
+		transition: color 0.15s ease;
+	}
+
+	.file-header:hover {
+		color: var(--text-primary);
+	}
+
+	.file-header-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.file-header-chevron {
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-muted);
+		flex-shrink: 0;
+		margin-left: var(--space-sm);
+	}
+
+	.file-header.expanded {
+		margin-bottom: var(--space-md);
 	}
 
 	/* ── Markdown body ───────────────────────────────────────────── */
