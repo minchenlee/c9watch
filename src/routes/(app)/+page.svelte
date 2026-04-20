@@ -354,7 +354,7 @@
 			toggleDemoMode();
 			return;
 		}
-		if (e.key >= '1' && e.key <= '9' && !expandedId) {
+		if (e.key >= '1' && e.key <= '9' && !expandedId && !e.metaKey && !e.ctrlKey) {
 			const index = parseInt(e.key) - 1;
 			if (index < filteredSessions.length) {
 				handleExpand(filteredSessions[index]);
