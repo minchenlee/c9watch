@@ -10,7 +10,7 @@
 
 	let { session, collapsed = false, onToggle }: Props = $props();
 
-	let tasks = $derived(($tasksBySession.get(session.id) ?? []) as Task[]);
+	let tasks = $derived($tasksBySession.get(session.id) ?? []);
 	let total = $derived(tasks.length);
 	let completed = $derived(tasks.filter((t) => t.status === 'completed').length);
 
