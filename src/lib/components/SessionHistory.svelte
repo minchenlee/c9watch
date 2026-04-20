@@ -471,8 +471,12 @@
 		font-family: var(--font-pixel);
 		font-size: 11px;
 		letter-spacing: 0.08em;
-		padding: 0 var(--space-sm);
-		min-width: 30px;
+		width: 24px;
+		height: 24px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0;
 		background: transparent;
 		border: none;
 		color: var(--text-muted);
@@ -486,7 +490,8 @@
 	}
 
 	.match-btn.active {
-		color: var(--accent-amber);
+		background: rgba(255, 255, 255, 0.1);
+		color: var(--text-primary);
 	}
 
 	.search-input:focus {
