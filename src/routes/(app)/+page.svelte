@@ -386,7 +386,6 @@
 {:else}
 <div class="dashboard">
 	<FdaBanner {fdaLikelyNeeded} />
-	<UpdateBanner onViewDetails={() => (activeTab = 'settings')} />
 	<div class="tab-bar" class:fullscreen={isFullscreen} data-tauri-drag-region>
 		<button
 			class="tab-btn"
@@ -437,6 +436,8 @@
 			<span class="tab-label">SETTINGS</span>
 		</button>
 	</div>
+
+	<UpdateBanner onViewDetails={() => (activeTab = 'settings')} />
 
 	{#if activeTab === 'history'}
 	<main class="grid-container history-main" in:fadeIn>

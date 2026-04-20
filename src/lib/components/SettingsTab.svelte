@@ -12,8 +12,7 @@
 		releaseNotesLoading,
 		manualCheck,
 		fetchReleaseNotes,
-		startDownloadAndInstall,
-		skipVersion
+		startDownloadAndInstall
 	} from '$lib/stores/updater';
 	import { flyIn } from '$lib/transitions';
 
@@ -45,10 +44,6 @@
 		setTimeout(() => (justChecked = false), 2500);
 	}
 
-	function handleSkip() {
-		if (update) skipVersion(update.version);
-	}
-
 	function handleInstall() {
 		startDownloadAndInstall();
 	}
@@ -68,6 +63,10 @@
 		if (!progress.total || progress.total === 0) return null;
 		return Math.min(100, Math.round((progress.received / progress.total) * 100));
 	});
+
+	let installing = $derived(
+		dlState === 'downloading' || dlState === 'ready' || dlState === 'installing'
+	);
 </script>
 
 <div class="settings-tab">
@@ -86,96 +85,72 @@
 	<section class="block" in:flyIn|global={{ index: 2, duration: 350, stride: 25 }}>
 		<div class="block-title">Updates</div>
 
-		<div class="row">
-			<span class="row-label">Status</span>
-			<span class="row-value">
+		<div class="status-row">
+			<div class="status-left">
 				{#if update}
-					<span class="badge badge-amber">New version {update.version} available</span>
+					<span class="status-label status-label--amber">Update available</span>
+					<span class="version-row">
+						<span class="version-old">{update.currentVersion}</span>
+						<span class="version-arrow">→</span>
+						<span class="version-new">{update.version}</span>
+					</span>
 				{:else if justChecked}
-					<span class="badge badge-muted">You're on the latest</span>
+					<span class="status-label">You're on the latest version</span>
 				{:else}
-					<span class="row-dim">Last check pending</span>
+					<span class="status-label status-label--dim">Not checked yet</span>
 				{/if}
-			</span>
-		</div>
-
-		<div class="actions">
-			<button class="btn btn-ghost" onclick={handleCheck} disabled={checking}>
+			</div>
+			<button class="btn btn-ghost btn-sm" onclick={handleCheck} disabled={checking}>
 				{checking ? 'Checking…' : 'Check for updates'}
 			</button>
 		</div>
 
 		{#if update}
-			<div class="update-panel">
-				<div class="update-header">
-					<div class="version-row">
-						<span class="version-old">{update.currentVersion}</span>
-						<span class="version-arrow">→</span>
-						<span class="version-new">{update.version}</span>
-					</div>
-				</div>
-
-				<div class="release-notes">
-					<div class="notes-title">Release notes</div>
-					{#if notesLoading}
-						<div class="state-msg">Loading release notes…</div>
-					{:else if notes}
-						<div class="markdown-body">{@html renderMarkdown(notes)}</div>
-					{:else}
-						<div class="state-msg">Release notes unavailable.</div>
-					{/if}
-				</div>
-
-				{#if dlState === 'downloading'}
-					<div class="progress-block">
-						<div class="progress-label">
-							Downloading…
-							{#if progress.total}
-								<span class="row-dim">
-									{formatBytes(progress.received)} / {formatBytes(progress.total)}
-								</span>
-							{:else}
-								<span class="row-dim">{formatBytes(progress.received)}</span>
-							{/if}
-						</div>
-						<div class="progress-track">
-							<div
-								class="progress-fill"
-								style:width={progressPct != null ? `${progressPct}%` : '100%'}
-								class:indeterminate={progressPct == null}
-							></div>
-						</div>
-					</div>
-				{:else if dlState === 'ready'}
-					<div class="state-msg state-msg--ok">Download ready. Installing…</div>
-				{:else if dlState === 'installing'}
-					<div class="state-msg state-msg--ok">Installing — c9watch will relaunch.</div>
-				{:else if dlState === 'error'}
-					<div class="state-msg state-msg--err">
-						Install failed{error ? `: ${error}` : ''}
-					</div>
+			<div class="release-notes">
+				<div class="notes-title">Release notes · {update.version}</div>
+				{#if notesLoading}
+					<div class="notes-body notes-body--state">Loading release notes…</div>
+				{:else if notes}
+					<div class="notes-body markdown-body">{@html renderMarkdown(notes)}</div>
+				{:else}
+					<div class="notes-body notes-body--state">Release notes unavailable.</div>
 				{/if}
+			</div>
 
-				<div class="actions">
-					<button
-						class="btn btn-primary"
-						onclick={handleInstall}
-						disabled={dlState === 'downloading' || dlState === 'ready' || dlState === 'installing'}
-					>
-						{#if dlState === 'downloading' || dlState === 'ready' || dlState === 'installing'}
-							Installing…
+			{#if dlState === 'downloading'}
+				<div class="progress-block">
+					<div class="progress-label">
+						Downloading…
+						{#if progress.total}
+							<span class="row-dim">
+								{formatBytes(progress.received)} / {formatBytes(progress.total)}
+							</span>
 						{:else}
-							Download and install
+							<span class="row-dim">{formatBytes(progress.received)}</span>
 						{/if}
-					</button>
-					<button
-						class="btn btn-ghost"
-						onclick={handleSkip}
-						disabled={dlState === 'downloading' || dlState === 'ready' || dlState === 'installing'}
-					>
-						Skip this version
-					</button>
+					</div>
+					<div class="progress-track">
+						<div
+							class="progress-fill"
+							style:width={progressPct != null ? `${progressPct}%` : '100%'}
+							class:indeterminate={progressPct == null}
+						></div>
+					</div>
 				</div>
+			{:else if dlState === 'ready'}
+				<div class="state-msg state-msg--ok">Download ready. Installing…</div>
+			{:else if dlState === 'installing'}
+				<div class="state-msg state-msg--ok">Installing — c9watch will relaunch.</div>
+			{:else if dlState === 'error'}
+				<div class="state-msg state-msg--err">
+					Install failed{error ? `: ${error}` : ''}
+				</div>
+			{/if}
+
+			<div class="install-row">
+				<button class="btn btn-primary" onclick={handleInstall} disabled={installing}>
+					{installing ? 'Installing…' : 'Download and install'}
+				</button>
 			</div>
 		{/if}
 	</section>
@@ -249,9 +224,6 @@
 
 	.row-value {
 		color: var(--text-primary);
-		display: inline-flex;
-		align-items: center;
-		gap: var(--space-sm);
 	}
 
 	.row-dim {
@@ -259,31 +231,57 @@
 		font-size: 12px;
 	}
 
-	.badge {
+	.status-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--space-md);
+		flex-wrap: wrap;
+	}
+
+	.status-left {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--space-md);
+		flex-wrap: wrap;
+	}
+
+	.status-label {
 		font-family: var(--font-mono);
-		font-size: 11px;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		padding: 3px 8px;
-		border: 1px solid var(--border-default);
-		line-height: 1;
+		font-size: 13px;
+		color: var(--text-primary);
+		letter-spacing: 0.02em;
 	}
 
-	.badge-amber {
+	.status-label--amber {
 		color: var(--accent-amber);
-		background: color-mix(in srgb, var(--accent-amber) 12%, transparent);
-		border-color: color-mix(in srgb, var(--accent-amber) 40%, transparent);
+		font-weight: 600;
 	}
 
-	.badge-muted {
+	.status-label--dim {
 		color: var(--text-muted);
 	}
 
-	.actions {
-		display: flex;
-		gap: var(--space-sm);
-		flex-wrap: wrap;
+	.version-row {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--space-xs);
+		font-family: var(--font-mono);
+		font-size: 13px;
+	}
+
+	.version-old {
+		color: var(--text-muted);
+		text-decoration: line-through;
+	}
+
+	.version-arrow {
+		color: var(--text-muted);
+	}
+
+	.version-new {
+		color: var(--accent-amber);
+		font-weight: 600;
 	}
 
 	.btn {
@@ -296,6 +294,11 @@
 		cursor: pointer;
 		transition: all var(--transition-fast);
 		border: 1px solid var(--border-default);
+	}
+
+	.btn-sm {
+		padding: 6px 12px;
+		font-size: 11px;
 	}
 
 	.btn:disabled {
@@ -324,43 +327,6 @@
 		border-color: color-mix(in srgb, var(--accent-amber) 60%, transparent);
 	}
 
-	.update-panel {
-		display: flex;
-		flex-direction: column;
-		gap: var(--space-md);
-		padding: var(--space-md);
-		background: var(--bg-elevated);
-		border: 1px solid color-mix(in srgb, var(--accent-amber) 25%, transparent);
-	}
-
-	.update-header {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-	}
-
-	.version-row {
-		display: flex;
-		align-items: center;
-		gap: var(--space-sm);
-		font-family: var(--font-mono);
-		font-size: 13px;
-	}
-
-	.version-old {
-		color: var(--text-muted);
-		text-decoration: line-through;
-	}
-
-	.version-arrow {
-		color: var(--text-muted);
-	}
-
-	.version-new {
-		color: var(--accent-amber);
-		font-weight: 600;
-	}
-
 	.release-notes {
 		display: flex;
 		flex-direction: column;
@@ -374,6 +340,19 @@
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
 		color: var(--text-muted);
+	}
+
+	.notes-body {
+		padding: var(--space-sm) var(--space-md);
+		background: var(--bg-elevated);
+		border: 1px solid var(--border-default);
+	}
+
+	.notes-body--state {
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-muted);
+		font-style: italic;
 	}
 
 	.state-msg {
@@ -391,6 +370,12 @@
 		color: var(--status-permission, #ff4444);
 	}
 
+	.install-row {
+		display: flex;
+		gap: var(--space-sm);
+		flex-wrap: wrap;
+	}
+
 	.markdown-body {
 		font-family: var(--font-sans);
 		font-size: 13px;
@@ -398,9 +383,6 @@
 		color: var(--text-primary);
 		max-height: 280px;
 		overflow-y: auto;
-		padding: var(--space-sm) var(--space-md);
-		background: var(--bg-base);
-		border: 1px solid var(--border-default);
 	}
 
 	.markdown-body :global(h1),
@@ -427,7 +409,7 @@
 	.markdown-body :global(code) {
 		font-family: var(--font-mono);
 		font-size: 12px;
-		background: var(--bg-elevated);
+		background: var(--bg-base);
 		padding: 1px 5px;
 		border: 1px solid var(--border-default);
 	}
