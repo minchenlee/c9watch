@@ -1,5 +1,7 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
+	import { slide } from 'svelte/transition';
+	import { cubicOut } from 'svelte/easing';
 	import { marked } from 'marked';
 	import DOMPurify from 'dompurify';
 	import { getMemoryFiles, revealInFileManager } from '$lib/api';
@@ -20,14 +22,19 @@
 	let copied = $state(false);
 
 	let expanded = $state<string | null>(null);
+	let fileHeaders: Record<string, HTMLButtonElement | null> = {};
 
 	$effect(() => {
 		if (!selectedProject) return;
 		expanded = selectedProject.files[0]?.filename ?? null;
 	});
 
-	function toggleFile(filename: string) {
+	async function toggleFile(filename: string) {
 		expanded = expanded === filename ? null : filename;
+		if (expanded === filename) {
+			await tick();
+			fileHeaders[filename]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+		}
 	}
 
 	function copyClaudeCommand() {
@@ -117,6 +124,7 @@
 						{#each selectedProject.files as file, i (file.filename)}
 							<div class="file-section" in:flyIn|global={{ index: i + 1, duration: 800, stride: 120 }}>
 								<button
+									bind:this={fileHeaders[file.filename]}
 									class="file-header"
 									class:expanded={expanded === file.filename}
 									onclick={() => toggleFile(file.filename)}
@@ -126,7 +134,7 @@
 									<span class="file-header-chevron">{expanded === file.filename ? '▾' : '▸'}</span>
 								</button>
 								{#if expanded === file.filename}
-									<div class="markdown-body">
+									<div class="markdown-body" transition:slide|local={{ duration: 250, easing: cubicOut }}>
 										{@html renderMarkdown(file.content)}
 									</div>
 								{/if}
