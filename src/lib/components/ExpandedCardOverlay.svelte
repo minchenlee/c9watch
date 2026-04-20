@@ -40,6 +40,7 @@
 	import { SessionStatus } from '$lib/types';
 	import MessageBubble from './MessageBubble.svelte';
 	import MessageNavMap from './MessageNavMap.svelte';
+	import TodoPanel from './TodoPanel.svelte';
 	import { createSlidingWindow, BATCH_SIZE } from '$lib/slidingWindow.svelte';
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
 	import { workersByPm, expandedSessionId } from '$lib/stores/sessions';
@@ -70,6 +71,7 @@
 	let tooltipX = $state(0);
 	let tooltipY = $state(0);
 	let navCollapsed = $state(false);
+	let tasksCollapsed = $state(false);
 	let workersCollapsed = $state(false);
 	// Only stagger the first batch of messages when the overlay mounts;
 	// subsequent streaming/polling of new messages should NOT animate.
@@ -539,7 +541,7 @@
 		<!-- Desktop: right column (nav + workers stacked) -->
 		<div class="right-column nav-desktop">
 			<!-- Navigation panel -->
-			<div class="nav-map-side" class:collapsed={navCollapsed} in:flyInX|global={{ index: 0, base: 200 }}>
+			<div class="nav-map-side" class:collapsed={navCollapsed} in:flyInX|global={{ index: 0 }}>
 				<button
 					type="button"
 					class="panel-header"
@@ -557,9 +559,18 @@
 				{/if}
 			</div>
 
+			<!-- TODOs panel (only when the session has tasks) -->
+			<TodoPanel
+				{session}
+				collapsed={tasksCollapsed}
+				onToggle={() => (tasksCollapsed = !tasksCollapsed)}
+				transitionIndex={1}
+
+			/>
+
 			<!-- Workers panel (only when relevant) -->
 			{#if showWorkersPanel}
-				<div class="workers-side-panel" class:collapsed={workersCollapsed} in:flyInX|global={{ index: 1, base: 200 }}>
+				<div class="workers-side-panel" class:collapsed={workersCollapsed} in:flyInX|global={{ index: 2 }}>
 					<button
 						type="button"
 						class="panel-header"

@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { initializeSessionListeners, sessions } from '$lib/stores/sessions';
 	import { initializeSubagentPolling } from '$lib/stores/subagents';
+	import { initializeTasksPolling } from '$lib/stores/tasks';
 	import { getSessions } from '$lib/api';
 	import { loadDemoDataIfActive } from '$lib/demo';
 	import { checkForUpdates } from '$lib/updater';
@@ -16,6 +17,7 @@
 		if (isTauri()) {
 			await initializeSessionListeners();
 			initializeSubagentPolling();
+			initializeTasksPolling();
 
 			if (!demoActive) {
 				const initialSessions = await getSessions();

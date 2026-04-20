@@ -1337,8 +1337,15 @@ fn find_session_metadata(session_id: &str) -> (Option<String>, Option<String>) {
     (None, None)
 }
 
-fn read_session_tasks(session_id: &str) -> Result<Vec<serde_json::Value>, String> {
+pub(crate) fn read_session_tasks(session_id: &str) -> Result<Vec<serde_json::Value>, String> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
+    read_session_tasks_in(&home_dir, session_id)
+}
+
+fn read_session_tasks_in(
+    home_dir: &std::path::Path,
+    session_id: &str,
+) -> Result<Vec<serde_json::Value>, String> {
     let tasks_dir = home_dir.join(".claude").join("tasks").join(session_id);
 
     if !tasks_dir.exists() {
@@ -1704,5 +1711,57 @@ mod cost_session_tests {
             "aaaa1111-bbbb",
         ]);
         assert!(res.is_ok(), "parse failed: {:?}", res.err());
+    }
+}
+
+#[cfg(test)]
+mod read_session_tasks_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn write_task(home: &std::path::Path, session_id: &str, file: &str, body: &str) {
+        let dir = home.join(".claude").join("tasks").join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(file), body).unwrap();
+    }
+
+    #[test]
+    fn returns_empty_when_dir_missing() {
+        let home = tempdir().unwrap();
+        let got = read_session_tasks_in(home.path(), "no-such-session").unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn parses_and_sorts_by_numeric_id() {
+        let home = tempdir().unwrap();
+        let sid = "session-abc";
+        write_task(home.path(), sid, "10.json", r#"{"id":"10","content":"ten","status":"pending"}"#);
+        write_task(home.path(), sid, "2.json", r#"{"id":"2","content":"two","status":"in_progress"}"#);
+        write_task(home.path(), sid, "1.json", r#"{"id":"1","content":"one","status":"completed"}"#);
+
+        let got = read_session_tasks_in(home.path(), sid).unwrap();
+        let ids: Vec<&str> = got
+            .iter()
+            .map(|t| t.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(ids, vec!["1", "2", "10"]);
+    }
+
+    #[test]
+    fn skips_malformed_json_and_non_json_files() {
+        let home = tempdir().unwrap();
+        let sid = "session-xyz";
+        write_task(home.path(), sid, "1.json", r#"{"id":"1","content":"good","status":"pending"}"#);
+        write_task(home.path(), sid, "2.json", "not valid json {{{");
+        write_task(home.path(), sid, "ignore.txt", r#"{"id":"99"}"#);
+
+        let got = read_session_tasks_in(home.path(), sid).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].get("id").and_then(|v| v.as_str()),
+            Some("1")
+        );
     }
 }

@@ -229,3 +229,12 @@ export interface DetectionDiagnostics {
   processesWithCwd: number;
   fdaLikelyNeeded: boolean;
 }
+
+export type TaskStatus = 'pending' | 'in_progress' | 'completed';
+
+export interface Task {
+  id: string;
+  subject: string;
+  activeForm: string;
+  status: TaskStatus;
+}
