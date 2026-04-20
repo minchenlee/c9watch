@@ -23,6 +23,7 @@
 
 	let expanded = $state<string | null>(null);
 	let fileHeaders: Record<string, HTMLButtonElement | null> = {};
+	let contentPane: HTMLDivElement | null = null;
 
 	$effect(() => {
 		if (!selectedProject) return;
@@ -31,10 +32,14 @@
 
 	async function toggleFile(filename: string) {
 		expanded = expanded === filename ? null : filename;
-		if (expanded === filename) {
-			await tick();
-			fileHeaders[filename]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-		}
+		if (expanded !== filename || !contentPane) return;
+		await tick();
+		const header = fileHeaders[filename];
+		if (!header) return;
+		const paneRect = contentPane.getBoundingClientRect();
+		const headerRect = header.getBoundingClientRect();
+		const targetTop = contentPane.scrollTop + (headerRect.top - paneRect.top);
+		contentPane.scrollTo({ top: targetTop, behavior: 'smooth' });
 	}
 
 	function copyClaudeCommand() {
@@ -102,7 +107,7 @@
 				{/each}
 			</aside>
 
-			<div class="memory-content">
+			<div class="memory-content" bind:this={contentPane}>
 				{#if selectedProject}
 					{#key selectedProject.projectPath}
 						<div class="content-header" in:flyIn|global={{ index: 0, duration: 800, stride: 120 }}>
