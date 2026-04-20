@@ -104,27 +104,44 @@ pub fn get_history() -> Result<Vec<HistoryEntry>, String> {
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("Failed to read history.jsonl: {e}"))?;
 
-    let mut entries = parse_history_jsonl(&content);
-
-    // Resolve native custom titles from Claude Code JSONL files (mtime-cached).
-    // Cache encoded project paths to avoid redundant encode_path_for_matching() calls —
-    // many entries share the same project.
+    let entries = parse_history_jsonl(&content);
     let projects_dir = home_dir.join(".claude").join("projects");
-    let mut encoded_cache: HashMap<String, PathBuf> = HashMap::new();
-    for entry in &mut entries {
-        let project_dir = encoded_cache
-            .entry(entry.project.clone())
-            .or_insert_with(|| {
-                let encoded = super::detector::encode_path_for_matching(&entry.project);
-                projects_dir.join(encoded)
-            });
-        let session_file = project_dir.join(format!("{}.jsonl", entry.session_id));
-        if let Some(title) = super::enrichment::get_cached_native_title(&session_file) {
-            entry.custom_title = Some(title);
-        }
-    }
+    Ok(filter_and_enrich(entries, &projects_dir, true))
+}
 
-    Ok(entries)
+/// Drop entries whose session JSONL has been removed (via `/clear`, Claude Code
+/// cleanup, or manual deletion) so the HISTORY tab never surfaces rows that
+/// would open an empty overlay. Optionally resolves native custom titles via
+/// the mtime-cached title reader.
+///
+/// Exposed so tests can exercise the filter without touching `~/.claude`.
+pub(crate) fn filter_and_enrich(
+    entries: Vec<HistoryEntry>,
+    projects_dir: &std::path::Path,
+    enrich_titles: bool,
+) -> Vec<HistoryEntry> {
+    let mut encoded_cache: HashMap<String, PathBuf> = HashMap::new();
+    entries
+        .into_iter()
+        .filter_map(|mut entry| {
+            let project_dir = encoded_cache
+                .entry(entry.project.clone())
+                .or_insert_with(|| {
+                    let encoded = super::detector::encode_path_for_matching(&entry.project);
+                    projects_dir.join(encoded)
+                });
+            let session_file = project_dir.join(format!("{}.jsonl", entry.session_id));
+            if !session_file.exists() {
+                return None;
+            }
+            if enrich_titles {
+                if let Some(title) = super::enrichment::get_cached_native_title(&session_file) {
+                    entry.custom_title = Some(title);
+                }
+            }
+            Some(entry)
+        })
+        .collect()
 }
 
 /// A single deep-search hit: session ID + first matching snippet (truncated).
@@ -430,5 +447,58 @@ mod tests {
         let jsonl = r#"{"display":"x","timestamp":1,"project":"/Users/you/Documents/GitHub/c9watch","sessionId":"s1"}"#;
         let result = parse_history_jsonl(jsonl);
         assert_eq!(result[0].project_name, "c9watch");
+    }
+
+    #[test]
+    fn test_filter_and_enrich_drops_missing_jsonl() {
+        use std::fs;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects_dir = tmp.path();
+
+        // Two entries share the same project. Create JSONL for the first only.
+        let project = "/p/myproj";
+        let encoded = super::super::detector::encode_path_for_matching(project);
+        let project_dir = projects_dir.join(&encoded);
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(project_dir.join("keep-sid.jsonl"), "").unwrap();
+        // Deliberately do not create drop-sid.jsonl.
+
+        let entries = vec![
+            HistoryEntry {
+                session_id: "keep-sid".into(),
+                display: "kept".into(),
+                timestamp: 2,
+                project: project.into(),
+                project_name: "myproj".into(),
+                custom_title: None,
+            },
+            HistoryEntry {
+                session_id: "drop-sid".into(),
+                display: "cleared".into(),
+                timestamp: 1,
+                project: project.into(),
+                project_name: "myproj".into(),
+                custom_title: None,
+            },
+        ];
+
+        let out = filter_and_enrich(entries, projects_dir, false);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, "keep-sid");
+    }
+
+    #[test]
+    fn test_filter_and_enrich_drops_all_when_projects_dir_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let entries = vec![HistoryEntry {
+            session_id: "orphan".into(),
+            display: "x".into(),
+            timestamp: 1,
+            project: "/p/gone".into(),
+            project_name: "gone".into(),
+            custom_title: None,
+        }];
+        let out = filter_and_enrich(entries, tmp.path(), false);
+        assert!(out.is_empty());
     }
 }
