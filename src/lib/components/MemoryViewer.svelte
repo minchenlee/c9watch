@@ -19,19 +19,15 @@
 
 	let copied = $state(false);
 
-	let expanded = $state<Record<string, boolean>>({});
+	let expanded = $state<string | null>(null);
 
 	$effect(() => {
 		if (!selectedProject) return;
-		const next: Record<string, boolean> = {};
-		selectedProject.files.forEach((f, i) => {
-			next[f.filename] = i === 0;
-		});
-		expanded = next;
+		expanded = selectedProject.files[0]?.filename ?? null;
 	});
 
 	function toggleFile(filename: string) {
-		expanded = { ...expanded, [filename]: !expanded[filename] };
+		expanded = expanded === filename ? null : filename;
 	}
 
 	function copyClaudeCommand() {
@@ -122,14 +118,14 @@
 							<div class="file-section" in:flyIn|global={{ index: i + 1, duration: 800, stride: 120 }}>
 								<button
 									class="file-header"
-									class:expanded={expanded[file.filename]}
+									class:expanded={expanded === file.filename}
 									onclick={() => toggleFile(file.filename)}
-									aria-expanded={expanded[file.filename] ? 'true' : 'false'}
+									aria-expanded={expanded === file.filename ? 'true' : 'false'}
 								>
 									<span class="file-header-name">{file.filename}</span>
-									<span class="file-header-chevron">{expanded[file.filename] ? '▾' : '▸'}</span>
+									<span class="file-header-chevron">{expanded === file.filename ? '▾' : '▸'}</span>
 								</button>
-								{#if expanded[file.filename]}
+								{#if expanded === file.filename}
 									<div class="markdown-body">
 										{@html renderMarkdown(file.content)}
 									</div>
