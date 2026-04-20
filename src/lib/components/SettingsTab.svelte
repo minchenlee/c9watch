@@ -2,6 +2,8 @@
 	import { onMount } from 'svelte';
 	import { marked } from 'marked';
 	import DOMPurify from 'dompurify';
+	import { openUrl } from '@tauri-apps/plugin-opener';
+	import { isTauri } from '$lib/ws';
 	import {
 		currentVersion,
 		updateAvailable,
@@ -51,6 +53,19 @@
 	function renderMarkdown(content: string): string {
 		const html = marked.parse(content, { async: false, breaks: true, gfm: true });
 		return DOMPurify.sanitize(html as string);
+	}
+
+	function handleNotesClick(e: MouseEvent) {
+		const anchor = (e.target as HTMLElement | null)?.closest('a');
+		if (!anchor) return;
+		const href = anchor.getAttribute('href');
+		if (!href || href.startsWith('#')) return;
+		e.preventDefault();
+		if (isTauri()) {
+			openUrl(href).catch((err) => console.error('[settings] openUrl failed:', err));
+		} else {
+			window.open(href, '_blank', 'noopener,noreferrer');
+		}
 	}
 
 	function formatBytes(n: number): string {
@@ -148,7 +163,9 @@
 					{#if notesLoading}
 						<div class="notes-state">Loading…</div>
 					{:else if notes}
-						<div class="markdown-body">{@html renderMarkdown(notes)}</div>
+						<!-- svelte-ignore a11y_no_static_element_interactions -->
+						<!-- svelte-ignore a11y_click_events_have_key_events -->
+						<div class="markdown-body" onclick={handleNotesClick}>{@html renderMarkdown(notes)}</div>
 					{:else}
 						<div class="notes-state">Release notes unavailable.</div>
 					{/if}
