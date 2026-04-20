@@ -471,7 +471,7 @@
 		font-family: var(--font-pixel);
 		font-size: 11px;
 		letter-spacing: 0.08em;
-		width: 24px;
+		width: 48px;
 		height: 24px;
 		display: flex;
 		align-items: center;
