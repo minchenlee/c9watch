@@ -22,7 +22,7 @@
 
 	let version = $derived($currentVersion);
 	let update = $derived($updateAvailable);
-	let state = $derived($downloadState);
+	let dlState = $derived($downloadState);
 	let progress = $derived($downloadProgress);
 	let error = $derived($downloadError);
 	let notes = $derived($releaseNotes);
@@ -126,7 +126,7 @@
 					{/if}
 				</div>
 
-				{#if state === 'downloading'}
+				{#if dlState === 'downloading'}
 					<div class="progress-block">
 						<div class="progress-label">
 							Downloading…
@@ -146,11 +146,11 @@
 							></div>
 						</div>
 					</div>
-				{:else if state === 'ready'}
+				{:else if dlState === 'ready'}
 					<div class="state-msg state-msg--ok">Download ready. Installing…</div>
-				{:else if state === 'installing'}
+				{:else if dlState === 'installing'}
 					<div class="state-msg state-msg--ok">Installing — c9watch will relaunch.</div>
-				{:else if state === 'error'}
+				{:else if dlState === 'error'}
 					<div class="state-msg state-msg--err">
 						Install failed{error ? `: ${error}` : ''}
 					</div>
@@ -160,9 +160,9 @@
 					<button
 						class="btn btn-primary"
 						onclick={handleInstall}
-						disabled={state === 'downloading' || state === 'ready' || state === 'installing'}
+						disabled={dlState === 'downloading' || dlState === 'ready' || dlState === 'installing'}
 					>
-						{#if state === 'downloading' || state === 'ready' || state === 'installing'}
+						{#if dlState === 'downloading' || dlState === 'ready' || dlState === 'installing'}
 							Installing…
 						{:else}
 							Download and install
@@ -171,7 +171,7 @@
 					<button
 						class="btn btn-ghost"
 						onclick={handleSkip}
-						disabled={state === 'downloading' || state === 'ready' || state === 'installing'}
+						disabled={dlState === 'downloading' || dlState === 'ready' || dlState === 'installing'}
 					>
 						Skip this version
 					</button>
