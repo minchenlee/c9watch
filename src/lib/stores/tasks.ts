@@ -33,9 +33,14 @@ async function refreshOnce() {
 				const raw = await invoke<unknown[]>('get_session_tasks', { sessionId });
 				const tasks: Task[] = raw.map((t) => {
 					const obj = t as Record<string, unknown>;
+					const subject = typeof obj.subject === 'string' ? obj.subject
+						: typeof obj.description === 'string' ? obj.description
+						: '';
+					const activeForm = typeof obj.activeForm === 'string' ? obj.activeForm : subject;
 					return {
 						id: String(obj.id ?? ''),
-						content: typeof obj.content === 'string' ? obj.content : '',
+						subject,
+						activeForm,
 						status: normalizeStatus(obj.status),
 					};
 				});

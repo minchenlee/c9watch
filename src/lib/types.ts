@@ -234,6 +234,7 @@ export type TaskStatus = 'pending' | 'in_progress' | 'completed';
 
 export interface Task {
   id: string;
-  content: string;
+  subject: string;
+  activeForm: string;
   status: TaskStatus;
 }

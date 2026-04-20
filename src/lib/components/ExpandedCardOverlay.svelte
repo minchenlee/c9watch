@@ -541,7 +541,7 @@
 		<!-- Desktop: right column (nav + workers stacked) -->
 		<div class="right-column nav-desktop">
 			<!-- Navigation panel -->
-			<div class="nav-map-side" class:collapsed={navCollapsed} in:flyInX|global={{ index: 0, base: 200 }}>
+			<div class="nav-map-side" class:collapsed={navCollapsed} in:flyInX|global={{ index: 0 }}>
 				<button
 					type="button"
 					class="panel-header"
@@ -564,11 +564,13 @@
 				{session}
 				collapsed={tasksCollapsed}
 				onToggle={() => (tasksCollapsed = !tasksCollapsed)}
+				transitionIndex={1}
+
 			/>
 
 			<!-- Workers panel (only when relevant) -->
 			{#if showWorkersPanel}
-				<div class="workers-side-panel" class:collapsed={workersCollapsed} in:flyInX|global={{ index: 1, base: 200 }}>
+				<div class="workers-side-panel" class:collapsed={workersCollapsed} in:flyInX|global={{ index: 2 }}>
 					<button
 						type="button"
 						class="panel-header"

@@ -1,14 +1,17 @@
 <script lang="ts">
 	import { tasksBySession } from '$lib/stores/tasks';
+	import { flyInX } from '$lib/transitions';
 	import type { Session, Task } from '$lib/types';
 
 	interface Props {
 		session: Session;
 		collapsed?: boolean;
 		onToggle?: () => void;
+		/** Cascade index for the entry transition (parent owns the order). */
+		transitionIndex?: number;
 	}
 
-	let { session, collapsed = false, onToggle }: Props = $props();
+	let { session, collapsed = false, onToggle, transitionIndex = 0 }: Props = $props();
 
 	let tasks = $derived($tasksBySession.get(session.id) ?? []);
 	let total = $derived(tasks.length);
@@ -22,7 +25,7 @@
 </script>
 
 {#if total > 0}
-	<div class="todo-side-panel" class:collapsed>
+	<div class="todo-side-panel" class:collapsed in:flyInX|global={{ index: transitionIndex }}>
 		<button
 			type="button"
 			class="panel-header"
@@ -38,7 +41,7 @@
 				{#each tasks as t (t.id)}
 					<div class="todo-row" class:completed={t.status === 'completed'}>
 						<span class="todo-icon todo-icon-{t.status}">{statusIcon(t.status)}</span>
-						<span class="todo-content">{t.content}</span>
+						<span class="todo-content">{t.status === 'in_progress' ? t.activeForm : t.subject}</span>
 					</div>
 				{/each}
 			</div>
