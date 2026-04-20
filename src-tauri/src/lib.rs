@@ -118,6 +118,15 @@ async fn get_subagent_transcript(
         .ok_or_else(|| format!("subagent {} not found in session {}", subagent_id, parent_session_id))
 }
 
+/// Returns the parsed TodoWrite tasks for a session, sorted by numeric `id`.
+/// Reads `~/.claude/tasks/<session_id>/*.json`. Returns an empty list when
+/// the directory does not exist; silently skips malformed JSON files.
+#[cfg(all(not(mobile), feature = "gui", feature = "cli"))]
+#[tauri::command]
+async fn get_session_tasks(session_id: String) -> Result<Vec<serde_json::Value>, String> {
+    cli::read_session_tasks(&session_id)
+}
+
 /// Save base64-encoded PNG data to a temp file and return the path.
 /// Used by the token distance visualizer to share canvas screenshots.
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -536,6 +545,7 @@ pub fn run() {
             get_memory_files,
             get_subagents,
             get_subagent_transcript,
+            get_session_tasks,
             save_temp_image,
             reveal_in_file_manager,
             stop_session,

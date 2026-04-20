@@ -1337,8 +1337,15 @@ fn find_session_metadata(session_id: &str) -> (Option<String>, Option<String>) {
     (None, None)
 }
 
-fn read_session_tasks(session_id: &str) -> Result<Vec<serde_json::Value>, String> {
+pub(crate) fn read_session_tasks(session_id: &str) -> Result<Vec<serde_json::Value>, String> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
+    read_session_tasks_in(&home_dir, session_id)
+}
+
+fn read_session_tasks_in(
+    home_dir: &std::path::Path,
+    session_id: &str,
+) -> Result<Vec<serde_json::Value>, String> {
     let tasks_dir = home_dir.join(".claude").join("tasks").join(session_id);
 
     if !tasks_dir.exists() {
