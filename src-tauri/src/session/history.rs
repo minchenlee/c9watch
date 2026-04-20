@@ -163,37 +163,23 @@ fn phrase_match(haystack: &str, needle: &str, whole_word: bool) -> bool {
     if !whole_word {
         return haystack.contains(needle);
     }
-    let needle_bytes = needle.as_bytes();
-    let nlen = needle_bytes.len();
-    let bytes = haystack.as_bytes();
+    let nlen = needle.len();
     let mut start = 0usize;
     while let Some(rel) = haystack[start..].find(needle) {
         let pos = start + rel;
-        let before_ok = if pos == 0 {
-            true
-        } else {
-            // Char before match must not be alphanumeric. Find previous char boundary.
-            let mut p = pos;
-            while p > 0 && !haystack.is_char_boundary(p - 1) {
-                p -= 1;
-            }
-            let prev_char = haystack[p.saturating_sub(1)..pos].chars().next_back();
-            prev_char.map_or(true, |c| !c.is_alphanumeric())
-        };
-        let end_pos = pos + nlen;
-        let after_ok = if end_pos >= bytes.len() {
-            true
-        } else {
-            haystack[end_pos..].chars().next().map_or(true, |c| !c.is_alphanumeric())
-        };
+        // `pos` from str::find is always on a char boundary.
+        let before_ok = haystack[..pos]
+            .chars()
+            .next_back()
+            .map_or(true, |c| !c.is_alphanumeric());
+        let after_ok = haystack[pos + nlen..]
+            .chars()
+            .next()
+            .map_or(true, |c| !c.is_alphanumeric());
         if before_ok && after_ok {
             return true;
         }
-        // Advance past the first byte of this match to find the next occurrence
         start = pos + 1;
-        if start >= haystack.len() {
-            break;
-        }
     }
     false
 }
