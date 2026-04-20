@@ -130,6 +130,37 @@
 		}
 	});
 
+	$effect(() => {
+		if (!browser) return;
+
+		const tabByKey: Record<string, typeof activeTab> = {
+			'1': 'monitor',
+			'2': 'history',
+			'3': 'cost',
+			'4': 'memory'
+		};
+
+		const handler = (e: KeyboardEvent) => {
+			if (!(e.metaKey || e.ctrlKey)) return;
+			if (e.altKey || e.shiftKey) return;
+			const tab = tabByKey[e.key];
+			if (!tab) return;
+
+			const target = e.target as HTMLElement | null;
+			if (target) {
+				const tag = target.tagName;
+				if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+				if (target.isContentEditable) return;
+			}
+
+			e.preventDefault();
+			activeTab = tab;
+		};
+
+		window.addEventListener('keydown', handler);
+		return () => window.removeEventListener('keydown', handler);
+	});
+
 	// Helper function to group sessions by project path, then by status
 	function groupByProjectAndStatus(sessions: Session[]) {
 		const groups: Array<{
@@ -323,7 +354,7 @@
 			toggleDemoMode();
 			return;
 		}
-		if (e.key >= '1' && e.key <= '9' && !expandedId) {
+		if (e.key >= '1' && e.key <= '9' && !expandedId && !e.metaKey && !e.ctrlKey) {
 			const index = parseInt(e.key) - 1;
 			if (index < filteredSessions.length) {
 				handleExpand(filteredSessions[index]);
