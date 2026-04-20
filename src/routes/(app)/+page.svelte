@@ -26,7 +26,9 @@
 	import { refreshCostData } from '$lib/stores/cost';
 	import { refreshSessionHistory } from '$lib/stores/history';
 	import MemoryViewer from '$lib/components/MemoryViewer.svelte';
+	import SettingsTab from '$lib/components/SettingsTab.svelte';
 	import FdaBanner from '$lib/components/FdaBanner.svelte';
+	import UpdateBanner from '$lib/components/UpdateBanner.svelte';
 	import DebugConsole from '$lib/components/DebugConsole.svelte';
 	import type { DetectionDiagnostics } from '$lib/types';
 
@@ -46,7 +48,7 @@
 
 	let isCompact = $state(false);
 
-	let activeTab = $state<'monitor' | 'history' | 'cost' | 'memory'>('monitor');
+	let activeTab = $state<'monitor' | 'history' | 'cost' | 'memory' | 'settings'>('monitor');
 	let fdaLikelyNeeded = $state(false);
 	let showDebugConsole = $state(false);
 	let showRenameHint = $state(false);
@@ -383,6 +385,7 @@
 {:else}
 <div class="dashboard">
 	<FdaBanner {fdaLikelyNeeded} />
+	<UpdateBanner onViewDetails={() => (activeTab = 'settings')} />
 	<div class="tab-bar" class:fullscreen={isFullscreen} data-tauri-drag-region>
 		<button
 			class="tab-btn"
@@ -416,6 +419,14 @@
 			<span class="tab-icon">◆</span>
 			<span class="tab-label">MEMORY</span>
 		</button>
+		<button
+			class="tab-btn"
+			class:active={activeTab === 'settings'}
+			onclick={() => (activeTab = 'settings')}
+		>
+			<span class="tab-icon">⚙</span>
+			<span class="tab-label">SETTINGS</span>
+		</button>
 		<!-- Drag handle: fills remaining space. The grip dots are absolutely
 		     centered in the whole tab bar so they appear at the window midpoint.
 		     Hidden in fullscreen where window dragging is unavailable. -->
@@ -437,6 +448,10 @@
 	{:else if activeTab === 'memory'}
 	<main class="grid-container history-main" in:fadeIn>
 		<MemoryViewer />
+	</main>
+	{:else if activeTab === 'settings'}
+	<main class="grid-container history-main" in:fadeIn>
+		<SettingsTab />
 	</main>
 	{:else}
 	<main class="grid-container" in:fadeIn>
