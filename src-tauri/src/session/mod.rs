@@ -2,10 +2,12 @@ pub mod custom_names;
 pub mod detector;
 pub mod parser;
 pub mod permissions;
+pub mod source;
 pub mod status;
 
 pub use custom_names::{CustomNames, CustomTitles};
-pub use detector::{DetectedSession, DetectionDiagnostics, SessionDetector};
+pub use detector::LegacySessionSource;
+pub use source::{CliActivity, DetectedSession, DetectionDiagnostics, SessionKind, SessionSource};
 pub use parser::{
     extract_messages, parse_all_entries, parse_last_n_entries, parse_sessions_index, ImageBlock,
     MessageContent, MessageType, SessionEntry, SessionIndexEntry, SessionsIndex,

@@ -1,6 +1,6 @@
 use crate::session::enrichment::detect_and_enrich_sessions_with_detector;
 pub use crate::session::enrichment::{detect_and_enrich_sessions, truncate_string, Session};
-use crate::session::{SessionDetector, SessionStatus};
+use crate::session::{LegacySessionSource, SessionStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -111,7 +111,7 @@ pub fn start_polling(
         let poll_interval = Duration::from_millis(3500);
 
         // Create detector once and reuse across poll cycles
-        let mut detector = match SessionDetector::new() {
+        let mut detector = match LegacySessionSource::new() {
             Ok(d) => d,
             Err(e) => {
                 crate::debug_log::log_error(&format!(

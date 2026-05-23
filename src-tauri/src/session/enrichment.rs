@@ -1,6 +1,6 @@
 use crate::session::{
     determine_status, get_pending_tool_input, get_pending_tool_name, parse_last_n_entries,
-    parse_sessions_index, SessionDetector, SessionStatus,
+    parse_sessions_index, LegacySessionSource, SessionStatus,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -70,13 +70,13 @@ pub(crate) fn get_cached_native_title(path: &Path) -> Option<String> {
 pub fn detect_and_enrich_sessions(
 ) -> Result<(Vec<Session>, crate::session::DetectionDiagnostics), String> {
     let mut detector =
-        SessionDetector::new().map_err(|e| format!("Failed to create session detector: {}", e))?;
+        LegacySessionSource::new().map_err(|e| format!("Failed to create session detector: {}", e))?;
     detect_and_enrich_sessions_with_detector(&mut detector)
 }
 
 /// Detect sessions using an existing detector (avoids recreating System each call)
 pub fn detect_and_enrich_sessions_with_detector(
-    detector: &mut SessionDetector,
+    detector: &mut LegacySessionSource,
 ) -> Result<(Vec<Session>, crate::session::DetectionDiagnostics), String> {
     let (detected_sessions, diagnostics) = detector
         .detect_sessions()
