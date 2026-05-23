@@ -15,6 +15,9 @@ use wait_timeout::ChildExt;
 struct CliAgent {
     pid: u32,
     cwd: PathBuf,
+    // `kind` was added alongside background-pinned sessions in CC 2.1.147.
+    // 2.1.145–146 emit `claude agents --json` without it; default to "interactive".
+    #[serde(default = "default_kind")]
     kind: String,
     #[serde(rename = "startedAt")]
     started_at: i64,
@@ -24,6 +27,10 @@ struct CliAgent {
     name: Option<String>,
     #[serde(default)]
     status: Option<String>,
+}
+
+fn default_kind() -> String {
+    "interactive".to_string()
 }
 
 pub struct CliSessionSource {
@@ -129,14 +136,49 @@ impl SessionSource for CliSessionSource {
         let agents: Vec<CliAgent> = serde_json::from_slice(&buf)
             .map_err(|e| SessionDetectorError::Parse(e.to_string()))?;
 
-        let sessions: Vec<DetectedSession> =
-            agents.into_iter().map(|a| self.map_agent_to_session(a)).collect();
+        // Filter out non-CLI entrypoints (e.g. sdk-ts from Zed/IDE integrations).
+        // `claude agents --json` lists every live agent including SDK-driven ones,
+        // but those don't write project JSONLs and aren't what c9watch monitors.
+        // The per-pid metadata at ~/.claude/sessions/<pid>.json carries `entrypoint`.
+        // If the file is missing or unreadable, keep the agent (older CC versions).
+        let sessions: Vec<DetectedSession> = agents
+            .into_iter()
+            .filter(|a| is_cli_entrypoint(a.pid))
+            .map(|a| self.map_agent_to_session(a))
+            .collect();
 
         Ok((sessions, DetectionDiagnostics::default()))
     }
 
     fn backend_name(&self) -> &'static str {
         "cli"
+    }
+}
+
+/// Returns true if the agent at this pid was launched as a `claude` CLI (not via
+/// the TypeScript/Python SDK). Reads `~/.claude/sessions/<pid>.json` and inspects
+/// the `entrypoint` field. Missing/unreadable file → keep (older CC builds didn't
+/// write this metadata; better to over-report than drop real CLIs).
+fn is_cli_entrypoint(pid: u32) -> bool {
+    match dirs::home_dir() {
+        Some(home) => is_cli_entrypoint_under(&home, pid),
+        None => true,
+    }
+}
+
+fn is_cli_entrypoint_under(home: &Path, pid: u32) -> bool {
+    let path = home.join(".claude").join("sessions").join(format!("{pid}.json"));
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return true,
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+    match value.get("entrypoint").and_then(|v| v.as_str()) {
+        Some(ep) => ep == "cli",
+        None => true,
     }
 }
 
@@ -256,6 +298,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_cli_output_missing_kind_defaults_to_interactive() {
+        // CC 2.1.145–146 emit `claude agents --json` without the `kind` field.
+        let json = r#"[{"pid":1,"cwd":"/tmp","startedAt":1,"sessionId":"x"}]"#;
+        let agents: Vec<CliAgent> = serde_json::from_str(json).unwrap();
+        assert_eq!(agents[0].kind, "interactive");
+    }
+
+    #[test]
     fn parse_cli_output_empty_array() {
         let agents: Vec<CliAgent> = serde_json::from_str("[]").unwrap();
         assert!(agents.is_empty());
@@ -322,6 +372,59 @@ mod tests {
         let result = lookup_with_cache(home, &mut cache, &cwd, session_id);
         assert_eq!(result, proj_dir);
         assert_eq!(cache.len(), 1, "cache size unchanged on hit");
+    }
+
+    fn write_session_meta(home: &Path, pid: u32, entrypoint: Option<&str>) {
+        let dir = home.join(".claude").join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = match entrypoint {
+            Some(ep) => format!(r#"{{"pid":{pid},"entrypoint":"{ep}"}}"#),
+            None => format!(r#"{{"pid":{pid}}}"#),
+        };
+        std::fs::write(dir.join(format!("{pid}.json")), body).unwrap();
+    }
+
+    #[test]
+    fn entrypoint_filter_keeps_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_session_meta(tmp.path(), 1, Some("cli"));
+        assert!(is_cli_entrypoint_under(tmp.path(), 1));
+    }
+
+    #[test]
+    fn entrypoint_filter_drops_sdk_ts() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_session_meta(tmp.path(), 2, Some("sdk-ts"));
+        assert!(!is_cli_entrypoint_under(tmp.path(), 2));
+    }
+
+    #[test]
+    fn entrypoint_filter_drops_sdk_py() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_session_meta(tmp.path(), 3, Some("sdk-py"));
+        assert!(!is_cli_entrypoint_under(tmp.path(), 3));
+    }
+
+    #[test]
+    fn entrypoint_filter_keeps_when_meta_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(is_cli_entrypoint_under(tmp.path(), 999));
+    }
+
+    #[test]
+    fn entrypoint_filter_keeps_when_field_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_session_meta(tmp.path(), 4, None);
+        assert!(is_cli_entrypoint_under(tmp.path(), 4));
+    }
+
+    #[test]
+    fn entrypoint_filter_keeps_when_meta_malformed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("5.json"), "not json").unwrap();
+        assert!(is_cli_entrypoint_under(tmp.path(), 5));
     }
 
     #[test]
