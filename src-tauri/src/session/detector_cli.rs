@@ -86,6 +86,20 @@ impl SessionSource for CliSessionSource {
             .spawn()
             .map_err(|e| SessionDetectorError::CliFailed(format!("spawn: {e}")))?;
 
+        // Drain stdout on a background thread to avoid pipe-buffer deadlock
+        // when the child writes more than the OS pipe buffer (typically 64KB).
+        // The reader exits naturally when the child closes stdout (on exit or kill).
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| SessionDetectorError::CliFailed("stdout pipe missing".to_string()))?;
+        let reader = std::thread::spawn(move || {
+            let mut stdout = stdout;
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        });
+
         let timeout = Duration::from_secs(2);
         let status = match child
             .wait_timeout(timeout)
@@ -94,21 +108,20 @@ impl SessionSource for CliSessionSource {
             Some(s) => s,
             None => {
                 let _ = child.kill();
+                // Still join the reader so it doesn't leak; kill closes the pipe.
+                let _ = reader.join();
                 return Err(SessionDetectorError::Timeout(timeout.as_millis()));
             }
         };
+
+        let buf = reader
+            .join()
+            .map_err(|_| SessionDetectorError::CliFailed("stdout reader panicked".to_string()))?;
 
         if !status.success() {
             return Err(SessionDetectorError::CliFailed(format!(
                 "exit code {status:?}"
             )));
-        }
-
-        let mut buf = Vec::new();
-        if let Some(mut stdout) = child.stdout.take() {
-            stdout
-                .read_to_end(&mut buf)
-                .map_err(|e| SessionDetectorError::CliFailed(format!("read: {e}")))?;
         }
 
         let agents: Vec<CliAgent> = serde_json::from_slice(&buf)
