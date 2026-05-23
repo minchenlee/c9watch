@@ -105,16 +105,45 @@ pub fn probe_claude_supports_agents_json() -> bool {
 }
 
 fn probe_version_supports() -> bool {
-    let Ok(out) = Command::new("claude").args(["--version"]).output() else {
+    use std::process::Stdio;
+    use wait_timeout::ChildExt;
+    let Ok(mut child) = Command::new("claude")
+        .args(["--version"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
         return false;
     };
-    if !out.status.success() {
-        return false;
+    // Drain stdout on a bg thread to avoid pipe deadlock (same pattern as
+    // detector_cli::detect). --version output is tiny, but the cost is trivial.
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => return false,
+    };
+    let reader = std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        buf
+    });
+    match child.wait_timeout(Duration::from_secs(2)) {
+        Ok(Some(status)) if status.success() => {
+            let buf = match reader.join() {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
+            let s = String::from_utf8_lossy(&buf);
+            parse_semver(&s)
+                .map(semver_supports_agents_json)
+                .unwrap_or(false)
+        }
+        _ => {
+            let _ = child.kill();
+            let _ = reader.join();
+            false
+        }
     }
-    let s = String::from_utf8_lossy(&out.stdout);
-    parse_semver(&s)
-        .map(semver_supports_agents_json)
-        .unwrap_or(false)
 }
 
 fn probe_command_works() -> bool {
