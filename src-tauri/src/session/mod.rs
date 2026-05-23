@@ -7,6 +7,8 @@ pub mod status;
 
 pub use custom_names::{CustomNames, CustomTitles};
 pub use detector::LegacySessionSource;
+pub mod detector_cli;
+pub use detector_cli::CliSessionSource;
 pub use source::{CliActivity, DetectedSession, DetectionDiagnostics, SessionKind, SessionSource};
 pub use parser::{
     extract_messages, parse_all_entries, parse_last_n_entries, parse_sessions_index, ImageBlock,
@@ -141,19 +143,13 @@ fn probe_command_works() -> bool {
 
 pub fn create_session_source() -> Box<dyn SessionSource> {
     use crate::session::detector::LegacySessionSource;
-    // CliSessionSource lands in Task 5; until then both auto-success and force-cli
-    // paths fall back to legacy. The match arms are kept distinct so Task 5 only
-    // needs to swap the constructor.
+    use crate::session::detector_cli::CliSessionSource;
     match mode_from_env() {
-        BackendMode::ForceCli => {
-            // TODO(Task 5): return Box::new(CliSessionSource::new())
-            Box::new(LegacySessionSource::new().expect("legacy ctor"))
-        }
+        BackendMode::ForceCli => Box::new(CliSessionSource::new()),
         BackendMode::ForceLegacy => Box::new(LegacySessionSource::new().expect("legacy ctor")),
         BackendMode::Auto => {
             if probe_claude_supports_agents_json() {
-                // TODO(Task 5): return Box::new(CliSessionSource::new())
-                Box::new(LegacySessionSource::new().expect("legacy ctor"))
+                Box::new(CliSessionSource::new())
             } else {
                 Box::new(LegacySessionSource::new().expect("legacy ctor"))
             }
