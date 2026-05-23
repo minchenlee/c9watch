@@ -94,7 +94,10 @@ fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
 }
 
 fn semver_supports_agents_json(v: (u32, u32, u32)) -> bool {
-    v >= (2, 1, 150)
+    // `claude agents --json` shipped in 2.1.145. 2.1.145–146 omit the `kind`
+    // field (background-pinned sessions came in 2.1.147); CliAgent::kind has
+    // a default so the older schema still parses.
+    v >= (2, 1, 145)
 }
 
 pub fn probe_claude_supports_agents_json() -> bool {
@@ -226,6 +229,11 @@ mod factory_tests {
     }
 
     #[test]
+    fn version_gate_accepts_2_1_145() {
+        assert!(semver_supports_agents_json((2, 1, 145)));
+    }
+
+    #[test]
     fn version_gate_accepts_2_1_150() {
         assert!(semver_supports_agents_json((2, 1, 150)));
     }
@@ -236,8 +244,8 @@ mod factory_tests {
     }
 
     #[test]
-    fn version_gate_rejects_2_1_149() {
-        assert!(!semver_supports_agents_json((2, 1, 149)));
+    fn version_gate_rejects_2_1_144() {
+        assert!(!semver_supports_agents_json((2, 1, 144)));
     }
 
     #[test]
