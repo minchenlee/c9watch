@@ -1,6 +1,7 @@
+use crate::session::source::{CliActivity, DetectedSession, DetectionDiagnostics, SessionSource};
 use crate::session::{
     determine_status, get_pending_tool_input, get_pending_tool_name, parse_last_n_entries,
-    parse_sessions_index, LegacySessionSource, SessionStatus,
+    parse_sessions_index, SessionStatus,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -34,6 +35,14 @@ pub struct Session {
     /// Populated in polling.rs by overlay from `~/.claude/c9watch/workers/*/meta.json`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_of: Option<String>,
+    /// User-set name from `claude agents` (Ctrl+T background-pinned sessions).
+    /// Only populated by the CLI backend; legacy backend leaves this None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub official_name: Option<String>,
+    /// Session start time in ms since epoch (from `claude agents --json`).
+    /// Only populated by the CLI backend; legacy backend leaves this None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
 }
 
 /// Cache for native custom titles, keyed by file path.
@@ -66,22 +75,51 @@ pub(crate) fn get_cached_native_title(path: &Path) -> Option<String> {
     }
 }
 
-/// Detect sessions and enrich them with status and conversation data
-pub fn detect_and_enrich_sessions(
-) -> Result<(Vec<Session>, crate::session::DetectionDiagnostics), String> {
-    let mut detector =
-        LegacySessionSource::new().map_err(|e| format!("Failed to create session detector: {}", e))?;
-    detect_and_enrich_sessions_with_detector(&mut detector)
+/// Combines the existing heuristic-based SessionStatus with the CLI activity signal.
+///
+/// CLI activity NEVER overrides NeedsAttention or Connecting — those stay driven by
+/// JSONL content + PermissionChecker. It only refines Working vs WaitingForInput.
+pub fn merge_cli_activity(
+    heuristic: SessionStatus,
+    cli: Option<CliActivity>,
+    has_pending_tool: bool,
+) -> SessionStatus {
+    match (heuristic, cli) {
+        (SessionStatus::NeedsAttention, _) => SessionStatus::NeedsAttention,
+        (SessionStatus::Connecting, _) => SessionStatus::Connecting,
+        (heuristic, None) => heuristic,
+        (SessionStatus::WaitingForInput, Some(CliActivity::Busy)) => SessionStatus::Working,
+        (SessionStatus::Working, Some(CliActivity::Idle)) if !has_pending_tool => {
+            SessionStatus::WaitingForInput
+        }
+        (heuristic, _) => heuristic,
+    }
 }
 
-/// Detect sessions using an existing detector (avoids recreating System each call)
-pub fn detect_and_enrich_sessions_with_detector(
-    detector: &mut LegacySessionSource,
-) -> Result<(Vec<Session>, crate::session::DetectionDiagnostics), String> {
-    let (detected_sessions, diagnostics) = detector
-        .detect_sessions()
-        .map_err(|e| format!("Failed to detect sessions: {}", e))?;
+/// Detect sessions and enrich them with status and conversation data.
+/// Uses the configured backend (CLI or Legacy) via the factory.
+pub fn detect_and_enrich_sessions(
+) -> Result<(Vec<Session>, DetectionDiagnostics), String> {
+    let mut source = crate::session::create_session_source();
+    detect_and_enrich_sessions_with_source(source.as_mut())
+}
 
+/// Detect sessions using a SessionSource trait object and enrich them.
+pub fn detect_and_enrich_sessions_with_source(
+    source: &mut dyn SessionSource,
+) -> Result<(Vec<Session>, DetectionDiagnostics), String> {
+    let (detected, diag) = source
+        .detect()
+        .map_err(|e| format!("Failed to detect sessions: {}", e))?;
+    enrich_detected_sessions(detected, diag)
+}
+
+/// Enrichment-only: takes already-detected sessions and adds JSONL-derived fields.
+/// Split out so callers can drop a lock before doing slow JSONL parsing.
+pub fn enrich_detected_sessions(
+    detected_sessions: Vec<DetectedSession>,
+    diagnostics: DetectionDiagnostics,
+) -> Result<(Vec<Session>, DetectionDiagnostics), String> {
     let custom_names = crate::session::CustomNames::load();
     let custom_titles = crate::session::CustomTitles::load();
     let mut sessions = Vec::new();
@@ -172,7 +210,9 @@ pub fn detect_and_enrich_sessions_with_detector(
             }
         };
 
-        let status = if entries.is_empty() {
+        let pending_tool_name = get_pending_tool_name(&entries);
+
+        let heuristic_status = if entries.is_empty() {
             SessionStatus::Connecting
         } else {
             let raw_status = determine_status(&entries);
@@ -185,9 +225,13 @@ pub fn detect_and_enrich_sessions_with_detector(
                 raw_status
             }
         };
+        let status = merge_cli_activity(
+            heuristic_status,
+            detected.cli_activity,
+            pending_tool_name.is_some(),
+        );
 
         let latest_message = get_latest_message_from_entries(&entries);
-        let pending_tool_name = get_pending_tool_name(&entries);
         let pending_tool_input = get_pending_tool_input(&entries);
 
         // Skip empty sessions (0 messages)
@@ -223,6 +267,8 @@ pub fn detect_and_enrich_sessions_with_detector(
             pending_tool_name,
             pending_tool_input,
             worker_of: None,
+            official_name: detected.official_name.clone(),
+            started_at_ms: detected.started_at_ms,
         });
     }
 
@@ -424,5 +470,65 @@ mod tests {
     #[test]
     fn test_truncate_string_utf8_emoji() {
         assert_eq!(truncate_string("Hello 👋 World", 7), "Hello 👋...");
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use crate::session::source::CliActivity;
+    use crate::session::SessionStatus;
+
+    #[test]
+    fn merge_preserves_needs_attention_when_busy() {
+        let merged =
+            merge_cli_activity(SessionStatus::NeedsAttention, Some(CliActivity::Busy), false);
+        assert_eq!(merged, SessionStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn merge_preserves_needs_attention_when_idle() {
+        let merged =
+            merge_cli_activity(SessionStatus::NeedsAttention, Some(CliActivity::Idle), false);
+        assert_eq!(merged, SessionStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn merge_preserves_connecting() {
+        let merged =
+            merge_cli_activity(SessionStatus::Connecting, Some(CliActivity::Busy), false);
+        assert_eq!(merged, SessionStatus::Connecting);
+    }
+
+    #[test]
+    fn merge_busy_promotes_waiting_to_working() {
+        let merged = merge_cli_activity(
+            SessionStatus::WaitingForInput,
+            Some(CliActivity::Busy),
+            false,
+        );
+        assert_eq!(merged, SessionStatus::Working);
+    }
+
+    #[test]
+    fn merge_idle_downgrades_working_without_pending_tool() {
+        let merged =
+            merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), false);
+        assert_eq!(merged, SessionStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn merge_idle_keeps_working_when_pending_tool() {
+        let merged =
+            merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), true);
+        assert_eq!(merged, SessionStatus::Working);
+    }
+
+    #[test]
+    fn merge_none_returns_heuristic_unchanged() {
+        let merged = merge_cli_activity(SessionStatus::Working, None, false);
+        assert_eq!(merged, SessionStatus::Working);
+        let merged = merge_cli_activity(SessionStatus::WaitingForInput, None, true);
+        assert_eq!(merged, SessionStatus::WaitingForInput);
     }
 }

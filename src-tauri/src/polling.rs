@@ -1,6 +1,6 @@
-use crate::session::enrichment::detect_and_enrich_sessions_with_detector;
+use crate::session::enrichment::detect_and_enrich_sessions_with_source;
 pub use crate::session::enrichment::{detect_and_enrich_sessions, truncate_string, Session};
-use crate::session::{LegacySessionSource, SessionStatus};
+use crate::session::SessionStatus;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -110,17 +110,9 @@ pub fn start_polling(
         let app_handle = Arc::new(app);
         let poll_interval = Duration::from_millis(3500);
 
-        // Create detector once and reuse across poll cycles
-        let mut detector = match LegacySessionSource::new() {
-            Ok(d) => d,
-            Err(e) => {
-                crate::debug_log::log_error(&format!(
-                    "Failed to create session detector: {}",
-                    e
-                ));
-                return;
-            }
-        };
+        // Create session source via factory once and reuse across poll cycles.
+        // Task 8 will replace this with shared Arc<Mutex<DetectorState>>.
+        let mut source = crate::session::create_session_source();
 
         // Track previous status for each session
         let previous_status: Arc<Mutex<HashMap<String, SessionStatus>>> =
@@ -140,7 +132,7 @@ pub fn start_polling(
 
         loop {
             // Detect and enrich sessions
-            match detect_and_enrich_sessions_with_detector(&mut detector) {
+            match detect_and_enrich_sessions_with_source(source.as_mut()) {
                 Ok((mut sessions, diagnostics)) => {
                     // Overlay worker_of from ~/.claude/c9watch/workers/*/meta.json
                     let overlay = load_workers_overlay();
