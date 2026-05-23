@@ -34,7 +34,17 @@
 	function tipLeave() { tooltipText = ''; }
 	function tipMove(e: MouseEvent) { tooltipX = e.clientX + 12; tooltipY = e.clientY + 12; }
 
-	let cardTitle = $derived(session.customTitle || session.summary || session.firstPrompt);
+	let cardTitle = $derived(
+		session.customTitle
+		|| session.officialName
+		|| session.summary
+		|| session.firstPrompt
+	);
+	let startedAtIso = $derived(
+		session.startedAtMs != null
+			? new Date(session.startedAtMs).toISOString()
+			: session.modified
+	);
 	let workerTip = $derived(session.workerOf ? `Worker of ${session.workerOf}` : '');
 	let workerIdShort = $derived(session.workerOf?.slice(0, 8) ?? '');
 
@@ -241,7 +251,7 @@
 							{costLabel}
 						</span>
 					{/if}
-					<span class="time-badge">{formatTimeSince(session.modified)}</span>
+					<span class="time-badge">{formatTimeSince(startedAtIso)}</span>
 				</div>
 			{/if}
 			

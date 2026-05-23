@@ -1,6 +1,6 @@
-use crate::session::enrichment::detect_and_enrich_sessions_with_detector;
+use crate::session::enrichment::enrich_detected_sessions;
 pub use crate::session::enrichment::{detect_and_enrich_sessions, truncate_string, Session};
-use crate::session::{SessionDetector, SessionStatus};
+use crate::session::{DetectorState, SessionStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -103,24 +103,13 @@ fn load_workers_overlay() -> Arc<HashMap<String, String>> {
 /// 5. Broadcasts session data to WebSocket clients
 pub fn start_polling(
     app: AppHandle,
+    detector: Arc<Mutex<DetectorState>>,
     sessions_tx: tokio::sync::broadcast::Sender<String>,
     notifications_tx: tokio::sync::broadcast::Sender<String>,
 ) {
     thread::spawn(move || {
         let app_handle = Arc::new(app);
         let poll_interval = Duration::from_millis(3500);
-
-        // Create detector once and reuse across poll cycles
-        let mut detector = match SessionDetector::new() {
-            Ok(d) => d,
-            Err(e) => {
-                crate::debug_log::log_error(&format!(
-                    "Failed to create session detector: {}",
-                    e
-                ));
-                return;
-            }
-        };
 
         // Track previous status for each session
         let previous_status: Arc<Mutex<HashMap<String, SessionStatus>>> =
@@ -139,8 +128,23 @@ pub fn start_polling(
         let mut prev_sessions_hash: Option<u64> = None;
 
         loop {
-            // Detect and enrich sessions
-            match detect_and_enrich_sessions_with_detector(&mut detector) {
+            // Lock the shared DetectorState only for the detection step itself,
+            // then drop the guard BEFORE the slow enrichment pass so other call
+            // sites (Tauri commands, focus handler) aren't blocked.
+            let detect_result = {
+                let mut state = match detector.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                state.detect()
+            };
+
+            let enriched = match detect_result {
+                Ok((detected, diag)) => enrich_detected_sessions(detected, diag),
+                Err(e) => Err(format!("Detect failed: {}", e)),
+            };
+
+            match enriched {
                 Ok((mut sessions, diagnostics)) => {
                     // Overlay worker_of from ~/.claude/c9watch/workers/*/meta.json
                     let overlay = load_workers_overlay();

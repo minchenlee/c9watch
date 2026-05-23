@@ -1,10 +1,10 @@
-use c9watch_lib::session::SessionDetector;
+use c9watch_lib::session::LegacySessionSource;
 
 fn main() {
     println!("Claude Session Detector Test\n");
 
     // Create a new detector
-    let mut detector = match SessionDetector::new() {
+    let mut detector = match LegacySessionSource::new() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Failed to create detector: {}", e);

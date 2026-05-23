@@ -22,7 +22,7 @@ pub mod cli;
 #[cfg(feature = "gui")]
 use actions::{open_session as open_session_action, stop_session as stop_session_action};
 #[cfg(feature = "gui")]
-use polling::{detect_and_enrich_sessions, start_polling, Session};
+use polling::{start_polling, Session};
 #[cfg(feature = "gui")]
 use serde::Serialize;
 #[cfg(feature = "gui")]
@@ -31,7 +31,7 @@ use session::conversation::Conversation;
 #[cfg(feature = "gui")]
 pub use session::conversation::get_conversation_data;
 #[cfg(feature = "gui")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 #[cfg(feature = "gui")]
 use std::time::Duration;
 #[cfg(feature = "gui")]
@@ -58,8 +58,18 @@ fn greet(name: &str) -> String {
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
-async fn get_sessions() -> Result<Vec<Session>, String> {
-    polling::detect_and_enrich_sessions().map(|(sessions, _)| sessions)
+async fn get_sessions(
+    detector: tauri::State<'_, Arc<Mutex<session::DetectorState>>>,
+) -> Result<Vec<Session>, String> {
+    let detect_result = {
+        let mut state = detector
+            .lock()
+            .map_err(|e| format!("Detector lock poisoned: {}", e))?;
+        state.detect()
+    };
+    let (detected, diag) = detect_result.map_err(|e| format!("Detect failed: {}", e))?;
+    session::enrichment::enrich_detected_sessions(detected, diag)
+        .map(|(sessions, _)| sessions)
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -165,12 +175,24 @@ async fn reveal_in_file_manager(path: String) -> Result<(), String> {
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
-async fn stop_session(app: AppHandle, pid: u32) -> Result<(), String> {
+async fn stop_session(
+    app: AppHandle,
+    detector: tauri::State<'_, Arc<Mutex<session::DetectorState>>>,
+    pid: u32,
+) -> Result<(), String> {
     stop_session_action(pid)?;
     std::thread::sleep(Duration::from_millis(300));
 
-    if let Ok((sessions, _)) = detect_and_enrich_sessions() {
-        let _ = app.emit("sessions-updated", &sessions);
+    let detect_result = {
+        let mut state = detector
+            .lock()
+            .map_err(|e| format!("Detector lock poisoned: {}", e))?;
+        state.detect()
+    };
+    if let Ok((detected, diag)) = detect_result {
+        if let Ok((sessions, _)) = session::enrichment::enrich_detected_sessions(detected, diag) {
+            let _ = app.emit("sessions-updated", &sessions);
+        }
     }
     Ok(())
 }
@@ -185,6 +207,7 @@ async fn open_session(pid: u32, project_path: String) -> Result<(), String> {
 #[tauri::command]
 async fn rename_session(
     app: AppHandle,
+    detector: tauri::State<'_, Arc<Mutex<session::DetectorState>>>,
     session_id: String,
     new_name: String,
 ) -> Result<(), String> {
@@ -196,8 +219,16 @@ async fn rename_session(
     custom_titles.set(session_id, new_name);
     custom_titles.save()?;
 
-    if let Ok((sessions, _)) = detect_and_enrich_sessions() {
-        let _ = app.emit("sessions-updated", &sessions);
+    let detect_result = {
+        let mut state = detector
+            .lock()
+            .map_err(|e| format!("Detector lock poisoned: {}", e))?;
+        state.detect()
+    };
+    if let Ok((detected, diag)) = detect_result {
+        if let Ok((sessions, _)) = session::enrichment::enrich_detected_sessions(detected, diag) {
+            let _ = app.emit("sessions-updated", &sessions);
+        }
     }
     Ok(())
 }
@@ -387,20 +418,41 @@ pub fn run() {
             });
             tauri::async_runtime::spawn(web_server::start_server(ws_state));
 
-            // ── Polling loop ────────────────────────────────────
-            start_polling(app.handle().clone(), sessions_tx, notifications_tx);
+            // ── Shared detector state ───────────────────────────
+            let detector_state: Arc<Mutex<session::DetectorState>> =
+                Arc::new(Mutex::new(session::DetectorState::new()));
+            app.manage(detector_state.clone());
 
-            // ── Main window: hide on close instead of destroying ──────────────
-            // This allows "Open Dashboard" from the popover to re-show it.
-            // Without this, closing the window destroys it and show() is a no-op.
+            // ── Polling loop ────────────────────────────────────
+            start_polling(
+                app.handle().clone(),
+                detector_state.clone(),
+                sessions_tx,
+                notifications_tx,
+            );
+
+            // ── Main window: hide on close + recheck backend on focus ─────────
+            // hide-on-close keeps "Open Dashboard" working from the popover.
+            // Focused(true) triggers DetectorState::recheck_and_maybe_swap so a
+            // user upgrading Claude Code mid-session can pick up the new
+            // backend the next time they refocus the app.
+            // NOTE: on_window_event in Tauri 2 REPLACES (not appends) the
+            // handler — both behaviors must live in this single closure.
             #[cfg(not(mobile))]
             if let Some(main_win) = app.get_webview_window("main") {
                 let main_win_clone = main_win.clone();
-                main_win.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let detector_for_focus = detector_state.clone();
+                main_win.on_window_event(move |event| match event {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
                         api.prevent_close();
                         let _ = main_win_clone.hide();
                     }
+                    tauri::WindowEvent::Focused(true) => {
+                        if let Ok(mut state) = detector_for_focus.lock() {
+                            state.recheck_and_maybe_swap();
+                        }
+                    }
+                    _ => {}
                 });
             }
 

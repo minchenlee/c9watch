@@ -57,6 +57,12 @@ export interface Session {
 
   /** Session ID of the PM that spawned this session (if it's a c9watch worker) */
   workerOf?: string | null;
+
+  /** Name set via `claude agents` Ctrl+T pin (CC ≥ 2.1.150). */
+  officialName?: string | null;
+
+  /** Session start timestamp from `claude agents --json` (ms since epoch). */
+  startedAtMs?: number | null;
 }
 
 /**

@@ -68,6 +68,7 @@ base64 = { version = "0.22", optional = true }
 # ── CLI-only dependencies ────────────────────────────────────────────
 clap = { version = "4", features = ["derive"], optional = true }
 regex = { version = "1", optional = true }
+wait-timeout = "0.2"
 
 # ── macOS GUI-only ───────────────────────────────────────────────────
 # tauri-nspanel provides NSPanel support for the popover (above fullscreen apps).

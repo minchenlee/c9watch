@@ -1,6 +1,7 @@
+use crate::session::source::{CliActivity, DetectedSession, DetectionDiagnostics, SessionSource};
 use crate::session::{
     determine_status, get_pending_tool_input, get_pending_tool_name, parse_last_n_entries,
-    parse_sessions_index, SessionDetector, SessionStatus,
+    parse_sessions_index, SessionStatus,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -34,6 +35,14 @@ pub struct Session {
     /// Populated in polling.rs by overlay from `~/.claude/c9watch/workers/*/meta.json`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_of: Option<String>,
+    /// User-set name from `claude agents` (Ctrl+T background-pinned sessions).
+    /// Only populated by the CLI backend; legacy backend leaves this None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub official_name: Option<String>,
+    /// Session start time in ms since epoch (from `claude agents --json`).
+    /// Only populated by the CLI backend; legacy backend leaves this None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
 }
 
 /// Cache for native custom titles, keyed by file path.
@@ -66,22 +75,51 @@ pub(crate) fn get_cached_native_title(path: &Path) -> Option<String> {
     }
 }
 
-/// Detect sessions and enrich them with status and conversation data
-pub fn detect_and_enrich_sessions(
-) -> Result<(Vec<Session>, crate::session::DetectionDiagnostics), String> {
-    let mut detector =
-        SessionDetector::new().map_err(|e| format!("Failed to create session detector: {}", e))?;
-    detect_and_enrich_sessions_with_detector(&mut detector)
+/// Combines the existing heuristic-based SessionStatus with the CLI activity signal.
+///
+/// CLI activity NEVER overrides NeedsAttention or Connecting — those stay driven by
+/// JSONL content + PermissionChecker. It only refines Working vs WaitingForInput.
+pub fn merge_cli_activity(
+    heuristic: SessionStatus,
+    cli: Option<CliActivity>,
+    has_pending_tool: bool,
+) -> SessionStatus {
+    match (heuristic, cli) {
+        (SessionStatus::NeedsAttention, _) => SessionStatus::NeedsAttention,
+        (SessionStatus::Connecting, _) => SessionStatus::Connecting,
+        (heuristic, None) => heuristic,
+        (SessionStatus::WaitingForInput, Some(CliActivity::Busy)) => SessionStatus::Working,
+        (SessionStatus::Working, Some(CliActivity::Idle)) if !has_pending_tool => {
+            SessionStatus::WaitingForInput
+        }
+        (heuristic, _) => heuristic,
+    }
 }
 
-/// Detect sessions using an existing detector (avoids recreating System each call)
-pub fn detect_and_enrich_sessions_with_detector(
-    detector: &mut SessionDetector,
-) -> Result<(Vec<Session>, crate::session::DetectionDiagnostics), String> {
-    let (detected_sessions, diagnostics) = detector
-        .detect_sessions()
-        .map_err(|e| format!("Failed to detect sessions: {}", e))?;
+/// Detect sessions and enrich them with status and conversation data.
+/// Uses the configured backend (CLI or Legacy) via the factory.
+pub fn detect_and_enrich_sessions(
+) -> Result<(Vec<Session>, DetectionDiagnostics), String> {
+    let mut source = crate::session::create_session_source();
+    detect_and_enrich_sessions_with_source(source.as_mut())
+}
 
+/// Detect sessions using a SessionSource trait object and enrich them.
+pub fn detect_and_enrich_sessions_with_source(
+    source: &mut dyn SessionSource,
+) -> Result<(Vec<Session>, DetectionDiagnostics), String> {
+    let (detected, diag) = source
+        .detect()
+        .map_err(|e| format!("Failed to detect sessions: {}", e))?;
+    enrich_detected_sessions(detected, diag)
+}
+
+/// Enrichment-only: takes already-detected sessions and adds JSONL-derived fields.
+/// Split out so callers can drop a lock before doing slow JSONL parsing.
+pub fn enrich_detected_sessions(
+    detected_sessions: Vec<DetectedSession>,
+    diagnostics: DetectionDiagnostics,
+) -> Result<(Vec<Session>, DetectionDiagnostics), String> {
     let custom_names = crate::session::CustomNames::load();
     let custom_titles = crate::session::CustomTitles::load();
     let mut sessions = Vec::new();
@@ -140,18 +178,32 @@ pub fn detect_and_enrich_sessions_with_detector(
 
                 // Try to get first prompt from JSONL file
                 let first_prompt = get_first_prompt_from_jsonl(&session_file_path)
-                    .unwrap_or_else(|| "(Active session)".to_string());
+                    .unwrap_or_else(|| {
+                        if detected.started_at_ms.is_some() {
+                            "(No conversation yet)".to_string()
+                        } else {
+                            "(Active session)".to_string()
+                        }
+                    });
 
                 // Count messages in the file
                 let message_count = count_messages_in_jsonl(&session_file_path);
 
-                // Get file modification time
+                // Get file modification time. Fall back to started_at_ms for
+                // CLI-sourced placeholder sessions (no JSONL yet) so the frontend
+                // doesn't choke on `new Date("").getTime()` → NaN when sorting.
                 let modified = std::fs::metadata(&session_file_path)
                     .and_then(|m| m.modified())
                     .ok()
                     .map(|t| {
                         let datetime: DateTime<Utc> = t.into();
                         datetime.to_rfc3339()
+                    })
+                    .or_else(|| {
+                        detected.started_at_ms.and_then(|ms| {
+                            DateTime::<Utc>::from_timestamp_millis(ms)
+                                .map(|dt| dt.to_rfc3339())
+                        })
                     })
                     .unwrap_or_default();
 
@@ -172,7 +224,9 @@ pub fn detect_and_enrich_sessions_with_detector(
             }
         };
 
-        let status = if entries.is_empty() {
+        let pending_tool_name = get_pending_tool_name(&entries);
+
+        let heuristic_status = if entries.is_empty() {
             SessionStatus::Connecting
         } else {
             let raw_status = determine_status(&entries);
@@ -185,13 +239,21 @@ pub fn detect_and_enrich_sessions_with_detector(
                 raw_status
             }
         };
+        let status = merge_cli_activity(
+            heuristic_status,
+            detected.cli_activity,
+            pending_tool_name.is_some(),
+        );
 
         let latest_message = get_latest_message_from_entries(&entries);
-        let pending_tool_name = get_pending_tool_name(&entries);
         let pending_tool_input = get_pending_tool_input(&entries);
 
-        // Skip empty sessions (0 messages)
-        if message_count == 0 {
+        // Skip empty sessions (0 messages) UNLESS CLI-sourced — `claude agents --json`
+        // confirms the agent is live even when no project JSONL exists (SDK-based
+        // interactive sessions never write to ~/.claude/projects/). Render a
+        // placeholder card so the dashboard count matches `claude agents --json`.
+        let cli_sourced = detected.started_at_ms.is_some();
+        if message_count == 0 && !cli_sourced {
             continue;
         }
 
@@ -223,6 +285,8 @@ pub fn detect_and_enrich_sessions_with_detector(
             pending_tool_name,
             pending_tool_input,
             worker_of: None,
+            official_name: detected.official_name.clone(),
+            started_at_ms: detected.started_at_ms,
         });
     }
 
@@ -424,5 +488,116 @@ mod tests {
     #[test]
     fn test_truncate_string_utf8_emoji() {
         assert_eq!(truncate_string("Hello 👋 World", 7), "Hello 👋...");
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use crate::session::source::CliActivity;
+    use crate::session::SessionStatus;
+
+    #[test]
+    fn merge_preserves_needs_attention_when_busy() {
+        let merged =
+            merge_cli_activity(SessionStatus::NeedsAttention, Some(CliActivity::Busy), false);
+        assert_eq!(merged, SessionStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn merge_preserves_needs_attention_when_idle() {
+        let merged =
+            merge_cli_activity(SessionStatus::NeedsAttention, Some(CliActivity::Idle), false);
+        assert_eq!(merged, SessionStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn merge_preserves_connecting() {
+        let merged =
+            merge_cli_activity(SessionStatus::Connecting, Some(CliActivity::Busy), false);
+        assert_eq!(merged, SessionStatus::Connecting);
+    }
+
+    #[test]
+    fn merge_busy_promotes_waiting_to_working() {
+        let merged = merge_cli_activity(
+            SessionStatus::WaitingForInput,
+            Some(CliActivity::Busy),
+            false,
+        );
+        assert_eq!(merged, SessionStatus::Working);
+    }
+
+    #[test]
+    fn merge_idle_downgrades_working_without_pending_tool() {
+        let merged =
+            merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), false);
+        assert_eq!(merged, SessionStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn merge_idle_keeps_working_when_pending_tool() {
+        let merged =
+            merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), true);
+        assert_eq!(merged, SessionStatus::Working);
+    }
+
+    #[test]
+    fn merge_none_returns_heuristic_unchanged() {
+        let merged = merge_cli_activity(SessionStatus::Working, None, false);
+        assert_eq!(merged, SessionStatus::Working);
+        let merged = merge_cli_activity(SessionStatus::WaitingForInput, None, true);
+        assert_eq!(merged, SessionStatus::WaitingForInput);
+    }
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::*;
+    use crate::session::source::{DetectedSession, DetectionDiagnostics, SessionKind};
+    use std::path::PathBuf;
+
+    #[test]
+    fn cli_placeholder_session_has_valid_modified_from_started_at_ms() {
+        // CLI-sourced session with no JSONL → must still produce parseable RFC3339
+        // `modified` so `new Date(modified).getTime()` doesn't yield NaN on the
+        // frontend (which would scramble sort/group ordering).
+        let tmp = tempfile::tempdir().unwrap();
+        let detected = DetectedSession {
+            pid: 12345,
+            cwd: PathBuf::from("/tmp/nonexistent"),
+            project_path: tmp.path().join("never-existed"),
+            session_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            project_name: "nonexistent".to_string(),
+            kind: SessionKind::Interactive,
+            started_at_ms: Some(1_700_000_000_000),
+            official_name: None,
+            cli_activity: None,
+        };
+        let (sessions, _) =
+            enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
+        assert_eq!(sessions.len(), 1, "CLI placeholder should be emitted");
+        let s = &sessions[0];
+        assert!(!s.modified.is_empty(), "modified must not be empty");
+        let parsed = DateTime::parse_from_rfc3339(&s.modified);
+        assert!(parsed.is_ok(), "modified must parse as RFC3339, got: {}", s.modified);
+        assert_eq!(s.started_at_ms, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn legacy_session_without_jsonl_still_skipped() {
+        // Legacy backend leaves started_at_ms = None. Without JSONL, no message
+        // count, no real data — keep dropping these to avoid the legacy ghost-pid bug.
+        let tmp = tempfile::tempdir().unwrap();
+        let detected = DetectedSession::with_legacy_defaults(
+            42,
+            PathBuf::from("/tmp/legacy"),
+            tmp.path().join("legacy-empty"),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()),
+            "legacy".to_string(),
+        );
+        let (sessions, _) =
+            enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
+        assert!(sessions.is_empty(), "legacy empty-JSONL session must be skipped");
     }
 }

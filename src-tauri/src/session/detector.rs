@@ -1,58 +1,19 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
-use thiserror::Error;
 
-#[derive(Error, Debug)]
-pub enum SessionDetectorError {
-    #[error("Failed to read directory: {0}")]
-    DirectoryRead(#[from] std::io::Error),
-
-    #[error("Failed to get home directory")]
-    HomeDirectoryNotFound,
-
-    #[error("Failed to refresh process information")]
-    ProcessRefreshError,
-}
-
-/// Information about a detected Claude Code session
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DetectedSession {
-    /// Process ID of the running claude process
-    pub pid: u32,
-
-    /// Current working directory of the process
-    pub cwd: PathBuf,
-
-    /// Path to the session's project directory in ~/.claude/projects/
-    pub project_path: PathBuf,
-
-    /// Session ID (UUID from session file)
-    pub session_id: Option<String>,
-
-    /// Project name (derived from cwd)
-    pub project_name: String,
-}
-
-/// Diagnostics about the session detection process
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct DetectionDiagnostics {
-    pub claude_processes_found: u32,
-    pub processes_with_cwd: u32,
-    pub fda_likely_needed: bool,
-}
+use super::source::{DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource};
 
 /// Session detector that finds running Claude processes and matches them to session files
-pub struct SessionDetector {
+pub struct LegacySessionSource {
     system: System,
     claude_projects_dir: PathBuf,
     claude_sessions_dir: PathBuf,
 }
 
-impl SessionDetector {
-    /// Creates a new SessionDetector
+impl LegacySessionSource {
+    /// Creates a new LegacySessionSource
     pub fn new() -> Result<Self, SessionDetectorError> {
         let home_dir = dirs::home_dir().ok_or(SessionDetectorError::HomeDirectoryNotFound)?;
 
@@ -224,13 +185,13 @@ impl SessionDetector {
                         })
                     {
                         used_session_ids.insert(meta.session_id.clone());
-                        sessions.push(DetectedSession {
-                            pid: proc.pid,
-                            cwd: proc_cwd.clone(),
-                            project_path: project_dir.clone(),
-                            session_id: Some(meta.session_id),
-                            project_name: project_name.clone(),
-                        });
+                        sessions.push(DetectedSession::with_legacy_defaults(
+                            proc.pid,
+                            proc_cwd.clone(),
+                            project_dir.clone(),
+                            Some(meta.session_id),
+                            project_name.clone(),
+                        ));
                         continue;
                     }
                 }
@@ -304,13 +265,13 @@ impl SessionDetector {
                 {
                     used_session_ids.insert(session_id.clone());
 
-                    sessions.push(DetectedSession {
-                        pid: proc.pid,
-                        cwd: proc_cwd.clone(),
-                        project_path: project_dir.clone(),
-                        session_id: Some(session_id),
-                        project_name: project_name.clone(),
-                    });
+                    sessions.push(DetectedSession::with_legacy_defaults(
+                        proc.pid,
+                        proc_cwd.clone(),
+                        project_dir.clone(),
+                        Some(session_id),
+                        project_name.clone(),
+                    ));
                 }
             } else {
                 crate::debug_log::log_warn(&format!(
@@ -439,9 +400,20 @@ impl SessionDetector {
     }
 }
 
-impl Default for SessionDetector {
+impl Default for LegacySessionSource {
     fn default() -> Self {
-        Self::new().expect("Failed to create SessionDetector")
+        Self::new().expect("Failed to create LegacySessionSource")
+    }
+}
+
+impl SessionSource for LegacySessionSource {
+    fn detect(
+        &mut self,
+    ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
+        self.detect_sessions()
+    }
+    fn backend_name(&self) -> &'static str {
+        "legacy"
     }
 }
 
@@ -503,13 +475,13 @@ mod tests {
 
     #[test]
     fn test_detector_creation() {
-        let result = SessionDetector::new();
+        let result = LegacySessionSource::new();
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_find_claude_processes() {
-        let detector = SessionDetector::new().unwrap();
+        let detector = LegacySessionSource::new().unwrap();
         let processes = detector.find_claude_processes();
         // This test will vary based on whether claude is running
         println!("Found {} claude processes", processes.len());
@@ -517,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_enumerate_project_directories() {
-        let detector = SessionDetector::new().unwrap();
+        let detector = LegacySessionSource::new().unwrap();
         let result = detector.enumerate_project_directories();
         assert!(result.is_ok());
 
