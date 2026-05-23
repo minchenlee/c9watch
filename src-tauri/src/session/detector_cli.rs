@@ -108,7 +108,9 @@ impl SessionSource for CliSessionSource {
             Some(s) => s,
             None => {
                 let _ = child.kill();
-                // Still join the reader so it doesn't leak; kill closes the pipe.
+                // Reap to avoid leaving a zombie on Unix; then join the reader
+                // (kill closes the pipe so the reader exits naturally).
+                let _ = child.wait();
                 let _ = reader.join();
                 return Err(SessionDetectorError::Timeout(timeout.as_millis()));
             }

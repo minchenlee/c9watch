@@ -140,6 +140,8 @@ fn probe_version_supports() -> bool {
         }
         _ => {
             let _ = child.kill();
+            // Reap to avoid leaving a zombie on Unix.
+            let _ = child.wait();
             let _ = reader.join();
             false
         }
@@ -157,16 +159,32 @@ fn probe_command_works() -> bool {
     else {
         return false;
     };
+    // Drain stdout on a bg thread to avoid pipe-buffer deadlock when the child
+    // writes more than the OS pipe buffer (typically 64KB) — without draining
+    // concurrently, the child blocks on write and wait_timeout falsely fires.
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => return false,
+    };
+    let reader = std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        buf
+    });
     match child.wait_timeout(Duration::from_secs(3)) {
         Ok(Some(status)) if status.success() => {
-            let mut buf = Vec::new();
-            if let Some(mut stdout) = child.stdout.take() {
-                let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
-            }
+            let buf = match reader.join() {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
             serde_json::from_slice::<Vec<serde_json::Value>>(&buf).is_ok()
         }
         _ => {
             let _ = child.kill();
+            // Reap to avoid leaving a zombie on Unix.
+            let _ = child.wait();
+            let _ = reader.join();
             false
         }
     }
