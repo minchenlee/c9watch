@@ -178,7 +178,13 @@ pub fn enrich_detected_sessions(
 
                 // Try to get first prompt from JSONL file
                 let first_prompt = get_first_prompt_from_jsonl(&session_file_path)
-                    .unwrap_or_else(|| "(Active session)".to_string());
+                    .unwrap_or_else(|| {
+                        if detected.started_at_ms.is_some() {
+                            "(No conversation yet)".to_string()
+                        } else {
+                            "(Active session)".to_string()
+                        }
+                    });
 
                 // Count messages in the file
                 let message_count = count_messages_in_jsonl(&session_file_path);
@@ -234,8 +240,12 @@ pub fn enrich_detected_sessions(
         let latest_message = get_latest_message_from_entries(&entries);
         let pending_tool_input = get_pending_tool_input(&entries);
 
-        // Skip empty sessions (0 messages)
-        if message_count == 0 {
+        // Skip empty sessions (0 messages) UNLESS CLI-sourced — `claude agents --json`
+        // confirms the agent is live even when no project JSONL exists (SDK-based
+        // interactive sessions never write to ~/.claude/projects/). Render a
+        // placeholder card so the dashboard count matches `claude agents --json`.
+        let cli_sourced = detected.started_at_ms.is_some();
+        if message_count == 0 && !cli_sourced {
             continue;
         }
 
