@@ -9,6 +9,8 @@ pub use custom_names::{CustomNames, CustomTitles};
 pub use detector::LegacySessionSource;
 pub mod detector_cli;
 pub use detector_cli::CliSessionSource;
+pub mod state;
+pub use state::DetectorState;
 pub use source::{CliActivity, DetectedSession, DetectionDiagnostics, SessionKind, SessionSource};
 pub use parser::{
     extract_messages, parse_all_entries, parse_last_n_entries, parse_sessions_index, ImageBlock,
