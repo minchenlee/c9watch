@@ -189,13 +189,21 @@ pub fn enrich_detected_sessions(
                 // Count messages in the file
                 let message_count = count_messages_in_jsonl(&session_file_path);
 
-                // Get file modification time
+                // Get file modification time. Fall back to started_at_ms for
+                // CLI-sourced placeholder sessions (no JSONL yet) so the frontend
+                // doesn't choke on `new Date("").getTime()` → NaN when sorting.
                 let modified = std::fs::metadata(&session_file_path)
                     .and_then(|m| m.modified())
                     .ok()
                     .map(|t| {
                         let datetime: DateTime<Utc> = t.into();
                         datetime.to_rfc3339()
+                    })
+                    .or_else(|| {
+                        detected.started_at_ms.and_then(|ms| {
+                            DateTime::<Utc>::from_timestamp_millis(ms)
+                                .map(|dt| dt.to_rfc3339())
+                        })
                     })
                     .unwrap_or_default();
 
@@ -540,5 +548,56 @@ mod merge_tests {
         assert_eq!(merged, SessionStatus::Working);
         let merged = merge_cli_activity(SessionStatus::WaitingForInput, None, true);
         assert_eq!(merged, SessionStatus::WaitingForInput);
+    }
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::*;
+    use crate::session::source::{DetectedSession, DetectionDiagnostics, SessionKind};
+    use std::path::PathBuf;
+
+    #[test]
+    fn cli_placeholder_session_has_valid_modified_from_started_at_ms() {
+        // CLI-sourced session with no JSONL → must still produce parseable RFC3339
+        // `modified` so `new Date(modified).getTime()` doesn't yield NaN on the
+        // frontend (which would scramble sort/group ordering).
+        let tmp = tempfile::tempdir().unwrap();
+        let detected = DetectedSession {
+            pid: 12345,
+            cwd: PathBuf::from("/tmp/nonexistent"),
+            project_path: tmp.path().join("never-existed"),
+            session_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            project_name: "nonexistent".to_string(),
+            kind: SessionKind::Interactive,
+            started_at_ms: Some(1_700_000_000_000),
+            official_name: None,
+            cli_activity: None,
+        };
+        let (sessions, _) =
+            enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
+        assert_eq!(sessions.len(), 1, "CLI placeholder should be emitted");
+        let s = &sessions[0];
+        assert!(!s.modified.is_empty(), "modified must not be empty");
+        let parsed = DateTime::parse_from_rfc3339(&s.modified);
+        assert!(parsed.is_ok(), "modified must parse as RFC3339, got: {}", s.modified);
+        assert_eq!(s.started_at_ms, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn legacy_session_without_jsonl_still_skipped() {
+        // Legacy backend leaves started_at_ms = None. Without JSONL, no message
+        // count, no real data — keep dropping these to avoid the legacy ghost-pid bug.
+        let tmp = tempfile::tempdir().unwrap();
+        let detected = DetectedSession::with_legacy_defaults(
+            42,
+            PathBuf::from("/tmp/legacy"),
+            tmp.path().join("legacy-empty"),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()),
+            "legacy".to_string(),
+        );
+        let (sessions, _) =
+            enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
+        assert!(sessions.is_empty(), "legacy empty-JSONL session must be skipped");
     }
 }
