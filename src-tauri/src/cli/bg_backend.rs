@@ -42,7 +42,7 @@ pub fn resolve_control_sock() -> Result<PathBuf, String> {
     ))
 }
 
-use crate::cli::bg_protocol::{OneShotReply, Request};
+use crate::cli::bg_protocol::{OneShotReply, Request, StatePatch};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -168,6 +168,120 @@ pub async fn spawn_bg(
     })
 }
 
+/// Tracks whether a worker has settled into a turn-end state (done or blocked).
+///
+/// Per Phase 0 findings: pid-only patches and `tempo:"active"` patches mid-turn
+/// must NOT count as settle. Only an explicit `state:"done"` or `state:"blocked"`
+/// transition is authoritative.
+#[derive(Debug, Default)]
+pub struct SettleDetector {
+    state: Option<String>,
+    tempo: Option<String>,
+    needs: Option<String>,
+    detail: Option<String>,
+}
+
+impl SettleDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn apply_patch(&mut self, patch: &StatePatch) {
+        if let Some(s) = &patch.state {
+            self.state = Some(s.clone());
+        }
+        if let Some(t) = &patch.tempo {
+            self.tempo = Some(t.clone());
+        }
+        if let Some(n) = &patch.needs {
+            self.needs = Some(n.clone());
+        }
+        if let Some(d) = &patch.detail {
+            self.detail = Some(d.clone());
+        }
+    }
+
+    pub fn is_settled(&self) -> bool {
+        matches!(self.state.as_deref(), Some("done") | Some("blocked"))
+    }
+
+    pub fn last_settled_state(&self) -> Option<&str> {
+        self.state.as_deref()
+    }
+
+    pub fn needs(&self) -> Option<&str> {
+        self.needs.as_deref()
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+}
+
+use tokio::sync::broadcast;
+
+/// Open a dedicated control.sock connection and subscribe to `short`'s events.
+///
+/// Returns a broadcast receiver that emits `SubscribeEvent` (filtered: `Stream`
+/// frames are dropped silently — they're ANSI PTY redraws, not useful for c9watch).
+/// The reader task runs until the connection EOFs or the receiver is dropped.
+pub async fn subscribe(
+    sock: &std::path::Path,
+    short: &str,
+) -> Result<broadcast::Receiver<crate::cli::bg_protocol::SubscribeEvent>, String> {
+    use crate::cli::bg_protocol::SubscribeEvent;
+
+    let mut conn = UnixStream::connect(sock)
+        .await
+        .map_err(|e| format!("subscribe connect {}: {}", sock.display(), e))?;
+
+    let wire = Request::Subscribe {
+        short: short.to_string(),
+    }
+    .to_wire();
+    conn.write_all(wire.as_bytes())
+        .await
+        .map_err(|e| format!("subscribe write: {}", e))?;
+    conn.write_all(b"\n")
+        .await
+        .map_err(|e| format!("subscribe newline: {}", e))?;
+    conn.flush().await.map_err(|e| format!("subscribe flush: {}", e))?;
+
+    let (tx, rx) = broadcast::channel::<SubscribeEvent>(64);
+    let short_owned = short.to_string();
+
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(conn);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => {
+                    eprintln!("[bg_backend] subscribe({}) EOF", short_owned);
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("[bg_backend] subscribe({}) read err: {}", short_owned, e);
+                    break;
+                }
+            }
+            let ev = match serde_json::from_str::<SubscribeEvent>(line.trim()) {
+                Ok(e) => e,
+                Err(_) => continue, // skip unparseable frames silently
+            };
+            if matches!(ev, SubscribeEvent::Stream { .. }) {
+                continue; // discard PTY frames
+            }
+            if tx.send(ev).is_err() {
+                break; // receiver dropped
+            }
+        }
+    });
+
+    Ok(rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +334,51 @@ mod tests {
     fn parse_backgrounded_missing_short_returns_none() {
         let out = "some unrelated output\n";
         assert!(parse_short_from_spawn(out).is_none());
+    }
+
+    #[test]
+    fn settle_detector_treats_done_as_settled() {
+        let mut det = SettleDetector::new();
+        det.apply_patch(&StatePatch {
+            state: Some("done".to_string()),
+            tempo: Some("idle".to_string()),
+            ..Default::default()
+        });
+        assert!(det.is_settled());
+        assert_eq!(det.last_settled_state(), Some("done"));
+    }
+
+    #[test]
+    fn settle_detector_treats_blocked_as_settled() {
+        let mut det = SettleDetector::new();
+        det.apply_patch(&StatePatch {
+            state: Some("blocked".to_string()),
+            tempo: Some("blocked".to_string()),
+            needs: Some("user input".to_string()),
+            ..Default::default()
+        });
+        assert!(det.is_settled());
+        assert_eq!(det.last_settled_state(), Some("blocked"));
+        assert_eq!(det.needs(), Some("user input"));
+    }
+
+    #[test]
+    fn settle_detector_ignores_pid_only_patches() {
+        let mut det = SettleDetector::new();
+        det.apply_patch(&StatePatch {
+            pid: Some(123),
+            ..Default::default()
+        });
+        assert!(!det.is_settled());
+    }
+
+    #[test]
+    fn settle_detector_ignores_active_tempo() {
+        let mut det = SettleDetector::new();
+        det.apply_patch(&StatePatch {
+            tempo: Some("active".to_string()),
+            ..Default::default()
+        });
+        assert!(!det.is_settled());
     }
 }

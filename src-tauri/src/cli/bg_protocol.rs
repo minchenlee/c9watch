@@ -33,7 +33,7 @@ pub struct OneShotReply {
     pub code: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SubscribeEvent {
     Snapshot {
