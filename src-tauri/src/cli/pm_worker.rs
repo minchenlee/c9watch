@@ -320,20 +320,25 @@ impl BgWorkerHandle {
         };
         pm_fs::write_worker_meta(&meta)?;
 
-        let events_rx = bg_backend::subscribe(&sock_path, &short).await?;
-
         let inbox_ctx = ctx.spawned_by.as_ref().map(|pm| InboxContext {
             session_id: session_id.clone(),
             spawned_by: pm.clone(),
         });
 
-        // Spawn a long-lived settle-watcher that fans out inbox events on every
-        // turn end regardless of whether a `--wait` caller is listening. Without
-        // this, PM-owned bg workers only emit Done/Awaiting events when a `send
-        // --wait` happens to be in flight — spawn-time prompts and non-waiting
-        // sends would silently miss completions.
+        // Mint two receivers up-front when a PM is attached: one for the
+        // long-lived settle watcher, one for `wait_for_turn` callers. Tokio
+        // broadcast receivers do NOT replay older messages, so both must
+        // exist before any event lands — otherwise a fast initial snapshot
+        // could slip past the second subscriber.
+        let receiver_count = if inbox_ctx.is_some() { 2 } else { 1 };
+        let (_tx, mut receivers) =
+            bg_backend::subscribe(&sock_path, &short, receiver_count).await?;
+        let events_rx = receivers.remove(0);
+
         if let Some(ref ctx) = inbox_ctx {
-            let watcher_rx = events_rx.resubscribe();
+            let watcher_rx = receivers
+                .pop()
+                .expect("subscribe(2) returned <2 receivers");
             let ctx = ctx.clone();
             let short_owned = short.clone();
             tokio::spawn(settle_watcher_task(watcher_rx, ctx, short_owned));

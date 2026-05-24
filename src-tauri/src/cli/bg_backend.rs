@@ -196,6 +196,14 @@ impl SettleDetector {
         }
         if let Some(t) = &patch.tempo {
             self.tempo = Some(t.clone());
+            // Worker started a new turn — invalidate the previous settle so
+            // is_settled() flips back to false and a subsequent done/blocked
+            // is recognised as a NEW settle. The daemon never emits a fresh
+            // state:active patch; only tempo carries the resumption signal.
+            if matches!(t.as_str(), "active" | "running") {
+                self.state = None;
+                self.needs = None;
+            }
         }
         if let Some(n) = &patch.needs {
             self.needs = Some(n.clone());
@@ -226,14 +234,30 @@ use tokio::sync::broadcast;
 
 /// Open a dedicated control.sock connection and subscribe to `short`'s events.
 ///
-/// Returns a broadcast receiver that emits `SubscribeEvent` (filtered: `Stream`
-/// frames are dropped silently — they're ANSI PTY redraws, not useful for c9watch).
-/// The reader task runs until the connection EOFs or the receiver is dropped.
+/// Returns `(Sender, Vec<Receiver>)` where the receivers count matches
+/// `receiver_count`. Receivers are minted BEFORE the reader task starts
+/// streaming events so callers cannot race past the initial snapshot.
+///
+/// Tokio broadcast receivers start at the current channel position when
+/// `subscribe()` is called; they do NOT replay older messages. So all
+/// downstream consumers MUST be created up-front.
+///
+/// Reader task discards `Stream` frames (ANSI PTY redraws). Reader exits on
+/// connection EOF or when all receivers are dropped.
 pub async fn subscribe(
     sock: &std::path::Path,
     short: &str,
-) -> Result<broadcast::Receiver<crate::cli::bg_protocol::SubscribeEvent>, String> {
+    receiver_count: usize,
+) -> Result<
+    (
+        broadcast::Sender<crate::cli::bg_protocol::SubscribeEvent>,
+        Vec<broadcast::Receiver<crate::cli::bg_protocol::SubscribeEvent>>,
+    ),
+    String,
+> {
     use crate::cli::bg_protocol::SubscribeEvent;
+
+    assert!(receiver_count >= 1, "subscribe requires receiver_count >= 1");
 
     let mut conn = UnixStream::connect(sock)
         .await
@@ -251,9 +275,19 @@ pub async fn subscribe(
         .map_err(|e| format!("subscribe newline: {}", e))?;
     conn.flush().await.map_err(|e| format!("subscribe flush: {}", e))?;
 
-    let (tx, rx) = broadcast::channel::<SubscribeEvent>(64);
-    let short_owned = short.to_string();
+    let (tx, first_rx) = broadcast::channel::<SubscribeEvent>(64);
+    // Mint all requested receivers SYNCHRONOUSLY before spawning the reader
+    // task so the channel is fully provisioned. New tokio broadcast receivers
+    // start at the current sender cursor — late subscribers do NOT replay
+    // older sends. So additional receivers must exist before any event flows.
+    let mut receivers = Vec::with_capacity(receiver_count);
+    receivers.push(first_rx);
+    for _ in 1..receiver_count {
+        receivers.push(tx.subscribe());
+    }
 
+    let reader_tx = tx.clone();
+    let short_owned = short.to_string();
     tokio::spawn(async move {
         let mut reader = BufReader::new(conn);
         let mut line = String::new();
@@ -277,13 +311,13 @@ pub async fn subscribe(
             if matches!(ev, SubscribeEvent::Stream { .. }) {
                 continue; // discard PTY frames
             }
-            if tx.send(ev).is_err() {
-                break; // receiver dropped
-            }
+            // Drop the event when all receivers are gone (post-kill); otherwise
+            // it lands on every active receiver's queue.
+            let _ = reader_tx.send(ev);
         }
     });
 
-    Ok(rx)
+    Ok((tx, receivers))
 }
 
 #[cfg(test)]
@@ -383,6 +417,51 @@ mod tests {
             ..Default::default()
         });
         assert!(!det.is_settled());
+    }
+
+    #[test]
+    fn settle_detector_resets_state_on_active_tempo() {
+        // Worker settles, then resumes with a tempo:active patch (no state
+        // field). Detector must clear `state` so the next done counts as a
+        // NEW settle — otherwise the settle_watcher dedupe latches forever.
+        let mut det = SettleDetector::new();
+        det.apply_patch(&StatePatch {
+            state: Some("done".to_string()),
+            tempo: Some("idle".to_string()),
+            ..Default::default()
+        });
+        assert!(det.is_settled());
+        // Worker starts next turn — only tempo flips.
+        det.apply_patch(&StatePatch {
+            tempo: Some("active".to_string()),
+            ..Default::default()
+        });
+        assert!(!det.is_settled(), "active tempo must clear prior settle");
+        // Next done arrives.
+        det.apply_patch(&StatePatch {
+            state: Some("done".to_string()),
+            tempo: Some("idle".to_string()),
+            ..Default::default()
+        });
+        assert!(det.is_settled());
+    }
+
+    #[test]
+    fn settle_detector_resets_state_on_running_tempo() {
+        let mut det = SettleDetector::new();
+        det.apply_patch(&StatePatch {
+            state: Some("blocked".to_string()),
+            tempo: Some("blocked".to_string()),
+            needs: Some("user input".to_string()),
+            ..Default::default()
+        });
+        assert!(det.is_settled());
+        det.apply_patch(&StatePatch {
+            tempo: Some("running".to_string()),
+            ..Default::default()
+        });
+        assert!(!det.is_settled());
+        assert_eq!(det.needs(), None, "needs must clear after resume");
     }
 
     #[test]
