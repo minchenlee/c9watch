@@ -42,6 +42,51 @@ pub fn resolve_control_sock() -> Result<PathBuf, String> {
     ))
 }
 
+use crate::cli::bg_protocol::{OneShotReply, Request};
+use std::path::Path;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+
+/// Send one request, read one reply, drop the connection.
+///
+/// The daemon closes the connection after each one-shot reply, so this is
+/// the only safe pattern for `reply`/`kill`/`nudge`/`ping`. Do NOT use for
+/// `subscribe` (subscribe takes over the connection — use [`subscribe`]).
+pub async fn rpc(sock: &Path, req: Request) -> Result<OneShotReply, String> {
+    let wire = req.to_wire();
+
+    let mut conn = tokio::time::timeout(
+        Duration::from_secs(2),
+        UnixStream::connect(sock),
+    )
+    .await
+    .map_err(|_| "connect timeout".to_string())?
+    .map_err(|e| format!("connect {}: {}", sock.display(), e))?;
+
+    conn.write_all(wire.as_bytes())
+        .await
+        .map_err(|e| format!("write request: {}", e))?;
+    conn.write_all(b"\n")
+        .await
+        .map_err(|e| format!("write newline: {}", e))?;
+    conn.flush().await.map_err(|e| format!("flush: {}", e))?;
+
+    let mut reader = BufReader::new(conn);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .map_err(|_| "reply timeout".to_string())?
+        .map_err(|e| format!("read reply: {}", e))?;
+
+    if line.is_empty() {
+        return Err("daemon closed connection without reply".to_string());
+    }
+
+    serde_json::from_str::<OneShotReply>(line.trim())
+        .map_err(|e| format!("parse reply {:?}: {}", line, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,5 +99,14 @@ mod tests {
             Ok(p) => assert!(p.ends_with("control.sock")),
             Err(e) => assert!(e.contains("/tmp/cc-daemon-")),
         }
+    }
+
+    #[test]
+    fn rpc_request_serializes_one_line_no_trailing_newline() {
+        use crate::cli::bg_protocol::Request;
+        let req = Request::Kill { short: "abc12345".to_string() };
+        let wire = req.to_wire();
+        assert!(!wire.contains('\n'), "to_wire must not embed newlines");
+        assert!(wire.starts_with('{') && wire.ends_with('}'));
     }
 }
