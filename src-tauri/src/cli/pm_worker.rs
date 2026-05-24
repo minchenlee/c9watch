@@ -279,6 +279,11 @@ pub struct BgWorkerHandle {
     events_rx: Option<tokio::sync::broadcast::Receiver<SubscribeEvent>>,
     #[allow(dead_code)]
     ready_fired: bool,
+    /// Set by `send_message` after the reply RPC. Tells `wait_for_turn` to
+    /// ignore any settled patches that arrive before it sees a fresh
+    /// `tempo:"active"|"running"` transition — those settles belong to the
+    /// previous turn, not the one this caller just sent.
+    awaiting_new_turn: bool,
 }
 
 impl BgWorkerHandle {
@@ -350,16 +355,17 @@ impl BgWorkerHandle {
             sock_path,
             events_rx: Some(events_rx),
             ready_fired: false,
+            awaiting_new_turn: false,
         })
     }
 
     pub async fn send_message(&mut self, text: &str) -> Result<(), String> {
         // Drain any stale settle events buffered from prior turns (spawn-time
-        // prompt, earlier non-waiting sends). Otherwise the next wait_for_turn
-        // could immediately return a stale Done for the previous turn instead
-        // of waiting for the one we're about to send. Worker is idle right
-        // now (it just settled), so no NEW events can land between drain and
-        // RPC send — drain is safe and complete here.
+        // prompt, earlier non-waiting sends). Drain alone isn't sufficient
+        // because the prior turn could settle AFTER drain but BEFORE the
+        // worker enters active for the new turn — so we ALSO arm a gate on
+        // wait_for_turn that requires observing a fresh tempo:active|running
+        // transition before any settle is accepted as belonging to this send.
         if let Some(rx) = self.events_rx.as_mut() {
             loop {
                 match rx.try_recv() {
@@ -384,13 +390,20 @@ impl BgWorkerHandle {
                 reply.error.unwrap_or_default()
             ));
         }
+        self.awaiting_new_turn = true;
         Ok(())
     }
 
     /// Wait for the next settle (done or blocked). Drains pid-only/active
     /// patches via SettleDetector. Returns `WAIT_TIMEOUT` error string on
     /// timeout, mirroring the print backend's contract.
+    ///
+    /// When `self.awaiting_new_turn` is true (set by `send_message`), any
+    /// settle that arrives before a fresh `tempo:active|running` transition
+    /// is treated as belonging to the previous turn and discarded — the
+    /// gate prevents a stale prior settle from being misreported.
     pub async fn wait_for_turn(&mut self, timeout: Duration) -> Result<TurnResult, String> {
+        let mut gate_pending = self.awaiting_new_turn;
         let rx = self
             .events_rx
             .as_mut()
@@ -409,40 +422,57 @@ impl BgWorkerHandle {
 
             self.ready_fired = true;
 
+            // Extract any StatePatch payloads from this event so we can both
+            // (a) update the detector and (b) inspect the tempo field for the
+            // post-send active-gate check.
+            let mut patches: Vec<crate::cli::bg_protocol::StatePatch> = Vec::new();
             match ev {
                 SubscribeEvent::Snapshot { record, .. } => {
-                    // Try nested `currentState` object first (some daemon versions
-                    // wrap state under it); fall back to top-level fields on the
-                    // record itself (`record.state`, `record.tempo`, ...), which
-                    // is what the round-trip PoC observed and what the integration
-                    // test exercises.
-                    let nested = record
-                        .get("currentState")
-                        .and_then(|v| {
-                            serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(v.clone())
-                                .ok()
-                        });
+                    let nested = record.get("currentState").and_then(|v| {
+                        serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(v.clone())
+                            .ok()
+                    });
                     let from_record = serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(
                         record.clone(),
                     )
                     .ok();
                     if let Some(p) = nested {
-                        det.apply_patch(&p);
+                        patches.push(p);
                     }
                     if let Some(p) = from_record {
-                        det.apply_patch(&p);
-                    }
-                    if det.is_settled() {
-                        return Ok(self.build_turn_result(&det));
+                        patches.push(p);
                     }
                 }
-                SubscribeEvent::State { patch } => {
-                    det.apply_patch(&patch);
-                    if det.is_settled() {
-                        return Ok(self.build_turn_result(&det));
+                SubscribeEvent::State { patch } => patches.push(patch),
+                SubscribeEvent::Stream { .. } => continue,
+            }
+
+            // Lower the gate as soon as we see the worker enter the new turn.
+            if gate_pending {
+                for p in &patches {
+                    if let Some(t) = p.tempo.as_deref() {
+                        if matches!(t, "active" | "running") {
+                            gate_pending = false;
+                            break;
+                        }
                     }
                 }
-                SubscribeEvent::Stream { .. } => {} // filtered upstream, but be safe
+            }
+
+            for p in &patches {
+                det.apply_patch(p);
+            }
+
+            if det.is_settled() && !gate_pending {
+                self.awaiting_new_turn = false;
+                return Ok(self.build_turn_result(&det));
+            }
+
+            // While the gate is still pending, any settle we observed is a
+            // STALE prior turn — clear it so the detector can re-arm on the
+            // real settle that follows the upcoming active transition.
+            if det.is_settled() && gate_pending {
+                det = SettleDetector::new();
             }
         }
     }
