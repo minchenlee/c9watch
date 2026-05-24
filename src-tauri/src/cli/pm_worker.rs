@@ -256,6 +256,290 @@ impl WorkerHandle {
     }
 }
 
+// ── Bg backend handle ─────────────────────────────────────────────────────────
+
+use crate::cli::bg_backend::{self, SettleDetector};
+use crate::cli::bg_protocol::{Request, SubscribeEvent};
+
+/// Worker handle backed by `claude --bg` + control.sock RPC.
+///
+/// Lifecycle:
+/// - `spawn` → `claude --bg <prompt>` subprocess returns short, then we open
+///   a dedicated subscribe connection.
+/// - `send_message` → one-shot `reply` RPC on a fresh connection.
+/// - `wait_for_turn` → consume subscribe events until SettleDetector reports
+///   settled (`done` or `blocked`).
+/// - `kill` → one-shot `kill` RPC + fallback `claude rm` subprocess for
+///   jobs-dir cleanup.
+pub struct BgWorkerHandle {
+    pub meta: WorkerMeta,
+    #[allow(dead_code)]
+    short: String,
+    sock_path: std::path::PathBuf,
+    events_rx: Option<tokio::sync::broadcast::Receiver<SubscribeEvent>>,
+    #[allow(dead_code)]
+    ready_fired: bool,
+    inbox_ctx: Option<InboxContext>,
+}
+
+impl BgWorkerHandle {
+    pub async fn spawn(
+        session_id: String,
+        args: SpawnArgs,
+        ctx: SpawnContext,
+        initial_prompt: String,
+    ) -> Result<Self, String> {
+        let sock_path = bg_backend::resolve_control_sock()?;
+
+        let worker_name = args
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("c9w-{}", &session_id[..8.min(session_id.len())]));
+
+        let short =
+            bg_backend::spawn_bg(&args, &session_id, &worker_name, &initial_prompt).await?;
+
+        let meta = WorkerMeta {
+            session_id: session_id.clone(),
+            // bg workers are daemon-managed; the CC daemon owns the actual PTY
+            // pid. We can't take ownership of the subprocess here, so leave
+            // pid=0 and rely on `claude agents --json` for live pid lookup
+            // (see detector refactor PR #107).
+            pid: 0,
+            name: args.name.clone(),
+            cwd: args.cwd.clone(),
+            spawned_at: Utc::now().to_rfc3339(),
+            spawned_by: ctx.spawned_by.clone(),
+            pm_pid: ctx.pm_pid,
+            spawn_args: PersistedSpawnArgs {
+                append_system_prompt: args.append_system_prompt,
+                permission_mode: args.permission_mode,
+                model: args.model,
+                add_dirs: args.add_dirs,
+            },
+            stopped_at: None,
+        };
+        pm_fs::write_worker_meta(&meta)?;
+
+        let events_rx = bg_backend::subscribe(&sock_path, &short).await?;
+
+        let inbox_ctx = ctx.spawned_by.as_ref().map(|pm| InboxContext {
+            session_id: session_id.clone(),
+            spawned_by: pm.clone(),
+        });
+
+        Ok(BgWorkerHandle {
+            meta,
+            short,
+            sock_path,
+            events_rx: Some(events_rx),
+            ready_fired: false,
+            inbox_ctx,
+        })
+    }
+
+    pub async fn send_message(&self, text: &str) -> Result<(), String> {
+        let reply = bg_backend::rpc(
+            &self.sock_path,
+            Request::Reply {
+                short: self.short.clone(),
+                text: text.to_string(),
+            },
+        )
+        .await?;
+        if !reply.ok {
+            return Err(format!(
+                "daemon rejected reply: {}",
+                reply.error.unwrap_or_default()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Wait for the next settle (done or blocked). Drains pid-only/active
+    /// patches via SettleDetector. Returns `WAIT_TIMEOUT` error string on
+    /// timeout, mirroring the print backend's contract.
+    pub async fn wait_for_turn(&mut self, timeout: Duration) -> Result<TurnResult, String> {
+        let rx = self
+            .events_rx
+            .as_mut()
+            .ok_or_else(|| "events_rx not available".to_string())?;
+        let mut det = SettleDetector::new();
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .ok_or_else(|| "WAIT_TIMEOUT".to_string())?;
+            let ev = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .map_err(|_| "WAIT_TIMEOUT".to_string())?
+                .map_err(|e| format!("event channel closed: {}", e))?;
+
+            self.ready_fired = true;
+
+            match ev {
+                SubscribeEvent::Snapshot { record, .. } => {
+                    if let Some(patch) = record.get("currentState").and_then(|v| {
+                        serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(v.clone())
+                            .ok()
+                    }) {
+                        det.apply_patch(&patch);
+                    }
+                    if det.is_settled() {
+                        return Ok(self.build_turn_result(&det));
+                    }
+                }
+                SubscribeEvent::State { patch } => {
+                    det.apply_patch(&patch);
+                    if det.is_settled() {
+                        return Ok(self.build_turn_result(&det));
+                    }
+                }
+                SubscribeEvent::Stream { .. } => {} // filtered upstream, but be safe
+            }
+        }
+    }
+
+    fn build_turn_result(&self, det: &SettleDetector) -> TurnResult {
+        let tr = TurnResult {
+            assistant_text: String::new(),
+            ended_at: Utc::now().to_rfc3339(),
+            subtype: det.last_settled_state().map(String::from),
+            is_error: false,
+            duration_ms: None,
+            num_turns: None,
+            stop_reason: det.last_settled_state().map(String::from),
+            total_cost_usd: None,
+            result_text: det.detail().map(String::from),
+        };
+        if det.last_settled_state() == Some("blocked") {
+            if let Some(ref ctx) = self.inbox_ctx {
+                if let Some(needs) = det.needs() {
+                    use crate::cli::pm_inbox;
+                    let ev = pm_inbox::InboxEvent::awaiting(
+                        &ctx.session_id,
+                        &ctx.spawned_by,
+                        needs.to_string(),
+                        det.detail().map(String::from),
+                    );
+                    if let Err(e) = pm_inbox::write_event(&ev) {
+                        eprintln!("[pm_worker bg] inbox awaiting write: {}", e);
+                    }
+                }
+            }
+        }
+        tr
+    }
+
+    pub async fn wait_ready(&mut self, _timeout: Duration) -> Result<(), String> {
+        // Bg workers are ready as soon as `claude --bg` returns the short.
+        // The subscribe stream will emit the initial snapshot ~immediately.
+        Ok(())
+    }
+
+    pub fn is_alive(&self) -> bool {
+        // Cheap heuristic: the subscribe broadcast channel is still open.
+        // When the reader task drops `tx`, `is_closed` reports true.
+        self.events_rx
+            .as_ref()
+            .map(|rx| !rx.is_closed())
+            .unwrap_or(false)
+    }
+
+    pub async fn kill(&mut self) -> Result<(), String> {
+        let reply = bg_backend::rpc(
+            &self.sock_path,
+            Request::Kill {
+                short: self.short.clone(),
+            },
+        )
+        .await?;
+        if !reply.ok {
+            eprintln!(
+                "[pm_worker bg] kill RPC rejected: {}",
+                reply.error.unwrap_or_default()
+            );
+        }
+        // Parallel subprocess `claude rm` for jobs-dir cleanup (no daemon
+        // equivalent). Best-effort; ignore errors.
+        let short = self.short.clone();
+        tokio::spawn(async move {
+            let _ = Command::new("claude").arg("rm").arg(&short).output().await;
+        });
+        Ok(())
+    }
+}
+
+// ── Backend-agnostic wrapper ──────────────────────────────────────────────────
+
+pub enum AnyWorkerHandle {
+    Print(WorkerHandle),
+    Bg(BgWorkerHandle),
+}
+
+impl AnyWorkerHandle {
+    pub fn meta(&self) -> &WorkerMeta {
+        match self {
+            Self::Print(h) => &h.meta,
+            Self::Bg(h) => &h.meta,
+        }
+    }
+
+    pub async fn send_message(&self, text: &str) -> Result<(), String> {
+        match self {
+            Self::Print(h) => h.send_message(text).await,
+            Self::Bg(h) => h.send_message(text).await,
+        }
+    }
+
+    pub async fn wait_for_turn(&mut self, timeout: Duration) -> Result<TurnResult, String> {
+        match self {
+            Self::Print(h) => h.wait_for_turn(timeout).await,
+            Self::Bg(h) => h.wait_for_turn(timeout).await,
+        }
+    }
+
+    pub async fn wait_ready(&mut self, timeout: Duration) -> Result<(), String> {
+        match self {
+            Self::Print(h) => h.wait_ready(timeout).await,
+            Self::Bg(h) => h.wait_ready(timeout).await,
+        }
+    }
+
+    pub fn is_alive(&mut self) -> bool {
+        match self {
+            Self::Print(h) => h.is_alive(),
+            Self::Bg(h) => h.is_alive(),
+        }
+    }
+
+    pub async fn kill(&mut self) -> Result<(), String> {
+        match self {
+            Self::Print(h) => h.kill().await,
+            Self::Bg(h) => h.kill().await,
+        }
+    }
+
+    /// Result-receiver methods only apply to the Print backend (Bg uses event
+    /// stream subscription via `wait_for_turn` instead). Bg returns None so
+    /// callers can branch on `matches!(handle, AnyWorkerHandle::Bg(_))` and
+    /// avoid the receiver-take dance.
+    pub fn take_result_receiver(&mut self) -> Option<mpsc::Receiver<TurnResult>> {
+        match self {
+            Self::Print(h) => h.take_result_receiver(),
+            Self::Bg(_) => None,
+        }
+    }
+
+    pub fn return_result_receiver(&mut self, rx: mpsc::Receiver<TurnResult>) {
+        match self {
+            Self::Print(h) => h.return_result_receiver(rx),
+            Self::Bg(_) => {} // no-op
+        }
+    }
+}
+
 // ── Internal tasks ───────────────────────────────────────────────────────────
 
 /// Reads StdinMessages from the channel and writes stream-json user envelopes

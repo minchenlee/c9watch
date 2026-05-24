@@ -1,6 +1,7 @@
 use crate::cli::pm_fs;
 use crate::cli::pm_rpc::RpcRequest;
-use crate::cli::pm_worker::{SpawnArgs, SpawnContext, WorkerHandle};
+use crate::cli::pm_worker::{AnyWorkerHandle, BgWorkerHandle, SpawnArgs, SpawnContext, WorkerHandle};
+use crate::cli::worker_backend::{select_backend, BackendKind};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +12,7 @@ use tokio::sync::Mutex;
 const DEFAULT_MAX_WORKERS: usize = 16;
 
 struct DaemonState {
-    workers: HashMap<String, WorkerHandle>,
+    workers: HashMap<String, AnyWorkerHandle>,
 }
 
 fn err_response(code: &str) -> serde_json::Value {
@@ -253,15 +254,28 @@ async fn handle_spawn(
     let spawned_by = ctx.spawned_by.clone();
     let canonical_cwd = args.cwd.clone();
 
-    // Spawn the worker
-    let worker = match WorkerHandle::spawn(session_id.clone(), args, ctx).await {
-        Ok(w) => w,
-        Err(e) => return err_response(&e),
+    // Spawn the worker via the selected backend. PrintBackend is the legacy
+    // path; BgBackend uses `claude --bg` + control.sock RPC.
+    let worker: AnyWorkerHandle = match select_backend() {
+        BackendKind::Bg => {
+            // Task 10 will add a proper `initial_prompt` field to
+            // RpcRequest::Spawn. For now, auto-inject "ready" as a stopgap
+            // so the existing CLI surface keeps working with the bg backend.
+            let initial_prompt = "ready".to_string();
+            match BgWorkerHandle::spawn(session_id.clone(), args, ctx, initial_prompt).await {
+                Ok(w) => AnyWorkerHandle::Bg(w),
+                Err(e) => return err_response(&e),
+            }
+        }
+        BackendKind::Print => match WorkerHandle::spawn(session_id.clone(), args, ctx).await {
+            Ok(w) => AnyWorkerHandle::Print(w),
+            Err(e) => return err_response(&e),
+        },
     };
 
-    let pid = worker.meta.pid;
-    let worker_name = worker.meta.name.clone();
-    let spawned_at = worker.meta.spawned_at.clone();
+    let pid = worker.meta().pid;
+    let worker_name = worker.meta().name.clone();
+    let spawned_at = worker.meta().spawned_at.clone();
 
     // Insert into state while holding the lock across the cap check so two
     // concurrent spawns cannot both read "count < max" and both proceed (H4).
@@ -334,7 +348,10 @@ async fn handle_send(
 
     // Send the message under the lock, then release it before awaiting the
     // turn result so other RPCs aren't blocked for up to `timeout_ms`.
-    let (rx_opt, callback_inbox) = {
+    //
+    // For Bg backend: no mpsc receiver to take — `wait_for_turn` consumes the
+    // subscribe broadcast directly. We branch below.
+    let (rx_opt, callback_inbox, is_bg) = {
         let mut st = state.lock().await;
         let worker = match st.workers.get_mut(&full_id) {
             Some(w) => w,
@@ -344,7 +361,8 @@ async fn handle_send(
             return err_response(&e);
         }
         let callback_inbox = callback_inbox_hint(&full_id);
-        let rx = if wait && timeout_ms > 0 {
+        let is_bg = matches!(worker, AnyWorkerHandle::Bg(_));
+        let rx = if wait && timeout_ms > 0 && !is_bg {
             match worker.take_result_receiver() {
                 Some(r) => Some(r),
                 None => {
@@ -356,7 +374,7 @@ async fn handle_send(
         } else {
             None
         };
-        (rx, callback_inbox)
+        (rx, callback_inbox, is_bg)
     };
 
     if !wait || timeout_ms == 0 {
@@ -368,11 +386,65 @@ async fn handle_send(
         });
     }
 
-    // rx_opt is Some here because wait && timeout_ms > 0
-    let mut rx = rx_opt.expect("rx must be Some when wait && timeout_ms > 0");
+    let timeout = Duration::from_millis(timeout_ms);
+
+    if is_bg {
+        // Bg backend: there is no mpsc receiver — `wait_for_turn` consumes
+        // events from the broadcast subscribe channel that lives on the
+        // BgWorkerHandle. To avoid holding the daemon state lock across a
+        // potentially long await (which would block all other RPCs for up
+        // to `timeout_ms`), the wait_for_turn future runs UNDER the lock.
+        //
+        // This is a known concern: we accept that Bg --wait serializes the
+        // daemon during the wait. Acceptable because the bg worker can only
+        // service one prompt at a time anyway, so concurrent --wait against
+        // the same worker would race regardless. Print backend remains lock-
+        // free via the receiver-take pattern.
+        let mut st = state.lock().await;
+        let worker = match st.workers.get_mut(&full_id) {
+            Some(w) => w,
+            None => return err_response("WORKER_CRASHED"),
+        };
+        let result = worker.wait_for_turn(timeout).await;
+        let still_alive = worker.is_alive();
+        drop(st);
+
+        return match result {
+            Ok(turn) => serde_json::json!({
+                "ok": true,
+                "sessionId": full_id,
+                "sent": true,
+                "turnCompleted": true,
+                "assistantText": turn.assistant_text,
+                "endedAt": turn.ended_at,
+                "callbackInbox": callback_inbox,
+            }),
+            Err(e) if e == "WAIT_TIMEOUT" && !still_alive => serde_json::json!({
+                "ok": false,
+                "error": "WORKER_CRASHED",
+                "sessionId": full_id,
+                "callbackInbox": callback_inbox,
+            }),
+            Err(e) if e == "WAIT_TIMEOUT" => serde_json::json!({
+                "ok": true,
+                "sessionId": full_id,
+                "sent": true,
+                "turnCompleted": false,
+                "callbackInbox": callback_inbox,
+            }),
+            Err(e) => serde_json::json!({
+                "ok": false,
+                "error": e,
+                "sessionId": full_id,
+            }),
+        };
+    }
+
+    // Print backend: existing receiver-based wait path.
+    // rx_opt is Some here because wait && timeout_ms > 0 && !is_bg
+    let mut rx = rx_opt.expect("rx must be Some when wait && timeout_ms > 0 && !is_bg");
 
     // Await the turn result WITHOUT holding the state lock
-    let timeout = Duration::from_millis(timeout_ms);
     let turn_result = tokio::time::timeout(timeout, rx.recv()).await;
 
     // Return the receiver (and peek worker liveness) so the worker can be used
@@ -440,14 +512,15 @@ async fn handle_list(state: Arc<Mutex<DaemonState>>) -> serde_json::Value {
         .iter_mut()
         .map(|(session_id, worker)| {
             let alive = worker.is_alive();
+            let meta = worker.meta();
             serde_json::json!({
                 "sessionId": session_id,
-                "pid": worker.meta.pid,
-                "name": worker.meta.name,
-                "cwd": worker.meta.cwd,
-                "spawnedAt": worker.meta.spawned_at,
-                "spawnedBy": worker.meta.spawned_by,
-                "pmPid": worker.meta.pm_pid,
+                "pid": meta.pid,
+                "name": meta.name,
+                "cwd": meta.cwd,
+                "spawnedAt": meta.spawned_at,
+                "spawnedBy": meta.spawned_by,
+                "pmPid": meta.pm_pid,
                 "alive": alive,
             })
         })
@@ -544,7 +617,7 @@ async fn shutdown_daemon(state: Arc<Mutex<DaemonState>>) -> ! {
 /// - 0 matches → WORKER_NOT_FOUND error.
 /// - 2+ matches → AMBIGUOUS_SESSION_ID error.
 fn resolve_worker_id(
-    workers: &HashMap<String, WorkerHandle>,
+    workers: &HashMap<String, AnyWorkerHandle>,
     prefix: &str,
 ) -> Result<String, String> {
     resolve_worker_id_from_keys(workers.keys().map(|k| k.as_str()), prefix)
@@ -595,19 +668,16 @@ async fn handle_workers_all(
         .iter_mut()
         .map(|(session_id, worker)| {
             let alive = worker.is_alive();
-            let status = resolve_status(
-                &worker.meta,
-                caller_pm_pid,
-                caller_pm_session_id.as_deref(),
-            );
+            let meta = worker.meta();
+            let status = resolve_status(meta, caller_pm_pid, caller_pm_session_id.as_deref());
             serde_json::json!({
                 "sessionId": session_id,
-                "pid": worker.meta.pid,
-                "name": worker.meta.name,
-                "cwd": worker.meta.cwd,
-                "spawnedAt": worker.meta.spawned_at,
-                "spawnedBy": worker.meta.spawned_by,
-                "pmPid": worker.meta.pm_pid,
+                "pid": meta.pid,
+                "name": meta.name,
+                "cwd": meta.cwd,
+                "spawnedAt": meta.spawned_at,
+                "spawnedBy": meta.spawned_by,
+                "pmPid": meta.pm_pid,
                 "alive": alive,
                 "status": status.as_str(),
             })
@@ -710,7 +780,7 @@ async fn handle_inbox_read(
                 .iter()
                 .filter_map(|(id, w)| {
                     let status = resolve_status(
-                        &w.meta,
+                        w.meta(),
                         caller_pm_pid,
                         Some(&caller_pm_session_id),
                     );
