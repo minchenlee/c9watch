@@ -18,6 +18,7 @@ pub enum CostSortDir {
 }
 
 pub mod adoption;
+pub mod bg_backend;
 pub mod bg_protocol;
 pub mod pm;
 pub mod pm_caller;
