@@ -184,7 +184,7 @@ impl WorkerHandle {
     }
 
     /// Send a user message to the worker's stdin.
-    pub async fn send_message(&self, text: &str) -> Result<(), String> {
+    pub async fn send_message(&mut self, text: &str) -> Result<(), String> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.stdin_tx
             .send(StdinMessage {
@@ -353,7 +353,23 @@ impl BgWorkerHandle {
         })
     }
 
-    pub async fn send_message(&self, text: &str) -> Result<(), String> {
+    pub async fn send_message(&mut self, text: &str) -> Result<(), String> {
+        // Drain any stale settle events buffered from prior turns (spawn-time
+        // prompt, earlier non-waiting sends). Otherwise the next wait_for_turn
+        // could immediately return a stale Done for the previous turn instead
+        // of waiting for the one we're about to send. Worker is idle right
+        // now (it just settled), so no NEW events can land between drain and
+        // RPC send — drain is safe and complete here.
+        if let Some(rx) = self.events_rx.as_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                }
+            }
+        }
         let reply = bg_backend::rpc(
             &self.sock_path,
             Request::Reply {
@@ -602,7 +618,7 @@ impl AnyWorkerHandle {
         }
     }
 
-    pub async fn send_message(&self, text: &str) -> Result<(), String> {
+    pub async fn send_message(&mut self, text: &str) -> Result<(), String> {
         match self {
             Self::Print(h) => h.send_message(text).await,
             Self::Bg(h) => h.send_message(text).await,
