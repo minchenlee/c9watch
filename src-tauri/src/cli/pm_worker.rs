@@ -279,7 +279,6 @@ pub struct BgWorkerHandle {
     events_rx: Option<tokio::sync::broadcast::Receiver<SubscribeEvent>>,
     #[allow(dead_code)]
     ready_fired: bool,
-    inbox_ctx: Option<InboxContext>,
 }
 
 impl BgWorkerHandle {
@@ -328,13 +327,24 @@ impl BgWorkerHandle {
             spawned_by: pm.clone(),
         });
 
+        // Spawn a long-lived settle-watcher that fans out inbox events on every
+        // turn end regardless of whether a `--wait` caller is listening. Without
+        // this, PM-owned bg workers only emit Done/Awaiting events when a `send
+        // --wait` happens to be in flight — spawn-time prompts and non-waiting
+        // sends would silently miss completions.
+        if let Some(ref ctx) = inbox_ctx {
+            let watcher_rx = events_rx.resubscribe();
+            let ctx = ctx.clone();
+            let short_owned = short.clone();
+            tokio::spawn(settle_watcher_task(watcher_rx, ctx, short_owned));
+        }
+
         Ok(BgWorkerHandle {
             meta,
             short,
             sock_path,
             events_rx: Some(events_rx),
             ready_fired: false,
-            inbox_ctx,
         })
     }
 
@@ -417,9 +427,13 @@ impl BgWorkerHandle {
     }
 
     fn build_turn_result(&self, det: &SettleDetector) -> TurnResult {
+        // Inbox event emission lives in `settle_watcher_task`, which has a
+        // dedicated subscribe-receiver and fires on EVERY settle (not just
+        // when a `--wait` caller is listening). This function only constructs
+        // the TurnResult for the optional `--wait` consumer.
         let assistant_text = det.detail().map(String::from).unwrap_or_default();
-        let tr = TurnResult {
-            assistant_text: assistant_text.clone(),
+        TurnResult {
+            assistant_text,
             ended_at: Utc::now().to_rfc3339(),
             subtype: det.last_settled_state().map(String::from),
             is_error: false,
@@ -428,48 +442,7 @@ impl BgWorkerHandle {
             stop_reason: det.last_settled_state().map(String::from),
             total_cost_usd: None,
             result_text: det.detail().map(String::from),
-        };
-        if let Some(ref ctx) = self.inbox_ctx {
-            use crate::cli::pm_inbox;
-            let ev = match det.last_settled_state() {
-                Some("blocked") => {
-                    let needs = det.needs().unwrap_or("user input").to_string();
-                    pm_inbox::InboxEvent::awaiting(
-                        &ctx.session_id,
-                        &ctx.spawned_by,
-                        needs,
-                        det.detail().map(String::from),
-                    )
-                }
-                _ => {
-                    // Normal turn end (done) or unrecognized settle — emit a
-                    // Done event mirroring the print backend's contract so PM
-                    // inbox listeners see the worker completed a turn.
-                    let excerpt = if assistant_text.is_empty() {
-                        None
-                    } else {
-                        Some(pm_inbox::truncate_excerpt(&assistant_text))
-                    };
-                    pm_inbox::InboxEvent::from_turn_result(
-                        &ctx.session_id,
-                        &ctx.spawned_by,
-                        pm_inbox::TurnResult {
-                            status: pm_inbox::EventStatus::Done,
-                            duration_ms: None,
-                            num_turns: None,
-                            stop_reason: det.last_settled_state().map(String::from),
-                            total_cost_usd: None,
-                            result_excerpt: excerpt,
-                            error_message: None,
-                        },
-                    )
-                }
-            };
-            if let Err(e) = pm_inbox::write_event(&ev) {
-                eprintln!("[pm_worker bg] inbox write: {}", e);
-            }
         }
-        tr
     }
 
     pub async fn wait_ready(&mut self, _timeout: Duration) -> Result<(), String> {
@@ -508,6 +481,104 @@ impl BgWorkerHandle {
             let _ = Command::new("claude").arg("rm").arg(&short).output().await;
         });
         Ok(())
+    }
+}
+
+/// Long-lived task: drains a dedicated subscribe-receiver and emits an inbox
+/// event (Done or Awaiting) on every settle transition. Runs for the worker's
+/// lifetime; exits when the subscribe stream EOFs (worker killed) or the
+/// channel lags out. Only spawned when the worker has a `spawned_by` PM.
+async fn settle_watcher_task(
+    mut rx: tokio::sync::broadcast::Receiver<SubscribeEvent>,
+    ctx: InboxContext,
+    short: String,
+) {
+    use crate::cli::pm_inbox;
+    let mut det = SettleDetector::new();
+    // Tracks the last state the detector reported as settled, so we only emit
+    // on transitions INTO a settled state (not while staying settled).
+    let mut last_emitted: Option<String> = None;
+    loop {
+        let ev = match rx.recv().await {
+            Ok(e) => e,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                eprintln!(
+                    "[pm_worker bg/{}] settle_watcher lagged {} events; resetting detector",
+                    short, n
+                );
+                det = SettleDetector::new();
+                last_emitted = None;
+                continue;
+            }
+        };
+        match ev {
+            SubscribeEvent::Snapshot { ref record, .. } => {
+                let nested = record.get("currentState").and_then(|v| {
+                    serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(v.clone()).ok()
+                });
+                let from_record = serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(
+                    record.clone(),
+                )
+                .ok();
+                if let Some(p) = nested {
+                    det.apply_patch(&p);
+                }
+                if let Some(p) = from_record {
+                    det.apply_patch(&p);
+                }
+            }
+            SubscribeEvent::State { ref patch } => {
+                det.apply_patch(patch);
+            }
+            SubscribeEvent::Stream { .. } => continue,
+        }
+        let current = det.last_settled_state().map(String::from);
+        if !det.is_settled() {
+            // Left the settled state — arm re-detection so the NEXT settle fires.
+            last_emitted = None;
+            continue;
+        }
+        if last_emitted == current {
+            // Same settle as before; don't re-emit.
+            continue;
+        }
+        let ev_to_write = match current.as_deref() {
+            Some("blocked") => {
+                let needs = det.needs().unwrap_or("user input").to_string();
+                pm_inbox::InboxEvent::awaiting(
+                    &ctx.session_id,
+                    &ctx.spawned_by,
+                    needs,
+                    det.detail().map(String::from),
+                )
+            }
+            _ => {
+                let assistant_text = det.detail().map(String::from).unwrap_or_default();
+                let excerpt = if assistant_text.is_empty() {
+                    None
+                } else {
+                    Some(pm_inbox::truncate_excerpt(&assistant_text))
+                };
+                pm_inbox::InboxEvent::from_turn_result(
+                    &ctx.session_id,
+                    &ctx.spawned_by,
+                    pm_inbox::TurnResult {
+                        status: pm_inbox::EventStatus::Done,
+                        duration_ms: None,
+                        num_turns: None,
+                        stop_reason: current.clone(),
+                        total_cost_usd: None,
+                        result_excerpt: excerpt,
+                        error_message: None,
+                    },
+                )
+            }
+        };
+        if let Err(e) = pm_inbox::write_event(&ev_to_write) {
+            eprintln!("[pm_worker bg/{}] settle_watcher inbox write: {}", short, e);
+        }
+        last_emitted = current;
     }
 }
 
