@@ -30,6 +30,10 @@ pub struct InboxEvent {
     pub result_excerpt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub awaiting_needs: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub awaiting_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,6 +42,7 @@ pub enum EventStatus {
     Done,
     Error,
     Crashed,
+    Awaiting,
 }
 
 /// Fields that vary between normal turn-end outcomes (success or error)
@@ -71,6 +76,8 @@ impl InboxEvent {
             total_cost_usd: tr.total_cost_usd,
             result_excerpt: tr.result_excerpt,
             error_message: tr.error_message,
+            awaiting_needs: None,
+            awaiting_detail: None,
         }
     }
 
@@ -88,6 +95,33 @@ impl InboxEvent {
             total_cost_usd: None,
             result_excerpt: None,
             error_message: Some(error_message),
+            awaiting_needs: None,
+            awaiting_detail: None,
+        }
+    }
+
+    /// Worker bg session transitioned to `state:"blocked"` — waiting on user input.
+    /// Specific to the bg backend; print backend never emits this.
+    pub fn awaiting(
+        worker_session_id: &str,
+        spawned_by: &str,
+        needs: String,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            event_id: new_event_id(),
+            session_id: worker_session_id.to_string(),
+            spawned_by: spawned_by.to_string(),
+            status: EventStatus::Awaiting,
+            finished_at: Utc::now().to_rfc3339(),
+            duration_ms: None,
+            num_turns: None,
+            stop_reason: None,
+            total_cost_usd: None,
+            result_excerpt: None,
+            error_message: None,
+            awaiting_needs: Some(needs),
+            awaiting_detail: detail,
         }
     }
 }
@@ -258,6 +292,8 @@ mod tests {
             total_cost_usd: Some(0.01),
             result_excerpt: Some("ok".to_string()),
             error_message: None,
+            awaiting_needs: None,
+            awaiting_detail: None,
         }
     }
 
@@ -354,5 +390,21 @@ mod tests {
         let char_count = t.chars().count();
         assert_eq!(char_count, EXCERPT_LIMIT + 1); // +1 for the ellipsis
         assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn awaiting_event_serializes_with_needs() {
+        let w = TestWorker::new();
+        let ev = InboxEvent::awaiting(
+            w.id(),
+            "session-pm-abc",
+            "user input on file overwrite".to_string(),
+            Some("waiting for confirmation".to_string()),
+        );
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"awaiting\""), "status missing: {}", json);
+        assert!(json.contains("user input on file overwrite"));
+        assert!(json.contains("waiting for confirmation"));
+        assert_eq!(ev.status, EventStatus::Awaiting);
     }
 }
