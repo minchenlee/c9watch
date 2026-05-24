@@ -64,6 +64,29 @@ fn parse_version_ge(ver: &str, min: (u32, u32, u32)) -> bool {
     (parts[0], parts[1], parts[2]) >= min
 }
 
+/// Validate the initial prompt against the selected backend.
+///
+/// - Bg backend: requires a non-empty prompt — returns it
+/// - Print backend: ignores the prompt (returns None)
+///
+/// Returns Err with "INITIAL_PROMPT_REQUIRED" prefix when bg backend has no prompt.
+pub fn validate_initial_prompt(
+    kind: BackendKind,
+    initial_prompt: Option<String>,
+) -> Result<Option<String>, String> {
+    match kind {
+        BackendKind::Bg => match initial_prompt {
+            Some(p) if !p.trim().is_empty() => Ok(Some(p)),
+            _ => Err(
+                "INITIAL_PROMPT_REQUIRED: the bg backend requires --prompt at spawn time. \
+                 Pass one via `c9watch spawn --prompt \"<text>\"` or set C9WATCH_WORKER_BACKEND=print"
+                    .to_string(),
+            ),
+        },
+        BackendKind::Print => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +115,47 @@ mod tests {
         assert!(!parse_version_ge("garbage", (2, 1, 150)));
         assert!(!parse_version_ge("2.1", (2, 1, 150)));
         assert!(!parse_version_ge("", (2, 1, 150)));
+    }
+}
+
+#[cfg(test)]
+mod backend_gating_tests {
+    use super::*;
+
+    /// Logic-only test: when backend is Bg, validate_initial_prompt must reject None.
+    /// When backend is Print, it accepts None.
+    #[test]
+    fn validate_initial_prompt_bg_rejects_none() {
+        let result = validate_initial_prompt(BackendKind::Bg, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("INITIAL_PROMPT_REQUIRED"));
+    }
+
+    #[test]
+    fn validate_initial_prompt_bg_rejects_empty_string() {
+        let result = validate_initial_prompt(BackendKind::Bg, Some("   ".to_string()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_initial_prompt_bg_accepts_real_text() {
+        let result = validate_initial_prompt(BackendKind::Bg, Some("do the thing".to_string()));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_deref(), Some("do the thing"));
+    }
+
+    #[test]
+    fn validate_initial_prompt_print_accepts_none() {
+        let result = validate_initial_prompt(BackendKind::Print, None);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn validate_initial_prompt_print_accepts_any_value() {
+        let result = validate_initial_prompt(BackendKind::Print, Some("ignored".to_string()));
+        assert!(result.is_ok());
+        // Print backend ignores the prompt — return None to signal that.
+        assert!(result.unwrap().is_none());
     }
 }

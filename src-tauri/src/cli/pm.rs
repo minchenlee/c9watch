@@ -134,6 +134,7 @@ fn daemon_rpc(request: &RpcRequest, timeout: Duration) -> Result<serde_json::Val
 pub fn cmd_spawn(
     args: SpawnArgs,
     append_system_prompt_file: Option<String>,
+    initial_prompt: Option<String>,
     pretty: bool,
 ) -> Result<(), String> {
     ensure_daemon()?;
@@ -173,6 +174,7 @@ pub fn cmd_spawn(
         add_dirs: args.add_dirs,
         spawned_by,
         pm_pid,
+        initial_prompt,
     };
 
     let response = daemon_rpc(&request, Duration::from_secs(30))?;

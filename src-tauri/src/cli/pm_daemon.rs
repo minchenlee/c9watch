@@ -1,7 +1,7 @@
 use crate::cli::pm_fs;
 use crate::cli::pm_rpc::RpcRequest;
 use crate::cli::pm_worker::{AnyWorkerHandle, BgWorkerHandle, SpawnArgs, SpawnContext, WorkerHandle};
-use crate::cli::worker_backend::{select_backend, BackendKind};
+use crate::cli::worker_backend::{select_backend, validate_initial_prompt, BackendKind};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -139,6 +139,7 @@ async fn handle_connection(
             add_dirs,
             spawned_by,
             pm_pid,
+            initial_prompt,
         } => {
             let args = SpawnArgs {
                 cwd,
@@ -149,7 +150,7 @@ async fn handle_connection(
                 add_dirs,
             };
             let ctx = SpawnContext { spawned_by, pm_pid };
-            handle_spawn(state, args, ctx, max_workers).await
+            handle_spawn(state, args, ctx, initial_prompt, max_workers).await
         }
         RpcRequest::Send {
             session_id,
@@ -225,6 +226,7 @@ async fn handle_spawn(
     state: Arc<Mutex<DaemonState>>,
     mut args: SpawnArgs,
     ctx: SpawnContext,
+    initial_prompt: Option<String>,
     max_workers: usize,
 ) -> serde_json::Value {
     // Validate and canonicalize --cwd + each --add-dir before acquiring the
@@ -254,15 +256,20 @@ async fn handle_spawn(
     let spawned_by = ctx.spawned_by.clone();
     let canonical_cwd = args.cwd.clone();
 
+    // Validate the initial prompt against the selected backend. Bg backend
+    // requires a non-empty prompt; Print backend ignores it.
+    let backend = select_backend();
+    let resolved_prompt = match validate_initial_prompt(backend, initial_prompt) {
+        Ok(p) => p,
+        Err(e) => return err_response(&e),
+    };
+
     // Spawn the worker via the selected backend. PrintBackend is the legacy
     // path; BgBackend uses `claude --bg` + control.sock RPC.
-    let worker: AnyWorkerHandle = match select_backend() {
+    let worker: AnyWorkerHandle = match backend {
         BackendKind::Bg => {
-            // Task 10 will add a proper `initial_prompt` field to
-            // RpcRequest::Spawn. For now, auto-inject "ready" as a stopgap
-            // so the existing CLI surface keeps working with the bg backend.
-            let initial_prompt = "ready".to_string();
-            match BgWorkerHandle::spawn(session_id.clone(), args, ctx, initial_prompt).await {
+            let prompt = resolved_prompt.expect("validate_initial_prompt guarantees Some for Bg");
+            match BgWorkerHandle::spawn(session_id.clone(), args, ctx, prompt).await {
                 Ok(w) => AnyWorkerHandle::Bg(w),
                 Err(e) => return err_response(&e),
             }
