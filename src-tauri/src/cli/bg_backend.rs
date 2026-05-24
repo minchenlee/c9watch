@@ -87,6 +87,87 @@ pub async fn rpc(sock: &Path, req: Request) -> Result<OneShotReply, String> {
         .map_err(|e| format!("parse reply {:?}: {}", line, e))
 }
 
+/// Parse the `backgrounded · <short> [· <name>]` line emitted by
+/// `claude --bg`. Tolerates middle dot (·) and bullet (•) separators
+/// and optional name / idle-hint suffixes.
+///
+/// Returns the 8-hex `short` ID (= sessionId prefix) on success.
+pub fn parse_short_from_spawn(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        // Strip the "backgrounded " prefix and any separator char.
+        let rest = trimmed.strip_prefix("backgrounded")?.trim_start();
+        let after_sep = rest
+            .trim_start_matches(['·', '•', '-', ':'])
+            .trim_start();
+        // First whitespace-delimited token should be 8 hex chars.
+        let token: String = after_sep
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect();
+        if token.len() == 8 {
+            return Some(token);
+        }
+    }
+    None
+}
+
+use crate::cli::pm_worker::SpawnArgs;
+use tokio::process::Command;
+
+/// Spawn a new bg-pinned worker via `claude --bg`. Returns the 8-hex `short`.
+///
+/// Requires CC >= 2.1.150 with the daemon running. The initial prompt is
+/// REQUIRED (idle-spawn + later `reply` was found unreliable in Phase 0).
+pub async fn spawn_bg(
+    args: &SpawnArgs,
+    session_id: &str,
+    worker_name: &str,
+    initial_prompt: &str,
+) -> Result<String, String> {
+    let mut cmd = Command::new("claude");
+    cmd.arg("--bg")
+        .arg("--session-id")
+        .arg(session_id)
+        .arg("--name")
+        .arg(worker_name)
+        .arg("--permission-mode")
+        .arg(&args.permission_mode);
+
+    if let Some(ref sp) = args.append_system_prompt {
+        cmd.arg("--append-system-prompt").arg(sp);
+    }
+    if let Some(ref model) = args.model {
+        cmd.arg("--model").arg(model);
+    }
+    for dir in &args.add_dirs {
+        cmd.arg("--add-dir").arg(dir);
+    }
+    cmd.arg(initial_prompt);
+    cmd.current_dir(&args.cwd);
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("claude --bg spawn failed: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "claude --bg exited {:?}: stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_short_from_spawn(&stdout).ok_or_else(|| {
+        format!(
+            "claude --bg did not emit 'backgrounded · <short>' line; stdout={:?}",
+            stdout
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +189,36 @@ mod tests {
         let wire = req.to_wire();
         assert!(!wire.contains('\n'), "to_wire must not embed newlines");
         assert!(wire.starts_with('{') && wire.ends_with('}'));
+    }
+
+    #[test]
+    fn parse_backgrounded_line_with_name() {
+        let out = "backgrounded · 545fd354 · my-worker\n";
+        assert_eq!(parse_short_from_spawn(out).as_deref(), Some("545fd354"));
+    }
+
+    #[test]
+    fn parse_backgrounded_line_no_name() {
+        let out = "backgrounded · 545fd354\n";
+        assert_eq!(parse_short_from_spawn(out).as_deref(), Some("545fd354"));
+    }
+
+    #[test]
+    fn parse_backgrounded_line_idle_hint() {
+        let out = "backgrounded · 545fd354 (idle — send a prompt to start)\n";
+        assert_eq!(parse_short_from_spawn(out).as_deref(), Some("545fd354"));
+    }
+
+    #[test]
+    fn parse_backgrounded_line_unicode_bullet_variant() {
+        // Some terminals render the middle dot as •.
+        let out = "backgrounded • 545fd354\n";
+        assert_eq!(parse_short_from_spawn(out).as_deref(), Some("545fd354"));
+    }
+
+    #[test]
+    fn parse_backgrounded_missing_short_returns_none() {
+        let out = "some unrelated output\n";
+        assert!(parse_short_from_spawn(out).is_none());
     }
 }
