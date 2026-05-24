@@ -380,11 +380,26 @@ impl BgWorkerHandle {
 
             match ev {
                 SubscribeEvent::Snapshot { record, .. } => {
-                    if let Some(patch) = record.get("currentState").and_then(|v| {
-                        serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(v.clone())
-                            .ok()
-                    }) {
-                        det.apply_patch(&patch);
+                    // Try nested `currentState` object first (some daemon versions
+                    // wrap state under it); fall back to top-level fields on the
+                    // record itself (`record.state`, `record.tempo`, ...), which
+                    // is what the round-trip PoC observed and what the integration
+                    // test exercises.
+                    let nested = record
+                        .get("currentState")
+                        .and_then(|v| {
+                            serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(v.clone())
+                                .ok()
+                        });
+                    let from_record = serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(
+                        record.clone(),
+                    )
+                    .ok();
+                    if let Some(p) = nested {
+                        det.apply_patch(&p);
+                    }
+                    if let Some(p) = from_record {
+                        det.apply_patch(&p);
                     }
                     if det.is_settled() {
                         return Ok(self.build_turn_result(&det));
@@ -402,8 +417,9 @@ impl BgWorkerHandle {
     }
 
     fn build_turn_result(&self, det: &SettleDetector) -> TurnResult {
+        let assistant_text = det.detail().map(String::from).unwrap_or_default();
         let tr = TurnResult {
-            assistant_text: String::new(),
+            assistant_text: assistant_text.clone(),
             ended_at: Utc::now().to_rfc3339(),
             subtype: det.last_settled_state().map(String::from),
             is_error: false,
@@ -413,20 +429,44 @@ impl BgWorkerHandle {
             total_cost_usd: None,
             result_text: det.detail().map(String::from),
         };
-        if det.last_settled_state() == Some("blocked") {
-            if let Some(ref ctx) = self.inbox_ctx {
-                if let Some(needs) = det.needs() {
-                    use crate::cli::pm_inbox;
-                    let ev = pm_inbox::InboxEvent::awaiting(
+        if let Some(ref ctx) = self.inbox_ctx {
+            use crate::cli::pm_inbox;
+            let ev = match det.last_settled_state() {
+                Some("blocked") => {
+                    let needs = det.needs().unwrap_or("user input").to_string();
+                    pm_inbox::InboxEvent::awaiting(
                         &ctx.session_id,
                         &ctx.spawned_by,
-                        needs.to_string(),
+                        needs,
                         det.detail().map(String::from),
-                    );
-                    if let Err(e) = pm_inbox::write_event(&ev) {
-                        eprintln!("[pm_worker bg] inbox awaiting write: {}", e);
-                    }
+                    )
                 }
+                _ => {
+                    // Normal turn end (done) or unrecognized settle — emit a
+                    // Done event mirroring the print backend's contract so PM
+                    // inbox listeners see the worker completed a turn.
+                    let excerpt = if assistant_text.is_empty() {
+                        None
+                    } else {
+                        Some(pm_inbox::truncate_excerpt(&assistant_text))
+                    };
+                    pm_inbox::InboxEvent::from_turn_result(
+                        &ctx.session_id,
+                        &ctx.spawned_by,
+                        pm_inbox::TurnResult {
+                            status: pm_inbox::EventStatus::Done,
+                            duration_ms: None,
+                            num_turns: None,
+                            stop_reason: det.last_settled_state().map(String::from),
+                            total_cost_usd: None,
+                            result_excerpt: excerpt,
+                            error_message: None,
+                        },
+                    )
+                }
+            };
+            if let Err(e) = pm_inbox::write_event(&ev) {
+                eprintln!("[pm_worker bg] inbox write: {}", e);
             }
         }
         tr

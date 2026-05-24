@@ -95,9 +95,13 @@ pub async fn rpc(sock: &Path, req: Request) -> Result<OneShotReply, String> {
 pub fn parse_short_from_spawn(stdout: &str) -> Option<String> {
     for line in stdout.lines() {
         let trimmed = line.trim();
-        // Strip the "backgrounded " prefix and any separator char.
-        let rest = trimmed.strip_prefix("backgrounded")?.trim_start();
+        // Skip lines that don't start with the expected prefix — bg spawn may
+        // emit banners, blank lines, or other notices before the real line.
+        let Some(rest) = trimmed.strip_prefix("backgrounded") else {
+            continue;
+        };
         let after_sep = rest
+            .trim_start()
             .trim_start_matches(['·', '•', '-', ':'])
             .trim_start();
         // First whitespace-delimited token should be 8 hex chars.
@@ -306,6 +310,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_backgrounded_skips_leading_noise() {
+        // Real spawns may emit blank lines, banners, or notices before the
+        // "backgrounded · <short>" line. Earlier impl returned None on first
+        // non-matching line — regression guard.
+        let out = "\n[notice] checking auth\n\nbackgrounded · 545fd354 · w\n";
+        assert_eq!(parse_short_from_spawn(out).as_deref(), Some("545fd354"));
+    }
+
+    #[test]
     fn parse_backgrounded_line_with_name() {
         let out = "backgrounded · 545fd354 · my-worker\n";
         assert_eq!(parse_short_from_spawn(out).as_deref(), Some("545fd354"));
@@ -370,6 +383,21 @@ mod tests {
             ..Default::default()
         });
         assert!(!det.is_settled());
+    }
+
+    #[test]
+    fn statepatch_deserializes_from_top_level_record() {
+        // wait_for_turn's snapshot path must accept `record.state` / `record.tempo`
+        // (the round-trip PoC shape), not just nested `record.currentState.*`.
+        let raw = serde_json::json!({
+            "state": "done",
+            "tempo": "idle",
+            "detail": "all set"
+        });
+        let p: crate::cli::bg_protocol::StatePatch = serde_json::from_value(raw).unwrap();
+        assert_eq!(p.state.as_deref(), Some("done"));
+        assert_eq!(p.tempo.as_deref(), Some("idle"));
+        assert_eq!(p.detail.as_deref(), Some("all set"));
     }
 
     #[test]
