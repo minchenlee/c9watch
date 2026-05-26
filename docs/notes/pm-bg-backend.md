@@ -24,8 +24,12 @@ Auto-detect picks `bg` when both:
 ## Bg backend internals
 
 - Spawn: `claude --bg --session-id <uuid> --name <id> --permission-mode <m> [...] "<prompt>"`. Initial prompt REQUIRED (idle-spawn + later `reply` is unreliable). Pass via `c9watch spawn --prompt "<text>"`.
-- Send: control.sock `{op:"reply", short, text}` one-shot RPC.
-- Events: dedicated UDS per worker, `{op:"subscribe", short}` push stream. `state:"done"` and `state:"blocked"` both count as turn-end.
+- Send: control.sock `{op:"reply", short, text}` one-shot RPC. Callers should
+  serialize sends: wait for the previous turn to complete before sending the
+  next prompt.
+- Events: dedicated UDS per worker, `{op:"subscribe", short}` push stream.
+  `state:"done"`, `state:"blocked"`, and `state:"working" + tempo:"idle"` count
+  as turn-end.
 - Kill: control.sock `{op:"kill", short}` RPC + parallel `claude rm <short>` subprocess for jobs-dir cleanup.
 
 ## Limitations
@@ -33,3 +37,9 @@ Auto-detect picks `bg` when both:
 - `claude --bg` flag is undocumented; CC may rename in future releases. We pin to >= 2.1.150 and fail-soft to print backend on probe error.
 - Subscribe streams don't multiplex — N workers = N file descriptors. Acceptable at N ≤ 16.
 - `BgWorkerHandle` holds the daemon state mutex while `wait_for_turn` is awaiting events. Other RPCs serialize behind a pending `--wait`. Acceptable for current single-PM dogfooding; revisit if multiple concurrent `--wait`s become common.
+- Rapid back-to-back `reply` RPCs are daemon-ambiguous. CC 2.1.150 may queue
+  the second prompt as its own turn, coalesce multiple prompts into one user
+  message, or inject a prompt into the currently running turn. The subscribe
+  stream does not expose a per-turn counter or reply acknowledgement, so the bg
+  backend cannot reliably attribute separate assistant responses unless callers
+  wait between sends.

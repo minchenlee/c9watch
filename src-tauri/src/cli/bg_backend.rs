@@ -23,8 +23,8 @@ pub fn resolve_control_sock() -> Result<PathBuf, String> {
     }
 
     // Pick the first (typically only) host-id subdir.
-    let entries = std::fs::read_dir(&base)
-        .map_err(|e| format!("read_dir {}: {}", base.display(), e))?;
+    let entries =
+        std::fs::read_dir(&base).map_err(|e| format!("read_dir {}: {}", base.display(), e))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -56,13 +56,10 @@ use tokio::net::UnixStream;
 pub async fn rpc(sock: &Path, req: Request) -> Result<OneShotReply, String> {
     let wire = req.to_wire();
 
-    let mut conn = tokio::time::timeout(
-        Duration::from_secs(2),
-        UnixStream::connect(sock),
-    )
-    .await
-    .map_err(|_| "connect timeout".to_string())?
-    .map_err(|e| format!("connect {}: {}", sock.display(), e))?;
+    let mut conn = tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(sock))
+        .await
+        .map_err(|_| "connect timeout".to_string())?
+        .map_err(|e| format!("connect {}: {}", sock.display(), e))?;
 
     conn.write_all(wire.as_bytes())
         .await
@@ -119,16 +116,31 @@ pub fn parse_short_from_spawn(stdout: &str) -> Option<String> {
 use crate::cli::pm_worker::SpawnArgs;
 use tokio::process::Command;
 
-/// Spawn a new bg-pinned worker via `claude --bg`. Returns the 8-hex `short`.
+/// Result of `spawn_bg`: CC daemon's `short` handle (used for RPC) plus the
+/// `sessionId` CC actually assigned to the bg session. The latter is REQUIRED
+/// for detector linkage because `claude --bg` ignores the `--session-id` flag
+/// and mints its own UUID for bg-pinned sessions (verified empirically on
+/// CC 2.1.150 — see roster.json's `launch.args` for the rewrite evidence).
+#[derive(Debug, Clone)]
+pub struct BgSpawnInfo {
+    pub short: String,
+    pub cc_session_id: String,
+}
+
+/// Spawn a new bg-pinned worker via `claude --bg`.
 ///
 /// Requires CC >= 2.1.150 with the daemon running. The initial prompt is
 /// REQUIRED (idle-spawn + later `reply` was found unreliable in Phase 0).
+///
+/// After spawn, queries `claude agents --json` to recover CC's actual
+/// `sessionId` (which differs from the pre-generated `session_id` we passed —
+/// CC ignores `--session-id` for bg sessions).
 pub async fn spawn_bg(
     args: &SpawnArgs,
     session_id: &str,
     worker_name: &str,
     initial_prompt: &str,
-) -> Result<String, String> {
+) -> Result<BgSpawnInfo, String> {
     let mut cmd = Command::new("claude");
     cmd.arg("--bg")
         .arg("--session-id")
@@ -164,19 +176,72 @@ pub async fn spawn_bg(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_short_from_spawn(&stdout).ok_or_else(|| {
+    let short = parse_short_from_spawn(&stdout).ok_or_else(|| {
         format!(
             "claude --bg did not emit 'backgrounded · <short>' line; stdout={:?}",
             stdout
         )
+    })?;
+
+    let cc_session_id = lookup_cc_session_id_by_name(worker_name).await?;
+    Ok(BgSpawnInfo {
+        short,
+        cc_session_id,
     })
 }
 
-/// Tracks whether a worker has settled into a turn-end state (done or blocked).
+/// Query `claude agents --json` and return the `sessionId` of the bg-pinned
+/// session whose `name` equals `worker_name`. CC's daemon does not honor
+/// `--session-id` on `--bg`, so this is how we recover the real UUID assigned
+/// to our worker.
+///
+/// Retries up to 5 times with 100ms backoff because `claude agents --json`
+/// reads from the daemon's roster, and there's a small window between spawn
+/// returning and the roster being flushed.
+async fn lookup_cc_session_id_by_name(worker_name: &str) -> Result<String, String> {
+    for attempt in 0..5 {
+        let output = Command::new("claude")
+            .arg("agents")
+            .arg("--json")
+            .output()
+            .await
+            .map_err(|e| format!("claude agents --json failed: {}", e))?;
+
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Ok(agents) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
+                for agent in agents {
+                    if agent.get("name").and_then(|n| n.as_str()) == Some(worker_name) {
+                        if let Some(sid) = agent.get("sessionId").and_then(|s| s.as_str()) {
+                            return Ok(sid.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if attempt < 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    Err(format!(
+        "claude agents --json did not list a bg session named '{}' after 5 attempts",
+        worker_name
+    ))
+}
+
+/// Tracks whether a worker has settled into a turn-end state.
+///
+/// Three terminal shapes observed in CC 2.1.150:
+/// - `state:"done"` (normal finish)
+/// - `state:"blocked"` (awaiting user input)
+/// - `state:"working", tempo:"idle"` (open-ended assistant text classified as
+///   "conversation continues but engine is quiescent" — typical for replies
+///   ending in phrases like "awaiting your next instruction")
 ///
 /// Per Phase 0 findings: pid-only patches and `tempo:"active"` patches mid-turn
-/// must NOT count as settle. Only an explicit `state:"done"` or `state:"blocked"`
-/// transition is authoritative.
+/// must NOT count as settle. Worker re-entry (`tempo:"active"|"running"`)
+/// clears the prior settle so subsequent done/blocked/working counts as new.
 #[derive(Debug, Default)]
 pub struct SettleDetector {
     state: Option<String>,
@@ -214,7 +279,16 @@ impl SettleDetector {
     }
 
     pub fn is_settled(&self) -> bool {
+        // Primary terminal states observed in CC 2.1.150: `done` (normal finish)
+        // and `blocked` (awaiting user input). A third terminal shape exists for
+        // open-ended assistant text that CC's classifier interprets as
+        // "conversation continues but engine is quiescent": `state:"working"` +
+        // `tempo:"idle"`. Without this clause `wait_for_turn` hangs until
+        // timeout. The tempo qualifier prevents mid-turn `working+active`
+        // patches (none observed in 2.1.150, but defensive) from short-circuiting
+        // the wait.
         matches!(self.state.as_deref(), Some("done") | Some("blocked"))
+            || (self.state.as_deref() == Some("working") && self.tempo.as_deref() == Some("idle"))
     }
 
     pub fn last_settled_state(&self) -> Option<&str> {
@@ -257,7 +331,10 @@ pub async fn subscribe(
 > {
     use crate::cli::bg_protocol::SubscribeEvent;
 
-    assert!(receiver_count >= 1, "subscribe requires receiver_count >= 1");
+    assert!(
+        receiver_count >= 1,
+        "subscribe requires receiver_count >= 1"
+    );
 
     let mut conn = UnixStream::connect(sock)
         .await
@@ -273,7 +350,9 @@ pub async fn subscribe(
     conn.write_all(b"\n")
         .await
         .map_err(|e| format!("subscribe newline: {}", e))?;
-    conn.flush().await.map_err(|e| format!("subscribe flush: {}", e))?;
+    conn.flush()
+        .await
+        .map_err(|e| format!("subscribe flush: {}", e))?;
 
     let (tx, first_rx) = broadcast::channel::<SubscribeEvent>(64);
     // Mint all requested receivers SYNCHRONOUSLY before spawning the reader
@@ -337,7 +416,9 @@ mod tests {
     #[test]
     fn rpc_request_serializes_one_line_no_trailing_newline() {
         use crate::cli::bg_protocol::Request;
-        let req = Request::Kill { short: "abc12345".to_string() };
+        let req = Request::Kill {
+            short: "abc12345".to_string(),
+        };
         let wire = req.to_wire();
         assert!(!wire.contains('\n'), "to_wire must not embed newlines");
         assert!(wire.starts_with('{') && wire.ends_with('}'));
@@ -487,5 +568,68 @@ mod tests {
             ..Default::default()
         });
         assert!(!det.is_settled());
+    }
+
+    #[test]
+    fn settle_detector_treats_working_idle_as_settled() {
+        // CC 2.1.150 emits `state:"working", tempo:"idle"` for open-ended
+        // assistant turns that the daemon's classifier interprets as
+        // "conversation continues but engine is quiescent". Without this rule,
+        // `wait_for_turn` hangs until timeout. Reproduced empirically on
+        // probe-01: `{"state":"working","detail":"Waiting.","tempo":"idle"}`.
+        let mut det = SettleDetector::new();
+        det.apply_patch(&StatePatch {
+            state: Some("working".to_string()),
+            tempo: Some("idle".to_string()),
+            detail: Some("Waiting.".to_string()),
+            ..Default::default()
+        });
+        assert!(det.is_settled());
+        assert_eq!(det.last_settled_state(), Some("working"));
+    }
+
+    #[test]
+    fn settle_detector_ignores_working_with_active_tempo() {
+        // Defensive: if CC ever emits `working+active` mid-turn, do NOT settle.
+        let mut det = SettleDetector::new();
+        det.apply_patch(&StatePatch {
+            state: Some("working".to_string()),
+            tempo: Some("active".to_string()),
+            ..Default::default()
+        });
+        assert!(!det.is_settled());
+    }
+
+    #[test]
+    fn settle_detector_ignores_working_without_tempo() {
+        // `working` alone (no tempo field) must not settle — only the explicit
+        // working+idle pair is the quiescent terminal shape.
+        let mut det = SettleDetector::new();
+        det.apply_patch(&StatePatch {
+            state: Some("working".to_string()),
+            ..Default::default()
+        });
+        assert!(!det.is_settled());
+    }
+
+    #[test]
+    fn settle_detector_resets_working_settle_on_active_tempo() {
+        // working+idle should reset on a subsequent active tempo just like
+        // done/blocked does, so the next settle is recognised as new.
+        let mut det = SettleDetector::new();
+        det.apply_patch(&StatePatch {
+            state: Some("working".to_string()),
+            tempo: Some("idle".to_string()),
+            ..Default::default()
+        });
+        assert!(det.is_settled());
+        det.apply_patch(&StatePatch {
+            tempo: Some("active".to_string()),
+            ..Default::default()
+        });
+        assert!(
+            !det.is_settled(),
+            "active tempo must clear prior working settle"
+        );
     }
 }

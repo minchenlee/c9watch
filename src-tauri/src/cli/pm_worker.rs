@@ -300,11 +300,19 @@ impl BgWorkerHandle {
             .clone()
             .unwrap_or_else(|| format!("c9w-{}", &session_id[..8.min(session_id.len())]));
 
-        let short =
-            bg_backend::spawn_bg(&args, &session_id, &worker_name, &initial_prompt).await?;
+        let info = bg_backend::spawn_bg(&args, &session_id, &worker_name, &initial_prompt).await?;
+        let short = info.short;
+        // CC daemon assigns its own sessionId to bg-pinned sessions, ignoring
+        // the `--session-id` flag we passed. The detector matches sessions by
+        // CC's sessionId (from `claude agents --json`), so we MUST use it as
+        // the worker's identity everywhere downstream — meta.json,
+        // workers/<dir>, inbox/<dir>, and the daemon state map. The
+        // pre-generated `session_id` was a placeholder; from here on,
+        // `effective_session_id` is canonical.
+        let effective_session_id = info.cc_session_id;
 
         let meta = WorkerMeta {
-            session_id: session_id.clone(),
+            session_id: effective_session_id.clone(),
             // bg workers are daemon-managed; the CC daemon owns the actual PTY
             // pid. We can't take ownership of the subprocess here, so leave
             // pid=0 and rely on `claude agents --json` for live pid lookup
@@ -326,7 +334,7 @@ impl BgWorkerHandle {
         pm_fs::write_worker_meta(&meta)?;
 
         let inbox_ctx = ctx.spawned_by.as_ref().map(|pm| InboxContext {
-            session_id: session_id.clone(),
+            session_id: effective_session_id.clone(),
             spawned_by: pm.clone(),
         });
 
@@ -341,9 +349,7 @@ impl BgWorkerHandle {
         let events_rx = receivers.remove(0);
 
         if let Some(ref ctx) = inbox_ctx {
-            let watcher_rx = receivers
-                .pop()
-                .expect("subscribe(2) returned <2 receivers");
+            let watcher_rx = receivers.pop().expect("subscribe(2) returned <2 receivers");
             let ctx = ctx.clone();
             let short_owned = short.clone();
             tokio::spawn(settle_watcher_task(watcher_rx, ctx, short_owned));
@@ -432,10 +438,11 @@ impl BgWorkerHandle {
                         serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(v.clone())
                             .ok()
                     });
-                    let from_record = serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(
-                        record.clone(),
-                    )
-                    .ok();
+                    let from_record =
+                        serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(
+                            record.clone(),
+                        )
+                        .ok();
                     if let Some(p) = nested {
                         patches.push(p);
                     }
@@ -568,10 +575,9 @@ async fn settle_watcher_task(
                 let nested = record.get("currentState").and_then(|v| {
                     serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(v.clone()).ok()
                 });
-                let from_record = serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(
-                    record.clone(),
-                )
-                .ok();
+                let from_record =
+                    serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(record.clone())
+                        .ok();
                 if let Some(p) = nested {
                     det.apply_patch(&p);
                 }
@@ -722,7 +728,9 @@ async fn stdin_writer_task(
         let line = match serde_json::to_string(&envelope) {
             Ok(s) => s,
             Err(e) => {
-                let _ = msg.ack.send(Err(format!("Failed to serialize message: {}", e)));
+                let _ = msg
+                    .ack
+                    .send(Err(format!("Failed to serialize message: {}", e)));
                 continue;
             }
         };
@@ -773,7 +781,10 @@ async fn stdout_tee_task(
     let mut log_file = match log_file {
         Ok(f) => Some(f),
         Err(e) => {
-            eprintln!("[pm_worker] Failed to open stdout log {:?}: {}", log_path, e);
+            eprintln!(
+                "[pm_worker] Failed to open stdout log {:?}: {}",
+                log_path, e
+            );
             None
         }
     };
@@ -830,13 +841,25 @@ async fn stdout_tee_task(
                 }
             }
             "result" => {
-                let subtype = event.get("subtype").and_then(|v| v.as_str()).map(String::from);
-                let is_error = event.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                let subtype = event
+                    .get("subtype")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let is_error = event
+                    .get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let duration_ms = event.get("duration_ms").and_then(|v| v.as_u64());
                 let num_turns = event.get("num_turns").and_then(|v| v.as_u64());
-                let stop_reason = event.get("stop_reason").and_then(|v| v.as_str()).map(String::from);
+                let stop_reason = event
+                    .get("stop_reason")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let total_cost_usd = event.get("total_cost_usd").and_then(|v| v.as_f64());
-                let result_text = event.get("result").and_then(|v| v.as_str()).map(String::from);
+                let result_text = event
+                    .get("result")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
 
                 let result = TurnResult {
                     assistant_text: std::mem::take(&mut assistant_buf),
@@ -855,14 +878,14 @@ async fn stdout_tee_task(
 
                 if let Some(ref ctx) = inbox {
                     use crate::cli::pm_inbox::{self, EventStatus, InboxEvent, TurnResult};
-                    let status = if is_error || subtype.as_deref().map(|s| s != "success").unwrap_or(false) {
+                    let status = if is_error
+                        || subtype.as_deref().map(|s| s != "success").unwrap_or(false)
+                    {
                         EventStatus::Error
                     } else {
                         EventStatus::Done
                     };
-                    let excerpt = result_text
-                        .as_ref()
-                        .map(|s| pm_inbox::truncate_excerpt(s));
+                    let excerpt = result_text.as_ref().map(|s| pm_inbox::truncate_excerpt(s));
                     let err_msg = if matches!(status, EventStatus::Error) {
                         // Prefer the result `subtype` (e.g. "error_during_execution",
                         // "error_max_turns") since `stop_reason` is typically only
@@ -952,7 +975,10 @@ async fn stderr_tee_task(stderr: tokio::process::ChildStderr, log_path: PathBuf)
     let mut log_file = match log_file {
         Ok(f) => Some(f),
         Err(e) => {
-            eprintln!("[pm_worker] Failed to open stderr log {:?}: {}", log_path, e);
+            eprintln!(
+                "[pm_worker] Failed to open stderr log {:?}: {}",
+                log_path, e
+            );
             None
         }
     };

@@ -1,6 +1,8 @@
 use crate::cli::pm_fs;
 use crate::cli::pm_rpc::RpcRequest;
-use crate::cli::pm_worker::{AnyWorkerHandle, BgWorkerHandle, SpawnArgs, SpawnContext, WorkerHandle};
+use crate::cli::pm_worker::{
+    AnyWorkerHandle, BgWorkerHandle, SpawnArgs, SpawnContext, WorkerHandle,
+};
 use crate::cli::worker_backend::{select_backend, validate_initial_prompt, BackendKind};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -96,11 +98,7 @@ pub async fn run_daemon() -> Result<(), String> {
 
 // ── Connection handler ────────────────────────────────────────────────────────
 
-async fn handle_connection(
-    stream: UnixStream,
-    state: Arc<Mutex<DaemonState>>,
-    max_workers: usize,
-) {
+async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>, max_workers: usize) {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
@@ -166,7 +164,16 @@ async fn handle_connection(
             force,
             caller_pm_session_id,
             caller_pm_pid,
-        } => handle_adopt(state, session_id, force, caller_pm_session_id, caller_pm_pid).await,
+        } => {
+            handle_adopt(
+                state,
+                session_id,
+                force,
+                caller_pm_session_id,
+                caller_pm_pid,
+            )
+            .await
+        }
         RpcRequest::WorkersAll {
             caller_pm_session_id,
             caller_pm_pid,
@@ -283,6 +290,12 @@ async fn handle_spawn(
     let pid = worker.meta().pid;
     let worker_name = worker.meta().name.clone();
     let spawned_at = worker.meta().spawned_at.clone();
+    // Bg backend rewrites session_id to CC's actual UUID inside spawn (CC
+    // ignores `--session-id` for bg sessions). From here on, the meta's
+    // session_id is canonical — use it for the state map key and the
+    // response. The pre-spawn `session_id` (still owned by us) was only a
+    // placeholder for the Bg path; the Print path still uses it unchanged.
+    let effective_session_id = worker.meta().session_id.clone();
 
     // Insert into state while holding the lock across the cap check so two
     // concurrent spawns cannot both read "count < max" and both proceed (H4).
@@ -294,7 +307,7 @@ async fn handle_spawn(
             let _ = w.kill().await;
             return err_response("TOO_MANY_WORKERS");
         }
-        st.workers.insert(session_id.clone(), worker);
+        st.workers.insert(effective_session_id.clone(), worker);
     }
 
     // Wait for worker readiness (first stdout event) before returning.
@@ -307,7 +320,7 @@ async fn handle_spawn(
     // is held only for the duration of that single .await.
     let ready_result = {
         let mut st = state.lock().await;
-        if let Some(worker) = st.workers.get_mut(&session_id) {
+        if let Some(worker) = st.workers.get_mut(&effective_session_id) {
             worker.wait_ready(Duration::from_secs(15)).await
         } else {
             Err("Worker disappeared immediately after insert".to_string())
@@ -317,17 +330,17 @@ async fn handle_spawn(
     if let Err(e) = ready_result {
         // Worker failed to initialize — clean up
         let mut st = state.lock().await;
-        if let Some(mut w) = st.workers.remove(&session_id) {
+        if let Some(mut w) = st.workers.remove(&effective_session_id) {
             let _ = w.kill().await;
         }
         return err_response(&format!("SPAWN_FAILED: {}", e));
     }
 
-    let callback_inbox = callback_inbox_hint(&session_id);
+    let callback_inbox = callback_inbox_hint(&effective_session_id);
 
     serde_json::json!({
         "ok": true,
-        "sessionId": session_id,
+        "sessionId": effective_session_id,
         "pid": pid,
         "name": worker_name,
         "cwd": canonical_cwd,
@@ -507,7 +520,13 @@ async fn handle_list(state: Arc<Mutex<DaemonState>>) -> serde_json::Value {
     let dead: Vec<String> = st
         .workers
         .iter_mut()
-        .filter_map(|(id, worker)| if worker.is_alive() { None } else { Some(id.clone()) })
+        .filter_map(|(id, worker)| {
+            if worker.is_alive() {
+                None
+            } else {
+                Some(id.clone())
+            }
+        })
         .collect();
     for id in dead {
         st.workers.remove(&id);
@@ -567,15 +586,15 @@ fn cleanup_worker_dir(session_id: &str) {
         Ok(dir) => {
             if let Err(e) = std::fs::remove_dir_all(&dir) {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "[pm_daemon] Failed to remove worker dir {:?}: {}",
-                        dir, e
-                    );
+                    eprintln!("[pm_daemon] Failed to remove worker dir {:?}: {}", dir, e);
                 }
             }
         }
         Err(e) => {
-            eprintln!("[pm_daemon] Cannot resolve worker dir for {}: {}", session_id, e);
+            eprintln!(
+                "[pm_daemon] Cannot resolve worker dir for {}: {}",
+                session_id, e
+            );
         }
     }
 }
@@ -594,7 +613,10 @@ async fn shutdown_daemon(state: Arc<Mutex<DaemonState>>) -> ! {
         let mut ids = Vec::with_capacity(st.workers.len());
         for (id, mut worker) in st.workers.drain() {
             if let Err(e) = worker.kill().await {
-                eprintln!("[pm_daemon] Failed to kill worker {} during shutdown: {}", id, e);
+                eprintln!(
+                    "[pm_daemon] Failed to kill worker {} during shutdown: {}",
+                    id, e
+                );
             }
             ids.push(id);
         }
@@ -786,11 +808,8 @@ async fn handle_inbox_read(
             st.workers
                 .iter()
                 .filter_map(|(id, w)| {
-                    let status = resolve_status(
-                        w.meta(),
-                        caller_pm_pid,
-                        Some(&caller_pm_session_id),
-                    );
+                    let status =
+                        resolve_status(w.meta(), caller_pm_pid, Some(&caller_pm_session_id));
                     if status == WorkerStatus::OwnedByYou {
                         Some(id.clone())
                     } else {
@@ -1045,7 +1064,11 @@ mod tests {
             "expected 'does not exist', got: {}",
             err
         );
-        assert!(err.contains("/this/path/definitely/does/not/exist/h5test"), "path should appear in error: {}", err);
+        assert!(
+            err.contains("/this/path/definitely/does/not/exist/h5test"),
+            "path should appear in error: {}",
+            err
+        );
     }
 
     #[test]
@@ -1115,16 +1138,14 @@ mod tests {
 
         rt.block_on(async {
             // Step 1: bind socket
-            let _listener = UnixListener::bind(&sock_path)
-                .expect("bind Unix socket");
+            let _listener = UnixListener::bind(&sock_path).expect("bind Unix socket");
 
             // Assert: socket exists, pid file does NOT yet
             assert!(sock_path.exists(), "socket must exist after bind");
             assert!(!pid_path.exists(), "pid file must not exist before write");
 
             // Step 2: write pid file
-            fs::write(&pid_path, std::process::id().to_string())
-                .expect("write pid file");
+            fs::write(&pid_path, std::process::id().to_string()).expect("write pid file");
 
             // Assert: both now exist in the correct causal order
             assert!(sock_path.exists(), "socket still exists after pid write");
