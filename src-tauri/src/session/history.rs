@@ -153,19 +153,49 @@ pub struct DeepSearchHit {
     pub snippet: String,
 }
 
-/// Extract a short snippet from `text` centred around the first occurrence of any query word.
-/// For multi-word queries, centres on the first word found.
+/// Returns true if `haystack` contains `needle` according to the given mode flags.
+/// - `case_sensitive = false`: both sides are lowercased (haystack is assumed pre-lowered when passed in).
+/// - `whole_word = true`: the match must be flanked by non-alphanumeric chars (or the string ends).
+fn phrase_match(haystack: &str, needle: &str, whole_word: bool) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    if !whole_word {
+        return haystack.contains(needle);
+    }
+    let nlen = needle.len();
+    let mut start = 0usize;
+    while let Some(rel) = haystack[start..].find(needle) {
+        let pos = start + rel;
+        // `pos` from str::find is always on a char boundary.
+        let before_ok = haystack[..pos]
+            .chars()
+            .next_back()
+            .map_or(true, |c| !c.is_alphanumeric());
+        let after_ok = haystack[pos + nlen..]
+            .chars()
+            .next()
+            .map_or(true, |c| !c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        start = pos + 1;
+    }
+    false
+}
+
+/// Extract a short snippet from `text` centred around the first occurrence of the query.
+/// `query_norm` is the case-normalised query (lowercased if case-insensitive, original if
+/// case-sensitive). `text_norm` is the matching-form of `text`.
 /// Returns at most 200 characters with the match roughly in the middle.
-fn extract_snippet(text: &str, query_lower: &str) -> String {
-    let lower = text.to_lowercase();
-    let words: Vec<&str> = query_lower.split_whitespace().filter(|w| !w.is_empty()).collect();
-    // Find the earliest occurrence of any word
-    let pos = words.iter()
-        .filter_map(|w| lower.find(w).map(|p| (p, w.len())))
-        .min_by_key(|(p, _)| *p);
-    let Some((pos, word_len)) = pos else {
+fn extract_snippet(text: &str, text_norm: &str, query_norm: &str) -> String {
+    if query_norm.is_empty() {
+        return text.chars().take(200).collect();
+    }
+    let Some(pos) = text_norm.find(query_norm) else {
         return text.chars().take(200).collect();
     };
+    let word_len = query_norm.len();
     let half = 80usize;
     let start = pos.saturating_sub(half);
     let end = (pos + word_len + half).min(text.len());
@@ -236,10 +266,17 @@ fn extract_message_text(line: &str) -> Option<String> {
     }
 }
 
-/// Search all session JSONL files under ~/.claude/projects/ for a query string.
-/// Returns hits with session ID and a short matching snippet, case-insensitive.
+/// Search all session JSONL files under ~/.claude/projects/ for a query.
+///
+/// Matches the query as a literal substring (phrase match). When
+/// `case_sensitive` is false the comparison is lowercased; when `whole_word`
+/// is true the match must be flanked by non-alphanumeric chars.
 /// Runs file reads concurrently using threads.
-pub fn deep_search(query: &str) -> Result<Vec<DeepSearchHit>, String> {
+pub fn deep_search(
+    query: &str,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Result<Vec<DeepSearchHit>, String> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
     let projects_dir = home_dir.join(".claude").join("projects");
 
@@ -247,12 +284,14 @@ pub fn deep_search(query: &str) -> Result<Vec<DeepSearchHit>, String> {
         return Ok(vec![]);
     }
 
-    let query_lower = query.to_lowercase();
-    let query_words: Vec<String> = query_lower
-        .split_whitespace()
-        .filter(|w| !w.is_empty())
-        .map(|w| w.to_string())
-        .collect();
+    let query_norm = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_lowercase()
+    };
+    if query_norm.is_empty() {
+        return Ok(vec![]);
+    }
 
     // Collect all candidate JSONL file paths
     let mut candidates: Vec<(String, std::path::PathBuf)> = Vec::new();
@@ -281,46 +320,38 @@ pub fn deep_search(query: &str) -> Result<Vec<DeepSearchHit>, String> {
     // Search files concurrently using threads
     use std::sync::{Arc, Mutex};
     let matched: Arc<Mutex<Vec<DeepSearchHit>>> = Arc::new(Mutex::new(Vec::new()));
-    let query_lower = Arc::new(query_lower);
-    let query_words = Arc::new(query_words);
+    let query_norm = Arc::new(query_norm);
 
     let handles: Vec<_> = candidates
         .into_iter()
         .map(|(session_id, path)| {
             let matched = Arc::clone(&matched);
-            let query_lower = Arc::clone(&query_lower);
-            let query_words = Arc::clone(&query_words);
+            let query_norm = Arc::clone(&query_norm);
             std::thread::spawn(move || {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     // Only search user/assistant message text — skip metadata entries
                     // (summary, file-history-snapshot, etc.) which contain fields like
                     // sessionId, cwd, gitBranch that would trivially match most queries.
-                    // For multi-word queries, ALL words must appear somewhere in the
-                    // session's messages (not necessarily in the same line).
-                    // Collect (original, lowercased) pairs so we lowercase once.
+                    // Collect (original, matching-form) pairs; matching form is the
+                    // original when case-sensitive, or lowercased otherwise.
                     let messages: Vec<(String, String)> = content
                         .lines()
                         .filter_map(|line| extract_message_text(line))
                         .map(|text| {
-                            let lower = text.to_lowercase();
-                            (text, lower)
+                            let norm = if case_sensitive {
+                                text.clone()
+                            } else {
+                                text.to_lowercase()
+                            };
+                            (text, norm)
                         })
                         .collect();
-                    // Check each word against all messages joined.
-                    // W is typically ≤5 and Rust's contains() is SIMD-optimized.
-                    let combined_lower: String = messages.iter()
-                        .map(|(_, lower)| lower.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let all_match = query_words.iter().all(|w| combined_lower.contains(w.as_str()));
-                    if all_match {
-                        // Find the first message line containing any query word for snippet
-                        let snippet = messages.iter()
-                            .find(|(_, lower)| {
-                                query_words.iter().any(|w| lower.contains(w.as_str()))
-                            })
-                            .map(|(text, _)| extract_snippet(text, &query_lower))
-                            .unwrap_or_default();
+                    // Find first message containing the query (as phrase).
+                    let hit = messages.iter().find(|(_, norm)| {
+                        phrase_match(norm, query_norm.as_str(), whole_word)
+                    });
+                    if let Some((text, norm)) = hit {
+                        let snippet = extract_snippet(text, norm, query_norm.as_str());
                         if !snippet.is_empty() {
                             let mut guard = matched.lock().unwrap();
                             guard.push(DeepSearchHit { session_id, snippet });
@@ -500,5 +531,49 @@ mod tests {
         }];
         let out = filter_and_enrich(entries, tmp.path(), false);
         assert!(out.is_empty());
+    }
+
+    // ── phrase_match ────────────────────────────────────────────────
+
+    #[test]
+    fn test_phrase_match_substring_default() {
+        // Plain substring — case-insensitive caller lowercases both sides.
+        assert!(phrase_match("hello claude code world", "claude code", false));
+        // Two words present but not as a phrase → no match
+        assert!(!phrase_match("claude is here and code is there", "claude code", false));
+    }
+
+    #[test]
+    fn test_phrase_match_case_sensitive_caller_controls_case() {
+        // Helper itself is byte-level; the case_sensitive flag at the caller
+        // decides whether to lowercase inputs. Verify that the raw compare
+        // distinguishes case when caller does NOT lowercase.
+        assert!(phrase_match("HELLO CLAUDE CODE", "CLAUDE CODE", false));
+        assert!(!phrase_match("HELLO CLAUDE CODE", "claude code", false));
+    }
+
+    #[test]
+    fn test_phrase_match_whole_word() {
+        // whole-word ON: "cat" must not match "concatenate"
+        assert!(!phrase_match("the concatenate function", "cat", true));
+        assert!(phrase_match("the cat sat on the mat", "cat", true));
+        // Edge of string
+        assert!(phrase_match("cat", "cat", true));
+        assert!(phrase_match("cat.", "cat", true));
+        assert!(phrase_match(".cat", "cat", true));
+        // Numeric boundary also counts as alphanumeric
+        assert!(!phrase_match("cats123", "cats", true));
+    }
+
+    #[test]
+    fn test_phrase_match_empty_needle_false() {
+        assert!(!phrase_match("anything", "", false));
+        assert!(!phrase_match("anything", "", true));
+    }
+
+    #[test]
+    fn test_phrase_match_multiple_occurrences_with_whole_word() {
+        // Earlier occurrence is a non-boundary hit; later one is a match.
+        assert!(phrase_match("catalog, then cat", "cat", true));
     }
 }

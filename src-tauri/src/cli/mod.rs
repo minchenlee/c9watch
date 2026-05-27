@@ -94,6 +94,14 @@ pub enum Commands {
         /// Maximum number of results to return
         #[arg(short = 'n', long, default_value = "20")]
         limit: usize,
+
+        /// Match case exactly (default: case-insensitive)
+        #[arg(long)]
+        case_sensitive: bool,
+
+        /// Require the query to match at word boundaries
+        #[arg(long)]
+        whole_word: bool,
     },
 
     /// Identify this session (find the calling agent's own session by PID ancestry)
@@ -246,7 +254,16 @@ pub fn run(cli: Cli) {
             query,
             project,
             limit,
-        } => cmd_search(&query, project.as_deref(), limit, cli.pretty),
+            case_sensitive,
+            whole_word,
+        } => cmd_search(
+            &query,
+            project.as_deref(),
+            limit,
+            case_sensitive,
+            whole_word,
+            cli.pretty,
+        ),
         Commands::SelfId => cmd_self(cli.pretty),
         Commands::Stop { target } => cmd_stop(&target, cli.pretty),
         Commands::Watch {
@@ -446,12 +463,14 @@ fn cmd_search(
     query: &str,
     project_filter: Option<&str>,
     limit: usize,
+    case_sensitive: bool,
+    whole_word: bool,
     pretty: bool,
 ) -> Result<(), String> {
     if query.trim().is_empty() {
         return Err("Search query cannot be empty".to_string());
     }
-    let hits = session::deep_search(query)?;
+    let hits = session::deep_search(query, case_sensitive, whole_word)?;
 
     let enriched: Vec<serde_json::Value> = hits
         .into_iter()

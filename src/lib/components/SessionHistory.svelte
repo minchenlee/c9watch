@@ -19,6 +19,8 @@
 	let sortOrder = $state<'newest' | 'oldest'>('newest');
 	let groupByProject = $state(false);
 	let collapsedProjects = $state<Set<string>>(new Set());
+	let caseSensitive = $state(false);
+	let wholeWord = $state(false);
 
 	let deepSearching = $state(false);
 	// Map of sessionId → matching snippet. null = no search run yet.
@@ -34,6 +36,9 @@
 			if (savedSort === 'newest' || savedSort === 'oldest') sortOrder = savedSort;
 			const savedGroup = localStorage.getItem('historyGroup');
 			if (savedGroup === 'true') groupByProject = true;
+			if (localStorage.getItem('c9watch.historySearch.caseSensitive') === 'true')
+				caseSensitive = true;
+			if (localStorage.getItem('c9watch.historySearch.wholeWord') === 'true') wholeWord = true;
 		}
 		// History data is preloaded at app startup (see +page.svelte onMount);
 		// this refresh picks up anything new if the tab was reopened later.
@@ -48,11 +53,22 @@
 		if (browser) localStorage.setItem('historyGroup', String(groupByProject));
 	});
 
+	$effect(() => {
+		if (browser)
+			localStorage.setItem('c9watch.historySearch.caseSensitive', String(caseSensitive));
+	});
+
+	$effect(() => {
+		if (browser) localStorage.setItem('c9watch.historySearch.wholeWord', String(wholeWord));
+	});
+
 	// Debounced deep search: fires 300ms after the query settles.
 	// deepSearching is set only after the timer fires — no spinner during the
 	// debounce window itself, which avoids flicker on every keystroke.
 	$effect(() => {
 		const q = query;
+		const cs = caseSensitive;
+		const ww = wholeWord;
 		if (!q.trim()) {
 			deepSearchResults = null;
 			deepSearching = false;
@@ -63,7 +79,7 @@
 		const timer = setTimeout(async () => {
 			deepSearching = true;
 			try {
-				const hits = await deepSearchSessions(q);
+				const hits = await deepSearchSessions(q, cs, ww);
 				if (!cancelled) deepSearchResults = new Map(hits.map((h) => [h.sessionId, h.snippet]));
 			} catch (e) {
 				if (!cancelled) console.error('Deep search failed:', e);
@@ -77,20 +93,46 @@
 		};
 	});
 
+	// ── Match helpers ────────────────────────────────────────────────
+	/** Normalize a string for comparison given the current case-sensitivity mode. */
+	function norm(s: string): string {
+		return caseSensitive ? s : s.toLowerCase();
+	}
+
+	/** Whole-word match: true if `needle` appears in `haystack` flanked by non-alphanumerics. */
+	function phraseMatch(haystack: string, needle: string): boolean {
+		if (!needle) return false;
+		if (!wholeWord) return haystack.includes(needle);
+		let from = 0;
+		while (from <= haystack.length) {
+			const pos = haystack.indexOf(needle, from);
+			if (pos < 0) return false;
+			const before = pos === 0 ? '' : haystack.charAt(pos - 1);
+			const after = pos + needle.length >= haystack.length ? '' : haystack.charAt(pos + needle.length);
+			const boundaryBefore = before === '' || !/[a-z0-9]/i.test(before);
+			const boundaryAfter = after === '' || !/[a-z0-9]/i.test(after);
+			if (boundaryBefore && boundaryAfter) return true;
+			from = pos + 1;
+		}
+		return false;
+	}
+
 	// ── Filtering & sorting ──────────────────────────────────────────
 	let filtered = $derived.by(() => {
 		let entries = allEntries;
 
 		if (query.trim()) {
-			const words = query.toLowerCase().split(/\s+/).filter(Boolean);
-			entries = entries.filter(
-				(e) => {
-					const display = e.display.toLowerCase();
-					const project = e.projectName.toLowerCase();
-					const title = e.customTitle?.toLowerCase() ?? '';
-					return words.every((w) => display.includes(w) || project.includes(w) || title.includes(w));
-				}
-			);
+			const needle = norm(query);
+			entries = entries.filter((e) => {
+				const display = norm(e.display);
+				const project = norm(e.projectName);
+				const title = e.customTitle ? norm(e.customTitle) : '';
+				return (
+					phraseMatch(display, needle) ||
+					phraseMatch(project, needle) ||
+					phraseMatch(title, needle)
+				);
+			});
 
 			// If deep search has run, also include sessions that matched full content
 			if (deepSearchResults !== null) {
@@ -178,14 +220,31 @@
 
 	// ── Helpers ──────────────────────────────────────────────────────
 
-	/** Wrap every occurrence of each search word in `text` with <mark> tags (case-insensitive). */
+	/** Wrap every occurrence of the query phrase in `text` with <mark> tags.
+	 * Honors the current caseSensitive + wholeWord toggle state. */
 	function highlight(text: string, kw: string): string {
 		if (!kw.trim()) return escapeHtml(text);
-		const words = kw.split(/\s+/).filter(Boolean);
-		if (words.length === 0) return escapeHtml(text);
-		const escaped = escapeHtml(text);
-		const pattern = words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
-		return escaped.replace(new RegExp(pattern, 'gi'), (m) => `<mark>${m}</mark>`);
+		const escapedQuery = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+		const pattern = wholeWord ? `(?<![a-z0-9])${escapedQuery}(?![a-z0-9])` : escapedQuery;
+		const flags = caseSensitive ? 'g' : 'gi';
+		let re: RegExp;
+		try {
+			re = new RegExp(pattern, flags);
+		} catch {
+			return escapeHtml(text);
+		}
+		// Walk the source string so the <mark> wraps the matched substring with
+		// its original casing, then escape only the surrounding segments.
+		let out = '';
+		let last = 0;
+		for (const m of text.matchAll(re)) {
+			const start = m.index ?? 0;
+			out += escapeHtml(text.slice(last, start));
+			out += `<mark>${escapeHtml(m[0])}</mark>`;
+			last = start + m[0].length;
+		}
+		out += escapeHtml(text.slice(last));
+		return out;
 	}
 
 	function escapeHtml(s: string): string {
@@ -222,6 +281,22 @@
 				placeholder="Search sessions..."
 				bind:value={query}
 			/>
+			<div class="match-toggle" role="group" aria-label="Search match options">
+				<button
+					class="match-btn"
+					class:active={caseSensitive}
+					onclick={() => (caseSensitive = !caseSensitive)}
+					title="Match case"
+					aria-pressed={caseSensitive}
+				>Aa</button>
+				<button
+					class="match-btn"
+					class:active={wholeWord}
+					onclick={() => (wholeWord = !wholeWord)}
+					title="Match whole word"
+					aria-pressed={wholeWord}
+				>W</button>
+			</div>
 		</div>
 
 		<div class="options-row" in:flyIn|global={{ index: 2, duration: 350, stride: 25 }}>
@@ -367,8 +442,15 @@
 		border-bottom: 1px solid var(--border-default);
 	}
 
+	.search-row {
+		display: flex;
+		align-items: stretch;
+		gap: var(--space-sm);
+	}
+
 	.search-input {
-		width: 100%;
+		flex: 1;
+		min-width: 0;
 		background: var(--bg-elevated);
 		border: 1px solid var(--border-default);
 		color: var(--text-primary);
@@ -377,6 +459,39 @@
 		padding: var(--space-sm) var(--space-md);
 		outline: none;
 		box-sizing: border-box;
+	}
+
+	.match-toggle {
+		display: flex;
+		border: 1px solid var(--border-default);
+		flex-shrink: 0;
+	}
+
+	.match-btn {
+		font-family: var(--font-pixel);
+		font-size: 11px;
+		letter-spacing: 0.08em;
+		width: 35.5px;
+		height: 35.5px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0;
+		background: transparent;
+		border: none;
+		color: var(--text-muted);
+		cursor: pointer;
+		text-transform: uppercase;
+	}
+
+	.match-btn:hover {
+		color: var(--text-primary);
+		background: rgba(255, 255, 255, 0.08);
+	}
+
+	.match-btn.active {
+		background: rgba(255, 255, 255, 0.1);
+		color: var(--text-primary);
 	}
 
 	.search-input:focus {

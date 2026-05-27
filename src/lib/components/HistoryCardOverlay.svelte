@@ -81,14 +81,12 @@
 				}
 				tick().then(() => {
 					if (searchQuery) {
-						// Find the first user/assistant message matching all query words.
-						// Uses multi-word AND to stay consistent with Rust deep_search.
-						const words = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
+						// Case-insensitive phrase match — consistent with deep_search defaults.
+						const needle = searchQuery.toLowerCase();
 						const matchIndex = conversation!.messages.findIndex(
 							(m) => {
 								if (m.messageType !== 'User' && m.messageType !== 'Assistant') return false;
-								const lower = m.content.toLowerCase();
-								return words.some((w) => lower.includes(w));
+								return m.content.toLowerCase().includes(needle);
 							}
 						);
 						if (matchIndex >= 0) {

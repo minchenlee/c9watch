@@ -86,11 +86,19 @@ async fn get_session_history() -> Result<Vec<session::HistoryEntry>, String> {
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
-async fn deep_search_sessions(query: String) -> Result<Vec<session::DeepSearchHit>, String> {
+async fn deep_search_sessions(
+    query: String,
+    #[allow(non_snake_case)] caseSensitive: Option<bool>,
+    #[allow(non_snake_case)] wholeWord: Option<bool>,
+) -> Result<Vec<session::DeepSearchHit>, String> {
     if query.trim().is_empty() {
         return Ok(vec![]);
     }
-    session::deep_search(&query)
+    session::deep_search(
+        &query,
+        caseSensitive.unwrap_or(false),
+        wholeWord.unwrap_or(false),
+    )
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]

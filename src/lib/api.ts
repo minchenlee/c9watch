@@ -104,10 +104,18 @@ export async function getSessionHistory(): Promise<HistoryEntry[]> {
  * Returns session IDs of matching sessions.
  * (Desktop/Tauri only — returns empty array on mobile/browser)
  */
-export async function deepSearchSessions(query: string): Promise<DeepSearchHit[]> {
+export async function deepSearchSessions(
+	query: string,
+	caseSensitive = false,
+	wholeWord = false,
+): Promise<DeepSearchHit[]> {
 	if (get(isDemoMode)) return [];
 	if (useWebSocket()) return [];
-	return await invoke<DeepSearchHit[]>('deep_search_sessions', { query });
+	return await invoke<DeepSearchHit[]>('deep_search_sessions', {
+		query,
+		caseSensitive,
+		wholeWord,
+	});
 }
 
 /**
