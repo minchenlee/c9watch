@@ -1,5 +1,7 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
+	import { slide } from 'svelte/transition';
+	import { cubicOut } from 'svelte/easing';
 	import { marked } from 'marked';
 	import DOMPurify from 'dompurify';
 	import { getMemoryFiles, revealInFileManager } from '$lib/api';
@@ -18,6 +20,27 @@
 	let selectedProject = $derived(projects[selectedIndex] ?? null);
 
 	let copied = $state(false);
+
+	let expanded = $state<string | null>(null);
+	let fileHeaders: Record<string, HTMLButtonElement | null> = {};
+	let contentPane: HTMLDivElement | null = null;
+
+	$effect(() => {
+		if (!selectedProject) return;
+		expanded = selectedProject.files[0]?.filename ?? null;
+	});
+
+	async function toggleFile(filename: string) {
+		expanded = expanded === filename ? null : filename;
+		if (expanded !== filename || !contentPane) return;
+		await tick();
+		const header = fileHeaders[filename];
+		if (!header) return;
+		const paneRect = contentPane.getBoundingClientRect();
+		const headerRect = header.getBoundingClientRect();
+		const targetTop = contentPane.scrollTop + (headerRect.top - paneRect.top);
+		contentPane.scrollTo({ top: targetTop, behavior: 'smooth' });
+	}
 
 	function copyClaudeCommand() {
 		if (!selectedProject) return;
@@ -84,7 +107,7 @@
 				{/each}
 			</aside>
 
-			<div class="memory-content">
+			<div class="memory-content" bind:this={contentPane}>
 				{#if selectedProject}
 					{#key selectedProject.projectPath}
 						<div class="content-header" in:flyIn|global={{ index: 0, duration: 800, stride: 120 }}>
@@ -105,10 +128,21 @@
 						</div>
 						{#each selectedProject.files as file, i (file.filename)}
 							<div class="file-section" in:flyIn|global={{ index: i + 1, duration: 800, stride: 120 }}>
-								<div class="file-header">{file.filename}</div>
-								<div class="markdown-body">
-									{@html renderMarkdown(file.content)}
-								</div>
+								<button
+									bind:this={fileHeaders[file.filename]}
+									class="file-header"
+									class:expanded={expanded === file.filename}
+									onclick={() => toggleFile(file.filename)}
+									aria-expanded={expanded === file.filename ? 'true' : 'false'}
+								>
+									<span class="file-header-name">{file.filename}</span>
+									<span class="file-header-chevron">{expanded === file.filename ? '▾' : '▸'}</span>
+								</button>
+								{#if expanded === file.filename}
+									<div class="markdown-body" transition:slide|local={{ duration: 250, easing: cubicOut }}>
+										{@html renderMarkdown(file.content)}
+									</div>
+								{/if}
 							</div>
 						{/each}
 					{/key}
@@ -329,27 +363,58 @@
 	/* ── File sections ───────────────────────────────────────────── */
 
 	.file-section {
-		margin-bottom: var(--space-xl);
+		margin-bottom: var(--space-md);
 	}
 
 	.file-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		width: 100%;
 		font-family: var(--font-pixel);
-		font-size: 11px;
+		font-size: 13px;
 		font-weight: 600;
 		text-transform: uppercase;
-		letter-spacing: 0.05em;
+		letter-spacing: 0.1em;
 		color: var(--accent);
-		margin-bottom: var(--space-md);
-		padding: var(--space-xs) 0;
+		margin: 0;
+		padding: var(--space-sm) 0;
+		background: none;
+		border: none;
 		border-bottom: 1px solid var(--border-default);
+		cursor: pointer;
+		text-align: left;
+		transition: color 0.15s ease;
+	}
+
+	.file-header:hover {
+		color: var(--text-primary);
+	}
+
+	.file-header-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.file-header-chevron {
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-muted);
+		flex-shrink: 0;
+		margin-left: var(--space-sm);
+	}
+
+	.file-header.expanded {
+		margin-bottom: var(--space-md);
 	}
 
 	/* ── Markdown body ───────────────────────────────────────────── */
 
 	.markdown-body {
 		font-family: var(--font-sans);
-		font-size: 13px;
-		line-height: 1.6;
+		font-size: 15px;
+		line-height: 1.65;
 		color: var(--text-primary);
 	}
 
@@ -361,9 +426,9 @@
 		color: var(--text-primary);
 	}
 
-	.markdown-body :global(h1) { font-size: 16px; }
-	.markdown-body :global(h2) { font-size: 14px; }
-	.markdown-body :global(h3) { font-size: 13px; }
+	.markdown-body :global(h1) { font-size: 20px; }
+	.markdown-body :global(h2) { font-size: 17px; }
+	.markdown-body :global(h3) { font-size: 15px; }
 
 	.markdown-body :global(p) {
 		margin: var(--space-sm) 0;
@@ -383,7 +448,7 @@
 		background: rgba(255, 255, 255, 0.06);
 		padding: 2px 5px;
 		border-radius: 3px;
-		font-size: 12px;
+		font-size: 13px;
 		font-family: var(--font-mono);
 	}
 
@@ -411,8 +476,8 @@
 		margin: 0;
 		padding: var(--space-md);
 		overflow-x: auto;
-		font-size: 12px;
-		line-height: 1.5;
+		font-size: 13px;
+		line-height: 1.55;
 	}
 
 	.markdown-body :global(pre code) {
@@ -447,7 +512,7 @@
 		width: 100%;
 		border-collapse: collapse;
 		margin: var(--space-md) 0;
-		font-size: 12px;
+		font-size: 14px;
 	}
 
 	.markdown-body :global(th),
