@@ -113,6 +113,18 @@ async fn get_memory_files() -> Result<Vec<session::ProjectMemory>, String> {
     session::get_memory_files()
 }
 
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn list_workflows() -> Result<Vec<session::WorkflowSummary>, String> {
+    session::list_workflows()
+}
+
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn get_workflow_detail(run_id: String) -> Result<session::WorkflowDetail, String> {
+    session::get_workflow_detail(&run_id)
+}
+
 /// Returns a map of parent_session_id -> subagent invocations detected by
 /// parsing each session's JSONL transcript for Agent/Task tool_use entries.
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -603,6 +615,8 @@ pub fn run() {
             deep_search_sessions,
             get_cost_data,
             get_memory_files,
+            list_workflows,
+            get_workflow_detail,
             get_subagents,
             get_subagent_transcript,
             get_session_tasks,

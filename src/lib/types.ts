@@ -244,3 +244,47 @@ export interface Task {
   activeForm: string;
   status: TaskStatus;
 }
+
+/**
+ * A Claude Code workflow run (multi-agent orchestration), as surfaced by the
+ * WORKFLOWS tab. Read from ~/.claude/projects/<proj>/<session>/workflows/wf_*.json.
+ */
+export type WorkflowStatus = 'running' | 'completed' | 'failed';
+
+export interface WorkflowSummary {
+  runId: string;
+  workflowName: string;
+  summary: string;
+  status: string;
+  /** epoch ms */
+  startTime: number;
+  durationMs: number;
+  agentCount: number;
+  totalTokens: number;
+  totalToolCalls: number;
+  defaultModel: string;
+  phaseCount: number;
+  projectName: string;
+  projectPath: string;
+}
+
+export interface WorkflowAgent {
+  label: string;
+  phaseTitle: string;
+  state: string;
+  model: string;
+  tokens: number;
+  toolCalls: number;
+  durationMs: number;
+  lastToolName: string;
+  promptPreview: string;
+  resultPreview: string;
+}
+
+export interface WorkflowDetail extends WorkflowSummary {
+  phases: string[];
+  agents: WorkflowAgent[];
+  script: string;
+  /** pretty-printed JSON of the workflow's result, or '' */
+  resultJson: string;
+}

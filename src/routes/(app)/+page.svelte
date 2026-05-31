@@ -26,6 +26,7 @@
 	import { refreshCostData } from '$lib/stores/cost';
 	import { refreshSessionHistory } from '$lib/stores/history';
 	import MemoryViewer from '$lib/components/MemoryViewer.svelte';
+	import WorkflowViewer from '$lib/components/WorkflowViewer.svelte';
 	import SettingsTab from '$lib/components/SettingsTab.svelte';
 	import FdaBanner from '$lib/components/FdaBanner.svelte';
 	import UpdateBanner from '$lib/components/UpdateBanner.svelte';
@@ -48,7 +49,7 @@
 
 	let isCompact = $state(false);
 
-	let activeTab = $state<'monitor' | 'history' | 'cost' | 'memory' | 'settings'>('monitor');
+	let activeTab = $state<'monitor' | 'history' | 'cost' | 'memory' | 'workflows' | 'settings'>('monitor');
 	let fdaLikelyNeeded = $state(false);
 	let showDebugConsole = $state(false);
 	let showRenameHint = $state(false);
@@ -140,7 +141,8 @@
 			'2': 'history',
 			'3': 'cost',
 			'4': 'memory',
-			'5': 'settings'
+			'5': 'workflows',
+			'6': 'settings'
 		};
 
 		const handler = (e: KeyboardEvent) => {
@@ -419,6 +421,14 @@
 			<span class="tab-icon">◆</span>
 			<span class="tab-label">MEMORY</span>
 		</button>
+		<button
+			class="tab-btn"
+			class:active={activeTab === 'workflows'}
+			onclick={() => (activeTab = 'workflows')}
+		>
+			<span class="tab-icon">⛓</span>
+			<span class="tab-label">WORKFLOWS</span>
+		</button>
 		<!-- Drag handle: fills remaining space. The grip dots are absolutely
 		     centered in the whole tab bar so they appear at the window midpoint.
 		     Hidden in fullscreen where window dragging is unavailable. -->
@@ -450,6 +460,10 @@
 	{:else if activeTab === 'memory'}
 	<main class="grid-container history-main" in:fadeIn>
 		<MemoryViewer />
+	</main>
+	{:else if activeTab === 'workflows'}
+	<main class="grid-container history-main" in:fadeIn>
+		<WorkflowViewer />
 	</main>
 	{:else if activeTab === 'settings'}
 	<main class="grid-container history-main" in:fadeIn>

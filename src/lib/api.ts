@@ -5,7 +5,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { get } from 'svelte/store';
-import type { Session, Conversation, HistoryEntry, DeepSearchHit, CostData, ProjectMemory, LogEntry } from './types';
+import type { Session, Conversation, HistoryEntry, DeepSearchHit, CostData, ProjectMemory, LogEntry, WorkflowSummary, WorkflowDetail } from './types';
 import { isDemoMode } from './demo/mode';
 import { getDemoSessions, demoConversations } from './demo/data';
 import { wsClient, useWebSocket } from './ws';
@@ -136,6 +136,25 @@ export async function getMemoryFiles(): Promise<ProjectMemory[]> {
 	if (get(isDemoMode)) return [];
 	if (useWebSocket()) return [];
 	return await invoke<ProjectMemory[]>('get_memory_files');
+}
+
+/**
+ * List all workflow runs across projects (running first, then newest first).
+ * (Desktop/Tauri only — returns empty array on mobile/browser)
+ */
+export async function listWorkflows(): Promise<WorkflowSummary[]> {
+	if (get(isDemoMode)) return [];
+	if (useWebSocket()) return [];
+	return await invoke<WorkflowSummary[]>('list_workflows');
+}
+
+/**
+ * Get full detail (phases, agents, script, result) for one workflow run.
+ * (Desktop/Tauri only)
+ */
+export async function getWorkflowDetail(runId: string): Promise<WorkflowDetail> {
+	if (useWebSocket()) throw new Error('workflows unavailable in this mode');
+	return await invoke<WorkflowDetail>('get_workflow_detail', { runId });
 }
 
 /**

@@ -46,6 +46,11 @@ pub use subagents::{
     SubagentInfo, SubagentStatus, SubagentTranscript,
 };
 
+pub mod workflows;
+pub use workflows::{
+    get_workflow_detail, list_workflows, WorkflowAgent, WorkflowDetail, WorkflowSummary,
+};
+
 use std::process::Command;
 use std::time::Duration;
 
