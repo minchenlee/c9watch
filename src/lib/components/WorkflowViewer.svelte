@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import { slide } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 	import {
@@ -41,12 +42,15 @@
 			return;
 		}
 		// Track the live-changing fields so a running run refetches on each update.
+		// (Do NOT read `detail` here — that would make the effect re-run every time
+		// the fetch resolves and sets `detail`, causing an infinite refetch loop.)
 		void s.durationMs;
 		void s.totalTokens;
 		void s.status;
 
 		const runId = s.runId;
-		detailLoading = detail?.runId !== runId;
+		const alreadyShowing = untrack(() => detail?.runId === runId);
+		detailLoading = !alreadyShowing;
 		let cancelled = false;
 		getWorkflowDetail(runId)
 			.then((d) => {
