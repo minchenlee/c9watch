@@ -18,6 +18,7 @@
 	let detail = $state<WorkflowDetail | null>(null);
 	let detailLoading = $state(false);
 	let expandedAgent = $state<string | null>(null);
+	let agentsOpen = $state(true);
 	let scriptOpen = $state(false);
 	let resultOpen = $state(false);
 
@@ -141,6 +142,24 @@
 		const hours = Math.floor(totalMin / 60);
 		return `${hours}h ${totalMin % 60}m`;
 	}
+
+	// Prettify a preview string: if it parses as JSON, pretty-print it (2-space
+	// indent); otherwise return the text trimmed. Agent resultPreviews are often
+	// raw single-line JSON, which is much easier to read indented.
+	function formatPreview(text: string): string {
+		const t = text.trim();
+		if (
+			(t.startsWith('{') && t.endsWith('}')) ||
+			(t.startsWith('[') && t.endsWith(']'))
+		) {
+			try {
+				return JSON.stringify(JSON.parse(t), null, 2);
+			} catch {
+				// not valid JSON (e.g. truncated preview) — fall through
+			}
+		}
+		return t;
+	}
 </script>
 
 <div class="workflow-viewer">
@@ -230,49 +249,68 @@
 					{detailLoading ? 'Loading detail…' : 'No agents recorded'}
 				</div>
 			{:else}
-				{#each phaseGroups as group (group.title)}
-					<div class="phase-group">
-						<div class="sub-header">{group.title}</div>
-						{#each group.agents as agent, ai (group.title + '-' + agent.label + '-' + ai)}
-							{@const key = group.title + '-' + agent.label + '-' + ai}
-							<div class="agent-card" class:expanded={expandedAgent === key}>
-								<button class="agent-head" onclick={() => toggleAgent(key)}>
-									<span class="agent-label">{agent.label}</span>
-									<span class="pill agent {agent.state}">{agent.state}</span>
-									<span class="agent-spacer"></span>
-									<span class="agent-meta">{agent.model}</span>
-									<span class="agent-meta">{formatTokens(agent.tokens)}</span>
-									<span class="agent-meta">{agent.toolCalls} tools</span>
-									<span class="agent-meta">{formatDuration(agent.durationMs)}</span>
-									{#if agent.lastToolName}
-										<span class="agent-tool">{agent.lastToolName}</span>
-									{/if}
-									<span class="agent-chevron" aria-hidden="true"
-										>{expandedAgent === key ? '▾' : '▸'}</span
-									>
-								</button>
-								{#if expandedAgent === key}
-									<div
-										class="agent-body"
-										transition:slide|local={{ duration: 200, easing: cubicOut }}
-									>
-										{#if agent.promptPreview}
-											<div class="preview-label">Prompt</div>
-											<pre class="preview-box">{agent.promptPreview}</pre>
-										{/if}
-										{#if agent.resultPreview}
-											<div class="preview-label">Result</div>
-											<pre class="preview-box">{agent.resultPreview}</pre>
-										{/if}
-										{#if !agent.promptPreview && !agent.resultPreview}
-											<div class="preview-empty">No preview available</div>
-										{/if}
-									</div>
-								{/if}
-							</div>
-						{/each}
-					</div>
-				{/each}
+				<!-- ── AGENTS (peer panel to SCRIPT / RESULT) ──────── -->
+				<div class="panel">
+					<button
+						class="panel-head"
+						class:open={agentsOpen}
+						onclick={() => (agentsOpen = !agentsOpen)}
+					>
+						<span class="panel-title">Agents</span>
+						<span class="panel-count">{detail ? detail.agents.length : ''}</span>
+						<span class="panel-chevron" aria-hidden="true">{agentsOpen ? '▾' : '▸'}</span>
+					</button>
+					{#if agentsOpen}
+						<div
+							class="panel-inner"
+							transition:slide|local={{ duration: 200, easing: cubicOut }}
+						>
+							{#each phaseGroups as group (group.title)}
+								<div class="phase-group">
+									<div class="sub-header">{group.title}</div>
+									{#each group.agents as agent, ai (group.title + '-' + agent.label + '-' + ai)}
+										{@const key = group.title + '-' + agent.label + '-' + ai}
+										<div class="agent-card" class:expanded={expandedAgent === key}>
+											<button class="agent-head" onclick={() => toggleAgent(key)}>
+												<span class="agent-label">{agent.label}</span>
+												<span class="pill agent {agent.state}">{agent.state}</span>
+												<span class="agent-spacer"></span>
+												<span class="agent-meta">{agent.model}</span>
+												<span class="agent-meta">{formatTokens(agent.tokens)}</span>
+												<span class="agent-meta">{agent.toolCalls} tools</span>
+												<span class="agent-meta">{formatDuration(agent.durationMs)}</span>
+												{#if agent.lastToolName}
+													<span class="agent-tool">{agent.lastToolName}</span>
+												{/if}
+												<span class="agent-chevron" aria-hidden="true"
+													>{expandedAgent === key ? '▾' : '▸'}</span
+												>
+											</button>
+											{#if expandedAgent === key}
+												<div
+													class="agent-body"
+													transition:slide|local={{ duration: 200, easing: cubicOut }}
+												>
+													{#if agent.promptPreview}
+														<div class="preview-label">Prompt</div>
+														<pre class="preview-box">{agent.promptPreview}</pre>
+													{/if}
+													{#if agent.resultPreview}
+														<div class="preview-label">Result</div>
+														<pre class="preview-box">{formatPreview(agent.resultPreview)}</pre>
+													{/if}
+													{#if !agent.promptPreview && !agent.resultPreview}
+														<div class="preview-empty">No preview available</div>
+													{/if}
+												</div>
+											{/if}
+										</div>
+									{/each}
+								</div>
+							{/each}
+						</div>
+					{/if}
+				</div>
 
 				{#if detail}
 					<!-- ── SCRIPT ─────────────────────────────────────── -->
@@ -382,7 +420,6 @@
 		background: none;
 		border: none;
 		border-bottom: 1px solid var(--border-default);
-		border-left: 2px solid transparent;
 		cursor: pointer;
 		text-align: left;
 		transition: all 0.15s ease;
@@ -390,10 +427,6 @@
 
 	.run-row:hover {
 		background: var(--bg-elevated);
-	}
-
-	.run-row.running {
-		border-left-color: var(--accent-amber);
 	}
 
 	.run-main {
@@ -487,15 +520,14 @@
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
 		padding: 2px 6px;
-		border-radius: 3px;
 		line-height: 1;
 		flex-shrink: 0;
 	}
 
 	.pill.completed,
 	.pill.done {
-		color: var(--text-muted);
-		background: rgba(255, 255, 255, 0.05);
+		color: var(--text-secondary);
+		background: rgba(255, 255, 255, 0.07);
 	}
 
 	.pill.running {
@@ -601,7 +633,6 @@
 		background: var(--bg-card);
 		border: 1px solid var(--border-default);
 		padding: 2px var(--space-sm);
-		border-radius: 3px;
 	}
 
 	.stat-chip.model {
@@ -629,7 +660,6 @@
 	.agent-card {
 		background: var(--bg-card);
 		border: 1px solid var(--border-default);
-		border-radius: 6px;
 		margin-bottom: var(--space-sm);
 		overflow: hidden;
 		transition: border-color 0.15s ease;
@@ -707,7 +737,6 @@
 		color: var(--text-secondary);
 		background: var(--bg-base);
 		border: 1px solid var(--border-default);
-		border-radius: 4px;
 		padding: var(--space-sm);
 		margin: 0;
 		max-height: 240px;
@@ -733,7 +762,7 @@
 	.panel-head {
 		display: flex;
 		align-items: center;
-		justify-content: space-between;
+		gap: var(--space-sm);
 		width: 100%;
 		font-family: var(--font-pixel);
 		font-size: 13px;
@@ -760,7 +789,18 @@
 		white-space: nowrap;
 	}
 
+	.panel-count {
+		font-family: var(--font-pixel);
+		font-size: 12px;
+		color: var(--text-secondary);
+	}
+
+	.panel-inner {
+		padding-top: var(--space-md);
+	}
+
 	.panel-chevron {
+		margin-left: auto;
 		font-family: var(--font-mono);
 		font-size: 12px;
 		color: var(--text-muted);
@@ -775,7 +815,6 @@
 		background: var(--bg-base);
 		border: 1px solid var(--border-default);
 		border-top: none;
-		border-radius: 0 0 4px 4px;
 		padding: var(--space-md);
 		margin: 0;
 		max-height: 360px;
