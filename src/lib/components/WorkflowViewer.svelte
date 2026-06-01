@@ -143,22 +143,55 @@
 		return `${hours}h ${totalMin % 60}m`;
 	}
 
-	// Prettify a preview string: if it parses as JSON, pretty-print it (2-space
-	// indent); otherwise return the text trimmed. Agent resultPreviews are often
-	// raw single-line JSON, which is much easier to read indented.
+	// Prettify a preview string: pretty-print the first JSON object/array found
+	// in it (2-space indent); otherwise return the text trimmed. Agent
+	// resultPreviews are often raw single-line JSON, sometimes with a prefix,
+	// suffix, or truncation, so we slice the first {/[ … last }/] before parsing.
 	function formatPreview(text: string): string {
 		const t = text.trim();
-		if (
-			(t.startsWith('{') && t.endsWith('}')) ||
-			(t.startsWith('[') && t.endsWith(']'))
-		) {
+		const candidate = extractJson(t);
+		if (candidate !== null) {
 			try {
-				return JSON.stringify(JSON.parse(t), null, 2);
+				return JSON.stringify(JSON.parse(candidate), null, 2);
 			} catch {
 				// not valid JSON (e.g. truncated preview) — fall through
 			}
 		}
 		return t;
+	}
+
+	// Slice the first {…} or […] span out of a string. Picks whichever bracket
+	// type appears first, then matches to its last closing bracket. Returns null
+	// if no balanced-looking span exists.
+	function extractJson(t: string): string | null {
+		const firstObj = t.indexOf('{');
+		const firstArr = t.indexOf('[');
+		let open = -1;
+		let close = -1;
+		if (firstObj !== -1 && (firstArr === -1 || firstObj < firstArr)) {
+			open = firstObj;
+			close = t.lastIndexOf('}');
+		} else if (firstArr !== -1) {
+			open = firstArr;
+			close = t.lastIndexOf(']');
+		}
+		if (open === -1 || close <= open) return null;
+		return t.slice(open, close + 1);
+	}
+
+	// ── Raw/Parsed toggle ────────────────────────────────────────────
+	// Tracks which code boxes the user flipped to raw. Default is parsed.
+	let rawBoxes = $state<Set<string>>(new Set());
+
+	function isRaw(id: string): boolean {
+		return rawBoxes.has(id);
+	}
+
+	function toggleRaw(id: string) {
+		const next = new Set(rawBoxes);
+		if (next.has(id)) next.delete(id);
+		else next.add(id);
+		rawBoxes = next;
 	}
 </script>
 
@@ -296,8 +329,25 @@
 														<pre class="preview-box">{agent.promptPreview}</pre>
 													{/if}
 													{#if agent.resultPreview}
-														<div class="preview-label">Result</div>
-														<pre class="preview-box">{formatPreview(agent.resultPreview)}</pre>
+														{@const rid = key + ':result'}
+														<div class="preview-label">
+															Result
+															<span class="raw-toggle">
+																<button
+																	class="raw-btn"
+																	class:active={!isRaw(rid)}
+																	onclick={() => toggleRaw(rid)}>Parsed</button
+																>
+																<button
+																	class="raw-btn"
+																	class:active={isRaw(rid)}
+																	onclick={() => toggleRaw(rid)}>Raw</button
+																>
+															</span>
+														</div>
+														<pre class="preview-box">{isRaw(rid)
+																? agent.resultPreview
+																: formatPreview(agent.resultPreview)}</pre>
 													{/if}
 													{#if !agent.promptPreview && !agent.resultPreview}
 														<div class="preview-empty">No preview available</div>
@@ -343,7 +393,21 @@
 							</button>
 							{#if resultOpen}
 								<div transition:slide|local={{ duration: 200, easing: cubicOut }}>
-									<pre class="code-box">{detail.resultJson}</pre>
+									<div class="code-toolbar">
+										<button
+											class="raw-btn"
+											class:active={!isRaw('result-panel')}
+											onclick={() => toggleRaw('result-panel')}>Parsed</button
+										>
+										<button
+											class="raw-btn"
+											class:active={isRaw('result-panel')}
+											onclick={() => toggleRaw('result-panel')}>Raw</button
+										>
+									</div>
+									<pre class="code-box">{isRaw('result-panel')
+											? detail.resultJson
+											: formatPreview(detail.resultJson)}</pre>
 								</div>
 							{/if}
 						</div>
@@ -722,12 +786,18 @@
 	}
 
 	.preview-label {
+		display: flex;
+		align-items: center;
 		font-family: var(--font-pixel);
 		font-size: 11px;
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
 		color: var(--text-muted);
 		margin: var(--space-sm) 0 var(--space-xs);
+	}
+
+	.preview-label .raw-toggle {
+		margin-left: auto;
 	}
 
 	.preview-box {
@@ -773,7 +843,6 @@
 		padding: var(--space-sm) 0;
 		background: none;
 		border: none;
-		border-bottom: 1px solid var(--border-default);
 		cursor: pointer;
 		text-align: left;
 		transition: color 0.15s ease;
@@ -814,11 +883,46 @@
 		color: var(--text-secondary);
 		background: var(--bg-base);
 		border: 1px solid var(--border-default);
-		border-top: none;
 		padding: var(--space-md);
 		margin: 0;
 		max-height: 360px;
 		overflow: auto;
 		white-space: pre;
+	}
+
+	/* ── Raw/Parsed toggle ───────────────────────────────────────── */
+	.raw-toggle {
+		display: inline-flex;
+		gap: 2px;
+		margin-left: var(--space-sm);
+	}
+
+	.code-toolbar {
+		display: flex;
+		justify-content: flex-end;
+		gap: 2px;
+		margin-bottom: var(--space-xs);
+	}
+
+	.raw-btn {
+		font-family: var(--font-mono);
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--text-muted);
+		background: none;
+		border: 1px solid var(--border-default);
+		padding: 1px 6px;
+		cursor: pointer;
+		transition: all 0.15s ease;
+	}
+
+	.raw-btn:hover {
+		color: var(--text-secondary);
+	}
+
+	.raw-btn.active {
+		color: var(--accent-amber);
+		border-color: var(--accent-amber);
 	}
 </style>
