@@ -14,10 +14,12 @@
 		value,
 		depth = 0,
 		emphasis = false,
-	}: { value: unknown; depth?: number; emphasis?: boolean } = $props();
+		reading = false,
+	}: { value: unknown; depth?: number; emphasis?: boolean; reading?: boolean } = $props();
 
 	const MAX_DEPTH = 12;
-	const LONG_STRING = 280;
+	// In reading mode (full-view modal) strings stay generous before clamping.
+	let LONG_STRING = $derived(reading ? 1200 : 280);
 
 	let expanded = $state(false);
 
@@ -148,9 +150,9 @@
 		<span class="scalar dim">[]</span>
 	{:else if tableFor(value)}
 		{@const tbl = tableFor(value)!}
-		<SchemaTable rows={tbl.rows} schema={tbl.schema} />
+		<SchemaTable rows={tbl.rows} schema={tbl.schema} {reading} />
 	{:else}
-		<div class="array">
+		<div class="array" class:reading>
 			{#each value as item, i (i)}
 				{@const isObj = item && typeof item === 'object' && !Array.isArray(item)}
 				<div class="card">
@@ -166,12 +168,12 @@
 							{/if}
 						</div>
 						<div class="card-body">
-							<Self value={item} depth={depth + 1} />
+							<Self value={item} depth={depth + 1} {reading} />
 						</div>
 					{:else}
 						<div class="card-head">
 							<span class="card-idx">{i + 1}</span>
-							<Self value={item} depth={depth + 1} />
+							<Self value={item} depth={depth + 1} {reading} />
 						</div>
 					{/if}
 				</div>
@@ -182,7 +184,7 @@
 	{#if entries.length === 0}
 		<span class="scalar dim">{'{}'}</span>
 	{:else}
-		<div class="obj">
+		<div class="obj" class:reading>
 			{#each entries as [k, v] (k)}
 				{@const h = hintFor(k, v)}
 				{@const childKind = kind(v)}
@@ -194,7 +196,7 @@
 						{:else if h.kind === 'mono' && typeof v === 'string'}
 							<span class="scalar mono ellipsis" title={v}>{v}</span>
 						{:else}
-							<Self value={v} depth={depth + 1} emphasis={h.kind === 'emphasis'} />
+							<Self value={v} depth={depth + 1} emphasis={h.kind === 'emphasis'} {reading} />
 						{/if}
 					</div>
 				</div>
@@ -207,18 +209,20 @@
 		<span class="scalar dim">""</span>
 	{:else if long && !expanded}
 		<div class="str clamped">
-			<span class="str-text">{value.slice(0, LONG_STRING)}…</span>
+			<span class="str-text" class:reading>{value.slice(0, LONG_STRING)}…</span>
 			<button class="more-btn" onclick={() => (expanded = true)}>▸ more</button>
 		</div>
 	{:else if long && expanded}
 		<div class="str" transition:slide|local={{ duration: 150, easing: cubicOut }}>
-			<span class="str-text">{value}</span>
+			<span class="str-text" class:reading>{value}</span>
 			<button class="more-btn" onclick={() => (expanded = false)}>▾ less</button>
 		</div>
 	{:else}
 		<!-- Quote strings that look like a JSON literal (null/true/false/number)
 		     so they can't be mistaken for the real scalar. -->
-		<span class="str-text" class:emphasis>{looksLikeLiteral(value) ? JSON.stringify(value) : value}</span>
+		<span class="str-text" class:emphasis class:reading
+			>{looksLikeLiteral(value) ? JSON.stringify(value) : value}</span
+		>
 	{/if}
 {:else}
 	<!-- number / boolean -->
@@ -394,5 +398,30 @@
 	.badge.neutral {
 		color: var(--text-secondary);
 		background: rgba(255, 255, 255, 0.07);
+	}
+
+	/* ── Reading mode (full-view modal): larger, airier ───────────── */
+	.obj.reading {
+		gap: 8px;
+	}
+	.obj.reading > :global(.row) {
+		padding: 3px 0;
+	}
+	.obj.reading > :global(.row) > :global(.key) {
+		font-size: 13px;
+	}
+	.obj.reading > :global(.row.block) > :global(.val) {
+		padding-left: var(--space-lg);
+	}
+	.array.reading {
+		gap: var(--space-md);
+	}
+	.array.reading > :global(.card) {
+		padding: var(--space-md);
+	}
+	.str-text.reading {
+		font-size: 14px;
+		line-height: 1.65;
+		color: var(--text-primary);
 	}
 </style>

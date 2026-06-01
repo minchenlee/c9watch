@@ -13,6 +13,8 @@
 	import { getWorkflowDetail } from '$lib/api';
 	import type { WorkflowSummary, WorkflowAgent, WorkflowDetail, ResultSchema } from '$lib/types';
 	import JsonWidget from './JsonWidget.svelte';
+	import ResultModal from './ResultModal.svelte';
+	import { outline } from '$lib/result-outline';
 
 	// ── State ────────────────────────────────────────────────────────
 	let selectedRunId = $state<string | null>(null);
@@ -31,6 +33,7 @@
 	let agentsOpen = $state(true);
 	let scriptOpen = $state(false);
 	let resultOpen = $state(false);
+	let resultModalOpen = $state(false);
 
 	// Selected summary from the list — keeps the header rendering instantly.
 	let selectedSummary = $derived(
@@ -83,6 +86,7 @@
 		expandedAgent = null;
 		scriptOpen = false;
 		resultOpen = false;
+		resultModalOpen = false;
 		rawBoxes = new Set(); // don't leak a Raw preference across runs
 	}
 
@@ -465,32 +469,44 @@
 							{#if resultOpen}
 								{@const parsed = parseResult(detail.resultJson)}
 								<div transition:slide|local={{ duration: 200, easing: cubicOut }}>
-									<div class="code-toolbar">
-										<button
-											class="raw-btn"
-											class:active={!isRaw('result-panel') && parsed.ok}
-											disabled={!parsed.ok}
-											onclick={() => setRaw('result-panel', false)}>Parsed</button
-										>
-										<button
-											class="raw-btn"
-											class:active={isRaw('result-panel') || !parsed.ok}
-											onclick={() => setRaw('result-panel', true)}>Raw</button
-										>
-									</div>
-									{#if isRaw('result-panel') || !parsed.ok}
-										{#if !parsed.ok}
-											<div class="parse-note">unparseable — showing raw</div>
-										{/if}
+									{#if !parsed.ok}
+										<div class="parse-note">unparseable — showing raw</div>
 										<pre class="code-box">{detail.resultJson}</pre>
 									{:else}
-										<div class="widget-box">
-											<JsonWidget value={parsed.value} />
+										{@const entries = outline(parsed.value)}
+										<div class="result-overview">
+											<div class="overview-list">
+												{#each entries as e (e.key)}
+													<div class="overview-row">
+														<span class="ov-key">{e.key || '(value)'}</span>
+														{#if e.kind === 'array' || e.kind === 'object'}
+															<span class="ov-count">{e.hint}</span>
+														{:else}
+															<span class="ov-hint">{e.hint}</span>
+														{/if}
+													</div>
+												{/each}
+											</div>
+											<button class="open-full-btn" onclick={() => (resultModalOpen = true)}>
+												Open full view ⤢
+											</button>
 										</div>
 									{/if}
 								</div>
 							{/if}
 						</div>
+
+						{#if resultModalOpen}
+							{@const parsed = parseResult(detail.resultJson)}
+							{#if parsed.ok}
+								<ResultModal
+									value={parsed.value}
+									rawJson={detail.resultJson}
+									title={detail.workflowName}
+									onclose={() => (resultModalOpen = false)}
+								/>
+							{/if}
+						{/if}
 					{/if}
 				{/if}
 			{/if}
@@ -977,13 +993,6 @@
 		margin-left: var(--space-sm);
 	}
 
-	.code-toolbar {
-		display: flex;
-		justify-content: flex-end;
-		gap: 2px;
-		margin-bottom: var(--space-xs);
-	}
-
 	.raw-btn {
 		font-family: var(--font-mono);
 		font-size: 10px;
@@ -1011,12 +1020,66 @@
 		cursor: not-allowed;
 	}
 
-	.widget-box {
-		background: var(--bg-base);
-		border: 1px solid var(--border-default);
-		padding: var(--space-md);
-		max-height: 480px;
-		overflow: auto;
+	/* ── Result overview (inline) ─────────────────────────────────── */
+	.result-overview {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-md);
+	}
+
+	.overview-list {
+		display: flex;
+		flex-direction: column;
+	}
+
+	.overview-row {
+		display: flex;
+		align-items: baseline;
+		gap: var(--space-md);
+		padding: 6px var(--space-sm);
+		border-bottom: 1px solid var(--border-default);
+	}
+	.overview-row:last-child {
+		border-bottom: none;
+	}
+
+	.ov-key {
+		font-family: var(--font-mono);
+		font-size: 13px;
+		color: var(--text-primary);
+		flex-shrink: 0;
+		min-width: 140px;
+	}
+
+	.ov-count {
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--accent-amber);
+	}
+
+	.ov-hint {
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-muted);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.open-full-btn {
+		align-self: flex-start;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		padding: 6px 14px;
+		background: none;
+		border: 1px solid var(--accent-amber);
+		color: var(--accent-amber);
+		cursor: pointer;
+	}
+	.open-full-btn:hover {
+		background: var(--status-permission-glow);
 	}
 
 	.parse-note {

@@ -8,10 +8,16 @@
 	// columns; the longest text prop is an expandable per-row body; enum props
 	// render as colored badges. Caller only mounts this when matchSchema() hit and
 	// pickColumns().fallback is false.
-	let { rows, schema }: { rows: Record<string, unknown>[]; schema: ResultSchema } = $props();
+	let {
+		rows,
+		schema,
+		reading = false,
+	}: { rows: Record<string, unknown>[]; schema: ResultSchema; reading?: boolean } = $props();
 
 	let layout = $derived(pickColumns(schema, rows));
+	// In reading mode every row body starts open (full-view modal = read it all).
 	let openRows = $state<Set<number>>(new Set());
+	let allOpen = $derived(reading);
 
 	function toggle(i: number) {
 		const next = new Set(openRows);
@@ -33,7 +39,7 @@
 	}
 </script>
 
-<div class="schema-table">
+<div class="schema-table" class:reading>
 	<div class="thead" style="--cols: {layout.columns.length}">
 		<span class="th idx-col" aria-hidden="true"></span>
 		{#each layout.columns as col (col.name)}
@@ -45,7 +51,8 @@
 	</div>
 	{#each rows as row, i (i)}
 		{@const hasBody = layout.bodyKey != null && cell(row, layout.bodyKey).trim() !== ''}
-		<div class="trow" class:open={openRows.has(i)}>
+		{@const bodyShown = hasBody && (allOpen || openRows.has(i))}
+		<div class="trow" class:open={bodyShown}>
 			<button
 				class="tr"
 				class:clickable={hasBody}
@@ -65,10 +72,10 @@
 					</span>
 				{/each}
 				{#if layout.bodyKey}
-					<span class="td expand-col">{hasBody ? (openRows.has(i) ? '▾' : '▸') : ''}</span>
+					<span class="td expand-col">{hasBody ? (bodyShown ? '▾' : '▸') : ''}</span>
 				{/if}
 			</button>
-			{#if hasBody && openRows.has(i) && layout.bodyKey}
+			{#if bodyShown && layout.bodyKey}
 				<div class="row-body" transition:slide|local={{ duration: 150, easing: cubicOut }}>
 					{cell(row, layout.bodyKey)}
 				</div>
@@ -183,5 +190,19 @@
 	.badge.neutral {
 		color: var(--text-secondary);
 		background: rgba(255, 255, 255, 0.07);
+	}
+
+	/* ── Reading mode (full-view modal) ───────────────────────────── */
+	.schema-table.reading .td {
+		font-size: 13px;
+	}
+	.schema-table.reading .cell-text {
+		white-space: normal;
+		word-break: break-word;
+	}
+	.schema-table.reading .row-body {
+		font-size: 13px;
+		line-height: 1.6;
+		color: var(--text-primary);
 	}
 </style>
