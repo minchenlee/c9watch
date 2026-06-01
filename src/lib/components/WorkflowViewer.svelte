@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { untrack } from 'svelte';
+	import { untrack, setContext } from 'svelte';
 	import { slide } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 	import {
@@ -11,12 +11,21 @@
 		stopWorkflowPolling,
 	} from '$lib/stores/workflows';
 	import { getWorkflowDetail } from '$lib/api';
-	import type { WorkflowSummary, WorkflowAgent, WorkflowDetail } from '$lib/types';
+	import type { WorkflowSummary, WorkflowAgent, WorkflowDetail, ResultSchema } from '$lib/types';
 	import JsonWidget from './JsonWidget.svelte';
 
 	// ── State ────────────────────────────────────────────────────────
 	let selectedRunId = $state<string | null>(null);
 	let detail = $state<WorkflowDetail | null>(null);
+
+	// Expose the current run's result schemas to the recursive JsonWidget tree
+	// (RESULT panel) without prop-drilling. Reactive via a getter so it tracks
+	// selectRun() / refetches.
+	setContext('wf-result-schemas', {
+		get value(): ResultSchema[] {
+			return detail?.resultSchemas ?? [];
+		},
+	});
 	let detailLoading = $state(false);
 	let expandedAgent = $state<string | null>(null);
 	let agentsOpen = $state(true);

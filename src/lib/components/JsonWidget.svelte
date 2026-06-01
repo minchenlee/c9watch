@@ -1,7 +1,11 @@
 <script lang="ts">
 	import { slide } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
+	import { getContext } from 'svelte';
 	import Self from './JsonWidget.svelte';
+	import SchemaTable from './SchemaTable.svelte';
+	import type { ResultSchema } from '$lib/types';
+	import { matchSchema, pickColumns } from '$lib/workflow-schema';
 
 	// Recursive native-GUI renderer for an arbitrary JSON value. Objects render as
 	// key/value rows, arrays as numbered cards, strings as (clamped) text blocks,
@@ -16,6 +20,31 @@
 	const LONG_STRING = 280;
 
 	let expanded = $state(false);
+
+	// Result schemas (from the workflow script) reach the recursive tree via
+	// context, so we can render a matched array-of-objects as a tailored table
+	// instead of generic cards. Tolerate absence (JsonWidget works standalone).
+	const schemaCtx = getContext<{ value: ResultSchema[] }>('wf-result-schemas');
+	function resultSchemas(): ResultSchema[] {
+		return schemaCtx?.value ?? [];
+	}
+
+	// When an array's elements are all objects, try a schema-driven table.
+	// Returns null (→ generic card render) when no schema, no match, or the
+	// matched layout is unsuitable for a table.
+	function tableFor(
+		arr: unknown[]
+	): { rows: Record<string, unknown>[]; schema: ResultSchema } | null {
+		const schemas = resultSchemas();
+		if (schemas.length === 0 || arr.length === 0) return null;
+		if (!arr.every((x) => x && typeof x === 'object' && !Array.isArray(x))) return null;
+		const rows = arr as Record<string, unknown>[];
+		const elemKeys = Array.from(new Set(rows.flatMap((r) => Object.keys(r))));
+		const schema = matchSchema(elemKeys, schemas);
+		if (!schema) return null;
+		if (pickColumns(schema, rows).fallback) return null;
+		return { rows, schema };
+	}
 
 	function kind(v: unknown): string {
 		if (v === null) return 'null';
@@ -117,6 +146,9 @@
 {:else if Array.isArray(value)}
 	{#if value.length === 0}
 		<span class="scalar dim">[]</span>
+	{:else if tableFor(value)}
+		{@const tbl = tableFor(value)!}
+		<SchemaTable rows={tbl.rows} schema={tbl.schema} />
 	{:else}
 		<div class="array">
 			{#each value as item, i (i)}

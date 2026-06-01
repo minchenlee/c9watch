@@ -281,10 +281,26 @@ export interface WorkflowAgent {
   resultPreview: string;
 }
 
+export interface FieldMeta {
+  name: string;
+  /** "string" | "number" | "integer" | "boolean" | "array" | "object" | "" */
+  ty: string;
+  enumVals?: string[];
+  description?: string;
+}
+
+export interface ResultSchema {
+  /** element-object property names, in schema order */
+  keys: string[];
+  props: FieldMeta[];
+}
+
 export interface WorkflowDetail extends WorkflowSummary {
   phases: string[];
   agents: WorkflowAgent[];
   script: string;
   /** pretty-printed JSON of the workflow's result, or '' */
   resultJson: string;
+  /** element-object schemas extracted from the script; [] when none */
+  resultSchemas: ResultSchema[];
 }
