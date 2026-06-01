@@ -14,6 +14,7 @@
 	import type { WorkflowSummary, WorkflowAgent, WorkflowDetail, ResultSchema } from '$lib/types';
 	import JsonWidget from './JsonWidget.svelte';
 	import ResultModal from './ResultModal.svelte';
+	import WorkflowGraph from './WorkflowGraph.svelte';
 	import { outline } from '$lib/result-outline';
 
 	// ── State ────────────────────────────────────────────────────────
@@ -31,6 +32,7 @@
 	let detailLoading = $state(false);
 	let expandedAgent = $state<string | null>(null);
 	let agentsOpen = $state(true);
+	let agentView = $state<'list' | 'graph'>('list');
 	let scriptOpen = $state(false);
 	let resultOpen = $state(false);
 	let resultModalOpen = $state(false);
@@ -373,7 +375,22 @@
 							class="panel-inner"
 							transition:slide|local={{ duration: 200, easing: cubicOut }}
 						>
-							{#each phaseGroups as group (group.title)}
+							<div class="wf-view-toggle">
+								<button
+									class="wf-view-btn"
+									class:active={agentView === 'list'}
+									onclick={() => (agentView = 'list')}>List</button
+								>
+								<button
+									class="wf-view-btn"
+									class:active={agentView === 'graph'}
+									onclick={() => (agentView = 'graph')}>Graph</button
+								>
+							</div>
+							{#if agentView === 'graph'}
+								<WorkflowGraph {phaseGroups} workflowName={selectedSummary.workflowName} />
+							{:else}
+								{#each phaseGroups as group (group.title)}
 								<div class="phase-group">
 									<div class="sub-header">{group.title}</div>
 									{#each group.agents as agent, ai (group.title + '-' + agent.label + '-' + ai)}
@@ -433,6 +450,7 @@
 									{/each}
 								</div>
 							{/each}
+							{/if}
 						</div>
 					{/if}
 				</div>
@@ -962,6 +980,28 @@
 
 	.panel-inner {
 		padding-top: var(--space-md);
+	}
+
+	.wf-view-toggle {
+		display: flex;
+		gap: 4px;
+		margin-bottom: var(--space-md);
+	}
+	.wf-view-btn {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--text-muted);
+		background: var(--bg-card);
+		border: 1px solid var(--border-default);
+		border-radius: 4px;
+		padding: 4px 12px;
+		cursor: pointer;
+	}
+	.wf-view-btn.active {
+		color: var(--accent-amber);
+		border-color: var(--accent-amber);
 	}
 
 	.panel-chevron {
