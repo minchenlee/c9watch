@@ -146,37 +146,84 @@
 	// Prettify a preview string: pretty-print the first JSON object/array found
 	// in it (2-space indent); otherwise return the text trimmed. Agent
 	// resultPreviews are often raw single-line JSON, sometimes with a prefix,
-	// suffix, or truncation, so we slice the first {/[ … last }/] before parsing.
+	// suffix, or — most commonly — TRUNCATED mid-value (no closing brace). We
+	// slice from the first {/[ and repair truncation by closing open
+	// brackets/strings before parsing, so even a cut-off preview prettifies.
 	function formatPreview(text: string): string {
 		const t = text.trim();
-		const candidate = extractJson(t);
-		if (candidate !== null) {
+		const start = firstBracket(t);
+		if (start === -1) return t;
+		const repaired = repairJson(t.slice(start));
+		if (repaired !== null) {
 			try {
-				return JSON.stringify(JSON.parse(candidate), null, 2);
+				return JSON.stringify(JSON.parse(repaired), null, 2);
 			} catch {
-				// not valid JSON (e.g. truncated preview) — fall through
+				// still unparseable — fall through to raw
 			}
 		}
 		return t;
 	}
 
-	// Slice the first {…} or […] span out of a string. Picks whichever bracket
-	// type appears first, then matches to its last closing bracket. Returns null
-	// if no balanced-looking span exists.
-	function extractJson(t: string): string | null {
-		const firstObj = t.indexOf('{');
-		const firstArr = t.indexOf('[');
-		let open = -1;
-		let close = -1;
-		if (firstObj !== -1 && (firstArr === -1 || firstObj < firstArr)) {
-			open = firstObj;
-			close = t.lastIndexOf('}');
-		} else if (firstArr !== -1) {
-			open = firstArr;
-			close = t.lastIndexOf(']');
+	// Index of the first { or [ in the string, or -1.
+	function firstBracket(t: string): number {
+		const o = t.indexOf('{');
+		const a = t.indexOf('[');
+		if (o === -1) return a;
+		if (a === -1) return o;
+		return Math.min(o, a);
+	}
+
+	// Walk a JSON-ish string from its opening bracket, tracking string/escape
+	// state and a stack of open {/[. Stop at the position where the top-level
+	// value closes (balanced). If the string ends while still open (truncated),
+	// trim any trailing partial token and append the missing closers. Returns a
+	// parseable string, or null if nothing usable.
+	function repairJson(s: string): string | null {
+		const stack: string[] = [];
+		let inStr = false;
+		let esc = false;
+		let end = -1;
+		for (let i = 0; i < s.length; i++) {
+			const c = s[i];
+			if (inStr) {
+				if (esc) esc = false;
+				else if (c === '\\') esc = true;
+				else if (c === '"') inStr = false;
+				continue;
+			}
+			if (c === '"') inStr = true;
+			else if (c === '{' || c === '[') stack.push(c === '{' ? '}' : ']');
+			else if (c === '}' || c === ']') {
+				stack.pop();
+				if (stack.length === 0) {
+					end = i;
+					break;
+				}
+			}
 		}
-		if (open === -1 || close <= open) return null;
-		return t.slice(open, close + 1);
+		// Balanced top-level value found — return exactly that span.
+		if (end !== -1) return s.slice(0, end + 1);
+		if (stack.length === 0) return null;
+
+		// Truncated: build a repaired tail. Close an open string, drop a dangling
+		// partial token (after the last comma/colon/bracket), then add closers.
+		let body = s;
+		if (inStr) body += '"';
+		body = dropDanglingTail(body);
+		while (stack.length) body += stack.pop();
+		return body;
+	}
+
+	// After truncation repair, the text may end on a partial key/value with no
+	// value yet (e.g. `…,"foo"` or `…,"foo":`). Trim back to the last point that
+	// leaves valid JSON: cut a trailing comma, or a `"key":` with no value.
+	function dropDanglingTail(s: string): string {
+		let t = s.replace(/,\s*$/, '');
+		// `"key":` dangling with no value → drop the whole key:value start.
+		t = t.replace(/,?\s*"(?:[^"\\]|\\.)*"\s*:\s*$/, '');
+		// trailing comma left by the above
+		t = t.replace(/,\s*$/, '');
+		return t;
 	}
 
 	// ── Raw/Parsed toggle ────────────────────────────────────────────
@@ -283,7 +330,7 @@
 				</div>
 			{:else}
 				<!-- ── AGENTS (peer panel to SCRIPT / RESULT) ──────── -->
-				<div class="panel">
+				<div class="wf-panel">
 					<button
 						class="panel-head"
 						class:open={agentsOpen}
@@ -364,7 +411,7 @@
 
 				{#if detail}
 					<!-- ── SCRIPT ─────────────────────────────────────── -->
-					<div class="panel">
+					<div class="wf-panel">
 						<button
 							class="panel-head"
 							class:open={scriptOpen}
@@ -382,7 +429,7 @@
 
 					<!-- ── RESULT ─────────────────────────────────────── -->
 					{#if detail.resultJson}
-						<div class="panel">
+						<div class="wf-panel">
 							<button
 								class="panel-head"
 								class:open={resultOpen}
@@ -825,7 +872,7 @@
 	}
 
 	/* ── Collapsible script / result panels ──────────────────────── */
-	.panel {
+	.wf-panel {
 		margin-top: var(--space-md);
 	}
 
