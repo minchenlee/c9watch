@@ -12,6 +12,7 @@
 	} from '$lib/stores/workflows';
 	import { getWorkflowDetail } from '$lib/api';
 	import type { WorkflowSummary, WorkflowAgent, WorkflowDetail } from '$lib/types';
+	import JsonWidget from './JsonWidget.svelte';
 
 	// ── State ────────────────────────────────────────────────────────
 	let selectedRunId = $state<string | null>(null);
@@ -73,6 +74,7 @@
 		expandedAgent = null;
 		scriptOpen = false;
 		resultOpen = false;
+		rawBoxes = new Set(); // don't leak a Raw preference across runs
 	}
 
 	function back() {
@@ -226,6 +228,16 @@
 		return t;
 	}
 
+	// Parse the result JSON for the widget render; on failure the panel falls
+	// back to raw text.
+	function parseResult(json: string): { ok: boolean; value: unknown } {
+		try {
+			return { ok: true, value: JSON.parse(json) };
+		} catch {
+			return { ok: false, value: null };
+		}
+	}
+
 	// ── Raw/Parsed toggle ────────────────────────────────────────────
 	// Tracks which code boxes the user flipped to raw. Default is parsed.
 	let rawBoxes = $state<Set<string>>(new Set());
@@ -234,10 +246,13 @@
 		return rawBoxes.has(id);
 	}
 
-	function toggleRaw(id: string) {
+	// Explicit setter (not a blind flip) so the Parsed/Raw segmented buttons are
+	// idempotent: clicking the already-active segment is a no-op.
+	function setRaw(id: string, raw: boolean) {
+		if (rawBoxes.has(id) === raw) return;
 		const next = new Set(rawBoxes);
-		if (next.has(id)) next.delete(id);
-		else next.add(id);
+		if (raw) next.add(id);
+		else next.delete(id);
 		rawBoxes = next;
 	}
 </script>
@@ -383,12 +398,12 @@
 																<button
 																	class="raw-btn"
 																	class:active={!isRaw(rid)}
-																	onclick={() => toggleRaw(rid)}>Parsed</button
+																	onclick={() => setRaw(rid, false)}>Parsed</button
 																>
 																<button
 																	class="raw-btn"
 																	class:active={isRaw(rid)}
-																	onclick={() => toggleRaw(rid)}>Raw</button
+																	onclick={() => setRaw(rid, true)}>Raw</button
 																>
 															</span>
 														</div>
@@ -439,22 +454,31 @@
 								<span class="panel-chevron" aria-hidden="true">{resultOpen ? '▾' : '▸'}</span>
 							</button>
 							{#if resultOpen}
+								{@const parsed = parseResult(detail.resultJson)}
 								<div transition:slide|local={{ duration: 200, easing: cubicOut }}>
 									<div class="code-toolbar">
 										<button
 											class="raw-btn"
-											class:active={!isRaw('result-panel')}
-											onclick={() => toggleRaw('result-panel')}>Parsed</button
+											class:active={!isRaw('result-panel') && parsed.ok}
+											disabled={!parsed.ok}
+											onclick={() => setRaw('result-panel', false)}>Parsed</button
 										>
 										<button
 											class="raw-btn"
-											class:active={isRaw('result-panel')}
-											onclick={() => toggleRaw('result-panel')}>Raw</button
+											class:active={isRaw('result-panel') || !parsed.ok}
+											onclick={() => setRaw('result-panel', true)}>Raw</button
 										>
 									</div>
-									<pre class="code-box">{isRaw('result-panel')
-											? detail.resultJson
-											: formatPreview(detail.resultJson)}</pre>
+									{#if isRaw('result-panel') || !parsed.ok}
+										{#if !parsed.ok}
+											<div class="parse-note">unparseable — showing raw</div>
+										{/if}
+										<pre class="code-box">{detail.resultJson}</pre>
+									{:else}
+										<div class="widget-box">
+											<JsonWidget value={parsed.value} />
+										</div>
+									{/if}
 								</div>
 							{/if}
 						</div>
@@ -971,5 +995,27 @@
 	.raw-btn.active {
 		color: var(--accent-amber);
 		border-color: var(--accent-amber);
+	}
+
+	.raw-btn:disabled {
+		opacity: 0.35;
+		cursor: not-allowed;
+	}
+
+	.widget-box {
+		background: var(--bg-base);
+		border: 1px solid var(--border-default);
+		padding: var(--space-md);
+		max-height: 480px;
+		overflow: auto;
+	}
+
+	.parse-note {
+		font-family: var(--font-mono);
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--accent-amber);
+		margin-bottom: var(--space-xs);
 	}
 </style>
