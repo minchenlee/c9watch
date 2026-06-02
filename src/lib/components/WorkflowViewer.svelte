@@ -16,6 +16,7 @@
 	import ResultModal from './ResultModal.svelte';
 	import WorkflowGraph from './WorkflowGraph.svelte';
 	import { outline } from '$lib/result-outline';
+	import { highlightJs } from '$lib/workflow-highlight';
 
 	// ── State ────────────────────────────────────────────────────────
 	let selectedRunId = $state<string | null>(null);
@@ -32,9 +33,10 @@
 	let detailLoading = $state(false);
 	let expandedAgent = $state<string | null>(null);
 	let agentsOpen = $state(true);
+	let summaryOpen = $state(true);
 	let agentView = $state<'list' | 'graph'>('list');
 	let scriptOpen = $state(false);
-	let resultOpen = $state(false);
+	let resultOpen = $state(true);
 	let resultModalOpen = $state(false);
 
 	// Selected summary from the list — keeps the header rendering instantly.
@@ -87,7 +89,7 @@
 		detail = null;
 		expandedAgent = null;
 		scriptOpen = false;
-		resultOpen = false;
+		resultOpen = true;
 		resultModalOpen = false;
 		rawBoxes = new Set(); // don't leak a Raw preference across runs
 	}
@@ -354,12 +356,116 @@
 				</div>
 			</div>
 
+			{#if detail}
+				<!-- ── SUMMARY ────────────────────────────────────── -->
+				<div class="wf-panel">
+					<button
+						class="panel-head"
+						class:open={summaryOpen}
+						onclick={() => (summaryOpen = !summaryOpen)}
+					>
+						<span class="panel-title">Summary</span>
+						<span class="panel-chevron" aria-hidden="true">{summaryOpen ? '▾' : '▸'}</span>
+					</button>
+					{#if summaryOpen}
+						<div
+							class="panel-inner"
+							transition:slide|local={{ duration: 200, easing: cubicOut }}
+						>
+							{#if detail.summary}
+								<p class="summary-text">{detail.summary}</p>
+							{/if}
+							<div class="summary-grid">
+								<div class="sg-cell"><span class="sg-k">Status</span><span class="sg-v {detail.status}">{detail.status}</span></div>
+								<div class="sg-cell"><span class="sg-k">Phases</span><span class="sg-v">{detail.phases.length}</span></div>
+								<div class="sg-cell"><span class="sg-k">Agents</span><span class="sg-v">{detail.agents.length}</span></div>
+								<div class="sg-cell"><span class="sg-k">Tokens</span><span class="sg-v">{formatTokens(detail.totalTokens)}</span></div>
+								<div class="sg-cell"><span class="sg-k">Tools</span><span class="sg-v">{detail.totalToolCalls}</span></div>
+								<div class="sg-cell"><span class="sg-k">Duration</span><span class="sg-v">{detail.status === 'running' ? 'live' : formatDuration(detail.durationMs)}</span></div>
+								<div class="sg-cell"><span class="sg-k">Model</span><span class="sg-v">{detail.defaultModel}</span></div>
+							</div>
+						</div>
+					{/if}
+				</div>
+
+				<!-- ── RESULT ─────────────────────────────────────── -->
+				{#if detail.resultJson}
+					<div class="wf-panel">
+						<button
+							class="panel-head"
+							class:open={resultOpen}
+							onclick={() => (resultOpen = !resultOpen)}
+						>
+							<span class="panel-title">Result</span>
+							<span class="panel-chevron" aria-hidden="true">{resultOpen ? '▾' : '▸'}</span>
+						</button>
+						{#if resultOpen}
+							{@const parsed = parseResult(detail.resultJson)}
+							<div transition:slide|local={{ duration: 200, easing: cubicOut }}>
+								{#if !parsed.ok}
+									<div class="parse-note">unparseable — showing raw</div>
+									<pre class="code-box">{detail.resultJson}</pre>
+								{:else}
+									{@const entries = outline(parsed.value)}
+									<div class="result-overview">
+										<div class="overview-list">
+											{#each entries as e (e.key)}
+												<div class="overview-row">
+													<span class="ov-key">{e.key || '(value)'}</span>
+													{#if e.kind === 'array' || e.kind === 'object'}
+														<span class="ov-count">{e.hint}</span>
+													{:else}
+														<span class="ov-hint">{e.hint}</span>
+													{/if}
+												</div>
+											{/each}
+										</div>
+										<button class="open-full-btn" onclick={() => (resultModalOpen = true)}>
+											Open full view ⤢
+										</button>
+									</div>
+								{/if}
+							</div>
+						{/if}
+
+						{#if resultModalOpen}
+							{@const parsed = parseResult(detail.resultJson)}
+							{#if parsed.ok}
+								<ResultModal
+									value={parsed.value}
+									rawJson={detail.resultJson}
+									title={detail.workflowName}
+									onclose={() => (resultModalOpen = false)}
+								/>
+							{/if}
+						{/if}
+					</div>
+				{/if}
+
+				<!-- ── SCRIPT ─────────────────────────────────────── -->
+				<div class="wf-panel">
+					<button
+						class="panel-head"
+						class:open={scriptOpen}
+						onclick={() => (scriptOpen = !scriptOpen)}
+					>
+						<span class="panel-title">Script</span>
+						<span class="panel-chevron" aria-hidden="true">{scriptOpen ? '▾' : '▸'}</span>
+					</button>
+					{#if scriptOpen}
+						<div transition:slide|local={{ duration: 200, easing: cubicOut }}>
+							<pre class="code-box hl">{@html highlightJs(detail.script)}</pre>
+						</div>
+					{/if}
+				</div>
+			{/if}
+
 			{#if phaseGroups.length === 0}
 				<div class="state-msg">
 					{detailLoading ? 'Loading detail…' : 'No agents recorded'}
 				</div>
 			{:else}
-				<!-- ── AGENTS (peer panel to SCRIPT / RESULT) ──────── -->
+				<!-- ── AGENTS ──────────────────────────────────────── -->
 				<div class="wf-panel">
 					<button
 						class="panel-head"
@@ -454,79 +560,6 @@
 						</div>
 					{/if}
 				</div>
-
-				{#if detail}
-					<!-- ── SCRIPT ─────────────────────────────────────── -->
-					<div class="wf-panel">
-						<button
-							class="panel-head"
-							class:open={scriptOpen}
-							onclick={() => (scriptOpen = !scriptOpen)}
-						>
-							<span class="panel-title">Script</span>
-							<span class="panel-chevron" aria-hidden="true">{scriptOpen ? '▾' : '▸'}</span>
-						</button>
-						{#if scriptOpen}
-							<div transition:slide|local={{ duration: 200, easing: cubicOut }}>
-								<pre class="code-box">{detail.script}</pre>
-							</div>
-						{/if}
-					</div>
-
-					<!-- ── RESULT ─────────────────────────────────────── -->
-					{#if detail.resultJson}
-						<div class="wf-panel">
-							<button
-								class="panel-head"
-								class:open={resultOpen}
-								onclick={() => (resultOpen = !resultOpen)}
-							>
-								<span class="panel-title">Result</span>
-								<span class="panel-chevron" aria-hidden="true">{resultOpen ? '▾' : '▸'}</span>
-							</button>
-							{#if resultOpen}
-								{@const parsed = parseResult(detail.resultJson)}
-								<div transition:slide|local={{ duration: 200, easing: cubicOut }}>
-									{#if !parsed.ok}
-										<div class="parse-note">unparseable — showing raw</div>
-										<pre class="code-box">{detail.resultJson}</pre>
-									{:else}
-										{@const entries = outline(parsed.value)}
-										<div class="result-overview">
-											<div class="overview-list">
-												{#each entries as e (e.key)}
-													<div class="overview-row">
-														<span class="ov-key">{e.key || '(value)'}</span>
-														{#if e.kind === 'array' || e.kind === 'object'}
-															<span class="ov-count">{e.hint}</span>
-														{:else}
-															<span class="ov-hint">{e.hint}</span>
-														{/if}
-													</div>
-												{/each}
-											</div>
-											<button class="open-full-btn" onclick={() => (resultModalOpen = true)}>
-												Open full view ⤢
-											</button>
-										</div>
-									{/if}
-								</div>
-							{/if}
-						</div>
-
-						{#if resultModalOpen}
-							{@const parsed = parseResult(detail.resultJson)}
-							{#if parsed.ok}
-								<ResultModal
-									value={parsed.value}
-									rawJson={detail.resultJson}
-									title={detail.workflowName}
-									onclose={() => (resultModalOpen = false)}
-								/>
-							{/if}
-						{/if}
-					{/if}
-				{/if}
 			{/if}
 		</div>
 	{/if}
@@ -1024,6 +1057,61 @@
 		max-height: 360px;
 		overflow: auto;
 		white-space: pre;
+	}
+
+	/* ── Script syntax highlight ─────────────────────────────────── */
+	.code-box.hl :global(.tok-keyword) {
+		color: var(--accent-amber);
+	}
+	.code-box.hl :global(.tok-string) {
+		color: #2ecc71;
+	}
+	.code-box.hl :global(.tok-comment) {
+		color: var(--text-muted);
+		font-style: italic;
+	}
+	.code-box.hl :global(.tok-number) {
+		color: #5fb3ff;
+	}
+
+	/* ── Summary panel ───────────────────────────────────────────── */
+	.summary-text {
+		font-family: var(--font-mono);
+		font-size: 13px;
+		line-height: 1.55;
+		color: var(--text-primary);
+		margin: 0 0 var(--space-md) 0;
+	}
+	.summary-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+		gap: var(--space-sm);
+	}
+	.sg-cell {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		border: 1px solid var(--border-default);
+		background: var(--bg-card);
+		padding: 6px 10px;
+	}
+	.sg-k {
+		font-family: var(--font-mono);
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--text-muted);
+	}
+	.sg-v {
+		font-family: var(--font-mono);
+		font-size: 13px;
+		color: var(--text-primary);
+	}
+	.sg-v.running {
+		color: var(--accent-amber);
+	}
+	.sg-v.failed {
+		color: #e74c3c;
 	}
 
 	/* ── Raw/Parsed toggle ───────────────────────────────────────── */
