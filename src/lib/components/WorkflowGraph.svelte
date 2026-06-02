@@ -66,6 +66,28 @@
 		return String(n);
 	}
 
+	function fmtDuration(ms: number): string {
+		if (ms < 1000) return `${ms}ms`;
+		const s = ms / 1000;
+		if (s < 60) return `${s.toFixed(1)}s`;
+		const m = Math.floor(s / 60);
+		return `${m}m ${Math.round(s % 60)}s`;
+	}
+
+	// Click-to-select an agent → right detail panel. Keyed by phase+label+index
+	// so duplicate labels across phases stay distinct.
+	let selectedKey = $state<string | null>(null);
+	let selected = $derived.by(() => {
+		if (!selectedKey) return null;
+		for (const p of layout.phases) {
+			for (let i = 0; i < p.agents.length; i++) {
+				if (`${p.title}-${p.agents[i].a.label}-${i}` === selectedKey)
+					return { phase: p.title, agent: p.agents[i].a };
+			}
+		}
+		return null;
+	});
+
 	let svgEl: SVGSVGElement | undefined = $state();
 	let copied = $state(false);
 
@@ -102,43 +124,94 @@
 		<button class="wf-graph-btn" onclick={copyMermaid}>{copied ? 'Copied ✓' : 'Copy .mmd'}</button>
 		<button class="wf-graph-btn" onclick={downloadSvg}>Download SVG</button>
 	</div>
-	<div class="wf-graph-scroll">
-		<svg
-			bind:this={svgEl}
-			width={layout.width}
-			height={layout.height}
-			viewBox="0 0 {layout.width} {layout.height}"
-		>
-			<!-- edges -->
-			{#each layout.phases as p}
-				{#each p.agents as ag}
-					<path class="wf-edge" d={edge(p.x, p.y, ag.x, ag.y)} />
+	<div class="wf-graph-body">
+		<div class="wf-graph-scroll">
+			<svg
+				bind:this={svgEl}
+				width={layout.width}
+				height={layout.height}
+				viewBox="0 0 {layout.width} {layout.height}"
+			>
+				<!-- edges -->
+				{#each layout.phases as p}
+					{#each p.agents as ag}
+						<path class="wf-edge" d={edge(p.x, p.y, ag.x, ag.y)} />
+					{/each}
 				{/each}
-			{/each}
-			<!-- phase nodes -->
-			{#each layout.phases as p}
-				<g transform="translate({p.x},{p.y})">
-					<rect class="wf-node-phase" width={PHASE_W} height={NODE_H} rx="6" />
-					<text class="wf-node-phase-label" x="12" y="20">{p.title}</text>
-					<text class="wf-node-sub" x="12" y="36">{p.agents.length} agents</text>
-				</g>
-			{/each}
-			<!-- agent nodes -->
-			{#each layout.phases as p}
-				{#each p.agents as ag}
-					<g transform="translate({ag.x},{ag.y})">
-						<rect class="wf-node-agent {ag.a.state}" width={AGENT_W} height={NODE_H} rx="6" />
-						{#if ag.a.state === 'running'}
-							<circle class="wf-run-dot" cx="14" cy={NODE_H / 2} r="4" />
-						{/if}
-						<text class="wf-node-agent-label" x="28" y="20">{ag.a.label}</text>
-						<text class="wf-node-sub" x="28" y="36"
-							>{ag.a.model} · {fmtTokens(ag.a.tokens)} · {ag.a.toolCalls} tools</text
-						>
+				<!-- phase nodes -->
+				{#each layout.phases as p}
+					<g transform="translate({p.x},{p.y})">
+						<rect class="wf-node-phase" width={PHASE_W} height={NODE_H} />
+						<text class="wf-node-phase-label" x="12" y="20">{p.title}</text>
+						<text class="wf-node-sub" x="12" y="36">{p.agents.length} agents</text>
 					</g>
 				{/each}
-			{/each}
-		</svg>
+				<!-- agent nodes (sharp corners, click-to-select) -->
+				{#each layout.phases as p}
+					{#each p.agents as ag, i}
+						{@const key = `${p.title}-${ag.a.label}-${i}`}
+						<g
+							class="wf-agent-g"
+							transform="translate({ag.x},{ag.y})"
+							role="button"
+							tabindex="0"
+							onclick={() => (selectedKey = selectedKey === key ? null : key)}
+							onkeydown={(e) => {
+								if (e.key === 'Enter' || e.key === ' ') {
+									e.preventDefault();
+									selectedKey = selectedKey === key ? null : key;
+								}
+							}}
+						>
+							<rect
+								class="wf-node-agent {ag.a.state}"
+								class:selected={selectedKey === key}
+								width={AGENT_W}
+								height={NODE_H}
+							/>
+							{#if ag.a.state === 'running'}
+								<circle class="wf-run-dot" cx="14" cy={NODE_H / 2} r="4" />
+							{/if}
+							<text class="wf-node-agent-label" x="28" y="20">{ag.a.label}</text>
+							<text class="wf-node-sub" x="28" y="36"
+								>{ag.a.model} · {fmtTokens(ag.a.tokens)} · {ag.a.toolCalls} tools</text
+							>
+						</g>
+					{/each}
+				{/each}
+			</svg>
+		</div>
+
+		{#if selected}
+			<div class="wf-detail-panel">
+				<div class="wf-detail-head">
+					<span class="wf-detail-title">{selected.agent.label}</span>
+					<button class="wf-detail-close" onclick={() => (selectedKey = null)}>✕</button>
+				</div>
+				<div class="wf-detail-meta">
+					<span class="wf-pill {selected.agent.state}">{selected.agent.state}</span>
+					<span class="wf-meta-chip">{selected.phase}</span>
+					<span class="wf-meta-chip">{selected.agent.model}</span>
+					<span class="wf-meta-chip">{fmtTokens(selected.agent.tokens)} tokens</span>
+					<span class="wf-meta-chip">{selected.agent.toolCalls} tools</span>
+					<span class="wf-meta-chip">{fmtDuration(selected.agent.durationMs)}</span>
+					{#if selected.agent.lastToolName}
+						<span class="wf-meta-chip">last: {selected.agent.lastToolName}</span>
+					{/if}
+				</div>
+				{#if selected.agent.promptPreview}
+					<div class="wf-detail-label">Prompt</div>
+					<pre class="wf-detail-box">{selected.agent.promptPreview}</pre>
+				{/if}
+				{#if selected.agent.resultPreview}
+					<div class="wf-detail-label">Result</div>
+					<pre class="wf-detail-box">{selected.agent.resultPreview}</pre>
+				{/if}
+				{#if !selected.agent.promptPreview && !selected.agent.resultPreview}
+					<div class="wf-detail-empty">No preview available</div>
+				{/if}
+			</div>
+		{/if}
 	</div>
 </div>
 
@@ -169,12 +242,121 @@
 		color: var(--accent-amber);
 		border-color: var(--accent-amber);
 	}
+	.wf-graph-body {
+		display: flex;
+		gap: var(--space-sm);
+		align-items: stretch;
+	}
 	.wf-graph-scroll {
+		flex: 1 1 auto;
+		min-width: 0;
 		overflow: auto;
 		max-height: 60vh;
 		border: 1px solid var(--border-default);
 		border-radius: 6px;
 		background: var(--bg-base);
+	}
+	.wf-agent-g {
+		cursor: pointer;
+	}
+	.wf-node-agent.selected {
+		stroke: var(--accent-amber);
+		stroke-width: 2.5;
+	}
+
+	/* ── Agent detail side panel ─────────────────────────────────── */
+	.wf-detail-panel {
+		flex: 0 0 340px;
+		max-height: 60vh;
+		overflow: auto;
+		border: 1px solid var(--border-default);
+		border-radius: 6px;
+		background: var(--bg-card);
+		padding: var(--space-md);
+	}
+	.wf-detail-head {
+		display: flex;
+		align-items: center;
+		gap: var(--space-sm);
+		margin-bottom: var(--space-sm);
+	}
+	.wf-detail-title {
+		font-family: var(--font-mono);
+		font-size: 13px;
+		color: var(--text-primary);
+		word-break: break-word;
+		flex: 1;
+	}
+	.wf-detail-close {
+		background: none;
+		border: none;
+		color: var(--text-muted);
+		cursor: pointer;
+		font-size: 13px;
+		padding: 0 4px;
+	}
+	.wf-detail-close:hover {
+		color: var(--accent-amber);
+	}
+	.wf-detail-meta {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 4px;
+		margin-bottom: var(--space-md);
+	}
+	.wf-meta-chip {
+		font-family: var(--font-mono);
+		font-size: 10px;
+		color: var(--text-muted);
+		border: 1px solid var(--border-default);
+		padding: 2px 6px;
+	}
+	.wf-pill {
+		font-family: var(--font-mono);
+		font-size: 10px;
+		text-transform: uppercase;
+		padding: 2px 6px;
+		border: 1px solid var(--border-default);
+		color: var(--text-muted);
+	}
+	.wf-pill.running {
+		color: var(--accent-amber);
+		border-color: var(--accent-amber);
+	}
+	.wf-pill.completed {
+		color: #2ecc71;
+		border-color: #2ecc71;
+	}
+	.wf-pill.failed {
+		color: #e74c3c;
+		border-color: #e74c3c;
+	}
+	.wf-detail-label {
+		font-family: var(--font-mono);
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--text-muted);
+		margin: var(--space-sm) 0 4px;
+	}
+	.wf-detail-box {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		line-height: 1.5;
+		color: var(--text-secondary);
+		background: var(--bg-base);
+		border: 1px solid var(--border-default);
+		padding: var(--space-sm);
+		margin: 0;
+		white-space: pre-wrap;
+		word-break: break-word;
+		max-height: 240px;
+		overflow: auto;
+	}
+	.wf-detail-empty {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
 	}
 	.wf-edge {
 		fill: none;
