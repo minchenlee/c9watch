@@ -2,36 +2,48 @@
 
 這份文件用來驗收 PR [#112](https://github.com/minchenlee/c9watch/pull/112) 的 Codex monitoring 功能。
 
-## 目前可使用的 binary
+## 目前可使用的 App 與 binary
 
-目前已經有一個可以直接使用的 macOS arm64 debug binary：
+目前已經產生可直接啟動的 macOS arm64 debug App：
+
+```text
+/private/tmp/c9watch-codex-monitoring-todo/src-tauri/target/debug/bundle/macos/c9watch.app
+```
+
+啟動前，先關閉其他正在執行的 c9watch，避免 macOS 同時執行兩個相同 bundle ID 的版本。接著執行：
+
+```bash
+open /private/tmp/c9watch-codex-monitoring-todo/src-tauri/target/debug/bundle/macos/c9watch.app
+```
+
+也可以先打開輸出資料夾，再從 Finder 雙擊 `c9watch.app`：
+
+```bash
+open /private/tmp/c9watch-codex-monitoring-todo/src-tauri/target/debug/bundle/macos
+```
+
+App 資訊：
+
+- 版本：`c9watch 0.8.1`
+- 架構：macOS arm64
+- 功能版本基準：`c895caf`
+- App executable SHA-256：`48aca6e4bd59132720374b9a0ee91ad02225dc5d17a70332b72b34f6b27285e7`
+- 這是本機 ad-hoc signed debug App，尚未 notarize，也不是正式 release `.dmg`
+
+CLI 與原始 GUI executable 仍位於：
 
 ```text
 /private/tmp/c9watch-codex-monitoring-todo/src-tauri/target/debug/c9watch
 ```
 
-在 feature worktree 內的相對路徑是：
-
-```text
-src-tauri/target/debug/c9watch
-```
-
-Binary 資訊：
-
-- 版本：`c9watch 0.8.1`
-- 架構：macOS arm64
-- 功能版本基準：`c895caf`
-- SHA-256：`451dd6e36872e5ef0ef820e06fe5fca430f828bc72f20269fcfebe87c7ee47f2`
-- 這是本機 debug executable，不是已簽署的 `.app` 或 `.dmg`
-
-啟動前，先關閉其他正在執行的 c9watch，避免同時看到兩個版本。
+正常情況下，不帶參數執行這個 executable 也會開啟 GUI：
 
 ```bash
 cd /private/tmp/c9watch-codex-monitoring-todo
 ./src-tauri/target/debug/c9watch
 ```
 
-執行後 Terminal 會被程式佔用。請保留這個視窗查看 log，並使用另一個 Terminal 執行 Codex CLI 或 c9watch CLI。
+如果它只印出 `Monitor and manage Claude Code sessions` 和 CLI Usage，代表 binary 被 `--no-default-features --features cli` 的測試 build 覆蓋。請使用本文件最後的指令重新 build GUI App。
 
 確認 binary 版本：
 
@@ -81,7 +93,7 @@ cd /private/tmp/c9watch-codex-monitoring-todo
 
 ### 1. 啟動與基本檢查
 
-1. 啟動上面的 debug binary。
+1. 啟動上面的 debug App。
 2. 打開主視窗和 menu bar popover。
 3. 確認程式沒有立即關閉，也沒有空白畫面。
 4. 執行：
@@ -289,18 +301,25 @@ c9watch binary SHA-256：
 
 Rollout file 可能包含私人 prompt、路徑或 tool output。不要直接把完整檔案公開貼到 GitHub；先移除敏感內容。
 
-## 重新 build binary
+## 重新 build App
 
 如果目前的 `/private/tmp` worktree 已被刪除，可以在 feature branch 重新 build：
 
 ```bash
 git switch feature/codex-monitoring
 npm install
-npm run build
-cargo build --manifest-path src-tauri/Cargo.toml
+CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=none CARGO_INCREMENTAL=0 \
+  npm run tauri build -- --debug --bundles app \
+  --config '{"bundle":{"createUpdaterArtifacts":false}}'
 ```
 
-Debug binary 會在：
+Debug App 會在：
+
+```text
+src-tauri/target/debug/bundle/macos/c9watch.app
+```
+
+GUI 與 CLI 共用的 executable 會在：
 
 ```text
 src-tauri/target/debug/c9watch
@@ -319,4 +338,4 @@ src-tauri/target/release/bundle/macos/c9watch.app
 src-tauri/target/release/bundle/dmg/
 ```
 
-目前這個 worktree 尚未產生 release `.app` 或 `.dmg`；手動測試請先使用上面的 debug binary。
+目前這個 worktree 已有 debug `.app`，但尚未產生 release `.app` 或 `.dmg`。手動測試請使用上面的 debug App。
