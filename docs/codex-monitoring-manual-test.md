@@ -26,8 +26,8 @@ App 資訊：
 
 - 版本：`c9watch 0.8.1`
 - 架構：macOS arm64
-- 功能版本基準：`c895caf`
-- App executable SHA-256：`48aca6e4bd59132720374b9a0ee91ad02225dc5d17a70332b72b34f6b27285e7`
+- 功能版本基準：`b659e1f`
+- App executable SHA-256：`45fbc79b1315d8d490b77a013a8643da7d7f83307e3397109679399d88f74bf1`
 - 這是本機 ad-hoc signed debug App，尚未 notarize，也不是正式 release `.dmg`
 
 CLI 與原始 GUI executable 仍位於：
@@ -49,6 +49,12 @@ cd /private/tmp/c9watch-codex-monitoring-todo
 
 ```bash
 ./src-tauri/target/debug/c9watch --version
+```
+
+確認目前 App executable 的 SHA-256：
+
+```bash
+shasum -a 256 src-tauri/target/debug/bundle/macos/c9watch.app/Contents/MacOS/c9watch
 ```
 
 查看 c9watch 偵測到的 session 資料：
@@ -81,13 +87,14 @@ cd /private/tmp/c9watch-codex-monitoring-todo
 
 ## 最小驗收流程
 
-如果時間有限，至少完成以下五項：
+如果時間有限，至少完成以下六項：
 
 - [ ] Codex App session 可以出現在 Monitor，並顯示 `CODEX` badge。
 - [ ] Codex CLI session 可以出現在 Monitor，而且 CLI JSON 顯示 `surface: cli`。
-- [ ] `All | Claude Code | Codex` filter 會真的改變 Monitor、History、Cost 的內容。
+- [ ] `All | Claude Code | Codex` filter 會真的改變 Monitor、History、Cost、Memory 的內容。
 - [ ] Resume 同一個 Codex session 後只出現一張卡片，而且完整對話仍可查看。
-- [ ] Cost 的 Codex token 有被計入，沒有價格時顯示 `UNPRICED`，不是 `$0`。
+- [ ] Cost 會估算已知 Codex model；Codex 用藍色、Claude Code 用橘色，而且 cost/token 保持在同一列。
+- [ ] Memory 的 `Codex` filter 會顯示 `MEMORY.md` 和 `memory_summary.md`。
 
 ## 完整測試步驟
 
@@ -168,7 +175,7 @@ cd /private/tmp/c9watch-codex-monitoring-todo
    - `Claude Code`
    - `Codex`
 3. 打開 menu bar popover，確認 filter 同步。
-4. 依序查看 Monitor、History、Cost。
+4. 依序查看 Monitor、History、Cost、Memory。
 5. 關閉並重新啟動 c9watch。
 
 預期結果：
@@ -178,6 +185,7 @@ cd /private/tmp/c9watch-codex-monitoring-todo
 - `Codex` 只顯示 Codex 資料。
 - Filter 會同步到 popover。
 - 切換 tab 後 filter 仍然生效，不只是 badge 改變。
+- Memory 的 project 數量、選取項目和空白提示也會跟著 filter 改變。
 - 重啟後仍保留最後選擇的 filter。
 
 ### 5. Codex subagent grouping
@@ -257,9 +265,35 @@ cd /private/tmp/c9watch-codex-monitoring-todo
 
 - Codex token 會被計入 token 總數和圖表。
 - Codex-only 日期不會從 token 圖表消失。
-- 沒有 Codex 定價時顯示 `UNPRICED`，不能顯示成 `$0`。
-- 混合資料會分開表示已知 USD cost 和 unpriced Codex tokens。
+- `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 等已知 model 會顯示 USD 估算。
+- 畫面會說明這是 OpenAI Standard short-context API rate 的 lower-bound estimate，不是訂閱帳單；long-context 可能更高。
+- 未知 Codex model 顯示 `UNPRICED`，不能顯示成 `$0`。
+- Codex 用量使用藍色，Claude Code 使用橘色，並有可見的 provider legend。
+- 每一筆 session 的 cost/token、badge、prompt、日期和 model 保持在同一列。
+- 同一天切換 model 時會分開計價；未知 model 的 tokens 不會污染已知 model 的估算。
 - Provider filter 會重新計算資料，不只是隱藏畫面上的 label。
+
+### 9. Memory 與 provider filter
+
+1. 確認本機至少有一個 Codex durable memory file：
+
+   ```bash
+   ls ~/.codex/memories/MEMORY.md ~/.codex/memories/memory_summary.md
+   ```
+
+2. 前往 Memory。
+3. 依序選擇 `All`、`Claude Code`、`Codex` filter。
+4. 在 `Codex` filter 下打開 Codex memory group 和其中的 Markdown file。
+
+預期結果：
+
+- `Codex` filter 只顯示帶有 `CODEX` badge 的 Codex memory group。
+- 可以看到存在於本機的頂層 `MEMORY.md` 和 `memory_summary.md`。
+- 不會遞迴載入 `rollout_summaries/`、`raw_memories.md` 或其他內部資料。
+- `Claude Code` filter 仍顯示原本的 `~/.claude/projects/*/memory/` 內容。
+- 切換 filter 後，數量、選取項目、內容和空白提示都正確更新。
+- Codex memory 不會顯示錯誤的 `claude "Review my memory files"` 指令。
+- Reveal in Finder 會開啟 `~/.codex/memories/`。
 
 ## 測試結果記錄
 
@@ -279,6 +313,7 @@ c9watch binary SHA-256：
 [ ] 6. Resume 同一個 session
 [ ] 7. History 與搜尋
 [ ] 8. Cost 與 token
+[ ] 9. Memory 與 provider filter
 
 問題與備註：
 ```
