@@ -10,10 +10,14 @@ fn main() {
         let args: Vec<String> = std::env::args().collect();
         if args.len() > 1 {
             let first = args[1].as_str();
+            // Always route PM command names through Clap. When the
+            // `pm-orchestration` feature is disabled their variants are absent,
+            // so Clap reports an unknown command instead of falling through and
+            // unexpectedly launching the GUI.
             let known_commands = [
                 "list", "status", "self", "view", "history", "search", "stop", "watch", "tasks",
-                "spawn", "send", "workers", "inbox", "adopt", "cost", "daemon",
-                "help",
+                "spawn", "send", "workers", "inbox", "adopt", "daemon",
+                "cost", "help",
             ];
             let is_cli = known_commands.contains(&first)
                 || first == "--help"

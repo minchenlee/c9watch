@@ -12,6 +12,7 @@
 	} from '$lib/stores/sessions';
 	import { getConversation, stopSession, openSession } from '$lib/api';
 	import { isDemoMode, toggleDemoMode } from '$lib/demo';
+	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 	import { isTauri } from '$lib/ws';
 	import StatusBar from '$lib/components/StatusBar.svelte';
 	import SessionCard from '$lib/components/SessionCard.svelte';
@@ -70,7 +71,10 @@
 				isCompact = true;
 			}
 			const savedFilter = localStorage.getItem('sessionFilter');
-			if (savedFilter === 'humans' || savedFilter === 'workers') {
+			if (
+				PM_ORCHESTRATION_ENABLED &&
+				(savedFilter === 'humans' || savedFilter === 'workers')
+			) {
 				sessionFilter = savedFilter;
 			}
 		}
@@ -253,10 +257,14 @@
 		});
 	}
 
+	// With PM orchestration disabled, show every session — legacy `workerOf`
+	// records render as ordinary sessions and the HUMANS/WORKERS split is gone.
 	let filteredSessions = $derived(
-		sessions.filter((s) =>
-			sessionFilter === 'workers' ? !!s.workerOf : !s.workerOf
-		)
+		!PM_ORCHESTRATION_ENABLED
+			? sessions
+			: sessions.filter((s) =>
+					sessionFilter === 'workers' ? !!s.workerOf : !s.workerOf
+				)
 	);
 
 	let projectGroups = $derived(groupByProjectAndStatus(filteredSessions));
@@ -490,6 +498,7 @@
 						</button>
 					{/if}
 					<div class="header-spacer"></div>
+					{#if PM_ORCHESTRATION_ENABLED}
 					<div class="view-toggle">
 						<button
 							type="button"
@@ -518,6 +527,7 @@
 							</svg>
 						</button>
 					</div>
+					{/if}
 					<div class="view-toggle">
 						<button
 							class="toggle-btn"
@@ -583,7 +593,7 @@
 						</div>
 					</div>
 					<div class="empty-content">
-						{#if sessionFilter === 'workers'}
+						{#if PM_ORCHESTRATION_ENABLED && sessionFilter === 'workers'}
 							<h2>No Workers Spawned</h2>
 							<p>Spawn a worker from a Claude Code session with <code>c9watch spawn</code></p>
 							<div class="empty-hint">
