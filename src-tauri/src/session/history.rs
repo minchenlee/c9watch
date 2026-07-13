@@ -659,7 +659,7 @@ mod tests {
             (
                 "app.jsonl",
                 r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"app-history","cwd":"/tmp/app","source":"vscode","originator":"Codex Desktop"}}
-{"timestamp":"2026-07-13T01:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"app request"}]}}"#,
+{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"app request"}}"#,
             ),
             (
                 "cli.jsonl",

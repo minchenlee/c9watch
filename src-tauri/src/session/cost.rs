@@ -1024,7 +1024,7 @@ mod tests {
             sessions.join("app.jsonl"),
             [
                 r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"codex-app-cost","cwd":"/tmp/app","source":"vscode","originator":"Codex Desktop"}}"#,
-                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"measure this session"}]}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"measure this session"}}"#,
                 r#"{"timestamp":"2026-07-13T01:02:00Z","type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
                 r#"{"timestamp":"2026-07-13T01:03:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":120,"cached_input_tokens":40,"output_tokens":30,"reasoning_output_tokens":12,"total_tokens":150}}}}"#,
                 r#"{"timestamp":"2026-07-13T01:04:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":300,"cached_input_tokens":100,"output_tokens":80,"reasoning_output_tokens":32,"total_tokens":380}}}}"#,

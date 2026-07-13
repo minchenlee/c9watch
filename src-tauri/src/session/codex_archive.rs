@@ -2,15 +2,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const MAX_DISPLAY_CHARS: usize = 400;
+const MAX_INDEXED_MESSAGES: usize = 20_000;
+const MAX_INDEXED_MESSAGE_CHARS: usize = 16_384;
+const MAX_INDEXED_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+const FILE_ANCHOR_BYTES: usize = 256;
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CodexTokenUsage {
     pub input_tokens: u64,
@@ -93,6 +97,24 @@ pub(crate) struct CodexTokenDay {
     pub usage: CodexTokenUsage,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+struct ArchivedMessage {
+    timestamp: String,
+    role: String,
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+struct ArchivedTokenEvent {
+    timestamp: String,
+    model: String,
+    usage: CodexTokenUsage,
+    #[serde(default)]
+    cumulative: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CodexRolloutSnapshot {
@@ -106,6 +128,10 @@ pub(crate) struct CodexRolloutSnapshot {
     pub updated_at_ms: u64,
     pub token_days: Vec<CodexTokenDay>,
     pub path: PathBuf,
+    #[serde(default)]
+    messages: Vec<ArchivedMessage>,
+    #[serde(default)]
+    token_events: Vec<ArchivedTokenEvent>,
 }
 
 impl CodexRolloutSnapshot {
@@ -119,6 +145,8 @@ impl CodexRolloutSnapshot {
 pub(crate) struct FileFingerprint {
     pub size: u64,
     pub modified_ns: u64,
+    #[serde(default)]
+    pub identity: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +154,16 @@ pub(crate) struct FileFingerprint {
 struct CachedRollout {
     fingerprint: FileFingerprint,
     snapshot: CodexRolloutSnapshot,
+    #[serde(default)]
+    offset: u64,
+    #[serde(default)]
+    pending: Vec<u8>,
+    #[serde(default)]
+    current_model: String,
+    #[serde(default)]
+    indexed_message_bytes: usize,
+    #[serde(default)]
+    anchor: Vec<u8>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -148,7 +186,19 @@ fn fingerprint(path: &Path) -> Option<FileFingerprint> {
     Some(FileFingerprint {
         size: metadata.len(),
         modified_ns,
+        identity: file_identity(&metadata),
     })
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.ino()
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &std::fs::Metadata) -> u64 {
+    0
 }
 
 pub(crate) fn default_sessions_root(home: &Path) -> PathBuf {
@@ -204,53 +254,8 @@ fn truncate(value: &str, limit: usize) -> String {
     result
 }
 
-pub(crate) fn is_injected_codex_text(value: &str) -> bool {
-    let value = value.trim_start();
-    [
-        "<environment_context>",
-        "<permissions instructions>",
-        "<app-context>",
-        "<collaboration_mode>",
-        "<skills_instructions>",
-        "<recommended_plugins>",
-        "<developer>",
-        "<system>",
-        "<memory>",
-        "<user_instructions>",
-    ]
-    .iter()
-    .any(|prefix| value.starts_with(prefix))
-}
-
 fn message_text(value: &Value) -> Option<(String, String)> {
     let payload = value.get("payload")?;
-    if value.get("type").and_then(Value::as_str) == Some("response_item")
-        && payload.get("type").and_then(Value::as_str) == Some("message")
-    {
-        let role = payload.get("role")?.as_str()?.to_string();
-        if role != "user" && role != "assistant" {
-            return None;
-        }
-        let text = payload
-            .get("content")?
-            .as_array()?
-            .iter()
-            .filter_map(|block| {
-                let kind = block.get("type").and_then(Value::as_str)?;
-                if matches!(kind, "input_text" | "output_text" | "text") {
-                    block.get("text").and_then(Value::as_str)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        if text.trim().is_empty() || (role == "user" && is_injected_codex_text(&text)) {
-            return None;
-        }
-        return Some((role, text));
-    }
-
     if value.get("type").and_then(Value::as_str) == Some("event_msg") {
         let kind = payload.get("type").and_then(Value::as_str)?;
         let role = match kind {
@@ -259,7 +264,7 @@ fn message_text(value: &Value) -> Option<(String, String)> {
             _ => return None,
         };
         let text = payload.get("message").and_then(Value::as_str)?.to_string();
-        if text.trim().is_empty() || (role == "user" && is_injected_codex_text(&text)) {
+        if text.trim().is_empty() {
             return None;
         }
         return Some((role.to_string(), text));
@@ -268,6 +273,9 @@ fn message_text(value: &Value) -> Option<(String, String)> {
 }
 
 fn classify_session(source: &Value, originator: &str) -> (String, String, Option<String>) {
+    if matches!(originator, "Claude Code" | "Claude Cowork") {
+        return classify_agent(source, "integration".to_string());
+    }
     let originator_lower = originator.to_ascii_lowercase();
     let surface = if originator_lower.contains("desktop") {
         "app"
@@ -286,6 +294,10 @@ fn classify_session(source: &Value, originator: &str) -> (String, String, Option
     }
     .to_string();
 
+    classify_agent(source, surface)
+}
+
+fn classify_agent(source: &Value, surface: String) -> (String, String, Option<String>) {
     let Some(subagent) = source.get("subagent") else {
         return (surface, "root".to_string(), None);
     };
@@ -318,158 +330,237 @@ struct DayAccum {
     models: HashMap<String, u64>,
 }
 
-pub(crate) fn scan_rollout(path: &Path) -> Option<CodexRolloutSnapshot> {
-    let file = File::open(path).ok()?;
-    let mut reader = BufReader::with_capacity(128 * 1024, file);
-    let mut line = String::new();
-    let mut thread_id = String::new();
-    let mut cwd = String::new();
-    let mut surface = "unknown".to_string();
-    let mut agent_kind = "root".to_string();
-    let mut parent_thread_id = None;
-    let mut display = String::new();
-    let mut created_at_ms = 0;
-    let mut updated_at_ms = 0;
-    let mut current_model = "unknown".to_string();
-    let mut previous_total = CodexTokenUsage::default();
-    let mut token_days: HashMap<String, DayAccum> = HashMap::new();
+fn empty_cached(path: &Path, fingerprint: FileFingerprint) -> CachedRollout {
+    CachedRollout {
+        fingerprint,
+        snapshot: CodexRolloutSnapshot {
+            thread_id: String::new(),
+            cwd: String::new(),
+            surface: "unknown".to_string(),
+            agent_kind: "root".to_string(),
+            parent_thread_id: None,
+            display: String::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            token_days: Vec::new(),
+            path: path.to_path_buf(),
+            messages: Vec::new(),
+            token_events: Vec::new(),
+        },
+        offset: 0,
+        pending: Vec::new(),
+        current_model: "unknown".to_string(),
+        indexed_message_bytes: 0,
+        anchor: Vec::new(),
+    }
+}
 
-    loop {
-        line.clear();
-        let read = reader.read_line(&mut line).ok()?;
-        if read == 0 {
-            break;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
-            // A live writer may leave a partial final JSONL record. Its size change will
-            // invalidate the cache and the completed record will be read next time.
-            continue;
-        };
-        let timestamp = value
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let timestamp_ms = timestamp_ms(timestamp);
-        if timestamp_ms > 0 {
-            if created_at_ms == 0 {
-                created_at_ms = timestamp_ms;
+fn refresh_rollout(
+    path: &Path,
+    fingerprint: FileFingerprint,
+    previous: Option<CachedRollout>,
+) -> Option<CachedRollout> {
+    let mut file = File::open(path).ok()?;
+    let mut reset = previous.as_ref().map_or(true, |cached| {
+        fingerprint.identity != cached.fingerprint.identity
+            || fingerprint.size < cached.offset
+            || (fingerprint.size == cached.fingerprint.size
+                && fingerprint.modified_ns != cached.fingerprint.modified_ns)
+    });
+    if !reset {
+        let cached = previous.as_ref()?;
+        if !cached.anchor.is_empty() {
+            let anchor_start = cached.offset.saturating_sub(cached.anchor.len() as u64);
+            file.seek(SeekFrom::Start(anchor_start)).ok()?;
+            let mut current = vec![0; cached.anchor.len()];
+            if file.read_exact(&mut current).is_err() || current != cached.anchor {
+                reset = true;
             }
-            updated_at_ms = updated_at_ms.max(timestamp_ms);
         }
+    }
+    let mut cached = if reset {
+        empty_cached(path, fingerprint)
+    } else {
+        previous?
+    };
+    file.seek(SeekFrom::Start(cached.offset)).ok()?;
+    let mut appended = Vec::new();
+    file.read_to_end(&mut appended).ok()?;
+    cached.offset += appended.len() as u64;
+    cached.pending.extend_from_slice(&appended);
 
-        match value.get("type").and_then(Value::as_str) {
-            Some("session_meta") => {
-                let payload = value.get("payload").unwrap_or(&Value::Null);
-                thread_id = payload
-                    .get("id")
-                    .or_else(|| payload.get("session_id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                cwd = payload
+    let complete_len = cached
+        .pending
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let complete = cached.pending[..complete_len].to_vec();
+    cached.pending.drain(..complete_len);
+    for line in complete.split(|byte| *byte == b'\n') {
+        if let Ok(value) = serde_json::from_slice::<Value>(line) {
+            apply_archive_event(&mut cached, &value);
+        }
+    }
+    // Static rollout files and tests may omit a terminal newline. A syntactically
+    // complete record is safe to consume; an incomplete writer record remains buffered.
+    if let Ok(value) = serde_json::from_slice::<Value>(&cached.pending) {
+        apply_archive_event(&mut cached, &value);
+        cached.pending.clear();
+    }
+    let anchor_len = FILE_ANCHOR_BYTES.min(cached.offset as usize);
+    cached.anchor.resize(anchor_len, 0);
+    file.seek(SeekFrom::Start(cached.offset - anchor_len as u64))
+        .ok()?;
+    file.read_exact(&mut cached.anchor).ok()?;
+    cached.fingerprint = fingerprint;
+    rebuild_token_days(&mut cached.snapshot);
+    Some(cached)
+}
+
+fn apply_archive_event(cached: &mut CachedRollout, value: &Value) {
+    let timestamp = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let millis = timestamp_ms(timestamp);
+    if millis > 0 {
+        if cached.snapshot.created_at_ms == 0 {
+            cached.snapshot.created_at_ms = millis;
+        }
+        cached.snapshot.updated_at_ms = cached.snapshot.updated_at_ms.max(millis);
+    }
+    match value.get("type").and_then(Value::as_str) {
+        Some("session_meta") => {
+            let payload = value.get("payload").unwrap_or(&Value::Null);
+            cached.snapshot.thread_id = payload
+                .get("id")
+                .or_else(|| payload.get("session_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            cached.snapshot.cwd = payload
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let source = payload.get("source").unwrap_or(&Value::Null);
+            let originator = payload
+                .get("originator")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            (
+                cached.snapshot.surface,
+                cached.snapshot.agent_kind,
+                cached.snapshot.parent_thread_id,
+            ) = classify_session(source, originator);
+        }
+        Some("turn_context") => {
+            let payload = value.get("payload").unwrap_or(&Value::Null);
+            if let Some(model) = payload.get("model").and_then(Value::as_str) {
+                cached.current_model = model.to_string();
+            }
+            if cached.snapshot.cwd.is_empty() {
+                cached.snapshot.cwd = payload
                     .get("cwd")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let source = payload.get("source").unwrap_or(&Value::Null);
-                let originator = payload
-                    .get("originator")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                (surface, agent_kind, parent_thread_id) = classify_session(source, originator);
-            }
-            Some("turn_context") => {
-                let payload = value.get("payload").unwrap_or(&Value::Null);
-                if let Some(model) = payload.get("model").and_then(Value::as_str) {
-                    current_model = model.to_string();
-                }
-                if cwd.is_empty() {
-                    cwd = payload
-                        .get("cwd")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                }
-            }
-            Some("event_msg")
-                if value.pointer("/payload/type").and_then(Value::as_str)
-                    == Some("token_count") =>
-            {
-                let usage_value = value
-                    .pointer("/payload/info/total_token_usage")
-                    .or_else(|| value.pointer("/payload/total_token_usage"));
-                if let Some(usage_value) = usage_value {
-                    let cumulative = CodexTokenUsage::from_value(usage_value);
-                    if !cumulative.is_zero() {
-                        let delta = cumulative.delta_from(previous_total);
-                        previous_total = cumulative;
-                        if !delta.is_zero() {
-                            let date = timestamp_date(timestamp);
-                            let day = token_days.entry(date).or_default();
-                            if day.timestamp.is_empty() || timestamp < day.timestamp.as_str() {
-                                day.timestamp = timestamp.to_string();
-                            }
-                            day.usage.add_assign(delta);
-                            *day.models.entry(current_model.clone()).or_default() +=
-                                delta.total_tokens;
-                        }
-                    }
-                } else if let Some(last) = value.pointer("/payload/info/last_token_usage") {
-                    let usage = CodexTokenUsage::from_value(last);
-                    if !usage.is_zero() {
-                        let date = timestamp_date(timestamp);
-                        let day = token_days.entry(date).or_default();
-                        if day.timestamp.is_empty() || timestamp < day.timestamp.as_str() {
-                            day.timestamp = timestamp.to_string();
-                        }
-                        day.usage.add_assign(usage);
-                        *day.models.entry(current_model.clone()).or_default() += usage.total_tokens;
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        if let Some((role, text)) = message_text(&value) {
-            if role == "user" {
-                display = truncate(text.trim(), MAX_DISPLAY_CHARS);
             }
         }
+        Some("event_msg")
+            if value.pointer("/payload/type").and_then(Value::as_str) == Some("token_count") =>
+        {
+            let cumulative = value
+                .pointer("/payload/info/total_token_usage")
+                .or_else(|| value.pointer("/payload/total_token_usage"));
+            let (usage, is_cumulative) = if let Some(usage_value) = cumulative {
+                (CodexTokenUsage::from_value(usage_value), true)
+            } else {
+                (
+                    value
+                        .pointer("/payload/info/last_token_usage")
+                        .map(CodexTokenUsage::from_value)
+                        .unwrap_or_default(),
+                    false,
+                )
+            };
+            if !usage.is_zero() {
+                let event = ArchivedTokenEvent {
+                    timestamp: timestamp.to_string(),
+                    model: cached.current_model.clone(),
+                    usage,
+                    cumulative: is_cumulative,
+                };
+                if !cached.snapshot.token_events.contains(&event) {
+                    cached.snapshot.token_events.push(event);
+                }
+            }
+        }
+        _ => {}
     }
+    if let Some((role, text)) = message_text(value) {
+        let message = ArchivedMessage {
+            timestamp: timestamp.to_string(),
+            role: role.clone(),
+            text: truncate(text.trim(), MAX_INDEXED_MESSAGE_CHARS),
+        };
+        if !cached.snapshot.messages.contains(&message)
+            && cached.snapshot.messages.len() < MAX_INDEXED_MESSAGES
+            && cached
+                .indexed_message_bytes
+                .saturating_add(message.text.len())
+                <= MAX_INDEXED_MESSAGE_BYTES
+        {
+            cached.indexed_message_bytes += message.text.len();
+            cached.snapshot.messages.push(message);
+        }
+        if role == "user" {
+            cached.snapshot.display = truncate(text.trim(), MAX_DISPLAY_CHARS);
+        }
+    }
+}
 
-    if thread_id.is_empty() {
-        return None;
+fn rebuild_token_days(snapshot: &mut CodexRolloutSnapshot) {
+    let mut days: HashMap<String, DayAccum> = HashMap::new();
+    let mut previous_total = CodexTokenUsage::default();
+    for event in &snapshot.token_events {
+        let usage = if event.cumulative {
+            let delta = event.usage.delta_from(previous_total);
+            previous_total = event.usage;
+            delta
+        } else {
+            event.usage
+        };
+        let day = days.entry(timestamp_date(&event.timestamp)).or_default();
+        if day.timestamp.is_empty() || event.timestamp < day.timestamp {
+            day.timestamp = event.timestamp.clone();
+        }
+        day.usage.add_assign(usage);
+        *day.models.entry(event.model.clone()).or_default() += usage.total_tokens;
     }
-    let mut token_days: Vec<CodexTokenDay> = token_days
+    snapshot.token_days = days
         .into_iter()
-        .map(|(date, day)| {
-            let model = day
+        .map(|(date, day)| CodexTokenDay {
+            date,
+            timestamp: day.timestamp,
+            model: day
                 .models
                 .into_iter()
                 .max_by_key(|(_, tokens)| *tokens)
                 .map(|(model, _)| model)
-                .unwrap_or_else(|| "unknown".to_string());
-            CodexTokenDay {
-                date,
-                timestamp: day.timestamp,
-                model,
-                usage: day.usage,
-            }
+                .unwrap_or_else(|| "unknown".to_string()),
+            usage: day.usage,
         })
         .collect();
-    token_days.sort_by(|left, right| left.date.cmp(&right.date));
-    Some(CodexRolloutSnapshot {
-        thread_id,
-        cwd,
-        surface,
-        agent_kind,
-        parent_thread_id,
-        display,
-        created_at_ms,
-        updated_at_ms,
-        token_days,
-        path: path.to_path_buf(),
-    })
+    snapshot
+        .token_days
+        .sort_by(|left, right| left.date.cmp(&right.date));
+}
+
+pub(crate) fn scan_rollout(path: &Path) -> Option<CodexRolloutSnapshot> {
+    let fingerprint = fingerprint(path)?;
+    let cached = refresh_rollout(path, fingerprint, None)?;
+    (!cached.snapshot.thread_id.is_empty()).then_some(cached.snapshot)
 }
 
 fn write_cache(path: &Path, cache: &ArchiveCache) {
@@ -514,59 +605,91 @@ pub(crate) fn load_snapshots(root: &Path, cache_path: &Path) -> Vec<CodexRollout
             continue;
         };
         let key = path.to_string_lossy().to_string();
-        let unchanged = cache
+        if cache
             .files
             .get(&key)
-            .is_some_and(|entry| entry.fingerprint == fingerprint);
-        if unchanged {
+            .is_some_and(|entry| entry.fingerprint == fingerprint)
+        {
             continue;
         }
-        if let Some(snapshot) = scan_rollout(&path) {
-            cache.files.insert(
-                key,
-                CachedRollout {
-                    fingerprint,
-                    snapshot,
-                },
-            );
+        let previous = cache.files.remove(&key);
+        if let Some(cached) = refresh_rollout(&path, fingerprint, previous) {
+            if !cached.snapshot.thread_id.is_empty() {
+                cache.files.insert(key, cached);
+            }
         } else {
             cache.files.remove(&key);
         }
     }
     write_cache(cache_path, &cache);
 
-    // A thread can have more than one persisted path after migrations/resume. Keep
-    // the newest complete snapshot and never double-count its history or tokens.
+    // A resumed thread may span several rollout paths. Merge their authoritative
+    // events so older prompts and token usage survive without double counting overlap.
     let mut by_thread: HashMap<String, CodexRolloutSnapshot> = HashMap::new();
     for entry in cache.files.into_values() {
         let snapshot = entry.snapshot;
-        match by_thread.get(&snapshot.thread_id) {
-            Some(existing)
-                if (existing.updated_at_ms, existing.path.as_os_str())
-                    >= (snapshot.updated_at_ms, snapshot.path.as_os_str()) => {}
-            _ => {
-                by_thread.insert(snapshot.thread_id.clone(), snapshot);
-            }
+        if let Some(existing) = by_thread.get_mut(&snapshot.thread_id) {
+            merge_snapshot(existing, snapshot);
+        } else {
+            by_thread.insert(snapshot.thread_id.clone(), snapshot);
         }
     }
     by_thread.into_values().collect()
 }
 
+fn merge_snapshot(existing: &mut CodexRolloutSnapshot, incoming: CodexRolloutSnapshot) {
+    let incoming_is_newer = (incoming.updated_at_ms, incoming.path.as_os_str())
+        > (existing.updated_at_ms, existing.path.as_os_str());
+    existing.created_at_ms = match (existing.created_at_ms, incoming.created_at_ms) {
+        (0, created) | (created, 0) => created,
+        (left, right) => left.min(right),
+    };
+    existing.updated_at_ms = existing.updated_at_ms.max(incoming.updated_at_ms);
+    let mut indexed_bytes: usize = existing
+        .messages
+        .iter()
+        .map(|message| message.text.len())
+        .sum();
+    for message in incoming.messages {
+        if !existing.messages.contains(&message)
+            && existing.messages.len() < MAX_INDEXED_MESSAGES
+            && indexed_bytes.saturating_add(message.text.len()) <= MAX_INDEXED_MESSAGE_BYTES
+        {
+            indexed_bytes += message.text.len();
+            existing.messages.push(message);
+        }
+    }
+    existing
+        .messages
+        .sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    for event in incoming.token_events {
+        if !existing.token_events.contains(&event) {
+            existing.token_events.push(event);
+        }
+    }
+    existing
+        .token_events
+        .sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    if incoming_is_newer {
+        existing.cwd = incoming.cwd;
+        existing.surface = incoming.surface;
+        existing.agent_kind = incoming.agent_kind;
+        existing.parent_thread_id = incoming.parent_thread_id;
+        existing.path = incoming.path;
+    }
+    existing.display = existing
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| truncate(message.text.trim(), MAX_DISPLAY_CHARS))
+        .unwrap_or_default();
+    rebuild_token_days(existing);
+}
+
 pub(crate) fn load_default_snapshots(home: &Path) -> Vec<CodexRolloutSnapshot> {
     load_snapshots(&default_sessions_root(home), &default_cache_path(home))
 }
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct SearchCacheKey {
-    path: PathBuf,
-    fingerprint: FileFingerprint,
-    query: String,
-    case_sensitive: bool,
-    whole_word: bool,
-}
-
-static SEARCH_CACHE: OnceLock<Mutex<HashMap<SearchCacheKey, Option<String>>>> = OnceLock::new();
-const MAX_SEARCH_CACHE_ENTRIES: usize = 2048;
 
 pub(crate) fn search_rollout<F>(
     snapshot: &CodexRolloutSnapshot,
@@ -578,52 +701,18 @@ pub(crate) fn search_rollout<F>(
 where
     F: Fn(&str, &str, bool) -> bool,
 {
-    let fingerprint = fingerprint(&snapshot.path)?;
-    let key = SearchCacheKey {
-        path: snapshot.path.clone(),
-        fingerprint,
-        query: query.to_string(),
-        case_sensitive,
-        whole_word,
-    };
-    let cache = SEARCH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(cached) = cache.lock().ok()?.get(&key).cloned() {
-        return cached;
-    }
-
-    let file = File::open(&snapshot.path).ok()?;
-    let mut reader = BufReader::with_capacity(128 * 1024, file);
-    let mut line = String::new();
-    let mut result = None;
-    loop {
-        line.clear();
-        if reader.read_line(&mut line).ok()? == 0 {
-            break;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
-            continue;
-        };
-        let Some((_, text)) = message_text(&value) else {
-            continue;
-        };
+    for message in &snapshot.messages {
+        let text = &message.text;
         let normalized = if case_sensitive {
             text.clone()
         } else {
             text.to_lowercase()
         };
         if phrase_match(&normalized, query, whole_word) {
-            result = Some(text);
-            break;
+            return Some(text.clone());
         }
     }
-
-    if let Ok(mut cache) = cache.lock() {
-        if cache.len() >= MAX_SEARCH_CACHE_ENTRIES {
-            cache.clear();
-        }
-        cache.insert(key, result.clone());
-    }
-    result
+    None
 }
 
 #[cfg(test)]
@@ -665,6 +754,13 @@ mod tests {
                 r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"guardian-1","cwd":"/tmp/app","originator":"Codex Desktop","source":{"subagent":{"other":"guardian"}}}}"#,
             ],
         );
+        let integration = directory.path().join("integration.jsonl");
+        write_rollout(
+            &integration,
+            &[
+                r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"integration-1","cwd":"/tmp/app","source":"vscode","originator":"Claude Code"}}"#,
+            ],
+        );
 
         assert_eq!(scan_rollout(&app).unwrap().surface, "app");
         assert_eq!(scan_rollout(&cli).unwrap().surface, "cli");
@@ -672,6 +768,7 @@ mod tests {
         assert_eq!(child.agent_kind, "subagent");
         assert_eq!(child.parent_thread_id.as_deref(), Some("app-1"));
         assert!(scan_rollout(&guardian).unwrap().is_internal());
+        assert_eq!(scan_rollout(&integration).unwrap().surface, "integration");
     }
 
     #[test]
@@ -721,7 +818,7 @@ mod tests {
             concat!(
                 r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"partial-1","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#,
                 "\n",
-                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"completed prompt"}]}}"#
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"completed prompt"}}"#
             ),
         )
         .unwrap();
@@ -730,34 +827,34 @@ mod tests {
     }
 
     #[test]
-    fn injected_context_is_not_used_as_display() {
+    fn response_items_are_not_used_as_display() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("messages.jsonl");
         write_rollout(
             &path,
             &[
                 r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"message-1","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#,
-                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"real request"}]}}"#,
-                r#"{"timestamp":"2026-07-13T01:02:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>secret system context</environment_context>"}]}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"private duplicate"}]}}"#,
+                r#"{"timestamp":"2026-07-13T01:02:00Z","type":"event_msg","payload":{"type":"user_message","message":"real request"}}"#,
             ],
         );
         assert_eq!(scan_rollout(&path).unwrap().display, "real request");
     }
 
     #[test]
-    fn deep_search_skips_injected_and_developer_messages() {
+    fn deep_search_uses_cached_authoritative_messages_without_the_rollout_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("search.jsonl");
         write_rollout(
             &path,
             &[
                 r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"search-1","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#,
-                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"private needle"}]}}"#,
-                r#"{"timestamp":"2026-07-13T01:02:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>private needle</environment_context>"}]}}"#,
-                r#"{"timestamp":"2026-07-13T01:03:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible needle"}]}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"private needle"}]}}"#,
+                r#"{"timestamp":"2026-07-13T01:03:00Z","type":"event_msg","payload":{"type":"agent_message","message":"visible needle"}}"#,
             ],
         );
         let snapshot = scan_rollout(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
         let hit = search_rollout(&snapshot, "needle", false, false, |text, query, _| {
             text.contains(query)
         });
@@ -765,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_thread_ids_keep_newest_snapshot() {
+    fn duplicate_thread_ids_merge_unique_messages_and_token_usage() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("sessions");
         std::fs::create_dir_all(&root).unwrap();
@@ -773,16 +870,69 @@ mod tests {
             &root.join("old.jsonl"),
             &[
                 r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"duplicate","cwd":"/tmp/old","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"older prompt"}}"#,
+                r#"{"timestamp":"2026-07-13T01:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}}"#,
             ],
         );
         write_rollout(
             &root.join("new.jsonl"),
             &[
                 r#"{"timestamp":"2026-07-13T02:00:00Z","type":"session_meta","payload":{"id":"duplicate","cwd":"/tmp/new","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T01:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}}"#,
+                r#"{"timestamp":"2026-07-13T02:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"newer prompt"}}"#,
+                r#"{"timestamp":"2026-07-13T02:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"output_tokens":30,"total_tokens":180}}}}"#,
             ],
         );
         let snapshots = load_snapshots(&root, &directory.path().join("cache.json"));
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].cwd, "/tmp/new");
+        assert_eq!(snapshots[0].display, "newer prompt");
+        assert_eq!(snapshots[0].messages.len(), 2);
+        assert_eq!(snapshots[0].token_days[0].usage.total_tokens, 180);
+    }
+
+    #[test]
+    fn incremental_cache_retains_prior_events_and_resets_after_truncation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("incremental.jsonl");
+        write_rollout(
+            &path,
+            &[
+                r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"incremental","cwd":"/tmp/old","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"first"}}"#,
+            ],
+        );
+        let cache_path = directory.path().join("cache.json");
+        load_snapshots(&root, &cache_path);
+        let first_size = std::fs::metadata(&path).unwrap().len();
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            "\n{}",
+            r#"{"timestamp":"2026-07-13T01:02:00Z","type":"event_msg","payload":{"type":"user_message","message":"second"}}"#
+        )
+        .unwrap();
+        let appended = load_snapshots(&root, &cache_path);
+        assert_eq!(appended[0].messages.len(), 2);
+        let cache: ArchiveCache =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        assert!(cache.files.values().next().unwrap().offset > first_size);
+
+        write_rollout(
+            &path,
+            &[
+                r#"{"timestamp":"2026-07-13T03:00:00Z","type":"session_meta","payload":{"id":"incremental","cwd":"/tmp/new","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T03:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"replacement"}}"#,
+            ],
+        );
+        let truncated = load_snapshots(&root, &cache_path);
+        assert_eq!(truncated[0].display, "replacement");
+        assert_eq!(truncated[0].messages.len(), 1);
     }
 }
