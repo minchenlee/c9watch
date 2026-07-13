@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 const MAX_DISPLAY_CHARS: usize = 400;
 const MAX_INDEXED_MESSAGES: usize = 20_000;
 const MAX_INDEXED_MESSAGE_CHARS: usize = 16_384;
@@ -324,7 +324,6 @@ fn classify_agent(source: &Value, surface: String) -> (String, String, Option<St
 struct DayAccum {
     timestamp: String,
     usage: CodexTokenUsage,
-    models: HashMap<String, u64>,
 }
 
 fn empty_cached(path: &Path, fingerprint: FileFingerprint) -> CachedRollout {
@@ -530,7 +529,7 @@ fn apply_archive_event(cached: &mut CachedRollout, value: &Value) {
 }
 
 fn rebuild_token_days(snapshot: &mut CodexRolloutSnapshot) {
-    let mut days: HashMap<String, DayAccum> = HashMap::new();
+    let mut days: HashMap<(String, String), DayAccum> = HashMap::new();
     let mut previous_totals: HashMap<&str, CodexTokenUsage> = HashMap::new();
     let mut seen_events: HashSet<(String, String, CodexTokenUsage, bool)> = HashSet::new();
     for event in &snapshot.token_events {
@@ -555,30 +554,28 @@ fn rebuild_token_days(snapshot: &mut CodexRolloutSnapshot) {
         )) {
             continue;
         }
-        let day = days.entry(timestamp_date(&event.timestamp)).or_default();
+        let day = days
+            .entry((timestamp_date(&event.timestamp), event.model.clone()))
+            .or_default();
         if day.timestamp.is_empty() || event.timestamp < day.timestamp {
             day.timestamp = event.timestamp.clone();
         }
         day.usage.add_assign(usage);
-        *day.models.entry(event.model.clone()).or_default() += usage.total_tokens;
     }
     snapshot.token_days = days
         .into_iter()
-        .map(|(date, day)| CodexTokenDay {
+        .map(|((date, model), day)| CodexTokenDay {
             date,
             timestamp: day.timestamp,
-            model: day
-                .models
-                .into_iter()
-                .max_by_key(|(_, tokens)| *tokens)
-                .map(|(model, _)| model)
-                .unwrap_or_else(|| "unknown".to_string()),
+            model,
             usage: day.usage,
         })
         .collect();
-    snapshot
-        .token_days
-        .sort_by(|left, right| left.date.cmp(&right.date));
+    snapshot.token_days.sort_by(|left, right| {
+        left.date
+            .cmp(&right.date)
+            .then_with(|| left.model.cmp(&right.model))
+    });
 }
 
 pub(crate) fn scan_rollout(path: &Path) -> Option<CodexRolloutSnapshot> {
@@ -1069,6 +1066,7 @@ mod tests {
             &root.join("old.jsonl"),
             &[
                 r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"resumed","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T01:00:30Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
                 r#"{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":80,"output_tokens":20,"total_tokens":100}}}}"#,
             ],
         );
@@ -1076,15 +1074,36 @@ mod tests {
             &root.join("resumed.jsonl"),
             &[
                 r#"{"timestamp":"2026-07-13T02:00:00Z","type":"session_meta","payload":{"id":"resumed","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T02:00:30Z","type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
                 r#"{"timestamp":"2026-07-13T02:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":120,"output_tokens":30,"total_tokens":150}}}}"#,
             ],
         );
 
         let snapshots = load_snapshots(&root, &directory.path().join("cache.json"));
         assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].token_days[0].usage.input_tokens, 200);
-        assert_eq!(snapshots[0].token_days[0].usage.output_tokens, 50);
-        assert_eq!(snapshots[0].token_days[0].usage.total_tokens, 250);
+        assert_eq!(snapshots[0].token_days.len(), 2);
+        let sol = snapshots[0]
+            .token_days
+            .iter()
+            .find(|day| day.model == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(sol.usage.input_tokens, 80);
+        assert_eq!(sol.usage.output_tokens, 20);
+        let luna = snapshots[0]
+            .token_days
+            .iter()
+            .find(|day| day.model == "gpt-5.6-luna")
+            .unwrap();
+        assert_eq!(luna.usage.input_tokens, 120);
+        assert_eq!(luna.usage.output_tokens, 30);
+        assert_eq!(
+            snapshots[0]
+                .token_days
+                .iter()
+                .map(|day| day.usage.total_tokens)
+                .sum::<u64>(),
+            250
+        );
     }
 
     #[test]

@@ -1215,6 +1215,61 @@ mod tests {
     }
 
     #[test]
+    fn codex_cost_records_price_same_day_models_independently() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".codex/sessions/2026/07/13");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("model-switch.jsonl"),
+            [
+                r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"codex-model-switch","cwd":"/tmp/models","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+                r#"{"timestamp":"2026-07-13T01:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"output_tokens":100,"total_tokens":1100}}}}"#,
+                r#"{"timestamp":"2026-07-13T01:03:00Z","type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+                r#"{"timestamp":"2026-07-13T01:04:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1500,"output_tokens":150,"total_tokens":1650}}}}"#,
+                r#"{"timestamp":"2026-07-13T01:05:00Z","type":"turn_context","payload":{"model":"gpt-future-codex"}}"#,
+                r#"{"timestamp":"2026-07-13T01:06:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1700,"output_tokens":170,"total_tokens":1870}}}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let records = codex_cost_records(home.path());
+        assert_eq!(records.len(), 3);
+
+        let sol = records
+            .iter()
+            .find(|record| record.model == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(sol.total_tokens, 1_100);
+        assert!((sol.cost - 0.008).abs() < 1e-10);
+        assert!(sol.cost_available);
+
+        let luna = records
+            .iter()
+            .find(|record| record.model == "gpt-5.6-luna")
+            .unwrap();
+        assert_eq!(luna.input_tokens, 500);
+        assert_eq!(luna.output_tokens, 50);
+        assert_eq!(luna.total_tokens, 550);
+        assert!((luna.cost - 0.0008).abs() < 1e-10);
+        assert!(luna.cost_available);
+
+        let unknown = records
+            .iter()
+            .find(|record| record.model == "gpt-future-codex")
+            .unwrap();
+        assert_eq!(unknown.total_tokens, 220);
+        assert_eq!(unknown.cost, 0.0);
+        assert!(!unknown.cost_available);
+
+        let data = aggregate(&records);
+        assert_eq!(data.total_tokens, 1_870);
+        assert_eq!(data.unpriced_tokens, 220);
+        assert!((data.total_cost - 0.0088).abs() < 1e-10);
+    }
+
+    #[test]
     fn test_cwd_shared_across_date_splits() {
         let dir = std::env::temp_dir().join("c9watch_test_cwd");
         let _ = std::fs::remove_dir_all(&dir);
