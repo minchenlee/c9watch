@@ -43,7 +43,7 @@
 	import TodoPanel from './TodoPanel.svelte';
 	import { createSlidingWindow, BATCH_SIZE } from '$lib/slidingWindow.svelte';
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
-	import { workersByPm, expandedSessionId, codexSubagentsByParent } from '$lib/stores/sessions';
+	import { workersByPm, expandedSessionId, codexSubagentsByParent, codexVisibleParentByChild } from '$lib/stores/sessions';
 	import { visibleSubagentsBySession } from '$lib/stores/subagents';
 	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
@@ -199,6 +199,7 @@
 		}))
 	]);
 	let hasSubagents = $derived(mySubagents.length > 0);
+	let visibleCodexParentId = $derived($codexVisibleParentByChild.get(session.id) ?? null);
 	let subagentsCollapsed = $state(false);
 
 	// Subagent preview: when set, the conversation area renders a synthesized
@@ -407,8 +408,8 @@
 					</div>
 				</div>
 				<div class="header-actions">
-						{#if session.provider === 'codex' && (session.parentThreadId || (session.rootSessionId && session.rootSessionId !== session.id))}
-							<button type="button" class="header-button" onclick={() => expandedSessionId.set(session.parentThreadId || session.rootSessionId!)} title="Back to parent session" aria-label="Back to parent session">←</button>
+						{#if visibleCodexParentId}
+							<button type="button" class="header-button" onclick={() => expandedSessionId.set(visibleCodexParentId)} title="Back to parent session" aria-label="Back to parent session">←</button>
 						{/if}
 						{#if canSessionAction(session, 'stop')}
 							<button type="button" class="header-button" onclick={() => onstop?.()} title="Stop Session">

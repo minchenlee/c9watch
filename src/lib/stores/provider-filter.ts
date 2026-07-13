@@ -14,4 +14,7 @@ export const providerFilter = writable<ProviderFilter>(
 
 if (browser) {
 	providerFilter.subscribe((value) => localStorage.setItem(STORAGE_KEY, sanitize(value)));
+	window.addEventListener('storage', (event) => {
+		if (event.key === STORAGE_KEY) providerFilter.set(sanitize(event.newValue));
+	});
 }

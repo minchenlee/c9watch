@@ -38,12 +38,62 @@ export function isCodexSubagent(session: Session): boolean {
 	return providerOf(session) === 'codex' && session.agentKind === 'subagent' && !isHiddenInternalSession(session);
 }
 
-export function codexParentId(session: Session): string | null {
-	return session.parentThreadId ?? session.rootSessionId ?? null;
+export interface CodexHierarchy {
+	topLevelIds: Set<string>;
+	subagentsByParent: Map<string, Session[]>;
 }
 
-export function isTopLevelSession(session: Session): boolean {
-	return !isHiddenInternalSession(session) && !isCodexSubagent(session);
+/**
+ * Flatten visible Codex descendants beneath their nearest visible root.
+ * If every referenced ancestor has expired or is missing, the highest
+ * surviving subagent is promoted so no normal agent disappears from the UI.
+ */
+export function resolveCodexHierarchy(sessions: Session[]): CodexHierarchy {
+	const byId = new Map(sessions.map((session) => [session.id, session]));
+	const topLevelIds = new Set(
+		sessions
+			.filter((session) => !isHiddenInternalSession(session) && !isCodexSubagent(session))
+			.map((session) => session.id)
+	);
+	const subagentsByParent = new Map<string, Session[]>();
+
+	function nextExistingAncestor(session: Session): Session | null {
+		for (const id of [session.parentThreadId, session.rootSessionId]) {
+			if (!id || id === session.id) continue;
+			const ancestor = byId.get(id);
+			if (ancestor) return ancestor;
+		}
+		return null;
+	}
+
+	for (const session of sessions) {
+		if (!isCodexSubagent(session)) continue;
+
+		let cursor = session;
+		let anchor: Session = session;
+		const visited = new Set([session.id]);
+		while (true) {
+			const ancestor = nextExistingAncestor(cursor);
+			if (!ancestor || visited.has(ancestor.id)) break;
+			visited.add(ancestor.id);
+			if (!isHiddenInternalSession(ancestor) && !isCodexSubagent(ancestor)) {
+				anchor = ancestor;
+				break;
+			}
+			if (isCodexSubagent(ancestor)) anchor = ancestor;
+			cursor = ancestor;
+		}
+
+		if (anchor.id === session.id) {
+			topLevelIds.add(session.id);
+			continue;
+		}
+		const group = subagentsByParent.get(anchor.id) ?? [];
+		group.push(session);
+		subagentsByParent.set(anchor.id, group);
+	}
+
+	return { topLevelIds, subagentsByParent };
 }
 
 export function canSessionAction(session: Session, action: SessionAction): boolean {

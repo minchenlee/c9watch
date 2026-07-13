@@ -10,7 +10,7 @@ import { SessionStatus } from '../types';
 import { isDemoMode } from '../demo/mode';
 import { openSession } from '../api';
 import { wsClient, useWebSocket, getStoredWsUrl, isTauri } from '../ws';
-import { codexParentId, isCodexSubagent, isHiddenInternalSession } from '../provider';
+import { resolveCodexHierarchy } from '../provider';
 
 /**
  * Store containing all active sessions
@@ -72,19 +72,22 @@ export const workersByPm = derived(sessions, ($sessions) => {
 	return m;
 });
 
-/** Normal Codex subagents grouped under their immediate/root parent. Internal agents are omitted. */
-export const codexSubagentsByParent = derived(sessions, ($sessions) => {
-	const grouped = new Map<string, Session[]>();
-	for (const session of $sessions) {
-		if (!isCodexSubagent(session) || isHiddenInternalSession(session)) continue;
-		const parentId = codexParentId(session);
-		if (!parentId) continue;
-		const group = grouped.get(parentId) ?? [];
-		group.push(session);
-		grouped.set(parentId, group);
+export const codexHierarchy = derived(sessions, resolveCodexHierarchy);
+
+/** Normal Codex descendants flattened beneath the nearest visible root. */
+export const codexSubagentsByParent = derived(codexHierarchy, ($hierarchy) => $hierarchy.subagentsByParent);
+
+/** Visible parent used by child overlays, including flattened descendants. */
+export const codexVisibleParentByChild = derived(codexSubagentsByParent, ($groups) => {
+	const parents = new Map<string, string>();
+	for (const [parentId, children] of $groups) {
+		for (const child of children) parents.set(child.id, parentId);
 	}
-	return grouped;
+	return parents;
 });
+
+/** IDs shown in monitor/popover; includes normal roots and promoted orphans. */
+export const visibleTopLevelSessionIds = derived(codexHierarchy, ($hierarchy) => $hierarchy.topLevelIds);
 
 /**
  * Derived store: sessions sorted by attention priority

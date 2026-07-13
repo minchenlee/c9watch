@@ -8,7 +8,8 @@
 		sortedSessions,
 		expandedSessionId,
 		currentConversation,
-		statusSummary
+		statusSummary,
+		visibleTopLevelSessionIds
 	} from '$lib/stores/sessions';
 	import { getConversation, stopSession, openSession } from '$lib/api';
 	import { isDemoMode, toggleDemoMode } from '$lib/demo';
@@ -34,7 +35,7 @@
 	import type { DetectionDiagnostics } from '$lib/types';
 	import ProviderFilter from '$lib/components/ProviderFilter.svelte';
 	import { providerFilter } from '$lib/stores/provider-filter';
-	import { isTopLevelSession, matchesProvider, providerFilterLabel } from '$lib/provider';
+	import { matchesProvider, providerFilterLabel } from '$lib/provider';
 
 	let demoActive = $derived($isDemoMode);
 	let showQRModal = $state(false);
@@ -264,7 +265,7 @@
 	// records render as ordinary sessions and the HUMANS/WORKERS split is gone.
 	let filteredSessions = $derived.by(() => {
 		const providerSessions = sessions
-			.filter(isTopLevelSession)
+			.filter((session) => $visibleTopLevelSessionIds.has(session.id))
 			.filter((session) => matchesProvider(session, $providerFilter));
 		return !PM_ORCHESTRATION_ENABLED
 			? providerSessions
@@ -321,18 +322,22 @@
 		}
 	});
 
+	let conversationRequestId = 0;
 	$effect(() => {
-		if (expandedId) {
-			getConversation(expandedId)
+		const sessionId = expandedId;
+		const requestId = ++conversationRequestId;
+		currentConversation.set(null);
+		if (sessionId) {
+			getConversation(sessionId)
 				.then((conv) => {
-					currentConversation.set(conv);
+					if (requestId === conversationRequestId && conv.sessionId === sessionId) {
+						currentConversation.set(conv);
+					}
 				})
 				.catch((error) => {
 					console.error('Failed to fetch conversation:', error);
-					currentConversation.set(null);
+					if (requestId === conversationRequestId) currentConversation.set(null);
 				});
-		} else {
-			currentConversation.set(null);
 		}
 	});
 
