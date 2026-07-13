@@ -260,6 +260,7 @@ impl CodexSessionSource {
             }
             summaries.push((path.clone(), summary, rollout_age_secs(path, wall_now)));
         }
+        let mut summaries = merge_live_rollout_summaries(summaries);
 
         // A root rollout can be quiet while a spawned child is actively writing.
         // Pull its immediate/root ancestors from the cached filename index and pin
@@ -353,6 +354,64 @@ impl CodexSessionSource {
         }
         Ok((sessions, DetectionDiagnostics::default()))
     }
+}
+
+type LiveRolloutSummary = (PathBuf, CodexRolloutSummary, u64);
+
+fn merge_live_rollout_summaries(summaries: Vec<LiveRolloutSummary>) -> Vec<LiveRolloutSummary> {
+    let mut merged: HashMap<String, LiveRolloutSummary> = HashMap::new();
+    let mut thread_order = Vec::new();
+    let mut unidentified = Vec::new();
+    for incoming in summaries {
+        if incoming.1.thread_id.is_empty() {
+            unidentified.push(incoming);
+            continue;
+        }
+        match merged.entry(incoming.1.thread_id.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                thread_order.push(entry.key().clone());
+                entry.insert(incoming);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                merge_live_rollout_summary(entry.get_mut(), incoming);
+            }
+        }
+    }
+    unidentified.extend(
+        thread_order
+            .into_iter()
+            .filter_map(|thread_id| merged.remove(&thread_id)),
+    );
+    unidentified
+}
+
+fn merge_live_rollout_summary(existing: &mut LiveRolloutSummary, mut incoming: LiveRolloutSummary) {
+    let existing_timestamp = parse_timestamp_millis(&existing.1.last_timestamp).unwrap_or(i64::MIN);
+    let incoming_timestamp = parse_timestamp_millis(&incoming.1.last_timestamp).unwrap_or(i64::MIN);
+    let incoming_is_newer = incoming_timestamp > existing_timestamp
+        || (incoming_timestamp == existing_timestamp
+            && (incoming.2 < existing.2 || (incoming.2 == existing.2 && incoming.0 > existing.0)));
+
+    let started_at_ms = match (existing.1.started_at_ms, incoming.1.started_at_ms) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left @ Some(_), None) => left,
+        (None, right) => right,
+    };
+    let mut messages = std::mem::take(&mut existing.1.messages);
+    messages.append(&mut incoming.1.messages);
+    messages.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.role.cmp(&right.role))
+            .then_with(|| left.content.cmp(&right.content))
+    });
+    messages.dedup();
+
+    if incoming_is_newer {
+        *existing = incoming;
+    }
+    existing.1.started_at_ms = started_at_ms;
+    existing.1.messages = messages;
 }
 
 fn rollout_age_secs(path: &Path, wall_now: SystemTime) -> u64 {
@@ -598,32 +657,49 @@ fn find_codex_conversation_under(
     thread_id: &str,
 ) -> Result<Vec<CodexMessage>, String> {
     let suffix = format!("-{thread_id}.jsonl");
-    for year in fs::read_dir(sessions_root).into_iter().flatten().flatten() {
-        for month in fs::read_dir(year.path()).into_iter().flatten().flatten() {
-            for day in fs::read_dir(month.path()).into_iter().flatten().flatten() {
-                for rollout in fs::read_dir(day.path()).into_iter().flatten().flatten() {
-                    let path = rollout.path();
-                    if path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.ends_with(&suffix))
-                    {
-                        let mut source = CodexSessionSource::at_root(sessions_root.to_path_buf());
-                        return source
-                            .summary_for(&path)
-                            .map(|summary| summary.messages)
-                            .map_err(|error| error.to_string());
-                    }
-                }
+    let mut paths: Vec<_> = collect_rollout_paths(sessions_root)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&suffix))
+        })
+        .collect();
+    paths.sort();
+    if paths.is_empty() {
+        return Err(format!("Codex session {thread_id} not found"));
+    }
+
+    let mut source = CodexSessionSource::at_root(sessions_root.to_path_buf());
+    let mut messages = Vec::new();
+    let mut parsed_any = false;
+    let mut last_error = None;
+    for path in paths {
+        match source.summary_for(&path) {
+            Ok(mut summary) => {
+                parsed_any = true;
+                messages.append(&mut summary.messages);
             }
+            Err(error) => last_error = Some(error.to_string()),
         }
     }
-    Err(format!("Codex session {thread_id} not found"))
+    if !parsed_any {
+        return Err(last_error.unwrap_or_else(|| format!("Codex session {thread_id} not found")));
+    }
+    messages.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.role.cmp(&right.role))
+            .then_with(|| left.content.cmp(&right.content))
+    });
+    messages.dedup();
+    Ok(messages)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use std::io::Write;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -826,12 +902,77 @@ mod tests {
     #[test]
     fn day_candidates_include_today_and_yesterday_across_midnight() {
         let source = CodexSessionSource::at_root(PathBuf::from("/sessions"));
-        let now = DateTime::parse_from_rfc3339("2026-07-13T00:00:01+08:00")
-            .unwrap()
-            .with_timezone(&Local);
+        let now = Local
+            .with_ymd_and_hms(2026, 7, 13, 0, 0, 1)
+            .single()
+            .unwrap();
         let dirs = source.candidate_day_dirs_at(now);
         assert!(dirs[0].ends_with("2026/07/13"));
         assert!(dirs[1].ends_with("2026/07/12"));
+    }
+
+    #[test]
+    fn duplicate_live_rollouts_merge_into_the_newest_thread_state() {
+        let temp = TempDir::new().unwrap();
+        let now = Local::now();
+        let day = temp.path().join(now.format("%Y/%m/%d").to_string());
+        fs::create_dir_all(&day).unwrap();
+        let old_path = day.join("rollout-2026-07-13T00-00-00-duplicate.jsonl");
+        write_lines(
+            &old_path,
+            &[
+                event(
+                    "2026-07-13T00:00:00Z",
+                    "session_meta",
+                    serde_json::json!({"id":"duplicate","cwd":"/tmp/project","source":"cli","originator":"codex-tui"}),
+                ),
+                event(
+                    "2026-07-13T00:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"user_message","message":"older prompt"}),
+                ),
+                event(
+                    "2026-07-13T00:00:02Z",
+                    "event_msg",
+                    serde_json::json!({"type":"task_complete"}),
+                ),
+            ],
+            true,
+        );
+        let new_path = day.join("rollout-2026-07-13T01-00-00-duplicate.jsonl");
+        write_lines(
+            &new_path,
+            &[
+                event(
+                    "2026-07-13T01:00:00Z",
+                    "session_meta",
+                    serde_json::json!({"id":"duplicate","cwd":"/tmp/project","source":"cli","originator":"codex-tui"}),
+                ),
+                event(
+                    "2026-07-13T01:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"user_message","message":"newer prompt"}),
+                ),
+                event(
+                    "2026-07-13T01:00:02Z",
+                    "event_msg",
+                    serde_json::json!({"type":"task_started"}),
+                ),
+            ],
+            true,
+        );
+
+        let wall_now = SystemTime::now();
+        set_modified_age(&old_path, wall_now, Duration::from_secs(60));
+        set_modified_age(&new_path, wall_now, Duration::from_secs(1));
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let (sessions, _) = source.detect_at_with_clock(now, wall_now).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        let summary = sessions[0].codex_summary.as_ref().unwrap();
+        assert_eq!(summary.lifecycle, CodexLifecycle::Working);
+        assert_eq!(summary.messages.len(), 2);
+        assert_eq!(summary.latest_message(), Some("newer prompt"));
     }
 
     #[test]
@@ -1037,5 +1178,58 @@ mod tests {
         let messages = find_codex_conversation_under(temp.path(), "thread-id").unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "hello");
+    }
+
+    #[test]
+    fn conversation_lookup_merges_resumed_rollout_fragments() {
+        let temp = TempDir::new().unwrap();
+        let old_day = temp.path().join("2026/07/12");
+        let new_day = temp.path().join("2026/07/13");
+        fs::create_dir_all(&old_day).unwrap();
+        fs::create_dir_all(&new_day).unwrap();
+        let old_path = old_day.join("rollout-2026-07-12T23-00-00-thread-id.jsonl");
+        write_lines(
+            &old_path,
+            &[
+                event(
+                    "2026-07-12T23:00:00Z",
+                    "session_meta",
+                    serde_json::json!({"id":"thread-id","cwd":"/tmp/project","source":"cli","originator":"codex-tui"}),
+                ),
+                event(
+                    "2026-07-12T23:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"user_message","message":"first prompt"}),
+                ),
+            ],
+            true,
+        );
+        let new_path = new_day.join("rollout-2026-07-13T01-00-00-thread-id.jsonl");
+        write_lines(
+            &new_path,
+            &[
+                event(
+                    "2026-07-13T01:00:00Z",
+                    "session_meta",
+                    serde_json::json!({"id":"thread-id","cwd":"/tmp/project","source":"cli","originator":"codex-tui"}),
+                ),
+                event(
+                    "2026-07-12T23:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"user_message","message":"first prompt"}),
+                ),
+                event(
+                    "2026-07-13T01:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"agent_message","message":"resumed answer"}),
+                ),
+            ],
+            true,
+        );
+
+        let messages = find_codex_conversation_under(temp.path(), "thread-id").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "first prompt");
+        assert_eq!(messages[1].content, "resumed answer");
     }
 }
