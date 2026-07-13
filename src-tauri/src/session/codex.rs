@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::source::{
     AgentKind, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionKind,
@@ -359,8 +359,13 @@ fn rollout_age_secs(path: &Path, wall_now: SystemTime) -> u64 {
     fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
-        .and_then(|modified| wall_now.duration_since(modified).ok())
-        .map_or(u64::MAX, |age| age.as_secs())
+        .map(|modified| {
+            wall_now
+                .duration_since(modified)
+                .unwrap_or_default()
+                .as_secs()
+        })
+        .unwrap_or(u64::MAX)
 }
 
 /// A full discovery reads directory entries and metadata only. It is throttled
@@ -620,6 +625,7 @@ fn find_codex_conversation_under(
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn event(timestamp: &str, event_type: &str, payload: Value) -> String {
