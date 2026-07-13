@@ -178,6 +178,10 @@ See [SKILLS.md](SKILLS.md) for more install options.
 - **Cost tracker** -- Track Claude Code spending with daily, per-project, and per-model breakdowns; click any session to preview the conversation; sort by date or cost
 - **CLI for agents** -- `c9watch list`, `view`, `history`, `search`, `stop`, `watch`, `cost` commands for scriptable session management and agent-to-agent monitoring
 - **PM orchestration** -- Spawn, message, and manage child Claude Code "worker" sessions from a parent "PM" session via `c9watch spawn`, `send`, `workers`, `adopt`, `inbox`, `tasks`. WORKER and PM badges visible on session cards; PMs show a Workers panel in the overlay
+- **PM-orchestration on subscription quota** — c9watch workers run as
+  `claude --bg` background-pinned sessions, billed against your Pro/Max
+  chat quota (not the separate Agent SDK credit pool that took effect
+  2026-06-15). Falls back to legacy `--print` mode on older CC.
 - **Subagent visibility** -- Detect and display Task-tool subagents spawned inside any session, with click-to-preview transcripts
 - **Entry animations** -- Staggered cascade transitions across tabs and overlay panels for fluid navigation
 - **Token distance visualizer** -- See your token usage as a rice stack towering past 22 real-world landmarks, with animated stacking, native share sheet, and Instagram-ready PNG export

@@ -5,6 +5,17 @@ All notable changes to c9watch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- PM-orchestration `bg` backend: spawn workers via `claude --bg` instead of
+  `claude --print`. Workers stay on Pro/Max subscription quota after
+  Anthropic's 2026-06-15 Agent SDK billing split. Auto-detected when CC
+  >= 2.1.150. Override with `C9WATCH_WORKER_BACKEND=bg|print|auto`.
+- `c9watch spawn --prompt <text>` flag (required when bg backend is active).
+- `EventStatus::Awaiting` + `InboxEvent::awaiting()` for bg workers entering
+  `state:blocked` (turn ended waiting on user input — distinct from done/crashed).
+
 ## [0.8.1] - 2026-04-20
 
 ### Fixed

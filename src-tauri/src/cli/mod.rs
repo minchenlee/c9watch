@@ -18,6 +18,9 @@ pub enum CostSortDir {
 }
 
 pub mod adoption;
+pub mod bg_backend;
+pub mod bg_protocol;
+pub mod worker_backend;
 pub mod pm;
 pub mod pm_caller;
 pub mod pm_daemon;
@@ -158,6 +161,10 @@ pub enum Commands {
         model: Option<String>,
         #[arg(long)]
         add_dir: Vec<String>,
+        /// Initial prompt sent at spawn time. REQUIRED for bg backend (CC >= 2.1.150).
+        /// PrintBackend ignores this — prompts come via `c9watch send` after spawn.
+        #[arg(long)]
+        prompt: Option<String>,
     },
 
     /// Send a message to a spawned worker session
@@ -281,6 +288,7 @@ pub fn run(cli: Cli) {
             permission_mode,
             model,
             add_dir,
+            prompt,
         } => (|| -> Result<(), String> {
             let resolved_cwd = match cwd {
                 Some(c) => c,
@@ -297,7 +305,7 @@ pub fn run(cli: Cli) {
                 model,
                 add_dirs: add_dir,
             };
-            pm::cmd_spawn(args, append_system_prompt_file, cli.pretty)
+            pm::cmd_spawn(args, append_system_prompt_file, prompt, cli.pretty)
         })(),
         Commands::Send {
             session_id,

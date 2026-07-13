@@ -22,6 +22,8 @@ pub enum RpcRequest {
         spawned_by: Option<String>,
         #[serde(rename = "pmPid", default)]
         pm_pid: Option<u32>,
+        #[serde(rename = "initialPrompt", default)]
+        initial_prompt: Option<String>,
     },
     #[serde(rename = "send")]
     Send {
@@ -145,6 +147,7 @@ mod tests {
             add_dirs: vec![],
             spawned_by: Some("pm-session-abc".to_string()),
             pm_pid: Some(42),
+            initial_prompt: None,
         };
         let json = serde_json::to_string(&req).expect("serialize should succeed");
         assert!(json.contains("\"op\":\"spawn\""), "should contain op:spawn, got: {}", json);

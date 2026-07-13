@@ -184,7 +184,7 @@ impl WorkerHandle {
     }
 
     /// Send a user message to the worker's stdin.
-    pub async fn send_message(&self, text: &str) -> Result<(), String> {
+    pub async fn send_message(&mut self, text: &str) -> Result<(), String> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.stdin_tx
             .send(StdinMessage {
@@ -256,6 +256,458 @@ impl WorkerHandle {
     }
 }
 
+// ── Bg backend handle ─────────────────────────────────────────────────────────
+
+use crate::cli::bg_backend::{self, SettleDetector};
+use crate::cli::bg_protocol::{Request, SubscribeEvent};
+
+/// Worker handle backed by `claude --bg` + control.sock RPC.
+///
+/// Lifecycle:
+/// - `spawn` → `claude --bg <prompt>` subprocess returns short, then we open
+///   a dedicated subscribe connection.
+/// - `send_message` → one-shot `reply` RPC on a fresh connection.
+/// - `wait_for_turn` → consume subscribe events until SettleDetector reports
+///   settled (`done` or `blocked`).
+/// - `kill` → one-shot `kill` RPC + fallback `claude rm` subprocess for
+///   jobs-dir cleanup.
+pub struct BgWorkerHandle {
+    pub meta: WorkerMeta,
+    #[allow(dead_code)]
+    short: String,
+    sock_path: std::path::PathBuf,
+    events_rx: Option<tokio::sync::broadcast::Receiver<SubscribeEvent>>,
+    #[allow(dead_code)]
+    ready_fired: bool,
+    /// Set by `send_message` after the reply RPC. Tells `wait_for_turn` to
+    /// ignore any settled patches that arrive before it sees a fresh
+    /// `tempo:"active"|"running"` transition — those settles belong to the
+    /// previous turn, not the one this caller just sent.
+    awaiting_new_turn: bool,
+}
+
+impl BgWorkerHandle {
+    pub async fn spawn(
+        session_id: String,
+        args: SpawnArgs,
+        ctx: SpawnContext,
+        initial_prompt: String,
+    ) -> Result<Self, String> {
+        let sock_path = bg_backend::resolve_control_sock()?;
+
+        let worker_name = args
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("c9w-{}", &session_id[..8.min(session_id.len())]));
+
+        let info = bg_backend::spawn_bg(&args, &session_id, &worker_name, &initial_prompt).await?;
+        let short = info.short;
+        // CC daemon assigns its own sessionId to bg-pinned sessions, ignoring
+        // the `--session-id` flag we passed. The detector matches sessions by
+        // CC's sessionId (from `claude agents --json`), so we MUST use it as
+        // the worker's identity everywhere downstream — meta.json,
+        // workers/<dir>, inbox/<dir>, and the daemon state map. The
+        // pre-generated `session_id` was a placeholder; from here on,
+        // `effective_session_id` is canonical.
+        let effective_session_id = info.cc_session_id;
+
+        let meta = WorkerMeta {
+            session_id: effective_session_id.clone(),
+            // bg workers are daemon-managed; the CC daemon owns the actual PTY
+            // pid. We can't take ownership of the subprocess here, so leave
+            // pid=0 and rely on `claude agents --json` for live pid lookup
+            // (see detector refactor PR #107).
+            pid: 0,
+            name: args.name.clone(),
+            cwd: args.cwd.clone(),
+            spawned_at: Utc::now().to_rfc3339(),
+            spawned_by: ctx.spawned_by.clone(),
+            pm_pid: ctx.pm_pid,
+            spawn_args: PersistedSpawnArgs {
+                append_system_prompt: args.append_system_prompt,
+                permission_mode: args.permission_mode,
+                model: args.model,
+                add_dirs: args.add_dirs,
+            },
+            stopped_at: None,
+        };
+        pm_fs::write_worker_meta(&meta)?;
+
+        let inbox_ctx = ctx.spawned_by.as_ref().map(|pm| InboxContext {
+            session_id: effective_session_id.clone(),
+            spawned_by: pm.clone(),
+        });
+
+        // Mint two receivers up-front when a PM is attached: one for the
+        // long-lived settle watcher, one for `wait_for_turn` callers. Tokio
+        // broadcast receivers do NOT replay older messages, so both must
+        // exist before any event lands — otherwise a fast initial snapshot
+        // could slip past the second subscriber.
+        let receiver_count = if inbox_ctx.is_some() { 2 } else { 1 };
+        let (_tx, mut receivers) =
+            bg_backend::subscribe(&sock_path, &short, receiver_count).await?;
+        let events_rx = receivers.remove(0);
+
+        if let Some(ref ctx) = inbox_ctx {
+            let watcher_rx = receivers.pop().expect("subscribe(2) returned <2 receivers");
+            let ctx = ctx.clone();
+            let short_owned = short.clone();
+            tokio::spawn(settle_watcher_task(watcher_rx, ctx, short_owned));
+        }
+
+        Ok(BgWorkerHandle {
+            meta,
+            short,
+            sock_path,
+            events_rx: Some(events_rx),
+            ready_fired: false,
+            awaiting_new_turn: false,
+        })
+    }
+
+    pub async fn send_message(&mut self, text: &str) -> Result<(), String> {
+        // Drain any stale settle events buffered from prior turns (spawn-time
+        // prompt, earlier non-waiting sends). Drain alone isn't sufficient
+        // because the prior turn could settle AFTER drain but BEFORE the
+        // worker enters active for the new turn — so we ALSO arm a gate on
+        // wait_for_turn that requires observing a fresh tempo:active|running
+        // transition before any settle is accepted as belonging to this send.
+        if let Some(rx) = self.events_rx.as_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                }
+            }
+        }
+        let reply = bg_backend::rpc(
+            &self.sock_path,
+            Request::Reply {
+                short: self.short.clone(),
+                text: text.to_string(),
+            },
+        )
+        .await?;
+        if !reply.ok {
+            return Err(format!(
+                "daemon rejected reply: {}",
+                reply.error.unwrap_or_default()
+            ));
+        }
+        self.awaiting_new_turn = true;
+        Ok(())
+    }
+
+    /// Wait for the next settle (done or blocked). Drains pid-only/active
+    /// patches via SettleDetector. Returns `WAIT_TIMEOUT` error string on
+    /// timeout, mirroring the print backend's contract.
+    ///
+    /// When `self.awaiting_new_turn` is true (set by `send_message`), any
+    /// settle that arrives before a fresh `tempo:active|running` transition
+    /// is treated as belonging to the previous turn and discarded — the
+    /// gate prevents a stale prior settle from being misreported.
+    pub async fn wait_for_turn(&mut self, timeout: Duration) -> Result<TurnResult, String> {
+        let mut gate_pending = self.awaiting_new_turn;
+        let rx = self
+            .events_rx
+            .as_mut()
+            .ok_or_else(|| "events_rx not available".to_string())?;
+        let mut det = SettleDetector::new();
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .ok_or_else(|| "WAIT_TIMEOUT".to_string())?;
+            let ev = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .map_err(|_| "WAIT_TIMEOUT".to_string())?
+                .map_err(|e| format!("event channel closed: {}", e))?;
+
+            self.ready_fired = true;
+
+            // Extract any StatePatch payloads from this event so we can both
+            // (a) update the detector and (b) inspect the tempo field for the
+            // post-send active-gate check.
+            let mut patches: Vec<crate::cli::bg_protocol::StatePatch> = Vec::new();
+            match ev {
+                SubscribeEvent::Snapshot { record, .. } => {
+                    let nested = record.get("currentState").and_then(|v| {
+                        serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(v.clone())
+                            .ok()
+                    });
+                    let from_record =
+                        serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(
+                            record.clone(),
+                        )
+                        .ok();
+                    if let Some(p) = nested {
+                        patches.push(p);
+                    }
+                    if let Some(p) = from_record {
+                        patches.push(p);
+                    }
+                }
+                SubscribeEvent::State { patch } => patches.push(patch),
+                SubscribeEvent::Stream { .. } => continue,
+            }
+
+            // Lower the gate as soon as we see the worker enter the new turn.
+            if gate_pending {
+                for p in &patches {
+                    if let Some(t) = p.tempo.as_deref() {
+                        if matches!(t, "active" | "running") {
+                            gate_pending = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            for p in &patches {
+                det.apply_patch(p);
+            }
+
+            if det.is_settled() && !gate_pending {
+                self.awaiting_new_turn = false;
+                return Ok(self.build_turn_result(&det));
+            }
+
+            // While the gate is still pending, any settle we observed is a
+            // STALE prior turn — clear it so the detector can re-arm on the
+            // real settle that follows the upcoming active transition.
+            if det.is_settled() && gate_pending {
+                det = SettleDetector::new();
+            }
+        }
+    }
+
+    fn build_turn_result(&self, det: &SettleDetector) -> TurnResult {
+        // Inbox event emission lives in `settle_watcher_task`, which has a
+        // dedicated subscribe-receiver and fires on EVERY settle (not just
+        // when a `--wait` caller is listening). This function only constructs
+        // the TurnResult for the optional `--wait` consumer.
+        let assistant_text = det.detail().map(String::from).unwrap_or_default();
+        TurnResult {
+            assistant_text,
+            ended_at: Utc::now().to_rfc3339(),
+            subtype: det.last_settled_state().map(String::from),
+            is_error: false,
+            duration_ms: None,
+            num_turns: None,
+            stop_reason: det.last_settled_state().map(String::from),
+            total_cost_usd: None,
+            result_text: det.detail().map(String::from),
+        }
+    }
+
+    pub async fn wait_ready(&mut self, _timeout: Duration) -> Result<(), String> {
+        // Bg workers are ready as soon as `claude --bg` returns the short.
+        // The subscribe stream will emit the initial snapshot ~immediately.
+        Ok(())
+    }
+
+    pub fn is_alive(&self) -> bool {
+        // Cheap heuristic: the subscribe broadcast channel is still open.
+        // When the reader task drops `tx`, `is_closed` reports true.
+        self.events_rx
+            .as_ref()
+            .map(|rx| !rx.is_closed())
+            .unwrap_or(false)
+    }
+
+    pub async fn kill(&mut self) -> Result<(), String> {
+        let reply = bg_backend::rpc(
+            &self.sock_path,
+            Request::Kill {
+                short: self.short.clone(),
+            },
+        )
+        .await?;
+        if !reply.ok {
+            eprintln!(
+                "[pm_worker bg] kill RPC rejected: {}",
+                reply.error.unwrap_or_default()
+            );
+        }
+        // Parallel subprocess `claude rm` for jobs-dir cleanup (no daemon
+        // equivalent). Best-effort; ignore errors.
+        let short = self.short.clone();
+        tokio::spawn(async move {
+            let _ = Command::new("claude").arg("rm").arg(&short).output().await;
+        });
+        Ok(())
+    }
+}
+
+/// Long-lived task: drains a dedicated subscribe-receiver and emits an inbox
+/// event (Done or Awaiting) on every settle transition. Runs for the worker's
+/// lifetime; exits when the subscribe stream EOFs (worker killed) or the
+/// channel lags out. Only spawned when the worker has a `spawned_by` PM.
+async fn settle_watcher_task(
+    mut rx: tokio::sync::broadcast::Receiver<SubscribeEvent>,
+    ctx: InboxContext,
+    short: String,
+) {
+    use crate::cli::pm_inbox;
+    let mut det = SettleDetector::new();
+    // Tracks the last state the detector reported as settled, so we only emit
+    // on transitions INTO a settled state (not while staying settled).
+    let mut last_emitted: Option<String> = None;
+    loop {
+        let ev = match rx.recv().await {
+            Ok(e) => e,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                eprintln!(
+                    "[pm_worker bg/{}] settle_watcher lagged {} events; resetting detector",
+                    short, n
+                );
+                det = SettleDetector::new();
+                last_emitted = None;
+                continue;
+            }
+        };
+        match ev {
+            SubscribeEvent::Snapshot { ref record, .. } => {
+                let nested = record.get("currentState").and_then(|v| {
+                    serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(v.clone()).ok()
+                });
+                let from_record =
+                    serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(record.clone())
+                        .ok();
+                if let Some(p) = nested {
+                    det.apply_patch(&p);
+                }
+                if let Some(p) = from_record {
+                    det.apply_patch(&p);
+                }
+            }
+            SubscribeEvent::State { ref patch } => {
+                det.apply_patch(patch);
+            }
+            SubscribeEvent::Stream { .. } => continue,
+        }
+        let current = det.last_settled_state().map(String::from);
+        if !det.is_settled() {
+            // Left the settled state — arm re-detection so the NEXT settle fires.
+            last_emitted = None;
+            continue;
+        }
+        if last_emitted == current {
+            // Same settle as before; don't re-emit.
+            continue;
+        }
+        let ev_to_write = match current.as_deref() {
+            Some("blocked") => {
+                let needs = det.needs().unwrap_or("user input").to_string();
+                pm_inbox::InboxEvent::awaiting(
+                    &ctx.session_id,
+                    &ctx.spawned_by,
+                    needs,
+                    det.detail().map(String::from),
+                )
+            }
+            _ => {
+                let assistant_text = det.detail().map(String::from).unwrap_or_default();
+                let excerpt = if assistant_text.is_empty() {
+                    None
+                } else {
+                    Some(pm_inbox::truncate_excerpt(&assistant_text))
+                };
+                pm_inbox::InboxEvent::from_turn_result(
+                    &ctx.session_id,
+                    &ctx.spawned_by,
+                    pm_inbox::TurnResult {
+                        status: pm_inbox::EventStatus::Done,
+                        duration_ms: None,
+                        num_turns: None,
+                        stop_reason: current.clone(),
+                        total_cost_usd: None,
+                        result_excerpt: excerpt,
+                        error_message: None,
+                    },
+                )
+            }
+        };
+        if let Err(e) = pm_inbox::write_event(&ev_to_write) {
+            eprintln!("[pm_worker bg/{}] settle_watcher inbox write: {}", short, e);
+        }
+        last_emitted = current;
+    }
+}
+
+// ── Backend-agnostic wrapper ──────────────────────────────────────────────────
+
+pub enum AnyWorkerHandle {
+    Print(WorkerHandle),
+    Bg(BgWorkerHandle),
+}
+
+impl AnyWorkerHandle {
+    pub fn meta(&self) -> &WorkerMeta {
+        match self {
+            Self::Print(h) => &h.meta,
+            Self::Bg(h) => &h.meta,
+        }
+    }
+
+    pub async fn send_message(&mut self, text: &str) -> Result<(), String> {
+        match self {
+            Self::Print(h) => h.send_message(text).await,
+            Self::Bg(h) => h.send_message(text).await,
+        }
+    }
+
+    pub async fn wait_for_turn(&mut self, timeout: Duration) -> Result<TurnResult, String> {
+        match self {
+            Self::Print(h) => h.wait_for_turn(timeout).await,
+            Self::Bg(h) => h.wait_for_turn(timeout).await,
+        }
+    }
+
+    pub async fn wait_ready(&mut self, timeout: Duration) -> Result<(), String> {
+        match self {
+            Self::Print(h) => h.wait_ready(timeout).await,
+            Self::Bg(h) => h.wait_ready(timeout).await,
+        }
+    }
+
+    pub fn is_alive(&mut self) -> bool {
+        match self {
+            Self::Print(h) => h.is_alive(),
+            Self::Bg(h) => h.is_alive(),
+        }
+    }
+
+    pub async fn kill(&mut self) -> Result<(), String> {
+        match self {
+            Self::Print(h) => h.kill().await,
+            Self::Bg(h) => h.kill().await,
+        }
+    }
+
+    /// Result-receiver methods only apply to the Print backend (Bg uses event
+    /// stream subscription via `wait_for_turn` instead). Bg returns None so
+    /// callers can branch on `matches!(handle, AnyWorkerHandle::Bg(_))` and
+    /// avoid the receiver-take dance.
+    pub fn take_result_receiver(&mut self) -> Option<mpsc::Receiver<TurnResult>> {
+        match self {
+            Self::Print(h) => h.take_result_receiver(),
+            Self::Bg(_) => None,
+        }
+    }
+
+    pub fn return_result_receiver(&mut self, rx: mpsc::Receiver<TurnResult>) {
+        match self {
+            Self::Print(h) => h.return_result_receiver(rx),
+            Self::Bg(_) => {} // no-op
+        }
+    }
+}
+
 // ── Internal tasks ───────────────────────────────────────────────────────────
 
 /// Reads StdinMessages from the channel and writes stream-json user envelopes
@@ -276,7 +728,9 @@ async fn stdin_writer_task(
         let line = match serde_json::to_string(&envelope) {
             Ok(s) => s,
             Err(e) => {
-                let _ = msg.ack.send(Err(format!("Failed to serialize message: {}", e)));
+                let _ = msg
+                    .ack
+                    .send(Err(format!("Failed to serialize message: {}", e)));
                 continue;
             }
         };
@@ -327,7 +781,10 @@ async fn stdout_tee_task(
     let mut log_file = match log_file {
         Ok(f) => Some(f),
         Err(e) => {
-            eprintln!("[pm_worker] Failed to open stdout log {:?}: {}", log_path, e);
+            eprintln!(
+                "[pm_worker] Failed to open stdout log {:?}: {}",
+                log_path, e
+            );
             None
         }
     };
@@ -384,13 +841,25 @@ async fn stdout_tee_task(
                 }
             }
             "result" => {
-                let subtype = event.get("subtype").and_then(|v| v.as_str()).map(String::from);
-                let is_error = event.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                let subtype = event
+                    .get("subtype")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let is_error = event
+                    .get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let duration_ms = event.get("duration_ms").and_then(|v| v.as_u64());
                 let num_turns = event.get("num_turns").and_then(|v| v.as_u64());
-                let stop_reason = event.get("stop_reason").and_then(|v| v.as_str()).map(String::from);
+                let stop_reason = event
+                    .get("stop_reason")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let total_cost_usd = event.get("total_cost_usd").and_then(|v| v.as_f64());
-                let result_text = event.get("result").and_then(|v| v.as_str()).map(String::from);
+                let result_text = event
+                    .get("result")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
 
                 let result = TurnResult {
                     assistant_text: std::mem::take(&mut assistant_buf),
@@ -409,14 +878,14 @@ async fn stdout_tee_task(
 
                 if let Some(ref ctx) = inbox {
                     use crate::cli::pm_inbox::{self, EventStatus, InboxEvent, TurnResult};
-                    let status = if is_error || subtype.as_deref().map(|s| s != "success").unwrap_or(false) {
+                    let status = if is_error
+                        || subtype.as_deref().map(|s| s != "success").unwrap_or(false)
+                    {
                         EventStatus::Error
                     } else {
                         EventStatus::Done
                     };
-                    let excerpt = result_text
-                        .as_ref()
-                        .map(|s| pm_inbox::truncate_excerpt(s));
+                    let excerpt = result_text.as_ref().map(|s| pm_inbox::truncate_excerpt(s));
                     let err_msg = if matches!(status, EventStatus::Error) {
                         // Prefer the result `subtype` (e.g. "error_during_execution",
                         // "error_max_turns") since `stop_reason` is typically only
@@ -506,7 +975,10 @@ async fn stderr_tee_task(stderr: tokio::process::ChildStderr, log_path: PathBuf)
     let mut log_file = match log_file {
         Ok(f) => Some(f),
         Err(e) => {
-            eprintln!("[pm_worker] Failed to open stderr log {:?}: {}", log_path, e);
+            eprintln!(
+                "[pm_worker] Failed to open stderr log {:?}: {}",
+                log_path, e
+            );
             None
         }
     };

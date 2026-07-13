@@ -1,6 +1,9 @@
 use crate::cli::pm_fs;
 use crate::cli::pm_rpc::RpcRequest;
-use crate::cli::pm_worker::{SpawnArgs, SpawnContext, WorkerHandle};
+use crate::cli::pm_worker::{
+    AnyWorkerHandle, BgWorkerHandle, SpawnArgs, SpawnContext, WorkerHandle,
+};
+use crate::cli::worker_backend::{select_backend, validate_initial_prompt, BackendKind};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +14,7 @@ use tokio::sync::Mutex;
 const DEFAULT_MAX_WORKERS: usize = 16;
 
 struct DaemonState {
-    workers: HashMap<String, WorkerHandle>,
+    workers: HashMap<String, AnyWorkerHandle>,
 }
 
 fn err_response(code: &str) -> serde_json::Value {
@@ -95,11 +98,7 @@ pub async fn run_daemon() -> Result<(), String> {
 
 // ── Connection handler ────────────────────────────────────────────────────────
 
-async fn handle_connection(
-    stream: UnixStream,
-    state: Arc<Mutex<DaemonState>>,
-    max_workers: usize,
-) {
+async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>, max_workers: usize) {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
@@ -138,6 +137,7 @@ async fn handle_connection(
             add_dirs,
             spawned_by,
             pm_pid,
+            initial_prompt,
         } => {
             let args = SpawnArgs {
                 cwd,
@@ -148,7 +148,7 @@ async fn handle_connection(
                 add_dirs,
             };
             let ctx = SpawnContext { spawned_by, pm_pid };
-            handle_spawn(state, args, ctx, max_workers).await
+            handle_spawn(state, args, ctx, initial_prompt, max_workers).await
         }
         RpcRequest::Send {
             session_id,
@@ -164,7 +164,16 @@ async fn handle_connection(
             force,
             caller_pm_session_id,
             caller_pm_pid,
-        } => handle_adopt(state, session_id, force, caller_pm_session_id, caller_pm_pid).await,
+        } => {
+            handle_adopt(
+                state,
+                session_id,
+                force,
+                caller_pm_session_id,
+                caller_pm_pid,
+            )
+            .await
+        }
         RpcRequest::WorkersAll {
             caller_pm_session_id,
             caller_pm_pid,
@@ -224,6 +233,7 @@ async fn handle_spawn(
     state: Arc<Mutex<DaemonState>>,
     mut args: SpawnArgs,
     ctx: SpawnContext,
+    initial_prompt: Option<String>,
     max_workers: usize,
 ) -> serde_json::Value {
     // Validate and canonicalize --cwd + each --add-dir before acquiring the
@@ -253,15 +263,39 @@ async fn handle_spawn(
     let spawned_by = ctx.spawned_by.clone();
     let canonical_cwd = args.cwd.clone();
 
-    // Spawn the worker
-    let worker = match WorkerHandle::spawn(session_id.clone(), args, ctx).await {
-        Ok(w) => w,
+    // Validate the initial prompt against the selected backend. Bg backend
+    // requires a non-empty prompt; Print backend ignores it.
+    let backend = select_backend();
+    let resolved_prompt = match validate_initial_prompt(backend, initial_prompt) {
+        Ok(p) => p,
         Err(e) => return err_response(&e),
     };
 
-    let pid = worker.meta.pid;
-    let worker_name = worker.meta.name.clone();
-    let spawned_at = worker.meta.spawned_at.clone();
+    // Spawn the worker via the selected backend. PrintBackend is the legacy
+    // path; BgBackend uses `claude --bg` + control.sock RPC.
+    let worker: AnyWorkerHandle = match backend {
+        BackendKind::Bg => {
+            let prompt = resolved_prompt.expect("validate_initial_prompt guarantees Some for Bg");
+            match BgWorkerHandle::spawn(session_id.clone(), args, ctx, prompt).await {
+                Ok(w) => AnyWorkerHandle::Bg(w),
+                Err(e) => return err_response(&e),
+            }
+        }
+        BackendKind::Print => match WorkerHandle::spawn(session_id.clone(), args, ctx).await {
+            Ok(w) => AnyWorkerHandle::Print(w),
+            Err(e) => return err_response(&e),
+        },
+    };
+
+    let pid = worker.meta().pid;
+    let worker_name = worker.meta().name.clone();
+    let spawned_at = worker.meta().spawned_at.clone();
+    // Bg backend rewrites session_id to CC's actual UUID inside spawn (CC
+    // ignores `--session-id` for bg sessions). From here on, the meta's
+    // session_id is canonical — use it for the state map key and the
+    // response. The pre-spawn `session_id` (still owned by us) was only a
+    // placeholder for the Bg path; the Print path still uses it unchanged.
+    let effective_session_id = worker.meta().session_id.clone();
 
     // Insert into state while holding the lock across the cap check so two
     // concurrent spawns cannot both read "count < max" and both proceed (H4).
@@ -273,7 +307,7 @@ async fn handle_spawn(
             let _ = w.kill().await;
             return err_response("TOO_MANY_WORKERS");
         }
-        st.workers.insert(session_id.clone(), worker);
+        st.workers.insert(effective_session_id.clone(), worker);
     }
 
     // Wait for worker readiness (first stdout event) before returning.
@@ -286,7 +320,7 @@ async fn handle_spawn(
     // is held only for the duration of that single .await.
     let ready_result = {
         let mut st = state.lock().await;
-        if let Some(worker) = st.workers.get_mut(&session_id) {
+        if let Some(worker) = st.workers.get_mut(&effective_session_id) {
             worker.wait_ready(Duration::from_secs(15)).await
         } else {
             Err("Worker disappeared immediately after insert".to_string())
@@ -296,17 +330,17 @@ async fn handle_spawn(
     if let Err(e) = ready_result {
         // Worker failed to initialize — clean up
         let mut st = state.lock().await;
-        if let Some(mut w) = st.workers.remove(&session_id) {
+        if let Some(mut w) = st.workers.remove(&effective_session_id) {
             let _ = w.kill().await;
         }
         return err_response(&format!("SPAWN_FAILED: {}", e));
     }
 
-    let callback_inbox = callback_inbox_hint(&session_id);
+    let callback_inbox = callback_inbox_hint(&effective_session_id);
 
     serde_json::json!({
         "ok": true,
-        "sessionId": session_id,
+        "sessionId": effective_session_id,
         "pid": pid,
         "name": worker_name,
         "cwd": canonical_cwd,
@@ -334,7 +368,10 @@ async fn handle_send(
 
     // Send the message under the lock, then release it before awaiting the
     // turn result so other RPCs aren't blocked for up to `timeout_ms`.
-    let (rx_opt, callback_inbox) = {
+    //
+    // For Bg backend: no mpsc receiver to take — `wait_for_turn` consumes the
+    // subscribe broadcast directly. We branch below.
+    let (rx_opt, callback_inbox, is_bg) = {
         let mut st = state.lock().await;
         let worker = match st.workers.get_mut(&full_id) {
             Some(w) => w,
@@ -344,7 +381,8 @@ async fn handle_send(
             return err_response(&e);
         }
         let callback_inbox = callback_inbox_hint(&full_id);
-        let rx = if wait && timeout_ms > 0 {
+        let is_bg = matches!(worker, AnyWorkerHandle::Bg(_));
+        let rx = if wait && timeout_ms > 0 && !is_bg {
             match worker.take_result_receiver() {
                 Some(r) => Some(r),
                 None => {
@@ -356,7 +394,7 @@ async fn handle_send(
         } else {
             None
         };
-        (rx, callback_inbox)
+        (rx, callback_inbox, is_bg)
     };
 
     if !wait || timeout_ms == 0 {
@@ -368,11 +406,65 @@ async fn handle_send(
         });
     }
 
-    // rx_opt is Some here because wait && timeout_ms > 0
-    let mut rx = rx_opt.expect("rx must be Some when wait && timeout_ms > 0");
+    let timeout = Duration::from_millis(timeout_ms);
+
+    if is_bg {
+        // Bg backend: there is no mpsc receiver — `wait_for_turn` consumes
+        // events from the broadcast subscribe channel that lives on the
+        // BgWorkerHandle. To avoid holding the daemon state lock across a
+        // potentially long await (which would block all other RPCs for up
+        // to `timeout_ms`), the wait_for_turn future runs UNDER the lock.
+        //
+        // This is a known concern: we accept that Bg --wait serializes the
+        // daemon during the wait. Acceptable because the bg worker can only
+        // service one prompt at a time anyway, so concurrent --wait against
+        // the same worker would race regardless. Print backend remains lock-
+        // free via the receiver-take pattern.
+        let mut st = state.lock().await;
+        let worker = match st.workers.get_mut(&full_id) {
+            Some(w) => w,
+            None => return err_response("WORKER_CRASHED"),
+        };
+        let result = worker.wait_for_turn(timeout).await;
+        let still_alive = worker.is_alive();
+        drop(st);
+
+        return match result {
+            Ok(turn) => serde_json::json!({
+                "ok": true,
+                "sessionId": full_id,
+                "sent": true,
+                "turnCompleted": true,
+                "assistantText": turn.assistant_text,
+                "endedAt": turn.ended_at,
+                "callbackInbox": callback_inbox,
+            }),
+            Err(e) if e == "WAIT_TIMEOUT" && !still_alive => serde_json::json!({
+                "ok": false,
+                "error": "WORKER_CRASHED",
+                "sessionId": full_id,
+                "callbackInbox": callback_inbox,
+            }),
+            Err(e) if e == "WAIT_TIMEOUT" => serde_json::json!({
+                "ok": true,
+                "sessionId": full_id,
+                "sent": true,
+                "turnCompleted": false,
+                "callbackInbox": callback_inbox,
+            }),
+            Err(e) => serde_json::json!({
+                "ok": false,
+                "error": e,
+                "sessionId": full_id,
+            }),
+        };
+    }
+
+    // Print backend: existing receiver-based wait path.
+    // rx_opt is Some here because wait && timeout_ms > 0 && !is_bg
+    let mut rx = rx_opt.expect("rx must be Some when wait && timeout_ms > 0 && !is_bg");
 
     // Await the turn result WITHOUT holding the state lock
-    let timeout = Duration::from_millis(timeout_ms);
     let turn_result = tokio::time::timeout(timeout, rx.recv()).await;
 
     // Return the receiver (and peek worker liveness) so the worker can be used
@@ -428,7 +520,13 @@ async fn handle_list(state: Arc<Mutex<DaemonState>>) -> serde_json::Value {
     let dead: Vec<String> = st
         .workers
         .iter_mut()
-        .filter_map(|(id, worker)| if worker.is_alive() { None } else { Some(id.clone()) })
+        .filter_map(|(id, worker)| {
+            if worker.is_alive() {
+                None
+            } else {
+                Some(id.clone())
+            }
+        })
         .collect();
     for id in dead {
         st.workers.remove(&id);
@@ -440,14 +538,15 @@ async fn handle_list(state: Arc<Mutex<DaemonState>>) -> serde_json::Value {
         .iter_mut()
         .map(|(session_id, worker)| {
             let alive = worker.is_alive();
+            let meta = worker.meta();
             serde_json::json!({
                 "sessionId": session_id,
-                "pid": worker.meta.pid,
-                "name": worker.meta.name,
-                "cwd": worker.meta.cwd,
-                "spawnedAt": worker.meta.spawned_at,
-                "spawnedBy": worker.meta.spawned_by,
-                "pmPid": worker.meta.pm_pid,
+                "pid": meta.pid,
+                "name": meta.name,
+                "cwd": meta.cwd,
+                "spawnedAt": meta.spawned_at,
+                "spawnedBy": meta.spawned_by,
+                "pmPid": meta.pm_pid,
                 "alive": alive,
             })
         })
@@ -487,15 +586,15 @@ fn cleanup_worker_dir(session_id: &str) {
         Ok(dir) => {
             if let Err(e) = std::fs::remove_dir_all(&dir) {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "[pm_daemon] Failed to remove worker dir {:?}: {}",
-                        dir, e
-                    );
+                    eprintln!("[pm_daemon] Failed to remove worker dir {:?}: {}", dir, e);
                 }
             }
         }
         Err(e) => {
-            eprintln!("[pm_daemon] Cannot resolve worker dir for {}: {}", session_id, e);
+            eprintln!(
+                "[pm_daemon] Cannot resolve worker dir for {}: {}",
+                session_id, e
+            );
         }
     }
 }
@@ -514,7 +613,10 @@ async fn shutdown_daemon(state: Arc<Mutex<DaemonState>>) -> ! {
         let mut ids = Vec::with_capacity(st.workers.len());
         for (id, mut worker) in st.workers.drain() {
             if let Err(e) = worker.kill().await {
-                eprintln!("[pm_daemon] Failed to kill worker {} during shutdown: {}", id, e);
+                eprintln!(
+                    "[pm_daemon] Failed to kill worker {} during shutdown: {}",
+                    id, e
+                );
             }
             ids.push(id);
         }
@@ -544,7 +646,7 @@ async fn shutdown_daemon(state: Arc<Mutex<DaemonState>>) -> ! {
 /// - 0 matches → WORKER_NOT_FOUND error.
 /// - 2+ matches → AMBIGUOUS_SESSION_ID error.
 fn resolve_worker_id(
-    workers: &HashMap<String, WorkerHandle>,
+    workers: &HashMap<String, AnyWorkerHandle>,
     prefix: &str,
 ) -> Result<String, String> {
     resolve_worker_id_from_keys(workers.keys().map(|k| k.as_str()), prefix)
@@ -595,19 +697,16 @@ async fn handle_workers_all(
         .iter_mut()
         .map(|(session_id, worker)| {
             let alive = worker.is_alive();
-            let status = resolve_status(
-                &worker.meta,
-                caller_pm_pid,
-                caller_pm_session_id.as_deref(),
-            );
+            let meta = worker.meta();
+            let status = resolve_status(meta, caller_pm_pid, caller_pm_session_id.as_deref());
             serde_json::json!({
                 "sessionId": session_id,
-                "pid": worker.meta.pid,
-                "name": worker.meta.name,
-                "cwd": worker.meta.cwd,
-                "spawnedAt": worker.meta.spawned_at,
-                "spawnedBy": worker.meta.spawned_by,
-                "pmPid": worker.meta.pm_pid,
+                "pid": meta.pid,
+                "name": meta.name,
+                "cwd": meta.cwd,
+                "spawnedAt": meta.spawned_at,
+                "spawnedBy": meta.spawned_by,
+                "pmPid": meta.pm_pid,
                 "alive": alive,
                 "status": status.as_str(),
             })
@@ -709,11 +808,8 @@ async fn handle_inbox_read(
             st.workers
                 .iter()
                 .filter_map(|(id, w)| {
-                    let status = resolve_status(
-                        &w.meta,
-                        caller_pm_pid,
-                        Some(&caller_pm_session_id),
-                    );
+                    let status =
+                        resolve_status(w.meta(), caller_pm_pid, Some(&caller_pm_session_id));
                     if status == WorkerStatus::OwnedByYou {
                         Some(id.clone())
                     } else {
@@ -968,7 +1064,11 @@ mod tests {
             "expected 'does not exist', got: {}",
             err
         );
-        assert!(err.contains("/this/path/definitely/does/not/exist/h5test"), "path should appear in error: {}", err);
+        assert!(
+            err.contains("/this/path/definitely/does/not/exist/h5test"),
+            "path should appear in error: {}",
+            err
+        );
     }
 
     #[test]
@@ -1038,16 +1138,14 @@ mod tests {
 
         rt.block_on(async {
             // Step 1: bind socket
-            let _listener = UnixListener::bind(&sock_path)
-                .expect("bind Unix socket");
+            let _listener = UnixListener::bind(&sock_path).expect("bind Unix socket");
 
             // Assert: socket exists, pid file does NOT yet
             assert!(sock_path.exists(), "socket must exist after bind");
             assert!(!pid_path.exists(), "pid file must not exist before write");
 
             // Step 2: write pid file
-            fs::write(&pid_path, std::process::id().to_string())
-                .expect("write pid file");
+            fs::write(&pid_path, std::process::id().to_string()).expect("write pid file");
 
             // Assert: both now exist in the correct causal order
             assert!(sock_path.exists(), "socket still exists after pid write");
