@@ -43,6 +43,15 @@
 		return claude + codex > 0 ? (claude / (claude + codex)) * 100 : 100;
 	}
 
+	function providerBreakdownLabel(sessions: SessionCostRecord[]): string {
+		const claude = providerUsageValue(sessions, 'claudeCode');
+		const codex = providerUsageValue(sessions, 'codex');
+		const total = claude + codex;
+		const format = mode === 'tokens' ? formatTokens : formatCost;
+		const percentage = (value: number) => total > 0 ? `${((value / total) * 100).toFixed(0)}%` : '0%';
+		return `Claude Code ${format(claude)} (${percentage(claude)}), Codex ${format(codex)} (${percentage(codex)})`;
+	}
+
 	function formatAggregate(cost: number, tokens: number, unpricedTokens: number): string {
 		if (mode === 'tokens') return formatTokens(tokens);
 		if (tokens > 0 && unpricedTokens === tokens) return 'UNPRICED';
@@ -585,7 +594,7 @@
 				<div class="pricing-note" role="note">
 					<span class="pricing-note-label">{hasCodexUsage ? 'ESTIMATED USD' : 'USD COVERAGE'}</span>
 					<span>
-						{#if hasCodexUsage}Codex cost uses OpenAI Standard API rates; it is not your ChatGPT/Codex subscription bill.{/if}
+						{#if hasCodexUsage}Codex cost is a lower-bound estimate using OpenAI Standard short-context API rates. Long-context calls may cost more. It is not your ChatGPT/Codex subscription bill.{/if}
 						{#if hasCodexUsage && filteredUnpricedTokens > 0}<span aria-hidden="true"> · </span>{/if}
 						{#if filteredUnpricedTokens > 0}
 							{#if filteredUnpricedTokens === filteredTotalTokens}
@@ -597,6 +606,10 @@
 					</span>
 				</div>
 			{/if}
+			<div class="provider-usage-legend" aria-label="Cost chart provider colors">
+				<span class="provider-usage-legend-item"><span class="provider-usage-swatch claude" aria-hidden="true"></span>CLAUDE CODE</span>
+				<span class="provider-usage-legend-item"><span class="provider-usage-swatch codex" aria-hidden="true"></span>CODEX</span>
+			</div>
 			{#if filteredProjectCosts.length === 0}
 				<div class="state-msg">No {providerFilterLabel($providerFilter)} usage data available.</div>
 			{/if}
@@ -642,7 +655,7 @@
 							onmouseenter={() => hoveredBucket = bucket.key}
 							onmouseleave={() => hoveredBucket = null}
 							role="img"
-							aria-label="{bucket.label}: {formatAggregate(bucket.cost, bucket.tokens, bucket.unpricedTokens)}"
+							aria-label="{bucket.label}: {formatAggregate(bucket.cost, bucket.tokens, bucket.unpricedTokens)}; {providerBreakdownLabel(bucket.sessions)}"
 						>
 							{#if hoveredBucket === bucket.key}
 								<div class="vchart-tooltip">
@@ -702,7 +715,12 @@
 
 						{#if !collapsedProjects.has(proj.project)}
 							{@const projValue = mode === 'usd' ? proj.totalCost : proj.totalTokens}
-							<div class="grid-bar-track" bind:clientWidth={projectTrackWidth}>
+							<div
+								class="grid-bar-track"
+								bind:clientWidth={projectTrackWidth}
+								role="img"
+								aria-label="{proj.projectName}: {formatAggregate(proj.totalCost, proj.totalTokens, proj.unpricedTokens)}; {providerBreakdownLabel(proj.sessions)}"
+							>
 								<div class="grid-container" style="grid-template-columns: repeat({projectBarColumns}, 1fr);">
 									{#each buildProviderBarBlocks(projectScaleMax > 0 ? (projValue / projectScaleMax) * 100 : 0, projectBarColumns, proj.sessions) as block}
 										<div class="rect {block.type}"></div>
@@ -713,7 +731,7 @@
 							<!-- svelte-ignore a11y_click_events_have_key_events -->
 							<!-- svelte-ignore a11y_no_static_element_interactions -->
 							{@const sorted = sortSessions(proj.sessions)}
-							{#each expandedProjects.has(proj.project) ? sorted : sorted.slice(0, 5) as session (session.sessionId + '-' + session.date)}
+							{#each expandedProjects.has(proj.project) ? sorted : sorted.slice(0, 5) as session (session.sessionId + '-' + session.date + '-' + session.model)}
 								<!-- svelte-ignore a11y_click_events_have_key_events -->
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<div class="session-detail" class:codex-session={session.provider === 'codex'} onclick={() => handleSessionClick(session)}>
@@ -841,6 +859,38 @@
 		font-size: 10px;
 		letter-spacing: 0.08em;
 		color: var(--accent-amber);
+	}
+
+	.provider-usage-legend {
+		display: flex;
+		align-items: center;
+		gap: var(--space-lg);
+		font-family: var(--font-mono);
+		font-size: 10px;
+		letter-spacing: 0.08em;
+		color: var(--text-muted);
+	}
+
+	.provider-usage-legend-item {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+	}
+
+	.provider-usage-swatch {
+		width: 10px;
+		height: 10px;
+		border: 1px solid color-mix(in srgb, currentColor 55%, var(--border-default));
+	}
+
+	.provider-usage-swatch.claude {
+		color: var(--accent-amber);
+		background: var(--accent-amber);
+	}
+
+	.provider-usage-swatch.codex {
+		color: var(--accent-blue);
+		background: var(--accent-blue);
 	}
 
 	.cost-section {
