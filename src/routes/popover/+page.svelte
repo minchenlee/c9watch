@@ -1,15 +1,23 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
-	import { sortedSessions, statusSummary, sessions as sessionsStore, initializeSessionListeners } from '$lib/stores/sessions';
+	import { sortedSessions, sessions as sessionsStore, initializeSessionListeners } from '$lib/stores/sessions';
 	import { openSession, getSessions } from '$lib/api';
 	import { SessionStatus } from '$lib/types';
 	import type { Session } from '$lib/types';
 	import { invoke } from '@tauri-apps/api/core';
 	import { listen } from '@tauri-apps/api/event';
 	import { isDemoMode, loadDemoDataIfActive } from '$lib/demo';
+	import { providerFilter } from '$lib/stores/provider-filter';
+	import { canSessionAction, isTopLevelSession, matchesProvider, providerFilterLabel } from '$lib/provider';
+	import ProviderFilter from '$lib/components/ProviderFilter.svelte';
+	import ProviderBadge from '$lib/components/ProviderBadge.svelte';
 
-	let sessions = $derived($sortedSessions);
-	let summary = $derived($statusSummary);
+	let sessions = $derived($sortedSessions.filter(isTopLevelSession).filter((session) => matchesProvider(session, $providerFilter)));
+	let summary = $derived({
+		working: sessions.filter((s) => s.status === SessionStatus.Working || s.status === SessionStatus.Connecting).length,
+		permission: sessions.filter((s) => s.status === SessionStatus.NeedsAttention).length,
+		input: sessions.filter((s) => s.status === SessionStatus.WaitingForInput).length
+	});
 	let totalSessions = $derived(sessions.length);
 
 	// Pixel grid state
@@ -145,6 +153,7 @@
 			</svg>
 		</button>
 	</header>
+	<div class="popover-filter"><ProviderFilter compact /></div>
 
 	<div class="pixel-grid" class:empty={totalSessions === 0} bind:clientWidth={trackWidth}>
 		<div class="grid-inner" style="grid-template-columns: repeat({columns}, 1fr);">
@@ -157,20 +166,23 @@
 	<main class="popover-content">
 		{#if sessions.length === 0}
 			<div class="empty-state">
-				<p>No active sessions</p>
+				<p>No {providerFilterLabel($providerFilter)} sessions</p>
 			</div>
 		{:else}
 			<div class="session-list">
 				{#each sessions as session (session.id)}
-					<button class="session-card" onclick={() => handleOpen(session)}>
+					<button class="session-card" disabled={!canSessionAction(session, 'open')} onclick={() => handleOpen(session)}>
 						<div class="card-top">
 							<span class="session-dot" style="background: {getStatusColor(session.status)}"></span>
+							<ProviderBadge provider={session.provider} surface={session.surface} compact />
 							<span class="session-project">{session.sessionName}</span>
+							{#if canSessionAction(session, 'open')}
 							<svg aria-hidden="true" class="open-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 								<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
 								<polyline points="15 3 21 3 21 9" />
 								<line x1="10" y1="14" x2="21" y2="3" />
 							</svg>
+							{/if}
 						</div>
 						<div class="card-title">{session.customTitle || session.firstPrompt}</div>
 						{#if session.latestMessage}
@@ -204,6 +216,9 @@
 		padding: 10px 16px;
 		flex-shrink: 0;
 	}
+
+	.popover-filter { display: flex; justify-content: center; padding: 0 12px 8px; border-bottom: 1px solid var(--border-muted); }
+	.session-card:disabled { cursor: default; opacity: .82; }
 
 	.total-count {
 		font-size: 11px;

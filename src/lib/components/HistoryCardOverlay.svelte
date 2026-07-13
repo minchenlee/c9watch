@@ -8,6 +8,7 @@
 	import { createSlidingWindow, BATCH_SIZE, MAX_VISIBLE } from '$lib/slidingWindow.svelte';
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
+	import ProviderBadge from './ProviderBadge.svelte';
 
 	interface Props {
 		entry: HistoryEntry;
@@ -160,6 +161,7 @@
 				<div class="header-left" data-tauri-drag-region>
 					<div class="header-info">
 						<div class="header-title">
+							<ProviderBadge provider={entry.provider} surface={entry.surface} />
 							<h2 id="overlay-title" class="project-name">{entry.projectName}</h2>
 						</div>
 						<div class="header-meta">

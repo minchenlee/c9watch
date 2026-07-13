@@ -6,6 +6,9 @@
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
 	import { flyIn } from '$lib/transitions';
 	import { historyEntries, historyLoading, historyError, refreshSessionHistory } from '$lib/stores/history';
+	import { providerFilter } from '$lib/stores/provider-filter';
+	import { matchesProvider, providerFilterLabel } from '$lib/provider';
+	import ProviderBadge from './ProviderBadge.svelte';
 
 	// ── Props ────────────────────────────────────────────────────────
 	let { activeSessionIds = new Set<string>() }: { activeSessionIds?: Set<string> } = $props();
@@ -119,7 +122,7 @@
 
 	// ── Filtering & sorting ──────────────────────────────────────────
 	let filtered = $derived.by(() => {
-		let entries = allEntries;
+		let entries = allEntries.filter((entry) => matchesProvider(entry, $providerFilter));
 
 		if (query.trim()) {
 			const needle = norm(query);
@@ -138,13 +141,13 @@
 			if (deepSearchResults !== null) {
 				const metaIds = new Set(entries.map((e) => e.sessionId));
 				const deepOnly = allEntries.filter(
-					(e) => deepSearchResults!.has(e.sessionId) && !metaIds.has(e.sessionId)
+					(e) => matchesProvider(e, $providerFilter) && deepSearchResults!.has(e.sessionId) && !metaIds.has(e.sessionId)
 				);
 				entries = [...entries, ...deepOnly];
 			}
 		} else if (deepSearchResults !== null) {
 			// No text query but deep search ran — show all deep search hits
-			entries = allEntries.filter((e) => deepSearchResults!.has(e.sessionId));
+			entries = allEntries.filter((e) => matchesProvider(e, $providerFilter) && deepSearchResults!.has(e.sessionId));
 		}
 
 		return [...entries].sort((a, b) =>
@@ -353,7 +356,7 @@
 		{:else if error}
 			<div class="state-msg error">Error: {error}</div>
 		{:else if filtered.length === 0}
-			<div class="state-msg">No sessions found.</div>
+				<div class="state-msg">No {providerFilterLabel($providerFilter)} sessions found.</div>
 		{:else if groupByProject && groups}
 			{#each groups as group, gi (group.project)}
 				{@const baseIdx = (groupOffsets[gi] ?? 0) + 3}
@@ -385,7 +388,7 @@
 									{#if entry.customTitle}<span class="row-title">{@html highlight(entry.customTitle, query)}</span>{/if}
 									<span class="row-display">{@html highlight((snippet ?? entry.display) || '(no prompt)', query)}</span>
 								</span>
-								<span class="row-badge-slot">{#if activeSessionIds.has(entry.sessionId)}<span class="active-badge">ACTIVE</span>{/if}</span>
+								<span class="row-badge-slot"><ProviderBadge provider={entry.provider} surface={entry.surface} compact />{#if activeSessionIds.has(entry.sessionId)}<span class="active-badge">ACTIVE</span>{/if}</span>
 								<span class="row-time">{relativeTime(entry.timestamp)}</span>
 							</button>
 						{/each}
@@ -405,7 +408,7 @@
 					<div class="row-content">
 						<div class="row-top-grid">
 							<span class="row-project">{entry.projectName}</span>
-							<span class="row-badge-slot">{#if activeSessionIds.has(entry.sessionId)}<span class="active-badge">ACTIVE</span>{/if}</span>
+								<span class="row-badge-slot"><ProviderBadge provider={entry.provider} surface={entry.surface} compact />{#if activeSessionIds.has(entry.sessionId)}<span class="active-badge">ACTIVE</span>{/if}</span>
 							<span class="row-time">{relativeTime(entry.timestamp)}</span>
 						</div>
 						<span class="row-prompt">

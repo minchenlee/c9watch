@@ -12,6 +12,21 @@ export enum SessionStatus {
   Connecting = 'Connecting'            // Session starting up
 }
 
+export type SessionProvider = 'claudeCode' | 'codex';
+export type SessionSurface = 'claudeCode' | 'app' | 'cli' | 'exec' | 'integration' | 'unknown';
+export type AgentKind = 'root' | 'subagent' | 'internal';
+
+export interface SessionActionCapabilities {
+  open?: boolean;
+  stop?: boolean;
+  rename?: boolean;
+  conversation?: boolean;
+  canOpen?: boolean;
+  canStop?: boolean;
+  canRename?: boolean;
+  canReadConversation?: boolean;
+}
+
 /**
  * A Claude Code session
  */
@@ -63,6 +78,19 @@ export interface Session {
 
   /** Session start timestamp from `claude agents --json` (ms since epoch). */
   startedAtMs?: number | null;
+
+  /** Provider metadata is optional for compatibility; missing means Claude Code. */
+  provider?: SessionProvider;
+  surface?: SessionSurface;
+  agentKind?: AgentKind;
+  parentThreadId?: string | null;
+  rootSessionId?: string | null;
+  agentPath?: string | null;
+  agentNickname?: string | null;
+  agentRole?: string | null;
+  internalKind?: string | null;
+  capabilities?: SessionActionCapabilities;
+  actionCapabilities?: SessionActionCapabilities;
 }
 
 /**
@@ -143,6 +171,8 @@ export interface HistoryEntry {
 
   /** Custom title override — if set, shown instead of the first prompt */
   customTitle: string | null;
+  provider?: SessionProvider;
+  surface?: SessionSurface;
 }
 
 /**
@@ -163,6 +193,8 @@ export interface SessionCostRecord {
   totalTokens: number;
   /** Custom title or truncated first user message */
   sessionName: string;
+  provider?: SessionProvider;
+  surface?: SessionSurface;
 }
 
 /**

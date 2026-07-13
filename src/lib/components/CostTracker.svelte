@@ -1,12 +1,15 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { getConversation } from '$lib/api';
-	import type { HistoryEntry, Conversation } from '$lib/types';
+	import type { HistoryEntry, Conversation, CostData } from '$lib/types';
 	import TokenDistanceVisualizer from './token-distance/TokenDistanceVisualizer.svelte';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
 	import { costData as costDataStore, costMode, refreshCostData } from '$lib/stores/cost';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
 	import { flyIn, fadeIn } from '$lib/transitions';
+	import { providerFilter } from '$lib/stores/provider-filter';
+	import { matchesProvider, providerFilterLabel } from '$lib/provider';
+	import ProviderBadge from './ProviderBadge.svelte';
 
 	type TimeScale = 'daily' | 'weekly' | 'monthly';
 
@@ -25,7 +28,26 @@
 
 	// ── State ────────────────────────────────────────────────────────
 	let loading = $state(true);
-	let costData = $derived($costDataStore);
+	let rawCostData = $derived($costDataStore);
+	let costData = $derived.by((): CostData | null => {
+		if (!rawCostData) return null;
+		const dailyCosts = rawCostData.dailyCosts.map((day) => {
+			const sessions = day.sessions.filter((session) => matchesProvider(session, $providerFilter));
+			return { ...day, sessions, cost: sessions.reduce((sum, session) => sum + session.cost, 0) };
+		});
+		const projectCosts = rawCostData.projectCosts.map((project) => {
+			const sessions = project.sessions.filter((session) => matchesProvider(session, $providerFilter));
+			return { ...project, sessions, totalCost: sessions.reduce((sum, session) => sum + session.cost, 0) };
+		}).filter((project) => project.sessions.length > 0);
+		const sessions = dailyCosts.flatMap((day) => day.sessions);
+		return {
+			...rawCostData,
+			dailyCosts,
+			projectCosts,
+			totalCost: sessions.reduce((sum, session) => sum + session.cost, 0),
+			totalTokens: sumTokens(sessions)
+		};
+	});
 	let mode = $derived($costMode);
 	let collapsedProjects = $state<Set<string>>(new Set());
 	let modelTrackWidth = $state(0);
@@ -143,6 +165,8 @@
 			project: session.project,
 			projectName: session.projectName,
 			customTitle: session.sessionName || null,
+			provider: session.provider,
+			surface: session.surface,
 		};
 		conversation = null;
 		try {
@@ -503,8 +527,11 @@
 		<div class="state-msg">Loading cost data...</div>
 	{:else if !costData}
 		<div class="state-msg">No cost data available.</div>
-	{:else}
+		{:else}
 		<div class="list-area">
+			{#if filteredProjectCosts.length === 0}
+				<div class="state-msg">No {providerFilterLabel($providerFilter)} cost data available.</div>
+			{/if}
 			<!-- ── BY MODEL ───────────────────────────────────────── -->
 			<div class="model-status-bar" in:flyIn={{ index: 0, duration: 650, stride: 90 }}>
 				<div class="sub-header">BY MODEL</div>
@@ -613,7 +640,10 @@
 							<!-- svelte-ignore a11y_no_static_element_interactions -->
 							{@const sorted = sortSessions(proj.sessions)}
 							{#each expandedProjects.has(proj.project) ? sorted : sorted.slice(0, 5) as session (session.sessionId + '-' + session.date)}
+								<!-- svelte-ignore a11y_click_events_have_key_events -->
+								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<div class="session-detail" onclick={() => handleSessionClick(session)}>
+									<ProviderBadge provider={session.provider} surface={session.surface} compact />
 									<span class="detail-name" title={session.sessionName || session.sessionId}>{session.sessionName || session.sessionId.slice(0, 8)}</span>
 									<span class="detail-session-id" title={session.sessionId}>{session.sessionId.slice(0, 8)}</span>
 									<span class="detail-spacer"></span>

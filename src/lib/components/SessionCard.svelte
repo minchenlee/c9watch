@@ -5,6 +5,8 @@
 	import { workersByPm } from '$lib/stores/sessions';
 	import { formatCostOrTokens } from '$lib/cost-utils';
 	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
+	import ProviderBadge from './ProviderBadge.svelte';
+	import { canSessionAction } from '$lib/provider';
 
 	interface Props {
 		session: Session;
@@ -26,6 +28,10 @@
 	let isPermission = $derived(session.status === SessionStatus.NeedsAttention);
 	let isWaitingInput = $derived(session.status === SessionStatus.WaitingForInput);
 	let isWorking = $derived(session.status === SessionStatus.Working);
+	let canExpand = $derived(canSessionAction(session, 'conversation'));
+	let canOpen = $derived(canSessionAction(session, 'open'));
+	let canStop = $derived(canSessionAction(session, 'stop'));
+	let canRename = $derived(canSessionAction(session, 'rename'));
 
 	let tooltipText = $state('');
 	let tooltipX = $state(0);
@@ -110,7 +116,7 @@
 		if (target.closest('.action-btn')) {
 			return;
 		}
-		onexpand?.();
+		if (canExpand) onexpand?.();
 	}
 
 	function handleCardKeydown(e: KeyboardEvent) {
@@ -118,7 +124,7 @@
 			const target = e.target as HTMLElement;
 			if (target.classList.contains('session-card')) {
 				e.preventDefault();
-				onexpand?.();
+				if (canExpand) onexpand?.();
 			}
 		}
 	}
@@ -216,9 +222,10 @@
 		{/if}
 
 		<!-- Project & Stats Row -->
-		<div class="stats-row">
-			<div class="badge-group">
-				<span class="session-name-badge">{session.sessionName}</span>
+			<div class="stats-row">
+				<div class="badge-group">
+					<ProviderBadge provider={session.provider} surface={session.surface} {compact} />
+					<span class="session-name-badge">{session.sessionName}</span>
 				{#if PM_ORCHESTRATION_ENABLED && session.workerOf && !workersView}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<span
@@ -291,41 +298,49 @@
 			<p class="task-preview">{session.latestMessage || session.firstPrompt}</p>
 
 			<!-- Bottom Actions -->
-			<div class="card-actions-container">
-				<div class="card-actions">
-					<button type="button" class="action-btn" onclick={handleRenameClick} title="Rename">
+				<div class="card-actions-container">
+					<div class="card-actions">
+						{#if canRename}
+						<button type="button" class="action-btn" onclick={handleRenameClick} title="Rename">
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 							<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
 							<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
 						</svg>
 						RENAME
-					</button>
-					<button type="button" class="action-btn danger" onclick={handleStop} title="Stop">
+						</button>
+						{/if}
+						{#if canStop}
+						<button type="button" class="action-btn danger" onclick={handleStop} title="Stop">
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 							<rect x="6" y="6" width="12" height="12" rx="1" />
 						</svg>
 						STOP
-					</button>
-					<button type="button" class="action-btn primary" onclick={handleOpen} title="Open">
+						</button>
+						{/if}
+						{#if canOpen}
+						<button type="button" class="action-btn primary" onclick={handleOpen} title="Open">
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 							<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
 							<polyline points="15 3 21 3 21 9" />
 							<line x1="10" y1="14" x2="21" y2="3" />
 						</svg>
 						OPEN
-					</button>
+						</button>
+						{/if}
+					</div>
 				</div>
-			</div>
-		{:else}
-			<div class="compact-actions">
-				<button type="button" class="action-btn icon-only" onclick={handleOpen} title="Open">
+			{:else}
+				<div class="compact-actions">
+					{#if canOpen}
+					<button type="button" class="action-btn icon-only" onclick={handleOpen} title="Open">
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 						<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
 						<polyline points="15 3 21 3 21 9" />
 						<line x1="10" y1="14" x2="21" y2="3" />
 					</svg>
-				</button>
-			</div>
+					</button>
+					{/if}
+				</div>
 		{/if}
 	</div>
 
