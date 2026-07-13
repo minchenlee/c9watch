@@ -34,6 +34,10 @@ gui = [
     "dep:tauri-nspanel",
 ]
 cli = ["dep:clap", "dep:regex", "dep:tokio"]
+# PM/worker orchestration (spawn/send/workers/inbox/adopt/daemon). Opt-in only —
+# Claude Code and Codex now provide native agent spawning, so this is excluded
+# from `default`. Build with `--features pm-orchestration` to expose it.
+pm-orchestration = ["cli"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }

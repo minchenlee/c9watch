@@ -17,16 +17,28 @@ pub enum CostSortDir {
     Desc,
 }
 
+// PM/worker orchestration modules — opt-in only. Compiled out of default builds.
+#[cfg(feature = "pm-orchestration")]
 pub mod adoption;
+#[cfg(feature = "pm-orchestration")]
 pub mod bg_backend;
+#[cfg(feature = "pm-orchestration")]
 pub mod bg_protocol;
+#[cfg(feature = "pm-orchestration")]
 pub mod worker_backend;
+#[cfg(feature = "pm-orchestration")]
 pub mod pm;
+#[cfg(feature = "pm-orchestration")]
 pub mod pm_caller;
+#[cfg(feature = "pm-orchestration")]
 pub mod pm_daemon;
+#[cfg(feature = "pm-orchestration")]
 pub mod pm_fs;
+#[cfg(feature = "pm-orchestration")]
 pub mod pm_inbox;
+#[cfg(feature = "pm-orchestration")]
 pub mod pm_rpc;
+#[cfg(feature = "pm-orchestration")]
 pub mod pm_worker;
 
 #[derive(Parser)]
@@ -146,6 +158,7 @@ pub enum Commands {
     },
 
     /// Spawn a new worker session managed by c9watch
+    #[cfg(feature = "pm-orchestration")]
     Spawn {
         #[arg(long)]
         cwd: Option<String>,
@@ -168,6 +181,7 @@ pub enum Commands {
     },
 
     /// Send a message to a spawned worker session
+    #[cfg(feature = "pm-orchestration")]
     Send {
         session_id: String,
         #[arg(long)]
@@ -183,6 +197,7 @@ pub enum Commands {
     },
 
     /// List workers spawned by c9watch
+    #[cfg(feature = "pm-orchestration")]
     Workers {
         /// Include workers owned by other PMs (adds a status column per entry)
         #[arg(long)]
@@ -190,6 +205,7 @@ pub enum Commands {
     },
 
     /// List callback events from workers owned by this PM session
+    #[cfg(feature = "pm-orchestration")]
     Inbox {
         /// Remove events after listing
         #[arg(long)]
@@ -203,6 +219,7 @@ pub enum Commands {
     },
 
     /// Adopt an existing worker as owned by this PM session
+    #[cfg(feature = "pm-orchestration")]
     Adopt {
         /// Worker session id or unique prefix
         session_id: String,
@@ -241,6 +258,7 @@ pub enum Commands {
     },
 
     /// [hidden] Run the PM daemon
+    #[cfg(feature = "pm-orchestration")]
     #[command(hide = true)]
     Daemon,
 }
@@ -280,6 +298,7 @@ pub fn run(cli: Cli) {
             changes_only,
         } => cmd_watch(interval, project.as_deref(), compact, changes_only),
         Commands::Tasks { session_id } => cmd_tasks(&session_id, cli.pretty),
+        #[cfg(feature = "pm-orchestration")]
         Commands::Spawn {
             cwd,
             name,
@@ -307,6 +326,7 @@ pub fn run(cli: Cli) {
             };
             pm::cmd_spawn(args, append_system_prompt_file, prompt, cli.pretty)
         })(),
+        #[cfg(feature = "pm-orchestration")]
         Commands::Send {
             session_id,
             message,
@@ -315,14 +335,18 @@ pub fn run(cli: Cli) {
             wait,
             timeout,
         } => pm::cmd_send(session_id, message, stdin, file, wait, timeout, cli.pretty),
+        #[cfg(feature = "pm-orchestration")]
         Commands::Workers { all } => pm::cmd_workers(all, cli.pretty),
+        #[cfg(feature = "pm-orchestration")]
         Commands::Inbox { consume, clear, worker } => {
             pm::cmd_inbox(consume, clear, worker, cli.pretty)
         }
+        #[cfg(feature = "pm-orchestration")]
         Commands::Adopt { session_id, force } => pm::cmd_adopt(session_id, force, cli.pretty),
         Commands::Cost { daily, weekly, project, since, sort, sort_dir, session, session_prefix } => {
             cmd_cost(daily, weekly, project.as_deref(), since.as_deref(), sort, sort_dir, session.as_deref(), session_prefix.as_deref(), cli.pretty)
         }
+        #[cfg(feature = "pm-orchestration")]
         Commands::Daemon => {
             match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt.block_on(pm_daemon::run_daemon()),
@@ -576,6 +600,7 @@ fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
     // previously parse as PID and SIGKILL an arbitrary OS process. Ask the
     // daemon for a worker match first; only fall back to PID if no worker
     // matches AND the target parses as u32.
+    #[cfg(feature = "pm-orchestration")]
     if let Some(worker_id) = try_resolve_worker(target) {
         return pm::cmd_stop(worker_id, pretty);
     }
@@ -592,7 +617,15 @@ fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
 
     // Not numeric, no worker match — fall through to PM so it can surface
     // WORKER_NOT_FOUND (after starting the daemon if needed).
-    pm::cmd_stop(target.to_string(), pretty)
+    #[cfg(feature = "pm-orchestration")]
+    return pm::cmd_stop(target.to_string(), pretty);
+
+    // Without PM orchestration a non-numeric target can't refer to anything.
+    #[cfg(not(feature = "pm-orchestration"))]
+    Err(format!(
+        "invalid stop target '{}': expected a numeric PID",
+        target
+    ))
 }
 
 /// If the PM daemon is already running and has exactly one worker whose
@@ -603,6 +636,7 @@ fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
 ///
 /// This function never starts the daemon: if the daemon isn't running there
 /// can't be any workers to match against, so PID-based stop is safe.
+#[cfg(feature = "pm-orchestration")]
 fn try_resolve_worker(target: &str) -> Option<String> {
     use std::time::Duration;
     let sock_path = pm_fs::daemon_sock_path().ok()?;

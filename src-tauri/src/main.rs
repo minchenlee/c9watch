@@ -10,11 +10,16 @@ fn main() {
         let args: Vec<String> = std::env::args().collect();
         if args.len() > 1 {
             let first = args[1].as_str();
-            let known_commands = [
+            #[allow(unused_mut)]
+            let mut known_commands: Vec<&str> = vec![
                 "list", "status", "self", "view", "history", "search", "stop", "watch", "tasks",
-                "spawn", "send", "workers", "inbox", "adopt", "cost", "daemon",
-                "help",
+                "cost", "help",
             ];
+            // PM/worker orchestration subcommands are opt-in only.
+            #[cfg(feature = "pm-orchestration")]
+            known_commands.extend_from_slice(&[
+                "spawn", "send", "workers", "inbox", "adopt", "daemon",
+            ]);
             let is_cli = known_commands.contains(&first)
                 || first == "--help"
                 || first == "-h"
