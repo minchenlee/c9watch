@@ -58,6 +58,45 @@
 		return unpricedTokens > 0 ? `${formatCost(cost)} PRICED` : formatCost(cost);
 	}
 
+	const MODEL_COLOR_PALETTE = [
+		'var(--accent-blue)',
+		'#00c2a8',
+		'var(--accent-green)',
+		'var(--accent-purple)',
+		'var(--accent-pink)',
+		'#f5c542',
+		'var(--accent-red)',
+		'#22d3ee'
+	];
+
+	/** Keep model colors stable across the bar and legend, regardless of usage order. */
+	function modelColor(model: string, provider: SessionProvider): string {
+		const normalized = model.trim().toLowerCase();
+		if (!normalized || normalized === '-') return 'var(--text-muted)';
+
+		if (normalized.startsWith('claude-opus')) return 'var(--accent-amber)';
+		if (normalized.startsWith('claude-sonnet')) return 'var(--accent-purple)';
+		if (normalized.startsWith('claude-haiku')) return 'var(--accent-pink)';
+
+		if (normalized.includes('terra')) return '#00c2a8';
+		if (normalized.includes('sol')) return 'var(--accent-blue)';
+		if (normalized.includes('luna')) return 'var(--accent-green)';
+		if (normalized.includes('spark')) return 'var(--accent-pink)';
+		if (normalized.includes('mini') || normalized.includes('nano')) return '#f5c542';
+		if (normalized.startsWith('gpt-5.5')) return 'var(--accent-purple)';
+		if (normalized.startsWith('gpt-5.4')) return 'var(--accent-red)';
+
+		if (provider === 'codex' || normalized.startsWith('gpt-')) {
+			let hash = 0;
+			for (let i = 0; i < normalized.length; i++) {
+				hash = ((hash << 5) - hash + normalized.charCodeAt(i)) | 0;
+			}
+			return MODEL_COLOR_PALETTE[Math.abs(hash) % MODEL_COLOR_PALETTE.length];
+		}
+
+		return 'var(--text-muted)';
+	}
+
 	// ── State ────────────────────────────────────────────────────────
 	let loading = $state(true);
 	let rawCostData = $derived($costDataStore);
@@ -455,7 +494,7 @@
 
 	/** Combined model bar: allocates blocks proportionally like StatusBar */
 	let modelStatusArray = $derived.by(() => {
-		if (filteredModelCosts.length === 0) return Array(modelBarColumns).fill('empty');
+		if (filteredModelCosts.length === 0) return Array<string>(modelBarColumns).fill('');
 
 		const models = filteredModelCosts;
 		const percentages = models.map(mc => (mc.percentage / 100) * modelBarColumns);
@@ -477,10 +516,10 @@
 
 		const arr: string[] = [];
 		for (let i = 0; i < models.length; i++) {
-			const cls = models[i].provider === 'codex' ? 'codex' : models[i].model.startsWith('claude-opus') ? 'opus' : models[i].model.startsWith('claude-sonnet') ? 'sonnet' : 'haiku';
-			for (let j = 0; j < result[i]; j++) arr.push(cls);
+			const color = modelColor(models[i].model, models[i].provider);
+			for (let j = 0; j < result[i]; j++) arr.push(color);
 		}
-		while (arr.length < modelBarColumns) arr.push('empty');
+		while (arr.length < modelBarColumns) arr.push('');
 		return arr;
 	});
 
@@ -620,7 +659,7 @@
 				<div class="progress-track" bind:clientWidth={modelTrackWidth}>
 					<div class="grid-container" style="grid-template-columns: repeat({modelBarColumns}, 1fr);">
 						{#each modelStatusArray as status, i}
-							<div class="rect {status}"></div>
+							<div class="rect" class:filled={status !== ''} style={status ? `--model-color: ${status}` : undefined}></div>
 						{/each}
 					</div>
 				</div>
@@ -628,7 +667,7 @@
 				<div class="model-legend">
 					{#each filteredModelCosts as mc (mc.key)}
 						<div class="model-legend-item">
-							<span class="dot {mc.provider === 'codex' ? 'codex' : mc.model.startsWith('claude-opus') ? 'opus' : mc.model.startsWith('claude-sonnet') ? 'sonnet' : 'haiku'}"></span>
+							<span class="dot" style={`--model-color: ${modelColor(mc.model, mc.provider)}`}></span>
 							<span class="model-legend-label">{mc.displayName.toUpperCase()}</span>
 							<span class="model-legend-cost" class:unpriced={mode === 'usd' && mc.unpricedTokens === mc.tokens}>{formatAggregate(mc.cost, mc.tokens, mc.unpricedTokens)}</span>
 							<span class="model-legend-pct">{mode === 'usd' && mc.unpricedTokens === mc.tokens ? '—' : `${mc.percentage.toFixed(0)}%`}</span>
@@ -735,7 +774,7 @@
 								<!-- svelte-ignore a11y_click_events_have_key_events -->
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<div class="session-detail" class:codex-session={session.provider === 'codex'} onclick={() => handleSessionClick(session)}>
-									<ProviderBadge provider={session.provider} surface={session.surface} compact accent="cost" />
+									<ProviderBadge provider={session.provider} surface={session.surface} compact />
 									<span class="detail-name" title={session.sessionName || session.sessionId}>{session.sessionName || session.sessionId.slice(0, 8)}</span>
 									<span class="detail-session-id" title={session.sessionId}>{session.sessionId.slice(0, 8)}</span>
 									<span class="detail-spacer"></span>
@@ -1040,11 +1079,7 @@
 		border-radius: 1px;
 	}
 
-	.rect.opus { background-color: var(--accent-amber); box-shadow: 0 0 4px color-mix(in srgb, var(--accent-amber) 30%, transparent); }
-	.rect.sonnet { background-color: var(--accent-purple); box-shadow: 0 0 4px color-mix(in srgb, var(--accent-purple) 30%, transparent); }
-	.rect.haiku { background-color: var(--accent-pink); box-shadow: 0 0 4px color-mix(in srgb, var(--accent-pink) 30%, transparent); }
-	.rect.codex { background-color: var(--accent-blue); box-shadow: 0 0 4px color-mix(in srgb, var(--accent-blue) 30%, transparent); }
-	.rect.claude { background-color: var(--accent-amber); box-shadow: 0 0 4px color-mix(in srgb, var(--accent-amber) 30%, transparent); }
+	.rect.filled { background-color: var(--model-color); box-shadow: 0 0 4px color-mix(in srgb, var(--model-color) 30%, transparent); }
 
 	.model-legend {
 		display: flex;
@@ -1061,12 +1096,8 @@
 	.model-legend-item .dot {
 		width: 8px;
 		height: 8px;
+		background: var(--model-color);
 	}
-
-	.model-legend-item .dot.opus { background: var(--accent-amber); }
-	.model-legend-item .dot.sonnet { background: var(--accent-purple); }
-	.model-legend-item .dot.haiku { background: var(--accent-pink); }
-	.model-legend-item .dot.codex { background: var(--accent-blue); }
 
 	.model-legend-label {
 		font-family: var(--font-mono);
