@@ -87,12 +87,12 @@ Inspect detected sessions:
 
 If time is limited, complete at least these six checks:
 
-- [ ] A Codex App session appears in Monitor with a `CODEX` badge.
+- [ ] A Codex App session appears in Monitor with a blue `CODEX` badge.
 - [ ] A Codex CLI session appears in Monitor and its CLI JSON reports `surface: cli`.
 - [ ] The `All | Claude Code | Codex` filter changes the actual data in Monitor, History, Cost, and Memory.
 - [ ] Resuming the same Codex session produces one card and retains the full conversation.
-- [ ] Cost estimates known Codex models, uses blue for Codex and amber for Claude Code, and keeps cost or token values on the same row.
-- [ ] The Memory tab's `Codex` filter displays `MEMORY.md` and `memory_summary.md` when they exist.
+- [ ] The Cost tab estimates known Codex models, gives each model a consistent distinct color, and keeps cost or token values on the same row.
+- [ ] The Memory tab's `Codex` filter displays `MEMORY.md` and `memory_summary.md` with a blue `CODEX` badge when they exist.
 
 ## Full Test Procedure
 
@@ -128,7 +128,7 @@ Expected results:
 Expected results:
 
 - The session appears in Monitor.
-- The card displays a `CODEX` badge.
+- The card displays a blue `CODEX` badge.
 - The project path and prompt content are correct.
 - Unsupported Stop, Rename, and Open Session actions are not shown.
 - CLI JSON reports `provider: codex` and `surface: app`.
@@ -156,7 +156,7 @@ Expected results:
 Expected results:
 
 - Monitor displays one card for the Codex session.
-- The card displays a `CODEX` badge.
+- The card displays a blue `CODEX` badge.
 - CLI JSON reports:
   - `provider: codex`
   - `surface: cli`
@@ -234,6 +234,7 @@ Expected results:
 - The session ID appears on only one card.
 - The card uses the latest rollout state instead of being overwritten by an older idle state.
 - The conversation contains both the `FIRST` and `SECOND` markers.
+- Assistant messages use the provider-neutral `AGENT` role label.
 - Duplicate rollout messages are not displayed twice.
 
 ### 7. History and Search
@@ -267,6 +268,7 @@ Expected results:
 - The UI explains that estimates use OpenAI Standard short-context API rates, are a lower bound, may understate long-context calls, and are not the subscription bill.
 - Unknown Codex models display `UNPRICED`, not `$0`.
 - Codex usage is blue, Claude Code usage is amber, and a visible provider legend is present.
+- Each model in `BY MODEL` has a consistent distinct color in both the summary bar and its legend marker.
 - Each session's cost or token value stays on the same row as its badge, prompt, date, and model.
 - Usage is priced separately when a session changes models on the same day.
 - Unknown-model tokens do not affect estimates for known models.
@@ -286,7 +288,7 @@ Expected results:
 
 Expected results:
 
-- The `Codex` filter displays only the Codex memory group with a `CODEX` badge.
+- The `Codex` filter displays only the Codex memory group with a blue `CODEX` badge.
 - Existing top-level `MEMORY.md` and `memory_summary.md` files are available.
 - The tab does not recursively load `rollout_summaries/`, `raw_memories.md`, or other internal data.
 - The `Claude Code` filter still displays memory from `~/.claude/projects/*/memory/`.
