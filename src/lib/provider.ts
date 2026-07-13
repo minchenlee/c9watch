@@ -1,8 +1,8 @@
-import type { HistoryEntry, Session, SessionCostRecord, SessionProvider, SessionSurface } from './types';
+import type { Session, SessionProvider, SessionSurface } from './types';
 
 export type ProviderFilter = 'all' | SessionProvider;
 export type SessionAction = 'open' | 'stop' | 'rename' | 'conversation';
-type ProviderRecord = Pick<Session, 'provider'> | Pick<HistoryEntry, 'provider'> | Pick<SessionCostRecord, 'provider'>;
+type ProviderRecord = { provider?: SessionProvider | null };
 
 export function providerOf(record: ProviderRecord): SessionProvider {
 	return record.provider === 'codex' ? 'codex' : 'claudeCode';

@@ -263,9 +263,11 @@ export interface MemoryFile {
 }
 
 /**
- * All memory files for a single Claude Code project
+ * Memory files owned by a Claude Code project or Codex's durable memory store.
  */
 export interface ProjectMemory {
+  /** Missing in older payloads, which are treated as Claude Code. */
+  provider?: SessionProvider;
   projectName: string;
   projectPath: string;
   memoryDirPath: string;

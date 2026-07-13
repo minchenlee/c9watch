@@ -6,14 +6,15 @@
 		provider?: SessionProvider;
 		surface?: SessionSurface;
 		compact?: boolean;
+		noun?: string;
 	}
 
-	let { provider = 'claudeCode', surface, compact = false }: Props = $props();
+	let { provider = 'claudeCode', surface, compact = false, noun = 'session' }: Props = $props();
 	let normalized = $derived<SessionProvider>(provider === 'codex' ? 'codex' : 'claudeCode');
 	let surfaceText = $derived(normalized === 'codex' ? surfaceLabel(surface) : null);
 </script>
 
-<span class="provider-stack" class:compact aria-label={`${providerLabel(normalized)} session${surfaceText ? `, ${surfaceText}` : ''}`}>
+<span class="provider-stack" class:compact aria-label={`${providerLabel(normalized)} ${noun}${surfaceText ? `, ${surfaceText}` : ''}`}>
 	<span class="provider-badge" class:codex={normalized === 'codex'}>{providerLabel(normalized)}</span>
 	{#if surfaceText}<span class="surface-badge">{surfaceText}</span>{/if}
 </span>

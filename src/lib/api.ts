@@ -129,7 +129,7 @@ export async function getCostData(): Promise<CostData | null> {
 }
 
 /**
- * Get all memory files from ~/.claude/projects/{project}/memory/*.md
+ * Get supported Claude Code project memories and Codex durable memory files.
  * (Desktop/Tauri only — returns empty array on mobile/browser)
  */
 export async function getMemoryFiles(): Promise<ProjectMemory[]> {
