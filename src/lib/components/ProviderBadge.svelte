@@ -7,15 +7,16 @@
 		surface?: SessionSurface;
 		compact?: boolean;
 		noun?: string;
+		accent?: 'default' | 'cost';
 	}
 
-	let { provider = 'claudeCode', surface, compact = false, noun = 'session' }: Props = $props();
+	let { provider = 'claudeCode', surface, compact = false, noun = 'session', accent = 'default' }: Props = $props();
 	let normalized = $derived<SessionProvider>(provider === 'codex' ? 'codex' : 'claudeCode');
 	let surfaceText = $derived(normalized === 'codex' ? surfaceLabel(surface) : null);
 </script>
 
 <span class="provider-stack" class:compact aria-label={`${providerLabel(normalized)} ${noun}${surfaceText ? `, ${surfaceText}` : ''}`}>
-	<span class="provider-badge" class:codex={normalized === 'codex'}>{providerLabel(normalized)}</span>
+	<span class="provider-badge" class:codex={normalized === 'codex'} class:cost-accent={accent === 'cost'}>{providerLabel(normalized)}</span>
 	{#if surfaceText}<span class="surface-badge">{surfaceText}</span>{/if}
 </span>
 
@@ -29,6 +30,7 @@
 		background: color-mix(in srgb, var(--bg-elevated) 86%, transparent);
 	}
 	.provider-badge.codex { color: var(--accent-amber); border-color: color-mix(in srgb, var(--accent-amber) 42%, var(--border-default)); }
+	.provider-badge.codex.cost-accent { color: var(--accent-blue); border-color: color-mix(in srgb, var(--accent-blue) 55%, var(--border-default)); }
 	.surface-badge { height: 16px; padding: 0 4px; border-style: dashed; font-size: 7px; color: var(--text-secondary); }
 	.compact .provider-badge { height: 16px; font-size: 7px; }
 	.compact .surface-badge { display: none; }

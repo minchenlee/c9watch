@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { getConversation } from '$lib/api';
-	import type { HistoryEntry, Conversation, CostData } from '$lib/types';
+	import type { HistoryEntry, Conversation, CostData, SessionCostRecord, SessionProvider } from '$lib/types';
 	import TokenDistanceVisualizer from './token-distance/TokenDistanceVisualizer.svelte';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
 	import { costData as costDataStore, costMode, refreshCostData } from '$lib/stores/cost';
@@ -26,6 +26,21 @@
 
 	function sumTokens(sessions: import('$lib/types').SessionCostRecord[]): number {
 		return sessions.reduce((sum, s) => sum + (s.totalTokens || 0), 0);
+	}
+
+	function providerUsageValue(sessions: SessionCostRecord[], provider: SessionProvider): number {
+		return sessions
+			.filter((session) => (session.provider === 'codex' ? 'codex' : 'claudeCode') === provider)
+			.reduce((sum, session) => {
+				if (mode === 'tokens') return sum + (session.totalTokens || 0);
+				return sum + (isCostAvailable(session) ? session.cost : 0);
+			}, 0);
+	}
+
+	function claudeUsageShare(sessions: SessionCostRecord[]): number {
+		const claude = providerUsageValue(sessions, 'claudeCode');
+		const codex = providerUsageValue(sessions, 'codex');
+		return claude + codex > 0 ? (claude / (claude + codex)) * 100 : 100;
 	}
 
 	function formatAggregate(cost: number, tokens: number, unpricedTokens: number): string {
@@ -59,6 +74,7 @@
 		};
 	});
 	let mode = $derived($costMode);
+	let hasCodexUsage = $derived(costData?.dailyCosts.some((day) => day.sessions.some((session) => session.provider === 'codex')) ?? false);
 	let collapsedProjects = $state<Set<string>>(new Set());
 	let modelTrackWidth = $state(0);
 	let projectTrackWidth = $state(0);
@@ -459,11 +475,16 @@
 		return arr;
 	});
 
-	/** Build grid blocks: `filled` blocks of given color class, rest `empty` */
-	function buildBarBlocks(fillPct: number, totalCols: number, colorClass: string): Array<{ type: string }> {
+	/** Build a project bar with provider-specific blocks, then fill the remainder. */
+	function buildProviderBarBlocks(fillPct: number, totalCols: number, sessions: SessionCostRecord[]): Array<{ type: string }> {
 		const filled = Math.round((fillPct / 100) * totalCols);
+		const claude = providerUsageValue(sessions, 'claudeCode');
+		const codex = providerUsageValue(sessions, 'codex');
+		const total = claude + codex;
+		const claudeBlocks = total > 0 ? Math.round((claude / total) * filled) : 0;
 		const arr: Array<{ type: string }> = [];
-		for (let i = 0; i < filled; i++) arr.push({ type: colorClass });
+		for (let i = 0; i < claudeBlocks; i++) arr.push({ type: 'claude' });
+		for (let i = claudeBlocks; i < filled; i++) arr.push({ type: 'codex' });
 		while (arr.length < totalCols) arr.push({ type: 'empty' });
 		return arr;
 	}
@@ -560,14 +581,18 @@
 		<div class="state-msg">No cost data available.</div>
 		{:else}
 		<div class="list-area">
-			{#if filteredUnpricedTokens > 0}
+			{#if mode === 'usd' && (hasCodexUsage || filteredUnpricedTokens > 0)}
 				<div class="pricing-note" role="note">
-					<span class="pricing-note-label">USD COVERAGE</span>
+					<span class="pricing-note-label">{hasCodexUsage ? 'ESTIMATED USD' : 'USD COVERAGE'}</span>
 					<span>
-						{#if filteredUnpricedTokens === filteredTotalTokens}
-							Pricing unavailable for {formatTokens(filteredUnpricedTokens)} tracked tokens. Token totals remain complete.
-						{:else}
-							{formatCost(filteredTotalCost)} priced · {formatTokens(filteredUnpricedTokens)} tokens unpriced. USD totals exclude unpriced usage.
+						{#if hasCodexUsage}Codex cost uses OpenAI Standard API rates; it is not your ChatGPT/Codex subscription bill.{/if}
+						{#if hasCodexUsage && filteredUnpricedTokens > 0}<span aria-hidden="true"> · </span>{/if}
+						{#if filteredUnpricedTokens > 0}
+							{#if filteredUnpricedTokens === filteredTotalTokens}
+								Pricing unavailable for {formatTokens(filteredUnpricedTokens)} tracked tokens. Token totals remain complete.
+							{:else}
+								{formatCost(filteredTotalCost)} priced · {formatTokens(filteredUnpricedTokens)} tokens unpriced. USD totals exclude unpriced usage.
+							{/if}
 						{/if}
 					</span>
 				</div>
@@ -611,6 +636,7 @@
 				<div class="vchart-area">
 					{#each chronoBuckets as bucket (bucket.key)}
 						{@const barValue = mode === 'usd' ? bucket.cost : bucket.tokens}
+						{@const claudeShare = claudeUsageShare(bucket.sessions)}
 						<div
 							class="vchart-col"
 							onmouseenter={() => hoveredBucket = bucket.key}
@@ -629,7 +655,7 @@
 								<div
 									class="vchart-bar"
 									class:vchart-bar-empty={barValue === 0}
-									style="height: {bucketScaleMax > 0 ? (barValue / bucketScaleMax) * 100 : 0}%"
+									style="height: {bucketScaleMax > 0 ? (barValue / bucketScaleMax) * 100 : 0}%; --claude-share: {claudeShare}%"
 								></div>
 							</div>
 							<span class="vchart-label">
@@ -678,7 +704,7 @@
 							{@const projValue = mode === 'usd' ? proj.totalCost : proj.totalTokens}
 							<div class="grid-bar-track" bind:clientWidth={projectTrackWidth}>
 								<div class="grid-container" style="grid-template-columns: repeat({projectBarColumns}, 1fr);">
-									{#each buildBarBlocks(projectScaleMax > 0 ? (projValue / projectScaleMax) * 100 : 0, projectBarColumns, 'amber') as block}
+									{#each buildProviderBarBlocks(projectScaleMax > 0 ? (projValue / projectScaleMax) * 100 : 0, projectBarColumns, proj.sessions) as block}
 										<div class="rect {block.type}"></div>
 									{/each}
 								</div>
@@ -690,8 +716,8 @@
 							{#each expandedProjects.has(proj.project) ? sorted : sorted.slice(0, 5) as session (session.sessionId + '-' + session.date)}
 								<!-- svelte-ignore a11y_click_events_have_key_events -->
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
-								<div class="session-detail" onclick={() => handleSessionClick(session)}>
-									<ProviderBadge provider={session.provider} surface={session.surface} compact />
+								<div class="session-detail" class:codex-session={session.provider === 'codex'} onclick={() => handleSessionClick(session)}>
+									<ProviderBadge provider={session.provider} surface={session.surface} compact accent="cost" />
 									<span class="detail-name" title={session.sessionName || session.sessionId}>{session.sessionName || session.sessionId.slice(0, 8)}</span>
 									<span class="detail-session-id" title={session.sessionId}>{session.sessionId.slice(0, 8)}</span>
 									<span class="detail-spacer"></span>
@@ -968,7 +994,7 @@
 	.rect.sonnet { background-color: var(--accent-purple); box-shadow: 0 0 4px color-mix(in srgb, var(--accent-purple) 30%, transparent); }
 	.rect.haiku { background-color: var(--accent-pink); box-shadow: 0 0 4px color-mix(in srgb, var(--accent-pink) 30%, transparent); }
 	.rect.codex { background-color: var(--accent-blue); box-shadow: 0 0 4px color-mix(in srgb, var(--accent-blue) 30%, transparent); }
-	.rect.amber { background-color: var(--accent-amber); box-shadow: 0 0 4px color-mix(in srgb, var(--accent-amber) 30%, transparent); }
+	.rect.claude { background-color: var(--accent-amber); box-shadow: 0 0 4px color-mix(in srgb, var(--accent-amber) 30%, transparent); }
 
 	.model-legend {
 		display: flex;
@@ -1076,20 +1102,25 @@
 	.vchart-bar {
 		width: 100%;
 		min-height: 2px;
-		background: var(--accent-amber);
-		background-image: repeating-linear-gradient(
-			0deg,
-			transparent,
-			transparent 3px,
-			rgba(0, 0, 0, 0.2) 3px,
-			rgba(0, 0, 0, 0.2) 4px
-		);
-		box-shadow: 0 0 4px color-mix(in srgb, var(--accent-amber) 30%, transparent);
+		background:
+			repeating-linear-gradient(
+				0deg,
+				transparent,
+				transparent 3px,
+				rgba(0, 0, 0, 0.2) 3px,
+				rgba(0, 0, 0, 0.2) 4px
+			),
+			linear-gradient(
+				to top,
+				var(--accent-amber) 0 var(--claude-share),
+				var(--accent-blue) var(--claude-share) 100%
+			);
+		box-shadow: 0 0 4px color-mix(in srgb, var(--text-secondary) 30%, transparent);
 		transition: height 300ms ease;
 	}
 
 	.vchart-col:hover .vchart-bar {
-		box-shadow: 0 0 8px color-mix(in srgb, var(--accent-amber) 50%, transparent);
+		box-shadow: 0 0 8px color-mix(in srgb, var(--text-secondary) 50%, transparent);
 	}
 
 	.vchart-bar-empty {
@@ -1148,13 +1179,17 @@
 
 	.session-detail {
 		display: grid;
-		grid-template-columns: minmax(100px, 300px) auto 1fr auto auto auto;
+		grid-template-columns: auto minmax(100px, 300px) auto minmax(0, 1fr) auto auto minmax(60px, max-content);
 		gap: var(--space-md);
 		align-items: center;
 		padding: var(--space-xs) var(--space-sm);
 		font-family: var(--font-mono);
 		font-size: 13px;
 		cursor: pointer;
+	}
+
+	.session-detail.codex-session {
+		box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent-blue) 70%, transparent);
 	}
 
 	.session-detail:hover {
@@ -1171,21 +1206,29 @@
 	.detail-session-id {
 		color: var(--text-muted);
 		font-size: 11px;
+		white-space: nowrap;
 	}
 
 	.detail-time {
 		color: var(--text-muted);
+		white-space: nowrap;
 	}
 
 	.detail-model {
 		color: var(--text-muted);
 		min-width: 50px;
+		white-space: nowrap;
 	}
 
 	.detail-cost {
 		color: var(--text-secondary);
 		min-width: 50px;
 		text-align: right;
+		white-space: nowrap;
+	}
+
+	.session-detail.codex-session .detail-cost {
+		color: var(--accent-blue);
 	}
 
 	/* ── Project groups ───────────────────────────────────────────── */
