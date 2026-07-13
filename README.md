@@ -287,6 +287,7 @@ Thanks to these wonderful people who have contributed to c9watch:
     </tr>
     <tr>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/ajonesw"><img src="https://github.com/ajonesw.png?s=100" width="100px;" alt="Alex Jones-Wolsey"/><br /><sub><b>Alex Jones-Wolsey</b></sub></a><br /><a href="#code-ajonesw" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/jeff-carey"><img src="https://github.com/jeff-carey.png?s=100" width="100px;" alt="Jeff Carey"/><br /><sub><b>Jeff Carey</b></sub></a><br /><a href="#code-jeff-carey" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>
