@@ -5,15 +5,21 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::source::{
     AgentKind, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionKind,
     SessionProvider, SessionSource, SessionSurface,
 };
 
-const NORMAL_FRESHNESS_SECS: u64 = 90;
-const WORKING_FRESHNESS_SECS: u64 = 15 * 60;
+/// Rollouts do not expose a supported process-liveness API. Keep recently idle
+/// roots long enough to remain useful, but apply finite ceilings so crashed or
+/// closed sessions eventually age out.
+const IDLE_FRESHNESS_SECS: u64 = 30 * 60;
+const WORKING_FRESHNESS_SECS: u64 = 4 * 60 * 60;
+const LINKED_PARENT_CEILING_SECS: u64 = 24 * 60 * 60;
+const DISCOVERY_RECENT_SECS: u64 = LINKED_PARENT_CEILING_SECS;
+const FULL_DISCOVERY_INTERVAL_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CodexLifecycle {
@@ -44,6 +50,7 @@ pub struct CodexRolloutSummary {
     pub internal_kind: Option<String>,
     pub lifecycle: CodexLifecycle,
     pub messages: Vec<CodexMessage>,
+    pub started_at_ms: Option<i64>,
     pub last_timestamp: String,
 }
 
@@ -79,6 +86,8 @@ struct CacheEntry {
 pub struct CodexSessionSource {
     sessions_root: PathBuf,
     cache: HashMap<PathBuf, CacheEntry>,
+    archive_index: HashMap<String, PathBuf>,
+    last_full_discovery: Option<SystemTime>,
     #[cfg(test)]
     parse_count: usize,
 }
@@ -93,6 +102,8 @@ impl CodexSessionSource {
         Self {
             sessions_root,
             cache: HashMap::new(),
+            archive_index: HashMap::new(),
+            last_full_discovery: None,
             #[cfg(test)]
             parse_count: 0,
         }
@@ -110,8 +121,13 @@ impl CodexSessionSource {
             .collect()
     }
 
-    fn rollout_paths_at(&self, now: DateTime<Local>) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
+    fn rollout_paths_at(&mut self, now: DateTime<Local>, wall_now: SystemTime) -> Vec<PathBuf> {
+        let mut paths: HashSet<PathBuf> = self
+            .cache
+            .keys()
+            .filter(|path| rollout_age_secs(path, wall_now) <= DISCOVERY_RECENT_SECS)
+            .cloned()
+            .collect();
         for day_dir in self.candidate_day_dirs_at(now) {
             let Ok(entries) = fs::read_dir(day_dir) else {
                 continue;
@@ -123,10 +139,31 @@ impl CodexSessionSource {
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"));
                 if path.is_file() && is_rollout {
-                    paths.push(path);
+                    paths.insert(path);
                 }
             }
         }
+
+        let discovery_due = self.last_full_discovery.map_or(true, |last| {
+            wall_now.duration_since(last).unwrap_or_default().as_secs()
+                >= FULL_DISCOVERY_INTERVAL_SECS
+        });
+        if discovery_due {
+            let mut next_index = HashMap::new();
+            for path in collect_rollout_paths(&self.sessions_root) {
+                if let Some(thread_id) = thread_id_from_rollout_filename(&path) {
+                    next_index.insert(thread_id, path.clone());
+                }
+                if rollout_age_secs(&path, wall_now) <= DISCOVERY_RECENT_SECS {
+                    paths.insert(path);
+                }
+            }
+            self.archive_index = next_index;
+            self.last_full_discovery = Some(wall_now);
+        }
+
+        let mut paths: Vec<_> = paths.into_iter().collect();
+        paths.sort();
         paths
     }
 
@@ -203,29 +240,83 @@ impl CodexSessionSource {
         &mut self,
         now: DateTime<Local>,
     ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
-        let paths = self.rollout_paths_at(now);
-        let existing: HashSet<PathBuf> = paths.iter().cloned().collect();
+        self.detect_at_with_clock(now, SystemTime::now())
+    }
+
+    fn detect_at_with_clock(
+        &mut self,
+        now: DateTime<Local>,
+        wall_now: SystemTime,
+    ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
+        let paths = self.rollout_paths_at(now, wall_now);
+        let mut summaries = Vec::new();
+        for path in &paths {
+            let Ok(summary) = self.summary_for(path) else {
+                continue;
+            };
+            if !summary.thread_id.is_empty() {
+                self.archive_index
+                    .insert(summary.thread_id.clone(), path.clone());
+            }
+            summaries.push((path.clone(), summary, rollout_age_secs(path, wall_now)));
+        }
+
+        // A root rollout can be quiet while a spawned child is actively writing.
+        // Pull its immediate/root ancestors from the cached filename index and pin
+        // them only up to a finite ceiling.
+        let linked_parent_ids: HashSet<String> = summaries
+            .iter()
+            .filter(|(_, summary, age)| {
+                summary.agent_kind == AgentKind::Subagent
+                    && summary.lifecycle == CodexLifecycle::Working
+                    && *age <= WORKING_FRESHNESS_SECS
+            })
+            .flat_map(|(_, summary, _)| {
+                [
+                    summary.parent_thread_id.clone(),
+                    summary.root_session_id.clone(),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .collect();
+        let present_ids: HashSet<String> = summaries
+            .iter()
+            .map(|(_, summary, _)| summary.thread_id.clone())
+            .collect();
+        for thread_id in linked_parent_ids
+            .iter()
+            .filter(|id| !present_ids.contains(*id))
+        {
+            let Some(path) = self.archive_index.get(thread_id).cloned() else {
+                continue;
+            };
+            let age = rollout_age_secs(&path, wall_now);
+            if age > LINKED_PARENT_CEILING_SECS {
+                continue;
+            }
+            if let Ok(summary) = self.summary_for(&path) {
+                summaries.push((path, summary, age));
+            }
+        }
+
+        let existing: HashSet<PathBuf> =
+            summaries.iter().map(|(path, _, _)| path.clone()).collect();
         self.cache.retain(|path, _| existing.contains(path));
 
         let mut sessions = Vec::new();
-        for path in paths {
-            let Ok(summary) = self.summary_for(&path) else {
-                continue;
-            };
+        for (_path, summary, age_secs) in summaries {
             if summary.thread_id.is_empty() || summary.agent_kind == AgentKind::Internal {
                 continue;
             }
-            let age_secs = fs::metadata(&path)
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                .map_or(u64::MAX, |age| age.as_secs());
             let freshness = if summary.lifecycle == CodexLifecycle::Working {
                 WORKING_FRESHNESS_SECS
             } else {
-                NORMAL_FRESHNESS_SECS
+                IDLE_FRESHNESS_SECS
             };
-            if age_secs > freshness {
+            let linked_parent = linked_parent_ids.contains(&summary.thread_id)
+                && age_secs <= LINKED_PARENT_CEILING_SECS;
+            if age_secs > freshness && !linked_parent {
                 continue;
             }
 
@@ -242,7 +333,7 @@ impl CodexSessionSource {
                 session_id: Some(summary.thread_id.clone()),
                 project_name,
                 kind: SessionKind::Interactive,
-                started_at_ms: parse_timestamp_millis(&summary.last_timestamp),
+                started_at_ms: summary.started_at_ms,
                 official_name: summary.agent_nickname.clone(),
                 cli_activity: None,
                 provider: SessionProvider::Codex,
@@ -262,6 +353,54 @@ impl CodexSessionSource {
         }
         Ok((sessions, DetectionDiagnostics::default()))
     }
+}
+
+fn rollout_age_secs(path: &Path, wall_now: SystemTime) -> u64 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| wall_now.duration_since(modified).ok())
+        .map_or(u64::MAX, |age| age.as_secs())
+}
+
+/// A full discovery reads directory entries and metadata only. It is throttled
+/// by `FULL_DISCOVERY_INTERVAL_SECS`; JSONL content is parsed only for recently
+/// modified paths and linked ancestors.
+fn collect_rollout_paths(root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut pending = vec![(root.to_path_buf(), 0usize)];
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > 4 {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push((path, depth + 1));
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+            {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+fn thread_id_from_rollout_filename(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    if stem.len() < 36 {
+        return None;
+    }
+    let candidate = &stem[stem.len() - 36..];
+    uuid::Uuid::parse_str(candidate)
+        .ok()
+        .map(|id| id.to_string())
 }
 
 #[cfg(unix)]
@@ -306,13 +445,19 @@ fn apply_rollout_event(summary: &mut CodexRolloutSummary, value: &Value) {
         return;
     };
     match event_type {
-        Some("session_meta") => apply_session_meta(summary, payload),
+        Some("session_meta") => apply_session_meta(summary, timestamp, payload),
         Some("event_msg") => apply_event_message(summary, timestamp, payload),
         _ => {}
     }
 }
 
-fn apply_session_meta(summary: &mut CodexRolloutSummary, payload: &Value) {
+fn apply_session_meta(summary: &mut CodexRolloutSummary, timestamp: &str, payload: &Value) {
+    summary.started_at_ms = parse_timestamp_millis(timestamp).or_else(|| {
+        payload
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_timestamp_millis)
+    });
     summary.thread_id = payload
         .get("id")
         .and_then(Value::as_str)
@@ -518,6 +663,23 @@ mod tests {
         }
     }
 
+    fn set_modified_age(path: &Path, wall_now: SystemTime, age: Duration) {
+        let modified = wall_now.checked_sub(age).unwrap();
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+
+    fn session_ids(sessions: &[DetectedSession]) -> HashSet<&str> {
+        sessions
+            .iter()
+            .filter_map(|session| session.session_id.as_deref())
+            .collect()
+    }
+
     #[test]
     fn parses_app_and_cli_roots() {
         let temp = TempDir::new().unwrap();
@@ -549,6 +711,7 @@ mod tests {
         let mut spawned = CodexRolloutSummary::default();
         apply_session_meta(
             &mut spawned,
+            "2026-07-13T00:00:00Z",
             &serde_json::json!({
                 "id": "child", "cwd": "/tmp", "originator": "Codex Desktop",
                 "session_id": "root", "source": {"subagent": {"thread_spawn": {
@@ -564,6 +727,7 @@ mod tests {
         let mut guardian = CodexRolloutSummary::default();
         apply_session_meta(
             &mut guardian,
+            "2026-07-13T00:00:00Z",
             &serde_json::json!({
                 "id": "g", "cwd": "/tmp", "originator": "Codex Desktop",
                 "source": {"subagent": {"other": "guardian"}}
@@ -575,6 +739,7 @@ mod tests {
         let mut review = CodexRolloutSummary::default();
         apply_session_meta(
             &mut review,
+            "2026-07-13T00:00:00Z",
             &serde_json::json!({
                 "id": "r", "cwd": "/tmp", "originator": "codex_exec",
                 "source": {"subagent": "review"}
@@ -664,6 +829,136 @@ mod tests {
     }
 
     #[test]
+    fn discovers_recently_modified_rollout_in_old_creation_directory() {
+        let temp = TempDir::new().unwrap();
+        let old_day = temp.path().join("2025/01/02");
+        fs::create_dir_all(&old_day).unwrap();
+        let path =
+            old_day.join("rollout-2025-01-02T00-00-00-019f58e8-afcb-7681-bf1b-585420b500c3.jsonl");
+        let mut lines = root_fixture(Value::String("cli".into()), "codex-tui");
+        lines.push(event(
+            "2026-07-13T00:00:03Z",
+            "event_msg",
+            serde_json::json!({"type":"task_complete"}),
+        ));
+        write_lines(&path, &lines, true);
+
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let (sessions, _) = source
+            .detect_at_with_clock(Local::now(), SystemTime::now())
+            .unwrap();
+        assert!(session_ids(&sessions).contains("root-id"));
+    }
+
+    #[test]
+    fn retains_idle_root_beyond_ninety_seconds_with_finite_ceiling() {
+        let temp = TempDir::new().unwrap();
+        let now = Local::now();
+        let wall_now = SystemTime::now();
+        let day = temp.path().join(now.format("%Y/%m/%d").to_string());
+        fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout-idle-root.jsonl");
+        let mut lines = root_fixture(Value::String("vscode".into()), "Codex Desktop");
+        lines.push(event(
+            "2026-07-13T00:00:03Z",
+            "event_msg",
+            serde_json::json!({"type":"task_complete"}),
+        ));
+        write_lines(&path, &lines, true);
+        set_modified_age(&path, wall_now, Duration::from_secs(5 * 60));
+
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let (sessions, _) = source.detect_at_with_clock(now, wall_now).unwrap();
+        assert!(session_ids(&sessions).contains("root-id"));
+    }
+
+    #[test]
+    fn retains_long_working_turn() {
+        let temp = TempDir::new().unwrap();
+        let now = Local::now();
+        let wall_now = SystemTime::now();
+        let day = temp.path().join(now.format("%Y/%m/%d").to_string());
+        fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout-working-root.jsonl");
+        write_lines(
+            &path,
+            &root_fixture(Value::String("cli".into()), "codex-tui"),
+            true,
+        );
+        set_modified_age(&path, wall_now, Duration::from_secs(30 * 60));
+
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let (sessions, _) = source.detect_at_with_clock(now, wall_now).unwrap();
+        assert!(session_ids(&sessions).contains("root-id"));
+    }
+
+    #[test]
+    fn active_child_pins_stale_root_but_not_forever() {
+        const ROOT: &str = "019f58e8-afcb-7681-bf1b-585420b500c3";
+        const CHILD: &str = "019f5986-4549-79e1-a409-0d09dcb7044c";
+        let temp = TempDir::new().unwrap();
+        let now = Local::now();
+        let wall_now = SystemTime::now();
+        let day = temp.path().join(now.format("%Y/%m/%d").to_string());
+        fs::create_dir_all(&day).unwrap();
+        let root_path = day.join(format!("rollout-2026-07-13T00-00-00-{ROOT}.jsonl"));
+        write_lines(
+            &root_path,
+            &[
+                event(
+                    "2026-07-13T00:00:00Z",
+                    "session_meta",
+                    serde_json::json!({"id":ROOT,"cwd":"/tmp/project","source":"vscode","originator":"Codex Desktop"}),
+                ),
+                event(
+                    "2026-07-13T00:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"task_complete"}),
+                ),
+            ],
+            true,
+        );
+        set_modified_age(&root_path, wall_now, Duration::from_secs(2 * 60 * 60));
+        let child_path = day.join(format!("rollout-2026-07-13T01-00-00-{CHILD}.jsonl"));
+        write_lines(
+            &child_path,
+            &[
+                event(
+                    "2026-07-13T01:00:00Z",
+                    "session_meta",
+                    serde_json::json!({
+                        "id":CHILD,"session_id":ROOT,"cwd":"/tmp/project",
+                        "originator":"Codex Desktop","source":{"subagent":{"thread_spawn":{
+                            "parent_thread_id":ROOT,"depth":1,"agent_path":"/root/child"
+                        }}}
+                    }),
+                ),
+                event(
+                    "2026-07-13T01:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"task_started"}),
+                ),
+            ],
+            true,
+        );
+
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let (sessions, _) = source.detect_at_with_clock(now, wall_now).unwrap();
+        let ids = session_ids(&sessions);
+        assert!(ids.contains(ROOT));
+        assert!(ids.contains(CHILD));
+
+        set_modified_age(
+            &root_path,
+            wall_now,
+            Duration::from_secs(LINKED_PARENT_CEILING_SECS + 1),
+        );
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let (sessions, _) = source.detect_at_with_clock(now, wall_now).unwrap();
+        assert!(!session_ids(&sessions).contains(ROOT));
+    }
+
+    #[test]
     fn response_items_are_never_conversation_messages() {
         let mut summary = CodexRolloutSummary::default();
         apply_rollout_event(
@@ -711,6 +1006,10 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].provider, SessionProvider::Codex);
         assert_eq!(sessions[0].agent_kind, AgentKind::Root);
+        assert_eq!(
+            sessions[0].started_at_ms,
+            parse_timestamp_millis("2026-07-13T00:00:00Z")
+        );
         assert!(!sessions[0].can_open);
         assert!(!sessions[0].can_stop);
         assert!(!sessions[0].can_rename);
