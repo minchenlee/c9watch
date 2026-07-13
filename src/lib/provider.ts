@@ -47,6 +47,14 @@ export function isTopLevelSession(session: Session): boolean {
 }
 
 export function canSessionAction(session: Session, action: SessionAction): boolean {
+	const directCapability = {
+		open: session.canOpen,
+		stop: session.canStop,
+		rename: session.canRename,
+		conversation: undefined
+	}[action];
+	if (typeof directCapability === 'boolean') return directCapability;
+
 	const caps = session.actionCapabilities ?? session.capabilities;
 	const aliases = {
 		open: ['open', 'canOpen'],
