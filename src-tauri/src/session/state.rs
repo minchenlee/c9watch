@@ -1,4 +1,5 @@
 // src-tauri/src/session/state.rs
+use super::codex::CodexSessionSource;
 use super::source::{
     DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource,
 };
@@ -14,6 +15,7 @@ pub struct DetectorState {
     consecutive_failures: u32,
     telemetry_counter: Arc<AtomicU32>,
     mode: BackendMode,
+    codex_source: Option<CodexSessionSource>,
 }
 
 impl DetectorState {
@@ -23,21 +25,32 @@ impl DetectorState {
             consecutive_failures: 0,
             telemetry_counter: Arc::new(AtomicU32::new(0)),
             mode: mode_from_env(),
+            codex_source: CodexSessionSource::new().ok(),
         }
     }
 
     pub fn detect(
         &mut self,
     ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
-        match self.source.detect() {
-            Ok(out) => {
+        let claude_result = self.source.detect();
+        let codex_result = self.codex_source.as_mut().map(SessionSource::detect);
+        match claude_result {
+            Ok((mut sessions, diagnostics)) => {
                 self.consecutive_failures = 0;
-                Ok(out)
+                if let Some(Ok((mut codex_sessions, _))) = codex_result {
+                    sessions.append(&mut codex_sessions);
+                }
+                Ok((sessions, diagnostics))
             }
             Err(e) => {
                 self.consecutive_failures += 1;
                 if self.should_downgrade() {
                     self.downgrade_to_legacy();
+                }
+                if let Some(Ok((codex_sessions, diagnostics))) = codex_result {
+                    if !codex_sessions.is_empty() {
+                        return Ok((codex_sessions, diagnostics));
+                    }
                 }
                 Err(e)
             }
@@ -87,6 +100,7 @@ impl DetectorState {
             consecutive_failures: 0,
             telemetry_counter: Arc::new(AtomicU32::new(0)),
             mode,
+            codex_source: None,
         }
     }
 

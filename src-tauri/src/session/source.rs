@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
 
+use super::codex::CodexRolloutSummary;
+
 #[derive(Error, Debug)]
 pub enum SessionDetectorError {
     #[error("Failed to read directory: {0}")]
@@ -33,6 +35,35 @@ pub enum CliActivity {
     Idle,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionProvider {
+    #[default]
+    ClaudeCode,
+    Codex,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionSurface {
+    #[default]
+    ClaudeCode,
+    App,
+    Cli,
+    Exec,
+    Integration,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentKind {
+    #[default]
+    Root,
+    Subagent,
+    Internal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DetectionDiagnostics {
@@ -53,6 +84,36 @@ pub struct DetectedSession {
     pub started_at_ms: Option<i64>,
     pub official_name: Option<String>,
     pub cli_activity: Option<CliActivity>,
+    #[serde(default)]
+    pub provider: SessionProvider,
+    #[serde(default)]
+    pub surface: SessionSurface,
+    #[serde(default)]
+    pub agent_kind: AgentKind,
+    #[serde(default)]
+    pub parent_thread_id: Option<String>,
+    #[serde(default)]
+    pub root_session_id: Option<String>,
+    #[serde(default)]
+    pub agent_path: Option<String>,
+    #[serde(default)]
+    pub agent_nickname: Option<String>,
+    #[serde(default)]
+    pub agent_role: Option<String>,
+    #[serde(default)]
+    pub internal_kind: Option<String>,
+    #[serde(default = "default_true")]
+    pub can_open: bool,
+    #[serde(default = "default_true")]
+    pub can_stop: bool,
+    #[serde(default = "default_true")]
+    pub can_rename: bool,
+    #[serde(skip)]
+    pub codex_summary: Option<CodexRolloutSummary>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl DetectedSession {
@@ -74,6 +135,19 @@ impl DetectedSession {
             started_at_ms: None,
             official_name: None,
             cli_activity: None,
+            provider: SessionProvider::ClaudeCode,
+            surface: SessionSurface::ClaudeCode,
+            agent_kind: AgentKind::Root,
+            parent_thread_id: None,
+            root_session_id: None,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+            internal_kind: None,
+            can_open: true,
+            can_stop: true,
+            can_rename: true,
+            codex_summary: None,
         }
     }
 }
@@ -115,5 +189,17 @@ mod tests {
         assert_eq!(d.started_at_ms, None);
         assert!(d.official_name.is_none());
         assert!(d.cli_activity.is_none());
+        assert_eq!(d.provider, SessionProvider::ClaudeCode);
+        assert_eq!(d.surface, SessionSurface::ClaudeCode);
+        assert_eq!(d.agent_kind, AgentKind::Root);
+        assert!(d.can_open && d.can_stop && d.can_rename);
+    }
+
+    #[test]
+    fn provider_surface_and_agent_kind_use_frontend_contract_values() {
+        assert_eq!(serde_json::to_string(&SessionProvider::ClaudeCode).unwrap(), "\"claudeCode\"");
+        assert_eq!(serde_json::to_string(&SessionProvider::Codex).unwrap(), "\"codex\"");
+        assert_eq!(serde_json::to_string(&SessionSurface::Integration).unwrap(), "\"integration\"");
+        assert_eq!(serde_json::to_string(&AgentKind::Subagent).unwrap(), "\"subagent\"");
     }
 }

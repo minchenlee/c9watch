@@ -1,4 +1,5 @@
 pub mod custom_names;
+pub mod codex;
 pub mod detector;
 pub mod parser;
 pub mod permissions;
@@ -11,7 +12,10 @@ pub mod detector_cli;
 pub use detector_cli::CliSessionSource;
 pub mod state;
 pub use state::DetectorState;
-pub use source::{CliActivity, DetectedSession, DetectionDiagnostics, SessionKind, SessionSource};
+pub use source::{
+    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionKind, SessionProvider,
+    SessionSource, SessionSurface,
+};
 pub use parser::{
     extract_messages, parse_all_entries, parse_last_n_entries, parse_sessions_index, ImageBlock,
     MessageContent, MessageType, SessionEntry, SessionIndexEntry, SessionsIndex,

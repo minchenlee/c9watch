@@ -27,39 +27,57 @@ pub fn get_conversation_data(session_id: &str) -> Result<Conversation, String> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
     let claude_projects_dir = home_dir.join(".claude").join("projects");
 
-    let entries = std::fs::read_dir(&claude_projects_dir)
-        .map_err(|e| format!("Failed to read projects directory: {}", e))?;
-
     let session_filename = format!("{}.jsonl", session_id);
 
-    for entry in entries.flatten() {
-        let project_path = entry.path();
-        if !project_path.is_dir() {
-            continue;
+    if let Ok(entries) = std::fs::read_dir(&claude_projects_dir) {
+        for entry in entries.flatten() {
+            let project_path = entry.path();
+            if !project_path.is_dir() {
+                continue;
+            }
+
+            let session_file = project_path.join(&session_filename);
+            if session_file.exists() {
+                let entries = parse_all_entries(&session_file)
+                    .map_err(|e| format!("Failed to parse session file: {}", e))?;
+
+                let messages = extract_messages(&entries);
+
+                let conversation_messages: Vec<ConversationMessage> = messages
+                    .into_iter()
+                    .map(|(timestamp, msg_type, content, images)| ConversationMessage {
+                        timestamp,
+                        message_type: msg_type,
+                        content,
+                        images,
+                    })
+                    .collect();
+
+                return Ok(Conversation {
+                    session_id: session_id.to_string(),
+                    messages: conversation_messages,
+                });
+            }
         }
+    }
 
-        let session_file = project_path.join(&session_filename);
-        if session_file.exists() {
-            let entries = parse_all_entries(&session_file)
-                .map_err(|e| format!("Failed to parse session file: {}", e))?;
-
-            let messages = extract_messages(&entries);
-
-            let conversation_messages: Vec<ConversationMessage> = messages
+    if let Ok(messages) = crate::session::codex::find_codex_conversation(session_id) {
+        return Ok(Conversation {
+            session_id: session_id.to_string(),
+            messages: messages
                 .into_iter()
-                .map(|(timestamp, msg_type, content, images)| ConversationMessage {
-                    timestamp,
-                    message_type: msg_type,
-                    content,
-                    images,
+                .map(|message| ConversationMessage {
+                    timestamp: message.timestamp,
+                    message_type: if message.role == "user" {
+                        MessageType::User
+                    } else {
+                        MessageType::Assistant
+                    },
+                    content: message.content,
+                    images: Vec::new(),
                 })
-                .collect();
-
-            return Ok(Conversation {
-                session_id: session_id.to_string(),
-                messages: conversation_messages,
-            });
-        }
+                .collect(),
+        });
     }
 
     Err(format!(

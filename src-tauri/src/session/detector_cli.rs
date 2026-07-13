@@ -78,6 +78,19 @@ impl CliSessionSource {
                 _ => None,
             },
             cwd: a.cwd,
+            provider: super::source::SessionProvider::ClaudeCode,
+            surface: super::source::SessionSurface::ClaudeCode,
+            agent_kind: super::source::AgentKind::Root,
+            parent_thread_id: None,
+            root_session_id: None,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+            internal_kind: None,
+            can_open: true,
+            can_stop: true,
+            can_rename: true,
+            codex_summary: None,
         }
     }
 }
