@@ -45,6 +45,7 @@
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
 	import { workersByPm, expandedSessionId } from '$lib/stores/sessions';
 	import { visibleSubagentsBySession } from '$lib/stores/subagents';
+	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
 	import { formatTimeSince, formatDurationMs } from '$lib/time-utils';
 	import { getSessionStatusColor, getSessionStatusLabel, getSubagentStatusColor, getSubagentStatusLabel, getWorkerStatusColor, getWorkerStatusLabel } from '$lib/status-utils';
@@ -174,8 +175,12 @@
 	let resolvedWorkers = $derived(
 		$workersByPm.get(session.workerOf ?? session.id) ?? []
 	);
-	let isPm = $derived(!session.workerOf && resolvedWorkers.length > 0);
-	let showWorkersPanel = $derived(resolvedWorkers.length > 0);
+	let isPm = $derived(
+		PM_ORCHESTRATION_ENABLED && !session.workerOf && resolvedWorkers.length > 0
+	);
+	let showWorkersPanel = $derived(
+		PM_ORCHESTRATION_ENABLED && resolvedWorkers.length > 0
+	);
 
 	let mySubagents = $derived($visibleSubagentsBySession.get(session.id) ?? []);
 	let hasSubagents = $derived(mySubagents.length > 0);
@@ -317,7 +322,7 @@
 								onmouseleave={tipLeave}
 								onmousemove={tipMove}
 							>{session.customTitle || session.summary || session.firstPrompt || 'New Session'}</h2>
-							{#if session.workerOf}
+							{#if PM_ORCHESTRATION_ENABLED && session.workerOf}
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<span
 									class="worker-badge"

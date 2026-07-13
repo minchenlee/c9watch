@@ -4,6 +4,7 @@
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
 	import { workersByPm } from '$lib/stores/sessions';
 	import { formatCostOrTokens } from '$lib/cost-utils';
+	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 
 	interface Props {
 		session: Session;
@@ -166,7 +167,7 @@
 >
 	<!-- Card Content -->
 	<div class="card-body">
-		{#if workersView && session.workerOf}
+		{#if PM_ORCHESTRATION_ENABLED && workersView && session.workerOf}
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div
 				class="pm-prefix"
@@ -218,7 +219,7 @@
 		<div class="stats-row">
 			<div class="badge-group">
 				<span class="session-name-badge">{session.sessionName}</span>
-				{#if session.workerOf && !workersView}
+				{#if PM_ORCHESTRATION_ENABLED && session.workerOf && !workersView}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<span
 						class="worker-badge"
@@ -227,7 +228,7 @@
 						onmousemove={tipMove}
 					>WORKER</span>
 				{/if}
-				{#if isPm}
+				{#if PM_ORCHESTRATION_ENABLED && isPm}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<span
 						class="pm-badge"
