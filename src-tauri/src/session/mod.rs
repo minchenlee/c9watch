@@ -30,6 +30,7 @@ pub mod history;
 pub use history::{deep_search, get_history, DeepSearchHit, HistoryEntry};
 
 pub mod cost;
+mod codex_archive;
 pub use cost::{get_cost_data, CostData};
 
 pub mod memory;

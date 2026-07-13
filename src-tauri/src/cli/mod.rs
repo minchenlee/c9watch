@@ -1293,6 +1293,9 @@ fn enrich_history_entry(entry: session::HistoryEntry) -> serde_json::Value {
         "timestamp": entry.timestamp,
         "project": entry.project,
         "projectName": entry.project_name,
+        "provider": entry.provider,
+        "surface": entry.surface,
+        "agentKind": entry.agent_kind,
     });
 
     if let Some(title) = entry.custom_title {

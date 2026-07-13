@@ -26,6 +26,16 @@ pub struct HistoryEntry {
     pub project: String,
     pub project_name: String,
     pub custom_title: Option<String>,
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<String>,
+}
+
+fn default_provider() -> String {
+    "claudeCode".to_string()
 }
 
 /// Accumulated state per session during dedup: earliest and latest prompt entries.
@@ -59,10 +69,13 @@ pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
                 }
                 None => {
                     let sid = raw.session_id.clone();
-                    by_session.insert(sid, SessionAccum {
-                        last: raw.clone(),
-                        first: raw,
-                    });
+                    by_session.insert(
+                        sid,
+                        SessionAccum {
+                            last: raw.clone(),
+                            first: raw,
+                        },
+                    );
                 }
             }
         }
@@ -83,6 +96,9 @@ pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
                 project: accum.first.project,
                 project_name,
                 custom_title: None,
+                provider: default_provider(),
+                surface: None,
+                agent_kind: None,
             }
         })
         .collect();
@@ -96,17 +112,43 @@ pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
 pub fn get_history() -> Result<Vec<HistoryEntry>, String> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
     let path = home_dir.join(".claude").join("history.jsonl");
-
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read history.jsonl: {e}"))?;
-
-    let entries = parse_history_jsonl(&content);
     let projects_dir = home_dir.join(".claude").join("projects");
-    Ok(filter_and_enrich(entries, &projects_dir, true))
+    let mut entries = if path.exists() {
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read history.jsonl: {e}"))?;
+        filter_and_enrich(parse_history_jsonl(&content), &projects_dir, true)
+    } else {
+        Vec::new()
+    };
+
+    entries.extend(codex_history_entries(&home_dir));
+    entries.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    Ok(entries)
+}
+
+fn codex_history_entries(home_dir: &std::path::Path) -> Vec<HistoryEntry> {
+    super::codex_archive::load_default_snapshots(home_dir)
+        .into_iter()
+        .filter(|snapshot| !snapshot.is_internal())
+        .map(|snapshot| {
+            let project_name = PathBuf::from(&snapshot.cwd)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            HistoryEntry {
+                session_id: snapshot.thread_id,
+                display: snapshot.display,
+                timestamp: snapshot.updated_at_ms.max(snapshot.created_at_ms),
+                project: snapshot.cwd,
+                project_name,
+                custom_title: None,
+                provider: "codex".to_string(),
+                surface: Some(snapshot.surface),
+                agent_kind: Some(snapshot.agent_kind),
+            }
+        })
+        .collect()
 }
 
 /// Drop entries whose session JSONL has been removed (via `/clear`, Claude Code
@@ -151,6 +193,10 @@ pub struct DeepSearchHit {
     pub session_id: String,
     /// Up to 200 chars of context around the first keyword match, from the matching line.
     pub snippet: String,
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
 }
 
 /// Returns true if `haystack` contains `needle` according to the given mode flags.
@@ -249,7 +295,9 @@ fn extract_message_text(line: &str) -> Option<String> {
                 .iter()
                 .filter_map(|b| {
                     if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                        b.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
                     } else {
                         None
                     }
@@ -279,10 +327,6 @@ pub fn deep_search(
 ) -> Result<Vec<DeepSearchHit>, String> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
     let projects_dir = home_dir.join(".claude").join("projects");
-
-    if !projects_dir.exists() {
-        return Ok(vec![]);
-    }
 
     let query_norm = if case_sensitive {
         query.to_string()
@@ -347,14 +391,19 @@ pub fn deep_search(
                         })
                         .collect();
                     // Find first message containing the query (as phrase).
-                    let hit = messages.iter().find(|(_, norm)| {
-                        phrase_match(norm, query_norm.as_str(), whole_word)
-                    });
+                    let hit = messages
+                        .iter()
+                        .find(|(_, norm)| phrase_match(norm, query_norm.as_str(), whole_word));
                     if let Some((text, norm)) = hit {
                         let snippet = extract_snippet(text, norm, query_norm.as_str());
                         if !snippet.is_empty() {
                             let mut guard = matched.lock().unwrap();
-                            guard.push(DeepSearchHit { session_id, snippet });
+                            guard.push(DeepSearchHit {
+                                session_id,
+                                snippet,
+                                provider: default_provider(),
+                                surface: None,
+                            });
                         }
                     }
                 }
@@ -366,10 +415,69 @@ pub fn deep_search(
         let _ = handle.join();
     }
 
-    let result = Arc::try_unwrap(matched)
+    let mut result = Arc::try_unwrap(matched)
         .map_err(|_| "Arc unwrap failed")?
         .into_inner()
         .map_err(|e| format!("Mutex poisoned: {e}"))?;
+
+    let codex_snapshots: Vec<_> = super::codex_archive::load_default_snapshots(&home_dir)
+        .into_iter()
+        .filter(|snapshot| !snapshot.is_internal())
+        .collect();
+    let codex_matched: Arc<Mutex<Vec<DeepSearchHit>>> = Arc::new(Mutex::new(Vec::new()));
+    let candidates = Arc::new(codex_snapshots);
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let worker_count = candidates.len().min(4);
+    let handles: Vec<_> = (0..worker_count)
+        .map(|_| {
+            let candidates = Arc::clone(&candidates);
+            let next = Arc::clone(&next);
+            let matched = Arc::clone(&codex_matched);
+            let query_norm = Arc::clone(&query_norm);
+            std::thread::spawn(move || loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(snapshot) = candidates.get(index) else {
+                    break;
+                };
+                if let Some(text) = super::codex_archive::search_rollout(
+                    snapshot,
+                    query_norm.as_str(),
+                    case_sensitive,
+                    whole_word,
+                    phrase_match,
+                ) {
+                    let normalized = if case_sensitive {
+                        text.clone()
+                    } else {
+                        text.to_lowercase()
+                    };
+                    let snippet = extract_snippet(&text, &normalized, query_norm.as_str());
+                    if !snippet.is_empty() {
+                        matched.lock().unwrap().push(DeepSearchHit {
+                            session_id: snapshot.thread_id.clone(),
+                            snippet,
+                            provider: "codex".to_string(),
+                            surface: Some(snapshot.surface.clone()),
+                        });
+                    }
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        let _ = handle.join();
+    }
+    result.extend(
+        Arc::try_unwrap(codex_matched)
+            .map_err(|_| "Codex search Arc unwrap failed")?
+            .into_inner()
+            .map_err(|error| format!("Codex search mutex poisoned: {error}"))?,
+    );
+    result.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
 
     Ok(result)
 }
@@ -502,6 +610,9 @@ mod tests {
                 project: project.into(),
                 project_name: "myproj".into(),
                 custom_title: None,
+                provider: default_provider(),
+                surface: None,
+                agent_kind: None,
             },
             HistoryEntry {
                 session_id: "drop-sid".into(),
@@ -510,6 +621,9 @@ mod tests {
                 project: project.into(),
                 project_name: "myproj".into(),
                 custom_title: None,
+                provider: default_provider(),
+                surface: None,
+                agent_kind: None,
             },
         ];
 
@@ -528,9 +642,64 @@ mod tests {
             project: "/p/gone".into(),
             project_name: "gone".into(),
             custom_title: None,
+            provider: default_provider(),
+            surface: None,
+            agent_kind: None,
         }];
         let out = filter_and_enrich(entries, tmp.path(), false);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn codex_history_includes_app_cli_and_normal_subagents_but_not_guardians() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".codex/sessions/2026/07/13");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let fixtures = [
+            (
+                "app.jsonl",
+                r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"app-history","cwd":"/tmp/app","source":"vscode","originator":"Codex Desktop"}}
+{"timestamp":"2026-07-13T01:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"app request"}]}}"#,
+            ),
+            (
+                "cli.jsonl",
+                r#"{"timestamp":"2026-07-13T02:00:00Z","type":"session_meta","payload":{"id":"cli-history","cwd":"/tmp/cli","source":"cli","originator":"codex-tui"}}
+{"timestamp":"2026-07-13T02:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"cli request"}}"#,
+            ),
+            (
+                "child.jsonl",
+                r#"{"timestamp":"2026-07-13T03:00:00Z","type":"session_meta","payload":{"id":"child-history","cwd":"/tmp/app","originator":"Codex Desktop","source":{"subagent":{"thread_spawn":{"parent_thread_id":"app-history","depth":1}}}}}"#,
+            ),
+            (
+                "guardian.jsonl",
+                r#"{"timestamp":"2026-07-13T04:00:00Z","type":"session_meta","payload":{"id":"guardian-history","cwd":"/tmp/app","originator":"Codex Desktop","source":{"subagent":{"other":"guardian"}}}}"#,
+            ),
+        ];
+        for (name, content) in fixtures {
+            std::fs::write(sessions.join(name), content).unwrap();
+        }
+
+        let entries = codex_history_entries(home.path());
+        assert_eq!(entries.len(), 3);
+        let app = entries
+            .iter()
+            .find(|entry| entry.session_id == "app-history")
+            .unwrap();
+        assert_eq!(app.provider, "codex");
+        assert_eq!(app.surface.as_deref(), Some("app"));
+        assert_eq!(app.display, "app request");
+        let cli = entries
+            .iter()
+            .find(|entry| entry.session_id == "cli-history")
+            .unwrap();
+        assert_eq!(cli.surface.as_deref(), Some("cli"));
+        assert_eq!(cli.display, "cli request");
+        assert!(entries
+            .iter()
+            .any(|entry| entry.agent_kind.as_deref() == Some("subagent")));
+        assert!(!entries
+            .iter()
+            .any(|entry| entry.session_id == "guardian-history"));
     }
 
     // ── phrase_match ────────────────────────────────────────────────
@@ -538,9 +707,17 @@ mod tests {
     #[test]
     fn test_phrase_match_substring_default() {
         // Plain substring — case-insensitive caller lowercases both sides.
-        assert!(phrase_match("hello claude code world", "claude code", false));
+        assert!(phrase_match(
+            "hello claude code world",
+            "claude code",
+            false
+        ));
         // Two words present but not as a phrase → no match
-        assert!(!phrase_match("claude is here and code is there", "claude code", false));
+        assert!(!phrase_match(
+            "claude is here and code is there",
+            "claude code",
+            false
+        ));
     }
 
     #[test]
