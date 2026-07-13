@@ -13,6 +13,78 @@ struct ModelPricing {
     output: f64,
 }
 
+/// OpenAI Standard short-context API pricing in USD per million tokens.
+/// Source: https://developers.openai.com/api/docs/pricing (checked 2026-07-13).
+struct CodexModelPricing {
+    input: f64,
+    cached_input: f64,
+    output: f64,
+}
+
+fn get_codex_pricing(model: &str) -> Option<CodexModelPricing> {
+    Some(match model {
+        "gpt-5.6-sol" => CodexModelPricing {
+            input: 5.0,
+            cached_input: 0.50,
+            output: 30.0,
+        },
+        "gpt-5.6-terra" => CodexModelPricing {
+            input: 2.50,
+            cached_input: 0.25,
+            output: 15.0,
+        },
+        "gpt-5.6-luna" => CodexModelPricing {
+            input: 1.0,
+            cached_input: 0.10,
+            output: 6.0,
+        },
+        "gpt-5.5" => CodexModelPricing {
+            input: 5.0,
+            cached_input: 0.50,
+            output: 30.0,
+        },
+        "gpt-5.4" => CodexModelPricing {
+            input: 2.50,
+            cached_input: 0.25,
+            output: 15.0,
+        },
+        "gpt-5.4-mini" => CodexModelPricing {
+            input: 0.75,
+            cached_input: 0.075,
+            output: 4.50,
+        },
+        "gpt-5.4-nano" => CodexModelPricing {
+            input: 0.20,
+            cached_input: 0.02,
+            output: 1.25,
+        },
+        "gpt-5.3-codex" => CodexModelPricing {
+            input: 1.75,
+            cached_input: 0.175,
+            output: 14.0,
+        },
+        _ => return None,
+    })
+}
+
+/// Estimate a Codex session's API-equivalent cost. `input_tokens` includes
+/// cached input, while `output_tokens` already includes reasoning output.
+fn estimate_codex_cost(
+    model: &str,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+) -> Option<f64> {
+    let pricing = get_codex_pricing(model)?;
+    let uncached_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
+    Some(
+        (uncached_input_tokens as f64 * pricing.input
+            + cached_input_tokens as f64 * pricing.cached_input
+            + output_tokens as f64 * pricing.output)
+            / 1_000_000.0,
+    )
+}
+
 /// Map model ID strings to their pricing. Handles both dated and undated variants.
 /// Pricing sourced from Claude Code v2.1.76 binary (2026-03-15).
 fn get_pricing(model: &str, speed: &str) -> Option<ModelPricing> {
@@ -309,7 +381,7 @@ pub struct ModelCost {
 }
 
 /// Bump this when pricing or token counting logic changes to force cache rebuild.
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 6;
 
 /// Cache structure stored at ~/.claude/cost-cache.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,10 +567,14 @@ fn codex_cost_records(home_dir: &std::path::Path) -> Vec<SessionCostRecord> {
                     truncated
                 }
             };
-            snapshot
-                .token_days
-                .into_iter()
-                .map(move |day| SessionCostRecord {
+            snapshot.token_days.into_iter().map(move |day| {
+                let estimated_cost = estimate_codex_cost(
+                    &day.model,
+                    day.usage.input_tokens,
+                    day.usage.cached_input_tokens,
+                    day.usage.output_tokens,
+                );
+                SessionCostRecord {
                     session_id: snapshot.thread_id.clone(),
                     project: snapshot.cwd.clone(),
                     project_name: project_name.clone(),
@@ -506,8 +582,8 @@ fn codex_cost_records(home_dir: &std::path::Path) -> Vec<SessionCostRecord> {
                     provider: "codex".to_string(),
                     surface: Some(snapshot.surface.clone()),
                     agent_kind: Some(snapshot.agent_kind.clone()),
-                    cost: 0.0,
-                    cost_available: false,
+                    cost: estimated_cost.unwrap_or_default(),
+                    cost_available: estimated_cost.is_some(),
                     input_tokens: day.usage.input_tokens,
                     cached_input_tokens: day.usage.cached_input_tokens,
                     output_tokens: day.usage.output_tokens,
@@ -516,7 +592,8 @@ fn codex_cost_records(home_dir: &std::path::Path) -> Vec<SessionCostRecord> {
                     timestamp: day.timestamp,
                     date: day.date,
                     session_name: session_name.clone(),
-                })
+                }
+            })
         })
         .collect()
 }
@@ -831,6 +908,54 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_codex_cost_sol() {
+        let cost = estimate_codex_cost("gpt-5.6-sol", 1_000, 200, 100).unwrap();
+        assert!((cost - 0.0071).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_estimate_codex_cost_luna() {
+        let cost = estimate_codex_cost("gpt-5.6-luna", 1_000, 0, 100).unwrap();
+        assert!((cost - 0.0016).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_estimate_codex_cost_charges_cached_input_separately() {
+        let cost = estimate_codex_cost("gpt-5.4", 1_000, 400, 0).unwrap();
+        // 600 uncached at $2.50/MTok + 400 cached at $0.25/MTok.
+        assert!((cost - 0.0016).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_estimate_codex_cost_unknown_model_is_unpriced() {
+        assert!(estimate_codex_cost("gpt-future-codex", 1_000, 400, 100).is_none());
+    }
+
+    #[test]
+    fn test_codex_standard_pricing_table() {
+        let expected = [
+            ("gpt-5.6-sol", 5.0, 0.50, 30.0),
+            ("gpt-5.6-terra", 2.50, 0.25, 15.0),
+            ("gpt-5.6-luna", 1.0, 0.10, 6.0),
+            ("gpt-5.5", 5.0, 0.50, 30.0),
+            ("gpt-5.4", 2.50, 0.25, 15.0),
+            ("gpt-5.4-mini", 0.75, 0.075, 4.50),
+            ("gpt-5.4-nano", 0.20, 0.02, 1.25),
+            ("gpt-5.3-codex", 1.75, 0.175, 14.0),
+        ];
+
+        for (model, input, cached_input, output) in expected {
+            let pricing = get_codex_pricing(model).unwrap();
+            assert!((pricing.input - input).abs() < 1e-10, "{model} input");
+            assert!(
+                (pricing.cached_input - cached_input).abs() < 1e-10,
+                "{model} cached input"
+            );
+            assert!((pricing.output - output).abs() < 1e-10, "{model} output");
+        }
+    }
+
+    #[test]
     fn test_calculate_cost_sonnet() {
         // 1000 input tokens at $3/M = $0.003
         // 500 output tokens at $15/M = $0.0075
@@ -1016,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_cost_records_include_real_token_breakdown_without_usd_estimate() {
+    fn codex_cost_records_include_token_breakdown_and_usd_estimate() {
         let home = tempfile::tempdir().unwrap();
         let sessions = home.path().join(".codex/sessions/2026/07/13");
         std::fs::create_dir_all(&sessions).unwrap();
@@ -1066,23 +1191,27 @@ mod tests {
         assert_eq!(record.output_tokens, 80);
         assert_eq!(record.reasoning_output_tokens, 32);
         assert_eq!(record.total_tokens, 380);
-        assert_eq!(record.cost, 0.0);
-        assert!(!record.cost_available);
+        // output_tokens already includes reasoning tokens, so reasoning is not added again.
+        assert!((record.cost - 0.001725).abs() < 1e-10);
+        assert!(record.cost_available);
         let cli = records
             .iter()
             .find(|record| record.session_id == "codex-cli-cost")
             .unwrap();
         assert_eq!(cli.surface.as_deref(), Some("cli"));
         assert_eq!(cli.total_tokens, 30);
+        assert!((cli.cost - 0.000056625).abs() < 1e-10);
+        assert!(cli.cost_available);
 
         let data = aggregate(&records);
         assert_eq!(data.total_tokens, 410);
-        assert_eq!(data.unpriced_tokens, 410);
+        assert_eq!(data.unpriced_tokens, 0);
+        assert!((data.total_cost - 0.001781625).abs() < 1e-10);
         assert_eq!(data.model_costs.len(), 2);
         assert!(data
             .model_costs
             .iter()
-            .all(|model| model.provider == "codex" && !model.cost_available));
+            .all(|model| model.provider == "codex" && model.cost_available));
     }
 
     #[test]
