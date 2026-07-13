@@ -25,6 +25,12 @@ pub fn open_session(pid: u32, project_path: String) -> Result<(), String> {
         return focus_iterm2_session(pid);
     }
 
+    // macOS Terminal.app: use tty matching to focus the correct tab (macOS only)
+    #[cfg(target_os = "macos")]
+    if app_name == "Terminal" {
+        return focus_terminal_session(pid);
+    }
+
     // JetBrains IDEs: use URL scheme to focus the correct project window
     if is_jetbrains_ide(&app_name) {
         return focus_jetbrains_window(&app_name, &project_path);
@@ -167,6 +173,81 @@ fn focus_iterm2_session(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Focus the correct macOS Terminal.app tab by matching tty
+///
+/// Terminal.app tabs expose their tty (e.g. "/dev/ttys004") in the scripting
+/// dictionary, so the exact tab can be selected instead of just activating
+/// the app. Unlike iTerm2 there is no session layer — windows contain tabs.
+/// `miniaturized` is a native window property here, so no Accessibility
+/// permission is needed to restore a Dock-minimized window.
+///
+/// Ordering matters: select the tab and raise its window (referenced by a
+/// stable window id, not the loop variable) BEFORE calling `activate`. Calling
+/// `activate` first surfaces whatever window was already frontmost, and a
+/// subsequent raise of a background window does not reliably re-order the
+/// display — so a session in a non-frontmost window would be missed.
+#[cfg(target_os = "macos")]
+fn focus_terminal_session(pid: u32) -> Result<(), String> {
+    let tty = get_session_tty(pid);
+    crate::debug_log::log_info(&format!(
+        "[open_session] Terminal tty for PID {}: {:?}",
+        pid, tty
+    ));
+
+    let Some(tty) = tty else {
+        // No tty found — fall back to app activation
+        return activate_app_fallback("Terminal");
+    };
+
+    // AppleScript: find the tab by tty, select it, raise its window by id,
+    // then activate the app last.
+    let script = format!(
+        r#"
+        tell application "Terminal"
+            set targetWinId to missing value
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if tty of t ends with "{tty}" then
+                        set selected of t to true
+                        set targetWinId to id of w
+                        exit repeat
+                    end if
+                end repeat
+                if targetWinId is not missing value then exit repeat
+            end repeat
+            if targetWinId is missing value then return "not found"
+            try
+                if miniaturized of (window id targetWinId) then set miniaturized of (window id targetWinId) to false
+            end try
+            set index of (window id targetWinId) to 1
+            set frontmost of (window id targetWinId) to true
+            activate
+            return "found"
+        end tell
+        "#,
+        tty = tty
+    );
+
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| format!("Failed to run AppleScript: {}", e))?;
+
+    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    crate::debug_log::log_info(&format!(
+        "[open_session] Terminal tty match result: {}",
+        result
+    ));
+
+    if result != "found" {
+        // Tab no longer exists (or tty changed) — fall back to app activation
+        return activate_app_fallback("Terminal");
+    }
+
+    Ok(())
+}
+
 /// Focus the correct JetBrains IDE project window using the IDE's URL scheme.
 ///
 /// JetBrains IDEs register custom URL schemes (e.g., phpstorm://, idea://) that
@@ -250,8 +331,9 @@ fn activate_app_fallback(app_name: &str) -> Result<(), String> {
     // so we use System Events to set AXMinimized to false.
     //
     // This fallback is used by terminals without a dedicated code path or CLI:
-    // Ghostty, Alacritty, kitty, Warp, Hyper, WezTerm, macOS Terminal, etc.
-    // (iTerm2 has its own focus_iterm2_session; VS Code/Cursor/Zed use CLI.)
+    // Ghostty, Alacritty, kitty, Warp, Hyper, WezTerm, etc.
+    // (iTerm2 and macOS Terminal have their own tty-matching focus functions;
+    // VS Code/Cursor/Zed use CLI.)
     //
     // Notes:
     // - Unminimizes ALL windows of the app, not just the target one.

@@ -25,6 +25,7 @@ We appreciate all contributions, big and small. Thank you to the following peopl
 - **Grimmer Kang** ([@grimmerk](https://github.com/grimmerk)) - Add list item numbers to history session rows ([#50](https://github.com/minchenlee/c9watch/pull/50))
 - **Grimmer Kang** ([@grimmerk](https://github.com/grimmerk)) - Multi-word AND search in history ([#51](https://github.com/minchenlee/c9watch/pull/51))
 - **Grimmer Kang** ([@grimmerk](https://github.com/grimmerk)) - Custom title and ACTIVE badge in history ([#52](https://github.com/minchenlee/c9watch/pull/52))
+- **Jeff Carey** ([@jeff-carey](https://github.com/jeff-carey)) - Added exact Terminal.app window and tab focusing via TTY matching ([#109](https://github.com/minchenlee/c9watch/pull/109))
 
 ### Performance
 

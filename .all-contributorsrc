@@ -85,6 +85,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "jeff-carey",
+      "name": "Jeff Carey",
+      "avatar_url": "https://github.com/jeff-carey.png",
+      "profile": "https://github.com/jeff-carey",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "contributorsPerLine": 7,
