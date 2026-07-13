@@ -2,12 +2,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 const MAX_DISPLAY_CHARS: usize = 400;
 const MAX_INDEXED_MESSAGES: usize = 20_000;
 const MAX_INDEXED_MESSAGE_CHARS: usize = 16_384;
@@ -113,6 +113,9 @@ struct ArchivedTokenEvent {
     usage: CodexTokenUsage,
     #[serde(default)]
     cumulative: bool,
+    /// Cumulative counters restart independently for each rollout stream.
+    #[serde(default)]
+    stream_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +131,10 @@ pub(crate) struct CodexRolloutSnapshot {
     pub updated_at_ms: u64,
     pub token_days: Vec<CodexTokenDay>,
     pub path: PathBuf,
+    #[serde(default)]
+    paths: Vec<PathBuf>,
+    #[serde(default)]
+    messages_complete: bool,
     #[serde(default)]
     messages: Vec<ArchivedMessage>,
     #[serde(default)]
@@ -308,19 +315,9 @@ fn classify_agent(source: &Value, surface: String) -> (String, String, Option<St
             .map(str::to_string);
         return (surface, "subagent".to_string(), parent);
     }
-    let internal_label = subagent
-        .as_str()
-        .or_else(|| subagent.get("other").and_then(Value::as_str))
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if ["review", "guardian", "compact", "memory"]
-        .iter()
-        .any(|part| internal_label.contains(part))
-    {
-        (surface, "internal".to_string(), None)
-    } else {
-        (surface, "subagent".to_string(), None)
-    }
+    // User-spawned agents carry thread_spawn metadata. Every other subagent
+    // source shape is a Codex-owned helper, including kinds added in the future.
+    (surface, "internal".to_string(), None)
 }
 
 #[derive(Default)]
@@ -344,6 +341,8 @@ fn empty_cached(path: &Path, fingerprint: FileFingerprint) -> CachedRollout {
             updated_at_ms: 0,
             token_days: Vec::new(),
             path: path.to_path_buf(),
+            paths: vec![path.to_path_buf()],
+            messages_complete: true,
             messages: Vec::new(),
             token_events: Vec::new(),
         },
@@ -490,6 +489,7 @@ fn apply_archive_event(cached: &mut CachedRollout, value: &Value) {
                     model: cached.current_model.clone(),
                     usage,
                     cumulative: is_cumulative,
+                    stream_id: cached.snapshot.path.to_string_lossy().into_owned(),
                 };
                 if !cached.snapshot.token_events.contains(&event) {
                     cached.snapshot.token_events.push(event);
@@ -499,20 +499,29 @@ fn apply_archive_event(cached: &mut CachedRollout, value: &Value) {
         _ => {}
     }
     if let Some((role, text)) = message_text(value) {
+        let trimmed = text.trim();
         let message = ArchivedMessage {
             timestamp: timestamp.to_string(),
             role: role.clone(),
-            text: truncate(text.trim(), MAX_INDEXED_MESSAGE_CHARS),
+            text: truncate(trimmed, MAX_INDEXED_MESSAGE_CHARS),
         };
-        if !cached.snapshot.messages.contains(&message)
-            && cached.snapshot.messages.len() < MAX_INDEXED_MESSAGES
-            && cached
-                .indexed_message_bytes
-                .saturating_add(message.text.len())
-                <= MAX_INDEXED_MESSAGE_BYTES
-        {
-            cached.indexed_message_bytes += message.text.len();
-            cached.snapshot.messages.push(message);
+        if !cached.snapshot.messages.contains(&message) {
+            let text_is_complete = trimmed.chars().count() <= MAX_INDEXED_MESSAGE_CHARS;
+            let fits = cached.snapshot.messages.len() < MAX_INDEXED_MESSAGES
+                && cached
+                    .indexed_message_bytes
+                    .saturating_add(message.text.len())
+                    <= MAX_INDEXED_MESSAGE_BYTES;
+            if text_is_complete && fits {
+                cached.indexed_message_bytes += message.text.len();
+                cached.snapshot.messages.push(message);
+            } else {
+                cached.snapshot.messages_complete = false;
+                if fits {
+                    cached.indexed_message_bytes += message.text.len();
+                    cached.snapshot.messages.push(message);
+                }
+            }
         }
         if role == "user" {
             cached.snapshot.display = truncate(text.trim(), MAX_DISPLAY_CHARS);
@@ -522,15 +531,30 @@ fn apply_archive_event(cached: &mut CachedRollout, value: &Value) {
 
 fn rebuild_token_days(snapshot: &mut CodexRolloutSnapshot) {
     let mut days: HashMap<String, DayAccum> = HashMap::new();
-    let mut previous_total = CodexTokenUsage::default();
+    let mut previous_totals: HashMap<&str, CodexTokenUsage> = HashMap::new();
+    let mut seen_events: HashSet<(String, String, CodexTokenUsage, bool)> = HashSet::new();
     for event in &snapshot.token_events {
         let usage = if event.cumulative {
+            let previous_total = previous_totals
+                .get(event.stream_id.as_str())
+                .copied()
+                .unwrap_or_default();
             let delta = event.usage.delta_from(previous_total);
-            previous_total = event.usage;
+            previous_totals.insert(event.stream_id.as_str(), event.usage);
             delta
         } else {
             event.usage
         };
+        // Resumed rollout files can replay an authoritative prefix. Preserve the
+        // per-stream cumulative baseline above, but count an identical event only once.
+        if !seen_events.insert((
+            event.timestamp.clone(),
+            event.model.clone(),
+            event.usage,
+            event.cumulative,
+        )) {
+            continue;
+        }
         let day = days.entry(timestamp_date(&event.timestamp)).or_default();
         if day.timestamp.is_empty() || event.timestamp < day.timestamp {
             day.timestamp = event.timestamp.clone();
@@ -645,6 +669,15 @@ fn merge_snapshot(existing: &mut CodexRolloutSnapshot, incoming: CodexRolloutSna
         (left, right) => left.min(right),
     };
     existing.updated_at_ms = existing.updated_at_ms.max(incoming.updated_at_ms);
+    existing.messages_complete &= incoming.messages_complete;
+    if existing.paths.is_empty() {
+        existing.paths.push(existing.path.clone());
+    }
+    for path in incoming.paths.iter().chain(std::iter::once(&incoming.path)) {
+        if !existing.paths.contains(path) {
+            existing.paths.push(path.clone());
+        }
+    }
     let mut indexed_bytes: usize = existing
         .messages
         .iter()
@@ -701,6 +734,57 @@ pub(crate) fn search_rollout<F>(
 where
     F: Fn(&str, &str, bool) -> bool,
 {
+    if snapshot.messages_complete {
+        for message in &snapshot.messages {
+            let text = &message.text;
+            let normalized = if case_sensitive {
+                text.clone()
+            } else {
+                text.to_lowercase()
+            };
+            if phrase_match(&normalized, query, whole_word) {
+                return Some(text.clone());
+            }
+        }
+        return None;
+    }
+
+    // The persisted message cache is intentionally bounded. For an incomplete
+    // snapshot, stream the authoritative event_msg records from every merged
+    // rollout so deep search remains exact without retaining unbounded text.
+    let mut searched = HashSet::new();
+    let mut all_paths_read = true;
+    for path in snapshot.paths.iter().chain(std::iter::once(&snapshot.path)) {
+        if !searched.insert(path) {
+            continue;
+        }
+        let Ok(file) = File::open(path) else {
+            all_paths_read = false;
+            continue;
+        };
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Some((_, text)) = message_text(&value) else {
+                continue;
+            };
+            let normalized = if case_sensitive {
+                text.clone()
+            } else {
+                text.to_lowercase()
+            };
+            if phrase_match(&normalized, query, whole_word) {
+                return Some(text);
+            }
+        }
+    }
+    if all_paths_read {
+        return None;
+    }
+
+    // If a rollout disappeared after caching, retain the previous best-effort
+    // behavior for its cached excerpts rather than dropping all searchability.
     for message in &snapshot.messages {
         let text = &message.text;
         let normalized = if case_sensitive {
@@ -754,6 +838,13 @@ mod tests {
                 r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"guardian-1","cwd":"/tmp/app","originator":"Codex Desktop","source":{"subagent":{"other":"guardian"}}}}"#,
             ],
         );
+        let future_internal = directory.path().join("future-internal.jsonl");
+        write_rollout(
+            &future_internal,
+            &[
+                r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"future-internal-1","cwd":"/tmp/app","originator":"Codex Desktop","source":{"subagent":{"other":"new_helper_kind"}}}}"#,
+            ],
+        );
         let integration = directory.path().join("integration.jsonl");
         write_rollout(
             &integration,
@@ -768,6 +859,7 @@ mod tests {
         assert_eq!(child.agent_kind, "subagent");
         assert_eq!(child.parent_thread_id.as_deref(), Some("app-1"));
         assert!(scan_rollout(&guardian).unwrap().is_internal());
+        assert!(scan_rollout(&future_internal).unwrap().is_internal());
         assert_eq!(scan_rollout(&integration).unwrap().surface, "integration");
     }
 
@@ -862,6 +954,83 @@ mod tests {
     }
 
     #[test]
+    fn deep_search_falls_back_to_full_authoritative_message_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("long-search.jsonl");
+        let message = format!(
+            "{} needle-beyond-index",
+            "x".repeat(MAX_INDEXED_MESSAGE_CHARS + 32)
+        );
+        let lines = [
+            serde_json::json!({
+                "timestamp":"2026-07-13T01:00:00Z", "type":"session_meta",
+                "payload":{"id":"long-search-1","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp":"2026-07-13T01:01:00Z", "type":"event_msg",
+                "payload":{"type":"agent_message","message":message}
+            })
+            .to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let snapshot = scan_rollout(&path).unwrap();
+        assert!(!snapshot.messages[0].text.contains("needle-beyond-index"));
+        let hit = search_rollout(
+            &snapshot,
+            "needle-beyond-index",
+            false,
+            false,
+            |text, query, _| text.contains(query),
+        );
+        assert!(hit.is_some_and(|text| text.ends_with("needle-beyond-index")));
+    }
+
+    #[test]
+    fn deep_search_does_not_use_truncation_as_a_word_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("whole-word-search.jsonl");
+        let message = format!(
+            "{} needleSuffix",
+            "x".repeat(MAX_INDEXED_MESSAGE_CHARS - " needle".chars().count())
+        );
+        let lines = [
+            serde_json::json!({
+                "timestamp":"2026-07-13T01:00:00Z", "type":"session_meta",
+                "payload":{"id":"whole-word-1","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp":"2026-07-13T01:01:00Z", "type":"event_msg",
+                "payload":{"type":"agent_message","message":message}
+            })
+            .to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let snapshot = scan_rollout(&path).unwrap();
+        assert!(snapshot.messages[0].text.ends_with("needle…"));
+        let hit = search_rollout(
+            &snapshot,
+            "needle",
+            false,
+            true,
+            |text, query, whole_word| {
+                let Some(index) = text.find(query) else {
+                    return false;
+                };
+                !whole_word
+                    || text[index + query.len()..]
+                        .chars()
+                        .next()
+                        .map_or(true, |character| !character.is_alphanumeric())
+            },
+        );
+        assert!(hit.is_none());
+    }
+
+    #[test]
     fn duplicate_thread_ids_merge_unique_messages_and_token_usage() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("sessions");
@@ -889,6 +1058,33 @@ mod tests {
         assert_eq!(snapshots[0].display, "newer prompt");
         assert_eq!(snapshots[0].messages.len(), 2);
         assert_eq!(snapshots[0].token_days[0].usage.total_tokens, 180);
+    }
+
+    #[test]
+    fn duplicate_thread_rollouts_keep_independent_cumulative_baselines() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        write_rollout(
+            &root.join("old.jsonl"),
+            &[
+                r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"resumed","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":80,"output_tokens":20,"total_tokens":100}}}}"#,
+            ],
+        );
+        write_rollout(
+            &root.join("resumed.jsonl"),
+            &[
+                r#"{"timestamp":"2026-07-13T02:00:00Z","type":"session_meta","payload":{"id":"resumed","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T02:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":120,"output_tokens":30,"total_tokens":150}}}}"#,
+            ],
+        );
+
+        let snapshots = load_snapshots(&root, &directory.path().join("cache.json"));
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].token_days[0].usage.input_tokens, 200);
+        assert_eq!(snapshots[0].token_days[0].usage.output_tokens, 50);
+        assert_eq!(snapshots[0].token_days[0].usage.total_tokens, 250);
     }
 
     #[test]
