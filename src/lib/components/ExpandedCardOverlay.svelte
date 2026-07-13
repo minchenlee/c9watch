@@ -162,7 +162,7 @@
 
 	let costRecord = $derived($sessionCostMap.get(session.id));
 	let primaryCostLabel = $derived(
-		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode) : null
+		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, costRecord.costAvailable ?? costRecord.provider !== 'codex') : null
 	);
 
 	let isPermission = $derived(session.status === SessionStatus.NeedsAttention);
@@ -385,9 +385,9 @@
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
 							{#if costRecord}
 								<span class="separator">·</span>
-								<span class="cost-breakdown" title="Total cost: {formatCost(costRecord.cost)} · {formatTokens(costRecord.totalTokens)} tokens · {modelDisplayName(costRecord.model)}">
+								<span class="cost-breakdown" title="{costRecord.costAvailable ?? costRecord.provider !== 'codex' ? `Total cost: ${formatCost(costRecord.cost)}` : 'USD pricing unavailable'} · {formatTokens(costRecord.totalTokens)} tokens · {modelDisplayName(costRecord.model)}">
 									<span class="cost-primary">{primaryCostLabel}</span>
-									<span class="cost-secondary">· {$costMode === 'usd' ? formatTokens(costRecord.totalTokens) + ' tok' : formatCost(costRecord.cost)}</span>
+									<span class="cost-secondary">· {$costMode === 'usd' ? formatTokens(costRecord.totalTokens) + ' tok' : formatCostOrTokens(costRecord.cost, costRecord.totalTokens, 'usd', costRecord.costAvailable ?? costRecord.provider !== 'codex')}</span>
 									<span class="cost-secondary">· {modelDisplayName(costRecord.model)}</span>
 								</span>
 							{/if}

@@ -220,20 +220,21 @@ export function getDemoHistoryEntries(): HistoryEntry[] {
 export function getDemoCostData(): CostData {
 	const date = new Date().toISOString().slice(0, 10);
 	const sessions: SessionCostRecord[] = [
-		{ sessionId: 'demo-1', project: '/Users/demo/projects/web-app', projectName: 'web-app', model: 'claude-sonnet-4-5', cost: 0.42, timestamp: minutesAgo(30), date, totalTokens: 62_000, sessionName: 'OAuth2 authentication', provider: 'claudeCode', surface: 'claudeCode' },
-		{ sessionId: 'demo-codex-root', project: '/Users/demo/projects/c9watch', projectName: 'c9watch', model: 'gpt-5.4', cost: 0.18, timestamp: minutesAgo(12), date, totalTokens: 31_000, sessionName: 'Codex monitoring rollout', provider: 'codex', surface: 'app' }
+		{ sessionId: 'demo-1', project: '/Users/demo/projects/web-app', projectName: 'web-app', model: 'claude-sonnet-4-5', cost: 0.42, costAvailable: true, inputTokens: 45_000, cachedInputTokens: 12_000, outputTokens: 17_000, reasoningOutputTokens: 0, timestamp: minutesAgo(30), date, totalTokens: 62_000, sessionName: 'OAuth2 authentication', provider: 'claudeCode', surface: 'claudeCode' },
+		{ sessionId: 'demo-codex-root', project: '/Users/demo/projects/c9watch', projectName: 'c9watch', model: 'gpt-5.4', cost: 0, costAvailable: false, inputTokens: 23_000, cachedInputTokens: 8_000, outputTokens: 8_000, reasoningOutputTokens: 2_000, timestamp: minutesAgo(12), date, totalTokens: 31_000, sessionName: 'Codex monitoring rollout', provider: 'codex', surface: 'app' }
 	];
 	return {
-		totalCost: 0.6,
+		totalCost: 0.42,
 		totalTokens: 93_000,
-		dailyCosts: [{ date, cost: 0.6, sessions }],
+		unpricedTokens: 31_000,
+		dailyCosts: [{ date, cost: 0.42, sessions }],
 		projectCosts: [
 			{ project: sessions[0].project, projectName: sessions[0].projectName, totalCost: sessions[0].cost, sessions: [sessions[0]] },
 			{ project: sessions[1].project, projectName: sessions[1].projectName, totalCost: sessions[1].cost, sessions: [sessions[1]] }
 		],
 		modelCosts: [
-			{ model: sessions[0].model, displayName: 'Sonnet', cost: sessions[0].cost, percentage: 70 },
-			{ model: sessions[1].model, displayName: 'GPT-5.4', cost: sessions[1].cost, percentage: 30 }
+			{ model: sessions[0].model, displayName: 'Sonnet', provider: 'claudeCode', cost: sessions[0].cost, percentage: 100, totalTokens: sessions[0].totalTokens, costAvailable: true },
+			{ model: sessions[1].model, displayName: 'GPT-5.4', provider: 'codex', cost: 0, percentage: 0, totalTokens: sessions[1].totalTokens, costAvailable: false }
 		]
 	};
 }

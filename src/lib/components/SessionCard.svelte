@@ -60,7 +60,7 @@
 
 	let costRecord = $derived($sessionCostMap.get(session.id));
 	let costLabel = $derived(
-		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode) : null
+		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, costRecord.costAvailable ?? costRecord.provider !== 'codex') : null
 	);
 
 	function getStatusColor(): string {

@@ -189,6 +189,12 @@ export interface SessionCostRecord {
   /** Primary model (highest cost contributor) */
   model: string;
   cost: number;
+  /** False when tokens are known but no local USD price is available. */
+  costAvailable: boolean;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
   /** ISO 8601 timestamp of earliest assistant message */
   timestamp: string;
   /** Date portion "YYYY-MM-DD" */
@@ -199,6 +205,7 @@ export interface SessionCostRecord {
   sessionName: string;
   provider?: SessionProvider;
   surface?: SessionSurface;
+  agentKind?: AgentKind;
 }
 
 /**
@@ -228,6 +235,9 @@ export interface ModelCost {
   displayName: string;
   cost: number;
   percentage: number;
+  provider?: SessionProvider;
+  totalTokens: number;
+  costAvailable: boolean;
 }
 
 /**
@@ -237,6 +247,8 @@ export interface CostData {
   totalCost: number;
   /** Sum of all input + output tokens across all sessions */
   totalTokens: number;
+  /** Tokens retained in totals but excluded from USD totals because pricing is unavailable. */
+  unpricedTokens: number;
   dailyCosts: DailyCost[];
   projectCosts: ProjectCost[];
   modelCosts: ModelCost[];
