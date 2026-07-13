@@ -10,6 +10,7 @@ import { SessionStatus } from '../types';
 import { isDemoMode } from '../demo/mode';
 import { openSession } from '../api';
 import { wsClient, useWebSocket, getStoredWsUrl, isTauri } from '../ws';
+import { codexParentId, isCodexSubagent, isHiddenInternalSession } from '../provider';
 
 /**
  * Store containing all active sessions
@@ -69,6 +70,20 @@ export const workersByPm = derived(sessions, ($sessions) => {
 		}
 	}
 	return m;
+});
+
+/** Normal Codex subagents grouped under their immediate/root parent. Internal agents are omitted. */
+export const codexSubagentsByParent = derived(sessions, ($sessions) => {
+	const grouped = new Map<string, Session[]>();
+	for (const session of $sessions) {
+		if (!isCodexSubagent(session) || isHiddenInternalSession(session)) continue;
+		const parentId = codexParentId(session);
+		if (!parentId) continue;
+		const group = grouped.get(parentId) ?? [];
+		group.push(session);
+		grouped.set(parentId, group);
+	}
+	return grouped;
 });
 
 /**

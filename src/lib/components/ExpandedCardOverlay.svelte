@@ -43,13 +43,15 @@
 	import TodoPanel from './TodoPanel.svelte';
 	import { createSlidingWindow, BATCH_SIZE } from '$lib/slidingWindow.svelte';
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
-	import { workersByPm, expandedSessionId } from '$lib/stores/sessions';
+	import { workersByPm, expandedSessionId, codexSubagentsByParent } from '$lib/stores/sessions';
 	import { visibleSubagentsBySession } from '$lib/stores/subagents';
 	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
 	import { formatTimeSince, formatDurationMs } from '$lib/time-utils';
 	import { getSessionStatusColor, getSessionStatusLabel, getSubagentStatusColor, getSubagentStatusLabel, getWorkerStatusColor, getWorkerStatusLabel } from '$lib/status-utils';
 	import { isTauri } from '$lib/ws';
+	import ProviderBadge from './ProviderBadge.svelte';
+	import { canSessionAction } from '$lib/provider';
 
 	interface Props {
 		session: Session;
@@ -182,7 +184,20 @@
 		PM_ORCHESTRATION_ENABLED && resolvedWorkers.length > 0
 	);
 
-	let mySubagents = $derived($visibleSubagentsBySession.get(session.id) ?? []);
+	let mySubagents = $derived([
+		...($visibleSubagentsBySession.get(session.id) ?? []),
+		...($codexSubagentsByParent.get(session.id) ?? []).map((child): SubagentInfo => ({
+			id: child.id,
+			sessionId: child.id,
+			provider: 'codex',
+			agentType: child.agentRole || child.agentNickname || 'subagent',
+			description: child.agentNickname || child.summary || child.firstPrompt || child.agentRole || 'Codex subagent',
+			startedAt: child.startedAtMs ? new Date(child.startedAtMs).toISOString() : child.modified,
+			completedAt: child.status === SessionStatus.Working ? null : child.modified,
+			parentSessionId: session.id,
+			status: child.status === SessionStatus.Working || child.status === SessionStatus.Connecting ? 'running' : 'completed'
+		}))
+	]);
 	let hasSubagents = $derived(mySubagents.length > 0);
 	let subagentsCollapsed = $state(false);
 
@@ -208,6 +223,10 @@
 	let previewError = $derived(previewState.error);
 
 	async function openSubagentPreview(sa: SubagentInfo) {
+		if (sa.provider === 'codex' && sa.sessionId) {
+			expandedSessionId.set(sa.sessionId);
+			return;
+		}
 		const sid = session.id;
 		const initialState: PreviewState = {
 			selection: sa,
@@ -314,6 +333,7 @@
 
 					<div class="header-info">
 						<div class="header-title">
+							<ProviderBadge provider={session.provider} surface={session.surface} />
 							<!-- svelte-ignore a11y_no_static_element_interactions -->
 							<h2
 								id="overlay-title"
@@ -387,17 +407,24 @@
 					</div>
 				</div>
 				<div class="header-actions">
-					<button type="button" class="header-button" onclick={() => onstop?.()} title="Stop Session">
+						{#if session.provider === 'codex' && (session.parentThreadId || (session.rootSessionId && session.rootSessionId !== session.id))}
+							<button type="button" class="header-button" onclick={() => expandedSessionId.set(session.parentThreadId || session.rootSessionId!)} title="Back to parent session" aria-label="Back to parent session">←</button>
+						{/if}
+						{#if canSessionAction(session, 'stop')}
+							<button type="button" class="header-button" onclick={() => onstop?.()} title="Stop Session">
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 							<rect x="6" y="6" width="12" height="12" rx="1" />
 						</svg>
-					</button>
-					<button type="button" class="header-button" onclick={() => onopen?.()} title="Open in IDE">
+							</button>
+						{/if}
+						{#if canSessionAction(session, 'open')}
+							<button type="button" class="header-button" onclick={() => onopen?.()} title="Open in IDE">
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 						<polyline points="12 6 18 6 18 12" />
 							<line x1="7" y1="17" x2="18" y2="6" />
 						</svg>
-					</button>
+							</button>
+						{/if}
 					<div class="header-divider"></div>
 					<button
 						type="button"

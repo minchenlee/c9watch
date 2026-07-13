@@ -2,7 +2,7 @@
  * Demo session and conversation data for UI exploration
  */
 
-import type { Session, Conversation } from '../types';
+import type { Session, Conversation, HistoryEntry, CostData, SessionCostRecord } from '../types';
 import { SessionStatus } from '../types';
 
 function minutesAgo(minutes: number): string {
@@ -85,7 +85,10 @@ export function getDemoSessions(): Session[] {
 			modified: minutesAgo(2),
 			status: SessionStatus.NeedsAttention,
 			latestMessage: 'I need to write to src/auth/providers.ts — may I proceed?',
-			pendingToolName: 'Write'
+			pendingToolName: 'Write',
+			provider: 'claudeCode',
+			surface: 'claudeCode',
+			agentKind: 'root'
 		},
 		{
 			id: 'demo-2',
@@ -100,7 +103,10 @@ export function getDemoSessions(): Session[] {
 			modified: minutesAgo(5),
 			status: SessionStatus.Working,
 			latestMessage: 'Running the profiler on the VirtualizedTable component to identify the bottleneck...',
-			pendingToolName: null
+			pendingToolName: null,
+			provider: 'claudeCode',
+			surface: 'claudeCode',
+			agentKind: 'root'
 		},
 
 		// Project 2: api-server — NeedsAttention + Working
@@ -165,8 +171,71 @@ export function getDemoSessions(): Session[] {
 			status: SessionStatus.WaitingForInput,
 			latestMessage: 'All 14 command handlers have been migrated to the Result pattern. Tests pass.',
 			pendingToolName: null
+		},
+		{
+				id: 'demo-codex-root', pid: 91001, sessionName: 'c9watch', customTitle: 'Codex monitoring rollout',
+				projectPath: '/Users/demo/projects/c9watch', gitBranch: 'feature/codex-monitoring',
+				firstPrompt: 'Implement mixed-provider monitoring', summary: 'Coordinating Codex monitoring across app and CLI',
+				messageCount: 28, modified: minutesAgo(3), status: SessionStatus.Working,
+				latestMessage: 'Reviewing the frontend provider contract and rollout hierarchy...', pendingToolName: null,
+				provider: 'codex', surface: 'app', agentKind: 'root', rootSessionId: 'demo-codex-root',
+				actionCapabilities: { conversation: true, open: false, stop: false, rename: false }
+		},
+		{
+				id: 'demo-codex-subagent', pid: 91002, sessionName: 'c9watch', customTitle: null,
+				projectPath: '/Users/demo/projects/c9watch', gitBranch: 'feature/codex-monitoring',
+				firstPrompt: 'Audit provider filtering', summary: 'Auditing provider filtering across session surfaces',
+				messageCount: 11, modified: minutesAgo(2), status: SessionStatus.Working,
+				latestMessage: 'Checking history and cost records for real provider filtering...', pendingToolName: null,
+				provider: 'codex', surface: 'exec', agentKind: 'subagent', parentThreadId: 'demo-codex-root',
+				rootSessionId: 'demo-codex-root', agentPath: '/root/provider-audit', agentNickname: 'provider-audit', agentRole: 'reviewer',
+				actionCapabilities: { conversation: true, open: false, stop: false, rename: false }
+		},
+		{
+				id: 'demo-codex-guardian', pid: 91003, sessionName: 'c9watch', customTitle: null,
+				projectPath: '/Users/demo/projects/c9watch', gitBranch: 'feature/codex-monitoring',
+				firstPrompt: 'Internal review guard', summary: 'Internal guardian process', messageCount: 2,
+				modified: minutesAgo(1), status: SessionStatus.Working, latestMessage: 'Validating policy state', pendingToolName: null,
+				provider: 'codex', surface: 'app', agentKind: 'internal', parentThreadId: 'demo-codex-root',
+				rootSessionId: 'demo-codex-root', internalKind: 'guardian'
 		}
 	];
+}
+
+export function getDemoHistoryEntries(): HistoryEntry[] {
+	return [
+		{
+			sessionId: 'demo-1', display: 'Add OAuth2 login with Google and GitHub providers',
+			timestamp: Date.now() - 30 * 60_000, project: '/Users/demo/projects/web-app', projectName: 'web-app',
+			customTitle: null, provider: 'claudeCode', surface: 'claudeCode'
+		},
+		{
+			sessionId: 'demo-codex-root', display: 'Implement mixed-provider monitoring',
+			timestamp: Date.now() - 12 * 60_000, project: '/Users/demo/projects/c9watch', projectName: 'c9watch',
+			customTitle: 'Codex monitoring rollout', provider: 'codex', surface: 'app'
+		}
+	];
+}
+
+export function getDemoCostData(): CostData {
+	const date = new Date().toISOString().slice(0, 10);
+	const sessions: SessionCostRecord[] = [
+		{ sessionId: 'demo-1', project: '/Users/demo/projects/web-app', projectName: 'web-app', model: 'claude-sonnet-4-5', cost: 0.42, timestamp: minutesAgo(30), date, totalTokens: 62_000, sessionName: 'OAuth2 authentication', provider: 'claudeCode', surface: 'claudeCode' },
+		{ sessionId: 'demo-codex-root', project: '/Users/demo/projects/c9watch', projectName: 'c9watch', model: 'gpt-5.4', cost: 0.18, timestamp: minutesAgo(12), date, totalTokens: 31_000, sessionName: 'Codex monitoring rollout', provider: 'codex', surface: 'app' }
+	];
+	return {
+		totalCost: 0.6,
+		totalTokens: 93_000,
+		dailyCosts: [{ date, cost: 0.6, sessions }],
+		projectCosts: [
+			{ project: sessions[0].project, projectName: sessions[0].projectName, totalCost: sessions[0].cost, sessions: [sessions[0]] },
+			{ project: sessions[1].project, projectName: sessions[1].projectName, totalCost: sessions[1].cost, sessions: [sessions[1]] }
+		],
+		modelCosts: [
+			{ model: sessions[0].model, displayName: 'Sonnet', cost: sessions[0].cost, percentage: 70 },
+			{ model: sessions[1].model, displayName: 'GPT-5.4', cost: sessions[1].cost, percentage: 30 }
+		]
+	};
 }
 
 /**
@@ -174,6 +243,20 @@ export function getDemoSessions(): Session[] {
  * Provides realistic message histories for 3 sessions.
  */
 export const demoConversations: Record<string, Conversation> = {
+	'demo-codex-root': {
+		sessionId: 'demo-codex-root',
+		messages: [
+			{ timestamp: minutesAgo(12), messageType: 'User', content: 'Implement mixed-provider monitoring with shared filters.' },
+			{ timestamp: minutesAgo(3), messageType: 'Assistant', content: 'I am coordinating provider UI and delegated a filter audit to a Codex subagent.' }
+		]
+	},
+	'demo-codex-subagent': {
+		sessionId: 'demo-codex-subagent',
+		messages: [
+			{ timestamp: minutesAgo(5), messageType: 'User', content: 'Audit provider filtering across all session surfaces.' },
+			{ timestamp: minutesAgo(2), messageType: 'Assistant', content: 'History, cost, monitor, and popover now consume the same persisted provider filter.' }
+		]
+	},
 	'demo-1': {
 		sessionId: 'demo-1',
 		messages: [

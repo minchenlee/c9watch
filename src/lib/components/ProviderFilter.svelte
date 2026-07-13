@@ -6,7 +6,7 @@
 	let { compact = false }: Props = $props();
 	const options: Array<{ value: ProviderFilterValue; label: string; short: string }> = [
 		{ value: 'all', label: 'All providers', short: 'ALL' },
-		{ value: 'claudeCode', label: 'Claude Code', short: 'CLAUDE' },
+		{ value: 'claudeCode', label: 'Claude Code', short: 'CLAUDE CODE' },
 		{ value: 'codex', label: 'Codex', short: 'CODEX' }
 	];
 </script>
