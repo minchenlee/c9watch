@@ -127,8 +127,16 @@ pub enum Commands {
     /// matches a live PM worker's session id (exact or unique prefix), the
     /// worker is stopped. Otherwise, a numeric target is treated as a PID
     /// and the corresponding Claude process is killed.
+    #[cfg(feature = "pm-orchestration")]
     Stop {
         /// Worker session id/prefix (preferred) or numeric PID for regular sessions
+        target: String,
+    },
+
+    /// Stop a session by PID (kills the corresponding Claude process).
+    #[cfg(not(feature = "pm-orchestration"))]
+    Stop {
+        /// Numeric PID of the session's Claude process
         target: String,
     },
 
