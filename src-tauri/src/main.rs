@@ -10,16 +10,15 @@ fn main() {
         let args: Vec<String> = std::env::args().collect();
         if args.len() > 1 {
             let first = args[1].as_str();
-            #[allow(unused_mut)]
-            let mut known_commands: Vec<&str> = vec![
+            // Always route PM command names through Clap. When the
+            // `pm-orchestration` feature is disabled their variants are absent,
+            // so Clap reports an unknown command instead of falling through and
+            // unexpectedly launching the GUI.
+            let known_commands = [
                 "list", "status", "self", "view", "history", "search", "stop", "watch", "tasks",
+                "spawn", "send", "workers", "inbox", "adopt", "daemon",
                 "cost", "help",
             ];
-            // PM/worker orchestration subcommands are opt-in only.
-            #[cfg(feature = "pm-orchestration")]
-            known_commands.extend_from_slice(&[
-                "spawn", "send", "workers", "inbox", "adopt", "daemon",
-            ]);
             let is_cli = known_commands.contains(&first)
                 || first == "--help"
                 || first == "-h"

@@ -71,7 +71,10 @@
 				isCompact = true;
 			}
 			const savedFilter = localStorage.getItem('sessionFilter');
-			if (savedFilter === 'humans' || savedFilter === 'workers') {
+			if (
+				PM_ORCHESTRATION_ENABLED &&
+				(savedFilter === 'humans' || savedFilter === 'workers')
+			) {
 				sessionFilter = savedFilter;
 			}
 		}
@@ -590,7 +593,7 @@
 						</div>
 					</div>
 					<div class="empty-content">
-						{#if sessionFilter === 'workers'}
+						{#if PM_ORCHESTRATION_ENABLED && sessionFilter === 'workers'}
 							<h2>No Workers Spawned</h2>
 							<p>Spawn a worker from a Claude Code session with <code>c9watch spawn</code></p>
 							<div class="empty-hint">
