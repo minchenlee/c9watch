@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **PM orchestration is now disabled by default.** Claude Code and Codex
+  provide native agent spawning, so c9watch's own PM/worker orchestration is
+  opt-in. Normal builds omit the PM CLI subcommands (`spawn`, `send`,
+  `workers`, `inbox`, `adopt`, `daemon`) and hide the dashboard's
+  HUMANS/WORKERS toggle, WORKER/PM badges, worker title prefix, and Workers
+  panel. All sessions still show normally — records with legacy `workerOf`
+  metadata render as ordinary sessions — and the native Subagents panel is
+  unchanged. The implementation is preserved, not removed:
+  - Enable the CLI with the `pm-orchestration` Cargo feature:
+    `cargo build --no-default-features --features cli,pm-orchestration`.
+  - Enable the dashboard UI by setting `PM_ORCHESTRATION_ENABLED = true` in
+    `src/lib/feature-flags.ts`.
+
 ### Added
 - PM-orchestration `bg` backend: spawn workers via `claude --bg` instead of
   `claude --print`. Workers stay on Pro/Max subscription quota after
