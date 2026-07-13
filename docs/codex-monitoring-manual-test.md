@@ -1,165 +1,163 @@
-# Codex monitoring 手動測試指南
+# Codex Monitoring Manual Test Guide
 
-這份文件用來驗收 PR [#112](https://github.com/minchenlee/c9watch/pull/112) 的 Codex monitoring 功能。
+This guide validates the Codex monitoring functionality in PR [#112](https://github.com/minchenlee/c9watch/pull/112).
 
-## 目前可使用的 App 與 binary
+## Available Debug App and Binary
 
-目前已經產生可直接啟動的 macOS arm64 debug App：
-
-```text
-/private/tmp/c9watch-codex-monitoring-todo/src-tauri/target/debug/bundle/macos/c9watch.app
-```
-
-啟動前，先關閉其他正在執行的 c9watch，避免 macOS 同時執行兩個相同 bundle ID 的版本。接著執行：
-
-```bash
-open /private/tmp/c9watch-codex-monitoring-todo/src-tauri/target/debug/bundle/macos/c9watch.app
-```
-
-也可以先打開輸出資料夾，再從 Finder 雙擊 `c9watch.app`：
-
-```bash
-open /private/tmp/c9watch-codex-monitoring-todo/src-tauri/target/debug/bundle/macos
-```
-
-App 資訊：
-
-- 版本：`c9watch 0.8.1`
-- 架構：macOS arm64
-- 功能版本基準：`b659e1f`
-- App executable SHA-256：`45fbc79b1315d8d490b77a013a8643da7d7f83307e3397109679399d88f74bf1`
-- 這是本機 ad-hoc signed debug App，尚未 notarize，也不是正式 release `.dmg`
-
-CLI 與原始 GUI executable 仍位於：
+After building the feature branch, the macOS arm64 debug app is available at:
 
 ```text
-/private/tmp/c9watch-codex-monitoring-todo/src-tauri/target/debug/c9watch
+src-tauri/target/debug/bundle/macos/c9watch.app
 ```
 
-正常情況下，不帶參數執行這個 executable 也會開啟 GUI：
+Quit any other running c9watch instance first. Running two apps with the same bundle identifier can make it unclear which build is active. Launch the debug app from the repository root:
 
 ```bash
-cd /private/tmp/c9watch-codex-monitoring-todo
+open src-tauri/target/debug/bundle/macos/c9watch.app
+```
+
+To open the output folder in Finder and launch the app manually:
+
+```bash
+open src-tauri/target/debug/bundle/macos
+```
+
+The current debug app has these properties:
+
+- Version: `c9watch 0.8.1`
+- Architecture: macOS arm64
+- Signing: local ad-hoc signature
+- Not notarized and not intended for release distribution
+
+The combined GUI and CLI executable is available at:
+
+```text
+src-tauri/target/debug/c9watch
+```
+
+Running it without arguments should also start the GUI:
+
+```bash
 ./src-tauri/target/debug/c9watch
 ```
 
-如果它只印出 `Monitor and manage Claude Code sessions` 和 CLI Usage，代表 binary 被 `--no-default-features --features cli` 的測試 build 覆蓋。請使用本文件最後的指令重新 build GUI App。
+If it only prints `Monitor and manage Claude Code sessions` followed by CLI usage, a CLI-only test build has overwritten the executable. Rebuild the debug app using the command at the end of this guide.
 
-確認 binary 版本：
+Confirm the binary version:
 
 ```bash
 ./src-tauri/target/debug/c9watch --version
 ```
 
-確認目前 App executable 的 SHA-256：
+Calculate the current app executable checksum:
 
 ```bash
 shasum -a 256 src-tauri/target/debug/bundle/macos/c9watch.app/Contents/MacOS/c9watch
 ```
 
-查看 c9watch 偵測到的 session 資料：
+Inspect detected sessions:
 
 ```bash
 ./src-tauri/target/debug/c9watch list --pretty
 ```
 
-## 測試前準備
+## Test Preparation
 
-1. 確認 Codex CLI 可以使用：
+1. Confirm that the Codex CLI is available:
 
    ```bash
    codex --version
    ```
 
-2. 確認本機已有 Codex session 資料：
+2. Confirm that local Codex session data exists:
 
    ```bash
    ls ~/.codex/sessions
    ```
 
-3. 每次測試使用容易搜尋、而且不重複的文字，例如：
+3. Use a unique, searchable marker for each test, for example:
 
    ```text
    C9WATCH-MANUAL-20260713-01
    ```
 
-4. 如果要測試 provider filter，請同時保留至少一個 Claude Code session 和一個 Codex session。
+4. To test provider filtering, keep at least one Claude Code session and one Codex session available.
 
-## 最小驗收流程
+## Minimum Acceptance Flow
 
-如果時間有限，至少完成以下六項：
+If time is limited, complete at least these six checks:
 
-- [ ] Codex App session 可以出現在 Monitor，並顯示 `CODEX` badge。
-- [ ] Codex CLI session 可以出現在 Monitor，而且 CLI JSON 顯示 `surface: cli`。
-- [ ] `All | Claude Code | Codex` filter 會真的改變 Monitor、History、Cost、Memory 的內容。
-- [ ] Resume 同一個 Codex session 後只出現一張卡片，而且完整對話仍可查看。
-- [ ] Cost 會估算已知 Codex model；Codex 用藍色、Claude Code 用橘色，而且 cost/token 保持在同一列。
-- [ ] Memory 的 `Codex` filter 會顯示 `MEMORY.md` 和 `memory_summary.md`。
+- [ ] A Codex App session appears in Monitor with a `CODEX` badge.
+- [ ] A Codex CLI session appears in Monitor and its CLI JSON reports `surface: cli`.
+- [ ] The `All | Claude Code | Codex` filter changes the actual data in Monitor, History, Cost, and Memory.
+- [ ] Resuming the same Codex session produces one card and retains the full conversation.
+- [ ] Cost estimates known Codex models, uses blue for Codex and amber for Claude Code, and keeps cost or token values on the same row.
+- [ ] The Memory tab's `Codex` filter displays `MEMORY.md` and `memory_summary.md` when they exist.
 
-## 完整測試步驟
+## Full Test Procedure
 
-### 1. 啟動與基本檢查
+### 1. Startup and Basic Checks
 
-1. 啟動上面的 debug App。
-2. 打開主視窗和 menu bar popover。
-3. 確認程式沒有立即關閉，也沒有空白畫面。
-4. 執行：
+1. Launch the debug app.
+2. Open the main window and menu bar popover.
+3. Confirm that the app stays open and does not display a blank window.
+4. Run:
 
    ```bash
    ./src-tauri/target/debug/c9watch status
    ./src-tauri/target/debug/c9watch list --pretty
    ```
 
-預期結果：
+Expected results:
 
-- 指令正常回傳 JSON。
-- 既有 Claude Code session 仍然可以正常顯示。
-- 不應因為加入 Codex monitoring 而破壞原本的 session。
+- Both commands return valid JSON.
+- Existing Claude Code sessions still appear normally.
+- Adding Codex monitoring does not break existing session detection.
 
-### 2. Codex App session
+### 2. Codex App Session
 
-1. 在 Codex App 建立一個新 session。
-2. 輸入包含唯一測試文字的 prompt，例如：
+1. Create a session in the Codex App.
+2. Enter a prompt containing a unique marker, for example:
 
    ```text
-   請只回覆 C9WATCH-APP-20260713-01
+   Reply only with C9WATCH-APP-20260713-01
    ```
 
-3. 回到 c9watch Monitor。
+3. Return to c9watch Monitor.
 
-預期結果：
+Expected results:
 
-- Session 出現在 Monitor。
-- 卡片顯示 `CODEX` badge。
-- Project path 和 prompt 內容正確。
-- Codex session 不應顯示不支援的 Stop、Rename 或 Open session 操作。
-- CLI JSON 的 `provider` 是 `codex`，`surface` 是 `app`。
+- The session appears in Monitor.
+- The card displays a `CODEX` badge.
+- The project path and prompt content are correct.
+- Unsupported Stop, Rename, and Open Session actions are not shown.
+- CLI JSON reports `provider: codex` and `surface: app`.
 
-### 3. Codex CLI session
+### 3. Codex CLI Session
 
-1. 在另一個 Terminal、測試專案目錄中啟動：
+1. Start Codex from another terminal in a test project directory:
 
    ```bash
    codex
    ```
 
-2. 輸入唯一測試文字：
+2. Enter a unique marker:
 
    ```text
-   請只回覆 C9WATCH-CLI-20260713-01
+   Reply only with C9WATCH-CLI-20260713-01
    ```
 
-3. 執行：
+3. Run:
 
    ```bash
    ./src-tauri/target/debug/c9watch list --pretty
    ```
 
-預期結果：
+Expected results:
 
-- Monitor 只出現一張對應的 Codex session 卡片。
-- 卡片顯示 `CODEX` badge。
-- CLI JSON 顯示：
+- Monitor displays one card for the Codex session.
+- The card displays a `CODEX` badge.
+- CLI JSON reports:
   - `provider: codex`
   - `surface: cli`
   - `agentKind: root`
@@ -167,178 +165,179 @@ shasum -a 256 src-tauri/target/debug/bundle/macos/c9watch.app/Contents/MacOS/c9w
   - `canStop: false`
   - `canRename: false`
 
-### 4. Provider filter
+### 4. Provider Filter
 
-1. 同時準備至少一個 Claude Code session 和一個 Codex session。
-2. 在主視窗依序選擇：
+1. Keep at least one Claude Code session and one Codex session available.
+2. Select each provider option in the main window:
    - `All`
    - `Claude Code`
    - `Codex`
-3. 打開 menu bar popover，確認 filter 同步。
-4. 依序查看 Monitor、History、Cost、Memory。
-5. 關閉並重新啟動 c9watch。
+3. Open the menu bar popover and confirm that the filter is synchronized.
+4. Check Monitor, History, Cost, and Memory under each filter.
+5. Quit and restart c9watch.
 
-預期結果：
+Expected results:
 
-- `All` 顯示兩種 provider。
-- `Claude Code` 只顯示 Claude Code 資料。
-- `Codex` 只顯示 Codex 資料。
-- Filter 會同步到 popover。
-- 切換 tab 後 filter 仍然生效，不只是 badge 改變。
-- Memory 的 project 數量、選取項目和空白提示也會跟著 filter 改變。
-- 重啟後仍保留最後選擇的 filter。
+- `All` displays both providers.
+- `Claude Code` displays only Claude Code data.
+- `Codex` displays only Codex data.
+- The filter is synchronized with the popover.
+- Changing tabs does not reset the filter or make it cosmetic only.
+- Memory project counts, selection, content, and empty states follow the filter.
+- The selected filter persists after restarting c9watch.
 
-### 5. Codex subagent grouping
+### 5. Codex Subagent Grouping
 
-1. 在 Codex session 中要求它建立一個 subagent，例如：
-
-   ```text
-   請啟動一個 subagent，讓它檢查目前資料夾有哪些 Markdown 文件，完成後回報數量。
-   ```
-
-2. 在 subagent 執行期間查看 Monitor 和 popover。
-
-預期結果：
-
-- 正常 subagent 顯示在 parent session 的 Subagents 區域。
-- Nested subagent 不會消失；它會被整理到可見的 root session 下。
-- 如果 parent 暫時不存在，仍在執行的 orphan subagent 不會完全消失。
-- Codex 內部的 guardian、review 或其他 internal helper 不會變成獨立卡片。
-
-### 6. Resume 同一個 Codex session
-
-這項測試是 PR review comment 的主要回歸測試。
-
-1. 在 Codex CLI 建立 session，輸入：
+1. Ask a Codex session to create a subagent, for example:
 
    ```text
-   請記住 C9WATCH-RESUME-FIRST-20260713-01
+   Start a subagent to list the Markdown files in the current directory and report the total count.
    ```
 
-2. 結束 Codex CLI。
-3. 立即 resume 最近的 session：
+2. Check Monitor and the popover while the subagent is running.
+
+Expected results:
+
+- A normal subagent appears under its parent session's Subagents section.
+- A nested subagent remains visible under an appropriate root session.
+- A running orphan subagent remains visible when its parent is temporarily unavailable.
+- Internal guardian, review, and other helper agents do not appear as independent session cards.
+
+### 6. Resume the Same Codex Session
+
+This is an important regression test for the PR review fixes.
+
+1. Start a Codex CLI session and enter:
+
+   ```text
+   Remember C9WATCH-RESUME-FIRST-20260713-01
+   ```
+
+2. Exit the Codex CLI.
+3. Resume the latest session immediately:
 
    ```bash
-   codex resume --last "請回覆 C9WATCH-RESUME-SECOND-20260713-01"
+   codex resume --last "Reply with C9WATCH-RESUME-SECOND-20260713-01"
    ```
 
-   如果 `--last` 可能選到別的 session，可以使用 c9watch CLI 找到 session ID，再執行：
+   If `--last` may select a different session, find the session ID with the c9watch CLI and run:
 
    ```bash
-   codex resume <SESSION_ID> "請回覆 C9WATCH-RESUME-SECOND-20260713-01"
+   codex resume <SESSION_ID> "Reply with C9WATCH-RESUME-SECOND-20260713-01"
    ```
 
-4. 查看 Monitor。
-5. 點開 session 的 conversation。
+4. Check Monitor.
+5. Open the session conversation.
 
-預期結果：
+Expected results:
 
-- 同一個 session ID 只出現一張卡片。
-- 卡片使用最新 rollout 的狀態，不會被舊的 idle 狀態蓋掉。
-- Conversation 同時包含 `FIRST` 和 `SECOND` 兩段內容。
-- 重複的 rollout message 不會重複顯示。
+- The session ID appears on only one card.
+- The card uses the latest rollout state instead of being overwritten by an older idle state.
+- The conversation contains both the `FIRST` and `SECOND` markers.
+- Duplicate rollout messages are not displayed twice.
 
-### 7. History 與搜尋
+### 7. History and Search
 
-1. 完成一個 Codex App 或 CLI session。
-2. 前往 History。
-3. 選擇 `Codex` filter。
-4. 搜尋前面使用的唯一測試文字。
-5. 打開搜尋結果的完整 conversation。
+1. Complete a Codex App or CLI session.
+2. Open History.
+3. Select the `Codex` filter.
+4. Search for the unique marker used earlier.
+5. Open the complete conversation from the result.
 
-預期結果：
+Expected results:
 
-- History 會出現 Codex session。
-- Metadata search 和 deep search 都可以找到 Codex 內容。
-- Claude Code 資料不會在 `Codex` filter 下出現。
-- Resumed session 的所有 conversation fragments 都可以看到。
-- Internal helper 不會出現在 History。
+- Codex sessions appear in History.
+- Metadata search and deep search both find Codex content.
+- Claude Code data does not appear under the `Codex` filter.
+- All conversation fragments from a resumed session are available.
+- Internal helper sessions do not appear in History.
 
-### 8. Cost 與 token
+### 8. Cost and Token Usage
 
-1. 前往 Cost。
-2. 選擇 `Codex` filter。
-3. 切換 USD 和 TOKENS 圖表。
-4. 再切回 `All`，查看混合 provider 的資料。
+1. Open Cost.
+2. Select the `Codex` filter.
+3. Switch between the USD and TOKENS charts.
+4. Switch back to `All` and inspect mixed-provider data.
 
-預期結果：
+Expected results:
 
-- Codex token 會被計入 token 總數和圖表。
-- Codex-only 日期不會從 token 圖表消失。
-- `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 等已知 model 會顯示 USD 估算。
-- 畫面會說明這是 OpenAI Standard short-context API rate 的 lower-bound estimate，不是訂閱帳單；long-context 可能更高。
-- 未知 Codex model 顯示 `UNPRICED`，不能顯示成 `$0`。
-- Codex 用量使用藍色，Claude Code 使用橘色，並有可見的 provider legend。
-- 每一筆 session 的 cost/token、badge、prompt、日期和 model 保持在同一列。
-- 同一天切換 model 時會分開計價；未知 model 的 tokens 不會污染已知 model 的估算。
-- Provider filter 會重新計算資料，不只是隱藏畫面上的 label。
+- Codex tokens are included in totals and charts.
+- Dates containing only Codex usage remain visible in token charts.
+- Known models such as `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` display USD estimates.
+- The UI explains that estimates use OpenAI Standard short-context API rates, are a lower bound, may understate long-context calls, and are not the subscription bill.
+- Unknown Codex models display `UNPRICED`, not `$0`.
+- Codex usage is blue, Claude Code usage is amber, and a visible provider legend is present.
+- Each session's cost or token value stays on the same row as its badge, prompt, date, and model.
+- Usage is priced separately when a session changes models on the same day.
+- Unknown-model tokens do not affect estimates for known models.
+- Provider filtering recalculates the displayed data rather than hiding labels only.
 
-### 9. Memory 與 provider filter
+### 9. Memory and Provider Filtering
 
-1. 確認本機至少有一個 Codex durable memory file：
+1. Confirm that at least one durable Codex memory file exists:
 
    ```bash
    ls ~/.codex/memories/MEMORY.md ~/.codex/memories/memory_summary.md
    ```
 
-2. 前往 Memory。
-3. 依序選擇 `All`、`Claude Code`、`Codex` filter。
-4. 在 `Codex` filter 下打開 Codex memory group 和其中的 Markdown file。
+2. Open Memory.
+3. Select `All`, `Claude Code`, and `Codex` in turn.
+4. Under the `Codex` filter, open the Codex memory group and a Markdown file.
 
-預期結果：
+Expected results:
 
-- `Codex` filter 只顯示帶有 `CODEX` badge 的 Codex memory group。
-- 可以看到存在於本機的頂層 `MEMORY.md` 和 `memory_summary.md`。
-- 不會遞迴載入 `rollout_summaries/`、`raw_memories.md` 或其他內部資料。
-- `Claude Code` filter 仍顯示原本的 `~/.claude/projects/*/memory/` 內容。
-- 切換 filter 後，數量、選取項目、內容和空白提示都正確更新。
-- Codex memory 不會顯示錯誤的 `claude "Review my memory files"` 指令。
-- Reveal in Finder 會開啟 `~/.codex/memories/`。
+- The `Codex` filter displays only the Codex memory group with a `CODEX` badge.
+- Existing top-level `MEMORY.md` and `memory_summary.md` files are available.
+- The tab does not recursively load `rollout_summaries/`, `raw_memories.md`, or other internal data.
+- The `Claude Code` filter still displays memory from `~/.claude/projects/*/memory/`.
+- Counts, selection, content, and empty states update correctly when the filter changes.
+- Codex memory does not display the Claude-only `claude "Review my memory files"` command.
+- Reveal in Finder opens `~/.codex/memories/`.
 
-## 測試結果記錄
+## Test Result Template
 
-可以複製下面的格式記錄：
+Copy this template when recording results:
 
 ```text
-日期：
-macOS 版本：
-Codex 版本：
-c9watch binary SHA-256：
+Date:
+macOS version:
+Codex version:
+c9watch binary SHA-256:
 
-[ ] 1. 啟動與基本檢查
+[ ] 1. Startup and basic checks
 [ ] 2. Codex App session
 [ ] 3. Codex CLI session
 [ ] 4. Provider filter
 [ ] 5. Codex subagent grouping
-[ ] 6. Resume 同一個 session
-[ ] 7. History 與搜尋
-[ ] 8. Cost 與 token
-[ ] 9. Memory 與 provider filter
+[ ] 6. Resume the same session
+[ ] 7. History and search
+[ ] 8. Cost and token usage
+[ ] 9. Memory and provider filtering
 
-問題與備註：
+Issues and notes:
 ```
 
-## 發現問題時要保留什麼
+## Information to Capture for a Bug Report
 
-請保留：
+Keep the following information:
 
-- 問題畫面的 screenshot。
-- 測試使用的唯一文字。
-- Codex session ID。
-- `codex --version` 和 `c9watch --version` 的輸出。
-- c9watch 啟動 Terminal 中的 log。
-- 以下指令的輸出：
+- A screenshot of the issue.
+- The unique test marker.
+- The Codex session ID.
+- Output from `codex --version` and `c9watch --version`.
+- Relevant c9watch logs.
+- Output from:
 
   ```bash
   ./src-tauri/target/debug/c9watch list --pretty
   find ~/.codex/sessions -name "*<SESSION_ID>.jsonl" -print
   ```
 
-Rollout file 可能包含私人 prompt、路徑或 tool output。不要直接把完整檔案公開貼到 GitHub；先移除敏感內容。
+Rollout files may contain private prompts, paths, or tool output. Do not post a complete rollout file publicly. Remove sensitive content first.
 
-## 重新 build App
+## Rebuild the Debug App
 
-如果目前的 `/private/tmp` worktree 已被刪除，可以在 feature branch 重新 build：
+From the feature branch, run:
 
 ```bash
 git switch feature/codex-monitoring
@@ -348,29 +347,29 @@ CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=none CARGO_INCREMENTAL=0 \
   --config '{"bundle":{"createUpdaterArtifacts":false}}'
 ```
 
-Debug App 會在：
+The debug app is written to:
 
 ```text
 src-tauri/target/debug/bundle/macos/c9watch.app
 ```
 
-GUI 與 CLI 共用的 executable 會在：
+The combined GUI and CLI executable is written to:
 
 ```text
 src-tauri/target/debug/c9watch
 ```
 
-如果需要正式的 `.app` 和 `.dmg`：
+To build release `.app` and `.dmg` artifacts, run:
 
 ```bash
 npm run tauri build
 ```
 
-輸出位置：
+Release outputs are written to:
 
 ```text
 src-tauri/target/release/bundle/macos/c9watch.app
 src-tauri/target/release/bundle/dmg/
 ```
 
-目前這個 worktree 已有 debug `.app`，但尚未產生 release `.app` 或 `.dmg`。手動測試請使用上面的 debug App。
+Use the debug app for local manual testing. Release artifacts require the project's normal signing and notarization process before distribution.
