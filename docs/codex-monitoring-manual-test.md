@@ -91,7 +91,7 @@ If time is limited, complete at least these six checks:
 - [ ] A Codex CLI session appears in Monitor and its CLI JSON reports `surface: cli`.
 - [ ] The `All | Claude Code | Codex` filter changes the actual data in Monitor, History, Cost, and Memory.
 - [ ] Resuming the same Codex session produces one card and retains the full conversation.
-- [ ] The Cost tab estimates known Codex models, gives each model a consistent distinct color, and keeps cost or token values on the same row.
+- [ ] The Cost tab estimates known Codex models, gives each model a consistent distinct color, and shows one row per session under `BY PROJECT`.
 - [ ] The Memory tab's `Codex` filter displays `MEMORY.md` and `memory_summary.md` with a blue `CODEX` badge when they exist.
 
 ## Full Test Procedure
@@ -235,6 +235,7 @@ Expected results:
 - The card uses the latest rollout state instead of being overwritten by an older idle state.
 - The conversation contains both the `FIRST` and `SECOND` markers.
 - Assistant messages use the provider-neutral `AGENT` role label.
+- The Tools toggle hides and restores Codex tool calls and tool results.
 - Duplicate rollout messages are not displayed twice.
 
 ### 7. History and Search
@@ -269,6 +270,9 @@ Expected results:
 - Unknown Codex models display `UNPRICED`, not `$0`.
 - Codex usage is blue, Claude Code usage is amber, and a visible provider legend is present.
 - Each model in `BY MODEL` has a consistent distinct color in both the summary bar and its legend marker.
+- `BY PROJECT` displays one row per provider/session ID, even when accounting spans multiple days or models.
+- A merged multi-model session displays `N MODELS`; hovering it lists the contributing models.
+- Merging visible rows does not change per-model pricing, token totals, or priced/unpriced totals.
 - Each session's cost or token value stays on the same row as its badge, prompt, date, and model.
 - Usage is priced separately when a session changes models on the same day.
 - Unknown-model tokens do not affect estimates for known models.
