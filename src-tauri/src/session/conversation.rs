@@ -68,11 +68,7 @@ pub fn get_conversation_data(session_id: &str) -> Result<Conversation, String> {
                 .into_iter()
                 .map(|message| ConversationMessage {
                     timestamp: message.timestamp,
-                    message_type: if message.role == "user" {
-                        MessageType::User
-                    } else {
-                        MessageType::Assistant
-                    },
+                    message_type: message.message_type,
                     content: message.content,
                     images: Vec::new(),
                 })

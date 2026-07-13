@@ -5,7 +5,7 @@
 	import TokenDistanceVisualizer from './token-distance/TokenDistanceVisualizer.svelte';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
 	import { costData as costDataStore, costMode, refreshCostData } from '$lib/stores/cost';
-	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
+	import { formatCost, formatTokens, modelDisplayName } from '$lib/cost-utils';
 	import { flyIn, fadeIn } from '$lib/transitions';
 	import { providerFilter } from '$lib/stores/provider-filter';
 	import { matchesProvider, providerFilterLabel } from '$lib/provider';
@@ -13,6 +13,10 @@
 	import { isCostAvailable, selectChartDays, summarizeCostSessions } from '$lib/cost-semantics';
 
 	type TimeScale = 'daily' | 'weekly' | 'monthly';
+	type CostSessionRow = SessionCostRecord & {
+		models: string[];
+		unpricedTokens: number;
+	};
 
 	interface TimeBucket {
 		key: string;
@@ -56,6 +60,56 @@
 		if (mode === 'tokens') return formatTokens(tokens);
 		if (tokens > 0 && unpricedTokens === tokens) return 'UNPRICED';
 		return unpricedTokens > 0 ? `${formatCost(cost)} PRICED` : formatCost(cost);
+	}
+
+	/** Merge per-day/per-model accounting fragments into one visible session row. */
+	function mergeSessionRows(sessions: SessionCostRecord[]): CostSessionRow[] {
+		const rows = new Map<string, CostSessionRow>();
+		for (const [index, session] of sessions.entries()) {
+			const provider = session.provider === 'codex' ? 'codex' : 'claudeCode';
+			const key = session.sessionId
+				? `${provider}:${session.sessionId}`
+				: `${provider}:${session.date}:${session.timestamp}:${session.model}:${index}`;
+			const unpricedTokens = isCostAvailable(session) ? 0 : session.totalTokens;
+			const model = session.model || 'unknown';
+			const existing = rows.get(key);
+			if (!existing) {
+				rows.set(key, { ...session, models: [model], unpricedTokens });
+				continue;
+			}
+
+			existing.cost += session.cost;
+			existing.inputTokens += session.inputTokens;
+			existing.cachedInputTokens += session.cachedInputTokens;
+			existing.outputTokens += session.outputTokens;
+			existing.reasoningOutputTokens += session.reasoningOutputTokens;
+			existing.totalTokens += session.totalTokens;
+			existing.unpricedTokens += unpricedTokens;
+			existing.costAvailable = existing.unpricedTokens < existing.totalTokens;
+			if (!existing.models.includes(model)) existing.models.push(model);
+			if (session.timestamp > existing.timestamp) {
+				existing.timestamp = session.timestamp;
+				existing.date = session.date;
+				existing.surface = session.surface;
+				existing.agentKind = session.agentKind;
+			}
+			if (session.sessionName) existing.sessionName = session.sessionName;
+		}
+		return Array.from(rows.values());
+	}
+
+	function sessionModelLabel(session: CostSessionRow): string {
+		if (session.models.length === 1) {
+			const model = session.models[0];
+			return model === 'unknown' ? 'UNPRICED' : modelDisplayName(model);
+		}
+		return `${session.models.length} MODELS`;
+	}
+
+	function sessionModelTitle(session: CostSessionRow): string {
+		return session.models
+			.map((model) => model === 'unknown' ? 'Unpriced / unknown model' : modelDisplayName(model))
+			.join(', ');
 	}
 
 	const MODEL_COLOR_PALETTE = [
@@ -217,7 +271,7 @@
 		}
 	}
 
-	function sortSessions(sessions: import('$lib/types').SessionCostRecord[]): import('$lib/types').SessionCostRecord[] {
+	function sortSessions<T extends SessionCostRecord>(sessions: T[]): T[] {
 		const dir = sessionSortDir === 'desc' ? -1 : 1;
 		return [...sessions].sort((a, b) => {
 			if (sessionSortField === 'cost') {
@@ -435,15 +489,15 @@
 
 	/** Project costs filtered to the active time window */
 	let filteredProjectCosts = $derived.by(() => {
-		if (!costData) return [] as Array<{ project: string; projectName: string; totalCost: number; totalTokens: number; unpricedTokens: number; sessions: import('$lib/types').SessionCostRecord[] }>;
+		if (!costData) return [] as Array<{ project: string; projectName: string; totalCost: number; totalTokens: number; unpricedTokens: number; sessions: SessionCostRecord[]; displaySessions: CostSessionRow[] }>;
 		const tw = getTimeWindow();
 
-		const projMap = new Map<string, { project: string; projectName: string; totalCost: number; totalTokens: number; unpricedTokens: number; sessions: import('$lib/types').SessionCostRecord[] }>();
+		const projMap = new Map<string, { project: string; projectName: string; totalCost: number; totalTokens: number; unpricedTokens: number; sessions: SessionCostRecord[]; displaySessions: CostSessionRow[] }>();
 		for (const proj of costData.projectCosts) {
 			const filtered = tw ? proj.sessions.filter(s => s.date >= tw.start && s.date < tw.end) : proj.sessions;
 			if (filtered.length === 0) continue;
 			const summary = summarizeCostSessions(filtered);
-			projMap.set(proj.project, { project: proj.project, projectName: proj.projectName, totalCost: summary.cost, totalTokens: summary.tokens, unpricedTokens: summary.unpricedTokens, sessions: filtered });
+			projMap.set(proj.project, { project: proj.project, projectName: proj.projectName, totalCost: summary.cost, totalTokens: summary.tokens, unpricedTokens: summary.unpricedTokens, sessions: filtered, displaySessions: mergeSessionRows(filtered) });
 		}
 		return Array.from(projMap.values()).sort((a, b) => mode === 'tokens' ? b.totalTokens - a.totalTokens : b.totalCost - a.totalCost);
 	});
@@ -748,7 +802,7 @@
 							aria-label={collapsedProjects.has(proj.project) ? 'Expand project' : 'Collapse project'}
 						>
 							<span class="collapse-toggle" aria-hidden="true">{collapsedProjects.has(proj.project) ? '▶' : '▼'}</span>
-							<span class="group-name">{proj.projectName.toUpperCase()} <span class="group-count">({proj.sessions.length})</span></span>
+							<span class="group-name">{proj.projectName.toUpperCase()} <span class="group-count">({proj.displaySessions.length})</span></span>
 							<span class="group-cost" class:unpriced={mode === 'usd' && proj.unpricedTokens === proj.totalTokens}>{formatAggregate(proj.totalCost, proj.totalTokens, proj.unpricedTokens)}</span>
 						</div>
 
@@ -769,8 +823,8 @@
 
 							<!-- svelte-ignore a11y_click_events_have_key_events -->
 							<!-- svelte-ignore a11y_no_static_element_interactions -->
-							{@const sorted = sortSessions(proj.sessions)}
-							{#each expandedProjects.has(proj.project) ? sorted : sorted.slice(0, 5) as session (session.sessionId + '-' + session.date + '-' + session.model)}
+							{@const sorted = sortSessions(proj.displaySessions)}
+							{#each expandedProjects.has(proj.project) ? sorted : sorted.slice(0, 5) as session ((session.provider ?? 'claudeCode') + '-' + session.sessionId + '-' + session.timestamp)}
 								<!-- svelte-ignore a11y_click_events_have_key_events -->
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<div class="session-detail" class:codex-session={session.provider === 'codex'} onclick={() => handleSessionClick(session)}>
@@ -779,12 +833,12 @@
 									<span class="detail-session-id" title={session.sessionId}>{session.sessionId.slice(0, 8)}</span>
 									<span class="detail-spacer"></span>
 									<span class="detail-time">{formatDateTime(session.timestamp)}</span>
-									<span class="detail-model">{modelDisplayName(session.model)}</span>
-									<span class="detail-cost" class:unpriced={mode === 'usd' && !isCostAvailable(session)}>{formatCostOrTokens(session.cost, session.totalTokens, mode, isCostAvailable(session))}</span>
+									<span class="detail-model" title={sessionModelTitle(session)}>{sessionModelLabel(session)}</span>
+									<span class="detail-cost" class:unpriced={mode === 'usd' && session.unpricedTokens === session.totalTokens}>{formatAggregate(session.cost, session.totalTokens, session.unpricedTokens)}</span>
 								</div>
 							{/each}
 
-							{#if proj.sessions.length > 5}
+							{#if proj.displaySessions.length > 5}
 								<!-- svelte-ignore a11y_click_events_have_key_events -->
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<div class="more-sessions" onclick={() => {
@@ -796,7 +850,7 @@
 									}
 									expandedProjects = next;
 								}}>
-									{expandedProjects.has(proj.project) ? 'Show less' : `${proj.sessions.length - 5} more sessions`}
+									{expandedProjects.has(proj.project) ? 'Show less' : `${proj.displaySessions.length - 5} more sessions`}
 								</div>
 							{/if}
 						{/if}

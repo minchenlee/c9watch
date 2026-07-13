@@ -7,6 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::parser::MessageType;
 use super::source::{
     AgentKind, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionKind,
     SessionProvider, SessionSource, SessionSurface,
@@ -33,6 +34,7 @@ pub enum CodexLifecycle {
 pub struct CodexMessage {
     pub timestamp: String,
     pub role: String,
+    pub message_type: MessageType,
     pub content: String,
 }
 
@@ -63,7 +65,16 @@ impl CodexRolloutSummary {
     }
 
     pub fn latest_message(&self) -> Option<&str> {
-        self.messages.last().map(|message| message.content.as_str())
+        self.messages
+            .iter()
+            .rev()
+            .find(|message| {
+                matches!(
+                    message.message_type,
+                    MessageType::User | MessageType::Assistant
+                )
+            })
+            .map(|message| message.content.as_str())
     }
 }
 
@@ -88,6 +99,7 @@ pub struct CodexSessionSource {
     cache: HashMap<PathBuf, CacheEntry>,
     archive_index: HashMap<String, PathBuf>,
     last_full_discovery: Option<SystemTime>,
+    capture_tool_messages: bool,
     #[cfg(test)]
     parse_count: usize,
 }
@@ -104,8 +116,16 @@ impl CodexSessionSource {
             cache: HashMap::new(),
             archive_index: HashMap::new(),
             last_full_discovery: None,
+            capture_tool_messages: false,
             #[cfg(test)]
             parse_count: 0,
+        }
+    }
+
+    fn conversation_at_root(sessions_root: PathBuf) -> Self {
+        Self {
+            capture_tool_messages: true,
+            ..Self::at_root(sessions_root)
         }
     }
 
@@ -223,7 +243,11 @@ impl CodexSessionSource {
                 continue;
             }
             if let Ok(value) = serde_json::from_slice::<Value>(line) {
-                apply_rollout_event(&mut entry.summary, &value);
+                apply_rollout_event_with_tools(
+                    &mut entry.summary,
+                    &value,
+                    self.capture_tool_messages,
+                );
             }
         }
         entry.stamp = stamp;
@@ -496,7 +520,16 @@ fn parse_timestamp_millis(timestamp: &str) -> Option<i64> {
         .map(|timestamp| timestamp.timestamp_millis())
 }
 
+#[cfg(test)]
 fn apply_rollout_event(summary: &mut CodexRolloutSummary, value: &Value) {
+    apply_rollout_event_with_tools(summary, value, false);
+}
+
+fn apply_rollout_event_with_tools(
+    summary: &mut CodexRolloutSummary,
+    value: &Value,
+    capture_tool_messages: bool,
+) {
     let timestamp = value
         .get("timestamp")
         .and_then(Value::as_str)
@@ -511,6 +544,9 @@ fn apply_rollout_event(summary: &mut CodexRolloutSummary, value: &Value) {
     match event_type {
         Some("session_meta") => apply_session_meta(summary, timestamp, payload),
         Some("event_msg") => apply_event_message(summary, timestamp, payload),
+        Some("response_item") if capture_tool_messages => {
+            apply_response_item(summary, timestamp, payload)
+        }
         _ => {}
     }
 }
@@ -617,6 +653,11 @@ fn apply_event_message(summary: &mut CodexRolloutSummary, timestamp: &str, paylo
                 summary.messages.push(CodexMessage {
                     timestamp: timestamp.to_string(),
                     role: role.to_string(),
+                    message_type: if role == "user" {
+                        MessageType::User
+                    } else {
+                        MessageType::Assistant
+                    },
                     content: content.to_string(),
                 });
             }
@@ -633,6 +674,100 @@ fn apply_event_message(summary: &mut CodexRolloutSummary, timestamp: &str, paylo
         }
         _ => {}
     }
+}
+
+fn response_item_value(value: Option<&Value>) -> String {
+    let Some(value) = value else {
+        return String::new();
+    };
+    if let Some(text) = value.as_str() {
+        return serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|parsed| serde_json::to_string_pretty(&parsed).ok())
+            .unwrap_or_else(|| text.to_string());
+    }
+    serde_json::to_string_pretty(value).unwrap_or_default()
+}
+
+fn response_item_id(payload: &Value) -> &str {
+    payload
+        .get("call_id")
+        .or_else(|| payload.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn apply_response_item(summary: &mut CodexRolloutSummary, timestamp: &str, payload: &Value) {
+    let Some(kind) = payload.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    let (message_type, role, content) = match kind {
+        "function_call" | "custom_tool_call" => {
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            let details =
+                response_item_value(payload.get("arguments").or_else(|| payload.get("input")));
+            (
+                MessageType::ToolUse,
+                "tool_use",
+                format!("[{name}] {} - {details}", response_item_id(payload)),
+            )
+        }
+        "function_call_output" | "custom_tool_call_output" => {
+            let output = response_item_value(payload.get("output"));
+            (
+                MessageType::ToolResult,
+                "tool_result",
+                format!("[Result] {}: {output}", response_item_id(payload)),
+            )
+        }
+        "web_search_call" => {
+            let details = response_item_value(payload.get("action"));
+            (
+                MessageType::ToolUse,
+                "tool_use",
+                format!("[web_search] {} - {details}", response_item_id(payload)),
+            )
+        }
+        "tool_search_call" => {
+            let details = response_item_value(payload.get("arguments"));
+            (
+                MessageType::ToolUse,
+                "tool_use",
+                format!("[tool_search] {} - {details}", response_item_id(payload)),
+            )
+        }
+        "tool_search_output" => {
+            let output = response_item_value(payload.get("tools"));
+            (
+                MessageType::ToolResult,
+                "tool_result",
+                format!("[Result] {}: {output}", response_item_id(payload)),
+            )
+        }
+        "image_generation_call" => {
+            let details = response_item_value(payload.get("revised_prompt"));
+            (
+                MessageType::ToolUse,
+                "tool_use",
+                format!(
+                    "[image_generation] {} - {details}",
+                    response_item_id(payload)
+                ),
+            )
+        }
+        // Message and reasoning response items have equivalent public event_msg
+        // records. Ignoring them avoids duplicate conversation content.
+        _ => return,
+    };
+    summary.messages.push(CodexMessage {
+        timestamp: timestamp.to_string(),
+        role: role.to_string(),
+        message_type,
+        content,
+    });
 }
 
 fn rollback_messages(messages: &mut Vec<CodexMessage>, turns: usize) {
@@ -670,7 +805,7 @@ fn find_codex_conversation_under(
         return Err(format!("Codex session {thread_id} not found"));
     }
 
-    let mut source = CodexSessionSource::at_root(sessions_root.to_path_buf());
+    let mut source = CodexSessionSource::conversation_at_root(sessions_root.to_path_buf());
     let mut messages = Vec::new();
     let mut parsed_any = false;
     let mut last_error = None;
@@ -1106,7 +1241,7 @@ mod tests {
     }
 
     #[test]
-    fn response_items_are_never_conversation_messages() {
+    fn response_item_messages_are_not_duplicated_into_conversations() {
         let mut summary = CodexRolloutSummary::default();
         apply_rollout_event(
             &mut summary,
@@ -1116,6 +1251,34 @@ mod tests {
             }),
         );
         assert!(summary.messages.is_empty());
+    }
+
+    #[test]
+    fn response_item_tool_calls_are_filterable_conversation_messages() {
+        let mut summary = CodexRolloutSummary::default();
+        apply_rollout_event_with_tools(
+            &mut summary,
+            &serde_json::json!({
+                "timestamp":"2026-07-13T00:00:01Z", "type":"response_item",
+                "payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"pwd\"}"}
+            }),
+            true,
+        );
+        apply_rollout_event_with_tools(
+            &mut summary,
+            &serde_json::json!({
+                "timestamp":"2026-07-13T00:00:02Z", "type":"response_item",
+                "payload":{"type":"function_call_output","call_id":"call-1","output":"/tmp/project"}
+            }),
+            true,
+        );
+
+        assert_eq!(summary.messages.len(), 2);
+        assert_eq!(summary.messages[0].message_type, MessageType::ToolUse);
+        assert!(summary.messages[0].content.contains("exec_command"));
+        assert!(summary.messages[0].content.contains("pwd"));
+        assert_eq!(summary.messages[1].message_type, MessageType::ToolResult);
+        assert!(summary.messages[1].content.contains("/tmp/project"));
     }
 
     #[test]
@@ -1163,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_lookup_uses_only_codex_event_messages() {
+    fn conversation_lookup_ignores_duplicate_response_item_messages() {
         let temp = TempDir::new().unwrap();
         let day = temp.path().join("2026/07/13");
         fs::create_dir_all(&day).unwrap();
@@ -1178,6 +1341,31 @@ mod tests {
         let messages = find_codex_conversation_under(temp.path(), "thread-id").unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "hello");
+    }
+
+    #[test]
+    fn conversation_lookup_includes_codex_tool_messages() {
+        let temp = TempDir::new().unwrap();
+        let day = temp.path().join("2026/07/13");
+        fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout-2026-07-13T00-00-00-thread-id.jsonl");
+        let mut lines = root_fixture(Value::String("cli".into()), "codex-tui");
+        lines.push(event(
+            "2026-07-13T00:00:04Z",
+            "response_item",
+            serde_json::json!({"type":"custom_tool_call", "name":"view_image", "call_id":"call-1", "input":"{\"path\":\"/tmp/image.png\"}"}),
+        ));
+        lines.push(event(
+            "2026-07-13T00:00:05Z",
+            "response_item",
+            serde_json::json!({"type":"custom_tool_call_output", "call_id":"call-1", "output":"ok"}),
+        ));
+        write_lines(&path, &lines, true);
+
+        let messages = find_codex_conversation_under(temp.path(), "thread-id").unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].message_type, MessageType::ToolUse);
+        assert_eq!(messages[2].message_type, MessageType::ToolResult);
     }
 
     #[test]
