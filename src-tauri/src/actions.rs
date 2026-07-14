@@ -19,6 +19,13 @@ pub fn open_session(pid: u32, project_path: String) -> Result<(), String> {
         app_name, project_name, project_path
     ));
 
+    // Supacode: the session's env carries its worktree/tab/surface IDs,
+    // so we can focus the exact surface via the bundled `supacode` CLI (macOS only)
+    #[cfg(target_os = "macos")]
+    if app_name == "supacode" {
+        return focus_supacode_session(pid);
+    }
+
     // iTerm2: use tty matching to focus the correct tab (macOS only)
     #[cfg(target_os = "macos")]
     if app_name == "iTerm" || app_name == "iTerm2" {
@@ -121,6 +128,109 @@ fn get_session_tty(pid: u32) -> Option<String> {
         current_pid = ppid;
     }
     None
+}
+
+/// Read a single environment variable from a running process via `ps eww`.
+/// Only visible for processes owned by the current user, which is the case
+/// for the Claude sessions c9watch monitors.
+#[cfg(target_os = "macos")]
+fn get_process_env(pid: u32, key: &str) -> Option<String> {
+    let output = Command::new("ps")
+        .arg("eww")
+        .arg("-o")
+        .arg("command=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let prefix = format!("{}=", key);
+    // `ps eww` appends env as space-separated KEY=VALUE words. Supacode IDs are
+    // URL-encoded / UUIDs, so they never contain spaces.
+    raw.split_whitespace()
+        .find_map(|word| word.strip_prefix(prefix.as_str()).map(|v| v.to_string()))
+}
+
+/// Locate the `supacode` CLI bundled with the app
+#[cfg(target_os = "macos")]
+fn get_supacode_cli() -> Option<String> {
+    let paths = [
+        "/Applications/supacode.app/Contents/Resources/bin/supacode",
+        "/usr/local/bin/supacode",
+    ];
+    paths
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|p| p.to_string())
+}
+
+/// Focus the exact Supacode tab + surface owning a Claude session.
+///
+/// Supacode injects SUPACODE_WORKTREE_ID / SUPACODE_TAB_ID / SUPACODE_SURFACE_ID
+/// into every surface's shell, so the Claude process's own environment says
+/// exactly where it lives. The bundled `supacode` CLI does the focusing.
+#[cfg(target_os = "macos")]
+fn focus_supacode_session(pid: u32) -> Result<(), String> {
+    let worktree = get_process_env(pid, "SUPACODE_WORKTREE_ID");
+    let tab = get_process_env(pid, "SUPACODE_TAB_ID");
+    let surface = get_process_env(pid, "SUPACODE_SURFACE_ID");
+
+    crate::debug_log::log_info(&format!(
+        "[open_session] Supacode coords for PID {}: worktree={:?} tab={:?} surface={:?}",
+        pid, worktree, tab, surface
+    ));
+
+    // Bring the app to the front first so the focused surface is visible
+    activate_app_fallback("supacode")?;
+
+    let (Some(worktree), Some(tab)) = (worktree, tab) else {
+        // Env not visible (or an older Supacode without the vars) —
+        // app-level activation is the best we can do
+        return Ok(());
+    };
+
+    let Some(cli) = get_supacode_cli() else {
+        crate::debug_log::log_error("[open_session] Supacode CLI not found");
+        return Ok(());
+    };
+
+    let mut tab_cmd = Command::new(&cli);
+    tab_cmd
+        .arg("tab")
+        .arg("focus")
+        .arg("--worktree")
+        .arg(&worktree)
+        .arg("--tab")
+        .arg(&tab)
+        .arg("--timeout")
+        .arg("5");
+    if let Err(e) = tab_cmd.output() {
+        crate::debug_log::log_error(&format!("[open_session] supacode tab focus failed: {}", e));
+        return Ok(());
+    }
+
+    if let Some(surface) = surface {
+        let mut surface_cmd = Command::new(&cli);
+        surface_cmd
+            .arg("surface")
+            .arg("focus")
+            .arg("--worktree")
+            .arg(&worktree)
+            .arg("--tab")
+            .arg(&tab)
+            .arg("--surface")
+            .arg(&surface)
+            .arg("--timeout")
+            .arg("5");
+        if let Err(e) = surface_cmd.output() {
+            crate::debug_log::log_error(&format!(
+                "[open_session] supacode surface focus failed: {}",
+                e
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Focus the correct iTerm2 tab/session by matching tty
@@ -796,6 +906,12 @@ fn get_app_name(comm: &str) -> Option<&'static str> {
         if comm_lower.contains(".app/") || comm_lower.contains(".app") {
             if comm_lower.contains("zed.app") {
                 return Some("Zed");
+            }
+            // Supacode's surfaces run under a zmx helper that re-parents to
+            // launchd, but its binary path still lives inside supacode.app.
+            // Must be checked BEFORE VS Code: "supacode.app" contains "code.app".
+            if comm_lower.contains("supacode.app") {
+                return Some("supacode");
             }
             if comm_lower.contains("visual studio code.app") || comm_lower.contains("code.app") {
                 return Some("Visual Studio Code");
