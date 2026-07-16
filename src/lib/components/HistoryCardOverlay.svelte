@@ -32,6 +32,11 @@
 	let primaryCostLabel = $derived(
 		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, costRecord.costAvailable ?? costRecord.provider !== 'codex') : null
 	);
+	let resumeCommand = $derived(
+		entry.provider === 'codex'
+			? `cd "${entry.project}" && codex resume ${entry.sessionId}`
+			: `cd "${entry.project}" && claude --resume ${entry.sessionId}`
+	);
 
 	let visibleMessages = $derived.by(() => {
 		if (!conversation) return [];
@@ -132,8 +137,7 @@
 	}
 
 	async function copyResumeCommand() {
-		const cmd = `cd "${entry.project}" && claude --resume ${entry.sessionId}`;
-		await navigator.clipboard.writeText(cmd);
+		await navigator.clipboard.writeText(resumeCommand);
 		copied = true;
 		setTimeout(() => {
 			copied = false;
@@ -186,7 +190,7 @@
 					title="Click to copy resume command"
 				>
 					<span class="resume-label">{copied ? 'COPIED!' : 'RESUME'}</span>
-					<code class="resume-cmd">cd "{entry.project}" && claude --resume {entry.sessionId}</code>
+					<code class="resume-cmd">{resumeCommand}</code>
 				</button>
 
 				<div class="header-actions">

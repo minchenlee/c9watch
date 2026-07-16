@@ -232,6 +232,8 @@ This is an important regression test for the PR review fixes.
    codex resume <SESSION_ID> "Reply with C9WATCH-RESUME-SECOND-20260713-01"
    ```
 
+   When the same Codex session is opened from History or Cost, its resume chip must display and copy `codex resume <SESSION_ID>`, not `claude --resume <SESSION_ID>`.
+
 4. Check Monitor.
 5. Open the session conversation.
 

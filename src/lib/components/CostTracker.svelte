@@ -135,9 +135,10 @@
 		if (normalized.includes('terra')) return '#00c2a8';
 		if (normalized.includes('sol')) return 'var(--accent-blue)';
 		if (normalized.includes('luna')) return 'var(--accent-green)';
-		if (normalized.includes('spark')) return 'var(--accent-pink)';
-		if (normalized.includes('mini') || normalized.includes('nano')) return '#f5c542';
-		if (normalized.startsWith('gpt-5.5')) return 'var(--accent-purple)';
+		if (normalized.includes('spark')) return '#22d3ee';
+		if (normalized.includes('nano')) return '#f97316';
+		if (normalized.includes('mini')) return '#f5c542';
+		if (normalized.startsWith('gpt-5.5')) return '#e879f9';
 		if (normalized.startsWith('gpt-5.4')) return 'var(--accent-red)';
 
 		if (provider === 'codex' || normalized.startsWith('gpt-')) {
