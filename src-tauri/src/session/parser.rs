@@ -577,7 +577,7 @@ pub fn extract_messages(
 }
 
 /// Message type enumeration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MessageType {
     User,
     Assistant,

@@ -29,7 +29,7 @@
 			case 'User':
 				return 'You';
 			case 'Assistant':
-				return 'Claude';
+				return 'Agent';
 			case 'Thinking':
 				return 'Thinking';
 			case 'ToolUse':
@@ -401,4 +401,3 @@
 		border: 1px solid var(--border-muted);
 	}
 </style>
-

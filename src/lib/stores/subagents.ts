@@ -21,6 +21,8 @@ export interface SubagentInfo {
 	completedAt: string | null;
 	parentSessionId: string;
 	status: SubagentStatus;
+	provider?: 'claudeCode' | 'codex';
+	sessionId?: string;
 }
 
 /** Raw map: parent session id -> subagents */

@@ -6,24 +6,43 @@
 	import DOMPurify from 'dompurify';
 	import { getMemoryFiles, revealInFileManager } from '$lib/api';
 	import type { ProjectMemory } from '$lib/types';
+	import { providerFilter } from '$lib/stores/provider-filter';
+	import { matchesProvider, providerFilterLabel, providerOf } from '$lib/provider';
+	import ProviderBadge from '$lib/components/ProviderBadge.svelte';
 	import { flyIn } from '$lib/transitions';
 
-	let projects = $state<ProjectMemory[]>([]);
+	let allProjects = $state<ProjectMemory[]>([]);
 	let loading = $state(true);
-	let selectedIndex = $state(0);
+	let selectedKey = $state<string | null>(null);
 
 	onMount(async () => {
-		projects = await getMemoryFiles();
-		loading = false;
+		try {
+			allProjects = await getMemoryFiles();
+		} finally {
+			loading = false;
+		}
 	});
 
-	let selectedProject = $derived(projects[selectedIndex] ?? null);
+	let projects = $derived(allProjects.filter((project) => matchesProvider(project, $providerFilter)));
+
+	function projectKey(project: ProjectMemory): string {
+		return `${providerOf(project)}:${project.memoryDirPath}`;
+	}
+
+	let selectedProject = $derived(
+		projects.find((project) => projectKey(project) === selectedKey) ?? projects[0] ?? null
+	);
+
+	$effect(() => {
+		const nextKey = selectedProject ? projectKey(selectedProject) : null;
+		if (selectedKey !== nextKey) selectedKey = nextKey;
+	});
 
 	let copied = $state(false);
 
 	let expanded = $state<string | null>(null);
 	let fileHeaders: Record<string, HTMLButtonElement | null> = {};
-	let contentPane: HTMLDivElement | null = null;
+	let contentPane = $state<HTMLDivElement | null>(null);
 
 	$effect(() => {
 		if (!selectedProject) return;
@@ -43,7 +62,7 @@
 	}
 
 	function copyClaudeCommand() {
-		if (!selectedProject) return;
+		if (!selectedProject || providerOf(selectedProject) !== 'claudeCode') return;
 		const cmd = `claude "Review my memory files and suggest improvements" --project-dir ${selectedProject.projectPath}`;
 		navigator.clipboard.writeText(cmd);
 		copied = true;
@@ -89,19 +108,30 @@
 	{#if loading}
 		<div class="state-msg"><span class="loading-spinner">◌</span> Scanning memory files…</div>
 	{:else if projects.length === 0}
-		<div class="state-msg">No memory files found.</div>
-		<div class="empty-hint">Claude Code stores memory in ~/.claude/projects/*/memory/</div>
+		<div class="state-msg">
+			{$providerFilter === 'all' ? 'No memory files found.' : `No ${providerFilterLabel($providerFilter)} memory files found.`}
+		</div>
+		{#if $providerFilter === 'codex'}
+			<div class="empty-hint">Codex stores durable memory in ~/.codex/memories/</div>
+		{:else if $providerFilter === 'claudeCode'}
+			<div class="empty-hint">Claude Code stores memory in ~/.claude/projects/*/memory/</div>
+		{:else}
+			<div class="empty-hint">Memory is discovered from ~/.claude/projects/*/memory/ and ~/.codex/memories/</div>
+		{/if}
 	{:else}
 		<div class="two-panel">
 			<aside class="project-list">
-				{#each projects as project, i}
+				{#each projects as project, i (projectKey(project))}
 					<button
 						class="project-item"
-						class:selected={i === selectedIndex}
-						onclick={() => (selectedIndex = i)}
+						class:selected={projectKey(project) === selectedKey}
+						onclick={() => (selectedKey = projectKey(project))}
 						in:flyIn|global={{ index: i + 1, duration: 350, stride: 25 }}
 					>
-						<span class="project-item-name">{project.projectName}</span>
+						<span class="project-item-main">
+							<ProviderBadge provider={providerOf(project)} compact noun="memory" />
+							<span class="project-item-name">{project.projectName}</span>
+						</span>
 						<span class="project-item-count">{project.files.length}</span>
 					</button>
 				{/each}
@@ -109,9 +139,10 @@
 
 			<div class="memory-content" bind:this={contentPane}>
 				{#if selectedProject}
-					{#key selectedProject.projectPath}
+					{#key projectKey(selectedProject)}
 						<div class="content-header" in:flyIn|global={{ index: 0, duration: 800, stride: 120 }}>
 							<div class="content-path-row">
+								<ProviderBadge provider={providerOf(selectedProject)} compact noun="memory" />
 								<span class="content-path">{selectedProject.projectPath}</span>
 								<button class="reveal-btn" onclick={handleReveal} title="Reveal in Finder">
 									<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -121,10 +152,14 @@
 									</svg>
 								</button>
 							</div>
-							<button class="claude-cmd" onclick={copyClaudeCommand} title="Copy command to discuss memory with Claude Code">
-								<span class="cmd-text">claude "Review my memory files" --project-dir {selectedProject.projectPath}</span>
-								<span class="cmd-copy">{copied ? '✓ Copied' : 'Copy'}</span>
-							</button>
+							{#if providerOf(selectedProject) === 'claudeCode'}
+								<button class="claude-cmd" onclick={copyClaudeCommand} title="Copy command to discuss memory with Claude Code">
+									<span class="cmd-text">claude "Review my memory files" --project-dir {selectedProject.projectPath}</span>
+									<span class="cmd-copy">{copied ? '✓ Copied' : 'Copy'}</span>
+								</button>
+							{:else}
+								<div class="provider-note">Codex reads these durable memory files automatically.</div>
+							{/if}
 						</div>
 						{#each selectedProject.files as file, i (file.filename)}
 							<div class="file-section" in:flyIn|global={{ index: i + 1, duration: 800, stride: 120 }}>
@@ -287,6 +322,14 @@
 		white-space: nowrap;
 	}
 
+	.project-item-main {
+		display: flex;
+		align-items: center;
+		gap: var(--space-sm);
+		min-width: 0;
+		overflow: hidden;
+	}
+
 	.project-item-count {
 		font-family: var(--font-mono);
 		font-size: 10px;
@@ -358,6 +401,16 @@
 		flex-shrink: 0;
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
+	}
+
+	.provider-note {
+		margin-top: var(--space-sm);
+		padding: var(--space-sm) var(--space-md);
+		border: 1px solid var(--border-default);
+		border-radius: 6px;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
 	}
 
 	/* ── File sections ───────────────────────────────────────────── */

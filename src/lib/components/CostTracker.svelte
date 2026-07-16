@@ -1,32 +1,184 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { getConversation } from '$lib/api';
-	import type { HistoryEntry, Conversation } from '$lib/types';
+	import type { HistoryEntry, Conversation, CostData, SessionCostRecord, SessionProvider } from '$lib/types';
 	import TokenDistanceVisualizer from './token-distance/TokenDistanceVisualizer.svelte';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
 	import { costData as costDataStore, costMode, refreshCostData } from '$lib/stores/cost';
-	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
+	import { formatCost, formatTokens, modelDisplayName } from '$lib/cost-utils';
 	import { flyIn, fadeIn } from '$lib/transitions';
+	import { providerFilter } from '$lib/stores/provider-filter';
+	import { matchesProvider, providerFilterLabel } from '$lib/provider';
+	import ProviderBadge from './ProviderBadge.svelte';
+	import { isCostAvailable, selectChartDays, summarizeCostSessions } from '$lib/cost-semantics';
 
 	type TimeScale = 'daily' | 'weekly' | 'monthly';
+	type CostSessionRow = SessionCostRecord & {
+		models: string[];
+		unpricedTokens: number;
+	};
 
 	interface TimeBucket {
 		key: string;
 		label: string;
 		cost: number;
 		tokens: number;
+		unpricedTokens: number;
 		sessions: import('$lib/types').SessionCostRecord[];
-		subBuckets?: { label: string; cost: number; tokens: number; sessions: import('$lib/types').SessionCostRecord[] }[];
+		subBuckets?: { label: string; cost: number; tokens: number; unpricedTokens: number; sessions: import('$lib/types').SessionCostRecord[] }[];
 	}
 
 	function sumTokens(sessions: import('$lib/types').SessionCostRecord[]): number {
 		return sessions.reduce((sum, s) => sum + (s.totalTokens || 0), 0);
 	}
 
+	function providerUsageValue(sessions: SessionCostRecord[], provider: SessionProvider): number {
+		return sessions
+			.filter((session) => (session.provider === 'codex' ? 'codex' : 'claudeCode') === provider)
+			.reduce((sum, session) => {
+				if (mode === 'tokens') return sum + (session.totalTokens || 0);
+				return sum + (isCostAvailable(session) ? session.cost : 0);
+			}, 0);
+	}
+
+	function claudeUsageShare(sessions: SessionCostRecord[]): number {
+		const claude = providerUsageValue(sessions, 'claudeCode');
+		const codex = providerUsageValue(sessions, 'codex');
+		return claude + codex > 0 ? (claude / (claude + codex)) * 100 : 100;
+	}
+
+	function providerBreakdownLabel(sessions: SessionCostRecord[]): string {
+		const claude = providerUsageValue(sessions, 'claudeCode');
+		const codex = providerUsageValue(sessions, 'codex');
+		const total = claude + codex;
+		const format = mode === 'tokens' ? formatTokens : formatCost;
+		const percentage = (value: number) => total > 0 ? `${((value / total) * 100).toFixed(0)}%` : '0%';
+		return `Claude Code ${format(claude)} (${percentage(claude)}), Codex ${format(codex)} (${percentage(codex)})`;
+	}
+
+	function formatAggregate(cost: number, tokens: number, unpricedTokens: number): string {
+		if (mode === 'tokens') return formatTokens(tokens);
+		if (tokens > 0 && unpricedTokens === tokens) return 'UNPRICED';
+		return unpricedTokens > 0 ? `${formatCost(cost)} PRICED` : formatCost(cost);
+	}
+
+	/** Merge per-day/per-model accounting fragments into one visible session row. */
+	function mergeSessionRows(sessions: SessionCostRecord[]): CostSessionRow[] {
+		const rows = new Map<string, CostSessionRow>();
+		for (const [index, session] of sessions.entries()) {
+			const provider = session.provider === 'codex' ? 'codex' : 'claudeCode';
+			const key = session.sessionId
+				? `${provider}:${session.sessionId}`
+				: `${provider}:${session.date}:${session.timestamp}:${session.model}:${index}`;
+			const unpricedTokens = isCostAvailable(session) ? 0 : session.totalTokens;
+			const model = session.model || 'unknown';
+			const existing = rows.get(key);
+			if (!existing) {
+				rows.set(key, { ...session, models: [model], unpricedTokens });
+				continue;
+			}
+
+			existing.cost += session.cost;
+			existing.inputTokens += session.inputTokens;
+			existing.cachedInputTokens += session.cachedInputTokens;
+			existing.outputTokens += session.outputTokens;
+			existing.reasoningOutputTokens += session.reasoningOutputTokens;
+			existing.totalTokens += session.totalTokens;
+			existing.unpricedTokens += unpricedTokens;
+			existing.costAvailable = existing.unpricedTokens < existing.totalTokens;
+			if (!existing.models.includes(model)) existing.models.push(model);
+			if (session.timestamp > existing.timestamp) {
+				existing.timestamp = session.timestamp;
+				existing.date = session.date;
+				existing.surface = session.surface;
+				existing.agentKind = session.agentKind;
+			}
+			if (session.sessionName) existing.sessionName = session.sessionName;
+		}
+		return Array.from(rows.values());
+	}
+
+	function sessionModelLabel(session: CostSessionRow): string {
+		if (session.models.length === 1) {
+			const model = session.models[0];
+			return model === 'unknown' ? 'UNPRICED' : modelDisplayName(model);
+		}
+		return `${session.models.length} MODELS`;
+	}
+
+	function sessionModelTitle(session: CostSessionRow): string {
+		return session.models
+			.map((model) => model === 'unknown' ? 'Unpriced / unknown model' : modelDisplayName(model))
+			.join(', ');
+	}
+
+	const MODEL_COLOR_PALETTE = [
+		'var(--accent-blue)',
+		'#00c2a8',
+		'var(--accent-green)',
+		'var(--accent-purple)',
+		'var(--accent-pink)',
+		'#f5c542',
+		'var(--accent-red)',
+		'#22d3ee'
+	];
+
+	/** Keep model colors stable across the bar and legend, regardless of usage order. */
+	function modelColor(model: string, provider: SessionProvider): string {
+		const normalized = model.trim().toLowerCase();
+		if (!normalized || normalized === '-') return 'var(--text-muted)';
+
+		if (normalized.startsWith('claude-opus')) return 'var(--accent-amber)';
+		if (normalized.startsWith('claude-sonnet')) return 'var(--accent-purple)';
+		if (normalized.startsWith('claude-haiku')) return 'var(--accent-pink)';
+
+		if (normalized.includes('terra')) return '#00c2a8';
+		if (normalized.includes('sol')) return 'var(--accent-blue)';
+		if (normalized.includes('luna')) return 'var(--accent-green)';
+		if (normalized.includes('spark')) return '#22d3ee';
+		if (normalized.includes('nano')) return '#f97316';
+		if (normalized.includes('mini')) return '#f5c542';
+		if (normalized.startsWith('gpt-5.5')) return '#e879f9';
+		if (normalized.startsWith('gpt-5.4')) return 'var(--accent-red)';
+		if (normalized.startsWith('gpt-5.3-codex')) return '#a3e635';
+
+		if (provider === 'codex' || normalized.startsWith('gpt-')) {
+			let hash = 0;
+			for (let i = 0; i < normalized.length; i++) {
+				hash = ((hash << 5) - hash + normalized.charCodeAt(i)) | 0;
+			}
+			return MODEL_COLOR_PALETTE[Math.abs(hash) % MODEL_COLOR_PALETTE.length];
+		}
+
+		return 'var(--text-muted)';
+	}
+
 	// ── State ────────────────────────────────────────────────────────
 	let loading = $state(true);
-	let costData = $derived($costDataStore);
+	let rawCostData = $derived($costDataStore);
+	let costData = $derived.by((): CostData | null => {
+		if (!rawCostData) return null;
+		const dailyCosts = rawCostData.dailyCosts.map((day) => {
+			const sessions = day.sessions.filter((session) => matchesProvider(session, $providerFilter));
+			return { ...day, sessions, cost: summarizeCostSessions(sessions).cost };
+		});
+		const projectCosts = rawCostData.projectCosts.map((project) => {
+			const sessions = project.sessions.filter((session) => matchesProvider(session, $providerFilter));
+			return { ...project, sessions, totalCost: summarizeCostSessions(sessions).cost };
+		}).filter((project) => project.sessions.length > 0);
+		const sessions = dailyCosts.flatMap((day) => day.sessions);
+		const summary = summarizeCostSessions(sessions);
+		return {
+			...rawCostData,
+			dailyCosts,
+			projectCosts,
+			totalCost: summary.cost,
+			totalTokens: summary.tokens,
+			unpricedTokens: summary.unpricedTokens
+		};
+	});
 	let mode = $derived($costMode);
+	let hasCodexUsage = $derived(costData?.dailyCosts.some((day) => day.sessions.some((session) => session.provider === 'codex')) ?? false);
 	let collapsedProjects = $state<Set<string>>(new Set());
 	let modelTrackWidth = $state(0);
 	let projectTrackWidth = $state(0);
@@ -121,7 +273,7 @@
 		}
 	}
 
-	function sortSessions(sessions: import('$lib/types').SessionCostRecord[]): import('$lib/types').SessionCostRecord[] {
+	function sortSessions<T extends SessionCostRecord>(sessions: T[]): T[] {
 		const dir = sessionSortDir === 'desc' ? -1 : 1;
 		return [...sessions].sort((a, b) => {
 			if (sessionSortField === 'cost') {
@@ -143,6 +295,8 @@
 			project: session.project,
 			projectName: session.projectName,
 			customTitle: session.sessionName || null,
+			provider: session.provider,
+			surface: session.surface,
 		};
 		conversation = null;
 		try {
@@ -179,20 +333,25 @@
 	// ── Derived ──────────────────────────────────────────────────────
 	let timeBuckets = $derived.by((): TimeBucket[] => {
 		if (!costData) return [];
-		const days = costData.dailyCosts.filter(d => d.cost > 0);
+		const days = selectChartDays(costData.dailyCosts, mode);
 		const today = toLocalDateStr(new Date());
 
 		if (timeScale === 'daily') {
-			return days.slice(0, 14).map(d => ({
-				key: d.date,
-				label: formatDayLabel(d.date),
-				cost: d.cost,
-				tokens: sumTokens(d.sessions),
-				sessions: d.sessions
-			}));
+			return days.slice(0, 14).map(d => {
+				const summary = summarizeCostSessions(d.sessions);
+				return {
+					key: d.date,
+					label: formatDayLabel(d.date),
+					cost: summary.cost,
+					tokens: summary.tokens,
+					unpricedTokens: summary.unpricedTokens,
+					sessions: d.sessions
+				};
+			});
 		}
 
 		if (timeScale === 'weekly') {
+			if (days.length === 0) return [];
 			// Build data map from actual sessions
 			const weekMap = new Map<string, { cost: number; sessions: typeof days[0]['sessions']; dayBuckets: Map<string, { cost: number; sessions: typeof days[0]['sessions'] }> }>();
 			for (const d of days) {
@@ -217,15 +376,17 @@
 					label: formatWeekLabel(wk),
 					cost: data?.cost ?? 0,
 					tokens: data ? sumTokens(data.sessions) : 0,
+					unpricedTokens: data ? summarizeCostSessions(data.sessions).unpricedTokens : 0,
 					sessions: data?.sessions ?? [],
 					subBuckets: data ? Array.from(data.dayBuckets.entries())
 						.sort(([a], [b]) => b.localeCompare(a))
-						.map(([date, d]) => ({ label: formatDayLabel(date), cost: d.cost, tokens: sumTokens(d.sessions), sessions: d.sessions })) : []
+						.map(([date, d]) => ({ label: formatDayLabel(date), cost: d.cost, tokens: sumTokens(d.sessions), unpricedTokens: summarizeCostSessions(d.sessions).unpricedTokens, sessions: d.sessions })) : []
 				};
 			});
 		}
 
 		// monthly
+		if (days.length === 0) return [];
 		const monthMap = new Map<string, { cost: number; sessions: typeof days[0]['sessions']; weekBuckets: Map<string, { cost: number; sessions: typeof days[0]['sessions'] }> }>();
 		for (const d of days) {
 			const mk = d.date.slice(0, 7);
@@ -252,10 +413,11 @@
 				label: formatMonthLabel(mk),
 				cost: data?.cost ?? 0,
 				tokens: data ? sumTokens(data.sessions) : 0,
+				unpricedTokens: data ? summarizeCostSessions(data.sessions).unpricedTokens : 0,
 				sessions: data?.sessions ?? [],
 				subBuckets: data ? Array.from(data.weekBuckets.entries())
 					.sort(([a], [b]) => b.localeCompare(a))
-					.map(([wk, w]) => ({ label: formatWeekLabel(wk), cost: w.cost, tokens: sumTokens(w.sessions), sessions: w.sessions })) : []
+					.map(([wk, w]) => ({ label: formatWeekLabel(wk), cost: w.cost, tokens: sumTokens(w.sessions), unpricedTokens: summarizeCostSessions(w.sessions).unpricedTokens, sessions: w.sessions })) : []
 			};
 		});
 	});
@@ -290,7 +452,7 @@
 	});
 
 	/** Model costs filtered to the active time window */
-	let filteredModelCosts = $derived.by((): Array<{ model: string; displayName: string; cost: number; tokens: number; percentage: number }> => {
+	let filteredModelCosts = $derived.by((): Array<{ key: string; model: string; provider: import('$lib/types').SessionProvider; displayName: string; cost: number; tokens: number; unpricedTokens: number; percentage: number }> => {
 		if (!costData) return [];
 		const tw = getTimeWindow();
 
@@ -298,43 +460,48 @@
 			.filter(d => !tw || (d.date >= tw.start && d.date < tw.end))
 			.flatMap(d => d.sessions);
 
-		const modelMap = new Map<string, { cost: number; tokens: number }>();
+		const modelMap = new Map<string, { model: string; provider: import('$lib/types').SessionProvider; cost: number; tokens: number; unpricedTokens: number }>();
 		for (const s of sessions) {
-			const cur = modelMap.get(s.model) || { cost: 0, tokens: 0 };
-			cur.cost += s.cost;
+			const provider = s.provider === 'codex' ? 'codex' : 'claudeCode';
+			const key = `${provider}:${s.model}`;
+			const cur = modelMap.get(key) || { model: s.model, provider, cost: 0, tokens: 0, unpricedTokens: 0 };
+			if (isCostAvailable(s)) cur.cost += s.cost;
 			cur.tokens += s.totalTokens || 0;
-			modelMap.set(s.model, cur);
+			if (!isCostAvailable(s)) cur.unpricedTokens += s.totalTokens || 0;
+			modelMap.set(key, cur);
 		}
 
 		const totalCost = Array.from(modelMap.values()).reduce((a, b) => a + b.cost, 0);
+		const totalTokens = Array.from(modelMap.values()).reduce((a, b) => a + b.tokens, 0);
 		return Array.from(modelMap.entries())
-			.map(([model, v]) => ({
-				model,
-				displayName: modelDisplayName(model),
+			.map(([key, v]) => ({
+				key,
+				model: v.model,
+				provider: v.provider,
+				displayName: modelDisplayName(v.model),
 				cost: v.cost,
 				tokens: v.tokens,
-				percentage: totalCost > 0 ? (v.cost / totalCost) * 100 : 0
+				unpricedTokens: v.unpricedTokens,
+				percentage: mode === 'tokens'
+					? (totalTokens > 0 ? (v.tokens / totalTokens) * 100 : 0)
+					: (totalCost > 0 ? (v.cost / totalCost) * 100 : 0)
 			}))
-			.sort((a, b) => b.cost - a.cost);
+			.sort((a, b) => mode === 'tokens' ? b.tokens - a.tokens : b.cost - a.cost);
 	});
 
 	/** Project costs filtered to the active time window */
 	let filteredProjectCosts = $derived.by(() => {
-		if (!costData) return [] as Array<{ project: string; projectName: string; totalCost: number; totalTokens: number; sessions: import('$lib/types').SessionCostRecord[] }>;
+		if (!costData) return [] as Array<{ project: string; projectName: string; totalCost: number; totalTokens: number; unpricedTokens: number; sessions: SessionCostRecord[]; displaySessions: CostSessionRow[] }>;
 		const tw = getTimeWindow();
-		const source = !tw
-			? costData.projectCosts.map(p => ({ ...p, sessions: p.sessions }))
-			: null;
 
-		const projMap = new Map<string, { project: string; projectName: string; totalCost: number; totalTokens: number; sessions: import('$lib/types').SessionCostRecord[] }>();
+		const projMap = new Map<string, { project: string; projectName: string; totalCost: number; totalTokens: number; unpricedTokens: number; sessions: SessionCostRecord[]; displaySessions: CostSessionRow[] }>();
 		for (const proj of costData.projectCosts) {
 			const filtered = tw ? proj.sessions.filter(s => s.date >= tw.start && s.date < tw.end) : proj.sessions;
 			if (filtered.length === 0) continue;
-			const cost = filtered.reduce((sum, s) => sum + s.cost, 0);
-			const tokens = sumTokens(filtered);
-			projMap.set(proj.project, { project: proj.project, projectName: proj.projectName, totalCost: cost, totalTokens: tokens, sessions: filtered });
+			const summary = summarizeCostSessions(filtered);
+			projMap.set(proj.project, { project: proj.project, projectName: proj.projectName, totalCost: summary.cost, totalTokens: summary.tokens, unpricedTokens: summary.unpricedTokens, sessions: filtered, displaySessions: mergeSessionRows(filtered) });
 		}
-		return Array.from(projMap.values()).sort((a, b) => b.totalCost - a.totalCost);
+		return Array.from(projMap.values()).sort((a, b) => mode === 'tokens' ? b.totalTokens - a.totalTokens : b.totalCost - a.totalCost);
 	});
 
 	/** Total cost filtered to the active time window */
@@ -344,7 +511,7 @@
 		if (!tw) return costData.totalCost;
 		return costData.dailyCosts
 			.filter(d => d.date >= tw.start && d.date < tw.end)
-			.reduce((sum, d) => sum + d.cost, 0);
+			.reduce((sum, d) => sum + summarizeCostSessions(d.sessions).cost, 0);
 	});
 
 	/** Total tokens filtered to the active time window */
@@ -355,6 +522,14 @@
 		return costData.dailyCosts
 			.filter(d => d.date >= tw.start && d.date < tw.end)
 			.reduce((sum, d) => sum + sumTokens(d.sessions), 0);
+	});
+
+	let filteredUnpricedTokens = $derived.by(() => {
+		if (!costData) return 0;
+		const tw = getTimeWindow();
+		return costData.dailyCosts
+			.filter(d => !tw || (d.date >= tw.start && d.date < tw.end))
+			.reduce((sum, d) => sum + summarizeCostSessions(d.sessions).unpricedTokens, 0);
 	});
 
 	let allCollapsed = $derived(
@@ -375,7 +550,7 @@
 
 	/** Combined model bar: allocates blocks proportionally like StatusBar */
 	let modelStatusArray = $derived.by(() => {
-		if (filteredModelCosts.length === 0) return Array(modelBarColumns).fill('empty');
+		if (filteredModelCosts.length === 0) return Array<string>(modelBarColumns).fill('');
 
 		const models = filteredModelCosts;
 		const percentages = models.map(mc => (mc.percentage / 100) * modelBarColumns);
@@ -397,18 +572,23 @@
 
 		const arr: string[] = [];
 		for (let i = 0; i < models.length; i++) {
-			const cls = models[i].model.startsWith('claude-opus') ? 'opus' : models[i].model.startsWith('claude-sonnet') ? 'sonnet' : 'haiku';
-			for (let j = 0; j < result[i]; j++) arr.push(cls);
+			const color = modelColor(models[i].model, models[i].provider);
+			for (let j = 0; j < result[i]; j++) arr.push(color);
 		}
-		while (arr.length < modelBarColumns) arr.push('empty');
+		while (arr.length < modelBarColumns) arr.push('');
 		return arr;
 	});
 
-	/** Build grid blocks: `filled` blocks of given color class, rest `empty` */
-	function buildBarBlocks(fillPct: number, totalCols: number, colorClass: string): Array<{ type: string }> {
+	/** Build a project bar with provider-specific blocks, then fill the remainder. */
+	function buildProviderBarBlocks(fillPct: number, totalCols: number, sessions: SessionCostRecord[]): Array<{ type: string }> {
 		const filled = Math.round((fillPct / 100) * totalCols);
+		const claude = providerUsageValue(sessions, 'claudeCode');
+		const codex = providerUsageValue(sessions, 'codex');
+		const total = claude + codex;
+		const claudeBlocks = total > 0 ? Math.round((claude / total) * filled) : 0;
 		const arr: Array<{ type: string }> = [];
-		for (let i = 0; i < filled; i++) arr.push({ type: colorClass });
+		for (let i = 0; i < claudeBlocks; i++) arr.push({ type: 'claude' });
+		for (let i = claudeBlocks; i < filled; i++) arr.push({ type: 'codex' });
 		while (arr.length < totalCols) arr.push({ type: 'empty' });
 		return arr;
 	}
@@ -460,7 +640,7 @@
 	<div class="section-header">
 		<span class="section-title">COST TRACKER</span>
 		{#if costData}
-			<span class="section-total" in:flyIn={{ index: 0, stride: 40 }}>{formatCostOrTokens(filteredTotalCost, filteredTotalTokens, mode)}</span>
+			<span class="section-total" class:unpriced={mode === 'usd' && filteredUnpricedTokens > 0} in:flyIn={{ index: 0, stride: 40 }}>{formatAggregate(filteredTotalCost, filteredTotalTokens, filteredUnpricedTokens)}</span>
 			<div class="mode-toggle" role="group" aria-label="Display mode" in:flyIn={{ index: 1, stride: 40 }}>
 				<button
 					class="mode-btn"
@@ -503,8 +683,31 @@
 		<div class="state-msg">Loading cost data...</div>
 	{:else if !costData}
 		<div class="state-msg">No cost data available.</div>
-	{:else}
+		{:else}
 		<div class="list-area">
+			{#if mode === 'usd' && (hasCodexUsage || filteredUnpricedTokens > 0)}
+				<div class="pricing-note" role="note">
+					<span class="pricing-note-label">{hasCodexUsage ? 'ESTIMATED USD' : 'USD COVERAGE'}</span>
+					<span>
+						{#if hasCodexUsage}Codex cost is a lower-bound estimate using OpenAI Standard short-context API rates. Long-context calls may cost more. It is not your ChatGPT/Codex subscription bill.{/if}
+						{#if hasCodexUsage && filteredUnpricedTokens > 0}<span aria-hidden="true"> · </span>{/if}
+						{#if filteredUnpricedTokens > 0}
+							{#if filteredUnpricedTokens === filteredTotalTokens}
+								Pricing unavailable for {formatTokens(filteredUnpricedTokens)} tracked tokens. Token totals remain complete.
+							{:else}
+								{formatCost(filteredTotalCost)} priced · {formatTokens(filteredUnpricedTokens)} tokens unpriced. USD totals exclude unpriced usage.
+							{/if}
+						{/if}
+					</span>
+				</div>
+			{/if}
+			<div class="provider-usage-legend" aria-label="Cost chart provider colors">
+				<span class="provider-usage-legend-item"><span class="provider-usage-swatch claude" aria-hidden="true"></span>CLAUDE CODE</span>
+				<span class="provider-usage-legend-item"><span class="provider-usage-swatch codex" aria-hidden="true"></span>CODEX</span>
+			</div>
+			{#if filteredProjectCosts.length === 0}
+				<div class="state-msg">No {providerFilterLabel($providerFilter)} usage data available.</div>
+			{/if}
 			<!-- ── BY MODEL ───────────────────────────────────────── -->
 			<div class="model-status-bar" in:flyIn={{ index: 0, duration: 650, stride: 90 }}>
 				<div class="sub-header">BY MODEL</div>
@@ -512,18 +715,18 @@
 				<div class="progress-track" bind:clientWidth={modelTrackWidth}>
 					<div class="grid-container" style="grid-template-columns: repeat({modelBarColumns}, 1fr);">
 						{#each modelStatusArray as status, i}
-							<div class="rect {status}"></div>
+							<div class="rect" class:filled={status !== ''} style={status ? `--model-color: ${status}` : undefined}></div>
 						{/each}
 					</div>
 				</div>
 
 				<div class="model-legend">
-					{#each filteredModelCosts as mc (mc.model)}
+					{#each filteredModelCosts as mc (mc.key)}
 						<div class="model-legend-item">
-							<span class="dot {mc.model.startsWith('claude-opus') ? 'opus' : mc.model.startsWith('claude-sonnet') ? 'sonnet' : 'haiku'}"></span>
+							<span class="dot" style={`--model-color: ${modelColor(mc.model, mc.provider)}`}></span>
 							<span class="model-legend-label">{mc.displayName.toUpperCase()}</span>
-							<span class="model-legend-cost">{formatCostOrTokens(mc.cost, mc.tokens, mode)}</span>
-							<span class="model-legend-pct">{mc.percentage.toFixed(0)}%</span>
+							<span class="model-legend-cost" class:unpriced={mode === 'usd' && mc.unpricedTokens === mc.tokens}>{formatAggregate(mc.cost, mc.tokens, mc.unpricedTokens)}</span>
+							<span class="model-legend-pct">{mode === 'usd' && mc.unpricedTokens === mc.tokens ? '—' : `${mc.percentage.toFixed(0)}%`}</span>
 						</div>
 					{/each}
 				</div>
@@ -535,27 +738,32 @@
 			<div class="cost-section" in:flyIn={{ index: 1, duration: 650, stride: 90 }}>
 				<div class="sub-header">{scaleSectionTitle}</div>
 
+				{#if mode === 'usd' && chronoBuckets.length === 0 && filteredUnpricedTokens > 0}
+					<div class="chart-unpriced-state">NO PRICED USD DATA · {formatTokens(filteredUnpricedTokens)} TOKENS AVAILABLE IN TOKENS MODE</div>
+				{:else}
 				<div class="vchart-area">
 					{#each chronoBuckets as bucket (bucket.key)}
 						{@const barValue = mode === 'usd' ? bucket.cost : bucket.tokens}
+						{@const claudeShare = claudeUsageShare(bucket.sessions)}
 						<div
 							class="vchart-col"
 							onmouseenter={() => hoveredBucket = bucket.key}
 							onmouseleave={() => hoveredBucket = null}
 							role="img"
-							aria-label="{bucket.label}: {formatCostOrTokens(bucket.cost, bucket.tokens, mode)}"
+							aria-label="{bucket.label}: {formatAggregate(bucket.cost, bucket.tokens, bucket.unpricedTokens)}; {providerBreakdownLabel(bucket.sessions)}"
 						>
 							{#if hoveredBucket === bucket.key}
 								<div class="vchart-tooltip">
 									<span class="vchart-tooltip-label">{bucket.label}</span>
-									<span class="vchart-tooltip-cost">{formatCostOrTokens(bucket.cost, bucket.tokens, mode)}</span>
+									<span class="vchart-tooltip-cost">{formatAggregate(bucket.cost, bucket.tokens, bucket.unpricedTokens)}</span>
+									{#if mode === 'usd' && bucket.unpricedTokens > 0}<span class="vchart-tooltip-unpriced">+ {formatTokens(bucket.unpricedTokens)} TOKENS UNPRICED</span>{/if}
 								</div>
 							{/if}
 							<div class="vchart-bar-wrap">
 								<div
 									class="vchart-bar"
 									class:vchart-bar-empty={barValue === 0}
-									style="height: {bucketScaleMax > 0 ? (barValue / bucketScaleMax) * 100 : 0}%"
+									style="height: {bucketScaleMax > 0 ? (barValue / bucketScaleMax) * 100 : 0}%; --claude-share: {claudeShare}%"
 								></div>
 							</div>
 							<span class="vchart-label">
@@ -564,6 +772,7 @@
 						</div>
 					{/each}
 				</div>
+				{/if}
 			</div>
 
 			<!-- ── BY PROJECT ─────────────────────────────────────── -->
@@ -595,15 +804,20 @@
 							aria-label={collapsedProjects.has(proj.project) ? 'Expand project' : 'Collapse project'}
 						>
 							<span class="collapse-toggle" aria-hidden="true">{collapsedProjects.has(proj.project) ? '▶' : '▼'}</span>
-							<span class="group-name">{proj.projectName.toUpperCase()} <span class="group-count">({proj.sessions.length})</span></span>
-							<span class="group-cost">{formatCostOrTokens(proj.totalCost, proj.totalTokens, mode)}</span>
+							<span class="group-name">{proj.projectName.toUpperCase()} <span class="group-count">({proj.displaySessions.length})</span></span>
+							<span class="group-cost" class:unpriced={mode === 'usd' && proj.unpricedTokens === proj.totalTokens}>{formatAggregate(proj.totalCost, proj.totalTokens, proj.unpricedTokens)}</span>
 						</div>
 
 						{#if !collapsedProjects.has(proj.project)}
 							{@const projValue = mode === 'usd' ? proj.totalCost : proj.totalTokens}
-							<div class="grid-bar-track" bind:clientWidth={projectTrackWidth}>
+							<div
+								class="grid-bar-track"
+								bind:clientWidth={projectTrackWidth}
+								role="img"
+								aria-label="{proj.projectName}: {formatAggregate(proj.totalCost, proj.totalTokens, proj.unpricedTokens)}; {providerBreakdownLabel(proj.sessions)}"
+							>
 								<div class="grid-container" style="grid-template-columns: repeat({projectBarColumns}, 1fr);">
-									{#each buildBarBlocks(projectScaleMax > 0 ? (projValue / projectScaleMax) * 100 : 0, projectBarColumns, 'amber') as block}
+									{#each buildProviderBarBlocks(projectScaleMax > 0 ? (projValue / projectScaleMax) * 100 : 0, projectBarColumns, proj.sessions) as block}
 										<div class="rect {block.type}"></div>
 									{/each}
 								</div>
@@ -611,19 +825,22 @@
 
 							<!-- svelte-ignore a11y_click_events_have_key_events -->
 							<!-- svelte-ignore a11y_no_static_element_interactions -->
-							{@const sorted = sortSessions(proj.sessions)}
-							{#each expandedProjects.has(proj.project) ? sorted : sorted.slice(0, 5) as session (session.sessionId + '-' + session.date)}
-								<div class="session-detail" onclick={() => handleSessionClick(session)}>
+							{@const sorted = sortSessions(proj.displaySessions)}
+							{#each expandedProjects.has(proj.project) ? sorted : sorted.slice(0, 5) as session ((session.provider ?? 'claudeCode') + '-' + session.sessionId + '-' + session.timestamp)}
+								<!-- svelte-ignore a11y_click_events_have_key_events -->
+								<!-- svelte-ignore a11y_no_static_element_interactions -->
+								<div class="session-detail" class:codex-session={session.provider === 'codex'} onclick={() => handleSessionClick(session)}>
+									<ProviderBadge provider={session.provider} surface={session.surface} compact />
 									<span class="detail-name" title={session.sessionName || session.sessionId}>{session.sessionName || session.sessionId.slice(0, 8)}</span>
 									<span class="detail-session-id" title={session.sessionId}>{session.sessionId.slice(0, 8)}</span>
 									<span class="detail-spacer"></span>
 									<span class="detail-time">{formatDateTime(session.timestamp)}</span>
-									<span class="detail-model">{modelDisplayName(session.model)}</span>
-									<span class="detail-cost">{formatCostOrTokens(session.cost, session.totalTokens, mode)}</span>
+									<span class="detail-model" title={sessionModelTitle(session)}>{sessionModelLabel(session)}</span>
+									<span class="detail-cost" class:unpriced={mode === 'usd' && session.unpricedTokens === session.totalTokens}>{formatAggregate(session.cost, session.totalTokens, session.unpricedTokens)}</span>
 								</div>
 							{/each}
 
-							{#if proj.sessions.length > 5}
+							{#if proj.displaySessions.length > 5}
 								<!-- svelte-ignore a11y_click_events_have_key_events -->
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<div class="more-sessions" onclick={() => {
@@ -635,7 +852,7 @@
 									}
 									expandedProjects = next;
 								}}>
-									{expandedProjects.has(proj.project) ? 'Show less' : `${proj.sessions.length - 5} more sessions`}
+									{expandedProjects.has(proj.project) ? 'Show less' : `${proj.displaySessions.length - 5} more sessions`}
 								</div>
 							{/if}
 						{/if}
@@ -700,6 +917,14 @@
 		color: var(--text-secondary);
 	}
 
+	.section-total.unpriced,
+	.model-legend-cost.unpriced,
+	.group-cost.unpriced,
+	.detail-cost.unpriced {
+		color: var(--accent-amber);
+		letter-spacing: 0.06em;
+	}
+
 	.list-area {
 		flex: 1;
 		overflow-y: auto;
@@ -707,6 +932,60 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--space-xl);
+	}
+
+	.pricing-note {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: var(--space-md);
+		padding: var(--space-sm) var(--space-md);
+		border-left: 2px solid var(--accent-amber);
+		background: color-mix(in srgb, var(--accent-amber) 7%, transparent);
+		font-family: var(--font-mono);
+		font-size: 12px;
+		line-height: 1.5;
+		color: var(--text-secondary);
+	}
+
+	.pricing-note-label {
+		flex: 0 0 auto;
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		letter-spacing: 0.08em;
+		color: var(--accent-amber);
+	}
+
+	.provider-usage-legend {
+		display: flex;
+		align-items: center;
+		gap: var(--space-lg);
+		font-family: var(--font-mono);
+		font-size: 10px;
+		letter-spacing: 0.08em;
+		color: var(--text-muted);
+	}
+
+	.provider-usage-legend-item {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+	}
+
+	.provider-usage-swatch {
+		width: 10px;
+		height: 10px;
+		border: 1px solid color-mix(in srgb, currentColor 55%, var(--border-default));
+	}
+
+	.provider-usage-swatch.claude {
+		color: var(--accent-amber);
+		background: var(--accent-amber);
+	}
+
+	.provider-usage-swatch.codex {
+		color: var(--accent-blue);
+		background: var(--accent-blue);
 	}
 
 	.cost-section {
@@ -856,13 +1135,11 @@
 		border-radius: 1px;
 	}
 
-	.rect.opus { background-color: var(--accent-amber); box-shadow: 0 0 4px color-mix(in srgb, var(--accent-amber) 30%, transparent); }
-	.rect.sonnet { background-color: var(--accent-purple); box-shadow: 0 0 4px color-mix(in srgb, var(--accent-purple) 30%, transparent); }
-	.rect.haiku { background-color: var(--accent-pink); box-shadow: 0 0 4px color-mix(in srgb, var(--accent-pink) 30%, transparent); }
-	.rect.amber { background-color: var(--accent-amber); box-shadow: 0 0 4px color-mix(in srgb, var(--accent-amber) 30%, transparent); }
+	.rect.filled { background-color: var(--model-color); box-shadow: 0 0 4px color-mix(in srgb, var(--model-color) 30%, transparent); }
 
 	.model-legend {
 		display: flex;
+		flex-wrap: wrap;
 		gap: var(--space-xl);
 	}
 
@@ -875,11 +1152,8 @@
 	.model-legend-item .dot {
 		width: 8px;
 		height: 8px;
+		background: var(--model-color);
 	}
-
-	.model-legend-item .dot.opus { background: var(--accent-amber); }
-	.model-legend-item .dot.sonnet { background: var(--accent-purple); }
-	.model-legend-item .dot.haiku { background: var(--accent-pink); }
 
 	.model-legend-label {
 		font-family: var(--font-mono);
@@ -932,6 +1206,19 @@
 		padding: var(--space-sm) 0;
 	}
 
+	.chart-unpriced-state {
+		display: grid;
+		place-items: center;
+		min-height: 120px;
+		border: 1px dashed color-mix(in srgb, var(--accent-amber) 45%, var(--border-default));
+		font-family: var(--font-mono);
+		font-size: 11px;
+		letter-spacing: 0.06em;
+		color: var(--accent-amber);
+		text-align: center;
+		padding: var(--space-lg);
+	}
+
 	.vchart-col {
 		flex: 1;
 		display: flex;
@@ -952,20 +1239,25 @@
 	.vchart-bar {
 		width: 100%;
 		min-height: 2px;
-		background: var(--accent-amber);
-		background-image: repeating-linear-gradient(
-			0deg,
-			transparent,
-			transparent 3px,
-			rgba(0, 0, 0, 0.2) 3px,
-			rgba(0, 0, 0, 0.2) 4px
-		);
-		box-shadow: 0 0 4px color-mix(in srgb, var(--accent-amber) 30%, transparent);
+		background:
+			repeating-linear-gradient(
+				0deg,
+				transparent,
+				transparent 3px,
+				rgba(0, 0, 0, 0.2) 3px,
+				rgba(0, 0, 0, 0.2) 4px
+			),
+			linear-gradient(
+				to top,
+				var(--accent-amber) 0 var(--claude-share),
+				var(--accent-blue) var(--claude-share) 100%
+			);
+		box-shadow: 0 0 4px color-mix(in srgb, var(--text-secondary) 30%, transparent);
 		transition: height 300ms ease;
 	}
 
 	.vchart-col:hover .vchart-bar {
-		box-shadow: 0 0 8px color-mix(in srgb, var(--accent-amber) 50%, transparent);
+		box-shadow: 0 0 8px color-mix(in srgb, var(--text-secondary) 50%, transparent);
 	}
 
 	.vchart-bar-empty {
@@ -1009,6 +1301,13 @@
 		color: var(--text-muted);
 	}
 
+	.vchart-tooltip-unpriced {
+		font-family: var(--font-mono);
+		font-size: 9px;
+		color: var(--accent-amber);
+		letter-spacing: 0.04em;
+	}
+
 	.vchart-tooltip-cost {
 		font-family: var(--font-mono);
 		font-size: 11px;
@@ -1017,13 +1316,17 @@
 
 	.session-detail {
 		display: grid;
-		grid-template-columns: minmax(100px, 300px) auto 1fr auto auto auto;
+		grid-template-columns: auto minmax(100px, 300px) auto minmax(0, 1fr) auto auto minmax(60px, max-content);
 		gap: var(--space-md);
 		align-items: center;
 		padding: var(--space-xs) var(--space-sm);
 		font-family: var(--font-mono);
 		font-size: 13px;
 		cursor: pointer;
+	}
+
+	.session-detail.codex-session {
+		box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent-blue) 70%, transparent);
 	}
 
 	.session-detail:hover {
@@ -1040,21 +1343,29 @@
 	.detail-session-id {
 		color: var(--text-muted);
 		font-size: 11px;
+		white-space: nowrap;
 	}
 
 	.detail-time {
 		color: var(--text-muted);
+		white-space: nowrap;
 	}
 
 	.detail-model {
 		color: var(--text-muted);
 		min-width: 50px;
+		white-space: nowrap;
 	}
 
 	.detail-cost {
 		color: var(--text-secondary);
 		min-width: 50px;
 		text-align: right;
+		white-space: nowrap;
+	}
+
+	.session-detail.codex-session .detail-cost {
+		color: var(--accent-blue);
 	}
 
 	/* ── Project groups ───────────────────────────────────────────── */

@@ -5,6 +5,9 @@ use std::process::Command;
 /// This finds the parent application of the Claude process and activates it.
 /// Works with Terminal, iTerm2, Zed, VS Code, Cursor, and other applications.
 pub fn open_session(pid: u32, project_path: String) -> Result<(), String> {
+    if pid == 0 {
+        return Err("This session does not expose a focusable terminal process".to_string());
+    }
     // Find the parent application by walking up the process tree
     let app_name = find_parent_app(pid)?;
 
@@ -949,6 +952,9 @@ fn is_jetbrains_ide(app_name: &str) -> bool {
 /// This gracefully terminates the Claude process by sending a SIGTERM signal.
 /// SIGTERM is preferred over SIGINT as Claude Code may trap SIGINT for its own use.
 pub fn stop_session(pid: u32) -> Result<(), String> {
+    if pid == 0 {
+        return Err("This session cannot be stopped through c9watch".to_string());
+    }
     crate::debug_log::log_info(&format!("[stop_session] Stopping PID: {}", pid));
 
     // First try SIGTERM (signal 15) - graceful termination

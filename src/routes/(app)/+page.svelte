@@ -8,7 +8,8 @@
 		sortedSessions,
 		expandedSessionId,
 		currentConversation,
-		statusSummary
+		statusSummary,
+		visibleTopLevelSessionIds
 	} from '$lib/stores/sessions';
 	import { getConversation, stopSession, openSession } from '$lib/api';
 	import { isDemoMode, toggleDemoMode } from '$lib/demo';
@@ -32,6 +33,9 @@
 	import UpdateBanner from '$lib/components/UpdateBanner.svelte';
 	import DebugConsole from '$lib/components/DebugConsole.svelte';
 	import type { DetectionDiagnostics } from '$lib/types';
+	import ProviderFilter from '$lib/components/ProviderFilter.svelte';
+	import { providerFilter } from '$lib/stores/provider-filter';
+	import { matchesProvider, providerFilterLabel } from '$lib/provider';
 
 	let demoActive = $derived($isDemoMode);
 	let showQRModal = $state(false);
@@ -259,13 +263,16 @@
 
 	// With PM orchestration disabled, show every session — legacy `workerOf`
 	// records render as ordinary sessions and the HUMANS/WORKERS split is gone.
-	let filteredSessions = $derived(
-		!PM_ORCHESTRATION_ENABLED
-			? sessions
-			: sessions.filter((s) =>
-					sessionFilter === 'workers' ? !!s.workerOf : !s.workerOf
-				)
-	);
+	let filteredSessions = $derived.by(() => {
+		const providerSessions = sessions
+			.filter((session) => $visibleTopLevelSessionIds.has(session.id))
+			.filter((session) => matchesProvider(session, $providerFilter));
+		return !PM_ORCHESTRATION_ENABLED
+			? providerSessions
+			: providerSessions.filter((session) =>
+					sessionFilter === 'workers' ? !!session.workerOf : !session.workerOf
+				);
+	});
 
 	let projectGroups = $derived(groupByProjectAndStatus(filteredSessions));
 	let allStatusGroups = $derived(groupSessionsByStatus(filteredSessions));
@@ -310,17 +317,27 @@
 	let expandedSession = $derived(sessions.find((s) => s.id === expandedId) || null);
 
 	$effect(() => {
-		if (expandedId) {
-			getConversation(expandedId)
+		if (expandedSession && !matchesProvider(expandedSession, $providerFilter)) {
+			expandedSessionId.set(null);
+		}
+	});
+
+	let conversationRequestId = 0;
+	$effect(() => {
+		const sessionId = expandedId;
+		const requestId = ++conversationRequestId;
+		currentConversation.set(null);
+		if (sessionId) {
+			getConversation(sessionId)
 				.then((conv) => {
-					currentConversation.set(conv);
+					if (requestId === conversationRequestId && conv.sessionId === sessionId) {
+						currentConversation.set(conv);
+					}
 				})
 				.catch((error) => {
 					console.error('Failed to fetch conversation:', error);
-					currentConversation.set(null);
+					if (requestId === conversationRequestId) currentConversation.set(null);
 				});
-		} else {
-			currentConversation.set(null);
 		}
 	});
 
@@ -435,6 +452,7 @@
 				<span class="drag-dots" transition:fade={{ duration: 250 }}>⠿ ⠿ ⠿</span>
 			{/if}
 		</div>
+		<div class="global-provider-filter"><ProviderFilter compact /></div>
 		<button
 			class="tab-btn"
 			class:active={activeTab === 'settings'}
@@ -469,7 +487,7 @@
 			<section class="system-section" in:flyIn|global={{ index: 0 }}>
 				<div class="project-header">
 					<span class="project-name">System status</span>
-					<span class="project-count">{sessions.length}</span>
+					<span class="project-count">{filteredSessions.length}</span>
 					<button
 						class="toggle-btn demo-toggle"
 						class:active={demoActive}
@@ -607,8 +625,8 @@
 								Workers appear here once they're spawned by a PM session
 							</div>
 						{:else}
-							<h2>No Active Sessions</h2>
-							<p>Start a Claude Code session in your terminal or IDE</p>
+							<h2>No {providerFilterLabel($providerFilter)} Sessions</h2>
+							<p>{ $providerFilter === 'all' ? 'Start a Claude Code or Codex session' : `Start a ${providerFilterLabel($providerFilter)} session` }</p>
 							<div class="empty-hint">
 								<span class="hint-icon">
 									<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -837,6 +855,8 @@
 		-webkit-app-region: drag;
 		cursor: grab;
 	}
+
+	.global-provider-filter { display: flex; align-items: center; padding: 0 var(--space-sm); -webkit-app-region: no-drag; }
 
 	/* Grip indicator — absolutely centered in the full window width.
 	   pointer-events: none so it never blocks tab button clicks. */

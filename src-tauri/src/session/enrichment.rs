@@ -1,4 +1,8 @@
-use crate::session::source::{CliActivity, DetectedSession, DetectionDiagnostics, SessionSource};
+use crate::session::codex::CodexLifecycle;
+use crate::session::source::{
+    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionProvider, SessionSource,
+    SessionSurface,
+};
 use crate::session::{
     determine_status, get_pending_tool_input, get_pending_tool_name, parse_last_n_entries,
     parse_sessions_index, SessionStatus,
@@ -43,6 +47,24 @@ pub struct Session {
     /// Only populated by the CLI backend; legacy backend leaves this None.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at_ms: Option<i64>,
+    pub provider: SessionProvider,
+    pub surface: SessionSurface,
+    pub agent_kind: AgentKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_nickname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal_kind: Option<String>,
+    pub can_open: bool,
+    pub can_stop: bool,
+    pub can_rename: bool,
 }
 
 /// Cache for native custom titles, keyed by file path.
@@ -101,7 +123,26 @@ pub fn merge_cli_activity(
 pub fn detect_and_enrich_sessions(
 ) -> Result<(Vec<Session>, DetectionDiagnostics), String> {
     let mut source = crate::session::create_session_source();
-    detect_and_enrich_sessions_with_source(source.as_mut())
+    let claude_result = source.detect();
+    let codex_result = crate::session::codex::CodexSessionSource::new()
+        .ok()
+        .and_then(|mut codex| codex.detect().ok());
+    match claude_result {
+        Ok((mut detected, diagnostics)) => {
+            if let Some((mut codex_sessions, _)) = codex_result {
+                detected.append(&mut codex_sessions);
+            }
+            enrich_detected_sessions(detected, diagnostics)
+        }
+        Err(error) => {
+            if let Some((codex_sessions, diagnostics)) = codex_result {
+                if !codex_sessions.is_empty() {
+                    return enrich_detected_sessions(codex_sessions, diagnostics);
+                }
+            }
+            Err(format!("Failed to detect sessions: {error}"))
+        }
+    }
 }
 
 /// Detect sessions using a SessionSource trait object and enrich them.
@@ -139,6 +180,67 @@ pub fn enrich_detected_sessions(
             continue;
         }
         seen_ids.insert(session_id.clone());
+
+        if let Some(summary) = detected.codex_summary.as_ref() {
+            let first_prompt = summary
+                .first_prompt()
+                .map(|prompt| truncate_string(prompt, 100))
+                .unwrap_or_else(|| "(No conversation yet)".to_string());
+            let latest_message = summary
+                .latest_message()
+                .map(|message| truncate_string(message, 200))
+                .unwrap_or_default();
+            let session_name = custom_names
+                .get(&session_id)
+                .cloned()
+                .or_else(|| detected.agent_nickname.clone())
+                .unwrap_or_else(|| detected.project_name.clone());
+            let modified = if summary.last_timestamp.is_empty() {
+                detected
+                    .started_at_ms
+                    .and_then(DateTime::<Utc>::from_timestamp_millis)
+                    .map(|timestamp| timestamp.to_rfc3339())
+                    .unwrap_or_default()
+            } else {
+                summary.last_timestamp.clone()
+            };
+            sessions.push(Session {
+                id: session_id.clone(),
+                pid: detected.pid,
+                session_name,
+                custom_title: custom_titles.get(&session_id).cloned(),
+                project_path: detected.cwd.to_string_lossy().to_string(),
+                git_branch: None,
+                first_prompt,
+                summary: None,
+                message_count: summary.messages.len() as u32,
+                modified,
+                status: if summary.lifecycle == CodexLifecycle::Working {
+                    SessionStatus::Working
+                } else {
+                    SessionStatus::WaitingForInput
+                },
+                latest_message,
+                pending_tool_name: None,
+                pending_tool_input: None,
+                worker_of: None,
+                official_name: detected.official_name.clone(),
+                started_at_ms: detected.started_at_ms,
+                provider: detected.provider,
+                surface: detected.surface,
+                agent_kind: detected.agent_kind,
+                parent_thread_id: detected.parent_thread_id.clone(),
+                root_session_id: detected.root_session_id.clone(),
+                agent_path: detected.agent_path.clone(),
+                agent_nickname: detected.agent_nickname.clone(),
+                agent_role: detected.agent_role.clone(),
+                internal_kind: detected.internal_kind.clone(),
+                can_open: detected.can_open,
+                can_stop: detected.can_stop,
+                can_rename: detected.can_rename,
+            });
+            continue;
+        }
 
         // Try to parse sessions-index.json to get basic info (optional)
         let index_path = detected.project_path.join("sessions-index.json");
@@ -287,6 +389,18 @@ pub fn enrich_detected_sessions(
             worker_of: None,
             official_name: detected.official_name.clone(),
             started_at_ms: detected.started_at_ms,
+            provider: detected.provider,
+            surface: detected.surface,
+            agent_kind: detected.agent_kind,
+            parent_thread_id: detected.parent_thread_id.clone(),
+            root_session_id: detected.root_session_id.clone(),
+            agent_path: detected.agent_path.clone(),
+            agent_nickname: detected.agent_nickname.clone(),
+            agent_role: detected.agent_role.clone(),
+            internal_kind: detected.internal_kind.clone(),
+            can_open: detected.can_open,
+            can_stop: detected.can_stop,
+            can_rename: detected.can_rename,
         });
     }
 
@@ -573,6 +687,19 @@ mod placeholder_tests {
             started_at_ms: Some(1_700_000_000_000),
             official_name: None,
             cli_activity: None,
+            provider: SessionProvider::ClaudeCode,
+            surface: SessionSurface::ClaudeCode,
+            agent_kind: AgentKind::Root,
+            parent_thread_id: None,
+            root_session_id: None,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+            internal_kind: None,
+            can_open: true,
+            can_stop: true,
+            can_rename: true,
+            codex_summary: None,
         };
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();

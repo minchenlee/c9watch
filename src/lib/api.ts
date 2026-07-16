@@ -7,7 +7,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { get } from 'svelte/store';
 import type { Session, Conversation, HistoryEntry, DeepSearchHit, CostData, ProjectMemory, LogEntry } from './types';
 import { isDemoMode } from './demo/mode';
-import { getDemoSessions, demoConversations } from './demo/data';
+import { getDemoSessions, getDemoHistoryEntries, getDemoCostData, demoConversations } from './demo/data';
 import { wsClient, useWebSocket } from './ws';
 
 /**
@@ -94,7 +94,7 @@ export async function getServerInfo(): Promise<ServerInfo> {
  * (Desktop/Tauri only — returns empty array on mobile/browser)
  */
 export async function getSessionHistory(): Promise<HistoryEntry[]> {
-	if (get(isDemoMode)) return [];
+	if (get(isDemoMode)) return getDemoHistoryEntries();
 	if (useWebSocket()) return [];
 	return await invoke<HistoryEntry[]>('get_session_history');
 }
@@ -123,13 +123,13 @@ export async function deepSearchSessions(
  * (Desktop/Tauri only — returns null on mobile/browser)
  */
 export async function getCostData(): Promise<CostData | null> {
-	if (get(isDemoMode)) return null;
+	if (get(isDemoMode)) return getDemoCostData();
 	if (useWebSocket()) return null;
 	return await invoke<CostData>('get_cost_data');
 }
 
 /**
- * Get all memory files from ~/.claude/projects/{project}/memory/*.md
+ * Get supported Claude Code project memories and Codex durable memory files.
  * (Desktop/Tauri only — returns empty array on mobile/browser)
  */
 export async function getMemoryFiles(): Promise<ProjectMemory[]> {

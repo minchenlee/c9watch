@@ -1192,6 +1192,7 @@ fn compact_session(s: &session::enrichment::Session) -> serde_json::Value {
         "projectPath": s.project_path,
         "sessionName": s.session_name,
     });
+    insert_session_contract(&mut json, s);
 
     // Only include non-null optional fields
     if let Some(ref tool) = s.pending_tool_name {
@@ -1234,6 +1235,7 @@ fn full_session(s: session::enrichment::Session) -> serde_json::Value {
         "modified": s.modified,
         "status": s.status,
     });
+    insert_session_contract(&mut json, &s);
 
     let obj = json.as_object_mut().unwrap();
 
@@ -1266,6 +1268,36 @@ fn full_session(s: session::enrichment::Session) -> serde_json::Value {
     json
 }
 
+fn insert_session_contract(json: &mut serde_json::Value, session: &session::enrichment::Session) {
+    let Some(object) = json.as_object_mut() else {
+        return;
+    };
+    object.insert("provider".to_string(), serde_json::json!(session.provider));
+    object.insert("surface".to_string(), serde_json::json!(session.surface));
+    object.insert(
+        "agentKind".to_string(),
+        serde_json::json!(session.agent_kind),
+    );
+    object.insert("canOpen".to_string(), serde_json::json!(session.can_open));
+    object.insert("canStop".to_string(), serde_json::json!(session.can_stop));
+    object.insert(
+        "canRename".to_string(),
+        serde_json::json!(session.can_rename),
+    );
+    for (key, value) in [
+        ("parentThreadId", session.parent_thread_id.as_ref()),
+        ("rootSessionId", session.root_session_id.as_ref()),
+        ("agentPath", session.agent_path.as_ref()),
+        ("agentNickname", session.agent_nickname.as_ref()),
+        ("agentRole", session.agent_role.as_ref()),
+        ("internalKind", session.internal_kind.as_ref()),
+    ] {
+        if let Some(value) = value {
+            object.insert(key.to_string(), serde_json::json!(value));
+        }
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn enrich_history_entry(entry: session::HistoryEntry) -> serde_json::Value {
@@ -1293,6 +1325,9 @@ fn enrich_history_entry(entry: session::HistoryEntry) -> serde_json::Value {
         "timestamp": entry.timestamp,
         "project": entry.project,
         "projectName": entry.project_name,
+        "provider": entry.provider,
+        "surface": entry.surface,
+        "agentKind": entry.agent_kind,
     });
 
     if let Some(title) = entry.custom_title {
@@ -1316,6 +1351,9 @@ fn enrich_search_hit(hit: session::DeepSearchHit) -> serde_json::Value {
         "snippet": strip_system_tags(&hit.snippet),
         "projectPath": project_path,
         "modified": modified,
+        "provider": hit.provider,
+        "surface": hit.surface,
+        "agentKind": hit.agent_kind,
     })
 }
 
@@ -1543,6 +1581,87 @@ fn resolve_session_id_lightweight(prefix: &str) -> Result<String, String> {
 }
 
 #[cfg(test)]
+mod session_formatter_tests {
+    use super::*;
+    use crate::session::source::{AgentKind, SessionProvider, SessionSurface};
+    use crate::session::SessionStatus;
+
+    fn codex_subagent() -> session::enrichment::Session {
+        session::enrichment::Session {
+            id: "child-thread".to_string(),
+            pid: 0,
+            session_name: "child".to_string(),
+            custom_title: None,
+            project_path: "/tmp/project".to_string(),
+            git_branch: None,
+            first_prompt: "investigate".to_string(),
+            summary: None,
+            message_count: 3,
+            modified: "2026-07-13T00:00:00Z".to_string(),
+            status: SessionStatus::Working,
+            latest_message: String::new(),
+            pending_tool_name: None,
+            pending_tool_input: None,
+            worker_of: None,
+            official_name: None,
+            started_at_ms: Some(1_752_364_800_000),
+            provider: SessionProvider::Codex,
+            surface: SessionSurface::App,
+            agent_kind: AgentKind::Subagent,
+            parent_thread_id: Some("parent-thread".to_string()),
+            root_session_id: Some("root-thread".to_string()),
+            agent_path: Some("/root/investigator".to_string()),
+            agent_nickname: Some("Scout".to_string()),
+            agent_role: Some("investigator".to_string()),
+            internal_kind: Some("spawned".to_string()),
+            can_open: false,
+            can_stop: false,
+            can_rename: false,
+        }
+    }
+
+    fn assert_codex_contract(value: &serde_json::Value) {
+        assert_eq!(value["provider"], "codex");
+        assert_eq!(value["surface"], "app");
+        assert_eq!(value["agentKind"], "subagent");
+        assert_eq!(value["parentThreadId"], "parent-thread");
+        assert_eq!(value["rootSessionId"], "root-thread");
+        assert_eq!(value["agentPath"], "/root/investigator");
+        assert_eq!(value["agentNickname"], "Scout");
+        assert_eq!(value["agentRole"], "investigator");
+        assert_eq!(value["internalKind"], "spawned");
+        assert_eq!(value["canOpen"], false);
+        assert_eq!(value["canStop"], false);
+        assert_eq!(value["canRename"], false);
+    }
+
+    #[test]
+    fn search_hit_includes_provider_surface_and_agent_kind() {
+        let value = enrich_search_hit(session::DeepSearchHit {
+            session_id: "search-session".to_string(),
+            snippet: "matching text".to_string(),
+            provider: "codex".to_string(),
+            surface: Some("cli".to_string()),
+            agent_kind: "subagent".to_string(),
+        });
+
+        assert_eq!(value["provider"], "codex");
+        assert_eq!(value["surface"], "cli");
+        assert_eq!(value["agentKind"], "subagent");
+    }
+
+    #[test]
+    fn compact_session_includes_provider_hierarchy_and_capabilities() {
+        assert_codex_contract(&compact_session(&codex_subagent()));
+    }
+
+    #[test]
+    fn full_session_includes_provider_hierarchy_and_capabilities() {
+        assert_codex_contract(&full_session(codex_subagent()));
+    }
+}
+
+#[cfg(test)]
 mod cost_session_tests {
     use super::*;
     use crate::session::cost::SessionCostRecord;
@@ -1553,7 +1672,15 @@ mod cost_session_tests {
             project: "/tmp/proj".to_string(),
             project_name: "proj".to_string(),
             model: model.to_string(),
+            provider: "claudeCode".to_string(),
+            surface: None,
+            agent_kind: None,
             cost,
+            cost_available: true,
+            input_tokens: tokens,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
             total_tokens: tokens,
             timestamp: format!("{}T00:00:00Z", date),
             date: date.to_string(),

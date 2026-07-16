@@ -1,15 +1,23 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
-	import { sortedSessions, statusSummary, sessions as sessionsStore, initializeSessionListeners } from '$lib/stores/sessions';
+	import { sortedSessions, sessions as sessionsStore, initializeSessionListeners, visibleTopLevelSessionIds } from '$lib/stores/sessions';
 	import { openSession, getSessions } from '$lib/api';
 	import { SessionStatus } from '$lib/types';
 	import type { Session } from '$lib/types';
 	import { invoke } from '@tauri-apps/api/core';
 	import { listen } from '@tauri-apps/api/event';
 	import { isDemoMode, loadDemoDataIfActive } from '$lib/demo';
+	import { providerFilter } from '$lib/stores/provider-filter';
+	import { canSessionAction, matchesProvider, providerFilterLabel } from '$lib/provider';
+	import ProviderFilter from '$lib/components/ProviderFilter.svelte';
+	import ProviderBadge from '$lib/components/ProviderBadge.svelte';
 
-	let sessions = $derived($sortedSessions);
-	let summary = $derived($statusSummary);
+	let sessions = $derived($sortedSessions.filter((session) => $visibleTopLevelSessionIds.has(session.id)).filter((session) => matchesProvider(session, $providerFilter)));
+	let summary = $derived({
+		working: sessions.filter((s) => s.status === SessionStatus.Working || s.status === SessionStatus.Connecting).length,
+		permission: sessions.filter((s) => s.status === SessionStatus.NeedsAttention).length,
+		input: sessions.filter((s) => s.status === SessionStatus.WaitingForInput).length
+	});
 	let totalSessions = $derived(sessions.length);
 
 	// Pixel grid state
@@ -136,9 +144,9 @@
 <div class="popover">
 	<header class="popover-header">
 		<span class="total-count">{totalSessions} session{totalSessions !== 1 ? 's' : ''}</span>
-		<button class="dashboard-btn" onclick={openMainWindow}>
-			Open Dashboard
-			<svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+		<ProviderFilter compact variant="select" />
+		<button class="dashboard-btn" aria-label="Open dashboard" title="Open dashboard" onclick={openMainWindow}>
+			<svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 				<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
 				<polyline points="15 3 21 3 21 9" />
 				<line x1="10" y1="14" x2="21" y2="3" />
@@ -157,20 +165,23 @@
 	<main class="popover-content">
 		{#if sessions.length === 0}
 			<div class="empty-state">
-				<p>No active sessions</p>
+				<p>No {providerFilterLabel($providerFilter)} sessions</p>
 			</div>
 		{:else}
 			<div class="session-list">
 				{#each sessions as session (session.id)}
-					<button class="session-card" onclick={() => handleOpen(session)}>
+					<button class="session-card" disabled={!canSessionAction(session, 'open')} onclick={() => handleOpen(session)}>
 						<div class="card-top">
 							<span class="session-dot" style="background: {getStatusColor(session.status)}"></span>
+							<ProviderBadge provider={session.provider} surface={session.surface} compact />
 							<span class="session-project">{session.sessionName}</span>
+							{#if canSessionAction(session, 'open')}
 							<svg aria-hidden="true" class="open-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 								<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
 								<polyline points="15 3 21 3 21 9" />
 								<line x1="10" y1="14" x2="21" y2="3" />
 							</svg>
+							{/if}
 						</div>
 						<div class="card-title">{session.customTitle || session.firstPrompt}</div>
 						{#if session.latestMessage}
@@ -198,46 +209,54 @@
 	}
 
 	.popover-header {
-		display: flex;
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto 28px;
 		align-items: center;
-		justify-content: space-between;
+		gap: 8px;
 		padding: 10px 16px;
 		flex-shrink: 0;
+		border-bottom: 1px solid var(--border-muted);
 	}
+
+	.session-card:disabled { cursor: default; opacity: .82; }
 
 	.total-count {
 		font-size: 11px;
 		color: var(--text-muted);
+		white-space: nowrap;
 	}
 
 	.dashboard-btn {
 		display: flex;
 		align-items: center;
-		gap: 5px;
-		padding: 4px 0;
+		justify-content: center;
+		position: relative;
+		width: 28px;
+		height: 28px;
+		padding: 0;
 		border: none;
+		border-radius: 2px;
 		background: transparent;
 		color: var(--text-muted);
-		font-family: var(--font-mono);
-		font-size: 10px;
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
 		cursor: pointer;
-		transition: color var(--transition-fast);
+		transition: color var(--transition-fast), background var(--transition-fast);
 	}
 
 	.dashboard-btn:hover {
 		color: var(--text-primary);
+		background: var(--bg-elevated);
 	}
 
 	.dashboard-btn:focus-visible {
-		outline: none;
+		outline: 1px solid var(--border-focus);
+		outline-offset: 2px;
 	}
+
+	.dashboard-btn::before { content: ''; position: absolute; inset: -8px; }
 
 	.pixel-grid {
 		height: 16px;
 		background: var(--bg-elevated);
-		border-top: 1px solid var(--border-muted);
 		border-bottom: 1px solid var(--border-muted);
 		padding: 3px 16px;
 		flex-shrink: 0;

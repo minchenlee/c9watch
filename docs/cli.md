@@ -110,11 +110,16 @@ c9watch search "refactor parser" --project c9watch
       "sessionId": "d8036d8f-...",
       "snippet": "we should add this to our backlog",
       "projectPath": "/Users/you/project",
-      "modified": "2026-03-14T17:59:33+00:00"
+      "modified": "2026-03-14T17:59:33+00:00",
+      "provider": "codex",
+      "surface": "cli",
+      "agentKind": "root"
     }
   ]
 }
 ```
+
+Search covers Claude Code and Codex history. Each hit includes `provider`, `surface`, and `agentKind` so consumers can distinguish the source and session type.
 
 ### `history` — Past Sessions
 

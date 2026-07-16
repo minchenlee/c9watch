@@ -8,6 +8,7 @@
 	import { createSlidingWindow, BATCH_SIZE, MAX_VISIBLE } from '$lib/slidingWindow.svelte';
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
+	import ProviderBadge from './ProviderBadge.svelte';
 
 	interface Props {
 		entry: HistoryEntry;
@@ -29,7 +30,12 @@
 
 	let costRecord = $derived($sessionCostMap.get(entry.sessionId));
 	let primaryCostLabel = $derived(
-		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode) : null
+		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, costRecord.costAvailable ?? costRecord.provider !== 'codex') : null
+	);
+	let resumeCommand = $derived(
+		entry.provider === 'codex'
+			? `cd "${entry.project}" && codex resume ${entry.sessionId}`
+			: `cd "${entry.project}" && claude --resume ${entry.sessionId}`
 	);
 
 	let visibleMessages = $derived.by(() => {
@@ -131,8 +137,7 @@
 	}
 
 	async function copyResumeCommand() {
-		const cmd = `cd "${entry.project}" && claude --resume ${entry.sessionId}`;
-		await navigator.clipboard.writeText(cmd);
+		await navigator.clipboard.writeText(resumeCommand);
 		copied = true;
 		setTimeout(() => {
 			copied = false;
@@ -160,15 +165,16 @@
 				<div class="header-left" data-tauri-drag-region>
 					<div class="header-info">
 						<div class="header-title">
+							<ProviderBadge provider={entry.provider} surface={entry.surface} />
 							<h2 id="overlay-title" class="project-name">{entry.projectName}</h2>
 						</div>
 						<div class="header-meta">
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
 							{#if costRecord}
 								<span class="separator">·</span>
-								<span class="cost-breakdown" title="Total cost: {formatCost(costRecord.cost)} · {formatTokens(costRecord.totalTokens)} tokens · {modelDisplayName(costRecord.model)}">
+								<span class="cost-breakdown" title="{costRecord.costAvailable ?? costRecord.provider !== 'codex' ? `Total cost: ${formatCost(costRecord.cost)}` : 'USD pricing unavailable'} · {formatTokens(costRecord.totalTokens)} tokens · {modelDisplayName(costRecord.model)}">
 									<span class="cost-primary">{primaryCostLabel}</span>
-									<span class="cost-secondary">· {$costMode === 'usd' ? formatTokens(costRecord.totalTokens) + ' tok' : formatCost(costRecord.cost)}</span>
+									<span class="cost-secondary">· {$costMode === 'usd' ? formatTokens(costRecord.totalTokens) + ' tok' : formatCostOrTokens(costRecord.cost, costRecord.totalTokens, 'usd', costRecord.costAvailable ?? costRecord.provider !== 'codex')}</span>
 									<span class="cost-secondary">· {modelDisplayName(costRecord.model)}</span>
 								</span>
 							{/if}
@@ -184,7 +190,7 @@
 					title="Click to copy resume command"
 				>
 					<span class="resume-label">{copied ? 'COPIED!' : 'RESUME'}</span>
-					<code class="resume-cmd">cd "{entry.project}" && claude --resume {entry.sessionId}</code>
+					<code class="resume-cmd">{resumeCommand}</code>
 				</button>
 
 				<div class="header-actions">

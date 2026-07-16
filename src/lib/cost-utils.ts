@@ -27,7 +27,8 @@ export function formatTokens(tokens: number): string {
 }
 
 /** Render either the USD cost or the token count, depending on mode. */
-export function formatCostOrTokens(usd: number, tokens: number, mode: CostMode): string {
+export function formatCostOrTokens(usd: number, tokens: number, mode: CostMode, costAvailable = true): string {
+	if (mode === 'usd' && !costAvailable) return 'UNPRICED';
 	return mode === 'usd' ? formatCost(usd) : formatTokens(tokens);
 }
 
@@ -48,6 +49,11 @@ export function buildSessionCostMap(data: CostData | null): Map<string, SessionC
 			} else {
 				existing.cost += rec.cost;
 				existing.totalTokens += rec.totalTokens;
+				existing.inputTokens = (existing.inputTokens || 0) + (rec.inputTokens || 0);
+				existing.cachedInputTokens = (existing.cachedInputTokens || 0) + (rec.cachedInputTokens || 0);
+				existing.outputTokens = (existing.outputTokens || 0) + (rec.outputTokens || 0);
+				existing.reasoningOutputTokens = (existing.reasoningOutputTokens || 0) + (rec.reasoningOutputTokens || 0);
+				existing.costAvailable = (existing.costAvailable ?? existing.provider !== 'codex') && (rec.costAvailable ?? rec.provider !== 'codex');
 				if (rec.timestamp > existing.timestamp) {
 					existing.timestamp = rec.timestamp;
 					existing.model = rec.model;
