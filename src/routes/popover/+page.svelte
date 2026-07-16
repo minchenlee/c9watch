@@ -144,16 +144,18 @@
 <div class="popover">
 	<header class="popover-header">
 		<span class="total-count">{totalSessions} session{totalSessions !== 1 ? 's' : ''}</span>
-		<button class="dashboard-btn" onclick={openMainWindow}>
-			Open Dashboard
-			<svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-				<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-				<polyline points="15 3 21 3 21 9" />
-				<line x1="10" y1="14" x2="21" y2="3" />
-			</svg>
-		</button>
+		<div class="header-actions">
+			<ProviderFilter compact variant="select" />
+			<button class="dashboard-btn" onclick={openMainWindow}>
+				Open Dashboard
+				<svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+					<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+					<polyline points="15 3 21 3 21 9" />
+					<line x1="10" y1="14" x2="21" y2="3" />
+				</svg>
+			</button>
+		</div>
 	</header>
-	<div class="popover-filter"><ProviderFilter compact /></div>
 
 	<div class="pixel-grid" class:empty={totalSessions === 0} bind:clientWidth={trackWidth}>
 		<div class="grid-inner" style="grid-template-columns: repeat({columns}, 1fr);">
@@ -213,11 +215,13 @@
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
+		gap: 12px;
 		padding: 10px 16px;
 		flex-shrink: 0;
+		border-bottom: 1px solid var(--border-muted);
 	}
 
-	.popover-filter { display: flex; justify-content: center; padding: 0 12px 8px; border-bottom: 1px solid var(--border-muted); }
+	.header-actions { display: flex; align-items: center; gap: 14px; min-width: 0; }
 	.session-card:disabled { cursor: default; opacity: .82; }
 
 	.total-count {
@@ -252,7 +256,6 @@
 	.pixel-grid {
 		height: 16px;
 		background: var(--bg-elevated);
-		border-top: 1px solid var(--border-muted);
 		border-bottom: 1px solid var(--border-muted);
 		padding: 3px 16px;
 		flex-shrink: 0;

@@ -87,7 +87,7 @@ Inspect detected sessions:
 
 If time is limited, complete at least these six checks:
 
-- [ ] A Codex App session appears in Monitor with a blue `CODEX` badge.
+- [ ] Codex sessions use a blue `CODEX` badge and Claude Code sessions use an orange `CLAUDE CODE` badge in the main window and menu bar popover.
 - [ ] A Codex CLI session appears in Monitor and its CLI JSON reports `surface: cli`.
 - [ ] The `All | Claude Code | Codex` filter changes the actual data in Monitor, History, Cost, and Memory.
 - [ ] Resuming the same Codex session produces one card and retains the full conversation.
@@ -173,8 +173,9 @@ Expected results:
    - `Claude Code`
    - `Codex`
 3. Open the menu bar popover and confirm that the filter is synchronized.
-4. Check Monitor, History, Cost, and Memory under each filter.
-5. Quit and restart c9watch.
+4. In the popover header, use the compact `SHOW` dropdown to select each provider.
+5. Check Monitor, History, Cost, and Memory under each filter.
+6. Quit and restart c9watch.
 
 Expected results:
 
@@ -182,6 +183,9 @@ Expected results:
 - `Claude Code` displays only Claude Code data.
 - `Codex` displays only Codex data.
 - The filter is synchronized with the popover.
+- The popover filter stays on the same header row as the session count and `OPEN DASHBOARD`; it does not overlap, wrap, or create a separate full-width row.
+- The main window keeps the segmented provider control, while the popover uses one compact native dropdown.
+- Claude Code badges are orange and Codex badges are blue wherever provider badges appear.
 - Changing tabs does not reset the filter or make it cosmetic only.
 - Memory project counts, selection, content, and empty states follow the filter.
 - The selected filter persists after restarting c9watch.

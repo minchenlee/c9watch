@@ -28,8 +28,9 @@
 		letter-spacing: .08em; white-space: nowrap; color: var(--text-muted);
 		background: color-mix(in srgb, var(--bg-elevated) 86%, transparent);
 	}
+	.provider-badge { color: var(--accent-amber); border-color: color-mix(in srgb, var(--accent-amber) 55%, var(--border-default)); }
 	.provider-badge.codex { color: var(--accent-blue); border-color: color-mix(in srgb, var(--accent-blue) 55%, var(--border-default)); }
-	.surface-badge { height: 16px; padding: 0 4px; border-style: dashed; font-size: 7px; color: var(--text-secondary); }
+	.surface-badge { height: 16px; padding: 0 4px; border-color: var(--border-default); border-style: dashed; font-size: 7px; color: var(--text-secondary); }
 	.compact .provider-badge { height: 16px; font-size: 7px; }
 	.compact .surface-badge { display: none; }
 </style>
