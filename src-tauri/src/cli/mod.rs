@@ -510,7 +510,35 @@ fn cmd_search(
     if query.trim().is_empty() {
         return Err("Search query cannot be empty".to_string());
     }
-    let hits = session::deep_search(query, case_sensitive, whole_word)?;
+    let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
+    let output = cmd_search_output(
+        &home_dir,
+        query,
+        project_filter,
+        limit,
+        case_sensitive,
+        whole_word,
+    )?;
+    print_json(&output, pretty)
+}
+
+fn cmd_search_output(
+    home_dir: &std::path::Path,
+    query: &str,
+    project_filter: Option<&str>,
+    limit: usize,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Result<serde_json::Value, String> {
+    if query.trim().is_empty() {
+        return Err("Search query cannot be empty".to_string());
+    }
+    let hits = session::history::deep_search_under(
+        home_dir,
+        query,
+        case_sensitive,
+        whole_word,
+    )?;
 
     let enriched: Vec<serde_json::Value> = hits
         .into_iter()
@@ -524,7 +552,7 @@ fn cmd_search(
         "hits": enriched,
         "truncated": enriched.len() == limit,
     });
-    print_json(&output, pretty)
+    Ok(output)
 }
 
 /// Identify the calling agent's own session by walking up the PID tree
@@ -1689,21 +1717,45 @@ mod session_formatter_tests {
     }
 
     #[test]
-    fn codex_search_hit_metadata_keeps_real_project_and_modified_timestamp() {
-        let value = enrich_search_hit(session::DeepSearchHit {
-            session_id: "codex-search".to_string(),
-            snippet: "search marker".to_string(),
-            project_path: Some("/tmp/codex-project".to_string()),
-            modified: Some("2026-07-13T02:03:04+00:00".to_string()),
-            provider: "codex".to_string(),
-            surface: Some("cli".to_string()),
-            agent_kind: "root".to_string(),
-        });
+    fn codex_rollout_search_wiring_attaches_metadata_and_filters_project() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".codex/sessions/2026/07/13");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout-codex-search.jsonl"),
+            concat!(
+                r#"{"timestamp":"2026-07-13T02:03:04Z","type":"session_meta","payload":{"id":"codex-search","cwd":"/tmp/codex-project","source":"cli","originator":"codex-tui"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-07-13T02:03:04Z","type":"event_msg","payload":{"type":"user_message","message":"search wiring marker"}}"#,
+            ),
+        )
+        .unwrap();
 
-        assert_eq!(value["projectPath"], "/tmp/codex-project");
-        assert_eq!(value["modified"], "2026-07-13T02:03:04+00:00");
-        assert!(search_hit_matches_project(&value, Some("codex-project")));
-        assert!(!search_hit_matches_project(&value, Some("other-project")));
+        let matching = cmd_search_output(
+            home.path(),
+            "search wiring marker",
+            Some("codex-project"),
+            20,
+            false,
+            false,
+        )
+        .unwrap();
+        let hits = matching["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["sessionId"], "codex-search");
+        assert_eq!(hits[0]["projectPath"], "/tmp/codex-project");
+        assert_eq!(hits[0]["modified"], "2026-07-13T02:03:04+00:00");
+
+        let nonmatching = cmd_search_output(
+            home.path(),
+            "search wiring marker",
+            Some("other-project"),
+            20,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(nonmatching["hits"].as_array().unwrap().is_empty());
     }
 
     #[test]

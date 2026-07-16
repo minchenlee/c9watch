@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A raw line from ~/.claude/history.jsonl
 #[derive(Debug, Clone, Deserialize)]
@@ -357,6 +357,15 @@ pub fn deep_search(
     whole_word: bool,
 ) -> Result<Vec<DeepSearchHit>, String> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
+    deep_search_under(&home_dir, query, case_sensitive, whole_word)
+}
+
+pub(crate) fn deep_search_under(
+    home_dir: &Path,
+    query: &str,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Result<Vec<DeepSearchHit>, String> {
     let projects_dir = home_dir.join(".claude").join("projects");
 
     let query_norm = if case_sensitive {
@@ -738,36 +747,6 @@ mod tests {
         assert!(!entries
             .iter()
             .any(|entry| entry.session_id == "guardian-history"));
-    }
-
-    #[test]
-    fn codex_deep_search_hit_carries_snapshot_project_and_modified_metadata() {
-        let home = tempfile::tempdir().unwrap();
-        let rollout = home.path().join("rollout-search.jsonl");
-        std::fs::write(
-            &rollout,
-            concat!(
-                r#"{"timestamp":"2026-07-13T02:03:04Z","type":"session_meta","payload":{"id":"codex-search","cwd":"/tmp/codex-project","source":"cli","originator":"codex-tui"}}"#,
-                "\n",
-                r#"{"timestamp":"2026-07-13T02:03:04Z","type":"event_msg","payload":{"type":"user_message","message":"search marker"}}"#,
-            ),
-        )
-        .unwrap();
-
-        let snapshot = crate::session::codex_archive::scan_rollout(&rollout).unwrap();
-        let (project_path, modified) = codex_snapshot_metadata(&snapshot);
-        let hit = DeepSearchHit {
-            session_id: snapshot.thread_id,
-            snippet: "search marker".to_string(),
-            project_path,
-            modified,
-            provider: "codex".to_string(),
-            surface: Some(snapshot.surface),
-            agent_kind: snapshot.agent_kind,
-        };
-
-        assert_eq!(hit.project_path.as_deref(), Some("/tmp/codex-project"));
-        assert_eq!(hit.modified.as_deref(), Some("2026-07-13T02:03:04+00:00"));
     }
 
     // ── phrase_match ────────────────────────────────────────────────
