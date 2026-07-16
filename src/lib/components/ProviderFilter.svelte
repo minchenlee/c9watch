@@ -151,7 +151,7 @@
 		gap: 8px;
 		height: 26px;
 		min-width: 112px;
-		border: 1px solid var(--border-muted);
+		border: 0;
 		border-radius: 2px;
 		padding: 0 8px;
 		background: var(--bg-base);
