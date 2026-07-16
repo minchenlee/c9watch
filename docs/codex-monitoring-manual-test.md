@@ -186,7 +186,7 @@ Expected results:
 - The popover header keeps the session count, compact provider dropdown, and icon-only dashboard action on one line without overlap or wrapping.
 - The main window keeps the segmented provider control, while the popover uses one compact custom dropdown.
 - The popover dropdown uses c9watch styling instead of the system menu, supports keyboard navigation and outside-click dismissal, and does not change its border color when focused.
-- The dropdown menu is wider than its trigger, keeps `CLAUDE CODE` on one line, and uses compact option rows.
+- The dropdown menu is wider than its trigger, keeps `CLAUDE CODE` on one line, and uses a 20px trigger and compact option rows.
 - Claude Code badges are orange and Codex badges are blue wherever provider badges appear.
 - Changing tabs does not reset the filter or make it cosmetic only.
 - Memory project counts, selection, content, and empty states follow the filter.

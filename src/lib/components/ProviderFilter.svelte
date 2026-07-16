@@ -203,7 +203,7 @@
 	.option-check { color: var(--text-secondary); text-align: right; }
 	.provider-select.compact { gap: 5px; }
 	.compact .select-label { font-size: 7px; }
-	.compact .dropdown-trigger { height: 23px; min-width: 96px; padding-inline: 7px; font-size: 8px; }
+	.compact .dropdown-trigger { height: 20px; min-width: 96px; padding-inline: 7px; font-size: 8px; }
 	@media (prefers-reduced-motion: reduce) { .dropdown-trigger svg { transition: none; } }
 	@media (max-width: 720px) { .provider-filter:not(.compact) button { padding-inline: 6px; font-size: 8px; } }
 </style>
