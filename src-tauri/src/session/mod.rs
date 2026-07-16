@@ -33,6 +33,14 @@ pub mod cost;
 mod codex_archive;
 pub use cost::{get_cost_data, CostData};
 
+pub(crate) fn codex_session_ids(home: &std::path::Path, prefix: &str) -> Vec<String> {
+    codex_archive::load_default_snapshots(home)
+        .into_iter()
+        .filter(|snapshot| snapshot.thread_id.starts_with(prefix))
+        .map(|snapshot| snapshot.thread_id)
+        .collect()
+}
+
 pub mod memory;
 pub use memory::{get_memory_files, MemoryFile, ProjectMemory};
 

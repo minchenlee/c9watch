@@ -510,19 +510,40 @@ fn cmd_search(
     if query.trim().is_empty() {
         return Err("Search query cannot be empty".to_string());
     }
-    let hits = session::deep_search(query, case_sensitive, whole_word)?;
+    let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
+    let output = cmd_search_output(
+        &home_dir,
+        query,
+        project_filter,
+        limit,
+        case_sensitive,
+        whole_word,
+    )?;
+    print_json(&output, pretty)
+}
+
+fn cmd_search_output(
+    home_dir: &std::path::Path,
+    query: &str,
+    project_filter: Option<&str>,
+    limit: usize,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Result<serde_json::Value, String> {
+    if query.trim().is_empty() {
+        return Err("Search query cannot be empty".to_string());
+    }
+    let hits = session::history::deep_search_under(
+        home_dir,
+        query,
+        case_sensitive,
+        whole_word,
+    )?;
 
     let enriched: Vec<serde_json::Value> = hits
         .into_iter()
         .map(|hit| enrich_search_hit(hit))
-        .filter(|hit| match project_filter {
-            Some(filter) => hit
-                .get("projectPath")
-                .and_then(|p| p.as_str())
-                .map(|p| p.contains(filter))
-                .unwrap_or(false),
-            None => true,
-        })
+        .filter(|hit| search_hit_matches_project(hit, project_filter))
         .take(limit)
         .collect();
 
@@ -531,7 +552,7 @@ fn cmd_search(
         "hits": enriched,
         "truncated": enriched.len() == limit,
     });
-    print_json(&output, pretty)
+    Ok(output)
 }
 
 /// Identify the calling agent's own session by walking up the PID tree
@@ -1340,12 +1361,38 @@ fn enrich_history_entry(entry: session::HistoryEntry) -> serde_json::Value {
 }
 
 fn enrich_search_hit(hit: session::DeepSearchHit) -> serde_json::Value {
-    let (project_path_encoded, modified) = find_session_metadata(&hit.session_id);
+    let (project_path, modified) = if hit.provider.eq_ignore_ascii_case("codex") {
+        (hit.project_path.clone(), hit.modified.clone())
+    } else {
+        let (project_path_encoded, modified) = find_session_metadata(&hit.session_id);
 
-    // Decode the encoded project path back to a real filesystem path
-    // e.g. "-Users-liminchen-Documents-GitHub-c9watch" -> "/Users/liminchen/Documents/GitHub/c9watch"
-    let project_path = project_path_encoded.map(|encoded| decode_project_path(&encoded));
+        // Decode the encoded project path back to a real filesystem path
+        // e.g. "-Users-liminchen-Documents-GitHub-c9watch" -> "/Users/liminchen/Documents/GitHub/c9watch"
+        (
+            project_path_encoded.map(|encoded| decode_project_path(&encoded)),
+            modified,
+        )
+    };
 
+    format_search_hit(hit, project_path, modified)
+}
+
+fn search_hit_matches_project(hit: &serde_json::Value, project_filter: Option<&str>) -> bool {
+    match project_filter {
+        Some(filter) => hit
+            .get("projectPath")
+            .and_then(|path| path.as_str())
+            .map(|path| path.contains(filter))
+            .unwrap_or(false),
+        None => true,
+    }
+}
+
+fn format_search_hit(
+    hit: session::DeepSearchHit,
+    project_path: Option<String>,
+    modified: Option<String>,
+) -> serde_json::Value {
     serde_json::json!({
         "sessionId": hit.session_id,
         "snippet": strip_system_tags(&hit.snippet),
@@ -1531,6 +1578,13 @@ fn resolve_session_id_lightweight(prefix: &str) -> Result<String, String> {
     }
 
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
+    resolve_session_id_lightweight_under(prefix, &home_dir)
+}
+
+fn resolve_session_id_lightweight_under(
+    prefix: &str,
+    home_dir: &std::path::Path,
+) -> Result<String, String> {
     let projects_dir = home_dir.join(".claude").join("projects");
 
     let mut matches: Vec<String> = Vec::new();
@@ -1559,6 +1613,16 @@ fn resolve_session_id_lightweight(prefix: &str) -> Result<String, String> {
         }
     }
 
+    matches.extend(session::codex_session_ids(home_dir, prefix));
+
+    resolve_session_id_matches(prefix, matches)
+}
+
+fn resolve_session_id_matches(prefix: &str, matches: Vec<String>) -> Result<String, String> {
+    let mut matches = matches;
+    matches.sort();
+    matches.dedup();
+
     match matches.len() {
         0 => {
             // If it looks like a full UUID, let it through (might be a valid ID
@@ -1567,14 +1631,14 @@ fn resolve_session_id_lightweight(prefix: &str) -> Result<String, String> {
                 Ok(prefix.to_string())
             } else {
                 Err(format!(
-                    "No session found matching prefix '{}'",
+                    "No session found matching prefix '{}' across Claude Code and Codex",
                     prefix
                 ))
             }
         }
         1 => Ok(matches.into_iter().next().unwrap()),
         n => Err(format!(
-            "Ambiguous session ID prefix '{}' matches {} sessions",
+            "Ambiguous session ID prefix '{}' matches {} sessions across Claude Code and Codex",
             prefix, n
         )),
     }
@@ -1640,6 +1704,8 @@ mod session_formatter_tests {
         let value = enrich_search_hit(session::DeepSearchHit {
             session_id: "search-session".to_string(),
             snippet: "matching text".to_string(),
+            project_path: Some("/tmp/codex-project".to_string()),
+            modified: Some("2026-07-13T02:03:04+00:00".to_string()),
             provider: "codex".to_string(),
             surface: Some("cli".to_string()),
             agent_kind: "subagent".to_string(),
@@ -1648,6 +1714,101 @@ mod session_formatter_tests {
         assert_eq!(value["provider"], "codex");
         assert_eq!(value["surface"], "cli");
         assert_eq!(value["agentKind"], "subagent");
+    }
+
+    #[test]
+    fn codex_rollout_search_wiring_attaches_metadata_and_filters_project() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".codex/sessions/2026/07/13");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout-codex-search.jsonl"),
+            concat!(
+                r#"{"timestamp":"2026-07-13T02:03:04Z","type":"session_meta","payload":{"id":"codex-search","cwd":"/tmp/codex-project","source":"cli","originator":"codex-tui"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-07-13T02:03:04Z","type":"event_msg","payload":{"type":"user_message","message":"search wiring marker"}}"#,
+            ),
+        )
+        .unwrap();
+
+        let matching = cmd_search_output(
+            home.path(),
+            "search wiring marker",
+            Some("codex-project"),
+            20,
+            false,
+            false,
+        )
+        .unwrap();
+        let hits = matching["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["sessionId"], "codex-search");
+        assert_eq!(hits[0]["projectPath"], "/tmp/codex-project");
+        assert_eq!(hits[0]["modified"], "2026-07-13T02:03:04+00:00");
+
+        let nonmatching = cmd_search_output(
+            home.path(),
+            "search wiring marker",
+            Some("other-project"),
+            20,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(nonmatching["hits"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_prefix_resolves_unique_codex_id() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join(".codex/sessions/2026/07/13");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout-codex-unique.jsonl"),
+            r#"{"timestamp":"2026-07-13T02:03:04Z","type":"session_meta","payload":{"id":"codex-unique-thread","cwd":"/tmp/codex","source":"cli","originator":"codex-tui"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_session_id_lightweight_under("codex-unique", home.path()).unwrap(),
+            "codex-unique-thread"
+        );
+    }
+
+    #[test]
+    fn session_prefix_reports_ambiguity_across_providers() {
+        let home = tempfile::tempdir().unwrap();
+        let claude_project = home.path().join(".claude/projects/project");
+        std::fs::create_dir_all(&claude_project).unwrap();
+        std::fs::write(
+            claude_project.join("shared-claude-session.jsonl"),
+            "",
+        )
+        .unwrap();
+        let codex_sessions = home.path().join(".codex/sessions/2026/07/13");
+        std::fs::create_dir_all(&codex_sessions).unwrap();
+        std::fs::write(
+            codex_sessions.join("rollout-shared-codex.jsonl"),
+            r#"{"timestamp":"2026-07-13T02:03:04Z","type":"session_meta","payload":{"id":"shared-codex-thread","cwd":"/tmp/codex","source":"cli","originator":"codex-tui"}}"#,
+        )
+        .unwrap();
+
+        let error = resolve_session_id_lightweight_under("shared", home.path()).unwrap_err();
+
+        assert!(error.contains("Ambiguous session ID prefix 'shared'"));
+        assert!(error.contains("matches 2 sessions"));
+        assert!(error.contains("Claude Code and Codex"));
+    }
+
+    #[test]
+    fn session_prefix_reports_no_match_across_providers() {
+        let home = tempfile::tempdir().unwrap();
+        let error = resolve_session_id_lightweight_under("missing", home.path()).unwrap_err();
+
+        assert_eq!(
+            error,
+            "No session found matching prefix 'missing' across Claude Code and Codex"
+        );
     }
 
     #[test]
