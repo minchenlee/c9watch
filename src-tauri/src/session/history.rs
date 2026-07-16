@@ -193,6 +193,10 @@ pub struct DeepSearchHit {
     pub session_id: String,
     /// Up to 200 chars of context around the first keyword match, from the matching line.
     pub snippet: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<String>,
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -203,6 +207,27 @@ pub struct DeepSearchHit {
 
 fn default_agent_kind() -> String {
     "root".to_string()
+}
+
+fn codex_snapshot_metadata(
+    snapshot: &super::codex_archive::CodexRolloutSnapshot,
+) -> (Option<String>, Option<String>) {
+    let project_path = (!snapshot.cwd.is_empty()).then(|| snapshot.cwd.clone());
+    let timestamp_ms = snapshot.updated_at_ms.max(snapshot.created_at_ms);
+    let modified = (timestamp_ms > 0)
+        .then(|| chrono::DateTime::from_timestamp_millis(timestamp_ms as i64))
+        .flatten()
+        .map(|datetime| datetime.to_rfc3339())
+        .or_else(|| {
+            std::fs::metadata(&snapshot.path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .map(|time| {
+                    let datetime: chrono::DateTime<chrono::Utc> = time.into();
+                    datetime.to_rfc3339()
+                })
+        });
+    (project_path, modified)
 }
 
 /// Returns true if `haystack` contains `needle` according to the given mode flags.
@@ -407,6 +432,8 @@ pub fn deep_search(
                             guard.push(DeepSearchHit {
                                 session_id,
                                 snippet,
+                                project_path: None,
+                                modified: None,
                                 provider: default_provider(),
                                 surface: Some("claudeCode".to_string()),
                                 agent_kind: default_agent_kind(),
@@ -460,9 +487,12 @@ pub fn deep_search(
                     };
                     let snippet = extract_snippet(&text, &normalized, query_norm.as_str());
                     if !snippet.is_empty() {
+                        let (project_path, modified) = codex_snapshot_metadata(snapshot);
                         matched.lock().unwrap().push(DeepSearchHit {
                             session_id: snapshot.thread_id.clone(),
                             snippet,
+                            project_path,
+                            modified,
                             provider: "codex".to_string(),
                             surface: Some(snapshot.surface.clone()),
                             agent_kind: snapshot.agent_kind.clone(),
@@ -708,6 +738,36 @@ mod tests {
         assert!(!entries
             .iter()
             .any(|entry| entry.session_id == "guardian-history"));
+    }
+
+    #[test]
+    fn codex_deep_search_hit_carries_snapshot_project_and_modified_metadata() {
+        let home = tempfile::tempdir().unwrap();
+        let rollout = home.path().join("rollout-search.jsonl");
+        std::fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-07-13T02:03:04Z","type":"session_meta","payload":{"id":"codex-search","cwd":"/tmp/codex-project","source":"cli","originator":"codex-tui"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-07-13T02:03:04Z","type":"event_msg","payload":{"type":"user_message","message":"search marker"}}"#,
+            ),
+        )
+        .unwrap();
+
+        let snapshot = crate::session::codex_archive::scan_rollout(&rollout).unwrap();
+        let (project_path, modified) = codex_snapshot_metadata(&snapshot);
+        let hit = DeepSearchHit {
+            session_id: snapshot.thread_id,
+            snippet: "search marker".to_string(),
+            project_path,
+            modified,
+            provider: "codex".to_string(),
+            surface: Some(snapshot.surface),
+            agent_kind: snapshot.agent_kind,
+        };
+
+        assert_eq!(hit.project_path.as_deref(), Some("/tmp/codex-project"));
+        assert_eq!(hit.modified.as_deref(), Some("2026-07-13T02:03:04+00:00"));
     }
 
     // ── phrase_match ────────────────────────────────────────────────
