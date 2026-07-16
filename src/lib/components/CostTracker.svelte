@@ -140,7 +140,7 @@
 		if (normalized.includes('mini')) return '#f5c542';
 		if (normalized.startsWith('gpt-5.5')) return '#e879f9';
 		if (normalized.startsWith('gpt-5.4')) return 'var(--accent-red)';
-		if (normalized.startsWith('gpt-5.3-codex')) return 'var(--accent-purple)';
+		if (normalized.startsWith('gpt-5.3-codex')) return '#a3e635';
 
 		if (provider === 'codex' || normalized.startsWith('gpt-')) {
 			let hash = 0;
