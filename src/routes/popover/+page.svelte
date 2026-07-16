@@ -143,20 +143,15 @@
 
 <div class="popover">
 	<header class="popover-header">
-		<div class="header-primary">
-			<span class="total-count">{totalSessions} session{totalSessions !== 1 ? 's' : ''}</span>
-			<button class="dashboard-btn" onclick={openMainWindow}>
-				Open Dashboard
-				<svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-					<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-					<polyline points="15 3 21 3 21 9" />
-					<line x1="10" y1="14" x2="21" y2="3" />
-				</svg>
-			</button>
-		</div>
-		<div class="filter-row">
-			<ProviderFilter compact variant="select" />
-		</div>
+		<span class="total-count">{totalSessions} session{totalSessions !== 1 ? 's' : ''}</span>
+		<ProviderFilter compact variant="select" />
+		<button class="dashboard-btn" aria-label="Open dashboard" title="Open dashboard" onclick={openMainWindow}>
+			<svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+				<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+				<polyline points="15 3 21 3 21 9" />
+				<line x1="10" y1="14" x2="21" y2="3" />
+			</svg>
+		</button>
 	</header>
 
 	<div class="pixel-grid" class:empty={totalSessions === 0} bind:clientWidth={trackWidth}>
@@ -214,16 +209,15 @@
 	}
 
 	.popover-header {
-		display: flex;
-		flex-direction: column;
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto 28px;
+		align-items: center;
 		gap: 8px;
-		padding: 12px 16px 10px;
+		padding: 10px 16px;
 		flex-shrink: 0;
 		border-bottom: 1px solid var(--border-muted);
 	}
 
-	.header-primary { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; min-width: 0; }
-	.filter-row { display: flex; align-items: center; width: 100%; }
 	.session-card:disabled { cursor: default; opacity: .82; }
 
 	.total-count {
@@ -235,27 +229,30 @@
 	.dashboard-btn {
 		display: flex;
 		align-items: center;
-		gap: 5px;
-		padding: 4px 0;
+		justify-content: center;
+		position: relative;
+		width: 28px;
+		height: 28px;
+		padding: 0;
 		border: none;
+		border-radius: 2px;
 		background: transparent;
 		color: var(--text-muted);
-		font-family: var(--font-mono);
-		font-size: 10px;
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		white-space: nowrap;
 		cursor: pointer;
-		transition: color var(--transition-fast);
+		transition: color var(--transition-fast), background var(--transition-fast);
 	}
 
 	.dashboard-btn:hover {
 		color: var(--text-primary);
+		background: var(--bg-elevated);
 	}
 
 	.dashboard-btn:focus-visible {
-		outline: none;
+		outline: 1px solid var(--border-focus);
+		outline-offset: 2px;
 	}
+
+	.dashboard-btn::before { content: ''; position: absolute; inset: -8px; }
 
 	.pixel-grid {
 		height: 16px;
