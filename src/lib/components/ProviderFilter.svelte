@@ -117,7 +117,7 @@
 							onclick={() => selectProvider(option.value)}
 						>
 							<span class="option-marker {option.value}" aria-hidden="true"></span>
-							<span>{option.short}</span>
+							<span class="option-label">{option.short}</span>
 							<span class="option-check" aria-hidden="true">{$providerFilter === option.value ? '✓' : ''}</span>
 						</button>
 					{/each}
@@ -170,23 +170,23 @@
 		position: absolute;
 		top: calc(100% + 4px);
 		left: 0;
-		width: 100%;
-		padding: 3px;
+		width: 124px;
+		padding: 2px;
 		border: 1px solid var(--border-muted);
 		border-radius: 2px;
 		background: var(--bg-base);
-		box-shadow: 0 4px 8px rgba(0, 0, 0, .55);
+		box-shadow: 0 3px 6px rgba(0, 0, 0, .5);
 	}
 	.dropdown-option {
 		display: grid;
-		grid-template-columns: 6px minmax(0, 1fr) 10px;
+		grid-template-columns: 5px minmax(0, 1fr) 8px;
 		align-items: center;
-		gap: 6px;
+		gap: 5px;
 		width: 100%;
-		min-height: 24px;
+		min-height: 20px;
 		border: 0;
 		border-radius: 1px;
-		padding: 0 5px;
+		padding: 0 4px;
 		background: transparent;
 		color: var(--text-muted);
 		font: 700 8px/1 var(--font-mono);
@@ -196,6 +196,7 @@
 	}
 	.dropdown-option.active { color: var(--text-primary); background: var(--bg-elevated); }
 	.dropdown-option.selected { color: var(--text-secondary); }
+	.option-label { white-space: nowrap; }
 	.option-marker { width: 5px; height: 5px; border: 1px solid var(--border-default); }
 	.option-marker.claudeCode { border-color: var(--accent-amber); background: var(--accent-amber); }
 	.option-marker.codex { border-color: var(--accent-blue); background: var(--accent-blue); }
