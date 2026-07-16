@@ -183,7 +183,7 @@ Expected results:
 - `Claude Code` displays only Claude Code data.
 - `Codex` displays only Codex data.
 - The filter is synchronized with the popover.
-- The popover filter stays on the same header row as the session count and `OPEN DASHBOARD`; it does not overlap, wrap, or create a separate full-width row.
+- The popover header keeps the session count and `OPEN DASHBOARD` on one line, with the compact provider dropdown on a separate secondary line; none of the controls overlap or wrap.
 - The main window keeps the segmented provider control, while the popover uses one compact native dropdown.
 - Claude Code badges are orange and Codex badges are blue wherever provider badges appear.
 - Changing tabs does not reset the filter or make it cosmetic only.

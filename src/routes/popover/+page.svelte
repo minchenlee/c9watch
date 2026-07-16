@@ -143,9 +143,8 @@
 
 <div class="popover">
 	<header class="popover-header">
-		<span class="total-count">{totalSessions} session{totalSessions !== 1 ? 's' : ''}</span>
-		<div class="header-actions">
-			<ProviderFilter compact variant="select" />
+		<div class="header-primary">
+			<span class="total-count">{totalSessions} session{totalSessions !== 1 ? 's' : ''}</span>
 			<button class="dashboard-btn" onclick={openMainWindow}>
 				Open Dashboard
 				<svg aria-hidden="true" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -154,6 +153,9 @@
 					<line x1="10" y1="14" x2="21" y2="3" />
 				</svg>
 			</button>
+		</div>
+		<div class="filter-row">
+			<ProviderFilter compact variant="select" />
 		</div>
 	</header>
 
@@ -213,20 +215,21 @@
 
 	.popover-header {
 		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
-		padding: 10px 16px;
+		flex-direction: column;
+		gap: 8px;
+		padding: 12px 16px 10px;
 		flex-shrink: 0;
 		border-bottom: 1px solid var(--border-muted);
 	}
 
-	.header-actions { display: flex; align-items: center; gap: 14px; min-width: 0; }
+	.header-primary { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; min-width: 0; }
+	.filter-row { display: flex; align-items: center; width: 100%; }
 	.session-card:disabled { cursor: default; opacity: .82; }
 
 	.total-count {
 		font-size: 11px;
 		color: var(--text-muted);
+		white-space: nowrap;
 	}
 
 	.dashboard-btn {
@@ -241,6 +244,7 @@
 		font-size: 10px;
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
+		white-space: nowrap;
 		cursor: pointer;
 		transition: color var(--transition-fast);
 	}
