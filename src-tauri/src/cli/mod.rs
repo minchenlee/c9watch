@@ -1351,6 +1351,9 @@ fn enrich_search_hit(hit: session::DeepSearchHit) -> serde_json::Value {
         "snippet": strip_system_tags(&hit.snippet),
         "projectPath": project_path,
         "modified": modified,
+        "provider": hit.provider,
+        "surface": hit.surface,
+        "agentKind": hit.agent_kind,
     })
 }
 
@@ -1630,6 +1633,21 @@ mod session_formatter_tests {
         assert_eq!(value["canOpen"], false);
         assert_eq!(value["canStop"], false);
         assert_eq!(value["canRename"], false);
+    }
+
+    #[test]
+    fn search_hit_includes_provider_surface_and_agent_kind() {
+        let value = enrich_search_hit(session::DeepSearchHit {
+            session_id: "search-session".to_string(),
+            snippet: "matching text".to_string(),
+            provider: "codex".to_string(),
+            surface: Some("cli".to_string()),
+            agent_kind: "subagent".to_string(),
+        });
+
+        assert_eq!(value["provider"], "codex");
+        assert_eq!(value["surface"], "cli");
+        assert_eq!(value["agentKind"], "subagent");
     }
 
     #[test]

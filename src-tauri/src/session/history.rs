@@ -197,6 +197,12 @@ pub struct DeepSearchHit {
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<String>,
+    #[serde(default = "default_agent_kind")]
+    pub agent_kind: String,
+}
+
+fn default_agent_kind() -> String {
+    "root".to_string()
 }
 
 /// Returns true if `haystack` contains `needle` according to the given mode flags.
@@ -402,7 +408,8 @@ pub fn deep_search(
                                 session_id,
                                 snippet,
                                 provider: default_provider(),
-                                surface: None,
+                                surface: Some("claudeCode".to_string()),
+                                agent_kind: default_agent_kind(),
                             });
                         }
                     }
@@ -458,6 +465,7 @@ pub fn deep_search(
                             snippet,
                             provider: "codex".to_string(),
                             surface: Some(snapshot.surface.clone()),
+                            agent_kind: snapshot.agent_kind.clone(),
                         });
                     }
                 }
