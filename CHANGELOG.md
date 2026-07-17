@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Enable the dashboard UI by setting `PM_ORCHESTRATION_ENABLED = true` in
     `src/lib/feature-flags.ts`.
 
+### Improved
+- **Lower memory usage for Codex session monitoring.** Incremental rollout
+  parsing and bounded monitor representations reduce peak RSS by 65.8% on a
+  controlled workload while preserving full conversation and tool details.
+  ([#116](https://github.com/minchenlee/c9watch/pull/116))
+- Added a dry-run-by-default utility for cleaning stale Cargo targets from
+  other registered worktrees.
+
 ### Added
 - PM-orchestration `bg` backend: spawn workers via `claude --bg` instead of
   `claude --print`. Workers stay on Pro/Max subscription quota after
