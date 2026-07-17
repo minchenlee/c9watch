@@ -1,9 +1,10 @@
 use chrono::{DateTime, Local};
+use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,8 +20,22 @@ use super::source::{
 const IDLE_FRESHNESS_SECS: u64 = 30 * 60;
 const WORKING_FRESHNESS_SECS: u64 = 4 * 60 * 60;
 const LINKED_PARENT_CEILING_SECS: u64 = 24 * 60 * 60;
-const DISCOVERY_RECENT_SECS: u64 = LINKED_PARENT_CEILING_SECS;
+// Discovery only needs to cover sessions that could survive the active-session
+// freshness filter. Older linked parents are resolved on demand through the
+// filename index below, so parsing every rollout from the last 24 hours only
+// increases memory without making another session visible.
+const DISCOVERY_RECENT_SECS: u64 = WORKING_FRESHNESS_SECS;
 const FULL_DISCOVERY_INTERVAL_SECS: u64 = 60;
+// The monitor only renders 100 chars of the first prompt and 200 chars of the
+// latest message. Keep enough content for those exact views while full
+// conversations continue to be parsed on demand.
+const MONITOR_MESSAGE_CHARS: usize = 200;
+const MONITOR_HEADER_CAPTURE_BYTES: usize = 4096;
+const FILE_SIGNATURE_SAMPLE_BYTES: u64 = 4096;
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+// The 64-bit prefix digest keeps replacement detection bounded; a theoretical
+// digest collision is preferable to retaining the previous transcript bytes.
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CodexLifecycle {
@@ -36,6 +51,14 @@ pub struct CodexMessage {
     pub role: String,
     pub message_type: MessageType,
     pub content: String,
+    #[serde(skip)]
+    content_identity: MessageIdentity,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct MessageIdentity {
+    content_len: usize,
+    content_hash: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -85,11 +108,18 @@ struct FileStamp {
     identity: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FileSignature {
+    prefix_hash: u64,
+    checkpoint_hash: u64,
+}
+
 #[derive(Debug, Clone)]
 struct CacheEntry {
     stamp: FileStamp,
     offset: u64,
-    pending: Vec<u8>,
+    signature: FileSignature,
+    logical_prefix_hash: u64,
     summary: CodexRolloutSummary,
 }
 
@@ -97,11 +127,13 @@ struct CacheEntry {
 pub struct CodexSessionSource {
     sessions_root: PathBuf,
     cache: HashMap<PathBuf, CacheEntry>,
-    archive_index: HashMap<String, PathBuf>,
+    archive_index: HashMap<String, Vec<PathBuf>>,
     last_full_discovery: Option<SystemTime>,
     capture_tool_messages: bool,
     #[cfg(test)]
     parse_count: usize,
+    #[cfg(test)]
+    reset_count: usize,
 }
 
 impl CodexSessionSource {
@@ -119,6 +151,8 @@ impl CodexSessionSource {
             capture_tool_messages: false,
             #[cfg(test)]
             parse_count: 0,
+            #[cfg(test)]
+            reset_count: 0,
         }
     }
 
@@ -158,7 +192,10 @@ impl CodexSessionSource {
                     .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"));
-                if path.is_file() && is_rollout {
+                if path.is_file()
+                    && is_rollout
+                    && rollout_age_secs(&path, wall_now) <= DISCOVERY_RECENT_SECS
+                {
                     paths.insert(path);
                 }
             }
@@ -171,8 +208,10 @@ impl CodexSessionSource {
         if discovery_due {
             let mut next_index = HashMap::new();
             for path in collect_rollout_paths(&self.sessions_root) {
-                if let Some(thread_id) = thread_id_from_rollout_filename(&path) {
-                    next_index.insert(thread_id, path.clone());
+                if rollout_age_secs(&path, wall_now) <= LINKED_PARENT_CEILING_SECS {
+                    if let Some(thread_id) = thread_id_from_rollout_filename(&path) {
+                        index_rollout_path(&mut next_index, thread_id, path.clone());
+                    }
                 }
                 if rollout_age_secs(&path, wall_now) <= DISCOVERY_RECENT_SECS {
                     paths.insert(path);
@@ -206,51 +245,116 @@ impl CodexSessionSource {
             }
         }
 
-        let must_reset = self.cache.get(path).is_none_or(|entry| {
-            stamp.identity != entry.stamp.identity
-                || stamp.len < entry.offset
-                || (stamp.len == entry.stamp.len
-                    && stamp.modified_nanos != entry.stamp.modified_nanos)
-        });
+        let previous = self.cache.get(path).cloned();
+        let must_reset = match previous.as_ref() {
+            None => true,
+            Some(entry) => {
+                let structurally_replaced = stamp.identity != entry.stamp.identity
+                    || stamp.len < entry.offset
+                    || stamp.len < entry.stamp.len;
+                if structurally_replaced {
+                    true
+                } else {
+                    match file_signature(path, entry.offset) {
+                        Ok(signature) if signature != entry.signature => true,
+                        Ok(_) => {
+                            if entry.offset <= FILE_SIGNATURE_SAMPLE_BYTES {
+                                false
+                            } else {
+                                // Matching bounded samples is only the cheap
+                                // append fast path. Recheck the complete
+                                // logical prefix before trusting the cached
+                                // summary, so a same-inode rewrite in the
+                                // middle cannot leave stale messages behind.
+                                File::open(path)
+                                    .and_then(|mut file| {
+                                        hash_file_region(&mut file, 0, entry.offset)
+                                    })
+                                    .map(|hash| hash != entry.logical_prefix_hash)
+                                    .unwrap_or(true)
+                            }
+                        }
+                        Err(_) => true,
+                    }
+                }
+            }
+        };
+
+        #[cfg(test)]
+        if must_reset {
+            self.reset_count += 1;
+        }
 
         let mut entry = if must_reset {
             CacheEntry {
                 stamp,
                 offset: 0,
-                pending: Vec::new(),
+                signature: FileSignature::default(),
+                logical_prefix_hash: FNV_OFFSET_BASIS,
                 summary: CodexRolloutSummary::default(),
             }
         } else {
-            self.cache.get(path).cloned().expect("cache entry exists")
+            previous.expect("cache entry exists")
         };
 
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(entry.offset))?;
-        let mut appended = Vec::new();
-        file.read_to_end(&mut appended)?;
-        entry.offset += appended.len() as u64;
-        entry.pending.extend_from_slice(&appended);
+        let mut reader = BufReader::new(file);
+        if self.capture_tool_messages {
+            let mut line = Vec::new();
+            loop {
+                let line_start = entry.offset;
+                line.clear();
+                let bytes_read = reader.read_until(b'\n', &mut line)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                if line.last() != Some(&b'\n') {
+                    // Keep the offset at the start of an incomplete record.
+                    // The next poll rereads only this final line after it is
+                    // resumed; no partial payload remains in the cache.
+                    entry.offset = line_start;
+                    break;
+                }
 
-        let complete_len = entry
-            .pending
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |position| position + 1);
-        let complete = entry.pending[..complete_len].to_vec();
-        entry.pending.drain(..complete_len);
-        for line in complete.split(|byte| *byte == b'\n') {
-            if line.is_empty() {
-                continue;
+                entry.offset = line_start + bytes_read as u64;
+                entry.logical_prefix_hash = hash_bytes(entry.logical_prefix_hash, &line);
+                apply_rollout_line(&mut entry.summary, &line, true);
             }
-            if let Ok(value) = serde_json::from_slice::<Value>(line) {
-                apply_rollout_event_with_tools(
-                    &mut entry.summary,
-                    &value,
-                    self.capture_tool_messages,
+        } else {
+            loop {
+                let line_start = entry.offset;
+                let record = read_monitor_line(&mut reader, entry.logical_prefix_hash)?;
+                if record.bytes_read == 0 {
+                    break;
+                }
+                if !record.complete {
+                    entry.offset = line_start;
+                    break;
+                }
+
+                entry.offset = line_start + record.bytes_read;
+                entry.logical_prefix_hash = record.logical_prefix_hash;
+                let Some(header) = record.header else {
+                    continue;
+                };
+                let relevant = matches!(
+                    header.event_type.as_deref(),
+                    Some("session_meta" | "event_msg")
                 );
+                if relevant {
+                    let line = match record.line {
+                        Some(line) => line,
+                        None => read_line_at(path, line_start, record.bytes_read)?,
+                    };
+                    apply_monitor_line(&mut entry.summary, &line);
+                } else if let Some(timestamp) = header.timestamp.as_deref() {
+                    entry.summary.last_timestamp = timestamp.to_string();
+                }
             }
         }
         entry.stamp = stamp;
+        entry.signature = file_signature(path, entry.offset).unwrap_or_default();
         #[cfg(test)]
         {
             self.parse_count += 1;
@@ -279,8 +383,11 @@ impl CodexSessionSource {
                 continue;
             };
             if !summary.thread_id.is_empty() {
-                self.archive_index
-                    .insert(summary.thread_id.clone(), path.clone());
+                index_rollout_path(
+                    &mut self.archive_index,
+                    summary.thread_id.clone(),
+                    path.clone(),
+                );
             }
             summaries.push((path.clone(), summary, rollout_age_secs(path, wall_now)));
         }
@@ -305,29 +412,31 @@ impl CodexSessionSource {
                 .flatten()
             })
             .collect();
-        let present_ids: HashSet<String> = summaries
-            .iter()
-            .map(|(_, summary, _)| summary.thread_id.clone())
-            .collect();
-        for thread_id in linked_parent_ids
-            .iter()
-            .filter(|id| !present_ids.contains(*id))
-        {
-            let Some(path) = self.archive_index.get(thread_id).cloned() else {
-                continue;
-            };
-            let age = rollout_age_secs(&path, wall_now);
-            if age > LINKED_PARENT_CEILING_SECS {
-                continue;
-            }
-            if let Ok(summary) = self.summary_for(&path) {
-                summaries.push((path, summary, age));
+        let mut existing_paths: HashSet<PathBuf> =
+            summaries.iter().map(|(path, _, _)| path.clone()).collect();
+        for thread_id in &linked_parent_ids {
+            let paths = self
+                .archive_index
+                .get(thread_id)
+                .cloned()
+                .unwrap_or_default();
+            for path in paths {
+                if existing_paths.contains(&path) {
+                    continue;
+                }
+                let age = rollout_age_secs(&path, wall_now);
+                if age > LINKED_PARENT_CEILING_SECS {
+                    continue;
+                }
+                if let Ok(summary) = self.summary_for(&path) {
+                    existing_paths.insert(path.clone());
+                    summaries.push((path, summary, age));
+                }
             }
         }
+        summaries = merge_live_rollout_summaries(summaries);
 
-        let existing: HashSet<PathBuf> =
-            summaries.iter().map(|(path, _, _)| path.clone()).collect();
-        self.cache.retain(|path, _| existing.contains(path));
+        self.cache.retain(|path, _| existing_paths.contains(path));
 
         let mut sessions = Vec::new();
         for (_path, summary, age_secs) in summaries {
@@ -380,6 +489,135 @@ impl CodexSessionSource {
     }
 }
 
+#[derive(Clone, Deserialize)]
+struct RolloutEventHeader {
+    timestamp: Option<String>,
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+}
+
+struct RolloutHeaderVisitor<'a> {
+    header: &'a mut Option<RolloutEventHeader>,
+}
+
+impl<'de, 'a> Visitor<'de> for RolloutHeaderVisitor<'a> {
+    type Value = RolloutEventHeader;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a rollout JSON object")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut timestamp = None;
+        let mut event_type = None;
+        let mut timestamp_seen = false;
+        let mut event_type_seen = false;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "timestamp" => {
+                    timestamp_seen = true;
+                    timestamp = map.next_value()?;
+                }
+                "type" => {
+                    event_type_seen = true;
+                    event_type = map.next_value()?;
+                }
+                _ => {
+                    map.next_value::<de::IgnoredAny>()?;
+                }
+            }
+
+            if timestamp_seen && event_type_seen {
+                let header = RolloutEventHeader {
+                    timestamp,
+                    event_type,
+                };
+                *self.header = Some(header.clone());
+                return Ok(header);
+            }
+        }
+
+        Ok(RolloutEventHeader {
+            timestamp,
+            event_type,
+        })
+    }
+}
+
+fn apply_rollout_line(summary: &mut CodexRolloutSummary, line: &[u8], capture_tool_messages: bool) {
+    let Ok(header) = serde_json::from_slice::<RolloutEventHeader>(line) else {
+        return;
+    };
+    if let Some(timestamp) = header.timestamp.as_deref() {
+        summary.last_timestamp = timestamp.to_string();
+    }
+    let event_type = header.event_type.as_deref();
+    let relevant = match event_type {
+        Some("session_meta" | "event_msg") => true,
+        Some("response_item") => capture_tool_messages,
+        _ => false,
+    };
+    if !relevant {
+        return;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(line) else {
+        return;
+    };
+    apply_rollout_event_with_tools(summary, &value, capture_tool_messages);
+}
+
+fn apply_monitor_line(summary: &mut CodexRolloutSummary, line: &[u8]) {
+    let Ok(value) = serde_json::from_slice::<Value>(line) else {
+        return;
+    };
+    apply_rollout_event_with_tools(summary, &value, false);
+}
+
+fn truncate_monitor_message(message: &str) -> String {
+    let mut chars = message.chars();
+    let truncated: String = chars.by_ref().take(MONITOR_MESSAGE_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn message_identity(content: &str) -> MessageIdentity {
+    let content_hash = hash_bytes(FNV_OFFSET_BASIS, content.as_bytes());
+    MessageIdentity {
+        content_len: content.len(),
+        content_hash,
+    }
+}
+
+fn push_codex_message(
+    summary: &mut CodexRolloutSummary,
+    timestamp: &str,
+    role: &str,
+    message_type: MessageType,
+    content: String,
+    compact_for_monitor: bool,
+) {
+    let content_identity = message_identity(&content);
+    let content = if compact_for_monitor {
+        truncate_monitor_message(&content)
+    } else {
+        content
+    };
+    summary.messages.push(CodexMessage {
+        timestamp: timestamp.to_string(),
+        role: role.to_string(),
+        message_type,
+        content,
+        content_identity,
+    });
+}
+
 type LiveRolloutSummary = (PathBuf, CodexRolloutSummary, u64);
 
 fn merge_live_rollout_summaries(summaries: Vec<LiveRolloutSummary>) -> Vec<LiveRolloutSummary> {
@@ -428,6 +666,7 @@ fn merge_live_rollout_summary(existing: &mut LiveRolloutSummary, mut incoming: L
             .cmp(&right.timestamp)
             .then_with(|| left.role.cmp(&right.role))
             .then_with(|| left.content.cmp(&right.content))
+            .then_with(|| left.content_identity.cmp(&right.content_identity))
     });
     messages.dedup();
 
@@ -449,6 +688,199 @@ fn rollout_age_secs(path: &Path, wall_now: SystemTime) -> u64 {
                 .as_secs()
         })
         .unwrap_or(u64::MAX)
+}
+
+fn index_rollout_path(index: &mut HashMap<String, Vec<PathBuf>>, thread_id: String, path: PathBuf) {
+    let paths = index.entry(thread_id).or_default();
+    if !paths.contains(&path) {
+        paths.push(path);
+        paths.sort();
+    }
+}
+
+struct MonitorLine {
+    bytes_read: u64,
+    complete: bool,
+    logical_prefix_hash: u64,
+    header: Option<RolloutEventHeader>,
+    line: Option<Vec<u8>>,
+}
+
+/// A JSONL reader that stops at one newline. It retains only a small prefix
+/// until the header identifies a relevant record; ignored records drain with a
+/// fixed buffer, while relevant records are captured for one semantic parse.
+struct JsonlLineReader<'a> {
+    reader: &'a mut BufReader<File>,
+    bytes_read: u64,
+    logical_prefix_hash: u64,
+    complete: bool,
+    eof: bool,
+    captured: Vec<u8>,
+    capture_all: bool,
+    capture_overflowed: bool,
+}
+
+impl<'a> JsonlLineReader<'a> {
+    fn new(reader: &'a mut BufReader<File>, logical_prefix_hash: u64) -> Self {
+        Self {
+            reader,
+            bytes_read: 0,
+            logical_prefix_hash,
+            complete: false,
+            eof: false,
+            captured: Vec::new(),
+            capture_all: false,
+            capture_overflowed: false,
+        }
+    }
+
+    fn drain_to_newline(&mut self, capture_remainder: bool) -> io::Result<()> {
+        if capture_remainder {
+            self.capture_all = true;
+        } else {
+            self.captured.clear();
+            self.capture_overflowed = true;
+        }
+        let mut scratch = [0u8; 4096];
+        while !self.complete && !self.eof {
+            if self.read(&mut scratch)? == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Read for JsonlLineReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() || self.complete || self.eof {
+            return Ok(0);
+        }
+
+        let buffer = self.reader.fill_buf()?;
+        if buffer.is_empty() {
+            self.eof = true;
+            return Ok(0);
+        }
+
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let available = newline.map_or(buffer.len(), |position| position + 1);
+        let bytes_to_copy = available.min(output.len());
+        output[..bytes_to_copy].copy_from_slice(&buffer[..bytes_to_copy]);
+        self.reader.consume(bytes_to_copy);
+        if !self.capture_overflowed {
+            if self.capture_all {
+                self.captured.extend_from_slice(&output[..bytes_to_copy]);
+            } else {
+                let remaining_capacity =
+                    MONITOR_HEADER_CAPTURE_BYTES.saturating_sub(self.captured.len());
+                let capture_len = bytes_to_copy.min(remaining_capacity);
+                self.captured.extend_from_slice(&output[..capture_len]);
+                if capture_len < bytes_to_copy {
+                    self.capture_overflowed = true;
+                }
+            }
+        }
+        self.bytes_read += bytes_to_copy as u64;
+        self.logical_prefix_hash = hash_bytes(self.logical_prefix_hash, &output[..bytes_to_copy]);
+        if newline.is_some_and(|position| bytes_to_copy == position + 1) {
+            self.complete = true;
+        }
+        Ok(bytes_to_copy)
+    }
+}
+
+fn read_monitor_line(
+    reader: &mut BufReader<File>,
+    logical_prefix_hash: u64,
+) -> io::Result<MonitorLine> {
+    let mut line_reader = JsonlLineReader::new(reader, logical_prefix_hash);
+    // serde_json calls end_map after the visitor returns. Keep the early
+    // header separately so that end_map cannot force a payload traversal.
+    let mut peeked_header = None;
+    let parsed_header = {
+        let mut deserializer = serde_json::Deserializer::from_reader(&mut line_reader);
+        (&mut deserializer).deserialize_map(RolloutHeaderVisitor {
+            header: &mut peeked_header,
+        })
+    };
+    let header = parsed_header.ok().or(peeked_header);
+    let relevant = header.as_ref().is_some_and(|header| {
+        matches!(
+            header.event_type.as_deref(),
+            Some("session_meta" | "event_msg")
+        )
+    });
+    line_reader.drain_to_newline(relevant)?;
+    let line = if relevant && line_reader.complete && !line_reader.capture_overflowed {
+        Some(std::mem::take(&mut line_reader.captured))
+    } else {
+        None
+    };
+    Ok(MonitorLine {
+        bytes_read: line_reader.bytes_read,
+        complete: line_reader.complete,
+        logical_prefix_hash: line_reader.logical_prefix_hash,
+        header,
+        line,
+    })
+}
+
+fn read_line_at(path: &Path, offset: u64, bytes: u64) -> io::Result<Vec<u8>> {
+    // Rare fallback for a relevant record whose header appears beyond the
+    // bounded capture prefix. Ordinary records are captured and parsed once.
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut line = Vec::new();
+    file.take(bytes).read_to_end(&mut line)?;
+    Ok(line)
+}
+
+/// Read only bounded samples from the already parsed logical prefix. The
+/// sample end must not move when a file grows, otherwise an ordinary append
+/// would look like a replacement for small rollouts.
+fn file_signature(path: &Path, logical_len: u64) -> io::Result<FileSignature> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let logical_end = logical_len.min(file_len);
+    let prefix_len = logical_end.min(FILE_SIGNATURE_SAMPLE_BYTES);
+    let prefix_hash = hash_file_region(&mut file, 0, prefix_len)?;
+    let checkpoint_end = logical_end;
+    let checkpoint_start = checkpoint_end.saturating_sub(FILE_SIGNATURE_SAMPLE_BYTES);
+    let checkpoint_hash = hash_file_region(
+        &mut file,
+        checkpoint_start,
+        checkpoint_end.saturating_sub(checkpoint_start),
+    )?;
+    Ok(FileSignature {
+        prefix_hash,
+        checkpoint_hash,
+    })
+}
+
+fn hash_file_region(file: &mut File, start: u64, len: u64) -> io::Result<u64> {
+    file.seek(SeekFrom::Start(start))?;
+    let mut remaining = len;
+    let mut buffer = [0u8; 4096];
+    let mut hash = FNV_OFFSET_BASIS;
+    while remaining > 0 {
+        let read_len = remaining.min(buffer.len() as u64) as usize;
+        let bytes_read = file.read(&mut buffer[..read_len])?;
+        if bytes_read == 0 {
+            break;
+        }
+        hash = hash_bytes(hash, &buffer[..bytes_read]);
+        remaining -= bytes_read as u64;
+    }
+    Ok(hash)
+}
+
+fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// A full discovery reads directory entries and metadata only. It is throttled
@@ -543,7 +975,9 @@ fn apply_rollout_event_with_tools(
     };
     match event_type {
         Some("session_meta") => apply_session_meta(summary, timestamp, payload),
-        Some("event_msg") => apply_event_message(summary, timestamp, payload),
+        Some("event_msg") => {
+            apply_event_message(summary, timestamp, payload, !capture_tool_messages)
+        }
         Some("response_item") if capture_tool_messages => {
             apply_response_item(summary, timestamp, payload)
         }
@@ -641,7 +1075,12 @@ fn classify_surface(source: &Value, originator: &str) -> SessionSurface {
     }
 }
 
-fn apply_event_message(summary: &mut CodexRolloutSummary, timestamp: &str, payload: &Value) {
+fn apply_event_message(
+    summary: &mut CodexRolloutSummary,
+    timestamp: &str,
+    payload: &Value,
+    compact_for_monitor: bool,
+) {
     match payload.get("type").and_then(Value::as_str) {
         Some("user_message") | Some("agent_message") => {
             let role = if payload.get("type").and_then(Value::as_str) == Some("user_message") {
@@ -650,16 +1089,18 @@ fn apply_event_message(summary: &mut CodexRolloutSummary, timestamp: &str, paylo
                 "assistant"
             };
             if let Some(content) = payload.get("message").and_then(Value::as_str) {
-                summary.messages.push(CodexMessage {
-                    timestamp: timestamp.to_string(),
-                    role: role.to_string(),
-                    message_type: if role == "user" {
+                push_codex_message(
+                    summary,
+                    timestamp,
+                    role,
+                    if role == "user" {
                         MessageType::User
                     } else {
                         MessageType::Assistant
                     },
-                    content: content.to_string(),
-                });
+                    content.to_string(),
+                    compact_for_monitor,
+                );
             }
         }
         Some("task_started") => summary.lifecycle = CodexLifecycle::Working,
@@ -762,12 +1203,7 @@ fn apply_response_item(summary: &mut CodexRolloutSummary, timestamp: &str, paylo
         // records. Ignoring them avoids duplicate conversation content.
         _ => return,
     };
-    summary.messages.push(CodexMessage {
-        timestamp: timestamp.to_string(),
-        role: role.to_string(),
-        message_type,
-        content,
-    });
+    push_codex_message(summary, timestamp, role, message_type, content, false);
 }
 
 fn rollback_messages(messages: &mut Vec<CodexMessage>, turns: usize) {
@@ -826,6 +1262,7 @@ fn find_codex_conversation_under(
             .cmp(&right.timestamp)
             .then_with(|| left.role.cmp(&right.role))
             .then_with(|| left.content.cmp(&right.content))
+            .then_with(|| left.content_identity.cmp(&right.content_identity))
     });
     messages.dedup();
     Ok(messages)
@@ -840,8 +1277,16 @@ mod tests {
     use tempfile::TempDir;
 
     fn event(timestamp: &str, event_type: &str, payload: Value) -> String {
-        serde_json::json!({"timestamp": timestamp, "type": event_type, "payload": payload})
-            .to_string()
+        ordered_event(timestamp, event_type, payload)
+    }
+
+    fn ordered_event(timestamp: &str, event_type: &str, payload: Value) -> String {
+        format!(
+            r#"{{"timestamp":{},"type":{},"payload":{}}}"#,
+            serde_json::to_string(timestamp).unwrap(),
+            serde_json::to_string(event_type).unwrap(),
+            serde_json::to_string(&payload).unwrap()
+        )
     }
 
     fn root_fixture(source: Value, originator: &str) -> Vec<String> {
@@ -980,7 +1425,7 @@ mod tests {
             "task_started",
             "turn_aborted",
         ] {
-            apply_event_message(&mut summary, "", &serde_json::json!({"type": kind}));
+            apply_event_message(&mut summary, "", &serde_json::json!({"type": kind}), false);
         }
         assert_eq!(summary.lifecycle, CodexLifecycle::Idle);
         for (role, message) in [
@@ -992,12 +1437,14 @@ mod tests {
                 &mut summary,
                 "",
                 &serde_json::json!({"type": role, "message": message}),
+                false,
             );
         }
         apply_event_message(
             &mut summary,
             "",
             &serde_json::json!({"type": "thread_rolled_back", "num_turns": 1}),
+            false,
         );
         assert_eq!(summary.messages.len(), 2);
         assert_eq!(summary.lifecycle, CodexLifecycle::Idle);
@@ -1032,6 +1479,199 @@ mod tests {
 
         write_lines(&path, &lines[..1], true);
         assert_eq!(source.summary_for(&path).unwrap().messages.len(), 0);
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{{not-json}}").unwrap();
+        writeln!(
+            file,
+            "{}",
+            event(
+                "2026-07-13T00:00:04Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"recovered"}),
+            )
+        )
+        .unwrap();
+        drop(file);
+        let summary = source.summary_for(&path).unwrap();
+        assert_eq!(summary.messages.len(), 1);
+        assert_eq!(summary.latest_message(), Some("recovered"));
+        assert_eq!(summary.last_timestamp, "2026-07-13T00:00:04Z");
+    }
+
+    #[test]
+    fn small_append_reuses_cached_prefix_without_resetting() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("rollout-small.jsonl");
+        let lines = root_fixture(Value::String("cli".into()), "codex-tui");
+        write_lines(&path, &lines, true);
+        assert!(fs::metadata(&path).unwrap().len() < FILE_SIGNATURE_SAMPLE_BYTES);
+
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        assert_eq!(source.summary_for(&path).unwrap().messages.len(), 1);
+        assert_eq!(source.reset_count, 1);
+
+        let appended = event(
+            "2026-07-13T00:00:03Z",
+            "event_msg",
+            serde_json::json!({"type":"agent_message","message":"appended"}),
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{appended}").unwrap();
+        drop(file);
+
+        let summary = source.summary_for(&path).unwrap();
+        assert_eq!(summary.messages.len(), 2);
+        assert_eq!(summary.latest_message(), Some("appended"));
+        assert_eq!(
+            source.reset_count, 1,
+            "a small append must not reparse the prefix"
+        );
+    }
+
+    #[test]
+    fn middle_same_inode_rewrite_that_grows_discards_stale_summary() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("rollout-middle-rewrite.jsonl");
+        let old_middle = "old-middle-".to_string() + &"m".repeat(5000);
+        let new_middle = "new-middle-".to_string() + &"n".repeat(5000);
+        let lines = vec![
+            event(
+                "2026-07-13T00:00:00Z",
+                "session_meta",
+                serde_json::json!({
+                    "id":"middle-rewrite", "cwd":"/tmp/project", "source":"cli",
+                    "originator":"codex-tui"
+                }),
+            ),
+            event(
+                "2026-07-13T00:00:01Z",
+                "prefix_padding",
+                serde_json::json!({"padding":"p".repeat(6000)}),
+            ),
+            event(
+                "2026-07-13T00:00:02Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":old_middle.clone()}),
+            ),
+            event(
+                "2026-07-13T00:00:03Z",
+                "suffix_padding",
+                serde_json::json!({"padding":"s".repeat(6000)}),
+            ),
+            event(
+                "2026-07-13T00:00:04Z",
+                "event_msg",
+                serde_json::json!({"type":"task_complete"}),
+            ),
+        ];
+        write_lines(&path, &lines, true);
+
+        let old_middle_preview = truncate_monitor_message(&old_middle);
+        let new_middle_preview = truncate_monitor_message(&new_middle);
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let old_summary = source.summary_for(&path).unwrap();
+        assert_eq!(old_summary.first_prompt().unwrap(), old_middle_preview);
+        let old_length = fs::metadata(&path).unwrap().len();
+        let old_inode = file_identity(&fs::metadata(&path).unwrap());
+
+        let mut rewritten = fs::read(&path).unwrap();
+        let old_middle_offset = rewritten
+            .windows(old_middle.len())
+            .position(|window| window == old_middle.as_bytes())
+            .unwrap();
+        assert!(old_middle_offset as u64 >= FILE_SIGNATURE_SAMPLE_BYTES);
+        assert!(
+            old_length - (old_middle_offset + old_middle.len()) as u64
+                >= FILE_SIGNATURE_SAMPLE_BYTES
+        );
+        rewritten[old_middle_offset..old_middle_offset + old_middle.len()]
+            .copy_from_slice(new_middle.as_bytes());
+        assert_eq!(rewritten.len() as u64, old_length);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&rewritten).unwrap();
+        writeln!(
+            file,
+            "{}",
+            event(
+                "2026-07-13T00:00:05Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"growth"}),
+            )
+        )
+        .unwrap();
+        drop(file);
+
+        let metadata = fs::metadata(&path).unwrap();
+        assert!(metadata.len() > old_length);
+        assert_eq!(file_identity(&metadata), old_inode);
+        let summary = source.summary_for(&path).unwrap();
+        assert_eq!(summary.first_prompt().unwrap(), new_middle_preview);
+        assert!(!summary
+            .messages
+            .iter()
+            .any(|message| message.content == old_middle_preview));
+        assert_eq!(summary.latest_message(), Some("growth"));
+        assert_eq!(source.reset_count, 2);
+    }
+
+    #[test]
+    fn same_inode_replacement_that_grows_discards_stale_summary() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("rollout-replaced.jsonl");
+        let original = root_fixture(Value::String("cli".into()), "codex-tui");
+        write_lines(&path, &original, true);
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let original_summary = source.summary_for(&path).unwrap();
+        let original_metadata = fs::metadata(&path).unwrap();
+
+        let replacement = vec![
+            event(
+                "2026-07-13T01:00:00Z",
+                "session_meta",
+                serde_json::json!({
+                    "id":"replacement-id", "cwd":"/tmp/project", "source":"cli",
+                    "originator":"codex-tui"
+                }),
+            ),
+            event(
+                "2026-07-13T01:00:01Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"user_message",
+                    "message":"replacement prompt with a longer body than before"
+                }),
+            ),
+            event(
+                "2026-07-13T01:00:02Z",
+                "event_msg",
+                serde_json::json!({"type":"task_started"}),
+            ),
+        ];
+        write_lines(&path, &replacement, true);
+        let replacement_metadata = fs::metadata(&path).unwrap();
+        assert!(replacement_metadata.len() > original_metadata.len());
+        assert_eq!(
+            file_identity(&original_metadata),
+            file_identity(&replacement_metadata),
+            "the fixture must exercise a same-inode rewrite"
+        );
+
+        let summary = source.summary_for(&path).unwrap();
+        assert_ne!(summary.thread_id, original_summary.thread_id);
+        assert_eq!(summary.thread_id, "replacement-id");
+        assert_eq!(
+            summary.first_prompt(),
+            Some("replacement prompt with a longer body than before")
+        );
+        assert!(!summary
+            .messages
+            .iter()
+            .any(|message| message.content == "hello"));
     }
 
     #[test]
@@ -1044,6 +1684,259 @@ mod tests {
         let dirs = source.candidate_day_dirs_at(now);
         assert!(dirs[0].ends_with("2026/07/13"));
         assert!(dirs[1].ends_with("2026/07/12"));
+    }
+
+    #[test]
+    fn discovery_does_not_parse_rollouts_older_than_visible_working_ceiling() {
+        let temp = TempDir::new().unwrap();
+        let now = Local::now();
+        let wall_now = SystemTime::now();
+        let day = temp.path().join(now.format("%Y/%m/%d").to_string());
+        fs::create_dir_all(&day).unwrap();
+
+        let recent = day.join("rollout-recent.jsonl");
+        write_lines(
+            &recent,
+            &[
+                event(
+                    "2026-07-13T00:00:00Z",
+                    "session_meta",
+                    serde_json::json!({"id":"recent","cwd":"/tmp/project","source":"cli","originator":"codex-tui"}),
+                ),
+                event(
+                    "2026-07-13T00:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"task_started"}),
+                ),
+            ],
+            true,
+        );
+        set_modified_age(&recent, wall_now, Duration::from_secs(60));
+
+        const STALE_ID: &str = "019f58e8-afcb-7681-bf1b-585420b500c3";
+        let stale = day.join(format!("rollout-stale-{STALE_ID}.jsonl"));
+        write_lines(
+            &stale,
+            &[
+                event(
+                    "2026-07-13T00:00:00Z",
+                    "session_meta",
+                    serde_json::json!({"id":STALE_ID,"cwd":"/tmp/project","source":"cli","originator":"codex-tui"}),
+                ),
+                event(
+                    "2026-07-13T00:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"task_started"}),
+                ),
+            ],
+            true,
+        );
+        set_modified_age(
+            &stale,
+            wall_now,
+            Duration::from_secs(WORKING_FRESHNESS_SECS + 1),
+        );
+
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let (sessions, _) = source.detect_at_with_clock(now, wall_now).unwrap();
+
+        assert_eq!(session_ids(&sessions), HashSet::from(["recent"]));
+        assert_eq!(
+            source.parse_count, 1,
+            "stale rollout content must not be parsed"
+        );
+        assert!(source.archive_index.contains_key(STALE_ID));
+    }
+
+    #[test]
+    fn monitor_compacts_message_content_but_conversation_keeps_full_text() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("rollout-long.jsonl");
+        let long_message = "x".repeat(32 * 1024);
+        write_lines(
+            &path,
+            &[
+                event(
+                    "2026-07-13T00:00:00Z",
+                    "session_meta",
+                    serde_json::json!({"id":"long","cwd":"/tmp/project","source":"cli","originator":"codex-tui"}),
+                ),
+                event(
+                    "2026-07-13T00:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"agent_message","message":long_message}),
+                ),
+            ],
+            true,
+        );
+
+        let mut monitor = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let monitor_summary = monitor.summary_for(&path).unwrap();
+        assert_eq!(
+            monitor_summary.latest_message().unwrap().chars().count(),
+            MONITOR_MESSAGE_CHARS + 3
+        );
+        assert!(monitor_summary.latest_message().unwrap().ends_with("..."));
+
+        let mut conversation = CodexSessionSource::conversation_at_root(temp.path().to_path_buf());
+        let conversation_summary = conversation.summary_for(&path).unwrap();
+        assert_eq!(
+            conversation_summary.latest_message().unwrap(),
+            "x".repeat(32 * 1024)
+        );
+
+        let unicode = "🦀".repeat(MONITOR_MESSAGE_CHARS + 10);
+        let mut unicode_summary = CodexRolloutSummary::default();
+        apply_rollout_event(
+            &mut unicode_summary,
+            &serde_json::json!({
+                "timestamp":"2026-07-13T00:00:02Z", "type":"event_msg",
+                "payload":{"type":"agent_message","message":unicode}
+            }),
+        );
+        let compacted = unicode_summary.latest_message().unwrap();
+        assert_eq!(compacted.chars().count(), MONITOR_MESSAGE_CHARS + 3);
+        assert_eq!(
+            compacted.strip_suffix("...").unwrap().chars().count(),
+            MONITOR_MESSAGE_CHARS
+        );
+        assert!(compacted
+            .strip_suffix("...")
+            .unwrap()
+            .chars()
+            .all(|character| character == '🦀'));
+    }
+
+    #[test]
+    fn filtered_valid_records_still_update_activity_timestamp() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("rollout-filtered.jsonl");
+        write_lines(
+            &path,
+            &[
+                event(
+                    "2026-07-13T00:00:00Z",
+                    "session_meta",
+                    serde_json::json!({"id":"filtered","cwd":"/tmp/project","source":"cli","originator":"codex-tui"}),
+                ),
+                event(
+                    "2026-07-13T00:00:01Z",
+                    "response_item",
+                    serde_json::json!({
+                        "type":"message", "role":"assistant",
+                        "content":[{"type":"output_text","text":"large duplicate"}]
+                    }),
+                ),
+                event(
+                    "2026-07-13T00:00:02Z",
+                    "token_count",
+                    serde_json::json!({"info":{"input_tokens":999999}}),
+                ),
+            ],
+            true,
+        );
+
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let summary = source.summary_for(&path).unwrap();
+        assert_eq!(summary.last_timestamp, "2026-07-13T00:00:02Z");
+        assert!(summary.messages.is_empty());
+    }
+
+    #[test]
+    fn monitor_skips_oversized_ignored_records_without_retaining_the_body() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("rollout-oversized-ignored.jsonl");
+        write_lines(
+            &path,
+            &[
+                event(
+                    "2026-07-13T00:00:00Z",
+                    "session_meta",
+                    serde_json::json!({"id":"oversized","cwd":"/tmp/project","source":"cli","originator":"codex-tui"}),
+                ),
+                event(
+                    "2026-07-13T00:00:01Z",
+                    "response_item",
+                    serde_json::json!({
+                        "type":"reasoning",
+                        "encrypted_content":"r".repeat(128 * 1024)
+                    }),
+                ),
+                event(
+                    "2026-07-13T00:00:02Z",
+                    "event_msg",
+                    serde_json::json!({"type":"task_started"}),
+                ),
+            ],
+            true,
+        );
+
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let summary = source.summary_for(&path).unwrap();
+        assert_eq!(summary.last_timestamp, "2026-07-13T00:00:02Z");
+        assert!(summary.messages.is_empty());
+        assert_eq!(
+            source.cache.get(&path).unwrap().offset,
+            fs::metadata(&path).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn monitor_header_peek_consumes_one_record_and_preserves_offsets() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("rollout-header-peek.jsonl");
+        let ignored = ordered_event(
+            "2026-07-13T00:00:00Z",
+            "response_item",
+            serde_json::json!({
+                "type":"reasoning",
+                "encrypted_content":"r".repeat(32 * 1024)
+            }),
+        );
+        let relevant = ordered_event(
+            "2026-07-13T00:00:01Z",
+            "event_msg",
+            serde_json::json!({"type":"task_started"}),
+        );
+        write_lines(&path, &[ignored.clone(), relevant.clone()], true);
+        let first_line = format!("{ignored}\n");
+        let second_line = format!("{relevant}\n");
+
+        let mut reader = BufReader::new(File::open(&path).unwrap());
+        let first = read_monitor_line(&mut reader, FNV_OFFSET_BASIS).unwrap();
+        assert!(first.complete);
+        assert_eq!(first.bytes_read, first_line.len() as u64);
+        assert_eq!(
+            first
+                .header
+                .as_ref()
+                .and_then(|header| header.event_type.as_deref()),
+            Some("response_item")
+        );
+        assert!(first.line.is_none());
+
+        let second = read_monitor_line(&mut reader, first.logical_prefix_hash).unwrap();
+        assert!(second.complete);
+        assert_eq!(second.bytes_read, second_line.len() as u64);
+        assert_eq!(
+            second
+                .header
+                .as_ref()
+                .and_then(|header| header.event_type.as_deref()),
+            Some("event_msg")
+        );
+        assert_eq!(second.line.as_deref(), Some(second_line.as_bytes()));
+        assert_eq!(
+            first.bytes_read + second.bytes_read,
+            fs::metadata(&path).unwrap().len()
+        );
+        assert_eq!(
+            second.logical_prefix_hash,
+            hash_bytes(
+                hash_bytes(FNV_OFFSET_BASIS, first_line.as_bytes()),
+                second_line.as_bytes()
+            )
+        );
     }
 
     #[test]
@@ -1238,6 +2131,176 @@ mod tests {
         let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
         let (sessions, _) = source.detect_at_with_clock(now, wall_now).unwrap();
         assert!(!session_ids(&sessions).contains(ROOT));
+    }
+
+    #[test]
+    fn active_child_keeps_all_linked_parent_fragments_within_ceiling() {
+        const ROOT: &str = "019f58e8-afcb-7681-bf1b-585420b500c3";
+        const CHILD: &str = "019f5986-4549-79e1-a409-0d09dcb7044c";
+        let temp = TempDir::new().unwrap();
+        let now = Local::now();
+        let wall_now = SystemTime::now();
+        let day = temp.path().join(now.format("%Y/%m/%d").to_string());
+        fs::create_dir_all(&day).unwrap();
+
+        let first_parent = day.join(format!("rollout-2026-07-13T00-00-00-{ROOT}.jsonl"));
+        write_lines(
+            &first_parent,
+            &[
+                event(
+                    "2026-07-13T00:00:00Z",
+                    "session_meta",
+                    serde_json::json!({"id":ROOT,"cwd":"/tmp/project","source":"cli","originator":"codex-tui"}),
+                ),
+                event(
+                    "2026-07-13T00:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"user_message","message":"first fragment"}),
+                ),
+                event(
+                    "2026-07-13T00:00:02Z",
+                    "event_msg",
+                    serde_json::json!({"type":"task_complete"}),
+                ),
+            ],
+            true,
+        );
+        set_modified_age(&first_parent, wall_now, Duration::from_secs(6 * 60 * 60));
+
+        let resumed_parent = day.join(format!("rollout-2026-07-13T01-00-00-{ROOT}.jsonl"));
+        write_lines(
+            &resumed_parent,
+            &[
+                event(
+                    "2026-07-13T01:00:00Z",
+                    "session_meta",
+                    serde_json::json!({"id":ROOT,"cwd":"/tmp/project","source":"cli","originator":"codex-tui"}),
+                ),
+                event(
+                    "2026-07-13T01:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"agent_message","message":"resumed fragment"}),
+                ),
+                event(
+                    "2026-07-13T01:00:02Z",
+                    "event_msg",
+                    serde_json::json!({"type":"task_complete"}),
+                ),
+            ],
+            true,
+        );
+        set_modified_age(&resumed_parent, wall_now, Duration::from_secs(5 * 60 * 60));
+
+        let child = day.join(format!("rollout-2026-07-13T02-00-00-{CHILD}.jsonl"));
+        write_lines(
+            &child,
+            &[
+                event(
+                    "2026-07-13T02:00:00Z",
+                    "session_meta",
+                    serde_json::json!({
+                        "id":CHILD,"session_id":ROOT,"cwd":"/tmp/project",
+                        "originator":"Codex Desktop","source":{"subagent":{"thread_spawn":{
+                            "parent_thread_id":ROOT,"agent_path":"/root/child"
+                        }}}
+                    }),
+                ),
+                event(
+                    "2026-07-13T02:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"task_started"}),
+                ),
+            ],
+            true,
+        );
+        set_modified_age(&child, wall_now, Duration::from_secs(60));
+
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let (sessions, _) = source.detect_at_with_clock(now, wall_now).unwrap();
+        let root = sessions
+            .iter()
+            .find(|session| session.session_id.as_deref() == Some(ROOT))
+            .and_then(|session| session.codex_summary.as_ref())
+            .unwrap();
+
+        assert_eq!(source.archive_index.get(ROOT).unwrap().len(), 2);
+        assert_eq!(root.messages.len(), 2);
+        assert_eq!(root.messages[0].content, "first fragment");
+        assert_eq!(root.messages[1].content, "resumed fragment");
+
+        // A parent fragment exactly at the linked-parent ceiling must remain
+        // discoverable through the existing index/cache on a later poll.
+        set_modified_age(
+            &first_parent,
+            wall_now,
+            Duration::from_secs(LINKED_PARENT_CEILING_SECS),
+        );
+        let (sessions, _) = source.detect_at_with_clock(now, wall_now).unwrap();
+        let root = sessions
+            .iter()
+            .find(|session| session.session_id.as_deref() == Some(ROOT))
+            .and_then(|session| session.codex_summary.as_ref())
+            .unwrap();
+        assert_eq!(
+            source.archive_index.get(ROOT).unwrap(),
+            &vec![first_parent.clone(), resumed_parent.clone()]
+        );
+        assert!(source.cache.contains_key(&first_parent));
+        assert!(source.cache.contains_key(&resumed_parent));
+        assert_eq!(root.messages.len(), 2);
+        assert_eq!(root.messages[0].content, "first fragment");
+        assert_eq!(root.messages[1].content, "resumed fragment");
+    }
+
+    #[test]
+    fn monitor_dedup_keeps_long_messages_with_identical_visible_prefixes() {
+        let temp = TempDir::new().unwrap();
+        let now = Local::now();
+        let day = temp.path().join(now.format("%Y/%m/%d").to_string());
+        fs::create_dir_all(&day).unwrap();
+        let prefix = "p".repeat(MONITOR_MESSAGE_CHARS);
+
+        for suffix in ["A", "B"] {
+            let path = day.join(format!(
+                "rollout-2026-07-13T00-00-01-{suffix}-duplicate.jsonl"
+            ));
+            write_lines(
+                &path,
+                &[
+                    event(
+                        "2026-07-13T00:00:00Z",
+                        "session_meta",
+                        serde_json::json!({"id":"same-prefix","cwd":"/tmp/project","source":"cli","originator":"codex-tui"}),
+                    ),
+                    event(
+                        "2026-07-13T00:00:01Z",
+                        "event_msg",
+                        serde_json::json!({"type":"agent_message","message":format!("{prefix}{suffix}")}),
+                    ),
+                ],
+                true,
+            );
+        }
+
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let (sessions, _) = source.detect_at(now).unwrap();
+        let summary = sessions[0].codex_summary.as_ref().unwrap();
+        assert_eq!(summary.messages.len(), 2);
+        assert_eq!(summary.messages[0].timestamp, "2026-07-13T00:00:01Z");
+        assert_eq!(summary.messages[1].timestamp, "2026-07-13T00:00:01Z");
+        assert_eq!(summary.messages[0].role, "assistant");
+        assert_eq!(summary.messages[1].role, "assistant");
+        assert_eq!(summary.messages[0].message_type, MessageType::Assistant);
+        assert_eq!(summary.messages[1].message_type, MessageType::Assistant);
+        assert_eq!(summary.messages[0].content, summary.messages[1].content);
+        assert_ne!(
+            summary.messages[0].content_identity, summary.messages[1].content_identity,
+            "full-content identity must keep identical compact previews distinct"
+        );
+        assert!(summary
+            .messages
+            .iter()
+            .any(|message| message.content.ends_with("p...")));
     }
 
     #[test]
