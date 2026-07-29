@@ -94,6 +94,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "mamedium",
+      "name": "Mamed",
+      "avatar_url": "https://github.com/mamedium.png",
+      "profile": "https://github.com/mamedium",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "contributorsPerLine": 7,
