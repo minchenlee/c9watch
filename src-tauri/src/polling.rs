@@ -13,8 +13,7 @@ use tauri_plugin_notification::NotificationExt;
 
 /// Cached overlay: session_id -> spawnedBy (i.e. worker_of).
 /// Invalidated when the `~/.claude/c9watch/workers/` dir mtime changes.
-static WORKERS_OVERLAY: LazyLock<Mutex<Option<WorkersCache>>> =
-    LazyLock::new(|| Mutex::new(None));
+static WORKERS_OVERLAY: LazyLock<Mutex<Option<WorkersCache>>> = LazyLock::new(|| Mutex::new(None));
 
 struct WorkersCache {
     dir_mtime: SystemTime,
@@ -67,8 +66,12 @@ fn load_workers_overlay() -> Arc<HashMap<String, String>> {
     if let Ok(entries) = std::fs::read_dir(&workers_dir) {
         for entry in entries.flatten() {
             let meta_path = entry.path().join("meta.json");
-            let Ok(content) = std::fs::read_to_string(&meta_path) else { continue };
-            let Ok(meta) = serde_json::from_str::<WorkerMetaOverlay>(&content) else { continue };
+            let Ok(content) = std::fs::read_to_string(&meta_path) else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_str::<WorkerMetaOverlay>(&content) else {
+                continue;
+            };
             if meta.stopped_at.is_some() {
                 continue;
             }
@@ -171,9 +174,7 @@ pub fn start_polling(
                             } else {
                                 // Check for status transitions
                                 for session in &sessions {
-                                    if let Some(prev_status) =
-                                        prev_status_map.get(&session.id)
-                                    {
+                                    if let Some(prev_status) = prev_status_map.get(&session.id) {
                                         // Check for notification-worthy transitions
                                         let should_notify = matches!(
                                             (prev_status, &session.status),
@@ -189,9 +190,7 @@ pub fn start_polling(
                                             // from status flickering across poll cycles
                                             let on_cooldown = last_notification_time
                                                 .get(&session.id)
-                                                .map(|t| {
-                                                    t.elapsed() < notification_cooldown
-                                                })
+                                                .map(|t| t.elapsed() < notification_cooldown)
                                                 .unwrap_or(false);
 
                                             if !on_cooldown {
@@ -213,10 +212,8 @@ pub fn start_polling(
                                                         project_path: &session.project_path,
                                                     },
                                                 );
-                                                last_notification_time.insert(
-                                                    session.id.clone(),
-                                                    Instant::now(),
-                                                );
+                                                last_notification_time
+                                                    .insert(session.id.clone(), Instant::now());
                                             }
                                         }
                                     }
@@ -228,10 +225,8 @@ pub fn start_polling(
                             }
 
                             // Clean up disappeared sessions
-                            prev_status_map
-                                .retain(|id, _| current_session_ids.contains(id));
-                            last_notification_time
-                                .retain(|id, _| current_session_ids.contains(id));
+                            prev_status_map.retain(|id, _| current_session_ids.contains(id));
+                            last_notification_time.retain(|id, _| current_session_ids.contains(id));
                         }
                         Err(poisoned) => {
                             crate::debug_log::log_error("Mutex poisoned, recovering...");
@@ -240,8 +235,7 @@ pub fn start_polling(
 
                             // Seed the map with current sessions (no notifications after recovery)
                             for session in &sessions {
-                                prev_status_map
-                                    .insert(session.id.clone(), session.status.clone());
+                                prev_status_map.insert(session.id.clone(), session.status.clone());
                             }
                             is_first_cycle = false; // Mark as initialized
                         }
@@ -284,9 +278,7 @@ pub fn start_polling(
                                 "Full Disk Access likely needed: processes found but none have readable CWD",
                             );
                         }
-                        if let Err(e) =
-                            app_handle.emit("diagnostic-update", &diagnostics)
-                        {
+                        if let Err(e) = app_handle.emit("diagnostic-update", &diagnostics) {
                             crate::debug_log::log_error(&format!(
                                 "Failed to emit diagnostic-update: {}",
                                 e
@@ -296,10 +288,7 @@ pub fn start_polling(
                     }
                 }
                 Err(e) => {
-                    crate::debug_log::log_error(&format!(
-                        "Error detecting sessions: {}",
-                        e
-                    ));
+                    crate::debug_log::log_error(&format!("Error detecting sessions: {}", e));
                     // Continue polling even on error
                 }
             }
@@ -396,10 +385,7 @@ fn fire_notification(
     };
 
     if let Err(e) = app_handle.emit("notification-fired", &metadata) {
-        crate::debug_log::log_error(&format!(
-            "Failed to emit notification-fired: {}",
-            e
-        ));
+        crate::debug_log::log_error(&format!("Failed to emit notification-fired: {}", e));
     }
 
     // Broadcast to WebSocket clients for web notifications

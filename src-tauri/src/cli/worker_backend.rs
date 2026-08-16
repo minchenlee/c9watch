@@ -57,7 +57,11 @@ fn version_supports_bg() -> bool {
 }
 
 fn parse_version_ge(ver: &str, min: (u32, u32, u32)) -> bool {
-    let parts: Vec<u32> = ver.split('.').take(3).filter_map(|s| s.parse().ok()).collect();
+    let parts: Vec<u32> = ver
+        .split('.')
+        .take(3)
+        .filter_map(|s| s.parse().ok())
+        .collect();
     if parts.len() != 3 {
         return false;
     }

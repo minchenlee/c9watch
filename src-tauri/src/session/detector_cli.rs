@@ -146,8 +146,8 @@ impl SessionSource for CliSessionSource {
             )));
         }
 
-        let agents: Vec<CliAgent> = serde_json::from_slice(&buf)
-            .map_err(|e| SessionDetectorError::Parse(e.to_string()))?;
+        let agents: Vec<CliAgent> =
+            serde_json::from_slice(&buf).map_err(|e| SessionDetectorError::Parse(e.to_string()))?;
 
         // Filter out non-CLI entrypoints (e.g. sdk-ts from Zed/IDE integrations).
         // `claude agents --json` lists every live agent including SDK-driven ones,
@@ -180,7 +180,10 @@ fn is_cli_entrypoint(pid: u32) -> bool {
 }
 
 fn is_cli_entrypoint_under(home: &Path, pid: u32) -> bool {
-    let path = home.join(".claude").join("sessions").join(format!("{pid}.json"));
+    let path = home
+        .join(".claude")
+        .join("sessions")
+        .join(format!("{pid}.json"));
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(_) => return true,
@@ -351,7 +354,10 @@ mod tests {
         let home = tmp.path();
         let cwd = PathBuf::from("/Users/test/proj");
         let session_id = "sess-scan";
-        let wrong_dir = home.join(".claude").join("projects").join("totally-different-dir");
+        let wrong_dir = home
+            .join(".claude")
+            .join("projects")
+            .join("totally-different-dir");
         std::fs::create_dir_all(&wrong_dir).unwrap();
         std::fs::write(wrong_dir.join(format!("{session_id}.jsonl")), b"").unwrap();
 

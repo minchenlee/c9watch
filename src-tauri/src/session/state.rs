@@ -1,8 +1,6 @@
 // src-tauri/src/session/state.rs
 use super::codex::CodexSessionSource;
-use super::source::{
-    DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource,
-};
+use super::source::{DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource};
 use super::{create_session_source, mode_from_env, BackendMode};
 use crate::session::detector::LegacySessionSource;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -124,12 +122,17 @@ mod tests {
 
     impl FakeSource {
         fn new(name: &'static str, fails: u32) -> Self {
-            Self { name, fail_next: Cell::new(fails) }
+            Self {
+                name,
+                fail_next: Cell::new(fails),
+            }
         }
     }
 
     impl SessionSource for FakeSource {
-        fn detect(&mut self) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
+        fn detect(
+            &mut self,
+        ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
             let n = self.fail_next.get();
             if n > 0 {
                 self.fail_next.set(n - 1);
@@ -137,7 +140,9 @@ mod tests {
             }
             Ok((Vec::new(), DetectionDiagnostics::default()))
         }
-        fn backend_name(&self) -> &'static str { self.name }
+        fn backend_name(&self) -> &'static str {
+            self.name
+        }
     }
 
     #[test]
@@ -167,7 +172,8 @@ mod tests {
 
     #[test]
     fn force_cli_mode_never_downgrades() {
-        let mut s = DetectorState::for_test(Box::new(FakeSource::new("cli", 20)), BackendMode::ForceCli);
+        let mut s =
+            DetectorState::for_test(Box::new(FakeSource::new("cli", 20)), BackendMode::ForceCli);
         for _ in 0..20 {
             let _ = s.detect();
         }
@@ -176,7 +182,8 @@ mod tests {
 
     #[test]
     fn legacy_backend_failures_do_not_swap() {
-        let mut s = DetectorState::for_test(Box::new(FakeSource::new("legacy", 10)), BackendMode::Auto);
+        let mut s =
+            DetectorState::for_test(Box::new(FakeSource::new("legacy", 10)), BackendMode::Auto);
         for _ in 0..10 {
             let _ = s.detect();
         }
@@ -186,17 +193,24 @@ mod tests {
     #[test]
     fn counter_resets_on_success_between_failures() {
         let mut s = DetectorState::for_test(Box::new(FakeSource::new("cli", 3)), BackendMode::Auto);
-        for _ in 0..3 { let _ = s.detect(); }
+        for _ in 0..3 {
+            let _ = s.detect();
+        }
         let _ = s.detect();
         assert_eq!(s.consecutive_failures, 0);
         s.replace_source(Box::new(FakeSource::new("cli", 3)));
-        for _ in 0..3 { let _ = s.detect(); }
+        for _ in 0..3 {
+            let _ = s.detect();
+        }
         assert_eq!(s.backend_name(), "cli");
     }
 
     #[test]
     fn recheck_no_swap_in_force_modes() {
-        let mut s = DetectorState::for_test(Box::new(FakeSource::new("cli", 0)), BackendMode::ForceLegacy);
+        let mut s = DetectorState::for_test(
+            Box::new(FakeSource::new("cli", 0)),
+            BackendMode::ForceLegacy,
+        );
         s.recheck_and_maybe_swap();
         assert_eq!(s.backend_name(), "cli");
     }

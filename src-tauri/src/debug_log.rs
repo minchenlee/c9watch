@@ -143,7 +143,9 @@ mod tests {
         );
         // The last message we wrote should be present
         assert!(
-            our_msgs.iter().any(|l| l.message == format!("{}549", prefix)),
+            our_msgs
+                .iter()
+                .any(|l| l.message == format!("{}549", prefix)),
             "expected to find the last written message"
         );
     }

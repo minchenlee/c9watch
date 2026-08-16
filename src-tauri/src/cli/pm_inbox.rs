@@ -59,11 +59,7 @@ pub struct TurnResult {
 
 impl InboxEvent {
     /// Normal turn-end event from a `result` stream entry.
-    pub fn from_turn_result(
-        worker_session_id: &str,
-        spawned_by: &str,
-        tr: TurnResult,
-    ) -> Self {
+    pub fn from_turn_result(worker_session_id: &str, spawned_by: &str, tr: TurnResult) -> Self {
         Self {
             event_id: new_event_id(),
             session_id: worker_session_id.to_string(),
@@ -260,14 +256,12 @@ mod tests {
     impl TestWorker {
         fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let id = format!(
-                "test-w-{}-{}",
-                std::process::id(),
-                n
-            );
+            let id = format!("test-w-{}-{}", std::process::id(), n);
             Self(id)
         }
-        fn id(&self) -> &str { &self.0 }
+        fn id(&self) -> &str {
+            &self.0
+        }
     }
 
     impl Drop for TestWorker {

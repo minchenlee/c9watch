@@ -165,15 +165,30 @@ mod tests {
 
     #[test]
     fn session_kind_serializes_as_lowercase() {
-        assert_eq!(serde_json::to_string(&SessionKind::Interactive).unwrap(), "\"interactive\"");
-        assert_eq!(serde_json::to_string(&SessionKind::Background).unwrap(), "\"background\"");
-        assert_eq!(serde_json::to_string(&SessionKind::Unknown).unwrap(), "\"unknown\"");
+        assert_eq!(
+            serde_json::to_string(&SessionKind::Interactive).unwrap(),
+            "\"interactive\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionKind::Background).unwrap(),
+            "\"background\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionKind::Unknown).unwrap(),
+            "\"unknown\""
+        );
     }
 
     #[test]
     fn cli_activity_serializes_as_lowercase() {
-        assert_eq!(serde_json::to_string(&CliActivity::Busy).unwrap(), "\"busy\"");
-        assert_eq!(serde_json::to_string(&CliActivity::Idle).unwrap(), "\"idle\"");
+        assert_eq!(
+            serde_json::to_string(&CliActivity::Busy).unwrap(),
+            "\"busy\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CliActivity::Idle).unwrap(),
+            "\"idle\""
+        );
     }
 
     #[test]
@@ -197,9 +212,21 @@ mod tests {
 
     #[test]
     fn provider_surface_and_agent_kind_use_frontend_contract_values() {
-        assert_eq!(serde_json::to_string(&SessionProvider::ClaudeCode).unwrap(), "\"claudeCode\"");
-        assert_eq!(serde_json::to_string(&SessionProvider::Codex).unwrap(), "\"codex\"");
-        assert_eq!(serde_json::to_string(&SessionSurface::Integration).unwrap(), "\"integration\"");
-        assert_eq!(serde_json::to_string(&AgentKind::Subagent).unwrap(), "\"subagent\"");
+        assert_eq!(
+            serde_json::to_string(&SessionProvider::ClaudeCode).unwrap(),
+            "\"claudeCode\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionProvider::Codex).unwrap(),
+            "\"codex\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionSurface::Integration).unwrap(),
+            "\"integration\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Subagent).unwrap(),
+            "\"subagent\""
+        );
     }
 }

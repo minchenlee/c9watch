@@ -103,8 +103,8 @@ pub fn rpc_call(
         .map_err(|e| format!("Failed to set read timeout: {}", e))?;
 
     // Serialize request as a single JSON line
-    let mut line =
-        serde_json::to_string(request).map_err(|e| format!("Failed to serialize request: {}", e))?;
+    let mut line = serde_json::to_string(request)
+        .map_err(|e| format!("Failed to serialize request: {}", e))?;
     line.push('\n');
 
     // Write
@@ -150,10 +150,26 @@ mod tests {
             initial_prompt: None,
         };
         let json = serde_json::to_string(&req).expect("serialize should succeed");
-        assert!(json.contains("\"op\":\"spawn\""), "should contain op:spawn, got: {}", json);
-        assert!(json.contains("/Users/me/project"), "should contain cwd, got: {}", json);
-        assert!(json.contains("\"spawnedBy\":\"pm-session-abc\""), "should contain spawnedBy, got: {}", json);
-        assert!(json.contains("\"pmPid\":42"), "should contain pmPid, got: {}", json);
+        assert!(
+            json.contains("\"op\":\"spawn\""),
+            "should contain op:spawn, got: {}",
+            json
+        );
+        assert!(
+            json.contains("/Users/me/project"),
+            "should contain cwd, got: {}",
+            json
+        );
+        assert!(
+            json.contains("\"spawnedBy\":\"pm-session-abc\""),
+            "should contain spawnedBy, got: {}",
+            json
+        );
+        assert!(
+            json.contains("\"pmPid\":42"),
+            "should contain pmPid, got: {}",
+            json
+        );
     }
 
     #[test]
@@ -165,15 +181,27 @@ mod tests {
             timeout_ms: 30_000,
         };
         let json = serde_json::to_string(&req).expect("serialize should succeed");
-        assert!(json.contains("\"op\":\"send\""), "should contain op:send, got: {}", json);
-        assert!(json.contains("\"wait\":true"), "should contain wait:true, got: {}", json);
+        assert!(
+            json.contains("\"op\":\"send\""),
+            "should contain op:send, got: {}",
+            json
+        );
+        assert!(
+            json.contains("\"wait\":true"),
+            "should contain wait:true, got: {}",
+            json
+        );
     }
 
     #[test]
     fn test_list_request_serializes() {
         let req = RpcRequest::List;
         let json = serde_json::to_string(&req).expect("serialize should succeed");
-        assert!(json.contains("\"op\":\"list\""), "should contain op:list, got: {}", json);
+        assert!(
+            json.contains("\"op\":\"list\""),
+            "should contain op:list, got: {}",
+            json
+        );
     }
 
     #[test]
@@ -218,7 +246,11 @@ mod tests {
             session_id: "dead-beef-1234".to_string(),
         };
         let json = serde_json::to_string(&req).expect("serialize should succeed");
-        assert!(json.contains("\"op\":\"stop\""), "should contain op:stop, got: {}", json);
+        assert!(
+            json.contains("\"op\":\"stop\""),
+            "should contain op:stop, got: {}",
+            json
+        );
         assert!(
             json.contains("dead-beef-1234"),
             "should contain session_id, got: {}",

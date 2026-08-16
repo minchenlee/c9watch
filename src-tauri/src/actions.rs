@@ -240,7 +240,10 @@ fn focus_supacode_session(pid: u32) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn focus_iterm2_session(pid: u32) -> Result<(), String> {
     let tty = get_session_tty(pid);
-    crate::debug_log::log_info(&format!("[open_session] iTerm2 tty for PID {}: {:?}", pid, tty));
+    crate::debug_log::log_info(&format!(
+        "[open_session] iTerm2 tty for PID {}: {:?}",
+        pid, tty
+    ));
 
     let Some(tty) = tty else {
         // No tty found — just activate iTerm2
@@ -281,7 +284,10 @@ fn focus_iterm2_session(pid: u32) -> Result<(), String> {
         .map_err(|e| format!("Failed to run AppleScript: {}", e))?;
 
     let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    crate::debug_log::log_info(&format!("[open_session] iTerm2 tty match result: {}", result));
+    crate::debug_log::log_info(&format!(
+        "[open_session] iTerm2 tty match result: {}",
+        result
+    ));
 
     Ok(())
 }
@@ -369,8 +375,7 @@ fn focus_terminal_session(pid: u32) -> Result<(), String> {
 /// Screen Recording permissions.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn focus_jetbrains_window(app_name: &str, project_path: &str) -> Result<(), String> {
-    let scheme = jetbrains_url_scheme(app_name)
-        .unwrap_or("idea");
+    let scheme = jetbrains_url_scheme(app_name).unwrap_or("idea");
     let root = find_jetbrains_project_root(project_path);
 
     crate::debug_log::log_info(&format!(
@@ -380,7 +385,11 @@ fn focus_jetbrains_window(app_name: &str, project_path: &str) -> Result<(), Stri
 
     let encoded_path = encode_path_for_url(&root);
     let url = format!("{}://open?file={}", scheme, encoded_path);
-    let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let cmd = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
     let output = Command::new(cmd)
         .arg(&url)
         .output()
@@ -872,10 +881,15 @@ fn find_parent_app(pid: u32) -> Result<String, String> {
 
         // Move to parent
         if ppid <= 1 {
-            crate::debug_log::log_info("[open_session] Reached root, checking current comm one more time");
+            crate::debug_log::log_info(
+                "[open_session] Reached root, checking current comm one more time",
+            );
             // Check current process one more time before giving up
             if let Some(app_name) = get_app_name(&comm) {
-                crate::debug_log::log_info(&format!("[open_session] Found app at root: {}", app_name));
+                crate::debug_log::log_info(&format!(
+                    "[open_session] Found app at root: {}",
+                    app_name
+                ));
                 return Ok(app_name.to_string());
             }
             break;
@@ -1137,7 +1151,10 @@ mod tests {
         assert_eq!(get_app_name("wezterm-gui"), Some("WezTerm"));
         assert_eq!(get_app_name("foot"), Some("foot"));
         assert_eq!(get_app_name("gnome-terminal"), Some("GNOME Terminal"));
-        assert_eq!(get_app_name("gnome-terminal-server"), Some("GNOME Terminal"));
+        assert_eq!(
+            get_app_name("gnome-terminal-server"),
+            Some("GNOME Terminal")
+        );
         assert_eq!(get_app_name("konsole"), Some("Konsole"));
         assert_eq!(get_app_name("xfce4-terminal"), Some("Xfce Terminal"));
         assert_eq!(get_app_name("xterm"), Some("xterm"));
@@ -1327,8 +1344,14 @@ mod tests {
 
     #[test]
     fn test_encode_path_for_url() {
-        assert_eq!(encode_path_for_url("/Users/foo/project"), "/Users/foo/project");
-        assert_eq!(encode_path_for_url("/Users/John Smith/My Project"), "/Users/John%20Smith/My%20Project");
+        assert_eq!(
+            encode_path_for_url("/Users/foo/project"),
+            "/Users/foo/project"
+        );
+        assert_eq!(
+            encode_path_for_url("/Users/John Smith/My Project"),
+            "/Users/John%20Smith/My%20Project"
+        );
         assert_eq!(encode_path_for_url("/path/with#hash"), "/path/with%23hash");
         assert_eq!(encode_path_for_url("/path/with&amp"), "/path/with%26amp");
     }
@@ -1336,7 +1359,10 @@ mod tests {
     #[test]
     fn test_find_jetbrains_project_root() {
         // No .idea anywhere — returns original path
-        assert_eq!(find_jetbrains_project_root("/tmp/nonexistent/sub"), "/tmp/nonexistent/sub");
+        assert_eq!(
+            find_jetbrains_project_root("/tmp/nonexistent/sub"),
+            "/tmp/nonexistent/sub"
+        );
 
         // Root path — returns as-is
         assert_eq!(find_jetbrains_project_root("/"), "/");
@@ -1370,9 +1396,6 @@ mod tests {
             get_app_name("/Users/user/Library/Application Support/iTerm2/iTermServer-3.6.6"),
             Some("iTerm")
         );
-        assert_eq!(
-            get_app_name("iTermServer-3.5.0"),
-            Some("iTerm")
-        );
+        assert_eq!(get_app_name("iTermServer-3.5.0"), Some("iTerm"));
     }
 }

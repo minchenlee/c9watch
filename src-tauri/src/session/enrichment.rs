@@ -120,8 +120,7 @@ pub fn merge_cli_activity(
 
 /// Detect sessions and enrich them with status and conversation data.
 /// Uses the configured backend (CLI or Legacy) via the factory.
-pub fn detect_and_enrich_sessions(
-) -> Result<(Vec<Session>, DetectionDiagnostics), String> {
+pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, DetectionDiagnostics), String> {
     let mut source = crate::session::create_session_source();
     let claude_result = source.detect();
     let codex_result = crate::session::codex::CodexSessionSource::new()
@@ -275,12 +274,11 @@ pub fn enrich_detected_sessions(
             }
             None => {
                 // Session not in index or index doesn't exist - use fallback values
-                let session_file_path =
-                    detected.project_path.join(format!("{}.jsonl", session_id));
+                let session_file_path = detected.project_path.join(format!("{}.jsonl", session_id));
 
                 // Try to get first prompt from JSONL file
-                let first_prompt = get_first_prompt_from_jsonl(&session_file_path)
-                    .unwrap_or_else(|| {
+                let first_prompt =
+                    get_first_prompt_from_jsonl(&session_file_path).unwrap_or_else(|| {
                         if detected.started_at_ms.is_some() {
                             "(No conversation yet)".to_string()
                         } else {
@@ -303,8 +301,7 @@ pub fn enrich_detected_sessions(
                     })
                     .or_else(|| {
                         detected.started_at_ms.and_then(|ms| {
-                            DateTime::<Utc>::from_timestamp_millis(ms)
-                                .map(|dt| dt.to_rfc3339())
+                            DateTime::<Utc>::from_timestamp_millis(ms).map(|dt| dt.to_rfc3339())
                         })
                     })
                     .unwrap_or_default();
@@ -368,8 +365,7 @@ pub fn enrich_detected_sessions(
         // Get custom title: Claude Code native /rename takes priority over c9watch's own.
         // Uses a static cache keyed by (path, mtime) to avoid re-scanning the JSONL every cycle.
         let native_title = get_cached_native_title(&session_file_path);
-        let custom_title =
-            native_title.or_else(|| custom_titles.get(&session_id).cloned());
+        let custom_title = native_title.or_else(|| custom_titles.get(&session_id).cloned());
 
         sessions.push(Session {
             id: session_id,
@@ -445,9 +441,7 @@ pub fn get_first_prompt_from_jsonl_raw(path: &Path) -> Option<String> {
                         } else if let Some(arr) = content.as_array() {
                             for item in arr {
                                 if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                    if let Some(text) =
-                                        item.get("text").and_then(|t| t.as_str())
-                                    {
+                                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                                         return Some(text.to_string());
                                     }
                                 }
@@ -474,9 +468,7 @@ pub fn truncate_string(s: &str, max_chars: usize) -> String {
 }
 
 /// Extract the latest message content from session entries
-pub fn get_latest_message_from_entries(
-    entries: &[crate::session::parser::SessionEntry],
-) -> String {
+pub fn get_latest_message_from_entries(entries: &[crate::session::parser::SessionEntry]) -> String {
     if entries.is_empty() {
         return String::new();
     }
@@ -613,22 +605,27 @@ mod merge_tests {
 
     #[test]
     fn merge_preserves_needs_attention_when_busy() {
-        let merged =
-            merge_cli_activity(SessionStatus::NeedsAttention, Some(CliActivity::Busy), false);
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Busy),
+            false,
+        );
         assert_eq!(merged, SessionStatus::NeedsAttention);
     }
 
     #[test]
     fn merge_preserves_needs_attention_when_idle() {
-        let merged =
-            merge_cli_activity(SessionStatus::NeedsAttention, Some(CliActivity::Idle), false);
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Idle),
+            false,
+        );
         assert_eq!(merged, SessionStatus::NeedsAttention);
     }
 
     #[test]
     fn merge_preserves_connecting() {
-        let merged =
-            merge_cli_activity(SessionStatus::Connecting, Some(CliActivity::Busy), false);
+        let merged = merge_cli_activity(SessionStatus::Connecting, Some(CliActivity::Busy), false);
         assert_eq!(merged, SessionStatus::Connecting);
     }
 
@@ -644,15 +641,13 @@ mod merge_tests {
 
     #[test]
     fn merge_idle_downgrades_working_without_pending_tool() {
-        let merged =
-            merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), false);
+        let merged = merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), false);
         assert_eq!(merged, SessionStatus::WaitingForInput);
     }
 
     #[test]
     fn merge_idle_keeps_working_when_pending_tool() {
-        let merged =
-            merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), true);
+        let merged = merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), true);
         assert_eq!(merged, SessionStatus::Working);
     }
 
@@ -707,7 +702,11 @@ mod placeholder_tests {
         let s = &sessions[0];
         assert!(!s.modified.is_empty(), "modified must not be empty");
         let parsed = DateTime::parse_from_rfc3339(&s.modified);
-        assert!(parsed.is_ok(), "modified must parse as RFC3339, got: {}", s.modified);
+        assert!(
+            parsed.is_ok(),
+            "modified must parse as RFC3339, got: {}",
+            s.modified
+        );
         assert_eq!(s.started_at_ms, Some(1_700_000_000_000));
     }
 
@@ -725,6 +724,9 @@ mod placeholder_tests {
         );
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
-        assert!(sessions.is_empty(), "legacy empty-JSONL session must be skipped");
+        assert!(
+            sessions.is_empty(),
+            "legacy empty-JSONL session must be skipped"
+        );
     }
 }

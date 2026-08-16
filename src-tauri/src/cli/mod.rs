@@ -25,8 +25,6 @@ pub mod bg_backend;
 #[cfg(feature = "pm-orchestration")]
 pub mod bg_protocol;
 #[cfg(feature = "pm-orchestration")]
-pub mod worker_backend;
-#[cfg(feature = "pm-orchestration")]
 pub mod pm;
 #[cfg(feature = "pm-orchestration")]
 pub mod pm_caller;
@@ -40,6 +38,8 @@ pub mod pm_inbox;
 pub mod pm_rpc;
 #[cfg(feature = "pm-orchestration")]
 pub mod pm_worker;
+#[cfg(feature = "pm-orchestration")]
+pub mod worker_backend;
 
 #[derive(Parser)]
 #[command(
@@ -277,9 +277,11 @@ pub fn run(cli: Cli) {
     crate::debug_log::set_quiet(true);
 
     let result = match cli.command {
-        Commands::List { project, status, compact } => {
-            cmd_list(project.as_deref(), status.as_deref(), compact, cli.pretty)
-        }
+        Commands::List {
+            project,
+            status,
+            compact,
+        } => cmd_list(project.as_deref(), status.as_deref(), compact, cli.pretty),
         Commands::Status { project } => cmd_status(project.as_deref(), cli.pretty),
         Commands::View { session_id, last } => cmd_view(&session_id, last, cli.pretty),
         Commands::History { limit } => cmd_history(limit, cli.pretty),
@@ -346,21 +348,38 @@ pub fn run(cli: Cli) {
         #[cfg(feature = "pm-orchestration")]
         Commands::Workers { all } => pm::cmd_workers(all, cli.pretty),
         #[cfg(feature = "pm-orchestration")]
-        Commands::Inbox { consume, clear, worker } => {
-            pm::cmd_inbox(consume, clear, worker, cli.pretty)
-        }
+        Commands::Inbox {
+            consume,
+            clear,
+            worker,
+        } => pm::cmd_inbox(consume, clear, worker, cli.pretty),
         #[cfg(feature = "pm-orchestration")]
         Commands::Adopt { session_id, force } => pm::cmd_adopt(session_id, force, cli.pretty),
-        Commands::Cost { daily, weekly, project, since, sort, sort_dir, session, session_prefix } => {
-            cmd_cost(daily, weekly, project.as_deref(), since.as_deref(), sort, sort_dir, session.as_deref(), session_prefix.as_deref(), cli.pretty)
-        }
+        Commands::Cost {
+            daily,
+            weekly,
+            project,
+            since,
+            sort,
+            sort_dir,
+            session,
+            session_prefix,
+        } => cmd_cost(
+            daily,
+            weekly,
+            project.as_deref(),
+            since.as_deref(),
+            sort,
+            sort_dir,
+            session.as_deref(),
+            session_prefix.as_deref(),
+            cli.pretty,
+        ),
         #[cfg(feature = "pm-orchestration")]
-        Commands::Daemon => {
-            match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt.block_on(pm_daemon::run_daemon()),
-                Err(e) => Err(format!("Failed to create tokio runtime: {}", e)),
-            }
-        }
+        Commands::Daemon => match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.block_on(pm_daemon::run_daemon()),
+            Err(e) => Err(format!("Failed to create tokio runtime: {}", e)),
+        },
     };
 
     if let Err(e) = result {
@@ -442,9 +461,7 @@ fn cmd_status(project_filter: Option<&str>, pretty: bool) -> Result<(), String> 
             .trim_matches('"')
             .to_string();
         *by_status.entry(status_str).or_insert(0u32) += 1;
-        *by_project
-            .entry(s.session_name.clone())
-            .or_insert(0u32) += 1;
+        *by_project.entry(s.session_name.clone()).or_insert(0u32) += 1;
     }
 
     // Find sessions needing attention
@@ -533,12 +550,7 @@ fn cmd_search_output(
     if query.trim().is_empty() {
         return Err("Search query cannot be empty".to_string());
     }
-    let hits = session::history::deep_search_under(
-        home_dir,
-        query,
-        case_sensitive,
-        whole_word,
-    )?;
+    let hits = session::history::deep_search_under(home_dir, query, case_sensitive, whole_word)?;
 
     let enriched: Vec<serde_json::Value> = hits
         .into_iter()
@@ -673,12 +685,15 @@ fn try_resolve_worker(target: &str) -> Option<String> {
         return None;
     }
     let request = pm_rpc::RpcRequest::List;
-    let response =
-        pm_rpc::rpc_call(&sock_path, &request, Duration::from_secs(2)).ok()?;
+    let response = pm_rpc::rpc_call(&sock_path, &request, Duration::from_secs(2)).ok()?;
     let workers = response.get("workers").and_then(|w| w.as_array())?;
     let ids: Vec<String> = workers
         .iter()
-        .filter_map(|w| w.get("sessionId").and_then(|s| s.as_str()).map(String::from))
+        .filter_map(|w| {
+            w.get("sessionId")
+                .and_then(|s| s.as_str())
+                .map(String::from)
+        })
         .collect();
 
     // Delegate matching to the shared helper in pm_daemon so exact/prefix/
@@ -709,8 +724,7 @@ fn cmd_watch(
             }
         };
 
-        let mut current_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut current_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for s in &sessions {
             if let Some(filter) = project_filter {
@@ -851,7 +865,11 @@ fn resolve_cost_session_id(
         n => {
             let ids: Vec<String> = matches.into_iter().collect();
             let shown = ids.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
-            let suffix = if n > 5 { format!(" (and {} more)", n - 5) } else { String::new() };
+            let suffix = if n > 5 {
+                format!(" (and {} more)", n - 5)
+            } else {
+                String::new()
+            };
             Err(format!(
                 "Ambiguous '{}' matches {} sessions: {}{}",
                 needle, n, shown, suffix
@@ -1097,7 +1115,11 @@ fn cmd_cost(
                 }
             };
             // Flip for descending
-            if sort_dir == CostSortDir::Desc { ord.reverse() } else { ord }
+            if sort_dir == CostSortDir::Desc {
+                ord.reverse()
+            } else {
+                ord
+            }
         });
     };
 
@@ -1134,12 +1156,9 @@ fn cmd_cost(
             };
             use chrono::Datelike;
             let iso = d.iso_week();
-            let week_start = chrono::NaiveDate::from_isoywd_opt(
-                iso.year(),
-                iso.week(),
-                chrono::Weekday::Mon,
-            )
-            .unwrap_or(d);
+            let week_start =
+                chrono::NaiveDate::from_isoywd_opt(iso.year(), iso.week(), chrono::Weekday::Mon)
+                    .unwrap_or(d);
             let key = week_start.format("%Y-%m-%d").to_string();
             let e = by_week.entry(key).or_insert((0.0, 0, 0));
             e.0 += s.cost;
@@ -1187,11 +1206,16 @@ fn cmd_cost(
     sessions.sort_by(|a, b| {
         let ord = match effective_sort {
             CostSortField::Date => a.date.cmp(&b.date),
-            CostSortField::Cost => {
-                a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal)
-            }
+            CostSortField::Cost => a
+                .cost
+                .partial_cmp(&b.cost)
+                .unwrap_or(std::cmp::Ordering::Equal),
         };
-        if sort_dir == CostSortDir::Desc { ord.reverse() } else { ord }
+        if sort_dir == CostSortDir::Desc {
+            ord.reverse()
+        } else {
+            ord
+        }
     });
 
     let output = serde_json::json!({
@@ -1427,7 +1451,7 @@ fn decode_project_path(encoded: &str) -> String {
     //    This works because most path components are alphanumeric.
     if encoded.starts_with('-') {
         let decoded = encoded.replacen('-', "/", 1); // First `-` -> `/`
-        // Replace remaining `-` with `/`, but this is lossy for hyphenated dirs
+                                                     // Replace remaining `-` with `/`, but this is lossy for hyphenated dirs
         return decoded.replace('-', "/");
     }
 
@@ -1780,11 +1804,7 @@ mod session_formatter_tests {
         let home = tempfile::tempdir().unwrap();
         let claude_project = home.path().join(".claude/projects/project");
         std::fs::create_dir_all(&claude_project).unwrap();
-        std::fs::write(
-            claude_project.join("shared-claude-session.jsonl"),
-            "",
-        )
-        .unwrap();
+        std::fs::write(claude_project.join("shared-claude-session.jsonl"), "").unwrap();
         let codex_sessions = home.path().join(".codex/sessions/2026/07/13");
         std::fs::create_dir_all(&codex_sessions).unwrap();
         std::fs::write(
@@ -1851,10 +1871,34 @@ mod cost_session_tests {
 
     fn fixtures() -> Vec<SessionCostRecord> {
         vec![
-            rec("aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee", "2026-04-10", 1.25, 1000, "sonnet"),
-            rec("aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee", "2026-04-11", 0.75, 500, "sonnet"),
-            rec("aaaa2222-bbbb-cccc-dddd-ffffffffffff", "2026-04-10", 0.50, 200, "haiku"),
-            rec("bbbb3333-cccc-dddd-eeee-000000000000", "2026-04-11", 2.00, 5000, "opus"),
+            rec(
+                "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "2026-04-10",
+                1.25,
+                1000,
+                "sonnet",
+            ),
+            rec(
+                "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "2026-04-11",
+                0.75,
+                500,
+                "sonnet",
+            ),
+            rec(
+                "aaaa2222-bbbb-cccc-dddd-ffffffffffff",
+                "2026-04-10",
+                0.50,
+                200,
+                "haiku",
+            ),
+            rec(
+                "bbbb3333-cccc-dddd-eeee-000000000000",
+                "2026-04-11",
+                2.00,
+                5000,
+                "opus",
+            ),
         ]
     }
 
@@ -1869,15 +1913,16 @@ mod cost_session_tests {
     #[test]
     fn session_prefix_unambiguous() {
         let sessions = fixtures();
-        let got = resolve_cost_session_id(&sessions, "bbbb3333", SessionLookupKind::Session).unwrap();
+        let got =
+            resolve_cost_session_id(&sessions, "bbbb3333", SessionLookupKind::Session).unwrap();
         assert_eq!(got, "bbbb3333-cccc-dddd-eeee-000000000000");
     }
 
     #[test]
     fn session_prefix_too_short_for_session_flag() {
         let sessions = fixtures();
-        let err = resolve_cost_session_id(&sessions, "aaaa", SessionLookupKind::Session)
-            .unwrap_err();
+        let err =
+            resolve_cost_session_id(&sessions, "aaaa", SessionLookupKind::Session).unwrap_err();
         assert!(err.contains("too short"), "got: {}", err);
         assert!(err.contains("--session-prefix"), "got: {}", err);
     }
@@ -1892,8 +1937,8 @@ mod cost_session_tests {
     #[test]
     fn session_prefix_ambiguous_lists_candidates() {
         let sessions = fixtures();
-        let err = resolve_cost_session_id(&sessions, "aaaa", SessionLookupKind::Prefix)
-            .unwrap_err();
+        let err =
+            resolve_cost_session_id(&sessions, "aaaa", SessionLookupKind::Prefix).unwrap_err();
         assert!(err.contains("Ambiguous"), "got: {}", err);
         assert!(err.contains("aaaa1111-"), "got: {}", err);
         assert!(err.contains("aaaa2222-"), "got: {}", err);
@@ -1902,8 +1947,8 @@ mod cost_session_tests {
     #[test]
     fn session_prefix_no_match_errors() {
         let sessions = fixtures();
-        let err = resolve_cost_session_id(&sessions, "zzzzzzzz", SessionLookupKind::Prefix)
-            .unwrap_err();
+        let err =
+            resolve_cost_session_id(&sessions, "zzzzzzzz", SessionLookupKind::Prefix).unwrap_err();
         assert!(err.contains("No session matching"), "got: {}", err);
     }
 
@@ -1917,12 +1962,8 @@ mod cost_session_tests {
     #[test]
     fn build_breakdown_sums_across_days() {
         let sessions = fixtures();
-        let b = build_session_breakdown(
-            &sessions,
-            "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
-            None,
-        )
-        .unwrap();
+        let b = build_session_breakdown(&sessions, "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee", None)
+            .unwrap();
         assert!((b.total_cost - 2.00).abs() < 1e-9);
         assert_eq!(b.total_tokens, 1500);
         assert_eq!(b.daily.len(), 2);
@@ -1958,12 +1999,8 @@ mod cost_session_tests {
     #[test]
     fn json_output_shape_has_expected_fields() {
         let sessions = fixtures();
-        let b = build_session_breakdown(
-            &sessions,
-            "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
-            None,
-        )
-        .unwrap();
+        let b = build_session_breakdown(&sessions, "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee", None)
+            .unwrap();
         let v = breakdown_to_json(&b);
         for key in [
             "sessionId",
@@ -1980,10 +2017,7 @@ mod cost_session_tests {
         ] {
             assert!(v.get(key).is_some(), "missing key {} in {}", key, v);
         }
-        assert_eq!(
-            v["sessionId"],
-            "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee"
-        );
+        assert_eq!(v["sessionId"], "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee");
         assert_eq!(v["turns"], 2);
         let by_day = v["byDay"].as_array().unwrap();
         assert_eq!(by_day.len(), 2);
@@ -1997,15 +2031,15 @@ mod cost_session_tests {
     #[test]
     fn json_compact_is_single_line() {
         let sessions = fixtures();
-        let b = build_session_breakdown(
-            &sessions,
-            "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
-            None,
-        )
-        .unwrap();
+        let b = build_session_breakdown(&sessions, "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee", None)
+            .unwrap();
         let v = breakdown_to_json(&b);
         let compact = serde_json::to_string(&v).unwrap();
-        assert!(!compact.contains('\n'), "compact output must be single-line: {}", compact);
+        assert!(
+            !compact.contains('\n'),
+            "compact output must be single-line: {}",
+            compact
+        );
         let parsed: serde_json::Value = serde_json::from_str(&compact).unwrap();
         assert_eq!(parsed["sessionId"], "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee");
     }
@@ -2013,12 +2047,8 @@ mod cost_session_tests {
     #[test]
     fn json_pretty_is_indented_and_valid() {
         let sessions = fixtures();
-        let b = build_session_breakdown(
-            &sessions,
-            "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
-            None,
-        )
-        .unwrap();
+        let b = build_session_breakdown(&sessions, "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee", None)
+            .unwrap();
         let v = breakdown_to_json(&b);
         let pretty = serde_json::to_string_pretty(&v).unwrap();
         assert!(pretty.contains('\n'), "pretty output must be multi-line");
@@ -2031,13 +2061,7 @@ mod cost_session_tests {
     #[test]
     fn clap_rejects_session_with_daily() {
         use clap::Parser;
-        let res = Cli::try_parse_from([
-            "c9watch",
-            "cost",
-            "--session",
-            "aaaa1111-bbbb",
-            "--daily",
-        ]);
+        let res = Cli::try_parse_from(["c9watch", "cost", "--session", "aaaa1111-bbbb", "--daily"]);
         assert!(res.is_err(), "expected clap to reject --session + --daily");
     }
 
@@ -2061,12 +2085,7 @@ mod cost_session_tests {
     #[test]
     fn clap_accepts_session_alone() {
         use clap::Parser;
-        let res = Cli::try_parse_from([
-            "c9watch",
-            "cost",
-            "--session",
-            "aaaa1111-bbbb",
-        ]);
+        let res = Cli::try_parse_from(["c9watch", "cost", "--session", "aaaa1111-bbbb"]);
         assert!(res.is_ok(), "parse failed: {:?}", res.err());
     }
 }
@@ -2094,9 +2113,24 @@ mod read_session_tasks_tests {
     fn parses_and_sorts_by_numeric_id() {
         let home = tempdir().unwrap();
         let sid = "session-abc";
-        write_task(home.path(), sid, "10.json", r#"{"id":"10","content":"ten","status":"pending"}"#);
-        write_task(home.path(), sid, "2.json", r#"{"id":"2","content":"two","status":"in_progress"}"#);
-        write_task(home.path(), sid, "1.json", r#"{"id":"1","content":"one","status":"completed"}"#);
+        write_task(
+            home.path(),
+            sid,
+            "10.json",
+            r#"{"id":"10","content":"ten","status":"pending"}"#,
+        );
+        write_task(
+            home.path(),
+            sid,
+            "2.json",
+            r#"{"id":"2","content":"two","status":"in_progress"}"#,
+        );
+        write_task(
+            home.path(),
+            sid,
+            "1.json",
+            r#"{"id":"1","content":"one","status":"completed"}"#,
+        );
 
         let got = read_session_tasks_in(home.path(), sid).unwrap();
         let ids: Vec<&str> = got
@@ -2110,15 +2144,17 @@ mod read_session_tasks_tests {
     fn skips_malformed_json_and_non_json_files() {
         let home = tempdir().unwrap();
         let sid = "session-xyz";
-        write_task(home.path(), sid, "1.json", r#"{"id":"1","content":"good","status":"pending"}"#);
+        write_task(
+            home.path(),
+            sid,
+            "1.json",
+            r#"{"id":"1","content":"good","status":"pending"}"#,
+        );
         write_task(home.path(), sid, "2.json", "not valid json {{{");
         write_task(home.path(), sid, "ignore.txt", r#"{"id":"99"}"#);
 
         let got = read_session_tasks_in(home.path(), sid).unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(
-            got[0].get("id").and_then(|v| v.as_str()),
-            Some("1")
-        );
+        assert_eq!(got[0].get("id").and_then(|v| v.as_str()), Some("1"));
     }
 }

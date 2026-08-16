@@ -35,7 +35,9 @@ impl LegacySessionSource {
     }
 
     /// Detects all active Claude Code sessions
-    pub fn detect_sessions(&mut self) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
+    pub fn detect_sessions(
+        &mut self,
+    ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
         // Refresh process information (only what we need: name, cwd, start_time)
         self.system.refresh_processes_specifics(
             ProcessesToUpdate::All,
@@ -276,7 +278,8 @@ impl LegacySessionSource {
             } else {
                 crate::debug_log::log_warn(&format!(
                     "PID={}: no matching session found for cwd={}",
-                    proc.pid, proc_cwd.display()
+                    proc.pid,
+                    proc_cwd.display()
                 ));
             }
         }

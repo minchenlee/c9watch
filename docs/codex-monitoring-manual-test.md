@@ -24,7 +24,7 @@ open src-tauri/target/debug/bundle/macos
 
 The current debug app has these properties:
 
-- Version: `c9watch 0.8.1`
+- Version: `c9watch 0.9.0`
 - Architecture: macOS arm64
 - Signing: local ad-hoc signature
 - Not notarized and not intended for release distribution

@@ -42,7 +42,9 @@ pub fn ensure_daemon() -> Result<(), String> {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        return Err("Daemon failed to start within 3 seconds (waited for another process)".to_string());
+        return Err(
+            "Daemon failed to start within 3 seconds (waited for another process)".to_string(),
+        );
     }
 
     // We hold the exclusive lock. Check if a healthy daemon is already running.
@@ -61,8 +63,8 @@ pub fn ensure_daemon() -> Result<(), String> {
     }
 
     // Get current executable path
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to get current exe path: {}", e))?;
+    let exe =
+        std::env::current_exe().map_err(|e| format!("Failed to get current exe path: {}", e))?;
 
     // Open log file for append
     let log_path = pm_fs::daemon_log_path()?;
@@ -151,7 +153,9 @@ pub fn cmd_spawn(
         if meta.len() > PROMPT_FILE_MAX_BYTES {
             return Err(format!(
                 "PROMPT_FILE_TOO_LARGE: {:?} is {} bytes (limit {} bytes)",
-                path, meta.len(), PROMPT_FILE_MAX_BYTES
+                path,
+                meta.len(),
+                PROMPT_FILE_MAX_BYTES
             ));
         }
         Some(
@@ -288,15 +292,11 @@ pub fn cmd_inbox(
     pretty: bool,
 ) -> Result<(), String> {
     if consume && clear {
-        return Err(
-            "Specify at most one of --consume or --clear (they conflict)".to_string(),
-        );
+        return Err("Specify at most one of --consume or --clear (they conflict)".to_string());
     }
     ensure_daemon()?;
     let caller_pm_session_id = crate::cli::pm_caller::detect_caller_session_id_default()
-        .ok_or_else(|| {
-            "PM_SESSION_NOT_FOUND: run inside a Claude Code session".to_string()
-        })?;
+        .ok_or_else(|| "PM_SESSION_NOT_FOUND: run inside a Claude Code session".to_string())?;
     let caller_pm_pid = crate::cli::pm_caller::detect_caller_pid_default();
 
     let request = RpcRequest::InboxRead {
@@ -313,9 +313,7 @@ pub fn cmd_inbox(
 pub fn cmd_adopt(session_id: String, force: bool, pretty: bool) -> Result<(), String> {
     ensure_daemon()?;
     let caller_pm_session_id = crate::cli::pm_caller::detect_caller_session_id_default()
-        .ok_or_else(|| {
-            "PM_SESSION_NOT_FOUND: run inside a Claude Code session".to_string()
-        })?;
+        .ok_or_else(|| "PM_SESSION_NOT_FOUND: run inside a Claude Code session".to_string())?;
     let caller_pm_pid = crate::cli::pm_caller::detect_caller_pid_default();
 
     let request = RpcRequest::Adopt {

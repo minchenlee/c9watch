@@ -71,7 +71,10 @@ mod tests {
     #[test]
     fn test_preserves_normal_text() {
         let input = "Just a normal message with no tags";
-        assert_eq!(strip_system_tags(input), "Just a normal message with no tags");
+        assert_eq!(
+            strip_system_tags(input),
+            "Just a normal message with no tags"
+        );
     }
 
     #[test]

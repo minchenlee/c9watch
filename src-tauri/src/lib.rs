@@ -3,9 +3,9 @@
 #![cfg_attr(target_os = "macos", allow(clippy::unused_unit))]
 
 // ── Core modules (always compiled) ──────────────────────────────────
-pub mod session;
-pub mod debug_log;
 pub mod actions;
+pub mod debug_log;
+pub mod session;
 
 // ── GUI-only modules ────────────────────────────────────────────────
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -68,8 +68,7 @@ async fn get_sessions(
         state.detect()
     };
     let (detected, diag) = detect_result.map_err(|e| format!("Detect failed: {}", e))?;
-    session::enrichment::enrich_detected_sessions(detected, diag)
-        .map(|(sessions, _)| sessions)
+    session::enrichment::enrich_detected_sessions(detected, diag).map(|(sessions, _)| sessions)
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -117,10 +116,8 @@ async fn get_memory_files() -> Result<Vec<session::ProjectMemory>, String> {
 /// parsing each session's JSONL transcript for Agent/Task tool_use entries.
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
-async fn get_subagents() -> Result<
-    std::collections::HashMap<String, Vec<session::SubagentInfo>>,
-    String,
-> {
+async fn get_subagents(
+) -> Result<std::collections::HashMap<String, Vec<session::SubagentInfo>>, String> {
     Ok(session::all_subagents_by_session())
 }
 
@@ -132,8 +129,12 @@ async fn get_subagent_transcript(
     parent_session_id: String,
     subagent_id: String,
 ) -> Result<session::SubagentTranscript, String> {
-    session::get_subagent_transcript(&parent_session_id, &subagent_id)
-        .ok_or_else(|| format!("subagent {} not found in session {}", subagent_id, parent_session_id))
+    session::get_subagent_transcript(&parent_session_id, &subagent_id).ok_or_else(|| {
+        format!(
+            "subagent {} not found in session {}",
+            subagent_id, parent_session_id
+        )
+    })
 }
 
 /// Returns the parsed TodoWrite tasks for a session, sorted by numeric `id`.
@@ -156,9 +157,7 @@ async fn save_temp_image(data: String) -> Result<String, String> {
     let file_path = temp_dir.join("c9watch-token-journey.png");
 
     // data is base64-encoded PNG (no data URL prefix)
-    let bytes = data
-        .strip_prefix("data:image/png;base64,")
-        .unwrap_or(&data);
+    let bytes = data.strip_prefix("data:image/png;base64,").unwrap_or(&data);
 
     use base64::Engine;
     let decoded = base64::engine::general_purpose::STANDARD

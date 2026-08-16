@@ -45,12 +45,14 @@ pub fn get_conversation_data(session_id: &str) -> Result<Conversation, String> {
 
                 let conversation_messages: Vec<ConversationMessage> = messages
                     .into_iter()
-                    .map(|(timestamp, msg_type, content, images)| ConversationMessage {
-                        timestamp,
-                        message_type: msg_type,
-                        content,
-                        images,
-                    })
+                    .map(
+                        |(timestamp, msg_type, content, images)| ConversationMessage {
+                            timestamp,
+                            message_type: msg_type,
+                            content,
+                            images,
+                        },
+                    )
                     .collect();
 
                 return Ok(Conversation {

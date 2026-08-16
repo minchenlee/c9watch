@@ -7,36 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-16
+
+### Added
+- **Codex App and CLI monitoring.** c9watch now detects both Codex surfaces,
+  displays provider-aware `CODEX` badges, and groups Codex subagents under
+  their parent sessions.
+- **Shared provider filtering.** The `All | Claude Code | Codex` filter now
+  applies to Monitor, History, Cost, and Memory, including provider-specific
+  memory files and Codex model cost estimates.
+- **Claude agent metadata backend.** Use `claude agents --json` when
+  available, with a legacy fallback for older Claude Code installations.
+- **User-controlled updates.** The new SETTINGS tab and update banner let
+  users decide when an available app update is installed.
+- **TODO side panel.** Conversation previews can show the session's TODO list
+  without leaving the preview overlay.
+- **PM `bg` backend.** PM workers can use `claude --bg` instead of
+  `claude --print`, with automatic detection for newer Claude Code versions
+  and `C9WATCH_WORKER_BACKEND=bg|print|auto` override support.
+- `c9watch spawn --prompt <text>` is available when the `bg` backend is active.
+- Added `EventStatus::Awaiting` and `InboxEvent::awaiting()` for workers that
+  are waiting for user input.
+
 ### Changed
-- **PM orchestration is now disabled by default.** Claude Code and Codex
-  provide native agent spawning, so c9watch's own PM/worker orchestration is
-  opt-in. Normal builds omit the PM CLI subcommands (`spawn`, `send`,
-  `workers`, `inbox`, `adopt`, `daemon`) and hide the dashboard's
-  HUMANS/WORKERS toggle, WORKER/PM badges, worker title prefix, and Workers
-  panel. All sessions still show normally — records with legacy `workerOf`
-  metadata render as ordinary sessions — and the native Subagents panel is
-  unchanged. The implementation is preserved, not removed:
-  - Enable the CLI with the `pm-orchestration` Cargo feature:
-    `cargo build --no-default-features --features cli,pm-orchestration`.
-  - Enable the dashboard UI by setting `PM_ORCHESTRATION_ENABLED = true` in
-    `src/lib/feature-flags.ts`.
+- **PM orchestration is now disabled by default.** Normal builds omit the PM
+  CLI subcommands and hide the HUMANS/WORKERS toggle, worker badges, worker
+  title prefix, and Workers panel. The implementation remains opt-in through
+  the `pm-orchestration` Cargo feature and `PM_ORCHESTRATION_ENABLED` UI flag.
+- **History search now defaults to phrase matching** and exposes
+  case-sensitive and whole-word toggles.
+- **The MEMORY tab uses an accordion layout** with improved reading size and
+  animation.
+- Added `Cmd+1` through `Cmd+4` shortcuts for tab navigation.
+
+### Fixed
+- Preserved Codex CLI search metadata and prefixes across search results.
+- Dropped history entries whose JSONL files were cleared instead of showing
+  unviewable stale cards.
 
 ### Improved
 - **Lower memory usage for Codex session monitoring.** Incremental rollout
   parsing and bounded monitor representations reduce peak RSS by 65.8% on a
   controlled workload while preserving full conversation and tool details.
   ([#116](https://github.com/minchenlee/c9watch/pull/116))
+- Opening a session now focuses the matching macOS Terminal/iTerm2 target by
+  tty, and can focus the exact Supacode tab and surface when its coordinates
+  are available.
 - Added a dry-run-by-default utility for cleaning stale Cargo targets from
   other registered worktrees.
-
-### Added
-- PM-orchestration `bg` backend: spawn workers via `claude --bg` instead of
-  `claude --print`. Workers stay on Pro/Max subscription quota after
-  Anthropic's 2026-06-15 Agent SDK billing split. Auto-detected when CC
-  >= 2.1.150. Override with `C9WATCH_WORKER_BACKEND=bg|print|auto`.
-- `c9watch spawn --prompt <text>` flag (required when bg backend is active).
-- `EventStatus::Awaiting` + `InboxEvent::awaiting()` for bg workers entering
-  `state:blocked` (turn ended waiting on user input — distinct from done/crashed).
 
 ## [0.8.1] - 2026-04-20
 

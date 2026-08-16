@@ -158,9 +158,7 @@ impl<'de> Deserialize<'de> for UserMessage {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("image/png")
                                     .to_string();
-                                if let Some(data) =
-                                    source.get("data").and_then(|v| v.as_str())
-                                {
+                                if let Some(data) = source.get("data").and_then(|v| v.as_str()) {
                                     images.push(ImageBlock {
                                         media_type,
                                         data: data.to_string(),
@@ -412,7 +410,9 @@ fn format_system_tags(tags: &[(String, String)]) -> String {
     use std::fmt::Write;
 
     // Check if this is a slash command entry
-    let has_command_tags = tags.iter().any(|(name, _)| COMMAND_TAGS.contains(&name.as_str()));
+    let has_command_tags = tags
+        .iter()
+        .any(|(name, _)| COMMAND_TAGS.contains(&name.as_str()));
 
     if has_command_tags {
         // Format as: /command-name args
@@ -1055,7 +1055,9 @@ mod tests {
 
     #[test]
     fn test_is_system_message_caveat() {
-        assert!(is_system_content("<local-command-caveat>Caveat: ...</local-command-caveat>"));
+        assert!(is_system_content(
+            "<local-command-caveat>Caveat: ...</local-command-caveat>"
+        ));
     }
 
     #[test]
@@ -1082,7 +1084,9 @@ mod tests {
     #[test]
     fn test_is_system_message_bash() {
         assert!(is_system_content("<bash-input>git status</bash-input>"));
-        assert!(is_system_content("<bash-stdout>On branch main</bash-stdout>"));
+        assert!(is_system_content(
+            "<bash-stdout>On branch main</bash-stdout>"
+        ));
     }
 
     #[test]
