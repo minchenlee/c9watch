@@ -316,16 +316,38 @@ pub fn parse_last_n_entries<P: AsRef<Path>>(
 
 /// Parse all entries from a session JSONL file
 pub fn parse_all_entries<P: AsRef<Path>>(path: P) -> Result<Vec<SessionEntry>, String> {
+    parse_all_entries_with_progress(path, &mut |_, _| {})
+}
+
+/// Like [`parse_all_entries`], but reports `(bytes_read, bytes_total)` while scanning.
+pub fn parse_all_entries_with_progress<P: AsRef<Path>>(
+    path: P,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Vec<SessionEntry>, String> {
     let file =
         File::open(path.as_ref()).map_err(|e| format!("Failed to open JSONL file: {}", e))?;
-
-    let reader = BufReader::new(file);
-    let lines: Vec<String> = reader
-        .lines()
-        .map_while(Result::ok)
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-
+    let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    let mut buf = String::new();
+    let mut read = 0u64;
+    on_progress(0, total);
+    loop {
+        buf.clear();
+        let n = reader
+            .read_line(&mut buf)
+            .map_err(|e| format!("Failed to read JSONL file: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        read += n as u64;
+        on_progress(read, total);
+        let without_newline = buf.trim_end_matches(['\n', '\r']);
+        if !without_newline.trim().is_empty() {
+            lines.push(without_newline.to_string());
+        }
+    }
+    on_progress(total, total);
     Ok(parse_jsonl_entries(lines))
 }
 

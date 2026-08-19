@@ -2,6 +2,8 @@
 	import { onMount } from 'svelte';
 	import { browser } from '$app/environment';
 	import { deepSearchSessions, getConversation } from '$lib/api';
+	import { toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
+	import { get } from 'svelte/store';
 	import type { HistoryEntry, Conversation, DeepSearchHit } from '$lib/types';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
 	import { flyIn } from '$lib/transitions';
@@ -32,6 +34,7 @@
 	// Conversation viewer state
 	let selectedEntry = $state<HistoryEntry | null>(null);
 	let conversation = $state<Conversation | null>(null);
+	let conversationRequestId = 0;
 	// ── Persistence ──────────────────────────────────────────────────
 	onMount(() => {
 		if (browser) {
@@ -207,10 +210,17 @@
 
 	// ── Actions ──────────────────────────────────────────────────────
 	async function handleSelectEntry(entry: HistoryEntry) {
+		const requestId = ++conversationRequestId;
 		selectedEntry = entry;
 		conversation = null;
+		toolsLoadedFor.set(null);
 		try {
-			conversation = await getConversation(entry.sessionId);
+			const conv = await withConversationLoader(entry.sessionId, 'conversation', () =>
+				getConversation(entry.sessionId, false)
+			);
+			if (requestId !== conversationRequestId) return;
+			if (get(toolsLoadedFor) === entry.sessionId) return;
+			conversation = conv;
 		} catch (e) {
 			console.error('Failed to load conversation:', e);
 		}
@@ -425,7 +435,7 @@
 
 <!-- ── Conversation overlay ───────────────────────────────────────── -->
 {#if selectedEntry}
-	<HistoryCardOverlay entry={selectedEntry} {conversation} searchQuery={query.trim() && deepSearchResults?.has(selectedEntry.sessionId) ? query.trim() : undefined} onclose={handleCloseConversation} />
+	<HistoryCardOverlay entry={selectedEntry} {conversation} searchQuery={query.trim() && deepSearchResults?.has(selectedEntry.sessionId) ? query.trim() : undefined} onclose={handleCloseConversation} onconversation={(conv) => { if (selectedEntry?.sessionId === conv.sessionId) conversation = conv; }} />
 {/if}
 
 <style>

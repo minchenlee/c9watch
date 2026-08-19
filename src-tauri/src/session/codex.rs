@@ -129,7 +129,10 @@ pub struct CodexSessionSource {
     cache: HashMap<PathBuf, CacheEntry>,
     archive_index: HashMap<String, Vec<PathBuf>>,
     last_full_discovery: Option<SystemTime>,
+    /// When true, parse complete JSONL lines instead of the compact monitor path.
     capture_tool_messages: bool,
+    /// When true (and using the full-parse path), keep Codex tool use/result records.
+    include_tools: bool,
     #[cfg(test)]
     parse_count: usize,
     #[cfg(test)]
@@ -149,6 +152,7 @@ impl CodexSessionSource {
             archive_index: HashMap::new(),
             last_full_discovery: None,
             capture_tool_messages: false,
+            include_tools: false,
             #[cfg(test)]
             parse_count: 0,
             #[cfg(test)]
@@ -156,9 +160,10 @@ impl CodexSessionSource {
         }
     }
 
-    fn conversation_at_root(sessions_root: PathBuf) -> Self {
+    fn conversation_at_root(sessions_root: PathBuf, include_tools: bool) -> Self {
         Self {
             capture_tool_messages: true,
+            include_tools,
             ..Self::at_root(sessions_root)
         }
     }
@@ -227,6 +232,14 @@ impl CodexSessionSource {
     }
 
     fn summary_for(&mut self, path: &Path) -> Result<CodexRolloutSummary, std::io::Error> {
+        self.summary_for_with_progress(path, None)
+    }
+
+    fn summary_for_with_progress(
+        &mut self,
+        path: &Path,
+        mut on_progress: Option<&mut dyn FnMut(u64, u64)>,
+    ) -> Result<CodexRolloutSummary, std::io::Error> {
         let metadata = fs::metadata(path)?;
         let modified_nanos = metadata
             .modified()?
@@ -241,6 +254,9 @@ impl CodexSessionSource {
 
         if let Some(entry) = self.cache.get(path) {
             if entry.stamp == stamp {
+                if let Some(cb) = on_progress.as_mut() {
+                    cb(stamp.len, stamp.len);
+                }
                 return Ok(entry.summary.clone());
             }
         }
@@ -319,7 +335,10 @@ impl CodexSessionSource {
 
                 entry.offset = line_start + bytes_read as u64;
                 entry.logical_prefix_hash = hash_bytes(entry.logical_prefix_hash, &line);
-                apply_rollout_line(&mut entry.summary, &line, true);
+                apply_rollout_line(&mut entry.summary, &line, self.include_tools);
+                if let Some(cb) = on_progress.as_mut() {
+                    cb(entry.offset, stamp.len);
+                }
             }
         } else {
             loop {
@@ -567,14 +586,14 @@ fn apply_rollout_line(summary: &mut CodexRolloutSummary, line: &[u8], capture_to
     let Ok(value) = serde_json::from_slice::<Value>(line) else {
         return;
     };
-    apply_rollout_event_with_tools(summary, &value, capture_tool_messages);
+    apply_rollout_event_with_tools(summary, &value, capture_tool_messages, false);
 }
 
 fn apply_monitor_line(summary: &mut CodexRolloutSummary, line: &[u8]) {
     let Ok(value) = serde_json::from_slice::<Value>(line) else {
         return;
     };
-    apply_rollout_event_with_tools(summary, &value, false);
+    apply_rollout_event_with_tools(summary, &value, false, true);
 }
 
 fn truncate_monitor_message(message: &str) -> String {
@@ -912,6 +931,78 @@ fn collect_rollout_paths(root: &Path) -> Vec<PathBuf> {
     paths
 }
 
+fn thread_rollout_suffix(thread_id: &str) -> String {
+    format!("-{thread_id}.jsonl")
+}
+
+fn path_matches_thread(path: &Path, suffix: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(suffix))
+}
+
+fn scan_recent_thread_rollouts(sessions_root: &Path, suffix: &str) -> Vec<PathBuf> {
+    let now = Local::now();
+    [now, now - chrono::Duration::days(1)]
+        .into_iter()
+        .flat_map(|day| {
+            let dir = sessions_root
+                .join(day.format("%Y").to_string())
+                .join(day.format("%m").to_string())
+                .join(day.format("%d").to_string());
+            fs::read_dir(dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+        })
+        .filter(|path| path.is_file() && path_matches_thread(path, suffix))
+        .collect()
+}
+
+fn collect_thread_rollouts(sessions_root: &Path, suffix: &str) -> Vec<PathBuf> {
+    collect_rollout_paths(sessions_root)
+        .into_iter()
+        .filter(|path| path_matches_thread(path, suffix))
+        .collect()
+}
+
+/// Cache is a hint: union today's/yesterday's files so resume/compaction
+/// rollouts are not missed. If the cache is cold or every cached path is gone,
+/// fall through to a full walk.
+fn resolve_thread_rollout_paths(sessions_root: &Path, thread_id: &str) -> Vec<PathBuf> {
+    resolve_thread_rollout_paths_with_cache(
+        sessions_root,
+        thread_id,
+        super::codex_archive::cached_thread_paths(sessions_root, thread_id),
+    )
+}
+
+fn resolve_thread_rollout_paths_with_cache(
+    sessions_root: &Path,
+    thread_id: &str,
+    cached: Option<Vec<PathBuf>>,
+) -> Vec<PathBuf> {
+    let suffix = thread_rollout_suffix(thread_id);
+    if let Some(mut paths) = cached {
+        for path in scan_recent_thread_rollouts(sessions_root, &suffix) {
+            if !paths.iter().any(|existing| existing == &path) {
+                paths.push(path);
+            }
+        }
+        paths.retain(|path| path.is_file());
+        if !paths.is_empty() {
+            paths.sort();
+            return paths;
+        }
+    }
+
+    let mut paths = collect_thread_rollouts(sessions_root, &suffix);
+    paths.sort();
+    paths
+}
+
 fn thread_id_from_rollout_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     if stem.len() < 36 {
@@ -954,13 +1045,14 @@ fn parse_timestamp_millis(timestamp: &str) -> Option<i64> {
 
 #[cfg(test)]
 fn apply_rollout_event(summary: &mut CodexRolloutSummary, value: &Value) {
-    apply_rollout_event_with_tools(summary, value, false);
+    apply_rollout_event_with_tools(summary, value, false, true);
 }
 
 fn apply_rollout_event_with_tools(
     summary: &mut CodexRolloutSummary,
     value: &Value,
     capture_tool_messages: bool,
+    compact_for_monitor: bool,
 ) {
     let timestamp = value
         .get("timestamp")
@@ -975,9 +1067,7 @@ fn apply_rollout_event_with_tools(
     };
     match event_type {
         Some("session_meta") => apply_session_meta(summary, timestamp, payload),
-        Some("event_msg") => {
-            apply_event_message(summary, timestamp, payload, !capture_tool_messages)
-        }
+        Some("event_msg") => apply_event_message(summary, timestamp, payload, compact_for_monitor),
         Some("response_item") if capture_tool_messages => {
             apply_response_item(summary, timestamp, payload)
         }
@@ -1218,41 +1308,73 @@ fn rollback_messages(messages: &mut Vec<CodexMessage>, turns: usize) {
     }
 }
 
-pub fn find_codex_conversation(thread_id: &str) -> Result<Vec<CodexMessage>, String> {
+pub fn find_codex_conversation(
+    thread_id: &str,
+    include_tools: bool,
+) -> Result<Vec<CodexMessage>, String> {
+    find_codex_conversation_with_progress(thread_id, include_tools, &mut |_, _| {})
+}
+
+pub fn find_codex_conversation_with_progress(
+    thread_id: &str,
+    include_tools: bool,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Vec<CodexMessage>, String> {
     let home = dirs::home_dir().ok_or("Failed to get home directory")?;
-    find_codex_conversation_under(&home.join(".codex").join("sessions"), thread_id)
+    find_codex_conversation_under_with_progress(
+        &home.join(".codex").join("sessions"),
+        thread_id,
+        include_tools,
+        on_progress,
+    )
 }
 
 fn find_codex_conversation_under(
     sessions_root: &Path,
     thread_id: &str,
+    include_tools: bool,
 ) -> Result<Vec<CodexMessage>, String> {
-    let suffix = format!("-{thread_id}.jsonl");
-    let mut paths: Vec<_> = collect_rollout_paths(sessions_root)
-        .into_iter()
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(&suffix))
-        })
-        .collect();
-    paths.sort();
+    find_codex_conversation_under_with_progress(sessions_root, thread_id, include_tools, &mut |_, _| {})
+}
+
+fn find_codex_conversation_under_with_progress(
+    sessions_root: &Path,
+    thread_id: &str,
+    include_tools: bool,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Vec<CodexMessage>, String> {
+    let paths = resolve_thread_rollout_paths(sessions_root, thread_id);
     if paths.is_empty() {
         return Err(format!("Codex session {thread_id} not found"));
     }
 
-    let mut source = CodexSessionSource::conversation_at_root(sessions_root.to_path_buf());
+    let mut source =
+        CodexSessionSource::conversation_at_root(sessions_root.to_path_buf(), include_tools);
     let mut messages = Vec::new();
     let mut parsed_any = false;
     let mut last_error = None;
-    for path in paths {
-        match source.summary_for(&path) {
+    let file_lens: Vec<u64> = paths
+        .iter()
+        .map(|path| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0))
+        .collect();
+    let total: u64 = file_lens.iter().sum();
+    on_progress(0, total);
+    let mut read_acc = 0u64;
+    for (path, file_len) in paths.into_iter().zip(file_lens) {
+        match source.summary_for_with_progress(
+            &path,
+            Some(&mut |file_read, _file_total| {
+                on_progress(read_acc.saturating_add(file_read.min(file_len)), total);
+            }),
+        ) {
             Ok(mut summary) => {
                 parsed_any = true;
                 messages.append(&mut summary.messages);
             }
             Err(error) => last_error = Some(error.to_string()),
         }
+        read_acc = read_acc.saturating_add(file_len);
+        on_progress(read_acc, total);
     }
     if !parsed_any {
         return Err(last_error.unwrap_or_else(|| format!("Codex session {thread_id} not found")));
@@ -1778,7 +1900,8 @@ mod tests {
         );
         assert!(monitor_summary.latest_message().unwrap().ends_with("..."));
 
-        let mut conversation = CodexSessionSource::conversation_at_root(temp.path().to_path_buf());
+        let mut conversation =
+            CodexSessionSource::conversation_at_root(temp.path().to_path_buf(), false);
         let conversation_summary = conversation.summary_for(&path).unwrap();
         assert_eq!(
             conversation_summary.latest_message().unwrap(),
@@ -2326,6 +2449,7 @@ mod tests {
                 "payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"pwd\"}"}
             }),
             true,
+            false,
         );
         apply_rollout_event_with_tools(
             &mut summary,
@@ -2334,6 +2458,7 @@ mod tests {
                 "payload":{"type":"function_call_output","call_id":"call-1","output":"/tmp/project"}
             }),
             true,
+            false,
         );
 
         assert_eq!(summary.messages.len(), 2);
@@ -2401,7 +2526,7 @@ mod tests {
             serde_json::json!({"type":"message", "role":"user", "content":"injected"}),
         ));
         write_lines(&path, &lines, true);
-        let messages = find_codex_conversation_under(temp.path(), "thread-id").unwrap();
+        let messages = find_codex_conversation_under(temp.path(), "thread-id", true).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "hello");
     }
@@ -2425,10 +2550,100 @@ mod tests {
         ));
         write_lines(&path, &lines, true);
 
-        let messages = find_codex_conversation_under(temp.path(), "thread-id").unwrap();
+        let messages = find_codex_conversation_under(temp.path(), "thread-id", true).unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1].message_type, MessageType::ToolUse);
         assert_eq!(messages[2].message_type, MessageType::ToolResult);
+
+        let without_tools = find_codex_conversation_under(temp.path(), "thread-id", false).unwrap();
+        assert_eq!(without_tools.len(), 1);
+        assert_eq!(without_tools[0].content, "hello");
+    }
+
+    #[test]
+    fn conversation_lookup_reports_byte_progress() {
+        let temp = TempDir::new().unwrap();
+        let day = temp.path().join("2026/07/13");
+        fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout-2026-07-13T00-00-00-thread-id.jsonl");
+        let lines = root_fixture(Value::String("cli".into()), "codex-tui");
+        write_lines(&path, &lines, true);
+        let total = fs::metadata(&path).unwrap().len();
+
+        let mut reports = Vec::new();
+        let messages = find_codex_conversation_under_with_progress(
+            temp.path(),
+            "thread-id",
+            false,
+            &mut |read, reported_total| reports.push((read, reported_total)),
+        )
+        .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert!(!reports.is_empty());
+        assert_eq!(reports[0], (0, total));
+        assert_eq!(*reports.last().unwrap(), (total, total));
+        assert!(reports.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        assert!(reports.iter().all(|(_, reported)| *reported == total));
+    }
+
+    #[test]
+    fn conversation_lookup_unions_cached_paths_with_recent_day_files() {
+        let temp = TempDir::new().unwrap();
+        let old_day = temp.path().join("2026/07/12");
+        fs::create_dir_all(&old_day).unwrap();
+        let old_path = old_day.join("rollout-2026-07-12T23-00-00-thread-id.jsonl");
+        write_lines(
+            &old_path,
+            &root_fixture(Value::String("cli".into()), "codex-tui"),
+            true,
+        );
+
+        let now = Local::now();
+        let today = temp
+            .path()
+            .join(now.format("%Y").to_string())
+            .join(now.format("%m").to_string())
+            .join(now.format("%d").to_string());
+        fs::create_dir_all(&today).unwrap();
+        let new_path = today.join("rollout-today-thread-id.jsonl");
+        write_lines(
+            &new_path,
+            &[event(
+                "2026-08-19T00:00:04Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"resumed"}),
+            )],
+            true,
+        );
+
+        let resolved = resolve_thread_rollout_paths_with_cache(
+            temp.path(),
+            "thread-id",
+            Some(vec![old_path.clone()]),
+        );
+        assert!(resolved.contains(&old_path));
+        assert!(resolved.contains(&new_path));
+    }
+
+    #[test]
+    fn conversation_lookup_falls_back_to_walk_when_cached_paths_are_gone() {
+        let temp = TempDir::new().unwrap();
+        let old_day = temp.path().join("2026/07/12");
+        fs::create_dir_all(&old_day).unwrap();
+        let old_path = old_day.join("rollout-2026-07-12T23-00-00-thread-id.jsonl");
+        write_lines(
+            &old_path,
+            &root_fixture(Value::String("cli".into()), "codex-tui"),
+            true,
+        );
+
+        let resolved = resolve_thread_rollout_paths_with_cache(
+            temp.path(),
+            "thread-id",
+            Some(vec![old_day.join("deleted.jsonl")]),
+        );
+        assert_eq!(resolved, vec![old_path]);
     }
 
     #[test]
@@ -2478,7 +2693,7 @@ mod tests {
             true,
         );
 
-        let messages = find_codex_conversation_under(temp.path(), "thread-id").unwrap();
+        let messages = find_codex_conversation_under(temp.path(), "thread-id", true).unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "first prompt");
         assert_eq!(messages[1].content, "resumed answer");

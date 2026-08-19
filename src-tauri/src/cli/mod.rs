@@ -488,7 +488,7 @@ fn cmd_status(project_filter: Option<&str>, pretty: bool) -> Result<(), String> 
 
 fn cmd_view(session_id: &str, last: Option<usize>, pretty: bool) -> Result<(), String> {
     let resolved_id = resolve_session_id_lightweight(session_id)?;
-    let mut conversation = session::conversation::get_conversation_data(&resolved_id)?;
+    let mut conversation = session::conversation::get_conversation_data(&resolved_id, true)?;
 
     if let Some(n) = last {
         let len = conversation.messages.len();

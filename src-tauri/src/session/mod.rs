@@ -34,7 +34,7 @@ pub mod cost;
 pub use cost::{get_cost_data, CostData};
 
 pub(crate) fn codex_session_ids(home: &std::path::Path, prefix: &str) -> Vec<String> {
-    codex_archive::load_default_snapshots(home)
+    codex_archive::load_default_listing(home)
         .into_iter()
         .filter(|snapshot| snapshot.thread_id.starts_with(prefix))
         .map(|snapshot| snapshot.thread_id)
