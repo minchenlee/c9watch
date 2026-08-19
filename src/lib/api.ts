@@ -25,15 +25,21 @@ export async function getSessions(): Promise<Session[]> {
 /**
  * Get the full conversation history for a specific session
  */
-export async function getConversation(sessionId: string): Promise<Conversation> {
+export async function getConversation(
+	sessionId: string,
+	includeTools = false
+): Promise<Conversation> {
 	if (get(isDemoMode)) {
 		return demoConversations[sessionId] ?? { sessionId, messages: [] };
 	}
 
 	if (useWebSocket()) {
-		return await wsClient.request<Conversation>('getConversation', { sessionId });
+		return await wsClient.request<Conversation>('getConversation', {
+			sessionId,
+			includeTools
+		});
 	}
-	return await invoke<Conversation>('get_conversation', { sessionId });
+	return await invoke<Conversation>('get_conversation', { sessionId, includeTools });
 }
 
 /**

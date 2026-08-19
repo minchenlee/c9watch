@@ -554,7 +554,7 @@ fn scan_file(path: &std::path::Path) -> Vec<SessionCostRecord> {
 }
 
 fn codex_cost_records(home_dir: &std::path::Path) -> Vec<SessionCostRecord> {
-    super::codex_archive::load_default_snapshots(home_dir)
+    super::codex_archive::load_default_listing(home_dir)
         .into_iter()
         .filter(|snapshot| !snapshot.is_internal())
         .flat_map(|snapshot| {

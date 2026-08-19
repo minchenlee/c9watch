@@ -11,7 +11,7 @@
 		hideHeader?: boolean;
 	}
 
-	let { conversation, scrollContainer, showTools = $bindable(true), showThinking = $bindable(true), onExpandToIndex, hideHeader = false }: Props = $props();
+	let { conversation, scrollContainer, showTools = $bindable(false), showThinking = $bindable(true), onExpandToIndex, hideHeader = false }: Props = $props();
 
 	// Filter for "milestone" messages - user messages, tool blocks, and thinking steps
 	let items = $derived.by(() => {
@@ -72,8 +72,22 @@
 
 	function truncateContent(content: string | undefined): string {
 		if (!content) return '...';
-		const clean = content.replace(/[#*`]/g, '').trim();
-		return clean.length > 40 ? clean.substring(0, 40) + '...' : clean;
+		const limit = 40;
+		let preview = '';
+		for (const character of content) {
+			if (character === '#' || character === '*' || character === '`') continue;
+			if (character === '\n' || character === '\r') {
+				if (preview.length === 0) continue;
+				break;
+			}
+			preview += character;
+			if (preview.length >= limit) break;
+		}
+		preview = preview.trim();
+		if (!preview) return '...';
+		return content.length > preview.length || preview.length >= limit
+			? `${preview.slice(0, limit)}...`
+			: preview;
 	}
 </script>
 

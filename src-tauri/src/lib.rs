@@ -26,10 +26,10 @@ use polling::{start_polling, Session};
 #[cfg(feature = "gui")]
 use serde::Serialize;
 #[cfg(feature = "gui")]
-use session::conversation::Conversation;
+use session::conversation::{Conversation, ConversationProgress};
 // Re-export for web_server.rs which uses crate::get_conversation_data
 #[cfg(feature = "gui")]
-pub use session::conversation::get_conversation_data;
+pub use session::conversation::{get_conversation_data, get_conversation_data_with_progress};
 #[cfg(feature = "gui")]
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "gui")]
@@ -74,8 +74,27 @@ async fn get_sessions(
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
-async fn get_conversation(session_id: String) -> Result<Conversation, String> {
-    get_conversation_data(&session_id)
+async fn get_conversation(
+    app: tauri::AppHandle,
+    session_id: String,
+    include_tools: Option<bool>,
+) -> Result<Conversation, String> {
+    let include_tools = include_tools.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        let emit_id = session_id.clone();
+        get_conversation_data_with_progress(&session_id, include_tools, &mut |bytes_read, bytes_total| {
+            let _ = app.emit(
+                "conversation-progress",
+                ConversationProgress {
+                    session_id: emit_id.clone(),
+                    bytes_read,
+                    bytes_total,
+                },
+            );
+        })
+    })
+    .await
+    .map_err(|error| format!("Failed to load conversation: {error}"))?
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -410,6 +429,7 @@ pub fn run() {
 
             let (sessions_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
             let (notifications_tx, _nrx) = tokio::sync::broadcast::channel::<String>(16);
+            let (progress_tx, _prx) = tokio::sync::broadcast::channel::<String>(32);
 
             let server_info = ServerInfo {
                 token: token.clone(),
@@ -423,6 +443,7 @@ pub fn run() {
                 auth_token: token,
                 sessions_tx: sessions_tx.clone(),
                 notifications_tx: notifications_tx.clone(),
+                progress_tx,
             });
             tauri::async_runtime::spawn(web_server::start_server(ws_state));
 
