@@ -131,22 +131,23 @@
 	}
 
 	async function toggleTools() {
+		const requestedId = session.id;
 		const next = !showTools;
 		if (sessionLoading) return;
-		if (next && $toolsLoadedFor !== session.id) {
+		if (next && $toolsLoadedFor !== requestedId) {
 			try {
-				const conv = await withConversationLoader(session.id, 'tools', () =>
-					getConversation(session.id, true)
+				const conv = await withConversationLoader(requestedId, 'tools', () =>
+					getConversation(requestedId, true)
 				);
-				if (conv.sessionId === session.id) {
-					currentConversation.set(conv);
-					toolsLoadedFor.set(session.id);
-				}
+				if (session.id !== requestedId || conv.sessionId !== requestedId) return;
+				currentConversation.set(conv);
+				toolsLoadedFor.set(requestedId);
 			} catch (error) {
 				console.error('Failed to load tools:', error);
 				return;
 			}
 		}
+		if (session.id !== requestedId) return;
 		showTools = next;
 	}
 

@@ -67,22 +67,23 @@
 	}
 
 	async function toggleTools() {
+		const requestedId = entry.sessionId;
 		const next = !showTools;
 		if (sessionLoading) return;
-		if (next && $toolsLoadedFor !== entry.sessionId) {
+		if (next && $toolsLoadedFor !== requestedId) {
 			try {
-				const conv = await withConversationLoader(entry.sessionId, 'tools', () =>
-					getConversation(entry.sessionId, true)
+				const conv = await withConversationLoader(requestedId, 'tools', () =>
+					getConversation(requestedId, true)
 				);
-				if (conv.sessionId === entry.sessionId) {
-					onconversation?.(conv);
-					toolsLoadedFor.set(entry.sessionId);
-				}
+				if (entry.sessionId !== requestedId || conv.sessionId !== requestedId) return;
+				onconversation?.(conv);
+				toolsLoadedFor.set(requestedId);
 			} catch (error) {
 				console.error('Failed to load tools:', error);
 				return;
 			}
 		}
+		if (entry.sessionId !== requestedId) return;
 		showTools = next;
 	}
 

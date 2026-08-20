@@ -941,26 +941,6 @@ fn path_matches_thread(path: &Path, suffix: &str) -> bool {
         .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(suffix))
 }
 
-fn scan_recent_thread_rollouts(sessions_root: &Path, suffix: &str) -> Vec<PathBuf> {
-    let now = Local::now();
-    [now, now - chrono::Duration::days(1)]
-        .into_iter()
-        .flat_map(|day| {
-            let dir = sessions_root
-                .join(day.format("%Y").to_string())
-                .join(day.format("%m").to_string())
-                .join(day.format("%d").to_string());
-            fs::read_dir(dir)
-                .ok()
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|entry| entry.path())
-        })
-        .filter(|path| path.is_file() && path_matches_thread(path, suffix))
-        .collect()
-}
-
 fn collect_thread_rollouts(sessions_root: &Path, suffix: &str) -> Vec<PathBuf> {
     collect_rollout_paths(sessions_root)
         .into_iter()
@@ -968,9 +948,8 @@ fn collect_thread_rollouts(sessions_root: &Path, suffix: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Cache is a hint: union today's/yesterday's files so resume/compaction
-/// rollouts are not missed. If the cache is cold or every cached path is gone,
-/// fall through to a full walk.
+/// Cache is only a seed. Always walk so resume/compaction fragments outside
+/// today/yesterday are not dropped just because an older cached path still exists.
 fn resolve_thread_rollout_paths(sessions_root: &Path, thread_id: &str) -> Vec<PathBuf> {
     resolve_thread_rollout_paths_with_cache(
         sessions_root,
@@ -985,20 +964,13 @@ fn resolve_thread_rollout_paths_with_cache(
     cached: Option<Vec<PathBuf>>,
 ) -> Vec<PathBuf> {
     let suffix = thread_rollout_suffix(thread_id);
-    if let Some(mut paths) = cached {
-        for path in scan_recent_thread_rollouts(sessions_root, &suffix) {
-            if !paths.iter().any(|existing| existing == &path) {
-                paths.push(path);
-            }
-        }
-        paths.retain(|path| path.is_file());
-        if !paths.is_empty() {
-            paths.sort();
-            return paths;
+    let mut paths = cached.unwrap_or_default();
+    for path in collect_thread_rollouts(sessions_root, &suffix) {
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
         }
     }
-
-    let mut paths = collect_thread_rollouts(sessions_root, &suffix);
+    paths.retain(|path| path.is_file());
     paths.sort();
     paths
 }
@@ -2644,6 +2616,39 @@ mod tests {
             Some(vec![old_day.join("deleted.jsonl")]),
         );
         assert_eq!(resolved, vec![old_path]);
+    }
+
+    #[test]
+    fn conversation_lookup_walks_for_fragments_outside_cached_days() {
+        let temp = TempDir::new().unwrap();
+        let cached_day = temp.path().join("2026/07/12");
+        let later_day = temp.path().join("2026/07/14");
+        fs::create_dir_all(&cached_day).unwrap();
+        fs::create_dir_all(&later_day).unwrap();
+        let cached_path = cached_day.join("rollout-2026-07-12T23-00-00-thread-id.jsonl");
+        let later_path = later_day.join("rollout-2026-07-14T01-00-00-thread-id.jsonl");
+        write_lines(
+            &cached_path,
+            &root_fixture(Value::String("cli".into()), "codex-tui"),
+            true,
+        );
+        write_lines(
+            &later_path,
+            &[event(
+                "2026-07-14T01:00:00Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"later fragment"}),
+            )],
+            true,
+        );
+
+        let resolved = resolve_thread_rollout_paths_with_cache(
+            temp.path(),
+            "thread-id",
+            Some(vec![cached_path.clone()]),
+        );
+        assert!(resolved.contains(&cached_path));
+        assert!(resolved.contains(&later_path));
     }
 
     #[test]
