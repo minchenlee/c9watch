@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use super::codex::CodexRolloutSummary;
+use super::cursor::CursorTranscriptSummary;
 
 #[derive(Error, Debug)]
 pub enum SessionDetectorError {
@@ -41,6 +42,7 @@ pub enum SessionProvider {
     #[default]
     ClaudeCode,
     Codex,
+    Cursor,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -52,6 +54,7 @@ pub enum SessionSurface {
     Cli,
     Exec,
     Integration,
+    Cursor,
     Unknown,
 }
 
@@ -110,6 +113,8 @@ pub struct DetectedSession {
     pub can_rename: bool,
     #[serde(skip)]
     pub codex_summary: Option<CodexRolloutSummary>,
+    #[serde(skip)]
+    pub cursor_summary: Option<CursorTranscriptSummary>,
 }
 
 fn default_true() -> bool {
@@ -148,6 +153,7 @@ impl DetectedSession {
             can_stop: true,
             can_rename: true,
             codex_summary: None,
+            cursor_summary: None,
         }
     }
 }
@@ -219,6 +225,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SessionProvider::Codex).unwrap(),
             "\"codex\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionProvider::Cursor).unwrap(),
+            "\"cursor\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionSurface::Cursor).unwrap(),
+            "\"cursor\""
         );
         assert_eq!(
             serde_json::to_string(&SessionSurface::Integration).unwrap(),

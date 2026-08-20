@@ -4,6 +4,7 @@
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
 	import { workersByPm } from '$lib/stores/sessions';
 	import { formatCostOrTokens } from '$lib/cost-utils';
+	import { isCostAvailable } from '$lib/cost-semantics';
 	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 	import ProviderBadge from './ProviderBadge.svelte';
 	import { canSessionAction } from '$lib/provider';
@@ -60,7 +61,7 @@
 
 	let costRecord = $derived($sessionCostMap.get(session.id));
 	let costLabel = $derived(
-		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, costRecord.costAvailable ?? costRecord.provider !== 'codex') : null
+		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, isCostAvailable(costRecord)) : null
 	);
 
 	function getStatusColor(): string {

@@ -1,4 +1,5 @@
 pub mod codex;
+pub mod cursor;
 pub mod custom_names;
 pub mod detector;
 pub mod parser;
@@ -39,6 +40,10 @@ pub(crate) fn codex_session_ids(home: &std::path::Path, prefix: &str) -> Vec<Str
         .filter(|snapshot| snapshot.thread_id.starts_with(prefix))
         .map(|snapshot| snapshot.thread_id)
         .collect()
+}
+
+pub(crate) fn cursor_session_ids(home: &std::path::Path, prefix: &str) -> Vec<String> {
+    cursor::list_session_ids(home, prefix)
 }
 
 pub mod memory;

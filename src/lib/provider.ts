@@ -4,16 +4,24 @@ export type ProviderFilter = 'all' | SessionProvider;
 export type SessionAction = 'open' | 'stop' | 'rename' | 'conversation';
 type ProviderRecord = { provider?: SessionProvider | null };
 
+const KNOWN_PROVIDERS: SessionProvider[] = ['claudeCode', 'codex', 'cursor'];
+
 export function providerOf(record: ProviderRecord): SessionProvider {
-	return record.provider === 'codex' ? 'codex' : 'claudeCode';
+	return record.provider && KNOWN_PROVIDERS.includes(record.provider)
+		? record.provider
+		: 'claudeCode';
 }
 
 export function providerLabel(provider: SessionProvider): string {
-	return provider === 'codex' ? 'CODEX' : 'CLAUDE CODE';
+	if (provider === 'codex') return 'CODEX';
+	if (provider === 'cursor') return 'CURSOR';
+	return 'CLAUDE CODE';
 }
 
 export function surfaceLabel(surface?: SessionSurface): string | null {
-	if (!surface || surface === 'unknown' || surface === 'claudeCode') return null;
+	if (!surface || surface === 'unknown' || surface === 'claudeCode' || surface === 'cursor') {
+		return null;
+	}
 	return surface.toUpperCase();
 }
 
@@ -24,6 +32,7 @@ export function matchesProvider(record: ProviderRecord, filter: ProviderFilter):
 export function providerFilterLabel(filter: ProviderFilter): string {
 	if (filter === 'codex') return 'Codex';
 	if (filter === 'claudeCode') return 'Claude Code';
+	if (filter === 'cursor') return 'Cursor';
 	return 'All providers';
 }
 
@@ -35,7 +44,8 @@ export function isHiddenInternalSession(session: Session): boolean {
 }
 
 export function isCodexSubagent(session: Session): boolean {
-	return providerOf(session) === 'codex' && session.agentKind === 'subagent' && !isHiddenInternalSession(session);
+	const provider = providerOf(session);
+	return (provider === 'codex' || provider === 'cursor') && session.agentKind === 'subagent' && !isHiddenInternalSession(session);
 }
 
 export interface CodexHierarchy {
@@ -44,7 +54,7 @@ export interface CodexHierarchy {
 }
 
 /**
- * Flatten visible Codex descendants beneath their nearest visible root.
+ * Flatten visible Codex/Cursor descendants beneath their nearest visible root.
  * If every referenced ancestor has expired or is missing, the highest
  * surviving subagent is promoted so no normal agent disappears from the UI.
  */

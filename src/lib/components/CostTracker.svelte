@@ -8,7 +8,7 @@
 	import { formatCost, formatTokens, modelDisplayName } from '$lib/cost-utils';
 	import { flyIn, fadeIn } from '$lib/transitions';
 	import { providerFilter } from '$lib/stores/provider-filter';
-	import { matchesProvider, providerFilterLabel } from '$lib/provider';
+	import { matchesProvider, providerFilterLabel, providerOf } from '$lib/provider';
 	import ProviderBadge from './ProviderBadge.svelte';
 	import { isCostAvailable, selectChartDays, summarizeCostSessions } from '$lib/cost-semantics';
 
@@ -34,7 +34,7 @@
 
 	function providerUsageValue(sessions: SessionCostRecord[], provider: SessionProvider): number {
 		return sessions
-			.filter((session) => (session.provider === 'codex' ? 'codex' : 'claudeCode') === provider)
+			.filter((session) => providerOf(session) === provider)
 			.reduce((sum, session) => {
 				if (mode === 'tokens') return sum + (session.totalTokens || 0);
 				return sum + (isCostAvailable(session) ? session.cost : 0);
@@ -66,7 +66,7 @@
 	function mergeSessionRows(sessions: SessionCostRecord[]): CostSessionRow[] {
 		const rows = new Map<string, CostSessionRow>();
 		for (const [index, session] of sessions.entries()) {
-			const provider = session.provider === 'codex' ? 'codex' : 'claudeCode';
+			const provider = providerOf(session);
 			const key = session.sessionId
 				? `${provider}:${session.sessionId}`
 				: `${provider}:${session.date}:${session.timestamp}:${session.model}:${index}`;
@@ -462,7 +462,7 @@
 
 		const modelMap = new Map<string, { model: string; provider: import('$lib/types').SessionProvider; cost: number; tokens: number; unpricedTokens: number }>();
 		for (const s of sessions) {
-			const provider = s.provider === 'codex' ? 'codex' : 'claudeCode';
+			const provider = providerOf(s);
 			const key = `${provider}:${s.model}`;
 			const cur = modelMap.get(key) || { model: s.model, provider, cost: 0, tokens: 0, unpricedTokens: 0 };
 			if (isCostAvailable(s)) cur.cost += s.cost;

@@ -53,7 +53,7 @@ export function buildSessionCostMap(data: CostData | null): Map<string, SessionC
 				existing.cachedInputTokens = (existing.cachedInputTokens || 0) + (rec.cachedInputTokens || 0);
 				existing.outputTokens = (existing.outputTokens || 0) + (rec.outputTokens || 0);
 				existing.reasoningOutputTokens = (existing.reasoningOutputTokens || 0) + (rec.reasoningOutputTokens || 0);
-				existing.costAvailable = (existing.costAvailable ?? existing.provider !== 'codex') && (rec.costAvailable ?? rec.provider !== 'codex');
+				existing.costAvailable = (existing.costAvailable ?? (existing.provider !== 'codex' && existing.provider !== 'cursor')) && (rec.costAvailable ?? (rec.provider !== 'codex' && rec.provider !== 'cursor'));
 				if (rec.timestamp > existing.timestamp) {
 					existing.timestamp = rec.timestamp;
 					existing.model = rec.model;

@@ -78,6 +78,25 @@ pub fn get_conversation_data(session_id: &str) -> Result<Conversation, String> {
         });
     }
 
+    if let Ok(messages) = crate::session::cursor::find_cursor_conversation_with_progress(
+        session_id,
+        true,
+        &mut |_, _| {},
+    ) {
+        return Ok(Conversation {
+            session_id: session_id.to_string(),
+            messages: messages
+                .into_iter()
+                .map(|message| ConversationMessage {
+                    timestamp: message.timestamp,
+                    message_type: message.message_type,
+                    content: message.content,
+                    images: Vec::new(),
+                })
+                .collect(),
+        });
+    }
+
     Err(format!(
         "Session {} not found in any project directory",
         session_id

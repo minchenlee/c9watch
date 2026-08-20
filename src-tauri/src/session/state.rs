@@ -1,5 +1,6 @@
 // src-tauri/src/session/state.rs
 use super::codex::CodexSessionSource;
+use super::cursor::CursorSessionSource;
 use super::source::{DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource};
 use super::{create_session_source, mode_from_env, BackendMode};
 use crate::session::detector::LegacySessionSource;
@@ -14,6 +15,7 @@ pub struct DetectorState {
     telemetry_counter: Arc<AtomicU32>,
     mode: BackendMode,
     codex_source: Option<CodexSessionSource>,
+    cursor_source: Option<CursorSessionSource>,
 }
 
 impl DetectorState {
@@ -24,6 +26,7 @@ impl DetectorState {
             telemetry_counter: Arc::new(AtomicU32::new(0)),
             mode: mode_from_env(),
             codex_source: CodexSessionSource::new().ok(),
+            cursor_source: CursorSessionSource::new().ok(),
         }
     }
 
@@ -32,11 +35,15 @@ impl DetectorState {
     ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
         let claude_result = self.source.detect();
         let codex_result = self.codex_source.as_mut().map(SessionSource::detect);
+        let cursor_result = self.cursor_source.as_mut().map(SessionSource::detect);
         match claude_result {
             Ok((mut sessions, diagnostics)) => {
                 self.consecutive_failures = 0;
-                if let Some(Ok((mut codex_sessions, _))) = codex_result {
-                    sessions.append(&mut codex_sessions);
+                if let Some(Ok((mut extra, _))) = codex_result {
+                    sessions.append(&mut extra);
+                }
+                if let Some(Ok((mut extra, _))) = cursor_result {
+                    sessions.append(&mut extra);
                 }
                 Ok((sessions, diagnostics))
             }
@@ -45,10 +52,20 @@ impl DetectorState {
                 if self.should_downgrade() {
                     self.downgrade_to_legacy();
                 }
-                if let Some(Ok((codex_sessions, diagnostics))) = codex_result {
-                    if !codex_sessions.is_empty() {
-                        return Ok((codex_sessions, diagnostics));
+                let mut fallback = Vec::new();
+                let mut diagnostics = DetectionDiagnostics::default();
+                if let Some(Ok((sessions, extra))) = codex_result {
+                    fallback.extend(sessions);
+                    diagnostics = extra;
+                }
+                if let Some(Ok((sessions, extra))) = cursor_result {
+                    fallback.extend(sessions);
+                    if diagnostics.claude_processes_found == 0 {
+                        diagnostics = extra;
                     }
+                }
+                if !fallback.is_empty() {
+                    return Ok((fallback, diagnostics));
                 }
                 Err(e)
             }
@@ -99,6 +116,7 @@ impl DetectorState {
             telemetry_counter: Arc::new(AtomicU32::new(0)),
             mode,
             codex_source: None,
+            cursor_source: None,
         }
     }
 

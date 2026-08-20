@@ -20,8 +20,8 @@
 	<div class="list-content">
 		{#if currentSessions.length === 0}
 			<div class="empty-state">
-				<p>No active Claude sessions detected</p>
-				<p class="empty-hint">Start a Claude Code session to see it here</p>
+				<p>No active sessions detected</p>
+				<p class="empty-hint">Start a Claude Code, Codex, or Cursor Agent session to see it here</p>
 			</div>
 		{:else}
 			<div class="session-items">

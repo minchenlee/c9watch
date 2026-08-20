@@ -47,11 +47,12 @@
 	import { visibleSubagentsBySession } from '$lib/stores/subagents';
 	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
+	import { isCostAvailable } from '$lib/cost-semantics';
 	import { formatTimeSince, formatDurationMs } from '$lib/time-utils';
 	import { getSessionStatusColor, getSessionStatusLabel, getSubagentStatusColor, getSubagentStatusLabel, getWorkerStatusColor, getWorkerStatusLabel } from '$lib/status-utils';
 	import { isTauri } from '$lib/ws';
 	import ProviderBadge from './ProviderBadge.svelte';
-	import { canSessionAction } from '$lib/provider';
+	import { canSessionAction, providerOf } from '$lib/provider';
 
 	interface Props {
 		session: Session;
@@ -162,7 +163,7 @@
 
 	let costRecord = $derived($sessionCostMap.get(session.id));
 	let primaryCostLabel = $derived(
-		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, costRecord.costAvailable ?? costRecord.provider !== 'codex') : null
+		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, isCostAvailable(costRecord)) : null
 	);
 
 	let isPermission = $derived(session.status === SessionStatus.NeedsAttention);
@@ -189,9 +190,9 @@
 		...($codexSubagentsByParent.get(session.id) ?? []).map((child): SubagentInfo => ({
 			id: child.id,
 			sessionId: child.id,
-			provider: 'codex',
+			provider: providerOf(child),
 			agentType: child.agentRole || child.agentNickname || 'subagent',
-			description: child.agentNickname || child.summary || child.firstPrompt || child.agentRole || 'Codex subagent',
+			description: child.agentNickname || child.summary || child.firstPrompt || child.agentRole || (providerOf(child) === 'cursor' ? 'Cursor subagent' : 'Codex subagent'),
 			startedAt: child.startedAtMs ? new Date(child.startedAtMs).toISOString() : child.modified,
 			completedAt: child.status === SessionStatus.Working ? null : child.modified,
 			parentSessionId: session.id,
@@ -224,7 +225,7 @@
 	let previewError = $derived(previewState.error);
 
 	async function openSubagentPreview(sa: SubagentInfo) {
-		if (sa.provider === 'codex' && sa.sessionId) {
+		if ((sa.provider === 'codex' || sa.provider === 'cursor') && sa.sessionId) {
 			expandedSessionId.set(sa.sessionId);
 			return;
 		}
@@ -386,9 +387,9 @@
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
 							{#if costRecord}
 								<span class="separator">·</span>
-								<span class="cost-breakdown" title="{costRecord.costAvailable ?? costRecord.provider !== 'codex' ? `Total cost: ${formatCost(costRecord.cost)}` : 'USD pricing unavailable'} · {formatTokens(costRecord.totalTokens)} tokens · {modelDisplayName(costRecord.model)}">
+								<span class="cost-breakdown" title="{isCostAvailable(costRecord) ? `Total cost: ${formatCost(costRecord.cost)}` : 'USD pricing unavailable'} · {formatTokens(costRecord.totalTokens)} tokens · {modelDisplayName(costRecord.model)}">
 									<span class="cost-primary">{primaryCostLabel}</span>
-									<span class="cost-secondary">· {$costMode === 'usd' ? formatTokens(costRecord.totalTokens) + ' tok' : formatCostOrTokens(costRecord.cost, costRecord.totalTokens, 'usd', costRecord.costAvailable ?? costRecord.provider !== 'codex')}</span>
+									<span class="cost-secondary">· {$costMode === 'usd' ? formatTokens(costRecord.totalTokens) + ' tok' : formatCostOrTokens(costRecord.cost, costRecord.totalTokens, 'usd', isCostAvailable(costRecord))}</span>
 									<span class="cost-secondary">· {modelDisplayName(costRecord.model)}</span>
 								</span>
 							{/if}

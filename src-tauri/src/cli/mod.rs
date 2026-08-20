@@ -1638,6 +1638,7 @@ fn resolve_session_id_lightweight_under(
     }
 
     matches.extend(session::codex_session_ids(home_dir, prefix));
+    matches.extend(session::cursor_session_ids(home_dir, prefix));
 
     resolve_session_id_matches(prefix, matches)
 }
@@ -1655,14 +1656,14 @@ fn resolve_session_id_matches(prefix: &str, matches: Vec<String>) -> Result<Stri
                 Ok(prefix.to_string())
             } else {
                 Err(format!(
-                    "No session found matching prefix '{}' across Claude Code and Codex",
+                    "No session found matching prefix '{}' across Claude Code, Codex, and Cursor",
                     prefix
                 ))
             }
         }
         1 => Ok(matches.into_iter().next().unwrap()),
         n => Err(format!(
-            "Ambiguous session ID prefix '{}' matches {} sessions across Claude Code and Codex",
+            "Ambiguous session ID prefix '{}' matches {} sessions across Claude Code, Codex, and Cursor",
             prefix, n
         )),
     }
@@ -1817,7 +1818,7 @@ mod session_formatter_tests {
 
         assert!(error.contains("Ambiguous session ID prefix 'shared'"));
         assert!(error.contains("matches 2 sessions"));
-        assert!(error.contains("Claude Code and Codex"));
+        assert!(error.contains("Claude Code, Codex, and Cursor"));
     }
 
     #[test]
@@ -1827,7 +1828,7 @@ mod session_formatter_tests {
 
         assert_eq!(
             error,
-            "No session found matching prefix 'missing' across Claude Code and Codex"
+            "No session found matching prefix 'missing' across Claude Code, Codex, and Cursor"
         );
     }
 

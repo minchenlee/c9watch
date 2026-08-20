@@ -113,6 +113,8 @@
 		</div>
 		{#if $providerFilter === 'codex'}
 			<div class="empty-hint">Codex stores durable memory in ~/.codex/memories/</div>
+		{:else if $providerFilter === 'cursor'}
+			<div class="empty-hint">Cursor Agent memory is not monitored yet.</div>
 		{:else if $providerFilter === 'claudeCode'}
 			<div class="empty-hint">Claude Code stores memory in ~/.claude/projects/*/memory/</div>
 		{:else}

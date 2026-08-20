@@ -122,6 +122,7 @@ pub fn get_history() -> Result<Vec<HistoryEntry>, String> {
     };
 
     entries.extend(codex_history_entries(&home_dir));
+    entries.extend(crate::session::cursor::cursor_history_entries(&home_dir));
     entries.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
     Ok(entries)
 }
@@ -520,6 +521,14 @@ pub(crate) fn deep_search_under(
             .into_inner()
             .map_err(|error| format!("Codex search mutex poisoned: {error}"))?,
     );
+    result.extend(crate::session::cursor::search_cursor_transcripts(
+        &home_dir,
+        query_norm.as_str(),
+        case_sensitive,
+        whole_word,
+        phrase_match,
+        extract_snippet,
+    ));
     result.sort_by(|left, right| {
         left.provider
             .cmp(&right.provider)

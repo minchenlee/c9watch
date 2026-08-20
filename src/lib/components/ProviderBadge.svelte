@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { SessionProvider, SessionSurface } from '$lib/types';
-	import { providerLabel, surfaceLabel } from '$lib/provider';
+	import { providerLabel, providerOf, surfaceLabel } from '$lib/provider';
 
 	interface Props {
 		provider?: SessionProvider;
@@ -10,12 +10,12 @@
 	}
 
 	let { provider = 'claudeCode', surface, compact = false, noun = 'session' }: Props = $props();
-	let normalized = $derived<SessionProvider>(provider === 'codex' ? 'codex' : 'claudeCode');
+	let normalized = $derived<SessionProvider>(providerOf({ provider }));
 	let surfaceText = $derived(normalized === 'codex' ? surfaceLabel(surface) : null);
 </script>
 
 <span class="provider-stack" class:compact aria-label={`${providerLabel(normalized)} ${noun}${surfaceText ? `, ${surfaceText}` : ''}`}>
-	<span class="provider-badge" class:codex={normalized === 'codex'}>{providerLabel(normalized)}</span>
+	<span class="provider-badge" class:codex={normalized === 'codex'} class:cursor={normalized === 'cursor'}>{providerLabel(normalized)}</span>
 	{#if surfaceText}<span class="surface-badge">{surfaceText}</span>{/if}
 </span>
 
@@ -30,6 +30,7 @@
 	}
 	.provider-badge { color: var(--accent-amber); border-color: color-mix(in srgb, var(--accent-amber) 55%, var(--border-default)); }
 	.provider-badge.codex { color: var(--accent-blue); border-color: color-mix(in srgb, var(--accent-blue) 55%, var(--border-default)); }
+	.provider-badge.cursor { color: var(--accent-purple); border-color: color-mix(in srgb, var(--accent-purple) 55%, var(--border-default)); }
 	.surface-badge { height: 16px; padding: 0 4px; border-color: var(--border-default); border-style: dashed; font-size: 7px; color: var(--text-secondary); }
 	.compact .provider-badge { height: 16px; font-size: 7px; }
 	.compact .surface-badge { display: none; }

@@ -483,6 +483,7 @@ impl CodexSessionSource {
                 can_stop: false,
                 can_rename: false,
                 codex_summary: Some(summary),
+                cursor_summary: None,
             });
         }
         Ok((sessions, DetectionDiagnostics::default()))

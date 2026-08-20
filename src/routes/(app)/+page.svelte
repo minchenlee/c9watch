@@ -452,7 +452,7 @@
 				<span class="drag-dots" transition:fade={{ duration: 250 }}>⠿ ⠿ ⠿</span>
 			{/if}
 		</div>
-		<div class="global-provider-filter"><ProviderFilter compact /></div>
+		<div class="global-provider-filter"><ProviderFilter compact variant="select" /></div>
 		<button
 			class="tab-btn"
 			class:active={activeTab === 'settings'}
@@ -626,7 +626,7 @@
 							</div>
 						{:else}
 							<h2>No {providerFilterLabel($providerFilter)} Sessions</h2>
-							<p>{ $providerFilter === 'all' ? 'Start a Claude Code or Codex session' : `Start a ${providerFilterLabel($providerFilter)} session` }</p>
+							<p>{ $providerFilter === 'all' ? 'Start a Claude Code, Codex, or Cursor Agent session' : `Start a ${providerFilterLabel($providerFilter)} session` }</p>
 							<div class="empty-hint">
 								<span class="hint-icon">
 									<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

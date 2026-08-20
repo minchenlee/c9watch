@@ -1,4 +1,5 @@
 use crate::session::codex::CodexLifecycle;
+use crate::session::cursor::CursorLifecycle;
 use crate::session::source::{
     AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionProvider, SessionSource,
     SessionSurface,
@@ -126,18 +127,34 @@ pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, DetectionDiagnostic
     let codex_result = crate::session::codex::CodexSessionSource::new()
         .ok()
         .and_then(|mut codex| codex.detect().ok());
+    let cursor_result = crate::session::cursor::CursorSessionSource::new()
+        .ok()
+        .and_then(|mut cursor| cursor.detect().ok());
     match claude_result {
         Ok((mut detected, diagnostics)) => {
             if let Some((mut codex_sessions, _)) = codex_result {
                 detected.append(&mut codex_sessions);
             }
+            if let Some((mut cursor_sessions, _)) = cursor_result {
+                detected.append(&mut cursor_sessions);
+            }
             enrich_detected_sessions(detected, diagnostics)
         }
         Err(error) => {
-            if let Some((codex_sessions, diagnostics)) = codex_result {
-                if !codex_sessions.is_empty() {
-                    return enrich_detected_sessions(codex_sessions, diagnostics);
+            let mut fallback = Vec::new();
+            let mut diagnostics = DetectionDiagnostics::default();
+            if let Some((sessions, extra)) = codex_result {
+                fallback.extend(sessions);
+                diagnostics = extra;
+            }
+            if let Some((sessions, extra)) = cursor_result {
+                fallback.extend(sessions);
+                if diagnostics.claude_processes_found == 0 {
+                    diagnostics = extra;
                 }
+            }
+            if !fallback.is_empty() {
+                return enrich_detected_sessions(fallback, diagnostics);
             }
             Err(format!("Failed to detect sessions: {error}"))
         }
@@ -219,6 +236,75 @@ pub fn enrich_detected_sessions(
                 } else {
                     SessionStatus::WaitingForInput
                 },
+                latest_message,
+                pending_tool_name: None,
+                pending_tool_input: None,
+                worker_of: None,
+                official_name: detected.official_name.clone(),
+                started_at_ms: detected.started_at_ms,
+                provider: detected.provider,
+                surface: detected.surface,
+                agent_kind: detected.agent_kind,
+                parent_thread_id: detected.parent_thread_id.clone(),
+                root_session_id: detected.root_session_id.clone(),
+                agent_path: detected.agent_path.clone(),
+                agent_nickname: detected.agent_nickname.clone(),
+                agent_role: detected.agent_role.clone(),
+                internal_kind: detected.internal_kind.clone(),
+                can_open: detected.can_open,
+                can_stop: detected.can_stop,
+                can_rename: detected.can_rename,
+            });
+            continue;
+        }
+
+        if let Some(summary) = detected.cursor_summary.as_ref() {
+            let first_prompt = summary
+                .first_prompt()
+                .map(|prompt| truncate_string(prompt, 100))
+                .unwrap_or_else(|| "(No conversation yet)".to_string());
+            let latest_message = summary
+                .latest_message()
+                .map(|message| truncate_string(message, 200))
+                .unwrap_or_default();
+            let session_name = custom_names
+                .get(&session_id)
+                .cloned()
+                .or_else(|| detected.agent_nickname.clone())
+                .unwrap_or_else(|| detected.project_name.clone());
+            let modified = if summary.last_timestamp.is_empty() {
+                detected
+                    .started_at_ms
+                    .and_then(DateTime::<Utc>::from_timestamp_millis)
+                    .map(|timestamp| timestamp.to_rfc3339())
+                    .unwrap_or_default()
+            } else {
+                summary.last_timestamp.clone()
+            };
+            let status = if summary.lifecycle == CursorLifecycle::Working {
+                if summary.empty {
+                    SessionStatus::Connecting
+                } else {
+                    SessionStatus::Working
+                }
+            } else {
+                SessionStatus::WaitingForInput
+            };
+            sessions.push(Session {
+                id: session_id.clone(),
+                pid: detected.pid,
+                session_name,
+                custom_title: custom_titles
+                    .get(&session_id)
+                    .cloned()
+                    .or_else(|| detected.official_name.clone()),
+                project_path: detected.cwd.to_string_lossy().to_string(),
+                git_branch: None,
+                first_prompt,
+                summary: None,
+                message_count: summary.messages.len() as u32,
+                modified,
+                status,
                 latest_message,
                 pending_tool_name: None,
                 pending_tool_input: None,
@@ -695,6 +781,7 @@ mod placeholder_tests {
             can_stop: true,
             can_rename: true,
             codex_summary: None,
+            cursor_summary: None,
         };
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
