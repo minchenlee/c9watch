@@ -10,9 +10,11 @@ use super::source::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::hash::Hasher;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -84,6 +86,10 @@ struct FileStamp {
 struct CacheEntry {
     stamp: FileStamp,
     offset: u64,
+    /// Hash of the transcript bytes in `[0, offset)`. A larger file alone does
+    /// not prove an append: truncate-and-rewrite can also grow past the old
+    /// offset, so the cached prefix must still match before reusing it.
+    prefix_hash: u64,
     summary: CursorTranscriptSummary,
 }
 
@@ -171,8 +177,7 @@ impl CursorSessionSource {
             })
             .collect();
 
-        self.cache
-            .retain(|path, _| existing_paths.contains(path));
+        self.cache.retain(|path, _| existing_paths.contains(path));
 
         let mut sessions = Vec::new();
         for (_path, summary, age_secs) in live {
@@ -241,7 +246,10 @@ impl CursorSessionSource {
             }
         }
         let (existing, start_offset) = match self.cache.get(path) {
-            Some(cached) if stamp.len > cached.offset => {
+            Some(cached)
+                if stamp.len > cached.offset
+                    && hash_file_prefix(path, cached.offset) == Some(cached.prefix_hash) =>
+            {
                 (Some(cached.summary.clone()), cached.offset)
             }
             _ => (None, 0),
@@ -255,11 +263,13 @@ impl CursorSessionSource {
         if summary.cwd.as_os_str().is_empty() {
             summary.cwd = decode_cursor_project_key(&transcript.project_key);
         }
+        let prefix_hash = hash_file_prefix(path, offset).unwrap_or(0);
         self.cache.insert(
             path.to_path_buf(),
             CacheEntry {
                 stamp,
                 offset,
+                prefix_hash,
                 summary: summary.clone(),
             },
         );
@@ -309,8 +319,8 @@ pub fn find_cursor_conversation_under(
         .map(|meta| meta.len())
         .unwrap_or(0);
     on_progress(0, total);
-    let mut summary =
-        parse_transcript(&transcript.path, &transcript, false).map_err(|error| error.to_string())?;
+    let mut summary = parse_transcript(&transcript.path, &transcript, false)
+        .map_err(|error| error.to_string())?;
     on_progress(total, total);
     if !include_tools {
         summary
@@ -597,7 +607,11 @@ fn parse_transcript_range(
     Ok((summary, offset))
 }
 
-fn apply_transcript_line(summary: &mut CursorTranscriptSummary, value: &Value, compact: bool) -> bool {
+fn apply_transcript_line(
+    summary: &mut CursorTranscriptSummary,
+    value: &Value,
+    compact: bool,
+) -> bool {
     if value.get("type").and_then(Value::as_str) == Some("turn_ended") {
         summary.lifecycle = CursorLifecycle::Idle;
         return true;
@@ -637,10 +651,7 @@ fn apply_transcript_line(summary: &mut CursorTranscriptSummary, value: &Value, c
                 if block.get("type").and_then(Value::as_str) != Some("tool_use") {
                     continue;
                 }
-                let name = block
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool");
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
                 let input = block.get("input").cloned().unwrap_or(Value::Null);
                 if name == "Task" && summary.agent_kind == AgentKind::Subagent {
                     if let Some(subagent_type) = input.get("subagent_type").and_then(Value::as_str)
@@ -751,6 +762,29 @@ fn looks_like_uuid(value: &str) -> bool {
         && bytes[23] == b'-'
 }
 
+/// Hash the first `len` bytes of `path`, or `None` if the file is shorter or
+/// unreadable. Used to distinguish a genuine append from a truncate-and-rewrite
+/// that happens to end up longer than the previously cached offset.
+fn hash_file_prefix(path: &Path, len: u64) -> Option<u64> {
+    if fs::metadata(path).ok()?.len() < len {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let mut hasher = DefaultHasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = buf.len().min(remaining as usize);
+        let read = file.read(&mut buf[..want]).ok()?;
+        if read == 0 {
+            return None;
+        }
+        hasher.write(&buf[..read]);
+        remaining -= read as u64;
+    }
+    Some(hasher.finish())
+}
+
 fn file_stamp(path: &Path) -> Result<FileStamp, SessionDetectorError> {
     let metadata = fs::metadata(path)?;
     let modified_nanos = metadata
@@ -799,7 +833,10 @@ struct ComposerOverlay {
     generating: bool,
 }
 
-fn apply_composer_overlay(summary: &mut CursorTranscriptSummary, overlay: Option<&ComposerOverlay>) {
+fn apply_composer_overlay(
+    summary: &mut CursorTranscriptSummary,
+    overlay: Option<&ComposerOverlay>,
+) {
     let Some(overlay) = overlay else {
         return;
     };
@@ -827,14 +864,17 @@ fn load_composer_map(vscdb_path: Option<&Path>) -> HashMap<String, ComposerOverl
     read_composer_overlays(path).unwrap_or_default()
 }
 
-fn read_composer_overlays(path: &Path) -> Result<HashMap<String, ComposerOverlay>, rusqlite::Error> {
+fn read_composer_overlays(
+    path: &Path,
+) -> Result<HashMap<String, ComposerOverlay>, rusqlite::Error> {
     let uri = format!("file:{}?mode=ro", path.display());
     let conn = rusqlite::Connection::open_with_flags(
         &uri,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
     let _ = conn.busy_timeout(Duration::from_millis(50));
-    let mut stmt = conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")?;
+    let mut stmt =
+        conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")?;
     let rows = stmt.query_map([], |row| {
         let key: String = row.get(0)?;
         let value: String = row.get(1)?;
@@ -994,7 +1034,10 @@ mod tests {
             &session_dir.join(format!("{PARENT}.jsonl")),
             &[
                 &user_line("parent prompt"),
-                &tool_line("Task", r#"{"subagent_type":"explore","description":"scan"}"#),
+                &tool_line(
+                    "Task",
+                    r#"{"subagent_type":"explore","description":"scan"}"#,
+                ),
                 r#"{"type":"turn_ended","status":"success"}"#,
             ],
         );
@@ -1082,8 +1125,8 @@ mod tests {
                 &assistant_line("done"),
             ],
         );
-        let with_tools = find_cursor_conversation_under(tmp.path(), PARENT, true, &mut |_, _| {})
-            .unwrap();
+        let with_tools =
+            find_cursor_conversation_under(tmp.path(), PARENT, true, &mut |_, _| {}).unwrap();
         let without_tools =
             find_cursor_conversation_under(tmp.path(), PARENT, false, &mut |_, _| {}).unwrap();
         assert!(with_tools
@@ -1161,8 +1204,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let mut source =
-            CursorSessionSource::at_root_with_vscdb(tmp.path().to_path_buf(), db_path);
+        let mut source = CursorSessionSource::at_root_with_vscdb(tmp.path().to_path_buf(), db_path);
         let (sessions, _) = source.detect().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(
@@ -1240,7 +1282,10 @@ mod tests {
             DetectionDiagnostics::default(),
         )
         .unwrap();
-        assert_eq!(enriched[0].status, crate::session::SessionStatus::Connecting);
+        assert_eq!(
+            enriched[0].status,
+            crate::session::SessionStatus::Connecting
+        );
     }
 
     #[test]
@@ -1263,7 +1308,10 @@ mod tests {
         assert_eq!(entries[0].session_id, PARENT);
         assert_eq!(entries[0].provider, "cursor");
         assert_eq!(entries[0].display, "root prompt");
-        assert!(entries[0].timestamp > 0, "history should sort by last write, not birth");
+        assert!(
+            entries[0].timestamp > 0,
+            "history should sort by last write, not birth"
+        );
     }
 
     #[test]
@@ -1280,7 +1328,10 @@ mod tests {
         );
         let parsed = source.parse_count;
         let _ = source.detect().unwrap();
-        assert_eq!(source.parse_count, parsed, "unchanged file must be a cache hit");
+        assert_eq!(
+            source.parse_count, parsed,
+            "unchanged file must be a cache hit"
+        );
 
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(file, r#"{{"type":"turn_ended","status":"success"}}"#).unwrap();
@@ -1319,7 +1370,10 @@ mod tests {
             DetectionDiagnostics::default(),
         )
         .unwrap();
-        assert_eq!(enriched[0].status, crate::session::SessionStatus::WaitingForInput);
+        assert_eq!(
+            enriched[0].status,
+            crate::session::SessionStatus::WaitingForInput
+        );
     }
 
     #[test]
@@ -1350,6 +1404,53 @@ mod tests {
     }
 
     #[test]
+    fn truncated_then_rewritten_longer_matches_full_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = layout(tmp.path(), "demo-project");
+        let path = session_dir.join(format!("{PARENT}.jsonl"));
+        write_jsonl(
+            &path,
+            &[&user_line("old prompt"), &assistant_line("old answer")],
+        );
+
+        let mut source = CursorSessionSource::at_root(tmp.path().to_path_buf());
+        let (first, _) = source.detect().unwrap();
+        assert_eq!(
+            first[0].cursor_summary.as_ref().unwrap().first_prompt(),
+            Some("old prompt")
+        );
+        let cached_offset = source.cache.get(&path).unwrap().offset;
+
+        // Truncate and rewrite with content that is LONGER than the cached offset.
+        write_jsonl(
+            &path,
+            &[
+                &user_line("fresh prompt"),
+                &assistant_line("fresh answer"),
+                r#"{"type":"turn_ended","status":"success"}"#,
+            ],
+        );
+        let new_len = fs::metadata(&path).unwrap().len();
+        assert!(new_len > cached_offset, "fixture must exceed cached offset");
+
+        let (second, _) = source.detect().unwrap();
+        let summary = second[0].cursor_summary.as_ref().unwrap();
+
+        // Ground truth: a fresh source doing a full parse of the same file.
+        let mut fresh = CursorSessionSource::at_root(tmp.path().to_path_buf());
+        let (expected_sessions, _) = fresh.detect().unwrap();
+        let expected = expected_sessions[0].cursor_summary.as_ref().unwrap();
+
+        assert_eq!(
+            summary.messages, expected.messages,
+            "no stale messages may survive a truncate+rewrite"
+        );
+        assert_eq!(summary.first_prompt(), Some("fresh prompt"));
+        assert_eq!(summary.lifecycle, expected.lifecycle);
+        assert_eq!(summary.lifecycle, CursorLifecycle::Idle);
+    }
+
+    #[test]
     fn parent_task_tool_does_not_become_root_agent_role() {
         let tmp = tempfile::tempdir().unwrap();
         let session_dir = layout(tmp.path(), "demo-project");
@@ -1357,7 +1458,10 @@ mod tests {
             &session_dir.join(format!("{PARENT}.jsonl")),
             &[
                 &user_line("parent prompt"),
-                &tool_line("Task", r#"{"subagent_type":"explore","description":"scan"}"#),
+                &tool_line(
+                    "Task",
+                    r#"{"subagent_type":"explore","description":"scan"}"#,
+                ),
                 r#"{"type":"turn_ended","status":"success"}"#,
             ],
         );
