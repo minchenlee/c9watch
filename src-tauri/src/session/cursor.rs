@@ -245,14 +245,15 @@ impl CursorSessionSource {
                 return Ok(cached.summary.clone());
             }
         }
-        let (existing, start_offset) = match self.cache.get(path) {
-            Some(cached)
-                if stamp.len > cached.offset
-                    && hash_file_prefix(path, cached.offset) == Some(cached.prefix_hash) =>
-            {
-                (Some(cached.summary.clone()), cached.offset)
+        let (existing, start_offset, resumed_hasher) = match self.cache.get(path) {
+            Some(cached) if stamp.len > cached.offset => {
+                let resumed = verify_prefix(path, cached.offset, cached.prefix_hash);
+                match resumed {
+                    Some(hasher) => (Some(cached.summary.clone()), cached.offset, Some(hasher)),
+                    None => (None, 0, None),
+                }
             }
-            _ => (None, 0),
+            _ => (None, 0, None),
         };
         #[cfg(test)]
         {
@@ -263,7 +264,14 @@ impl CursorSessionSource {
         if summary.cwd.as_os_str().is_empty() {
             summary.cwd = decode_cursor_project_key(&transcript.project_key);
         }
-        let prefix_hash = hash_file_prefix(path, offset).unwrap_or(0);
+        let prefix_hash = if let Some(mut hasher) = resumed_hasher {
+            // Extend the verified prefix hash over the appended bytes instead
+            // of re-hashing the whole range.
+            feed_suffix(path, start_offset, offset, &mut hasher);
+            hasher.finish()
+        } else {
+            hash_file_prefix(path, offset).unwrap_or(0)
+        };
         self.cache.insert(
             path.to_path_buf(),
             CacheEntry {
@@ -762,15 +770,13 @@ fn looks_like_uuid(value: &str) -> bool {
         && bytes[23] == b'-'
 }
 
-/// Hash the first `len` bytes of `path`, or `None` if the file is shorter or
-/// unreadable. Used to distinguish a genuine append from a truncate-and-rewrite
-/// that happens to end up longer than the previously cached offset.
-fn hash_file_prefix(path: &Path, len: u64) -> Option<u64> {
+/// Feed exactly `len` bytes of `path` into `hasher`. Returns `None` if the
+/// file is shorter than `len`, unreadable, or ends prematurely.
+fn feed_prefix(path: &Path, len: u64, hasher: &mut DefaultHasher) -> Option<()> {
+    let mut file = File::open(path).ok()?;
     if fs::metadata(path).ok()?.len() < len {
         return None;
     }
-    let mut file = File::open(path).ok()?;
-    let mut hasher = DefaultHasher::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut remaining = len;
     while remaining > 0 {
@@ -782,7 +788,51 @@ fn hash_file_prefix(path: &Path, len: u64) -> Option<u64> {
         hasher.write(&buf[..read]);
         remaining -= read as u64;
     }
+    Some(())
+}
+
+/// Verify that the first `len` bytes of `path` hash to `expected_hash`.
+/// On success returns the hasher positioned after `len` bytes so callers can
+/// cheaply extend the hash over an appended suffix without re-reading.
+fn verify_prefix(path: &Path, len: u64, expected_hash: u64) -> Option<DefaultHasher> {
+    let mut hasher = DefaultHasher::new();
+    feed_prefix(path, len, &mut hasher)?;
+    (hasher.finish() == expected_hash).then_some(hasher)
+}
+
+/// Hash the first `len` bytes of `path`, or `None` if the file is shorter or
+/// unreadable. Used to distinguish a genuine append from a truncate-and-rewrite
+/// that happens to end up longer than the previously cached offset.
+fn hash_file_prefix(path: &Path, len: u64) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    feed_prefix(path, len, &mut hasher)?;
     Some(hasher.finish())
+}
+
+/// Feed the bytes of `path` in `[start, end)` into `hasher`, ignoring errors:
+/// a torn read just yields a weaker cache key, never a wrong summary.
+fn feed_suffix(path: &Path, start: u64, end: u64, hasher: &mut DefaultHasher) {
+    if end <= start {
+        return;
+    }
+    let Ok(mut file) = File::open(path) else {
+        return;
+    };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return;
+    }
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut remaining = end - start;
+    while remaining > 0 {
+        let want = buf.len().min(remaining as usize);
+        match file.read(&mut buf[..want]) {
+            Ok(0) | Err(_) => return,
+            Ok(read) => {
+                hasher.write(&buf[..read]);
+                remaining -= read as u64;
+            }
+        }
+    }
 }
 
 fn file_stamp(path: &Path) -> Result<FileStamp, SessionDetectorError> {
@@ -1448,6 +1498,52 @@ mod tests {
         assert_eq!(summary.first_prompt(), Some("fresh prompt"));
         assert_eq!(summary.lifecycle, expected.lifecycle);
         assert_eq!(summary.lifecycle, CursorLifecycle::Idle);
+    }
+
+    #[test]
+    fn partial_line_is_ignored_until_fully_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = layout(tmp.path(), "demo-project");
+        let path = session_dir.join(format!("{PARENT}.jsonl"));
+        write_jsonl(&path, &[&user_line("hello")]);
+
+        let mut source = CursorSessionSource::at_root(tmp.path().to_path_buf());
+        let (first, _) = source.detect().unwrap();
+        assert_eq!(first[0].cursor_summary.as_ref().unwrap().messages.len(), 1);
+
+        // A torn write: bytes beyond the last complete line must not advance
+        // the cached offset nor produce a message.
+        let partial = assistant_line("half written");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(partial[..partial.len() / 2].as_bytes())
+            .unwrap();
+
+        let (torn, _) = source.detect().unwrap();
+        assert_eq!(torn[0].cursor_summary.as_ref().unwrap().messages.len(), 1);
+
+        let (second, _) = source.detect().unwrap();
+        assert_eq!(second[0].cursor_summary.as_ref().unwrap().messages.len(), 1);
+
+        // Complete the line; it must appear exactly once.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(partial[partial.len() / 2..].as_bytes())
+            .unwrap();
+        writeln!(file).unwrap();
+        drop(file);
+
+        let (third, _) = source.detect().unwrap();
+        let messages = &third[0].cursor_summary.as_ref().unwrap().messages;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.content == "half written")
+                .count(),
+            1
+        );
     }
 
     #[test]
