@@ -2,6 +2,7 @@
 	import { tasksBySession } from '$lib/stores/tasks';
 	import { flyInX } from '$lib/transitions';
 	import type { Session, Task } from '$lib/types';
+	import { providerOf, providerSessionKey } from '$lib/provider';
 
 	interface Props {
 		session: Session;
@@ -13,7 +14,7 @@
 
 	let { session, collapsed = false, onToggle, transitionIndex = 0 }: Props = $props();
 
-	let tasks = $derived($tasksBySession.get(session.id) ?? []);
+	let tasks = $derived(providerOf(session) === 'claudeCode' ? ($tasksBySession.get(providerSessionKey('claudeCode', session.id)) ?? []) : []);
 	let total = $derived(tasks.length);
 	let completed = $derived(tasks.filter((t) => t.status === 'completed').length);
 

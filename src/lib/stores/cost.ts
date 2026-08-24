@@ -9,6 +9,7 @@ import { browser } from '$app/environment';
 import { getCostData } from '../api';
 import type { CostData, SessionCostRecord } from '../types';
 import { buildSessionCostMap, type CostMode } from '../cost-utils';
+import { providerSessionKey } from '../provider';
 
 const COST_MODE_KEY = 'c9watch.costMode';
 
@@ -51,6 +52,6 @@ export async function refreshCostData(): Promise<void> {
 }
 
 /** Convenience: snapshot the cost record for one session. */
-export function getSessionCost(sessionId: string): SessionCostRecord | undefined {
-	return get(sessionCostMap).get(sessionId);
+export function getSessionCost(sessionId: string, provider?: SessionCostRecord['provider']): SessionCostRecord | undefined {
+	return get(sessionCostMap).get(providerSessionKey(provider, sessionId));
 }

@@ -1,3 +1,4 @@
+use super::cache::FileVersion;
 use chrono::{DateTime, Local};
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -6,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use super::parser::MessageType;
 use super::source::{
@@ -101,12 +102,7 @@ impl CodexRolloutSummary {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
-    len: u64,
-    modified_nanos: u128,
-    identity: u64,
-}
+type FileStamp = FileVersion;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct FileSignature {
@@ -142,7 +138,7 @@ impl CodexSessionSource {
         Ok(Self::at_root(home.join(".codex").join("sessions")))
     }
 
-    fn at_root(sessions_root: PathBuf) -> Self {
+    pub(crate) fn at_root(sessions_root: PathBuf) -> Self {
         Self {
             sessions_root,
             cache: HashMap::new(),
@@ -154,6 +150,17 @@ impl CodexSessionSource {
             #[cfg(test)]
             reset_count: 0,
         }
+    }
+
+    pub(crate) fn contains_session_id(&self, session_id: &str) -> bool {
+        collect_rollout_paths(&self.sessions_root)
+            .iter()
+            .any(|path| thread_id_from_rollout_filename(path).as_deref() == Some(session_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parse_count_for_test(&self) -> usize {
+        self.parse_count
     }
 
     fn conversation_at_root(sessions_root: PathBuf) -> Self {
@@ -227,20 +234,34 @@ impl CodexSessionSource {
     }
 
     fn summary_for(&mut self, path: &Path) -> Result<CodexRolloutSummary, std::io::Error> {
-        let metadata = fs::metadata(path)?;
-        let modified_nanos = metadata
-            .modified()?
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let stamp = FileStamp {
-            len: metadata.len(),
-            modified_nanos,
-            identity: file_identity(&metadata),
-        };
+        const MAX_READ_ATTEMPTS: usize = 3;
 
+        for _ in 0..MAX_READ_ATTEMPTS {
+            let stamp = file_stamp(path)?;
+            let summary = self.summary_for_once(path, stamp)?;
+            let after = file_stamp(path)?;
+            if stamp == after {
+                return Ok(summary);
+            }
+            // The writer changed the file while it was being parsed. Do not
+            // expose a mixed summary; discard the entry and retry from a
+            // stable boundary.
+            self.cache.remove(path);
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("Codex rollout changed while reading: {}", path.display()),
+        ))
+    }
+
+    fn summary_for_once(
+        &mut self,
+        path: &Path,
+        stamp: FileStamp,
+    ) -> Result<CodexRolloutSummary, std::io::Error> {
         if let Some(entry) = self.cache.get(path) {
-            if entry.stamp == stamp {
+            if entry.stamp == stamp && stamp.supports_unchanged_fast_path() {
                 return Ok(entry.summary.clone());
             }
         }
@@ -251,7 +272,11 @@ impl CodexSessionSource {
             Some(entry) => {
                 let structurally_replaced = stamp.identity != entry.stamp.identity
                     || stamp.len < entry.offset
-                    || stamp.len < entry.stamp.len;
+                    || stamp.len < entry.stamp.len
+                    // A same-length rewrite is never an append. Reparse it
+                    // even when bounded samples happen to match.
+                    || stamp.len <= entry.stamp.len
+                    || !stamp.supports_unchanged_fast_path();
                 if structurally_replaced {
                     true
                 } else {
@@ -924,6 +949,10 @@ fn thread_id_from_rollout_filename(path: &Path) -> Option<String> {
         .map(|id| id.to_string())
 }
 
+fn file_stamp(path: &Path) -> io::Result<FileStamp> {
+    FileVersion::read(path)
+}
+
 #[cfg(unix)]
 fn file_identity(metadata: &fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
@@ -1498,6 +1527,49 @@ mod tests {
         assert_eq!(summary.messages.len(), 1);
         assert_eq!(summary.latest_message(), Some("recovered"));
         assert_eq!(summary.last_timestamp, "2026-07-13T00:00:04Z");
+    }
+
+    #[test]
+    fn same_length_rewrite_with_preserved_mtime_is_not_a_cache_hit() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("rollout-same-length.jsonl");
+        let meta = event(
+            "2026-07-13T00:00:00Z",
+            "session_meta",
+            serde_json::json!({
+                "id":"same-length", "cwd":"/tmp/project", "source":"cli",
+                "originator":"codex-tui"
+            }),
+        );
+        let old = event(
+            "2026-07-13T00:00:01Z",
+            "event_msg",
+            serde_json::json!({"type":"user_message","message":"old prompt"}),
+        );
+        let fresh = event(
+            "2026-07-13T00:00:01Z",
+            "event_msg",
+            serde_json::json!({"type":"user_message","message":"new prompt"}),
+        );
+        assert_eq!(old.len(), fresh.len());
+        write_lines(&path, &[meta.clone(), old], true);
+        let original_modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        assert_eq!(
+            source.summary_for(&path).unwrap().first_prompt(),
+            Some("old prompt")
+        );
+
+        write_lines(&path, &[meta, fresh], true);
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(original_modified).unwrap();
+        drop(file);
+
+        assert_eq!(
+            source.summary_for(&path).unwrap().first_prompt(),
+            Some("new prompt")
+        );
     }
 
     #[test]

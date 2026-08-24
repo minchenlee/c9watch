@@ -34,6 +34,9 @@ export interface Session {
   /** Session UUID */
   id: string;
 
+  /** Provider-scoped identity; falls back to provider + id for old payloads. */
+  sessionKey?: string;
+
   /** Process ID of the running Claude instance */
   pid: number;
 
@@ -135,6 +138,8 @@ export interface Message {
 export interface Conversation {
   /** Session ID this conversation belongs to */
   sessionId: string;
+  /** Provider namespace used to verify the response identity. */
+  provider?: SessionProvider;
 
   /** Array of messages in chronological order */
   messages: Message[];
@@ -146,6 +151,8 @@ export interface Conversation {
  */
 export interface DeepSearchHit {
   sessionId: string;
+  provider?: SessionProvider;
+  surface?: SessionSurface;
   /** ~200-char snippet from the first matching message line, with '…' padding if truncated. */
   snippet: string;
 }
@@ -156,6 +163,9 @@ export interface DeepSearchHit {
 export interface HistoryEntry {
   /** Session UUID */
   sessionId: string;
+
+  /** Provider-scoped identity for UI maps; old payloads can derive it. */
+  sessionKey?: string;
 
   /** The user's prompt text as displayed in Claude Code. May be an empty string. */
   display: string;

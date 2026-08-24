@@ -1,3 +1,4 @@
+use crate::session::SessionProvider;
 use crate::session::{extract_messages, parse_all_entries, ImageBlock, MessageType};
 use serde::Serialize;
 
@@ -6,6 +7,7 @@ use serde::Serialize;
 #[serde(rename_all = "camelCase")]
 pub struct Conversation {
     pub session_id: String,
+    pub provider: SessionProvider,
     pub messages: Vec<ConversationMessage>,
 }
 
@@ -21,9 +23,7 @@ pub struct ConversationMessage {
     pub images: Vec<ImageBlock>,
 }
 
-/// Get conversation data for a session by ID.
-/// Searches all project directories under ~/.claude/projects/ for the session file.
-pub fn get_conversation_data(session_id: &str) -> Result<Conversation, String> {
+fn claude_conversation(session_id: &str) -> Result<Conversation, String> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
     let claude_projects_dir = home_dir.join(".claude").join("projects");
 
@@ -57,48 +57,145 @@ pub fn get_conversation_data(session_id: &str) -> Result<Conversation, String> {
 
                 return Ok(Conversation {
                     session_id: session_id.to_string(),
+                    provider: SessionProvider::ClaudeCode,
                     messages: conversation_messages,
                 });
             }
         }
     }
 
-    if let Ok(messages) = crate::session::codex::find_codex_conversation(session_id) {
-        return Ok(Conversation {
-            session_id: session_id.to_string(),
-            messages: messages
-                .into_iter()
-                .map(|message| ConversationMessage {
-                    timestamp: message.timestamp,
-                    message_type: message.message_type,
-                    content: message.content,
-                    images: Vec::new(),
-                })
-                .collect(),
-        });
-    }
+    Err(format!(
+        "Claude Code session {} not found in any project directory",
+        session_id
+    ))
+}
 
-    if let Ok(messages) = crate::session::cursor::find_cursor_conversation_with_progress(
+fn codex_conversation(session_id: &str) -> Result<Conversation, String> {
+    let messages = crate::session::codex::find_codex_conversation(session_id)?;
+    Ok(Conversation {
+        session_id: session_id.to_string(),
+        provider: SessionProvider::Codex,
+        messages: messages
+            .into_iter()
+            .map(|message| ConversationMessage {
+                timestamp: message.timestamp,
+                message_type: message.message_type,
+                content: message.content,
+                images: Vec::new(),
+            })
+            .collect(),
+    })
+}
+
+fn cursor_conversation(session_id: &str) -> Result<Conversation, String> {
+    let messages = crate::session::cursor::find_cursor_conversation_with_progress(
         session_id,
         true,
         &mut |_, _| {},
-    ) {
-        return Ok(Conversation {
-            session_id: session_id.to_string(),
-            messages: messages
-                .into_iter()
-                .map(|message| ConversationMessage {
-                    timestamp: message.timestamp,
-                    message_type: message.message_type,
-                    content: message.content,
-                    images: Vec::new(),
-                })
-                .collect(),
-        });
+    )?;
+    Ok(Conversation {
+        session_id: session_id.to_string(),
+        provider: SessionProvider::Cursor,
+        messages: messages
+            .into_iter()
+            .map(|message| ConversationMessage {
+                timestamp: message.timestamp,
+                message_type: message.message_type,
+                content: message.content,
+                images: Vec::new(),
+            })
+            .collect(),
+    })
+}
+
+fn select_provider_conversation(
+    session_id: &str,
+    mut matches: Vec<(SessionProvider, Conversation)>,
+) -> Result<Conversation, String> {
+    match matches.len() {
+        0 => Err(format!("Session {} not found in any provider", session_id)),
+        1 => Ok(matches.pop().unwrap().1),
+        _ => Err(format!(
+            "Session {} is ambiguous across providers; pass provider explicitly",
+            session_id
+        )),
+    }
+}
+
+/// Get conversation data by provider-scoped identity when available.
+///
+/// The provider argument is optional for backward compatibility with older
+/// clients. New clients should pass it so an opaque ID cannot select a
+/// transcript from the wrong provider namespace.
+pub fn get_conversation_data_for_provider(
+    session_id: &str,
+    provider: Option<SessionProvider>,
+) -> Result<Conversation, String> {
+    if let Some(provider) = provider {
+        return match provider {
+            SessionProvider::ClaudeCode => claude_conversation(session_id),
+            SessionProvider::Codex => codex_conversation(session_id),
+            SessionProvider::Cursor => cursor_conversation(session_id),
+        };
     }
 
-    Err(format!(
-        "Session {} not found in any project directory",
-        session_id
-    ))
+    let mut matches = Vec::new();
+    for (provider, loader) in [
+        (
+            SessionProvider::ClaudeCode,
+            claude_conversation as fn(&str) -> Result<Conversation, String>,
+        ),
+        (SessionProvider::Codex, codex_conversation),
+        (SessionProvider::Cursor, cursor_conversation),
+    ] {
+        if let Ok(conversation) = loader(session_id) {
+            matches.push((provider, conversation));
+        }
+    }
+
+    select_provider_conversation(session_id, matches)
+}
+
+/// Backward-compatible ID-only lookup for CLI callers and old clients.
+pub fn get_conversation_data(session_id: &str) -> Result<Conversation, String> {
+    get_conversation_data_for_provider(session_id, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conversation(session_id: &str) -> Conversation {
+        Conversation {
+            session_id: session_id.to_string(),
+            provider: SessionProvider::ClaudeCode,
+            messages: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn providerless_conversation_lookup_rejects_cross_provider_collision() {
+        let error = select_provider_conversation(
+            "same-id",
+            vec![
+                (SessionProvider::ClaudeCode, conversation("same-id")),
+                (SessionProvider::Codex, conversation("same-id")),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error.contains("ambiguous across providers"));
+        assert!(error.contains("pass provider explicitly"));
+    }
+
+    #[test]
+    fn providerless_conversation_lookup_accepts_one_provider() {
+        let result = select_provider_conversation(
+            "only-id",
+            vec![(SessionProvider::Cursor, conversation("only-id"))],
+        )
+        .unwrap();
+
+        assert_eq!(result.session_id, "only-id");
+    }
 }

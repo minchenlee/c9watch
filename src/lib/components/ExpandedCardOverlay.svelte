@@ -52,7 +52,7 @@
 	import { getSessionStatusColor, getSessionStatusLabel, getSubagentStatusColor, getSubagentStatusLabel, getWorkerStatusColor, getWorkerStatusLabel } from '$lib/status-utils';
 	import { isTauri } from '$lib/ws';
 	import ProviderBadge from './ProviderBadge.svelte';
-	import { canSessionAction, providerOf } from '$lib/provider';
+	import { canSessionAction, providerOf, providerSessionKey, sessionKeyOf } from '$lib/provider';
 
 	interface Props {
 		session: Session;
@@ -161,7 +161,7 @@
 		}
 	});
 
-	let costRecord = $derived($sessionCostMap.get(session.id));
+	let costRecord = $derived($sessionCostMap.get(sessionKeyOf(session)));
 	let primaryCostLabel = $derived(
 		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, isCostAvailable(costRecord)) : null
 	);
@@ -172,11 +172,12 @@
 
 	// resolvedWorkers works for both PM (views own workers) and a worker
 	// (views siblings under the same PM). Highlights the current session in the list.
-	// When the session is a PM, workerOf is null, so we fall back to session.id
+	// When the session is a PM, workerOf is null, so we fall back to its
+	// provider-scoped key
 	// and resolvedWorkers IS myWorkers; the PM badge shows when length > 0 and
 	// workerOf is null (i.e. this session is itself the PM).
 	let resolvedWorkers = $derived(
-		$workersByPm.get(session.workerOf ?? session.id) ?? []
+		$workersByPm.get(session.workerOf ? providerSessionKey('claudeCode', session.workerOf) : sessionKeyOf(session)) ?? []
 	);
 	let isPm = $derived(
 		PM_ORCHESTRATION_ENABLED && !session.workerOf && resolvedWorkers.length > 0
@@ -185,9 +186,15 @@
 		PM_ORCHESTRATION_ENABLED && resolvedWorkers.length > 0
 	);
 
+	function subagentKey(subagent: SubagentInfo): string {
+		return providerSessionKey(subagent.provider, subagent.id);
+	}
+
 	let mySubagents = $derived([
-		...($visibleSubagentsBySession.get(session.id) ?? []),
-		...($codexSubagentsByParent.get(session.id) ?? []).map((child): SubagentInfo => ({
+		// The Claude subagent endpoint is Claude-only and still keys its response
+		// by the raw Claude session ID. Never consult it for another provider.
+		...(providerOf(session) === 'claudeCode' ? ($visibleSubagentsBySession.get(providerSessionKey('claudeCode', session.id)) ?? []) : []),
+		...($codexSubagentsByParent.get(sessionKeyOf(session)) ?? []).map((child): SubagentInfo => ({
 			id: child.id,
 			sessionId: child.id,
 			provider: providerOf(child),
@@ -200,19 +207,19 @@
 		}))
 	]);
 	let hasSubagents = $derived(mySubagents.length > 0);
-	let visibleCodexParentId = $derived($codexVisibleParentByChild.get(session.id) ?? null);
+	let visibleCodexParentId = $derived($codexVisibleParentByChild.get(sessionKeyOf(session)) ?? null);
 	let subagentsCollapsed = $state(false);
 
 	// Subagent preview: when set, the conversation area renders a synthesized
 	// transcript (prompt + result) for the clicked subagent instead of the
 	// parent session's messages.
 	//
-	// State is keyed by parent session id in a module-level Svelte rune map so
+	// State is keyed by the parent provider-scoped key in a module-level Svelte rune map so
 	// that re-renders triggered by store updates (new JSONL events arriving)
 	// do NOT reset the preview. Switching sessions naturally shows a fresh
 	// (empty) preview because the key changes.
 	let previewState = $derived(
-		previewStateBySession.get(session.id) ?? {
+		previewStateBySession.get(sessionKeyOf(session)) ?? {
 			selection: null,
 			transcript: null,
 			loading: false,
@@ -226,10 +233,11 @@
 
 	async function openSubagentPreview(sa: SubagentInfo) {
 		if ((sa.provider === 'codex' || sa.provider === 'cursor') && sa.sessionId) {
-			expandedSessionId.set(sa.sessionId);
+			expandedSessionId.set(providerSessionKey(sa.provider, sa.sessionId));
 			return;
 		}
-		const sid = session.id;
+		const sid = sessionKeyOf(session);
+		const rawParentSessionId = session.id;
 		const initialState: PreviewState = {
 			selection: sa,
 			transcript: null,
@@ -249,13 +257,13 @@
 
 		try {
 			const tr = await invoke<SubagentTranscript>('get_subagent_transcript', {
-				parentSessionId: sid,
+				parentSessionId: rawParentSessionId,
 				subagentId: sa.id,
 			});
 			// Guard: user may have switched to a different selection before
 			// this resolved. Only commit if the selection is still this one.
 			const current = previewStateBySession.get(sid);
-			if (current?.selection?.id === sa.id) {
+			if (current?.selection && subagentKey(current.selection) === subagentKey(sa)) {
 				previewStateBySession.set(sid, {
 					...current,
 					transcript: tr,
@@ -263,7 +271,7 @@
 			}
 		} catch (err) {
 			const current = previewStateBySession.get(sid);
-			if (current?.selection?.id === sa.id) {
+			if (current?.selection && subagentKey(current.selection) === subagentKey(sa)) {
 				previewStateBySession.set(sid, {
 					...current,
 					error: String(err),
@@ -271,7 +279,7 @@
 			}
 		} finally {
 			const current = previewStateBySession.get(sid);
-			if (current?.selection?.id === sa.id) {
+			if (current?.selection && subagentKey(current.selection) === subagentKey(sa)) {
 				previewStateBySession.set(sid, {
 					...current,
 					loading: false,
@@ -281,12 +289,12 @@
 	}
 
 	function closeSubagentPreview() {
-		const sid = session.id;
+		const sid = sessionKeyOf(session);
 		previewStateBySession.delete(sid);
 	}
 
-	function openWorker(id: string) {
-		expandedSessionId.set(id);
+	function openWorker(worker: Session) {
+		expandedSessionId.set(sessionKeyOf(worker));
 	}
 
 
@@ -617,15 +625,15 @@
 					</button>
 					{#if !workersCollapsed}
 						{#if session.workerOf}
-							<button class="back-to-pm" onclick={() => expandedSessionId.set(session.workerOf!)}>← Back to PM</button>
+							<button class="back-to-pm" onclick={() => expandedSessionId.set(providerSessionKey('claudeCode', session.workerOf!))}>← Back to PM</button>
 						{/if}
 						<div class="workers-list">
-							{#each resolvedWorkers as w (w.id)}
+							{#each resolvedWorkers as w (sessionKeyOf(w))}
 								<button
 									type="button"
 									class="worker-row"
-									class:active={w.id === session.id}
-									onclick={() => openWorker(w.id)}
+									class:active={sessionKeyOf(w) === sessionKeyOf(session)}
+									onclick={() => openWorker(w)}
 								>
 									<span class="worker-name">{w.customTitle || w.summary || w.sessionName}</span>
 									<span class="worker-status" style="color: {getWorkerStatusColor(w.status)}">
@@ -657,11 +665,11 @@
 							<button class="back-to-pm" onclick={closeSubagentPreview}>← Back to conversation</button>
 						{/if}
 						<div class="subagents-list">
-							{#each mySubagents as sa (sa.id)}
+							{#each mySubagents as sa (subagentKey(sa))}
 								<button
 									type="button"
 									class="subagent-row"
-									class:active={previewedSubagent?.id === sa.id}
+									class:active={previewedSubagent ? subagentKey(previewedSubagent) === subagentKey(sa) : false}
 									onclick={() => openSubagentPreview(sa)}
 									title={sa.description || sa.agentType}
 								>

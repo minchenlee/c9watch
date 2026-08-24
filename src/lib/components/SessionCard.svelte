@@ -7,7 +7,7 @@
 	import { isCostAvailable } from '$lib/cost-semantics';
 	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 	import ProviderBadge from './ProviderBadge.svelte';
-	import { canSessionAction } from '$lib/provider';
+	import { canSessionAction, sessionKeyOf } from '$lib/provider';
 
 	interface Props {
 		session: Session;
@@ -56,10 +56,10 @@
 	let workerTip = $derived(session.workerOf ? `Worker of ${session.workerOf}` : '');
 	let workerIdShort = $derived(session.workerOf?.slice(0, 8) ?? '');
 
-	let myWorkers = $derived($workersByPm.get(session.id) ?? []);
+	let myWorkers = $derived($workersByPm.get(sessionKeyOf(session)) ?? []);
 	let isPm = $derived(myWorkers.length > 0);
 
-	let costRecord = $derived($sessionCostMap.get(session.id));
+	let costRecord = $derived($sessionCostMap.get(sessionKeyOf(session)));
 	let costLabel = $derived(
 		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, isCostAvailable(costRecord)) : null
 	);

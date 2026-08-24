@@ -1,3 +1,4 @@
+use super::cache::FileVersion;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -5,14 +6,16 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::UNIX_EPOCH;
 
-const CACHE_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 5;
 const MAX_DISPLAY_CHARS: usize = 400;
 const MAX_INDEXED_MESSAGES: usize = 20_000;
 const MAX_INDEXED_MESSAGE_CHARS: usize = 16_384;
 const MAX_INDEXED_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const FILE_ANCHOR_BYTES: usize = 256;
+const MAX_REFRESH_ATTEMPTS: usize = 3;
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
@@ -153,6 +156,8 @@ pub(crate) struct FileFingerprint {
     pub size: u64,
     pub modified_ns: u64,
     #[serde(default)]
+    pub changed_ns: u64,
+    #[serde(default)]
     pub identity: u64,
 }
 
@@ -171,6 +176,10 @@ struct CachedRollout {
     indexed_message_bytes: usize,
     #[serde(default)]
     anchor: Vec<u8>,
+    /// Stable hash of every byte in `[0, offset)`. The anchor is only a cheap
+    /// early rejection; this hash is the correctness check for growing files.
+    #[serde(default)]
+    prefix_hash: u64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -183,29 +192,13 @@ struct ArchiveCache {
 static ARCHIVE_CACHE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn fingerprint(path: &Path) -> Option<FileFingerprint> {
-    let metadata = path.metadata().ok()?;
-    let modified_ns = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
-        .unwrap_or(0);
+    let version = FileVersion::read(path).ok()?;
     Some(FileFingerprint {
-        size: metadata.len(),
-        modified_ns,
-        identity: file_identity(&metadata),
+        size: version.len,
+        modified_ns: version.modified_nanos.min(u64::MAX as u128) as u64,
+        changed_ns: version.changed_nanos.min(u64::MAX as u128) as u64,
+        identity: version.identity,
     })
-}
-
-#[cfg(unix)]
-fn file_identity(metadata: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.ino()
-}
-
-#[cfg(not(unix))]
-fn file_identity(_metadata: &std::fs::Metadata) -> u64 {
-    0
 }
 
 pub(crate) fn default_sessions_root(home: &Path) -> PathBuf {
@@ -350,23 +343,78 @@ fn empty_cached(path: &Path, fingerprint: FileFingerprint) -> CachedRollout {
         current_model: "unknown".to_string(),
         indexed_message_bytes: 0,
         anchor: Vec::new(),
+        prefix_hash: FNV_OFFSET_BASIS,
     }
 }
 
+fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn hash_file_prefix(path: &Path, length: u64) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    let mut remaining = length;
+    let mut hash = FNV_OFFSET_BASIS;
+    let mut buffer = [0; 8192];
+    while remaining > 0 {
+        let limit = remaining.min(buffer.len() as u64) as usize;
+        let read = file.read(&mut buffer[..limit]).ok()?;
+        if read == 0 {
+            return None;
+        }
+        hash = hash_bytes(hash, &buffer[..read]);
+        remaining -= read as u64;
+    }
+    Some(hash)
+}
+
+fn has_strong_fingerprint(fingerprint: FileFingerprint) -> bool {
+    super::cache::has_strong_file_stamp(u128::from(fingerprint.changed_ns), fingerprint.identity)
+}
+
 fn refresh_rollout(
+    path: &Path,
+    initial_fingerprint: FileFingerprint,
+    previous: Option<CachedRollout>,
+) -> Option<CachedRollout> {
+    let mut expected = initial_fingerprint;
+    for _ in 0..MAX_REFRESH_ATTEMPTS {
+        let cached = refresh_rollout_once(path, expected, previous.clone())?;
+        let observed = fingerprint(path)?;
+        if observed == expected {
+            return Some(cached);
+        }
+        expected = observed;
+    }
+    None
+}
+
+fn refresh_rollout_once(
     path: &Path,
     fingerprint: FileFingerprint,
     previous: Option<CachedRollout>,
 ) -> Option<CachedRollout> {
     let mut file = File::open(path).ok()?;
     let mut reset = previous.as_ref().map_or(true, |cached| {
-        fingerprint.identity != cached.fingerprint.identity
+        !has_strong_fingerprint(fingerprint)
+            || !has_strong_fingerprint(cached.fingerprint)
+            || cached.prefix_hash == 0
+            || fingerprint.identity != cached.fingerprint.identity
             || fingerprint.size < cached.offset
             || (fingerprint.size == cached.fingerprint.size
-                && fingerprint.modified_ns != cached.fingerprint.modified_ns)
+                && (fingerprint.modified_ns != cached.fingerprint.modified_ns
+                    || fingerprint.changed_ns != cached.fingerprint.changed_ns))
     });
     if !reset {
         let cached = previous.as_ref()?;
+        // The fixed-size anchor is useful for a cheap early rejection, but it
+        // cannot detect a rewrite before the last 256 bytes. Verify the whole
+        // cached prefix before appending so a middle rewrite cannot leave stale
+        // messages or token totals in the archive cache.
         if !cached.anchor.is_empty() {
             let anchor_start = cached.offset.saturating_sub(cached.anchor.len() as u64);
             file.seek(SeekFrom::Start(anchor_start)).ok()?;
@@ -374,6 +422,14 @@ fn refresh_rollout(
             if file.read_exact(&mut current).is_err() || current != cached.anchor {
                 reset = true;
             }
+        }
+        if !reset
+            && match hash_file_prefix(path, cached.offset) {
+                Some(hash) => hash != cached.prefix_hash,
+                None => true,
+            }
+        {
+            reset = true;
         }
     }
     let mut cached = if reset {
@@ -385,6 +441,7 @@ fn refresh_rollout(
     let mut appended = Vec::new();
     file.read_to_end(&mut appended).ok()?;
     cached.offset += appended.len() as u64;
+    cached.prefix_hash = hash_bytes(cached.prefix_hash, &appended);
     cached.pending.extend_from_slice(&appended);
 
     let complete_len = cached
@@ -626,11 +683,11 @@ pub(crate) fn load_snapshots(root: &Path, cache_path: &Path) -> Vec<CodexRollout
             continue;
         };
         let key = path.to_string_lossy().to_string();
-        if cache
-            .files
-            .get(&key)
-            .is_some_and(|entry| entry.fingerprint == fingerprint)
-        {
+        if cache.files.get(&key).is_some_and(|entry| {
+            entry.fingerprint == fingerprint
+                && entry.prefix_hash != 0
+                && has_strong_fingerprint(fingerprint)
+        }) {
             continue;
         }
         let previous = cache.files.remove(&key);
@@ -1149,5 +1206,85 @@ mod tests {
         let truncated = load_snapshots(&root, &cache_path);
         assert_eq!(truncated[0].display, "replacement");
         assert_eq!(truncated[0].messages.len(), 1);
+    }
+
+    #[test]
+    fn archive_cache_invalidates_same_length_rewrite_with_preserved_mtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("same-length.jsonl");
+        let old_prompt = "old prompt";
+        let new_prompt = "new prompt";
+        let session = r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"same-length","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#;
+        let old_message = format!(
+            r#"{{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{{"type":"user_message","message":"{old_prompt}"}}}}"#
+        );
+        let new_message = format!(
+            r#"{{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{{"type":"user_message","message":"{new_prompt}"}}}}"#
+        );
+        assert_eq!(old_message.len(), new_message.len());
+        std::fs::write(&path, format!("{session}\n{old_message}")).unwrap();
+        let original_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let cache_path = directory.path().join("cache.json");
+        assert_eq!(load_snapshots(&root, &cache_path)[0].display, old_prompt);
+
+        std::fs::write(&path, format!("{session}\n{new_message}")).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(original_modified)
+            .unwrap();
+        let refreshed = load_snapshots(&root, &cache_path);
+        assert_eq!(refreshed[0].display, new_prompt);
+    }
+
+    #[test]
+    fn archive_cache_detects_middle_rewrite_before_anchor_on_append() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("middle-rewrite.jsonl");
+        let old_prompt = format!("old prompt {}", "a".repeat(96));
+        let new_prompt = format!("new prompt {}", "b".repeat(96));
+        assert_eq!(old_prompt.len(), new_prompt.len());
+        let session = r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"middle-rewrite","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#;
+        let old_message = format!(
+            r#"{{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{{"type":"user_message","message":"{old_prompt}"}}}}"#
+        );
+        let stable_tail = format!(
+            r#"{{"timestamp":"2026-07-13T01:02:00Z","type":"event_msg","payload":{{"type":"agent_message","message":"{}"}}}}"#,
+            "stable tail ".repeat(48)
+        );
+        assert!(stable_tail.len() > FILE_ANCHOR_BYTES);
+        std::fs::write(&path, format!("{session}\n{old_message}\n{stable_tail}")).unwrap();
+        let cache_path = directory.path().join("cache.json");
+        assert_eq!(load_snapshots(&root, &cache_path)[0].display, old_prompt);
+
+        let new_message = format!(
+            r#"{{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{{"type":"user_message","message":"{new_prompt}"}}}}"#
+        );
+        assert_eq!(old_message.len(), new_message.len());
+        std::fs::write(&path, format!("{session}\n{new_message}\n{stable_tail}")).unwrap();
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-07-13T01:03:00Z","type":"event_msg","payload":{{"type":"agent_message","message":"appended"}}}}"#
+        )
+        .unwrap();
+
+        let refreshed = load_snapshots(&root, &cache_path);
+        assert_eq!(refreshed[0].display, new_prompt);
+        assert!(refreshed[0]
+            .messages
+            .iter()
+            .any(|message| message.text == new_prompt));
+        assert!(!refreshed[0]
+            .messages
+            .iter()
+            .any(|message| message.text == old_prompt));
     }
 }

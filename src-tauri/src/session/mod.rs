@@ -1,3 +1,4 @@
+mod cache;
 pub mod codex;
 pub mod cursor;
 pub mod custom_names;
@@ -18,9 +19,37 @@ pub use parser::{
 };
 pub use permissions::PermissionChecker;
 pub use source::{
-    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionKind, SessionProvider,
-    SessionSource, SessionSurface,
+    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionIdentity, SessionKind,
+    SessionProvider, SessionSource, SessionSurface,
 };
+
+/// Rename currently mutates Claude Code's native custom-title records.
+/// Provider-aware callers must not accidentally route a Codex/Cursor ID into
+/// that Claude-only write path. `None` remains a legacy Claude request, while
+/// `validate_rename_request` adds the collision guard before any write.
+pub(crate) fn validate_rename_provider(provider: Option<SessionProvider>) -> Result<(), String> {
+    match provider {
+        Some(SessionProvider::ClaudeCode) => Ok(()),
+        None => Ok(()),
+        Some(provider) => Err(format!(
+            "renaming is only supported for Claude Code sessions; got {provider:?}"
+        )),
+    }
+}
+
+pub(crate) fn validate_rename_request(
+    provider: Option<SessionProvider>,
+    session_id: &str,
+    owners: &ProviderSourceOwners,
+) -> Result<(), String> {
+    validate_rename_provider(provider)?;
+    if provider.is_none() && owners.has_non_claude_session(session_id) {
+        return Err(format!(
+            "renaming session {session_id} requires an explicit provider because the ID collides across providers"
+        ));
+    }
+    Ok(())
+}
 pub use state::DetectorState;
 pub use status::{
     determine_status, determine_status_with_context, get_pending_tool_input, get_pending_tool_name,
@@ -48,6 +77,9 @@ pub(crate) fn cursor_session_ids(home: &std::path::Path, prefix: &str) -> Vec<St
 
 pub mod memory;
 pub use memory::{get_memory_files, MemoryFile, ProjectMemory};
+
+mod owners;
+pub(crate) use owners::{global_provider_source_owners, ProviderSourceOwners};
 
 pub mod enrichment;
 pub use enrichment::{detect_and_enrich_sessions, Session};
@@ -230,6 +262,42 @@ pub fn create_session_source() -> Box<dyn SessionSource> {
 #[cfg(test)]
 mod factory_tests {
     use super::*;
+
+    #[test]
+    fn rename_provider_validation_is_claude_only() {
+        assert!(validate_rename_provider(None).is_ok());
+        assert!(validate_rename_provider(Some(SessionProvider::ClaudeCode)).is_ok());
+        assert!(validate_rename_provider(Some(SessionProvider::Codex)).is_err());
+        assert!(validate_rename_provider(Some(SessionProvider::Cursor)).is_err());
+    }
+
+    #[test]
+    fn legacy_rename_is_rejected_for_a_cross_provider_collision() {
+        const SESSION_ID: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        let temp = tempfile::tempdir().unwrap();
+        let transcript_dir = temp
+            .path()
+            .join("synthetic-project")
+            .join("agent-transcripts")
+            .join(SESSION_ID);
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(
+            transcript_dir.join(format!("{SESSION_ID}.jsonl")),
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"collision fixture"}]}}
+"#,
+        )
+        .unwrap();
+
+        let cursor =
+            crate::session::cursor::CursorSessionSource::at_root(temp.path().to_path_buf());
+        assert!(cursor.contains_session_id(SESSION_ID));
+        let owners = ProviderSourceOwners::from_test_sources(None, Some(cursor));
+
+        assert!(validate_rename_request(None, SESSION_ID, &owners).is_err());
+        assert!(
+            validate_rename_request(Some(SessionProvider::ClaudeCode), SESSION_ID, &owners).is_ok()
+        );
+    }
 
     #[test]
     fn parse_semver_extracts_triple_from_cc_output() {

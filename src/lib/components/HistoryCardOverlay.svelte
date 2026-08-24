@@ -10,6 +10,7 @@
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
 	import { isCostAvailable } from '$lib/cost-semantics';
 	import ProviderBadge from './ProviderBadge.svelte';
+	import { providerSessionKey } from '$lib/provider';
 
 	interface Props {
 		entry: HistoryEntry;
@@ -29,7 +30,7 @@
 
 	const sw = createSlidingWindow();
 
-	let costRecord = $derived($sessionCostMap.get(entry.sessionId));
+	let costRecord = $derived($sessionCostMap.get(providerSessionKey(entry.provider, entry.sessionId)));
 	let primaryCostLabel = $derived(
 		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, isCostAvailable(costRecord)) : null
 	);
@@ -185,16 +186,23 @@
 					</div>
 				</div>
 
-				<button
-					type="button"
-					class="resume-chip"
-					class:copied
-					onclick={copyResumeCommand}
-					title="Click to copy resume command"
-				>
-					<span class="resume-label">{copied ? 'COPIED!' : 'RESUME'}</span>
-					<code class="resume-cmd">{resumeCommand}</code>
-				</button>
+				{#if entry.provider === 'cursor'}
+					<div class="resume-chip readonly" title="Cursor Agent transcripts are read-only">
+						<span class="resume-label">READ ONLY</span>
+						<code class="resume-cmd">Cursor Agent transcript</code>
+					</div>
+				{:else}
+					<button
+						type="button"
+						class="resume-chip"
+						class:copied
+						onclick={copyResumeCommand}
+						title="Click to copy resume command"
+					>
+						<span class="resume-label">{copied ? 'COPIED!' : 'RESUME'}</span>
+						<code class="resume-cmd">{resumeCommand}</code>
+					</button>
+				{/if}
 
 				<div class="header-actions">
 					<button
@@ -446,6 +454,15 @@
 
 	.resume-chip.copied {
 		border-color: var(--accent-green);
+	}
+
+	.resume-chip.readonly {
+		cursor: default;
+		opacity: 0.8;
+	}
+
+	.resume-chip.readonly:hover {
+		border-color: var(--border-default);
 	}
 
 	.resume-label {

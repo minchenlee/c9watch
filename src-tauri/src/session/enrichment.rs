@@ -1,8 +1,10 @@
+use crate::session::cache::FileVersion;
 use crate::session::codex::CodexLifecycle;
 use crate::session::cursor::CursorLifecycle;
+use crate::session::owners::global_provider_source_owners;
 use crate::session::source::{
-    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionProvider, SessionSource,
-    SessionSurface,
+    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionIdentity,
+    SessionProvider, SessionSource, SessionSurface,
 };
 use crate::session::{
     determine_status, get_pending_tool_input, get_pending_tool_name, parse_last_n_entries,
@@ -21,6 +23,8 @@ use std::sync::{LazyLock, Mutex};
 #[serde(rename_all = "camelCase")]
 pub struct Session {
     pub id: String,
+    /// Provider-scoped identity used by frontend selection and backend maps.
+    pub session_key: String,
     pub pid: u32,
     pub session_name: String,
     pub custom_title: Option<String>,
@@ -69,28 +73,60 @@ pub struct Session {
 }
 
 /// Cache for native custom titles, keyed by file path.
-/// Stores (mtime_as_nanos, cached_title) to avoid re-scanning JSONL files every poll cycle.
-static NATIVE_TITLE_CACHE: LazyLock<Mutex<HashMap<std::path::PathBuf, (u64, Option<String>)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// The stamp includes size and, on Unix, change time and inode.  Mtime alone
+/// can be coarse or unchanged for an in-place rewrite, which would otherwise
+/// let a stale title survive in the history view.
+type NativeTitleStamp = FileVersion;
 
-/// Look up the native custom title for a session JSONL, using a mtime-based cache.
+/// Stores the file stamp and cached title to avoid re-scanning JSONL files
+/// every poll cycle while still falling back safely on weak metadata systems.
+static NATIVE_TITLE_CACHE: LazyLock<
+    Mutex<HashMap<std::path::PathBuf, (NativeTitleStamp, Option<String>)>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn native_title_stamp(path: &Path) -> Option<NativeTitleStamp> {
+    FileVersion::read(path).ok()
+}
+
+fn claude_custom_name(
+    provider: SessionProvider,
+    names: &crate::session::CustomNames,
+    session_id: &str,
+) -> Option<String> {
+    (provider == SessionProvider::ClaudeCode)
+        .then(|| names.get(session_id).cloned())
+        .flatten()
+}
+
+fn claude_custom_title(
+    provider: SessionProvider,
+    titles: &crate::session::CustomTitles,
+    session_id: &str,
+) -> Option<String> {
+    (provider == SessionProvider::ClaudeCode)
+        .then(|| titles.get(session_id).cloned())
+        .flatten()
+}
+
+/// Look up the native custom title for a session JSONL, using a strong file
+/// stamp when the platform provides one and a safe re-scan otherwise.
 pub(crate) fn get_cached_native_title(path: &Path) -> Option<String> {
-    let mtime = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
+    let Some(stamp) = native_title_stamp(path) else {
+        if let Ok(mut cache) = NATIVE_TITLE_CACHE.lock() {
+            cache.remove(path);
+        }
+        return None;
+    };
 
     if let Ok(mut cache) = NATIVE_TITLE_CACHE.lock() {
-        if let Some((cached_mtime, cached_title)) = cache.get(path) {
-            if *cached_mtime == mtime {
+        if let Some((cached_stamp, cached_title)) = cache.get(path) {
+            if *cached_stamp == stamp && stamp.supports_unchanged_fast_path() {
                 return cached_title.clone();
             }
         }
         // Cache miss or stale — re-scan
         let title = crate::session::parser::get_native_custom_title_from_file(path);
-        cache.insert(path.to_path_buf(), (mtime, title.clone()));
+        cache.insert(path.to_path_buf(), (stamp, title.clone()));
         title
     } else {
         // Mutex poisoned — fallback to direct read
@@ -124,12 +160,9 @@ pub fn merge_cli_activity(
 pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, DetectionDiagnostics), String> {
     let mut source = crate::session::create_session_source();
     let claude_result = source.detect();
-    let codex_result = crate::session::codex::CodexSessionSource::new()
-        .ok()
-        .and_then(|mut codex| codex.detect().ok());
-    let cursor_result = crate::session::cursor::CursorSessionSource::new()
-        .ok()
-        .and_then(|mut cursor| cursor.detect().ok());
+    let owners = global_provider_source_owners();
+    let codex_result = owners.detect_codex();
+    let cursor_result = owners.detect_cursor();
     match claude_result {
         Ok((mut detected, diagnostics)) => {
             if let Some((mut codex_sessions, _)) = codex_result {
@@ -180,22 +213,23 @@ pub fn enrich_detected_sessions(
     let custom_names = crate::session::CustomNames::load();
     let custom_titles = crate::session::CustomTitles::load();
     let mut sessions = Vec::new();
-    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut seen_ids: HashSet<SessionIdentity> = HashSet::new();
 
     for detected in detected_sessions {
         // Get session ID - if not found, skip this session
-        let session_id = match &detected.session_id {
-            Some(id) => id.clone(),
+        let identity = match detected.identity() {
+            Some(identity) => identity,
             None => {
                 continue;
             }
         };
+        let session_id = identity.session_id.clone();
 
-        // Skip duplicate session IDs (same session can appear in multiple project dirs)
-        if seen_ids.contains(&session_id) {
+        // Skip duplicate provider-scoped identities (the same session can
+        // appear in multiple project dirs without collapsing other providers).
+        if !seen_ids.insert(identity) {
             continue;
         }
-        seen_ids.insert(session_id.clone());
 
         if let Some(summary) = detected.codex_summary.as_ref() {
             let first_prompt = summary
@@ -206,9 +240,7 @@ pub fn enrich_detected_sessions(
                 .latest_message()
                 .map(|message| truncate_string(message, 200))
                 .unwrap_or_default();
-            let session_name = custom_names
-                .get(&session_id)
-                .cloned()
+            let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
                 .or_else(|| detected.agent_nickname.clone())
                 .unwrap_or_else(|| detected.project_name.clone());
             let modified = if summary.last_timestamp.is_empty() {
@@ -222,9 +254,10 @@ pub fn enrich_detected_sessions(
             };
             sessions.push(Session {
                 id: session_id.clone(),
+                session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
                 pid: detected.pid,
                 session_name,
-                custom_title: custom_titles.get(&session_id).cloned(),
+                custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
                 project_path: detected.cwd.to_string_lossy().to_string(),
                 git_branch: None,
                 first_prompt,
@@ -267,9 +300,7 @@ pub fn enrich_detected_sessions(
                 .latest_message()
                 .map(|message| truncate_string(message, 200))
                 .unwrap_or_default();
-            let session_name = custom_names
-                .get(&session_id)
-                .cloned()
+            let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
                 .or_else(|| detected.agent_nickname.clone())
                 .unwrap_or_else(|| detected.project_name.clone());
             let modified = if summary.last_timestamp.is_empty() {
@@ -292,11 +323,10 @@ pub fn enrich_detected_sessions(
             };
             sessions.push(Session {
                 id: session_id.clone(),
+                session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
                 pid: detected.pid,
                 session_name,
-                custom_title: custom_titles
-                    .get(&session_id)
-                    .cloned()
+                custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id)
                     .or_else(|| detected.official_name.clone()),
                 project_path: detected.cwd.to_string_lossy().to_string(),
                 git_branch: None,
@@ -443,18 +473,18 @@ pub fn enrich_detected_sessions(
         }
 
         // Use custom name if available, otherwise use detected project name
-        let session_name = custom_names
-            .get(&session_id)
-            .cloned()
+        let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
             .unwrap_or(detected.project_name);
 
         // Get custom title: Claude Code native /rename takes priority over c9watch's own.
-        // Uses a static cache keyed by (path, mtime) to avoid re-scanning the JSONL every cycle.
+        // Uses a static cache keyed by path plus a strong file stamp when available.
         let native_title = get_cached_native_title(&session_file_path);
-        let custom_title = native_title.or_else(|| custom_titles.get(&session_id).cloned());
+        let custom_title = native_title
+            .or_else(|| claude_custom_title(detected.provider, &custom_titles, &session_id));
 
         sessions.push(Session {
-            id: session_id,
+            id: session_id.clone(),
+            session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
             pid: detected.pid,
             session_name,
             custom_title,
@@ -750,6 +780,7 @@ mod merge_tests {
 mod placeholder_tests {
     use super::*;
     use crate::session::source::{DetectedSession, DetectionDiagnostics, SessionKind};
+    use std::io::Write;
     use std::path::PathBuf;
 
     #[test]
@@ -815,5 +846,75 @@ mod placeholder_tests {
             sessions.is_empty(),
             "legacy empty-JSONL session must be skipped"
         );
+    }
+
+    #[test]
+    fn provider_scoped_identity_keeps_same_id_from_codex_and_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let same_id = "same-provider-id";
+
+        let mut codex = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/codex"),
+            tmp.path().join("codex"),
+            Some(same_id.to_string()),
+            "codex".to_string(),
+        );
+        codex.provider = SessionProvider::Codex;
+        codex.surface = SessionSurface::App;
+        let mut codex_summary = crate::session::codex::CodexRolloutSummary::default();
+        codex_summary.thread_id = same_id.to_string();
+        codex.codex_summary = Some(codex_summary);
+
+        let mut cursor = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/cursor"),
+            tmp.path().join("cursor"),
+            Some(same_id.to_string()),
+            "cursor".to_string(),
+        );
+        cursor.provider = SessionProvider::Cursor;
+        cursor.surface = SessionSurface::Cursor;
+        let mut cursor_summary = crate::session::cursor::CursorTranscriptSummary::default();
+        cursor_summary.session_id = same_id.to_string();
+        cursor.cursor_summary = Some(cursor_summary);
+
+        let (sessions, _) =
+            enrich_detected_sessions(vec![codex, cursor], DetectionDiagnostics::default()).unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_key, "codex:same-provider-id");
+        assert_eq!(sessions[1].session_key, "cursor:same-provider-id");
+    }
+
+    #[test]
+    fn native_title_cache_invalidates_on_transcript_change_and_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("synthetic-claude.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"custom-title","customTitle":"first","sessionId":"synthetic"}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        assert_eq!(get_cached_native_title(&path).as_deref(), Some("first"));
+        assert_eq!(get_cached_native_title(&path).as_deref(), Some("first"));
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"custom-title","customTitle":"second","sessionId":"synthetic"}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        assert_eq!(get_cached_native_title(&path).as_deref(), Some("second"));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(get_cached_native_title(&path), None);
     }
 }

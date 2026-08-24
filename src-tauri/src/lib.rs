@@ -29,7 +29,7 @@ use serde::Serialize;
 use session::conversation::Conversation;
 // Re-export for web_server.rs which uses crate::get_conversation_data
 #[cfg(feature = "gui")]
-pub use session::conversation::get_conversation_data;
+pub use session::conversation::{get_conversation_data, get_conversation_data_for_provider};
 #[cfg(feature = "gui")]
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "gui")]
@@ -73,8 +73,11 @@ async fn get_sessions(
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
-async fn get_conversation(session_id: String) -> Result<Conversation, String> {
-    get_conversation_data(&session_id)
+async fn get_conversation(
+    session_id: String,
+    provider: Option<session::SessionProvider>,
+) -> Result<Conversation, String> {
+    get_conversation_data_for_provider(&session_id, provider)
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -211,20 +214,38 @@ async fn open_session(pid: u32, project_path: String) -> Result<(), String> {
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
+pub(crate) fn run_validated_rename<F>(
+    provider: Option<session::SessionProvider>,
+    session_id: &str,
+    owners: &session::ProviderSourceOwners,
+    write: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    session::validate_rename_request(provider, session_id, owners)?;
+    write()
+}
+
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn rename_session(
     app: AppHandle,
     detector: tauri::State<'_, Arc<Mutex<session::DetectorState>>>,
     session_id: String,
     new_name: String,
+    provider: Option<session::SessionProvider>,
 ) -> Result<(), String> {
-    // Write to Claude Code's native JSONL format (primary)
-    write_native_custom_title(&session_id, &new_name);
+    let owners = session::global_provider_source_owners();
+    run_validated_rename(provider, &session_id, &owners, || {
+        // Write to Claude Code's native JSONL format (primary)
+        write_native_custom_title(&session_id, &new_name);
 
-    // Also write to c9watch's own custom titles (fallback for history view)
-    let mut custom_titles = session::CustomTitles::load();
-    custom_titles.set(session_id, new_name);
-    custom_titles.save()?;
+        // Also write to c9watch's own custom titles (fallback for history view)
+        let mut custom_titles = session::CustomTitles::load();
+        custom_titles.set(session_id.clone(), new_name.clone());
+        custom_titles.save()
+    })?;
 
     let detect_result = {
         let mut state = detector
@@ -293,6 +314,76 @@ pub fn write_native_custom_title(session_id: &str, title: &str) {
         "Could not find JSONL file for session {} to write native custom-title",
         session_id
     ));
+}
+
+#[cfg(all(test, not(mobile), feature = "gui"))]
+mod rename_collision_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
+
+    const SESSION_ID: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+
+    fn synthetic_cursor_owner(temp: &TempDir) -> session::ProviderSourceOwners {
+        let transcript_dir = temp
+            .path()
+            .join("synthetic-project")
+            .join("agent-transcripts")
+            .join(SESSION_ID);
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(
+            transcript_dir.join(format!("{SESSION_ID}.jsonl")),
+            b"{\"role\":\"user\",\"message\":{\"content\":[]}}\n",
+        )
+        .unwrap();
+
+        session::ProviderSourceOwners::from_test_sources(
+            None,
+            Some(session::cursor::CursorSessionSource::at_root(
+                temp.path().to_path_buf(),
+            )),
+        )
+    }
+
+    fn synthetic_codex_owner(temp: &TempDir) -> session::ProviderSourceOwners {
+        let rollout_dir = temp.path().join("2026").join("08").join("24");
+        std::fs::create_dir_all(&rollout_dir).unwrap();
+        std::fs::write(
+            rollout_dir.join(format!("rollout-synthetic-{SESSION_ID}.jsonl")),
+            b"{}\n",
+        )
+        .unwrap();
+
+        session::ProviderSourceOwners::from_test_sources(
+            Some(session::codex::CodexSessionSource::at_root(
+                temp.path().to_path_buf(),
+            )),
+            None,
+        )
+    }
+
+    fn assert_no_write_for_collision(owners: session::ProviderSourceOwners) {
+        let writes = AtomicUsize::new(0);
+        let result = run_validated_rename(None, SESSION_ID, &owners, || {
+            writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn tauri_rename_collision_rejects_before_custom_title_write_for_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_no_write_for_collision(synthetic_cursor_owner(&temp));
+    }
+
+    #[test]
+    fn tauri_rename_collision_rejects_before_custom_title_write_for_codex() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_no_write_for_collision(synthetic_codex_owner(&temp));
+    }
 }
 
 /// Get the terminal title for a session (iTerm2 only, macOS)

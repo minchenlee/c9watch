@@ -1,6 +1,5 @@
 // src-tauri/src/session/state.rs
-use super::codex::CodexSessionSource;
-use super::cursor::CursorSessionSource;
+use super::owners::{global_provider_source_owners, ProviderSourceOwners};
 use super::source::{DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource};
 use super::{create_session_source, mode_from_env, BackendMode};
 use crate::session::detector::LegacySessionSource;
@@ -14,8 +13,7 @@ pub struct DetectorState {
     consecutive_failures: u32,
     telemetry_counter: Arc<AtomicU32>,
     mode: BackendMode,
-    codex_source: Option<CodexSessionSource>,
-    cursor_source: Option<CursorSessionSource>,
+    provider_sources: ProviderSourceOwners,
 }
 
 impl DetectorState {
@@ -25,8 +23,7 @@ impl DetectorState {
             consecutive_failures: 0,
             telemetry_counter: Arc::new(AtomicU32::new(0)),
             mode: mode_from_env(),
-            codex_source: CodexSessionSource::new().ok(),
-            cursor_source: CursorSessionSource::new().ok(),
+            provider_sources: global_provider_source_owners(),
         }
     }
 
@@ -34,15 +31,15 @@ impl DetectorState {
         &mut self,
     ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
         let claude_result = self.source.detect();
-        let codex_result = self.codex_source.as_mut().map(SessionSource::detect);
-        let cursor_result = self.cursor_source.as_mut().map(SessionSource::detect);
+        let codex_result = self.provider_sources.detect_codex();
+        let cursor_result = self.provider_sources.detect_cursor();
         match claude_result {
             Ok((mut sessions, diagnostics)) => {
                 self.consecutive_failures = 0;
-                if let Some(Ok((mut extra, _))) = codex_result {
+                if let Some((mut extra, _)) = codex_result {
                     sessions.append(&mut extra);
                 }
-                if let Some(Ok((mut extra, _))) = cursor_result {
+                if let Some((mut extra, _)) = cursor_result {
                     sessions.append(&mut extra);
                 }
                 Ok((sessions, diagnostics))
@@ -54,11 +51,11 @@ impl DetectorState {
                 }
                 let mut fallback = Vec::new();
                 let mut diagnostics = DetectionDiagnostics::default();
-                if let Some(Ok((sessions, extra))) = codex_result {
+                if let Some((sessions, extra)) = codex_result {
                     fallback.extend(sessions);
                     diagnostics = extra;
                 }
-                if let Some(Ok((sessions, extra))) = cursor_result {
+                if let Some((sessions, extra)) = cursor_result {
                     fallback.extend(sessions);
                     if diagnostics.claude_processes_found == 0 {
                         diagnostics = extra;
@@ -115,8 +112,7 @@ impl DetectorState {
             consecutive_failures: 0,
             telemetry_counter: Arc::new(AtomicU32::new(0)),
             mode,
-            codex_source: None,
-            cursor_source: None,
+            provider_sources: ProviderSourceOwners::from_test_sources(None, None),
         }
     }
 

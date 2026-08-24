@@ -1,13 +1,14 @@
 <script lang="ts">
 	import { sessions, selectedSessionId } from '$lib/stores/sessions';
 	import SessionItem from './SessionItem.svelte';
+	import { sessionKeyOf } from '$lib/provider';
 
 	// Subscribe to stores
 	let currentSessions = $derived($sessions);
 	let currentSelectedId = $derived($selectedSessionId);
 
-	function selectSession(sessionId: string) {
-		selectedSessionId.set(sessionId);
+	function selectSession(sessionKey: string) {
+		selectedSessionId.set(sessionKey);
 	}
 </script>
 
@@ -25,11 +26,11 @@
 			</div>
 		{:else}
 			<div class="session-items">
-				{#each currentSessions as session (session.id)}
+				{#each currentSessions as session (sessionKeyOf(session))}
 					<SessionItem
 						{session}
-						selected={session.id === currentSelectedId}
-						onclick={() => selectSession(session.id)}
+						selected={sessionKeyOf(session) === currentSelectedId}
+						onclick={() => selectSession(sessionKeyOf(session))}
 					/>
 				{/each}
 			</div>

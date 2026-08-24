@@ -8,11 +8,11 @@
 	import { listen } from '@tauri-apps/api/event';
 	import { isDemoMode, loadDemoDataIfActive } from '$lib/demo';
 	import { providerFilter } from '$lib/stores/provider-filter';
-	import { canSessionAction, matchesProvider, providerFilterLabel } from '$lib/provider';
+	import { canSessionAction, matchesProvider, providerFilterLabel, sessionKeyOf } from '$lib/provider';
 	import ProviderFilter from '$lib/components/ProviderFilter.svelte';
 	import ProviderBadge from '$lib/components/ProviderBadge.svelte';
 
-	let sessions = $derived($sortedSessions.filter((session) => $visibleTopLevelSessionIds.has(session.id)).filter((session) => matchesProvider(session, $providerFilter)));
+	let sessions = $derived($sortedSessions.filter((session) => $visibleTopLevelSessionIds.has(sessionKeyOf(session))).filter((session) => matchesProvider(session, $providerFilter)));
 	let summary = $derived({
 		working: sessions.filter((s) => s.status === SessionStatus.Working || s.status === SessionStatus.Connecting).length,
 		permission: sessions.filter((s) => s.status === SessionStatus.NeedsAttention).length,
@@ -169,7 +169,7 @@
 			</div>
 		{:else}
 			<div class="session-list">
-				{#each sessions as session (session.id)}
+				{#each sessions as session (sessionKeyOf(session))}
 					<button class="session-card" disabled={!canSessionAction(session, 'open')} onclick={() => handleOpen(session)}>
 						<div class="card-top">
 							<span class="session-dot" style="background: {getStatusColor(session.status)}"></span>

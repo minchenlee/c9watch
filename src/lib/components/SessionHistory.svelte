@@ -7,7 +7,7 @@
 	import { flyIn } from '$lib/transitions';
 	import { historyEntries, historyLoading, historyError, refreshSessionHistory } from '$lib/stores/history';
 	import { providerFilter } from '$lib/stores/provider-filter';
-	import { matchesProvider, providerFilterLabel } from '$lib/provider';
+	import { matchesProvider, providerFilterLabel, providerSessionKey } from '$lib/provider';
 	import ProviderBadge from './ProviderBadge.svelte';
 
 	// ── Props ────────────────────────────────────────────────────────
@@ -28,10 +28,12 @@
 	let deepSearching = $state(false);
 	// Map of sessionId → matching snippet. null = no search run yet.
 	let deepSearchResults = $state<Map<string, string> | null>(null);
+	const entryKey = (entry: HistoryEntry) => providerSessionKey(entry.provider, entry.sessionId);
 
 	// Conversation viewer state
 	let selectedEntry = $state<HistoryEntry | null>(null);
 	let conversation = $state<Conversation | null>(null);
+	let conversationRequestId = 0;
 	// ── Persistence ──────────────────────────────────────────────────
 	onMount(() => {
 		if (browser) {
@@ -83,7 +85,11 @@
 			deepSearching = true;
 			try {
 				const hits = await deepSearchSessions(q, cs, ww);
-				if (!cancelled) deepSearchResults = new Map(hits.map((h) => [h.sessionId, h.snippet]));
+				if (!cancelled) {
+					deepSearchResults = new Map(
+						hits.map((h) => [providerSessionKey(h.provider, h.sessionId), h.snippet]),
+					);
+				}
 			} catch (e) {
 				if (!cancelled) console.error('Deep search failed:', e);
 			} finally {
@@ -139,15 +145,15 @@
 
 			// If deep search has run, also include sessions that matched full content
 			if (deepSearchResults !== null) {
-				const metaIds = new Set(entries.map((e) => e.sessionId));
-				const deepOnly = allEntries.filter(
-					(e) => matchesProvider(e, $providerFilter) && deepSearchResults!.has(e.sessionId) && !metaIds.has(e.sessionId)
-				);
+					const metaIds = new Set(entries.map(entryKey));
+					const deepOnly = allEntries.filter(
+						(e) => matchesProvider(e, $providerFilter) && deepSearchResults!.has(entryKey(e)) && !metaIds.has(entryKey(e))
+					);
 				entries = [...entries, ...deepOnly];
 			}
 		} else if (deepSearchResults !== null) {
 			// No text query but deep search ran — show all deep search hits
-			entries = allEntries.filter((e) => matchesProvider(e, $providerFilter) && deepSearchResults!.has(e.sessionId));
+				entries = allEntries.filter((e) => matchesProvider(e, $providerFilter) && deepSearchResults!.has(entryKey(e)));
 		}
 
 		return [...entries].sort((a, b) =>
@@ -207,12 +213,17 @@
 
 	// ── Actions ──────────────────────────────────────────────────────
 	async function handleSelectEntry(entry: HistoryEntry) {
+		const requestId = ++conversationRequestId;
 		selectedEntry = entry;
 		conversation = null;
 		try {
-			conversation = await getConversation(entry.sessionId);
+		const result = await getConversation(entry.sessionId, entry.provider);
+		const resultKey = providerSessionKey(result.provider ?? entry.provider, result.sessionId);
+		if (requestId === conversationRequestId && resultKey === entryKey(entry)) {
+			conversation = result;
+		}
 		} catch (e) {
-			console.error('Failed to load conversation:', e);
+			if (requestId === conversationRequestId) console.error('Failed to load conversation:', e);
 		}
 	}
 
@@ -375,8 +386,8 @@
 						<span class="group-count">{group.entries.length}</span>
 					</div>
 					{#if !collapsedProjects.has(group.project)}
-						{#each group.entries as entry, i (entry.sessionId)}
-							{@const snippet = query.trim() ? (deepSearchResults?.get(entry.sessionId) ?? null) : null}
+						{#each group.entries as entry, i (entryKey(entry))}
+							{@const snippet = query.trim() ? (deepSearchResults?.get(entryKey(entry)) ?? null) : null}
 							<button
 								class="session-row session-row-grid"
 								class:has-snippet={!!snippet}
@@ -388,7 +399,7 @@
 									{#if entry.customTitle}<span class="row-title">{@html highlight(entry.customTitle, query)}</span>{/if}
 									<span class="row-display">{@html highlight((snippet ?? entry.display) || '(no prompt)', query)}</span>
 								</span>
-								<span class="row-badge-slot"><ProviderBadge provider={entry.provider} surface={entry.surface} compact />{#if activeSessionIds.has(entry.sessionId)}<span class="active-badge">ACTIVE</span>{/if}</span>
+								<span class="row-badge-slot"><ProviderBadge provider={entry.provider} surface={entry.surface} compact />{#if activeSessionIds.has(entryKey(entry))}<span class="active-badge">ACTIVE</span>{/if}</span>
 								<span class="row-time">{relativeTime(entry.timestamp)}</span>
 							</button>
 						{/each}
@@ -396,8 +407,8 @@
 				</div>
 			{/each}
 		{:else}
-			{#each filtered as entry, i (entry.sessionId)}
-				{@const snippet = query.trim() ? (deepSearchResults?.get(entry.sessionId) ?? null) : null}
+			{#each filtered as entry, i (entryKey(entry))}
+				{@const snippet = query.trim() ? (deepSearchResults?.get(entryKey(entry)) ?? null) : null}
 				<button
 					class="session-row session-row-flat"
 					class:has-snippet={!!snippet}
@@ -408,7 +419,7 @@
 					<div class="row-content">
 						<div class="row-top-grid">
 							<span class="row-project">{entry.projectName}</span>
-								<span class="row-badge-slot"><ProviderBadge provider={entry.provider} surface={entry.surface} compact />{#if activeSessionIds.has(entry.sessionId)}<span class="active-badge">ACTIVE</span>{/if}</span>
+								<span class="row-badge-slot"><ProviderBadge provider={entry.provider} surface={entry.surface} compact />{#if activeSessionIds.has(entryKey(entry))}<span class="active-badge">ACTIVE</span>{/if}</span>
 							<span class="row-time">{relativeTime(entry.timestamp)}</span>
 						</div>
 						<span class="row-prompt">
@@ -425,7 +436,7 @@
 
 <!-- ── Conversation overlay ───────────────────────────────────────── -->
 {#if selectedEntry}
-	<HistoryCardOverlay entry={selectedEntry} {conversation} searchQuery={query.trim() && deepSearchResults?.has(selectedEntry.sessionId) ? query.trim() : undefined} onclose={handleCloseConversation} />
+	<HistoryCardOverlay entry={selectedEntry} {conversation} searchQuery={query.trim() && deepSearchResults?.has(entryKey(selectedEntry)) ? query.trim() : undefined} onclose={handleCloseConversation} />
 {/if}
 
 <style>

@@ -3,6 +3,7 @@
 //! JSONL transcripts are the source of truth for discovery and liveness.
 //! `state.vscdb` is an optional read-only overlay for title, cwd, and model.
 
+use super::cache::FileVersion;
 use super::parser::MessageType;
 use super::source::{
     AgentKind, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionKind,
@@ -76,11 +77,7 @@ impl CursorTranscriptSummary {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
-    len: u64,
-    modified_nanos: u128,
-}
+type FileStamp = FileVersion;
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
@@ -123,6 +120,11 @@ impl CursorSessionSource {
         Self::at_roots(projects_root, None)
     }
 
+    #[cfg(test)]
+    pub(crate) fn parse_count_for_test(&self) -> u32 {
+        self.parse_count
+    }
+
     fn at_roots(projects_root: PathBuf, vscdb_path: Option<PathBuf>) -> Self {
         Self {
             projects_root,
@@ -131,6 +133,12 @@ impl CursorSessionSource {
             #[cfg(test)]
             parse_count: 0,
         }
+    }
+
+    pub(crate) fn contains_session_id(&self, session_id: &str) -> bool {
+        collect_transcript_refs(&self.projects_root)
+            .iter()
+            .any(|transcript| transcript.session_id == session_id)
     }
 
     #[cfg(test)]
@@ -148,10 +156,14 @@ impl CursorSessionSource {
 
         for transcript in &refs {
             existing_paths.insert(transcript.path.clone());
+            let age = file_age_secs(&transcript.path, wall_now);
+            if age > LINKED_PARENT_CEILING_SECS {
+                self.cache.remove(&transcript.path);
+                continue;
+            }
             let Ok(summary) = self.summary_for(&transcript.path, transcript) else {
                 continue;
             };
-            let age = file_age_secs(&transcript.path, wall_now);
             live.push((transcript.path.clone(), summary, age));
         }
 
@@ -177,7 +189,13 @@ impl CursorSessionSource {
             })
             .collect();
 
-        self.cache.retain(|path, _| existing_paths.contains(path));
+        let cacheable_paths: HashSet<PathBuf> = live
+            .iter()
+            .filter(|(_, _, age)| *age <= LINKED_PARENT_CEILING_SECS)
+            .map(|(path, _, _)| path.clone())
+            .collect();
+        self.cache
+            .retain(|path, _| existing_paths.contains(path) && cacheable_paths.contains(path));
 
         let mut sessions = Vec::new();
         for (_path, summary, age_secs) in live {
@@ -239,10 +257,32 @@ impl CursorSessionSource {
         path: &Path,
         transcript: &TranscriptRef,
     ) -> Result<CursorTranscriptSummary, SessionDetectorError> {
+        const MAX_READ_ATTEMPTS: usize = 3;
+
+        for _ in 0..MAX_READ_ATTEMPTS {
+            let (stamp, summary) = self.summary_for_once(path, transcript)?;
+            let after = file_stamp(path)?;
+            if stamp == after {
+                return Ok(summary);
+            }
+            self.cache.remove(path);
+        }
+
+        Err(SessionDetectorError::Parse(format!(
+            "Cursor transcript changed while reading: {}",
+            path.display()
+        )))
+    }
+
+    fn summary_for_once(
+        &mut self,
+        path: &Path,
+        transcript: &TranscriptRef,
+    ) -> Result<(FileStamp, CursorTranscriptSummary), SessionDetectorError> {
         let stamp = file_stamp(path)?;
         if let Some(cached) = self.cache.get(path) {
-            if cached.stamp == stamp {
-                return Ok(cached.summary.clone());
+            if cached.stamp == stamp && stamp.supports_unchanged_fast_path() {
+                return Ok((stamp, cached.summary.clone()));
             }
         }
         let (existing, start_offset, resumed_hasher) = match self.cache.get(path) {
@@ -267,10 +307,20 @@ impl CursorSessionSource {
         let prefix_hash = if let Some(mut hasher) = resumed_hasher {
             // Extend the verified prefix hash over the appended bytes instead
             // of re-hashing the whole range.
-            feed_suffix(path, start_offset, offset, &mut hasher);
+            feed_suffix(path, start_offset, offset, &mut hasher).ok_or_else(|| {
+                SessionDetectorError::Parse(format!(
+                    "Cursor transcript suffix changed while hashing: {}",
+                    path.display()
+                ))
+            })?;
             hasher.finish()
         } else {
-            hash_file_prefix(path, offset).unwrap_or(0)
+            hash_file_prefix(path, offset).ok_or_else(|| {
+                SessionDetectorError::Parse(format!(
+                    "Cursor transcript prefix could not be hashed: {}",
+                    path.display()
+                ))
+            })?
         };
         self.cache.insert(
             path.to_path_buf(),
@@ -281,7 +331,7 @@ impl CursorSessionSource {
                 summary: summary.clone(),
             },
         );
-        Ok(summary)
+        Ok((stamp, summary))
     }
 }
 
@@ -809,44 +859,35 @@ fn hash_file_prefix(path: &Path, len: u64) -> Option<u64> {
     Some(hasher.finish())
 }
 
-/// Feed the bytes of `path` in `[start, end)` into `hasher`, ignoring errors:
-/// a torn read just yields a weaker cache key, never a wrong summary.
-fn feed_suffix(path: &Path, start: u64, end: u64, hasher: &mut DefaultHasher) {
+/// Feed the bytes of `path` in `[start, end)` into `hasher`.
+///
+/// A failure is reported to the caller so an incomplete hash can never be
+/// persisted as if it represented the full cached prefix.
+fn feed_suffix(path: &Path, start: u64, end: u64, hasher: &mut DefaultHasher) -> Option<()> {
     if end <= start {
-        return;
+        return Some(());
     }
-    let Ok(mut file) = File::open(path) else {
-        return;
-    };
+    let mut file = File::open(path).ok()?;
     if file.seek(SeekFrom::Start(start)).is_err() {
-        return;
+        return None;
     }
     let mut buf = vec![0u8; 64 * 1024];
     let mut remaining = end - start;
     while remaining > 0 {
         let want = buf.len().min(remaining as usize);
         match file.read(&mut buf[..want]) {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => return None,
             Ok(read) => {
                 hasher.write(&buf[..read]);
                 remaining -= read as u64;
             }
         }
     }
+    Some(())
 }
 
 fn file_stamp(path: &Path) -> Result<FileStamp, SessionDetectorError> {
-    let metadata = fs::metadata(path)?;
-    let modified_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    Ok(FileStamp {
-        len: metadata.len(),
-        modified_nanos,
-    })
+    Ok(FileVersion::read(path)?)
 }
 
 fn file_age_secs(path: &Path, wall_now: SystemTime) -> u64 {
@@ -1301,6 +1342,36 @@ mod tests {
     }
 
     #[test]
+    fn cache_evicts_transcripts_past_visibility_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = layout(tmp.path(), "demo-project");
+        let path = session_dir.join(format!("{PARENT}.jsonl"));
+        write_jsonl(
+            &path,
+            &[
+                &user_line("old chat"),
+                r#"{"type":"turn_ended","status":"success"}"#,
+            ],
+        );
+
+        let mut source = CursorSessionSource::at_root(tmp.path().to_path_buf());
+        let (sessions, _) = source.detect().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(source.cache.contains_key(&path));
+
+        let stale = SystemTime::now() + Duration::from_secs(LINKED_PARENT_CEILING_SECS + 60);
+        let (sessions, _) = source.detect_at(stale).unwrap();
+        assert!(sessions.is_empty());
+        assert!(source.cache.is_empty());
+        let parse_count = source.parse_count;
+
+        let later = stale + Duration::from_secs(60);
+        let (sessions, _) = source.detect_at(later).unwrap();
+        assert!(sessions.is_empty());
+        assert_eq!(source.parse_count, parse_count);
+    }
+
+    #[test]
     fn decode_keeps_hyphenated_directory_names() {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("my-app");
@@ -1403,6 +1474,141 @@ mod tests {
     }
 
     #[test]
+    fn deleted_and_renamed_transcripts_are_removed_from_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = layout(tmp.path(), "demo-project");
+        let path = session_dir.join(format!("{PARENT}.jsonl"));
+        write_jsonl(&path, &[&user_line("will disappear")]);
+
+        let mut source = CursorSessionSource::at_root(tmp.path().to_path_buf());
+        let (sessions, _) = source.detect().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(source.cache.contains_key(&path));
+
+        fs::remove_file(&path).unwrap();
+        let (sessions, _) = source.detect().unwrap();
+        assert!(sessions.is_empty());
+        assert!(!source.cache.contains_key(&path));
+
+        let renamed_dir = tmp
+            .path()
+            .join("demo-project")
+            .join("agent-transcripts")
+            .join(CHILD_DONE);
+        fs::rename(&session_dir, &renamed_dir).unwrap();
+        let renamed_path = renamed_dir.join(format!("{CHILD_DONE}.jsonl"));
+        write_jsonl(&renamed_path, &[&user_line("renamed session")]);
+
+        let (sessions, _) = source.detect().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id.as_deref(), Some(CHILD_DONE));
+        assert!(!source.cache.contains_key(&path));
+        assert!(source.cache.contains_key(&renamed_path));
+    }
+
+    #[test]
+    fn large_transcript_incremental_parse_matches_full_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = layout(tmp.path(), "demo-project");
+        let path = session_dir.join(format!("{PARENT}.jsonl"));
+        let mut lines = vec![user_line("large transcript")];
+        for index in 0..8_192 {
+            lines.push(assistant_line(&format!("synthetic message {index}")));
+        }
+        let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_jsonl(&path, &line_refs);
+
+        let mut source = CursorSessionSource::at_root(tmp.path().to_path_buf());
+        let (first, _) = source.detect().unwrap();
+        let initial = first[0].cursor_summary.as_ref().unwrap().messages.len();
+        assert_eq!(initial, 8_193);
+
+        let appended = assistant_line("synthetic appended message");
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{appended}").unwrap();
+        drop(file);
+
+        let (incremental, _) = source.detect().unwrap();
+        let mut fresh = CursorSessionSource::at_root(tmp.path().to_path_buf());
+        let (full, _) = fresh.detect().unwrap();
+        let incremental_messages = &incremental[0].cursor_summary.as_ref().unwrap().messages;
+        let full_messages = &full[0].cursor_summary.as_ref().unwrap().messages;
+        assert_eq!(incremental_messages.len(), full_messages.len());
+        for (incremental, full) in incremental_messages.iter().zip(full_messages) {
+            assert_eq!(incremental.role, full.role);
+            assert_eq!(incremental.message_type, full.message_type);
+            assert_eq!(incremental.content, full.content);
+        }
+        assert_eq!(
+            incremental[0]
+                .cursor_summary
+                .as_ref()
+                .unwrap()
+                .messages
+                .len(),
+            initial + 1
+        );
+    }
+
+    #[test]
+    fn concurrent_torn_write_is_ignored_then_committed_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = layout(tmp.path(), "demo-project");
+        let path = session_dir.join(format!("{PARENT}.jsonl"));
+        write_jsonl(&path, &[&user_line("before concurrent write")]);
+
+        let mut source = CursorSessionSource::at_root(tmp.path().to_path_buf());
+        source.detect().unwrap();
+
+        let assistant = assistant_line("concurrent assistant");
+        let split = assistant.len() / 2;
+        let (partial_ready_tx, partial_ready_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let (complete_tx, complete_rx) = std::sync::mpsc::channel();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(writer_path)
+                .unwrap();
+            file.write_all(&assistant.as_bytes()[..split]).unwrap();
+            file.flush().unwrap();
+            partial_ready_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            file.write_all(&assistant.as_bytes()[split..]).unwrap();
+            writeln!(file).unwrap();
+            file.flush().unwrap();
+            complete_tx.send(()).unwrap();
+        });
+
+        partial_ready_rx.recv().unwrap();
+        let (during_write, _) = source.detect().unwrap();
+        assert_eq!(
+            during_write[0]
+                .cursor_summary
+                .as_ref()
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
+        continue_tx.send(()).unwrap();
+        complete_rx.recv().unwrap();
+        writer.join().unwrap();
+
+        let (after_write, _) = source.detect().unwrap();
+        let messages = &after_write[0].cursor_summary.as_ref().unwrap().messages;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.content == "concurrent assistant")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn turn_ended_only_file_stays_idle_not_connecting() {
         let tmp = tempfile::tempdir().unwrap();
         let session_dir = layout(tmp.path(), "demo-project");
@@ -1451,6 +1657,45 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn same_length_rewrite_with_preserved_mtime_is_not_a_cache_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = layout(tmp.path(), "demo-project");
+        let path = session_dir.join(format!("{PARENT}.jsonl"));
+        let old = user_line("old prompt");
+        let fresh = user_line("new prompt");
+        assert_eq!(old.len(), fresh.len());
+        write_jsonl(&path, &[&old]);
+        let original_modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+        let mut source = CursorSessionSource::at_root(tmp.path().to_path_buf());
+        let (first, _) = source.detect().unwrap();
+        assert_eq!(
+            first[0].cursor_summary.as_ref().unwrap().first_prompt(),
+            Some("old prompt")
+        );
+
+        write_jsonl(&path, &[&fresh]);
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(original_modified).unwrap();
+        drop(file);
+
+        let (second, _) = source.detect().unwrap();
+        assert_eq!(
+            second[0].cursor_summary.as_ref().unwrap().first_prompt(),
+            Some("new prompt")
+        );
+    }
+
+    #[test]
+    fn suffix_hash_failure_is_reported_instead_of_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("missing-transcript.jsonl");
+        let mut hasher = DefaultHasher::new();
+
+        assert!(feed_suffix(&path, 0, 1, &mut hasher).is_none());
     }
 
     #[test]

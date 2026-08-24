@@ -4,6 +4,7 @@
  */
 
 import type { CostData, SessionCostRecord } from './types';
+import { providerSessionKey } from './provider';
 
 export type CostMode = 'usd' | 'tokens';
 
@@ -43,9 +44,10 @@ export function buildSessionCostMap(data: CostData | null): Map<string, SessionC
 
 	for (const day of data.dailyCosts) {
 		for (const rec of day.sessions) {
-			const existing = map.get(rec.sessionId);
+			const key = providerSessionKey(rec.provider, rec.sessionId);
+			const existing = map.get(key);
 			if (!existing) {
-				map.set(rec.sessionId, { ...rec });
+				map.set(key, { ...rec });
 			} else {
 				existing.cost += rec.cost;
 				existing.totalTokens += rec.totalTokens;

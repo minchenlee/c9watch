@@ -41,6 +41,8 @@ enum ClientMsg {
     GetConversation {
         #[serde(rename = "sessionId")]
         session_id: String,
+        #[serde(default)]
+        provider: Option<crate::session::SessionProvider>,
     },
 
     #[serde(rename = "stopSession")]
@@ -59,6 +61,8 @@ enum ClientMsg {
         session_id: String,
         #[serde(rename = "newName")]
         new_name: String,
+        #[serde(default)]
+        provider: Option<crate::session::SessionProvider>,
     },
 
     #[serde(rename = "getMemoryFiles")]
@@ -250,6 +254,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
 // ── Message dispatch ────────────────────────────────────────────────
 
 async fn handle_message(msg: ClientMsg) -> ServerMsg {
+    handle_message_with_owners(msg, crate::session::global_provider_source_owners()).await
+}
+
+async fn handle_message_with_owners(
+    msg: ClientMsg,
+    owners: crate::session::ProviderSourceOwners,
+) -> ServerMsg {
     match msg {
         ClientMsg::GetSessions => match crate::polling::detect_and_enrich_sessions() {
             Ok(sessions) => ServerMsg::Sessions {
@@ -258,14 +269,15 @@ async fn handle_message(msg: ClientMsg) -> ServerMsg {
             Err(e) => ServerMsg::Error { message: e },
         },
 
-        ClientMsg::GetConversation { session_id } => {
-            match crate::get_conversation_data(&session_id) {
-                Ok(conv) => ServerMsg::Conversation {
-                    data: serde_json::to_value(&conv).unwrap_or_default(),
-                },
-                Err(e) => ServerMsg::Error { message: e },
-            }
-        }
+        ClientMsg::GetConversation {
+            session_id,
+            provider,
+        } => match crate::get_conversation_data_for_provider(&session_id, provider) {
+            Ok(conv) => ServerMsg::Conversation {
+                data: serde_json::to_value(&conv).unwrap_or_default(),
+            },
+            Err(e) => ServerMsg::Error { message: e },
+        },
 
         ClientMsg::StopSession { pid } => match crate::actions::stop_session(pid) {
             Ok(()) => ServerMsg::Ok,
@@ -282,13 +294,16 @@ async fn handle_message(msg: ClientMsg) -> ServerMsg {
         ClientMsg::RenameSession {
             session_id,
             new_name,
+            provider,
         } => {
-            // Write to Claude Code's native JSONL format
-            crate::write_native_custom_title(&session_id, &new_name);
-            // Also write to c9watch's own custom titles (fallback)
-            let mut custom_titles = crate::session::CustomTitles::load();
-            custom_titles.set(session_id, new_name);
-            match custom_titles.save() {
+            match crate::run_validated_rename(provider, &session_id, &owners, || {
+                // Write to Claude Code's native JSONL format
+                crate::write_native_custom_title(&session_id, &new_name);
+                // Also write to c9watch's own custom titles (fallback)
+                let mut custom_titles = crate::session::CustomTitles::load();
+                custom_titles.set(session_id.clone(), new_name.clone());
+                custom_titles.save()
+            }) {
                 Ok(()) => ServerMsg::Ok,
                 Err(e) => ServerMsg::Error { message: e },
             }
@@ -300,5 +315,117 @@ async fn handle_message(msg: ClientMsg) -> ServerMsg {
             },
             Err(e) => ServerMsg::Error { message: e },
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SESSION_ID: &str = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+
+    fn synthetic_cursor_owner(temp: &tempfile::TempDir) -> crate::session::ProviderSourceOwners {
+        let transcript_dir = temp
+            .path()
+            .join("synthetic-project")
+            .join("agent-transcripts")
+            .join(SESSION_ID);
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(
+            transcript_dir.join(format!("{SESSION_ID}.jsonl")),
+            b"{\"role\":\"user\",\"message\":{\"content\":[]}}\n",
+        )
+        .unwrap();
+
+        crate::session::ProviderSourceOwners::from_test_sources(
+            None,
+            Some(crate::session::cursor::CursorSessionSource::at_root(
+                temp.path().to_path_buf(),
+            )),
+        )
+    }
+
+    fn synthetic_codex_owner(temp: &tempfile::TempDir) -> crate::session::ProviderSourceOwners {
+        let rollout_dir = temp.path().join("2026").join("08").join("24");
+        std::fs::create_dir_all(&rollout_dir).unwrap();
+        std::fs::write(
+            rollout_dir.join(format!("rollout-synthetic-{SESSION_ID}.jsonl")),
+            b"{}\n",
+        )
+        .unwrap();
+
+        crate::session::ProviderSourceOwners::from_test_sources(
+            Some(crate::session::codex::CodexSessionSource::at_root(
+                temp.path().to_path_buf(),
+            )),
+            None,
+        )
+    }
+
+    #[test]
+    fn rename_message_keeps_provider_namespace_for_validation() {
+        let message: ClientMsg = serde_json::from_value(serde_json::json!({
+            "type": "renameSession",
+            "sessionId": "same-id",
+            "newName": "synthetic",
+            "provider": "cursor"
+        }))
+        .unwrap();
+
+        match message {
+            ClientMsg::RenameSession { provider, .. } => {
+                assert_eq!(provider, Some(crate::session::SessionProvider::Cursor));
+                assert!(crate::session::validate_rename_provider(provider).is_err());
+            }
+            _ => panic!("expected rename message"),
+        }
+    }
+
+    #[test]
+    fn legacy_rename_message_keeps_compatibility_shape() {
+        let message: ClientMsg = serde_json::from_value(serde_json::json!({
+            "type": "renameSession",
+            "sessionId": "legacy-id",
+            "newName": "synthetic"
+        }))
+        .unwrap();
+
+        match message {
+            ClientMsg::RenameSession { provider, .. } => {
+                assert!(provider.is_none());
+                assert!(crate::session::validate_rename_provider(provider).is_ok());
+            }
+            _ => panic!("expected rename message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_rename_collision_rejects_before_custom_title_write() {
+        let cursor_temp = tempfile::tempdir().unwrap();
+        let codex_temp = tempfile::tempdir().unwrap();
+        let owners = [
+            synthetic_cursor_owner(&cursor_temp),
+            synthetic_codex_owner(&codex_temp),
+        ];
+
+        for owners in owners {
+            let response = handle_message_with_owners(
+                ClientMsg::RenameSession {
+                    session_id: SESSION_ID.to_string(),
+                    new_name: "synthetic collision".to_string(),
+                    provider: None,
+                },
+                owners,
+            )
+            .await;
+
+            match response {
+                ServerMsg::Error { message } => {
+                    assert!(message.contains("requires an explicit provider"));
+                }
+                ServerMsg::Ok => panic!("collision must not reach title writes"),
+                other => panic!("unexpected WebSocket response: {other:?}"),
+            }
+        }
     }
 }

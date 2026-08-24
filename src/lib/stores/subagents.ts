@@ -10,6 +10,7 @@ import { writable, derived, get } from 'svelte/store';
 import { invoke } from '@tauri-apps/api/core';
 import { sessions } from './sessions';
 import { isTauri } from '../ws';
+import { providerSessionKey } from '../provider';
 
 export type SubagentStatus = 'running' | 'completed';
 
@@ -58,10 +59,12 @@ async function refreshOnce() {
 	if (!isTauri()) return;
 	try {
 		const raw = await invoke<Record<string, SubagentInfo[]>>('get_subagents');
-		const m = new Map<string, SubagentInfo[]>();
-		for (const [k, v] of Object.entries(raw)) {
-			m.set(k, v);
-		}
+			const m = new Map<string, SubagentInfo[]>();
+			for (const [k, v] of Object.entries(raw)) {
+				// Accept the provider-scoped key from current backends and normalize
+				// older Claude-only payloads that used the raw session ID.
+				m.set(k.includes(':') ? k : providerSessionKey('claudeCode', k), v);
+			}
 		subagentsBySession.set(m);
 	} catch {
 		// Backend may be unavailable in non-Tauri contexts; ignore.

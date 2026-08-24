@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-24
+
+### Added
+- **Cursor Agent monitoring.** Detect Cursor Agent root and subagent sessions,
+  expose Cursor lifecycle and provider metadata, and include Cursor sessions in
+  Monitor, History, conversation search, and provider filtering.
+- **Provider-scoped session identity.** Claude Code, Codex, and Cursor session
+  IDs are isolated across detection, enrichment, CLI output, notifications, and
+  frontend selection state.
+- **Cursor transcript resilience coverage.** Synthetic tests cover lifecycle
+  transitions, deleted and renamed transcripts, large transcripts, and reads
+  concurrent with an incomplete write.
+
+### Fixed
+- **Cursor incremental transcript cache correctness.** Appends now verify the
+  cached prefix before reusing the prior summary, so truncate-and-rewrite and
+  prefix-mismatch changes fall back to a full parse. Incomplete final JSONL
+  records remain pending until a complete line is available.
+- **Provider collision safety for rename requests.** Explicit Codex/Cursor
+  rename targets are rejected, and providerless legacy requests are rejected
+  before writing when the raw ID is also detected under another provider.
+- **Codex archive cache correctness.** Persistent archive snapshots now reject
+  weak/coarse file metadata, detect same-length and middle rewrites, and retry
+  when a rollout changes while it is being read.
+- **Shared provider source lifetime.** GUI polling and CLI/Web enrichment reuse
+  the same Codex and Cursor incremental sources instead of silently reparsing
+  from a cold cache on every request.
+
 ## [0.9.0] - 2026-08-16
 
 ### Added

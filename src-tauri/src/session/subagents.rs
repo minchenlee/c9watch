@@ -658,8 +658,8 @@ pub fn get_subagent_transcript(
     None
 }
 
-/// Build a map of parent_session_id -> subagents for all sessions found under
-/// `~/.claude/projects/`. Caller filters/joins as needed.
+/// Build a map of provider-scoped parent identity -> subagents for all Claude
+/// sessions found under `~/.claude/projects/`. Caller filters/joins as needed.
 pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
     let mut out: HashMap<String, Vec<SubagentInfo>> = HashMap::new();
     let Some(home) = dirs::home_dir() else {
@@ -687,7 +687,7 @@ pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
             };
             let subs = active_subagents_for_path(stem, &path);
             if !subs.is_empty() {
-                out.insert(stem.to_string(), subs);
+                out.insert(format!("claudeCode:{stem}"), subs);
             }
         }
     }

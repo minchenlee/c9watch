@@ -12,6 +12,19 @@ export function providerOf(record: ProviderRecord): SessionProvider {
 		: 'claudeCode';
 }
 
+/** Build the identity used by maps and UI selection instead of raw IDs. */
+export function providerSessionKey(provider: SessionProvider | undefined, id: string): string {
+	const normalized = provider && KNOWN_PROVIDERS.includes(provider) ? provider : 'claudeCode';
+	return `${normalized}:${id}`;
+}
+
+export function sessionKeyOf(session: Pick<Session, 'id' | 'provider' | 'sessionKey'>): string {
+	// Derive the key from the canonical provider/id pair.  Do not trust a
+	// stale or malformed serialized sessionKey: it is a compatibility field,
+	// while provider + id is the identity boundary that prevents collisions.
+	return providerSessionKey(providerOf(session), session.id);
+}
+
 export function providerLabel(provider: SessionProvider): string {
 	if (provider === 'codex') return 'CODEX';
 	if (provider === 'cursor') return 'CURSOR';
@@ -59,18 +72,18 @@ export interface CodexHierarchy {
  * surviving subagent is promoted so no normal agent disappears from the UI.
  */
 export function resolveCodexHierarchy(sessions: Session[]): CodexHierarchy {
-	const byId = new Map(sessions.map((session) => [session.id, session]));
+	const byId = new Map(sessions.map((session) => [sessionKeyOf(session), session]));
 	const topLevelIds = new Set(
 		sessions
 			.filter((session) => !isHiddenInternalSession(session) && !isCodexSubagent(session))
-			.map((session) => session.id)
+			.map((session) => sessionKeyOf(session))
 	);
 	const subagentsByParent = new Map<string, Session[]>();
 
 	function nextExistingAncestor(session: Session): Session | null {
 		for (const id of [session.parentThreadId, session.rootSessionId]) {
 			if (!id || id === session.id) continue;
-			const ancestor = byId.get(id);
+			const ancestor = byId.get(providerSessionKey(providerOf(session), id));
 			if (ancestor) return ancestor;
 		}
 		return null;
@@ -81,11 +94,11 @@ export function resolveCodexHierarchy(sessions: Session[]): CodexHierarchy {
 
 		let cursor = session;
 		let anchor: Session = session;
-		const visited = new Set([session.id]);
+		const visited = new Set([sessionKeyOf(session)]);
 		while (true) {
 			const ancestor = nextExistingAncestor(cursor);
-			if (!ancestor || visited.has(ancestor.id)) break;
-			visited.add(ancestor.id);
+			if (!ancestor || visited.has(sessionKeyOf(ancestor))) break;
+			visited.add(sessionKeyOf(ancestor));
 			if (!isHiddenInternalSession(ancestor) && !isCodexSubagent(ancestor)) {
 				anchor = ancestor;
 				break;
@@ -94,13 +107,13 @@ export function resolveCodexHierarchy(sessions: Session[]): CodexHierarchy {
 			cursor = ancestor;
 		}
 
-		if (anchor.id === session.id) {
-			topLevelIds.add(session.id);
+		if (sessionKeyOf(anchor) === sessionKeyOf(session)) {
+			topLevelIds.add(sessionKeyOf(session));
 			continue;
 		}
-		const group = subagentsByParent.get(anchor.id) ?? [];
+		const group = subagentsByParent.get(sessionKeyOf(anchor)) ?? [];
 		group.push(session);
-		subagentsByParent.set(anchor.id, group);
+		subagentsByParent.set(sessionKeyOf(anchor), group);
 	}
 
 	return { topLevelIds, subagentsByParent };
