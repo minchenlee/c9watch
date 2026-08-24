@@ -317,7 +317,13 @@ impl CursorSessionSource {
                 return Ok((stamp, cached.summary.clone()));
             }
         }
-        let (existing, start_offset, resumed_hash) = match self.cache.get(path) {
+        let (
+            existing,
+            start_offset,
+            resumed_hash,
+            resumed_full_verification,
+            inherited_next_full_verify_offset,
+        ) = match self.cache.get(path) {
             Some(cached) if stamp.len > cached.offset => {
                 let full_verification = cached.offset <= EXACT_PREFIX_VERIFY_LIMIT
                     || stamp.len >= cached.next_full_verify_offset;
@@ -337,12 +343,14 @@ impl CursorSessionSource {
                             Some(cached.summary.clone()),
                             cached.offset,
                             Some(cached.prefix_hash),
+                            full_verification,
+                            Some(cached.next_full_verify_offset),
                         )
                     }
-                    None => (None, 0, None),
+                    None => (None, 0, None, false, None),
                 }
             }
-            _ => (None, 0, None),
+            _ => (None, 0, None, false, None),
         };
         #[cfg(test)]
         {
@@ -353,6 +361,7 @@ impl CursorSessionSource {
         if summary.cwd.as_os_str().is_empty() {
             summary.cwd = decode_cursor_project_key(&transcript.project_key);
         }
+        let full_prefix_validation = resumed_hash.is_none() || resumed_full_verification;
         let snapshot = if let Some(mut hash) = resumed_hash {
             // Extend the verified prefix hash over the appended bytes instead
             // of re-hashing the whole range. Large files use a bounded guard
@@ -382,6 +391,11 @@ impl CursorSessionSource {
                 ))
             })?
         };
+        let next_full_verify_offset = if full_prefix_validation {
+            next_full_verify_offset(offset)
+        } else {
+            inherited_next_full_verify_offset.unwrap_or_else(|| next_full_verify_offset(offset))
+        };
         self.cache.insert(
             path.to_path_buf(),
             CacheEntry {
@@ -389,7 +403,7 @@ impl CursorSessionSource {
                 offset,
                 prefix_hash: snapshot.hash,
                 prefix_guard: snapshot.guard,
-                next_full_verify_offset: next_full_verify_offset(offset),
+                next_full_verify_offset,
                 summary: summary.clone(),
             },
         );
@@ -1681,6 +1695,78 @@ mod tests {
         assert!(
             verified <= max_expected,
             "large append validation read {verified} bytes, expected at most {max_expected}"
+        );
+    }
+
+    #[test]
+    fn large_append_reaches_checkpoint_and_detects_middle_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = layout(tmp.path(), "demo-project");
+        let path = session_dir.join(format!("{PARENT}.jsonl"));
+        let padding = "x".repeat(16 * 1024);
+        let padding_line = format!(r#"{{"type":"synthetic_padding","padding":"{padding}"}}"#);
+        let middle_old = user_line("middle old");
+        let middle_new = user_line("middle new");
+        assert_eq!(middle_old.len(), middle_new.len());
+
+        let mut file = File::create(&path).unwrap();
+        writeln!(file, "{}", user_line("head")).unwrap();
+        for _ in 0..160 {
+            writeln!(file, "{padding_line}").unwrap();
+        }
+        let middle_offset = file.stream_position().unwrap();
+        writeln!(file, "{middle_old}").unwrap();
+        for _ in 0..160 {
+            writeln!(file, "{padding_line}").unwrap();
+        }
+        drop(file);
+
+        let mut source = CursorSessionSource::at_root(tmp.path().to_path_buf());
+        let (initial, _) = source.detect().unwrap();
+        let initial_summary = initial[0].cursor_summary.as_ref().unwrap();
+        assert!(initial_summary
+            .messages
+            .iter()
+            .any(|message| message.content == "middle old"));
+        let initial_checkpoint = source.cache.get(&path).unwrap().next_full_verify_offset;
+        assert!(source.cache.get(&path).unwrap().offset > EXACT_PREFIX_VERIFY_LIMIT);
+
+        for index in 0..8 {
+            let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(append, r#"{{"type":"synthetic_append","index":{index}}}"#).unwrap();
+            drop(append);
+            source.detect().unwrap();
+        }
+        assert_eq!(
+            source.cache.get(&path).unwrap().next_full_verify_offset,
+            initial_checkpoint,
+            "guard-only appends must not move the scheduled full checkpoint"
+        );
+
+        let mut rewrite = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        rewrite.seek(SeekFrom::Start(middle_offset)).unwrap();
+        rewrite.write_all(middle_new.as_bytes()).unwrap();
+        drop(rewrite);
+
+        let mut detected_rewrite = false;
+        for _ in 8..96 {
+            let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(append, "{padding_line}").unwrap();
+            drop(append);
+            let (sessions, _) = source.detect().unwrap();
+            let summary = sessions[0].cursor_summary.as_ref().unwrap();
+            if summary
+                .messages
+                .iter()
+                .any(|message| message.content == "middle new")
+            {
+                detected_rewrite = true;
+                break;
+            }
+        }
+        assert!(
+            detected_rewrite,
+            "a middle rewrite must be detected when the fixed checkpoint is reached"
         );
     }
 

@@ -42,7 +42,7 @@ push, tag, publish, or GitHub release was performed.
 
 | Gate | Result | Evidence / boundary |
 | --- | --- | --- |
-| Focused Cursor tests | PASS | 26 passed, 0 failed; synthetic fixtures cover append reuse, bounded large-append validation, prefix/truncate-rewrite fallback, partial lines, lifecycle, delete/rename, same-length rewrite with preserved mtime, large transcripts, torn concurrent writes, and suffix-hash read failure |
+| Focused Cursor tests | PASS | 27 passed, 0 failed; synthetic fixtures cover append reuse, bounded large-append validation, checkpoint scheduling and middle-rewrite detection, prefix/truncate-rewrite fallback, partial lines, lifecycle, delete/rename, same-length rewrite with preserved mtime, large transcripts, torn concurrent writes, and suffix-hash read failure |
 | Focused Codex source tests | PASS | 39 passed, 0 failed; includes incremental hits, partial/truncation, same-length and middle rewrites, lifecycle, hierarchy, and conversation behavior |
 | Focused Codex archive tests | PASS | 12 passed, 0 failed; synthetic fixtures cover partial lines, append/truncation, preserved-mtime same-length rewrite, anchor-external middle rewrite, merge/search, and token accounting |
 | Provider-scoped CLI references | PASS | `cli::` focused suite: 50 passed, 0 failed; `view`, `tasks`, and `cost --session` accept `claudeCode:<id>`, `codex:<id>`, and `cursor:<id>` and disambiguate colliding raw IDs |
@@ -50,19 +50,19 @@ push, tag, publish, or GitHub release was performed.
 | Shared cache-stamp contract | PASS | 3 passed, 0 failed; shared `FileVersion` reads length/change-time/identity, weak metadata rejects unchanged fast path, and strong identity/subsecond stamp is accepted |
 | Provider-aware rename protocol | PASS | 7 passed, 0 failed; explicit Codex/Cursor rename is rejected, providerless legacy requests retain their v0.9 shape, and a shared-owner collision guard rejects cross-provider IDs before any write |
 | Synthetic Tauri/WebSocket collision regression | PASS | 3 passed, 0 failed; synthetic Cursor and Codex owners reject providerless rename before the Tauri writer callback or WebSocket title-write dispatch |
-| Full Rust library tests | PASS | 359 passed, 1 ignored, 0 failed |
-| Rust integration tests | PASS | library 359 passed/1 ignored; main 0; background test 1 ignored; parser integration 3 passed |
+| Full Rust library tests | PASS | 361 passed, 1 ignored, 0 failed |
+| Rust integration tests | PASS | library 361 passed/1 ignored; main 0; background test 1 ignored; parser integration 3 passed |
 | Rust format | PASS | `cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check` |
 | Frontend type/check | PASS | `npm run check`: 0 errors, 0 warnings |
 | Frontend production build | PASS | `npm run build` completed with SvelteKit/Vite output |
 | Version metadata sync | PASS | `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` all report `0.10.0` |
 | Rust release compile | PASS | `cargo build --release --manifest-path src-tauri/Cargo.toml` |
 | Release workflow YAML parse | PASS | Ruby YAML parser loaded `.github/workflows/release.yml` successfully |
-| Tauri app bundle | UNVERIFIED in this final pass | Rust release compile passed; no new native bundle run was performed |
+| Tauri app bundle | PENDING GHA evidence | Workflow now includes signed/notarized bundle validation and a native launch/server-health smoke; no GHA run was completed in this checkout |
 | Tauri updater artifact | PENDING GHA evidence | Local signing requires `TAURI_SIGNING_PRIVATE_KEY`; workflow now fails closed when the secret/signature artifact is missing |
 | DMG bundle | PENDING GHA evidence | Local generated `bundle_dmg.sh` previously failed; repository release path uses GHA `tauri build` |
 | Apple notarization | PENDING GHA evidence | Workflow accepts Apple credentials; no local notarization was run |
-| x86_64 CI/native E2E | PENDING | Workflow matrix contains x86_64; no completed GHA/native behavior evidence in this checkout |
+| x86_64 CI/native E2E | PENDING | Workflow matrix contains x86_64 and native launch smoke; no completed GHA/native behavior E2E evidence in this checkout |
 | Diff whitespace | PASS | Review-fix commit range checked with `git diff --check HEAD^ HEAD` |
 
 The provider-owner synthetic suite also passes 6/6: global and cloned Codex/Cursor owners
@@ -113,8 +113,10 @@ re-review** and did not run tests or builds. Findings and current status:
   4 MiB use exact prefix verification on every append. Larger transcripts use
   fixed-size head/tail guards between geometrically scheduled full-prefix
   checkpoints, so normal append validation has a bounded read budget and the
-  cumulative full-revalidation work is linear in transcript growth. A synthetic
-  byte-budget regression covers the high-frequency large-file path.
+  cumulative full-revalidation work is linear in transcript growth. The next
+  checkpoint is anchored to the last full verification and is not moved by
+  guard-only appends. Synthetic regressions cover the high-frequency large-file
+  path and middle-rewrite detection at a checkpoint.
 - P3 Cursor suffix-hash errors being swallowed: fixed. Hash/read failure now
   returns a parse error instead of persisting an incomplete hash, with a
   synthetic regression test.
@@ -168,8 +170,9 @@ trusting a stale serialized key.
 build matrices until diff hygiene, Rust format/tests, and frontend check/build
 pass. The macOS job fails closed when updater signing or Apple signing and
 notarization credentials are absent, then verifies the built app with
-`codesign`, `stapler`, and `spctl`, validates the DMG with `hdiutil`, and checks
-that the signed updater archive and signature exist. The workflow preserves the
+`codesign`, `stapler`, and `spctl`, launches the native binary and checks its
+local server health/version endpoint, validates the DMG with `hdiutil`, and
+checks that the signed updater archive and signature exist. The workflow preserves the
 exact Tauri-generated `.app.tar.gz` bytes that were signed, renames those
 artifacts (without re-tarring the `.app`), renames DMGs to
 `c9watch_<tag>_<arch>.dmg`, and generates `latest.json` URLs matching the

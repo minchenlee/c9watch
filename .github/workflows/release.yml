@@ -13,6 +13,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -117,6 +119,34 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           xcrun stapler validate "$APP"
           spctl --assess --type execute --verbose=4 "$APP"
+
+      - name: Native launch and server health smoke
+        env:
+          HOME: ${{ runner.temp }}/c9watch-native-home
+        run: |
+          BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle"
+          APP=$(find "$BUNDLE/macos" -maxdepth 1 -type d -name '*.app' -print -quit)
+          BINARY="$APP/Contents/MacOS/c9watch"
+          test -x "$BINARY"
+          mkdir -p "$HOME"
+          "$BINARY" --version
+          "$BINARY" > "$RUNNER_TEMP/c9watch-native.log" 2>&1 &
+          PID=$!
+          cleanup() { kill "$PID" 2>/dev/null || true; }
+          trap cleanup EXIT
+          for _ in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9210/health >/dev/null; then
+              curl --fail --silent http://127.0.0.1:9210/info | grep -q '"version":"0.10.0"'
+              exit 0
+            fi
+            if ! kill -0 "$PID" 2>/dev/null; then
+              cat "$RUNNER_TEMP/c9watch-native.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/c9watch-native.log"
+          exit 1
 
       - name: Rename artifacts for clarity
         run: |

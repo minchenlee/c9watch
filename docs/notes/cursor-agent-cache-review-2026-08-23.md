@@ -38,7 +38,9 @@ The review-fix pass adds a bounded validation policy for large transcripts. File
 head/tail guards between full-prefix checkpoints, and schedule those checkpoints after
 geometric growth. This bounds normal append validation I/O and keeps cumulative full
 revalidation linear in transcript growth; an arbitrary rewrite in the unguarded middle
-of a large file is detected at the next full checkpoint.
+of a large file is detected at the next full checkpoint. Guard-only appends preserve
+the checkpoint anchored to the last full verification; the checkpoint is advanced only
+after a full verification or a full parse.
 
 ## Regression evidence reported by Pi
 
@@ -130,6 +132,7 @@ The source implementation and the executable review follow-ups are now committed
 - [x] Avoid double prefix hashing on append (`bd263eb`).
 - [x] Add a partial-line incremental parsing regression test (`bd263eb`).
 - [x] Add bounded large-transcript prefix validation and a synthetic byte-budget regression.
+- [x] Keep full-prefix checkpoint scheduling anchored across guard-only appends and test middle-rewrite detection at the checkpoint.
 - [ ] Decide whether same-length rewrite detection needs a platform-specific solution.
 
 The note is committed with the candidate. Full workspace build, Tauri integration/e2e
