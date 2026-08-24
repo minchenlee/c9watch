@@ -7,7 +7,7 @@ push, tag, publish, or GitHub release was performed.
 
 - Branch: `feature/cursor-agent-detection`
 - Original review baseline: `242f987` (`feat: prepare v0.10.0 Cursor Agent support`)
-- Review-fix candidate: the current HEAD, verified live with `git status` and `git log`
+- Final review candidate: `504c0e5`, verified live with `git status` and `git log`
 - v0.9.0 tag: `08b860d`; `origin/release/v0.9.0` points to the same commit.
 - `origin/main`: `223b61c`.
 - Known Cursor commits are present in HEAD: `13b9805`, `c26dff6`, `bd263eb`.
@@ -145,6 +145,13 @@ synthetic WebSocket dispatch test covering both providers. The tests use
 tempfile-backed owners and never write a real title file. Frontend/native
 behavior E2E remains a separate user-owned gate.
 
+A final independent review of `81e086a..504c0e5` then completed with
+`FINAL INDEPENDENT REVIEW: yes` and `VERDICT: PASS`. The reviewer independently
+checked the checkpoint invariants, release workflow parent checkout, readiness
+counts, provider/owner collision paths, and synthetic Tauri/WebSocket tests;
+no confirmed P0, P1, P2, or P3 findings remained. This does not convert the
+separate native/package/E2E or release-service gates into local acceptance.
+
 The provider/session ID collision paths are covered by `SessionIdentity`,
 provider-aware conversation dispatch, collision-aware legacy rename validation,
 provider-scoped frontend maps, Claude-only task/subagent lookup, CLI watch/cost
@@ -183,9 +190,9 @@ checkout.
 
 ## Decision
 
-- Ready for PR: **pending final re-review** — the two P2 findings and two P3
-  findings from the full independent review have been addressed in the
-  review-fix candidate, but the same reviewer must confirm the fixes.
+- Ready for PR: **yes, with the deferred E2E boundary recorded** — the final
+  independent reviewer returned `PASS` with no confirmed P0/P1/P2/P3 findings.
+  Full frontend/native behavior E2E remains a separate user-owned gate.
 - Ready for release: **no** — local DMG packaging, updater signing,
   notarization, cross-architecture GHA evidence, and native app E2E are not
   all green; no release authorization was given.
