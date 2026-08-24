@@ -11,10 +11,8 @@ use super::source::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::hash::Hasher;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,6 +21,12 @@ const IDLE_FRESHNESS_SECS: u64 = 30 * 60;
 const WORKING_FRESHNESS_SECS: u64 = 4 * 60 * 60;
 const LINKED_PARENT_CEILING_SECS: u64 = 24 * 60 * 60;
 const MONITOR_MESSAGE_CHARS: usize = 200;
+const EXACT_PREFIX_VERIFY_LIMIT: u64 = 4 * 1024 * 1024;
+const PREFIX_GUARD_BYTES: u64 = 64 * 1024;
+const MIN_FULL_VERIFY_GROWTH_BYTES: u64 = 1024 * 1024;
+const FULL_VERIFY_GROWTH_DIVISOR: u64 = 8;
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CursorLifecycle {
@@ -79,14 +83,33 @@ impl CursorTranscriptSummary {
 
 type FileStamp = FileVersion;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefixGuard {
+    len: u64,
+    head_hash: u64,
+    tail_hash: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PrefixSnapshot {
+    hash: u64,
+    guard: PrefixGuard,
+}
+
 #[derive(Debug, Clone)]
 struct CacheEntry {
     stamp: FileStamp,
     offset: u64,
-    /// Hash of the transcript bytes in `[0, offset)`. A larger file alone does
-    /// not prove an append: truncate-and-rewrite can also grow past the old
-    /// offset, so the cached prefix must still match before reusing it.
+    /// FNV hash of the transcript bytes in `[0, offset)`. The state can be
+    /// extended over an append without re-reading the existing prefix.
     prefix_hash: u64,
+    /// Bounded content guard used between full prefix validations on large
+    /// transcripts. Small transcripts continue to use exact verification.
+    prefix_guard: PrefixGuard,
+    /// Large transcripts are fully revalidated after a geometrically bounded
+    /// amount of growth. This keeps cumulative validation I/O linear in the
+    /// transcript size while bounding the large-file rewrite detection window.
+    next_full_verify_offset: u64,
     summary: CursorTranscriptSummary,
 }
 
@@ -105,6 +128,8 @@ pub struct CursorSessionSource {
     cache: HashMap<PathBuf, CacheEntry>,
     #[cfg(test)]
     parse_count: u32,
+    #[cfg(test)]
+    prefix_verification_bytes: u64,
 }
 
 impl CursorSessionSource {
@@ -125,6 +150,11 @@ impl CursorSessionSource {
         self.parse_count
     }
 
+    #[cfg(test)]
+    pub(crate) fn prefix_verification_bytes_for_test(&self) -> u64 {
+        self.prefix_verification_bytes
+    }
+
     fn at_roots(projects_root: PathBuf, vscdb_path: Option<PathBuf>) -> Self {
         Self {
             projects_root,
@@ -132,6 +162,8 @@ impl CursorSessionSource {
             cache: HashMap::new(),
             #[cfg(test)]
             parse_count: 0,
+            #[cfg(test)]
+            prefix_verification_bytes: 0,
         }
     }
 
@@ -285,11 +317,28 @@ impl CursorSessionSource {
                 return Ok((stamp, cached.summary.clone()));
             }
         }
-        let (existing, start_offset, resumed_hasher) = match self.cache.get(path) {
+        let (existing, start_offset, resumed_hash) = match self.cache.get(path) {
             Some(cached) if stamp.len > cached.offset => {
-                let resumed = verify_prefix(path, cached.offset, cached.prefix_hash);
-                match resumed {
-                    Some(hasher) => (Some(cached.summary.clone()), cached.offset, Some(hasher)),
+                let full_verification = cached.offset <= EXACT_PREFIX_VERIFY_LIMIT
+                    || stamp.len >= cached.next_full_verify_offset;
+                let verified_bytes = if full_verification {
+                    verify_prefix(path, cached.offset, cached.prefix_hash)
+                } else {
+                    verify_prefix_guard(path, cached.prefix_guard)
+                };
+                match verified_bytes {
+                    Some(_bytes) => {
+                        #[cfg(test)]
+                        {
+                            self.prefix_verification_bytes =
+                                self.prefix_verification_bytes.saturating_add(_bytes);
+                        }
+                        (
+                            Some(cached.summary.clone()),
+                            cached.offset,
+                            Some(cached.prefix_hash),
+                        )
+                    }
                     None => (None, 0, None),
                 }
             }
@@ -304,16 +353,27 @@ impl CursorSessionSource {
         if summary.cwd.as_os_str().is_empty() {
             summary.cwd = decode_cursor_project_key(&transcript.project_key);
         }
-        let prefix_hash = if let Some(mut hasher) = resumed_hasher {
+        let snapshot = if let Some(mut hash) = resumed_hash {
             // Extend the verified prefix hash over the appended bytes instead
-            // of re-hashing the whole range.
-            feed_suffix(path, start_offset, offset, &mut hasher).ok_or_else(|| {
+            // of re-hashing the whole range. Large files use a bounded guard
+            // between geometrically scheduled full-prefix validations.
+            feed_suffix(path, start_offset, offset, &mut hash).ok_or_else(|| {
                 SessionDetectorError::Parse(format!(
                     "Cursor transcript suffix changed while hashing: {}",
                     path.display()
                 ))
             })?;
-            hasher.finish()
+            PrefixSnapshot {
+                hash,
+                guard: hash_prefix_guard(path, offset)
+                    .ok_or_else(|| {
+                        SessionDetectorError::Parse(format!(
+                            "Cursor transcript prefix guard could not be hashed: {}",
+                            path.display()
+                        ))
+                    })?
+                    .0,
+            }
         } else {
             hash_file_prefix(path, offset).ok_or_else(|| {
                 SessionDetectorError::Parse(format!(
@@ -327,7 +387,9 @@ impl CursorSessionSource {
             CacheEntry {
                 stamp,
                 offset,
-                prefix_hash,
+                prefix_hash: snapshot.hash,
+                prefix_guard: snapshot.guard,
+                next_full_verify_offset: next_full_verify_offset(offset),
                 summary: summary.clone(),
             },
         );
@@ -820,70 +882,110 @@ fn looks_like_uuid(value: &str) -> bool {
         && bytes[23] == b'-'
 }
 
-/// Feed exactly `len` bytes of `path` into `hasher`. Returns `None` if the
-/// file is shorter than `len`, unreadable, or ends prematurely.
-fn feed_prefix(path: &Path, len: u64, hasher: &mut DefaultHasher) -> Option<()> {
-    let mut file = File::open(path).ok()?;
-    if fs::metadata(path).ok()?.len() < len {
+fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Feed `[start, end)` into an incremental FNV state. Returns `None` if the
+/// file is shorter than `end`, unreadable, or ends prematurely.
+fn feed_hash_range(path: &Path, start: u64, end: u64, hash: &mut u64) -> Option<u64> {
+    if end < start {
         return None;
     }
+    let mut file = File::open(path).ok()?;
+    if fs::metadata(path).ok()?.len() < end {
+        return None;
+    }
+    file.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = vec![0u8; 64 * 1024];
-    let mut remaining = len;
+    let mut remaining = end - start;
+    let mut bytes_read = 0;
     while remaining > 0 {
         let want = buf.len().min(remaining as usize);
         let read = file.read(&mut buf[..want]).ok()?;
         if read == 0 {
             return None;
         }
-        hasher.write(&buf[..read]);
+        *hash = hash_bytes(*hash, &buf[..read]);
         remaining -= read as u64;
+        bytes_read += read as u64;
     }
-    Some(())
+    Some(bytes_read)
 }
 
-/// Verify that the first `len` bytes of `path` hash to `expected_hash`.
-/// On success returns the hasher positioned after `len` bytes so callers can
-/// cheaply extend the hash over an appended suffix without re-reading.
-fn verify_prefix(path: &Path, len: u64, expected_hash: u64) -> Option<DefaultHasher> {
-    let mut hasher = DefaultHasher::new();
-    feed_prefix(path, len, &mut hasher)?;
-    (hasher.finish() == expected_hash).then_some(hasher)
+fn hash_range(path: &Path, start: u64, end: u64) -> Option<(u64, u64)> {
+    let mut hash = FNV_OFFSET_BASIS;
+    let bytes_read = feed_hash_range(path, start, end, &mut hash)?;
+    Some((hash, bytes_read))
 }
 
-/// Hash the first `len` bytes of `path`, or `None` if the file is shorter or
-/// unreadable. Used to distinguish a genuine append from a truncate-and-rewrite
-/// that happens to end up longer than the previously cached offset.
-fn hash_file_prefix(path: &Path, len: u64) -> Option<u64> {
-    let mut hasher = DefaultHasher::new();
-    feed_prefix(path, len, &mut hasher)?;
-    Some(hasher.finish())
+/// Verify the complete cached prefix. Small transcripts use this on every
+/// append; large transcripts use it at geometrically scheduled checkpoints.
+fn verify_prefix(path: &Path, len: u64, expected_hash: u64) -> Option<u64> {
+    let (hash, bytes_read) = hash_range(path, 0, len)?;
+    (hash == expected_hash).then_some(bytes_read)
 }
 
-/// Feed the bytes of `path` in `[start, end)` into `hasher`.
+fn hash_prefix_guard(path: &Path, len: u64) -> Option<(PrefixGuard, u64)> {
+    let head_len = len.min(PREFIX_GUARD_BYTES);
+    let (head_hash, head_bytes) = hash_range(path, 0, head_len)?;
+    if len <= PREFIX_GUARD_BYTES {
+        return Some((
+            PrefixGuard {
+                len,
+                head_hash,
+                tail_hash: head_hash,
+            },
+            head_bytes,
+        ));
+    }
+
+    let tail_start = len.saturating_sub(PREFIX_GUARD_BYTES);
+    let (tail_hash, tail_bytes) = hash_range(path, tail_start, len)?;
+    Some((
+        PrefixGuard {
+            len,
+            head_hash,
+            tail_hash,
+        },
+        head_bytes + tail_bytes,
+    ))
+}
+
+/// Verify fixed-size head/tail guards between full prefix checkpoints. This is
+/// intentionally bounded I/O: an arbitrary rewrite in the unguarded middle of
+/// a very large transcript is detected at the next geometric full checkpoint.
+fn verify_prefix_guard(path: &Path, expected: PrefixGuard) -> Option<u64> {
+    let (current, bytes_read) = hash_prefix_guard(path, expected.len)?;
+    (current == expected).then_some(bytes_read)
+}
+
+/// Hash the first `len` bytes and compute the bounded guard in the same cache
+/// update. The full hash is needed to extend the incremental state later.
+fn hash_file_prefix(path: &Path, len: u64) -> Option<PrefixSnapshot> {
+    let (hash, _) = hash_range(path, 0, len)?;
+    let (guard, _) = hash_prefix_guard(path, len)?;
+    Some(PrefixSnapshot { hash, guard })
+}
+
+/// Feed the bytes of `path` in `[start, end)` into `hash`.
 ///
 /// A failure is reported to the caller so an incomplete hash can never be
 /// persisted as if it represented the full cached prefix.
-fn feed_suffix(path: &Path, start: u64, end: u64, hasher: &mut DefaultHasher) -> Option<()> {
-    if end <= start {
-        return Some(());
+fn feed_suffix(path: &Path, start: u64, end: u64, hash: &mut u64) -> Option<()> {
+    feed_hash_range(path, start, end, hash).map(|_| ())
+}
+
+fn next_full_verify_offset(offset: u64) -> u64 {
+    if offset <= EXACT_PREFIX_VERIFY_LIMIT {
+        return offset;
     }
-    let mut file = File::open(path).ok()?;
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return None;
-    }
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut remaining = end - start;
-    while remaining > 0 {
-        let want = buf.len().min(remaining as usize);
-        match file.read(&mut buf[..want]) {
-            Ok(0) | Err(_) => return None,
-            Ok(read) => {
-                hasher.write(&buf[..read]);
-                remaining -= read as u64;
-            }
-        }
-    }
-    Some(())
+    let growth = (offset / FULL_VERIFY_GROWTH_DIVISOR).max(MIN_FULL_VERIFY_GROWTH_BYTES);
+    offset.saturating_add(growth)
 }
 
 fn file_stamp(path: &Path) -> Result<FileStamp, SessionDetectorError> {
@@ -1551,6 +1653,38 @@ mod tests {
     }
 
     #[test]
+    fn large_append_prefix_validation_has_a_bounded_read_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = layout(tmp.path(), "demo-project");
+        let path = session_dir.join(format!("{PARENT}.jsonl"));
+        let filler = "x".repeat(1024);
+        let line = format!(r#"{{"type":"synthetic_padding","padding":"{filler}"}}"#);
+        let line_count = (EXACT_PREFIX_VERIFY_LIMIT as usize / line.len()) + 128;
+        let lines = vec![line; line_count];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_jsonl(&path, &refs);
+
+        let mut source = CursorSessionSource::at_root(tmp.path().to_path_buf());
+        source.detect().unwrap();
+        let cached = source.cache.get(&path).unwrap();
+        assert!(cached.offset > EXACT_PREFIX_VERIFY_LIMIT);
+
+        let before = source.prefix_verification_bytes_for_test();
+        for index in 0..16 {
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(file, r#"{{"type":"synthetic_append","index":{index}}}"#).unwrap();
+            drop(file);
+            source.detect().unwrap();
+        }
+        let verified = source.prefix_verification_bytes_for_test() - before;
+        let max_expected = 16 * PREFIX_GUARD_BYTES * 2;
+        assert!(
+            verified <= max_expected,
+            "large append validation read {verified} bytes, expected at most {max_expected}"
+        );
+    }
+
+    #[test]
     fn concurrent_torn_write_is_ignored_then_committed_once() {
         let tmp = tempfile::tempdir().unwrap();
         let session_dir = layout(tmp.path(), "demo-project");
@@ -1693,9 +1827,9 @@ mod tests {
     fn suffix_hash_failure_is_reported_instead_of_cached() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("missing-transcript.jsonl");
-        let mut hasher = DefaultHasher::new();
+        let mut hash = FNV_OFFSET_BASIS;
 
-        assert!(feed_suffix(&path, 0, 1, &mut hasher).is_none());
+        assert!(feed_suffix(&path, 0, 1, &mut hash).is_none());
     }
 
     #[test]

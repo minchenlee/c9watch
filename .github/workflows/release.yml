@@ -9,7 +9,43 @@ permissions:
   contents: write
 
 jobs:
+  source-gates:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Diff hygiene
+        run: git diff --check "${GITHUB_SHA}^" "$GITHUB_SHA"
+
+      - name: Rust format
+        run: cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Rust library tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Rust integration tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --tests
+
+      - name: Frontend type and static checks
+        run: npm run check
+
+      - name: Frontend production build
+        run: npm run build
+
   build-macos:
+    needs: source-gates
     runs-on: macos-latest
     strategy:
       matrix:
@@ -43,19 +79,44 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: test -n "$TAURI_SIGNING_PRIVATE_KEY"
 
+      - name: Verify Apple signing and notarization credentials
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          test -n "$APPLE_CERTIFICATE"
+          test -n "$APPLE_CERTIFICATE_PASSWORD"
+          test -n "$APPLE_SIGNING_IDENTITY"
+          test -n "$APPLE_ID"
+          test -n "$APPLE_PASSWORD"
+          test -n "$APPLE_TEAM_ID"
+
       - name: Build Tauri app
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Apple code signing (optional — set these secrets to enable)
+          # Apple code signing
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # Apple notarization (optional — set these secrets to enable)
+          # Apple notarization
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npx tauri build --target ${{ matrix.target }}
+
+      - name: Validate signed and notarized native bundle
+        run: |
+          BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle"
+          APP=$(find "$BUNDLE/macos" -maxdepth 1 -type d -name '*.app' -print -quit)
+          test -n "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          xcrun stapler validate "$APP"
+          spctl --assess --type execute --verbose=4 "$APP"
 
       - name: Rename artifacts for clarity
         run: |
@@ -81,6 +142,14 @@ jobs:
             fi
           done
 
+          archive="macos/c9watch_${{ github.ref_name }}_${{ matrix.arch }}.app.tar.gz"
+          test -s "$archive"
+          test -s "${archive}.sig"
+
+          dmg=$(find dmg -maxdepth 1 -type f -name '*.dmg' -print -quit)
+          test -n "$dmg"
+          hdiutil imageinfo "$dmg" >/dev/null
+
       - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
@@ -103,6 +172,7 @@ jobs:
           if-no-files-found: error
 
   build-cli:
+    needs: source-gates
     strategy:
       matrix:
         include:
@@ -135,6 +205,17 @@ jobs:
             --no-default-features --features cli \
             --target ${{ matrix.target }}
 
+      - name: Verify Apple signing credentials
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          test -n "$APPLE_CERTIFICATE"
+          test -n "$APPLE_CERTIFICATE_PASSWORD"
+          test -n "$APPLE_SIGNING_IDENTITY"
+
       - name: Sign CLI binary (macOS)
         if: runner.os == 'macOS'
         env:
@@ -158,9 +239,8 @@ jobs:
             # Clean up sensitive files
             rm -f "$RUNNER_TEMP/certificate.p12"
             security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
-          else
-            codesign --force --options runtime --sign - "$BINARY"
           fi
+          codesign --verify --strict --verbose=2 "$BINARY"
 
       - name: Package CLI binary
         run: |

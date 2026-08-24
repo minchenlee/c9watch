@@ -1,16 +1,16 @@
 # Cursor Agent Incremental Cache Review
 
-Date: 2026-08-23  
-Branch: `feature/cursor-agent-detection`  
-Scope: `src-tauri/src/session/cursor.rs`  
-Source commits: `c26dff6`, `bd263eb`  
-Review note: untracked; not committed.
+Date: 2026-08-23
+Branch: `feature/cursor-agent-detection`
+Scope: `src-tauri/src/session/cursor.rs`
+Source commits: `c26dff6`, `bd263eb`
+Review note: preserved and committed with the v0.10.0 candidate.
 
 ## Outcome
 
 **Initial verdict: Approve with follow-up.**
 
-The implementation fixes the targeted truncate-and-grow transcript rewrite bug. The independent review found no P0, P1, or P2 correctness issue. The two executable follow-ups, P3-1 and P3-3, were subsequently completed. P3-2 and the large-transcript benchmark remain explicitly deferred.
+The implementation fixes the targeted truncate-and-grow transcript rewrite bug. The independent review found no P0, P1, or P2 correctness issue. The two executable follow-ups, P3-1 and P3-3, were subsequently completed. Same-length rewrites on filesystems with unchanged metadata remain an explicit platform limitation.
 
 ## Root cause
 
@@ -32,6 +32,13 @@ The change is confined to `src-tauri/src/session/cursor.rs` and does not alter f
 Commit `bd263eb` refactors the append path to reuse the verified prefix hasher. The implementation now separates prefix feeding, prefix verification, and suffix feeding so a genuine append hashes only the newly appended bytes after the cached prefix has been verified.
 
 The same follow-up adds `partial_line_is_ignored_until_fully_written`, covering a torn JSONL write: an unterminated line does not advance the offset, and the completed line is later emitted exactly once.
+
+The review-fix pass adds a bounded validation policy for large transcripts. Files up to
+4 MiB use exact prefix verification on every append. Larger files validate fixed-size
+head/tail guards between full-prefix checkpoints, and schedule those checkpoints after
+geometric growth. This bounds normal append validation I/O and keeps cumulative full
+revalidation linear in transcript growth; an arbitrary rewrite in the unguarded middle
+of a large file is detected at the next full checkpoint.
 
 ## Regression evidence reported by Pi
 
@@ -91,7 +98,8 @@ Before the follow-up commits, the Codex-side read-only inspection observed:
  M src-tauri/src/session/cursor.rs
 ```
 
-`git diff --check` produced no output at inspection time. No real `~/.cursor` transcript was used.
+No real `~/.cursor` transcript was used. The current review-fix commit also runs the
+range form of `git diff --check` as a release source gate.
 
 ## Independent review findings
 
@@ -121,7 +129,9 @@ The source implementation and the executable review follow-ups are now committed
 
 - [x] Avoid double prefix hashing on append (`bd263eb`).
 - [x] Add a partial-line incremental parsing regression test (`bd263eb`).
+- [x] Add bounded large-transcript prefix validation and a synthetic byte-budget regression.
 - [ ] Decide whether same-length rewrite detection needs a platform-specific solution.
-- [ ] Benchmark synthetic large transcripts if prefix-hash cost becomes user-visible.
 
-Current working tree status: source changes are committed at `bd263eb`; this review note is the only untracked file. Full workspace build, Tauri integration/e2e tests, real high-frequency writes, and large real-user transcripts remain outside this review's verification scope.
+The note is committed with the candidate. Full workspace build, Tauri integration/e2e
+tests, and large real-user transcripts remain outside this synthetic-fixture review's
+verification scope.
