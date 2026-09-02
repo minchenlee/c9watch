@@ -1410,6 +1410,12 @@ fn insert_session_contract(json: &mut serde_json::Value, session: &session::enri
             object.insert(key.to_string(), serde_json::json!(value));
         }
     }
+    if let Some(title) = &session.codex_title {
+        object.insert("codexTitle".to_string(), serde_json::json!(title));
+    }
+    if let Some(title) = &session.cursor_title {
+        object.insert("cursorTitle".to_string(), serde_json::json!(title));
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -1455,6 +1461,16 @@ fn enrich_history_entry(entry: session::HistoryEntry) -> serde_json::Value {
         json.as_object_mut()
             .unwrap()
             .insert("customTitle".to_string(), serde_json::json!(title));
+    }
+    if let Some(title) = entry.codex_title {
+        json.as_object_mut()
+            .unwrap()
+            .insert("codexTitle".to_string(), serde_json::json!(title));
+    }
+    if let Some(title) = entry.cursor_title {
+        json.as_object_mut()
+            .unwrap()
+            .insert("cursorTitle".to_string(), serde_json::json!(title));
     }
 
     json
@@ -1813,6 +1829,8 @@ mod session_formatter_tests {
             pid: 0,
             session_name: "child".to_string(),
             custom_title: None,
+            codex_title: Some("Codex thread title".to_string()),
+            cursor_title: None,
             project_path: "/tmp/project".to_string(),
             git_branch: None,
             first_prompt: "investigate".to_string(),
@@ -1843,6 +1861,7 @@ mod session_formatter_tests {
 
     fn assert_codex_contract(value: &serde_json::Value) {
         assert_eq!(value["sessionKey"], "codex:child-thread");
+        assert_eq!(value["codexTitle"], "Codex thread title");
         assert_eq!(value["provider"], "codex");
         assert_eq!(value["surface"], "app");
         assert_eq!(value["agentKind"], "subagent");

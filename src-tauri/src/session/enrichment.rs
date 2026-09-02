@@ -28,6 +28,12 @@ pub struct Session {
     pub pid: u32,
     pub session_name: String,
     pub custom_title: Option<String>,
+    /// Codex's current UI thread name from ~/.codex/session_index.jsonl.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_title: Option<String>,
+    /// Cursor's current UI composer name from state.vscdb.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_title: Option<String>,
     pub project_path: String,
     pub git_branch: Option<String>,
     pub first_prompt: String,
@@ -243,6 +249,7 @@ pub fn enrich_detected_sessions(
             let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
                 .or_else(|| detected.agent_nickname.clone())
                 .unwrap_or_else(|| detected.project_name.clone());
+            let codex_title = crate::session::codex::get_cached_codex_thread_title(&session_id);
             let modified = if summary.last_timestamp.is_empty() {
                 detected
                     .started_at_ms
@@ -258,6 +265,8 @@ pub fn enrich_detected_sessions(
                 pid: detected.pid,
                 session_name,
                 custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
+                codex_title,
+                cursor_title: None,
                 project_path: detected.cwd.to_string_lossy().to_string(),
                 git_branch: None,
                 first_prompt,
@@ -328,6 +337,8 @@ pub fn enrich_detected_sessions(
                 session_name,
                 custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id)
                     .or_else(|| detected.official_name.clone()),
+                codex_title: None,
+                cursor_title: summary.cursor_title.clone(),
                 project_path: detected.cwd.to_string_lossy().to_string(),
                 git_branch: None,
                 first_prompt,
@@ -488,6 +499,8 @@ pub fn enrich_detected_sessions(
             pid: detected.pid,
             session_name,
             custom_title,
+            codex_title: None,
+            cursor_title: None,
             project_path: detected.cwd.to_string_lossy().to_string(),
             git_branch,
             first_prompt,

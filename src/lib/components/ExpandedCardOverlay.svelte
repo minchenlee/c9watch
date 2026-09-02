@@ -199,7 +199,7 @@
 			sessionId: child.id,
 			provider: providerOf(child),
 			agentType: child.agentRole || child.agentNickname || 'subagent',
-			description: child.agentNickname || child.summary || child.firstPrompt || child.agentRole || (providerOf(child) === 'cursor' ? 'Cursor subagent' : 'Codex subagent'),
+				description: child.agentNickname || child.codexTitle || child.cursorTitle || child.summary || child.firstPrompt || child.agentRole || (providerOf(child) === 'cursor' ? 'Cursor subagent' : 'Codex subagent'),
 			startedAt: child.startedAtMs ? new Date(child.startedAtMs).toISOString() : child.modified,
 			completedAt: child.status === SessionStatus.Working ? null : child.modified,
 			parentSessionId: session.id,
@@ -351,7 +351,7 @@
 								onmouseenter={() => tipEnter(session.id)}
 								onmouseleave={tipLeave}
 								onmousemove={tipMove}
-							>{session.customTitle || session.summary || session.firstPrompt || 'New Session'}</h2>
+							>{session.customTitle || session.officialName || session.codexTitle || session.cursorTitle || session.summary || session.firstPrompt || 'New Session'}</h2>
 							{#if PM_ORCHESTRATION_ENABLED && session.workerOf}
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<span
@@ -635,7 +635,7 @@
 									class:active={sessionKeyOf(w) === sessionKeyOf(session)}
 									onclick={() => openWorker(w)}
 								>
-									<span class="worker-name">{w.customTitle || w.summary || w.sessionName}</span>
+								<span class="worker-name">{w.customTitle || w.codexTitle || w.cursorTitle || w.summary || w.sessionName}</span>
 									<span class="worker-status" style="color: {getWorkerStatusColor(w.status)}">
 										{getWorkerStatusLabel(w.status)}
 									</span>

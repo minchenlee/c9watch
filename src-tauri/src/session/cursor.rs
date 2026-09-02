@@ -50,6 +50,8 @@ pub struct CursorTranscriptSummary {
     pub agent_kind: AgentKind,
     pub parent_thread_id: Option<String>,
     pub root_session_id: Option<String>,
+    /// Cursor's current UI composer name from state.vscdb.
+    pub cursor_title: Option<String>,
     pub agent_nickname: Option<String>,
     pub agent_role: Option<String>,
     pub lifecycle: CursorLifecycle,
@@ -466,11 +468,13 @@ pub fn find_cursor_conversation_under(
 
 pub fn cursor_history_entries(home_dir: &Path) -> Vec<crate::session::history::HistoryEntry> {
     let projects_root = home_dir.join(".cursor").join("projects");
+    let composers = load_composer_map(default_vscdb_path(home_dir).as_deref());
     collect_transcript_refs(&projects_root)
         .into_iter()
         .filter(|item| item.agent_kind == AgentKind::Root)
         .filter_map(|item| {
-            let summary = parse_transcript(&item.path, &item, true).ok()?;
+            let mut summary = parse_transcript(&item.path, &item, true).ok()?;
+            apply_composer_overlay(&mut summary, composers.get(&item.session_id));
             let display = summary
                 .first_prompt()
                 .unwrap_or("(No conversation yet)")
@@ -497,7 +501,9 @@ pub fn cursor_history_entries(home_dir: &Path) -> Vec<crate::session::history::H
                 timestamp,
                 project: cwd.to_string_lossy().into_owned(),
                 project_name,
-                custom_title: summary.agent_nickname,
+                custom_title: None,
+                codex_title: None,
+                cursor_title: summary.cursor_title,
                 provider: "cursor".to_string(),
                 surface: Some("cursor".to_string()),
                 agent_kind: Some("root".to_string()),
@@ -1048,6 +1054,9 @@ fn apply_composer_overlay(
         return;
     };
     if let Some(name) = overlay.name.clone() {
+        summary.cursor_title = Some(name.clone());
+        // Preserve the existing nickname projection for subagent labels and
+        // older consumers while exposing the provider title separately.
         summary.agent_nickname = Some(name);
     }
     if let Some(cwd) = overlay.cwd.clone() {
@@ -1418,6 +1427,15 @@ mod tests {
             sessions[0].agent_nickname.as_deref(),
             Some("Research Cursor agent sessions")
         );
+        assert_eq!(
+            sessions[0]
+                .cursor_summary
+                .as_ref()
+                .unwrap()
+                .cursor_title
+                .as_deref(),
+            Some("Research Cursor agent sessions")
+        );
         assert_eq!(sessions[0].cwd, PathBuf::from("/tmp/real-cwd"));
         assert_eq!(
             sessions[0].cursor_summary.as_ref().unwrap().lifecycle,
@@ -1548,6 +1566,42 @@ mod tests {
         assert!(
             entries[0].timestamp > 0,
             "history should sort by last write, not birth"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn history_applies_cursor_composer_title_overlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join(".cursor").join("projects");
+        let session_dir = layout(&projects, "demo-project");
+        write_jsonl(
+            &session_dir.join(format!("{PARENT}.jsonl")),
+            &[&user_line("root prompt")],
+        );
+
+        let db_path = default_vscdb_path(tmp.path()).unwrap();
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        let payload = serde_json::json!({"name": "Cursor auto title"});
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            rusqlite::params![format!("composerData:{PARENT}"), payload.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let entries = cursor_history_entries(tmp.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].custom_title, None);
+        assert_eq!(
+            entries[0].cursor_title.as_deref(),
+            Some("Cursor auto title")
         );
     }
 

@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 6;
 const MAX_DISPLAY_CHARS: usize = 400;
 const MAX_INDEXED_MESSAGES: usize = 20_000;
 const MAX_INDEXED_MESSAGE_CHARS: usize = 16_384;
@@ -256,20 +256,24 @@ fn truncate(value: &str, limit: usize) -> String {
 
 fn message_text(value: &Value) -> Option<(String, String)> {
     let payload = value.get("payload")?;
-    if value.get("type").and_then(Value::as_str) == Some("event_msg") {
-        let kind = payload.get("type").and_then(Value::as_str)?;
-        let role = match kind {
-            "user_message" => "user",
-            "agent_message" => "assistant",
-            _ => return None,
-        };
-        let text = payload.get("message").and_then(Value::as_str)?.to_string();
-        if text.trim().is_empty() {
-            return None;
+    match value.get("type").and_then(Value::as_str) {
+        Some("event_msg") => {
+            let kind = payload.get("type").and_then(Value::as_str)?;
+            let role = match kind {
+                "user_message" => "user",
+                "agent_message" => "assistant",
+                _ => return None,
+            };
+            let text = payload.get("message").and_then(Value::as_str)?.to_string();
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some((role.to_string(), text))
         }
-        return Some((role.to_string(), text));
+        Some("response_item") => super::codex::response_item_message_text(payload)
+            .map(|(role, content, _)| (role, content)),
+        _ => None,
     }
-    None
 }
 
 fn classify_session(source: &Value, originator: &str) -> (String, String, Option<String>) {
@@ -804,7 +808,7 @@ where
     }
 
     // The persisted message cache is intentionally bounded. For an incomplete
-    // snapshot, stream the authoritative event_msg records from every merged
+    // snapshot, stream the authoritative message records from every merged
     // rollout so deep search remains exact without retaining unbounded text.
     let mut searched = HashSet::new();
     let mut all_paths_read = true;
@@ -973,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn response_items_are_not_used_as_display() {
+    fn response_item_messages_are_used_as_display() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("messages.jsonl");
         write_rollout(
@@ -984,11 +988,13 @@ mod tests {
                 r#"{"timestamp":"2026-07-13T01:02:00Z","type":"event_msg","payload":{"type":"user_message","message":"real request"}}"#,
             ],
         );
-        assert_eq!(scan_rollout(&path).unwrap().display, "real request");
+        let snapshot = scan_rollout(&path).unwrap();
+        assert_eq!(snapshot.display, "real request");
+        assert_eq!(snapshot.messages.len(), 2);
     }
 
     #[test]
-    fn deep_search_uses_cached_authoritative_messages_without_the_rollout_file() {
+    fn deep_search_includes_response_item_messages_without_the_rollout_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("search.jsonl");
         write_rollout(
@@ -1001,10 +1007,10 @@ mod tests {
         );
         let snapshot = scan_rollout(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
-        let hit = search_rollout(&snapshot, "needle", false, false, |text, query, _| {
+        let hit = search_rollout(&snapshot, "private", false, false, |text, query, _| {
             text.contains(query)
         });
-        assert_eq!(hit.as_deref(), Some("visible needle"));
+        assert_eq!(hit.as_deref(), Some("private needle"));
     }
 
     #[test]

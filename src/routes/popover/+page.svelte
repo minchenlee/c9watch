@@ -183,7 +183,7 @@
 							</svg>
 							{/if}
 						</div>
-						<div class="card-title">{session.customTitle || session.firstPrompt}</div>
+						<div class="card-title">{session.customTitle || session.officialName || session.codexTitle || session.cursorTitle || session.summary || session.firstPrompt}</div>
 						{#if session.latestMessage}
 							<div class="card-latest">{session.latestMessage}</div>
 						{/if}

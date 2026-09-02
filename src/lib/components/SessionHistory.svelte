@@ -126,6 +126,10 @@
 		return false;
 	}
 
+	function entryTitle(entry: HistoryEntry): string {
+		return entry.customTitle || entry.codexTitle || entry.cursorTitle || '';
+	}
+
 	// ── Filtering & sorting ──────────────────────────────────────────
 	let filtered = $derived.by(() => {
 		let entries = allEntries.filter((entry) => matchesProvider(entry, $providerFilter));
@@ -135,7 +139,7 @@
 			entries = entries.filter((e) => {
 				const display = norm(e.display);
 				const project = norm(e.projectName);
-				const title = e.customTitle ? norm(e.customTitle) : '';
+				const title = norm(entryTitle(e));
 				return (
 					phraseMatch(display, needle) ||
 					phraseMatch(project, needle) ||
@@ -396,7 +400,7 @@
 							>
 								<span class="row-number">{i + 1}</span>
 								<span class="row-prompt">
-									{#if entry.customTitle}<span class="row-title">{@html highlight(entry.customTitle, query)}</span>{/if}
+									{#if entryTitle(entry)}<span class="row-title">{@html highlight(entryTitle(entry), query)}</span>{/if}
 									<span class="row-display">{@html highlight((snippet ?? entry.display) || '(no prompt)', query)}</span>
 								</span>
 								<span class="row-badge-slot"><ProviderBadge provider={entry.provider} surface={entry.surface} compact />{#if activeSessionIds.has(entryKey(entry))}<span class="active-badge">ACTIVE</span>{/if}</span>
@@ -423,7 +427,7 @@
 							<span class="row-time">{relativeTime(entry.timestamp)}</span>
 						</div>
 						<span class="row-prompt">
-							{#if entry.customTitle}<span class="row-title">{@html highlight(entry.customTitle, query)}</span>{/if}
+							{#if entryTitle(entry)}<span class="row-title">{@html highlight(entryTitle(entry), query)}</span>{/if}
 							<span class="row-display">{@html highlight((snippet ?? entry.display) || '(no prompt)', query)}</span>
 						</span>
 					</div>

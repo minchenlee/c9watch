@@ -210,7 +210,9 @@ pub fn start_polling(
                                                         first_prompt: &session.first_prompt,
                                                         custom_title: session
                                                             .custom_title
-                                                            .as_deref(),
+                                                            .as_deref()
+                                                            .or(session.codex_title.as_deref())
+                                                            .or(session.cursor_title.as_deref()),
                                                         session_name: &session.session_name,
                                                         status: &session.status,
                                                         pending_tool_name: session

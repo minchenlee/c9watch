@@ -63,7 +63,7 @@
 			{/if}
 			<span class="time-since">{formatTimeSince(session.modified)}</span>
 		</div>
-		<div class="first-prompt">{truncatePrompt(session.summary || session.firstPrompt)}</div>
+		<div class="first-prompt">{truncatePrompt(session.customTitle || session.officialName || session.codexTitle || session.cursorTitle || session.summary || session.firstPrompt)}</div>
 		<div class="message-count">{session.messageCount} messages</div>
 	</div>
 </button>

@@ -26,6 +26,12 @@ pub struct HistoryEntry {
     pub project: String,
     pub project_name: String,
     pub custom_title: Option<String>,
+    /// Codex's current UI thread name from ~/.codex/session_index.jsonl.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_title: Option<String>,
+    /// Cursor's current UI composer name from state.vscdb.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_title: Option<String>,
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,6 +102,8 @@ pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
                 project: accum.first.project,
                 project_name,
                 custom_title: None,
+                codex_title: None,
+                cursor_title: None,
                 provider: default_provider(),
                 surface: None,
                 agent_kind: None,
@@ -137,6 +145,7 @@ fn codex_history_entries(home_dir: &std::path::Path) -> Vec<HistoryEntry> {
                 .and_then(|name| name.to_str())
                 .unwrap_or("unknown")
                 .to_string();
+            let codex_title = super::codex::get_cached_codex_thread_title(&snapshot.thread_id);
             HistoryEntry {
                 session_id: snapshot.thread_id,
                 display: snapshot.display,
@@ -144,6 +153,8 @@ fn codex_history_entries(home_dir: &std::path::Path) -> Vec<HistoryEntry> {
                 project: snapshot.cwd,
                 project_name,
                 custom_title: None,
+                codex_title,
+                cursor_title: None,
                 provider: "codex".to_string(),
                 surface: Some(snapshot.surface),
                 agent_kind: Some(snapshot.agent_kind),
@@ -666,6 +677,8 @@ mod tests {
                 project: project.into(),
                 project_name: "myproj".into(),
                 custom_title: None,
+                codex_title: None,
+                cursor_title: None,
                 provider: default_provider(),
                 surface: None,
                 agent_kind: None,
@@ -677,6 +690,8 @@ mod tests {
                 project: project.into(),
                 project_name: "myproj".into(),
                 custom_title: None,
+                codex_title: None,
+                cursor_title: None,
                 provider: default_provider(),
                 surface: None,
                 agent_kind: None,
@@ -698,6 +713,8 @@ mod tests {
             project: "/p/gone".into(),
             project_name: "gone".into(),
             custom_title: None,
+            codex_title: None,
+            cursor_title: None,
             provider: default_provider(),
             surface: None,
             agent_kind: None,

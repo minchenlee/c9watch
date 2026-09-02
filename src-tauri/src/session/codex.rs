@@ -1,12 +1,12 @@
 use super::cache::FileVersion;
 use chrono::{DateTime, Local};
-use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
 use super::parser::MessageType;
@@ -37,6 +37,25 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 // The 64-bit prefix digest keeps replacement detection bounded; a theoretical
 // digest collision is preferable to retaining the previous transcript bytes.
+const CODEX_SESSION_INDEX_FILENAME: &str = "session_index.jsonl";
+
+#[derive(Debug, Deserialize)]
+struct CodexSessionIndexEntry {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    thread_name: Option<String>,
+}
+
+type CodexThreadTitleStamp = FileVersion;
+
+/// Codex keeps its UI thread names in a small append-only index separate from
+/// the rollout transcript. Cache the parsed map, but invalidate it whenever
+/// the index file changes so title updates appear without re-reading it for
+/// every detected session.
+static CODEX_THREAD_TITLE_CACHE: LazyLock<
+    Mutex<Option<(CodexThreadTitleStamp, HashMap<String, String>)>>,
+> = LazyLock::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CodexLifecycle {
@@ -45,7 +64,7 @@ pub enum CodexLifecycle {
     Idle,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexMessage {
     pub timestamp: String,
@@ -54,7 +73,21 @@ pub struct CodexMessage {
     pub content: String,
     #[serde(skip)]
     content_identity: MessageIdentity,
+    #[serde(skip)]
+    title_candidate: bool,
 }
+
+impl PartialEq for CodexMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.timestamp == other.timestamp
+            && self.role == other.role
+            && self.message_type == other.message_type
+            && self.content == other.content
+            && self.content_identity == other.content_identity
+    }
+}
+
+impl Eq for CodexMessage {}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct MessageIdentity {
@@ -84,7 +117,7 @@ impl CodexRolloutSummary {
     pub fn first_prompt(&self) -> Option<&str> {
         self.messages
             .iter()
-            .find(|message| message.role == "user")
+            .find(|message| message.role == "user" && message.title_candidate)
             .map(|message| message.content.as_str())
     }
 
@@ -100,6 +133,77 @@ impl CodexRolloutSummary {
             })
             .map(|message| message.content.as_str())
     }
+}
+
+/// Parse Codex's local session index. The file can contain multiple records
+/// for one session as its title changes, so the last valid record wins.
+pub(crate) fn parse_codex_thread_titles(content: &str) -> HashMap<String, String> {
+    let mut titles = HashMap::new();
+    for line in content.lines() {
+        let Ok(entry) = serde_json::from_str::<CodexSessionIndexEntry>(line) else {
+            continue;
+        };
+        let session_id = entry.id.trim();
+        if session_id.is_empty() {
+            continue;
+        }
+        match entry
+            .thread_name
+            .map(|title| title.trim().to_string())
+            .filter(|title| !title.is_empty())
+        {
+            Some(title) => {
+                titles.insert(session_id.to_string(), title);
+            }
+            None => {
+                titles.remove(session_id);
+            }
+        }
+    }
+    titles
+}
+
+fn codex_session_index_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".codex").join(CODEX_SESSION_INDEX_FILENAME))
+}
+
+fn read_codex_thread_titles(path: &Path) -> HashMap<String, String> {
+    fs::read_to_string(path)
+        .map(|content| parse_codex_thread_titles(&content))
+        .unwrap_or_default()
+}
+
+/// Read the Codex UI title for a session, if the local Codex index provides
+/// one. This is intentionally best-effort because the index is an internal
+/// local file rather than a documented provider API.
+pub(crate) fn get_cached_codex_thread_title(session_id: &str) -> Option<String> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let path = codex_session_index_path()?;
+    let stamp = match FileVersion::read(&path) {
+        Ok(stamp) => stamp,
+        Err(_) => {
+            if let Ok(mut cache) = CODEX_THREAD_TITLE_CACHE.lock() {
+                *cache = None;
+            }
+            return None;
+        }
+    };
+
+    if let Ok(mut cache) = CODEX_THREAD_TITLE_CACHE.lock() {
+        let cache_is_current = cache.as_ref().is_some_and(|(cached_stamp, _)| {
+            *cached_stamp == stamp && stamp.supports_unchanged_fast_path()
+        });
+        if !cache_is_current {
+            *cache = Some((stamp, read_codex_thread_titles(&path)));
+        }
+        return cache
+            .as_ref()
+            .and_then(|(_, titles)| titles.get(session_id).cloned());
+    }
+
+    read_codex_thread_titles(&path).remove(session_id)
 }
 
 type FileStamp = FileVersion;
@@ -363,10 +467,7 @@ impl CodexSessionSource {
                 let Some(header) = record.header else {
                     continue;
                 };
-                let relevant = matches!(
-                    header.event_type.as_deref(),
-                    Some("session_meta" | "event_msg")
-                );
+                let relevant = monitor_record_is_relevant(&header);
                 if relevant {
                     let line = match record.line {
                         Some(line) => line,
@@ -520,57 +621,232 @@ struct RolloutEventHeader {
     timestamp: Option<String>,
     #[serde(rename = "type")]
     event_type: Option<String>,
+    #[serde(skip)]
+    payload_type: Option<String>,
 }
 
-struct RolloutHeaderVisitor<'a> {
-    header: &'a mut Option<RolloutEventHeader>,
+struct JsonHeaderScanner<'a> {
+    bytes: &'a [u8],
+    position: usize,
 }
 
-impl<'de, 'a> Visitor<'de> for RolloutHeaderVisitor<'a> {
-    type Value = RolloutEventHeader;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a rollout JSON object")
+impl<'a> JsonHeaderScanner<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
     }
 
-    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-    where
-        M: MapAccess<'de>,
-    {
-        let mut timestamp = None;
-        let mut event_type = None;
-        let mut timestamp_seen = false;
-        let mut event_type_seen = false;
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.position).copied()
+    }
 
-        while let Some(key) = map.next_key::<String>()? {
-            match key.as_str() {
-                "timestamp" => {
-                    timestamp_seen = true;
-                    timestamp = map.next_value()?;
-                }
-                "type" => {
-                    event_type_seen = true;
-                    event_type = map.next_value()?;
-                }
-                _ => {
-                    map.next_value::<de::IgnoredAny>()?;
-                }
-            }
+    fn skip_whitespace(&mut self) {
+        while self
+            .peek()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+        {
+            self.position += 1;
+        }
+    }
 
-            if timestamp_seen && event_type_seen {
-                let header = RolloutEventHeader {
-                    timestamp,
-                    event_type,
-                };
-                *self.header = Some(header.clone());
-                return Ok(header);
+    fn read_string(&mut self) -> Option<String> {
+        let start = self.position;
+        if self.peek()? != b'"' {
+            return None;
+        }
+        self.position += 1;
+        while let Some(byte) = self.peek() {
+            match byte {
+                b'\\' => {
+                    self.position += 1;
+                    self.position += 1;
+                }
+                b'"' => {
+                    self.position += 1;
+                    return serde_json::from_slice(&self.bytes[start..self.position]).ok();
+                }
+                _ => self.position += 1,
             }
         }
+        None
+    }
 
-        Ok(RolloutEventHeader {
-            timestamp,
-            event_type,
-        })
+    fn skip_string(&mut self) -> Option<()> {
+        self.read_string().map(|_| ())
+    }
+
+    fn skip_value(&mut self) -> Option<()> {
+        self.skip_whitespace();
+        match self.peek()? {
+            b'"' => self.skip_string(),
+            b'{' => self.skip_object(),
+            b'[' => self.skip_array(),
+            _ => {
+                while self.peek().is_some_and(|byte| {
+                    !matches!(byte, b',' | b']' | b'}' | b' ' | b'\n' | b'\r' | b'\t')
+                }) {
+                    self.position += 1;
+                }
+                Some(())
+            }
+        }
+    }
+
+    fn skip_object(&mut self) -> Option<()> {
+        if self.peek()? != b'{' {
+            return None;
+        }
+        self.position += 1;
+        self.skip_whitespace();
+        if self.peek() == Some(b'}') {
+            self.position += 1;
+            return Some(());
+        }
+        loop {
+            self.skip_whitespace();
+            self.read_string()?;
+            self.skip_whitespace();
+            if self.peek()? != b':' {
+                return None;
+            }
+            self.position += 1;
+            self.skip_value()?;
+            self.skip_whitespace();
+            match self.peek()? {
+                b',' => self.position += 1,
+                b'}' => {
+                    self.position += 1;
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn skip_array(&mut self) -> Option<()> {
+        if self.peek()? != b'[' {
+            return None;
+        }
+        self.position += 1;
+        self.skip_whitespace();
+        if self.peek() == Some(b']') {
+            self.position += 1;
+            return Some(());
+        }
+        loop {
+            self.skip_value()?;
+            self.skip_whitespace();
+            match self.peek()? {
+                b',' => self.position += 1,
+                b']' => {
+                    self.position += 1;
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn payload_type(&mut self) -> Option<String> {
+        self.skip_whitespace();
+        if self.peek()? != b'{' {
+            self.skip_value()?;
+            return None;
+        }
+        self.position += 1;
+        self.skip_whitespace();
+        if self.peek() == Some(b'}') {
+            self.position += 1;
+            return None;
+        }
+        loop {
+            self.skip_whitespace();
+            let key = self.read_string()?;
+            self.skip_whitespace();
+            if self.peek()? != b':' {
+                return None;
+            }
+            self.position += 1;
+            self.skip_whitespace();
+            if key == "type" {
+                return self.read_string();
+            }
+            self.skip_value()?;
+            self.skip_whitespace();
+            match self.peek()? {
+                b',' => self.position += 1,
+                b'}' => {
+                    self.position += 1;
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+fn scan_monitor_header(bytes: &[u8]) -> Option<RolloutEventHeader> {
+    let mut scanner = JsonHeaderScanner::new(bytes);
+    scanner.skip_whitespace();
+    if scanner.peek()? != b'{' {
+        return None;
+    }
+    scanner.position += 1;
+
+    let mut timestamp = None;
+    let mut event_type = None;
+    let mut payload_type = None;
+    loop {
+        scanner.skip_whitespace();
+        let key = scanner.read_string()?;
+        scanner.skip_whitespace();
+        if scanner.peek()? != b':' {
+            return None;
+        }
+        scanner.position += 1;
+        scanner.skip_whitespace();
+        match key.as_str() {
+            "timestamp" => timestamp = Some(scanner.read_string()?),
+            "type" => {
+                event_type = Some(scanner.read_string()?);
+                if event_type.as_deref() != Some("response_item") {
+                    return Some(RolloutEventHeader {
+                        timestamp,
+                        event_type,
+                        payload_type,
+                    });
+                }
+            }
+            "payload" if event_type.as_deref() == Some("response_item") => {
+                payload_type = scanner.payload_type();
+                return Some(RolloutEventHeader {
+                    timestamp,
+                    event_type,
+                    payload_type,
+                });
+            }
+            _ => scanner.skip_value()?,
+        }
+
+        scanner.skip_whitespace();
+        match scanner.peek()? {
+            b',' => scanner.position += 1,
+            b'}' => {
+                return Some(RolloutEventHeader {
+                    timestamp,
+                    event_type,
+                    payload_type,
+                });
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn monitor_record_is_relevant(header: &RolloutEventHeader) -> bool {
+    match header.event_type.as_deref() {
+        Some("session_meta" | "event_msg") => true,
+        Some("response_item") => header.payload_type.as_deref() == Some("message"),
+        _ => false,
     }
 }
 
@@ -628,8 +904,18 @@ fn push_codex_message(
     message_type: MessageType,
     content: String,
     compact_for_monitor: bool,
+    title_candidate: bool,
 ) {
     let content_identity = message_identity(&content);
+    if let Some(existing) = summary.messages.iter_mut().find(|message| {
+        message.timestamp == timestamp
+            && message.role == role
+            && message.message_type == message_type
+            && message.content_identity == content_identity
+    }) {
+        existing.title_candidate |= title_candidate;
+        return;
+    }
     let content = if compact_for_monitor {
         truncate_monitor_message(&content)
     } else {
@@ -641,7 +927,22 @@ fn push_codex_message(
         message_type,
         content,
         content_identity,
+        title_candidate,
     });
+}
+
+fn dedup_codex_messages(messages: &mut Vec<CodexMessage>) {
+    let mut deduplicated: Vec<CodexMessage> = Vec::with_capacity(messages.len());
+    for message in messages.drain(..) {
+        if let Some(existing) = deduplicated.last_mut() {
+            if existing == &message {
+                existing.title_candidate |= message.title_candidate;
+                continue;
+            }
+        }
+        deduplicated.push(message);
+    }
+    *messages = deduplicated;
 }
 
 type LiveRolloutSummary = (PathBuf, CodexRolloutSummary, u64);
@@ -694,7 +995,7 @@ fn merge_live_rollout_summary(existing: &mut LiveRolloutSummary, mut incoming: L
             .then_with(|| left.content.cmp(&right.content))
             .then_with(|| left.content_identity.cmp(&right.content_identity))
     });
-    messages.dedup();
+    dedup_codex_messages(&mut messages);
 
     if incoming_is_newer {
         *existing = incoming;
@@ -821,22 +1122,25 @@ fn read_monitor_line(
     logical_prefix_hash: u64,
 ) -> io::Result<MonitorLine> {
     let mut line_reader = JsonlLineReader::new(reader, logical_prefix_hash);
-    // serde_json calls end_map after the visitor returns. Keep the early
-    // header separately so that end_map cannot force a payload traversal.
-    let mut peeked_header = None;
-    let parsed_header = {
-        let mut deserializer = serde_json::Deserializer::from_reader(&mut line_reader);
-        (&mut deserializer).deserialize_map(RolloutHeaderVisitor {
-            header: &mut peeked_header,
-        })
-    };
-    let header = parsed_header.ok().or(peeked_header);
-    let relevant = header.as_ref().is_some_and(|header| {
-        matches!(
-            header.event_type.as_deref(),
-            Some("session_meta" | "event_msg")
-        )
-    });
+    // Read only a bounded prefix while a byte scanner identifies the outer
+    // event type and, for response_item records, the payload type. This keeps
+    // large reasoning/tool records out of serde_json::Value on the monitor
+    // path while still allowing message records through for titles/previews.
+    let mut probe = [0u8; MONITOR_HEADER_CAPTURE_BYTES];
+    let mut header = None;
+    while !line_reader.complete && line_reader.bytes_read < MONITOR_HEADER_CAPTURE_BYTES as u64 {
+        if line_reader.read(&mut probe)? == 0 {
+            break;
+        }
+        header = scan_monitor_header(&line_reader.captured);
+        if header.is_some() {
+            break;
+        }
+    }
+    if header.is_none() {
+        header = scan_monitor_header(&line_reader.captured);
+    }
+    let relevant = header.as_ref().is_some_and(monitor_record_is_relevant);
     line_reader.drain_to_newline(relevant)?;
     let line = if relevant && line_reader.complete && !line_reader.capture_overflowed {
         Some(std::mem::take(&mut line_reader.captured))
@@ -1008,8 +1312,8 @@ fn apply_rollout_event_with_tools(
         Some("event_msg") => {
             apply_event_message(summary, timestamp, payload, !capture_tool_messages)
         }
-        Some("response_item") if capture_tool_messages => {
-            apply_response_item(summary, timestamp, payload)
+        Some("response_item") => {
+            apply_response_item(summary, timestamp, payload, capture_tool_messages)
         }
         _ => {}
     }
@@ -1130,6 +1434,9 @@ fn apply_event_message(
                     },
                     content.to_string(),
                     compact_for_monitor,
+                    role == "user"
+                        && !crate::session::parser::is_system_content(content)
+                        && !is_codex_context_message(content),
                 );
             }
         }
@@ -1168,11 +1475,130 @@ fn response_item_id(payload: &Value) -> &str {
         .unwrap_or("unknown")
 }
 
-fn apply_response_item(summary: &mut CodexRolloutSummary, timestamp: &str, payload: &Value) {
+fn response_item_content_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(blocks) => {
+            let mut texts = Vec::new();
+            for block in blocks {
+                let text = match block {
+                    Value::String(text) => Some(text.as_str()),
+                    Value::Object(object) => {
+                        let kind = object.get("type").and_then(Value::as_str);
+                        let is_text_block = kind.is_none()
+                            || matches!(
+                                kind,
+                                Some("input_text" | "output_text" | "text" | "refusal")
+                            );
+                        if is_text_block {
+                            object.get("text").and_then(Value::as_str)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(text) = text.filter(|text| !text.is_empty()) {
+                    texts.push(text);
+                }
+            }
+            (!texts.is_empty()).then(|| texts.join("\n"))
+        }
+        Value::Object(object) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+const CODEX_CONTEXT_PREFIXES: &[&str] = &[
+    "<app-context>",
+    "<recommended_plugins>",
+    "<environment_context>",
+    "<permissions instructions>",
+    "<collaboration_mode>",
+    "<apps_instructions>",
+    "<plugins_instructions>",
+    "<skills_instructions>",
+    "# AGENTS.md instructions",
+    "## Memory",
+    "# Memory",
+];
+
+fn is_codex_context_message(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    CODEX_CONTEXT_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+}
+
+fn response_item_title_candidate(payload: &Value, role: &str, content: &str) -> bool {
+    if role != "user" {
+        return false;
+    }
+    payload
+        .get("internal_chat_message_metadata_passthrough")
+        .and_then(|metadata| metadata.get("content_item_kinds"))
+        .and_then(Value::as_array)
+        .map(|kinds| {
+            kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|kind| kind == "user.text")
+        })
+        .unwrap_or(!is_codex_context_message(content))
+}
+
+pub(crate) fn response_item_message_text(payload: &Value) -> Option<(String, String, bool)> {
+    if payload.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    let role = match payload.get("role").and_then(Value::as_str) {
+        Some("user") => "user",
+        Some("assistant") => "assistant",
+        // Developer messages are runtime instructions, not user-facing
+        // conversation content.
+        _ => return None,
+    };
+    let content = response_item_content_text(payload.get("content")?)?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    let title_candidate = response_item_title_candidate(payload, role, &content);
+    Some((role.to_string(), content, title_candidate))
+}
+
+fn apply_response_item(
+    summary: &mut CodexRolloutSummary,
+    timestamp: &str,
+    payload: &Value,
+    capture_tool_messages: bool,
+) {
     let Some(kind) = payload.get("type").and_then(Value::as_str) else {
         return;
     };
     let (message_type, role, content) = match kind {
+        "message" => {
+            let Some((role, content, title_candidate)) = response_item_message_text(payload) else {
+                return;
+            };
+            push_codex_message(
+                summary,
+                timestamp,
+                &role,
+                if role == "user" {
+                    MessageType::User
+                } else {
+                    MessageType::Assistant
+                },
+                content,
+                !capture_tool_messages,
+                title_candidate,
+            );
+            return;
+        }
+        _ if !capture_tool_messages => return,
         "function_call" | "custom_tool_call" => {
             let name = payload
                 .get("name")
@@ -1229,11 +1655,17 @@ fn apply_response_item(summary: &mut CodexRolloutSummary, timestamp: &str, paylo
                 ),
             )
         }
-        // Message and reasoning response items have equivalent public event_msg
-        // records. Ignoring them avoids duplicate conversation content.
         _ => return,
     };
-    push_codex_message(summary, timestamp, role, message_type, content, false);
+    push_codex_message(
+        summary,
+        timestamp,
+        role,
+        message_type,
+        content,
+        false,
+        false,
+    );
 }
 
 fn rollback_messages(messages: &mut Vec<CodexMessage>, turns: usize) {
@@ -1294,7 +1726,7 @@ fn find_codex_conversation_under(
             .then_with(|| left.content.cmp(&right.content))
             .then_with(|| left.content_identity.cmp(&right.content_identity))
     });
-    messages.dedup();
+    dedup_codex_messages(&mut messages);
     Ok(messages)
 }
 
@@ -1370,6 +1802,22 @@ mod tests {
             .iter()
             .filter_map(|session| session.session_id.as_deref())
             .collect()
+    }
+
+    #[test]
+    fn codex_thread_title_index_uses_latest_valid_record() {
+        let titles = parse_codex_thread_titles(
+            r#"
+            {"id":"session-a","thread_name":"old title","updated_at":"2026-09-02T01:00:00Z"}
+            not-json
+            {"id":"session-b","thread_name":"  Keep this title  "}
+            {"id":"session-a","thread_name":"new title","updated_at":"2026-09-02T02:00:00Z"}
+            {"id":"session-b","thread_name":""}
+            "#,
+        );
+
+        assert_eq!(titles.get("session-a"), Some(&"new title".to_string()));
+        assert!(!titles.contains_key("session-b"));
     }
 
     #[test]
@@ -1912,7 +2360,8 @@ mod tests {
         let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
         let summary = source.summary_for(&path).unwrap();
         assert_eq!(summary.last_timestamp, "2026-07-13T00:00:02Z");
-        assert!(summary.messages.is_empty());
+        assert_eq!(summary.messages.len(), 1);
+        assert_eq!(summary.latest_message(), Some("large duplicate"));
     }
 
     #[test]
@@ -2377,16 +2826,50 @@ mod tests {
     }
 
     #[test]
-    fn response_item_messages_are_not_duplicated_into_conversations() {
+    fn response_item_messages_are_included_in_conversations() {
         let mut summary = CodexRolloutSummary::default();
         apply_rollout_event(
             &mut summary,
             &serde_json::json!({
                 "timestamp":"2026-07-13T00:00:00Z", "type":"response_item",
-                "payload":{"type":"message","role":"user","content":"injected"}
+                "payload":{"type":"message","role":"user","content":[
+                    {"type":"input_text","text":"injected"}
+                ]}
             }),
         );
-        assert!(summary.messages.is_empty());
+        assert_eq!(summary.messages.len(), 1);
+        assert_eq!(summary.messages[0].role, "user");
+        assert_eq!(summary.messages[0].message_type, MessageType::User);
+        assert_eq!(summary.messages[0].content, "injected");
+    }
+
+    #[test]
+    fn response_item_messages_join_text_blocks_and_ignore_non_display_roles() {
+        let mut summary = CodexRolloutSummary::default();
+        apply_rollout_event(
+            &mut summary,
+            &serde_json::json!({
+                "timestamp":"2026-07-13T00:00:00Z", "type":"response_item",
+                "payload":{"type":"message","role":"assistant","content":[
+                    {"type":"output_text","text":"first"},
+                    {"type":"input_image","image_url":"data:image/png;base64,ignored"},
+                    {"type":"output_text","text":"second"}
+                ]}
+            }),
+        );
+        apply_rollout_event(
+            &mut summary,
+            &serde_json::json!({
+                "timestamp":"2026-07-13T00:00:01Z", "type":"response_item",
+                "payload":{"type":"message","role":"developer","content":[
+                    {"type":"input_text","text":"hidden instructions"}
+                ]}
+            }),
+        );
+
+        assert_eq!(summary.messages.len(), 1);
+        assert_eq!(summary.messages[0].message_type, MessageType::Assistant);
+        assert_eq!(summary.messages[0].content, "first\nsecond");
     }
 
     #[test]
@@ -2415,6 +2898,54 @@ mod tests {
         assert!(summary.messages[0].content.contains("pwd"));
         assert_eq!(summary.messages[1].message_type, MessageType::ToolResult);
         assert!(summary.messages[1].content.contains("/tmp/project"));
+    }
+
+    #[test]
+    fn monitor_parses_codex_response_item_message_with_metadata() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("rollout-codex-message.jsonl");
+        write_lines(
+            &path,
+            &[
+                event(
+                    "2026-07-13T00:00:00Z",
+                    "session_meta",
+                    serde_json::json!({
+                        "id":"codex-message", "cwd":"/tmp/project",
+                        "source":"vscode", "originator":"Codex Desktop"
+                    }),
+                ),
+                event(
+                    "2026-07-13T00:00:00Z",
+                    "response_item",
+                    serde_json::json!({
+                        "type":"message", "id":"context-1", "role":"user",
+                        "content":[{"type":"input_text", "text":"<recommended_plugins> injected context"}],
+                        "internal_chat_message_metadata_passthrough":{
+                            "turn_id":"turn-1",
+                            "content_item_kinds":["plugins.recommendations"]
+                        }
+                    }),
+                ),
+                event(
+                    "2026-07-13T00:00:01Z",
+                    "response_item",
+                    serde_json::json!({
+                        "type":"message", "id":"msg-1", "role":"user",
+                        "content":[{"type":"input_text", "text":"first prompt"}],
+                        "internal_chat_message_metadata_passthrough":{
+                            "turn_id":"turn-1", "content_item_kinds":["user.text"]
+                        }
+                    }),
+                ),
+            ],
+            true,
+        );
+
+        let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        let summary = source.summary_for(&path).unwrap();
+        assert_eq!(summary.first_prompt(), Some("first prompt"));
+        assert_eq!(summary.messages.len(), 2);
     }
 
     #[test]
@@ -2462,21 +2993,33 @@ mod tests {
     }
 
     #[test]
-    fn conversation_lookup_ignores_duplicate_response_item_messages() {
+    fn conversation_lookup_supports_mixed_message_formats_and_deduplicates_exact_overlap() {
         let temp = TempDir::new().unwrap();
         let day = temp.path().join("2026/07/13");
         fs::create_dir_all(&day).unwrap();
         let path = day.join("rollout-2026-07-13T00-00-00-thread-id.jsonl");
         let mut lines = root_fixture(Value::String("cli".into()), "codex-tui");
         lines.push(event(
+            "2026-07-13T00:00:01Z",
+            "response_item",
+            serde_json::json!({
+                "type":"message", "role":"user",
+                "content":[{"type":"input_text", "text":"hello"}]
+            }),
+        ));
+        lines.push(event(
             "2026-07-13T00:00:04Z",
             "response_item",
-            serde_json::json!({"type":"message", "role":"user", "content":"injected"}),
+            serde_json::json!({
+                "type":"message", "role":"assistant",
+                "content":[{"type":"output_text", "text":"injected"}]
+            }),
         ));
         write_lines(&path, &lines, true);
         let messages = find_codex_conversation_under(temp.path(), "thread-id").unwrap();
-        assert_eq!(messages.len(), 1);
+        assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[1].content, "injected");
     }
 
     #[test]

@@ -170,7 +170,7 @@
 					<div class="header-info">
 						<div class="header-title">
 							<ProviderBadge provider={entry.provider} surface={entry.surface} />
-							<h2 id="overlay-title" class="project-name">{entry.projectName}</h2>
+							<h2 id="overlay-title" class="project-name">{entry.customTitle || entry.codexTitle || entry.cursorTitle || entry.projectName}</h2>
 						</div>
 						<div class="header-meta">
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>

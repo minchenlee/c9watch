@@ -559,14 +559,17 @@ fn codex_cost_records(home_dir: &std::path::Path) -> Vec<SessionCostRecord> {
         .filter(|snapshot| !snapshot.is_internal())
         .flat_map(|snapshot| {
             let project_name = project_name_from_path(&snapshot.cwd);
-            let session_name = {
-                let truncated: String = snapshot.display.chars().take(40).collect();
-                if snapshot.display.chars().count() > 40 {
-                    format!("{truncated}…")
-                } else {
-                    truncated
-                }
-            };
+            // Prefer Codex's UI thread name, then retain the transcript display
+            // fallback for sessions that predate or lack the local index entry.
+            let session_name = super::codex::get_cached_codex_thread_title(&snapshot.thread_id)
+                .unwrap_or_else(|| {
+                    let truncated: String = snapshot.display.chars().take(40).collect();
+                    if snapshot.display.chars().count() > 40 {
+                        format!("{truncated}…")
+                    } else {
+                        truncated
+                    }
+                });
             snapshot.token_days.into_iter().map(move |day| {
                 let estimated_cost = estimate_codex_cost(
                     &day.model,

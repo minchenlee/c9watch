@@ -46,6 +46,12 @@ export interface Session {
   /** Custom title override for the session - if set, shown instead of summary/firstPrompt */
   customTitle: string | null;
 
+  /** Current Codex UI thread name from ~/.codex/session_index.jsonl. */
+  codexTitle?: string | null;
+
+  /** Current Cursor UI composer name from state.vscdb. */
+  cursorTitle?: string | null;
+
   /** Full path to project directory */
   projectPath: string;
 
@@ -185,6 +191,11 @@ export interface HistoryEntry {
 
   /** Custom title override — if set, shown instead of the first prompt */
   customTitle: string | null;
+
+  /** Current Codex UI thread name from ~/.codex/session_index.jsonl. */
+  codexTitle?: string | null;
+  /** Current Cursor UI composer name from state.vscdb. */
+  cursorTitle?: string | null;
   provider?: SessionProvider;
   surface?: SessionSurface;
 }

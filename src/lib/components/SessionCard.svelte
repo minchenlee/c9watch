@@ -45,6 +45,8 @@
 	let cardTitle = $derived(
 		session.customTitle
 		|| session.officialName
+		|| session.codexTitle
+		|| session.cursorTitle
 		|| session.summary
 		|| session.firstPrompt
 	);
