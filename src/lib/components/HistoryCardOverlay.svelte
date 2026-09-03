@@ -11,19 +11,30 @@
 	import { isCostAvailable } from '$lib/cost-semantics';
 	import ProviderBadge from './ProviderBadge.svelte';
 	import { providerSessionKey } from '$lib/provider';
+	import { getConversation } from '$lib/api';
+	import {
+		conversationLoad,
+		conversationLoadLabel,
+		isSessionLoading,
+		isToolsLoading,
+		toolsLoadedFor,
+		withConversationLoader
+	} from '$lib/stores/conversation-loader';
+	import ConversationLoadBar from './ConversationLoadBar.svelte';
 
 	interface Props {
 		entry: HistoryEntry;
 		conversation: Conversation | null;
 		searchQuery?: string;
 		onclose: () => void;
+		onconversation?: (conversation: Conversation) => void;
 	}
 
-	let { entry, conversation, searchQuery, onclose }: Props = $props();
+	let { entry, conversation, searchQuery, onclose, onconversation }: Props = $props();
 
 	let messagesContainer = $state<HTMLDivElement>(undefined!);
 	let hasScrolledToBottom = $state(false);
-	let showTools = $state(true);
+	let showTools = $state(false);
 	let showThinking = $state(true);
 	let navSheetOpen = $state(false);
 	let copied = $state(false);
@@ -47,10 +58,50 @@
 		return sw.sliceMessages(conversation.messages);
 	});
 
+	let toolsLoading = $derived(isToolsLoading(entry.sessionId, entry.provider, $conversationLoad));
+	let sessionLoading = $derived(isSessionLoading(entry.sessionId, entry.provider, $conversationLoad));
+	let loadLabel = $derived(
+		isSessionLoading(entry.sessionId, entry.provider, $conversationLoad)
+			? conversationLoadLabel($conversationLoad)
+			: null
+	);
+
 	function handleNavItemClick() {
 		// Close the bottom sheet on mobile after navigating
 		navSheetOpen = false;
 	}
+
+	async function toggleTools() {
+		const requestedId = entry.sessionId;
+		const requestedProvider = entry.provider;
+		const requestedKey = providerSessionKey(requestedProvider, requestedId);
+		const next = !showTools;
+		if (sessionLoading) return;
+		if (next && $toolsLoadedFor !== requestedKey) {
+			try {
+				const conv = await withConversationLoader(requestedId, requestedProvider, 'tools', () =>
+					getConversation(requestedId, requestedProvider, true)
+				);
+				if (
+					providerSessionKey(entry.provider, entry.sessionId) !== requestedKey ||
+					providerSessionKey(conv.provider ?? requestedProvider, conv.sessionId) !== requestedKey
+				) return;
+				onconversation?.(conv);
+				toolsLoadedFor.set(requestedKey);
+			} catch (error) {
+				console.error('Failed to load tools:', error);
+				return;
+			}
+		}
+		if (entry.sessionId !== requestedId) return;
+		showTools = next;
+	}
+
+	$effect(() => {
+		entry.sessionId;
+		entry.provider;
+		showTools = false;
+	});
 
 	onMount(() => {
 		const handleKeydown = (e: KeyboardEvent) => {
@@ -174,6 +225,10 @@
 						</div>
 						<div class="header-meta">
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
+							{#if loadLabel}
+								<span class="separator">·</span>
+								<span class="load-label">{loadLabel}</span>
+							{/if}
 							{#if costRecord}
 								<span class="separator">·</span>
 								<span class="cost-breakdown" title="{isCostAvailable(costRecord) ? `Total cost: ${formatCost(costRecord.cost)}` : 'USD pricing unavailable'} · {formatTokens(costRecord.totalTokens)} tokens · {modelDisplayName(costRecord.model)}">
@@ -217,9 +272,11 @@
 					<button
 						type="button"
 						class="header-button toggle-tools"
-						class:active={showTools}
-						onclick={() => showTools = !showTools}
-						title={showTools ? "Hide Tools" : "Show Tools"}
+						class:active={showTools && !toolsLoading}
+						class:loading={toolsLoading}
+						disabled={sessionLoading}
+						onclick={toggleTools}
+						title={toolsLoading ? "Loading tools" : sessionLoading ? "Loading conversation" : showTools ? "Hide Tools" : "Show Tools"}
 					>
 						<span>⚙</span>
 					</button>
@@ -232,6 +289,7 @@
 					</button>
 				</div>
 			</header>
+			<ConversationLoadBar sessionId={entry.sessionId} provider={entry.provider} />
 
 			<!-- Conversation Area -->
 			<div class="conversation-area" bind:this={messagesContainer} onscroll={handleScroll}>
@@ -409,6 +467,13 @@
 		color: var(--text-muted);
 	}
 
+	.load-label {
+		font-family: var(--font-pixel);
+		font-size: 11px;
+		letter-spacing: 0.08em;
+		color: var(--status-working);
+	}
+
 	.separator {
 		color: var(--text-muted);
 	}
@@ -503,6 +568,11 @@
 		color: var(--text-primary);
 	}
 
+	.header-button:disabled {
+		opacity: 1;
+		cursor: default;
+	}
+
 	.header-button span {
 		font-family: var(--font-mono);
 		font-size: 14px;
@@ -516,6 +586,22 @@
 	.header-button.active.toggle-tools {
 		color: var(--status-input);
 		opacity: 1;
+	}
+
+	.header-button.loading.toggle-tools {
+		color: var(--status-working);
+		opacity: 1;
+	}
+
+	.header-button.loading.toggle-tools span {
+		display: inline-block;
+		animation: gear-spin 0.8s linear infinite;
+	}
+
+	@keyframes gear-spin {
+		to {
+			transform: rotate(360deg);
+		}
 	}
 
 	.header-divider {

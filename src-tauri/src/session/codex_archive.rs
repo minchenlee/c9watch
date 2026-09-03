@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -117,7 +117,9 @@ struct ArchivedTokenEvent {
     #[serde(default)]
     cumulative: bool,
     /// Cumulative counters restart independently for each rollout stream.
-    #[serde(default)]
+    /// Omitted from the on-disk cache because it is always the parent file path
+    /// and was repeating ~100 bytes on every token event.
+    #[serde(default, skip_serializing)]
     stream_id: String,
 }
 
@@ -168,7 +170,7 @@ struct CachedRollout {
     snapshot: CodexRolloutSnapshot,
     #[serde(default)]
     offset: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending: Vec<u8>,
     #[serde(default)]
     current_model: String,
@@ -189,7 +191,23 @@ struct ArchiveCache {
     files: HashMap<String, CachedRollout>,
 }
 
-static ARCHIVE_CACHE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+#[derive(Clone, Copy)]
+enum SnapshotView {
+    Full,
+    Listing,
+}
+
+struct ProcessArchive {
+    cache: ArchiveCache,
+    merged: Vec<CodexRolloutSnapshot>,
+}
+
+static ARCHIVE_STATE: OnceLock<Mutex<HashMap<(PathBuf, PathBuf), ProcessArchive>>> =
+    OnceLock::new();
+
+fn archive_state() -> &'static Mutex<HashMap<(PathBuf, PathBuf), ProcessArchive>> {
+    ARCHIVE_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 fn fingerprint(path: &Path) -> Option<FileFingerprint> {
     let version = FileVersion::read(path).ok()?;
@@ -652,35 +670,93 @@ fn write_cache(path: &Path, cache: &ArchiveCache) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let Ok(json) = serde_json::to_vec(cache) else {
+    let temporary = path.with_extension("json.tmp");
+    let Ok(file) = File::create(&temporary) else {
         return;
     };
-    let temporary = path.with_extension("json.tmp");
-    if std::fs::write(&temporary, json).is_ok() {
+    let mut writer = BufWriter::new(file);
+    let ok = serde_json::to_writer(&mut writer, cache).is_ok() && writer.flush().is_ok();
+    drop(writer);
+    if ok {
         let _ = std::fs::rename(temporary, path);
+    } else {
+        let _ = std::fs::remove_file(&temporary);
     }
 }
 
-pub(crate) fn load_snapshots(root: &Path, cache_path: &Path) -> Vec<CodexRolloutSnapshot> {
-    let _guard = ARCHIVE_CACHE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut cache: ArchiveCache = std::fs::read(cache_path)
+fn read_cache_file(path: &Path) -> ArchiveCache {
+    let mut cache: ArchiveCache = File::open(path)
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .and_then(|file| serde_json::from_reader(BufReader::new(file)).ok())
         .filter(|cache: &ArchiveCache| cache.version == CACHE_VERSION)
         .unwrap_or_else(|| ArchiveCache {
             version: CACHE_VERSION,
             files: HashMap::new(),
         });
+    for entry in cache.files.values_mut() {
+        hydrate_stream_ids(entry);
+    }
+    cache
+}
 
+fn hydrate_stream_ids(cached: &mut CachedRollout) {
+    if cached.snapshot.path.as_os_str().is_empty() {
+        if let Some(path) = cached.snapshot.paths.first() {
+            cached.snapshot.path = path.clone();
+        }
+    }
+    let path = cached.snapshot.path.to_string_lossy().into_owned();
+    if path.is_empty() {
+        return;
+    }
+    for event in &mut cached.snapshot.token_events {
+        if event.stream_id.is_empty() {
+            event.stream_id = path.clone();
+        }
+    }
+}
+
+fn listing_snapshot(snapshot: &CodexRolloutSnapshot) -> CodexRolloutSnapshot {
+    CodexRolloutSnapshot {
+        thread_id: snapshot.thread_id.clone(),
+        cwd: snapshot.cwd.clone(),
+        surface: snapshot.surface.clone(),
+        agent_kind: snapshot.agent_kind.clone(),
+        parent_thread_id: snapshot.parent_thread_id.clone(),
+        display: snapshot.display.clone(),
+        created_at_ms: snapshot.created_at_ms,
+        updated_at_ms: snapshot.updated_at_ms,
+        token_days: snapshot.token_days.clone(),
+        path: snapshot.path.clone(),
+        paths: snapshot.paths.clone(),
+        messages_complete: snapshot.messages_complete,
+        messages: Vec::new(),
+        token_events: Vec::new(),
+    }
+}
+
+fn merge_all(cache: &ArchiveCache) -> Vec<CodexRolloutSnapshot> {
+    let mut by_thread: HashMap<String, CodexRolloutSnapshot> = HashMap::new();
+    for entry in cache.files.values() {
+        let snapshot = entry.snapshot.clone();
+        if let Some(existing) = by_thread.get_mut(&snapshot.thread_id) {
+            merge_snapshot(existing, snapshot);
+        } else {
+            by_thread.insert(snapshot.thread_id.clone(), snapshot);
+        }
+    }
+    by_thread.into_values().collect()
+}
+
+fn refresh_cache(cache: &mut ArchiveCache, root: &Path) -> bool {
     let candidates = collect_rollouts(root);
     let active_paths: HashSet<String> = candidates
         .iter()
         .map(|path| path.to_string_lossy().to_string())
         .collect();
+    let before = cache.files.len();
     cache.files.retain(|path, _| active_paths.contains(path));
+    let mut dirty = cache.files.len() != before;
 
     for path in candidates {
         let Some(fingerprint) = fingerprint(&path) else {
@@ -694,29 +770,69 @@ pub(crate) fn load_snapshots(root: &Path, cache_path: &Path) -> Vec<CodexRollout
         }) {
             continue;
         }
+        dirty = true;
         let previous = cache.files.remove(&key);
-        if let Some(cached) = refresh_rollout(&path, fingerprint, previous) {
+        if let Some(mut cached) = refresh_rollout(&path, fingerprint, previous) {
             if !cached.snapshot.thread_id.is_empty() {
+                hydrate_stream_ids(&mut cached);
                 cache.files.insert(key, cached);
             }
-        } else {
-            cache.files.remove(&key);
         }
     }
-    write_cache(cache_path, &cache);
+    dirty
+}
 
-    // A resumed thread may span several rollout paths. Merge their authoritative
-    // events so older prompts and token usage survive without double counting overlap.
-    let mut by_thread: HashMap<String, CodexRolloutSnapshot> = HashMap::new();
-    for entry in cache.files.into_values() {
-        let snapshot = entry.snapshot;
-        if let Some(existing) = by_thread.get_mut(&snapshot.thread_id) {
-            merge_snapshot(existing, snapshot);
-        } else {
-            by_thread.insert(snapshot.thread_id.clone(), snapshot);
+fn load_snapshots_with(
+    root: &Path,
+    cache_path: &Path,
+    view: SnapshotView,
+) -> Vec<CodexRolloutSnapshot> {
+    let key = (root.to_path_buf(), cache_path.to_path_buf());
+    let mut state = archive_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let archive = state.entry(key).or_insert_with(|| ProcessArchive {
+        cache: read_cache_file(cache_path),
+        merged: Vec::new(),
+    });
+    let dirty = refresh_cache(&mut archive.cache, root);
+    if dirty || archive.merged.is_empty() {
+        archive.merged = merge_all(&archive.cache);
+        if dirty {
+            write_cache(cache_path, &archive.cache);
         }
     }
-    by_thread.into_values().collect()
+    match view {
+        SnapshotView::Full => archive.merged.clone(),
+        SnapshotView::Listing => archive.merged.iter().map(listing_snapshot).collect(),
+    }
+}
+
+pub(crate) fn load_snapshots(root: &Path, cache_path: &Path) -> Vec<CodexRolloutSnapshot> {
+    load_snapshots_with(root, cache_path, SnapshotView::Full)
+}
+
+pub(crate) fn load_listing_snapshots(root: &Path, cache_path: &Path) -> Vec<CodexRolloutSnapshot> {
+    load_snapshots_with(root, cache_path, SnapshotView::Listing)
+}
+
+/// Fast path for conversation loading when History/Cost already warmed the archive.
+pub(crate) fn cached_thread_paths(sessions_root: &Path, thread_id: &str) -> Option<Vec<PathBuf>> {
+    let cache_path = sessions_root.parent()?.join("c9watch-archive-cache.json");
+    let key = (sessions_root.to_path_buf(), cache_path);
+    let state = archive_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = state
+        .get(&key)?
+        .merged
+        .iter()
+        .find(|item| item.thread_id == thread_id)?;
+    let mut paths = snapshot.paths.clone();
+    if !paths.contains(&snapshot.path) {
+        paths.push(snapshot.path.clone());
+    }
+    Some(paths)
 }
 
 fn merge_snapshot(existing: &mut CodexRolloutSnapshot, incoming: CodexRolloutSnapshot) {
@@ -780,6 +896,10 @@ fn merge_snapshot(existing: &mut CodexRolloutSnapshot, incoming: CodexRolloutSna
 
 pub(crate) fn load_default_snapshots(home: &Path) -> Vec<CodexRolloutSnapshot> {
     load_snapshots(&default_sessions_root(home), &default_cache_path(home))
+}
+
+pub(crate) fn load_default_listing(home: &Path) -> Vec<CodexRolloutSnapshot> {
+    load_listing_snapshots(&default_sessions_root(home), &default_cache_path(home))
 }
 
 pub(crate) fn search_rollout<F>(
@@ -1292,5 +1412,147 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.text == old_prompt));
+    }
+
+    #[test]
+    fn unchanged_reload_does_not_rewrite_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        write_rollout(
+            &root.join("stable.jsonl"),
+            &[
+                r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"stable","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#,
+            ],
+        );
+        let cache_path = directory.path().join("cache.json");
+        load_snapshots(&root, &cache_path);
+        let first = std::fs::read(&cache_path).unwrap();
+        let second = load_snapshots(&root, &cache_path);
+        assert_eq!(second[0].display, "hello");
+        let after = std::fs::read(&cache_path).unwrap();
+        assert_eq!(
+            first, after,
+            "unchanged rollouts must not rewrite the archive cache"
+        );
+    }
+
+    #[test]
+    fn process_cache_survives_deleted_cache_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        write_rollout(
+            &root.join("cached.jsonl"),
+            &[
+                r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"cached","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"keep me"}}"#,
+            ],
+        );
+        let cache_path = directory.path().join("cache.json");
+        load_snapshots(&root, &cache_path);
+        std::fs::remove_file(&cache_path).unwrap();
+        let second = load_snapshots(&root, &cache_path);
+        assert_eq!(second[0].display, "keep me");
+        assert!(
+            !cache_path.exists(),
+            "memory hit must not rewrite an unchanged cache"
+        );
+    }
+
+    #[test]
+    fn listing_snapshots_omit_search_index_but_keep_cost_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        write_rollout(
+            &root.join("listed.jsonl"),
+            &[
+                r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"listed","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+                r#"{"timestamp":"2026-07-13T01:02:00Z","type":"event_msg","payload":{"type":"user_message","message":"prompt text"}}"#,
+                r#"{"timestamp":"2026-07-13T01:03:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}}"#,
+            ],
+        );
+        let cache_path = directory.path().join("cache.json");
+        let listing = load_listing_snapshots(&root, &cache_path);
+        assert_eq!(listing[0].display, "prompt text");
+        assert!(listing[0].messages.is_empty());
+        assert!(listing[0].token_events.is_empty());
+        assert_eq!(listing[0].token_days[0].usage.total_tokens, 14);
+
+        let full = load_snapshots(&root, &cache_path);
+        assert_eq!(full[0].messages.len(), 1);
+        assert_eq!(full[0].token_events.len(), 1);
+    }
+
+    #[test]
+    #[ignore]
+    fn real_home_archive_load_timing() {
+        let home = dirs::home_dir().expect("home directory");
+        let sessions = default_sessions_root(&home);
+        if !sessions.exists() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let first = load_default_listing(&home);
+        let first_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let second = load_default_listing(&home);
+        let second_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let full = load_default_snapshots(&home);
+        let full_elapsed = started.elapsed();
+        let messages: usize = full.iter().map(|snapshot| snapshot.messages.len()).sum();
+        eprintln!(
+            "codex archive listing {} sessions: first {first_elapsed:?}, second {second_elapsed:?}; full {} messages in {full_elapsed:?}",
+            first.len(),
+            messages
+        );
+        assert_eq!(first.len(), second.len());
+        assert_eq!(first.len(), full.len());
+        assert!(
+            second_elapsed * 4 < first_elapsed || second_elapsed.as_millis() < 200,
+            "warm listing should reuse the process cache (first {first_elapsed:?}, second {second_elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn token_stream_id_is_not_persisted_and_still_merges_independent_streams() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        write_rollout(
+            &root.join("old.jsonl"),
+            &[
+                r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"resumed","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T01:00:30Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":80,"output_tokens":20,"total_tokens":100}}}}"#,
+            ],
+        );
+        write_rollout(
+            &root.join("new.jsonl"),
+            &[
+                r#"{"timestamp":"2026-07-13T02:00:00Z","type":"session_meta","payload":{"id":"resumed","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T02:00:30Z","type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+                r#"{"timestamp":"2026-07-13T02:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":120,"output_tokens":30,"total_tokens":150}}}}"#,
+            ],
+        );
+        let cache_path = directory.path().join("cache.json");
+        let snapshots = load_snapshots(&root, &cache_path);
+        let json = String::from_utf8(std::fs::read(&cache_path).unwrap()).unwrap();
+        assert!(
+            !json.contains("streamId"),
+            "per-event stream ids must not bloat the on-disk cache"
+        );
+        assert_eq!(
+            snapshots[0]
+                .token_days
+                .iter()
+                .map(|day| day.usage.total_tokens)
+                .sum::<u64>(),
+            250
+        );
     }
 }

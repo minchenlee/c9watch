@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { browser } from '$app/environment';
 	import { deepSearchSessions, getConversation } from '$lib/api';
+	import { toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
 	import type { HistoryEntry, Conversation, DeepSearchHit } from '$lib/types';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
 	import { flyIn } from '$lib/transitions';
@@ -220,12 +221,16 @@
 		const requestId = ++conversationRequestId;
 		selectedEntry = entry;
 		conversation = null;
+		toolsLoadedFor.set(null);
 		try {
-		const result = await getConversation(entry.sessionId, entry.provider);
-		const resultKey = providerSessionKey(result.provider ?? entry.provider, result.sessionId);
-		if (requestId === conversationRequestId && resultKey === entryKey(entry)) {
-			conversation = result;
-		}
+			const requestedKey = entryKey(entry);
+			const conv = await withConversationLoader(entry.sessionId, entry.provider, 'conversation', () =>
+				getConversation(entry.sessionId, entry.provider, false)
+			);
+			if (requestId !== conversationRequestId) return;
+			if ($toolsLoadedFor === requestedKey) return;
+			if (providerSessionKey(conv.provider ?? entry.provider, conv.sessionId) !== requestedKey) return;
+			conversation = conv;
 		} catch (e) {
 			if (requestId === conversationRequestId) console.error('Failed to load conversation:', e);
 		}
@@ -440,7 +445,19 @@
 
 <!-- ── Conversation overlay ───────────────────────────────────────── -->
 {#if selectedEntry}
-	<HistoryCardOverlay entry={selectedEntry} {conversation} searchQuery={query.trim() && deepSearchResults?.has(entryKey(selectedEntry)) ? query.trim() : undefined} onclose={handleCloseConversation} />
+	<HistoryCardOverlay
+		entry={selectedEntry}
+		{conversation}
+		searchQuery={query.trim() && deepSearchResults?.has(entryKey(selectedEntry)) ? query.trim() : undefined}
+		onclose={handleCloseConversation}
+		onconversation={(conv) => {
+			if (
+				selectedEntry &&
+				providerSessionKey(selectedEntry.provider, selectedEntry.sessionId) ===
+					providerSessionKey(conv.provider, conv.sessionId)
+			) conversation = conv;
+		}}
+	/>
 {/if}
 
 <style>

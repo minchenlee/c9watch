@@ -26,6 +26,7 @@ pub struct WsState {
     pub auth_token: String,
     pub sessions_tx: broadcast::Sender<String>,
     pub notifications_tx: broadcast::Sender<String>,
+    pub progress_tx: broadcast::Sender<String>,
 }
 
 // ── Protocol types ──────────────────────────────────────────────────
@@ -43,6 +44,8 @@ enum ClientMsg {
         session_id: String,
         #[serde(default)]
         provider: Option<crate::session::SessionProvider>,
+        #[serde(default, rename = "includeTools")]
+        include_tools: bool,
     },
 
     #[serde(rename = "stopSession")]
@@ -90,6 +93,9 @@ enum ServerMsg {
 
     #[serde(rename = "notification")]
     Notification { data: serde_json::Value },
+
+    #[serde(rename = "conversationProgress")]
+    ConversationProgress { data: serde_json::Value },
 
     #[serde(rename = "memoryFiles")]
     MemoryFiles { data: serde_json::Value },
@@ -197,6 +203,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
     crate::debug_log::log_info("[ws-server] Client connected");
     let mut sessions_rx = state.sessions_tx.subscribe();
     let mut notifications_rx = state.notifications_tx.subscribe();
+    let mut progress_rx = state.progress_tx.subscribe();
+
+    let mut inflight: Option<tokio::task::JoinHandle<ServerMsg>> = None;
 
     loop {
         tokio::select! {
@@ -205,15 +214,42 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         let text_str: &str = &text;
-                        let response = match serde_json::from_str::<ClientMsg>(text_str) {
-                            Ok(client_msg) => handle_message(client_msg).await,
-                            Err(e) => ServerMsg::Error {
-                                message: format!("Invalid message: {}", e),
-                            },
-                        };
-                        let json = serde_json::to_string(&response).unwrap_or_default();
-                        if socket.send(Message::Text(json)).await.is_err() {
-                            break;
+                        match serde_json::from_str::<ClientMsg>(text_str) {
+                            Ok(ClientMsg::GetConversation {
+                                session_id,
+                                provider,
+                                include_tools,
+                            }) => {
+                                if let Some(previous) = inflight.take() {
+                                    previous.abort();
+                                }
+                                let progress_tx = state.progress_tx.clone();
+                                inflight = Some(tokio::spawn(async move {
+                                    load_conversation_response(
+                                        session_id,
+                                        provider,
+                                        include_tools,
+                                        progress_tx,
+                                    )
+                                    .await
+                                }));
+                            }
+                            Ok(client_msg) => {
+                                let response = handle_message(client_msg).await;
+                                let json = serde_json::to_string(&response).unwrap_or_default();
+                                if socket.send(Message::Text(json)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let response = ServerMsg::Error {
+                                    message: format!("Invalid message: {}", e),
+                                };
+                                let json = serde_json::to_string(&response).unwrap_or_default();
+                                if socket.send(Message::Text(json)).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
                     Some(Ok(Message::Ping(data))) => {
@@ -223,6 +259,25 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
+                }
+            }
+            result = async {
+                match inflight.as_mut() {
+                    Some(handle) => Some(handle.await),
+                    None => std::future::pending().await,
+                }
+            } => {
+                inflight = None;
+                let response = match result {
+                    Some(Ok(response)) => response,
+                    Some(Err(error)) => ServerMsg::Error {
+                        message: format!("Failed to load conversation: {error}"),
+                    },
+                    None => continue,
+                };
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                if socket.send(Message::Text(json)).await.is_err() {
+                    break;
                 }
             }
             // Push session updates from polling loop
@@ -245,6 +300,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
                     break;
                 }
             }
+            Ok(progress_json) = progress_rx.recv() => {
+                let msg = ServerMsg::ConversationProgress {
+                    data: serde_json::from_str(&progress_json).unwrap_or_default(),
+                };
+                let json = serde_json::to_string(&msg).unwrap_or_default();
+                if socket.send(Message::Text(json)).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 
@@ -252,6 +316,41 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
 }
 
 // ── Message dispatch ────────────────────────────────────────────────
+
+async fn load_conversation_response(
+    session_id: String,
+    provider: Option<crate::session::SessionProvider>,
+    include_tools: bool,
+    progress_tx: broadcast::Sender<String>,
+) -> ServerMsg {
+    let emit_id = session_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::get_conversation_data_for_provider_with_progress(
+            &session_id,
+            provider,
+            include_tools,
+            &mut |bytes_read, bytes_total| {
+                let payload = serde_json::json!({
+                    "sessionId": emit_id,
+                    "provider": provider,
+                    "bytesRead": bytes_read,
+                    "bytesTotal": bytes_total,
+                });
+                let _ = progress_tx.send(payload.to_string());
+            },
+        )
+    })
+    .await
+    {
+        Ok(Ok(conv)) => ServerMsg::Conversation {
+            data: serde_json::to_value(&conv).unwrap_or_default(),
+        },
+        Ok(Err(e)) => ServerMsg::Error { message: e },
+        Err(e) => ServerMsg::Error {
+            message: format!("Failed to load conversation: {e}"),
+        },
+    }
+}
 
 async fn handle_message(msg: ClientMsg) -> ServerMsg {
     handle_message_with_owners(msg, crate::session::global_provider_source_owners()).await
@@ -272,12 +371,14 @@ async fn handle_message_with_owners(
         ClientMsg::GetConversation {
             session_id,
             provider,
-        } => match crate::get_conversation_data_for_provider(&session_id, provider) {
-            Ok(conv) => ServerMsg::Conversation {
-                data: serde_json::to_value(&conv).unwrap_or_default(),
-            },
-            Err(e) => ServerMsg::Error { message: e },
-        },
+            include_tools,
+        } => {
+            load_conversation_response(session_id, provider, include_tools, {
+                let (tx, _) = broadcast::channel(1);
+                tx
+            })
+            .await
+        }
 
         ClientMsg::StopSession { pid } => match crate::actions::stop_session(pid) {
             Ok(()) => ServerMsg::Ok,
@@ -342,6 +443,7 @@ mod tests {
             Some(crate::session::cursor::CursorSessionSource::at_root(
                 temp.path().to_path_buf(),
             )),
+            None,
         )
     }
 
@@ -358,6 +460,7 @@ mod tests {
             Some(crate::session::codex::CodexSessionSource::at_root(
                 temp.path().to_path_buf(),
             )),
+            None,
             None,
         )
     }

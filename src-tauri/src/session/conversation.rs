@@ -1,5 +1,6 @@
+use crate::session::parser::parse_all_entries_with_progress;
 use crate::session::SessionProvider;
-use crate::session::{extract_messages, parse_all_entries, ImageBlock, MessageType};
+use crate::session::{extract_messages, ImageBlock, MessageType};
 use serde::Serialize;
 
 /// Conversation structure
@@ -9,6 +10,16 @@ pub struct Conversation {
     pub session_id: String,
     pub provider: SessionProvider,
     pub messages: Vec<ConversationMessage>,
+}
+
+/// Byte-level load progress for a conversation parse.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationProgress {
+    pub session_id: String,
+    pub provider: Option<SessionProvider>,
+    pub bytes_read: u64,
+    pub bytes_total: u64,
 }
 
 /// Individual message in a conversation
@@ -23,10 +34,13 @@ pub struct ConversationMessage {
     pub images: Vec<ImageBlock>,
 }
 
-fn claude_conversation(session_id: &str) -> Result<Conversation, String> {
+fn claude_conversation(
+    session_id: &str,
+    include_tools: bool,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Conversation, String> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
     let claude_projects_dir = home_dir.join(".claude").join("projects");
-
     let session_filename = format!("{}.jsonl", session_id);
 
     if let Ok(entries) = std::fs::read_dir(&claude_projects_dir) {
@@ -37,30 +51,34 @@ fn claude_conversation(session_id: &str) -> Result<Conversation, String> {
             }
 
             let session_file = project_path.join(&session_filename);
-            if session_file.exists() {
-                let entries = parse_all_entries(&session_file)
-                    .map_err(|e| format!("Failed to parse session file: {}", e))?;
-
-                let messages = extract_messages(&entries);
-
-                let conversation_messages: Vec<ConversationMessage> = messages
-                    .into_iter()
-                    .map(
-                        |(timestamp, msg_type, content, images)| ConversationMessage {
-                            timestamp,
-                            message_type: msg_type,
-                            content,
-                            images,
-                        },
-                    )
-                    .collect();
-
-                return Ok(Conversation {
-                    session_id: session_id.to_string(),
-                    provider: SessionProvider::ClaudeCode,
-                    messages: conversation_messages,
-                });
+            if !session_file.exists() {
+                continue;
             }
+
+            let entries = parse_all_entries_with_progress(&session_file, on_progress)
+                .map_err(|e| format!("Failed to parse session file: {}", e))?;
+            let messages = extract_messages(&entries);
+            let conversation_messages = messages
+                .into_iter()
+                .filter(|(_, msg_type, _, _)| {
+                    include_tools
+                        || !matches!(msg_type, MessageType::ToolUse | MessageType::ToolResult)
+                })
+                .map(
+                    |(timestamp, msg_type, content, images)| ConversationMessage {
+                        timestamp,
+                        message_type: msg_type,
+                        content,
+                        images,
+                    },
+                )
+                .collect();
+
+            return Ok(Conversation {
+                session_id: session_id.to_string(),
+                provider: SessionProvider::ClaudeCode,
+                messages: conversation_messages,
+            });
         }
     }
 
@@ -70,8 +88,16 @@ fn claude_conversation(session_id: &str) -> Result<Conversation, String> {
     ))
 }
 
-fn codex_conversation(session_id: &str) -> Result<Conversation, String> {
-    let messages = crate::session::codex::find_codex_conversation(session_id)?;
+fn codex_conversation(
+    session_id: &str,
+    include_tools: bool,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Conversation, String> {
+    let messages = crate::session::codex::find_codex_conversation_with_progress(
+        session_id,
+        include_tools,
+        on_progress,
+    )?;
     Ok(Conversation {
         session_id: session_id.to_string(),
         provider: SessionProvider::Codex,
@@ -87,11 +113,15 @@ fn codex_conversation(session_id: &str) -> Result<Conversation, String> {
     })
 }
 
-fn cursor_conversation(session_id: &str) -> Result<Conversation, String> {
+fn cursor_conversation(
+    session_id: &str,
+    include_tools: bool,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Conversation, String> {
     let messages = crate::session::cursor::find_cursor_conversation_with_progress(
         session_id,
-        true,
-        &mut |_, _| {},
+        include_tools,
+        on_progress,
     )?;
     Ok(Conversation {
         session_id: session_id.to_string(),
@@ -106,6 +136,19 @@ fn cursor_conversation(session_id: &str) -> Result<Conversation, String> {
             })
             .collect(),
     })
+}
+
+fn load_for_provider(
+    session_id: &str,
+    provider: SessionProvider,
+    include_tools: bool,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Conversation, String> {
+    match provider {
+        SessionProvider::ClaudeCode => claude_conversation(session_id, include_tools, on_progress),
+        SessionProvider::Codex => codex_conversation(session_id, include_tools, on_progress),
+        SessionProvider::Cursor => cursor_conversation(session_id, include_tools, on_progress),
+    }
 }
 
 fn select_provider_conversation(
@@ -127,33 +170,52 @@ fn select_provider_conversation(
 /// The provider argument is optional for backward compatibility with older
 /// clients. New clients should pass it so an opaque ID cannot select a
 /// transcript from the wrong provider namespace.
+pub fn get_conversation_data_for_provider_with_progress(
+    session_id: &str,
+    provider: Option<SessionProvider>,
+    include_tools: bool,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Conversation, String> {
+    if let Some(provider) = provider {
+        return load_for_provider(session_id, provider, include_tools, on_progress);
+    }
+
+    let mut matches = Vec::new();
+    for provider in [
+        SessionProvider::ClaudeCode,
+        SessionProvider::Codex,
+        SessionProvider::Cursor,
+    ] {
+        if let Ok(conversation) =
+            load_for_provider(session_id, provider, include_tools, on_progress)
+        {
+            matches.push((provider, conversation));
+        }
+    }
+    select_provider_conversation(session_id, matches)
+}
+
+/// Get conversation data with progress reporting and optional tool records.
+pub fn get_conversation_data_with_progress(
+    session_id: &str,
+    include_tools: bool,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Conversation, String> {
+    get_conversation_data_for_provider_with_progress(
+        session_id,
+        None,
+        include_tools,
+        on_progress,
+    )
+}
+
+/// Backward-compatible provider-aware lookup. Existing callers receive the
+/// complete conversation, including tool records.
 pub fn get_conversation_data_for_provider(
     session_id: &str,
     provider: Option<SessionProvider>,
 ) -> Result<Conversation, String> {
-    if let Some(provider) = provider {
-        return match provider {
-            SessionProvider::ClaudeCode => claude_conversation(session_id),
-            SessionProvider::Codex => codex_conversation(session_id),
-            SessionProvider::Cursor => cursor_conversation(session_id),
-        };
-    }
-
-    let mut matches = Vec::new();
-    for (provider, loader) in [
-        (
-            SessionProvider::ClaudeCode,
-            claude_conversation as fn(&str) -> Result<Conversation, String>,
-        ),
-        (SessionProvider::Codex, codex_conversation),
-        (SessionProvider::Cursor, cursor_conversation),
-    ] {
-        if let Ok(conversation) = loader(session_id) {
-            matches.push((provider, conversation));
-        }
-    }
-
-    select_provider_conversation(session_id, matches)
+    get_conversation_data_for_provider_with_progress(session_id, provider, true, &mut |_, _| {})
 }
 
 /// Backward-compatible ID-only lookup for CLI callers and old clients.

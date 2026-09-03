@@ -136,7 +136,7 @@ pub fn get_history() -> Result<Vec<HistoryEntry>, String> {
 }
 
 fn codex_history_entries(home_dir: &std::path::Path) -> Vec<HistoryEntry> {
-    super::codex_archive::load_default_snapshots(home_dir)
+    super::codex_archive::load_default_listing(home_dir)
         .into_iter()
         .filter(|snapshot| !snapshot.is_internal())
         .map(|snapshot| {

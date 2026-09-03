@@ -12,6 +12,8 @@
 		visibleTopLevelSessionIds
 	} from '$lib/stores/sessions';
 	import { getConversation, stopSession, openSession } from '$lib/api';
+	import { toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
+	import { get } from 'svelte/store';
 	import { isDemoMode, toggleDemoMode } from '$lib/demo';
 	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 	import { isTauri } from '$lib/ws';
@@ -329,12 +331,16 @@
 		currentConversation.set(null);
 		const selected = expandedSession;
 		if (sessionId && selected) {
-				getConversation(selected.id, selected.provider)
-					.then((conv) => {
-						const responseKey = providerSessionKey(conv.provider ?? providerOf(selected), conv.sessionId);
-						if (requestId === conversationRequestId && responseKey === sessionId) {
-							currentConversation.set(conv);
-					}
+			const selectedKey = sessionKeyOf(selected);
+			toolsLoadedFor.set(null);
+			withConversationLoader(selected.id, selected.provider, 'conversation', () =>
+				getConversation(selected.id, selected.provider, false)
+			)
+				.then((conv) => {
+					if (requestId !== conversationRequestId) return;
+					if (get(toolsLoadedFor) === selectedKey) return;
+					if (providerSessionKey(conv.provider ?? providerOf(selected), conv.sessionId) !== selectedKey) return;
+					currentConversation.set(conv);
 				})
 				.catch((error) => {
 					console.error('Failed to fetch conversation:', error);

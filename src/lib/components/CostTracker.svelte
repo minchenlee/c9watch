@@ -1,6 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { getConversation } from '$lib/api';
+	import { toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
+	import { get } from 'svelte/store';
 	import type { HistoryEntry, Conversation, CostData, SessionCostRecord, SessionProvider } from '$lib/types';
 	import TokenDistanceVisualizer from './token-distance/TokenDistanceVisualizer.svelte';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
@@ -302,11 +304,10 @@
 		});
 	}
 
-	let loadingConversation = $state(false);
+	let conversationRequestId = 0;
 
 	async function handleSessionClick(session: import('$lib/types').SessionCostRecord) {
-		if (loadingConversation) return;
-		loadingConversation = true;
+		const requestId = ++conversationRequestId;
 		selectedEntry = {
 			sessionId: session.sessionId,
 			display: session.sessionName || session.sessionId.slice(0, 8),
@@ -318,12 +319,18 @@
 			surface: session.surface,
 		};
 		conversation = null;
+		toolsLoadedFor.set(null);
 		try {
-			conversation = await getConversation(session.sessionId, session.provider);
+			const requestedKey = providerSessionKey(session.provider, session.sessionId);
+			const conv = await withConversationLoader(session.sessionId, session.provider, 'conversation', () =>
+				getConversation(session.sessionId, session.provider, false)
+			);
+			if (requestId !== conversationRequestId) return;
+			if (get(toolsLoadedFor) === requestedKey) return;
+			if (providerSessionKey(conv.provider ?? session.provider, conv.sessionId) !== requestedKey) return;
+			conversation = conv;
 		} catch (e) {
 			console.error('Failed to load conversation:', e);
-		} finally {
-			loadingConversation = false;
 		}
 	}
 
@@ -906,7 +913,7 @@
 	/>
 {/if}
 {#if selectedEntry}
-	<HistoryCardOverlay entry={selectedEntry} {conversation} onclose={() => { selectedEntry = null; conversation = null; }} />
+	<HistoryCardOverlay entry={selectedEntry} {conversation} onclose={() => { selectedEntry = null; conversation = null; }} onconversation={(conv) => { if (selectedEntry && providerSessionKey(selectedEntry.provider, selectedEntry.sessionId) === providerSessionKey(conv.provider, conv.sessionId)) conversation = conv; }} />
 {/if}
 </div>
 

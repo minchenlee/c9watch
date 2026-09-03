@@ -11,6 +11,7 @@ import { isDemoMode } from '../demo/mode';
 import { openSession } from '../api';
 import { wsClient, useWebSocket, getStoredWsUrl, isTauri } from '../ws';
 import { providerSessionKey, resolveCodexHierarchy, sessionKeyOf } from '../provider';
+import { initConversationProgressListener } from './conversation-loader';
 
 /**
  * Store containing all active sessions
@@ -164,6 +165,7 @@ export async function initializeSessionListeners() {
 	} else {
 		await initTauriListeners();
 	}
+	await initConversationProgressListener();
 }
 
 // ── WebSocket mode ──────────────────────────────────────────────────
