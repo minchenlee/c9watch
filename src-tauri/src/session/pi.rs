@@ -21,7 +21,7 @@ use super::{AgentKind, SessionKind, SessionProvider, SessionSurface};
 use crate::session::parser::MessageType;
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -29,8 +29,11 @@ use std::time::SystemTime;
 const PI_FRESHNESS_IDLE_SECS: u64 = 30 * 60;
 /// Working pi transcripts older than this are treated as expired.
 const PI_FRESHNESS_WORKING_SECS: u64 = 4 * 60 * 60;
-/// A transcript written within this window counts as actively generating.
-const PI_WORKING_RECENCY_SECS: i64 = 120;
+/// A transcript counts as actively generating when its last *message*
+/// is this recent. Ledger lines (`compaction`, `model_change`) bump the
+/// file mtime without moving the conversation forward, so file mtime
+/// alone must not flip a session back to Working.
+const PI_MESSAGE_RECENCY_SECS: i64 = 120;
 /// Cap stored tool-result payloads so one dump cannot bloat conversation views.
 const PI_MAX_TOOL_RESULT_CHARS: usize = 2000;
 /// Cap stored tool-call argument previews.
@@ -324,10 +327,10 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
         session_id,
         ..PiTranscriptSummary::default()
     };
-    let mut pending_tools: Vec<(String, String)> = Vec::new();
-    let mut completed_tools: HashSet<String> = HashSet::new();
+    let mut pending_tools: HashMap<String, (u64, String)> = HashMap::new();
+    let mut tool_seq: u64 = 0;
     let mut last_role: Option<String> = None;
-    let mut last_message_ts: Option<String> = None;
+    let mut last_message_ts_ms: Option<i64> = None;
     let mut header_cwd: Option<String> = None;
     let mut header_ts: Option<i64> = None;
 
@@ -375,6 +378,7 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                     .and_then(|r| r.as_str())
                     .unwrap_or("")
                     .to_string();
+                let ts_ms = value.get("timestamp").and_then(parse_pi_timestamp_ms);
                 let ts = value
                     .get("timestamp")
                     .and_then(|t| t.as_i64())
@@ -389,8 +393,10 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                     "user" => {
                         summary.message_count += 1;
                         last_role = Some(role);
+                        if ts_ms.is_some() {
+                            last_message_ts_ms = ts_ms;
+                        }
                         if let Some(t) = ts.clone() {
-                            last_message_ts = Some(t.clone());
                             summary.last_timestamp = t;
                         }
                         for text in message_texts(message) {
@@ -403,8 +409,10 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                     "assistant" => {
                         summary.message_count += 1;
                         last_role = Some(role);
+                        if ts_ms.is_some() {
+                            last_message_ts_ms = ts_ms;
+                        }
                         if let Some(t) = ts.clone() {
-                            last_message_ts = Some(t.clone());
                             summary.last_timestamp = t;
                         }
                         if summary.model.is_none() {
@@ -441,8 +449,12 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                                         .and_then(|n| n.as_str())
                                         .unwrap_or("tool")
                                         .to_string();
-                                    if !id.is_empty() && !completed_tools.contains(&id) {
-                                        pending_tools.push((id, name));
+                                    // Order-sensitive: a later toolResult
+                                    // clears the id, but a re-issued call
+                                    // with the same id pends again.
+                                    if !id.is_empty() {
+                                        tool_seq += 1;
+                                        pending_tools.insert(id, (tool_seq, name));
                                     }
                                 }
                                 _ => {}
@@ -451,14 +463,16 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                     }
                     "toolResult" => {
                         last_role = Some(role);
+                        if ts_ms.is_some() {
+                            last_message_ts_ms = ts_ms;
+                        }
                         if let Some(t) = ts.clone() {
-                            last_message_ts = Some(t.clone());
                             summary.last_timestamp = t;
                         }
                         if let Some(id) =
                             message.get("toolCallId").and_then(|i| i.as_str())
                         {
-                            completed_tools.insert(id.to_string());
+                            pending_tools.remove(id);
                         }
                     }
                     _ => {}
@@ -480,22 +494,26 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
     summary.started_at_ms = header_ts;
     summary.empty = summary.message_count == 0;
 
-    pending_tools.retain(|(id, _)| !completed_tools.contains(id));
-    summary.pending_tool_name = pending_tools.last().map(|(_, name)| name.clone());
+    let mut pending: Vec<(u64, String)> = pending_tools.into_values().collect();
+    pending.sort_by_key(|(seq, _)| *seq);
+    summary.pending_tool_name = pending.last().map(|(_, name)| name.clone());
 
     // Liveness mirrors the Cursor provider: pending tool calls and trailing
-    // user messages mean the agent owns the turn; otherwise file recency
-    // decides whether output is still streaming.
-    let mtime_recent = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .is_some_and(|d| d.as_secs() < PI_WORKING_RECENCY_SECS as u64);
-    summary.lifecycle = if !pending_tools.is_empty() {
+    // user messages mean the agent owns the turn; otherwise only a recent
+    // *message* (not file activity) counts as still streaming.
+    let last_message_recent = last_message_ts_ms
+        .and_then(|ms| {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|now| now.as_millis() as i64 - ms < PI_MESSAGE_RECENCY_SECS * 1000)
+        })
+        .unwrap_or(false);
+    summary.lifecycle = if !pending.is_empty() {
         PiLifecycle::Working
     } else if last_role.as_deref() == Some("user") {
         PiLifecycle::Working
-    } else if last_message_ts.is_some() && mtime_recent {
+    } else if last_message_recent {
         PiLifecycle::Working
     } else {
         PiLifecycle::Idle
@@ -1352,6 +1370,136 @@ mod tests {
         let filtered = apply_pi_tool_filter(messages, false);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].message_type, MessageType::User);
+    }
+
+    #[test]
+    fn ledger_append_after_idle_stays_idle() {
+        // The exact regression for message-based liveness: a compaction
+        // ledger line bumps the file mtime, but the conversation ended
+        // long ago, so the session must stay Idle.
+        let dir = TempDir::new().unwrap();
+        let lines = vec![
+            r#"{"type":"session","session":{"id":"idle1","timestamp":1755325668328,"cwd":"/tmp/demo"}}"#,
+            r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"id":"m2","timestamp":1755325672000,"type":"message","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"done"}],"stopReason":"stop"}}"#,
+            r#"{"id":"c1","timestamp":1786864068328000,"type":"compaction","summary":"squashed"}"#,
+        ];
+        let path = write_transcript(&dir, "2026-08-16T07-07-48-328Z_idle1.jsonl", &lines);
+        let summary = summarize_pi_transcript(&path).unwrap();
+        assert_eq!(summary.lifecycle, PiLifecycle::Idle);
+        assert_eq!(summary.pending_tool_name, None);
+    }
+
+    #[test]
+    fn reissued_tool_call_pends_again_after_result() {
+        let dir = TempDir::new().unwrap();
+        let lines = vec![
+            r#"{"type":"session","session":{"id":"re1","timestamp":1755325668328,"cwd":"/tmp/demo"}}"#,
+            r#"{"id":"m1","timestamp":1755325669000,"type":"message","message":{"role":"assistant","model":"m","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{}}]}}"#,
+            r#"{"id":"m2","timestamp":1755325670000,"type":"message","message":{"role":"toolResult","toolCallId":"c1","toolName":"bash","content":"ok"}}"#,
+            r#"{"id":"m3","timestamp":1755325671000,"type":"message","message":{"role":"assistant","model":"m","content":[{"type":"toolCall","id":"c1","name":"bash","arguments":{}}]}}"#,
+        ];
+        let path = write_transcript(&dir, "2026-08-16T07-07-48-328Z_re1.jsonl", &lines);
+        let summary = summarize_pi_transcript(&path).unwrap();
+        assert_eq!(summary.lifecycle, PiLifecycle::Working);
+        assert_eq!(summary.pending_tool_name.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn headerless_file_without_messages_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let lines = vec![
+            r#"{"id":"c1","timestamp":1755325672000,"type":"compaction","summary":"squashed"}"#,
+            "not json at all",
+        ];
+        let path = write_transcript(&dir, "2026-08-16T07-07-48-328Z_ghost1.jsonl", &lines);
+        assert!(summarize_pi_transcript(&path).is_none());
+    }
+
+    #[test]
+    fn detect_respects_freshness_windows() {
+        use std::time::{Duration, SystemTime};
+        let dir = TempDir::new().unwrap();
+        let root = dir
+            .path()
+            .join(".pi")
+            .join("agent")
+            .join("sessions")
+            .join("encoded-cwd");
+        std::fs::create_dir_all(&root).unwrap();
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // Idle transcript, mtime 40min ago (> 30min idle window) → dropped.
+        let idle_lines = format!(
+            "{{\"type\":\"session\",\"session\":{{\"id\":\"oldidle\",\"timestamp\":{now_ms},\"cwd\":\"/tmp/demo\"}}}}\n\
+             {{\"id\":\"m\",\"timestamp\":{msg},\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"model\":\"m\",\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}],\"stopReason\":\"stop\"}}}}\n",
+            msg = now_ms - 40 * 60 * 1000,
+        );
+        let idle_path = root.join("2026-08-16T07-07-48-328Z_oldidle.jsonl");
+        std::fs::write(&idle_path, idle_lines).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(40 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&idle_path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        // Working transcript (pending tool), mtime 3h ago (< 4h working window) → kept.
+        let work_lines = format!(
+            "{{\"type\":\"session\",\"session\":{{\"id\":\"oldwork\",\"timestamp\":{now_ms},\"cwd\":\"/tmp/demo\"}}}}\n\
+             {{\"id\":\"m\",\"timestamp\":{msg},\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"model\":\"m\",\"content\":[{{\"type\":\"toolCall\",\"id\":\"c9\",\"name\":\"bash\",\"arguments\":{{}}}}]}}}}\n",
+            msg = now_ms - 3 * 60 * 60 * 1000,
+        );
+        let work_path = root.join("2026-08-16T07-07-48-328Z_oldwork.jsonl");
+        std::fs::write(&work_path, work_lines).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&work_path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let mut source = PiSessionSource::at_root(
+            dir.path().join(".pi").join("agent").join("sessions"),
+        );
+        let (sessions, _) = source.detect().unwrap();
+        let ids: Vec<&str> = sessions
+            .iter()
+            .filter_map(|s| s.session_id.as_deref())
+            .collect();
+        assert!(!ids.contains(&"oldidle"), "stale idle must expire");
+        assert!(ids.contains(&"oldwork"), "working within 4h must stay");
+    }
+
+    #[test]
+    fn history_and_cost_carry_pi_provider_namespace() {
+        let dir = TempDir::new().unwrap();
+        write_transcript(
+            &dir,
+            "2026-08-16T07-07-48-328Z_ns9.jsonl",
+            &sample_lines()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        let history = pi_history_entries(dir.path());
+        // The transcript header carries a different id; the filename wins.
+        let entry = history
+            .iter()
+            .find(|e| e.session_id == "ns9")
+            .expect("pi history entry");
+        assert_eq!(entry.provider, "pi");
+        let costs = pi_cost_records(dir.path());
+        assert!(
+            costs.iter().all(|r| r.provider == "pi"),
+            "cost records must stay in the pi namespace"
+        );
+        assert!(!costs.is_empty());
     }
 
     #[test]

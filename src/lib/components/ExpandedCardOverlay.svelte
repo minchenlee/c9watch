@@ -249,7 +249,7 @@
 			sessionId: child.id,
 			provider: providerOf(child),
 			agentType: child.agentRole || child.agentNickname || 'subagent',
-				description: child.agentNickname || child.codexTitle || child.cursorTitle || child.summary || child.firstPrompt || child.agentRole || (providerOf(child) === 'cursor' ? 'Cursor subagent' : 'Codex subagent'),
+				description: child.agentNickname || child.codexTitle || child.cursorTitle || child.summary || child.firstPrompt || child.agentRole || (providerOf(child) === 'cursor' ? 'Cursor subagent' : providerOf(child) === 'pi' ? 'Pi subagent' : 'Codex subagent'),
 			startedAt: child.startedAtMs ? new Date(child.startedAtMs).toISOString() : child.modified,
 			completedAt: child.status === SessionStatus.Working ? null : child.modified,
 			parentSessionId: session.id,
@@ -282,7 +282,7 @@
 	let previewError = $derived(previewState.error);
 
 	async function openSubagentPreview(sa: SubagentInfo) {
-		if ((sa.provider === 'codex' || sa.provider === 'cursor') && sa.sessionId) {
+		if ((sa.provider === 'codex' || sa.provider === 'cursor' || sa.provider === 'pi') && sa.sessionId) {
 			expandedSessionId.set(providerSessionKey(sa.provider, sa.sessionId));
 			return;
 		}
