@@ -4,6 +4,7 @@ use thiserror::Error;
 
 use super::codex::CodexRolloutSummary;
 use super::cursor::CursorTranscriptSummary;
+use super::pi::PiTranscriptSummary;
 
 #[derive(Error, Debug)]
 pub enum SessionDetectorError {
@@ -43,6 +44,7 @@ pub enum SessionProvider {
     ClaudeCode,
     Codex,
     Cursor,
+    Pi,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
@@ -99,6 +101,7 @@ fn provider_key(provider: SessionProvider) -> &'static str {
         SessionProvider::ClaudeCode => "claudeCode",
         SessionProvider::Codex => "codex",
         SessionProvider::Cursor => "cursor",
+        SessionProvider::Pi => "pi",
     }
 }
 
@@ -150,6 +153,8 @@ pub struct DetectedSession {
     pub codex_summary: Option<CodexRolloutSummary>,
     #[serde(skip)]
     pub cursor_summary: Option<CursorTranscriptSummary>,
+    #[serde(skip)]
+    pub pi_summary: Option<PiTranscriptSummary>,
 }
 
 fn default_true() -> bool {
@@ -199,6 +204,7 @@ impl DetectedSession {
             can_rename: true,
             codex_summary: None,
             cursor_summary: None,
+            pi_summary: None,
         }
     }
 }
@@ -276,6 +282,10 @@ mod tests {
             "\"cursor\""
         );
         assert_eq!(
+            serde_json::to_string(&SessionProvider::Pi).unwrap(),
+            "\"pi\""
+        );
+        assert_eq!(
             serde_json::to_string(&SessionSurface::Cursor).unwrap(),
             "\"cursor\""
         );
@@ -295,11 +305,14 @@ mod tests {
         let claude = SessionIdentity::new(SessionProvider::ClaudeCode, id);
         let codex = SessionIdentity::new(SessionProvider::Codex, id);
         let cursor = SessionIdentity::new(SessionProvider::Cursor, id);
+        let pi = SessionIdentity::new(SessionProvider::Pi, id);
 
         assert_ne!(claude, codex);
         assert_ne!(codex, cursor);
+        assert_ne!(cursor, pi);
         assert_eq!(claude.key(), "claudeCode:same-session-id");
         assert_eq!(codex.key(), "codex:same-session-id");
         assert_eq!(cursor.key(), "cursor:same-session-id");
+        assert_eq!(pi.key(), "pi:same-session-id");
     }
 }

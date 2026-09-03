@@ -162,6 +162,7 @@
 		if (normalized.startsWith('gpt-5.3-codex')) return '#a3e635';
 
 		if (provider === 'cursor') return 'var(--accent-purple)';
+		if (provider === 'pi') return 'var(--accent-green)';
 		if (provider === 'codex' || normalized.startsWith('gpt-')) {
 			let hash = 0;
 			for (let i = 0; i < normalized.length; i++) {
@@ -200,6 +201,7 @@
 	let mode = $derived($costMode);
 	let hasCodexUsage = $derived(costData?.dailyCosts.some((day) => day.sessions.some((session) => session.provider === 'codex')) ?? false);
 	let hasCursorUsage = $derived(costData?.dailyCosts.some((day) => day.sessions.some((session) => session.provider === 'cursor')) ?? false);
+	let hasPiUsage = $derived(costData?.dailyCosts.some((day) => day.sessions.some((session) => session.provider === 'pi')) ?? false);
 	let collapsedProjects = $state<Set<string>>(new Set());
 	let modelTrackWidth = $state(0);
 	let projectTrackWidth = $state(0);
@@ -611,7 +613,8 @@
 		const providers = [
 			{ type: 'claude', value: providerUsageValue(sessions, 'claudeCode') },
 			{ type: 'codex', value: providerUsageValue(sessions, 'codex') },
-			{ type: 'cursor', value: providerUsageValue(sessions, 'cursor') }
+			{ type: 'cursor', value: providerUsageValue(sessions, 'cursor') },
+			{ type: 'pi', value: providerUsageValue(sessions, 'pi') }
 		];
 		const total = providers.reduce((sum, provider) => sum + provider.value, 0);
 		const arr: Array<{ type: string }> = [];
@@ -740,6 +743,7 @@
 				<span class="provider-usage-legend-item"><span class="provider-usage-swatch claude" aria-hidden="true"></span>CLAUDE CODE</span>
 				<span class="provider-usage-legend-item"><span class="provider-usage-swatch codex" aria-hidden="true"></span>CODEX</span>
 				{#if hasCursorUsage}<span class="provider-usage-legend-item"><span class="provider-usage-swatch cursor" aria-hidden="true"></span>CURSOR</span>{/if}
+				{#if hasPiUsage}<span class="provider-usage-legend-item"><span class="provider-usage-swatch pi" aria-hidden="true"></span>PI</span>{/if}
 			</div>
 			{#if filteredProjectCosts.length === 0}
 				<div class="state-msg">No {providerFilterLabel($providerFilter)} usage data available.</div>
@@ -1029,9 +1033,15 @@
 		background: var(--accent-purple);
 	}
 
+	.provider-usage-swatch.pi {
+		color: var(--accent-green);
+		background: var(--accent-green);
+	}
+
 	.rect.claude { background: var(--accent-amber); }
 	.rect.codex { background: var(--accent-blue); }
 	.rect.cursor { background: var(--accent-purple); }
+	.rect.pi { background: var(--accent-green); }
 
 	.cost-section {
 		display: flex;

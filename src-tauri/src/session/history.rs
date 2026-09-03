@@ -131,6 +131,7 @@ pub fn get_history() -> Result<Vec<HistoryEntry>, String> {
 
     entries.extend(codex_history_entries(&home_dir));
     entries.extend(crate::session::cursor::cursor_history_entries(&home_dir));
+    entries.extend(crate::session::pi::pi_history_entries(&home_dir));
     entries.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
     Ok(entries)
 }
@@ -539,6 +540,12 @@ pub(crate) fn deep_search_under(
         whole_word,
         phrase_match,
         extract_snippet,
+    ));
+    result.extend(crate::session::pi::pi_deep_search(
+        &home_dir,
+        query,
+        case_sensitive,
+        whole_word,
     ));
     result.sort_by(|left, right| {
         left.provider

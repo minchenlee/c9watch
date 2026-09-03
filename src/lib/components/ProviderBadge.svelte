@@ -15,7 +15,7 @@
 </script>
 
 <span class="provider-stack" class:compact aria-label={`${providerLabel(normalized)} ${noun}${surfaceText ? `, ${surfaceText}` : ''}`}>
-	<span class="provider-badge" class:codex={normalized === 'codex'} class:cursor={normalized === 'cursor'}>{providerLabel(normalized)}</span>
+	<span class="provider-badge" class:codex={normalized === 'codex'} class:cursor={normalized === 'cursor'} class:pi={normalized === 'pi'}>{providerLabel(normalized)}</span>
 	{#if surfaceText}<span class="surface-badge">{surfaceText}</span>{/if}
 </span>
 
@@ -31,6 +31,7 @@
 	.provider-badge { color: var(--accent-amber); border-color: color-mix(in srgb, var(--accent-amber) 55%, var(--border-default)); }
 	.provider-badge.codex { color: var(--accent-blue); border-color: color-mix(in srgb, var(--accent-blue) 55%, var(--border-default)); }
 	.provider-badge.cursor { color: var(--accent-purple); border-color: color-mix(in srgb, var(--accent-purple) 55%, var(--border-default)); }
+	.provider-badge.pi { color: var(--accent-green); border-color: color-mix(in srgb, var(--accent-green) 55%, var(--border-default)); }
 	.surface-badge { height: 16px; padding: 0 4px; border-color: var(--border-default); border-style: dashed; font-size: 7px; color: var(--text-secondary); }
 	.compact .provider-badge { height: 16px; font-size: 7px; }
 	.compact .surface-badge { display: none; }

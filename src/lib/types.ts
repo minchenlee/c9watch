@@ -12,7 +12,7 @@ export enum SessionStatus {
   Connecting = 'Connecting'            // Session starting up
 }
 
-export type SessionProvider = 'claudeCode' | 'codex' | 'cursor';
+export type SessionProvider = 'claudeCode' | 'codex' | 'cursor' | 'pi';
 export type SessionSurface = 'claudeCode' | 'app' | 'cli' | 'exec' | 'integration' | 'cursor' | 'unknown';
 export type AgentKind = 'root' | 'subagent' | 'internal';
 

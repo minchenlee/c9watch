@@ -8,16 +8,19 @@
 
 use super::codex::CodexSessionSource;
 use super::cursor::CursorSessionSource;
+use super::pi::PiSessionSource;
 use super::source::{DetectedSession, DetectionDiagnostics, SessionSource};
 use std::sync::{Arc, LazyLock, Mutex};
 
 pub(crate) type SharedCodexSource = Arc<Mutex<Option<CodexSessionSource>>>;
 pub(crate) type SharedCursorSource = Arc<Mutex<Option<CursorSessionSource>>>;
+pub(crate) type SharedPiSource = Arc<Mutex<Option<PiSessionSource>>>;
 
 #[derive(Clone)]
 pub(crate) struct ProviderSourceOwners {
     pub(crate) codex: SharedCodexSource,
     pub(crate) cursor: SharedCursorSource,
+    pub(crate) pi: SharedPiSource,
     initialize_defaults: bool,
 }
 
@@ -26,6 +29,7 @@ impl ProviderSourceOwners {
         Self {
             codex: Arc::new(Mutex::new(None)),
             cursor: Arc::new(Mutex::new(None)),
+            pi: Arc::new(Mutex::new(None)),
             initialize_defaults: true,
         }
     }
@@ -52,7 +56,21 @@ impl ProviderSourceOwners {
         guard.as_mut()?.detect().ok()
     }
 
+    pub(crate) fn detect_pi(&self) -> Option<(Vec<DetectedSession>, DetectionDiagnostics)> {
+        let mut guard = recover_lock(&self.pi);
+        if guard.is_none() {
+            if !self.initialize_defaults {
+                return None;
+            }
+            *guard = PiSessionSource::new().ok();
+        }
+        guard.as_mut()?.detect().ok()
+    }
+
     pub(crate) fn has_non_claude_session(&self, session_id: &str) -> bool {
+        if self.has_pi_session(session_id) {
+            return true;
+        }
         let codex = {
             let mut guard = recover_lock(&self.codex);
             if guard.is_none() && self.initialize_defaults {
@@ -75,14 +93,26 @@ impl ProviderSourceOwners {
             .is_some_and(|source| source.contains_session_id(session_id))
     }
 
+    fn has_pi_session(&self, session_id: &str) -> bool {
+        let mut guard = recover_lock(&self.pi);
+        if guard.is_none() && self.initialize_defaults {
+            *guard = PiSessionSource::new().ok();
+        }
+        guard
+            .as_ref()
+            .is_some_and(|source| source.contains_session_id(session_id))
+    }
+
     #[cfg(test)]
     pub(crate) fn from_test_sources(
         codex: Option<CodexSessionSource>,
         cursor: Option<CursorSessionSource>,
+        pi: Option<PiSessionSource>,
     ) -> Self {
         Self {
             codex: Arc::new(Mutex::new(codex)),
             cursor: Arc::new(Mutex::new(cursor)),
+            pi: Arc::new(Mutex::new(pi)),
             initialize_defaults: false,
         }
     }
@@ -114,6 +144,7 @@ mod tests {
 
         assert!(Arc::ptr_eq(&owners.codex, &clone.codex));
         assert!(Arc::ptr_eq(&owners.cursor, &clone.cursor));
+        assert!(Arc::ptr_eq(&owners.pi, &clone.pi));
     }
 
     #[test]
@@ -126,6 +157,7 @@ mod tests {
             &detector_owner.cursor,
             &enrichment_owner.cursor
         ));
+        assert!(Arc::ptr_eq(&detector_owner.pi, &enrichment_owner.pi));
     }
 
     #[test]
@@ -135,16 +167,19 @@ mod tests {
 
         assert!(!Arc::ptr_eq(&left.codex, &right.codex));
         assert!(!Arc::ptr_eq(&left.cursor, &right.cursor));
+        assert!(!Arc::ptr_eq(&left.pi, &right.pi));
     }
 
     #[test]
     fn test_owners_without_sources_do_not_initialize_production_roots() {
-        let owners = ProviderSourceOwners::from_test_sources(None, None);
+        let owners = ProviderSourceOwners::from_test_sources(None, None, None);
 
         assert!(owners.detect_codex().is_none());
         assert!(owners.detect_cursor().is_none());
+        assert!(owners.detect_pi().is_none());
         assert!(owners.codex.lock().unwrap().is_none());
         assert!(owners.cursor.lock().unwrap().is_none());
+        assert!(owners.pi.lock().unwrap().is_none());
     }
 
     #[test]
@@ -167,6 +202,7 @@ mod tests {
         let owners = ProviderSourceOwners::from_test_sources(
             None,
             Some(CursorSessionSource::at_root(temp.path().to_path_buf())),
+            None,
         );
         let first = owners.detect_cursor().unwrap().0;
         let parses_after_first = owners
@@ -231,6 +267,7 @@ mod tests {
         let owners = ProviderSourceOwners::from_test_sources(
             Some(CodexSessionSource::at_root(temp.path().to_path_buf())),
             None,
+            None,
         );
         let first = owners.detect_codex().unwrap().0;
         let parses_after_first = owners
@@ -256,5 +293,43 @@ mod tests {
         assert_eq!(second[0].session_id, Some(SESSION_ID.to_string()));
         assert!(owners.has_non_claude_session(SESSION_ID));
         assert!(!owners.has_non_claude_session("missing-codex-session"));
+    }
+
+    #[test]
+    fn shared_pi_owner_detects_a_synthetic_fixture() {
+        const SESSION_ID: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        let temp = tempfile::tempdir().unwrap();
+        let cwd_dir = temp.path().join("encoded-cwd");
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+        std::fs::write(
+            cwd_dir.join(format!("2026-09-03T00-00-00-000Z_{SESSION_ID}.jsonl")),
+            format!(
+                concat!(
+                    r#"{{"type":"session","session":{{"id":"{id}","timestamp":1756857600000,"cwd":"/tmp/synthetic-pi"}}}}"#,
+                    "\n",
+                    r#"{{"type":"message","message":{{"role":"user","content":[{{"type":"text","text":"shared owner fixture"}}]}}}}"#,
+                    "\n",
+                ),
+                id = SESSION_ID,
+            ),
+        )
+        .unwrap();
+
+        let owners = ProviderSourceOwners::from_test_sources(
+            None,
+            None,
+            Some(crate::session::pi::PiSessionSource::at_root(
+                temp.path().to_path_buf(),
+            )),
+        );
+        let sessions = owners.detect_pi().unwrap().0;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, Some(SESSION_ID.to_string()));
+        assert_eq!(
+            sessions[0].provider,
+            crate::session::SessionProvider::Pi
+        );
+        assert!(owners.has_non_claude_session(SESSION_ID));
+        assert!(!owners.has_non_claude_session("missing-pi-session"));
     }
 }

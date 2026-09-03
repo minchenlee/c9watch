@@ -33,6 +33,7 @@ impl DetectorState {
         let claude_result = self.source.detect();
         let codex_result = self.provider_sources.detect_codex();
         let cursor_result = self.provider_sources.detect_cursor();
+        let pi_result = self.provider_sources.detect_pi();
         match claude_result {
             Ok((mut sessions, diagnostics)) => {
                 self.consecutive_failures = 0;
@@ -40,6 +41,9 @@ impl DetectorState {
                     sessions.append(&mut extra);
                 }
                 if let Some((mut extra, _)) = cursor_result {
+                    sessions.append(&mut extra);
+                }
+                if let Some((mut extra, _)) = pi_result {
                     sessions.append(&mut extra);
                 }
                 Ok((sessions, diagnostics))
@@ -56,6 +60,12 @@ impl DetectorState {
                     diagnostics = extra;
                 }
                 if let Some((sessions, extra)) = cursor_result {
+                    fallback.extend(sessions);
+                    if diagnostics.claude_processes_found == 0 {
+                        diagnostics = extra;
+                    }
+                }
+                if let Some((sessions, extra)) = pi_result {
                     fallback.extend(sessions);
                     if diagnostics.claude_processes_found == 0 {
                         diagnostics = extra;
@@ -112,7 +122,7 @@ impl DetectorState {
             consecutive_failures: 0,
             telemetry_counter: Arc::new(AtomicU32::new(0)),
             mode,
-            provider_sources: ProviderSourceOwners::from_test_sources(None, None),
+            provider_sources: ProviderSourceOwners::from_test_sources(None, None, None),
         }
     }
 

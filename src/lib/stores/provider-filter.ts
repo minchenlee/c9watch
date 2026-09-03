@@ -5,7 +5,7 @@ import type { ProviderFilter } from '$lib/provider';
 const STORAGE_KEY = 'c9watch.providerFilter';
 
 function sanitize(value: string | null): ProviderFilter {
-	return value === 'claudeCode' || value === 'codex' || value === 'cursor' ? value : 'all';
+	return value === 'claudeCode' || value === 'codex' || value === 'cursor' || value === 'pi' ? value : 'all';
 }
 
 export const providerFilter = writable<ProviderFilter>(

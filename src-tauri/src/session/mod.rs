@@ -1,6 +1,7 @@
 mod cache;
 pub mod codex;
 pub mod cursor;
+pub mod pi;
 pub mod custom_names;
 pub mod detector;
 pub mod parser;
@@ -73,6 +74,10 @@ pub(crate) fn codex_session_ids(home: &std::path::Path, prefix: &str) -> Vec<Str
 
 pub(crate) fn cursor_session_ids(home: &std::path::Path, prefix: &str) -> Vec<String> {
     cursor::list_session_ids(home, prefix)
+}
+
+pub(crate) fn pi_session_ids(home: &std::path::Path, prefix: &str) -> Vec<String> {
+    pi::pi_session_ids(home, prefix)
 }
 
 pub mod memory;
@@ -291,7 +296,7 @@ mod factory_tests {
         let cursor =
             crate::session::cursor::CursorSessionSource::at_root(temp.path().to_path_buf());
         assert!(cursor.contains_session_id(SESSION_ID));
-        let owners = ProviderSourceOwners::from_test_sources(None, Some(cursor));
+        let owners = ProviderSourceOwners::from_test_sources(None, Some(cursor), None);
 
         assert!(validate_rename_request(None, SESSION_ID, &owners).is_err());
         assert!(

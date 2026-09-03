@@ -138,6 +138,31 @@ fn cursor_conversation(
     })
 }
 
+fn pi_conversation(
+    session_id: &str,
+    _include_tools: bool,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Conversation, String> {
+    // pi transcripts are parsed in one pass; report completion for parity
+    // with the progress-reporting providers.
+    on_progress(0, 1);
+    let messages = crate::session::pi::read_pi_conversation(session_id)?;
+    on_progress(1, 1);
+    Ok(Conversation {
+        session_id: session_id.to_string(),
+        provider: SessionProvider::Pi,
+        messages: messages
+            .into_iter()
+            .map(|message| ConversationMessage {
+                timestamp: message.timestamp,
+                message_type: message.message_type,
+                content: message.content,
+                images: Vec::new(),
+            })
+            .collect(),
+    })
+}
+
 fn load_for_provider(
     session_id: &str,
     provider: SessionProvider,
@@ -148,6 +173,7 @@ fn load_for_provider(
         SessionProvider::ClaudeCode => claude_conversation(session_id, include_tools, on_progress),
         SessionProvider::Codex => codex_conversation(session_id, include_tools, on_progress),
         SessionProvider::Cursor => cursor_conversation(session_id, include_tools, on_progress),
+        SessionProvider::Pi => pi_conversation(session_id, include_tools, on_progress),
     }
 }
 
@@ -185,6 +211,7 @@ pub fn get_conversation_data_for_provider_with_progress(
         SessionProvider::ClaudeCode,
         SessionProvider::Codex,
         SessionProvider::Cursor,
+        SessionProvider::Pi,
     ] {
         if let Ok(conversation) =
             load_for_provider(session_id, provider, include_tools, on_progress)
@@ -242,6 +269,7 @@ mod tests {
             vec![
                 (SessionProvider::ClaudeCode, conversation("same-id")),
                 (SessionProvider::Codex, conversation("same-id")),
+                (SessionProvider::Pi, conversation("same-id")),
             ],
         )
         .unwrap_err();
