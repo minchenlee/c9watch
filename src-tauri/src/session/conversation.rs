@@ -140,7 +140,7 @@ fn cursor_conversation(
 
 fn pi_conversation(
     session_id: &str,
-    _include_tools: bool,
+    include_tools: bool,
     on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Conversation, String> {
     // pi transcripts are parsed in one pass; report completion for parity
@@ -148,6 +148,7 @@ fn pi_conversation(
     on_progress(0, 1);
     let messages = crate::session::pi::read_pi_conversation(session_id)?;
     on_progress(1, 1);
+    let messages = crate::session::pi::apply_pi_tool_filter(messages, include_tools);
     Ok(Conversation {
         session_id: session_id.to_string(),
         provider: SessionProvider::Pi,

@@ -246,16 +246,61 @@ pub(crate) fn pi_sessions_root(home: &Path) -> PathBuf {
 }
 
 /// Best-effort decode of pi's encoded cwd directory name (`--Users-foo-bar`
-/// for `/Users/foo/bar`). Only a fallback: the session header's `cwd` wins.
+/// for `/Users/foo/bar`). The encoding is lossy: `/` becomes `-` while real
+/// dashes are preserved, so names with dashes cannot round-trip. Callers
+/// prefer [`pi_dir_cwd`] (exact, via sibling headers) and use this last.
 fn decode_pi_cwd_dir(dir: &Path) -> String {
     let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let stripped = name.strip_prefix('-').unwrap_or(name);
+    let stripped = name.trim_matches('-');
     let decoded = stripped.replace('-', "/");
     if decoded.starts_with('/') {
         decoded
     } else {
         format!("/{decoded}")
     }
+}
+
+/// Exact cwd for a transcript directory: reuse any sibling transcript's
+/// session header (same cwd by construction). Falls back to lossy dirname
+/// decoding when no sibling carries a cwd.
+fn pi_dir_cwd(dir: &Path) -> String {
+    if let Ok(files) = std::fs::read_dir(dir) {
+        for entry in files.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(cwd) = read_pi_header_cwd(&path) {
+                return cwd;
+            }
+        }
+    }
+    decode_pi_cwd_dir(dir)
+}
+
+/// cwd from a transcript's session header (either schema), scanning only
+/// the head of the file. Returns `None` when no header carries a cwd.
+fn read_pi_header_cwd(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines().take(50) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) != Some("session") {
+            continue;
+        }
+        if let Some(cwd) = value
+            .get("session")
+            .and_then(|s| s.get("cwd"))
+            .and_then(|c| c.as_str())
+        {
+            return Some(cwd.to_string());
+        }
+        if let Some(cwd) = value.get("cwd").and_then(|c| c.as_str()) {
+            return Some(cwd.to_string());
+        }
+    }
+    None
 }
 
 /// Session id is the filename suffix after the last `_` (`<ts>_<uuid>.jsonl`).
@@ -300,8 +345,11 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                     if let Some(cwd) = session.get("cwd").and_then(|c| c.as_str()) {
                         header_cwd = Some(cwd.to_string());
                     }
-                    if let Some(ts) = session.get("timestamp").and_then(|t| t.as_i64()) {
-                        header_ts = Some(ts);
+                    if header_ts.is_none() {
+                        if let Some(ts) = session.get("timestamp").and_then(parse_pi_timestamp_ms)
+                        {
+                            header_ts = Some(ts);
+                        }
                     }
                 } else {
                     // Older pi transcripts keep the header flat:
@@ -423,7 +471,12 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
     if header_cwd.is_none() && header_ts.is_none() && summary.message_count == 0 {
         return None;
     }
-    summary.project_path = header_cwd.unwrap_or_default();
+    // Sibling headers share this directory's cwd, so a header-less file
+    // still resolves dash-containing paths exactly; dirname decoding is
+    // the last resort.
+    summary.project_path = header_cwd
+        .or_else(|| path.parent().map(pi_dir_cwd))
+        .unwrap_or_default();
     summary.started_at_ms = header_ts;
     summary.empty = summary.message_count == 0;
 
@@ -475,29 +528,29 @@ fn apply_pi_usage(summary: &mut PiTranscriptSummary, message: &serde_json::Value
     let Some(usage) = message.get("usage") else {
         return;
     };
-    summary.input_tokens += usage
-        .get("input")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    summary.output_tokens += usage
-        .get("output")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    summary.input_tokens += usage.get("input").map(u64_from_json).unwrap_or(0);
+    summary.output_tokens += usage.get("output").map(u64_from_json).unwrap_or(0);
     summary.cached_input_tokens += usage
         .get("cacheRead")
-        .and_then(|v| v.as_u64())
+        .map(u64_from_json)
         .unwrap_or(0)
-        + usage
-            .get("cacheWrite")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        + usage.get("cacheWrite").map(u64_from_json).unwrap_or(0);
     summary.reasoning_tokens += usage
         .get("reasoning")
-        .and_then(|v| v.as_u64())
+        .map(u64_from_json)
         .unwrap_or(0);
     if let Some(cost) = usage.get("cost").and_then(|c| c.get("total")) {
         summary.total_cost += cost.as_f64().unwrap_or(0.0);
     }
+}
+
+/// Token counts are integers, but accept floats defensively so `10.0`
+/// does not silently become 0 while cost still accrues.
+fn u64_from_json(value: &serde_json::Value) -> u64 {
+    value
+        .as_u64()
+        .or_else(|| value.as_f64().map(|f| f as u64))
+        .unwrap_or(0)
 }
 
 fn millis_to_rfc3339(ms: i64) -> String {
@@ -721,6 +774,7 @@ pub(crate) fn pi_conversation_path_for_session(
 
 pub(crate) fn pi_session_ids(home: &Path, prefix: &str) -> Vec<String> {
     let root = pi_sessions_root(home);
+    let mut seen = std::collections::HashSet::new();
     let mut ids = Vec::new();
     let Ok(dirs) = std::fs::read_dir(&root) else {
         return ids;
@@ -739,7 +793,7 @@ pub(crate) fn pi_session_ids(home: &Path, prefix: &str) -> Vec<String> {
                 continue;
             }
             if let Some(id) = pi_session_id_from_filename(&path) {
-                if id.starts_with(prefix) && !ids.contains(&id) {
+                if id.starts_with(prefix) && seen.insert(id.clone()) {
                     ids.push(id);
                 }
             }
@@ -767,6 +821,34 @@ pub(crate) fn pi_search_metadata(
 }
 
 // ── History / search / cost ─────────────────────────────────────────
+
+fn file_mtime_ms(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+}
+
+/// Drop tool records when the caller asked for a tool-free conversation,
+/// mirroring the other providers' `include_tools=false` behavior.
+pub(crate) fn apply_pi_tool_filter(
+    messages: Vec<PiConversationMessage>,
+    include_tools: bool,
+) -> Vec<PiConversationMessage> {
+    if include_tools {
+        return messages;
+    }
+    messages
+        .into_iter()
+        .filter(|m| {
+            !matches!(
+                m.message_type,
+                MessageType::ToolUse | MessageType::ToolResult
+            )
+        })
+        .collect()
+}
 
 pub(crate) fn pi_history_entries(home: &Path) -> Vec<crate::session::history::HistoryEntry> {
     let root = pi_sessions_root(home);
@@ -806,7 +888,14 @@ pub(crate) fn pi_history_entries(home: &Path) -> Vec<crate::session::history::Hi
             entries.push(crate::session::history::HistoryEntry {
                 session_id: summary.session_id,
                 display: summary.first_prompt.unwrap_or_default(),
-                timestamp: summary.started_at_ms.unwrap_or(0).max(0) as u64,
+                // Header-less transcripts fall back to file mtime so they
+                // do not all cluster at epoch in sorted history.
+                timestamp: summary
+                    .started_at_ms
+                    .filter(|ms| *ms > 0)
+                    .map(|ms| ms as u64)
+                    .or_else(|| file_mtime_ms(&path))
+                    .unwrap_or(0),
                 project,
                 project_name,
                 custom_title: None,
@@ -950,15 +1039,24 @@ fn pi_text_matches(text: &str, needle: &str, case_sensitive: bool, whole_word: b
 }
 
 /// ~200-char snippet around the first match, mirroring Claude search hits.
+/// Char-indexed throughout: lowercasing can change byte length (e.g. `İ`),
+/// so byte offsets from the lowered string must never slice the original.
 fn pi_snippet(text: &str, query: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
-    let pos = text
-        .to_lowercase()
-        .find(&query.to_lowercase())
-        .map(|byte| text[..byte].chars().count())
+    let query_chars: Vec<char> = query.to_lowercase().chars().collect();
+    if query_chars.is_empty() || chars.is_empty() {
+        return chars.into_iter().take(200).collect();
+    }
+    let lower_chars: Vec<char> = text.to_lowercase().chars().collect();
+    let pos = lower_chars
+        .windows(query_chars.len())
+        .position(|window| window == query_chars.as_slice())
         .unwrap_or(0);
-    let start = pos.saturating_sub(80);
-    let end = (pos + query.chars().count() + 120).min(chars.len());
+    // Lowered/original lengths can differ; clamp so indices stay in range.
+    // The window may be off by a char in exotic scripts, never a panic.
+    let start = pos.saturating_sub(80).min(chars.len());
+    let end = (pos + query_chars.len() + 120).min(chars.len());
+    let start = start.min(end);
     let mut snippet: String = chars[start..end].iter().collect();
     if start > 0 {
         snippet = format!("…{snippet}");
@@ -1013,6 +1111,11 @@ pub(crate) fn pi_cost_records(home: &Path) -> Vec<crate::session::cost::SessionC
                     .started_at_ms
                     .and_then(DateTime::from_timestamp_millis)
                     .map(|dt| dt.to_rfc3339())
+                    .or_else(|| {
+                        file_mtime_ms(&path).and_then(|ms| {
+                            DateTime::from_timestamp_millis(ms as i64).map(|dt| dt.to_rfc3339())
+                        })
+                    })
                     .unwrap_or_default()
             } else {
                 summary.last_timestamp.clone()
@@ -1169,6 +1272,86 @@ mod tests {
         assert!(messages
             .iter()
             .any(|m| m.message_type == MessageType::ToolResult && m.content == "old output"));
+    }
+
+    #[test]
+    fn headerless_file_reuses_sibling_cwd_with_dashes() {
+        let dir = TempDir::new().unwrap();
+        let lines = vec![
+            r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"no header here"}]}}"#,
+        ];
+        // Header-less file next to a sibling whose header carries a
+        // dash-containing cwd: the exact path must win over lossy decode.
+        let headerless =
+            write_transcript(&dir, "2026-09-03T00-00-00-000Z_naked1.jsonl", &lines);
+        let sibling_dir = headerless.parent().unwrap();
+        let mut sibling = std::fs::File::create(
+            sibling_dir.join("2026-09-03T00-00-01-000Z_sib2.jsonl"),
+        )
+        .unwrap();
+        use std::io::Write as _;
+        writeln!(
+            sibling,
+            r#"{{"type":"session","session":{{"id":"sib2","timestamp":1756857600000,"cwd":"/tmp/my-project"}}}}"#
+        )
+        .unwrap();
+        let summary = summarize_pi_transcript(&headerless).unwrap();
+        assert_eq!(summary.project_path, "/tmp/my-project");
+    }
+
+    #[test]
+    fn snippet_handles_multibyte_case_folding_without_panic() {
+        // `ß` lowercases to two chars (`ss`), shifting char offsets.
+        let text = "Die GROßE Straße führt nach Süden und weiter";
+        let snippet = pi_snippet(text, "grosse");
+        assert!(snippet.contains("GROßE"));
+        let cjk = "請直接在目前的 c9watch repository 工作，然後回報結果給我看";
+        let snippet = pi_snippet(cjk, "c9watch");
+        assert!(snippet.contains("c9watch"));
+        assert!(pi_snippet(text, "").chars().count() <= 200);
+    }
+
+    #[test]
+    fn timestamp_parser_accepts_int_float_and_rfc3339() {
+        use serde_json::json;
+        assert_eq!(
+            parse_pi_timestamp_ms(&json!(1755325668328i64)),
+            Some(1755325668328)
+        );
+        assert_eq!(
+            parse_pi_timestamp_ms(&json!(1755325668.5)),
+            Some(1755325668500)
+        );
+        assert_eq!(
+            parse_pi_timestamp_ms(&json!("2026-08-16T07:07:48.328Z")),
+            Some(1786864068328)
+        );
+        assert_eq!(parse_pi_timestamp_ms(&json!(null)), None);
+    }
+
+    #[test]
+    fn tool_filter_drops_tool_rows_when_disabled() {
+        let messages = vec![
+            PiConversationMessage {
+                timestamp: String::new(),
+                message_type: MessageType::User,
+                content: "hi".to_string(),
+            },
+            PiConversationMessage {
+                timestamp: String::new(),
+                message_type: MessageType::ToolUse,
+                content: "read".to_string(),
+            },
+            PiConversationMessage {
+                timestamp: String::new(),
+                message_type: MessageType::ToolResult,
+                content: "bytes".to_string(),
+            },
+        ];
+        assert_eq!(apply_pi_tool_filter(messages.clone(), true).len(), 3);
+        let filtered = apply_pi_tool_filter(messages, false);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].message_type, MessageType::User);
     }
 
     #[test]

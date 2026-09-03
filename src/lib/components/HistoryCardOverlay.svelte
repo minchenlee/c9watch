@@ -50,6 +50,8 @@
 			? `cd "${entry.project}" && codex resume ${entry.sessionId}`
 			: entry.provider === 'cursor'
 				? `Cursor Agent · ${entry.sessionId}`
+				: entry.provider === 'pi'
+					? `pi agent · ${entry.sessionId}`
 			: `cd "${entry.project}" && claude --resume ${entry.sessionId}`
 	);
 

@@ -1477,11 +1477,9 @@ fn enrich_history_entry(entry: session::HistoryEntry) -> serde_json::Value {
 }
 
 fn enrich_search_hit(hit: session::DeepSearchHit) -> serde_json::Value {
-    // pi hits already carry a decoded project path; reuse the stored metadata
-    // instead of probing Claude's project directories.
-    if hit.provider.eq_ignore_ascii_case("pi")
-        && (hit.project_path.is_some() || hit.modified.is_some())
-    {
+    // pi hits already carry decoded project metadata; never probe Claude's
+    // project directories with a pi UUID (it can only mismatch).
+    if hit.provider.eq_ignore_ascii_case("pi") {
         let project_path = hit.project_path.clone();
         let modified = hit.modified.clone();
         return format_search_hit(hit, project_path, modified);
