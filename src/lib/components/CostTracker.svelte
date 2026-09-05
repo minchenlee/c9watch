@@ -47,7 +47,8 @@
 		const providers: Array<{ color: string; value: number }> = [
 			{ color: 'var(--accent-amber)', value: providerUsageValue(sessions, 'claudeCode') },
 			{ color: 'var(--accent-blue)', value: providerUsageValue(sessions, 'codex') },
-			{ color: 'var(--accent-purple)', value: providerUsageValue(sessions, 'cursor') }
+			{ color: 'var(--accent-purple)', value: providerUsageValue(sessions, 'cursor') },
+			{ color: 'var(--accent-green)', value: providerUsageValue(sessions, 'pi') }
 		];
 		const total = providers.reduce((sum, provider) => sum + provider.value, 0);
 		let offset = 0;
@@ -64,7 +65,8 @@
 		const providers: Array<{ label: string; provider: SessionProvider }> = [
 			{ label: 'Claude Code', provider: 'claudeCode' },
 			{ label: 'Codex', provider: 'codex' },
-			{ label: 'Cursor', provider: 'cursor' }
+			{ label: 'Cursor', provider: 'cursor' },
+			{ label: 'Pi', provider: 'pi' }
 		];
 		const values = providers.map(({ provider }) => providerUsageValue(sessions, provider));
 		const total = values.reduce((sum, value) => sum + value, 0);

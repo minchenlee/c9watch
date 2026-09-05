@@ -52,6 +52,8 @@ pub struct PiTranscriptSummary {
     pub latest_snippet: Option<String>,
     pub message_count: usize,
     pub lifecycle: PiLifecycle,
+    last_message_ts_ms: Option<i64>,
+    trailing_user: bool,
     pub empty: bool,
     pub pending_tool_name: Option<String>,
     pub model: Option<String>,
@@ -129,6 +131,10 @@ impl PiSessionSource {
     }
 
     fn summary_for(&mut self, path: &Path) -> Option<PiTranscriptSummary> {
+        self.summary_for_at(path, chrono::Utc::now().timestamp_millis())
+    }
+
+    fn summary_for_at(&mut self, path: &Path, now_ms: i64) -> Option<PiTranscriptSummary> {
         let metadata = std::fs::metadata(path).ok()?;
         let len = metadata.len();
         let modified_nanos = metadata
@@ -139,10 +145,13 @@ impl PiSessionSource {
             .as_nanos();
         if let Some(cached) = self.cache.get(path) {
             if cached.len == len && cached.modified_nanos == modified_nanos {
-                return Some(cached.summary.clone());
+                let mut summary = cached.summary.clone();
+                summary.refresh_lifecycle(now_ms);
+                return Some(summary);
             }
         }
-        let summary = summarize_pi_transcript(path)?;
+        let mut summary = summarize_pi_transcript(path)?;
+        summary.refresh_lifecycle(now_ms);
         self.cache.insert(
             path.to_path_buf(),
             CachedSummary {
@@ -498,27 +507,32 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
     pending.sort_by_key(|(seq, _)| *seq);
     summary.pending_tool_name = pending.last().map(|(_, name)| name.clone());
 
-    // Liveness mirrors the Cursor provider: pending tool calls and trailing
-    // user messages mean the agent owns the turn; otherwise only a recent
-    // *message* (not file activity) counts as still streaming.
-    let last_message_recent = last_message_ts_ms
-        .and_then(|ms| {
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .ok()
-                .map(|now| now.as_millis() as i64 - ms < PI_MESSAGE_RECENCY_SECS * 1000)
-        })
-        .unwrap_or(false);
-    summary.lifecycle = if !pending.is_empty() {
-        PiLifecycle::Working
-    } else if last_role.as_deref() == Some("user") {
-        PiLifecycle::Working
-    } else if last_message_recent {
-        PiLifecycle::Working
-    } else {
-        PiLifecycle::Idle
-    };
+    summary.last_message_ts_ms = last_message_ts_ms;
+    summary.trailing_user = last_role.as_deref() == Some("user");
+    summary.refresh_lifecycle(chrono::Utc::now().timestamp_millis());
     Some(summary)
+}
+
+impl PiTranscriptSummary {
+    /// Cache transcript facts, but recompute time-dependent state on every poll.
+    fn refresh_lifecycle(&mut self, now_ms: i64) {
+        let recent = self.last_message_ts_ms.is_some_and(|ms| {
+            let age = now_ms.saturating_sub(ms);
+            (0..PI_MESSAGE_RECENCY_SECS * 1000).contains(&age)
+        });
+        self.lifecycle = if self.pending_tool_name.is_some() || self.trailing_user || recent {
+            PiLifecycle::Working
+        } else {
+            PiLifecycle::Idle
+        };
+    }
+}
+
+fn pi_thinking_text(block: &serde_json::Value) -> Option<&str> {
+    block
+        .get("thinking")
+        .and_then(|v| v.as_str())
+        .or_else(|| block.get("text").and_then(|v| v.as_str()))
 }
 
 /// Plain-text blocks of a user message.
@@ -697,7 +711,7 @@ pub(crate) fn read_pi_conversation_under(
                             }
                         }
                         Some("thinking") => {
-                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            if let Some(text) = pi_thinking_text(block) {
                                 if text.trim().is_empty() {
                                     continue;
                                 }
@@ -765,10 +779,7 @@ pub(crate) fn read_pi_conversation_under(
     Ok(messages)
 }
 
-pub(crate) fn pi_conversation_path_for_session(
-    home: &Path,
-    session_id: &str,
-) -> Option<PathBuf> {
+pub(crate) fn pi_conversation_path_for_session(home: &Path, session_id: &str) -> Option<PathBuf> {
     let root = pi_sessions_root(home);
     let dirs = std::fs::read_dir(&root).ok()?;
     for dir_entry in dirs.flatten() {
@@ -976,10 +987,13 @@ pub(crate) fn pi_deep_search(
                     if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
                         for block in blocks {
                             match block.get("type").and_then(|t| t.as_str()) {
-                                Some("text") | Some("thinking") => {
-                                    if let Some(text) =
-                                        block.get("text").and_then(|t| t.as_str())
-                                    {
+                                Some("thinking") => {
+                                    if let Some(text) = pi_thinking_text(block) {
+                                        candidates.push(text.to_string());
+                                    }
+                                }
+                                Some("text") => {
+                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                                         candidates.push(text.to_string());
                                     }
                                 }
@@ -1085,6 +1099,13 @@ fn pi_snippet(text: &str, query: &str) -> String {
     snippet
 }
 
+#[derive(Default)]
+struct PiCostDay {
+    usage: PiTranscriptSummary,
+    timestamp: String,
+    model_costs: HashMap<String, f64>,
+}
+
 pub(crate) fn pi_cost_records(home: &Path) -> Vec<crate::session::cost::SessionCostRecord> {
     let root = pi_sessions_root(home);
     let mut records = Vec::new();
@@ -1110,10 +1131,6 @@ pub(crate) fn pi_cost_records(home: &Path) -> Vec<crate::session::cost::SessionC
             if summary.session_id.is_empty() {
                 continue;
             }
-            let total_tokens = summary.input_tokens + summary.output_tokens;
-            if total_tokens == 0 {
-                continue;
-            }
             let project = if summary.project_path.is_empty() {
                 decode_pi_cwd_dir(&dir)
             } else {
@@ -1124,48 +1141,82 @@ pub(crate) fn pi_cost_records(home: &Path) -> Vec<crate::session::cost::SessionC
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown")
                 .to_string();
-            let timestamp = if summary.last_timestamp.is_empty() {
-                summary
-                    .started_at_ms
-                    .and_then(DateTime::from_timestamp_millis)
-                    .map(|dt| dt.to_rfc3339())
-                    .or_else(|| {
-                        file_mtime_ms(&path).and_then(|ms| {
-                            DateTime::from_timestamp_millis(ms as i64).map(|dt| dt.to_rfc3339())
-                        })
-                    })
-                    .unwrap_or_default()
-            } else {
-                summary.last_timestamp.clone()
+            let fallback_ms = summary
+                .started_at_ms
+                .or_else(|| file_mtime_ms(&path).map(|ms| ms as i64));
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
             };
-            let date = timestamp
-                .get(..10)
-                .filter(|d| d.len() == 10)
-                .unwrap_or("unknown")
-                .to_string();
-            records.push(crate::session::cost::SessionCostRecord {
-                session_id: summary.session_id.clone(),
-                project,
-                project_name,
-                model: summary.model.clone().unwrap_or_default(),
-                provider: "pi".to_string(),
-                surface: Some("cli".to_string()),
-                agent_kind: Some("root".to_string()),
-                cost: summary.total_cost,
-                cost_available: total_tokens > 0,
-                input_tokens: summary.input_tokens,
-                cached_input_tokens: summary.cached_input_tokens,
-                output_tokens: summary.output_tokens,
-                reasoning_output_tokens: summary.reasoning_tokens,
-                total_tokens,
-                timestamp,
-                date,
-                session_name: summary
-                    .first_prompt
-                    .map(|p| truncate_chars(p.trim(), 60))
-                    .filter(|p| !p.is_empty())
-                    .unwrap_or(summary.session_id.clone()),
-            });
+            let mut days: std::collections::BTreeMap<String, PiCostDay> = Default::default();
+            for line in content.lines() {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if value.get("type").and_then(|v| v.as_str()) != Some("message") {
+                    continue;
+                }
+                let Some(message) = value.get("message") else {
+                    continue;
+                };
+                if message.get("role").and_then(|v| v.as_str()) != Some("assistant")
+                    || message.get("usage").is_none()
+                {
+                    continue;
+                }
+                let timestamp = value
+                    .get("timestamp")
+                    .and_then(parse_pi_timestamp_ms)
+                    .or_else(|| message.get("timestamp").and_then(parse_pi_timestamp_ms))
+                    .or(fallback_ms)
+                    .map(millis_to_rfc3339)
+                    .unwrap_or_default();
+                let date = timestamp.get(..10).unwrap_or("unknown").to_string();
+                let day = days.entry(date).or_default();
+                if day.timestamp.is_empty() || timestamp < day.timestamp {
+                    day.timestamp = timestamp;
+                }
+                let previous_cost = day.usage.total_cost;
+                apply_pi_usage(&mut day.usage, message);
+                let model = message.get("model").and_then(|m| m.as_str()).unwrap_or("");
+                *day.model_costs.entry(model.to_string()).or_default() +=
+                    day.usage.total_cost - previous_cost;
+            }
+            for (date, day) in days {
+                let total_tokens = day.usage.input_tokens + day.usage.output_tokens;
+                if total_tokens == 0 {
+                    continue;
+                }
+                let model = day
+                    .model_costs
+                    .into_iter()
+                    .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+                    .map(|(model, _)| model)
+                    .unwrap_or_default();
+                records.push(crate::session::cost::SessionCostRecord {
+                    session_id: summary.session_id.clone(),
+                    project: project.clone(),
+                    project_name: project_name.clone(),
+                    model,
+                    provider: "pi".to_string(),
+                    surface: Some("cli".to_string()),
+                    agent_kind: Some("root".to_string()),
+                    cost: day.usage.total_cost,
+                    cost_available: total_tokens > 0,
+                    input_tokens: day.usage.input_tokens,
+                    cached_input_tokens: day.usage.cached_input_tokens,
+                    output_tokens: day.usage.output_tokens,
+                    reasoning_output_tokens: day.usage.reasoning_tokens,
+                    total_tokens,
+                    timestamp: day.timestamp,
+                    date,
+                    session_name: summary
+                        .first_prompt
+                        .as_ref()
+                        .map(|p| truncate_chars(p.trim(), 60))
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or(summary.session_id.clone()),
+                });
+            }
         }
     }
     records
@@ -1205,6 +1256,169 @@ mod tests {
     }
 
     #[test]
+    fn cached_lifecycle_ages_without_file_changes() {
+        let dir = TempDir::new().unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let message = serde_json::json!({"type":"message","timestamp":now_ms,
+            "message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}}).to_string();
+        let path = write_transcript(
+            &dir,
+            "t_cached.jsonl",
+            &[
+                r#"{"type":"session","cwd":"/tmp/demo","timestamp":"2026-09-01T00:00:00Z"}"#,
+                &message,
+            ],
+        );
+        let mut source = PiSessionSource::at_root(pi_sessions_root(dir.path()));
+        assert_eq!(
+            source.summary_for_at(&path, now_ms).unwrap().lifecycle,
+            PiLifecycle::Working
+        );
+        assert_eq!(
+            source
+                .summary_for_at(&path, now_ms + 119_999)
+                .unwrap()
+                .lifecycle,
+            PiLifecycle::Working
+        );
+        assert_eq!(
+            source
+                .summary_for_at(&path, now_ms + 120_000)
+                .unwrap()
+                .lifecycle,
+            PiLifecycle::Idle
+        );
+        // Cached facts are retained; only the returned snapshot ages.
+        assert_eq!(source.cache[&path].summary.lifecycle, PiLifecycle::Working);
+        assert_eq!(source.cache.len(), 1);
+
+        let pending = write_transcript(
+            &dir,
+            "t_pending.jsonl",
+            &[
+                r#"{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"bash"}]}}"#,
+            ],
+        );
+        assert_eq!(
+            source
+                .summary_for_at(&pending, now_ms + 120_000)
+                .unwrap()
+                .lifecycle,
+            PiLifecycle::Working
+        );
+    }
+
+    #[test]
+    fn official_thinking_is_visible_and_searchable() {
+        let dir = TempDir::new().unwrap();
+        write_transcript(
+            &dir,
+            "t_thought.jsonl",
+            &[
+                r#"{"type":"session","cwd":"/tmp/demo","timestamp":"2026-09-01T00:00:00Z"}"#,
+                r#"{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"UniqueReasoning 正式內容","text":"wrong fallback"},{"type":"thinking","text":"legacy reasoning"},{"type":"text","text":"done"}]}}"#,
+            ],
+        );
+        let rows = apply_pi_tool_filter(
+            read_pi_conversation_under(dir.path(), "thought").unwrap(),
+            false,
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].message_type, MessageType::Thinking);
+        assert_eq!(rows[0].content, "UniqueReasoning 正式內容");
+        assert_eq!(rows[1].content, "legacy reasoning");
+        for (query, sensitive, whole) in [
+            ("UniqueReasoning", true, true),
+            ("uniquereasoning", false, false),
+            ("正式內容", true, false),
+        ] {
+            let hits = pi_deep_search(dir.path(), query, sensitive, whole);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].session_id, "thought");
+            assert!(hits[0].snippet.contains("正式內容"));
+        }
+        assert!(pi_deep_search(dir.path(), "wrong fallback", true, false).is_empty());
+    }
+
+    #[test]
+    fn cost_records_split_days_and_ignore_later_user_activity() {
+        let dir = TempDir::new().unwrap();
+        let mut lines = vec![
+            r#"{"type":"session","cwd":"/tmp/demo","timestamp":"2026-09-01T00:00:00Z"}"#
+                .to_string(),
+        ];
+        for (timestamp, model, cost) in [
+            ("2026-09-01T02:00:00Z", "cheap", 1.0),
+            ("2026-09-01T01:00:00Z", "expensive", 2.0),
+            ("2026-09-02T01:00:00Z", "next-day", 4.0),
+        ] {
+            lines.push(serde_json::json!({"type":"message","timestamp":timestamp,"message":{
+                "role":"assistant","model":model,"content":[],
+                "usage":{"input":10,"output":5,"cacheRead":100,"cacheWrite":20,"reasoning":2,"cost":{"total":cost}}
+            }}).to_string());
+        }
+        lines.push(r#"{"type":"message","timestamp":"2026-09-03T00:00:00Z","message":{"role":"user","content":"continue"}}"#.to_string());
+        lines.push("{incomplete".to_string());
+        write_transcript(
+            &dir,
+            "t_days.jsonl",
+            &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let records = pi_cost_records(dir.path());
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].date, "2026-09-01");
+        assert_eq!(records[0].timestamp, "2026-09-01T01:00:00+00:00");
+        assert_eq!(records[0].cost, 3.0);
+        assert_eq!(records[0].input_tokens, 20);
+        assert_eq!(records[0].output_tokens, 10);
+        assert_eq!(records[0].cached_input_tokens, 240);
+        assert_eq!(records[0].reasoning_output_tokens, 4);
+        assert_eq!(records[0].model, "expensive");
+        assert_eq!(records[1].date, "2026-09-02");
+        assert_eq!(records[1].cost, 4.0);
+        assert_eq!(records[1].model, "next-day");
+        assert!(records
+            .iter()
+            .all(|r| r.session_id == "days" && r.provider == "pi"));
+    }
+
+    #[test]
+    fn cost_dates_use_message_timestamp_then_header_then_mtime() {
+        let dir = TempDir::new().unwrap();
+        write_transcript(
+            &dir,
+            "t_fallback.jsonl",
+            &[
+                r#"{"type":"session","cwd":"/tmp/demo","timestamp":"2026-09-01T00:00:00Z"}"#,
+                r#"{"type":"message","message":{"role":"assistant","timestamp":1788307200000,"usage":{"input":1,"output":1,"cost":{"total":1}}}}"#,
+                r#"{"type":"message","message":{"role":"assistant","usage":{"input":1,"output":1,"cost":{"total":2}}}}"#,
+            ],
+        );
+        let records = pi_cost_records(dir.path());
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].date, "2026-09-01");
+        assert_eq!(records[0].cost, 2.0);
+        assert_eq!(records[1].date, "2026-09-02");
+        assert_eq!(records[1].cost, 1.0);
+
+        let naked = TempDir::new().unwrap();
+        let path = write_transcript(
+            &naked,
+            "t_naked.jsonl",
+            &[
+                r#"{"type":"message","message":{"role":"assistant","usage":{"input":1,"output":1,"cost":{"total":3}}}}"#,
+            ],
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1788307200))
+            .unwrap();
+        assert_eq!(pi_cost_records(naked.path())[0].date, "2026-09-02");
+    }
+
+    #[test]
     fn session_id_comes_from_filename_suffix() {
         let dir = TempDir::new().unwrap();
         let path = write_transcript(
@@ -1221,7 +1435,14 @@ mod tests {
     #[test]
     fn summary_extracts_prompts_tokens_and_cost() {
         let dir = TempDir::new().unwrap();
-        let path = write_transcript(&dir, "2026-08-16T07-07-48-328Z_abc123.jsonl", &sample_lines().iter().map(String::as_str).collect::<Vec<_>>());
+        let path = write_transcript(
+            &dir,
+            "2026-08-16T07-07-48-328Z_abc123.jsonl",
+            &sample_lines()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
         let summary = summarize_pi_transcript(&path).unwrap();
         assert_eq!(summary.session_id, "abc123");
         assert_eq!(summary.project_path, "/tmp/demo");
@@ -1254,11 +1475,16 @@ mod tests {
     #[test]
     fn conversation_maps_roles_and_truncates_tool_results() {
         let dir = TempDir::new().unwrap();
-        write_transcript(&dir, "2026-08-16T07-07-48-328Z_conv9.jsonl", &sample_lines().iter().map(String::as_str).collect::<Vec<_>>());
-        let messages =
-            read_pi_conversation_under(dir.path(), "conv9").unwrap();
-        let kinds: Vec<MessageType> =
-            messages.iter().map(|m| m.message_type.clone()).collect();
+        write_transcript(
+            &dir,
+            "2026-08-16T07-07-48-328Z_conv9.jsonl",
+            &sample_lines()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        let messages = read_pi_conversation_under(dir.path(), "conv9").unwrap();
+        let kinds: Vec<MessageType> = messages.iter().map(|m| m.message_type.clone()).collect();
         assert_eq!(
             kinds,
             vec![
@@ -1303,10 +1529,8 @@ mod tests {
         let headerless =
             write_transcript(&dir, "2026-09-03T00-00-00-000Z_naked1.jsonl", &lines);
         let sibling_dir = headerless.parent().unwrap();
-        let mut sibling = std::fs::File::create(
-            sibling_dir.join("2026-09-03T00-00-01-000Z_sib2.jsonl"),
-        )
-        .unwrap();
+        let mut sibling =
+            std::fs::File::create(sibling_dir.join("2026-09-03T00-00-01-000Z_sib2.jsonl")).unwrap();
         use std::io::Write as _;
         writeln!(
             sibling,
@@ -1464,9 +1688,8 @@ mod tests {
             .set_modified(old)
             .unwrap();
 
-        let mut source = PiSessionSource::at_root(
-            dir.path().join(".pi").join("agent").join("sessions"),
-        );
+        let mut source =
+            PiSessionSource::at_root(dir.path().join(".pi").join("agent").join("sessions"));
         let (sessions, _) = source.detect().unwrap();
         let ids: Vec<&str> = sessions
             .iter()
