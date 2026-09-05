@@ -50,6 +50,8 @@
 			? `cd "${entry.project}" && codex resume ${entry.sessionId}`
 			: entry.provider === 'cursor'
 				? `Cursor Agent · ${entry.sessionId}`
+				: entry.provider === 'pi'
+					? `pi agent · ${entry.sessionId}`
 			: `cd "${entry.project}" && claude --resume ${entry.sessionId}`
 	);
 
@@ -248,6 +250,11 @@
 					<div class="resume-chip readonly" title="Cursor Agent transcripts are read-only">
 						<span class="resume-label">READ ONLY</span>
 						<code class="resume-cmd">Cursor Agent transcript</code>
+					</div>
+				{:else if entry.provider === 'pi'}
+					<div class="resume-chip readonly" title="pi agent transcripts are read-only">
+						<span class="resume-label">READ ONLY</span>
+						<code class="resume-cmd">pi agent transcript</code>
 					</div>
 				{:else}
 					<button

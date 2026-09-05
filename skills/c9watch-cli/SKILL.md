@@ -15,6 +15,8 @@ description: >
 
 c9watch is a CLI tool that lets you monitor and manage all Claude Code sessions running on the machine. Every command outputs JSON. Use it to see what other sessions are doing, search past work, track costs, and coordinate with sibling agents.
 
+c9watch also tracks **pi agent** (`pi`), **Codex**, and **Cursor** sessions. Every session and history entry carries a `provider` (`claudeCode`, `codex`, `cursor`, `pi`) and a provider-scoped `sessionKey` (`provider:id`, e.g. `pi:01a06659-...`). Use the `sessionKey` with `view`/`tasks` whenever an ID could collide across providers.
+
 ## Before you start
 
 Verify `c9watch` is available:
@@ -70,7 +72,7 @@ c9watch view <session-id>                       # full conversation
 c9watch view <session-id> --last 5              # last 5 messages (saves tokens)
 ```
 
-Session IDs support prefix matching — `c9watch view abc` resolves to the full UUID if unambiguous. System XML tags are automatically stripped from output.
+Session IDs support prefix matching — `c9watch view abc` resolves to the full UUID if unambiguous. Prefix with the provider when ambiguous: `c9watch view pi:abc`. System XML tags are automatically stripped from output.
 
 When viewing conversations, prefer `--last N` to avoid loading thousands of tokens from long sessions. Start with `--last 5` and go larger only if needed.
 
@@ -98,7 +100,7 @@ Multi-word queries use AND logic — all words must appear somewhere in the sess
 c9watch tasks <session-id>
 ```
 
-Returns `total`, `completed`, `inProgress`, `pending`, and the full `tasks[]` array.
+Returns `total`, `completed`, `inProgress`, `pending`, and the full `tasks[]` array. Tasks are only available for Claude Code sessions.
 
 ### Stop a session
 
@@ -137,4 +139,5 @@ Streams NDJSON (one JSON object per line). Events: `started`, `status_changed`, 
 - Use `--last N` on `view` to avoid loading entire long conversations.
 - Pipe through `jq` for filtering: `c9watch list | jq '.sessions[] | select(.status == "NeedsAttention")'`
 - The `self` command only works when called from within a Claude Code session (it needs a claude parent process in the PID tree).
+- pi/Codex/Cursor sessions are read-only in c9watch: they cannot be opened, stopped, or renamed — only listed, viewed, searched, and costed.
 - `--pretty` on any command gives indented JSON for human-readable output, but costs more tokens. Skip it when parsing programmatically.

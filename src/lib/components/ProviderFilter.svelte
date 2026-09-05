@@ -12,7 +12,8 @@
 		{ value: 'all', label: 'All providers', short: 'ALL' },
 		{ value: 'claudeCode', label: 'Claude Code', short: 'CLAUDE CODE' },
 		{ value: 'codex', label: 'Codex', short: 'CODEX' },
-		{ value: 'cursor', label: 'Cursor', short: 'CURSOR' }
+		{ value: 'cursor', label: 'Cursor', short: 'CURSOR' },
+		{ value: 'pi', label: 'Pi', short: 'PI' }
 	];
 	let dropdownOpen = $state(false);
 	let activeIndex = $state(0);
@@ -202,6 +203,7 @@
 	.option-marker.claudeCode { border-color: var(--accent-amber); background: var(--accent-amber); }
 	.option-marker.codex { border-color: var(--accent-blue); background: var(--accent-blue); }
 	.option-marker.cursor { border-color: var(--accent-purple); background: var(--accent-purple); }
+	.option-marker.pi { border-color: var(--accent-green); background: var(--accent-green); }
 	.option-check { color: var(--text-secondary); text-align: right; }
 	.provider-select.compact { gap: 5px; }
 	.compact .select-label { font-size: 7px; }

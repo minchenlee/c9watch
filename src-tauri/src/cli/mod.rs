@@ -1477,11 +1477,9 @@ fn enrich_history_entry(entry: session::HistoryEntry) -> serde_json::Value {
 }
 
 fn enrich_search_hit(hit: session::DeepSearchHit) -> serde_json::Value {
-    // pi hits already carry a decoded project path; reuse the stored metadata
-    // instead of probing Claude's project directories.
-    if hit.provider.eq_ignore_ascii_case("pi")
-        && (hit.project_path.is_some() || hit.modified.is_some())
-    {
+    // pi hits already carry decoded project metadata; never probe Claude's
+    // project directories with a pi UUID (it can only mismatch).
+    if hit.provider.eq_ignore_ascii_case("pi") {
         let project_path = hit.project_path.clone();
         let modified = hit.modified.clone();
         return format_search_hit(hit, project_path, modified);
@@ -1769,6 +1767,12 @@ fn resolve_session_reference_lightweight_under(
             .map(|id| session::SessionIdentity::new(session::SessionProvider::Cursor, id)),
     );
 
+    matches.extend(
+        session::pi_session_ids(home_dir, prefix)
+            .into_iter()
+            .map(|id| session::SessionIdentity::new(session::SessionProvider::Pi, id)),
+    );
+
     if let Some(provider) = provider_filter {
         matches.retain(|identity| identity.provider == provider);
     }
@@ -1787,6 +1791,7 @@ fn parse_provider_scoped_reference(reference: &str) -> Option<(session::SessionP
         "claudeCode" => session::SessionProvider::ClaudeCode,
         "codex" => session::SessionProvider::Codex,
         "cursor" => session::SessionProvider::Cursor,
+        "pi" => session::SessionProvider::Pi,
         _ => return None,
     };
     Some((provider, raw_prefix))

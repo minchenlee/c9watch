@@ -2,6 +2,7 @@ use crate::session::cache::FileVersion;
 use crate::session::codex::CodexLifecycle;
 use crate::session::cursor::CursorLifecycle;
 use crate::session::owners::global_provider_source_owners;
+use crate::session::pi::PiLifecycle;
 use crate::session::source::{
     AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionIdentity,
     SessionProvider, SessionSource, SessionSurface,
@@ -169,6 +170,7 @@ pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, DetectionDiagnostic
     let owners = global_provider_source_owners();
     let codex_result = owners.detect_codex();
     let cursor_result = owners.detect_cursor();
+    let pi_result = owners.detect_pi();
     match claude_result {
         Ok((mut detected, diagnostics)) => {
             if let Some((mut codex_sessions, _)) = codex_result {
@@ -176,6 +178,9 @@ pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, DetectionDiagnostic
             }
             if let Some((mut cursor_sessions, _)) = cursor_result {
                 detected.append(&mut cursor_sessions);
+            }
+            if let Some((mut pi_sessions, _)) = pi_result {
+                detected.append(&mut pi_sessions);
             }
             enrich_detected_sessions(detected, diagnostics)
         }
@@ -187,6 +192,12 @@ pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, DetectionDiagnostic
                 diagnostics = extra;
             }
             if let Some((sessions, extra)) = cursor_result {
+                fallback.extend(sessions);
+                if diagnostics.claude_processes_found == 0 {
+                    diagnostics = extra;
+                }
+            }
+            if let Some((sessions, extra)) = pi_result {
                 fallback.extend(sessions);
                 if diagnostics.claude_processes_found == 0 {
                     diagnostics = extra;
@@ -348,6 +359,76 @@ pub fn enrich_detected_sessions(
                 status,
                 latest_message,
                 pending_tool_name: None,
+                pending_tool_input: None,
+                worker_of: None,
+                official_name: detected.official_name.clone(),
+                started_at_ms: detected.started_at_ms,
+                provider: detected.provider,
+                surface: detected.surface,
+                agent_kind: detected.agent_kind,
+                parent_thread_id: detected.parent_thread_id.clone(),
+                root_session_id: detected.root_session_id.clone(),
+                agent_path: detected.agent_path.clone(),
+                agent_nickname: detected.agent_nickname.clone(),
+                agent_role: detected.agent_role.clone(),
+                internal_kind: detected.internal_kind.clone(),
+                can_open: detected.can_open,
+                can_stop: detected.can_stop,
+                can_rename: detected.can_rename,
+            });
+            continue;
+        }
+
+        if let Some(summary) = detected.pi_summary.as_ref() {
+            let first_prompt = summary
+                .first_prompt
+                .as_deref()
+                .map(|prompt| truncate_string(prompt, 100))
+                .filter(|prompt| !prompt.trim().is_empty())
+                .unwrap_or_else(|| "(No conversation yet)".to_string());
+            let latest_message = summary
+                .latest_snippet
+                .as_deref()
+                .map(|message| truncate_string(message, 200))
+                .unwrap_or_default();
+            let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
+                .or_else(|| detected.agent_nickname.clone())
+                .unwrap_or_else(|| detected.project_name.clone());
+            let modified = if summary.last_timestamp.is_empty() {
+                detected
+                    .started_at_ms
+                    .and_then(DateTime::<Utc>::from_timestamp_millis)
+                    .map(|timestamp| timestamp.to_rfc3339())
+                    .unwrap_or_default()
+            } else {
+                summary.last_timestamp.clone()
+            };
+            let status = if summary.lifecycle == PiLifecycle::Working {
+                if summary.empty {
+                    SessionStatus::Connecting
+                } else {
+                    SessionStatus::Working
+                }
+            } else {
+                SessionStatus::WaitingForInput
+            };
+            sessions.push(Session {
+                id: session_id.clone(),
+                session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
+                pid: detected.pid,
+                session_name,
+                custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
+                codex_title: None,
+                cursor_title: None,
+                project_path: detected.cwd.to_string_lossy().to_string(),
+                git_branch: None,
+                first_prompt,
+                summary: None,
+                message_count: summary.message_count as u32,
+                modified,
+                status,
+                latest_message,
+                pending_tool_name: summary.pending_tool_name.clone(),
                 pending_tool_input: None,
                 worker_of: None,
                 official_name: detected.official_name.clone(),
@@ -826,6 +907,7 @@ mod placeholder_tests {
             can_rename: true,
             codex_summary: None,
             cursor_summary: None,
+            pi_summary: None,
         };
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
@@ -892,12 +974,29 @@ mod placeholder_tests {
         cursor_summary.session_id = same_id.to_string();
         cursor.cursor_summary = Some(cursor_summary);
 
-        let (sessions, _) =
-            enrich_detected_sessions(vec![codex, cursor], DetectionDiagnostics::default()).unwrap();
+        let mut pi = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/pi"),
+            tmp.path().join("pi"),
+            Some(same_id.to_string()),
+            "pi".to_string(),
+        );
+        pi.provider = SessionProvider::Pi;
+        pi.surface = SessionSurface::Cli;
+        let mut pi_summary = crate::session::pi::PiTranscriptSummary::default();
+        pi_summary.session_id = same_id.to_string();
+        pi_summary.first_prompt = Some("pi prompt".to_string());
+        pi.pi_summary = Some(pi_summary);
 
-        assert_eq!(sessions.len(), 2);
+        let (sessions, _) =
+            enrich_detected_sessions(vec![codex, cursor, pi], DetectionDiagnostics::default())
+                .unwrap();
+
+        assert_eq!(sessions.len(), 3);
         assert_eq!(sessions[0].session_key, "codex:same-provider-id");
         assert_eq!(sessions[1].session_key, "cursor:same-provider-id");
+        assert_eq!(sessions[2].session_key, "pi:same-provider-id");
+        assert_eq!(sessions[2].provider, SessionProvider::Pi);
     }
 
     #[test]

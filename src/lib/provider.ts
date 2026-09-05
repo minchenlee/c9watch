@@ -4,7 +4,7 @@ export type ProviderFilter = 'all' | SessionProvider;
 export type SessionAction = 'open' | 'stop' | 'rename' | 'conversation';
 type ProviderRecord = { provider?: SessionProvider | null };
 
-const KNOWN_PROVIDERS: SessionProvider[] = ['claudeCode', 'codex', 'cursor'];
+const KNOWN_PROVIDERS: SessionProvider[] = ['claudeCode', 'codex', 'cursor', 'pi'];
 
 export function providerOf(record: ProviderRecord): SessionProvider {
 	return record.provider && KNOWN_PROVIDERS.includes(record.provider)
@@ -28,6 +28,7 @@ export function sessionKeyOf(session: Pick<Session, 'id' | 'provider' | 'session
 export function providerLabel(provider: SessionProvider): string {
 	if (provider === 'codex') return 'CODEX';
 	if (provider === 'cursor') return 'CURSOR';
+	if (provider === 'pi') return 'PI';
 	return 'CLAUDE CODE';
 }
 
@@ -46,6 +47,7 @@ export function providerFilterLabel(filter: ProviderFilter): string {
 	if (filter === 'codex') return 'Codex';
 	if (filter === 'claudeCode') return 'Claude Code';
 	if (filter === 'cursor') return 'Cursor';
+	if (filter === 'pi') return 'Pi';
 	return 'All providers';
 }
 

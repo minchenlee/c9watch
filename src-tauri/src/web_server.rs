@@ -470,6 +470,7 @@ mod tests {
             Some(crate::session::cursor::CursorSessionSource::at_root(
                 temp.path().to_path_buf(),
             )),
+            None,
         )
     }
 
@@ -486,6 +487,7 @@ mod tests {
             Some(crate::session::codex::CodexSessionSource::at_root(
                 temp.path().to_path_buf(),
             )),
+            None,
             None,
         )
     }

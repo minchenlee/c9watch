@@ -281,6 +281,7 @@ impl CursorSessionSource {
                 can_rename: false,
                 codex_summary: None,
                 cursor_summary: Some(summary),
+                pi_summary: None,
             });
         }
         Ok((sessions, DetectionDiagnostics::default()))

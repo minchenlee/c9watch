@@ -92,6 +92,7 @@ impl CliSessionSource {
             can_rename: true,
             codex_summary: None,
             cursor_summary: None,
+            pi_summary: None,
         }
     }
 }

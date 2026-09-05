@@ -366,6 +366,7 @@ mod rename_collision_tests {
             Some(session::cursor::CursorSessionSource::at_root(
                 temp.path().to_path_buf(),
             )),
+            None,
         )
     }
 
@@ -382,6 +383,7 @@ mod rename_collision_tests {
             Some(session::codex::CodexSessionSource::at_root(
                 temp.path().to_path_buf(),
             )),
+            None,
             None,
         )
     }

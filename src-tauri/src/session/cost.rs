@@ -730,6 +730,7 @@ pub fn get_cost_data() -> Result<CostData, String> {
 
     let mut sessions = cache.sessions;
     sessions.extend(codex_cost_records(&home_dir));
+    sessions.extend(crate::session::pi::pi_cost_records(&home_dir));
     Ok(aggregate(&sessions))
 }
 
