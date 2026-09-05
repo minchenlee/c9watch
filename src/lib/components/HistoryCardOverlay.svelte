@@ -218,7 +218,6 @@
 	<div class="overlay-layout">
 		<div
 			class="overlay-card"
-			in:scale={{ start: 0.95, duration: 300, easing: quintOut }}
 		>
 			<!-- Header -->
 			<header class="overlay-header" data-tauri-drag-region>
@@ -352,7 +351,7 @@
 
 		<!-- Desktop: sidebar nav -->
 		<div class="nav-map-side nav-desktop" in:scale={{ start: 0.95, duration: 300, easing: quintOut }}>
-			<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking {onExpandToIndex} />
+			<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking {onExpandToIndex} embedded />
 		</div>
 
 		<!-- Mobile: bottom sheet nav -->
@@ -374,22 +373,20 @@
 	.overlay-backdrop {
 		position: fixed;
 		inset: 0;
-		background: var(--bg-overlay);
+		background: var(--bg-base);
 		display: flex;
-		align-items: center;
-		justify-content: center;
+		align-items: stretch;
+		justify-content: stretch;
 		z-index: 1000;
-		padding: var(--space-2xl);
+		padding: 0;
 	}
 
 	.overlay-layout {
 		display: flex;
-		align-items: flex-start;
-		gap: var(--space-xl);
+		align-items: stretch;
+		gap: 0;
 		width: 100%;
-		max-width: 1100px;
-		height: 85vh;
-		max-height: 900px;
+		height: 100%;
 		pointer-events: none; /* Allow clicks through empty layout area */
 	}
 
@@ -398,19 +395,22 @@
 		flex: 1; /* Take up remaining space */
 		height: 100%;
 		background: var(--bg-card);
-		border: 1px solid var(--border-default);
+		border: 0;
 		display: flex;
 		flex-direction: column;
 		overflow: hidden;
 		pointer-events: auto; /* Enable clicks on the card */
-		box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
 	}
 
 	.nav-map-side.nav-desktop {
 		flex-shrink: 0;
+		width: 240px;
 		height: 100%;
 		display: flex;
 		flex-direction: column;
+		background: var(--bg-card);
+		border: 0;
+		border-left: 1px solid var(--border-default);
 		pointer-events: auto;
 	}
 

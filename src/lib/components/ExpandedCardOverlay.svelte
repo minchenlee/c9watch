@@ -32,8 +32,7 @@
 
 <script lang="ts">
 	import { onDestroy, onMount, tick } from 'svelte';
-	import { fade, scale } from 'svelte/transition';
-	import { quintOut } from 'svelte/easing';
+	import { fade } from 'svelte/transition';
 	import { flyIn, flyInX, fadeIn } from '$lib/transitions';
 	import { invoke } from '@tauri-apps/api/core';
 	import type { Session, Conversation } from '$lib/types';
@@ -87,6 +86,85 @@
 	let navCollapsed = $state(false);
 	let tasksCollapsed = $state(false);
 	let workersCollapsed = $state(false);
+	let overlayLayout = $state<HTMLDivElement>();
+	const SIDE_STORAGE_KEY = 'c9watch.overlaySideWidth';
+	const SIDE_MIN = 240;
+	const SIDE_MAX = 560;
+	const SIDE_DEFAULT = 320;
+
+	function clampSideWidth(value: number): number {
+		const layoutWidth = overlayLayout?.clientWidth ?? 0;
+		const max = layoutWidth > 0 ? Math.min(SIDE_MAX, Math.max(SIDE_MIN, Math.floor(layoutWidth * 0.45))) : SIDE_MAX;
+		return Math.round(Math.min(max, Math.max(SIDE_MIN, value)));
+	}
+
+	function readSideWidth(): number {
+		try {
+			const raw = Number(localStorage.getItem(SIDE_STORAGE_KEY));
+			if (Number.isFinite(raw) && raw > 0) return clampSideWidth(raw);
+		} catch {
+			/* localStorage may be unavailable */
+		}
+		return SIDE_DEFAULT;
+	}
+
+	let sideWidth = $state(typeof window !== 'undefined' ? readSideWidth() : SIDE_DEFAULT);
+	let sideDragging = $state(false);
+	let sideDrag = { x: 0, width: SIDE_DEFAULT };
+
+	function persistSideWidth(width: number) {
+		sideWidth = clampSideWidth(width);
+		try {
+			localStorage.setItem(SIDE_STORAGE_KEY, String(sideWidth));
+		} catch {
+			/* ignore quota / private mode */
+		}
+	}
+
+	function onSidePointerDown(event: PointerEvent) {
+		if (event.button !== 0) return;
+		event.preventDefault();
+		event.stopPropagation();
+		sideDragging = true;
+		sideDrag = { x: event.clientX, width: sideWidth };
+		(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+	}
+
+	function onSidePointerMove(event: PointerEvent) {
+		if (!sideDragging) return;
+		sideWidth = clampSideWidth(sideDrag.width + (sideDrag.x - event.clientX));
+	}
+
+	function onSidePointerUp(event: PointerEvent) {
+		if (!sideDragging) return;
+		sideDragging = false;
+		persistSideWidth(sideWidth);
+		try {
+			(event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
+		} catch {
+			/* already released */
+		}
+	}
+
+	function onSideDblClick() {
+		persistSideWidth(SIDE_DEFAULT);
+	}
+
+	function onSideKeydown(event: KeyboardEvent) {
+		if (event.key === 'ArrowLeft') {
+			event.preventDefault();
+			persistSideWidth(sideWidth + 16);
+		} else if (event.key === 'ArrowRight') {
+			event.preventDefault();
+			persistSideWidth(sideWidth - 16);
+		} else if (event.key === 'Home') {
+			event.preventDefault();
+			persistSideWidth(SIDE_MIN);
+		} else if (event.key === 'End') {
+			event.preventDefault();
+			persistSideWidth(SIDE_MAX);
+		}
+	}
 	// Only stagger the first batch of messages when the overlay mounts;
 	// subsequent streaming/polling of new messages should NOT animate.
 	let initialStaggerDone = $state(false);
@@ -383,12 +461,11 @@
 	tabindex="-1"
 	transition:fade={{ duration: 200 }}
 >
-	<div class="overlay-layout">
+	<div class="overlay-layout" class:side-dragging={sideDragging} bind:this={overlayLayout} style={`--overlay-side-width: ${sideWidth}px`}>
 		<div
 			class="overlay-card"
 			class:permission={isPermission}
 			class:waiting={isWaitingInput}
-			in:scale={{ start: 0.95, duration: 300, easing: quintOut }}
 		>
 			<!-- Header -->
 			<header class="overlay-header" data-tauri-drag-region>
@@ -642,6 +719,19 @@
 
 		<!-- Desktop: right column (nav + workers stacked) -->
 		<div class="right-column nav-desktop">
+			<button
+				type="button"
+				class="side-resizer"
+				class:dragging={sideDragging}
+				aria-label="Resize side panel"
+				title="Drag to resize. Double-click to reset."
+				onpointerdown={onSidePointerDown}
+				onpointermove={onSidePointerMove}
+				onpointerup={onSidePointerUp}
+				onpointercancel={onSidePointerUp}
+				ondblclick={onSideDblClick}
+				onkeydown={onSideKeydown}
+			></button>
 			<!-- Navigation panel -->
 			<div class="nav-map-side" class:collapsed={navCollapsed} in:flyInX|global={{ index: 0 }}>
 				<button
@@ -772,56 +862,93 @@
 	.overlay-backdrop {
 		position: fixed;
 		inset: 0;
-		background: var(--bg-overlay);
+		background: var(--bg-base);
 		display: flex;
-		align-items: center;
-		justify-content: center;
+		align-items: stretch;
+		justify-content: stretch;
 		z-index: 1000;
-		padding: var(--space-2xl);
+		padding: 0;
 	}
 
 	.overlay-layout {
-		display: flex;
-		align-items: flex-start;
-		gap: var(--space-xl);
+		position: relative;
 		width: 100%;
-		max-width: 1400px;
-		height: 85vh;
-		max-height: 900px;
+		height: 100%;
 		pointer-events: none; /* Allow clicks through empty layout area */
 	}
 
 	.overlay-card {
 		position: relative;
-		flex: 1; /* Take up remaining space */
-		min-width: 0; /* Allow flex to shrink below content width */
+		z-index: 2;
+		width: calc(100% - var(--overlay-side-width, 320px));
+		min-width: 0;
 		height: 100%;
 		background: var(--bg-card);
-		border: 1px solid var(--border-default);
+		border: 0;
 		display: flex;
 		flex-direction: column;
 		overflow: hidden;
 		pointer-events: auto; /* Enable clicks on the card */
-		box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
 	}
 
 	/* Right column: nav + workers stacked */
 	.right-column.nav-desktop {
-		flex-shrink: 0;
-		width: 240px;
+		position: absolute;
+		top: 0;
+		right: 0;
+		z-index: 3;
+		width: var(--overlay-side-width, 320px);
 		height: 100%;
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-md);
+		gap: 0;
+		background: var(--bg-card);
+		border-left: 1px solid var(--border-default);
 		pointer-events: auto;
 		overflow-y: auto;
+		opacity: 1;
+		transition: opacity 280ms cubic-bezier(0.16, 1, 0.3, 1);
 	}
 
+	.overlay-layout.side-dragging,
+	.overlay-layout.side-dragging * {
+		cursor: col-resize !important;
+		user-select: none !important;
+	}
+
+	.side-resizer {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		left: -3px;
+		z-index: 4;
+		width: 7px;
+		padding: 0;
+		border: 0;
+		background: transparent;
+		cursor: col-resize;
+	}
+	.side-resizer::before {
+		content: '';
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		left: 3px;
+		width: 1px;
+		background: transparent;
+	}
+	.side-resizer:hover::before,
+	.side-resizer:focus-visible::before,
+	.side-resizer.dragging::before {
+		background: var(--text-primary);
+	}
+
+	.workers-side-panel { border-top: 1px solid var(--border-default); }
 	/* Shared panel card style */
 	.nav-map-side,
 	.workers-side-panel {
 		background: var(--bg-card);
-		border: 1px solid var(--border-default);
+		border: 0;
 		display: flex;
 		flex-direction: column;
 		flex-shrink: 0;
@@ -1115,7 +1242,8 @@
 
 	.subagents-side-panel {
 		background: var(--bg-card);
-		border: 1px solid var(--border-default);
+		border: 0;
+		border-top: 1px solid var(--border-default);
 		display: flex;
 		flex-direction: column;
 		flex-shrink: 0;
@@ -1466,6 +1594,7 @@
 
 	/* ── Mobile Responsive ─────────────────────────────────────── */
 	@media (max-width: 768px) {
+		.side-resizer { display: none; }
 		.overlay-backdrop {
 			padding: 0;
 		}
@@ -1482,6 +1611,7 @@
 		}
 
 		.overlay-card {
+			width: 100%;
 			border: none;
 			box-shadow: none;
 		}

@@ -9,9 +9,10 @@
 		showThinking?: boolean;
 		onExpandToIndex?: (index: number) => void;
 		hideHeader?: boolean;
+		embedded?: boolean;
 	}
 
-	let { conversation, scrollContainer, showTools = $bindable(false), showThinking = $bindable(true), onExpandToIndex, hideHeader = false }: Props = $props();
+	let { conversation, scrollContainer, showTools = $bindable(false), showThinking = $bindable(true), onExpandToIndex, hideHeader = false, embedded = false }: Props = $props();
 
 	// Filter for "milestone" messages - user messages, tool blocks, and thinking steps
 	let items = $derived.by(() => {
@@ -91,7 +92,7 @@
 	}
 </script>
 
-<div class="nav-map-floating" class:hidden={!items.length}>
+<div class="nav-map-floating" class:embedded={hideHeader || embedded} class:hidden={!items.length}>
 	{#if !hideHeader}
 		<div class="nav-header">
 			<span class="nav-title">Navigation</span>
@@ -135,6 +136,20 @@
 
 	.nav-map-floating.hidden {
 		display: none;
+	}
+
+	.nav-map-floating.embedded {
+		width: 100%;
+		height: 100%;
+		max-height: 100%;
+		border: 0;
+		padding: 0;
+		gap: 0;
+	}
+
+	.nav-map-floating.embedded .nav-list {
+		flex: 1;
+		min-height: 0;
 	}
 
 	.nav-header {
