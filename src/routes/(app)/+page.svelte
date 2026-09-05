@@ -2,7 +2,7 @@
 	import { fade } from 'svelte/transition';
 	import { flip } from 'svelte/animate';
 	import { fadeIn, flyIn } from '$lib/transitions';
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { browser } from '$app/environment';
 	import {
 		sortedSessions,
@@ -324,12 +324,15 @@
 		}
 	});
 
+	// Polling replaces session objects; only a provider-qualified selection change
+	// should clear/reload the conversation. Read the current object untracked.
+	let conversationTarget = $derived(expandedSession ? sessionKeyOf(expandedSession) : null);
 	let conversationRequestId = 0;
 	$effect(() => {
-		const sessionId = expandedId;
+		const sessionId = conversationTarget;
 		const requestId = ++conversationRequestId;
 		currentConversation.set(null);
-		const selected = expandedSession;
+		const selected = untrack(() => expandedSession);
 		if (sessionId && selected) {
 			const selectedKey = sessionKeyOf(selected);
 			toolsLoadedFor.set(null);
