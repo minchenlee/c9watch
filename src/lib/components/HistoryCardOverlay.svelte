@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, tick } from 'svelte';
+	import { onDestroy, onMount, tick } from 'svelte';
 	import { fade, scale } from 'svelte/transition';
 	import { quintOut } from 'svelte/easing';
 	import type { HistoryEntry, Conversation } from '$lib/types';
@@ -8,20 +8,32 @@
 	import { createSlidingWindow, BATCH_SIZE, MAX_VISIBLE } from '$lib/slidingWindow.svelte';
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
+	import { isCostAvailable } from '$lib/cost-semantics';
 	import ProviderBadge from './ProviderBadge.svelte';
+	import { getConversation } from '$lib/api';
+	import {
+		conversationLoad,
+		conversationLoadLabel,
+		isSessionLoading,
+		isToolsLoading,
+		toolsLoadedFor,
+		withConversationLoader
+	} from '$lib/stores/conversation-loader';
+	import ConversationLoadBar from './ConversationLoadBar.svelte';
 
 	interface Props {
 		entry: HistoryEntry;
 		conversation: Conversation | null;
 		searchQuery?: string;
 		onclose: () => void;
+		onconversation?: (conversation: Conversation) => void;
 	}
 
-	let { entry, conversation, searchQuery, onclose }: Props = $props();
+	let { entry, conversation, searchQuery, onclose, onconversation }: Props = $props();
 
 	let messagesContainer = $state<HTMLDivElement>(undefined!);
 	let hasScrolledToBottom = $state(false);
-	let showTools = $state(true);
+	let showTools = $state(false);
 	let showThinking = $state(true);
 	let navSheetOpen = $state(false);
 	let copied = $state(false);
@@ -30,7 +42,7 @@
 
 	let costRecord = $derived($sessionCostMap.get(entry.sessionId));
 	let primaryCostLabel = $derived(
-		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, costRecord.costAvailable ?? costRecord.provider !== 'codex') : null
+		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, isCostAvailable(costRecord)) : null
 	);
 	let resumeCommand = $derived(
 		entry.provider === 'codex'
@@ -43,10 +55,45 @@
 		return sw.sliceMessages(conversation.messages);
 	});
 
+	let toolsLoading = $derived(isToolsLoading(entry.sessionId, $conversationLoad));
+	let sessionLoading = $derived(isSessionLoading(entry.sessionId, $conversationLoad));
+	let loadLabel = $derived(
+		$conversationLoad?.sessionId === entry.sessionId ? conversationLoadLabel($conversationLoad) : null
+	);
+
 	function handleNavItemClick() {
 		// Close the bottom sheet on mobile after navigating
 		navSheetOpen = false;
 	}
+
+	let disposed = false;
+	onDestroy(() => { disposed = true; });
+
+	async function toggleTools() {
+		const requestedId = entry.sessionId;
+		const next = !showTools;
+		if (sessionLoading) return;
+		if (next && $toolsLoadedFor !== requestedId) {
+			try {
+				const conv = await withConversationLoader(requestedId, 'tools', () =>
+					getConversation(requestedId, true)
+				);
+				if (disposed || entry.sessionId !== requestedId || conv.sessionId !== requestedId) return;
+				onconversation?.(conv);
+				toolsLoadedFor.set(requestedId);
+			} catch (error) {
+				console.error('Failed to load tools:', error);
+				return;
+			}
+		}
+		if (disposed || entry.sessionId !== requestedId) return;
+		showTools = next;
+	}
+
+	$effect(() => {
+		entry.sessionId;
+		showTools = false;
+	});
 
 	onMount(() => {
 		const handleKeydown = (e: KeyboardEvent) => {
@@ -170,11 +217,15 @@
 						</div>
 						<div class="header-meta">
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
+							{#if loadLabel}
+								<span class="separator">·</span>
+								<span class="load-label">{loadLabel}</span>
+							{/if}
 							{#if costRecord}
 								<span class="separator">·</span>
-								<span class="cost-breakdown" title="{costRecord.costAvailable ?? costRecord.provider !== 'codex' ? `Total cost: ${formatCost(costRecord.cost)}` : 'USD pricing unavailable'} · {formatTokens(costRecord.totalTokens)} tokens · {modelDisplayName(costRecord.model)}">
+								<span class="cost-breakdown" title="{isCostAvailable(costRecord) ? `Total cost: ${formatCost(costRecord.cost)}` : 'USD pricing unavailable'} · {formatTokens(costRecord.totalTokens)} tokens · {modelDisplayName(costRecord.model)}">
 									<span class="cost-primary">{primaryCostLabel}</span>
-									<span class="cost-secondary">· {$costMode === 'usd' ? formatTokens(costRecord.totalTokens) + ' tok' : formatCostOrTokens(costRecord.cost, costRecord.totalTokens, 'usd', costRecord.costAvailable ?? costRecord.provider !== 'codex')}</span>
+									<span class="cost-secondary">· {$costMode === 'usd' ? formatTokens(costRecord.totalTokens) + ' tok' : formatCostOrTokens(costRecord.cost, costRecord.totalTokens, 'usd', isCostAvailable(costRecord))}</span>
 									<span class="cost-secondary">· {modelDisplayName(costRecord.model)}</span>
 								</span>
 							{/if}
@@ -206,9 +257,11 @@
 					<button
 						type="button"
 						class="header-button toggle-tools"
-						class:active={showTools}
-						onclick={() => showTools = !showTools}
-						title={showTools ? "Hide Tools" : "Show Tools"}
+						class:active={showTools && !toolsLoading}
+						class:loading={toolsLoading}
+						disabled={sessionLoading}
+						onclick={toggleTools}
+						title={toolsLoading ? "Loading tools" : sessionLoading ? "Loading conversation" : showTools ? "Hide Tools" : "Show Tools"}
 					>
 						<span>⚙</span>
 					</button>
@@ -221,6 +274,7 @@
 					</button>
 				</div>
 			</header>
+			<ConversationLoadBar sessionId={entry.sessionId} />
 
 			<!-- Conversation Area -->
 			<div class="conversation-area" bind:this={messagesContainer} onscroll={handleScroll}>
@@ -398,6 +452,13 @@
 		color: var(--text-muted);
 	}
 
+	.load-label {
+		font-family: var(--font-pixel);
+		font-size: 11px;
+		letter-spacing: 0.08em;
+		color: var(--status-working);
+	}
+
 	.separator {
 		color: var(--text-muted);
 	}
@@ -483,6 +544,11 @@
 		color: var(--text-primary);
 	}
 
+	.header-button:disabled {
+		opacity: 1;
+		cursor: default;
+	}
+
 	.header-button span {
 		font-family: var(--font-mono);
 		font-size: 14px;
@@ -496,6 +562,22 @@
 	.header-button.active.toggle-tools {
 		color: var(--status-input);
 		opacity: 1;
+	}
+
+	.header-button.loading.toggle-tools {
+		color: var(--status-working);
+		opacity: 1;
+	}
+
+	.header-button.loading.toggle-tools span {
+		display: inline-block;
+		animation: gear-spin 0.8s linear infinite;
+	}
+
+	@keyframes gear-spin {
+		to {
+			transform: rotate(360deg);
+		}
 	}
 
 	.header-divider {

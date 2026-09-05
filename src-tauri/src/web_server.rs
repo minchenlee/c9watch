@@ -41,6 +41,8 @@ enum ClientMsg {
     GetConversation {
         #[serde(rename = "sessionId")]
         session_id: String,
+        #[serde(default, rename = "includeTools")]
+        include_tools: bool,
     },
 
     #[serde(rename = "stopSession")]
@@ -86,6 +88,9 @@ enum ServerMsg {
 
     #[serde(rename = "notification")]
     Notification { data: serde_json::Value },
+
+    #[serde(rename = "conversationProgress")]
+    ConversationProgress { data: serde_json::Value },
 
     #[serde(rename = "memoryFiles")]
     MemoryFiles { data: serde_json::Value },
@@ -193,6 +198,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
     crate::debug_log::log_info("[ws-server] Client connected");
     let mut sessions_rx = state.sessions_tx.subscribe();
     let mut notifications_rx = state.notifications_tx.subscribe();
+    let (progress_tx, mut progress_rx) = broadcast::channel::<String>(32);
+
+    let mut inflight: Option<tokio::task::JoinHandle<ServerMsg>> = None;
+    let mut inflight_id: Option<u64> = None;
 
     loop {
         tokio::select! {
@@ -201,15 +210,48 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         let text_str: &str = &text;
-                        let response = match serde_json::from_str::<ClientMsg>(text_str) {
-                            Ok(client_msg) => handle_message(client_msg).await,
-                            Err(e) => ServerMsg::Error {
-                                message: format!("Invalid message: {}", e),
-                            },
-                        };
-                        let json = serde_json::to_string(&response).unwrap_or_default();
-                        if socket.send(Message::Text(json)).await.is_err() {
-                            break;
+                        let request_id = serde_json::from_str::<serde_json::Value>(text_str)
+                            .ok().and_then(|value| value.get("requestId").and_then(|id| id.as_u64()));
+                        match serde_json::from_str::<ClientMsg>(text_str) {
+                            Ok(ClientMsg::GetConversation {
+                                session_id,
+                                include_tools,
+                            }) => {
+                                if let Some(previous) = inflight.take() {
+                                    previous.abort();
+                                    let cancelled = response_json(&ServerMsg::Error {
+                                        message: "Conversation request superseded".into(),
+                                    }, inflight_id.take());
+                                    if socket.send(Message::Text(cancelled)).await.is_err() { break; }
+                                }
+                                let progress_tx = progress_tx.clone();
+                                inflight_id = request_id;
+                                inflight = Some(tokio::spawn(async move {
+                                    load_conversation_response(
+                                        session_id,
+                                        include_tools,
+                                        progress_tx,
+                                        request_id,
+                                    )
+                                    .await
+                                }));
+                            }
+                            Ok(client_msg) => {
+                                let response = handle_message(client_msg).await;
+                                let json = response_json(&response, request_id);
+                                if socket.send(Message::Text(json)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let response = ServerMsg::Error {
+                                    message: format!("Invalid message: {}", e),
+                                };
+                                let json = response_json(&response, request_id);
+                                if socket.send(Message::Text(json)).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
                     Some(Ok(Message::Ping(data))) => {
@@ -219,6 +261,25 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
+                }
+            }
+            result = async {
+                match inflight.as_mut() {
+                    Some(handle) => Some(handle.await),
+                    None => std::future::pending().await,
+                }
+            } => {
+                inflight = None;
+                let response = match result {
+                    Some(Ok(response)) => response,
+                    Some(Err(error)) => ServerMsg::Error {
+                        message: format!("Failed to load conversation: {error}"),
+                    },
+                    None => continue,
+                };
+                let json = response_json(&response, inflight_id.take());
+                if socket.send(Message::Text(json)).await.is_err() {
+                    break;
                 }
             }
             // Push session updates from polling loop
@@ -241,13 +302,67 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
                     break;
                 }
             }
+            Ok(progress_json) = progress_rx.recv() => {
+                let msg = ServerMsg::ConversationProgress {
+                    data: serde_json::from_str(&progress_json).unwrap_or_default(),
+                };
+                let json = serde_json::to_string(&msg).unwrap_or_default();
+                if socket.send(Message::Text(json)).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 
+    if let Some(handle) = inflight {
+        handle.abort();
+    }
     crate::debug_log::log_info("[ws-server] Client disconnected");
 }
 
 // ── Message dispatch ────────────────────────────────────────────────
+
+fn response_json(response: &ServerMsg, request_id: Option<u64>) -> String {
+    let mut value = serde_json::to_value(response).unwrap_or_default();
+    if let Some(id) = request_id {
+        value["requestId"] = id.into();
+    }
+    value.to_string()
+}
+
+async fn load_conversation_response(
+    session_id: String,
+    include_tools: bool,
+    progress_tx: broadcast::Sender<String>,
+    request_id: Option<u64>,
+) -> ServerMsg {
+    let emit_id = session_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::get_conversation_data_with_progress(
+            &session_id,
+            include_tools,
+            &mut |bytes_read, bytes_total| {
+                let payload = serde_json::json!({
+                    "sessionId": emit_id,
+                    "requestId": request_id,
+                    "bytesRead": bytes_read,
+                    "bytesTotal": bytes_total,
+                });
+                let _ = progress_tx.send(payload.to_string());
+            },
+        )
+    })
+    .await
+    {
+        Ok(Ok(conv)) => ServerMsg::Conversation {
+            data: serde_json::to_value(&conv).unwrap_or_default(),
+        },
+        Ok(Err(e)) => ServerMsg::Error { message: e },
+        Err(e) => ServerMsg::Error {
+            message: format!("Failed to load conversation: {e}"),
+        },
+    }
+}
 
 async fn handle_message(msg: ClientMsg) -> ServerMsg {
     match msg {
@@ -258,13 +373,20 @@ async fn handle_message(msg: ClientMsg) -> ServerMsg {
             Err(e) => ServerMsg::Error { message: e },
         },
 
-        ClientMsg::GetConversation { session_id } => {
-            match crate::get_conversation_data(&session_id) {
-                Ok(conv) => ServerMsg::Conversation {
-                    data: serde_json::to_value(&conv).unwrap_or_default(),
+        ClientMsg::GetConversation {
+            session_id,
+            include_tools,
+        } => {
+            load_conversation_response(
+                session_id,
+                include_tools,
+                {
+                    let (tx, _) = broadcast::channel(1);
+                    tx
                 },
-                Err(e) => ServerMsg::Error { message: e },
-            }
+                None,
+            )
+            .await
         }
 
         ClientMsg::StopSession { pid } => match crate::actions::stop_session(pid) {
@@ -300,5 +422,41 @@ async fn handle_message(msg: ClientMsg) -> ServerMsg {
             },
             Err(e) => ServerMsg::Error { message: e },
         },
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn correlated_success_and_error_keep_request_ids() {
+        for response in [
+            ServerMsg::Ok,
+            ServerMsg::Error {
+                message: "superseded".into(),
+            },
+        ] {
+            let value: serde_json::Value =
+                serde_json::from_str(&response_json(&response, Some(42))).unwrap();
+            assert_eq!(value["requestId"], 42);
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&response_json(&ServerMsg::Ok, None)).unwrap();
+        assert!(value.get("requestId").is_none());
+    }
+
+    #[test]
+    fn conversation_requests_support_default_hidden_tools_and_correlation() {
+        let request: ClientMsg =
+            serde_json::from_str(r#"{"type":"getConversation","sessionId":"test","requestId":42}"#)
+                .unwrap();
+        assert!(matches!(
+            request,
+            ClientMsg::GetConversation {
+                include_tools: false,
+                ..
+            }
+        ));
     }
 }

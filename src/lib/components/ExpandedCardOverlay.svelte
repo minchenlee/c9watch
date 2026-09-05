@@ -31,7 +31,7 @@
 </script>
 
 <script lang="ts">
-	import { onMount, tick } from 'svelte';
+	import { onDestroy, onMount, tick } from 'svelte';
 	import { fade, scale } from 'svelte/transition';
 	import { quintOut } from 'svelte/easing';
 	import { flyIn, flyInX, fadeIn } from '$lib/transitions';
@@ -43,14 +43,25 @@
 	import TodoPanel from './TodoPanel.svelte';
 	import { createSlidingWindow, BATCH_SIZE } from '$lib/slidingWindow.svelte';
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
-	import { workersByPm, expandedSessionId, codexSubagentsByParent, codexVisibleParentByChild } from '$lib/stores/sessions';
+	import { currentConversation, workersByPm, expandedSessionId, codexSubagentsByParent, codexVisibleParentByChild } from '$lib/stores/sessions';
 	import { visibleSubagentsBySession } from '$lib/stores/subagents';
 	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
+	import { isCostAvailable } from '$lib/cost-semantics';
 	import { formatTimeSince, formatDurationMs } from '$lib/time-utils';
 	import { getSessionStatusColor, getSessionStatusLabel, getSubagentStatusColor, getSubagentStatusLabel, getWorkerStatusColor, getWorkerStatusLabel } from '$lib/status-utils';
 	import { isTauri } from '$lib/ws';
 	import ProviderBadge from './ProviderBadge.svelte';
+	import { getConversation } from '$lib/api';
+	import {
+		conversationLoad,
+		conversationLoadLabel,
+		isSessionLoading,
+		isToolsLoading,
+		toolsLoadedFor,
+		withConversationLoader
+	} from '$lib/stores/conversation-loader';
+	import ConversationLoadBar from './ConversationLoadBar.svelte';
 	import { canSessionAction } from '$lib/provider';
 
 	interface Props {
@@ -66,7 +77,7 @@
 	let messagesContainer = $state<HTMLDivElement>(undefined!);
 	let isInitialLoad = $state(true);
 	let hasScrolledToBottom = $state(false);
-	let showTools = $state(true);
+	let showTools = $state(false);
 	let showThinking = $state(true);
 	let navSheetOpen = $state(false);
 	let idCopied = $state(false);
@@ -101,6 +112,12 @@
 		).length;
 	});
 
+	let toolsLoading = $derived(isToolsLoading(session.id, $conversationLoad));
+	let sessionLoading = $derived(isSessionLoading(session.id, $conversationLoad));
+	let loadLabel = $derived(
+		$conversationLoad?.sessionId === session.id ? conversationLoadLabel($conversationLoad) : null
+	);
+
 	// Stagger messages only on the overlay's first render. After that,
 	// streaming/polling appends new messages — those should appear instantly.
 	function messageIn(node: Element, params: { index: number }) {
@@ -112,6 +129,35 @@
 		// Close the bottom sheet on mobile after navigating
 		navSheetOpen = false;
 	}
+
+	let disposed = false;
+	onDestroy(() => { disposed = true; });
+
+	async function toggleTools() {
+		const requestedId = session.id;
+		const next = !showTools;
+		if (sessionLoading) return;
+		if (next && $toolsLoadedFor !== requestedId) {
+			try {
+				const conv = await withConversationLoader(requestedId, 'tools', () =>
+					getConversation(requestedId, true)
+				);
+				if (disposed || session.id !== requestedId || conv.sessionId !== requestedId) return;
+				currentConversation.set(conv);
+				toolsLoadedFor.set(requestedId);
+			} catch (error) {
+				console.error('Failed to load tools:', error);
+				return;
+			}
+		}
+		if (disposed || session.id !== requestedId) return;
+		showTools = next;
+	}
+
+	$effect(() => {
+		session.id;
+		showTools = false;
+	});
 
 	onMount(() => {
 		isInitialLoad = false;
@@ -162,7 +208,7 @@
 
 	let costRecord = $derived($sessionCostMap.get(session.id));
 	let primaryCostLabel = $derived(
-		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, costRecord.costAvailable ?? costRecord.provider !== 'codex') : null
+		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, isCostAvailable(costRecord)) : null
 	);
 
 	let isPermission = $derived(session.status === SessionStatus.NeedsAttention);
@@ -384,11 +430,15 @@
 							<span class="session-name-badge">{session.sessionName}</span>
 							<span class="separator">·</span>
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
+							{#if loadLabel}
+								<span class="separator">·</span>
+								<span class="load-label">{loadLabel}</span>
+							{/if}
 							{#if costRecord}
 								<span class="separator">·</span>
-								<span class="cost-breakdown" title="{costRecord.costAvailable ?? costRecord.provider !== 'codex' ? `Total cost: ${formatCost(costRecord.cost)}` : 'USD pricing unavailable'} · {formatTokens(costRecord.totalTokens)} tokens · {modelDisplayName(costRecord.model)}">
+								<span class="cost-breakdown" title="{isCostAvailable(costRecord) ? `Total cost: ${formatCost(costRecord.cost)}` : 'USD pricing unavailable'} · {formatTokens(costRecord.totalTokens)} tokens · {modelDisplayName(costRecord.model)}">
 									<span class="cost-primary">{primaryCostLabel}</span>
-									<span class="cost-secondary">· {$costMode === 'usd' ? formatTokens(costRecord.totalTokens) + ' tok' : formatCostOrTokens(costRecord.cost, costRecord.totalTokens, 'usd', costRecord.costAvailable ?? costRecord.provider !== 'codex')}</span>
+									<span class="cost-secondary">· {$costMode === 'usd' ? formatTokens(costRecord.totalTokens) + ' tok' : formatCostOrTokens(costRecord.cost, costRecord.totalTokens, 'usd', isCostAvailable(costRecord))}</span>
 									<span class="cost-secondary">· {modelDisplayName(costRecord.model)}</span>
 								</span>
 							{/if}
@@ -439,9 +489,11 @@
 					<button
 						type="button"
 						class="header-button toggle-tools"
-						class:active={showTools}
-						onclick={() => showTools = !showTools}
-						title={showTools ? "Hide Tools" : "Show Tools"}
+						class:active={showTools && !toolsLoading}
+						class:loading={toolsLoading}
+						disabled={sessionLoading}
+						onclick={toggleTools}
+						title={toolsLoading ? "Loading tools" : sessionLoading ? "Loading conversation" : showTools ? "Hide Tools" : "Show Tools"}
 					>
 						<span>⚙</span>
 					</button>
@@ -454,6 +506,7 @@
 					</button>
 				</div>
 			</header>
+			<ConversationLoadBar sessionId={session.id} />
 
 			{#if tooltipText}
 				<div class="id-tooltip" style="left: {tooltipX}px; top: {tooltipY}px;">
@@ -1263,6 +1316,13 @@
 		color: var(--text-muted);
 	}
 
+	.load-label {
+		font-family: var(--font-pixel);
+		font-size: 11px;
+		letter-spacing: 0.08em;
+		color: var(--status-working);
+	}
+
 	.header-actions {
 		display: flex;
 		align-items: center;
@@ -1283,6 +1343,11 @@
 		color: var(--text-primary);
 	}
 
+	.header-button:disabled {
+		opacity: 1;
+		cursor: default;
+	}
+
 	.header-button span {
 		font-family: var(--font-mono);
 		font-size: 14px;
@@ -1296,6 +1361,22 @@
 	.header-button.active.toggle-tools {
 		color: var(--status-input);
 		opacity: 1;
+	}
+
+	.header-button.loading.toggle-tools {
+		color: var(--status-working);
+		opacity: 1;
+	}
+
+	.header-button.loading.toggle-tools span {
+		display: inline-block;
+		animation: gear-spin 0.8s linear infinite;
+	}
+
+	@keyframes gear-spin {
+		to {
+			transform: rotate(360deg);
+		}
 	}
 
 	.header-divider {
