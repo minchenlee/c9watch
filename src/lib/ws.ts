@@ -8,8 +8,8 @@ class WsClient {
 	private ws: WebSocket | null = null;
 	private url: string = '';
 	private _connected = false;
-	private pendingResolve: ((value: any) => void) | null = null;
-	private pendingReject: ((reason: any) => void) | null = null;
+	private nextRequestId = 0;
+	private pending = new Map<number, { resolve: (value: any) => void; reject: (reason: any) => void }>();
 	private listeners = new Map<string, Set<EventCallback>>();
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -69,9 +69,14 @@ class WsClient {
 			throw new Error('WebSocket not connected');
 		}
 		return new Promise((resolve, reject) => {
-			this.pendingResolve = resolve as (value: any) => void;
-			this.pendingReject = reject;
-			this.ws!.send(JSON.stringify({ type, ...data }));
+			const requestId = ++this.nextRequestId;
+			this.pending.set(requestId, { resolve, reject });
+			try {
+				this.ws!.send(JSON.stringify({ type, ...data, requestId }));
+			} catch (error) {
+				this.pending.delete(requestId);
+				reject(error);
+			}
 		});
 	}
 
@@ -100,18 +105,18 @@ class WsClient {
 				return;
 			}
 			if (msg.type === 'conversationProgress') {
-				this.emit('conversationProgress', msg.data);
+				if (msg.data.requestId == null || this.pending.has(msg.data.requestId)) {
+					this.emit('conversationProgress', msg.data);
+				}
 				return;
 			}
 
-			// Request-response: resolve or reject the pending promise
-			if (msg.type === 'error') {
-				this.pendingReject?.(new Error(msg.message));
-			} else {
-				this.pendingResolve?.(msg.data ?? msg);
-			}
-			this.pendingResolve = null;
-			this.pendingReject = null;
+			// Correlate responses: background conversations can finish out of order.
+			const pending = this.pending.get(msg.requestId);
+			if (!pending) return;
+			this.pending.delete(msg.requestId);
+			if (msg.type === 'error') pending.reject(new Error(msg.message));
+			else pending.resolve(msg.data ?? msg);
 		} catch (e) {
 			console.error('[ws] Failed to parse message:', e);
 		}
@@ -128,9 +133,8 @@ class WsClient {
 	}
 
 	private rejectPending(reason: string) {
-		this.pendingReject?.(new Error(reason));
-		this.pendingResolve = null;
-		this.pendingReject = null;
+		for (const request of this.pending.values()) request.reject(new Error(reason));
+		this.pending.clear();
 	}
 
 	private scheduleReconnect() {

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, tick } from 'svelte';
+	import { onDestroy, onMount, tick } from 'svelte';
 	import { fade, scale } from 'svelte/transition';
 	import { quintOut } from 'svelte/easing';
 	import type { HistoryEntry, Conversation } from '$lib/types';
@@ -66,6 +66,9 @@
 		navSheetOpen = false;
 	}
 
+	let disposed = false;
+	onDestroy(() => { disposed = true; });
+
 	async function toggleTools() {
 		const requestedId = entry.sessionId;
 		const next = !showTools;
@@ -75,7 +78,7 @@
 				const conv = await withConversationLoader(requestedId, 'tools', () =>
 					getConversation(requestedId, true)
 				);
-				if (entry.sessionId !== requestedId || conv.sessionId !== requestedId) return;
+				if (disposed || entry.sessionId !== requestedId || conv.sessionId !== requestedId) return;
 				onconversation?.(conv);
 				toolsLoadedFor.set(requestedId);
 			} catch (error) {
@@ -83,7 +86,7 @@
 				return;
 			}
 		}
-		if (entry.sessionId !== requestedId) return;
+		if (disposed || entry.sessionId !== requestedId) return;
 		showTools = next;
 	}
 

@@ -1286,7 +1286,18 @@ mod tests {
         let cache_path = directory.path().join("cache.json");
         load_snapshots(&root, &cache_path);
         let first = std::fs::read(&cache_path).unwrap();
+        let sentinel = UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        File::options()
+            .write(true)
+            .open(&cache_path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(sentinel))
+            .unwrap();
         let second = load_snapshots(&root, &cache_path);
+        assert_eq!(
+            std::fs::metadata(&cache_path).unwrap().modified().unwrap(),
+            sentinel
+        );
         assert_eq!(second[0].display, "hello");
         let after = std::fs::read(&cache_path).unwrap();
         assert_eq!(
@@ -1397,6 +1408,12 @@ mod tests {
             ],
         );
         let cache_path = directory.path().join("cache.json");
+        load_snapshots(&root, &cache_path);
+        // Simulate a fresh process so this exercises stream-id hydration from disk.
+        archive_state()
+            .lock()
+            .unwrap()
+            .remove(&(root.clone(), cache_path.clone()));
         let snapshots = load_snapshots(&root, &cache_path);
         let json = String::from_utf8(std::fs::read(&cache_path).unwrap()).unwrap();
         assert!(

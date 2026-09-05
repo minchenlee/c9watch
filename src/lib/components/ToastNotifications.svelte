@@ -26,20 +26,20 @@
 	}
 
 	.toast {
-		background: var(--bg-elevated);
-		border: 1px solid var(--status-input);
+		background: var(--bg-elevated, #1a1a2e);
+		border: 1px solid var(--status-input, #f5a623);
 		padding: 12px 16px;
-		animation: toast-in 0.2s linear;
+		animation: toast-in 0.3s ease-out;
 	}
 
 	@keyframes toast-in {
 		from {
 			opacity: 0;
-			transform: translateY(-8px);
+			transform: translateX(100%);
 		}
 		to {
 			opacity: 1;
-			transform: translateY(0);
+			transform: translateX(0);
 		}
 	}
 
@@ -47,7 +47,7 @@
 		font-family: var(--font-pixel, monospace);
 		font-size: 12px;
 		font-weight: 600;
-		color: var(--text-primary);
+		color: var(--text-primary, #fff);
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
 		margin-bottom: 4px;
@@ -59,7 +59,7 @@
 	.toast-body {
 		font-family: var(--font-mono, monospace);
 		font-size: 12px;
-		color: var(--text-secondary);
+		color: var(--text-secondary, #aaa);
 		line-height: 1.4;
 	}
 </style>

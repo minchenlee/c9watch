@@ -227,6 +227,7 @@
 	}
 
 	function handleCloseConversation() {
+		conversationRequestId++;
 		selectedEntry = null;
 		conversation = null;
 	}
