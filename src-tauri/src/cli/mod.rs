@@ -1766,6 +1766,7 @@ fn resolve_session_reference_lightweight_under(
             .into_iter()
             .map(|id| session::SessionIdentity::new(session::SessionProvider::Cursor, id)),
     );
+
     matches.extend(
         session::pi_session_ids(home_dir, prefix)
             .into_iter()

@@ -1,8 +1,8 @@
 use crate::session::cache::FileVersion;
 use crate::session::codex::CodexLifecycle;
 use crate::session::cursor::CursorLifecycle;
-use crate::session::pi::PiLifecycle;
 use crate::session::owners::global_provider_source_owners;
+use crate::session::pi::PiLifecycle;
 use crate::session::source::{
     AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionIdentity,
     SessionProvider, SessionSource, SessionSurface,
@@ -988,11 +988,9 @@ mod placeholder_tests {
         pi_summary.first_prompt = Some("pi prompt".to_string());
         pi.pi_summary = Some(pi_summary);
 
-        let (sessions, _) = enrich_detected_sessions(
-            vec![codex, cursor, pi],
-            DetectionDiagnostics::default()
-        )
-        .unwrap();
+        let (sessions, _) =
+            enrich_detected_sessions(vec![codex, cursor, pi], DetectionDiagnostics::default())
+                .unwrap();
 
         assert_eq!(sessions.len(), 3);
         assert_eq!(sessions[0].session_key, "codex:same-provider-id");

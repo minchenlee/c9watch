@@ -877,7 +877,21 @@ fn monitor_record_is_relevant(header: &RolloutEventHeader) -> bool {
 }
 
 fn apply_rollout_line(summary: &mut CodexRolloutSummary, line: &[u8], capture_tool_messages: bool) {
-    let Ok(header) = serde_json::from_slice::<RolloutEventHeader>(line) else {
+    // The monitor scanner populates payload_type separately; its serde-skipped
+    // field cannot classify a response_item in the full conversation reader.
+    #[derive(Deserialize)]
+    struct PayloadHeader {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct ConversationHeader {
+        timestamp: Option<String>,
+        #[serde(rename = "type")]
+        event_type: Option<String>,
+        payload: Option<PayloadHeader>,
+    }
+    let Ok(header) = serde_json::from_slice::<ConversationHeader>(line) else {
         return;
     };
     if let Some(timestamp) = header.timestamp.as_deref() {
@@ -889,7 +903,8 @@ fn apply_rollout_line(summary: &mut CodexRolloutSummary, line: &[u8], capture_to
         // Message response items are user-visible even when tool records are
         // filtered out. Tool-shaped response items only need the full path.
         Some("response_item") => {
-            capture_tool_messages || header.payload_type.as_deref() == Some("message")
+            capture_tool_messages
+                || header.payload.as_ref().and_then(|p| p.kind.as_deref()) == Some("message")
         }
         _ => false,
     };
@@ -3162,6 +3177,38 @@ mod tests {
         let without_tools = find_codex_conversation_under(temp.path(), "thread-id", false).unwrap();
         assert_eq!(without_tools.len(), 1);
         assert_eq!(without_tools[0].content, "hello");
+    }
+
+    #[test]
+    fn hidden_tools_preserves_response_item_only_conversation() {
+        let temp = TempDir::new().unwrap();
+        let day = temp.path().join("2026/07/13");
+        fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout-2026-07-13T00-00-00-thread-id.jsonl");
+        let lines = vec![
+            event("2026-07-13T00:00:00Z", "session_meta", serde_json::json!({"id":"thread-id","cwd":"/tmp"})),
+            event("2026-07-13T00:00:01Z", "response_item", serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":"question"}]})),
+            // serde's map order puts payload before type: both orders must work.
+            serde_json::json!({"type":"response_item","timestamp":"2026-07-13T00:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}).to_string(),
+            event("2026-07-13T00:00:03Z", "response_item", serde_json::json!({"type":"function_call_output","call_id":"tool","output":"hidden output"})),
+        ];
+        write_lines(&path, &lines, true);
+        for _ in 0..2 {
+            let messages = find_codex_conversation_under(temp.path(), "thread-id", false).unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|m| m.content.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["question", "answer"]
+            );
+        }
+        assert_eq!(
+            find_codex_conversation_under(temp.path(), "thread-id", true)
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]

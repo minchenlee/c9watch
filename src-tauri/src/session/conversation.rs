@@ -2,6 +2,7 @@ use crate::session::parser::parse_all_entries_with_progress;
 use crate::session::SessionProvider;
 use crate::session::{extract_messages, ImageBlock, MessageType};
 use serde::Serialize;
+use std::time::{Duration, Instant};
 
 /// Conversation structure
 #[derive(Debug, Clone, Serialize)]
@@ -146,9 +147,8 @@ fn pi_conversation(
     // pi transcripts are parsed in one pass; report completion for parity
     // with the progress-reporting providers.
     on_progress(0, 1);
-    let messages = crate::session::pi::read_pi_conversation(session_id)?;
+    let messages = crate::session::pi::read_pi_conversation_with_tools(session_id, include_tools)?;
     on_progress(1, 1);
-    let messages = crate::session::pi::apply_pi_tool_filter(messages, include_tools);
     Ok(Conversation {
         session_id: session_id.to_string(),
         provider: SessionProvider::Pi,
@@ -203,8 +203,25 @@ pub fn get_conversation_data_for_provider_with_progress(
     include_tools: bool,
     on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Conversation, String> {
+    let mut last_read = u64::MAX;
+    let mut last_at = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    let mut report = |read: u64, total: u64| {
+        let step = total.saturating_div(50).max(256 * 1024);
+        let due = last_read == u64::MAX
+            || read >= total
+            || read.saturating_sub(last_read) >= step
+            || last_at.elapsed() >= Duration::from_millis(80);
+        if due {
+            last_read = read;
+            last_at = Instant::now();
+            on_progress(read, total);
+        }
+    };
+
     if let Some(provider) = provider {
-        return load_for_provider(session_id, provider, include_tools, on_progress);
+        return load_for_provider(session_id, provider, include_tools, &mut report);
     }
 
     let mut matches = Vec::new();
@@ -215,7 +232,7 @@ pub fn get_conversation_data_for_provider_with_progress(
         SessionProvider::Pi,
     ] {
         if let Ok(conversation) =
-            load_for_provider(session_id, provider, include_tools, on_progress)
+            load_for_provider(session_id, provider, include_tools, &mut report)
         {
             matches.push((provider, conversation));
         }
@@ -229,12 +246,7 @@ pub fn get_conversation_data_with_progress(
     include_tools: bool,
     on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Conversation, String> {
-    get_conversation_data_for_provider_with_progress(
-        session_id,
-        None,
-        include_tools,
-        on_progress,
-    )
+    get_conversation_data_for_provider_with_progress(session_id, None, include_tools, on_progress)
 }
 
 /// Backward-compatible provider-aware lookup. Existing callers receive the

@@ -32,6 +32,12 @@ jobs:
       - name: Svelte check
         run: npm run check
 
+      - name: WebSocket request regression tests
+        run: node --test scripts/test-ws.mjs
+
+      - name: Conversation selection regression tests
+        run: node --conditions=browser --test scripts/test-conversation-selection.mjs
+
       - name: Rust check
         run: cargo check --manifest-path src-tauri/Cargo.toml
 

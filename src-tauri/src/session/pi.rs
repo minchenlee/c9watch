@@ -16,12 +16,15 @@
 //! the Cursor provider: message timestamps + file mtime drive Working/Idle,
 //! and the pid is reported as 0.
 
+use super::cache::FileVersion;
 use super::source::{DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource};
 use super::{AgentKind, SessionKind, SessionProvider, SessionSurface};
 use crate::session::parser::MessageType;
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -38,6 +41,8 @@ const PI_MESSAGE_RECENCY_SECS: i64 = 120;
 const PI_MAX_TOOL_RESULT_CHARS: usize = 2000;
 /// Cap stored tool-call argument previews.
 const PI_MAX_TOOL_ARGS_CHARS: usize = 300;
+const PI_MAX_SUMMARY_CHARS: usize = 400;
+const PI_MAX_CACHED_SUMMARIES: usize = 128;
 
 // ── Summary ─────────────────────────────────────────────────────────
 
@@ -84,11 +89,12 @@ pub struct PiConversationMessage {
 pub struct PiSessionSource {
     root: PathBuf,
     cache: HashMap<PathBuf, CachedSummary>,
+    #[cfg(test)]
+    parse_count: usize,
 }
 
 struct CachedSummary {
-    len: u64,
-    modified_nanos: u128,
+    version: FileVersion,
     summary: PiTranscriptSummary,
 }
 
@@ -102,6 +108,8 @@ impl PiSessionSource {
         Self {
             root,
             cache: HashMap::new(),
+            #[cfg(test)]
+            parse_count: 0,
         }
     }
 
@@ -135,32 +143,45 @@ impl PiSessionSource {
     }
 
     fn summary_for_at(&mut self, path: &Path, now_ms: i64) -> Option<PiTranscriptSummary> {
-        let metadata = std::fs::metadata(path).ok()?;
-        let len = metadata.len();
-        let modified_nanos = metadata
-            .modified()
-            .ok()?
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        if let Some(cached) = self.cache.get(path) {
-            if cached.len == len && cached.modified_nanos == modified_nanos {
-                let mut summary = cached.summary.clone();
-                summary.refresh_lifecycle(now_ms);
-                return Some(summary);
+        for _ in 0..3 {
+            let version = FileVersion::read(path).ok()?;
+            if let Some(cached) = self.cache.get(path) {
+                if cached.version == version && version.supports_unchanged_fast_path() {
+                    let mut summary = cached.summary.clone();
+                    summary.refresh_lifecycle(now_ms);
+                    return Some(summary);
+                }
             }
+            #[cfg(test)]
+            {
+                self.parse_count += 1;
+            }
+            let mut summary = summarize_pi_transcript(path)?;
+            summary.refresh_lifecycle(now_ms);
+            // Do not persist a summary of a file that changed during parsing.
+            if FileVersion::read(path).ok()? != version {
+                continue;
+            }
+            if !self.cache.contains_key(path) && self.cache.len() >= PI_MAX_CACHED_SUMMARIES {
+                if let Some(oldest) = self
+                    .cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.version.modified_nanos)
+                    .map(|(path, _)| path.clone())
+                {
+                    self.cache.remove(&oldest);
+                }
+            }
+            self.cache.insert(
+                path.to_path_buf(),
+                CachedSummary {
+                    version,
+                    summary: summary.clone(),
+                },
+            );
+            return Some(summary);
         }
-        let mut summary = summarize_pi_transcript(path)?;
-        summary.refresh_lifecycle(now_ms);
-        self.cache.insert(
-            path.to_path_buf(),
-            CachedSummary {
-                len,
-                modified_nanos,
-                summary: summary.clone(),
-            },
-        );
-        Some(summary)
+        None
     }
 }
 
@@ -170,9 +191,11 @@ impl SessionSource for PiSessionSource {
     ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
         let mut sessions = Vec::new();
         let Ok(dirs) = std::fs::read_dir(&self.root) else {
+            self.cache.clear();
             return Ok((sessions, DetectionDiagnostics::default()));
         };
         let now = SystemTime::now();
+        let mut recent_paths = HashSet::new();
         for dir_entry in dirs.flatten() {
             let dir = dir_entry.path();
             if !dir.is_dir() {
@@ -186,20 +209,24 @@ impl SessionSource for PiSessionSource {
                 if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                     continue;
                 }
-                let Some(summary) = self.summary_for(&path) else {
-                    continue;
-                };
-                if summary.session_id.is_empty() {
-                    continue;
-                }
-                // Freshness gate, mirroring the Cursor provider: idle
-                // transcripts expire fast, working ones linger.
+                // Even pending tools expire after four hours. Gate before any
+                // transcript read so historical archives do not enter polling.
                 let age_secs = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| now.duration_since(t).ok())
                     .map(|d| d.as_secs())
                     .unwrap_or(u64::MAX);
+                if age_secs >= PI_FRESHNESS_WORKING_SECS {
+                    continue;
+                }
+                recent_paths.insert(path.clone());
+                let Some(summary) = self.summary_for(&path) else {
+                    continue;
+                };
+                if summary.session_id.is_empty() {
+                    continue;
+                }
                 let fresh = match summary.lifecycle {
                     PiLifecycle::Working => age_secs < PI_FRESHNESS_WORKING_SECS,
                     PiLifecycle::Idle => age_secs < PI_FRESHNESS_IDLE_SECS,
@@ -245,6 +272,7 @@ impl SessionSource for PiSessionSource {
                 });
             }
         }
+        self.cache.retain(|path, _| recent_paths.contains(path));
         Ok((sessions, DetectionDiagnostics::default()))
     }
 
@@ -293,8 +321,9 @@ fn pi_dir_cwd(dir: &Path) -> String {
 /// cwd from a transcript's session header (either schema), scanning only
 /// the head of the file. Returns `None` when no header carries a cwd.
 fn read_pi_header_cwd(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    for line in content.lines().take(50) {
+    let reader = BufReader::new(File::open(path).ok()?);
+    for line in reader.lines().take(50) {
+        let line = line.ok()?;
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
             continue;
         };
@@ -330,7 +359,7 @@ fn pi_session_id_from_filename(path: &Path) -> Option<String> {
 /// Parse a pi transcript into a rollup summary. Returns `None` when the file
 /// has no usable session header (not a pi transcript).
 pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let reader = BufReader::new(File::open(path).ok()?);
     let session_id = pi_session_id_from_filename(path)?;
     let mut summary = PiTranscriptSummary {
         session_id,
@@ -343,7 +372,8 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
     let mut header_cwd: Option<String> = None;
     let mut header_ts: Option<i64> = None;
 
-    for line in content.lines() {
+    for line in reader.lines() {
+        let line = line.ok()?;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -358,8 +388,7 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                         header_cwd = Some(cwd.to_string());
                     }
                     if header_ts.is_none() {
-                        if let Some(ts) = session.get("timestamp").and_then(parse_pi_timestamp_ms)
-                        {
+                        if let Some(ts) = session.get("timestamp").and_then(parse_pi_timestamp_ms) {
                             header_ts = Some(ts);
                         }
                     }
@@ -372,9 +401,7 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                         }
                     }
                     if header_ts.is_none() {
-                        header_ts = value
-                            .get("timestamp")
-                            .and_then(parse_pi_timestamp_ms);
+                        header_ts = value.get("timestamp").and_then(parse_pi_timestamp_ms);
                     }
                 }
             }
@@ -410,9 +437,11 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                         }
                         for text in message_texts(message) {
                             if summary.first_prompt.is_none() && !text.trim().is_empty() {
-                                summary.first_prompt = Some(text.clone());
+                                summary.first_prompt =
+                                    Some(truncate_chars(&text, PI_MAX_SUMMARY_CHARS));
                             }
-                            summary.latest_snippet = Some(text);
+                            summary.latest_snippet =
+                                Some(truncate_chars(&text, PI_MAX_SUMMARY_CHARS));
                         }
                     }
                     "assistant" => {
@@ -434,16 +463,15 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                         let blocks = message
                             .get("content")
                             .and_then(|c| c.as_array())
-                            .cloned()
+                            .map(Vec::as_slice)
                             .unwrap_or_default();
-                        for block in &blocks {
+                        for block in blocks {
                             match block.get("type").and_then(|t| t.as_str()) {
                                 Some("text") => {
-                                    if let Some(text) =
-                                        block.get("text").and_then(|t| t.as_str())
-                                    {
+                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                                         if !text.trim().is_empty() {
-                                            summary.latest_snippet = Some(text.to_string());
+                                            summary.latest_snippet =
+                                                Some(truncate_chars(text, PI_MAX_SUMMARY_CHARS));
                                         }
                                     }
                                 }
@@ -478,9 +506,7 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                         if let Some(t) = ts.clone() {
                             summary.last_timestamp = t;
                         }
-                        if let Some(id) =
-                            message.get("toolCallId").and_then(|i| i.as_str())
-                        {
+                        if let Some(id) = message.get("toolCallId").and_then(|i| i.as_str()) {
                             pending_tools.remove(id);
                         }
                     }
@@ -562,15 +588,9 @@ fn apply_pi_usage(summary: &mut PiTranscriptSummary, message: &serde_json::Value
     };
     summary.input_tokens += usage.get("input").map(u64_from_json).unwrap_or(0);
     summary.output_tokens += usage.get("output").map(u64_from_json).unwrap_or(0);
-    summary.cached_input_tokens += usage
-        .get("cacheRead")
-        .map(u64_from_json)
-        .unwrap_or(0)
+    summary.cached_input_tokens += usage.get("cacheRead").map(u64_from_json).unwrap_or(0)
         + usage.get("cacheWrite").map(u64_from_json).unwrap_or(0);
-    summary.reasoning_tokens += usage
-        .get("reasoning")
-        .map(u64_from_json)
-        .unwrap_or(0);
+    summary.reasoning_tokens += usage.get("reasoning").map(u64_from_json).unwrap_or(0);
     if let Some(cost) = usage.get("cost").and_then(|c| c.get("total")) {
         summary.total_cost += cost.as_f64().unwrap_or(0.0);
     }
@@ -637,22 +657,36 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 // ── Conversation ────────────────────────────────────────────────────
 
-/// Full conversation rows for one pi session, oldest first.
-pub(crate) fn read_pi_conversation(session_id: &str) -> Result<Vec<PiConversationMessage>, String> {
+/// Conversation rows for one pi session, oldest first, with lazy tool inclusion.
+pub(crate) fn read_pi_conversation_with_tools(
+    session_id: &str,
+    include_tools: bool,
+) -> Result<Vec<PiConversationMessage>, String> {
     let home = dirs::home_dir().ok_or("Failed to get home directory")?;
-    read_pi_conversation_under(&home, session_id)
+    read_pi_conversation_under_with_tools(&home, session_id, include_tools)
 }
 
-pub(crate) fn read_pi_conversation_under(
+#[cfg(test)]
+fn read_pi_conversation_under(
     home: &Path,
     session_id: &str,
 ) -> Result<Vec<PiConversationMessage>, String> {
+    read_pi_conversation_under_with_tools(home, session_id, true)
+}
+
+fn read_pi_conversation_under_with_tools(
+    home: &Path,
+    session_id: &str,
+    include_tools: bool,
+) -> Result<Vec<PiConversationMessage>, String> {
     let path = pi_conversation_path_for_session(&home, session_id)
         .ok_or_else(|| format!("pi session {session_id} not found"))?;
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read pi transcript: {e}"))?;
+    let reader = BufReader::new(
+        File::open(&path).map_err(|e| format!("Failed to read pi transcript: {e}"))?,
+    );
     let mut messages = Vec::new();
-    for line in content.lines() {
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Failed to read pi transcript: {e}"))?;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -694,9 +728,9 @@ pub(crate) fn read_pi_conversation_under(
                 let blocks = message
                     .get("content")
                     .and_then(|c| c.as_array())
-                    .cloned()
+                    .map(Vec::as_slice)
                     .unwrap_or_default();
-                for block in &blocks {
+                for block in blocks {
                     match block.get("type").and_then(|t| t.as_str()) {
                         Some("text") => {
                             if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
@@ -722,11 +756,8 @@ pub(crate) fn read_pi_conversation_under(
                                 });
                             }
                         }
-                        Some("toolCall") => {
-                            let name = block
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("tool");
+                        Some("toolCall") if include_tools => {
+                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                             let args = block
                                 .get("arguments")
                                 .map(|a| {
@@ -750,7 +781,7 @@ pub(crate) fn read_pi_conversation_under(
                     }
                 }
             }
-            Some("toolResult") => {
+            Some("toolResult") if include_tools => {
                 let name = message
                     .get("toolName")
                     .and_then(|n| n.as_str())
@@ -861,7 +892,8 @@ fn file_mtime_ms(path: &Path) -> Option<u64> {
 
 /// Drop tool records when the caller asked for a tool-free conversation,
 /// mirroring the other providers' `include_tools=false` behavior.
-pub(crate) fn apply_pi_tool_filter(
+#[cfg(test)]
+fn apply_pi_tool_filter(
     messages: Vec<PiConversationMessage>,
     include_tools: bool,
 ) -> Vec<PiConversationMessage> {
@@ -963,17 +995,25 @@ pub(crate) fn pi_deep_search(
         let Ok(files) = std::fs::read_dir(&dir) else {
             continue;
         };
-        for file_entry in files.flatten() {
+        'files: for file_entry in files.flatten() {
             let path = file_entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            let Ok(file) = File::open(&path) else {
                 continue;
             };
             let mut snippet: Option<String> = None;
-            for line in content.lines() {
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            for line in BufReader::new(file).lines() {
+                let Ok(line) = line else {
+                    continue 'files;
+                };
+                // Finish validating UTF-8 without decoding more JSON once a
+                // match is found, preserving whole-file error semantics.
+                if snippet.is_some() {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
                     continue;
                 };
                 if value.get("type").and_then(|t| t.as_str()) != Some("message") {
@@ -998,9 +1038,7 @@ pub(crate) fn pi_deep_search(
                                     }
                                 }
                                 Some("toolCall") => {
-                                    if let Some(name) =
-                                        block.get("name").and_then(|n| n.as_str())
-                                    {
+                                    if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
                                         candidates.push(name.to_string());
                                     }
                                     // Tool arguments often carry the most
@@ -1025,9 +1063,6 @@ pub(crate) fn pi_deep_search(
                         snippet = Some(pi_snippet(&candidate, query));
                         break;
                     }
-                }
-                if snippet.is_some() {
-                    break;
                 }
             }
             let Some(snippet) = snippet else {
@@ -1061,7 +1096,9 @@ fn pi_text_matches(text: &str, needle: &str, case_sensitive: bool, whole_word: b
         } else {
             text.to_lowercase()
         };
-        return haystack.split(|c: char| !c.is_alphanumeric()).any(|word| word == needle);
+        return haystack
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| word == needle);
     }
     if case_sensitive {
         text.contains(needle)
@@ -1120,7 +1157,7 @@ pub(crate) fn pi_cost_records(home: &Path) -> Vec<crate::session::cost::SessionC
         let Ok(files) = std::fs::read_dir(&dir) else {
             continue;
         };
-        for file_entry in files.flatten() {
+        'files: for file_entry in files.flatten() {
             let path = file_entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
@@ -1144,12 +1181,15 @@ pub(crate) fn pi_cost_records(home: &Path) -> Vec<crate::session::cost::SessionC
             let fallback_ms = summary
                 .started_at_ms
                 .or_else(|| file_mtime_ms(&path).map(|ms| ms as i64));
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            let Ok(file) = File::open(&path) else {
                 continue;
             };
             let mut days: std::collections::BTreeMap<String, PiCostDay> = Default::default();
-            for line in content.lines() {
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            for line in BufReader::new(file).lines() {
+                let Ok(line) = line else {
+                    continue 'files;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
                     continue;
                 };
                 if value.get("type").and_then(|v| v.as_str()) != Some("message") {
@@ -1253,6 +1293,177 @@ mod tests {
             r#"{"id":"msg_3","timestamp":1755325671000,"type":"message","message":{"role":"toolResult","toolCallId":"call-1","toolName":"read","content":"file bytes","isError":false}}"#.to_string(),
             r#"{"id":"msg_4","timestamp":1755325672000,"type":"message","message":{"role":"assistant","model":"anthropic/claude-opus-4-6","content":[{"type":"text","text":"Done."}],"stopReason":"stop","usage":{"input":11,"output":6,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":17,"cost":{"total":0.002}}}}"#.to_string(),
         ]
+    }
+
+    #[test]
+    fn hidden_tools_preserves_conversation_text_and_thinking_during_parse() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join(".pi/agent/sessions/project");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("time_session.jsonl");
+        let lines = [
+            serde_json::json!({"type":"message","message":{"role":"user","content":[{"type":"text","text":"question"}]}}),
+            serde_json::json!({"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"answer"},{"type":"thinking","thinking":"reason"},{"type":"toolCall","name":"bash","arguments":{"cmd":"hidden"}}]}}),
+            serde_json::json!({"type":"message","message":{"role":"toolResult","content":"hidden output"}}),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let hidden = read_pi_conversation_under_with_tools(temp.path(), "session", false).unwrap();
+        assert_eq!(
+            hidden
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["question", "answer", "reason"]
+        );
+        assert_eq!(
+            read_pi_conversation_under(temp.path(), "session")
+                .unwrap()
+                .len(),
+            5
+        );
+        use std::io::Write;
+        File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[b'\n', 0xff])
+            .unwrap();
+        assert!(read_pi_conversation_under(temp.path(), "session").is_err());
+        assert!(pi_deep_search(temp.path(), "question", false, false).is_empty());
+        assert!(pi_cost_records(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn monitor_skips_expired_files_before_parsing_and_evicts_deleted_files() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("project");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("time_session.jsonl");
+        std::fs::write(&path, "{\"type\":\"session\",\"cwd\":\"/tmp\"}\n").unwrap();
+        let mut source = PiSessionSource::at_root(temp.path().to_path_buf());
+        source.detect().unwrap();
+        assert_eq!(source.parse_count, 1);
+        assert_eq!(source.cache.len(), 1);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(5 * 3600))
+            .unwrap();
+        source.detect().unwrap();
+        assert_eq!(
+            source.parse_count, 1,
+            "expired transcript must not be parsed"
+        );
+        assert!(source.cache.is_empty());
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now())
+            .unwrap();
+        source.detect().unwrap();
+        assert_eq!(source.cache.len(), 1);
+        std::fs::remove_file(path).unwrap();
+        source.detect().unwrap();
+        assert!(source.cache.is_empty());
+    }
+
+    #[test]
+    fn summary_cache_invalidates_preserved_mtime_rewrite_and_bounds_text() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("time_session.jsonl");
+        let record = |text: &str| {
+            serde_json::json!({"type":"message","message":{"role":"user","content":[{"type":"text","text":text}]}}).to_string()
+        };
+        std::fs::write(&path, record(&"a".repeat(10000))).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut source = PiSessionSource::at_root(temp.path().to_path_buf());
+        let first = source.summary_for(&path).unwrap();
+        assert!(first.first_prompt.as_ref().unwrap().chars().count() <= PI_MAX_SUMMARY_CHARS + 1);
+        if FileVersion::read(&path)
+            .unwrap()
+            .supports_unchanged_fast_path()
+        {
+            source.summary_for(&path).unwrap();
+            assert_eq!(source.parse_count, 1);
+        }
+        std::fs::write(&path, record(&"b".repeat(10000))).unwrap();
+        File::open(&path).unwrap().set_modified(mtime).unwrap();
+        let next = source.summary_for(&path).unwrap();
+        assert!(next.first_prompt.unwrap().starts_with('b'));
+        assert_eq!(next.message_count, 1);
+    }
+
+    #[test]
+    fn summary_cache_has_a_global_entry_bound() {
+        let temp = TempDir::new().unwrap();
+        let mut source = PiSessionSource::at_root(temp.path().to_path_buf());
+        for i in 0..PI_MAX_CACHED_SUMMARIES + 3 {
+            let path = temp.path().join(format!("time_{i}.jsonl"));
+            std::fs::write(&path, "{\"type\":\"session\",\"cwd\":\"/tmp\"}\n").unwrap();
+            assert!(source.summary_for(&path).is_some());
+        }
+        assert_eq!(source.cache.len(), PI_MAX_CACHED_SUMMARIES);
+    }
+
+    #[test]
+    fn header_lookup_does_not_read_the_transcript_body() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("time_session.jsonl");
+        let mut bytes = b"{\"type\":\"session\",\"cwd\":\"/tmp/exact-path\"}\n".to_vec();
+        bytes.extend_from_slice(&[0xff; 10000]);
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            read_pi_header_cwd(&path).as_deref(),
+            Some("/tmp/exact-path")
+        );
+        assert!(
+            summarize_pi_transcript(&path).is_none(),
+            "full summary still rejects invalid UTF-8"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual synthetic polling performance probe"]
+    fn expired_archive_polling_probe() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("project");
+        std::fs::create_dir(&dir).unwrap();
+        let header = "{\"type\":\"session\",\"cwd\":\"/tmp\"}\n";
+        let line = serde_json::json!({"type":"message","message":{"role":"toolResult","content":"x".repeat(8192)}}).to_string()+"\n";
+        let content = header.to_string() + &line.repeat(1024);
+        let mut paths = Vec::new();
+        for i in 0..12 {
+            let path = dir.join(format!("time_{i}.jsonl"));
+            std::fs::write(&path, &content).unwrap();
+            File::open(&path)
+                .unwrap()
+                .set_modified(SystemTime::now() - std::time::Duration::from_secs(5 * 3600))
+                .unwrap();
+            paths.push(path);
+        }
+        // Replay the old parse-before-freshness order with the new streaming
+        // parser: a conservative comparison, not a frozen full-app baseline.
+        let start = std::time::Instant::now();
+        for path in &paths {
+            assert!(summarize_pi_transcript(path).is_some());
+        }
+        let before = start.elapsed();
+        let mut source = PiSessionSource::at_root(temp.path().to_path_buf());
+        let start = std::time::Instant::now();
+        assert!(source.detect().unwrap().0.is_empty());
+        let after = start.elapsed();
+        assert_eq!(source.parse_count, 0);
+        eprintln!("synthetic expired archives: bytes={}, parse-before-gate={before:?}, gate-before-parse={after:?}",content.len()*paths.len());
     }
 
     #[test]
@@ -1424,7 +1635,10 @@ mod tests {
         let path = write_transcript(
             &dir,
             "2026-08-16T07-07-48-328Z_01a06659-1111-2222-3333-444455556666.jsonl",
-            &sample_lines().iter().map(String::as_str).collect::<Vec<_>>(),
+            &sample_lines()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
         );
         assert_eq!(
             pi_session_id_from_filename(&path).as_deref(),
@@ -1526,8 +1740,7 @@ mod tests {
         ];
         // Header-less file next to a sibling whose header carries a
         // dash-containing cwd: the exact path must win over lossy decode.
-        let headerless =
-            write_transcript(&dir, "2026-09-03T00-00-00-000Z_naked1.jsonl", &lines);
+        let headerless = write_transcript(&dir, "2026-09-03T00-00-00-000Z_naked1.jsonl", &lines);
         let sibling_dir = headerless.parent().unwrap();
         let mut sibling =
             std::fs::File::create(sibling_dir.join("2026-09-03T00-00-01-000Z_sib2.jsonl")).unwrap();

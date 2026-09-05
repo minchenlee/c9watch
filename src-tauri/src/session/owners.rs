@@ -325,10 +325,7 @@ mod tests {
         let sessions = owners.detect_pi().unwrap().0;
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, Some(SESSION_ID.to_string()));
-        assert_eq!(
-            sessions[0].provider,
-            crate::session::SessionProvider::Pi
-        );
+        assert_eq!(sessions[0].provider, crate::session::SessionProvider::Pi);
         assert!(owners.has_non_claude_session(SESSION_ID));
         assert!(!owners.has_non_claude_session("missing-pi-session"));
     }

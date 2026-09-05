@@ -1,11 +1,11 @@
 mod cache;
 pub mod codex;
 pub mod cursor;
-pub mod pi;
 pub mod custom_names;
 pub mod detector;
 pub mod parser;
 pub mod permissions;
+pub mod pi;
 pub mod source;
 pub mod status;
 
