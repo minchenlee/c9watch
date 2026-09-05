@@ -524,7 +524,6 @@ pub fn run() {
 
             let (sessions_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
             let (notifications_tx, _nrx) = tokio::sync::broadcast::channel::<String>(16);
-            let (progress_tx, _prx) = tokio::sync::broadcast::channel::<String>(32);
 
             let server_info = ServerInfo {
                 token: token.clone(),
@@ -538,7 +537,6 @@ pub fn run() {
                 auth_token: token,
                 sessions_tx: sessions_tx.clone(),
                 notifications_tx: notifications_tx.clone(),
-                progress_tx,
             });
             tauri::async_runtime::spawn(web_server::start_server(ws_state));
 

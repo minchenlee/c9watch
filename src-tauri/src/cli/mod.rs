@@ -1768,11 +1768,6 @@ fn resolve_session_reference_lightweight_under(
             .into_iter()
             .map(|id| session::SessionIdentity::new(session::SessionProvider::Cursor, id)),
     );
-    matches.extend(
-        session::pi_session_ids(home_dir, prefix)
-            .into_iter()
-            .map(|id| session::SessionIdentity::new(session::SessionProvider::Pi, id)),
-    );
 
     if let Some(provider) = provider_filter {
         matches.retain(|identity| identity.provider == provider);
@@ -1792,7 +1787,6 @@ fn parse_provider_scoped_reference(reference: &str) -> Option<(session::SessionP
         "claudeCode" => session::SessionProvider::ClaudeCode,
         "codex" => session::SessionProvider::Codex,
         "cursor" => session::SessionProvider::Cursor,
-        "pi" => session::SessionProvider::Pi,
         _ => return None,
     };
     Some((provider, raw_prefix))

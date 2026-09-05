@@ -31,7 +31,7 @@
 </script>
 
 <script lang="ts">
-	import { onMount, tick } from 'svelte';
+	import { onDestroy, onMount, tick } from 'svelte';
 	import { fade, scale } from 'svelte/transition';
 	import { quintOut } from 'svelte/easing';
 	import { flyIn, flyInX, fadeIn } from '$lib/transitions';
@@ -132,6 +132,9 @@
 		navSheetOpen = false;
 	}
 
+	let disposed = false;
+	onDestroy(() => { disposed = true; });
+
 	async function toggleTools() {
 		const requestedId = session.id;
 		const requestedProvider = providerOf(session);
@@ -143,7 +146,7 @@
 				const conv = await withConversationLoader(requestedId, requestedProvider, 'tools', () =>
 					getConversation(requestedId, requestedProvider, true)
 				);
-				if (
+				if (disposed ||
 					providerSessionKey(providerOf(session), session.id) !== requestedKey ||
 					providerSessionKey(conv.provider ?? requestedProvider, conv.sessionId) !== requestedKey
 				) return;
@@ -154,7 +157,7 @@
 				return;
 			}
 		}
-		if (session.id !== requestedId) return;
+		if (disposed || session.id !== requestedId) return;
 		showTools = next;
 	}
 

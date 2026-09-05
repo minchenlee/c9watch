@@ -16,6 +16,7 @@ const FILE_ANCHOR_BYTES: usize = 256;
 const MAX_REFRESH_ATTEMPTS: usize = 3;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
+const MAX_PROCESS_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
@@ -459,30 +460,35 @@ fn refresh_rollout_once(
     } else {
         previous?
     };
+    // Older cache files may hold the unfinished suffix at EOF. Rewind it and
+    // release its allocation; the authoritative file remains the source of truth.
+    cached.offset = cached.offset.saturating_sub(cached.pending.len() as u64);
+    cached.pending = Vec::new();
     file.seek(SeekFrom::Start(cached.offset)).ok()?;
-    let mut appended = Vec::new();
-    file.read_to_end(&mut appended).ok()?;
-    cached.offset += appended.len() as u64;
-    cached.prefix_hash = hash_bytes(cached.prefix_hash, &appended);
-    cached.pending.extend_from_slice(&appended);
-
-    let complete_len = cached
-        .pending
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    let complete = cached.pending[..complete_len].to_vec();
-    cached.pending.drain(..complete_len);
-    for line in complete.split(|byte| *byte == b'\n') {
-        if let Ok(value) = serde_json::from_slice::<Value>(line) {
-            apply_archive_event(&mut cached, &value);
+    {
+        let remaining = fingerprint.size.saturating_sub(cached.offset);
+        let mut reader = BufReader::new((&mut file).take(remaining));
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let bytes = reader.read_until(b'\n', &mut line).ok()?;
+            if bytes == 0 {
+                break;
+            }
+            let complete = line.last() == Some(&b'\n');
+            match apply_archive_line(&mut cached, &line) {
+                Ok(()) => {}
+                Err(_) if !complete => break,
+                Err(_) => {}
+            }
+            cached.offset += bytes as u64;
+            cached.prefix_hash = hash_bytes(cached.prefix_hash, &line);
+            // A huge tool result must not keep its scratch allocation for the
+            // rest of the file. No transcript buffer is stored in CachedRollout.
+            if line.capacity() > 64 * 1024 {
+                line = Vec::new();
+            }
         }
-    }
-    // Static rollout files and tests may omit a terminal newline. A syntactically
-    // complete record is safe to consume; an incomplete writer record remains buffered.
-    if let Ok(value) = serde_json::from_slice::<Value>(&cached.pending) {
-        apply_archive_event(&mut cached, &value);
-        cached.pending.clear();
     }
     let anchor_len = FILE_ANCHOR_BYTES.min(cached.offset as usize);
     cached.anchor.resize(anchor_len, 0);
@@ -494,11 +500,44 @@ fn refresh_rollout_once(
     Some(cached)
 }
 
-fn apply_archive_event(cached: &mut CachedRollout, value: &Value) {
-    let timestamp = value
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+#[derive(Deserialize)]
+struct ArchiveLineHeader {
+    #[serde(default)]
+    timestamp: Value,
+    #[serde(default, rename = "type")]
+    event_type: Value,
+    #[serde(default)]
+    payload: Option<ArchivePayloadHeader>,
+}
+
+#[derive(Deserialize)]
+struct ArchivePayloadHeader {
+    #[serde(default, rename = "type")]
+    kind: Value,
+}
+
+fn apply_archive_line(cached: &mut CachedRollout, line: &[u8]) -> Result<(), serde_json::Error> {
+    // Validate every record but don't allocate tool outputs that the archive
+    // never indexes. serde ignores the payload while reading this small header.
+    let header: ArchiveLineHeader = serde_json::from_slice(line)?;
+    if matches!(
+        header.event_type.as_str(),
+        Some("session_meta" | "event_msg" | "turn_context")
+    ) || (header.event_type.as_str() == Some("response_item")
+        && header
+            .payload
+            .as_ref()
+            .is_some_and(|payload| payload.kind.as_str() == Some("message")))
+    {
+        let value = serde_json::from_slice::<Value>(line)?;
+        apply_archive_event(cached, &value);
+    } else {
+        update_archive_timestamp(cached, header.timestamp.as_str().unwrap_or_default());
+    }
+    Ok(())
+}
+
+fn update_archive_timestamp(cached: &mut CachedRollout, timestamp: &str) {
     let millis = timestamp_ms(timestamp);
     if millis > 0 {
         if cached.snapshot.created_at_ms == 0 {
@@ -506,6 +545,14 @@ fn apply_archive_event(cached: &mut CachedRollout, value: &Value) {
         }
         cached.snapshot.updated_at_ms = cached.snapshot.updated_at_ms.max(millis);
     }
+}
+
+fn apply_archive_event(cached: &mut CachedRollout, value: &Value) {
+    let timestamp = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    update_archive_timestamp(cached, timestamp);
     match value.get("type").and_then(Value::as_str) {
         Some("session_meta") => {
             let payload = value.get("payload").unwrap_or(&Value::Null);
@@ -695,8 +742,45 @@ fn read_cache_file(path: &Path) -> ArchiveCache {
         });
     for entry in cache.files.values_mut() {
         hydrate_stream_ids(entry);
+        if !entry.pending.is_empty() {
+            entry.offset = entry.offset.saturating_sub(entry.pending.len() as u64);
+            entry.anchor.clear();
+            entry.prefix_hash = 0;
+        }
+        entry.pending = Vec::new();
     }
+    trim_message_cache(&mut cache, MAX_PROCESS_MESSAGE_BYTES);
     cache
+}
+
+/// Bound retained search excerpts across the whole archive, not only per file.
+/// Evicted excerpts remain searchable through the existing exact disk fallback.
+fn trim_message_cache(cache: &mut ArchiveCache, mut budget: usize) -> bool {
+    let mut paths: Vec<_> = cache
+        .files
+        .iter()
+        .map(|(path, entry)| (path.clone(), entry.snapshot.updated_at_ms))
+        .collect();
+    paths.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut trimmed = false;
+    for (path, _) in paths {
+        let entry = cache.files.get_mut(&path).expect("known archive file");
+        let bytes: usize = entry
+            .snapshot
+            .messages
+            .iter()
+            .map(|m| m.text.capacity())
+            .sum();
+        if bytes > budget {
+            entry.snapshot.messages = Vec::new();
+            entry.snapshot.messages_complete = false;
+            entry.indexed_message_bytes = 0;
+            trimmed = true;
+        } else {
+            budget -= bytes;
+        }
+    }
+    trimmed
 }
 
 fn hydrate_stream_ids(cached: &mut CachedRollout) {
@@ -795,16 +879,23 @@ fn load_snapshots_with(
         cache: read_cache_file(cache_path),
         merged: Vec::new(),
     });
-    let dirty = refresh_cache(&mut archive.cache, root);
+    let refreshed = refresh_cache(&mut archive.cache, root);
+    let trimmed = trim_message_cache(&mut archive.cache, MAX_PROCESS_MESSAGE_BYTES);
+    let dirty = refreshed || trimmed;
     if dirty || archive.merged.is_empty() {
-        archive.merged = merge_all(&archive.cache);
+        // Keep only listing metadata in the second index. Full text and token
+        // events already live in cache.files; cloning them here doubles retention.
+        archive.merged = merge_all(&archive.cache)
+            .iter()
+            .map(listing_snapshot)
+            .collect();
         if dirty {
             write_cache(cache_path, &archive.cache);
         }
     }
     match view {
-        SnapshotView::Full => archive.merged.clone(),
-        SnapshotView::Listing => archive.merged.iter().map(listing_snapshot).collect(),
+        SnapshotView::Full => merge_all(&archive.cache),
+        SnapshotView::Listing => archive.merged.clone(),
     }
 }
 
@@ -838,6 +929,11 @@ pub(crate) fn cached_thread_paths(sessions_root: &Path, thread_id: &str) -> Opti
 fn merge_snapshot(existing: &mut CodexRolloutSnapshot, incoming: CodexRolloutSnapshot) {
     let incoming_is_newer = (incoming.updated_at_ms, incoming.path.as_os_str())
         > (existing.updated_at_ms, existing.path.as_os_str());
+    let fallback_display = if incoming_is_newer && !incoming.display.is_empty() {
+        incoming.display.clone()
+    } else {
+        existing.display.clone()
+    };
     existing.created_at_ms = match (existing.created_at_ms, incoming.created_at_ms) {
         (0, created) | (created, 0) => created,
         (left, right) => left.min(right),
@@ -884,13 +980,17 @@ fn merge_snapshot(existing: &mut CodexRolloutSnapshot, incoming: CodexRolloutSna
         existing.parent_thread_id = incoming.parent_thread_id;
         existing.path = incoming.path;
     }
-    existing.display = existing
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-        .map(|message| truncate(message.text.trim(), MAX_DISPLAY_CHARS))
-        .unwrap_or_default();
+    existing.display = if existing.messages_complete {
+        existing
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(|message| truncate(message.text.trim(), MAX_DISPLAY_CHARS))
+            .unwrap_or(fallback_display)
+    } else {
+        fallback_display
+    };
     rebuild_token_days(existing);
 }
 
@@ -1415,6 +1515,109 @@ mod tests {
     }
 
     #[test]
+    fn process_listing_does_not_duplicate_full_archive_and_eviction_keeps_search_exact() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("session.jsonl");
+        write_rollout(
+            &path,
+            &[
+                r#"{"type":"session_meta","payload":{"id":"bounded","cwd":"/tmp","source":"cli"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"needle"}}"#,
+            ],
+        );
+        let cache_path = directory.path().join("cache.json");
+        load_listing_snapshots(&root, &cache_path);
+        let mut state = archive_state().lock().unwrap();
+        let archive = state.get_mut(&(root.clone(), cache_path.clone())).unwrap();
+        assert!(archive
+            .merged
+            .iter()
+            .all(|s| s.messages.is_empty() && s.token_events.is_empty()));
+        assert!(trim_message_cache(&mut archive.cache, 0));
+        let snapshot = &archive.cache.files.values().next().unwrap().snapshot;
+        assert!(!snapshot.messages_complete);
+        assert!(snapshot.messages.is_empty());
+        assert_eq!(
+            search_rollout(snapshot, "needle", true, false, |text, query, _| text
+                .contains(query))
+            .as_deref(),
+            Some("needle")
+        );
+    }
+
+    #[test]
+    fn merged_evicted_fragments_preserve_the_listing_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut old = empty_cached(
+            &directory.path().join("old"),
+            FileFingerprint {
+                size: 0,
+                modified_ns: 0,
+                changed_ns: 0,
+                identity: 0,
+            },
+        )
+        .snapshot;
+        old.thread_id = "same".into();
+        old.display = "old prompt".into();
+        old.updated_at_ms = 1;
+        old.messages_complete = false;
+        let mut new = old.clone();
+        new.updated_at_ms = 2;
+        new.display = "new prompt".into();
+        merge_snapshot(&mut old, new);
+        assert_eq!(old.display, "new prompt");
+    }
+
+    #[test]
+    fn incomplete_record_is_reread_without_retaining_a_large_pending_buffer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pending.jsonl");
+        let header = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"partial\"}}\n";
+        std::fs::write(&path, format!("{header}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"{}", "x".repeat(1024*1024))).unwrap();
+        let cached = refresh_rollout(&path, fingerprint(&path).unwrap(), None).unwrap();
+        assert_eq!(cached.offset, header.len() as u64);
+        assert_eq!(cached.pending.capacity(), 0);
+        let mut file = File::options().append(true).open(&path).unwrap();
+        file.write_all(b"\"}}\n").unwrap();
+        drop(file);
+        let complete = refresh_rollout(&path, fingerprint(&path).unwrap(), Some(cached)).unwrap();
+        assert!(!complete.snapshot.display.is_empty());
+        assert_eq!(complete.offset, std::fs::metadata(&path).unwrap().len());
+        assert_eq!(complete.pending.capacity(), 0);
+    }
+
+    #[test]
+    fn archive_does_not_retain_consumed_transcript_buffers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            r#"{"type":"session_meta","payload":{"id":"large","cwd":"/tmp","source":"cli"}}"#
+        )
+        .unwrap();
+        let line = format!(
+            "{{\"type\":\"response_item\",\"payload\":{{\"output\":\"{}\"}}}}\n",
+            "x".repeat(2048)
+        );
+        for _ in 0..4096 {
+            file.write_all(line.as_bytes()).unwrap();
+        }
+        drop(file);
+        let cached = refresh_rollout(&path, fingerprint(&path).unwrap(), None).unwrap();
+        assert!(cached.pending.is_empty());
+        assert!(
+            cached.pending.capacity() <= 64 * 1024,
+            "consumed transcript retained {} bytes",
+            cached.pending.capacity()
+        );
+    }
+
+    #[test]
     fn unchanged_reload_does_not_rewrite_cache() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("sessions");
@@ -1429,7 +1632,18 @@ mod tests {
         let cache_path = directory.path().join("cache.json");
         load_snapshots(&root, &cache_path);
         let first = std::fs::read(&cache_path).unwrap();
+        let sentinel = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        File::options()
+            .write(true)
+            .open(&cache_path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(sentinel))
+            .unwrap();
         let second = load_snapshots(&root, &cache_path);
+        assert_eq!(
+            std::fs::metadata(&cache_path).unwrap().modified().unwrap(),
+            sentinel
+        );
         assert_eq!(second[0].display, "hello");
         let after = std::fs::read(&cache_path).unwrap();
         assert_eq!(
@@ -1540,6 +1754,12 @@ mod tests {
             ],
         );
         let cache_path = directory.path().join("cache.json");
+        load_snapshots(&root, &cache_path);
+        // Simulate a fresh process so this exercises stream-id hydration from disk.
+        archive_state()
+            .lock()
+            .unwrap()
+            .remove(&(root.clone(), cache_path.clone()));
         let snapshots = load_snapshots(&root, &cache_path);
         let json = String::from_utf8(std::fs::read(&cache_path).unwrap()).unwrap();
         assert!(
