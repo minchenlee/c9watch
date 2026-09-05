@@ -53,7 +53,8 @@
 <style>
 	.todo-side-panel {
 		background: var(--bg-card);
-		border: 1px solid var(--border-default);
+		border: 0;
+		border-top: 1px solid var(--border-default);
 		display: flex;
 		flex-direction: column;
 		flex-shrink: 0;
