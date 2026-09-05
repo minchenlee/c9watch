@@ -29,12 +29,21 @@ struct StopGuard {
     disarmed: bool,
 }
 impl StopGuard {
-    fn new(short: String) -> Self { Self { short, disarmed: false } }
-    fn disarm(&mut self) { self.disarmed = true; }
+    fn new(short: String) -> Self {
+        Self {
+            short,
+            disarmed: false,
+        }
+    }
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
 }
 impl Drop for StopGuard {
     fn drop(&mut self) {
-        if self.disarmed { return; }
+        if self.disarmed {
+            return;
+        }
         eprintln!("[guard] cleaning up {}", self.short);
         let _ = Command::new("claude").arg("stop").arg(&self.short).status();
         let _ = Command::new("claude").arg("rm").arg(&self.short).status();
@@ -76,41 +85,58 @@ async fn bg_round_trip_inner() -> Result<()> {
 
     let mut guard = StopGuard::new(short.clone());
 
-    let stream = UnixStream::connect(&socket).await
+    let stream = UnixStream::connect(&socket)
+        .await
         .with_context(|| format!("step 3: connect to {}", socket))?;
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd).lines();
     println!("[connect] unix stream open");
 
     write_line(&mut wr, &json!({"proto":1,"op":"subscribe","short":short}))
-        .await.context("step 4: write subscribe")?;
+        .await
+        .context("step 4: write subscribe")?;
     println!("[subscribe] sent");
 
-    drain_initial_snapshot(&mut reader).await.context("step 4a: drain snapshot")?;
+    drain_initial_snapshot(&mut reader)
+        .await
+        .context("step 4a: drain snapshot")?;
 
     // Turn 1: the prompt we passed at spawn. Subscribing here catches the
     // mid-flight active→idle state patch reliably (verified manually).
-    let d1 = wait_for_idle(&mut reader, &short, "turn-1").await
+    let d1 = wait_for_idle(&mut reader, &short, "turn-1")
+        .await
         .context("step 5: wait for turn-1 idle")?;
     println!("[turn-1 detail] {:?}", d1);
 
     // Turn 2: send via the `reply` verb. Field is `text` (not message/prompt).
-    write_line(&mut wr, &json!({
-        "proto":1, "op":"reply", "short":short,
-        "text":"now say DONE in all caps and nothing else"
-    })).await.context("step 6: write turn-2 reply")?;
+    write_line(
+        &mut wr,
+        &json!({
+            "proto":1, "op":"reply", "short":short,
+            "text":"now say DONE in all caps and nothing else"
+        }),
+    )
+    .await
+    .context("step 6: write turn-2 reply")?;
     println!("[send] turn-2 reply sent");
 
-    let d2 = wait_for_idle(&mut reader, &short, "turn-2").await
+    let d2 = wait_for_idle(&mut reader, &short, "turn-2")
+        .await
         .context("step 7: wait for turn-2 idle")?;
     println!("[turn-2 detail] {:?}", d2);
 
-    let stop = Command::new("claude").arg("stop").arg(&short).status()
+    let stop = Command::new("claude")
+        .arg("stop")
+        .arg(&short)
+        .status()
         .context("step 8a: `claude stop`")?;
     println!("[stop] exit={}", stop.code().unwrap_or(-1));
     assert_eq!(stop.code().unwrap_or(-1), 0, "claude stop failed");
 
-    let rm = Command::new("claude").arg("rm").arg(&short).status()
+    let rm = Command::new("claude")
+        .arg("rm")
+        .arg(&short)
+        .status()
         .context("step 8b: `claude rm`")?;
     println!("[rm] exit={}", rm.code().unwrap_or(-1));
     assert_eq!(rm.code().unwrap_or(-1), 0, "claude rm failed");
@@ -124,7 +150,9 @@ async fn bg_round_trip_inner() -> Result<()> {
 }
 
 async fn write_line<W>(w: &mut W, v: &Value) -> Result<()>
-where W: tokio::io::AsyncWrite + Unpin {
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     w.write_all(format!("{}\n", v).as_bytes()).await?;
     Ok(())
 }
@@ -138,12 +166,19 @@ fn resolve_socket() -> Result<String> {
         .flatten()
     {
         let p = e.path().join("control.sock");
-        if p.exists() { hits.push(p.to_string_lossy().into_owned()); }
+        if p.exists() {
+            hits.push(p.to_string_lossy().into_owned());
+        }
     }
     match hits.len() {
         0 => bail!("no control.sock under {} (CC >= 2.1.145 required)", parent),
         1 => Ok(hits.remove(0)),
-        n => bail!("expected 1 host-id subdir under {}, found {}: {:?}", parent, n, hits),
+        n => bail!(
+            "expected 1 host-id subdir under {}, found {}: {:?}",
+            parent,
+            n,
+            hits
+        ),
     }
 }
 
@@ -157,11 +192,16 @@ fn spawn_bg(name: &str) -> Result<(String, String)> {
         let out = Command::new("claude")
             .args(["--bg", "--name", name, "--model", model, prompt])
             .current_dir("/tmp")
-            .stdout(Stdio::piped()).stderr(Stdio::piped())
-            .output().with_context(|| format!("spawn claude --bg --model {}", model))?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("spawn claude --bg --model {}", model))?;
         if !out.status.success() {
-            eprintln!("[spawn] model={} rejected: {}", model,
-                String::from_utf8_lossy(&out.stderr).trim());
+            eprintln!(
+                "[spawn] model={} rejected: {}",
+                model,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
             continue;
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -175,16 +215,20 @@ fn spawn_bg(name: &str) -> Result<(String, String)> {
 fn parse_short(stdout: &str) -> Result<String> {
     // "backgrounded · <8hex> [· name]" or with "(idle ...)" suffix.
     let re = Regex::new(r"backgrounded\s*[·•]\s*([0-9a-f]{8})").unwrap();
-    stdout.lines()
+    stdout
+        .lines()
         .find_map(|l| re.captures(l).map(|c| c[1].to_string()))
         .ok_or_else(|| anyhow!("no `backgrounded · <short>` line found"))
 }
 
 async fn drain_initial_snapshot<R>(reader: &mut tokio::io::Lines<BufReader<R>>) -> Result<()>
-where R: tokio::io::AsyncRead + Unpin {
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let rem = deadline.checked_duration_since(Instant::now())
+        let rem = deadline
+            .checked_duration_since(Instant::now())
             .ok_or_else(|| anyhow!("snapshot not received within 5s"))?;
         let line = match timeout(rem, reader.next_line()).await {
             Ok(Ok(Some(l))) => l,
@@ -192,10 +236,19 @@ where R: tokio::io::AsyncRead + Unpin {
             Ok(Err(e)) => bail!("read error: {}", e),
             Err(_) => bail!("snapshot not received within 5s"),
         };
-        let v: Value = match serde_json::from_str(&line) { Ok(v) => v, Err(_) => continue };
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
         if v.get("type").and_then(|x| x.as_str()) == Some("snapshot") {
-            let tempo = v.pointer("/record/tempo").and_then(|x| x.as_str()).unwrap_or("?");
-            let state = v.pointer("/record/state").and_then(|x| x.as_str()).unwrap_or("?");
+            let tempo = v
+                .pointer("/record/tempo")
+                .and_then(|x| x.as_str())
+                .unwrap_or("?");
+            let state = v
+                .pointer("/record/state")
+                .and_then(|x| x.as_str())
+                .unwrap_or("?");
             println!("[event] initial snapshot tempo={} state={}", tempo, state);
             return Ok(());
         }
@@ -208,9 +261,12 @@ where R: tokio::io::AsyncRead + Unpin {
 /// 3. `claude agents --json` poll: busy→idle transition (out-of-band)
 async fn wait_for_idle<R>(
     reader: &mut tokio::io::Lines<BufReader<R>>,
-    short: &str, label: &str,
+    short: &str,
+    label: &str,
 ) -> Result<Option<String>>
-where R: tokio::io::AsyncRead + Unpin {
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     tokio::select! {
         r = stream_or_state(reader, label) => r,
         r = poll_idle(short, label) => r,
@@ -219,21 +275,32 @@ where R: tokio::io::AsyncRead + Unpin {
 
 /// Drives the reader: returns on settled state patch OR stream-quiet.
 async fn stream_or_state<R>(
-    reader: &mut tokio::io::Lines<BufReader<R>>, label: &str,
+    reader: &mut tokio::io::Lines<BufReader<R>>,
+    label: &str,
 ) -> Result<Option<String>>
-where R: tokio::io::AsyncRead + Unpin {
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut saw_stream = false;
     let mut frames = 0u32;
     let deadline = Instant::now() + SETTLE_TIMEOUT;
     loop {
-        if Instant::now() >= deadline { bail!("{}: stream_or_state timeout", label); }
+        if Instant::now() >= deadline {
+            bail!("{}: stream_or_state timeout", label);
+        }
         match timeout(QUIET_WINDOW, reader.next_line()).await {
             Ok(Ok(Some(line))) => {
-                let v: Value = match serde_json::from_str(&line) { Ok(v) => v, Err(_) => continue };
+                let v: Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
                 match v.get("type").and_then(|x| x.as_str()) {
                     Some("stream") => {
-                        if !saw_stream { println!("[stream] {} first frame seen", label); }
-                        saw_stream = true; frames += 1;
+                        if !saw_stream {
+                            println!("[stream] {} first frame seen", label);
+                        }
+                        saw_stream = true;
+                        frames += 1;
                     }
                     Some("state") => {
                         let p = v.get("patch").cloned().unwrap_or(Value::Null);
@@ -242,8 +309,14 @@ where R: tokio::io::AsyncRead + Unpin {
                         if matches!(st, Some("done") | Some("blocked"))
                             || matches!(te, Some("idle") | Some("blocked"))
                         {
-                            let d = p.get("detail").and_then(|x| x.as_str()).map(|s| s.to_string());
-                            println!("[{} complete via state] state={:?} tempo={:?}", label, st, te);
+                            let d = p
+                                .get("detail")
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string());
+                            println!(
+                                "[{} complete via state] state={:?} tempo={:?}",
+                                label, st, te
+                            );
                             return Ok(d);
                         }
                     }
@@ -254,8 +327,10 @@ where R: tokio::io::AsyncRead + Unpin {
             Ok(Err(e)) => bail!("{}: read error: {}", label, e),
             Err(_) => {
                 if saw_stream {
-                    println!("[{} complete via stream-quiet] frames={} silence={:?}",
-                        label, frames, QUIET_WINDOW);
+                    println!(
+                        "[{} complete via stream-quiet] frames={} silence={:?}",
+                        label, frames, QUIET_WINDOW
+                    );
                     return Ok(None);
                 }
             }
@@ -274,7 +349,10 @@ async fn poll_idle(short: &str, label: &str) -> Result<Option<String>> {
         }
         let status = current_status(short)?;
         let disp = status.clone().unwrap_or_else(|| "<absent>".into());
-        if disp != last { println!("[poll] {} status={}", label, disp); last = disp.clone(); }
+        if disp != last {
+            println!("[poll] {} status={}", label, disp);
+            last = disp.clone();
+        }
         match status.as_deref() {
             Some("busy") | Some("running") | Some("active") => saw_busy = true,
             Some("idle") | Some("blocked") | Some("done") if saw_busy => {
@@ -289,15 +367,31 @@ async fn poll_idle(short: &str, label: &str) -> Result<Option<String>> {
 
 /// Returns `status` field of the agents entry whose sessionId starts with `short`.
 fn current_status(short: &str) -> Result<Option<String>> {
-    let out = Command::new("claude").args(["agents", "--json"]).output()
+    let out = Command::new("claude")
+        .args(["agents", "--json"])
+        .output()
         .context("run `claude agents --json`")?;
     if !out.status.success() {
-        bail!("claude agents --json failed: {}", String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "claude agents --json failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
-    let arr: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
-        .context("parse agents json")?;
-    Ok(arr.as_array().and_then(|a| a.iter().find(|e| {
-        e.get("sessionId").and_then(|x| x.as_str())
-            .map(|s| s.starts_with(short)).unwrap_or(false)
-    })).and_then(|e| e.get("status").and_then(|x| x.as_str()).map(|s| s.to_string())))
+    let arr: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).context("parse agents json")?;
+    Ok(arr
+        .as_array()
+        .and_then(|a| {
+            a.iter().find(|e| {
+                e.get("sessionId")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.starts_with(short))
+                    .unwrap_or(false)
+            })
+        })
+        .and_then(|e| {
+            e.get("status")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        }))
 }

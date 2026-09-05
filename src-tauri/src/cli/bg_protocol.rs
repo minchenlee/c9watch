@@ -20,7 +20,9 @@ impl Request {
     /// caller appends `\n` before send).
     pub fn to_wire(&self) -> String {
         let mut v = serde_json::to_value(self).expect("Request always serializes");
-        v.as_object_mut().unwrap().insert("proto".to_string(), serde_json::json!(1));
+        v.as_object_mut()
+            .unwrap()
+            .insert("proto".to_string(), serde_json::json!(1));
         serde_json::to_string(&v).expect("Value always serializes")
     }
 }
@@ -66,7 +68,9 @@ mod tests {
 
     #[test]
     fn subscribe_serializes_with_proto() {
-        let req = Request::Subscribe { short: "abc12345".to_string() };
+        let req = Request::Subscribe {
+            short: "abc12345".to_string(),
+        };
         let wire = req.to_wire();
         let v: serde_json::Value = serde_json::from_str(&wire).unwrap();
         assert_eq!(v["proto"], 1);
@@ -91,9 +95,7 @@ mod tests {
 
     #[test]
     fn parse_kill_ok_reply() {
-        let reply: OneShotReply = serde_json::from_str(
-            r#"{"ok":true,"op":"kill"}"#
-        ).unwrap();
+        let reply: OneShotReply = serde_json::from_str(r#"{"ok":true,"op":"kill"}"#).unwrap();
         assert!(reply.ok);
         assert_eq!(reply.op.as_deref(), Some("kill"));
     }
@@ -101,10 +103,14 @@ mod tests {
     #[test]
     fn parse_error_reply() {
         let reply: OneShotReply = serde_json::from_str(
-            r#"{"ok":false,"error":"malformed request: Invalid input","code":"EUNKNOWN"}"#
-        ).unwrap();
+            r#"{"ok":false,"error":"malformed request: Invalid input","code":"EUNKNOWN"}"#,
+        )
+        .unwrap();
         assert!(!reply.ok);
-        assert_eq!(reply.error.as_deref(), Some("malformed request: Invalid input"));
+        assert_eq!(
+            reply.error.as_deref(),
+            Some("malformed request: Invalid input")
+        );
     }
 
     #[test]

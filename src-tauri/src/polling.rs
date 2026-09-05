@@ -13,8 +13,7 @@ use tauri_plugin_notification::NotificationExt;
 
 /// Cached overlay: session_id -> spawnedBy (i.e. worker_of).
 /// Invalidated when the `~/.claude/c9watch/workers/` dir mtime changes.
-static WORKERS_OVERLAY: LazyLock<Mutex<Option<WorkersCache>>> =
-    LazyLock::new(|| Mutex::new(None));
+static WORKERS_OVERLAY: LazyLock<Mutex<Option<WorkersCache>>> = LazyLock::new(|| Mutex::new(None));
 
 struct WorkersCache {
     dir_mtime: SystemTime,
@@ -67,8 +66,12 @@ fn load_workers_overlay() -> Arc<HashMap<String, String>> {
     if let Ok(entries) = std::fs::read_dir(&workers_dir) {
         for entry in entries.flatten() {
             let meta_path = entry.path().join("meta.json");
-            let Ok(content) = std::fs::read_to_string(&meta_path) else { continue };
-            let Ok(meta) = serde_json::from_str::<WorkerMetaOverlay>(&content) else { continue };
+            let Ok(content) = std::fs::read_to_string(&meta_path) else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_str::<WorkerMetaOverlay>(&content) else {
+                continue;
+            };
             if meta.stopped_at.is_some() {
                 continue;
             }
@@ -149,14 +152,16 @@ pub fn start_polling(
                     // Overlay worker_of from ~/.claude/c9watch/workers/*/meta.json
                     let overlay = load_workers_overlay();
                     for s in sessions.iter_mut() {
-                        if let Some(by) = overlay.get(&s.id) {
-                            s.worker_of = Some(by.clone());
+                        if s.provider == crate::session::SessionProvider::ClaudeCode {
+                            if let Some(by) = overlay.get(&s.id) {
+                                s.worker_of = Some(by.clone());
+                            }
                         }
                     }
 
                     // Track current session IDs to clean up stale entries
                     let current_session_ids: HashSet<String> =
-                        sessions.iter().map(|s| s.id.clone()).collect();
+                        sessions.iter().map(|s| s.session_key.clone()).collect();
 
                     // Process status transitions and fire notifications
                     match previous_status.lock() {
@@ -164,15 +169,17 @@ pub fn start_polling(
                             if is_first_cycle {
                                 // First cycle: seed the map without notifications
                                 for session in &sessions {
-                                    prev_status_map
-                                        .insert(session.id.clone(), session.status.clone());
+                                    prev_status_map.insert(
+                                        session.session_key.clone(),
+                                        session.status.clone(),
+                                    );
                                 }
                                 is_first_cycle = false;
                             } else {
                                 // Check for status transitions
                                 for session in &sessions {
                                     if let Some(prev_status) =
-                                        prev_status_map.get(&session.id)
+                                        prev_status_map.get(&session.session_key)
                                     {
                                         // Check for notification-worthy transitions
                                         let should_notify = matches!(
@@ -188,10 +195,8 @@ pub fn start_polling(
                                             // Check cooldown to prevent duplicate notifications
                                             // from status flickering across poll cycles
                                             let on_cooldown = last_notification_time
-                                                .get(&session.id)
-                                                .map(|t| {
-                                                    t.elapsed() < notification_cooldown
-                                                })
+                                                .get(&session.session_key)
+                                                .map(|t| t.elapsed() < notification_cooldown)
                                                 .unwrap_or(false);
 
                                             if !on_cooldown {
@@ -200,10 +205,14 @@ pub fn start_polling(
                                                     &notifications_tx,
                                                     NotificationParams {
                                                         session_id: &session.id,
+                                                        session_key: &session.session_key,
+                                                        provider: session.provider,
                                                         first_prompt: &session.first_prompt,
                                                         custom_title: session
                                                             .custom_title
-                                                            .as_deref(),
+                                                            .as_deref()
+                                                            .or(session.codex_title.as_deref())
+                                                            .or(session.cursor_title.as_deref()),
                                                         session_name: &session.session_name,
                                                         status: &session.status,
                                                         pending_tool_name: session
@@ -214,7 +223,7 @@ pub fn start_polling(
                                                     },
                                                 );
                                                 last_notification_time.insert(
-                                                    session.id.clone(),
+                                                    session.session_key.clone(),
                                                     Instant::now(),
                                                 );
                                             }
@@ -222,16 +231,16 @@ pub fn start_polling(
                                     }
 
                                     // Update the status map
-                                    prev_status_map
-                                        .insert(session.id.clone(), session.status.clone());
+                                    prev_status_map.insert(
+                                        session.session_key.clone(),
+                                        session.status.clone(),
+                                    );
                                 }
                             }
 
                             // Clean up disappeared sessions
-                            prev_status_map
-                                .retain(|id, _| current_session_ids.contains(id));
-                            last_notification_time
-                                .retain(|id, _| current_session_ids.contains(id));
+                            prev_status_map.retain(|id, _| current_session_ids.contains(id));
+                            last_notification_time.retain(|id, _| current_session_ids.contains(id));
                         }
                         Err(poisoned) => {
                             crate::debug_log::log_error("Mutex poisoned, recovering...");
@@ -241,7 +250,7 @@ pub fn start_polling(
                             // Seed the map with current sessions (no notifications after recovery)
                             for session in &sessions {
                                 prev_status_map
-                                    .insert(session.id.clone(), session.status.clone());
+                                    .insert(session.session_key.clone(), session.status.clone());
                             }
                             is_first_cycle = false; // Mark as initialized
                         }
@@ -284,9 +293,7 @@ pub fn start_polling(
                                 "Full Disk Access likely needed: processes found but none have readable CWD",
                             );
                         }
-                        if let Err(e) =
-                            app_handle.emit("diagnostic-update", &diagnostics)
-                        {
+                        if let Err(e) = app_handle.emit("diagnostic-update", &diagnostics) {
                             crate::debug_log::log_error(&format!(
                                 "Failed to emit diagnostic-update: {}",
                                 e
@@ -296,10 +303,7 @@ pub fn start_polling(
                     }
                 }
                 Err(e) => {
-                    crate::debug_log::log_error(&format!(
-                        "Error detecting sessions: {}",
-                        e
-                    ));
+                    crate::debug_log::log_error(&format!("Error detecting sessions: {}", e));
                     // Continue polling even on error
                 }
             }
@@ -315,6 +319,8 @@ pub fn start_polling(
 struct NotificationMetadata {
     notification_id: i32,
     session_id: String,
+    session_key: String,
+    provider: crate::session::SessionProvider,
     pid: u32,
     project_path: String,
     title: String,
@@ -323,6 +329,8 @@ struct NotificationMetadata {
 /// Parameters for firing a notification
 struct NotificationParams<'a> {
     session_id: &'a str,
+    session_key: &'a str,
+    provider: crate::session::SessionProvider,
     first_prompt: &'a str,
     custom_title: Option<&'a str>,
     session_name: &'a str,
@@ -340,6 +348,8 @@ fn fire_notification(
 ) {
     let NotificationParams {
         session_id,
+        session_key,
+        provider,
         first_prompt,
         custom_title,
         session_name,
@@ -369,9 +379,9 @@ fn fire_notification(
         _ => return, // Should not happen based on the caller's logic
     };
 
-    // Generate a stable i32 ID from the session_id string using hash
+    // Generate a stable i32 ID from the provider-scoped key using hash
     let mut hasher = DefaultHasher::new();
-    session_id.hash(&mut hasher);
+    session_key.hash(&mut hasher);
     let notification_id = (hasher.finish() as i32).abs();
 
     // Fire native notification via Tauri plugin
@@ -390,16 +400,15 @@ fn fire_notification(
     let metadata = NotificationMetadata {
         notification_id,
         session_id: session_id.to_string(),
+        session_key: session_key.to_string(),
+        provider,
         pid,
         project_path: project_path.to_string(),
         title: title.clone(),
     };
 
     if let Err(e) = app_handle.emit("notification-fired", &metadata) {
-        crate::debug_log::log_error(&format!(
-            "Failed to emit notification-fired: {}",
-            e
-        ));
+        crate::debug_log::log_error(&format!("Failed to emit notification-fired: {}", e));
     }
 
     // Broadcast to WebSocket clients for web notifications
@@ -407,6 +416,8 @@ fn fire_notification(
         "title": title,
         "body": body,
         "sessionId": session_id,
+        "sessionKey": session_key,
+        "provider": provider,
         "pid": pid,
     });
     if let Ok(json) = serde_json::to_string(&ws_notification) {
@@ -417,6 +428,7 @@ fn fire_notification(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::SessionSource;
 
     #[cfg(unix)]
     #[test]
@@ -437,22 +449,35 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_and_enrich_sessions() {
-        // This test will only work if there are active Claude sessions
-        match detect_and_enrich_sessions() {
-            Ok((sessions, _diagnostics)) => {
-                println!("Detected {} sessions", sessions.len());
-                for session in sessions {
-                    println!(
-                        "Session: {} - {} (PID: {}, Status: {:?})",
-                        session.id, session.session_name, session.pid, session.status
-                    );
-                }
-            }
-            Err(e) => {
-                println!("Error detecting sessions: {}", e);
-            }
-        }
+    fn synthetic_cursor_detection_and_enrichment_uses_fixture_cursor_root() {
+        const SESSION_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript_dir = tmp
+            .path()
+            .join("projects")
+            .join("demo-project")
+            .join("agent-transcripts")
+            .join(SESSION_ID);
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(
+            transcript_dir.join(format!("{SESSION_ID}.jsonl")),
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>synthetic Cursor fixture</user_query>"}]}}
+"#,
+        )
+        .unwrap();
+
+        let mut source =
+            crate::session::cursor::CursorSessionSource::at_root(tmp.path().join("projects"));
+        let (detected, diagnostics) = source.detect().unwrap();
+        let (sessions, _) = enrich_detected_sessions(detected, diagnostics).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, SESSION_ID);
+        assert_eq!(
+            sessions[0].provider,
+            crate::session::SessionProvider::Cursor
+        );
+        assert_eq!(sessions[0].first_prompt, "synthetic Cursor fixture");
     }
 
     #[test]

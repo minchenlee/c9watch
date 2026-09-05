@@ -1,5 +1,7 @@
-pub mod custom_names;
+mod cache;
 pub mod codex;
+pub mod cursor;
+pub mod custom_names;
 pub mod detector;
 pub mod parser;
 pub mod permissions;
@@ -11,16 +13,44 @@ pub use detector::LegacySessionSource;
 pub mod detector_cli;
 pub use detector_cli::CliSessionSource;
 pub mod state;
-pub use state::DetectorState;
-pub use source::{
-    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionKind, SessionProvider,
-    SessionSource, SessionSurface,
-};
 pub use parser::{
     extract_messages, parse_all_entries, parse_last_n_entries, parse_sessions_index, ImageBlock,
     MessageContent, MessageType, SessionEntry, SessionIndexEntry, SessionsIndex,
 };
 pub use permissions::PermissionChecker;
+pub use source::{
+    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionIdentity, SessionKind,
+    SessionProvider, SessionSource, SessionSurface,
+};
+
+/// Rename currently mutates Claude Code's native custom-title records.
+/// Provider-aware callers must not accidentally route a Codex/Cursor ID into
+/// that Claude-only write path. `None` remains a legacy Claude request, while
+/// `validate_rename_request` adds the collision guard before any write.
+pub(crate) fn validate_rename_provider(provider: Option<SessionProvider>) -> Result<(), String> {
+    match provider {
+        Some(SessionProvider::ClaudeCode) => Ok(()),
+        None => Ok(()),
+        Some(provider) => Err(format!(
+            "renaming is only supported for Claude Code sessions; got {provider:?}"
+        )),
+    }
+}
+
+pub(crate) fn validate_rename_request(
+    provider: Option<SessionProvider>,
+    session_id: &str,
+    owners: &ProviderSourceOwners,
+) -> Result<(), String> {
+    validate_rename_provider(provider)?;
+    if provider.is_none() && owners.has_non_claude_session(session_id) {
+        return Err(format!(
+            "renaming session {session_id} requires an explicit provider because the ID collides across providers"
+        ));
+    }
+    Ok(())
+}
+pub use state::DetectorState;
 pub use status::{
     determine_status, determine_status_with_context, get_pending_tool_input, get_pending_tool_name,
     SessionStatus,
@@ -29,8 +59,8 @@ pub use status::{
 pub mod history;
 pub use history::{deep_search, get_history, DeepSearchHit, HistoryEntry};
 
-pub mod cost;
 mod codex_archive;
+pub mod cost;
 pub use cost::{get_cost_data, CostData};
 
 pub(crate) fn codex_session_ids(home: &std::path::Path, prefix: &str) -> Vec<String> {
@@ -41,8 +71,15 @@ pub(crate) fn codex_session_ids(home: &std::path::Path, prefix: &str) -> Vec<Str
         .collect()
 }
 
+pub(crate) fn cursor_session_ids(home: &std::path::Path, prefix: &str) -> Vec<String> {
+    cursor::list_session_ids(home, prefix)
+}
+
 pub mod memory;
 pub use memory::{get_memory_files, MemoryFile, ProjectMemory};
+
+mod owners;
+pub(crate) use owners::{global_provider_source_owners, ProviderSourceOwners};
 
 pub mod enrichment;
 pub use enrichment::{detect_and_enrich_sessions, Session};
@@ -55,8 +92,8 @@ pub use conversation::{get_conversation_data, Conversation, ConversationMessage}
 
 pub mod subagents;
 pub use subagents::{
-    active_subagents_for_path, all_subagents_by_session, get_subagent_transcript,
-    SubagentInfo, SubagentStatus, SubagentTranscript,
+    active_subagents_for_path, all_subagents_by_session, get_subagent_transcript, SubagentInfo,
+    SubagentStatus, SubagentTranscript,
 };
 
 use std::process::Command;
@@ -227,6 +264,42 @@ mod factory_tests {
     use super::*;
 
     #[test]
+    fn rename_provider_validation_is_claude_only() {
+        assert!(validate_rename_provider(None).is_ok());
+        assert!(validate_rename_provider(Some(SessionProvider::ClaudeCode)).is_ok());
+        assert!(validate_rename_provider(Some(SessionProvider::Codex)).is_err());
+        assert!(validate_rename_provider(Some(SessionProvider::Cursor)).is_err());
+    }
+
+    #[test]
+    fn legacy_rename_is_rejected_for_a_cross_provider_collision() {
+        const SESSION_ID: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        let temp = tempfile::tempdir().unwrap();
+        let transcript_dir = temp
+            .path()
+            .join("synthetic-project")
+            .join("agent-transcripts")
+            .join(SESSION_ID);
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(
+            transcript_dir.join(format!("{SESSION_ID}.jsonl")),
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"collision fixture"}]}}
+"#,
+        )
+        .unwrap();
+
+        let cursor =
+            crate::session::cursor::CursorSessionSource::at_root(temp.path().to_path_buf());
+        assert!(cursor.contains_session_id(SESSION_ID));
+        let owners = ProviderSourceOwners::from_test_sources(None, Some(cursor));
+
+        assert!(validate_rename_request(None, SESSION_ID, &owners).is_err());
+        assert!(
+            validate_rename_request(Some(SessionProvider::ClaudeCode), SESSION_ID, &owners).is_ok()
+        );
+    }
+
+    #[test]
     fn parse_semver_extracts_triple_from_cc_output() {
         assert_eq!(parse_semver("2.1.150 (Claude Code)\n"), Some((2, 1, 150)));
     }
@@ -238,7 +311,10 @@ mod factory_tests {
 
     #[test]
     fn parse_semver_handles_extra_text() {
-        assert_eq!(parse_semver("Claude Code 2.2.0 — build abc"), Some((2, 2, 0)));
+        assert_eq!(
+            parse_semver("Claude Code 2.2.0 — build abc"),
+            Some((2, 2, 0))
+        );
     }
 
     #[test]

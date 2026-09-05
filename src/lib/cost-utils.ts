@@ -4,6 +4,7 @@
  */
 
 import type { CostData, SessionCostRecord } from './types';
+import { providerSessionKey } from './provider';
 
 export type CostMode = 'usd' | 'tokens';
 
@@ -43,9 +44,10 @@ export function buildSessionCostMap(data: CostData | null): Map<string, SessionC
 
 	for (const day of data.dailyCosts) {
 		for (const rec of day.sessions) {
-			const existing = map.get(rec.sessionId);
+			const key = providerSessionKey(rec.provider, rec.sessionId);
+			const existing = map.get(key);
 			if (!existing) {
-				map.set(rec.sessionId, { ...rec });
+				map.set(key, { ...rec });
 			} else {
 				existing.cost += rec.cost;
 				existing.totalTokens += rec.totalTokens;
@@ -53,7 +55,7 @@ export function buildSessionCostMap(data: CostData | null): Map<string, SessionC
 				existing.cachedInputTokens = (existing.cachedInputTokens || 0) + (rec.cachedInputTokens || 0);
 				existing.outputTokens = (existing.outputTokens || 0) + (rec.outputTokens || 0);
 				existing.reasoningOutputTokens = (existing.reasoningOutputTokens || 0) + (rec.reasoningOutputTokens || 0);
-				existing.costAvailable = (existing.costAvailable ?? existing.provider !== 'codex') && (rec.costAvailable ?? rec.provider !== 'codex');
+				existing.costAvailable = (existing.costAvailable ?? (existing.provider !== 'codex' && existing.provider !== 'cursor')) && (rec.costAvailable ?? (rec.provider !== 'codex' && rec.provider !== 'cursor'));
 				if (rec.timestamp > existing.timestamp) {
 					existing.timestamp = rec.timestamp;
 					existing.model = rec.model;

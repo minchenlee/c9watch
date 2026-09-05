@@ -10,6 +10,7 @@
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
 	import { isCostAvailable } from '$lib/cost-semantics';
 	import ProviderBadge from './ProviderBadge.svelte';
+	import { providerSessionKey } from '$lib/provider';
 	import { getConversation } from '$lib/api';
 	import {
 		conversationLoad,
@@ -40,13 +41,15 @@
 
 	const sw = createSlidingWindow();
 
-	let costRecord = $derived($sessionCostMap.get(entry.sessionId));
+	let costRecord = $derived($sessionCostMap.get(providerSessionKey(entry.provider, entry.sessionId)));
 	let primaryCostLabel = $derived(
 		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, isCostAvailable(costRecord)) : null
 	);
 	let resumeCommand = $derived(
 		entry.provider === 'codex'
 			? `cd "${entry.project}" && codex resume ${entry.sessionId}`
+			: entry.provider === 'cursor'
+				? `Cursor Agent · ${entry.sessionId}`
 			: `cd "${entry.project}" && claude --resume ${entry.sessionId}`
 	);
 
@@ -55,10 +58,12 @@
 		return sw.sliceMessages(conversation.messages);
 	});
 
-	let toolsLoading = $derived(isToolsLoading(entry.sessionId, $conversationLoad));
-	let sessionLoading = $derived(isSessionLoading(entry.sessionId, $conversationLoad));
+	let toolsLoading = $derived(isToolsLoading(entry.sessionId, entry.provider, $conversationLoad));
+	let sessionLoading = $derived(isSessionLoading(entry.sessionId, entry.provider, $conversationLoad));
 	let loadLabel = $derived(
-		$conversationLoad?.sessionId === entry.sessionId ? conversationLoadLabel($conversationLoad) : null
+		isSessionLoading(entry.sessionId, entry.provider, $conversationLoad)
+			? conversationLoadLabel($conversationLoad)
+			: null
 	);
 
 	function handleNavItemClick() {
@@ -71,16 +76,21 @@
 
 	async function toggleTools() {
 		const requestedId = entry.sessionId;
+		const requestedProvider = entry.provider;
+		const requestedKey = providerSessionKey(requestedProvider, requestedId);
 		const next = !showTools;
 		if (sessionLoading) return;
-		if (next && $toolsLoadedFor !== requestedId) {
+		if (next && $toolsLoadedFor !== requestedKey) {
 			try {
-				const conv = await withConversationLoader(requestedId, 'tools', () =>
-					getConversation(requestedId, true)
+				const conv = await withConversationLoader(requestedId, requestedProvider, 'tools', () =>
+					getConversation(requestedId, requestedProvider, true)
 				);
-				if (disposed || entry.sessionId !== requestedId || conv.sessionId !== requestedId) return;
+				if (disposed ||
+					providerSessionKey(entry.provider, entry.sessionId) !== requestedKey ||
+					providerSessionKey(conv.provider ?? requestedProvider, conv.sessionId) !== requestedKey
+				) return;
 				onconversation?.(conv);
-				toolsLoadedFor.set(requestedId);
+				toolsLoadedFor.set(requestedKey);
 			} catch (error) {
 				console.error('Failed to load tools:', error);
 				return;
@@ -92,6 +102,7 @@
 
 	$effect(() => {
 		entry.sessionId;
+		entry.provider;
 		showTools = false;
 	});
 
@@ -213,7 +224,7 @@
 					<div class="header-info">
 						<div class="header-title">
 							<ProviderBadge provider={entry.provider} surface={entry.surface} />
-							<h2 id="overlay-title" class="project-name">{entry.projectName}</h2>
+							<h2 id="overlay-title" class="project-name">{entry.customTitle || entry.codexTitle || entry.cursorTitle || entry.projectName}</h2>
 						</div>
 						<div class="header-meta">
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
@@ -233,16 +244,23 @@
 					</div>
 				</div>
 
-				<button
-					type="button"
-					class="resume-chip"
-					class:copied
-					onclick={copyResumeCommand}
-					title="Click to copy resume command"
-				>
-					<span class="resume-label">{copied ? 'COPIED!' : 'RESUME'}</span>
-					<code class="resume-cmd">{resumeCommand}</code>
-				</button>
+				{#if entry.provider === 'cursor'}
+					<div class="resume-chip readonly" title="Cursor Agent transcripts are read-only">
+						<span class="resume-label">READ ONLY</span>
+						<code class="resume-cmd">Cursor Agent transcript</code>
+					</div>
+				{:else}
+					<button
+						type="button"
+						class="resume-chip"
+						class:copied
+						onclick={copyResumeCommand}
+						title="Click to copy resume command"
+					>
+						<span class="resume-label">{copied ? 'COPIED!' : 'RESUME'}</span>
+						<code class="resume-cmd">{resumeCommand}</code>
+					</button>
+				{/if}
 
 				<div class="header-actions">
 					<button
@@ -274,7 +292,7 @@
 					</button>
 				</div>
 			</header>
-			<ConversationLoadBar sessionId={entry.sessionId} />
+			<ConversationLoadBar sessionId={entry.sessionId} provider={entry.provider} />
 
 			<!-- Conversation Area -->
 			<div class="conversation-area" bind:this={messagesContainer} onscroll={handleScroll}>
@@ -504,6 +522,15 @@
 
 	.resume-chip.copied {
 		border-color: var(--accent-green);
+	}
+
+	.resume-chip.readonly {
+		cursor: default;
+		opacity: 0.8;
+	}
+
+	.resume-chip.readonly:hover {
+		border-color: var(--border-default);
 	}
 
 	.resume-label {

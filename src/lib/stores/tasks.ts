@@ -11,8 +11,9 @@ import { invoke } from '@tauri-apps/api/core';
 import { sessions } from './sessions';
 import { isTauri } from '../ws';
 import type { Task, TaskStatus } from '../types';
+import { providerOf, providerSessionKey } from '../provider';
 
-/** Raw map: session id -> ordered task list (sorted by numeric id). */
+/** Provider-scoped session key -> ordered task list (sorted by numeric id). */
 export const tasksBySession = writable<Map<string, Task[]>>(new Map());
 
 let pollHandle: ReturnType<typeof setInterval> | null = null;
@@ -24,7 +25,11 @@ function normalizeStatus(s: unknown): TaskStatus {
 
 async function refreshOnce() {
 	if (!isTauri()) return;
-	const ids = get(sessions).map((s) => s.id);
+	// TodoWrite tasks are a Claude Code namespace. Do not query or cache them
+	// for Codex/Cursor sessions whose opaque IDs may collide with Claude IDs.
+	const ids = get(sessions)
+		.filter((s) => providerOf(s) === 'claudeCode')
+		.map((s) => s.id);
 	const next = new Map<string, Task[]>();
 
 	await Promise.all(
@@ -45,7 +50,7 @@ async function refreshOnce() {
 					};
 				});
 				if (tasks.length > 0) {
-					next.set(sessionId, tasks);
+					next.set(providerSessionKey('claudeCode', sessionId), tasks);
 				}
 			} catch {
 				// Backend may be unavailable; skip silently (mirrors subagents).

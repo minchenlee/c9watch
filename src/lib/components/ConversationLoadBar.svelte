@@ -1,13 +1,19 @@
 <script lang="ts">
-	import { conversationLoad, conversationLoadPercent } from '$lib/stores/conversation-loader';
+	import type { SessionProvider } from '$lib/types';
+	import {
+		conversationLoad,
+		conversationLoadPercent,
+		isSessionLoading
+	} from '$lib/stores/conversation-loader';
 
 	interface Props {
 		sessionId: string;
+		provider?: SessionProvider;
 	}
 
-	let { sessionId }: Props = $props();
+	let { sessionId, provider }: Props = $props();
 
-	let active = $derived($conversationLoad?.sessionId === sessionId);
+	let active = $derived(isSessionLoading(sessionId, provider, $conversationLoad));
 	let percent = $derived(conversationLoadPercent($conversationLoad));
 </script>
 

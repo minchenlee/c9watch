@@ -11,7 +11,8 @@
 	const options: Array<{ value: ProviderFilterValue; label: string; short: string }> = [
 		{ value: 'all', label: 'All providers', short: 'ALL' },
 		{ value: 'claudeCode', label: 'Claude Code', short: 'CLAUDE CODE' },
-		{ value: 'codex', label: 'Codex', short: 'CODEX' }
+		{ value: 'codex', label: 'Codex', short: 'CODEX' },
+		{ value: 'cursor', label: 'Cursor', short: 'CURSOR' }
 	];
 	let dropdownOpen = $state(false);
 	let activeIndex = $state(0);
@@ -200,6 +201,7 @@
 	.option-marker { width: 5px; height: 5px; border: 1px solid var(--border-default); }
 	.option-marker.claudeCode { border-color: var(--accent-amber); background: var(--accent-amber); }
 	.option-marker.codex { border-color: var(--accent-blue); background: var(--accent-blue); }
+	.option-marker.cursor { border-color: var(--accent-purple); background: var(--accent-purple); }
 	.option-check { color: var(--text-secondary); text-align: right; }
 	.provider-select.compact { gap: 5px; }
 	.compact .select-label { font-size: 7px; }

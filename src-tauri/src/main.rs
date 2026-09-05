@@ -1,6 +1,9 @@
 // Prevents additional console window on Windows in release — GUI builds only.
 // CLI-only builds need the console for stdout/stderr output.
-#![cfg_attr(all(not(debug_assertions), feature = "gui"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), feature = "gui"),
+    windows_subsystem = "windows"
+)]
 
 fn main() {
     // CLI mode: if the first arg is a known subcommand or --help/--version,
@@ -16,8 +19,7 @@ fn main() {
             // unexpectedly launching the GUI.
             let known_commands = [
                 "list", "status", "self", "view", "history", "search", "stop", "watch", "tasks",
-                "spawn", "send", "workers", "inbox", "adopt", "daemon",
-                "cost", "help",
+                "spawn", "send", "workers", "inbox", "adopt", "daemon", "cost", "help",
             ];
             let is_cli = known_commands.contains(&first)
                 || first == "--help"

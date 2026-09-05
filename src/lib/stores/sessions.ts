@@ -10,7 +10,7 @@ import { SessionStatus } from '../types';
 import { isDemoMode } from '../demo/mode';
 import { openSession } from '../api';
 import { wsClient, useWebSocket, getStoredWsUrl, isTauri } from '../ws';
-import { resolveCodexHierarchy } from '../provider';
+import { providerSessionKey, resolveCodexHierarchy, sessionKeyOf } from '../provider';
 import { initConversationProgressListener } from './conversation-loader';
 
 /**
@@ -19,7 +19,7 @@ import { initConversationProgressListener } from './conversation-loader';
 export const sessions = writable<Session[]>([]);
 
 /**
- * Store containing the currently expanded session ID (for overlay)
+ * Store containing the currently expanded provider-scoped session key.
  */
 export const expandedSessionId = writable<string | null>(null);
 
@@ -65,9 +65,10 @@ export const workersByPm = derived(sessions, ($sessions) => {
 	const m = new Map<string, Session[]>();
 	for (const s of $sessions) {
 		if (s.workerOf) {
-			const arr = m.get(s.workerOf) ?? [];
+			const ownerKey = providerSessionKey('claudeCode', s.workerOf);
+			const arr = m.get(ownerKey) ?? [];
 			arr.push(s);
-			m.set(s.workerOf, arr);
+			m.set(ownerKey, arr);
 		}
 	}
 	return m;
@@ -82,7 +83,7 @@ export const codexSubagentsByParent = derived(codexHierarchy, ($hierarchy) => $h
 export const codexVisibleParentByChild = derived(codexSubagentsByParent, ($groups) => {
 	const parents = new Map<string, string>();
 	for (const [parentId, children] of $groups) {
-		for (const child of children) parents.set(child.id, parentId);
+		for (const child of children) parents.set(sessionKeyOf(child), parentId);
 	}
 	return parents;
 });
@@ -144,6 +145,8 @@ export const statusSummary = derived(sessions, ($sessions) => {
 interface NotificationMetadata {
 	notificationId: number;
 	sessionId: string;
+	sessionKey?: string;
+	provider?: Session['provider'];
 	pid: number;
 	projectPath: string;
 	title: string;
@@ -187,7 +190,7 @@ async function initWebSocketListeners() {
 		}
 	});
 
-	wsClient.on('notification', (data: { title: string; body: string; sessionId: string; pid: number }) => {
+	wsClient.on('notification', (data: { title: string; body: string; sessionId: string; sessionKey?: string; provider?: Session['provider']; pid: number }) => {
 		if (get(isDemoMode)) return;
 		showInAppNotification(data.title, data.body);
 	});

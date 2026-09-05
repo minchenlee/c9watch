@@ -9,7 +9,7 @@ export interface CostSummary {
 
 /** Missing availability is tolerated for older Claude payloads, but never prices Codex implicitly. */
 export function isCostAvailable(session: SessionCostRecord): boolean {
-	return session.costAvailable ?? session.provider !== 'codex';
+	return session.costAvailable ?? (session.provider !== 'codex' && session.provider !== 'cursor');
 }
 
 export function summarizeCostSessions(sessions: SessionCostRecord[]): CostSummary {

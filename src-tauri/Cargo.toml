@@ -1,7 +1,7 @@
 [package]
 name = "c9watch"
-version = "0.8.1"
-description = "Monitor and control all your Claude Code sessions from one place"
+version = "0.10.0"
+description = "Monitor and control Claude Code sessions, with Codex and Cursor Agent visibility"
 authors = ["minchenlee"]
 edition = "2021"
 
@@ -53,6 +53,7 @@ dirs = "5.0"
 chrono = "0.4"
 libc = "0.2.180"
 uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # ── GUI-only dependencies ────────────────────────────────────────────
 tauri = { version = "2", features = ["tray-icon"], optional = true }

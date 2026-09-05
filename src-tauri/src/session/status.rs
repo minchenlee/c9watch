@@ -214,17 +214,13 @@ fn is_assistant_asking_question(message: &AssistantMessage) -> bool {
 
     // Pattern 2: Last text block ends with '?' and stop_reason is end_turn
     if message.stop_reason.as_deref() == Some("end_turn") {
-        let last_text = message
-            .content
-            .iter()
-            .rev()
-            .find_map(|c| {
-                if let MessageContent::Text { text } = c {
-                    Some(text.as_str())
-                } else {
-                    None
-                }
-            });
+        let last_text = message.content.iter().rev().find_map(|c| {
+            if let MessageContent::Text { text } = c {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        });
 
         if let Some(text) = last_text {
             let trimmed = text.trim();
@@ -1199,7 +1195,10 @@ mod tests {
                 usage: None,
             },
         }];
-        assert_eq!(get_pending_tool_name(&entries), Some("Question".to_string()));
+        assert_eq!(
+            get_pending_tool_name(&entries),
+            Some("Question".to_string())
+        );
     }
 
     #[test]

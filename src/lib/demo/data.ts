@@ -198,6 +198,25 @@ export function getDemoSessions(): Session[] {
 				modified: minutesAgo(1), status: SessionStatus.Working, latestMessage: 'Validating policy state', pendingToolName: null,
 				provider: 'codex', surface: 'app', agentKind: 'internal', parentThreadId: 'demo-codex-root',
 				rootSessionId: 'demo-codex-root', internalKind: 'guardian'
+		},
+		{
+				id: 'demo-cursor-root', pid: 92001, sessionName: 'c9watch', customTitle: 'Cursor agent detection',
+				projectPath: '/Users/demo/projects/c9watch', gitBranch: 'feature/cursor-agent-detection',
+				firstPrompt: 'Detect Cursor Agent sessions and their Task subagents', summary: 'Watching Cursor transcripts',
+				messageCount: 14, modified: minutesAgo(1), status: SessionStatus.Working,
+				latestMessage: 'Parsing agent-transcripts JSONL and grouping Task subagents...', pendingToolName: null,
+				provider: 'cursor', surface: 'cursor', agentKind: 'root', rootSessionId: 'demo-cursor-root',
+				actionCapabilities: { conversation: true, open: false, stop: false, rename: false }
+		},
+		{
+				id: 'demo-cursor-subagent', pid: 92002, sessionName: 'c9watch', customTitle: null,
+				projectPath: '/Users/demo/projects/c9watch', gitBranch: 'feature/cursor-agent-detection',
+				firstPrompt: 'Explore how Cursor stores agent transcripts', summary: 'Exploring Cursor transcript layout',
+				messageCount: 6, modified: minutesAgo(1), status: SessionStatus.Working,
+				latestMessage: 'Reading ~/.cursor/projects/*/agent-transcripts...', pendingToolName: null,
+				provider: 'cursor', surface: 'cursor', agentKind: 'subagent', parentThreadId: 'demo-cursor-root',
+				rootSessionId: 'demo-cursor-root', agentNickname: 'Explore session discovery', agentRole: 'explore',
+				actionCapabilities: { conversation: true, open: false, stop: false, rename: false }
 		}
 	];
 }
@@ -213,6 +232,11 @@ export function getDemoHistoryEntries(): HistoryEntry[] {
 			sessionId: 'demo-codex-root', display: 'Implement mixed-provider monitoring',
 			timestamp: Date.now() - 12 * 60_000, project: '/Users/demo/projects/c9watch', projectName: 'c9watch',
 			customTitle: 'Codex monitoring rollout', provider: 'codex', surface: 'app'
+		},
+		{
+			sessionId: 'demo-cursor-root', display: 'Detect Cursor Agent sessions and their Task subagents',
+			timestamp: Date.now() - 4 * 60_000, project: '/Users/demo/projects/c9watch', projectName: 'c9watch',
+			customTitle: 'Cursor agent detection', provider: 'cursor', surface: 'cursor'
 		}
 	];
 }
@@ -256,6 +280,20 @@ export const demoConversations: Record<string, Conversation> = {
 		messages: [
 			{ timestamp: minutesAgo(5), messageType: 'User', content: 'Audit provider filtering across all session surfaces.' },
 			{ timestamp: minutesAgo(2), messageType: 'Assistant', content: 'History, cost, monitor, and popover now consume the same persisted provider filter.' }
+		]
+	},
+	'demo-cursor-root': {
+		sessionId: 'demo-cursor-root',
+		messages: [
+			{ timestamp: minutesAgo(4), messageType: 'User', content: 'Detect Cursor Agent sessions and their Task subagents' },
+			{ timestamp: minutesAgo(1), messageType: 'Assistant', content: 'Parsing agent-transcripts JSONL and grouping Task subagents under the parent chat.' }
+		]
+	},
+	'demo-cursor-subagent': {
+		sessionId: 'demo-cursor-subagent',
+		messages: [
+			{ timestamp: minutesAgo(3), messageType: 'User', content: 'Explore how Cursor stores agent transcripts' },
+			{ timestamp: minutesAgo(1), messageType: 'Assistant', content: 'Root chats live at <uuid>/<uuid>.jsonl; Task children are sibling files under subagents/.' }
 		]
 	},
 	'demo-1': {

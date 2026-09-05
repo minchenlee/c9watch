@@ -3,9 +3,9 @@
 #![cfg_attr(target_os = "macos", allow(clippy::unused_unit))]
 
 // ── Core modules (always compiled) ──────────────────────────────────
-pub mod session;
-pub mod debug_log;
 pub mod actions;
+pub mod debug_log;
+pub mod session;
 
 // ── GUI-only modules ────────────────────────────────────────────────
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -24,12 +24,13 @@ use actions::{open_session as open_session_action, stop_session as stop_session_
 #[cfg(feature = "gui")]
 use polling::{start_polling, Session};
 #[cfg(feature = "gui")]
-use serde::Serialize;
-#[cfg(feature = "gui")]
 use session::conversation::{Conversation, ConversationProgress};
 // Re-export for web_server.rs which uses crate::get_conversation_data
 #[cfg(feature = "gui")]
-pub use session::conversation::{get_conversation_data, get_conversation_data_with_progress};
+pub use session::conversation::{
+    get_conversation_data, get_conversation_data_for_provider,
+    get_conversation_data_for_provider_with_progress, get_conversation_data_with_progress,
+};
 #[cfg(feature = "gui")]
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "gui")]
@@ -68,8 +69,7 @@ async fn get_sessions(
         state.detect()
     };
     let (detected, diag) = detect_result.map_err(|e| format!("Detect failed: {}", e))?;
-    session::enrichment::enrich_detected_sessions(detected, diag)
-        .map(|(sessions, _)| sessions)
+    session::enrichment::enrich_detected_sessions(detected, diag).map(|(sessions, _)| sessions)
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -77,21 +77,28 @@ async fn get_sessions(
 async fn get_conversation(
     app: tauri::AppHandle,
     session_id: String,
+    provider: Option<session::SessionProvider>,
     include_tools: Option<bool>,
 ) -> Result<Conversation, String> {
     let include_tools = include_tools.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
         let emit_id = session_id.clone();
-        get_conversation_data_with_progress(&session_id, include_tools, &mut |bytes_read, bytes_total| {
-            let _ = app.emit(
-                "conversation-progress",
-                ConversationProgress {
-                    session_id: emit_id.clone(),
-                    bytes_read,
-                    bytes_total,
-                },
-            );
-        })
+        get_conversation_data_for_provider_with_progress(
+            &session_id,
+            provider,
+            include_tools,
+            &mut |bytes_read, bytes_total| {
+                let _ = app.emit(
+                    "conversation-progress",
+                    ConversationProgress {
+                        session_id: emit_id.clone(),
+                        provider,
+                        bytes_read,
+                        bytes_total,
+                    },
+                );
+            },
+        )
     })
     .await
     .map_err(|error| format!("Failed to load conversation: {error}"))?
@@ -136,10 +143,8 @@ async fn get_memory_files() -> Result<Vec<session::ProjectMemory>, String> {
 /// parsing each session's JSONL transcript for Agent/Task tool_use entries.
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
-async fn get_subagents() -> Result<
-    std::collections::HashMap<String, Vec<session::SubagentInfo>>,
-    String,
-> {
+async fn get_subagents(
+) -> Result<std::collections::HashMap<String, Vec<session::SubagentInfo>>, String> {
     Ok(session::all_subagents_by_session())
 }
 
@@ -151,8 +156,12 @@ async fn get_subagent_transcript(
     parent_session_id: String,
     subagent_id: String,
 ) -> Result<session::SubagentTranscript, String> {
-    session::get_subagent_transcript(&parent_session_id, &subagent_id)
-        .ok_or_else(|| format!("subagent {} not found in session {}", subagent_id, parent_session_id))
+    session::get_subagent_transcript(&parent_session_id, &subagent_id).ok_or_else(|| {
+        format!(
+            "subagent {} not found in session {}",
+            subagent_id, parent_session_id
+        )
+    })
 }
 
 /// Returns the parsed TodoWrite tasks for a session, sorted by numeric `id`.
@@ -175,9 +184,7 @@ async fn save_temp_image(data: String) -> Result<String, String> {
     let file_path = temp_dir.join("c9watch-token-journey.png");
 
     // data is base64-encoded PNG (no data URL prefix)
-    let bytes = data
-        .strip_prefix("data:image/png;base64,")
-        .unwrap_or(&data);
+    let bytes = data.strip_prefix("data:image/png;base64,").unwrap_or(&data);
 
     use base64::Engine;
     let decoded = base64::engine::general_purpose::STANDARD
@@ -231,20 +238,38 @@ async fn open_session(pid: u32, project_path: String) -> Result<(), String> {
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
+pub(crate) fn run_validated_rename<F>(
+    provider: Option<session::SessionProvider>,
+    session_id: &str,
+    owners: &session::ProviderSourceOwners,
+    write: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    session::validate_rename_request(provider, session_id, owners)?;
+    write()
+}
+
+#[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn rename_session(
     app: AppHandle,
     detector: tauri::State<'_, Arc<Mutex<session::DetectorState>>>,
     session_id: String,
     new_name: String,
+    provider: Option<session::SessionProvider>,
 ) -> Result<(), String> {
-    // Write to Claude Code's native JSONL format (primary)
-    write_native_custom_title(&session_id, &new_name);
+    let owners = session::global_provider_source_owners();
+    run_validated_rename(provider, &session_id, &owners, || {
+        // Write to Claude Code's native JSONL format (primary)
+        write_native_custom_title(&session_id, &new_name);
 
-    // Also write to c9watch's own custom titles (fallback for history view)
-    let mut custom_titles = session::CustomTitles::load();
-    custom_titles.set(session_id, new_name);
-    custom_titles.save()?;
+        // Also write to c9watch's own custom titles (fallback for history view)
+        let mut custom_titles = session::CustomTitles::load();
+        custom_titles.set(session_id.clone(), new_name.clone());
+        custom_titles.save()
+    })?;
 
     let detect_result = {
         let mut state = detector
@@ -313,6 +338,76 @@ pub fn write_native_custom_title(session_id: &str, title: &str) {
         "Could not find JSONL file for session {} to write native custom-title",
         session_id
     ));
+}
+
+#[cfg(all(test, not(mobile), feature = "gui"))]
+mod rename_collision_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
+
+    const SESSION_ID: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+
+    fn synthetic_cursor_owner(temp: &TempDir) -> session::ProviderSourceOwners {
+        let transcript_dir = temp
+            .path()
+            .join("synthetic-project")
+            .join("agent-transcripts")
+            .join(SESSION_ID);
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(
+            transcript_dir.join(format!("{SESSION_ID}.jsonl")),
+            b"{\"role\":\"user\",\"message\":{\"content\":[]}}\n",
+        )
+        .unwrap();
+
+        session::ProviderSourceOwners::from_test_sources(
+            None,
+            Some(session::cursor::CursorSessionSource::at_root(
+                temp.path().to_path_buf(),
+            )),
+        )
+    }
+
+    fn synthetic_codex_owner(temp: &TempDir) -> session::ProviderSourceOwners {
+        let rollout_dir = temp.path().join("2026").join("08").join("24");
+        std::fs::create_dir_all(&rollout_dir).unwrap();
+        std::fs::write(
+            rollout_dir.join(format!("rollout-synthetic-{SESSION_ID}.jsonl")),
+            b"{}\n",
+        )
+        .unwrap();
+
+        session::ProviderSourceOwners::from_test_sources(
+            Some(session::codex::CodexSessionSource::at_root(
+                temp.path().to_path_buf(),
+            )),
+            None,
+        )
+    }
+
+    fn assert_no_write_for_collision(owners: session::ProviderSourceOwners) {
+        let writes = AtomicUsize::new(0);
+        let result = run_validated_rename(None, SESSION_ID, &owners, || {
+            writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn tauri_rename_collision_rejects_before_custom_title_write_for_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_no_write_for_collision(synthetic_cursor_owner(&temp));
+    }
+
+    #[test]
+    fn tauri_rename_collision_rejects_before_custom_title_write_for_codex() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_no_write_for_collision(synthetic_codex_owner(&temp));
+    }
 }
 
 /// Get the terminal title for a session (iTerm2 only, macOS)

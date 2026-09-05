@@ -5,7 +5,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { get } from 'svelte/store';
-import type { Session, Conversation, HistoryEntry, DeepSearchHit, CostData, ProjectMemory, LogEntry } from './types';
+import type { Session, Conversation, HistoryEntry, DeepSearchHit, CostData, ProjectMemory, LogEntry, SessionProvider } from './types';
 import { isDemoMode } from './demo/mode';
 import { getDemoSessions, getDemoHistoryEntries, getDemoCostData, demoConversations } from './demo/data';
 import { wsClient, useWebSocket } from './ws';
@@ -27,6 +27,7 @@ export async function getSessions(): Promise<Session[]> {
  */
 export async function getConversation(
 	sessionId: string,
+	provider?: SessionProvider,
 	includeTools = false
 ): Promise<Conversation> {
 	if (get(isDemoMode)) {
@@ -36,10 +37,11 @@ export async function getConversation(
 	if (useWebSocket()) {
 		return await wsClient.request<Conversation>('getConversation', {
 			sessionId,
+			provider,
 			includeTools
 		});
 	}
-	return await invoke<Conversation>('get_conversation', { sessionId, includeTools });
+	return await invoke<Conversation>('get_conversation', { sessionId, provider, includeTools });
 }
 
 /**
@@ -71,14 +73,18 @@ export async function openSession(pid: number, projectPath: string): Promise<voi
 /**
  * Rename a session title
  */
-export async function renameSession(sessionId: string, newName: string): Promise<void> {
+export async function renameSession(
+	sessionId: string,
+	newName: string,
+	provider?: SessionProvider,
+): Promise<void> {
 	if (get(isDemoMode)) return;
 
 	if (useWebSocket()) {
-		await wsClient.request('renameSession', { sessionId, newName });
+		await wsClient.request('renameSession', { sessionId, newName, provider });
 		return;
 	}
-	await invoke<void>('rename_session', { sessionId, newName });
+	await invoke<void>('rename_session', { sessionId, newName, provider });
 }
 
 /**

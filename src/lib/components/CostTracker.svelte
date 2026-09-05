@@ -10,7 +10,7 @@
 	import { formatCost, formatTokens, modelDisplayName } from '$lib/cost-utils';
 	import { flyIn, fadeIn } from '$lib/transitions';
 	import { providerFilter } from '$lib/stores/provider-filter';
-	import { matchesProvider, providerFilterLabel } from '$lib/provider';
+	import { matchesProvider, providerFilterLabel, providerOf, providerSessionKey } from '$lib/provider';
 	import ProviderBadge from './ProviderBadge.svelte';
 	import { isCostAvailable, selectChartDays, summarizeCostSessions } from '$lib/cost-semantics';
 
@@ -36,26 +36,43 @@
 
 	function providerUsageValue(sessions: SessionCostRecord[], provider: SessionProvider): number {
 		return sessions
-			.filter((session) => (session.provider === 'codex' ? 'codex' : 'claudeCode') === provider)
+			.filter((session) => providerOf(session) === provider)
 			.reduce((sum, session) => {
 				if (mode === 'tokens') return sum + (session.totalTokens || 0);
 				return sum + (isCostAvailable(session) ? session.cost : 0);
 			}, 0);
 	}
 
-	function claudeUsageShare(sessions: SessionCostRecord[]): number {
-		const claude = providerUsageValue(sessions, 'claudeCode');
-		const codex = providerUsageValue(sessions, 'codex');
-		return claude + codex > 0 ? (claude / (claude + codex)) * 100 : 100;
+	function providerUsageGradient(sessions: SessionCostRecord[]): string {
+		const providers: Array<{ color: string; value: number }> = [
+			{ color: 'var(--accent-amber)', value: providerUsageValue(sessions, 'claudeCode') },
+			{ color: 'var(--accent-blue)', value: providerUsageValue(sessions, 'codex') },
+			{ color: 'var(--accent-purple)', value: providerUsageValue(sessions, 'cursor') }
+		];
+		const total = providers.reduce((sum, provider) => sum + provider.value, 0);
+		let offset = 0;
+		const stops = providers.map(({ color, value }) => {
+			const start = total > 0 ? (offset / total) * 100 : 0;
+			offset += value;
+			const end = total > 0 ? (offset / total) * 100 : 100;
+			return `${color} ${start}% ${end}%`;
+		});
+		return `linear-gradient(to top, ${stops.join(', ')})`;
 	}
 
 	function providerBreakdownLabel(sessions: SessionCostRecord[]): string {
-		const claude = providerUsageValue(sessions, 'claudeCode');
-		const codex = providerUsageValue(sessions, 'codex');
-		const total = claude + codex;
+		const providers: Array<{ label: string; provider: SessionProvider }> = [
+			{ label: 'Claude Code', provider: 'claudeCode' },
+			{ label: 'Codex', provider: 'codex' },
+			{ label: 'Cursor', provider: 'cursor' }
+		];
+		const values = providers.map(({ provider }) => providerUsageValue(sessions, provider));
+		const total = values.reduce((sum, value) => sum + value, 0);
 		const format = mode === 'tokens' ? formatTokens : formatCost;
 		const percentage = (value: number) => total > 0 ? `${((value / total) * 100).toFixed(0)}%` : '0%';
-		return `Claude Code ${format(claude)} (${percentage(claude)}), Codex ${format(codex)} (${percentage(codex)})`;
+		return providers
+			.map(({ label }, index) => `${label} ${format(values[index])} (${percentage(values[index])})`)
+			.join(', ');
 	}
 
 	function formatAggregate(cost: number, tokens: number, unpricedTokens: number): string {
@@ -68,9 +85,9 @@
 	function mergeSessionRows(sessions: SessionCostRecord[]): CostSessionRow[] {
 		const rows = new Map<string, CostSessionRow>();
 		for (const [index, session] of sessions.entries()) {
-			const provider = session.provider === 'codex' ? 'codex' : 'claudeCode';
+			const provider = providerOf(session);
 			const key = session.sessionId
-				? `${provider}:${session.sessionId}`
+				? providerSessionKey(provider, session.sessionId)
 				: `${provider}:${session.date}:${session.timestamp}:${session.model}:${index}`;
 			const unpricedTokens = isCostAvailable(session) ? 0 : session.totalTokens;
 			const model = session.model || 'unknown';
@@ -144,6 +161,7 @@
 		if (normalized.startsWith('gpt-5.4')) return 'var(--accent-red)';
 		if (normalized.startsWith('gpt-5.3-codex')) return '#a3e635';
 
+		if (provider === 'cursor') return 'var(--accent-purple)';
 		if (provider === 'codex' || normalized.startsWith('gpt-')) {
 			let hash = 0;
 			for (let i = 0; i < normalized.length; i++) {
@@ -181,6 +199,7 @@
 	});
 	let mode = $derived($costMode);
 	let hasCodexUsage = $derived(costData?.dailyCosts.some((day) => day.sessions.some((session) => session.provider === 'codex')) ?? false);
+	let hasCursorUsage = $derived(costData?.dailyCosts.some((day) => day.sessions.some((session) => session.provider === 'cursor')) ?? false);
 	let collapsedProjects = $state<Set<string>>(new Set());
 	let modelTrackWidth = $state(0);
 	let projectTrackWidth = $state(0);
@@ -302,11 +321,13 @@
 		conversation = null;
 		toolsLoadedFor.set(null);
 		try {
-			const conv = await withConversationLoader(session.sessionId, 'conversation', () =>
-				getConversation(session.sessionId, false)
+			const requestedKey = providerSessionKey(session.provider, session.sessionId);
+			const conv = await withConversationLoader(session.sessionId, session.provider, 'conversation', () =>
+				getConversation(session.sessionId, session.provider, false)
 			);
 			if (requestId !== conversationRequestId) return;
-			if (get(toolsLoadedFor) === session.sessionId) return;
+			if (get(toolsLoadedFor) === requestedKey) return;
+			if (providerSessionKey(conv.provider ?? session.provider, conv.sessionId) !== requestedKey) return;
 			conversation = conv;
 		} catch (e) {
 			console.error('Failed to load conversation:', e);
@@ -467,7 +488,7 @@
 
 		const modelMap = new Map<string, { model: string; provider: import('$lib/types').SessionProvider; cost: number; tokens: number; unpricedTokens: number }>();
 		for (const s of sessions) {
-			const provider = s.provider === 'codex' ? 'codex' : 'claudeCode';
+			const provider = providerOf(s);
 			const key = `${provider}:${s.model}`;
 			const cur = modelMap.get(key) || { model: s.model, provider, cost: 0, tokens: 0, unpricedTokens: 0 };
 			if (isCostAvailable(s)) cur.cost += s.cost;
@@ -587,13 +608,22 @@
 	/** Build a project bar with provider-specific blocks, then fill the remainder. */
 	function buildProviderBarBlocks(fillPct: number, totalCols: number, sessions: SessionCostRecord[]): Array<{ type: string }> {
 		const filled = Math.round((fillPct / 100) * totalCols);
-		const claude = providerUsageValue(sessions, 'claudeCode');
-		const codex = providerUsageValue(sessions, 'codex');
-		const total = claude + codex;
-		const claudeBlocks = total > 0 ? Math.round((claude / total) * filled) : 0;
+		const providers = [
+			{ type: 'claude', value: providerUsageValue(sessions, 'claudeCode') },
+			{ type: 'codex', value: providerUsageValue(sessions, 'codex') },
+			{ type: 'cursor', value: providerUsageValue(sessions, 'cursor') }
+		];
+		const total = providers.reduce((sum, provider) => sum + provider.value, 0);
 		const arr: Array<{ type: string }> = [];
-		for (let i = 0; i < claudeBlocks; i++) arr.push({ type: 'claude' });
-		for (let i = claudeBlocks; i < filled; i++) arr.push({ type: 'codex' });
+		for (let i = 0; i < filled && total > 0; i++) {
+			const midpoint = ((i + 0.5) / filled) * total;
+			let cumulative = 0;
+			const provider = providers.find(({ value }) => {
+				cumulative += value;
+				return midpoint <= cumulative;
+			}) ?? providers[providers.length - 1];
+			arr.push({ type: provider.type });
+		}
 		while (arr.length < totalCols) arr.push({ type: 'empty' });
 		return arr;
 	}
@@ -709,6 +739,7 @@
 			<div class="provider-usage-legend" aria-label="Cost chart provider colors">
 				<span class="provider-usage-legend-item"><span class="provider-usage-swatch claude" aria-hidden="true"></span>CLAUDE CODE</span>
 				<span class="provider-usage-legend-item"><span class="provider-usage-swatch codex" aria-hidden="true"></span>CODEX</span>
+				{#if hasCursorUsage}<span class="provider-usage-legend-item"><span class="provider-usage-swatch cursor" aria-hidden="true"></span>CURSOR</span>{/if}
 			</div>
 			{#if filteredProjectCosts.length === 0}
 				<div class="state-msg">No {providerFilterLabel($providerFilter)} usage data available.</div>
@@ -749,7 +780,7 @@
 				<div class="vchart-area">
 					{#each chronoBuckets as bucket (bucket.key)}
 						{@const barValue = mode === 'usd' ? bucket.cost : bucket.tokens}
-						{@const claudeShare = claudeUsageShare(bucket.sessions)}
+						{@const providerGradient = providerUsageGradient(bucket.sessions)}
 						<div
 							class="vchart-col"
 							onmouseenter={() => hoveredBucket = bucket.key}
@@ -768,7 +799,7 @@
 								<div
 									class="vchart-bar"
 									class:vchart-bar-empty={barValue === 0}
-									style="height: {bucketScaleMax > 0 ? (barValue / bucketScaleMax) * 100 : 0}%; --claude-share: {claudeShare}%"
+								style="height: {bucketScaleMax > 0 ? (barValue / bucketScaleMax) * 100 : 0}%; --provider-gradient: {providerGradient}"
 								></div>
 							</div>
 							<span class="vchart-label">
@@ -831,7 +862,7 @@
 							<!-- svelte-ignore a11y_click_events_have_key_events -->
 							<!-- svelte-ignore a11y_no_static_element_interactions -->
 							{@const sorted = sortSessions(proj.displaySessions)}
-							{#each expandedProjects.has(proj.project) ? sorted : sorted.slice(0, 5) as session ((session.provider ?? 'claudeCode') + '-' + session.sessionId + '-' + session.timestamp)}
+							{#each expandedProjects.has(proj.project) ? sorted : sorted.slice(0, 5) as session (providerSessionKey(session.provider, session.sessionId) + '-' + session.timestamp)}
 								<!-- svelte-ignore a11y_click_events_have_key_events -->
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<div class="session-detail" class:codex-session={session.provider === 'codex'} onclick={() => handleSessionClick(session)}>
@@ -882,7 +913,7 @@
 	/>
 {/if}
 {#if selectedEntry}
-	<HistoryCardOverlay entry={selectedEntry} {conversation} onclose={() => { selectedEntry = null; conversation = null; }} onconversation={(conv) => { if (selectedEntry?.sessionId === conv.sessionId) conversation = conv; }} />
+	<HistoryCardOverlay entry={selectedEntry} {conversation} onclose={() => { selectedEntry = null; conversation = null; }} onconversation={(conv) => { if (selectedEntry && providerSessionKey(selectedEntry.provider, selectedEntry.sessionId) === providerSessionKey(conv.provider, conv.sessionId)) conversation = conv; }} />
 {/if}
 </div>
 
@@ -992,6 +1023,15 @@
 		color: var(--accent-blue);
 		background: var(--accent-blue);
 	}
+
+	.provider-usage-swatch.cursor {
+		color: var(--accent-purple);
+		background: var(--accent-purple);
+	}
+
+	.rect.claude { background: var(--accent-amber); }
+	.rect.codex { background: var(--accent-blue); }
+	.rect.cursor { background: var(--accent-purple); }
 
 	.cost-section {
 		display: flex;
@@ -1252,11 +1292,7 @@
 				rgba(0, 0, 0, 0.2) 3px,
 				rgba(0, 0, 0, 0.2) 4px
 			),
-			linear-gradient(
-				to top,
-				var(--accent-amber) 0 var(--claude-share),
-				var(--accent-blue) var(--claude-share) 100%
-			);
+			var(--provider-gradient);
 		box-shadow: 0 0 4px color-mix(in srgb, var(--text-secondary) 30%, transparent);
 		transition: height 300ms ease;
 	}

@@ -12,8 +12,8 @@ export enum SessionStatus {
   Connecting = 'Connecting'            // Session starting up
 }
 
-export type SessionProvider = 'claudeCode' | 'codex';
-export type SessionSurface = 'claudeCode' | 'app' | 'cli' | 'exec' | 'integration' | 'unknown';
+export type SessionProvider = 'claudeCode' | 'codex' | 'cursor';
+export type SessionSurface = 'claudeCode' | 'app' | 'cli' | 'exec' | 'integration' | 'cursor' | 'unknown';
 export type AgentKind = 'root' | 'subagent' | 'internal';
 
 export interface SessionActionCapabilities {
@@ -34,6 +34,9 @@ export interface Session {
   /** Session UUID */
   id: string;
 
+  /** Provider-scoped identity; falls back to provider + id for old payloads. */
+  sessionKey?: string;
+
   /** Process ID of the running Claude instance */
   pid: number;
 
@@ -42,6 +45,12 @@ export interface Session {
 
   /** Custom title override for the session - if set, shown instead of summary/firstPrompt */
   customTitle: string | null;
+
+  /** Current Codex UI thread name from ~/.codex/session_index.jsonl. */
+  codexTitle?: string | null;
+
+  /** Current Cursor UI composer name from state.vscdb. */
+  cursorTitle?: string | null;
 
   /** Full path to project directory */
   projectPath: string;
@@ -135,6 +144,8 @@ export interface Message {
 export interface Conversation {
   /** Session ID this conversation belongs to */
   sessionId: string;
+  /** Provider namespace used to verify the response identity. */
+  provider?: SessionProvider;
 
   /** Array of messages in chronological order */
   messages: Message[];
@@ -146,6 +157,8 @@ export interface Conversation {
  */
 export interface DeepSearchHit {
   sessionId: string;
+  provider?: SessionProvider;
+  surface?: SessionSurface;
   /** ~200-char snippet from the first matching message line, with '…' padding if truncated. */
   snippet: string;
 }
@@ -156,6 +169,9 @@ export interface DeepSearchHit {
 export interface HistoryEntry {
   /** Session UUID */
   sessionId: string;
+
+  /** Provider-scoped identity for UI maps; old payloads can derive it. */
+  sessionKey?: string;
 
   /** The user's prompt text as displayed in Claude Code. May be an empty string. */
   display: string;
@@ -175,6 +191,11 @@ export interface HistoryEntry {
 
   /** Custom title override — if set, shown instead of the first prompt */
   customTitle: string | null;
+
+  /** Current Codex UI thread name from ~/.codex/session_index.jsonl. */
+  codexTitle?: string | null;
+  /** Current Cursor UI composer name from state.vscdb. */
+  cursorTitle?: string | null;
   provider?: SessionProvider;
   surface?: SessionSurface;
 }

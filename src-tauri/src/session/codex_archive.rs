@@ -1,3 +1,4 @@
+use super::cache::FileVersion;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -5,14 +6,16 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::UNIX_EPOCH;
 
-const CACHE_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 6;
 const MAX_DISPLAY_CHARS: usize = 400;
 const MAX_INDEXED_MESSAGES: usize = 20_000;
 const MAX_INDEXED_MESSAGE_CHARS: usize = 16_384;
 const MAX_INDEXED_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const FILE_ANCHOR_BYTES: usize = 256;
+const MAX_REFRESH_ATTEMPTS: usize = 3;
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
 const MAX_PROCESS_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -156,6 +159,8 @@ pub(crate) struct FileFingerprint {
     pub size: u64,
     pub modified_ns: u64,
     #[serde(default)]
+    pub changed_ns: u64,
+    #[serde(default)]
     pub identity: u64,
 }
 
@@ -174,6 +179,10 @@ struct CachedRollout {
     indexed_message_bytes: usize,
     #[serde(default)]
     anchor: Vec<u8>,
+    /// Stable hash of every byte in `[0, offset)`. The anchor is only a cheap
+    /// early rejection; this hash is the correctness check for growing files.
+    #[serde(default)]
+    prefix_hash: u64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -202,29 +211,13 @@ fn archive_state() -> &'static Mutex<HashMap<(PathBuf, PathBuf), ProcessArchive>
 }
 
 fn fingerprint(path: &Path) -> Option<FileFingerprint> {
-    let metadata = path.metadata().ok()?;
-    let modified_ns = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
-        .unwrap_or(0);
+    let version = FileVersion::read(path).ok()?;
     Some(FileFingerprint {
-        size: metadata.len(),
-        modified_ns,
-        identity: file_identity(&metadata),
+        size: version.len,
+        modified_ns: version.modified_nanos.min(u64::MAX as u128) as u64,
+        changed_ns: version.changed_nanos.min(u64::MAX as u128) as u64,
+        identity: version.identity,
     })
-}
-
-#[cfg(unix)]
-fn file_identity(metadata: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.ino()
-}
-
-#[cfg(not(unix))]
-fn file_identity(_metadata: &std::fs::Metadata) -> u64 {
-    0
 }
 
 pub(crate) fn default_sessions_root(home: &Path) -> PathBuf {
@@ -282,20 +275,24 @@ fn truncate(value: &str, limit: usize) -> String {
 
 fn message_text(value: &Value) -> Option<(String, String)> {
     let payload = value.get("payload")?;
-    if value.get("type").and_then(Value::as_str) == Some("event_msg") {
-        let kind = payload.get("type").and_then(Value::as_str)?;
-        let role = match kind {
-            "user_message" => "user",
-            "agent_message" => "assistant",
-            _ => return None,
-        };
-        let text = payload.get("message").and_then(Value::as_str)?.to_string();
-        if text.trim().is_empty() {
-            return None;
+    match value.get("type").and_then(Value::as_str) {
+        Some("event_msg") => {
+            let kind = payload.get("type").and_then(Value::as_str)?;
+            let role = match kind {
+                "user_message" => "user",
+                "agent_message" => "assistant",
+                _ => return None,
+            };
+            let text = payload.get("message").and_then(Value::as_str)?.to_string();
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some((role.to_string(), text))
         }
-        return Some((role.to_string(), text));
+        Some("response_item") => super::codex::response_item_message_text(payload)
+            .map(|(role, content, _)| (role, content)),
+        _ => None,
     }
-    None
 }
 
 fn classify_session(source: &Value, originator: &str) -> (String, String, Option<String>) {
@@ -369,23 +366,78 @@ fn empty_cached(path: &Path, fingerprint: FileFingerprint) -> CachedRollout {
         current_model: "unknown".to_string(),
         indexed_message_bytes: 0,
         anchor: Vec::new(),
+        prefix_hash: FNV_OFFSET_BASIS,
     }
 }
 
+fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn hash_file_prefix(path: &Path, length: u64) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    let mut remaining = length;
+    let mut hash = FNV_OFFSET_BASIS;
+    let mut buffer = [0; 8192];
+    while remaining > 0 {
+        let limit = remaining.min(buffer.len() as u64) as usize;
+        let read = file.read(&mut buffer[..limit]).ok()?;
+        if read == 0 {
+            return None;
+        }
+        hash = hash_bytes(hash, &buffer[..read]);
+        remaining -= read as u64;
+    }
+    Some(hash)
+}
+
+fn has_strong_fingerprint(fingerprint: FileFingerprint) -> bool {
+    super::cache::has_strong_file_stamp(u128::from(fingerprint.changed_ns), fingerprint.identity)
+}
+
 fn refresh_rollout(
+    path: &Path,
+    initial_fingerprint: FileFingerprint,
+    previous: Option<CachedRollout>,
+) -> Option<CachedRollout> {
+    let mut expected = initial_fingerprint;
+    for _ in 0..MAX_REFRESH_ATTEMPTS {
+        let cached = refresh_rollout_once(path, expected, previous.clone())?;
+        let observed = fingerprint(path)?;
+        if observed == expected {
+            return Some(cached);
+        }
+        expected = observed;
+    }
+    None
+}
+
+fn refresh_rollout_once(
     path: &Path,
     fingerprint: FileFingerprint,
     previous: Option<CachedRollout>,
 ) -> Option<CachedRollout> {
     let mut file = File::open(path).ok()?;
     let mut reset = previous.as_ref().map_or(true, |cached| {
-        fingerprint.identity != cached.fingerprint.identity
+        !has_strong_fingerprint(fingerprint)
+            || !has_strong_fingerprint(cached.fingerprint)
+            || cached.prefix_hash == 0
+            || fingerprint.identity != cached.fingerprint.identity
             || fingerprint.size < cached.offset
             || (fingerprint.size == cached.fingerprint.size
-                && fingerprint.modified_ns != cached.fingerprint.modified_ns)
+                && (fingerprint.modified_ns != cached.fingerprint.modified_ns
+                    || fingerprint.changed_ns != cached.fingerprint.changed_ns))
     });
     if !reset {
         let cached = previous.as_ref()?;
+        // The fixed-size anchor is useful for a cheap early rejection, but it
+        // cannot detect a rewrite before the last 256 bytes. Verify the whole
+        // cached prefix before appending so a middle rewrite cannot leave stale
+        // messages or token totals in the archive cache.
         if !cached.anchor.is_empty() {
             let anchor_start = cached.offset.saturating_sub(cached.anchor.len() as u64);
             file.seek(SeekFrom::Start(anchor_start)).ok()?;
@@ -393,6 +445,14 @@ fn refresh_rollout(
             if file.read_exact(&mut current).is_err() || current != cached.anchor {
                 reset = true;
             }
+        }
+        if !reset
+            && match hash_file_prefix(path, cached.offset) {
+                Some(hash) => hash != cached.prefix_hash,
+                None => true,
+            }
+        {
+            reset = true;
         }
     }
     let mut cached = if reset {
@@ -422,6 +482,7 @@ fn refresh_rollout(
                 Err(_) => {}
             }
             cached.offset += bytes as u64;
+            cached.prefix_hash = hash_bytes(cached.prefix_hash, &line);
             // A huge tool result must not keep its scratch allocation for the
             // rest of the file. No transcript buffer is stored in CachedRollout.
             if line.capacity() > 64 * 1024 {
@@ -445,6 +506,14 @@ struct ArchiveLineHeader {
     timestamp: Value,
     #[serde(default, rename = "type")]
     event_type: Value,
+    #[serde(default)]
+    payload: Option<ArchivePayloadHeader>,
+}
+
+#[derive(Deserialize)]
+struct ArchivePayloadHeader {
+    #[serde(default, rename = "type")]
+    kind: Value,
 }
 
 fn apply_archive_line(cached: &mut CachedRollout, line: &[u8]) -> Result<(), serde_json::Error> {
@@ -454,7 +523,12 @@ fn apply_archive_line(cached: &mut CachedRollout, line: &[u8]) -> Result<(), ser
     if matches!(
         header.event_type.as_str(),
         Some("session_meta" | "event_msg" | "turn_context")
-    ) {
+    ) || (header.event_type.as_str() == Some("response_item")
+        && header
+            .payload
+            .as_ref()
+            .is_some_and(|payload| payload.kind.as_str() == Some("message")))
+    {
         let value = serde_json::from_slice::<Value>(line)?;
         apply_archive_event(cached, &value);
     } else {
@@ -671,6 +745,7 @@ fn read_cache_file(path: &Path) -> ArchiveCache {
         if !entry.pending.is_empty() {
             entry.offset = entry.offset.saturating_sub(entry.pending.len() as u64);
             entry.anchor.clear();
+            entry.prefix_hash = 0;
         }
         entry.pending = Vec::new();
     }
@@ -772,11 +847,11 @@ fn refresh_cache(cache: &mut ArchiveCache, root: &Path) -> bool {
             continue;
         };
         let key = path.to_string_lossy().to_string();
-        if cache
-            .files
-            .get(&key)
-            .is_some_and(|entry| entry.fingerprint == fingerprint)
-        {
+        if cache.files.get(&key).is_some_and(|entry| {
+            entry.fingerprint == fingerprint
+                && entry.prefix_hash != 0
+                && has_strong_fingerprint(fingerprint)
+        }) {
             continue;
         }
         dirty = true;
@@ -953,7 +1028,7 @@ where
     }
 
     // The persisted message cache is intentionally bounded. For an incomplete
-    // snapshot, stream the authoritative event_msg records from every merged
+    // snapshot, stream the authoritative message records from every merged
     // rollout so deep search remains exact without retaining unbounded text.
     let mut searched = HashSet::new();
     let mut all_paths_read = true;
@@ -1122,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn response_items_are_not_used_as_display() {
+    fn response_item_messages_are_used_as_display() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("messages.jsonl");
         write_rollout(
@@ -1133,11 +1208,13 @@ mod tests {
                 r#"{"timestamp":"2026-07-13T01:02:00Z","type":"event_msg","payload":{"type":"user_message","message":"real request"}}"#,
             ],
         );
-        assert_eq!(scan_rollout(&path).unwrap().display, "real request");
+        let snapshot = scan_rollout(&path).unwrap();
+        assert_eq!(snapshot.display, "real request");
+        assert_eq!(snapshot.messages.len(), 2);
     }
 
     #[test]
-    fn deep_search_uses_cached_authoritative_messages_without_the_rollout_file() {
+    fn deep_search_includes_response_item_messages_without_the_rollout_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("search.jsonl");
         write_rollout(
@@ -1150,10 +1227,10 @@ mod tests {
         );
         let snapshot = scan_rollout(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
-        let hit = search_rollout(&snapshot, "needle", false, false, |text, query, _| {
+        let hit = search_rollout(&snapshot, "private", false, false, |text, query, _| {
             text.contains(query)
         });
-        assert_eq!(hit.as_deref(), Some("visible needle"));
+        assert_eq!(hit.as_deref(), Some("private needle"));
     }
 
     #[test]
@@ -1358,6 +1435,86 @@ mod tests {
     }
 
     #[test]
+    fn archive_cache_invalidates_same_length_rewrite_with_preserved_mtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("same-length.jsonl");
+        let old_prompt = "old prompt";
+        let new_prompt = "new prompt";
+        let session = r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"same-length","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#;
+        let old_message = format!(
+            r#"{{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{{"type":"user_message","message":"{old_prompt}"}}}}"#
+        );
+        let new_message = format!(
+            r#"{{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{{"type":"user_message","message":"{new_prompt}"}}}}"#
+        );
+        assert_eq!(old_message.len(), new_message.len());
+        std::fs::write(&path, format!("{session}\n{old_message}")).unwrap();
+        let original_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let cache_path = directory.path().join("cache.json");
+        assert_eq!(load_snapshots(&root, &cache_path)[0].display, old_prompt);
+
+        std::fs::write(&path, format!("{session}\n{new_message}")).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(original_modified)
+            .unwrap();
+        let refreshed = load_snapshots(&root, &cache_path);
+        assert_eq!(refreshed[0].display, new_prompt);
+    }
+
+    #[test]
+    fn archive_cache_detects_middle_rewrite_before_anchor_on_append() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("middle-rewrite.jsonl");
+        let old_prompt = format!("old prompt {}", "a".repeat(96));
+        let new_prompt = format!("new prompt {}", "b".repeat(96));
+        assert_eq!(old_prompt.len(), new_prompt.len());
+        let session = r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"middle-rewrite","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#;
+        let old_message = format!(
+            r#"{{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{{"type":"user_message","message":"{old_prompt}"}}}}"#
+        );
+        let stable_tail = format!(
+            r#"{{"timestamp":"2026-07-13T01:02:00Z","type":"event_msg","payload":{{"type":"agent_message","message":"{}"}}}}"#,
+            "stable tail ".repeat(48)
+        );
+        assert!(stable_tail.len() > FILE_ANCHOR_BYTES);
+        std::fs::write(&path, format!("{session}\n{old_message}\n{stable_tail}")).unwrap();
+        let cache_path = directory.path().join("cache.json");
+        assert_eq!(load_snapshots(&root, &cache_path)[0].display, old_prompt);
+
+        let new_message = format!(
+            r#"{{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{{"type":"user_message","message":"{new_prompt}"}}}}"#
+        );
+        assert_eq!(old_message.len(), new_message.len());
+        std::fs::write(&path, format!("{session}\n{new_message}\n{stable_tail}")).unwrap();
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-07-13T01:03:00Z","type":"event_msg","payload":{{"type":"agent_message","message":"appended"}}}}"#
+        )
+        .unwrap();
+
+        let refreshed = load_snapshots(&root, &cache_path);
+        assert_eq!(refreshed[0].display, new_prompt);
+        assert!(refreshed[0]
+            .messages
+            .iter()
+            .any(|message| message.text == new_prompt));
+        assert!(!refreshed[0]
+            .messages
+            .iter()
+            .any(|message| message.text == old_prompt));
+    }
+
+    #[test]
     fn process_listing_does_not_duplicate_full_archive_and_eviction_keeps_search_exact() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("sessions");
@@ -1398,6 +1555,7 @@ mod tests {
             FileFingerprint {
                 size: 0,
                 modified_ns: 0,
+                changed_ns: 0,
                 identity: 0,
             },
         )
@@ -1474,7 +1632,7 @@ mod tests {
         let cache_path = directory.path().join("cache.json");
         load_snapshots(&root, &cache_path);
         let first = std::fs::read(&cache_path).unwrap();
-        let sentinel = UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let sentinel = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
         File::options()
             .write(true)
             .open(&cache_path)

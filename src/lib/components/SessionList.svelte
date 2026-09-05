@@ -1,13 +1,14 @@
 <script lang="ts">
 	import { sessions, selectedSessionId } from '$lib/stores/sessions';
 	import SessionItem from './SessionItem.svelte';
+	import { sessionKeyOf } from '$lib/provider';
 
 	// Subscribe to stores
 	let currentSessions = $derived($sessions);
 	let currentSelectedId = $derived($selectedSessionId);
 
-	function selectSession(sessionId: string) {
-		selectedSessionId.set(sessionId);
+	function selectSession(sessionKey: string) {
+		selectedSessionId.set(sessionKey);
 	}
 </script>
 
@@ -20,16 +21,16 @@
 	<div class="list-content">
 		{#if currentSessions.length === 0}
 			<div class="empty-state">
-				<p>No active Claude sessions detected</p>
-				<p class="empty-hint">Start a Claude Code session to see it here</p>
+				<p>No active sessions detected</p>
+				<p class="empty-hint">Start a Claude Code, Codex, or Cursor Agent session to see it here</p>
 			</div>
 		{:else}
 			<div class="session-items">
-				{#each currentSessions as session (session.id)}
+				{#each currentSessions as session (sessionKeyOf(session))}
 					<SessionItem
 						{session}
-						selected={session.id === currentSelectedId}
-						onclick={() => selectSession(session.id)}
+						selected={sessionKeyOf(session) === currentSelectedId}
+						onclick={() => selectSession(sessionKeyOf(session))}
 					/>
 				{/each}
 			</div>

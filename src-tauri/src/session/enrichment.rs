@@ -1,7 +1,10 @@
+use crate::session::cache::FileVersion;
 use crate::session::codex::CodexLifecycle;
+use crate::session::cursor::CursorLifecycle;
+use crate::session::owners::global_provider_source_owners;
 use crate::session::source::{
-    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionProvider, SessionSource,
-    SessionSurface,
+    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionIdentity,
+    SessionProvider, SessionSource, SessionSurface,
 };
 use crate::session::{
     determine_status, get_pending_tool_input, get_pending_tool_name, parse_last_n_entries,
@@ -20,9 +23,17 @@ use std::sync::{LazyLock, Mutex};
 #[serde(rename_all = "camelCase")]
 pub struct Session {
     pub id: String,
+    /// Provider-scoped identity used by frontend selection and backend maps.
+    pub session_key: String,
     pub pid: u32,
     pub session_name: String,
     pub custom_title: Option<String>,
+    /// Codex's current UI thread name from ~/.codex/session_index.jsonl.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_title: Option<String>,
+    /// Cursor's current UI composer name from state.vscdb.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_title: Option<String>,
     pub project_path: String,
     pub git_branch: Option<String>,
     pub first_prompt: String,
@@ -68,28 +79,60 @@ pub struct Session {
 }
 
 /// Cache for native custom titles, keyed by file path.
-/// Stores (mtime_as_nanos, cached_title) to avoid re-scanning JSONL files every poll cycle.
-static NATIVE_TITLE_CACHE: LazyLock<Mutex<HashMap<std::path::PathBuf, (u64, Option<String>)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// The stamp includes size and, on Unix, change time and inode.  Mtime alone
+/// can be coarse or unchanged for an in-place rewrite, which would otherwise
+/// let a stale title survive in the history view.
+type NativeTitleStamp = FileVersion;
 
-/// Look up the native custom title for a session JSONL, using a mtime-based cache.
+/// Stores the file stamp and cached title to avoid re-scanning JSONL files
+/// every poll cycle while still falling back safely on weak metadata systems.
+static NATIVE_TITLE_CACHE: LazyLock<
+    Mutex<HashMap<std::path::PathBuf, (NativeTitleStamp, Option<String>)>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn native_title_stamp(path: &Path) -> Option<NativeTitleStamp> {
+    FileVersion::read(path).ok()
+}
+
+fn claude_custom_name(
+    provider: SessionProvider,
+    names: &crate::session::CustomNames,
+    session_id: &str,
+) -> Option<String> {
+    (provider == SessionProvider::ClaudeCode)
+        .then(|| names.get(session_id).cloned())
+        .flatten()
+}
+
+fn claude_custom_title(
+    provider: SessionProvider,
+    titles: &crate::session::CustomTitles,
+    session_id: &str,
+) -> Option<String> {
+    (provider == SessionProvider::ClaudeCode)
+        .then(|| titles.get(session_id).cloned())
+        .flatten()
+}
+
+/// Look up the native custom title for a session JSONL, using a strong file
+/// stamp when the platform provides one and a safe re-scan otherwise.
 pub(crate) fn get_cached_native_title(path: &Path) -> Option<String> {
-    let mtime = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
+    let Some(stamp) = native_title_stamp(path) else {
+        if let Ok(mut cache) = NATIVE_TITLE_CACHE.lock() {
+            cache.remove(path);
+        }
+        return None;
+    };
 
     if let Ok(mut cache) = NATIVE_TITLE_CACHE.lock() {
-        if let Some((cached_mtime, cached_title)) = cache.get(path) {
-            if *cached_mtime == mtime {
+        if let Some((cached_stamp, cached_title)) = cache.get(path) {
+            if *cached_stamp == stamp && stamp.supports_unchanged_fast_path() {
                 return cached_title.clone();
             }
         }
         // Cache miss or stale — re-scan
         let title = crate::session::parser::get_native_custom_title_from_file(path);
-        cache.insert(path.to_path_buf(), (mtime, title.clone()));
+        cache.insert(path.to_path_buf(), (stamp, title.clone()));
         title
     } else {
         // Mutex poisoned — fallback to direct read
@@ -120,25 +163,37 @@ pub fn merge_cli_activity(
 
 /// Detect sessions and enrich them with status and conversation data.
 /// Uses the configured backend (CLI or Legacy) via the factory.
-pub fn detect_and_enrich_sessions(
-) -> Result<(Vec<Session>, DetectionDiagnostics), String> {
+pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, DetectionDiagnostics), String> {
     let mut source = crate::session::create_session_source();
     let claude_result = source.detect();
-    let codex_result = crate::session::codex::CodexSessionSource::new()
-        .ok()
-        .and_then(|mut codex| codex.detect().ok());
+    let owners = global_provider_source_owners();
+    let codex_result = owners.detect_codex();
+    let cursor_result = owners.detect_cursor();
     match claude_result {
         Ok((mut detected, diagnostics)) => {
             if let Some((mut codex_sessions, _)) = codex_result {
                 detected.append(&mut codex_sessions);
             }
+            if let Some((mut cursor_sessions, _)) = cursor_result {
+                detected.append(&mut cursor_sessions);
+            }
             enrich_detected_sessions(detected, diagnostics)
         }
         Err(error) => {
-            if let Some((codex_sessions, diagnostics)) = codex_result {
-                if !codex_sessions.is_empty() {
-                    return enrich_detected_sessions(codex_sessions, diagnostics);
+            let mut fallback = Vec::new();
+            let mut diagnostics = DetectionDiagnostics::default();
+            if let Some((sessions, extra)) = codex_result {
+                fallback.extend(sessions);
+                diagnostics = extra;
+            }
+            if let Some((sessions, extra)) = cursor_result {
+                fallback.extend(sessions);
+                if diagnostics.claude_processes_found == 0 {
+                    diagnostics = extra;
                 }
+            }
+            if !fallback.is_empty() {
+                return enrich_detected_sessions(fallback, diagnostics);
             }
             Err(format!("Failed to detect sessions: {error}"))
         }
@@ -164,22 +219,23 @@ pub fn enrich_detected_sessions(
     let custom_names = crate::session::CustomNames::load();
     let custom_titles = crate::session::CustomTitles::load();
     let mut sessions = Vec::new();
-    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut seen_ids: HashSet<SessionIdentity> = HashSet::new();
 
     for detected in detected_sessions {
         // Get session ID - if not found, skip this session
-        let session_id = match &detected.session_id {
-            Some(id) => id.clone(),
+        let identity = match detected.identity() {
+            Some(identity) => identity,
             None => {
                 continue;
             }
         };
+        let session_id = identity.session_id.clone();
 
-        // Skip duplicate session IDs (same session can appear in multiple project dirs)
-        if seen_ids.contains(&session_id) {
+        // Skip duplicate provider-scoped identities (the same session can
+        // appear in multiple project dirs without collapsing other providers).
+        if !seen_ids.insert(identity) {
             continue;
         }
-        seen_ids.insert(session_id.clone());
 
         if let Some(summary) = detected.codex_summary.as_ref() {
             let first_prompt = summary
@@ -190,11 +246,10 @@ pub fn enrich_detected_sessions(
                 .latest_message()
                 .map(|message| truncate_string(message, 200))
                 .unwrap_or_default();
-            let session_name = custom_names
-                .get(&session_id)
-                .cloned()
+            let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
                 .or_else(|| detected.agent_nickname.clone())
                 .unwrap_or_else(|| detected.project_name.clone());
+            let codex_title = crate::session::codex::get_cached_codex_thread_title(&session_id);
             let modified = if summary.last_timestamp.is_empty() {
                 detected
                     .started_at_ms
@@ -206,9 +261,12 @@ pub fn enrich_detected_sessions(
             };
             sessions.push(Session {
                 id: session_id.clone(),
+                session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
                 pid: detected.pid,
                 session_name,
-                custom_title: custom_titles.get(&session_id).cloned(),
+                custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
+                codex_title,
+                cursor_title: None,
                 project_path: detected.cwd.to_string_lossy().to_string(),
                 git_branch: None,
                 first_prompt,
@@ -220,6 +278,74 @@ pub fn enrich_detected_sessions(
                 } else {
                     SessionStatus::WaitingForInput
                 },
+                latest_message,
+                pending_tool_name: None,
+                pending_tool_input: None,
+                worker_of: None,
+                official_name: detected.official_name.clone(),
+                started_at_ms: detected.started_at_ms,
+                provider: detected.provider,
+                surface: detected.surface,
+                agent_kind: detected.agent_kind,
+                parent_thread_id: detected.parent_thread_id.clone(),
+                root_session_id: detected.root_session_id.clone(),
+                agent_path: detected.agent_path.clone(),
+                agent_nickname: detected.agent_nickname.clone(),
+                agent_role: detected.agent_role.clone(),
+                internal_kind: detected.internal_kind.clone(),
+                can_open: detected.can_open,
+                can_stop: detected.can_stop,
+                can_rename: detected.can_rename,
+            });
+            continue;
+        }
+
+        if let Some(summary) = detected.cursor_summary.as_ref() {
+            let first_prompt = summary
+                .first_prompt()
+                .map(|prompt| truncate_string(prompt, 100))
+                .unwrap_or_else(|| "(No conversation yet)".to_string());
+            let latest_message = summary
+                .latest_message()
+                .map(|message| truncate_string(message, 200))
+                .unwrap_or_default();
+            let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
+                .or_else(|| detected.agent_nickname.clone())
+                .unwrap_or_else(|| detected.project_name.clone());
+            let modified = if summary.last_timestamp.is_empty() {
+                detected
+                    .started_at_ms
+                    .and_then(DateTime::<Utc>::from_timestamp_millis)
+                    .map(|timestamp| timestamp.to_rfc3339())
+                    .unwrap_or_default()
+            } else {
+                summary.last_timestamp.clone()
+            };
+            let status = if summary.lifecycle == CursorLifecycle::Working {
+                if summary.empty {
+                    SessionStatus::Connecting
+                } else {
+                    SessionStatus::Working
+                }
+            } else {
+                SessionStatus::WaitingForInput
+            };
+            sessions.push(Session {
+                id: session_id.clone(),
+                session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
+                pid: detected.pid,
+                session_name,
+                custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id)
+                    .or_else(|| detected.official_name.clone()),
+                codex_title: None,
+                cursor_title: summary.cursor_title.clone(),
+                project_path: detected.cwd.to_string_lossy().to_string(),
+                git_branch: None,
+                first_prompt,
+                summary: None,
+                message_count: summary.messages.len() as u32,
+                modified,
+                status,
                 latest_message,
                 pending_tool_name: None,
                 pending_tool_input: None,
@@ -275,12 +401,11 @@ pub fn enrich_detected_sessions(
             }
             None => {
                 // Session not in index or index doesn't exist - use fallback values
-                let session_file_path =
-                    detected.project_path.join(format!("{}.jsonl", session_id));
+                let session_file_path = detected.project_path.join(format!("{}.jsonl", session_id));
 
                 // Try to get first prompt from JSONL file
-                let first_prompt = get_first_prompt_from_jsonl(&session_file_path)
-                    .unwrap_or_else(|| {
+                let first_prompt =
+                    get_first_prompt_from_jsonl(&session_file_path).unwrap_or_else(|| {
                         if detected.started_at_ms.is_some() {
                             "(No conversation yet)".to_string()
                         } else {
@@ -303,8 +428,7 @@ pub fn enrich_detected_sessions(
                     })
                     .or_else(|| {
                         detected.started_at_ms.and_then(|ms| {
-                            DateTime::<Utc>::from_timestamp_millis(ms)
-                                .map(|dt| dt.to_rfc3339())
+                            DateTime::<Utc>::from_timestamp_millis(ms).map(|dt| dt.to_rfc3339())
                         })
                     })
                     .unwrap_or_default();
@@ -360,22 +484,23 @@ pub fn enrich_detected_sessions(
         }
 
         // Use custom name if available, otherwise use detected project name
-        let session_name = custom_names
-            .get(&session_id)
-            .cloned()
+        let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
             .unwrap_or(detected.project_name);
 
         // Get custom title: Claude Code native /rename takes priority over c9watch's own.
-        // Uses a static cache keyed by (path, mtime) to avoid re-scanning the JSONL every cycle.
+        // Uses a static cache keyed by path plus a strong file stamp when available.
         let native_title = get_cached_native_title(&session_file_path);
-        let custom_title =
-            native_title.or_else(|| custom_titles.get(&session_id).cloned());
+        let custom_title = native_title
+            .or_else(|| claude_custom_title(detected.provider, &custom_titles, &session_id));
 
         sessions.push(Session {
-            id: session_id,
+            id: session_id.clone(),
+            session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
             pid: detected.pid,
             session_name,
             custom_title,
+            codex_title: None,
+            cursor_title: None,
             project_path: detected.cwd.to_string_lossy().to_string(),
             git_branch,
             first_prompt,
@@ -445,9 +570,7 @@ pub fn get_first_prompt_from_jsonl_raw(path: &Path) -> Option<String> {
                         } else if let Some(arr) = content.as_array() {
                             for item in arr {
                                 if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                    if let Some(text) =
-                                        item.get("text").and_then(|t| t.as_str())
-                                    {
+                                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                                         return Some(text.to_string());
                                     }
                                 }
@@ -474,9 +597,7 @@ pub fn truncate_string(s: &str, max_chars: usize) -> String {
 }
 
 /// Extract the latest message content from session entries
-pub fn get_latest_message_from_entries(
-    entries: &[crate::session::parser::SessionEntry],
-) -> String {
+pub fn get_latest_message_from_entries(entries: &[crate::session::parser::SessionEntry]) -> String {
     if entries.is_empty() {
         return String::new();
     }
@@ -613,22 +734,27 @@ mod merge_tests {
 
     #[test]
     fn merge_preserves_needs_attention_when_busy() {
-        let merged =
-            merge_cli_activity(SessionStatus::NeedsAttention, Some(CliActivity::Busy), false);
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Busy),
+            false,
+        );
         assert_eq!(merged, SessionStatus::NeedsAttention);
     }
 
     #[test]
     fn merge_preserves_needs_attention_when_idle() {
-        let merged =
-            merge_cli_activity(SessionStatus::NeedsAttention, Some(CliActivity::Idle), false);
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Idle),
+            false,
+        );
         assert_eq!(merged, SessionStatus::NeedsAttention);
     }
 
     #[test]
     fn merge_preserves_connecting() {
-        let merged =
-            merge_cli_activity(SessionStatus::Connecting, Some(CliActivity::Busy), false);
+        let merged = merge_cli_activity(SessionStatus::Connecting, Some(CliActivity::Busy), false);
         assert_eq!(merged, SessionStatus::Connecting);
     }
 
@@ -644,15 +770,13 @@ mod merge_tests {
 
     #[test]
     fn merge_idle_downgrades_working_without_pending_tool() {
-        let merged =
-            merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), false);
+        let merged = merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), false);
         assert_eq!(merged, SessionStatus::WaitingForInput);
     }
 
     #[test]
     fn merge_idle_keeps_working_when_pending_tool() {
-        let merged =
-            merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), true);
+        let merged = merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), true);
         assert_eq!(merged, SessionStatus::Working);
     }
 
@@ -669,6 +793,7 @@ mod merge_tests {
 mod placeholder_tests {
     use super::*;
     use crate::session::source::{DetectedSession, DetectionDiagnostics, SessionKind};
+    use std::io::Write;
     use std::path::PathBuf;
 
     #[test]
@@ -700,6 +825,7 @@ mod placeholder_tests {
             can_stop: true,
             can_rename: true,
             codex_summary: None,
+            cursor_summary: None,
         };
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
@@ -707,7 +833,11 @@ mod placeholder_tests {
         let s = &sessions[0];
         assert!(!s.modified.is_empty(), "modified must not be empty");
         let parsed = DateTime::parse_from_rfc3339(&s.modified);
-        assert!(parsed.is_ok(), "modified must parse as RFC3339, got: {}", s.modified);
+        assert!(
+            parsed.is_ok(),
+            "modified must parse as RFC3339, got: {}",
+            s.modified
+        );
         assert_eq!(s.started_at_ms, Some(1_700_000_000_000));
     }
 
@@ -725,6 +855,79 @@ mod placeholder_tests {
         );
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
-        assert!(sessions.is_empty(), "legacy empty-JSONL session must be skipped");
+        assert!(
+            sessions.is_empty(),
+            "legacy empty-JSONL session must be skipped"
+        );
+    }
+
+    #[test]
+    fn provider_scoped_identity_keeps_same_id_from_codex_and_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let same_id = "same-provider-id";
+
+        let mut codex = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/codex"),
+            tmp.path().join("codex"),
+            Some(same_id.to_string()),
+            "codex".to_string(),
+        );
+        codex.provider = SessionProvider::Codex;
+        codex.surface = SessionSurface::App;
+        let mut codex_summary = crate::session::codex::CodexRolloutSummary::default();
+        codex_summary.thread_id = same_id.to_string();
+        codex.codex_summary = Some(codex_summary);
+
+        let mut cursor = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/cursor"),
+            tmp.path().join("cursor"),
+            Some(same_id.to_string()),
+            "cursor".to_string(),
+        );
+        cursor.provider = SessionProvider::Cursor;
+        cursor.surface = SessionSurface::Cursor;
+        let mut cursor_summary = crate::session::cursor::CursorTranscriptSummary::default();
+        cursor_summary.session_id = same_id.to_string();
+        cursor.cursor_summary = Some(cursor_summary);
+
+        let (sessions, _) =
+            enrich_detected_sessions(vec![codex, cursor], DetectionDiagnostics::default()).unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_key, "codex:same-provider-id");
+        assert_eq!(sessions[1].session_key, "cursor:same-provider-id");
+    }
+
+    #[test]
+    fn native_title_cache_invalidates_on_transcript_change_and_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("synthetic-claude.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"custom-title","customTitle":"first","sessionId":"synthetic"}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        assert_eq!(get_cached_native_title(&path).as_deref(), Some("first"));
+        assert_eq!(get_cached_native_title(&path).as_deref(), Some("first"));
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"custom-title","customTitle":"second","sessionId":"synthetic"}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        assert_eq!(get_cached_native_title(&path).as_deref(), Some("second"));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(get_cached_native_title(&path), None);
     }
 }

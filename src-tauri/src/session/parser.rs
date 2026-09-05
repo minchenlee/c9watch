@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Represents the sessions-index.json file structure
@@ -158,9 +158,7 @@ impl<'de> Deserialize<'de> for UserMessage {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("image/png")
                                     .to_string();
-                                if let Some(data) =
-                                    source.get("data").and_then(|v| v.as_str())
-                                {
+                                if let Some(data) = source.get("data").and_then(|v| v.as_str()) {
                                     images.push(ImageBlock {
                                         media_type,
                                         data: data.to_string(),
@@ -280,19 +278,45 @@ pub fn read_last_n_lines<P: AsRef<Path>>(path: P, n: usize) -> Result<Vec<String
         return Ok(lines[start..].to_vec());
     }
 
-    // For larger files, read from the end
-    // Estimate: average line is ~1KB, so read last n*1KB + buffer
-    let chunk_size = (n * 1024 * 2).min(file_size as usize);
+    // For larger files, read backwards in chunks until we have one complete
+    // line more than requested. A fixed byte window can begin in the middle of
+    // a valid, large JSONL record and silently drop the newest entry.
+    const REVERSE_CHUNK_BYTES: u64 = 8 * 1024;
     let mut file = file;
+    let mut position = file_size;
+    let mut chunks = Vec::new();
+    let mut newline_count = 0usize;
+    let required_newlines = n.saturating_add(1);
 
-    file.seek(SeekFrom::End(-(chunk_size as i64)))
-        .map_err(|e| format!("Failed to seek in file: {}", e))?;
+    while position > 0 {
+        let read_len = position.min(REVERSE_CHUNK_BYTES) as usize;
+        position -= read_len as u64;
+        file.seek(SeekFrom::Start(position))
+            .map_err(|e| format!("Failed to seek in file: {}", e))?;
 
-    let reader = BufReader::new(file);
-    let lines: Vec<String> = reader
+        let mut chunk = vec![0u8; read_len];
+        file.read_exact(&mut chunk)
+            .map_err(|e| format!("Failed to read JSONL chunk: {}", e))?;
+        newline_count =
+            newline_count.saturating_add(chunk.iter().filter(|byte| **byte == b'\n').count());
+        chunks.push(chunk);
+
+        if newline_count >= required_newlines {
+            break;
+        }
+    }
+
+    let total_bytes: usize = chunks.iter().map(Vec::len).sum();
+    let mut bytes = Vec::with_capacity(total_bytes);
+    for chunk in chunks.into_iter().rev() {
+        bytes.extend_from_slice(&chunk);
+    }
+
+    let content = String::from_utf8_lossy(&bytes);
+    let lines: Vec<String> = content
         .lines()
-        .map_while(Result::ok)
         .filter(|line| !line.trim().is_empty())
+        .map(ToOwned::to_owned)
         .collect();
 
     let start = if lines.len() > n { lines.len() - n } else { 0 };
@@ -434,7 +458,9 @@ fn format_system_tags(tags: &[(String, String)]) -> String {
     use std::fmt::Write;
 
     // Check if this is a slash command entry
-    let has_command_tags = tags.iter().any(|(name, _)| COMMAND_TAGS.contains(&name.as_str()));
+    let has_command_tags = tags
+        .iter()
+        .any(|(name, _)| COMMAND_TAGS.contains(&name.as_str()));
 
     if has_command_tags {
         // Format as: /command-name args
@@ -646,6 +672,7 @@ pub fn get_native_custom_title_from_file(path: &std::path::Path) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_parse_user_message() {
@@ -670,6 +697,46 @@ mod tests {
         } else {
             panic!("Failed to parse user message");
         }
+    }
+
+    #[test]
+    fn read_last_n_lines_expands_for_a_large_complete_jsonl_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large-record.jsonl");
+        let mut file = File::create(&path).unwrap();
+
+        for index in 0..20 {
+            let small_record = serde_json::json!({
+                "type": "user",
+                "uuid": format!("small-{index}"),
+                "timestamp": "2026-01-08T15:23:03.096Z",
+                "sessionId": "large",
+                "message": {"role": "user", "content": "small"}
+            });
+            writeln!(file, "{}", serde_json::to_string(&small_record).unwrap()).unwrap();
+        }
+
+        let long_content = "x".repeat(50 * 1024);
+        let long_record = serde_json::json!({
+            "type": "assistant",
+            "uuid": "large-assistant",
+            "timestamp": "2026-01-08T15:23:04.096Z",
+            "sessionId": "large",
+            "message": {
+                "model": "claude-sonnet",
+                "id": "large-message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": long_content}]
+            }
+        });
+        writeln!(file, "{}", serde_json::to_string(&long_record).unwrap()).unwrap();
+
+        let entries = parse_last_n_entries(&path, 20).unwrap();
+        assert_eq!(entries.len(), 20);
+        assert!(matches!(
+            entries.last(),
+            Some(SessionEntry::Assistant { .. })
+        ));
     }
 
     #[test]
@@ -1077,7 +1144,9 @@ mod tests {
 
     #[test]
     fn test_is_system_message_caveat() {
-        assert!(is_system_content("<local-command-caveat>Caveat: ...</local-command-caveat>"));
+        assert!(is_system_content(
+            "<local-command-caveat>Caveat: ...</local-command-caveat>"
+        ));
     }
 
     #[test]
@@ -1104,7 +1173,9 @@ mod tests {
     #[test]
     fn test_is_system_message_bash() {
         assert!(is_system_content("<bash-input>git status</bash-input>"));
-        assert!(is_system_content("<bash-stdout>On branch main</bash-stdout>"));
+        assert!(is_system_content(
+            "<bash-stdout>On branch main</bash-stdout>"
+        ));
     }
 
     #[test]

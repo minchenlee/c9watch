@@ -37,7 +37,7 @@
 	import type { DetectionDiagnostics } from '$lib/types';
 	import ProviderFilter from '$lib/components/ProviderFilter.svelte';
 	import { providerFilter } from '$lib/stores/provider-filter';
-	import { matchesProvider, providerFilterLabel } from '$lib/provider';
+	import { matchesProvider, providerFilterLabel, providerSessionKey, providerOf, sessionKeyOf } from '$lib/provider';
 
 	let demoActive = $derived($isDemoMode);
 	let showQRModal = $state(false);
@@ -45,7 +45,7 @@
 	let needsConnection = $state(!isTauri());
 
 	let sessions = $derived($sortedSessions);
-	let activeSessionIds = $derived(new Set(sessions.map((s) => s.id)));
+	let activeSessionIds = $derived(new Set(sessions.map((s) => sessionKeyOf(s))));
 	let summary = $derived($statusSummary);
 	let expandedId = $derived($expandedSessionId);
 	let conversation = $derived($currentConversation);
@@ -267,7 +267,7 @@
 	// records render as ordinary sessions and the HUMANS/WORKERS split is gone.
 	let filteredSessions = $derived.by(() => {
 		const providerSessions = sessions
-			.filter((session) => $visibleTopLevelSessionIds.has(session.id))
+			.filter((session) => $visibleTopLevelSessionIds.has(sessionKeyOf(session)))
 			.filter((session) => matchesProvider(session, $providerFilter));
 		return !PM_ORCHESTRATION_ENABLED
 			? providerSessions
@@ -316,7 +316,7 @@
 		).length
 	});
 
-	let expandedSession = $derived(sessions.find((s) => s.id === expandedId) || null);
+	let expandedSession = $derived(sessions.find((s) => sessionKeyOf(s) === expandedId) || null);
 
 	$effect(() => {
 		if (expandedSession && !matchesProvider(expandedSession, $providerFilter)) {
@@ -329,12 +329,17 @@
 		const sessionId = expandedId;
 		const requestId = ++conversationRequestId;
 		currentConversation.set(null);
-		toolsLoadedFor.set(null);
-		if (sessionId) {
-			withConversationLoader(sessionId, 'conversation', () => getConversation(sessionId, false))
+		const selected = expandedSession;
+		if (sessionId && selected) {
+			const selectedKey = sessionKeyOf(selected);
+			toolsLoadedFor.set(null);
+			withConversationLoader(selected.id, selected.provider, 'conversation', () =>
+				getConversation(selected.id, selected.provider, false)
+			)
 				.then((conv) => {
-					if (requestId !== conversationRequestId || conv.sessionId !== sessionId) return;
-					if (get(toolsLoadedFor) === sessionId) return;
+					if (requestId !== conversationRequestId) return;
+					if (get(toolsLoadedFor) === selectedKey) return;
+					if (providerSessionKey(conv.provider ?? providerOf(selected), conv.sessionId) !== selectedKey) return;
 					currentConversation.set(conv);
 				})
 				.catch((error) => {
@@ -345,7 +350,7 @@
 	});
 
 	function handleExpand(session: Session) {
-		expandedSessionId.set(session.id);
+		expandedSessionId.set(sessionKeyOf(session));
 	}
 
 	function handleClose() {
@@ -455,7 +460,7 @@
 				<span class="drag-dots" transition:fade={{ duration: 250 }}>⠿ ⠿ ⠿</span>
 			{/if}
 		</div>
-		<div class="global-provider-filter"><ProviderFilter compact /></div>
+		<div class="global-provider-filter"><ProviderFilter compact variant="select" /></div>
 		<button
 			class="tab-btn"
 			class:active={activeTab === 'settings'}
@@ -629,7 +634,7 @@
 							</div>
 						{:else}
 							<h2>No {providerFilterLabel($providerFilter)} Sessions</h2>
-							<p>{ $providerFilter === 'all' ? 'Start a Claude Code or Codex session' : `Start a ${providerFilterLabel($providerFilter)} session` }</p>
+							<p>{ $providerFilter === 'all' ? 'Start a Claude Code, Codex, or Cursor Agent session' : `Start a ${providerFilterLabel($providerFilter)} session` }</p>
 							<div class="empty-hint">
 								<span class="hint-icon">
 									<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -664,7 +669,7 @@
 										<span class="status-count">{group.attention.length}</span>
 									</div>
 									<div class="session-grid">
-										{#each group.attention as session, i (session.id)}
+						{#each group.attention as session, i (sessionKeyOf(session))}
 											<div
 												class="card-wrapper"
 												in:flyIn|global={{ index: baseIdx + 1 + i }}
@@ -691,7 +696,7 @@
 										<span class="status-count">{group.idle.length}</span>
 									</div>
 									<div class="session-grid">
-										{#each group.idle as session, i (session.id)}
+						{#each group.idle as session, i (sessionKeyOf(session))}
 											<div
 												class="card-wrapper"
 												in:flyIn|global={{ index: baseIdx + 1 + group.attention.length + i }}
@@ -718,7 +723,7 @@
 										<span class="status-count">{group.working.length}</span>
 									</div>
 									<div class="session-grid">
-										{#each group.working as session, i (session.id)}
+						{#each group.working as session, i (sessionKeyOf(session))}
 											<div
 												class="card-wrapper"
 												in:flyIn|global={{ index: baseIdx + 1 + group.attention.length + group.idle.length + i }}
@@ -752,7 +757,7 @@
 							</div>
 
 							<div class="all-sessions-grid" class:compact={isCompact}>
-								{#each group.sessions as session, i (session.id)}
+					{#each group.sessions as session, i (sessionKeyOf(session))}
 									<div
 										class="card-wrapper"
 										in:flyIn|global={{ index: baseIdx + 1 + i }}

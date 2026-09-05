@@ -52,6 +52,7 @@
 	import { getSessionStatusColor, getSessionStatusLabel, getSubagentStatusColor, getSubagentStatusLabel, getWorkerStatusColor, getWorkerStatusLabel } from '$lib/status-utils';
 	import { isTauri } from '$lib/ws';
 	import ProviderBadge from './ProviderBadge.svelte';
+	import { canSessionAction, providerOf, providerSessionKey, sessionKeyOf } from '$lib/provider';
 	import { getConversation } from '$lib/api';
 	import {
 		conversationLoad,
@@ -62,7 +63,6 @@
 		withConversationLoader
 	} from '$lib/stores/conversation-loader';
 	import ConversationLoadBar from './ConversationLoadBar.svelte';
-	import { canSessionAction } from '$lib/provider';
 
 	interface Props {
 		session: Session;
@@ -112,10 +112,12 @@
 		).length;
 	});
 
-	let toolsLoading = $derived(isToolsLoading(session.id, $conversationLoad));
-	let sessionLoading = $derived(isSessionLoading(session.id, $conversationLoad));
+	let toolsLoading = $derived(isToolsLoading(session.id, providerOf(session), $conversationLoad));
+	let sessionLoading = $derived(isSessionLoading(session.id, providerOf(session), $conversationLoad));
 	let loadLabel = $derived(
-		$conversationLoad?.sessionId === session.id ? conversationLoadLabel($conversationLoad) : null
+		isSessionLoading(session.id, providerOf(session), $conversationLoad)
+			? conversationLoadLabel($conversationLoad)
+			: null
 	);
 
 	// Stagger messages only on the overlay's first render. After that,
@@ -135,16 +137,21 @@
 
 	async function toggleTools() {
 		const requestedId = session.id;
+		const requestedProvider = providerOf(session);
+		const requestedKey = providerSessionKey(requestedProvider, requestedId);
 		const next = !showTools;
 		if (sessionLoading) return;
-		if (next && $toolsLoadedFor !== requestedId) {
+		if (next && $toolsLoadedFor !== requestedKey) {
 			try {
-				const conv = await withConversationLoader(requestedId, 'tools', () =>
-					getConversation(requestedId, true)
+				const conv = await withConversationLoader(requestedId, requestedProvider, 'tools', () =>
+					getConversation(requestedId, requestedProvider, true)
 				);
-				if (disposed || session.id !== requestedId || conv.sessionId !== requestedId) return;
+				if (disposed ||
+					providerSessionKey(providerOf(session), session.id) !== requestedKey ||
+					providerSessionKey(conv.provider ?? requestedProvider, conv.sessionId) !== requestedKey
+				) return;
 				currentConversation.set(conv);
-				toolsLoadedFor.set(requestedId);
+				toolsLoadedFor.set(requestedKey);
 			} catch (error) {
 				console.error('Failed to load tools:', error);
 				return;
@@ -156,6 +163,7 @@
 
 	$effect(() => {
 		session.id;
+		providerOf(session);
 		showTools = false;
 	});
 
@@ -206,7 +214,7 @@
 		}
 	});
 
-	let costRecord = $derived($sessionCostMap.get(session.id));
+	let costRecord = $derived($sessionCostMap.get(sessionKeyOf(session)));
 	let primaryCostLabel = $derived(
 		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, isCostAvailable(costRecord)) : null
 	);
@@ -217,11 +225,12 @@
 
 	// resolvedWorkers works for both PM (views own workers) and a worker
 	// (views siblings under the same PM). Highlights the current session in the list.
-	// When the session is a PM, workerOf is null, so we fall back to session.id
+	// When the session is a PM, workerOf is null, so we fall back to its
+	// provider-scoped key
 	// and resolvedWorkers IS myWorkers; the PM badge shows when length > 0 and
 	// workerOf is null (i.e. this session is itself the PM).
 	let resolvedWorkers = $derived(
-		$workersByPm.get(session.workerOf ?? session.id) ?? []
+		$workersByPm.get(session.workerOf ? providerSessionKey('claudeCode', session.workerOf) : sessionKeyOf(session)) ?? []
 	);
 	let isPm = $derived(
 		PM_ORCHESTRATION_ENABLED && !session.workerOf && resolvedWorkers.length > 0
@@ -230,14 +239,20 @@
 		PM_ORCHESTRATION_ENABLED && resolvedWorkers.length > 0
 	);
 
+	function subagentKey(subagent: SubagentInfo): string {
+		return providerSessionKey(subagent.provider, subagent.id);
+	}
+
 	let mySubagents = $derived([
-		...($visibleSubagentsBySession.get(session.id) ?? []),
-		...($codexSubagentsByParent.get(session.id) ?? []).map((child): SubagentInfo => ({
+		// The Claude subagent endpoint is Claude-only and still keys its response
+		// by the raw Claude session ID. Never consult it for another provider.
+		...(providerOf(session) === 'claudeCode' ? ($visibleSubagentsBySession.get(providerSessionKey('claudeCode', session.id)) ?? []) : []),
+		...($codexSubagentsByParent.get(sessionKeyOf(session)) ?? []).map((child): SubagentInfo => ({
 			id: child.id,
 			sessionId: child.id,
-			provider: 'codex',
+			provider: providerOf(child),
 			agentType: child.agentRole || child.agentNickname || 'subagent',
-			description: child.agentNickname || child.summary || child.firstPrompt || child.agentRole || 'Codex subagent',
+				description: child.agentNickname || child.codexTitle || child.cursorTitle || child.summary || child.firstPrompt || child.agentRole || (providerOf(child) === 'cursor' ? 'Cursor subagent' : 'Codex subagent'),
 			startedAt: child.startedAtMs ? new Date(child.startedAtMs).toISOString() : child.modified,
 			completedAt: child.status === SessionStatus.Working ? null : child.modified,
 			parentSessionId: session.id,
@@ -245,19 +260,19 @@
 		}))
 	]);
 	let hasSubagents = $derived(mySubagents.length > 0);
-	let visibleCodexParentId = $derived($codexVisibleParentByChild.get(session.id) ?? null);
+	let visibleCodexParentId = $derived($codexVisibleParentByChild.get(sessionKeyOf(session)) ?? null);
 	let subagentsCollapsed = $state(false);
 
 	// Subagent preview: when set, the conversation area renders a synthesized
 	// transcript (prompt + result) for the clicked subagent instead of the
 	// parent session's messages.
 	//
-	// State is keyed by parent session id in a module-level Svelte rune map so
+	// State is keyed by the parent provider-scoped key in a module-level Svelte rune map so
 	// that re-renders triggered by store updates (new JSONL events arriving)
 	// do NOT reset the preview. Switching sessions naturally shows a fresh
 	// (empty) preview because the key changes.
 	let previewState = $derived(
-		previewStateBySession.get(session.id) ?? {
+		previewStateBySession.get(sessionKeyOf(session)) ?? {
 			selection: null,
 			transcript: null,
 			loading: false,
@@ -270,11 +285,12 @@
 	let previewError = $derived(previewState.error);
 
 	async function openSubagentPreview(sa: SubagentInfo) {
-		if (sa.provider === 'codex' && sa.sessionId) {
-			expandedSessionId.set(sa.sessionId);
+		if ((sa.provider === 'codex' || sa.provider === 'cursor') && sa.sessionId) {
+			expandedSessionId.set(providerSessionKey(sa.provider, sa.sessionId));
 			return;
 		}
-		const sid = session.id;
+		const sid = sessionKeyOf(session);
+		const rawParentSessionId = session.id;
 		const initialState: PreviewState = {
 			selection: sa,
 			transcript: null,
@@ -294,13 +310,13 @@
 
 		try {
 			const tr = await invoke<SubagentTranscript>('get_subagent_transcript', {
-				parentSessionId: sid,
+				parentSessionId: rawParentSessionId,
 				subagentId: sa.id,
 			});
 			// Guard: user may have switched to a different selection before
 			// this resolved. Only commit if the selection is still this one.
 			const current = previewStateBySession.get(sid);
-			if (current?.selection?.id === sa.id) {
+			if (current?.selection && subagentKey(current.selection) === subagentKey(sa)) {
 				previewStateBySession.set(sid, {
 					...current,
 					transcript: tr,
@@ -308,7 +324,7 @@
 			}
 		} catch (err) {
 			const current = previewStateBySession.get(sid);
-			if (current?.selection?.id === sa.id) {
+			if (current?.selection && subagentKey(current.selection) === subagentKey(sa)) {
 				previewStateBySession.set(sid, {
 					...current,
 					error: String(err),
@@ -316,7 +332,7 @@
 			}
 		} finally {
 			const current = previewStateBySession.get(sid);
-			if (current?.selection?.id === sa.id) {
+			if (current?.selection && subagentKey(current.selection) === subagentKey(sa)) {
 				previewStateBySession.set(sid, {
 					...current,
 					loading: false,
@@ -326,12 +342,12 @@
 	}
 
 	function closeSubagentPreview() {
-		const sid = session.id;
+		const sid = sessionKeyOf(session);
 		previewStateBySession.delete(sid);
 	}
 
-	function openWorker(id: string) {
-		expandedSessionId.set(id);
+	function openWorker(worker: Session) {
+		expandedSessionId.set(sessionKeyOf(worker));
 	}
 
 
@@ -388,7 +404,7 @@
 								onmouseenter={() => tipEnter(session.id)}
 								onmouseleave={tipLeave}
 								onmousemove={tipMove}
-							>{session.customTitle || session.summary || session.firstPrompt || 'New Session'}</h2>
+							>{session.customTitle || session.officialName || session.codexTitle || session.cursorTitle || session.summary || session.firstPrompt || 'New Session'}</h2>
 							{#if PM_ORCHESTRATION_ENABLED && session.workerOf}
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<span
@@ -506,7 +522,7 @@
 					</button>
 				</div>
 			</header>
-			<ConversationLoadBar sessionId={session.id} />
+			<ConversationLoadBar sessionId={session.id} provider={providerOf(session)} />
 
 			{#if tooltipText}
 				<div class="id-tooltip" style="left: {tooltipX}px; top: {tooltipY}px;">
@@ -669,17 +685,17 @@
 					</button>
 					{#if !workersCollapsed}
 						{#if session.workerOf}
-							<button class="back-to-pm" onclick={() => expandedSessionId.set(session.workerOf!)}>← Back to PM</button>
+							<button class="back-to-pm" onclick={() => expandedSessionId.set(providerSessionKey('claudeCode', session.workerOf!))}>← Back to PM</button>
 						{/if}
 						<div class="workers-list">
-							{#each resolvedWorkers as w (w.id)}
+							{#each resolvedWorkers as w (sessionKeyOf(w))}
 								<button
 									type="button"
 									class="worker-row"
-									class:active={w.id === session.id}
-									onclick={() => openWorker(w.id)}
+									class:active={sessionKeyOf(w) === sessionKeyOf(session)}
+									onclick={() => openWorker(w)}
 								>
-									<span class="worker-name">{w.customTitle || w.summary || w.sessionName}</span>
+								<span class="worker-name">{w.customTitle || w.codexTitle || w.cursorTitle || w.summary || w.sessionName}</span>
 									<span class="worker-status" style="color: {getWorkerStatusColor(w.status)}">
 										{getWorkerStatusLabel(w.status)}
 									</span>
@@ -709,11 +725,11 @@
 							<button class="back-to-pm" onclick={closeSubagentPreview}>← Back to conversation</button>
 						{/if}
 						<div class="subagents-list">
-							{#each mySubagents as sa (sa.id)}
+							{#each mySubagents as sa (subagentKey(sa))}
 								<button
 									type="button"
 									class="subagent-row"
-									class:active={previewedSubagent?.id === sa.id}
+									class:active={previewedSubagent ? subagentKey(previewedSubagent) === subagentKey(sa) : false}
 									onclick={() => openSubagentPreview(sa)}
 									title={sa.description || sa.agentType}
 								>

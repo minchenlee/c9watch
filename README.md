@@ -4,9 +4,9 @@
 
 <h1 align="center">c9watch</h1>
 
-<p align="center">Monitor and control all your Claude Code sessions — built for both humans and agents.</p>
+<p align="center">Monitor and control Claude Code sessions, with Codex and Cursor Agent visibility — built for both humans and agents.</p>
 
-**c9watch** (short for **c**laude cod**e** watch, like k8s for Kubernetes) gives you a real-time view of every Claude Code session running on your machine. A **desktop dashboard** for you, and a **JSON CLI** for your agents — both watching the same sessions at the same time.
+**c9watch** (short for **c**laude cod**e** watch, like k8s for Kubernetes) gives you a real-time view of every Claude Code, Codex, and Cursor Agent session running on your machine. A **desktop dashboard** for you, and a **JSON CLI** for your agents — both watching the same sessions at the same time.
 
 You see which agent needs permission, which one is working, and which one is idle. Your agents can do the same — querying session status, searching past work, and coordinating with each other — all through the same tool.
 
@@ -123,6 +123,8 @@ c9watch status
 
 # View a conversation (prefix matching works)
 c9watch view abc123 --last 5 --pretty
+# Use the provider-scoped key from `c9watch list` when IDs collide
+c9watch view codex:<session-id> --last 5
 
 # Browse and search history
 c9watch history -n 20
@@ -143,6 +145,7 @@ c9watch tasks abc123
 # Cost breakdown, including per-session lookup
 c9watch cost --daily
 c9watch cost --session abc12345 --pretty
+c9watch cost --session codex:<session-id> --pretty
 c9watch cost --session-prefix abc
 
 # PM orchestration (opt-in — see note below): spawn and manage child workers

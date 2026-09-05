@@ -3,13 +3,12 @@
 	import { browser } from '$app/environment';
 	import { deepSearchSessions, getConversation } from '$lib/api';
 	import { toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
-	import { get } from 'svelte/store';
 	import type { HistoryEntry, Conversation, DeepSearchHit } from '$lib/types';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
 	import { flyIn } from '$lib/transitions';
 	import { historyEntries, historyLoading, historyError, refreshSessionHistory } from '$lib/stores/history';
 	import { providerFilter } from '$lib/stores/provider-filter';
-	import { matchesProvider, providerFilterLabel } from '$lib/provider';
+	import { matchesProvider, providerFilterLabel, providerSessionKey } from '$lib/provider';
 	import ProviderBadge from './ProviderBadge.svelte';
 
 	// ── Props ────────────────────────────────────────────────────────
@@ -30,6 +29,7 @@
 	let deepSearching = $state(false);
 	// Map of sessionId → matching snippet. null = no search run yet.
 	let deepSearchResults = $state<Map<string, string> | null>(null);
+	const entryKey = (entry: HistoryEntry) => providerSessionKey(entry.provider, entry.sessionId);
 
 	// Conversation viewer state
 	let selectedEntry = $state<HistoryEntry | null>(null);
@@ -86,7 +86,11 @@
 			deepSearching = true;
 			try {
 				const hits = await deepSearchSessions(q, cs, ww);
-				if (!cancelled) deepSearchResults = new Map(hits.map((h) => [h.sessionId, h.snippet]));
+				if (!cancelled) {
+					deepSearchResults = new Map(
+						hits.map((h) => [providerSessionKey(h.provider, h.sessionId), h.snippet]),
+					);
+				}
 			} catch (e) {
 				if (!cancelled) console.error('Deep search failed:', e);
 			} finally {
@@ -123,6 +127,10 @@
 		return false;
 	}
 
+	function entryTitle(entry: HistoryEntry): string {
+		return entry.customTitle || entry.codexTitle || entry.cursorTitle || '';
+	}
+
 	// ── Filtering & sorting ──────────────────────────────────────────
 	let filtered = $derived.by(() => {
 		let entries = allEntries.filter((entry) => matchesProvider(entry, $providerFilter));
@@ -132,7 +140,7 @@
 			entries = entries.filter((e) => {
 				const display = norm(e.display);
 				const project = norm(e.projectName);
-				const title = e.customTitle ? norm(e.customTitle) : '';
+				const title = norm(entryTitle(e));
 				return (
 					phraseMatch(display, needle) ||
 					phraseMatch(project, needle) ||
@@ -142,15 +150,15 @@
 
 			// If deep search has run, also include sessions that matched full content
 			if (deepSearchResults !== null) {
-				const metaIds = new Set(entries.map((e) => e.sessionId));
-				const deepOnly = allEntries.filter(
-					(e) => matchesProvider(e, $providerFilter) && deepSearchResults!.has(e.sessionId) && !metaIds.has(e.sessionId)
-				);
+					const metaIds = new Set(entries.map(entryKey));
+					const deepOnly = allEntries.filter(
+						(e) => matchesProvider(e, $providerFilter) && deepSearchResults!.has(entryKey(e)) && !metaIds.has(entryKey(e))
+					);
 				entries = [...entries, ...deepOnly];
 			}
 		} else if (deepSearchResults !== null) {
 			// No text query but deep search ran — show all deep search hits
-			entries = allEntries.filter((e) => matchesProvider(e, $providerFilter) && deepSearchResults!.has(e.sessionId));
+				entries = allEntries.filter((e) => matchesProvider(e, $providerFilter) && deepSearchResults!.has(entryKey(e)));
 		}
 
 		return [...entries].sort((a, b) =>
@@ -215,19 +223,20 @@
 		conversation = null;
 		toolsLoadedFor.set(null);
 		try {
-			const conv = await withConversationLoader(entry.sessionId, 'conversation', () =>
-				getConversation(entry.sessionId, false)
+			const requestedKey = entryKey(entry);
+			const conv = await withConversationLoader(entry.sessionId, entry.provider, 'conversation', () =>
+				getConversation(entry.sessionId, entry.provider, false)
 			);
 			if (requestId !== conversationRequestId) return;
-			if (get(toolsLoadedFor) === entry.sessionId) return;
+			if ($toolsLoadedFor === requestedKey) return;
+			if (providerSessionKey(conv.provider ?? entry.provider, conv.sessionId) !== requestedKey) return;
 			conversation = conv;
 		} catch (e) {
-			console.error('Failed to load conversation:', e);
+			if (requestId === conversationRequestId) console.error('Failed to load conversation:', e);
 		}
 	}
 
 	function handleCloseConversation() {
-		conversationRequestId++;
 		selectedEntry = null;
 		conversation = null;
 	}
@@ -386,8 +395,8 @@
 						<span class="group-count">{group.entries.length}</span>
 					</div>
 					{#if !collapsedProjects.has(group.project)}
-						{#each group.entries as entry, i (entry.sessionId)}
-							{@const snippet = query.trim() ? (deepSearchResults?.get(entry.sessionId) ?? null) : null}
+						{#each group.entries as entry, i (entryKey(entry))}
+							{@const snippet = query.trim() ? (deepSearchResults?.get(entryKey(entry)) ?? null) : null}
 							<button
 								class="session-row session-row-grid"
 								class:has-snippet={!!snippet}
@@ -396,10 +405,10 @@
 							>
 								<span class="row-number">{i + 1}</span>
 								<span class="row-prompt">
-									{#if entry.customTitle}<span class="row-title">{@html highlight(entry.customTitle, query)}</span>{/if}
+									{#if entryTitle(entry)}<span class="row-title">{@html highlight(entryTitle(entry), query)}</span>{/if}
 									<span class="row-display">{@html highlight((snippet ?? entry.display) || '(no prompt)', query)}</span>
 								</span>
-								<span class="row-badge-slot"><ProviderBadge provider={entry.provider} surface={entry.surface} compact />{#if activeSessionIds.has(entry.sessionId)}<span class="active-badge">ACTIVE</span>{/if}</span>
+								<span class="row-badge-slot"><ProviderBadge provider={entry.provider} surface={entry.surface} compact />{#if activeSessionIds.has(entryKey(entry))}<span class="active-badge">ACTIVE</span>{/if}</span>
 								<span class="row-time">{relativeTime(entry.timestamp)}</span>
 							</button>
 						{/each}
@@ -407,8 +416,8 @@
 				</div>
 			{/each}
 		{:else}
-			{#each filtered as entry, i (entry.sessionId)}
-				{@const snippet = query.trim() ? (deepSearchResults?.get(entry.sessionId) ?? null) : null}
+			{#each filtered as entry, i (entryKey(entry))}
+				{@const snippet = query.trim() ? (deepSearchResults?.get(entryKey(entry)) ?? null) : null}
 				<button
 					class="session-row session-row-flat"
 					class:has-snippet={!!snippet}
@@ -419,11 +428,11 @@
 					<div class="row-content">
 						<div class="row-top-grid">
 							<span class="row-project">{entry.projectName}</span>
-								<span class="row-badge-slot"><ProviderBadge provider={entry.provider} surface={entry.surface} compact />{#if activeSessionIds.has(entry.sessionId)}<span class="active-badge">ACTIVE</span>{/if}</span>
+								<span class="row-badge-slot"><ProviderBadge provider={entry.provider} surface={entry.surface} compact />{#if activeSessionIds.has(entryKey(entry))}<span class="active-badge">ACTIVE</span>{/if}</span>
 							<span class="row-time">{relativeTime(entry.timestamp)}</span>
 						</div>
 						<span class="row-prompt">
-							{#if entry.customTitle}<span class="row-title">{@html highlight(entry.customTitle, query)}</span>{/if}
+							{#if entryTitle(entry)}<span class="row-title">{@html highlight(entryTitle(entry), query)}</span>{/if}
 							<span class="row-display">{@html highlight((snippet ?? entry.display) || '(no prompt)', query)}</span>
 						</span>
 					</div>
@@ -436,7 +445,19 @@
 
 <!-- ── Conversation overlay ───────────────────────────────────────── -->
 {#if selectedEntry}
-	<HistoryCardOverlay entry={selectedEntry} {conversation} searchQuery={query.trim() && deepSearchResults?.has(selectedEntry.sessionId) ? query.trim() : undefined} onclose={handleCloseConversation} onconversation={(conv) => { if (selectedEntry?.sessionId === conv.sessionId) conversation = conv; }} />
+	<HistoryCardOverlay
+		entry={selectedEntry}
+		{conversation}
+		searchQuery={query.trim() && deepSearchResults?.has(entryKey(selectedEntry)) ? query.trim() : undefined}
+		onclose={handleCloseConversation}
+		onconversation={(conv) => {
+			if (
+				selectedEntry &&
+				providerSessionKey(selectedEntry.provider, selectedEntry.sessionId) ===
+					providerSessionKey(conv.provider, conv.sessionId)
+			) conversation = conv;
+		}}
+	/>
 {/if}
 
 <style>

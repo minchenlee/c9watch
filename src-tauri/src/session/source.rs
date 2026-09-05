@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use super::codex::CodexRolloutSummary;
+use super::cursor::CursorTranscriptSummary;
 
 #[derive(Error, Debug)]
 pub enum SessionDetectorError {
@@ -35,15 +36,16 @@ pub enum CliActivity {
     Idle,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionProvider {
     #[default]
     ClaudeCode,
     Codex,
+    Cursor,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionSurface {
     #[default]
@@ -52,6 +54,7 @@ pub enum SessionSurface {
     Cli,
     Exec,
     Integration,
+    Cursor,
     Unknown,
 }
 
@@ -62,6 +65,41 @@ pub enum AgentKind {
     Root,
     Subagent,
     Internal,
+}
+
+/// Stable identity for a detected session.
+///
+/// A provider owns the namespace of its session IDs. Keeping the provider in
+/// the key prevents a Claude, Codex, and Cursor session with the same opaque
+/// ID from sharing deduplication, status, or overlay state.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionIdentity {
+    pub provider: SessionProvider,
+    pub session_id: String,
+}
+
+impl SessionIdentity {
+    pub fn new(provider: SessionProvider, session_id: impl Into<String>) -> Self {
+        Self {
+            provider,
+            session_id: session_id.into(),
+        }
+    }
+
+    /// Opaque UI/storage key. The provider prefix is explicit so callers do
+    /// not have to infer a namespace from a raw session ID.
+    pub fn key(&self) -> String {
+        format!("{}:{}", provider_key(self.provider), self.session_id)
+    }
+}
+
+fn provider_key(provider: SessionProvider) -> &'static str {
+    match provider {
+        SessionProvider::ClaudeCode => "claudeCode",
+        SessionProvider::Codex => "codex",
+        SessionProvider::Cursor => "cursor",
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -110,6 +148,8 @@ pub struct DetectedSession {
     pub can_rename: bool,
     #[serde(skip)]
     pub codex_summary: Option<CodexRolloutSummary>,
+    #[serde(skip)]
+    pub cursor_summary: Option<CursorTranscriptSummary>,
 }
 
 fn default_true() -> bool {
@@ -117,6 +157,16 @@ fn default_true() -> bool {
 }
 
 impl DetectedSession {
+    pub fn identity(&self) -> Option<SessionIdentity> {
+        self.session_id
+            .as_ref()
+            .map(|id| SessionIdentity::new(self.provider, id.clone()))
+    }
+
+    pub fn identity_key(&self) -> Option<String> {
+        self.identity().map(|identity| identity.key())
+    }
+
     /// Legacy backend doesn't fill the new (Phase 2) fields. Helper enforces the defaults.
     pub fn with_legacy_defaults(
         pid: u32,
@@ -148,6 +198,7 @@ impl DetectedSession {
             can_stop: true,
             can_rename: true,
             codex_summary: None,
+            cursor_summary: None,
         }
     }
 }
@@ -165,15 +216,30 @@ mod tests {
 
     #[test]
     fn session_kind_serializes_as_lowercase() {
-        assert_eq!(serde_json::to_string(&SessionKind::Interactive).unwrap(), "\"interactive\"");
-        assert_eq!(serde_json::to_string(&SessionKind::Background).unwrap(), "\"background\"");
-        assert_eq!(serde_json::to_string(&SessionKind::Unknown).unwrap(), "\"unknown\"");
+        assert_eq!(
+            serde_json::to_string(&SessionKind::Interactive).unwrap(),
+            "\"interactive\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionKind::Background).unwrap(),
+            "\"background\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionKind::Unknown).unwrap(),
+            "\"unknown\""
+        );
     }
 
     #[test]
     fn cli_activity_serializes_as_lowercase() {
-        assert_eq!(serde_json::to_string(&CliActivity::Busy).unwrap(), "\"busy\"");
-        assert_eq!(serde_json::to_string(&CliActivity::Idle).unwrap(), "\"idle\"");
+        assert_eq!(
+            serde_json::to_string(&CliActivity::Busy).unwrap(),
+            "\"busy\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CliActivity::Idle).unwrap(),
+            "\"idle\""
+        );
     }
 
     #[test]
@@ -197,9 +263,43 @@ mod tests {
 
     #[test]
     fn provider_surface_and_agent_kind_use_frontend_contract_values() {
-        assert_eq!(serde_json::to_string(&SessionProvider::ClaudeCode).unwrap(), "\"claudeCode\"");
-        assert_eq!(serde_json::to_string(&SessionProvider::Codex).unwrap(), "\"codex\"");
-        assert_eq!(serde_json::to_string(&SessionSurface::Integration).unwrap(), "\"integration\"");
-        assert_eq!(serde_json::to_string(&AgentKind::Subagent).unwrap(), "\"subagent\"");
+        assert_eq!(
+            serde_json::to_string(&SessionProvider::ClaudeCode).unwrap(),
+            "\"claudeCode\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionProvider::Codex).unwrap(),
+            "\"codex\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionProvider::Cursor).unwrap(),
+            "\"cursor\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionSurface::Cursor).unwrap(),
+            "\"cursor\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionSurface::Integration).unwrap(),
+            "\"integration\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Subagent).unwrap(),
+            "\"subagent\""
+        );
+    }
+
+    #[test]
+    fn session_identity_namespaces_provider_ids() {
+        let id = "same-session-id";
+        let claude = SessionIdentity::new(SessionProvider::ClaudeCode, id);
+        let codex = SessionIdentity::new(SessionProvider::Codex, id);
+        let cursor = SessionIdentity::new(SessionProvider::Cursor, id);
+
+        assert_ne!(claude, codex);
+        assert_ne!(codex, cursor);
+        assert_eq!(claude.key(), "claudeCode:same-session-id");
+        assert_eq!(codex.key(), "codex:same-session-id");
+        assert_eq!(cursor.key(), "cursor:same-session-id");
     }
 }

@@ -85,6 +85,7 @@ Null/empty optional fields are omitted to save tokens.
 c9watch view <session-id>               # Full conversation
 c9watch view <session-id> --last 5      # Last 5 messages
 c9watch view 46fe --last 3 --pretty     # UUID prefix works
+c9watch view codex:<session-id>         # Provider-scoped key disambiguates IDs
 ```
 
 Each message includes:
@@ -119,7 +120,7 @@ c9watch search "refactor parser" --project c9watch
 }
 ```
 
-Search covers Claude Code and Codex history. Each hit includes `provider`, `surface`, and `agentKind` so consumers can distinguish the source and session type.
+Search covers Claude Code, Codex, and Cursor history. Each hit includes `provider`, `surface`, and `agentKind` so consumers can distinguish the source and session type.
 
 ### `history` — Past Sessions
 
@@ -165,6 +166,7 @@ Read tasks from `~/.claude/tasks/<session-id>/`.
 
 ```bash
 c9watch tasks <session-id>
+c9watch tasks cursor:<session-id>       # Provider-scoped key
 ```
 
 ```json
@@ -250,6 +252,11 @@ All commands that accept a session ID support UUID prefix matching:
 c9watch view 46fe          # Matches 46fe2af3-fd8e-43e3-bd6d-6c7800722cbf
 c9watch tasks 5c54          # Matches 5c5426de-08b0-484a-b1ae-1df59ac84a39
 ```
+
+`view`, `tasks`, and `cost --session` also accept the provider-scoped keys
+emitted by `list` and `watch`: `claudeCode:<id>`, `codex:<id>`, or
+`cursor:<id>`. This is the explicit form to use when the same raw ID exists
+under more than one provider.
 
 If the prefix is ambiguous (matches multiple sessions), an error is returned. Prefix resolution scans JSONL filenames directly — no process detection needed.
 

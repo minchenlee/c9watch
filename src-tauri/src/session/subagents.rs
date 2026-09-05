@@ -145,7 +145,9 @@ fn collect_user_tool_result_ids<P: AsRef<Path>>(path: P) -> HashMap<String, Stri
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         let entry_type = value.get("type").and_then(Value::as_str).unwrap_or("");
         if entry_type != "user" {
             continue;
@@ -164,9 +166,7 @@ fn collect_user_tool_result_ids<P: AsRef<Path>>(path: P) -> HashMap<String, Stri
         };
         for block in content {
             if block.get("type").and_then(Value::as_str) == Some("tool_result") {
-                if let Some(tool_use_id) =
-                    block.get("tool_use_id").and_then(Value::as_str)
-                {
+                if let Some(tool_use_id) = block.get("tool_use_id").and_then(Value::as_str) {
                     completed
                         .entry(tool_use_id.to_string())
                         .or_insert_with(|| timestamp.clone());
@@ -264,7 +264,9 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
         if line.trim().is_empty() || !line.contains(subagent_id) {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         let entry_type = value.get("type").and_then(Value::as_str).unwrap_or("");
         let timestamp = value
             .get("timestamp")
@@ -403,7 +405,9 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
             if line.trim().is_empty() || !line.contains(aid) {
                 continue;
             }
-            let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
             let entry_type = value.get("type").and_then(Value::as_str).unwrap_or("");
             let timestamp = value
                 .get("timestamp")
@@ -447,9 +451,7 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
                     }
                 }
                 async_result = match async_result {
-                    Some((prev_ts, prev_text)) if prev_ts > timestamp => {
-                        Some((prev_ts, prev_text))
-                    }
+                    Some((prev_ts, prev_text)) if prev_ts > timestamp => Some((prev_ts, prev_text)),
                     _ => Some((timestamp.clone(), result_body)),
                 };
                 continue;
@@ -466,8 +468,7 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
                 .map(|blocks| {
                     blocks.iter().any(|b| {
                         b.get("type").and_then(Value::as_str) == Some("tool_result")
-                            && b.get("tool_use_id").and_then(Value::as_str)
-                                == Some(subagent_id)
+                            && b.get("tool_use_id").and_then(Value::as_str) == Some(subagent_id)
                     })
                 })
                 .unwrap_or(false);
@@ -501,9 +502,7 @@ fn extract_transcript_from_file<P: AsRef<Path>>(
                 }
             }
             async_result = match async_result {
-                Some((prev_ts, prev_text)) if prev_ts > timestamp => {
-                    Some((prev_ts, prev_text))
-                }
+                Some((prev_ts, prev_text)) if prev_ts > timestamp => Some((prev_ts, prev_text)),
                 _ => Some((timestamp.clone(), result_text)),
             };
         }
@@ -547,9 +546,8 @@ fn parse_agent_id_from_stub(text: &str) -> Option<String> {
         while let Some(rel) = text[search_from..].find(key) {
             let idx = search_from + rel + key.len();
             // Advance past any quote/colon/space/equals chars.
-            let rest = text[idx..].trim_start_matches(|c: char| {
-                matches!(c, ':' | '=' | ' ' | '\t' | '"' | '\'')
-            });
+            let rest = text[idx..]
+                .trim_start_matches(|c: char| matches!(c, ':' | '=' | ' ' | '\t' | '"' | '\''));
             let candidate: String = rest
                 .chars()
                 .take_while(|c| c.is_ascii_hexdigit() || *c == '-' || *c == '_')
@@ -567,7 +565,9 @@ fn parse_agent_id_from_stub(text: &str) -> Option<String> {
 /// Concatenate user-message text content. Handles both plain string form
 /// (`content: "..."`) and structured block form (`content: [{type:text, text:"..."}]`).
 fn extract_user_message_text(content: Option<&Value>) -> String {
-    let Some(content) = content else { return String::new() };
+    let Some(content) = content else {
+        return String::new();
+    };
     if let Some(s) = content.as_str() {
         return s.to_string();
     }
@@ -618,12 +618,9 @@ fn collect_text_blocks(blocks: &[Value]) -> String {
 }
 
 fn extract_usage_stats(usage_str: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
-    let total_tokens = extract_tag(usage_str, "total_tokens")
-        .and_then(|s| s.parse::<u64>().ok());
-    let tool_uses = extract_tag(usage_str, "tool_uses")
-        .and_then(|s| s.parse::<u64>().ok());
-    let duration_ms = extract_tag(usage_str, "duration_ms")
-        .and_then(|s| s.parse::<u64>().ok());
+    let total_tokens = extract_tag(usage_str, "total_tokens").and_then(|s| s.parse::<u64>().ok());
+    let tool_uses = extract_tag(usage_str, "tool_uses").and_then(|s| s.parse::<u64>().ok());
+    let duration_ms = extract_tag(usage_str, "duration_ms").and_then(|s| s.parse::<u64>().ok());
     (total_tokens, tool_uses, duration_ms)
 }
 
@@ -641,13 +638,17 @@ pub fn get_subagent_transcript(
         if !project_path.is_dir() {
             continue;
         }
-        let Ok(file_iter) = fs::read_dir(&project_path) else { continue };
+        let Ok(file_iter) = fs::read_dir(&project_path) else {
+            continue;
+        };
         for file_entry in file_iter.flatten() {
             let path = file_entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             if stem != parent_session_id {
                 continue;
             }
@@ -657,8 +658,8 @@ pub fn get_subagent_transcript(
     None
 }
 
-/// Build a map of parent_session_id -> subagents for all sessions found under
-/// `~/.claude/projects/`. Caller filters/joins as needed.
+/// Build a map of provider-scoped parent identity -> subagents for all Claude
+/// sessions found under `~/.claude/projects/`. Caller filters/joins as needed.
 pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
     let mut out: HashMap<String, Vec<SubagentInfo>> = HashMap::new();
     let Some(home) = dirs::home_dir() else {
@@ -673,16 +674,20 @@ pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
         if !project_path.is_dir() {
             continue;
         }
-        let Ok(file_iter) = fs::read_dir(&project_path) else { continue };
+        let Ok(file_iter) = fs::read_dir(&project_path) else {
+            continue;
+        };
         for file_entry in file_iter.flatten() {
             let path = file_entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             let subs = active_subagents_for_path(stem, &path);
             if !subs.is_empty() {
-                out.insert(stem.to_string(), subs);
+                out.insert(format!("claudeCode:{stem}"), subs);
             }
         }
     }
@@ -727,7 +732,10 @@ mod tests {
         let subs = active_subagents_for_path("s1", f.path());
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].status, SubagentStatus::Completed);
-        assert_eq!(subs[0].completed_at.as_deref(), Some("2026-01-01T00:01:00Z"));
+        assert_eq!(
+            subs[0].completed_at.as_deref(),
+            Some("2026-01-01T00:01:00Z")
+        );
     }
 
     #[test]
@@ -755,8 +763,7 @@ mod tests {
         let f = write_jsonl(&[line, user]);
         let subs = active_subagents_for_path("s1", f.path());
         assert_eq!(subs.len(), 2);
-        let by_id: HashMap<&str, &SubagentInfo> =
-            subs.iter().map(|s| (s.id.as_str(), s)).collect();
+        let by_id: HashMap<&str, &SubagentInfo> = subs.iter().map(|s| (s.id.as_str(), s)).collect();
         assert_eq!(by_id["a1"].status, SubagentStatus::Completed);
         assert_eq!(by_id["a2"].status, SubagentStatus::Running);
     }
@@ -906,10 +913,7 @@ mod tests {
 
     #[test]
     fn extract_tag_helper() {
-        assert_eq!(
-            extract_tag("<a>foo</a>", "a"),
-            Some("foo".to_string())
-        );
+        assert_eq!(extract_tag("<a>foo</a>", "a"), Some("foo".to_string()));
         assert_eq!(
             extract_tag("x<result>multi\nline\nbody</result>y", "result"),
             Some("multi\nline\nbody".to_string())

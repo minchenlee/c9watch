@@ -9,7 +9,45 @@ permissions:
   contents: write
 
 jobs:
+  source-gates:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Diff hygiene
+        run: git diff --check "${GITHUB_SHA}^" "$GITHUB_SHA"
+
+      - name: Rust format
+        run: cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Rust library tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Rust integration tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --tests
+
+      - name: Frontend type and static checks
+        run: npm run check
+
+      - name: Frontend production build
+        run: npm run build
+
   build-macos:
+    needs: source-gates
     runs-on: macos-latest
     strategy:
       matrix:
@@ -38,50 +76,133 @@ jobs:
       - name: Install Tauri CLI
         run: npm install -g @tauri-apps/cli@2
 
+      - name: Verify updater signing key
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: test -n "$TAURI_SIGNING_PRIVATE_KEY"
+
+      - name: Verify Apple signing and notarization credentials
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          test -n "$APPLE_CERTIFICATE"
+          test -n "$APPLE_CERTIFICATE_PASSWORD"
+          test -n "$APPLE_SIGNING_IDENTITY"
+          test -n "$APPLE_ID"
+          test -n "$APPLE_PASSWORD"
+          test -n "$APPLE_TEAM_ID"
+
       - name: Build Tauri app
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Apple code signing (optional — set these secrets to enable)
+          # Apple code signing
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # Apple notarization (optional — set these secrets to enable)
+          # Apple notarization
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npx tauri build --target ${{ matrix.target }}
 
+      - name: Validate signed and notarized native bundle
+        run: |
+          BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle"
+          APP=$(find "$BUNDLE/macos" -maxdepth 1 -type d -name '*.app' -print -quit)
+          test -n "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          xcrun stapler validate "$APP"
+          spctl --assess --type execute --verbose=4 "$APP"
+
+      - name: Native launch and server health smoke
+        env:
+          HOME: ${{ runner.temp }}/c9watch-native-home
+        run: |
+          BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle"
+          APP=$(find "$BUNDLE/macos" -maxdepth 1 -type d -name '*.app' -print -quit)
+          BINARY="$APP/Contents/MacOS/c9watch"
+          test -x "$BINARY"
+          mkdir -p "$HOME"
+          "$BINARY" --version
+          "$BINARY" > "$RUNNER_TEMP/c9watch-native.log" 2>&1 &
+          PID=$!
+          cleanup() { kill "$PID" 2>/dev/null || true; }
+          trap cleanup EXIT
+          for _ in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9210/health >/dev/null; then
+              curl --fail --silent http://127.0.0.1:9210/info | grep -q '"version":"0.10.0"'
+              exit 0
+            fi
+            if ! kill -0 "$PID" 2>/dev/null; then
+              cat "$RUNNER_TEMP/c9watch-native.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/c9watch-native.log"
+          exit 1
+
       - name: Rename artifacts for clarity
         run: |
-          cd src-tauri/target/${{ matrix.target }}/release/bundle
+          BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle"
+          cd "$BUNDLE"
           if [ -d dmg ]; then
             for f in dmg/*.dmg; do
+              [ -f "$f" ] || continue
               mv "$f" "dmg/c9watch_${{ github.ref_name }}_${{ matrix.arch }}.dmg"
             done
           fi
+
+          # Keep the exact archive that Tauri signed. Re-tarring the .app in
+          # create-release would produce different bytes from the signed file.
+          for archive in macos/*.app.tar.gz; do
+            [ -f "$archive" ] || continue
+            final="macos/c9watch_${{ github.ref_name }}_${{ matrix.arch }}.app.tar.gz"
+            if [ "$archive" != "$final" ]; then
+              mv "$archive" "$final"
+              if [ -f "${archive}.sig" ]; then
+                mv "${archive}.sig" "${final}.sig"
+              fi
+            fi
+          done
+
+          archive="macos/c9watch_${{ github.ref_name }}_${{ matrix.arch }}.app.tar.gz"
+          test -s "$archive"
+          test -s "${archive}.sig"
+
+          dmg=$(find dmg -maxdepth 1 -type f -name '*.dmg' -print -quit)
+          test -n "$dmg"
+          hdiutil imageinfo "$dmg" >/dev/null
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
           name: macos-dmg-${{ matrix.arch }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          if-no-files-found: error
 
       - name: Upload app bundle
         uses: actions/upload-artifact@v4
         with:
           name: macos-app-${{ matrix.arch }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
+          if-no-files-found: error
 
-      - name: Upload updater signature (if exists)
+      - name: Upload signed updater artifact
         uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: updater-sig-${{ matrix.arch }}
-          path: src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz*
-          if-no-files-found: ignore
+          name: updater-${{ matrix.arch }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/macos/c9watch_${{ github.ref_name }}_${{ matrix.arch }}.app.tar.gz*
+          if-no-files-found: error
 
   build-cli:
+    needs: source-gates
     strategy:
       matrix:
         include:
@@ -114,6 +235,17 @@ jobs:
             --no-default-features --features cli \
             --target ${{ matrix.target }}
 
+      - name: Verify Apple signing credentials
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          test -n "$APPLE_CERTIFICATE"
+          test -n "$APPLE_CERTIFICATE_PASSWORD"
+          test -n "$APPLE_SIGNING_IDENTITY"
+
       - name: Sign CLI binary (macOS)
         if: runner.os == 'macOS'
         env:
@@ -137,9 +269,8 @@ jobs:
             # Clean up sensitive files
             rm -f "$RUNNER_TEMP/certificate.p12"
             security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
-          else
-            codesign --force --options runtime --sign - "$BINARY"
           fi
+          codesign --verify --strict --verbose=2 "$BINARY"
 
       - name: Package CLI binary
         run: |
@@ -164,15 +295,14 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create .tar.gz from .app bundles (for Homebrew)
+      - name: Collect signed updater artifacts
         run: |
-          cd artifacts
           for arch in aarch64 x86_64; do
-            if [ -d "macos-app-${arch}" ]; then
-              cd "macos-app-${arch}"
-              tar -czf "../c9watch_${{ github.ref_name }}_${arch}.app.tar.gz" *.app
-              cd ..
-            fi
+            archive="artifacts/updater-${arch}/c9watch_${{ github.ref_name }}_${arch}.app.tar.gz"
+            test -f "$archive"
+            test -f "${archive}.sig"
+            cp "$archive" "artifacts/c9watch_${{ github.ref_name }}_${arch}.app.tar.gz"
+            cp "${archive}.sig" "artifacts/c9watch_${{ github.ref_name }}_${arch}.app.tar.gz.sig"
           done
 
       - name: Generate updater JSON manifest
@@ -182,15 +312,8 @@ jobs:
           VERSION_NO_V="${VERSION#v}"
           DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-          # Read signatures if they exist
-          AARCH64_SIG=""
-          X86_64_SIG=""
-          if [ -f "artifacts/updater-sig-aarch64/"*.sig ]; then
-            AARCH64_SIG=$(cat artifacts/updater-sig-aarch64/*.sig 2>/dev/null || echo "")
-          fi
-          if [ -f "artifacts/updater-sig-x86_64/"*.sig ]; then
-            X86_64_SIG=$(cat artifacts/updater-sig-x86_64/*.sig 2>/dev/null || echo "")
-          fi
+          AARCH64_SIG=$(cat "artifacts/c9watch_${VERSION}_aarch64.app.tar.gz.sig")
+          X86_64_SIG=$(cat "artifacts/c9watch_${VERSION}_x86_64.app.tar.gz.sig")
 
           cat > artifacts/latest.json << MANIFEST
           {
