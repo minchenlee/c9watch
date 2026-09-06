@@ -11,6 +11,8 @@ pub mod session;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod auth;
 #[cfg(all(not(mobile), feature = "gui"))]
+pub mod notifications;
+#[cfg(all(not(mobile), feature = "gui"))]
 pub mod polling;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod web_server;
@@ -512,6 +514,7 @@ pub fn run() {
     #[cfg(not(mobile))]
     let builder = builder
         .setup(|app| {
+            notifications::initialize(app.handle()).map_err(std::io::Error::other)?;
             // ── WebSocket server ────────────────────────────────
             let token = auth::generate_token();
             let local_ip = auth::get_local_ip();
@@ -712,6 +715,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            notifications::get_notification_preferences,
+            notifications::save_notification_preferences,
+            notifications::test_native_notification,
             greet,
             get_sessions,
             get_conversation,

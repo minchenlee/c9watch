@@ -1852,6 +1852,7 @@ mod session_formatter_tests {
             message_count: 3,
             modified: "2026-07-13T00:00:00Z".to_string(),
             status: SessionStatus::Working,
+            notification_preview: None,
             latest_message: String::new(),
             pending_tool_name: None,
             pending_tool_input: None,

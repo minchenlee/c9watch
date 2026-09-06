@@ -460,6 +460,7 @@ dependencies = [
  "dirs 5.0.1",
  "libc",
  "mime_guess",
+ "notify-rust",
  "qr2term",
  "rand 0.8.5",
  "regex",

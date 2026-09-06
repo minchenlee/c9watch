@@ -43,6 +43,9 @@ pub struct Session {
     pub modified: String,
     pub status: SessionStatus,
     pub latest_message: String,
+    /// Assistant text only, bounded during enrichment for native notification previews.
+    #[serde(skip)]
+    pub notification_preview: Option<String>,
     pub pending_tool_name: Option<String>,
     /// The input/arguments of the pending tool (when status is NeedsPermission)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -257,6 +260,16 @@ pub fn enrich_detected_sessions(
                 .latest_message()
                 .map(|message| truncate_string(message, 200))
                 .unwrap_or_default();
+            let notification_preview = summary
+                .messages
+                .iter()
+                .rev()
+                .take_while(|m| m.message_type != crate::session::MessageType::User)
+                .find(|m| {
+                    m.message_type == crate::session::MessageType::Assistant
+                        && !m.content.trim().is_empty()
+                })
+                .map(|m| truncate_string(&m.content, 240));
             let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
                 .or_else(|| detected.agent_nickname.clone())
                 .unwrap_or_else(|| detected.project_name.clone());
@@ -290,6 +303,7 @@ pub fn enrich_detected_sessions(
                     SessionStatus::WaitingForInput
                 },
                 latest_message,
+                notification_preview,
                 pending_tool_name: None,
                 pending_tool_input: None,
                 worker_of: None,
@@ -320,6 +334,16 @@ pub fn enrich_detected_sessions(
                 .latest_message()
                 .map(|message| truncate_string(message, 200))
                 .unwrap_or_default();
+            let notification_preview = summary
+                .messages
+                .iter()
+                .rev()
+                .take_while(|m| m.message_type != crate::session::MessageType::User)
+                .find(|m| {
+                    m.message_type == crate::session::MessageType::Assistant
+                        && !m.content.trim().is_empty()
+                })
+                .map(|m| truncate_string(&m.content, 240));
             let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
                 .or_else(|| detected.agent_nickname.clone())
                 .unwrap_or_else(|| detected.project_name.clone());
@@ -358,6 +382,7 @@ pub fn enrich_detected_sessions(
                 modified,
                 status,
                 latest_message,
+                notification_preview,
                 pending_tool_name: None,
                 pending_tool_input: None,
                 worker_of: None,
@@ -391,6 +416,7 @@ pub fn enrich_detected_sessions(
                 .as_deref()
                 .map(|message| truncate_string(message, 200))
                 .unwrap_or_default();
+            let notification_preview = summary.latest_assistant_text.clone();
             let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
                 .or_else(|| detected.agent_nickname.clone())
                 .unwrap_or_else(|| detected.project_name.clone());
@@ -428,6 +454,7 @@ pub fn enrich_detected_sessions(
                 modified,
                 status,
                 latest_message,
+                notification_preview,
                 pending_tool_name: summary.pending_tool_name.clone(),
                 pending_tool_input: None,
                 worker_of: None,
@@ -553,6 +580,7 @@ pub fn enrich_detected_sessions(
         );
 
         let latest_message = get_latest_message_from_entries(&entries);
+        let notification_preview = notification_preview_from_entries(&entries);
         let pending_tool_input = get_pending_tool_input(&entries);
 
         // Skip empty sessions (0 messages) UNLESS CLI-sourced — `claude agents --json`
@@ -590,6 +618,7 @@ pub fn enrich_detected_sessions(
             modified,
             status,
             latest_message,
+            notification_preview,
             pending_tool_name,
             pending_tool_input,
             worker_of: None,
@@ -1028,5 +1057,56 @@ mod placeholder_tests {
         assert_eq!(get_cached_native_title(&path).as_deref(), Some("second"));
         std::fs::remove_file(&path).unwrap();
         assert_eq!(get_cached_native_title(&path), None);
+    }
+}
+
+/// Never expose thinking, tool results, or a previous turn as a reply preview.
+fn notification_preview_from_entries(entries: &[crate::session::SessionEntry]) -> Option<String> {
+    use crate::session::{MessageContent, SessionEntry};
+    for entry in entries.iter().rev() {
+        match entry {
+            SessionEntry::User { message, .. }
+                if !message.is_tool_result
+                    && !crate::session::parser::is_system_content(&message.content) =>
+            {
+                return None
+            }
+            SessionEntry::Assistant { message, .. } => {
+                let text = message
+                    .content
+                    .iter()
+                    .filter_map(|part| match part {
+                        MessageContent::Text { text } if !text.trim().is_empty() => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !text.is_empty() {
+                    return Some(truncate_string(&text, 240));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod notification_preview_tests {
+    use super::*;
+    #[test]
+    fn skips_thinking_and_stops_at_new_user_turn() {
+        let assistant: crate::session::SessionEntry = serde_json::from_str(r#"{"type":"assistant","uuid":"a","timestamp":"2026-09-06T00:00:00Z","message":{"role":"assistant","model":"test","id":"msg-test","content":[{"type":"text","text":"Visible reply"},{"type":"thinking","thinking":"Private thought"}]}}"#).unwrap();
+        assert_eq!(
+            notification_preview_from_entries(std::slice::from_ref(&assistant)).as_deref(),
+            Some("Visible reply")
+        );
+        let user = serde_json::from_str(
+            r#"{"type":"user","uuid":"u","timestamp":"2026-09-06T00:01:00Z","message":{"role":"user","content":"Next request"}}"#,
+        )
+        .unwrap();
+        assert_eq!(notification_preview_from_entries(&[assistant, user]), None);
     }
 }
