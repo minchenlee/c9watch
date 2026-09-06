@@ -9,6 +9,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter};
+#[cfg(not(target_os = "macos"))]
 use tauri_plugin_notification::NotificationExt;
 
 /// Cached overlay: session_id -> spawnedBy (i.e. worker_of).
@@ -192,6 +193,7 @@ pub fn start_polling(
                                         );
 
                                         if should_notify {
+                                            crate::notifications::notify(&app_handle, session);
                                             // Check cooldown to prevent duplicate notifications
                                             // from status flickering across poll cycles
                                             let on_cooldown = last_notification_time
@@ -386,6 +388,7 @@ fn fire_notification(
 
     // Fire native notification via Tauri plugin
     // Note: Notifications work in production builds (.app) but may not appear in dev mode
+    #[cfg(not(target_os = "macos"))]
     if let Err(e) = app_handle
         .notification()
         .builder()

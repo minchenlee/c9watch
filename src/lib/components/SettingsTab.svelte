@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import NotificationSettings from './NotificationSettings.svelte';
 	import { marked } from 'marked';
 	import DOMPurify from 'dompurify';
 	import { openUrl } from '@tauri-apps/plugin-opener';
@@ -16,9 +17,10 @@
 		fetchReleaseNotes,
 		startDownloadAndInstall
 	} from '$lib/stores/updater';
-	import { flyIn } from '$lib/transitions';
 
 	let checking = $state(false);
+	let activeSection = $state<'notifications' | 'about'>('notifications');
+	let nativeNotifications = $state(false);
 	let justChecked = $state(false);
 
 	let version = $derived($currentVersion);
@@ -30,6 +32,8 @@
 	let notesLoading = $derived($releaseNotesLoading);
 
 	onMount(() => {
+		nativeNotifications = isTauri() && /Mac/i.test(navigator.platform);
+		if (!nativeNotifications) activeSection = 'about';
 		if (update) fetchReleaseNotes();
 	});
 
@@ -85,19 +89,26 @@
 </script>
 
 <div class="settings-tab">
-	<div class="section-header" in:flyIn|global={{ index: 0, duration: 350, stride: 25 }}>
+	<div class="section-header" >
 		<span class="section-title">Settings</span>
 	</div>
 
-	<div class="content">
-		<div class="group" in:flyIn|global={{ index: 1, duration: 350, stride: 25 }}>
+	<div class="settings-shell">
+        <nav class="settings-nav" aria-label="Settings sections">
+            {#if nativeNotifications}<button class:active={activeSection === 'notifications'} aria-current={activeSection === 'notifications' ? 'page' : undefined} onclick={() => activeSection = 'notifications'}>Notifications</button>{/if}
+            <button class:active={activeSection === 'about'} aria-current={activeSection === 'about' ? 'page' : undefined} onclick={() => activeSection = 'about'}>About &amp; updates</button>
+        </nav>
+        <div class="content"><div class="settings-body">
+        {#if nativeNotifications}<div hidden={activeSection !== 'notifications'}><NotificationSettings /></div>{/if}
+        <div class="about-panel" hidden={activeSection !== 'about'}>
+		<div class="group" >
 			<div class="group-title group-title--lg">Version</div>
 			<div class="group-body">
 				<span class="mono">c9watch {version || '—'}</span>
 			</div>
 		</div>
 
-		<div class="group" in:flyIn|global={{ index: 2, duration: 350, stride: 25 }}>
+		<div class="group" >
 			<div class="group-title group-title--lg">Updates</div>
 			<div class="group-body">
 				<div class="status-line">
@@ -111,7 +122,7 @@
 					{:else if justChecked}
 						<span class="status-text">Up to date</span>
 					{:else}
-						<span class="status-text status-text--dim">—</span>
+						<span class="status-text status-text--dim">Check for the latest version</span>
 					{/if}
 					{#if update}
 						<button class="btn-primary" onclick={handleInstall} disabled={installing}>
@@ -157,7 +168,7 @@
 		</div>
 
 		{#if update}
-			<div class="group" in:flyIn|global={{ index: 3, duration: 350, stride: 25 }}>
+			<div class="group" >
 				<div class="group-title">Release notes · {update.version}</div>
 				<div class="notes-surface">
 					{#if notesLoading}
@@ -172,7 +183,7 @@
 				</div>
 			</div>
 		{/if}
-	</div>
+	</div></div></div></div>
 </div>
 
 <style>
@@ -504,4 +515,32 @@
 		0%, 100% { opacity: 0.5; }
 		50% { opacity: 1; }
 	}
+
+    .settings-body { width: 100%; max-width: 960px; margin: 0; display: flex; flex-direction: column; gap: var(--space-xl); padding: 0 var(--space-lg) var(--space-2xl); box-sizing: border-box;  }
+    .group { border-top: 1px solid var(--border-default); padding-top: var(--space-xl); }
+    .group-title, .group-title--lg { font-family: var(--font-pixel); font-size: 13px; letter-spacing: .1em; text-transform: uppercase; border: 0; color: var(--text-primary); }
+    .mono, .status-text, .version-diff, .notes-state, .state-line, .progress-label { font-size: 13px; text-transform: none; letter-spacing: normal; }
+    .btn-ghost, .btn-primary { font-family: var(--font-pixel); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding: 4px var(--space-sm); }
+    .markdown-body { font-size: 15px; }
+    .markdown-body :global(h1), .markdown-body :global(h2), .markdown-body :global(h3) { font-family: var(--font-sans); font-size: 16px; text-transform: none; letter-spacing: normal; color: var(--text-primary); }
+    .status-text--dim, .notes-state, .state-line, .progress-label { color: var(--text-secondary); }
+    button:focus-visible { outline: 1px solid var(--border-focus); outline-offset: 0; }
+    @media (max-width: 600px) { .settings-body { padding-inline: 0; } }
+    @media (prefers-reduced-motion: reduce) { .progress-fill { transition: none; animation: none; } }
+
+    .settings-shell { display: flex; flex: 1; min-height: 0; }
+    .settings-nav { width: 200px; min-width: 160px; flex-shrink: 0; border-right: 1px solid var(--border-default); }
+    .settings-nav button { display: block; width: 100%; text-align: left; padding: var(--space-sm) var(--space-md); border: 0; border-bottom: 1px solid var(--border-default); background: transparent; color: var(--text-secondary); font: 12px/1.5 var(--font-mono); cursor: pointer; }
+    .settings-nav button:hover { background: rgba(255,255,255,.03); color: var(--text-primary); }
+    .settings-nav button.active { background: rgba(255,255,255,.08); color: var(--text-primary); }
+    .settings-nav button.active { box-shadow: inset 2px 0 var(--border-focus); }
+    .content { min-width: 0; }
+    .about-panel > .group:first-child { border-top: 0; padding-top: 0; }
+    .about-panel > .group + .group { margin-top: var(--space-xl); }
+    @media (max-width: 680px) {
+        .settings-shell { flex-direction: column; }
+        .settings-nav { width: 100%; display: flex; border-right: 0; border-bottom: 1px solid var(--border-default); padding: 0 0 var(--space-sm); margin-bottom: var(--space-md); }
+        .settings-nav button { width: auto; }
+        .settings-nav button.active { box-shadow: inset 0 -1px var(--border-focus); }
+    }
 </style>

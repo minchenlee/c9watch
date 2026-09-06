@@ -1,0 +1,372 @@
+{
+  "status": "Source-derived recipes, not app-wide approved tokens; semantic names are documentation aliases only",
+  "base": "db460ab",
+  "recipes": [
+    {
+      "name": "page.heading",
+      "source": "src/lib/components/MemoryViewer.svelte",
+      "line": 212,
+      "selector": ".section-title",
+      "declarations": {
+        "font-family": "var(--font-pixel)",
+        "font-size": "22px",
+        "font-weight": "600",
+        "color": "var(--text-primary)",
+        "text-transform": "uppercase",
+        "letter-spacing": "0.1em",
+        "line-height": "1"
+      }
+    },
+    {
+      "name": "page.count",
+      "source": "src/lib/components/MemoryViewer.svelte",
+      "line": 222,
+      "selector": ".section-count",
+      "declarations": {
+        "font-family": "var(--font-pixel)",
+        "font-size": "18px",
+        "font-weight": "500",
+        "line-height": "1",
+        "color": "var(--text-secondary)"
+      }
+    },
+    {
+      "name": "section.heading",
+      "source": "src/lib/components/MemoryViewer.svelte",
+      "line": 424,
+      "selector": ".file-header",
+      "declarations": {
+        "display": "flex",
+        "align-items": "center",
+        "justify-content": "space-between",
+        "width": "100%",
+        "font-family": "var(--font-pixel)",
+        "font-size": "13px",
+        "font-weight": "600",
+        "text-transform": "uppercase",
+        "letter-spacing": "0.1em",
+        "color": "var(--accent)",
+        "margin": "0",
+        "padding": "var(--space-sm) 0",
+        "background": "none",
+        "border": "none",
+        "border-bottom": "1px solid var(--border-default)",
+        "cursor": "pointer",
+        "text-align": "left",
+        "transition": "color 0.15s ease"
+      }
+    },
+    {
+      "name": "navigation.pane",
+      "source": "src/lib/components/MemoryViewer.svelte",
+      "line": 285,
+      "selector": ".project-list",
+      "declarations": {
+        "width": "200px",
+        "min-width": "160px",
+        "border-right": "1px solid var(--border-default)",
+        "overflow-y": "auto",
+        "flex-shrink": "0"
+      }
+    },
+    {
+      "name": "navigation.item",
+      "source": "src/lib/components/MemoryViewer.svelte",
+      "line": 293,
+      "selector": ".project-item",
+      "declarations": {
+        "display": "flex",
+        "align-items": "center",
+        "justify-content": "space-between",
+        "width": "100%",
+        "padding": "var(--space-sm) var(--space-md)",
+        "background": "none",
+        "border": "none",
+        "border-bottom": "1px solid var(--border-default)",
+        "color": "var(--text-muted)",
+        "cursor": "pointer",
+        "text-align": "left",
+        "font-family": "var(--font-mono)",
+        "font-size": "12px",
+        "transition": "all 0.15s ease"
+      }
+    },
+    {
+      "name": "navigation.hover",
+      "source": "src/lib/components/MemoryViewer.svelte",
+      "line": 310,
+      "selector": ".project-item:hover",
+      "declarations": {
+        "background": "rgba(255, 255, 255, 0.03)",
+        "color": "var(--text-primary)"
+      }
+    },
+    {
+      "name": "navigation.selected",
+      "source": "src/lib/components/MemoryViewer.svelte",
+      "line": 315,
+      "selector": ".project-item.selected",
+      "declarations": {
+        "background": "rgba(255, 255, 255, 0.08)",
+        "color": "var(--text-primary)",
+        "border-left": "2px solid var(--accent)"
+      }
+    },
+    {
+      "name": "reading.body",
+      "source": "src/lib/components/MemoryViewer.svelte",
+      "line": 469,
+      "selector": ".markdown-body",
+      "declarations": {
+        "font-family": "var(--font-sans)",
+        "font-size": "15px",
+        "line-height": "1.65",
+        "color": "var(--text-primary)"
+      }
+    },
+    {
+      "name": "action.compact",
+      "source": "src/lib/components/CostTracker.svelte",
+      "line": 1083,
+      "selector": ".scale-trigger",
+      "declarations": {
+        "font-family": "var(--font-pixel)",
+        "font-size": "11px",
+        "letter-spacing": "0.05em",
+        "padding": "4px var(--space-sm)",
+        "background": "transparent",
+        "border": "1px solid var(--border-default)",
+        "color": "var(--text-secondary)",
+        "cursor": "pointer",
+        "text-transform": "uppercase"
+      }
+    },
+    {
+      "name": "action.compact.hover",
+      "source": "src/lib/components/CostTracker.svelte",
+      "line": 1095,
+      "selector": ".scale-trigger:hover",
+      "declarations": {
+        "border-color": "var(--text-muted)",
+        "color": "var(--text-primary)"
+      }
+    },
+    {
+      "name": "choice.compact",
+      "source": "src/lib/components/SessionHistory.svelte",
+      "line": 552,
+      "selector": ".option-btn",
+      "declarations": {
+        "font-family": "var(--font-pixel)",
+        "font-size": "10px",
+        "letter-spacing": "0.05em",
+        "padding": "4px var(--space-sm)",
+        "background": "transparent",
+        "border": "none",
+        "color": "var(--text-muted)",
+        "cursor": "pointer"
+      }
+    },
+    {
+      "name": "choice.selected.neutral",
+      "source": "src/lib/components/SessionHistory.svelte",
+      "line": 563,
+      "selector": ".option-btn.active",
+      "declarations": {
+        "background": "rgba(255, 255, 255, 0.1)",
+        "color": "var(--text-primary)"
+      }
+    },
+    {
+      "name": "choice.selected.semantic",
+      "source": "src/lib/components/CostTracker.svelte",
+      "line": 1510,
+      "selector": ".option-btn.active",
+      "declarations": {
+        "color": "var(--accent-amber)"
+      }
+    },
+    {
+      "name": "choice.hover",
+      "source": "src/lib/components/CostTracker.svelte",
+      "line": 1505,
+      "selector": ".option-btn:hover",
+      "declarations": {
+        "color": "var(--text-primary)",
+        "background": "rgba(255, 255, 255, 0.1)"
+      }
+    },
+    {
+      "name": "boolean.button",
+      "source": "src/lib/components/SessionHistory.svelte",
+      "line": 505,
+      "selector": ".match-btn",
+      "declarations": {
+        "font-family": "var(--font-pixel)",
+        "font-size": "11px",
+        "letter-spacing": "0.08em",
+        "width": "35.5px",
+        "height": "35.5px",
+        "display": "flex",
+        "align-items": "center",
+        "justify-content": "center",
+        "padding": "0",
+        "background": "transparent",
+        "border": "none",
+        "color": "var(--text-muted)",
+        "cursor": "pointer",
+        "text-transform": "uppercase"
+      }
+    },
+    {
+      "name": "boolean.button.hover",
+      "source": "src/lib/components/SessionHistory.svelte",
+      "line": 522,
+      "selector": ".match-btn:hover",
+      "declarations": {
+        "color": "var(--text-primary)",
+        "background": "rgba(255, 255, 255, 0.08)"
+      }
+    },
+    {
+      "name": "boolean.button.active",
+      "source": "src/lib/components/SessionHistory.svelte",
+      "line": 527,
+      "selector": ".match-btn.active",
+      "declarations": {
+        "background": "rgba(255, 255, 255, 0.1)",
+        "color": "var(--text-primary)"
+      }
+    },
+    {
+      "name": "input.text",
+      "source": "src/lib/components/SessionHistory.svelte",
+      "line": 486,
+      "selector": ".search-input",
+      "declarations": {
+        "flex": "1",
+        "min-width": "0",
+        "background": "var(--bg-elevated)",
+        "border": "1px solid var(--border-default)",
+        "color": "var(--text-primary)",
+        "font-family": "var(--font-mono)",
+        "font-size": "13px",
+        "padding": "var(--space-sm) var(--space-md)",
+        "outline": "none",
+        "box-sizing": "border-box"
+      }
+    },
+    {
+      "name": "input.focus",
+      "source": "src/lib/components/SessionHistory.svelte",
+      "line": 532,
+      "selector": ".search-input:focus",
+      "declarations": {
+        "border-color": "var(--border-focus)"
+      }
+    },
+    {
+      "name": "content.title",
+      "source": "src/lib/components/SessionCard.svelte",
+      "line": 390,
+      "selector": ".card-main-title",
+      "declarations": {
+        "font-family": "var(--font-sans)",
+        "font-size": "15px",
+        "font-weight": "600",
+        "color": "var(--text-primary)",
+        "margin": "0",
+        "overflow": "hidden",
+        "text-overflow": "ellipsis",
+        "letter-spacing": "0.05em",
+        "display": "-webkit-box",
+        "-webkit-line-clamp": "2",
+        "line-clamp": "2",
+        "-webkit-box-orient": "vertical",
+        "cursor": "default"
+      }
+    },
+    {
+      "name": "action.copy",
+      "source": "src/lib/components/MemoryViewer.svelte",
+      "line": 398,
+      "selector": ".cmd-copy",
+      "declarations": {
+        "font-family": "var(--font-mono)",
+        "font-size": "10px",
+        "font-weight": "600",
+        "color": "var(--accent)",
+        "flex-shrink": "0",
+        "text-transform": "uppercase",
+        "letter-spacing": "0.05em"
+      }
+    }
+  ],
+  "foundation": {
+    "--bg-base": "#000000",
+    "--bg-elevated": "#0a0a0a",
+    "--bg-card": "#111111",
+    "--bg-card-hover": "#1a1a1a",
+    "--bg-overlay": "rgba(0, 0, 0, 0.95)",
+    "--text-primary": "#ffffff",
+    "--text-secondary": "#888888",
+    "--text-muted": "#666666",
+    "--status-working": "#7928ca",
+    "--status-working-glow": "rgba(121, 40, 202, 0.25)",
+    "--status-permission": "#ff6600",
+    "--status-permission-glow": "rgba(255, 102, 0, 0.25)",
+    "--status-input": "#00ff88",
+    "--status-input-glow": "rgba(0, 255, 136, 0.2)",
+    "--status-connecting": "#666666",
+    "--status-connecting-glow": "rgba(102, 102, 102, 0.15)",
+    "--accent-blue": "#0070f3",
+    "--accent-green": "#00ff88",
+    "--accent-amber": "#ff6600",
+    "--accent-red": "#ff4444",
+    "--accent-purple": "#7928ca",
+    "--accent-pink": "#ff69b4",
+    "--border-default": "#333333",
+    "--border-muted": "#222222",
+    "--border-focus": "#ffffff",
+    "--border-glow": "rgba(255, 255, 255, 0.1)",
+    "--space-xs": "4px",
+    "--space-sm": "8px",
+    "--space-md": "12px",
+    "--space-lg": "16px",
+    "--space-xl": "24px",
+    "--space-2xl": "32px",
+    "--space-3xl": "48px",
+    "--radius-sm": "0",
+    "--radius-md": "0",
+    "--radius-lg": "0",
+    "--radius-xl": "0",
+    "--radius-2xl": "0",
+    "--shadow-sm": "none",
+    "--shadow-card": "none",
+    "--shadow-card-hover": "0 0 0 1px var(--border-focus)",
+    "--shadow-overlay": "0 0 0 1px var(--border-default)",
+    "--shadow-glow-blue": "0 0 20px var(--status-working-glow)",
+    "--shadow-glow-amber": "0 0 20px var(--status-permission-glow)",
+    "--shadow-glow-green": "0 0 20px var(--status-input-glow)",
+    "--font-sans": "'Geist', -apple-system, BlinkMacSystemFont, sans-serif",
+    "--font-mono": "'Geist Mono', 'SF Mono', Monaco, monospace",
+    "--font-pixel": "'Geist Pixel Square', var(--font-mono)",
+    "--font-pixel-grid": "'Geist Pixel Grid', var(--font-mono)",
+    "--transition-fast": "100ms linear",
+    "--transition-normal": "150ms linear",
+    "--transition-slow": "250ms linear",
+    "--transition-spring": "200ms linear"
+  },
+  "focus": {
+    "source": "src/app.css",
+    "selector": "button/input/textarea/select/[role=button]:focus-visible",
+    "outline": "1px solid var(--border-focus)",
+    "outline-offset": "0"
+  },
+  "gaps": [
+    "No established switch-track/thumb recipe outside NotificationSettings",
+    "No established checkbox or radio field recipe outside NotificationSettings in the inspected components",
+    "No consistent disabled or saving/error recipe across inspected Memory/History/Cost controls",
+    "Save versus immediate persistence is behavior, not a visual token"
+  ]
+}

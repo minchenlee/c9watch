@@ -1,0 +1,133 @@
+{
+  "date": "2026-09-06",
+  "branch": "codex/notification-settings",
+  "base": "db460ab",
+  "sourceSha256": {
+    "src-tauri/Cargo.toml": "3c6b288b5d9a64a8181e7592dbe8a17403b549645d6f60b7a2db2b6614c472f0",
+    "src-tauri/Cargo.lock": "925ea9acf9b4af9582cf7d658fbdf4070895cd746c97ffddbc9c0c3f4bad871d",
+    "src-tauri/src/notifications.rs": "5ae727ab897b8e1af8d153578a9afa9780e0fc54f8ba18c5beb6afdb92cdff0f",
+    "src-tauri/src/polling.rs": "3c06537aa08a474169ac13310403c85c445295961060a8aa0a78f48b52f733df",
+    "src-tauri/src/lib.rs": "6809dca2b06f17b6ef53885036a3263cb45014c4228ea59973dd3566c6575856",
+    "src-tauri/src/session/enrichment.rs": "43cf179ff97fdc7b8ee50f965ee4fabe6423bb53d4a4e7affff29f95fa967c1b",
+    "src-tauri/src/session/pi.rs": "c658ebf23f3b6fe7ac0fa4edcee61eee0342dadd7aa59ebd3784a40e792e5dea",
+    "src-tauri/src/cli/mod.rs": "70449dc40e7594687bb405c4988140bdb9705075630cab50cacf00441be4820a",
+    "src/lib/components/SettingsTab.svelte": "caee29f911fc8a6f44f85250469baddf635eaffd90da12697295623c3afcdcc3",
+    "src/lib/components/NotificationSettings.svelte": "a63595671bd3da478661f2d86bba734bd090e844715a5362550b60ab7dc72c5a",
+    "src-tauri/examples/notification_smoke.rs": "4214798dd90893aeb3ef9986614628e766ce8077f576b1f16c1c6c9dcdabbb69",
+    "src/app.css": "7ef476b80af321aa46acbafd65dec5dff01ef9671b1d65406ca3fba9b0b94612"
+  },
+  "qaApp": "/Users/liminchen/Applications/c9watch Notification QA.app",
+  "qaBinarySha256": "b67277c2a76e5c6d48c2c5dc43198038dfbd52d770013eb583918818c0acb0fd",
+  "svelteCheck": {
+    "errors": 0,
+    "warnings": 0
+  },
+  "frontendBuild": "passed",
+  "guiLibraryTests": {
+    "passed": 413,
+    "ignored": 3
+  },
+  "cliOnlyTests": {
+    "libraryPassed": 387,
+    "libraryIgnored": 3,
+    "integrationPassed": 3
+  },
+  "nativeSmoke": {
+    "expectedDeliveries": 3,
+    "actualDeliveries": 3,
+    "uuids": [
+      "55FF4CE3",
+      "78A2D2A4",
+      "EF36FDA9"
+    ],
+    "scope": "Synthetic Session events through the production dispatcher and macOS notification delivery; not a live external-agent test."
+  },
+  "nativeSettings": {
+    "savedAndReloaded": true,
+    "briefNotification": "D145194B",
+    "detailedNotification": "5B336905",
+    "soundOn": "Glass played at 08:14:06",
+    "soundOff": "hasSound false at 08:14:40",
+    "repeatedTestRequests": "passed"
+  },
+  "savedPreferences": {
+    "enabled": true,
+    "replyReady": true,
+    "questions": true,
+    "permissions": true,
+    "detail": "detailed",
+    "sound": false,
+    "cooldownSeconds": 30
+  },
+  "settingsUiRevision": {
+    "scope": "Settings UI layout, typography, controls, preview, and feedback; backend unchanged",
+    "svelteCheck": "0 errors, 0 warnings",
+    "frontendBuild": "passed",
+    "nativeBundle": "rebuilt and codesign verified",
+    "visualQA": [
+      "900x600 single column screenshot inspected",
+      "zoomed desktop two-column screenshot inspected",
+      "lower preview and save actions reached in narrow window"
+    ],
+    "interactionQA": [
+      "Brief removes preview text and marks unsaved",
+      "Test disabled until saved",
+      "Save restores saved state and enables test",
+      "Detailed restored and saved",
+      "Test command returns promptly in both window sizes"
+    ],
+    "priorBackendEvidence": "Rust tests and native dispatcher smoke above were completed before this UI revision; not rerun for presentation-only changes."
+  },
+  "designSystemAlignment": {
+    "tokens": "Existing surface, border, spacing, and typography tokens; additive text-description token",
+    "svelteCheck": "0 errors, 0 warnings",
+    "build": "passed",
+    "nativeVisualQA": "Not completed: native capture repeatedly returned stale blank content despite the current Settings accessibility tree. Reconnection and focus attempts did not resolve capture.",
+    "nativeInteractionQA": "Brief/Detailed preview and saved/unsaved state checked through accessibility; original detailed value restored."
+  },
+  "squareControlsRevision": {
+    "changes": "Content-width event hover; sharp switch tracks/thumbs, radio markers, preview and icon",
+    "svelteCheck": "0 errors, 0 warnings",
+    "frontendBuild": "passed",
+    "nativeBundle": "rebuilt and signature verified",
+    "visualQA": "pending"
+  },
+  "insetMarkersRevision": {
+    "change": "Event checkbox checkmark and white fill replaced by 8px inset square on black with thin outline",
+    "svelteCheck": "0 errors, 0 warnings",
+    "frontendBuild": "passed",
+    "nativeBundle": "rebuilt and signature verified",
+    "visualQA": "not yet inspected"
+  },
+  "compactNavigationRevision": {
+    "svelteCheck": "0 errors, 0 warnings",
+    "frontendBuild": "passed",
+    "nativeBuild": "passed, signature verified",
+    "nativeQA": [
+      "900x600 Notifications and About & updates screenshots inspected",
+      "Zoomed desktop notification and preview columns inspected",
+      "Unsaved Brief choice retained across section navigation",
+      "Restored original Detailed preference without saving test changes"
+    ]
+  },
+  "sourceRecipesRevision": {
+    "svelteCheck": "0 errors, 0 warnings",
+    "frontendBuild": "passed",
+    "nativeBuild": "passed, signature verified",
+    "candidateApp": "/private/tmp/c9watch-settings-nav-target/debug/bundle/macos/c9watch Notification QA.app",
+    "candidateBinarySha256": "b67277c2a76e5c6d48c2c5dc43198038dfbd52d770013eb583918818c0acb0fd",
+    "sourceSha256": {
+      "src/lib/components/NotificationSettings.svelte": "a63595671bd3da478661f2d86bba734bd090e844715a5362550b60ab7dc72c5a",
+      "src/lib/components/SettingsTab.svelte": "caee29f911fc8a6f44f85250469baddf635eaffd90da12697295623c3afcdcc3"
+    },
+    "installedQa": "/Users/liminchen/Applications/c9watch Notification QA.app",
+    "nativeQA": [
+      "900x600 and zoomed desktop screenshots inspected",
+      "Event On/Off updates aria-pressed and unsaved status",
+      "Unsaved event choice survives About & updates navigation",
+      "Save succeeds and re-enables test action",
+      "Brief/Detailed changes preview content",
+      "Original enabled events and detailed mode restored and saved"
+    ]
+  }
+}
