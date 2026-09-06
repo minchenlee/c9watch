@@ -166,3 +166,13 @@ export async function getDebugLogs(): Promise<LogEntry[]> {
 	if (useWebSocket()) return [];
 	return await invoke<LogEntry[]>('get_debug_logs');
 }
+
+/** Subscription quotas, separate from session token/cost estimates. */
+export async function getSubscriptionUsage(): Promise<import('./subscription-usage').SubscriptionUsage[]> {
+	if (get(isDemoMode)) {
+		const { demoSubscriptionUsage } = await import('./subscription-usage');
+		return demoSubscriptionUsage();
+	}
+	if (useWebSocket()) return wsClient.request('getSubscriptionUsage');
+	return invoke('get_subscription_usage');
+}

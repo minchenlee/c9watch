@@ -31,6 +31,7 @@
 	import { refreshSessionHistory } from '$lib/stores/history';
 	import MemoryViewer from '$lib/components/MemoryViewer.svelte';
 	import SettingsTab from '$lib/components/SettingsTab.svelte';
+	import SubscriptionUsage from '$lib/components/SubscriptionUsage.svelte';
 	import FdaBanner from '$lib/components/FdaBanner.svelte';
 	import UpdateBanner from '$lib/components/UpdateBanner.svelte';
 	import DebugConsole from '$lib/components/DebugConsole.svelte';
@@ -463,6 +464,7 @@
 				<span class="drag-dots" transition:fade={{ duration: 250 }}>⠿ ⠿ ⠿</span>
 			{/if}
 		</div>
+		<SubscriptionUsage showPercentage={isFullscreen} />
 		<div class="global-provider-filter"><ProviderFilter compact variant="select" /></div>
 		<button
 			class="tab-btn"
