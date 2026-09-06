@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import NotificationSettings from './NotificationSettings.svelte';
+	import UsageSettings from './UsageSettings.svelte';
 	import { marked } from 'marked';
 	import DOMPurify from 'dompurify';
 	import { openUrl } from '@tauri-apps/plugin-opener';
@@ -19,7 +20,7 @@
 	} from '$lib/stores/updater';
 
 	let checking = $state(false);
-	let activeSection = $state<'notifications' | 'about'>('notifications');
+	let activeSection = $state<'notifications' | 'usage' | 'about'>('notifications');
 	let nativeNotifications = $state(false);
 	let justChecked = $state(false);
 
@@ -33,7 +34,7 @@
 
 	onMount(() => {
 		nativeNotifications = isTauri() && /Mac/i.test(navigator.platform);
-		if (!nativeNotifications) activeSection = 'about';
+		if (!nativeNotifications) activeSection = 'usage';
 		if (update) fetchReleaseNotes();
 	});
 
@@ -96,10 +97,12 @@
 	<div class="settings-shell">
         <nav class="settings-nav" aria-label="Settings sections">
             {#if nativeNotifications}<button class:active={activeSection === 'notifications'} aria-current={activeSection === 'notifications' ? 'page' : undefined} onclick={() => activeSection = 'notifications'}>Notifications</button>{/if}
+            <button class:active={activeSection === 'usage'} aria-current={activeSection === 'usage' ? 'page' : undefined} onclick={() => activeSection = 'usage'}>Usage</button>
             <button class:active={activeSection === 'about'} aria-current={activeSection === 'about' ? 'page' : undefined} onclick={() => activeSection = 'about'}>About &amp; updates</button>
         </nav>
         <div class="content"><div class="settings-body">
         {#if nativeNotifications}<div hidden={activeSection !== 'notifications'}><NotificationSettings /></div>{/if}
+        <div hidden={activeSection !== 'usage'}><UsageSettings /></div>
         <div class="about-panel" hidden={activeSection !== 'about'}>
 		<div class="group" >
 			<div class="group-title group-title--lg">Version</div>

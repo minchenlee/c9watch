@@ -4,6 +4,7 @@
 
 // ── Core modules (always compiled) ──────────────────────────────────
 pub mod actions;
+pub mod claude_usage;
 pub mod debug_log;
 pub mod session;
 
@@ -16,6 +17,8 @@ pub mod notifications;
 pub mod polling;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod web_server;
+#[cfg(all(not(mobile), feature = "gui"))]
+pub mod subscription_usage;
 
 // ── CLI module ──────────────────────────────────────────────────────
 #[cfg(feature = "cli")]
@@ -57,6 +60,12 @@ use tauri_nspanel::{
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn get_subscription_usage() -> Vec<subscription_usage::SubscriptionUsage> {
+    subscription_usage::get_subscription_usage().await
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -147,7 +156,16 @@ async fn get_memory_files() -> Result<Vec<session::ProjectMemory>, String> {
 #[tauri::command]
 async fn get_subagents(
 ) -> Result<std::collections::HashMap<String, Vec<session::SubagentInfo>>, String> {
-    Ok(session::all_subagents_by_session())
+    // Transcript scans perform blocking disk I/O and JSON parsing. Running them
+    // directly on Tokio workers can starve subscription IPC, pipes and timers.
+    // Hold the permit inside the blocking job so cancellation cannot overlap scans.
+    static SCAN_GATE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let permit = SCAN_GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone().acquire_owned().await.map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        session::all_subagents_by_session()
+    }).await.map_err(|e| format!("Subagent scan failed: {e}"))
 }
 
 /// Returns the prompt + final result (plus usage stats when available) for a
@@ -720,6 +738,7 @@ pub fn run() {
             notifications::test_native_notification,
             greet,
             get_sessions,
+            get_subscription_usage,
             get_conversation,
             get_session_history,
             deep_search_sessions,

@@ -38,6 +38,12 @@ jobs:
       - name: Conversation selection regression tests
         run: node --conditions=browser --test scripts/test-conversation-selection.mjs
 
+      - name: Usage and polling regressions
+        run: |
+          node scripts/test-subagent-polling.mjs
+          node scripts/test-subscription-polling.mjs
+          node scripts/test-usage-preferences.mjs
+
       - name: Rust check
         run: cargo check --manifest-path src-tauri/Cargo.toml
 

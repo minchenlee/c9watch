@@ -21,3 +21,6 @@ CLAUDE.md
 docs/plans/
 docs/superpowers/
 .gstack/
+
+# Managed subscription QA outputs
+/.qa-build/

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import SubscriptionUsage from '$lib/components/SubscriptionUsage.svelte';
 	import { onMount, untrack } from 'svelte';
 	import { sortedSessions, sessions as sessionsStore, initializeSessionListeners, visibleTopLevelSessionIds } from '$lib/stores/sessions';
 	import { openSession, getSessions } from '$lib/api';
@@ -192,9 +193,16 @@
 			</div>
 		{/if}
 	</main>
+	<footer class="usage-footer">
+		<span>USAGE</span>
+		<SubscriptionUsage placement="top" />
+	</footer>
 </div>
 
 <style>
+	.usage-footer { display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; gap: 8px; padding: 8px 10px 8px 16px; border-top: 1px solid var(--border-muted); }
+	.usage-footer > span { font-size: 9px; letter-spacing: .08em; color: var(--text-muted); }
+
 	.popover {
 		display: flex;
 		flex-direction: column;

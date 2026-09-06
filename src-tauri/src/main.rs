@@ -19,7 +19,7 @@ fn main() {
             // unexpectedly launching the GUI.
             let known_commands = [
                 "list", "status", "self", "view", "history", "search", "stop", "watch", "tasks",
-                "spawn", "send", "workers", "inbox", "adopt", "daemon", "cost", "help",
+                "spawn", "send", "workers", "inbox", "adopt", "daemon", "cost", "usage-bridge", "help",
             ];
             let is_cli = known_commands.contains(&first)
                 || first == "--help"
