@@ -57,3 +57,9 @@ Event checkboxes now use an inset 8px square on black instead of a typographic c
 Settings now has a 180px left navigation with Notifications and About & updates, following the existing split-panel app layout. The navigation becomes horizontal below 680px. Notification preferences stay mounted while changing sections, retaining unsaved edits. Non-native environments show About & updates only.
 
 Buttons are 32px tall, checkbox/radio markers are 16px, and square switches are 32×18px with 12px thumbs. Event rows retain 32px click targets; detail choices use compact content blocks instead of filling the row. Descriptive text retains the high-contrast token.
+
+## Applying source-derived recipes
+
+Replaced bespoke checkbox/radio/switch graphics with History-style pressed buttons and a Brief/Detailed segmented group. Save remains explicit; explanatory copy states when changes apply. Actions and focus follow Cost/global styles, navigation follows Memory (200px, 8×12px padding, 3%/8% white hover/selection), and subsection headings use Pixel 13px. Neutral white selection replaces Memory's context-specific accent; necessary text uses secondary rather than insufficient-contrast muted text. These are deliberate adaptations, not exact copies of every property. Disabled styling remains a local fallback because the inventory found no consistent shared recipe.
+
+Frontend checks and native bundle build passed. After unlocking the Mac, the source-verified bundle replaced the isolated QA app. Native screenshots at 900x600 and zoomed desktop were inspected; event pressed state, draft retention across navigation, Save/Test interlock, and detail previews were verified. Original preferences were restored and saved. See sourceRecipesRevision in notification-validation.json.

@@ -11,13 +11,13 @@
     "src-tauri/src/session/enrichment.rs": "43cf179ff97fdc7b8ee50f965ee4fabe6423bb53d4a4e7affff29f95fa967c1b",
     "src-tauri/src/session/pi.rs": "c658ebf23f3b6fe7ac0fa4edcee61eee0342dadd7aa59ebd3784a40e792e5dea",
     "src-tauri/src/cli/mod.rs": "70449dc40e7594687bb405c4988140bdb9705075630cab50cacf00441be4820a",
-    "src/lib/components/SettingsTab.svelte": "0a965b3ca994ee5985e6b45e20eb41ccf6fe39b11e9ba0c6888abaa3d886a0e2",
-    "src/lib/components/NotificationSettings.svelte": "e37a69eaf5721a0bb15460f7825a8d3ea4ded6d287455fc09e078c95330272d7",
+    "src/lib/components/SettingsTab.svelte": "caee29f911fc8a6f44f85250469baddf635eaffd90da12697295623c3afcdcc3",
+    "src/lib/components/NotificationSettings.svelte": "a63595671bd3da478661f2d86bba734bd090e844715a5362550b60ab7dc72c5a",
     "src-tauri/examples/notification_smoke.rs": "4214798dd90893aeb3ef9986614628e766ce8077f576b1f16c1c6c9dcdabbb69",
     "src/app.css": "7ef476b80af321aa46acbafd65dec5dff01ef9671b1d65406ca3fba9b0b94612"
   },
   "qaApp": "/Users/liminchen/Applications/c9watch Notification QA.app",
-  "qaBinarySha256": "8734054922ab63da9c8b8615f54a903e6de41927aec039ef95fbf4b84e1d0b3a",
+  "qaBinarySha256": "b67277c2a76e5c6d48c2c5dc43198038dfbd52d770013eb583918818c0acb0fd",
   "svelteCheck": {
     "errors": 0,
     "warnings": 0
@@ -108,6 +108,26 @@
       "Zoomed desktop notification and preview columns inspected",
       "Unsaved Brief choice retained across section navigation",
       "Restored original Detailed preference without saving test changes"
+    ]
+  },
+  "sourceRecipesRevision": {
+    "svelteCheck": "0 errors, 0 warnings",
+    "frontendBuild": "passed",
+    "nativeBuild": "passed, signature verified",
+    "candidateApp": "/private/tmp/c9watch-settings-nav-target/debug/bundle/macos/c9watch Notification QA.app",
+    "candidateBinarySha256": "b67277c2a76e5c6d48c2c5dc43198038dfbd52d770013eb583918818c0acb0fd",
+    "sourceSha256": {
+      "src/lib/components/NotificationSettings.svelte": "a63595671bd3da478661f2d86bba734bd090e844715a5362550b60ab7dc72c5a",
+      "src/lib/components/SettingsTab.svelte": "caee29f911fc8a6f44f85250469baddf635eaffd90da12697295623c3afcdcc3"
+    },
+    "installedQa": "/Users/liminchen/Applications/c9watch Notification QA.app",
+    "nativeQA": [
+      "900x600 and zoomed desktop screenshots inspected",
+      "Event On/Off updates aria-pressed and unsaved status",
+      "Unsaved event choice survives About & updates navigation",
+      "Save succeeds and re-enables test action",
+      "Brief/Detailed changes preview content",
+      "Original enabled events and detailed mode restored and saved"
     ]
   }
 }

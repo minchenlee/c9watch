@@ -38,27 +38,27 @@
 </script>
 
 <section aria-labelledby="notification-heading">
-    <div class="heading"><div><h2 id="notification-heading">Notifications</h2><p class="intro">Choose what reaches you, and how much you see.</p></div><span class="platform">macOS native</span></div>
+    <div class="heading"><div><h2 id="notification-heading">Notifications</h2><p class="intro">Choose what reaches you. Changes apply when you save.</p></div><span class="platform">macOS native</span></div>
     {#if prefs}
         <div class="settings-layout">
             <fieldset disabled={busy}>
-                <label class="row master"><span><strong>Enable notifications</strong><small>For all providers on this Mac.</small></span><input type="checkbox" role="switch" aria-label="Enable notifications" bind:checked={prefs.enabled} /></label>
+                <div class="row master"><span>Notifications<small>For all providers on this Mac.</small></span><button class="choice" class:active={prefs.enabled} aria-label="Enable notifications" aria-pressed={prefs.enabled} onclick={() => { if (prefs) prefs.enabled = !prefs.enabled; }}>{prefs.enabled ? 'On' : 'Off'}</button></div>
                 {#if !prefs.enabled}<p class="off-note">Notifications are off. Your choices below will be kept.</p>{/if}
                 <div class="setting-group events" role="group" aria-labelledby="event-heading">
                     <h3 id="event-heading">Notify me when</h3>
-                    <label><input type="checkbox" bind:checked={prefs.replyReady} /><span>A reply is ready</span></label>
-                    <label><input type="checkbox" bind:checked={prefs.questions} /><span>An agent asks a question</span></label>
-                    <label><input type="checkbox" bind:checked={prefs.permissions} /><span>A tool needs permission</span></label>
+                    <div class="event-row"><span>A reply is ready</span><button class="choice" class:active={prefs.replyReady} aria-label="A reply is ready" aria-pressed={prefs.replyReady} onclick={() => { if (prefs) prefs.replyReady = !prefs.replyReady; }}>{prefs.replyReady ? 'On' : 'Off'}</button></div>
+                    <div class="event-row"><span>An agent asks a question</span><button class="choice" class:active={prefs.questions} aria-label="An agent asks a question" aria-pressed={prefs.questions} onclick={() => { if (prefs) prefs.questions = !prefs.questions; }}>{prefs.questions ? 'On' : 'Off'}</button></div>
+                    <div class="event-row"><span>A tool needs permission</span><button class="choice" class:active={prefs.permissions} aria-label="A tool needs permission" aria-pressed={prefs.permissions} onclick={() => { if (prefs) prefs.permissions = !prefs.permissions; }}>{prefs.permissions ? 'On' : 'Off'}</button></div>
                 </div>
                 <div class="setting-group">
                     <h3>Content detail</h3>
                     <div class="detail-options" role="group" aria-label="Content detail">
-                        <label class:selected={prefs.detail === 'brief'}><input type="radio" name="notification-detail" value="brief" bind:group={prefs.detail} /><span>Brief<small>Event and session</small></span></label>
-                        <label class:selected={prefs.detail === 'detailed'}><input type="radio" name="notification-detail" value="detailed" bind:group={prefs.detail} /><span>Detailed<small>Includes a preview</small></span></label>
+                        <button class="choice" class:active={prefs.detail === 'brief'} aria-pressed={prefs.detail === 'brief'} onclick={() => { if (prefs) prefs.detail = 'brief'; }}>Brief</button>
+                        <button class="choice" class:active={prefs.detail === 'detailed'} aria-pressed={prefs.detail === 'detailed'} onclick={() => { if (prefs) prefs.detail = 'detailed'; }}>Detailed</button>
                     </div>
-                    <p class="hint">Detailed notifications can include conversation text and commands.</p>
+                    <p class="hint">{prefs.detail === 'brief' ? 'Event and session only.' : 'Includes conversation text and commands.'}</p>
                 </div>
-                <label class="row"><span>Play a sound<small>Allow sounds in macOS notification settings too.</small></span><input type="checkbox" role="switch" aria-label="Play a sound" bind:checked={prefs.sound} /></label>
+                <div class="row"><span>Play a sound<small>Allow sounds in macOS notification settings too.</small></span><button class="choice" class:active={prefs.sound} aria-label="Play a sound" aria-pressed={prefs.sound} onclick={() => { if (prefs) prefs.sound = !prefs.sound; }}>{prefs.sound ? 'On' : 'Off'}</button></div>
                 <div class="row cooldown"><label for="notification-cooldown">Cooldown<small>Between the same event in a session.<br />Use 0 for no delay.</small></label><div class="number-control"><input id="notification-cooldown" type="number" min="0" max="600" step="1" bind:value={prefs.cooldownSeconds} aria-label="Cooldown in seconds" /><span>sec</span></div></div>
                 {#if !Number.isInteger(prefs.cooldownSeconds) || prefs.cooldownSeconds < 0 || prefs.cooldownSeconds > 600}<p class="error" role="alert">Enter a whole number from 0 to 600 seconds.</p>{/if}
             </fieldset>
@@ -80,55 +80,45 @@
 <style>
     section { color: var(--text-primary); font-size: 14px; line-height: 1.5; }
     .heading { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-lg); margin-bottom: var(--space-xl); }
-    h2 { margin: 0 0 6px; font-size: 18px; font-weight: 600; letter-spacing: -.02em; }
-    h3 { font-size: 14px; font-weight: 600; margin: 0 0 12px; }
+    h2 { margin: 0 0 var(--space-sm); font: 600 13px/1.5 var(--font-pixel); text-transform: uppercase; letter-spacing: .1em; }
+    h3 { font: 600 13px/1.5 var(--font-pixel); text-transform: uppercase; letter-spacing: .1em; margin: 0 0 var(--space-sm); }
     p { margin: 0; }
-    .intro, .hint, small { color: var(--text-description); font-size: 13px; line-height: 1.55; }
-    .platform { font-family: var(--font-mono); color: var(--text-description); font-size: 12px; white-space: nowrap; border: 1px solid var(--border-default); padding: 4px 8px; }
+    .intro, .hint, small { color: var(--text-secondary); font-size: 13px; line-height: 1.55; }
+    .platform { font-family: var(--font-mono); color: var(--text-secondary); font-size: 12px; white-space: nowrap; border: 1px solid var(--border-default); padding: 4px 8px; }
     .settings-layout { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: var(--space-2xl); align-items: start; }
     fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
     .row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-xl); padding: var(--space-lg) 0; border-bottom: 1px solid var(--border-default); }
     .master { padding-top: 0; }
     small { display: block; margin-top: 4px; }
     .setting-group { padding: var(--space-lg) 0; border-bottom: 1px solid var(--border-default); }
-    .events label { width: fit-content; max-width: 100%; padding-right: var(--space-md); display: flex; align-items: center; gap: var(--space-md); min-height: 32px; cursor: pointer; }
-    input[type=checkbox], input[type=radio] { appearance: none; -webkit-appearance: none; width: 16px; height: 16px; flex-shrink: 0; border: 1px solid var(--text-secondary); background: var(--bg-base); display: inline-grid; place-content: center; margin: 0; cursor: pointer; }
-    input[type=checkbox]:checked, input[type=radio]:checked { background: var(--text-primary); border-color: var(--text-primary); }
-    input[type=checkbox]:not([role=switch]):checked { background: var(--bg-base); }
-    input[type=checkbox]:not([role=switch]):checked::before { content: ''; width: 6px; height: 6px; background: var(--text-primary); }
-    input[type=radio] { border-radius: var(--radius-sm); }
-    input[type=radio]:checked::before { content: ''; width: 6px; height: 6px; border-radius: var(--radius-sm); background: var(--bg-base); }
-    input[role=switch] { width: 32px; height: 18px; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: flex-start; padding: 2px; background: var(--border-default); }
-    input[role=switch]::before { content: ''; display: block; width: 12px; height: 12px; border-radius: var(--radius-sm); background: var(--text-description); }
-    input[role=switch]:checked { background: var(--text-primary); }
-    input[role=switch]:checked::before { content: ''; background: var(--bg-base); transform: translateX(13px); }
-    .detail-options { display: flex; gap: var(--space-sm); margin-bottom: 12px; }
-    .detail-options label { display: flex; flex: 0 1 160px; align-items: center; gap: var(--space-sm); border: 1px solid var(--text-muted); padding: var(--space-sm) var(--space-md); cursor: pointer; }
-    .detail-options label.selected { background: var(--bg-card-hover); border-color: var(--text-primary); }
-    .detail-options small { font-size: 12px; }
-    .number-control { display: flex; align-items: center; gap: var(--space-sm); color: var(--text-description); }
-    input[type=number], button { color: var(--text-primary); background: var(--bg-card); border: 1px solid var(--text-muted); border-radius: var(--radius-sm); padding: 6px var(--space-md); font: inherit; font-size: 12px; min-height: 32px; }
-    input[type=number] { width: 64px; }
+    /* History pressed-button and segmented-option surfaces; text labels remain readable Sans. */
+    .event-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-lg); padding: var(--space-xs) 0; }
+    .detail-options { display: inline-flex; border: 1px solid var(--border-default); margin-bottom: var(--space-sm); }
+    button.choice { padding: 4px var(--space-sm); min-width: 42px; border: 1px solid var(--border-default); font-family: var(--font-pixel); font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--text-secondary); }
+    .detail-options button.choice { border: 0; }
+    button.choice:hover:not(:disabled) { background: rgba(255,255,255,.08); color: var(--text-primary); }
+    button.choice.active { background: rgba(255,255,255,.1); color: var(--text-primary); }
+    .number-control { display: flex; align-items: center; gap: var(--space-sm); color: var(--text-secondary); }
+    input[type=number] { width: 72px; color: var(--text-primary); background: var(--bg-elevated); border: 1px solid var(--border-default); padding: var(--space-sm) var(--space-md); font: 13px/1.5 var(--font-mono); }
     aside { padding: var(--space-lg); background: var(--bg-card); position: sticky; top: 0; }
     .preview { background: var(--bg-card-hover); border-radius: var(--radius-sm); padding: var(--space-lg); display: flex; flex-direction: column; gap: 7px; font-size: 13px; line-height: 1.5; margin: var(--space-xl) 0; overflow-wrap: anywhere; }
-    .preview-app { display: flex; gap: var(--space-sm); align-items: center; color: var(--text-description); margin-bottom: 4px; font-size: 12px; }
+    .preview-app { display: flex; gap: var(--space-sm); align-items: center; color: var(--text-secondary); margin-bottom: 4px; font-size: 12px; }
     .app-icon { background: var(--bg-base); color: var(--text-primary); font-family: var(--font-mono); padding: 3px 5px; border-radius: var(--radius-sm); }
     .preview-time { margin-left: auto; }
-    .preview strong { font-size: 14px; }
-    .preview p { color: var(--text-description); }
+    .preview strong { font-size: 15px; }
+    .preview p { color: var(--text-secondary); }
     .test { width: 100%; display: flex; justify-content: space-between; margin-bottom: 12px; }
-    button { cursor: pointer; font-family: var(--font-mono); font-size: 12px; transition: background var(--transition-fast), border-color var(--transition-fast); }
-    button:hover:not(:disabled), .events label:hover, .detail-options label:hover { background: var(--bg-card-hover); }
-    button.primary { background: var(--text-primary); color: var(--bg-base); border-color: var(--text-primary); font-weight: 600; }
-    button.primary:hover:not(:disabled) { background: var(--text-description); }
-    button:disabled { color: var(--text-secondary); border-color: var(--border-default); background: var(--bg-elevated); cursor: default; }
-    fieldset:disabled { opacity: .65; }
-    :is(button, input):focus-visible { outline: 2px solid var(--text-primary); outline-offset: 4px; }
+    /* Cost scale-trigger action; no fixed form-wide height. */
+    button { cursor: pointer; color: var(--text-secondary); background: transparent; border: 1px solid var(--border-default); padding: 4px var(--space-sm); font: 11px/1.5 var(--font-pixel); text-transform: uppercase; letter-spacing: .05em; transition: color var(--transition-fast), border-color var(--transition-fast); }
+    button:hover:not(:disabled) { color: var(--text-primary); border-color: var(--text-muted); }
+    button.primary { color: var(--text-primary); border-color: var(--text-secondary); }
+    button:disabled { opacity: .5; cursor: default; }
+    :is(button, input):focus-visible { outline: 1px solid var(--border-focus); outline-offset: 0; }
     .save-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-lg); margin-top: var(--space-xl); padding: var(--space-lg) 0; border-top: 1px solid var(--text-muted); }
-    .save-state { color: var(--text-description); font-size: 14px; }
-    .off-note, .permission-note, .feedback { color: var(--text-description); font-size: 13px; line-height: 1.6; margin-top: 14px; }
+    .save-state { color: var(--text-secondary); font-size: 14px; }
+    .off-note, .permission-note, .feedback { color: var(--text-secondary); font-size: 13px; line-height: 1.6; margin-top: 14px; }
     .error { color: var(--accent-red); font-size: 14px; overflow-wrap: anywhere; margin-top: 12px; }
     @media (max-width: 1180px) { .settings-layout { grid-template-columns: minmax(0, 1fr); gap: var(--space-xl); } aside { position: static; } .preview { max-width: 420px; } .test { width: auto; gap: var(--space-xl); } }
-    @media (max-width: 520px) { .heading { align-items: flex-start; flex-direction: column; gap: var(--space-sm); } .detail-options { flex-wrap: wrap; } .detail-options label { flex-basis: auto; } .row { gap: var(--space-md); } .save-bar { flex-wrap: wrap; } }
+    @media (max-width: 520px) { .heading { align-items: flex-start; flex-direction: column; gap: var(--space-sm); } .detail-options { flex-wrap: wrap; } .row { gap: var(--space-md); } .save-bar { flex-wrap: wrap; } }
     @media (prefers-reduced-motion: reduce) { button { transition: none; } }
 </style>

@@ -516,23 +516,24 @@
 		50% { opacity: 1; }
 	}
 
-    .settings-body { width: 100%; max-width: 960px; margin: 0; display: flex; flex-direction: column; gap: var(--space-xl); padding: var(--space-sm) var(--space-xl) var(--space-2xl); box-sizing: border-box;  }
+    .settings-body { width: 100%; max-width: 960px; margin: 0; display: flex; flex-direction: column; gap: var(--space-xl); padding: 0 var(--space-lg) var(--space-2xl); box-sizing: border-box;  }
     .group { border-top: 1px solid var(--border-default); padding-top: var(--space-xl); }
-    .group-title, .group-title--lg { font-family: var(--font-pixel); font-size: 18px; letter-spacing: .06em; text-transform: uppercase; border: 0; color: var(--text-primary); }
-    .mono, .status-text, .version-diff, .notes-state, .state-line, .progress-label { font-size: 14px; text-transform: none; letter-spacing: normal; }
-    .btn-ghost, .btn-primary { font-family: var(--font-mono); font-size: 12px; text-transform: none; letter-spacing: normal; min-height: 32px; padding: 6px 12px; }
+    .group-title, .group-title--lg { font-family: var(--font-pixel); font-size: 13px; letter-spacing: .1em; text-transform: uppercase; border: 0; color: var(--text-primary); }
+    .mono, .status-text, .version-diff, .notes-state, .state-line, .progress-label { font-size: 13px; text-transform: none; letter-spacing: normal; }
+    .btn-ghost, .btn-primary { font-family: var(--font-pixel); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding: 4px var(--space-sm); }
     .markdown-body { font-size: 15px; }
     .markdown-body :global(h1), .markdown-body :global(h2), .markdown-body :global(h3) { font-family: var(--font-sans); font-size: 16px; text-transform: none; letter-spacing: normal; color: var(--text-primary); }
-    .status-text--dim, .notes-state, .state-line, .progress-label { color: var(--text-description); }
-    button:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 4px; }
+    .status-text--dim, .notes-state, .state-line, .progress-label { color: var(--text-secondary); }
+    button:focus-visible { outline: 1px solid var(--border-focus); outline-offset: 0; }
     @media (max-width: 600px) { .settings-body { padding-inline: 0; } }
     @media (prefers-reduced-motion: reduce) { .progress-fill { transition: none; animation: none; } }
 
     .settings-shell { display: flex; flex: 1; min-height: 0; }
-    .settings-nav { width: 180px; flex-shrink: 0; border-right: 1px solid var(--border-default); padding-right: var(--space-md); }
-    .settings-nav button { display: block; width: 100%; text-align: left; padding: 10px 12px; border: 0; border-bottom: 1px solid var(--border-muted); background: transparent; color: var(--text-description); font: 12px/1.5 var(--font-mono); cursor: pointer; }
-    .settings-nav button:hover, .settings-nav button.active { background: var(--bg-card); color: var(--text-primary); }
-    .settings-nav button.active { box-shadow: inset -1px 0 var(--border-focus); }
+    .settings-nav { width: 200px; min-width: 160px; flex-shrink: 0; border-right: 1px solid var(--border-default); }
+    .settings-nav button { display: block; width: 100%; text-align: left; padding: var(--space-sm) var(--space-md); border: 0; border-bottom: 1px solid var(--border-default); background: transparent; color: var(--text-secondary); font: 12px/1.5 var(--font-mono); cursor: pointer; }
+    .settings-nav button:hover { background: rgba(255,255,255,.03); color: var(--text-primary); }
+    .settings-nav button.active { background: rgba(255,255,255,.08); color: var(--text-primary); }
+    .settings-nav button.active { box-shadow: inset 2px 0 var(--border-focus); }
     .content { min-width: 0; }
     .about-panel > .group:first-child { border-top: 0; padding-top: 0; }
     .about-panel > .group + .group { margin-top: var(--space-xl); }
