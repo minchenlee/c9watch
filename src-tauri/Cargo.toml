@@ -42,6 +42,7 @@ pm-orchestration = ["cli"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
+cc = "1"
 
 [dependencies]
 # ── Core (always included) ───────────────────────────────────────────

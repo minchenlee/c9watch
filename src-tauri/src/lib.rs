@@ -8,6 +8,9 @@ pub mod claude_usage;
 pub mod debug_log;
 pub mod session;
 
+#[cfg(all(target_os = "macos", feature = "gui"))]
+mod macos_now_playing;
+
 // ── GUI-only modules ────────────────────────────────────────────────
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod auth;

@@ -1,0 +1,13 @@
+{
+  "build": {
+    "beforeBuildCommand": "npm run build && npm run build:widget"
+  },
+  "bundle": {
+    "macOS": {
+      "minimumSystemVersion": "14.0",
+      "files": {
+        "PlugIns/c9watch-widget.appex": "../macos-widget/build/c9watch-widget.appex"
+      }
+    }
+  }
+}

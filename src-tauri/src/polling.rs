@@ -268,6 +268,9 @@ pub fn start_polling(
                     });
                     let changed = current_hash != prev_sessions_hash;
                     if changed {
+                        #[cfg(target_os = "macos")]
+                        crate::macos_now_playing::publish(&sessions);
+
                         if let Err(e) = app_handle.emit("sessions-updated", &sessions) {
                             crate::debug_log::log_error(&format!(
                                 "Failed to emit sessions-updated: {}",
