@@ -510,7 +510,7 @@
 		<MemoryViewer />
 	</main>
 	{:else if activeTab === 'settings'}
-	<main class="grid-container history-main" in:fadeIn>
+	<main class="grid-container history-main settings-main" in:fadeIn>
 		<SettingsTab />
 	</main>
 	{:else}
@@ -957,6 +957,10 @@
 		overflow: hidden;
 		display: flex;
 		flex-direction: column;
+	}
+
+	.history-main.settings-main {
+		padding-right: 0;
 	}
 
 	.sections-container {

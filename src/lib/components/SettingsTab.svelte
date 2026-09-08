@@ -522,7 +522,7 @@
 		50% { opacity: 1; }
 	}
 
-    .settings-body { width: 100%; max-width: 960px; margin: 0; display: flex; flex-direction: column; gap: var(--space-xl); padding: 0 var(--space-lg) var(--space-2xl); box-sizing: border-box;  }
+    .settings-body { width: 100%; max-width: none; margin: 0; display: flex; flex-direction: column; gap: var(--space-xl); padding: 0 0 var(--space-2xl) var(--space-lg); box-sizing: border-box;  }
     .group { border-top: 1px solid var(--border-default); padding-top: var(--space-xl); }
     .group-title, .group-title--lg { font-family: var(--font-pixel); font-size: 13px; letter-spacing: .1em; text-transform: uppercase; border: 0; color: var(--text-primary); }
     .mono, .status-text, .version-diff, .notes-state, .state-line, .progress-label { font-size: 13px; text-transform: none; letter-spacing: normal; }

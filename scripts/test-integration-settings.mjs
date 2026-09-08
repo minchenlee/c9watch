@@ -4,6 +4,7 @@ import { test } from 'node:test';
 
 const settings = readFileSync(new URL('../src/lib/components/SettingsTab.svelte', import.meta.url), 'utf8');
 const integration = readFileSync(new URL('../src/lib/components/IntegrationSettings.svelte', import.meta.url), 'utf8');
+const appPage = readFileSync(new URL('../src/routes/(app)/+page.svelte', import.meta.url), 'utf8');
 
 test('Settings exposes a shared Integration section instead of an OpenCode section', () => {
   assert.match(settings, /IntegrationSettings/);
@@ -19,4 +20,10 @@ test('Integration section groups local providers and the configurable OpenCode c
   assert.match(integration, /Automatic detection/);
   assert.match(integration, /<OpenCodeConnection \/>/);
   assert.match(integration, /Remote integrations/);
+});
+
+test('Settings content uses the available width without right padding', () => {
+  assert.match(appPage, /<main class="grid-container history-main settings-main"/);
+  assert.match(appPage, /\.history-main\.settings-main\s*\{\s*padding-right:\s*0;/);
+  assert.match(settings, /\.settings-body \{[^}]*max-width:\s*none;[^}]*padding:\s*0 0 var\(--space-2xl\) var\(--space-lg\)/s);
 });
