@@ -1,12 +1,12 @@
 <script lang="ts">
- import { codexInteractions } from '$lib/stores/codex-interactions';
+ import { codexInteractions, hasCodexThread } from '$lib/stores/codex-interactions';
  import CodexQuestionCard from './CodexQuestionCard.svelte';
  import CodexApprovalCard from './CodexApprovalCard.svelte';
  import CodexTurnProgress from './CodexTurnProgress.svelte';
  let { sessionId }: { sessionId: string } = $props();
- const relevant = $derived($codexInteractions.filter(s => s.pending.some(p => p.threadId === sessionId) || sessionId in s.statuses || sessionId in (s.turns ?? {})));
+ const relevant = $derived($codexInteractions.filter(s => hasCodexThread(s, sessionId)));
  const cards = $derived(relevant.flatMap(s => s.pending.filter(p => p.threadId === sessionId).map(request => ({ endpoint: s.endpoint, connected: s.connected, request }))));
- const progress = $derived(relevant.filter(s => s.turns?.[sessionId]));
+ const progress = $derived(relevant.filter(s => s.turns?.[sessionId]?.plan?.length || s.turns?.[sessionId]?.diff));
  const ambiguous = $derived(relevant.filter(s => s.connected).length > 1);
  const waitingWithoutDetails = $derived(!cards.length && relevant.some(s => s.connected && s.statuses[sessionId] === 'waiting'));
 </script>
@@ -17,7 +17,7 @@
    {#if card.request.kind === 'question'}<CodexQuestionCard {...card} {ambiguous} />{:else}<CodexApprovalCard {...card} {ambiguous} />{/if}
   {/each}
   {#each progress as snapshot (`${snapshot.endpoint}:${snapshot.turns![sessionId].turnId}`)}
-   <CodexTurnProgress progress={snapshot.turns![sessionId]} endpoint={snapshot.endpoint} connected={snapshot.connected} {sessionId} {ambiguous} />
+   <CodexTurnProgress progress={snapshot.turns![sessionId]} />
   {/each}
   {#if waitingWithoutDetails}<p>Codex is waiting for you. Open the original conversation for details.</p>{/if}
  </section>

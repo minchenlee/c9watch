@@ -12,7 +12,8 @@
  let values = $state<Record<string, unknown>>({});
  let notice = $state('');
  const enabled = $derived(connected && !ambiguous && !request.submitted && !sending && !submitted && !unknown);
- const title = $derived(request.kind === 'form' ? 'MCP REQUEST' : request.kind === 'permission' ? 'PERMISSION REQUEST' : request.kind === 'file' ? 'FILE CHANGE APPROVAL' : d.networkApprovalContext ? 'NETWORK APPROVAL' : d.kind === 'stdin' ? 'COMMAND INPUT APPROVAL' : 'COMMAND APPROVAL');
+ const hasFormFields = $derived(Object.keys(d.requestedSchema?.properties ?? {}).length > 0);
+ const title = $derived(request.kind === 'form' ? d.mode === 'url' ? 'MCP EXTERNAL STEP' : hasFormFields ? 'MCP FORM' : 'MCP APPROVAL' : request.kind === 'permission' ? 'PERMISSION APPROVAL' : request.kind === 'file' ? 'FILE CHANGE APPROVAL' : d.networkApprovalContext ? 'NETWORK APPROVAL' : d.kind === 'stdin' ? 'COMMAND INPUT APPROVAL' : 'COMMAND APPROVAL');
  function ready(action: string) {
   if (action === 'accept' && request.kind === 'file') return reviewed;
   if (action === 'grant') return selected.length > 0;
@@ -20,13 +21,18 @@
   return true;
  }
  function label(action: string) {
-  if (action === 'accept') return request.kind === 'form' ? d.mode === 'url' ? 'CONFIRM COMPLETED' : 'SUBMIT FORM' : 'APPROVE ONCE';
-  if (action === 'grant') return 'GRANT SELECTED · THIS TURN';
-  if (action === 'deny') return 'DENY PERMISSIONS';
-  return action === 'cancel' ? 'CANCEL' : 'DECLINE';
+  if (action === 'accept') return request.kind === 'form' ? d.mode === 'url' ? 'CONFIRM COMPLETED' : hasFormFields ? 'SUBMIT ANSWERS' : 'APPROVE' : 'APPROVE ONCE';
+  if (action === 'grant') return 'APPROVE SELECTED · THIS TURN';
+  if (action === 'deny') return 'REJECT';
+  return action === 'cancel' ? 'CANCEL' : 'REJECT';
  }
  async function decide(action: string) {
-  if (!enabled || !ready(action) || !canDecide(endpoint, request, action)) return;
+  if (!enabled || !ready(action)) return;
+  if (!canDecide(endpoint, request, action)) {
+   notice = 'This request changed or its connection is unavailable. Refreshing the current request; no response was sent.';
+   void refreshCodexInteractions();
+   return;
+  }
   sending = true; notice = '';
   try {
    const receipt = await invoke<{ status: string; detail: string }>('decide_codex_interaction', {
@@ -60,7 +66,7 @@
   {#if request.actions?.includes('accept')}<button class="choice" class:selected={reviewed} aria-pressed={reviewed} disabled={!enabled} onclick={() => reviewed = !reviewed}><span class="marker"></span>I reviewed the complete changes and paths</button>
   {:else}<p>Approval here requires a complete diff and a one-time scope. Review the proposal in Codex.</p>{/if}
  {:else if request.kind === 'permission'}
-  <p>Choose permissions to grant for <strong>this turn only</strong>.</p>
+  <p>Choose permissions to approve for <strong>this turn only</strong>.</p>
   {#each d.choices ?? [] as choice}<button class="choice" class:selected={selected.includes(choice.id)} aria-pressed={selected.includes(choice.id)} disabled={!enabled} onclick={() => selected = selected.includes(choice.id) ? selected.filter(id => id !== choice.id) : [...selected, choice.id]}><span class="marker"></span>{choice.label}</button>{/each}
   <details><summary>Full requested scope (deny restrictions are preserved)</summary><pre>{JSON.stringify(d.permissions, null, 2)}</pre></details>
  {:else if request.kind === 'form'}
@@ -70,13 +76,14 @@
    <button class="choice" class:selected={completed} aria-pressed={completed} disabled={!enabled || !d.safeUrl} onclick={() => completed = !completed}><span class="marker"></span>I completed the external step</button>
   {:else if d.supportedForm && d.requestedSchema}
    <CodexMcpForm schema={d.requestedSchema} bind:values disabled={!enabled} />
-  {:else}<p>This form needs the original Codex client.</p>{/if}
+  {:else}<p>Review this request in the original Codex client.</p>{/if}
  {/if}
  {#if !connected}<p role="status">Connection lost. Review the current request in Codex.</p><button onclick={() => dismissDisconnected(endpoint, request.token)}>DISMISS STALE CARD</button>
  {:else if ambiguous}<p role="status">Multiple connections have this session. Continue in Codex.</p>
  {:else if request.submitted || submitted}<p role="status">Response submitted. Waiting for Codex to clear the request.</p>
  {:else}<div class="actions">{#each request.actions ?? [] as action}<button onclick={() => decide(action)} disabled={!enabled || !ready(action)}>{sending ? 'SUBMITTING…' : label(action)}</button>{/each}</div>{/if}
- {#if request.kind === 'command' || request.kind === 'file'}<p class="hint">Decline lets Codex continue without this action. Cancel interrupts the turn.</p>{/if}
+ {#if request.kind === 'command' || request.kind === 'file'}<p class="hint">Reject skips this action. Cancel interrupts the turn.</p>{/if}
+ {#if request.kind === 'form'}<p class="hint">Reject declines this request. Cancel dismisses it. Neither approves access.</p>{/if}
  {#if notice}<p role="status">{notice}</p>{/if}
 </article>
 <style>

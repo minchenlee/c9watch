@@ -32,6 +32,13 @@ export interface InteractionSnapshot {
 }
 export const codexInteractions = writable<InteractionSnapshot[]>([]);
 
+export function hasCodexThread(snapshot: InteractionSnapshot, threadId: string): boolean {
+ return snapshot.pending.some(p => p.threadId === threadId) ||
+  (snapshot.statuses[threadId] !== 'notLoaded' &&
+   (threadId in snapshot.statuses || !!snapshot.turns?.[threadId]));
+}
+
+
 // Preserve disconnected cards only until the user dismisses them, with a hard bound.
 export function mergeSnapshots(previous: InteractionSnapshot[], fresh: InteractionSnapshot[]) {
  const result = fresh.map(s => s.connected ? s : {
@@ -46,7 +53,7 @@ export function mergeSnapshots(previous: InteractionSnapshot[], fresh: Interacti
 }
 export function projectCodexSession(session: Session, snapshots: InteractionSnapshot[]): Session {
  if (session.provider !== 'codex') return session;
- const candidates = snapshots.filter(s => s.pending.some(p => p.threadId === session.id) || session.id in s.statuses);
+ const candidates = snapshots.filter(s => hasCodexThread(s, session.id));
  const pending = candidates.flatMap(s => s.pending.filter(p => p.threadId === session.id));
  if (pending.length) {
   const disconnected = candidates.some(s => !s.connected);
@@ -91,11 +98,11 @@ export function dismissDisconnected(endpoint: string, token: string) {
 }
 export function canAnswer(endpoint: string, request: PendingInteraction) {
  const all = get(codexInteractions);
- const matching = all.filter(s => s.connected && (s.pending.some(p => p.threadId === request.threadId) || request.threadId in s.statuses));
+ const matching = all.filter(s => s.connected && hasCodexThread(s, request.threadId));
  return matching.length === 1 && matching[0].endpoint === endpoint && matching[0].pending.some(p => p.token === request.token && p.answerable && !p.submitted);
 }
 
 export function canDecide(endpoint: string, request: PendingInteraction, action: string) {
- const matching = get(codexInteractions).filter(s => s.connected && (s.pending.some(p => p.threadId === request.threadId) || request.threadId in s.statuses));
+ const matching = get(codexInteractions).filter(s => s.connected && hasCodexThread(s, request.threadId));
  return matching.length === 1 && matching[0].endpoint === endpoint && matching[0].pending.some(p => p.token === request.token && !p.submitted && p.actions?.includes(action));
 }

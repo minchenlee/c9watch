@@ -54,6 +54,7 @@
 	import { canSessionAction, providerOf, providerSessionKey, sessionKeyOf } from '$lib/provider';
 	import { getConversation } from '$lib/api';
 	import {
+		conversationError,
 		conversationLoad,
 		conversationLoadLabel,
 		isSessionLoading,
@@ -674,7 +675,12 @@
 				{:else if !conversation}
 					<div class="loading-state">
 
-						<p>Loading conversation...</p>
+						{#if $conversationError?.key === sessionKeyOf(session)}
+                            <p role="alert">Unable to load conversation: {$conversationError.message}</p>
+                            <p>Retrying automatically…</p>
+                        {:else}
+                            <p>Loading conversation...</p>
+                        {/if}
 					</div>
 				{:else if conversation.messages.length === 0}
 					<div class="empty-state">

@@ -105,3 +105,36 @@ test('subagent polling coalesces overlapping scans and recovers after failure', 
  const next = module.refreshOnce(); assert.equal(requests.length,2);
  requests[1].resolve({}); await next;
 });
+
+test('an unloaded endpoint does not block a live Computer Use approval',()=>{
+ const approval={...request,kind:'form',actions:['accept','decline','cancel']};
+ const live={...snapshot,pending:[approval]};
+ const unloaded={...snapshot,endpoint:'old',pending:[],statuses:{A:'notLoaded'},turns:{A:{turnId:'old',status:'completed'}}};
+ assert.equal(exports.hasCodexThread(unloaded,'A'),false);
+ codexInteractions.set([live,unloaded]);
+ assert.equal(exports.canDecide('e1',approval,'accept'),true);
+ assert.equal(exports.canDecide('old',approval,'accept'),false);
+ codexInteractions.set([live,{...unloaded,statuses:{A:'active'}}]);
+ assert.equal(exports.canDecide('e1',approval,'accept'),false);
+ codexInteractions.set([live,{...unloaded,pending:[approval]}]);
+ assert.equal(exports.canDecide('e1',approval,'accept'),false);
+});
+
+const approvalCard = readFileSync(new URL('../src/lib/components/CodexApprovalCard.svelte', import.meta.url), 'utf8');
+const decideHandler = approvalCard.slice(approvalCard.indexOf(' async function decide('),approvalCard.indexOf(' async function openExternal('));
+const approvalJs = ts.transpileModule(`
+export function approvalHarness(){
+ const request={token:'old',threadId:'A',kind:'form'},endpoint='e';
+ const enabled=true,ready=()=>true,canDecide=()=>false;
+ let notice='',refreshes=0,sends=0;
+ const refreshCodexInteractions=()=>{refreshes++;return Promise.resolve();};
+ const invoke=()=>{sends++;};
+ ${decideHandler}
+ return {decide,state:()=>({notice,refreshes,sends})};
+}`,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ES2022}}).outputText;
+const {approvalHarness}=await import('data:text/javascript;base64,'+Buffer.from(approvalJs).toString('base64'));
+test('a changed approval request explains the failed click and refreshes without sending',async()=>{
+ const h=approvalHarness();await h.decide('accept');
+ assert.equal(h.state().sends,0);assert.equal(h.state().refreshes,1);
+ assert.match(h.state().notice,/no response was sent/);
+});

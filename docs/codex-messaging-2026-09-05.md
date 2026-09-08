@@ -152,3 +152,26 @@ Real acceptance task kept its thread UUID while edit/resubmit created `rollout-.
 Regression covers original + edit and a second edit cutting further back. Full Rust lib: 435 passed / 5 ignored. Read-only real-task diagnostic loaded 14 messages through the latest 2026-09-08T01:12:08 response (previous UI showed 8 messages from the original file). Optional rerun: `C9WATCH_QA_THREAD=<uuid> cargo test --manifest-path src-tauri/Cargo.toml --lib local_edited_conversation_diagnostic -- --ignored --nocapture`. No task input, answer or approval was submitted by this diagnostic.
 
 Native QA of the rebuilt independent bundle confirmed Respond to greeting shows the edited 00:46/00:47 continuation and the latest 08:11 user / 08:12 assistant messages; the superseded 00:39/00:40 tail is absent. The QA app was closed afterward. The separately scoped first-load performance change is not included in this messaging build.
+
+### Chained edited-history correction (2026-09-08)
+
+A second Desktop edit can reference the previous rollout UUID in `history_base.thread_id`, rather than the root task UUID. Resolve that parent only among segments whose metadata matches the requested task, follow the selected rollout's ancestry, apply ordinal cutoffs, and exclude abandoned sibling edits. Missing parents and cycles fail explicitly. The conversation UI now shows scoped load errors and clears them on successful retry instead of remaining on Loading.
+
+Validation: chained-edit and abandoned-tail regression; real task `01a07a11-f12e-7571-98f6-33d3f4fe6ce0` loaded 112 messages in a read-only diagnostic (0.17s); Rust 435 passed, 5 ignored; frontend 21 passed; Svelte check clean. The separate cold-start archive-lock performance fix remains on `codex/first-session-load`.
+Native follow-up: rebuilt and relaunched the messaging app bundle. The target task reached 114 messages with 28 navigation entries; selecting its earlier question-report entry visibly displayed the user message and attached screenshot. Cold first-open delay remains separate from the corrected history-chain rejection.
+
+### Composer turn controls (2026-09-08)
+
+Moved Running/Waiting status into the composer heading as a labeled icon. Empty active drafts show Stop; text or attachments reveal Send alongside a smaller Stop. Completed turns no longer add a separate row. Plan/diff content and pending approvals remain above the composer. Stop receipts remain keyed to endpoint/task/turn across reopening, disable duplicate delivery, and preserve unknown outcomes without automatic retry.
+
+Validation: Svelte check clean; 23 frontend tests passed, including duplicate stop, exact turn identity, late receipts and unavailable controls. Rebuilt/relaunched the native bundle; verified a real waiting approval remains visible, and running empty/draft composer layouts show the expected stop-only / send-plus-stop controls. Preview draft was cleared without sending or interrupting the actual turn.
+
+### Approval terminology (2026-09-08)
+
+Approval actions now consistently use APPROVE / REJECT / CANCEL, with ONCE and SELECTED · THIS TURN retaining explicit scope. MCP requests with no schema fields are labeled MCP APPROVAL / APPROVE; forms with fields use MCP FORM / SUBMIT ANSWERS, while URL workflows retain explicit completion confirmation. Protocol actions and validation remain unchanged. Svelte check passed without warnings.
+
+### Computer Use approval blocking (2026-09-08)
+
+A connected endpoint retaining `statuses[thread] = notLoaded` was incorrectly counted as a second owner, disabling a live request on another endpoint. Shared thread membership now excludes unloaded entries unless an actual pending request remains; the card, composer and answer/decision guards use the same rule. Genuine duplicate live owners remain blocked. If a request changes between render and click, the approval card now explains that nothing was sent and refreshes instead of silently returning.
+
+Validation: 25 frontend tests pass, including unloaded-owner, genuine duplicate-owner, exact endpoint and stale-click cases; Svelte check clean. No live failing Computer Use request remained during diagnosis, so the reported incident itself is not yet reproduced end-to-end. MCP schema handling and permission scope were not broadened.

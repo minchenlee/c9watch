@@ -2136,7 +2136,8 @@ fn paginated_conversation(
     paths: &[PathBuf], thread_id: &str, include_tools: bool,
     on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Vec<CodexMessage>, String> {
-    let mut segments = Vec::new();
+    let mut available = HashMap::new();
+    let mut latest = None;
     for path in paths {
         let mut first = String::new();
         BufReader::new(File::open(path).map_err(|e| e.to_string())?)
@@ -2145,22 +2146,35 @@ fn paginated_conversation(
         if meta["type"] != "session_meta" || meta["payload"]["id"] != thread_id {
             continue;
         }
+        let stem = path.file_stem().and_then(|s| s.to_str()).ok_or("Invalid rollout filename")?;
+        let rollout_id = stem.rsplit_once('_').map(|(_, id)| id).unwrap_or(thread_id).to_string();
         let base = &meta["payload"]["history_base"];
-        let cutoff = if base.is_object() {
-            if base["thread_id"] != thread_id { return Err("Cross-task history base is not supported".into()); }
-            Some(base["end_ordinal_exclusive"].as_u64().ok_or("Missing history cutoff")?)
+        let parent = if base.is_object() {
+            Some((base["thread_id"].as_str().ok_or("Missing history parent")?.to_string(),
+                base["end_ordinal_exclusive"].as_u64().ok_or("Missing history cutoff")?))
         } else { None };
-        segments.push((path, cutoff, u64::MAX));
+        available.insert(rollout_id.clone(), (path, parent));
+        latest = Some(rollout_id);
     }
+    // Follow the selected rollout's ancestry; sibling edits are abandoned history.
+    let mut next = latest;
+    let mut visited = HashSet::new();
+    let mut segments = Vec::new();
     let mut ceiling = u64::MAX;
-    for (_, cutoff, end) in segments.iter_mut().rev() {
-        *end = ceiling;
-        if let Some(cutoff) = cutoff { ceiling = ceiling.min(*cutoff); }
+    while let Some(id) = next {
+        if !visited.insert(id.clone()) { return Err("Cycle in conversation history".into()); }
+        let (path, parent) = available.get(&id).ok_or_else(|| format!("Missing conversation history segment: {id}"))?;
+        segments.push((*path, ceiling));
+        next = parent.as_ref().map(|(id, cutoff)| {
+            ceiling = ceiling.min(*cutoff);
+            id.clone()
+        });
     }
-    let total = paths.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum();
+    segments.reverse();
+    let total = segments.iter().filter_map(|(p, _)| fs::metadata(p).ok()).map(|m| m.len()).sum();
     let mut read = 0;
     let mut summary = CodexRolloutSummary::default();
-    for (path, _, end) in segments {
+    for (path, end) in segments {
         let mut reader = BufReader::new(File::open(path).map_err(|e| e.to_string())?);
         let mut line = String::new();
         loop {
@@ -2284,8 +2298,15 @@ mod tests {
         let contents = || find_codex_conversation_under(temp.path(),id,false).unwrap().into_iter().map(|m|m.content).collect::<Vec<_>>();
         assert_eq!(contents(), vec!["keep", "edited"]);
         let second = temp.path().join(format!("rollout-2026-09-08T00-02-00-{id}_33333333-3333-4333-8333-333333333333.jsonl"));
+        let mut chained: Value = serde_json::from_str(&meta(4, Some(4))).unwrap();
+        chained["payload"]["history_base"]["thread_id"] = serde_json::json!("22222222-2222-4222-8222-222222222222");
+        write_lines(&second, &[chained.to_string(), message(5,"second edit")], true);
+        assert_eq!(contents(), vec!["keep", "edited", "second edit"]);
         write_lines(&second, &[meta(1,Some(1)),message(2,"replacement")], true);
         assert_eq!(contents(), vec!["replacement"]);
+        chained["payload"]["history_base"]["thread_id"] = serde_json::json!("missing");
+        write_lines(&second, &[chained.to_string()], true);
+        assert!(find_codex_conversation_under(temp.path(),id,false).unwrap_err().contains("Missing conversation history segment"));
     }
 
     #[test]

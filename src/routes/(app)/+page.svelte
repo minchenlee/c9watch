@@ -12,7 +12,7 @@
 		visibleTopLevelSessionIds
 	} from '$lib/stores/sessions';
 	import { getConversation, stopSession, openSession } from '$lib/api';
-	import { toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
+	import { conversationError, toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
 	import { get } from 'svelte/store';
 	import { isDemoMode, toggleDemoMode } from '$lib/demo';
 	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
@@ -332,6 +332,7 @@
 		const sessionId = conversationTarget;
 		const requestId = ++conversationRequestId;
 		currentConversation.set(null);
+		conversationError.set(null);
 		const selected = untrack(() => expandedSession);
 		let cancelled = false;
 		let timer: ReturnType<typeof setTimeout>;
@@ -349,8 +350,12 @@
 					if (includeTools !== (get(toolsLoadedFor) === selectedKey)) return;
 					if (providerSessionKey(conv.provider ?? providerOf(selected!), conv.sessionId) !== selectedKey) return;
 					currentConversation.set(conv);
+					conversationError.set(null);
 				} catch (error) {
 					console.error('Failed to fetch conversation:', error);
+					if (!cancelled && requestId === conversationRequestId) {
+						conversationError.set({ key: selectedKey, message: String(error) });
+					}
 					// Keep the last successful preview during transient refresh failures.
 				} finally {
 					if (!cancelled && requestId === conversationRequestId) {

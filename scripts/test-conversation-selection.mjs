@@ -21,18 +21,19 @@ export function harness() {
  let expandedSession = $derived(sessions.find(s => sessionKeyOf(s) === expandedId) || null);
  let value = null;
  const currentConversation = {set(v) {value = v;}};
+ const conversationError = {value:null,set(v) {this.value=v;}};
  const toolsLoadedFor = {value:null,set(v) {this.value=v;}};
  const get = s => s.value;
  const timers = new Map(); let timerId = 0;
  const setTimeout = fn => {timers.set(++timerId,fn);return timerId;};
  const clearTimeout = id => timers.delete(id);
  const requests = [];
- const getConversation = (id,provider) => new Promise(resolve => requests.push({id,provider,resolve}));
+ const getConversation = (id,provider) => new Promise((resolve,reject) => requests.push({id,provider,resolve,reject}));
  const withConversationLoader = (_id,_provider,_kind,task) => task();
  const dispose = $effect.root(() => {
  ${loader}
  });
- return {requests,dispose,refresh(){const work=[...timers.values()];timers.clear();work.forEach(fn=>fn());},value:()=>value,poll:()=>{sessions=sessions.map(s=>({...s}));},select(provider){sessions=[{id:'same',provider}];expandedId=provider+':same';},close(){expandedId=null;}};
+ return {requests,dispose,error:()=>conversationError.value,refresh(){const work=[...timers.values()];timers.clear();work.forEach(fn=>fn());},value:()=>value,poll:()=>{sessions=sessions.map(s=>({...s}));},select(provider){sessions=[{id:'same',provider}];expandedId=provider+':same';},close(){expandedId=null;}};
 }`;
 let code = compileModule(ts.transpileModule(source, {compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ES2022}}).outputText, { filename: 'conversation-selection.svelte.js', generate: 'client' }).js.code;
 code = code.replace(/from '([^']+)'/g, (_, spec) => `from '${import.meta.resolve(spec)}'`);
@@ -88,4 +89,17 @@ test('following new replies advances the visible tail without unbounded renderin
  const messages=Array.from({length:3},(_,i)=>({content:String(i)}));
  sw.followLatest(3);assert.equal(sw.sliceMessages(messages).at(-1).content,'2');
  sw.followLatest(1000);assert.equal(sw.endIndex,1000);assert.ok(sw.endIndex-sw.startIndex<=MAX_VISIBLE);
+});
+
+ test('load errors are scoped to selection and clear after successful retry', async () => {
+ const h=harness();
+ try {
+  flushSync();h.requests[0].reject('Missing history segment');await settle();
+  assert.deepEqual(h.error(),{key:'codex:same',message:'Missing history segment'});
+  h.refresh();h.select('cursor');flushSync();assert.equal(h.error(),null);
+  h.requests[1].reject('late failure');await settle();assert.equal(h.error(),null);
+  h.requests[2].reject('temporary');await settle();assert.equal(h.error().key,'cursor:same');
+  h.refresh();h.requests[3].resolve({sessionId:'same',provider:'cursor',messages:[]});await settle();
+  assert.equal(h.error(),null);assert.ok(h.value());
+ } finally {h.dispose();}
 });

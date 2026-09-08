@@ -93,3 +93,25 @@ test('definite not-sent and rejected receipts retain drafts and allow manual ret
   h.requests[1].resolve({status:'accepted',detail:'Accepted'});await pending;
  }
 });
+
+const stopHandler = source.slice(source.indexOf(' async function stop()'), source.indexOf('\n\tfunction autosize'));
+const stopJs = ts.transpileModule(`
+export function stopHarness() {
+ const stops = new Map(); let stopDisabled=false;
+ let turn={turnId:'one'}, snapshot={endpoint:'local'}, sessionId='A', stopKey='local:A:one';
+ const requests=[]; const invoke=(command,args)=>new Promise((resolve,reject)=>requests.push({command,args,resolve,reject}));
+ const refreshCodexInteractions=()=>Promise.resolve();
+ ${stopHandler}
+ return {stop,stops,requests,disable(){stopDisabled=true;},next(){turn={turnId:'two'};stopKey='local:A:two';}};
+}`, {compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ES2022}}).outputText;
+const {stopHarness}=await import('data:text/javascript;base64,'+Buffer.from(stopJs).toString('base64'));
+test('stop is sent once for the exact turn and late receipts do not disable a new turn',async()=>{
+ const h=stopHarness();const first=h.stop();await h.stop();assert.equal(h.requests.length,1);
+ assert.deepEqual(h.requests[0].args,{endpoint:'local',threadId:'A',turnId:'one'});
+ h.next();h.requests[0].resolve({status:'submitted',detail:'Stopping'});await first;
+ const next=h.stop();assert.equal(h.requests.length,2);h.requests[1].reject(Error('lost'));await next;
+ await h.stop();assert.equal(h.requests.length,2);assert.equal(h.stops.get('local:A:two').status,'unknown');
+});
+test('unavailable stop cannot invoke the backend',async()=>{
+ const h=stopHarness();h.disable();await h.stop();assert.equal(h.requests.length,0);
+});

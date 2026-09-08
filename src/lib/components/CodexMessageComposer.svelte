@@ -4,11 +4,13 @@
 	type Draft = { images?: Attachment[]; text: string; pending: boolean; notice: string; unknown: boolean };
 	// Bounded, provider-qualified drafts survive closing/reopening a detail view.
 	const drafts = new SvelteMap<string, Draft>();
+	const stops = new SvelteMap<string, { status: string; notice: string }>();
 </script>
 
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { invoke } from '@tauri-apps/api/core';
+	import { codexInteractions, hasCodexThread, refreshCodexInteractions } from '$lib/stores/codex-interactions';
 	import CodexDesktopSupport from './CodexDesktopSupport.svelte';
 	let { sessionId }: { sessionId: string } = $props();
 	const key = $derived(`codex:${sessionId}`);
@@ -24,6 +26,29 @@
 	let fileInput = $state<HTMLInputElement>(undefined!);
 	const draftFull = $derived(!drafts.has(key) && drafts.size >= 20 && ![...drafts.values()].some(value => !value.pending && !value.unknown && !value.text.length && !value.images?.length));
 	const tooLong = $derived(new TextEncoder().encode(draft.text).length > 32768);
+
+ const relevant = $derived($codexInteractions.filter(s => hasCodexThread(s, sessionId)));
+ const live = $derived(relevant.filter(s => s.connected));
+ const snapshot = $derived(live.length === 1 ? live[0] : relevant[0]);
+ const turn = $derived(snapshot?.turns?.[sessionId]);
+ const stopKey = $derived(`${snapshot?.endpoint}:${sessionId}:${turn?.turnId}`);
+ const stopState = $derived(stops.get(stopKey));
+ const active = $derived(turn?.status === 'inProgress');
+ const waiting = $derived(snapshot?.statuses[sessionId] === 'waiting' || snapshot?.pending.some(p => p.threadId === sessionId && !p.submitted));
+ const stopping = $derived(active && (turn?.stopping || ['sending', 'submitted'].includes(stopState?.status ?? '')));
+ const hasContent = $derived(!!draft.text.trim() || !!draft.images?.length);
+ const stopDisabled = $derived(live.length !== 1 || !snapshot?.connected || !active || !!turn?.stopping || !!stopState);
+ const turnLabel = $derived(live.length > 1 ? 'Multiple connections · check Codex' : snapshot && !snapshot.connected ? 'Disconnected · status may be outdated' : stopping ? 'Stopping…' : active && stopState?.status === 'unknown' ? 'Stop delivery unknown · check Codex' : waiting ? 'Waiting for your response' : active ? 'Running' : turn?.status === 'failed' ? 'Failed' : turn?.status === 'interrupted' ? 'Stopped' : available ? 'Ready' : 'Disconnected');
+ async function stop() {
+  if (stopDisabled || !turn || !snapshot || stops.has(stopKey)) return;
+  const target = stopKey;
+  stops.set(target, {status: 'sending', notice: ''});
+  try {
+   const receipt = await invoke<{status: string; detail: string}>('interrupt_codex_turn', {endpoint: snapshot.endpoint, threadId: sessionId, turnId: turn.turnId});
+   stops.set(target, {status: receipt.status, notice: receipt.detail});
+  } catch { stops.set(target, {status: 'unknown', notice: 'Stop delivery is unknown. Check the current turn in Codex.'}); }
+  finally { void refreshCodexInteractions(); }
+ }
 
 	function autosize(node: HTMLTextAreaElement) {
 		$effect(() => {
@@ -104,7 +129,7 @@
 </script>
 
 	<section class="composer" aria-label="Send a message to Codex">
-		<div class="heading"><span class="square" class:connected={available}></span><label for="codex-message" title="Send to this session. While working, Codex receives an additional instruction.">MESSAGE CODEX</label>{#if available && !checking}<span class="shortcut">⌘ / Ctrl Enter to send</span>{/if}</div>
+
 	{#if checking || !available}
 		<div class="connection"><span>{checking ? 'Checking connection…' : reason}</span><button onclick={check} disabled={checking}>RECHECK</button></div>
 		{#if !checking && checkedAt}<p role="status">Checked at {checkedAt} · Not connected to this task</p>{/if}
@@ -117,12 +142,16 @@
 			{#if draft.images?.length}<div class="attachments">{#each draft.images as image, i}<div class="attachment"><img src={image.url} alt={image.name} /><button title={`Remove ${image.name}`} aria-label={`Remove ${image.name}`} disabled={draftFull || attaching || draft.pending || draft.unknown} onclick={() => update({ images: draft.images?.filter((_, index) => index !== i) })}>×</button></div>{/each}</div>{/if}
 			<div class="input-row">
 				<button title="Attach images (PNG, JPEG, WebP; 4 MiB total)" aria-label="Attach images" disabled={draftFull || attaching || draft.pending || draft.unknown} onclick={() => fileInput.click()}>{attaching ? '…' : '+'}</button>
-				<textarea id="codex-message" onpaste={paste} use:autosize rows="1" maxlength="32768" value={draft.text} disabled={draftFull || draft.pending} placeholder="Message this session…" oninput={(event) => update({ text: event.currentTarget.value })}
+				<textarea id="codex-message" onpaste={paste} use:autosize rows="1" maxlength="32768" value={draft.text} disabled={draftFull || draft.pending} aria-label="Message this Codex session" placeholder="Message this session… · ⌘ / Ctrl Enter to send" oninput={(event) => update({ text: event.currentTarget.value })}
 				onkeydown={(event) => { if (!event.isComposing && (event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void send(); } }}></textarea>
-			<button class="send" onclick={send} disabled={draftFull || attaching || draft.pending || draft.unknown || tooLong || (!draft.text.trim() && !draft.images?.length)}>{draft.pending ? 'SENDING…' : 'SEND'}</button>
+			{#if !active || hasContent}
+			<button class="send" aria-label={draft.pending ? 'Sending message' : 'Send message'} title={`Send message · ${turnLabel}`} onclick={send} disabled={draftFull || attaching || draft.pending || draft.unknown || tooLong || (!draft.text.trim() && !draft.images?.length)}>{#if draft.pending}…{:else}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 20V4m-7 7 7-7 7 7" /></svg>{/if}</button>
+ {/if}
+ {#if active}<button class="stop" class:running={!waiting && snapshot?.connected && live.length === 1} class:secondary={hasContent} onclick={stop} disabled={stopDisabled} aria-label={stopping ? 'Stopping current turn' : 'Stop current turn'} title={`Stop current turn · ${turnLabel}`}>{#if stopping}…{:else}<svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><rect x="4" y="4" width="10" height="10" fill="currentColor" /></svg>{/if}</button>{/if}
 		</div>
 		{#if tooLong}<p role="status">Message exceeds 32 KiB</p>{/if}
 	{/if}
+	{#if active && stopState?.notice}<p role="status">{stopState.notice}</p>{/if}
 	{#if draftFull}<p role="status">Draft limit reached (20 sessions). Open another draft and clear its text and images to make room.</p>{/if}
 	{#if draft.notice}<p role="status">{draft.notice}</p>{/if}
 	{#if draft.unknown}<button onclick={() => update({ unknown: false, notice: 'Check complete. You can edit or send the message again.' })}>I CHECKED THE ORIGINAL SESSION</button>{/if}
@@ -136,9 +165,12 @@
 	.attachment button { position: absolute; top: 0; right: 0; padding: 0 4px; background: var(--bg-card); }
 
 	.composer { flex-shrink: 0; border-top: 1px solid var(--border-default); padding: 8px 16px; background: var(--bg-card); }
-	.heading { display: flex; align-items: center; gap: 8px; font: 11px var(--font-mono, monospace); letter-spacing: .08em; color: var(--text-secondary, #888); margin-bottom: 6px; }
-	.square { width: 6px; height: 6px; background: #555; }
-	.square.connected { background: var(--accent-green, #00ff88); }
+ .stop.running svg { animation: pulse 3.6s ease-in-out infinite; }
+ @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .65; } }
+ @media (prefers-reduced-motion: reduce) { .stop.running svg { animation: none; } }
+ .send, .stop { width: 36px; }
+ .stop.secondary { width: 30px; }
+ button:focus-visible { outline: 1px solid var(--text-primary); outline-offset: 2px; }
 	p, .connection { font-size: 12px; color: var(--text-secondary, #888); line-height: 1.5; }
 	textarea { box-sizing: border-box; width: 100%; resize: none; min-width: 0; min-height: 36px; max-height: 140px; padding: 8px 10px; background: transparent; color: var(--text-primary); border: 1px solid var(--border-default); border-radius: 0; font: inherit; font-size: 13px; line-height: 18px; }
 	textarea:focus { outline: 1px solid var(--text-secondary, #888); }
@@ -149,7 +181,6 @@
 	.input-row { display: flex; align-items: flex-end; gap: 8px; }
 	.input-row > button { box-sizing: border-box; height: 36px; min-height: 36px; padding: 0 10px; display: inline-flex; align-items: center; justify-content: center; }
 	.input-row > button[aria-label="Attach images"] { width: 36px; }
-	.shortcut { margin-left: auto; font-size: 10px; letter-spacing: 0; color: var(--text-muted); }
 	.send { min-height: 36px; color: var(--text-primary, #eee); }
 	p { margin: 4px 0 0; overflow-wrap: anywhere; }
 	.setup-toggle { margin-top: 6px; }
