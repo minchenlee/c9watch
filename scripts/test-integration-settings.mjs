@@ -22,8 +22,8 @@ test('Integration section groups local providers and the configurable OpenCode c
   assert.match(integration, /Remote integrations/);
 });
 
-test('Settings content uses the available width without right padding', () => {
+test('Settings content uses the available width and aligns with the tab bar', () => {
   assert.match(appPage, /<main class="grid-container history-main settings-main"/);
-  assert.match(appPage, /\.history-main\.settings-main\s*\{\s*padding-right:\s*0;/);
+  assert.match(appPage, /\.history-main\.settings-main\s*\{\s*padding-right:\s*var\(--space-md\);/);
   assert.match(settings, /\.settings-body \{[^}]*max-width:\s*none;[^}]*padding:\s*0 0 var\(--space-2xl\) var\(--space-lg\)/s);
 });

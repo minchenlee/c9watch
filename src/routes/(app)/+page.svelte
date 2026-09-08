@@ -960,7 +960,7 @@
 	}
 
 	.history-main.settings-main {
-		padding-right: 0;
+		padding-right: var(--space-md);
 	}
 
 	.sections-container {
