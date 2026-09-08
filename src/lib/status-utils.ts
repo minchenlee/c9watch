@@ -26,7 +26,7 @@ export function getSessionStatusLabel(status: SessionStatus, pendingToolName?: s
 			}
 			return 'Approval Required';
 		case SessionStatus.WaitingForInput:
-			return 'Ready';
+			return pendingToolName || 'Ready';
 		case SessionStatus.Connecting:
 			return 'Connecting';
 		default:

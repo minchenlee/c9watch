@@ -55,8 +55,11 @@ export const visibleSubagentsBySession = derived(subagentsBySession, ($map) => {
 
 let pollHandle: ReturnType<typeof setInterval> | null = null;
 
+let refreshing = false;
+
 async function refreshOnce() {
-	if (!isTauri()) return;
+	if (!isTauri() || refreshing) return;
+	refreshing = true;
 	try {
 		const raw = await invoke<Record<string, SubagentInfo[]>>('get_subagents');
 			const m = new Map<string, SubagentInfo[]>();
@@ -68,6 +71,8 @@ async function refreshOnce() {
 		subagentsBySession.set(m);
 	} catch {
 		// Backend may be unavailable in non-Tauri contexts; ignore.
+	} finally {
+		refreshing = false;
 	}
 }
 

@@ -31,7 +31,7 @@
 </script>
 
 <script lang="ts">
-	import { onDestroy, onMount, tick } from 'svelte';
+	import { onDestroy, onMount, tick, untrack } from 'svelte';
 	import { fade } from 'svelte/transition';
 	import { flyIn, flyInX, fadeIn } from '$lib/transitions';
 	import { invoke } from '@tauri-apps/api/core';
@@ -62,6 +62,8 @@
 		withConversationLoader
 	} from '$lib/stores/conversation-loader';
 	import ConversationLoadBar from './ConversationLoadBar.svelte';
+	import CodexMessageComposer from './CodexMessageComposer.svelte';
+	import CodexPendingInteractions from './CodexPendingInteractions.svelte';
 
 	interface Props {
 		session: Session;
@@ -284,6 +286,7 @@
 				const isAtBottom =
 					messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight < 150;
 				if (isAtBottom) {
+					untrack(() => sw.followLatest(conversation.messages.length));
 					tick().then(() => {
 						messagesContainer.scrollTop = messagesContainer.scrollHeight;
 					});
@@ -700,6 +703,14 @@
 					</div>
 				{/if}
 			</div>
+
+			<!-- Mobile: FAB to open nav sheet -->
+			{#if providerOf(session) === 'codex' && isTauri()}
+				{#key sessionKeyOf(session)}
+					<CodexPendingInteractions sessionId={session.id} />
+					<CodexMessageComposer sessionId={session.id} />
+				{/key}
+			{/if}
 
 			<!-- Mobile: FAB to open nav sheet -->
 			<button

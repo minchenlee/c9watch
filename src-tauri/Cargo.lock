@@ -458,6 +458,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs 5.0.1",
+ "futures-util",
  "libc",
  "mime_guess",
  "qr2term",
@@ -479,6 +480,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite",
  "uuid",
  "wait-timeout",
 ]

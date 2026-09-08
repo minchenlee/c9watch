@@ -17,6 +17,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [features]
 default = ["gui", "cli"]
 gui = [
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
     "dep:tauri",
     "dep:tauri-build",
     "dep:tauri-plugin-notification",
@@ -43,6 +45,8 @@ pm-orchestration = ["cli"]
 tauri-build = { version = "2", features = [], optional = true }
 
 [dependencies]
+tokio-tungstenite = { version = "0.24", optional = true }
+futures-util = { version = "0.3", optional = true }
 # ── Core (always included) ───────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -63,7 +67,7 @@ tauri-plugin-updater = { version = "2", optional = true }
 tauri-plugin-process = { version = "2", optional = true }
 tauri-plugin-sharekit = { version = "0.3", optional = true }
 axum = { version = "0.7", features = ["ws"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "process", "signal", "fs", "time", "macros"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "io-std", "process", "signal", "fs", "time", "macros"], optional = true }
 rand = { version = "0.8", optional = true }
 qr2term = { version = "0.3", optional = true }
 rust-embed = { version = "8", optional = true }

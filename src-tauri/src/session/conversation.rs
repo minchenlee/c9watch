@@ -108,7 +108,7 @@ fn codex_conversation(
                 timestamp: message.timestamp,
                 message_type: message.message_type,
                 content: message.content,
-                images: Vec::new(),
+                images: message.images,
             })
             .collect(),
     })

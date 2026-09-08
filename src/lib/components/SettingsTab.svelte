@@ -4,6 +4,7 @@
 	import DOMPurify from 'dompurify';
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { isTauri } from '$lib/ws';
+	import CodexDesktopSupport from './CodexDesktopSupport.svelte';
 	import {
 		currentVersion,
 		updateAvailable,
@@ -90,6 +91,7 @@
 	</div>
 
 	<div class="content">
+		{#if isTauri()}<CodexDesktopSupport />{/if}
 		<div class="group" in:flyIn|global={{ index: 1, duration: 350, stride: 25 }}>
 			<div class="group-title group-title--lg">Version</div>
 			<div class="group-body">

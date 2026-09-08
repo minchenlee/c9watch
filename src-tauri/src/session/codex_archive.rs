@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-const CACHE_VERSION: u32 = 6;
+const CACHE_VERSION: u32 = 7;
 const MAX_DISPLAY_CHARS: usize = 400;
 const MAX_INDEXED_MESSAGES: usize = 20_000;
 const MAX_INDEXED_MESSAGE_CHARS: usize = 16_384;
@@ -287,6 +287,11 @@ fn message_text(value: &Value) -> Option<(String, String)> {
             if text.trim().is_empty() {
                 return None;
             }
+            let text = if role == "user" {
+                super::codex::display_user_text(&text)?
+            } else {
+                text
+            };
             Some((role.to_string(), text))
         }
         Some("response_item") => super::codex::response_item_message_text(payload)

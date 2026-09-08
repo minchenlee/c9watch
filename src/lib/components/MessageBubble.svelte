@@ -113,7 +113,7 @@
 	{#if message.images?.length}
 		<div class="message-images">
 			{#each message.images as img}
-				<img src="data:{img.mediaType};base64,{img.data}" alt="Attached screenshot" class="attached-image" />
+				<img src="data:{img.mediaType};base64,{img.data}" alt="Attached screenshot" loading="lazy" decoding="async" class="attached-image" />
 			{/each}
 		</div>
 	{/if}

@@ -4,6 +4,12 @@
 
 // ── Core modules (always compiled) ──────────────────────────────────
 pub mod actions;
+#[cfg(all(unix, feature = "gui"))]
+pub mod codex_bridge;
+#[cfg(all(unix, feature = "gui"))]
+pub mod codex_messaging;
+#[cfg(all(unix, feature = "gui"))]
+pub mod codex_interactions;
 pub mod debug_log;
 pub mod session;
 
@@ -145,7 +151,10 @@ async fn get_memory_files() -> Result<Vec<session::ProjectMemory>, String> {
 #[tauri::command]
 async fn get_subagents(
 ) -> Result<std::collections::HashMap<String, Vec<session::SubagentInfo>>, String> {
-    Ok(session::all_subagents_by_session())
+    // Transcript scans must not occupy the async workers used by interaction IPC.
+    tauri::async_runtime::spawn_blocking(session::all_subagents_by_session)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Returns the prompt + final result (plus usage stats when available) for a
@@ -712,6 +721,13 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            codex_interactions::codex_interaction_snapshots,
+            codex_interactions::answer_codex_question,
+            codex_interactions::decide_codex_interaction,
+            codex_interactions::interrupt_codex_turn,
+            codex_messaging::codex_message_capability,
+            codex_messaging::send_codex_message,
+            codex_bridge::launch_codex_desktop_bridge,
             greet,
             get_sessions,
             get_conversation,

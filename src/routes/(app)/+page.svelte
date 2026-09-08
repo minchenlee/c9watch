@@ -333,23 +333,34 @@
 		const requestId = ++conversationRequestId;
 		currentConversation.set(null);
 		const selected = untrack(() => expandedSession);
+		let cancelled = false;
+		let timer: ReturnType<typeof setTimeout>;
 		if (sessionId && selected) {
 			const selectedKey = sessionKeyOf(selected);
 			toolsLoadedFor.set(null);
-			withConversationLoader(selected.id, selected.provider, 'conversation', () =>
-				getConversation(selected.id, selected.provider, false)
-			)
-				.then((conv) => {
-					if (requestId !== conversationRequestId) return;
-					if (get(toolsLoadedFor) === selectedKey) return;
-					if (providerSessionKey(conv.provider ?? providerOf(selected), conv.sessionId) !== selectedKey) return;
+			async function refresh(initial: boolean) {
+				const includeTools = get(toolsLoadedFor) === selectedKey;
+				try {
+					const task = () => getConversation(selected!.id, selected!.provider, includeTools);
+					const conv = await (initial
+						? withConversationLoader(selected!.id, selected!.provider, 'conversation', task)
+						: task());
+					if (cancelled || requestId !== conversationRequestId) return;
+					if (includeTools !== (get(toolsLoadedFor) === selectedKey)) return;
+					if (providerSessionKey(conv.provider ?? providerOf(selected!), conv.sessionId) !== selectedKey) return;
 					currentConversation.set(conv);
-				})
-				.catch((error) => {
+				} catch (error) {
 					console.error('Failed to fetch conversation:', error);
-					if (requestId === conversationRequestId) currentConversation.set(null);
-				});
+					// Keep the last successful preview during transient refresh failures.
+				} finally {
+					if (!cancelled && requestId === conversationRequestId) {
+						timer = setTimeout(() => void refresh(false), 2000);
+					}
+				}
+			}
+			void refresh(true);
 		}
+		return () => { cancelled = true; clearTimeout(timer); };
 	});
 
 	function handleExpand(session: Session) {

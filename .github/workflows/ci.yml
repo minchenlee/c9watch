@@ -36,7 +36,7 @@ jobs:
         run: node --test scripts/test-ws.mjs
 
       - name: Conversation selection regression tests
-        run: node --conditions=browser --test scripts/test-conversation-selection.mjs
+        run: node --conditions=browser --test scripts/test-conversation-selection.mjs scripts/test-codex-composer.mjs scripts/test-codex-interactions.mjs
 
       - name: Rust check
         run: cargo check --manifest-path src-tauri/Cargo.toml
