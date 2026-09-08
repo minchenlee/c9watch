@@ -54,12 +54,13 @@ export const visibleSubagentsBySession = derived(subagentsBySession, ($map) => {
 });
 
 let pollHandle: ReturnType<typeof setInterval> | null = null;
-
-let refreshing = false;
+let refreshInFlight = false;
+let generation = 0;
 
 async function refreshOnce() {
-	if (!isTauri() || refreshing) return;
-	refreshing = true;
+	if (!isTauri() || refreshInFlight) return;
+	refreshInFlight = true;
+	const requestGeneration = generation;
 	try {
 		const raw = await invoke<Record<string, SubagentInfo[]>>('get_subagents');
 			const m = new Map<string, SubagentInfo[]>();
@@ -68,11 +69,11 @@ async function refreshOnce() {
 				// older Claude-only payloads that used the raw session ID.
 				m.set(k.includes(':') ? k : providerSessionKey('claudeCode', k), v);
 			}
-		subagentsBySession.set(m);
+		if (requestGeneration === generation) subagentsBySession.set(m);
 	} catch {
 		// Backend may be unavailable in non-Tauri contexts; ignore.
 	} finally {
-		refreshing = false;
+		refreshInFlight = false;
 	}
 }
 
@@ -94,6 +95,7 @@ export function initializeSubagentPolling() {
 	refreshOnce();
 	// Return a teardown for tests/HMR.
 	return () => {
+		generation++;
 		if (pollHandle !== null) {
 			clearInterval(pollHandle);
 			pollHandle = null;

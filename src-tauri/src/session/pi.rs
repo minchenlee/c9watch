@@ -55,6 +55,7 @@ pub struct PiTranscriptSummary {
     pub last_timestamp: String,
     pub first_prompt: Option<String>,
     pub latest_snippet: Option<String>,
+    pub latest_assistant_text: Option<String>,
     pub message_count: usize,
     pub lifecycle: PiLifecycle,
     last_message_ts_ms: Option<i64>,
@@ -427,6 +428,7 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                     });
                 match role.as_str() {
                     "user" => {
+                        summary.latest_assistant_text = None;
                         summary.message_count += 1;
                         last_role = Some(role);
                         if ts_ms.is_some() {
@@ -470,6 +472,8 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
                                 Some("text") => {
                                     if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                                         if !text.trim().is_empty() {
+                                            summary.latest_assistant_text =
+                                                Some(truncate_chars(text, 240));
                                             summary.latest_snippet =
                                                 Some(truncate_chars(text, PI_MAX_SUMMARY_CHARS));
                                         }

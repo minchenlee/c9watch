@@ -74,6 +74,8 @@
 	--text-primary: #ffffff;
 	--text-secondary: #888888;
 	--text-muted: #666666;
+	/* Longer help text on dark form surfaces. */
+	--text-description: #aaaaaa;
 
 	/* Status Colors - Sharp & Clear */
 	--status-working: #7928ca;

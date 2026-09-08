@@ -58,6 +58,15 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Capture Claude Code status-line quotas locally (no API requests)
+    UsageBridge {
+        /// Back up settings and connect the bridge, preserving the existing status line
+        #[arg(long, conflicts_with = "passthrough")]
+        install: bool,
+        /// Forward the original JSON to an existing status line command
+        #[arg(long)]
+        passthrough: bool,
+    },
     /// List all active Claude Code sessions
     List {
         /// Filter by project path (substring match)
@@ -277,6 +286,7 @@ pub fn run(cli: Cli) {
     crate::debug_log::set_quiet(true);
 
     let result = match cli.command {
+        Commands::UsageBridge { install, passthrough } => crate::claude_usage::run(install, passthrough),
         Commands::List {
             project,
             status,
@@ -1852,6 +1862,7 @@ mod session_formatter_tests {
             message_count: 3,
             modified: "2026-07-13T00:00:00Z".to_string(),
             status: SessionStatus::Working,
+            notification_preview: None,
             latest_message: String::new(),
             pending_tool_name: None,
             pending_tool_input: None,

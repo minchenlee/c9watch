@@ -37,6 +37,9 @@ enum ClientMsg {
     #[serde(rename = "getSessions")]
     GetSessions,
 
+    #[serde(rename = "getSubscriptionUsage")]
+    GetSubscriptionUsage,
+
     #[serde(rename = "getConversation")]
     GetConversation {
         #[serde(rename = "sessionId")]
@@ -75,6 +78,8 @@ enum ClientMsg {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 enum ServerMsg {
+    #[serde(rename = "subscriptionUsage")]
+    SubscriptionUsage { data: serde_json::Value },
     #[serde(rename = "sessions")]
     Sessions { data: serde_json::Value },
 
@@ -382,6 +387,9 @@ async fn handle_message_with_owners(
     owners: crate::session::ProviderSourceOwners,
 ) -> ServerMsg {
     match msg {
+        ClientMsg::GetSubscriptionUsage => ServerMsg::SubscriptionUsage {
+            data: serde_json::to_value(crate::subscription_usage::get_subscription_usage().await).unwrap_or_default(),
+        },
         ClientMsg::GetSessions => match crate::polling::detect_and_enrich_sessions() {
             Ok(sessions) => ServerMsg::Sessions {
                 data: serde_json::to_value(&sessions).unwrap_or_default(),
