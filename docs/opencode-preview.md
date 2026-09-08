@@ -8,7 +8,7 @@ servers or inspect OpenCode's local databases/transcripts.
 ## Try it
 
 1. Start a terminal session with a known port: `opencode --port 4096`.
-2. In c9watch Settings → OpenCode, enter `http://127.0.0.1:4096` and click
+2. In c9watch Settings → Integration → OpenCode, enter `http://127.0.0.1:4096` and click
    **CONNECT**. If the server requires Basic authentication, enter its username
    (normally `opencode`) and password.
 3. Select the **OpenCode** provider filter and open a session card to read its
@@ -85,10 +85,10 @@ Full provider-qualified CLI IDs can be read even when absent from discovery.
 Native QA of the development bundle exercised Working/Ready across directories,
 HTTP 503 with Retry, recovery, live conversation updates, and visible English /
 Chinese conversation content after the animation repair. The PR branch is based
-on current main and places the connection form in Settings → OpenCode, alongside
-Notifications, Usage, and About. The independent PR bundle builds and launches with current main. Its Settings
-navigation still needs visual revalidation: Computer Use repeatedly rejected
-clicks as an app-change conflict after refreshing the accessibility state.
+on current main and places provider integrations in Settings → Integration:
+Claude Code, Codex, Cursor, and Pi use local automatic detection, while OpenCode
+keeps its explicit HTTP connection form. Computer Use verified the renamed
+navigation item and the rendered Integration page in the independent PR bundle.
 It contains no temporary render diagnostics or messaging bridge.
 
 Automated checks include provider isolation, initial-error retry and stale

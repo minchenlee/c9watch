@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import OpenCodeConnection from './OpenCodeConnection.svelte';
+	import IntegrationSettings from './IntegrationSettings.svelte';
 	import NotificationSettings from './NotificationSettings.svelte';
 	import UsageSettings from './UsageSettings.svelte';
 	import { marked } from 'marked';
@@ -21,7 +21,7 @@
 	} from '$lib/stores/updater';
 
 	let checking = $state(false);
-	let activeSection = $state<'notifications' | 'usage' | 'opencode' | 'about'>('notifications');
+	let activeSection = $state<'notifications' | 'usage' | 'integration' | 'about'>('notifications');
 	let nativeNotifications = $state(false);
 	let justChecked = $state(false);
 
@@ -99,13 +99,13 @@
         <nav class="settings-nav" aria-label="Settings sections">
             {#if nativeNotifications}<button class:active={activeSection === 'notifications'} aria-current={activeSection === 'notifications' ? 'page' : undefined} onclick={() => activeSection = 'notifications'}>Notifications</button>{/if}
             <button class:active={activeSection === 'usage'} aria-current={activeSection === 'usage' ? 'page' : undefined} onclick={() => activeSection = 'usage'}>Usage</button>
-            {#if isTauri()}<button class:active={activeSection === 'opencode'} aria-current={activeSection === 'opencode' ? 'page' : undefined} onclick={() => activeSection = 'opencode'}>OpenCode</button>{/if}
+            {#if isTauri()}<button class:active={activeSection === 'integration'} aria-current={activeSection === 'integration' ? 'page' : undefined} onclick={() => activeSection = 'integration'}>Integration</button>{/if}
             <button class:active={activeSection === 'about'} aria-current={activeSection === 'about' ? 'page' : undefined} onclick={() => activeSection = 'about'}>About &amp; updates</button>
         </nav>
         <div class="content"><div class="settings-body">
         {#if nativeNotifications}<div hidden={activeSection !== 'notifications'}><NotificationSettings /></div>{/if}
         <div hidden={activeSection !== 'usage'}><UsageSettings /></div>
-        {#if isTauri()}<div hidden={activeSection !== 'opencode'}><OpenCodeConnection /></div>{/if}
+        {#if isTauri()}<div hidden={activeSection !== 'integration'}><IntegrationSettings /></div>{/if}
         <div class="about-panel" hidden={activeSection !== 'about'}>
 		<div class="group" >
 			<div class="group-title group-title--lg">Version</div>
