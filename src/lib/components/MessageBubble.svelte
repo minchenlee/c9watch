@@ -136,7 +136,8 @@
 		max-width: 100%;
 		border-left: 1px solid var(--border-default);
 		transition: background var(--transition-fast);
-		animation: fade-in 0.3s ease-out backwards;
+		/* The overlay owns entry motion through the visibility-safe transitions.
+		   A second CSS fade could freeze this bubble at opacity 0 in WebKit. */
 	}
 
 	.message-bubble:hover {

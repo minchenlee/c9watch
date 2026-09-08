@@ -174,6 +174,7 @@ pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, DetectionDiagnostic
     let codex_result = owners.detect_codex();
     let cursor_result = owners.detect_cursor();
     let pi_result = owners.detect_pi();
+    let opencode_sessions = super::opencode::detect_once();
     match claude_result {
         Ok((mut detected, diagnostics)) => {
             if let Some((mut codex_sessions, _)) = codex_result {
@@ -185,10 +186,11 @@ pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, DetectionDiagnostic
             if let Some((mut pi_sessions, _)) = pi_result {
                 detected.append(&mut pi_sessions);
             }
+            detected.extend(opencode_sessions);
             enrich_detected_sessions(detected, diagnostics)
         }
         Err(error) => {
-            let mut fallback = Vec::new();
+            let mut fallback = opencode_sessions;
             let mut diagnostics = DetectionDiagnostics::default();
             if let Some((sessions, extra)) = codex_result {
                 fallback.extend(sessions);
@@ -383,6 +385,50 @@ pub fn enrich_detected_sessions(
                 status,
                 latest_message,
                 notification_preview,
+                pending_tool_name: None,
+                pending_tool_input: None,
+                worker_of: None,
+                official_name: detected.official_name.clone(),
+                started_at_ms: detected.started_at_ms,
+                provider: detected.provider,
+                surface: detected.surface,
+                agent_kind: detected.agent_kind,
+                parent_thread_id: detected.parent_thread_id.clone(),
+                root_session_id: detected.root_session_id.clone(),
+                agent_path: detected.agent_path.clone(),
+                agent_nickname: detected.agent_nickname.clone(),
+                agent_role: detected.agent_role.clone(),
+                internal_kind: detected.internal_kind.clone(),
+                can_open: detected.can_open,
+                can_stop: detected.can_stop,
+                can_rename: detected.can_rename,
+            });
+            continue;
+        }
+
+        if let Some(summary) = detected.opencode_summary.as_ref() {
+            let first_prompt = detected.official_name.clone().unwrap_or_default();
+            let latest_message = summary.diagnostic.clone();
+            let session_name = detected.project_name.clone();
+            let modified = summary.modified.clone();
+            let status = summary.status.clone();
+            sessions.push(Session {
+                id: session_id.clone(),
+                session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
+                pid: detected.pid,
+                session_name,
+                custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
+                codex_title: None,
+                cursor_title: None,
+                project_path: detected.cwd.to_string_lossy().to_string(),
+                git_branch: None,
+                first_prompt,
+                summary: None,
+                message_count: 0,
+                modified,
+                status,
+                latest_message,
+                notification_preview: None,
                 pending_tool_name: None,
                 pending_tool_input: None,
                 worker_of: None,
@@ -937,6 +983,7 @@ mod placeholder_tests {
             codex_summary: None,
             cursor_summary: None,
             pi_summary: None,
+            opencode_summary: None,
         };
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();

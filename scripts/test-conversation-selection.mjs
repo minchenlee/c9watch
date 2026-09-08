@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { compileModule } from 'svelte/compiler';
 import { flushSync } from 'svelte';
+import ts from 'typescript';
 
 // Execute the actual page's reactive loader with deferred backend responses.
 const page = readFileSync(new URL('../src/routes/(app)/+page.svelte', import.meta.url), 'utf8');
@@ -22,18 +23,35 @@ export function harness() {
  const currentConversation = {set(v) {value = v;}};
  const toolsLoadedFor = {value:null,set(v) {this.value=v;}};
  const get = s => s.value;
+ const timers = new Map(); let timerId = 0;
+ const setTimeout = fn => {timers.set(++timerId,fn);return timerId;};
+ const clearTimeout = id => timers.delete(id);
  const requests = [];
- const getConversation = (id,provider) => new Promise(resolve => requests.push({id,provider,resolve}));
+ const getConversation = (id,provider) => new Promise((resolve,reject) => requests.push({id,provider,resolve,reject}));
  const withConversationLoader = (_id,_provider,_kind,task) => task();
+ ${loader.slice(0, loader.indexOf("\t$effect(() => {"))}
  const dispose = $effect.root(() => {
- ${loader}
+ ${loader.slice(loader.indexOf("\t$effect(() => {"))}
  });
- return {requests,dispose,value:()=>value,poll:()=>{sessions=sessions.map(s=>({...s}));},select(provider){sessions=[{id:'same',provider}];expandedId=provider+':same';},close(){expandedId=null;}};
+ return {requests,dispose,error:()=>conversationError,retry:()=>retryConversation(),refresh(){const work=[...timers.values()];timers.clear();work.forEach(fn=>fn());},value:()=>value,poll:()=>{sessions=sessions.map(s=>({...s}));},select(provider){sessions=[{id:'same',provider}];expandedId=provider+':same';},close(){expandedId=null;}};
 }`;
-let code = compileModule(source, { filename: 'conversation-selection.svelte.js', generate: 'client' }).js.code;
+let code = compileModule(ts.transpileModule(source, {compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ES2022}}).outputText, { filename: 'conversation-selection.svelte.js', generate: 'client' }).js.code;
 code = code.replace(/from '([^']+)'/g, (_, spec) => `from '${import.meta.resolve(spec)}'`);
 const { harness } = await import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'));
 const settle = async () => { await Promise.resolve(); await Promise.resolve(); flushSync(); };
+
+test('initial failure is visible, retry succeeds, and stale errors are ignored', async () => {
+ const h=harness();
+ try {
+  flushSync(); h.requests[0].reject(new Error('OpenCode HTTP 503')); await settle();
+  assert.match(h.error(), /503/); assert.equal(h.value(),null);
+  h.retry(); flushSync(); assert.equal(h.error(),null); assert.equal(h.requests.length,2);
+  const response={sessionId:'same',provider:'codex',messages:[{content:'recovered'}]};
+  h.requests[1].resolve(response); await settle(); assert.equal(h.value(),response);
+  h.refresh(); h.select('opencode'); flushSync();
+  h.requests[2].reject(new Error('stale error')); await settle(); assert.equal(h.error(),null);
+ } finally {h.dispose();}
+});
 
 test('poll updates neither restart an in-flight load nor erase loaded messages', async () => {
  const h=harness();
@@ -58,4 +76,30 @@ test('provider switch rejects stale replies and reopening loads again', async ()
   h.close();flushSync();assert.equal(h.value(),null);
   h.select('cursor');flushSync();assert.equal(h.requests.length,3);
  } finally {h.dispose();}
+});
+
+ test('open preview refreshes serially and discards a response after close', async () => {
+ const h=harness();
+ try {
+  flushSync(); h.refresh(); assert.equal(h.requests.length,1);
+  h.requests[0].resolve({sessionId:'same',provider:'codex',messages:[{content:'old'}]});await settle();
+  h.refresh();assert.equal(h.requests.length,2);
+  h.refresh();assert.equal(h.requests.length,2);
+  const updated={sessionId:'same',provider:'codex',messages:[{content:'old'},{content:'reply'}]};
+  h.requests[1].resolve(updated);await settle();assert.equal(h.value(),updated);
+  h.refresh();assert.equal(h.requests.length,3);
+  h.close();flushSync();h.requests[2].resolve(updated);await settle();
+  assert.equal(h.value(),null);h.refresh();assert.equal(h.requests.length,3);
+ } finally {h.dispose();}
+});
+
+const slidingSource = readFileSync(new URL('../src/lib/slidingWindow.svelte.ts', import.meta.url), 'utf8');
+let slidingCode = compileModule(ts.transpileModule(slidingSource, {compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ES2022}}).outputText, {filename:'sliding-window.svelte.js',generate:'client'}).js.code;
+slidingCode = slidingCode.replace(/from '([^']+)'/g, (_, spec) => `from '${import.meta.resolve(spec)}'`);
+const {createSlidingWindow, MAX_VISIBLE} = await import('data:text/javascript;base64,'+Buffer.from(slidingCode).toString('base64'));
+test('following new replies advances the visible tail without unbounded rendering', () => {
+ const sw=createSlidingWindow();sw.reset(2);
+ const messages=Array.from({length:3},(_,i)=>({content:String(i)}));
+ sw.followLatest(3);assert.equal(sw.sliceMessages(messages).at(-1).content,'2');
+ sw.followLatest(1000);assert.equal(sw.endIndex,1000);assert.ok(sw.endIndex-sw.startIndex<=MAX_VISIBLE);
 });

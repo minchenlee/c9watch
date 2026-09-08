@@ -31,8 +31,8 @@
 </script>
 
 <script lang="ts">
-	import { onDestroy, onMount, tick } from 'svelte';
-	import { fade } from 'svelte/transition';
+	import { onDestroy, onMount, tick, untrack } from 'svelte';
+	import { fade } from '$lib/transitions';
 	import { flyIn, flyInX, fadeIn } from '$lib/transitions';
 	import { invoke } from '@tauri-apps/api/core';
 	import type { Session, Conversation } from '$lib/types';
@@ -66,12 +66,14 @@
 	interface Props {
 		session: Session;
 		conversation: Conversation | null;
+		loadError?: string | null;
+		onretry?: () => void;
 		onclose?: () => void;
 		onstop?: () => void;
 		onopen?: () => void;
 	}
 
-	let { session, conversation, onclose, onstop, onopen }: Props = $props();
+	let { session, conversation, loadError = null, onretry, onclose, onstop, onopen }: Props = $props();
 
 	let messagesContainer = $state<HTMLDivElement>(undefined!);
 	let isInitialLoad = $state(true);
@@ -284,6 +286,7 @@
 				const isAtBottom =
 					messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight < 150;
 				if (isAtBottom) {
+					untrack(() => sw.followLatest(conversation.messages.length));
 					tick().then(() => {
 						messagesContainer.scrollTop = messagesContainer.scrollHeight;
 					});
@@ -330,7 +333,7 @@
 			sessionId: child.id,
 			provider: providerOf(child),
 			agentType: child.agentRole || child.agentNickname || 'subagent',
-				description: child.agentNickname || child.codexTitle || child.cursorTitle || child.summary || child.firstPrompt || child.agentRole || (providerOf(child) === 'cursor' ? 'Cursor subagent' : providerOf(child) === 'pi' ? 'Pi subagent' : 'Codex subagent'),
+				description: child.agentNickname || child.codexTitle || child.cursorTitle || child.summary || child.firstPrompt || child.agentRole || (providerOf(child) === 'cursor' ? 'Cursor subagent' : providerOf(child) === 'pi' ? 'Pi subagent' : providerOf(child) === 'opencode' ? 'OpenCode subagent' : 'Codex subagent'),
 			startedAt: child.startedAtMs ? new Date(child.startedAtMs).toISOString() : child.modified,
 			completedAt: child.status === SessionStatus.Working ? null : child.modified,
 			parentSessionId: session.id,
@@ -363,7 +366,7 @@
 	let previewError = $derived(previewState.error);
 
 	async function openSubagentPreview(sa: SubagentInfo) {
-		if ((sa.provider === 'codex' || sa.provider === 'cursor' || sa.provider === 'pi') && sa.sessionId) {
+		if ((sa.provider === 'codex' || sa.provider === 'cursor' || sa.provider === 'pi' || sa.provider === 'opencode') && sa.sessionId) {
 			expandedSessionId.set(providerSessionKey(sa.provider, sa.sessionId));
 			return;
 		}
@@ -668,6 +671,12 @@
 							</div>
 						{/if}
 					</div>
+				{:else if !conversation && loadError}
+					<div class="loading-state" role="alert">
+						<p>Could not load conversation</p>
+						<p>{loadError}</p>
+						<button class="retry-conversation" onclick={onretry}>RETRY</button>
+					</div>
 				{:else if !conversation}
 					<div class="loading-state">
 
@@ -859,6 +868,8 @@
 </div>
 
 <style>
+	.retry-conversation { padding: 8px 12px; border: 1px solid var(--border-default); border-radius: var(--radius-sm); background: var(--bg-elevated); color: var(--text-primary); font: 11px var(--font-mono); cursor: pointer; }
+
 	.overlay-backdrop {
 		position: fixed;
 		inset: 0;

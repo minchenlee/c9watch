@@ -636,6 +636,7 @@ impl CodexSessionSource {
                 codex_summary: Some(summary),
                 cursor_summary: None,
                 pi_summary: None,
+                opencode_summary: None,
             });
         }
         Ok((sessions, DetectionDiagnostics::default()))

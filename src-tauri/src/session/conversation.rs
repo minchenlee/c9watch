@@ -175,6 +175,7 @@ fn load_for_provider(
         SessionProvider::Codex => codex_conversation(session_id, include_tools, on_progress),
         SessionProvider::Cursor => cursor_conversation(session_id, include_tools, on_progress),
         SessionProvider::Pi => pi_conversation(session_id, include_tools, on_progress),
+        SessionProvider::Opencode => super::opencode::conversation(session_id, include_tools),
     }
 }
 

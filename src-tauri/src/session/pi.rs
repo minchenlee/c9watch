@@ -270,6 +270,7 @@ impl SessionSource for PiSessionSource {
                     codex_summary: None,
                     cursor_summary: None,
                     pi_summary: Some(summary),
+                    opencode_summary: None,
                 });
             }
         }

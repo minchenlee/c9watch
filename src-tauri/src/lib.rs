@@ -733,6 +733,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            session::opencode::opencode_connection_status,
+            session::opencode::opencode_connect,
             notifications::get_notification_preferences,
             notifications::save_notification_preferences,
             notifications::test_native_notification,

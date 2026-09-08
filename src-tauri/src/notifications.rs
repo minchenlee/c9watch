@@ -215,6 +215,7 @@ fn content(s: &Session, event: Event, detail: Detail) -> (String, String) {
         SessionProvider::Codex => "Codex",
         SessionProvider::Cursor => "Cursor",
         SessionProvider::Pi => "Pi",
+        SessionProvider::Opencode => "OpenCode",
     };
     let project = std::path::Path::new(&s.project_path)
         .file_name()

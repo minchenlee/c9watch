@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import { slide } from 'svelte/transition';
+	import { slide } from '$lib/transitions';
 	import { cubicOut } from 'svelte/easing';
 	import { marked } from 'marked';
 	import DOMPurify from 'dompurify';

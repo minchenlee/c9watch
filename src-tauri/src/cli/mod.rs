@@ -1734,6 +1734,13 @@ fn resolve_session_reference_lightweight_under(
         .map_or((None, reference), |(provider, raw_prefix)| {
             (Some(provider), raw_prefix)
         });
+    // Explicit full OpenCode IDs do not depend on the monitor's freshness window.
+    if provider_filter == Some(session::SessionProvider::Opencode)
+        && prefix.len() >= 30 && prefix.starts_with("ses_")
+        && prefix[4..].bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return Ok((prefix.to_string(), provider_filter));
+    }
     let projects_dir = home_dir.join(".claude").join("projects");
 
     let mut matches: Vec<session::SessionIdentity> = Vec::new();
@@ -1783,6 +1790,14 @@ fn resolve_session_reference_lightweight_under(
             .map(|id| session::SessionIdentity::new(session::SessionProvider::Pi, id)),
     );
 
+    if provider_filter.is_none() || provider_filter == Some(session::SessionProvider::Opencode) {
+        matches.extend(
+            session::opencode::detect_once().into_iter()
+                .filter_map(|s| s.identity())
+                .filter(|s| s.session_id.starts_with(prefix)),
+        );
+    }
+
     if let Some(provider) = provider_filter {
         matches.retain(|identity| identity.provider == provider);
     }
@@ -1802,6 +1817,7 @@ fn parse_provider_scoped_reference(reference: &str) -> Option<(session::SessionP
         "codex" => session::SessionProvider::Codex,
         "cursor" => session::SessionProvider::Cursor,
         "pi" => session::SessionProvider::Pi,
+        "opencode" => session::SessionProvider::Opencode,
         _ => return None,
     };
     Some((provider, raw_prefix))
@@ -1845,6 +1861,15 @@ mod session_formatter_tests {
     use super::*;
     use crate::session::source::{AgentKind, SessionProvider, SessionSurface};
     use crate::session::SessionStatus;
+
+    #[test]
+    fn explicit_opencode_id_bypasses_recent_session_discovery() {
+        let home = tempfile::tempdir().unwrap();
+        let id = "ses_f835ea1f8ffelnS2uzHgkM9qUq";
+        let result = super::resolve_session_reference_lightweight_under(
+            &format!("opencode:{id}"), home.path()).unwrap();
+        assert_eq!(result, (id.to_string(), Some(SessionProvider::Opencode)));
+    }
 
     fn codex_subagent() -> session::enrichment::Session {
         session::enrichment::Session {

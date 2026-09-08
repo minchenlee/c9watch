@@ -1,5 +1,25 @@
-import { fly, fade, type FlyParams, type FadeParams } from 'svelte/transition';
+import { fly, fade as svelteFade, scale as svelteScale, slide as svelteSlide, type FlyParams, type FadeParams, type ScaleParams, type SlideParams } from 'svelte/transition';
 import { cubicOut } from 'svelte/easing';
+import { isTauri } from './ws';
+
+// Native WebKit can suspend its animation timeline even after an intro starts,
+// while DOM/AX updates continue. Native content must not depend on a transition
+// finishing to become visible. Browser transitions remain animated when visible.
+function skipMotion(node: Element): boolean {
+	return isTauri() || node.ownerDocument.visibilityState === 'hidden' || prefersReducedMotion();
+}
+
+export function fade(node: Element, params: FadeParams = {}) {
+	return skipMotion(node) ? { duration: 0, delay: 0 } : svelteFade(node, params);
+}
+
+export function scale(node: Element, params: ScaleParams = {}) {
+	return skipMotion(node) ? { duration: 0, delay: 0 } : svelteScale(node, params);
+}
+
+export function slide(node: Element, params: SlideParams = {}) {
+	return skipMotion(node) ? { duration: 0, delay: 0 } : svelteSlide(node, params);
+}
 
 function prefersReducedMotion(): boolean {
 	if (typeof window === 'undefined' || !window.matchMedia) return false;
@@ -18,12 +38,12 @@ export function flyIn(
 	node: Element,
 	params: { index?: number; y?: number; duration?: number; stride?: number; base?: number } = {}
 ) {
-	if (prefersReducedMotion()) {
-		return fade(node, { duration: 0 });
+	if (skipMotion(node)) {
+		return { duration: 0, delay: 0 };
 	}
 	const { index = 0, y = 8, duration = 400, stride = 60, base = 0 } = params;
 	if (index > CASCADE_CAP) {
-		return fade(node, { duration: 0 });
+		return { duration: 0, delay: 0 };
 	}
 	return fly(node, {
 		y,
@@ -36,8 +56,8 @@ export function flyIn(
 
 // Plain fade that respects reduced motion.
 export function fadeIn(node: Element, params: FadeParams = {}) {
-	if (prefersReducedMotion()) {
-		return fade(node, { duration: 0 });
+	if (skipMotion(node)) {
+		return { duration: 0, delay: 0 };
 	}
 	return fade(node, { duration: 320, easing: cubicOut, ...params });
 }
@@ -48,12 +68,12 @@ export function flyInX(
 	node: Element,
 	params: { index?: number; x?: number; duration?: number; stride?: number; base?: number } = {}
 ) {
-	if (prefersReducedMotion()) {
-		return fade(node, { duration: 0 });
+	if (skipMotion(node)) {
+		return { duration: 0, delay: 0 };
 	}
 	const { index = 0, x = 12, duration = 400, stride = 60, base = 0 } = params;
 	if (index > CASCADE_CAP) {
-		return fade(node, { duration: 0 });
+		return { duration: 0, delay: 0 };
 	}
 	return fly(node, {
 		x,
