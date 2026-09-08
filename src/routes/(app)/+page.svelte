@@ -361,7 +361,8 @@
 					console.error('Failed to fetch conversation:', error);
 					// Keep the last successful preview during transient refresh failures.
 				} finally {
-					if (!cancelled && requestId === conversationRequestId) {
+					// Local providers parse transcripts in full; only OpenCode needs HTTP polling.
+					if (providerOf(selected!) === 'opencode' && !cancelled && requestId === conversationRequestId) {
 						timer = setTimeout(() => void refresh(false), 2000);
 					}
 				}

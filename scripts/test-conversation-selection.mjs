@@ -12,9 +12,9 @@ const end = page.indexOf('\n\tfunction handleExpand', start);
 const loader = page.slice(start, end);
 const source = `
 import { untrack } from 'svelte';
-export function harness() {
- let sessions = $state([{id:'same',provider:'codex'}]);
- let expandedId = $state('codex:same');
+export function harness(initialProvider = 'codex') {
+ let sessions = $state([{id:'same',provider:initialProvider}]);
+ let expandedId = $state(initialProvider + ':same');
  const sessionKeyOf = s => s.provider + ':' + s.id;
  const providerSessionKey = (provider,id) => provider + ':' + id;
  const providerOf = s => s.provider;
@@ -41,14 +41,14 @@ const { harness } = await import('data:text/javascript;base64,' + Buffer.from(co
 const settle = async () => { await Promise.resolve(); await Promise.resolve(); flushSync(); };
 
 test('initial failure is visible, retry succeeds, and stale errors are ignored', async () => {
- const h=harness();
+ const h=harness('opencode');
  try {
   flushSync(); h.requests[0].reject(new Error('OpenCode HTTP 503')); await settle();
   assert.match(h.error(), /503/); assert.equal(h.value(),null);
   h.retry(); flushSync(); assert.equal(h.error(),null); assert.equal(h.requests.length,2);
-  const response={sessionId:'same',provider:'codex',messages:[{content:'recovered'}]};
+  const response={sessionId:'same',provider:'opencode',messages:[{content:'recovered'}]};
   h.requests[1].resolve(response); await settle(); assert.equal(h.value(),response);
-  h.refresh(); h.select('opencode'); flushSync();
+  h.refresh(); h.select('codex'); flushSync();
   h.requests[2].reject(new Error('stale error')); await settle(); assert.equal(h.error(),null);
  } finally {h.dispose();}
 });
@@ -79,13 +79,13 @@ test('provider switch rejects stale replies and reopening loads again', async ()
 });
 
  test('open preview refreshes serially and discards a response after close', async () => {
- const h=harness();
+ const h=harness('opencode');
  try {
   flushSync(); h.refresh(); assert.equal(h.requests.length,1);
-  h.requests[0].resolve({sessionId:'same',provider:'codex',messages:[{content:'old'}]});await settle();
+  h.requests[0].resolve({sessionId:'same',provider:'opencode',messages:[{content:'old'}]});await settle();
   h.refresh();assert.equal(h.requests.length,2);
   h.refresh();assert.equal(h.requests.length,2);
-  const updated={sessionId:'same',provider:'codex',messages:[{content:'old'},{content:'reply'}]};
+  const updated={sessionId:'same',provider:'opencode',messages:[{content:'old'},{content:'reply'}]};
   h.requests[1].resolve(updated);await settle();assert.equal(h.value(),updated);
   h.refresh();assert.equal(h.requests.length,3);
   h.close();flushSync();h.requests[2].resolve(updated);await settle();
@@ -102,4 +102,22 @@ test('following new replies advances the visible tail without unbounded renderin
  const messages=Array.from({length:3},(_,i)=>({content:String(i)}));
  sw.followLatest(3);assert.equal(sw.sliceMessages(messages).at(-1).content,'2');
  sw.followLatest(1000);assert.equal(sw.endIndex,1000);assert.ok(sw.endIndex-sw.startIndex<=MAX_VISIBLE);
+});
+
+
+test('local providers load once and allow manual retry without scheduling full reparses', async () => {
+ for (const provider of ['claudeCode', 'codex', 'cursor', 'pi']) {
+  const h = harness(provider);
+  try {
+   flushSync();
+   h.requests[0].reject(new Error('temporary read failure')); await settle();
+   h.refresh(); assert.equal(h.requests.length, 1, provider);
+   h.retry(); flushSync(); assert.equal(h.requests.length, 2, provider);
+   const response = {sessionId:'same', provider, messages:[{content:'loaded'}]};
+   h.requests[1].resolve(response); await settle();
+   for (let i = 0; i < 3; i++) { h.poll(); flushSync(); h.refresh(); }
+   assert.equal(h.requests.length, 2, provider);
+   assert.equal(h.value(), response);
+  } finally { h.dispose(); }
+ }
 });

@@ -57,7 +57,11 @@ Pages are reassembled in chronological order and tool filtering occurs per
 page. Oversized pages are retried with smaller page sizes. The 8 MiB limit
 applies to each page; a single message larger than that returns an explicit
 error. Repeated cursors and loads exceeding one minute are rejected. Initial
-conversation errors appear in the panel with a Retry action.
+conversation errors appear in the panel with a Retry action. Only OpenCode
+previews refresh on a two-second timer; local providers load on selection or
+manual retry without periodically reparsing unchanged transcripts. Legacy
+ID-only conversation lookup includes OpenCode and still rejects cross-provider
+ID collisions.
 
 ## Native rendering
 
