@@ -390,7 +390,7 @@ async fn handle_message_with_owners(
         ClientMsg::GetSubscriptionUsage => ServerMsg::SubscriptionUsage {
             data: serde_json::to_value(crate::subscription_usage::get_subscription_usage().await).unwrap_or_default(),
         },
-        ClientMsg::GetSessions => match crate::polling::detect_and_enrich_sessions() {
+        ClientMsg::GetSessions => match crate::blocking::scan(&crate::blocking::DISCOVERY, crate::polling::detect_and_enrich_sessions).await {
             Ok(sessions) => ServerMsg::Sessions {
                 data: serde_json::to_value(&sessions).unwrap_or_default(),
             },

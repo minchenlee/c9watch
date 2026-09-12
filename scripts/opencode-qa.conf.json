@@ -1,0 +1,6 @@
+{
+  "productName": "c9watch OpenCode Ready QA",
+  "identifier": "com.minchenlee.c9watch.opencodereadyqa",
+  "build": {"beforeBuildCommand": ""},
+  "bundle": {"createUpdaterArtifacts": false}
+}

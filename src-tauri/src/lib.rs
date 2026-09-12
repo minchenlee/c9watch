@@ -16,6 +16,8 @@ pub mod notifications;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod polling;
 #[cfg(all(not(mobile), feature = "gui"))]
+mod blocking;
+#[cfg(all(not(mobile), feature = "gui"))]
 pub mod web_server;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod subscription_usage;
@@ -73,14 +75,18 @@ async fn get_subscription_usage() -> Vec<subscription_usage::SubscriptionUsage> 
 async fn get_sessions(
     detector: tauri::State<'_, Arc<Mutex<session::DetectorState>>>,
 ) -> Result<Vec<Session>, String> {
-    let detect_result = {
-        let mut state = detector
-            .lock()
-            .map_err(|e| format!("Detector lock poisoned: {}", e))?;
-        state.detect()
-    };
-    let (detected, diag) = detect_result.map_err(|e| format!("Detect failed: {}", e))?;
-    session::enrichment::enrich_detected_sessions(detected, diag).map(|(sessions, _)| sessions)
+    let detector = Arc::clone(detector.inner());
+    blocking::scan(&blocking::DISCOVERY, move || {
+        let detect_result = {
+            let mut state = detector
+                .lock()
+                .map_err(|e| format!("Detector lock poisoned: {}", e))?;
+            state.detect()
+        };
+        let (detected, diag) = detect_result.map_err(|e| format!("Detect failed: {}", e))?;
+        session::enrichment::enrich_detected_sessions(detected, diag).map(|(sessions, _)| sessions)
+    })
+    .await
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -159,13 +165,7 @@ async fn get_subagents(
     // Transcript scans perform blocking disk I/O and JSON parsing. Running them
     // directly on Tokio workers can starve subscription IPC, pipes and timers.
     // Hold the permit inside the blocking job so cancellation cannot overlap scans.
-    static SCAN_GATE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    let permit = SCAN_GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone().acquire_owned().await.map_err(|e| e.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let _permit = permit;
-        session::all_subagents_by_session()
-    }).await.map_err(|e| format!("Subagent scan failed: {e}"))
+    blocking::scan(&blocking::SUBAGENTS, || Ok(session::all_subagents_by_session())).await
 }
 
 /// Returns the prompt + final result (plus usage stats when available) for a
@@ -176,12 +176,15 @@ async fn get_subagent_transcript(
     parent_session_id: String,
     subagent_id: String,
 ) -> Result<session::SubagentTranscript, String> {
-    session::get_subagent_transcript(&parent_session_id, &subagent_id).ok_or_else(|| {
-        format!(
-            "subagent {} not found in session {}",
-            subagent_id, parent_session_id
-        )
+    blocking::scan(&blocking::SUBAGENT_TRANSCRIPT, move || {
+        session::get_subagent_transcript(&parent_session_id, &subagent_id).ok_or_else(|| {
+            format!(
+                "subagent {} not found in session {}",
+                subagent_id, parent_session_id
+            )
+        })
     })
+    .await
 }
 
 /// Returns the parsed TodoWrite tasks for a session, sorted by numeric `id`.
@@ -735,6 +738,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             session::opencode::opencode_connection_status,
             session::opencode::opencode_connect,
+            session::opencode::opencode_session_children,
             notifications::get_notification_preferences,
             notifications::save_notification_preferences,
             notifications::test_native_notification,

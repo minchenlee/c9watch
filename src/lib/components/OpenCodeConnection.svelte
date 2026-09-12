@@ -8,31 +8,38 @@
 	let status = $state<ConnectionStatus | null>(null);
 	let error = $state('');
 	let busy = $state(false);
+	let generation = 0;
 	onMount(() => {
 		let disposed = false;
 		let first = true;
+		let timer: ReturnType<typeof setTimeout>;
 		async function refresh() {
+			const requestGeneration = generation;
 			try {
+				if (busy) return;
 				const next = await invoke<ConnectionStatus>('opencode_connection_status');
-				if (disposed) return;
+				if (disposed || requestGeneration !== generation) return;
 				status = next;
 				if (first && next.url) url = next.url;
 				first = false;
-			} catch (e) { if (!disposed) error = String(e); }
+			} catch (e) { if (!disposed && requestGeneration === generation) error = String(e); }
+			finally { if (!disposed) timer = setTimeout(refresh, 2000); }
 		}
 		void refresh();
-		const timer = setInterval(refresh, 2000);
-		return () => { disposed = true; clearInterval(timer); };
+		return () => { disposed = true; generation++; clearTimeout(timer); };
 	});
 	async function connect(disconnect = false) {
+		if (busy) return;
+		const requestGeneration = ++generation;
 		busy = true;
 		error = '';
 		try {
 			await invoke('opencode_connect', { url: disconnect ? '' : url, username, password: password || null });
 			password = '';
-			status = await invoke<ConnectionStatus>('opencode_connection_status');
-		} catch (e) { error = String(e); }
-		finally { busy = false; }
+			const next = await invoke<ConnectionStatus>('opencode_connection_status');
+			if (requestGeneration === generation) status = next;
+		} catch (e) { if (requestGeneration === generation) error = String(e); }
+		finally { if (requestGeneration === generation) busy = false; }
 	}
 </script>
 

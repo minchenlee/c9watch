@@ -30,3 +30,17 @@ test('OpenCode descendants attach only to their own provider and orphans remain 
   assert.equal(hierarchy.subagentsByParent.has('claudeCode:root'), false);
   assert.equal(hierarchy.topLevelIds.has('opencode:orphan'), true);
 });
+
+test('directory-qualified OpenCode roots and children cannot collide', () => {
+  const sessions = ['/a', '/b'].flatMap(directory => {
+    const suffix = '?directory=' + encodeURIComponent(directory);
+    return [
+      { id: 'same' + suffix, provider: 'opencode', agentKind: 'root' },
+      { id: 'child' + suffix, provider: 'opencode', agentKind: 'subagent', parentThreadId: 'same' + suffix }
+    ];
+  });
+  const hierarchy = provider.resolveCodexHierarchy(sessions);
+  assert.equal(hierarchy.topLevelIds.size, 2);
+  assert.deepEqual(hierarchy.subagentsByParent.get('opencode:same?directory=%2Fa'), [sessions[1]]);
+  assert.deepEqual(hierarchy.subagentsByParent.get('opencode:same?directory=%2Fb'), [sessions[3]]);
+});

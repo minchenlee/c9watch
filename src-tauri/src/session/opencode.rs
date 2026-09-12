@@ -11,11 +11,40 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
+const MAX_CONVERSATION_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_CONVERSATION_MESSAGES: usize = 10_000;
+const MAX_PAGES: usize = 128;
+const MAX_SESSIONS: usize = 512;
+const MAX_DIRECTORIES: usize = 32;
 const IDLE_FRESHNESS_MS: i64 = 30 * 60 * 1000;
+
+/// Shared by every request in an operation, including oversized-page retries.
+struct Budget {
+    deadline: Instant,
+    remaining: u64,
+}
+
+impl Budget {
+    fn new(seconds: u64, bytes: u64) -> Self {
+        Self {
+            deadline: Instant::now() + Duration::from_secs(seconds),
+            remaining: bytes,
+        }
+    }
+
+    fn timeout(&self) -> Result<Duration, String> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .map(|duration| duration.min(Duration::from_secs(3)))
+            .ok_or_else(|| "OpenCode operation timed out".into())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct OpenCodeSummary {
@@ -29,6 +58,7 @@ struct Connection {
     url: reqwest::Url,
     username: String,
     password: Option<String>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Connection {
@@ -61,23 +91,26 @@ impl Connection {
             url,
             username,
             password,
+            cancelled: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    fn get<T: serde::de::DeserializeOwned>(
-        &self,
-        client: &Client,
-        segments: &[&str],
-    ) -> Result<T, String> {
-        self.get_page(client, segments, &[]).map(|(value, _)| value)
+    fn check_active(&self) -> Result<(), String> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Err("OpenCode connection changed or disconnected".into())
+        } else {
+            Ok(())
+        }
     }
 
-    fn get_page<T: serde::de::DeserializeOwned>(
+    fn get_page_bounded<T: serde::de::DeserializeOwned>(
         &self,
         client: &Client,
         segments: &[&str],
         query: &[(&str, &str)],
+        budget: &mut Budget,
     ) -> Result<(T, Option<String>), String> {
+        self.check_active()?;
         let mut url = self.url.clone();
         url.path_segments_mut()
             .map_err(|_| "Invalid OpenCode URL")?
@@ -86,13 +119,14 @@ impl Connection {
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query.iter().copied());
         }
-        let mut request = client.get(url);
+        let mut request = client.get(url).timeout(budget.timeout()?);
         if let Some(password) = &self.password {
             request = request.basic_auth(&self.username, Some(password));
         }
         let response = request
             .send()
             .map_err(|_| "OpenCode connection failed or timed out")?;
+        self.check_active()?;
         if !response.status().is_success() {
             return Err(format!("OpenCode HTTP {}", response.status().as_u16()));
         }
@@ -102,11 +136,24 @@ impl Connection {
             .map(|v| v.to_str().map(str::to_owned))
             .transpose()
             .map_err(|_| "Invalid OpenCode pagination cursor")?;
+        if next_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() > 4096)
+        {
+            return Err("OpenCode pagination cursor exceeds 4096 bytes".into());
+        }
         let mut bytes = Vec::new();
+        let allowed = MAX_RESPONSE.min(budget.remaining);
         response
-            .take(MAX_RESPONSE + 1)
+            .take(allowed + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| "OpenCode response read failed")?;
+        self.check_active()?;
+        budget.timeout()?;
+        if bytes.len() as u64 > budget.remaining {
+            return Err("OpenCode operation exceeds total response byte limit".into());
+        }
+        budget.remaining -= bytes.len() as u64;
         if bytes.len() as u64 > MAX_RESPONSE {
             return Err("OpenCode response exceeds 8 MiB".into());
         }
@@ -120,12 +167,14 @@ fn client() -> Result<Client, String> {
     Client::builder()
         .timeout(Duration::from_secs(3))
         .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(1)
+        .pool_idle_timeout(Duration::from_secs(5))
         .no_proxy()
         .build()
         .map_err(|_| "Could not initialize OpenCode HTTP client".into())
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct RemoteSession {
     id: String,
     directory: String,
@@ -135,7 +184,7 @@ struct RemoteSession {
     time: RemoteTime,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct RemoteTime {
     created: i64,
     updated: i64,
@@ -154,8 +203,61 @@ fn timestamp(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+// Keep the shared provider identity opaque. Directory is encoded in OpenCode's
+// local ID only; HTTP paths always use the original remote ID.
+fn scoped_id(id: &str, directory: &str) -> String {
+    let mut url = reqwest::Url::parse("http://identity/").unwrap();
+    url.query_pairs_mut().append_pair("directory", directory);
+    format!("{}?{}", id, url.query().unwrap())
+}
+
+fn split_id(id: &str) -> Result<(&str, Option<String>), String> {
+    let Some((raw, query)) = id.split_once('?') else {
+        return Ok((id, None));
+    };
+    let url = reqwest::Url::parse(&format!("http://identity/?{query}"))
+        .map_err(|_| "Invalid OpenCode session identity")?;
+    let pairs: Vec<_> = url.query_pairs().collect();
+    if raw.is_empty() || pairs.len() != 1 || pairs[0].0 != "directory" || pairs[0].1.is_empty() {
+        return Err("Invalid OpenCode session identity".into());
+    }
+    Ok((raw, Some(pairs[0].1.to_string())))
+}
+
+pub(crate) fn is_full_session_reference(id: &str) -> bool {
+    split_id(id).is_ok_and(|(raw, _)| {
+        raw.len() >= 30
+            && raw.starts_with("ses_")
+            && raw[4..].bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
+pub(crate) fn matches_session_reference(scoped: &str, requested: &str) -> bool {
+    scoped == requested
+        || (split_id(requested).is_ok_and(|(_, directory)| directory.is_none())
+            && split_id(scoped).is_ok_and(|(raw, _)| raw == requested))
+}
+
+#[derive(Deserialize)]
+struct Health {
+    healthy: bool,
+    version: String,
+}
+
 fn snapshot(connection: &Connection, client: &Client) -> Result<Vec<DetectedSession>, String> {
-    let sessions: Vec<RemoteSession> = connection.get(client, &["session"])?;
+    let mut budget = Budget::new(10, 16 * 1024 * 1024);
+    let (health, _): (Health, _) =
+        connection.get_page_bounded(client, &["global", "health"], &[], &mut budget)?;
+    if !health.healthy || health.version.is_empty() {
+        return Err("OpenCode server is unhealthy".into());
+    }
+    // Ask for one beyond the bound so a server-side cap cannot silently look complete.
+    let limit = (MAX_SESSIONS + 1).to_string();
+    let (sessions, _): (Vec<RemoteSession>, _) =
+        connection.get_page_bounded(client, &["session"], &[("limit", &limit)], &mut budget)?;
+    if sessions.len() > MAX_SESSIONS {
+        return Err("OpenCode discovery exceeds 512 sessions".into());
+    }
     // Status is directory-scoped even though the session list spans the project.
     let mut statuses_by_directory = HashMap::new();
     for directory in sessions
@@ -164,8 +266,15 @@ fn snapshot(connection: &Connection, client: &Client) -> Result<Vec<DetectedSess
         .map(|s| s.directory.as_str())
         .collect::<BTreeSet<_>>()
     {
-        let (statuses, _): (HashMap<String, RemoteStatus>, _) =
-            connection.get_page(client, &["session", "status"], &[("directory", directory)])?;
+        if statuses_by_directory.len() >= MAX_DIRECTORIES {
+            return Err("OpenCode discovery exceeds 32 directories".into());
+        }
+        let (statuses, _): (HashMap<String, RemoteStatus>, _) = connection.get_page_bounded(
+            client,
+            &["session", "status"],
+            &[("directory", directory)],
+            &mut budget,
+        )?;
         statuses_by_directory.insert(directory.to_owned(), statuses);
     }
     Ok(sessions
@@ -186,7 +295,7 @@ fn snapshot(connection: &Connection, client: &Client) -> Result<Vec<DetectedSess
                 0,
                 s.directory.clone().into(),
                 s.directory.clone().into(),
-                Some(s.id.clone()),
+                Some(scoped_id(&s.id, &s.directory)),
                 s.title.clone(),
             );
             detected.provider = SessionProvider::Opencode;
@@ -198,7 +307,7 @@ fn snapshot(connection: &Connection, client: &Client) -> Result<Vec<DetectedSess
             } else {
                 AgentKind::Root
             };
-            detected.parent_thread_id = s.parent_id;
+            detected.parent_thread_id = s.parent_id.map(|id| scoped_id(&id, &s.directory));
             detected.can_open = false;
             detected.can_stop = false;
             detected.can_rename = false;
@@ -292,11 +401,18 @@ pub fn opencode_connect(
     };
     {
         let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = &cache.connection {
+            old.cancelled.store(true, Ordering::Release);
+        }
         cache.connection = connection;
         cache.generation += 1;
         cache.sessions.clear();
         cache.error = None;
         cache.connected = false;
+    }
+    // Never wait for an old load while handling disconnect on the UI thread.
+    if let Ok(mut reader) = CONVERSATION_READER.try_lock() {
+        reader.cached = None;
     }
     detect();
     Ok(())
@@ -324,15 +440,23 @@ pub(crate) fn detect() -> Vec<DetectedSession> {
                     let result = snapshot(&connection, &client);
                     let mut cache = shared.lock().unwrap_or_else(|e| e.into_inner());
                     // A response from an old endpoint must never populate a new connection.
-                    if cache.generation == generation {
-                        apply_result(&mut cache, result);
-                    }
+                    apply_generation_result(&mut cache, generation, result);
                 }
                 std::thread::sleep(Duration::from_secs(2));
             }
         });
     }
     cache.sessions.clone()
+}
+
+fn apply_generation_result(
+    cache: &mut Cache,
+    generation: u64,
+    result: Result<Vec<DetectedSession>, String>,
+) {
+    if cache.generation == generation {
+        apply_result(cache, result);
+    }
 }
 
 fn apply_result(cache: &mut Cache, result: Result<Vec<DetectedSession>, String>) {
@@ -372,36 +496,228 @@ pub(crate) fn detect_once() -> Vec<DetectedSession> {
 }
 
 pub(crate) fn conversation(id: &str, include_tools: bool) -> Result<Conversation, String> {
-    let connection = CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .connection
-        .clone()
-        .ok_or("OpenCode is not configured")?;
-    read_conversation(&connection, &client()?, id, include_tools)
+    let connection = {
+        let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if split_id(id)?.1.is_none() {
+            let matches = cache
+                .sessions
+                .iter()
+                .filter(|s| {
+                    s.session_id
+                        .as_deref()
+                        .is_some_and(|key| matches_session_reference(key, id))
+                })
+                .count();
+            if matches > 1 {
+                return Err(
+                    "OpenCode session ID is ambiguous across directories; use the scoped ID".into(),
+                );
+            }
+        }
+        cache
+            .connection
+            .clone()
+            .ok_or("OpenCode is not configured")?
+    };
+    // Fail fast instead of queueing blocking threads during retries/window churn.
+    let mut reader = CONVERSATION_READER
+        .try_lock()
+        .map_err(|_| "OpenCode conversation load already in progress; retry shortly")?;
+    reader.load(&connection, id, include_tools)
 }
 
+#[derive(Default)]
+struct ConversationReader {
+    client: Option<Client>,
+    cached: Option<CachedConversation>,
+}
+
+struct CachedConversation {
+    connection: Arc<AtomicBool>,
+    include_tools: bool,
+    loaded: Instant,
+    value: Conversation,
+}
+
+static CONVERSATION_READER: LazyLock<Mutex<ConversationReader>> =
+    LazyLock::new(|| Mutex::new(ConversationReader::default()));
+
+impl ConversationReader {
+    fn load(
+        &mut self,
+        connection: &Connection,
+        id: &str,
+        include_tools: bool,
+    ) -> Result<Conversation, String> {
+        connection.check_active()?;
+        if let Some(cached) = &self.cached {
+            if Arc::ptr_eq(&cached.connection, &connection.cancelled)
+                && cached.value.session_id == id
+                && cached.include_tools == include_tools
+                && cached.loaded.elapsed() < Duration::from_secs(1)
+            {
+                return Ok(cached.value.clone());
+            }
+        }
+        self.cached = None;
+        if self.client.is_none() {
+            self.client = Some(client()?);
+        }
+        let client = self.client.as_ref().unwrap();
+        let mut budget = Budget::new(60, MAX_CONVERSATION_BYTES);
+        let detail = session_detail(connection, client, id, &mut budget)?;
+        let address = scoped_id(&detail.id, &detail.directory);
+        let mut value =
+            read_conversation_bounded(connection, client, &address, include_tools, &mut budget)?;
+        value.session_id = id.into();
+        connection.check_active()?;
+        self.cached = Some(CachedConversation {
+            connection: Arc::clone(&connection.cancelled),
+            include_tools,
+            loaded: Instant::now(),
+            value: value.clone(),
+        });
+        Ok(value)
+    }
+}
+
+fn session_detail(
+    connection: &Connection,
+    client: &Client,
+    id: &str,
+    budget: &mut Budget,
+) -> Result<RemoteSession, String> {
+    let (raw, directory) = split_id(id)?;
+    let query: Vec<_> = directory
+        .as_deref()
+        .map(|dir| ("directory", dir))
+        .into_iter()
+        .collect();
+    let (detail, _): (RemoteSession, _) =
+        connection.get_page_bounded(client, &["session", raw], &query, budget)?;
+    if detail.id != raw
+        || directory
+            .as_ref()
+            .is_some_and(|dir| dir != &detail.directory)
+    {
+        return Err("OpenCode session detail does not match requested identity".into());
+    }
+    if detail.time.archived.is_some() {
+        return Err("OpenCode session is archived".into());
+    }
+    Ok(detail)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeChild {
+    session_id: String,
+    parent_thread_id: String,
+    directory: String,
+    title: String,
+}
+
+/// On-demand hierarchy reads share the same fail-fast HTTP gate as conversations.
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub async fn opencode_session_children(session_id: String) -> Result<Vec<OpenCodeChild>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connection
+            .clone()
+            .ok_or("OpenCode is not configured")?;
+        let _guard = CONVERSATION_READER
+            .try_lock()
+            .map_err(|_| "OpenCode load already in progress; retry shortly")?;
+        read_children(&connection, &client()?, &session_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(any(feature = "gui", test))]
+fn read_children(
+    connection: &Connection,
+    client: &Client,
+    id: &str,
+) -> Result<Vec<OpenCodeChild>, String> {
+    let mut budget = Budget::new(10, MAX_RESPONSE);
+    let parent = session_detail(connection, client, id, &mut budget)?;
+    let (children, _): (Vec<RemoteSession>, _) = connection.get_page_bounded(
+        client,
+        &["session", &parent.id, "children"],
+        &[("directory", &parent.directory)],
+        &mut budget,
+    )?;
+    if children.len() > MAX_SESSIONS {
+        return Err("OpenCode children exceed 512 sessions".into());
+    }
+    children
+        .into_iter()
+        .map(|child| {
+            if child.directory != parent.directory || child.parent_id.as_deref() != Some(&parent.id)
+            {
+                return Err("OpenCode child does not match requested parent/directory".into());
+            }
+            Ok(OpenCodeChild {
+                session_id: scoped_id(&child.id, &child.directory),
+                parent_thread_id: scoped_id(&parent.id, &parent.directory),
+                directory: child.directory,
+                title: child.title,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn read_conversation(
     connection: &Connection,
     client: &Client,
     id: &str,
     include_tools: bool,
 ) -> Result<Conversation, String> {
+    read_conversation_bounded(
+        connection,
+        client,
+        id,
+        include_tools,
+        &mut Budget::new(60, MAX_CONVERSATION_BYTES),
+    )
+}
+
+fn read_conversation_bounded(
+    connection: &Connection,
+    client: &Client,
+    id: &str,
+    include_tools: bool,
+    budget: &mut Budget,
+) -> Result<Conversation, String> {
+    let (raw, directory) = split_id(id)?;
     let mut pages = Vec::new();
     let mut before: Option<String> = None;
     let mut cursors = HashSet::new();
     let mut limit = 20usize;
-    let started = std::time::Instant::now();
+    let mut message_count = 0;
     loop {
-        if pages.len() >= 1000 || started.elapsed() > Duration::from_secs(60) {
-            return Err("OpenCode conversation is too large to load in one minute".into());
+        if pages.len() >= MAX_PAGES {
+            return Err("OpenCode conversation exceeds 128 pages".into());
         }
         let limit_text = limit.to_string();
         let mut query = vec![("limit", limit_text.as_str())];
         if let Some(cursor) = &before {
             query.push(("before", cursor.as_str()));
         }
-        let result = connection.get_page::<Vec<Value>>(client, &["session", id, "message"], &query);
+        if let Some(directory) = &directory {
+            query.push(("directory", directory.as_str()));
+        }
+        let result = connection.get_page_bounded::<Vec<Value>>(
+            client,
+            &["session", raw, "message"],
+            &query,
+            budget,
+        );
         let (rows, next) = match result {
             Err(error) if error == "OpenCode response exceeds 8 MiB" && limit > 1 => {
                 limit = (limit / 2).max(1);
@@ -409,7 +725,15 @@ fn read_conversation(
             }
             other => other?,
         };
-        pages.push(parse_conversation(id, rows, include_tools)?.messages);
+        if rows.len() > limit {
+            return Err("OpenCode server ignored message page limit".into());
+        }
+        let messages = parse_conversation(id, rows, include_tools)?.messages;
+        message_count += messages.len();
+        if message_count > MAX_CONVERSATION_MESSAGES {
+            return Err("OpenCode conversation exceeds 10000 rendered messages".into());
+        }
+        pages.push(messages);
         match next {
             Some(cursor) if !cursor.is_empty() && cursors.insert(cursor.clone()) => {
                 before = Some(cursor)
@@ -436,7 +760,14 @@ fn parse_conversation(
         let role = row["info"]["role"]
             .as_str()
             .ok_or("Malformed OpenCode message role")?;
-        let time = timestamp(row["info"]["time"]["created"].as_i64().unwrap_or_default());
+        if !matches!(role, "user" | "assistant") {
+            return Err("Malformed OpenCode message role".into());
+        }
+        let time = timestamp(
+            row["info"]["time"]["created"]
+                .as_i64()
+                .ok_or("Malformed OpenCode message timestamp")?,
+        );
         let parts = row["parts"]
             .as_array()
             .ok_or("Malformed OpenCode message parts")?;
@@ -448,7 +779,10 @@ fn parse_conversation(
                     } else {
                         MessageType::Assistant
                     },
-                    part["text"].as_str().unwrap_or_default().to_owned(),
+                    part["text"]
+                        .as_str()
+                        .ok_or("Malformed OpenCode message text")?
+                        .to_owned(),
                 ),
                 Some("tool") if include_tools => (
                     MessageType::ToolResult,
@@ -479,6 +813,14 @@ fn parse_conversation(
 }
 
 #[cfg(test)]
+#[path = "opencode_regression.rs"]
+mod regression;
+
+#[cfg(test)]
+#[path = "opencode_perf.rs"]
+mod perf;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -495,8 +837,23 @@ mod tests {
     }
 
     fn server_with_headers(
-        responses: Vec<(&str, u16, String, &str)>,
+        mut responses: Vec<(&str, u16, String, &str)>,
     ) -> (Connection, std::thread::JoinHandle<()>) {
+        if responses
+            .first()
+            .is_some_and(|(path, _, _, _)| *path == "/session")
+        {
+            responses[0].0 = "/session?limit=513";
+            responses.insert(
+                0,
+                (
+                    "/global/health",
+                    200,
+                    r#"{"healthy":true,"version":"fixture"}"#.into(),
+                    "",
+                ),
+            );
+        }
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let connection = Connection::parse(
             &format!("http://{}", listener.local_addr().unwrap()),
@@ -555,7 +912,10 @@ mod tests {
         let sessions = snapshot(&connection, &client().unwrap()).unwrap();
         thread.join().unwrap();
         assert_eq!(sessions.len(), 4);
-        assert_eq!(sessions[0].identity_key().as_deref(), Some("opencode:busy"));
+        assert_eq!(
+            sessions[0].identity_key().as_deref(),
+            Some("opencode:busy?directory=%2Fsynthetic%2Fproject")
+        );
         assert_eq!(
             sessions[0].opencode_summary.as_ref().unwrap().status,
             SessionStatus::Working
@@ -572,7 +932,10 @@ mod tests {
             sessions[3].opencode_summary.as_ref().unwrap().status,
             SessionStatus::Connecting
         );
-        assert_eq!(sessions[2].parent_thread_id.as_deref(), Some("busy"));
+        assert_eq!(
+            sessions[2].parent_thread_id.as_deref(),
+            Some("busy?directory=%2Fsynthetic%2Fproject")
+        );
         assert!(sessions
             .iter()
             .all(|s| s.pid == 0 && !s.can_open && !s.can_stop && !s.can_rename));

@@ -33,7 +33,7 @@ jobs:
         run: npm run check
 
       - name: WebSocket request regression tests
-        run: node --test scripts/test-ws.mjs scripts/test-hidden-transitions.mjs scripts/test-opencode-provider.mjs scripts/test-integration-settings.mjs
+        run: node --test scripts/test-ws.mjs scripts/test-hidden-transitions.mjs scripts/test-opencode-provider.mjs scripts/test-opencode-connection.mjs scripts/test-integration-settings.mjs
 
       - name: Conversation selection regression tests
         run: node --conditions=browser --test scripts/test-conversation-selection.mjs

@@ -1736,8 +1736,7 @@ fn resolve_session_reference_lightweight_under(
         });
     // Explicit full OpenCode IDs do not depend on the monitor's freshness window.
     if provider_filter == Some(session::SessionProvider::Opencode)
-        && prefix.len() >= 30 && prefix.starts_with("ses_")
-        && prefix[4..].bytes().all(|b| b.is_ascii_alphanumeric())
+        && session::opencode::is_full_session_reference(prefix)
     {
         return Ok((prefix.to_string(), provider_filter));
     }
@@ -1869,6 +1868,10 @@ mod session_formatter_tests {
         let result = super::resolve_session_reference_lightweight_under(
             &format!("opencode:{id}"), home.path()).unwrap();
         assert_eq!(result, (id.to_string(), Some(SessionProvider::Opencode)));
+        let scoped = format!("{id}?directory=%2Farchive%2F%E4%B8%AD%E6%96%87");
+        let result = super::resolve_session_reference_lightweight_under(
+            &format!("opencode:{scoped}"), home.path()).unwrap();
+        assert_eq!(result, (scoped, Some(SessionProvider::Opencode)));
     }
 
     fn codex_subagent() -> session::enrichment::Session {
