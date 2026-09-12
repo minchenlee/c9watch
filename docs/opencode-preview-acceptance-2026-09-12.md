@@ -248,15 +248,29 @@ Observed with native Computer Use, not browser simulation:
 | Integration | Final rebuilt bundle: visible form, aligned right inset, URL, Connecting then AX `Connected · 3 sessions`; settings apply only to this isolated app |
 | OpenCode-only / cross-directory status | Final bundle screenshots: OpenCode filter, 2 roots, Working 1 / Waiting 1; Chinese root READY, old English root WORKING; child is grouped under English root |
 | English conversation | Final bundle screenshot and AX: 24 chronological messages, real visible English and Chinese glyphs, `/fixture/a`, correct Working header; no send/stop/rename/terminal controls |
-| Chinese conversation / live refresh | Earlier same-source UI bundle, binary `6fc6b89c2f7b2493a1de6190d675948898df9c2df0ee9848b8b07410d0ad4e37`: visible `/fixture/中文`, 24→26 messages, new 25/26 entries and revision 1; final build afterward included only a backend scoped legacy-collision guard change |
-| Initial HTTP 503 / Retry / recovery | Earlier bundle screenshot: `Could not load conversation`, `OpenCode HTTP 503`, RETRY; Retry clicked while 503 persisted and error returned correctly. After clearing failure, polling recovered. A separate attempted click after auto-recovery had a stale AX index and is not counted as successful Retry evidence |
-| Tooling limits | An earlier coordinate click failed `noWindowsAvailable`; native Raise + keyboard filter selection recovered. A later Mac lock stopped interaction. After unlocking became possible, final bundle was relaunched and screenshots above succeeded. Mac locked again before final Ready/live-update, hide/show and disconnect/reconnect steps; those are not screenshot passes |
+| Ready / live refresh / hide-show | After user unlock, final binary's English overlay visibly showed READY, 26 messages and `/fixture/a · live revision 1` (earlier 24 / revision 0). Invoked native Hide then Raise; the restored 900×600 screenshot visibly retained messages 22–26 and readable English/Chinese glyphs |
+| Disconnect / cleanup | Final binary Settings DISCONNECT yielded visible `Not connected`; monitor screenshot showed SYSTEM STATUS 0 / NO OPENCODE SESSIONS. Two HTTP metric snapshots across subsequent UI actions both remained at 3,377 requests / active 0, confirming polling stopped while disconnected |
+| Reconnect / identity | Changed fixture to revision 2 while disconnected, explicitly re-entered the same URL and CONNECTed. AX Connecting → screenshot `Connected · 3 sessions`; monitor restored two roots with Working 1 / Waiting 1. Reopened Chinese root: screenshot showed READY, 26 messages and `/fixture/中文 · live revision 2`, not prior English-directory content or cached revision 1 |
+| Global 503 / initial error / Retry | Final binary: global fixture 503 retained both roots, marked Connecting and exposed `OpenCode HTTP 503`. Opening Chinese root showed 0 messages, `Could not load conversation`, `OpenCode HTTP 503` and RETRY in a full screenshot. Clicked Retry while 503 persisted; fresh error returned. Integration form also visibly showed HTTP 503 |
+| Global recovery | Cleared global error and advanced revision 3. Settings screenshot restored `Connected · 3 sessions`; monitor returned to Working 1 / Waiting 1 with Chinese READY. Reopened conversation screenshot showed 26 chronological messages, `/fixture/中文 · live revision 3` and no error. This repeats recovery on the final binary, not just the earlier UI bundle |
+| Tooling limits | Earlier `noWindowsAvailable` and stale AX indexes were recovered by selecting the exact QA app, Raise and fresh/full AX reads. Tiny hidden-window thumbnail captures are not used as legibility evidence; the restored full-size screenshots are. Mac locks interrupted earlier attempts; user unlock enabled all required steps above. A later lock interrupted optional compact-layout/extra child checks after required recovery evidence was complete |
 
 Images were returned inline by native Computer Use in this task, not exported as
 PNG files. AX text is identified separately; HTTP fixture state is not pixel
-evidence. In particular, setting `busy:false,fresh:true,revision:1,messages:26`
-after the final English screenshot succeeded at the fixture/data layer but the
-next screenshot was blocked by the locked Mac. Do not infer its visual result.
+evidence. The previously blocked `busy:false,fresh:true,revision:1,messages:26`
+visual check was actually completed after user unlock, as recorded above.
+Opening Settings can show healthy status before the independent monitor snapshot
+has refreshed; the monitor subsequently recovered without manual state changes.
+One click used an AX card index invalidated by that status movement; a fresh full
+tree and the successful reopen are the evidence, not the failed click.
+
+After native acceptance, the synthetic fixture's final metrics were 3,803 requests,
+active 0, peak 2 (independent discovery + conversation). The task-owned fixture
+on port 64647 and earlier isolated real server on 64648 were stopped. No user
+provider server was stopped. The QA app may remain open/offline after the later
+Mac lock; this is not a release install or persistent connection configuration.
+Post-cleanup `lsof -nP -iTCP:64647 -iTCP:64648` returned no entries (exit 1,
+the no-matches result), including a permitted system-level check.
 
 Actual installed OpenCode **1.18.20** was started on loopback port 64648 with
 fresh isolated XDG config/data/state/cache directories. Verified healthy/version,
@@ -267,23 +281,26 @@ No user prompts, real model response or paid model call was generated. Current
 nonempty conversation and error acceptance relies on the committed HTTP fixture,
 not the old document's OpenCode 1.18.29/model-response claim.
 
-## Remaining gates / verdict
+## Verdict / user decision
 
-**Not yet unconditional merge-ready:** implementation and automated/performance
-gates passed, but the Mac lock prevents completing the requested native sequence.
-After unlocking, resume only this QA bundle and fixture:
+**The local candidate is merge-ready for the agreed development-preview scope.**
+Implementation, full/targeted automated checks, reproducible boundedness/performance
+fixtures and required native/debug checks have passed. No further source blocker
+was found. This acceptance follow-up changes documentation only; implementation
+commit `0f9509e8e66c3a56646f02d79c8f3e7067543af7` and the native binary hash above
+are unchanged. Disconnect was directly verified before reconnect/outage/recovery;
+after the later Mac lock, test-server process cleanup was used, not another claim
+of a native Disconnect click.
 
-1. Observe final English root Ready and revision 1 / 26 messages; hide/show the
-   overlay and verify visible content (automated transition policy already passes).
-2. Settings → Integration → DISCONNECT: Not connected; OpenCode-only monitor
-   becomes empty. Reconnect same URL: Connecting → Connected, both directories
-   and their scoped conversations return without old data.
-3. Exercise global 503 and recovery in Settings/monitor, then disconnect cleanly;
-   fixture request activity must stop after the bounded in-flight timeout.
+**Remote PR #127 is not yet the verified candidate.** The final read-only GitHub
+check still reports OPEN / non-draft / CLEAN at `a1fe4c1`, base `d3fe23e`, with
+the September 8 CI result. User approval is required before pushing this reviewed
+candidate to `codex/opencode-provider` and updating PR evidence. Fresh remote CI
+must then pass on the new head; leave merge to the user. No push, PR mutation or
+merge was performed during this task.
 
-No further source blocker was found in this audit. These remaining observations
-must be recorded before changing this verdict; a green prior remote CI or current
-data-only fixture response is not a substitute. Then request user approval to
-push the reviewed candidate to PR #127 and update its evidence, rerun remote CI,
-and leave merge to the user. Signed distribution, notarization, release deployment
-and unsupported capabilities are explicitly not accepted or promised here.
+Limits remain explicit: benchmarks are debug loopback fixtures on a shared Mac,
+not a production latency guarantee; current real OpenCode checks do not include
+a model-generated reply. Native evidence includes full-size screenshots and AX,
+not an exported screenshot archive. Distribution signing, notarization, release
+deployment and unsupported capabilities are not accepted or promised here.
