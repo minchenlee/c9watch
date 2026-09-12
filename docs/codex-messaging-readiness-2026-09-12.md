@@ -1,6 +1,11 @@
 # Codex Desktop messaging / interactions: candidate evidence
 
-Status: **NOT merge-ready: updated-main integration and remaining native acceptance are blocked.** Automated gates and
+Historical checkpoint. **Superseded by [the authorized integration evidence](codex-messaging-integration-2026-09-13.md)**
+at implementation commit `000043a1fc31959a012d65522b0289e036897a53`. Main integration
+and native image preview/send are now verified locally; the newer report lists
+the remaining gates. Numbers and blockers below describe the earlier candidates.
+
+Status at this checkpoint: **NOT merge-ready: updated-main integration and remaining native acceptance are blocked.** Automated gates and
 the synthetic performance checks below pass. This is a local candidate, not an
 updated PR or a release approval. No push, PR mutation, merge, signing, or
 notarization was performed.
