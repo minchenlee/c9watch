@@ -1,6 +1,6 @@
 # Codex Desktop messaging / interactions: candidate evidence
 
-Status: **NOT merge-ready: native acceptance is blocked.** Automated gates and
+Status: **NOT merge-ready: updated-main integration and remaining native acceptance are blocked.** Automated gates and
 the synthetic performance checks below pass. This is a local candidate, not an
 updated PR or a release approval. No push, PR mutation, merge, signing, or
 notarization was performed.
@@ -221,7 +221,7 @@ Desktop/model performance, browser raster RSS, or long-duration leak freedom.
 
 ## Native QA and remaining gates
 
-Final unsigned artifact (not launched again after the repeated UI-tool failures):
+Final unsigned artifact (subsequently launched and partially accepted below):
 `/private/tmp/c9watch-messaging-ready/src-tauri/target/debug/bundle/macos/c9watch Messaging Candidate.app`.
 Binary SHA-256: `a874666c4837d4d38a361d5994b11d93a1cb0e31515b6888fddc35f37da0556e`.
 The no-model transport/cleanup probes above were rerun against this exact binary.
@@ -260,7 +260,7 @@ transcript was edited, no real turn was stopped, and no real approval was sent.
   justified. Main RSS snapshots were 153,728 KiB then 89,760 KiB about 12 minutes
   after launch; these exclude WebKit child processes and are not a soak test.
 
-Still required before claiming merge-ready:
+Remaining gates at initial handoff (see the superseding follow-up below):
 
 1. Reliable native access to the final candidate: confirm image preview, actual
    synthetic composer send/steer and Stop, recheck/disconnect, refreshed history,
@@ -278,3 +278,121 @@ Use `scripts/experimental/codex-interaction-ui-fixture.py VISIBLE_CODEX_THREAD_U
 to create fresh local synthetic controls. It exits after 20 minutes or SIGTERM,
 removes only its own sockets/ready marker, and keeps synthetic evidence. It does
 not load or resume that thread in Codex. Recheck is required after starting it.
+
+## Final-bundle follow-up: native evidence and integration boundary
+
+On 2026-09-12 at approximately 23:42–23:52 Asia/Taipei, the user confirmed the
+candidate was operable and explicitly authorized native launch/control. The
+worktree was clean at implementation commit `d77e20d`; the binary hash matched
+the final artifact above. No implementation changed during this follow-up.
+
+### Accepted on the exact final bundle
+
+- A single composer send cleared its draft and displayed "Accepted by the
+  current Codex turn." The fixture recorded exactly **one** `turn/steer`,
+  `expectedTurnId: native-ui-fixture`, correct thread identity, and the complete
+  text `QA_ONLY native candidate steer 中文 20260912`. No real model was contacted.
+  After a clipboard-tool timeout, an AX read verified the full draft; there was
+  no blind retry or duplicate submission.
+- The multi-question answer preserved `Local` and `native candidate QA 中文`;
+  its card cleared. Command Reject, file Approve after the review checkbox, and
+  permission Approve with **only** `read:0` each cleared their synthetic card.
+  No command, file change, or actual permission grant occurred.
+- Typed MCP recorded integer `0`, boolean `false`, string `candidate fixture`,
+  and choice `local`; zero-field MCP recorded `{}`. Both cards cleared.
+- Opening the URL retained its request and explicitly said opening did not
+  approve it. Selecting completion and confirming cleared the card.
+- Stop changed the fake turn to interrupted/idle, removed Stop, and displayed
+  a disabled send control with "Stopped". No real turn was stopped. Native
+  duplicate-stop delivery was not injected; prior automated tests cover it.
+- Open history refreshed from 24 to 25 to 26 messages, showing independently
+  appended parent-task messages without closing the preview. The monitor showed
+  27 after restart. No transcript was edited for this evidence.
+
+Synthetic payloads remain under
+`/tmp/c9watch-codex-501/2fe950f0-924a-4724-aea9-499026ac3658/` in
+`messages.jsonl`, `answer.json`, and `decisions.jsonl`. Fixture PID 53805 was
+stopped with SIGTERM; it exited 0 and its sockets/ready marker were removed.
+Its output also logged two WebSocket peer disconnects without close frames;
+these are not clean WebSocket closing-handshake evidence. The message log still
+contains exactly one delivery. No live-model output is stored there.
+
+### Picker/restart and native memory boundary
+
+The valid 2196-byte 32×32 PNG was selected. Initially an AX-selected row left
+Open disabled; keyboard navigation selected it with Open enabled. Confirming
+produced `noWindowsAvailable`/`timeoutReached`, including reacquisition of the
+running candidate. Raise and refreshed AX state did not resolve it. **Image
+preview and image-bearing send remain unaccepted.**
+
+The process remained alive. `/usr/bin/sample 50878 1 1 -file
+/private/tmp/c9watch-candidate-picker.sample.txt` showed 400/415 main-thread
+samples in the normal AppKit event-loop wait; the remainder was WebKit/
+RunningBoard IPC. No synchronous archive scan occupied this thread in that
+one-second sample. This does not prove UI usability or rule out a WebKit or
+automation issue.
+
+Native Cmd-Q succeeded: PID 50878 and WebKit PIDs 50892/50893/50894/50897 exited.
+Relaunching the same app path created PID 55310 and WebKit PIDs
+55313/55314/55315/55316. The initial AX window returned after 6540 ms without app
+content yet; a later read showed the working monitor. **6540 ms is not a measured
+time-to-ready or app-only startup time.** The temporary bundle ID did not resolve
+after quit; its known full path did. No other app was stopped.
+
+Read-only `ps -o pid,rss,etime,command` snapshots (KiB):
+
+| Observation | Candidate RSS | WebKit-inclusive sum |
+|---|---:|---:|
+| Original process at ~6m26s | 104,560 | 222,144 |
+| After picker at ~11m06s | 129,936 | 342,560 |
+| Restart at ~22s | 303,296 | 445,584 |
+| Restart at ~56s | 153,280 | 285,040 |
+
+The four WebKit processes are attributed by matching launch/termination
+lifecycle, not a privileged kernel responsibility query. The sums include GPU,
+networking, and both content processes and may double-count shared pages.
+Independent WebContent `vmmap -summary` reported 318.2 MiB physical footprint /
+594.3 MiB peak with probabilistic guard malloc enabled; footprint is not RSS and
+is not added to the table. These observations establish neither a long-run
+memory cap nor native non-regression against a baseline. Image preview/send,
+idle start, session-switch draft QA, post-disconnect Recheck, stable time-to-ready,
+and controlled native memory/latency comparison remain open.
+
+### New main conflicts: stop before crossing feature ownership
+
+OpenCode PR #127 was squash-merged while QA resumed. GitHub's main ref resolved
+to `69e2288b7d103a957a97d9ff341e3c11f1fc0bf5`. Fetch changed only local Git refs;
+no main-checkout files or remote refs were written. The following diagnostic
+created only Git objects, not a merge commit, index changes, or conflict files:
+
+```sh
+git fetch origin main
+git merge-tree --write-tree --name-only origin/main d77e20d
+```
+
+It exited **1**, with conflicts in:
+
+- `src-tauri/src/lib.rs`: main's shared `blocking::scan(DISCOVERY, ...)` versus
+  candidate admission; both providers' Tauri command registrations.
+- `src-tauri/src/web_server.rs`: competing shared scan dispatch.
+- `src/routes/(app)/+page.svelte`: main polls only OpenCode and uses local error
+  state/manual retry; candidate adds scoped error state and foreground/Codex polling.
+- `scripts/test-conversation-selection.mjs`: those incompatible polling/error contracts.
+- `src/lib/components/SettingsTab.svelte`: Integration versus Codex support sections.
+- `src/lib/components/ExpandedCardOverlay.svelte`: transition import and retry/error styles.
+
+Semantic review beyond conflict-marker removal is required: for example, both
+error representations occur in the automatic merge. No conflict was resolved
+and no OpenCode code was copied into the candidate. Per the user's explicit
+stop condition, shared dispatch, refresh, and settings integration requires a
+new scope decision before editing.
+
+PR #128 remained OPEN at `f906bff`, now **CONFLICTING / DIRTY**. Its metadata
+still reported base OID `d3fe23e`; the separately queried main ref and local
+merge-tree verified the new conflict. No push, PR update, or merge occurred.
+The earlier passing test counts apply to `d77e20d`, **not** an integrated tree.
+
+Next: authorize isolated integration with current main while preserving
+OpenCode's accepted behavior; resolve both contracts, rerun affected gates,
+rebuild, and complete native QA before asking for any push/PR update. Real
+model/Desktop approval, signing, and release remain separate gates.
