@@ -27,13 +27,17 @@ export function harness() {
  const timers = new Map(); let timerId = 0;
  const setTimeout = fn => {timers.set(++timerId,fn);return timerId;};
  const clearTimeout = id => timers.delete(id);
+ const listeners = new Map();
+ const window = {addEventListener:(key,fn)=>listeners.set(key,fn),removeEventListener:key=>listeners.delete(key)};
+ const document = {...window,visibilityState:'visible'};
+ const isTauri=()=>true; let statusRefreshes=0; const refreshCodexInteractions=()=>{statusRefreshes++;return Promise.resolve();};
  const requests = [];
  const getConversation = (id,provider) => new Promise((resolve,reject) => requests.push({id,provider,resolve,reject}));
  const withConversationLoader = (_id,_provider,_kind,task) => task();
  const dispose = $effect.root(() => {
  ${loader}
  });
- return {requests,dispose,error:()=>conversationError.value,refresh(){const work=[...timers.values()];timers.clear();work.forEach(fn=>fn());},value:()=>value,poll:()=>{sessions=sessions.map(s=>({...s}));},select(provider){sessions=[{id:'same',provider}];expandedId=provider+':same';},close(){expandedId=null;}};
+ return {requests,dispose,statusRefreshes:()=>statusRefreshes,wake(hidden=false){document.visibilityState=hidden?'hidden':'visible';listeners.get('focus')?.();listeners.get('visibilitychange')?.();},error:()=>conversationError.value,refresh(){const work=[...timers.values()];timers.clear();work.forEach(fn=>fn());},value:()=>value,poll:()=>{sessions=sessions.map(s=>({...s}));},select(provider){sessions=[{id:'same',provider}];expandedId=provider+':same';},close(){expandedId=null;}};
 }`;
 let code = compileModule(ts.transpileModule(source, {compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ES2022}}).outputText, { filename: 'conversation-selection.svelte.js', generate: 'client' }).js.code;
 code = code.replace(/from '([^']+)'/g, (_, spec) => `from '${import.meta.resolve(spec)}'`);
@@ -102,4 +106,18 @@ test('following new replies advances the visible tail without unbounded renderin
   h.refresh();h.requests[3].resolve({sessionId:'same',provider:'cursor',messages:[]});await settle();
   assert.equal(h.error(),null);assert.ok(h.value());
  } finally {h.dispose();}
+});
+
+test('foreground refresh is single-flight, skips hidden windows and cleans up on close',async()=>{
+ const h=harness();try{
+  flushSync();h.wake();assert.equal(h.requests.length,1);
+  h.requests[0].resolve({sessionId:'same',provider:'codex',messages:[]});await settle();
+  h.wake(true);assert.equal(h.requests.length,1);
+  h.wake();assert.ok(h.statusRefreshes()>0);assert.equal(h.requests.length,2);
+  for(let i=0;i<100;i++){h.wake();h.refresh();}
+  assert.equal(h.requests.length,2);
+  h.requests[1].resolve({sessionId:'same',provider:'codex',messages:[{content:'fresh'}]});await settle();
+  assert.equal(h.value().messages[0].content,'fresh');
+  h.close();flushSync();h.wake();assert.equal(h.requests.length,2);
+ }finally{h.dispose();}
 });

@@ -458,7 +458,7 @@ impl CodexSessionSource {
             loop {
                 let line_start = entry.offset;
                 line.clear();
-                let bytes_read = reader.read_until(b'\n', &mut line)?;
+                let bytes_read = read_conversation_line(&mut reader, &mut line)?;
                 if bytes_read == 0 {
                     break;
                 }
@@ -471,6 +471,7 @@ impl CodexSessionSource {
                 }
 
                 entry.offset = line_start + bytes_read as u64;
+                if entry.offset > MAX_CONVERSATION_BYTES { return Err(io::Error::new(io::ErrorKind::InvalidData, "Conversation exceeds 128 MiB preview limit")); }
                 entry.logical_prefix_hash = hash_bytes(entry.logical_prefix_hash, &line);
                 apply_rollout_line(&mut entry.summary, &line, self.include_tools);
                 if let Some(cb) = on_progress.as_mut() {
@@ -1209,6 +1210,33 @@ fn read_monitor_line(
     })
 }
 
+const MAX_CONVERSATION_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_CONVERSATION_RECORD: u64 = 8 * 1024 * 1024;
+
+fn read_conversation_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<usize> {
+    let size = reader.take(MAX_CONVERSATION_RECORD + 1).read_until(b'\n', line)?;
+    if size as u64 > MAX_CONVERSATION_RECORD {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Conversation record exceeds 8 MiB preview limit. Open the original session in Codex."));
+    }
+    Ok(size)
+}
+
+fn limit_conversation_images(messages: &mut [CodexMessage]) {
+    let mut count = 0;
+    let mut bytes = 0;
+    for message in messages {
+        let before = message.images.len();
+        message.images.retain(|image| {
+            if count >= 8 || bytes + image.data.len() > 12 * 1024 * 1024 { return false; }
+            count += 1; bytes += image.data.len(); true
+        });
+        if before != message.images.len() {
+            message.content.push_str("\n[Image unavailable: preview limit reached]");
+            message.content = message.content.trim().to_string();
+        }
+    }
+}
+
 fn read_line_at(path: &Path, offset: u64, bytes: u64) -> io::Result<Vec<u8>> {
     // Rare fallback for a relevant record whose header appears beyond the
     // bounded capture prefix. Ordinary records are captured and parsed once.
@@ -1724,6 +1752,15 @@ pub(crate) fn response_item_message_text(payload: &Value) -> Option<(String, Str
 // Resolve only explicit image blocks/markup while opening a conversation, never
 // during monitor discovery. Bound encoded images across the entire preview.
 fn attach_codex_images(summary: &mut CodexRolloutSummary, payload: &Value, timestamp: &str) {
+    let identity = response_item_message_text(payload).map(|(_, text, _)| message_identity(&text));
+    let Some(index) = summary.messages.iter().rposition(|m| {
+        m.timestamp == timestamp && Some(m.content_identity) == identity
+    }) else {
+        return;
+    };
+    if summary.messages[index].role != "user" || !summary.messages[index].images.is_empty() {
+        return;
+    }
     #[cfg(feature = "gui")]
     {
         use base64::Engine;
@@ -1734,19 +1771,8 @@ fn attach_codex_images(summary: &mut CodexRolloutSummary, payload: &Value, times
             .map(|i| i.data.len())
             .sum();
         let mut remaining = (12 * 1024 * 1024usize).saturating_sub(used);
-        let identity =
-            response_item_message_text(payload).map(|(_, text, _)| message_identity(&text));
-        let Some(message) = summary
-            .messages
-            .iter_mut()
-            .rev()
-            .find(|m| m.timestamp == timestamp && Some(m.content_identity) == identity)
-        else {
-            return;
-        };
-        if message.role != "user" || !message.images.is_empty() {
-            return;
-        }
+        let mut remaining_count = 8usize.saturating_sub(summary.messages.iter().map(|m| m.images.len()).sum());
+        let message = &mut summary.messages[index];
         let mut sources = Vec::new();
         if let Some(blocks) = payload["content"].as_array() {
             for block in blocks {
@@ -1770,6 +1796,7 @@ fn attach_codex_images(summary: &mut CodexRolloutSummary, payload: &Value, times
             }
         }
         for source in sources.into_iter().take(4) {
+            if remaining_count == 0 { break; }
             let loaded = (|| -> Option<super::parser::ImageBlock> {
                 let bytes = if source.starts_with("data:image/") {
                     let (header, data) = source.split_once(',')?;
@@ -1811,15 +1838,7 @@ fn attach_codex_images(summary: &mut CodexRolloutSummary, payload: &Value, times
                     }
                     bytes
                 };
-                let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-                    "image/png"
-                } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-                    "image/jpeg"
-                } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-                    "image/webp"
-                } else {
-                    return None;
-                };
+                let mime = crate::codex_images::validate(&bytes).ok()?;
                 let data = base64::engine::general_purpose::STANDARD.encode(bytes);
                 if data.len() > remaining {
                     return None;
@@ -1834,31 +1853,26 @@ fn attach_codex_images(summary: &mut CodexRolloutSummary, payload: &Value, times
                     continue;
                 }
                 remaining -= image.data.len();
+                remaining_count -= 1;
                 message.images.push(image);
             }
         }
-        // Replace the generated markup with a concise fallback when the file is gone.
-        let mut text = message.content.clone();
-        while let Some(start) = text.find("<image ") {
-            let Some(end) = text[start..].find("</image>").map(|i| start + i + 8) else {
-                break;
-            };
-            text.replace_range(
-                start..end,
-                if message.images.is_empty() {
-                    "[Image unavailable]"
-                } else {
-                    ""
-                },
-            );
-        }
-        if !message.images.is_empty() && text.trim() == "[Image attached]" {
-            text.clear();
-        }
-        message.content = text.trim().to_string();
     }
-    #[cfg(not(feature = "gui"))]
-    let _ = (summary, payload, timestamp);
+    // Normalization is part of the conversation contract in every build. CLI
+    // builds do not read images, but must not leak generated path markup either.
+    let message = &mut summary.messages[index];
+    let fallback = if message.images.is_empty() { "[Image unavailable]" } else { "" };
+    let mut text = message.content.clone();
+    while let Some(start) = text.find("<image ") {
+        let Some(end) = text[start..].find("</image>").map(|i| start + i + 8) else {
+            break;
+        };
+        text.replace_range(start..end, fallback);
+    }
+    if text.trim() == "[Image attached]" {
+        text = fallback.into();
+    }
+    message.content = text.trim().to_string();
 }
 
 fn is_codex_question_tool(name: &str) -> bool {
@@ -2073,7 +2087,7 @@ fn find_codex_conversation_under(
     )
 }
 
-fn find_codex_conversation_under_with_progress(
+pub(super) fn find_codex_conversation_under_with_progress(
     sessions_root: &Path,
     thread_id: &str,
     include_tools: bool,
@@ -2082,6 +2096,10 @@ fn find_codex_conversation_under_with_progress(
     let paths = resolve_thread_rollout_paths(sessions_root, thread_id);
     if paths.is_empty() {
         return Err(format!("Codex session {thread_id} not found"));
+    }
+    let size = paths.iter().filter_map(|p| fs::metadata(p).ok()).fold(0u64, |n, m| n.saturating_add(m.len()));
+    if paths.len() > 512 || size > MAX_CONVERSATION_BYTES {
+        return Err("Conversation exceeds the 512-segment / 128 MiB preview limit. Open the original session in Codex.".into());
     }
 
     if paths.iter().any(|path| path.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.contains('_'))) {
@@ -2108,9 +2126,14 @@ fn find_codex_conversation_under_with_progress(
             }),
         ) {
             Ok(mut summary) => {
+                // This source only lives for one preview; do not retain another
+                // cloned transcript/image set for every history segment.
+                source.cache.remove(&path);
                 parsed_any = true;
                 messages.append(&mut summary.messages);
+                limit_conversation_images(&mut messages);
             }
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => return Err(error.to_string()),
             Err(error) => last_error = Some(error.to_string()),
         }
         read_acc = read_acc.saturating_add(file_len);
@@ -2139,10 +2162,9 @@ fn paginated_conversation(
     let mut available = HashMap::new();
     let mut latest = None;
     for path in paths {
-        let mut first = String::new();
-        BufReader::new(File::open(path).map_err(|e| e.to_string())?)
-            .read_line(&mut first).map_err(|e| e.to_string())?;
-        let meta: Value = serde_json::from_str(&first).map_err(|e| e.to_string())?;
+        let mut first = Vec::new();
+        read_conversation_line(&mut BufReader::new(File::open(path).map_err(|e| e.to_string())?), &mut first).map_err(|e| e.to_string())?;
+        let meta: Value = serde_json::from_slice(&first).map_err(|e| e.to_string())?;
         if meta["type"] != "session_meta" || meta["payload"]["id"] != thread_id {
             continue;
         }
@@ -2176,14 +2198,15 @@ fn paginated_conversation(
     let mut summary = CodexRolloutSummary::default();
     for (path, end) in segments {
         let mut reader = BufReader::new(File::open(path).map_err(|e| e.to_string())?);
-        let mut line = String::new();
+        let mut line = Vec::new();
         loop {
             line.clear();
-            let size = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+            let size = read_conversation_line(&mut reader, &mut line).map_err(|e| e.to_string())?;
             if size == 0 { break; }
             read += size as u64; on_progress(read, total);
-            if !line.ends_with('\n') { break; }
-            let Ok(value) = serde_json::from_str::<Value>(&line) else { continue; };
+            if read > MAX_CONVERSATION_BYTES { return Err("Conversation exceeds 128 MiB preview limit".into()); }
+            if line.last() != Some(&b'\n') { break; }
+            let Ok(value) = serde_json::from_slice::<Value>(&line) else { continue; };
             let ordinal = value["ordinal"].as_u64().ok_or("Missing ordinal in paginated history")?;
             if ordinal >= end { continue; }
             apply_rollout_event_with_tools(&mut summary, &value, include_tools, false);
@@ -2309,6 +2332,7 @@ mod tests {
         assert!(find_codex_conversation_under(temp.path(),id,false).unwrap_err().contains("Missing conversation history segment"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn conversation_rejects_fifo_image_without_waiting_for_a_writer() {
         use std::os::unix::ffi::OsStrExt;
@@ -2330,12 +2354,72 @@ mod tests {
         assert_eq!(summary.messages[0].content, "[Image unavailable]");
     }
 
+    #[test]
+    fn conversation_unavailable_images_have_a_fallback_in_every_build() {
+        let temp = TempDir::new().unwrap();
+        let invalid = temp.path().join("invalid.png");
+        fs::write(&invalid, b"not an image").unwrap();
+        let truncated = temp.path().join("header-only.png");
+        fs::write(&truncated, b"\x89PNG\r\n\x1a\n").unwrap();
+        let oversized = temp.path().join("large.png");
+        let file = fs::File::create(&oversized).unwrap();
+        file.set_len(4 * 1024 * 1024 + 1).unwrap();
+        for path in [invalid, truncated, oversized, temp.path().join("missing.png"), temp.path().to_path_buf()] {
+            let payload = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":format!("Look\n<image path=\"{}\"></image>", path.display())}]});
+            let mut summary = CodexRolloutSummary::default();
+            apply_response_item(&mut summary, "now", &payload, false, false);
+            assert!(summary.messages[0].images.is_empty());
+            assert_eq!(summary.messages[0].content, "Look\n[Image unavailable]");
+        }
+        let payload = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,bad!"}]});
+        let mut summary = CodexRolloutSummary::default();
+        apply_response_item(&mut summary, "now", &payload, false, false);
+        assert!(summary.messages[0].images.is_empty());
+        assert_eq!(summary.messages[0].content, "[Image unavailable]");
+    }
+
+    #[test]
+    fn conversation_preview_rejects_oversized_records_and_files() {
+        for paginated in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let id = "00000000-0000-0000-0000-000000000001";
+            let suffix = if paginated { format!("_{id}") } else { String::new() };
+            let path = temp.path().join(format!("rollout-2026-09-12T00-00-00-{id}{suffix}.jsonl"));
+            let mut file = fs::File::create(&path).unwrap();
+            writeln!(file, "{}", serde_json::json!({"ordinal":0,"type":"session_meta","payload":{"id":id,"cwd":"/tmp"}})).unwrap();
+            io::copy(&mut io::repeat(b'x').take(MAX_CONVERSATION_RECORD + 1), &mut file).unwrap();
+            writeln!(file).unwrap();
+            let error = find_codex_conversation_under(temp.path(), id, false).unwrap_err();
+            assert!(error.contains("8 MiB preview limit"), "{error}");
+            file.set_len(MAX_CONVERSATION_BYTES + 1).unwrap();
+            let error = find_codex_conversation_under(temp.path(), id, false).unwrap_err();
+            assert!(error.contains("128 MiB preview limit"), "{error}");
+        }
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn conversation_image_count_is_bounded_across_segments() {
+        let mut messages = Vec::new();
+        for segment in 0..2 {
+            let mut summary = CodexRolloutSummary::default();
+            for ordinal in 0..6 {
+                let payload = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":format!("<image path=\"{}/icons/32x32.png\"></image>", env!("CARGO_MANIFEST_DIR"))}]});
+                apply_response_item(&mut summary, &format!("{segment}-{ordinal}"), &payload, false, false);
+            }
+            messages.extend(summary.messages);
+            limit_conversation_images(&mut messages);
+        }
+        assert_eq!(messages.iter().map(|m| m.images.len()).sum::<usize>(), 8);
+        assert!(messages.last().unwrap().content.contains("preview limit reached"));
+    }
+
     #[cfg(feature = "gui")]
     #[test]
     fn conversation_renders_codex_images_without_monitor_retention() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("image.png");
-        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        std::fs::write(&path, include_bytes!("../../icons/32x32.png")).unwrap();
         let payload = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":format!("Look here\n<image name=[Image #1] path=\"{}\"></image>", path.display())}]});
         let mut summary = CodexRolloutSummary::default();
         apply_response_item(&mut summary, "now", &payload, false, false);
@@ -2346,7 +2430,8 @@ mod tests {
         let mut monitor = CodexRolloutSummary::default();
         apply_response_item(&mut monitor, "now", &payload, false, true);
         assert!(monitor.messages[0].images.is_empty());
-        let inline = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]});
+        use base64::Engine;
+        let inline = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_image","image_url":format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(include_bytes!("../../icons/32x32.png")))}]});
         apply_response_item(&mut summary, "later", &inline, false, false);
         assert_eq!(summary.messages[1].images.len(), 1);
         assert!(summary.messages[1].content.is_empty());

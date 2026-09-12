@@ -2,8 +2,9 @@
 """Temporary, local-only native UI fixture. Never contacts Codex or writes transcripts.
 Pass a visible Codex thread UUID to project synthetic cards onto that session in QA.
 """
-import asyncio,json,os,sys,uuid,signal,shutil
+import asyncio,json,os,sys,uuid,signal,base64
 from pathlib import Path
+from websockets.asyncio.server import unix_serve
 
 async def main():
     thread=str(uuid.UUID(sys.argv[1]))
@@ -20,9 +21,26 @@ async def main():
     permission=card('permission',{'choices':[{'id':'network','label':'Network access'},{'id':'read:0','label':'read: /tmp/qa'}],'permissions':{'network':{'enabled':True},'fileSystem':{'read':['/tmp/qa']}}},['grant','deny'])
     form=card('form',{'serverName':'QA fixture','mode':'form','message':'Test form — no remote submission','supportedForm':True,'requestedSchema':{'type':'object','required':['label','count','ok'],'properties':{'label':{'type':'string','minLength':1},'count':{'type':'integer','minimum':0},'ok':{'type':'boolean'},'mode':{'type':'string','oneOf':[{'const':'local','title':'Local fixture'},{'const':'remote','title':'Remote fixture'}]}}}},['accept','decline','cancel'])
     url=card('form',{'serverName':'QA fixture','mode':'url','message':'URL fixture — opening is optional','url':'https://example.com/','safeUrl':True},['accept','decline','cancel'])
+    empty=card('form',{'serverName':'QA fixture','mode':'form','message':'Zero-field fixture — no remote submission','supportedForm':True,'requestedSchema':{'type':'object','properties':{}}},['accept','decline','cancel'])
     state={'endpoint':directory.name,'connected':True,'pending':[request,approval,file,permission,form,url],'statuses':{thread:'waiting'},'overflow':False,'turns':{thread:{'turnId':'native-ui-fixture','status':'inProgress','stopping':False,'plan':[{'step':'Review synthetic cards','status':'inProgress'},{'step':'Check clearing and stop','status':'pending'}],'explanation':'QA fixture only','diff':'-old\n+new','diffTruncated':False}}}
+    state['pending'].append(empty)
+    (directory/'image.png').write_bytes((Path(__file__).resolve().parents[2]/'src-tauri/icons/32x32.png').read_bytes())
     stop=asyncio.Event()
-    async def placeholder(reader,writer):writer.close()
+    async def messaging(ws):
+        async for raw in ws:
+            value=json.loads(raw)
+            method=value.get('method')
+            if method=='initialize':result={}
+            elif method=='initialized':continue
+            elif method=='thread/loaded/list':result={'data':[thread],'nextCursor':None}
+            elif method in ['turn/start','turn/steer'] and value.get('params',{}).get('threadId')==thread:
+                if method=='turn/steer' and value['params'].get('expectedTurnId')!='native-ui-fixture':
+                    await ws.send(json.dumps({'id':value['id'],'error':{'code':-32600,'message':'QA turn changed'}}));continue
+                with (directory/'messages.jsonl').open('a') as log:log.write(json.dumps(value,ensure_ascii=False)+'\n')
+                result={'turnId':'native-ui-fixture'} if method=='turn/steer' else {'turn':{'id':'native-ui-fixture'}}
+            else:
+                await ws.send(json.dumps({'id':value.get('id'),'error':{'code':-32601,'message':'QA fixture rejects unsupported operation'}}));continue
+            await ws.send(json.dumps({'id':value['id'],'result':result}))
     async def client(reader,writer):
         try:
             value=json.loads(await asyncio.wait_for(reader.readline(),3))
@@ -45,7 +63,7 @@ async def main():
             else:result={'status':'not_sent','detail':'QA fixture rejected the request'}
             writer.write((json.dumps(result)+'\n').encode());await writer.drain()
         finally:writer.close()
-    server=await asyncio.start_unix_server(placeholder,directory/'server.sock')
+    server=await unix_serve(messaging,directory/'server.sock',compression=None,max_size=8*1024*1024)
     control=await asyncio.start_unix_server(client,directory/'interactions.sock')
     for name in ['server.sock','interactions.sock']:os.chmod(directory/name,0o600)
     (directory/'ready').write_text(str(os.getpid()))

@@ -41,6 +41,10 @@
  const turnLabel = $derived(live.length > 1 ? 'Multiple connections · check Codex' : snapshot && !snapshot.connected ? 'Disconnected · status may be outdated' : stopping ? 'Stopping…' : active && stopState?.status === 'unknown' ? 'Stop delivery unknown · check Codex' : waiting ? 'Waiting for your response' : active ? 'Running' : turn?.status === 'failed' ? 'Failed' : turn?.status === 'interrupted' ? 'Stopped' : available ? 'Ready' : 'Disconnected');
  async function stop() {
   if (stopDisabled || !turn || !snapshot || stops.has(stopKey)) return;
+  if (stops.size >= 1024) {
+   update({notice: 'Stop history is full. Stop this turn in Codex, then restart c9watch to reset the local history.'});
+   return;
+  }
   const target = stopKey;
   stops.set(target, {status: 'sending', notice: ''});
   try {
@@ -77,6 +81,7 @@
 				const size = images.reduce((n, image) => n + image.url.split(',')[1].length * 3 / 4, 0);
 				if (size > 4 * 1024 * 1024) throw new Error('Images exceed 4 MiB total.');
 			}
+			await invoke('validate_codex_images', { images: images.map(image => image.url) });
 			const otherBytes = [...drafts].filter(([id]) => id !== target).reduce((n, [, d]) => n + (d.images ?? []).reduce((sum, image) => sum + image.url.length, 0), 0);
 			if (otherBytes + images.reduce((n, image) => n + image.url.length, 0) > 16 * 1024 * 1024) throw new Error('Image drafts are full. Remove images from another draft.');
 			update({ images, notice: '' }, target);
@@ -118,7 +123,10 @@
 		const text = draft.text;
 		if (!update({ pending: true, notice: 'Sending…' }, target)) return;
 		try {
-			const receipt = await invoke<{ status: string; detail: string }>('send_codex_message', { sessionId: id, text, ...(draft.images?.length ? { images: draft.images.map(image => image.url) } : {}) });
+			// Keep the observed turn identity even if its interaction socket went
+			// stale. The backend rechecks unique loaded ownership; a stale steer
+			// must reject, never silently become turn/start for a successor.
+			const receipt = await invoke<{ status: string; detail: string }>('send_codex_message', { sessionId: id, text, ...(active && turn ? { expectedTurnId: turn.turnId } : {}), ...(draft.images?.length ? { images: draft.images.map(image => image.url) } : {}) });
 			update({ pending: false, notice: receipt.detail, unknown: receipt.status === 'unknown',
 				...((receipt.status === 'accepted' || receipt.status === 'queued') ? { text: '', images: [] } : {}) }, target);
 		} catch (error) {

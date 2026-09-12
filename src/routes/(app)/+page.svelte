@@ -12,6 +12,7 @@
 		visibleTopLevelSessionIds
 	} from '$lib/stores/sessions';
 	import { getConversation, stopSession, openSession } from '$lib/api';
+	import { refreshCodexInteractions } from '$lib/stores/codex-interactions';
 	import { conversationError, toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
 	import { get } from 'svelte/store';
 	import { isDemoMode, toggleDemoMode } from '$lib/demo';
@@ -336,11 +337,16 @@
 		conversationError.set(null);
 		const selected = untrack(() => expandedSession);
 		let cancelled = false;
+		let refreshInFlight = false;
+		let wake = () => {};
 		let timer: ReturnType<typeof setTimeout>;
 		if (sessionId && selected) {
 			const selectedKey = sessionKeyOf(selected);
 			toolsLoadedFor.set(null);
 			async function refresh(initial: boolean) {
+				if (cancelled || refreshInFlight) return;
+				refreshInFlight = true;
+				clearTimeout(timer);
 				const includeTools = get(toolsLoadedFor) === selectedKey;
 				try {
 					const task = () => getConversation(selected!.id, selected!.provider, includeTools);
@@ -359,14 +365,27 @@
 					}
 					// Keep the last successful preview during transient refresh failures.
 				} finally {
+					refreshInFlight = false;
 					if (!cancelled && requestId === conversationRequestId) {
 						timer = setTimeout(() => void refresh(false), 2000);
 					}
 				}
 			}
+			wake = () => {
+				if (document.visibilityState === 'hidden') return;
+				void refresh(false);
+				if (isTauri() && providerOf(selected!) === 'codex') void refreshCodexInteractions();
+			};
+			window.addEventListener('focus', wake);
+			document.addEventListener('visibilitychange', wake);
 			void refresh(true);
 		}
-		return () => { cancelled = true; clearTimeout(timer); };
+		return () => {
+			cancelled = true;
+			clearTimeout(timer);
+			window.removeEventListener('focus', wake);
+			document.removeEventListener('visibilitychange', wake);
+		};
 	});
 
 	function handleExpand(session: Session) {

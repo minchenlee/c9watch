@@ -138,3 +138,19 @@ test('a changed approval request explains the failed click and refreshes without
  assert.equal(h.state().sends,0);assert.equal(h.state().refreshes,1);
  assert.match(h.state().notice,/no response was sent/);
 });
+
+test('interaction refresh coalesces a burst and releases its single-flight guard after failure', async()=>{
+ const module={}, requests=[];
+ const invoke=()=>new Promise((resolve,reject)=>requests.push({resolve,reject}));
+ new Function('exports','writable','get','invoke','SessionStatus',js)(module,writable,get,invoke,status);
+ const burst=Array.from({length:100},()=>module.refreshCodexInteractions());
+ assert.equal(requests.length,1);
+ requests[0].reject(new Error('offline'));await Promise.all(burst);
+ const next=module.refreshCodexInteractions();assert.equal(requests.length,2);
+ requests[1].resolve([snapshot]);await next;
+ assert.equal(get(module.codexInteractions)[0].connected,true);
+});
+
+test('MCP zero-field confirmation is complete without fabricated field values',()=>{
+ assert.equal(forms.formComplete({type:'object',properties:{}},{}),true);
+});

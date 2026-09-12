@@ -291,8 +291,10 @@ async fn bridge(binary: &Path, original: &[OsString]) -> Result<i32, String> {
             max_frame_size: Some(MAX_FRAME),
             ..Default::default()
         };
-        let (ws, _) = client_async_with_config("ws://localhost/", stream, Some(config))
-            .await
+        let (ws, _) = tokio::time::timeout(
+            Duration::from_secs(3),
+            client_async_with_config("ws://localhost/", stream, Some(config)),
+        ).await.map_err(|_| "Codex WebSocket handshake timed out".to_string())?
             .map_err(|e| e.to_string())?;
         fs::write(guard.directory.join("ready"), guard.pid.to_string())
             .map_err(|e| e.to_string())?;

@@ -8,6 +8,8 @@ pub mod actions;
 pub mod codex_bridge;
 #[cfg(all(unix, feature = "gui"))]
 pub mod codex_messaging;
+#[cfg(feature = "gui")]
+mod codex_images;
 #[cfg(all(unix, feature = "gui"))]
 pub mod codex_interactions;
 pub mod claude_usage;
@@ -61,6 +63,55 @@ use tauri_nspanel::{
 
 // ── GUI-only: Tauri commands ─────────────────────────────────────────
 
+// Native and WebSocket history/conversation scans share bounded admission.
+// Keep the permit in the worker: cancelling an IPC future cannot cancel filesystem
+// I/O and must not admit another scan before that I/O actually finishes.
+#[cfg(all(not(mobile), feature = "gui"))]
+async fn run_session_scan<T: Send + 'static>(
+    scan: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+    let permit = SLOTS.try_acquire().map_err(|_| "Session scans are busy. Retry shortly.".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        scan()
+    }).await.map_err(|e| format!("Session scan failed: {e}"))?
+}
+
+#[cfg(all(test, not(mobile), feature = "gui"))]
+#[tokio::test(flavor = "current_thread")]
+async fn native_scans_leave_async_timers_live_and_bound_cancelled_work() {
+    let mut releases = Vec::new();
+    let mut jobs = Vec::new();
+    for _ in 0..4 {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (began, running) = tokio::sync::oneshot::channel();
+        releases.push(release);
+        jobs.push(tokio::spawn(async move {
+            run_session_scan(move || {
+                let _ = began.send(());
+                wait.recv_timeout(Duration::from_secs(2)).map_err(|e| e.to_string())
+            }).await
+        }));
+        running.await.unwrap();
+    }
+    let started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(jobs.iter().all(|job| !job.is_finished()), "scan blocked the async worker until its watchdog expired");
+    assert!(run_session_scan(|| Ok(())).await.unwrap_err().contains("busy"));
+    web_server::assert_scan_requests_are_busy().await;
+    for job in jobs { job.abort(); let _ = job.await; }
+    assert!(run_session_scan(|| Ok(())).await.unwrap_err().contains("busy"), "cancellation released slots while I/O was still running");
+    eprintln!("native scan gate: 4 held workers, timer {:?}, fifth scan rejected, cancelled workers retain permits", started.elapsed());
+    for release in releases { release.send(()).unwrap(); }
+    let mut recovered = false;
+    for _ in 0..100 {
+        if run_session_scan(|| Ok(())).await.is_ok() { recovered = true; break; }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(recovered);
+}
+
 #[cfg(feature = "gui")]
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
@@ -79,14 +130,15 @@ async fn get_subscription_usage() -> Vec<subscription_usage::SubscriptionUsage> 
 async fn get_sessions(
     detector: tauri::State<'_, Arc<Mutex<session::DetectorState>>>,
 ) -> Result<Vec<Session>, String> {
-    let detect_result = {
-        let mut state = detector
-            .lock()
-            .map_err(|e| format!("Detector lock poisoned: {}", e))?;
-        state.detect()
-    };
-    let (detected, diag) = detect_result.map_err(|e| format!("Detect failed: {}", e))?;
-    session::enrichment::enrich_detected_sessions(detected, diag).map(|(sessions, _)| sessions)
+    let detector = Arc::clone(detector.inner());
+    run_session_scan(move || {
+        let detect_result = {
+            let mut state = detector.lock().map_err(|e| format!("Detector lock poisoned: {e}"))?;
+            state.detect()
+        };
+        let (detected, diag) = detect_result.map_err(|e| format!("Detect failed: {e}"))?;
+        session::enrichment::enrich_detected_sessions(detected, diag).map(|(sessions, _)| sessions)
+    }).await
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -98,7 +150,7 @@ async fn get_conversation(
     include_tools: Option<bool>,
 ) -> Result<Conversation, String> {
     let include_tools = include_tools.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_session_scan(move || {
         let emit_id = session_id.clone();
         get_conversation_data_for_provider_with_progress(
             &session_id,
@@ -118,13 +170,12 @@ async fn get_conversation(
         )
     })
     .await
-    .map_err(|error| format!("Failed to load conversation: {error}"))?
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_session_history() -> Result<Vec<session::HistoryEntry>, String> {
-    session::get_history()
+    run_session_scan(session::get_history).await
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -137,17 +188,15 @@ async fn deep_search_sessions(
     if query.trim().is_empty() {
         return Ok(vec![]);
     }
-    session::deep_search(
-        &query,
-        caseSensitive.unwrap_or(false),
-        wholeWord.unwrap_or(false),
-    )
+    run_session_scan(move || {
+        session::deep_search(&query, caseSensitive.unwrap_or(false), wholeWord.unwrap_or(false))
+    }).await
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_cost_data() -> Result<session::CostData, String> {
-    session::get_cost_data()
+    run_session_scan(session::get_cost_data).await
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -745,6 +794,7 @@ pub fn run() {
             codex_interactions::interrupt_codex_turn,
             codex_messaging::codex_message_capability,
             codex_messaging::send_codex_message,
+            codex_messaging::validate_codex_images,
             codex_bridge::launch_codex_desktop_bridge,
             notifications::get_notification_preferences,
             notifications::save_notification_preferences,

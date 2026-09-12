@@ -132,6 +132,9 @@ async fn require_loaded(ws: &mut Socket, session_id: &str) -> Result<(), String>
 }
 
 async fn resolve_session(session_id: &str) -> Result<Socket, String> {
+    // Bound probes across composer windows as well as concurrent send preparation.
+    static PROBES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+    let _permit = PROBES.try_acquire().map_err(|_| "Codex connection checks are busy. Recheck shortly.".to_string())?;
     let mut paths = crate::codex_bridge::endpoints();
     if paths.len() > 8 {
         return Err(
@@ -204,7 +207,7 @@ async fn send_at(path: &Path, session_id: &str, text: &str) -> Result<Receipt, S
 }
 
 async fn send_connected(ws: &mut Socket, session_id: &str, text: &str) -> Result<Receipt, String> {
-    send_input(ws, session_id, message_input(text, &[])?).await
+    send_input(ws, session_id, message_input(text, &[])?, None).await
 }
 
 fn message_input(text: &str, images: &[String]) -> Result<Vec<Value>, String> {
@@ -228,42 +231,44 @@ fn message_input(text: &str, images: &[String]) -> Result<Vec<Value>, String> {
         if total > 4 * 1024 * 1024 {
             return Err("Images exceed 4 MiB total".into());
         }
-        let valid = match header {
-            "data:image/png;base64" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-            "data:image/jpeg;base64" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-            "data:image/webp;base64" => {
-                bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP")
-            }
-            _ => false,
-        };
-        if !valid {
-            return Err("Attach PNG, JPEG or WebP images".into());
-        }
+        let mime = crate::codex_images::validate(&bytes)?;
+        if header != format!("data:{mime};base64") { return Err("Image type does not match its contents".into()); }
         input.push(json!({"type":"image","url":url}));
     }
     Ok(input)
+}
+
+#[tauri::command]
+pub async fn validate_codex_images(images: Vec<String>) -> Result<(), String> {
+    crate::run_session_scan(move || message_input("", &images).map(|_| ())).await
 }
 
 async fn send_input(
     ws: &mut Socket,
     session_id: &str,
     input: Vec<Value>,
+    expected_turn_id: Option<&str>,
 ) -> Result<Receipt, String> {
-    // turn/start adds input to an idle thread or steers an active one on the installed
-    // protocol. No model, cwd, sandbox, approval or history overrides are provided.
+    // A composer observing an active turn must not accidentally start a successor
+    // if that turn finishes before delivery. A rejected steer is never retried as start.
+    let (method, params) = match expected_turn_id {
+        Some(turn) => ("turn/steer", json!({"threadId":session_id,"input":input,"expectedTurnId":turn})),
+        None => ("turn/start", json!({"threadId":session_id,"input":input})),
+    };
     let response = tokio::time::timeout(
         Duration::from_secs(10),
         rpc(
             ws,
             100,
-            "turn/start",
-            json!({"threadId":session_id,"input":input}),
+            method,
+            params,
         ),
     )
     .await;
     Ok(match response {
         Ok(Ok(v)) if v.get("error").is_some() => Receipt { status: "rejected", detail: "Codex rejected the message. Check the original session before retrying.".into(), turn_id: None },
-        Ok(Ok(v)) if v["result"]["turn"]["id"].is_string() => Receipt { status: "accepted", detail: "Accepted by Codex. Follow the reply and any approval requests in the original session.".into(), turn_id: v["result"]["turn"]["id"].as_str().map(str::to_owned) },
+        Ok(Ok(v)) if expected_turn_id.is_some() && v["result"]["turnId"].as_str() == expected_turn_id => Receipt { status: "accepted", detail: "Accepted by the current Codex turn. Follow the reply in the original session.".into(), turn_id: expected_turn_id.map(str::to_owned) },
+        Ok(Ok(v)) if expected_turn_id.is_none() && v["result"]["turn"]["id"].is_string() => Receipt { status: "accepted", detail: "Accepted by Codex. Follow the reply and any approval requests in the original session.".into(), turn_id: v["result"]["turn"]["id"].as_str().map(str::to_owned) },
         _ => Receipt { status: "unknown", detail: "Delivery could not be confirmed. Check the original session before sending again; c9watch will not retry automatically.".into(), turn_id: None },
     })
 }
@@ -273,11 +278,14 @@ pub async fn send_codex_message(
     session_id: String,
     text: String,
     images: Option<Vec<String>>,
+    expected_turn_id: Option<String>,
 ) -> Result<Receipt, String> {
     // Only this preparation phase can produce a definite not-sent error.
     let prepared = async {
         validate_id(&session_id)?;
-        let input = message_input(&text, &images.unwrap_or_default())?;
+        if expected_turn_id.as_ref().is_some_and(|id| id.is_empty() || id.len() > 256) {
+            return Err("Invalid expected turn identity".into());
+        }
         {
             let mut set = SENDING
                 .get_or_init(Default::default)
@@ -288,6 +296,7 @@ pub async fn send_codex_message(
             }
         }
         let _sending = Sending(session_id.clone());
+        let input = crate::run_session_scan(move || message_input(&text, &images.unwrap_or_default())).await?;
         let ws = resolve_session(&session_id).await?;
         Ok::<_, String>((_sending, ws, input))
     }
@@ -302,7 +311,7 @@ pub async fn send_codex_message(
             })
         }
     };
-    send_input(&mut ws, &session_id, input).await
+    send_input(&mut ws, &session_id, input, expected_turn_id.as_deref()).await
 }
 
 #[cfg(test)]
@@ -368,7 +377,7 @@ mod tests {
             (ID, "", None),
             (ID, "hello", Some(vec!["invalid image".into()])),
         ] {
-            let receipt = send_codex_message(id.into(), text.into(), images)
+            let receipt = send_codex_message(id.into(), text.into(), images, None)
                 .await
                 .unwrap();
             assert_eq!(receipt.status, "not_sent");
@@ -380,7 +389,7 @@ mod tests {
     fn image_inputs_are_bounded_and_use_native_protocol() {
         let url = format!(
             "data:image/png;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n")
+            base64::engine::general_purpose::STANDARD.encode(include_bytes!("../icons/32x32.png"))
         );
         let input = message_input("", &[url.clone()]).unwrap();
         assert_eq!(input, vec![json!({"type":"image","url":url})]);
@@ -446,6 +455,64 @@ mod tests {
     async fn lost_ack_is_unknown_and_not_retried() {
         assert_eq!(scenario(true, false).await.unwrap().status, "unknown");
     }
+
+    #[tokio::test]
+    async fn steering_checks_turn_identity_and_never_falls_back_to_start() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        for (response, status) in [
+            (json!({"result":{"turnId":"original"}}), "accepted"),
+            (json!({"result":{"turnId":"different"}}), "unknown"),
+            (json!({"error":{"code":-32600,"message":"turn changed"}}), "rejected"),
+        ] {
+            let (client, server) = UnixStream::pair().unwrap();
+            let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+            let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+            let owner = tokio::spawn(async move {
+                let request: Value = serde_json::from_str(&server.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+                assert_eq!(request["method"], "turn/steer");
+                assert_eq!(request["params"], json!({"threadId":ID,"expectedTurnId":"original","input":[{"type":"text","text":"change"}]}));
+                // An unrelated response must never settle this send.
+                server.send(Message::Text(json!({"id":999,"result":{"turnId":"original"}}).to_string())).await.unwrap();
+                let mut response = response;
+                response["id"] = request["id"].clone();
+                server.send(Message::Text(response.to_string())).await.unwrap();
+                assert!(!matches!(server.next().await, Some(Ok(Message::Text(_)))), "send was retried");
+            });
+            let receipt = send_input(&mut client, ID, message_input("change", &[]).unwrap(), Some("original")).await.unwrap();
+            assert_eq!(receipt.status, status);
+            drop(client);
+            owner.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn late_ack_times_out_once_and_closes_the_connection() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let owner = tokio::spawn(async move {
+            let request = server.next().await.unwrap().unwrap();
+            assert!(request.into_text().unwrap().contains("turn/start"));
+            tokio::time::sleep(Duration::from_millis(10_100)).await;
+            let _ = server.send(Message::Text(json!({"id":100,"result":{"turn":{"id":"late"}}}).to_string())).await;
+            assert!(!matches!(server.next().await, Some(Ok(Message::Text(_)))), "unknown delivery was retried");
+        });
+        let started = std::time::Instant::now();
+        let receipt = send_input(&mut client, ID, message_input("once", &[]).unwrap(), None).await.unwrap();
+        assert_eq!(receipt.status, "unknown");
+        assert!(started.elapsed() < Duration::from_secs(12));
+        drop(client);
+        owner.await.unwrap();
+    }
+
+    #[test]
+    fn oversized_image_is_rejected_before_delivery() {
+        let mut bytes = vec![0; 4 * 1024 * 1024 + 1];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+        assert!(message_input("", &[url]).unwrap_err().contains("4 MiB"));
+    }
     #[test]
     fn rejects_names_and_provider_qualified_ids() {
         assert!(validate_id("codex:abc").is_err());
@@ -504,10 +571,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let steered = send_at(
-            &path,
+        assert_eq!(first.status, "accepted");
+        let mut steering_socket = connect(&path).await.unwrap();
+        require_loaded(&mut steering_socket, id).await.unwrap();
+        let steered = send_input(
+            &mut steering_socket,
             id,
-            "Also include the literal C9WATCH_STEER_OK in your answer. Do not use tools.",
+            message_input("Also include the literal C9WATCH_STEER_OK in your answer. Do not use tools.", &[]).unwrap(),
+            first.turn_id.as_deref(),
         )
         .await
         .unwrap();

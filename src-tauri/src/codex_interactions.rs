@@ -501,6 +501,17 @@ struct Control {
     value: Value,
     reply: oneshot::Sender<Value>,
 }
+
+// A stalled owner pipe or WebSocket must not indefinitely hold the single
+// interaction writer. Closing the bridge leaves uncertain responses uncertain.
+async fn write_with_deadline<T, E: std::fmt::Display>(
+    operation: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    tokio::time::timeout(Duration::from_secs(3), operation)
+        .await
+        .map_err(|_| "Codex transport write timed out; peer is not reading".to_string())?
+        .map_err(|error| error.to_string())
+}
 async fn control_listener(listener: UnixListener, tx: mpsc::Sender<Control>) {
     let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
     loop {
@@ -579,9 +590,11 @@ pub async fn relay(ws: WebSocketStream<UnixStream>, directory: &Path) -> Result<
                         if value.get("method").is_none() && value["id"].as_str().is_some_and(|id|stop_ids.contains(id)) {continue;}
                         registry.observe(&value);
                         let line = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
-                        stdout.write_all(&line).await.map_err(|e| e.to_string())?;
-                        stdout.write_all(b"\n").await.map_err(|e| e.to_string())?;
-                        stdout.flush().await.map_err(|e| e.to_string())?;
+                        write_with_deadline(async {
+                            stdout.write_all(&line).await?;
+                            stdout.write_all(b"\n").await?;
+                            stdout.flush().await
+                        }).await?;
                     }
                     Message::Close(_) => return Ok(()),
                     Message::Binary(_) => return Err("Unexpected binary protocol frame".into()),
@@ -597,7 +610,7 @@ pub async fn relay(ws: WebSocketStream<UnixStream>, directory: &Path) -> Result<
                     let line: Vec<_> = pending.drain(..=end).collect();
                     if line.iter().all(u8::is_ascii_whitespace) { continue; }
                     let value: Value = serde_json::from_slice(&line).map_err(|e| e.to_string())?;
-                    if registry.owner_response(&value) { sink.send(Message::Text(value.to_string())).await.map_err(|e| e.to_string())?; }
+                    if registry.owner_response(&value) { write_with_deadline(sink.send(Message::Text(value.to_string()))).await?; }
                 }
                 if pending.len() > MAX_WIRE { return Err("JSONL record exceeds 8 MiB".into()); }
             }
@@ -610,7 +623,7 @@ pub async fn relay(ws: WebSocketStream<UnixStream>, directory: &Path) -> Result<
                     match registry.interrupt(&thread,&turn) {
                         Err(error)=>{let _=control.reply.send(json!({"status":"not_sent","detail":error}));}
                         Ok(wire)=>{
-                            if let Err(e)=sink.send(Message::Text(wire.to_string())).await {let _=control.reply.send(json!({"status":"unknown","detail":"Stop delivery is unknown. Check Codex."}));return Err(e.to_string());}
+                            if let Err(e)=write_with_deadline(sink.send(Message::Text(wire.to_string()))).await {let _=control.reply.send(json!({"status":"unknown","detail":"Stop delivery is unknown. Check Codex."}));return Err(e);}
                             stop_ids.insert(text(&wire,"id"));
                             stop_replies.insert(text(&wire,"id"),(control.reply,thread,turn));
                         }
@@ -626,7 +639,7 @@ pub async fn relay(ws: WebSocketStream<UnixStream>, directory: &Path) -> Result<
                     } {
                         Err(error) => json!({"status":"not_sent","detail":error}),
                         Ok(response) => {
-                            if let Err(e) = sink.send(Message::Text(response.to_string())).await {
+                            if let Err(e) = write_with_deadline(sink.send(Message::Text(response.to_string()))).await {
                                 let _ = control.reply.send(json!({"status":"unknown","detail":"Connection failed. Check Codex before answering again."}));
                                 return Err(e.to_string());
                             }

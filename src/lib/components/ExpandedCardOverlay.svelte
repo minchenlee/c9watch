@@ -611,6 +611,9 @@
 				</div>
 			{/if}
 
+			{#if conversation && $conversationError?.key === sessionKeyOf(session)}
+				<p class="sync-error" role="status">Conversation update failed: {$conversationError.message}. Showing the last loaded messages; retrying automatically.</p>
+			{/if}
 			<!-- Conversation Area -->
 			<div class="conversation-area" bind:this={messagesContainer} onscroll={handleScroll}>
 				{#if previewedSubagent}
@@ -876,6 +879,13 @@
 </div>
 
 <style>
+	.sync-error {
+		margin: 0;
+		padding: 8px 16px;
+		color: var(--text-secondary);
+		font-size: 12px;
+		border-bottom: 1px solid var(--border-default);
+	}
 	.overlay-backdrop {
 		position: fixed;
 		inset: 0;

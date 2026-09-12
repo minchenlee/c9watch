@@ -206,6 +206,10 @@ struct ProcessArchive {
 static ARCHIVE_STATE: OnceLock<Mutex<HashMap<(PathBuf, PathBuf), ProcessArchive>>> =
     OnceLock::new();
 
+#[cfg(test)]
+#[path = "codex_archive_perf.rs"]
+mod messaging_performance;
+
 fn archive_state() -> &'static Mutex<HashMap<(PathBuf, PathBuf), ProcessArchive>> {
     ARCHIVE_STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -916,9 +920,9 @@ pub(crate) fn load_listing_snapshots(root: &Path, cache_path: &Path) -> Vec<Code
 pub(crate) fn cached_thread_paths(sessions_root: &Path, thread_id: &str) -> Option<Vec<PathBuf>> {
     let cache_path = sessions_root.parent()?.join("c9watch-archive-cache.json");
     let key = (sessions_root.to_path_buf(), cache_path);
-    let state = archive_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // This is an optional path hint. History/Cost may be rebuilding the archive
+    // under this lock; a conversation can instead use its complete filename walk.
+    let state = archive_state().try_lock().ok()?;
     let snapshot = state
         .get(&key)?
         .merged

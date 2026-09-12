@@ -581,4 +581,13 @@ mod tests {
             json!({"action":"cancel","content":null})
         );
     }
+
+    #[test]
+    fn zero_field_mcp_approval_preserves_an_empty_object() {
+        let p = json!({"mode":"form","requestedSchema":{"type":"object","properties":{}}});
+        let d = details("form", &p, None);
+        assert!(supported_form(&p["requestedSchema"]));
+        assert_eq!(response("form", &p, &d, "accept", &json!({"content":{}})).unwrap(), json!({"action":"accept","content":{}}));
+        assert!(response("form", &p, &d, "accept", &json!({"content":{"unexpected":true}})).is_err());
+    }
 }
