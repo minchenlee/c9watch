@@ -45,6 +45,7 @@ pub enum SessionProvider {
     Codex,
     Cursor,
     Pi,
+    Opencode,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
@@ -102,6 +103,7 @@ fn provider_key(provider: SessionProvider) -> &'static str {
         SessionProvider::Codex => "codex",
         SessionProvider::Cursor => "cursor",
         SessionProvider::Pi => "pi",
+        SessionProvider::Opencode => "opencode",
     }
 }
 
@@ -155,6 +157,8 @@ pub struct DetectedSession {
     pub cursor_summary: Option<CursorTranscriptSummary>,
     #[serde(skip)]
     pub pi_summary: Option<PiTranscriptSummary>,
+    #[serde(skip)]
+    pub opencode_summary: Option<super::opencode::OpenCodeSummary>,
 }
 
 fn default_true() -> bool {
@@ -205,6 +209,7 @@ impl DetectedSession {
             codex_summary: None,
             cursor_summary: None,
             pi_summary: None,
+            opencode_summary: None,
         }
     }
 }

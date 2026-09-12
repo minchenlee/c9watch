@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { slide } from 'svelte/transition';
+	import { slide } from '$lib/transitions';
 	import { getDebugLogs } from '$lib/api';
 	import type { LogEntry } from '$lib/types';
 

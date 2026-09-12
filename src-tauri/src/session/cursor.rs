@@ -282,6 +282,7 @@ impl CursorSessionSource {
                 codex_summary: None,
                 cursor_summary: Some(summary),
                 pi_summary: None,
+                opencode_summary: None,
             });
         }
         Ok((sessions, DetectionDiagnostics::default()))

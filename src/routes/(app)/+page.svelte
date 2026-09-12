@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { fade } from 'svelte/transition';
+	import { fade } from '$lib/transitions';
 	import { flip } from 'svelte/animate';
 	import { fadeIn, flyIn } from '$lib/transitions';
 	import { onMount, untrack } from 'svelte';
@@ -329,28 +329,47 @@
 	// should clear/reload the conversation. Read the current object untracked.
 	let conversationTarget = $derived(expandedSession ? sessionKeyOf(expandedSession) : null);
 	let conversationRequestId = 0;
+	let conversationError = $state<string | null>(null);
+	let conversationRetry = $state(0);
+	function retryConversation() { conversationRetry += 1; }
 	$effect(() => {
 		const sessionId = conversationTarget;
+		conversationRetry;
+		conversationError = null;
 		const requestId = ++conversationRequestId;
 		currentConversation.set(null);
 		const selected = untrack(() => expandedSession);
+		let cancelled = false;
+		let timer: ReturnType<typeof setTimeout>;
 		if (sessionId && selected) {
 			const selectedKey = sessionKeyOf(selected);
 			toolsLoadedFor.set(null);
-			withConversationLoader(selected.id, selected.provider, 'conversation', () =>
-				getConversation(selected.id, selected.provider, false)
-			)
-				.then((conv) => {
-					if (requestId !== conversationRequestId) return;
-					if (get(toolsLoadedFor) === selectedKey) return;
-					if (providerSessionKey(conv.provider ?? providerOf(selected), conv.sessionId) !== selectedKey) return;
+			async function refresh(initial: boolean) {
+				const includeTools = get(toolsLoadedFor) === selectedKey;
+				try {
+					const task = () => getConversation(selected!.id, selected!.provider, includeTools);
+					const conv = await (initial
+						? withConversationLoader(selected!.id, selected!.provider, 'conversation', task)
+						: task());
+					if (cancelled || requestId !== conversationRequestId) return;
+					if (includeTools !== (get(toolsLoadedFor) === selectedKey)) return;
+					if (providerSessionKey(conv.provider ?? providerOf(selected!), conv.sessionId) !== selectedKey) return;
+					conversationError = null;
 					currentConversation.set(conv);
-				})
-				.catch((error) => {
+				} catch (error) {
+					if (!cancelled && requestId === conversationRequestId) conversationError = String(error);
 					console.error('Failed to fetch conversation:', error);
-					if (requestId === conversationRequestId) currentConversation.set(null);
-				});
+					// Keep the last successful preview during transient refresh failures.
+				} finally {
+					// Local providers parse transcripts in full; only OpenCode needs HTTP polling.
+					if (providerOf(selected!) === 'opencode' && !cancelled && requestId === conversationRequestId) {
+						timer = setTimeout(() => void refresh(false), 2000);
+					}
+				}
+			}
+			void refresh(true);
 		}
+		return () => { cancelled = true; clearTimeout(timer); };
 	});
 
 	function handleExpand(session: Session) {
@@ -491,7 +510,7 @@
 		<MemoryViewer />
 	</main>
 	{:else if activeTab === 'settings'}
-	<main class="grid-container history-main" in:fadeIn>
+	<main class="grid-container history-main settings-main" in:fadeIn>
 		<SettingsTab />
 	</main>
 	{:else}
@@ -792,6 +811,8 @@
 		<ExpandedCardOverlay
 			session={expandedSession}
 			{conversation}
+			loadError={conversationError}
+			onretry={retryConversation}
 			onclose={handleClose}
 			onstop={() => handleStop(expandedSession.pid)}
 			onopen={() => handleOpen(expandedSession.pid, expandedSession.projectPath)}
@@ -936,6 +957,10 @@
 		overflow: hidden;
 		display: flex;
 		flex-direction: column;
+	}
+
+	.history-main.settings-main {
+		padding-right: var(--space-md);
 	}
 
 	.sections-container {

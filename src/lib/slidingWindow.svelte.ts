@@ -23,6 +23,11 @@ export function createSlidingWindow() {
 		startIndex = initialStart ?? Math.max(0, totalMessages - BATCH_SIZE);
 	}
 
+	function followLatest(totalMessages: number) {
+		endIndex = totalMessages;
+		startIndex = Math.max(0, Math.min(startIndex, totalMessages), totalMessages - MAX_VISIBLE);
+	}
+
 	function sliceMessages(messages: Message[]): Message[] {
 		return messages.slice(startIndex, endIndex);
 	}
@@ -108,6 +113,7 @@ export function createSlidingWindow() {
 		get loading() { return loading; },
 		reset,
 		sliceMessages,
+		followLatest,
 		loadOlder,
 		loadNewer,
 		handleScroll,

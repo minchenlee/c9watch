@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import IntegrationSettings from './IntegrationSettings.svelte';
 	import NotificationSettings from './NotificationSettings.svelte';
 	import UsageSettings from './UsageSettings.svelte';
 	import { marked } from 'marked';
@@ -20,7 +21,7 @@
 	} from '$lib/stores/updater';
 
 	let checking = $state(false);
-	let activeSection = $state<'notifications' | 'usage' | 'about'>('notifications');
+	let activeSection = $state<'notifications' | 'usage' | 'integration' | 'about'>('notifications');
 	let nativeNotifications = $state(false);
 	let justChecked = $state(false);
 
@@ -98,11 +99,13 @@
         <nav class="settings-nav" aria-label="Settings sections">
             {#if nativeNotifications}<button class:active={activeSection === 'notifications'} aria-current={activeSection === 'notifications' ? 'page' : undefined} onclick={() => activeSection = 'notifications'}>Notifications</button>{/if}
             <button class:active={activeSection === 'usage'} aria-current={activeSection === 'usage' ? 'page' : undefined} onclick={() => activeSection = 'usage'}>Usage</button>
+            {#if isTauri()}<button class:active={activeSection === 'integration'} aria-current={activeSection === 'integration' ? 'page' : undefined} onclick={() => activeSection = 'integration'}>Integration</button>{/if}
             <button class:active={activeSection === 'about'} aria-current={activeSection === 'about' ? 'page' : undefined} onclick={() => activeSection = 'about'}>About &amp; updates</button>
         </nav>
         <div class="content"><div class="settings-body">
         {#if nativeNotifications}<div hidden={activeSection !== 'notifications'}><NotificationSettings /></div>{/if}
         <div hidden={activeSection !== 'usage'}><UsageSettings /></div>
+        {#if isTauri()}<div hidden={activeSection !== 'integration'}><IntegrationSettings /></div>{/if}
         <div class="about-panel" hidden={activeSection !== 'about'}>
 		<div class="group" >
 			<div class="group-title group-title--lg">Version</div>
@@ -519,7 +522,7 @@
 		50% { opacity: 1; }
 	}
 
-    .settings-body { width: 100%; max-width: 960px; margin: 0; display: flex; flex-direction: column; gap: var(--space-xl); padding: 0 var(--space-lg) var(--space-2xl); box-sizing: border-box;  }
+    .settings-body { width: 100%; max-width: none; margin: 0; display: flex; flex-direction: column; gap: var(--space-xl); padding: 0 0 var(--space-2xl) var(--space-lg); box-sizing: border-box;  }
     .group { border-top: 1px solid var(--border-default); padding-top: var(--space-xl); }
     .group-title, .group-title--lg { font-family: var(--font-pixel); font-size: 13px; letter-spacing: .1em; text-transform: uppercase; border: 0; color: var(--text-primary); }
     .mono, .status-text, .version-diff, .notes-state, .state-line, .progress-label { font-size: 13px; text-transform: none; letter-spacing: normal; }

@@ -13,7 +13,8 @@
 		{ value: 'claudeCode', label: 'Claude Code', short: 'CLAUDE CODE' },
 		{ value: 'codex', label: 'Codex', short: 'CODEX' },
 		{ value: 'cursor', label: 'Cursor', short: 'CURSOR' },
-		{ value: 'pi', label: 'Pi', short: 'PI' }
+		{ value: 'pi', label: 'Pi', short: 'PI' },
+		{ value: 'opencode', label: 'OpenCode', short: 'OPENCODE' }
 	];
 	let dropdownOpen = $state(false);
 	let activeIndex = $state(0);
@@ -204,6 +205,7 @@
 	.option-marker.codex { border-color: var(--accent-blue); background: var(--accent-blue); }
 	.option-marker.cursor { border-color: var(--accent-purple); background: var(--accent-purple); }
 	.option-marker.pi { border-color: var(--accent-green); background: var(--accent-green); }
+	.option-marker.opencode { border-color: var(--accent-pink); background: var(--accent-pink); }
 	.option-check { color: var(--text-secondary); text-align: right; }
 	.provider-select.compact { gap: 5px; }
 	.compact .select-label { font-size: 7px; }

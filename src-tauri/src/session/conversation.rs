@@ -175,6 +175,7 @@ fn load_for_provider(
         SessionProvider::Codex => codex_conversation(session_id, include_tools, on_progress),
         SessionProvider::Cursor => cursor_conversation(session_id, include_tools, on_progress),
         SessionProvider::Pi => pi_conversation(session_id, include_tools, on_progress),
+        SessionProvider::Opencode => super::opencode::conversation(session_id, include_tools),
     }
 }
 
@@ -224,16 +225,24 @@ pub fn get_conversation_data_for_provider_with_progress(
         return load_for_provider(session_id, provider, include_tools, &mut report);
     }
 
+    probe_providerless_conversation(session_id, |provider| {
+        load_for_provider(session_id, provider, include_tools, &mut report)
+    })
+}
+
+fn probe_providerless_conversation(
+    session_id: &str,
+    mut load: impl FnMut(SessionProvider) -> Result<Conversation, String>,
+) -> Result<Conversation, String> {
     let mut matches = Vec::new();
     for provider in [
         SessionProvider::ClaudeCode,
         SessionProvider::Codex,
         SessionProvider::Cursor,
         SessionProvider::Pi,
+        SessionProvider::Opencode,
     ] {
-        if let Ok(conversation) =
-            load_for_provider(session_id, provider, include_tools, &mut report)
-        {
+        if let Ok(conversation) = load(provider) {
             matches.push((provider, conversation));
         }
     }
@@ -273,6 +282,27 @@ mod tests {
             provider: SessionProvider::ClaudeCode,
             messages: Vec::new(),
         }
+    }
+
+    #[test]
+    fn providerless_probe_finds_opencode_and_still_rejects_collisions() {
+        let load = |provider| {
+            if provider == SessionProvider::Opencode {
+                Ok(Conversation { provider, ..conversation("remote-id") })
+            } else {
+                Err("not found".into())
+            }
+        };
+        let result = probe_providerless_conversation("remote-id", load).unwrap();
+        assert_eq!(result.provider, SessionProvider::Opencode);
+        let error = probe_providerless_conversation("remote-id", |provider| {
+            if provider == SessionProvider::Pi {
+                Ok(Conversation { provider, ..conversation("remote-id") })
+            } else {
+                load(provider)
+            }
+        }).unwrap_err();
+        assert!(error.contains("ambiguous across providers"));
     }
 
     #[test]
