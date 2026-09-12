@@ -4,7 +4,7 @@ export type ProviderFilter = 'all' | SessionProvider;
 export type SessionAction = 'open' | 'stop' | 'rename' | 'conversation';
 type ProviderRecord = { provider?: SessionProvider | null };
 
-const KNOWN_PROVIDERS: SessionProvider[] = ['claudeCode', 'codex', 'cursor', 'pi'];
+const KNOWN_PROVIDERS: SessionProvider[] = ['claudeCode', 'codex', 'cursor', 'pi', 'opencode'];
 
 export function providerOf(record: ProviderRecord): SessionProvider {
 	return record.provider && KNOWN_PROVIDERS.includes(record.provider)
@@ -29,6 +29,7 @@ export function providerLabel(provider: SessionProvider): string {
 	if (provider === 'codex') return 'CODEX';
 	if (provider === 'cursor') return 'CURSOR';
 	if (provider === 'pi') return 'PI';
+	if (provider === 'opencode') return 'OPENCODE';
 	return 'CLAUDE CODE';
 }
 
@@ -48,6 +49,7 @@ export function providerFilterLabel(filter: ProviderFilter): string {
 	if (filter === 'claudeCode') return 'Claude Code';
 	if (filter === 'cursor') return 'Cursor';
 	if (filter === 'pi') return 'Pi';
+	if (filter === 'opencode') return 'OpenCode';
 	return 'All providers';
 }
 
@@ -60,7 +62,7 @@ export function isHiddenInternalSession(session: Session): boolean {
 
 export function isCodexSubagent(session: Session): boolean {
 	const provider = providerOf(session);
-	return (provider === 'codex' || provider === 'cursor') && session.agentKind === 'subagent' && !isHiddenInternalSession(session);
+	return (provider === 'codex' || provider === 'cursor' || provider === 'opencode') && session.agentKind === 'subagent' && !isHiddenInternalSession(session);
 }
 
 export interface CodexHierarchy {

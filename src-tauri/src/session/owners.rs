@@ -67,8 +67,18 @@ impl ProviderSourceOwners {
         guard.as_mut()?.detect().ok()
     }
 
+    pub(crate) fn detect_opencode(&self) -> Vec<DetectedSession> {
+        if !self.initialize_defaults {
+            return Vec::new();
+        }
+        super::opencode::detect()
+    }
+
     pub(crate) fn has_non_claude_session(&self, session_id: &str) -> bool {
-        if self.has_pi_session(session_id) {
+        if self.detect_opencode().iter().any(|s| s.session_id.as_deref()
+            .is_some_and(|id| super::opencode::matches_session_reference(id, session_id)))
+            || self.has_pi_session(session_id)
+        {
             return true;
         }
         let codex = {

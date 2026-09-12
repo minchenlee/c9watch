@@ -34,6 +34,7 @@ impl DetectorState {
         let codex_result = self.provider_sources.detect_codex();
         let cursor_result = self.provider_sources.detect_cursor();
         let pi_result = self.provider_sources.detect_pi();
+        let opencode_sessions = self.provider_sources.detect_opencode();
         match claude_result {
             Ok((mut sessions, diagnostics)) => {
                 self.consecutive_failures = 0;
@@ -46,6 +47,7 @@ impl DetectorState {
                 if let Some((mut extra, _)) = pi_result {
                     sessions.append(&mut extra);
                 }
+                sessions.extend(opencode_sessions);
                 Ok((sessions, diagnostics))
             }
             Err(e) => {
@@ -53,7 +55,7 @@ impl DetectorState {
                 if self.should_downgrade() {
                     self.downgrade_to_legacy();
                 }
-                let mut fallback = Vec::new();
+                let mut fallback = opencode_sessions;
                 let mut diagnostics = DetectionDiagnostics::default();
                 if let Some((sessions, extra)) = codex_result {
                     fallback.extend(sessions);

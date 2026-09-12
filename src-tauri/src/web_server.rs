@@ -379,7 +379,7 @@ async fn handle_message(msg: ClientMsg) -> ServerMsg {
     handle_message_with_owners(msg, crate::session::global_provider_source_owners()).await
 }
 
-// Called by the single admission-gate test while all four workers are occupied.
+// Called while session I/O and the independent discovery slot are occupied.
 // Check actual dispatch without scanning user data or racing another gate test.
 #[cfg(test)]
 pub(super) async fn assert_scan_requests_are_busy() {
@@ -389,7 +389,7 @@ pub(super) async fn assert_scan_requests_are_busy() {
         include_tools: false,
     }] {
         let response = handle_message(request).await;
-        assert!(matches!(response, ServerMsg::Error { ref message } if message.contains("busy")), "{response:?}");
+        assert!(matches!(response, ServerMsg::Error { ref message } if message.contains("in progress")), "{response:?}");
     }
 }
 
@@ -401,7 +401,7 @@ async fn handle_message_with_owners(
         ClientMsg::GetSubscriptionUsage => ServerMsg::SubscriptionUsage {
             data: serde_json::to_value(crate::subscription_usage::get_subscription_usage().await).unwrap_or_default(),
         },
-        ClientMsg::GetSessions => match crate::run_session_scan(crate::polling::detect_and_enrich_sessions).await {
+        ClientMsg::GetSessions => match crate::blocking::scan(&crate::blocking::DISCOVERY, crate::polling::detect_and_enrich_sessions).await {
             Ok(sessions) => ServerMsg::Sessions {
                 data: serde_json::to_value(&sessions).unwrap_or_default(),
             },

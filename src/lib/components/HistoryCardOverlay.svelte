@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount, tick } from 'svelte';
-	import { fade, scale } from 'svelte/transition';
+	import { fade, scale } from '$lib/transitions';
 	import { quintOut } from 'svelte/easing';
 	import type { HistoryEntry, Conversation } from '$lib/types';
 	import MessageBubble from './MessageBubble.svelte';

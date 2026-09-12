@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { fade } from 'svelte/transition';
+	import { fade } from '$lib/transitions';
 	import { flip } from 'svelte/animate';
 	import { fadeIn, flyIn } from '$lib/transitions';
 	import { onMount, untrack } from 'svelte';
@@ -329,7 +329,12 @@
 	// Polling replaces session objects; only a provider-qualified selection change
 	// should clear/reload the conversation. Read the current object untracked.
 	let conversationTarget = $derived(expandedSession ? sessionKeyOf(expandedSession) : null);
+	let conversationRevision = $derived(expandedSession && providerOf(expandedSession) === 'codex'
+		? JSON.stringify([sessionKeyOf(expandedSession), expandedSession.modified, expandedSession.messageCount]) : null);
 	let conversationRequestId = 0;
+	let refreshSelected = () => {};
+	let refreshRevision = (_revision: string | null) => {};
+	function retryConversation() { refreshSelected(); }
 	$effect(() => {
 		const sessionId = conversationTarget;
 		const requestId = ++conversationRequestId;
@@ -338,6 +343,8 @@
 		const selected = untrack(() => expandedSession);
 		let cancelled = false;
 		let refreshInFlight = false;
+		let revisionQueued = false;
+		let observedRevision = untrack(() => conversationRevision);
 		let wake = () => {};
 		let timer: ReturnType<typeof setTimeout>;
 		if (sessionId && selected) {
@@ -347,6 +354,7 @@
 				if (cancelled || refreshInFlight) return;
 				refreshInFlight = true;
 				clearTimeout(timer);
+				conversationError.set(null);
 				const includeTools = get(toolsLoadedFor) === selectedKey;
 				try {
 					const task = () => getConversation(selected!.id, selected!.provider, includeTools);
@@ -367,12 +375,28 @@
 				} finally {
 					refreshInFlight = false;
 					if (!cancelled && requestId === conversationRequestId) {
-						timer = setTimeout(() => void refresh(false), 2000);
+						if (revisionQueued) {
+							revisionQueued = false;
+							void refresh(false);
+						} else if (providerOf(selected!) === 'opencode') {
+							// Local providers must not repeatedly parse unchanged transcripts.
+							timer = setTimeout(() => void refresh(false), 2000);
+						}
 					}
 				}
 			}
+			refreshSelected = () => { void refresh(true); };
+			refreshRevision = (revision) => {
+				if (revision === observedRevision) return;
+				observedRevision = revision;
+				if (document.visibilityState === 'hidden') return;
+				// Coalesce changes that arrive while parsing into one trailing read.
+				if (refreshInFlight) revisionQueued = true;
+				else void refresh(false);
+			};
 			wake = () => {
 				if (document.visibilityState === 'hidden') return;
+				if (!['codex', 'opencode'].includes(providerOf(selected!))) return;
 				void refresh(false);
 				if (isTauri() && providerOf(selected!) === 'codex') void refreshCodexInteractions();
 			};
@@ -382,10 +406,16 @@
 		}
 		return () => {
 			cancelled = true;
+			refreshSelected = () => {};
+			refreshRevision = () => {};
 			clearTimeout(timer);
 			window.removeEventListener('focus', wake);
 			document.removeEventListener('visibilitychange', wake);
 		};
+	});
+	$effect(() => {
+		const revision = conversationRevision;
+		untrack(() => refreshRevision(revision));
 	});
 
 	function handleExpand(session: Session) {
@@ -526,7 +556,7 @@
 		<MemoryViewer />
 	</main>
 	{:else if activeTab === 'settings'}
-	<main class="grid-container history-main" in:fadeIn>
+	<main class="grid-container history-main settings-main" in:fadeIn>
 		<SettingsTab />
 	</main>
 	{:else}
@@ -827,6 +857,8 @@
 		<ExpandedCardOverlay
 			session={expandedSession}
 			{conversation}
+			loadError={$conversationError?.key === sessionKeyOf(expandedSession) ? $conversationError.message : null}
+			onretry={retryConversation}
 			onclose={handleClose}
 			onstop={() => handleStop(expandedSession.pid)}
 			onopen={() => handleOpen(expandedSession.pid, expandedSession.projectPath)}
@@ -971,6 +1003,10 @@
 		overflow: hidden;
 		display: flex;
 		flex-direction: column;
+	}
+
+	.history-main.settings-main {
+		padding-right: var(--space-md);
 	}
 
 	.sections-container {
