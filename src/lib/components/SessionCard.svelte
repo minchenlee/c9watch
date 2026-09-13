@@ -761,7 +761,7 @@
 	}
 
 	/* ── Mobile Responsive ─────────────────────────────────────── */
-	@media (max-width: 768px) {
+	@media (max-width: 768px), (orientation: landscape) and (max-height: 500px) {
 		.session-card {
 			height: auto;
 			min-height: 0;
@@ -860,7 +860,7 @@
 	}
 
 	/* Landscape phones: keep cards shorter so more sessions fit */
-	@media (max-width: 768px) and (orientation: landscape) {
+	@media (orientation: landscape) and (max-height: 500px) {
 		.session-card {
 			padding: 10px 12px;
 		}

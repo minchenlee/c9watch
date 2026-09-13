@@ -255,7 +255,7 @@
 	}
 
 	/* ── Mobile Responsive ─────────────────────────────────────── */
-	@media (max-width: 768px) {
+	@media (max-width: 768px), (orientation: landscape) and (max-height: 500px) {
 		.system-status-bar {
 			padding: var(--space-md);
 			gap: var(--space-sm);
@@ -279,7 +279,7 @@
 		}
 	}
 
-	@media (max-width: 768px) and (orientation: landscape) {
+	@media (orientation: landscape) and (max-height: 500px) {
 		.system-status-bar {
 			padding: var(--space-sm) var(--space-md);
 			gap: 6px;

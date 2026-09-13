@@ -428,7 +428,7 @@
 		text-align: center;
 	}
 
-	@media (max-width: 768px) {
+	@media (max-width: 768px), (orientation: landscape) and (max-height: 500px) {
 		.connection-screen {
 			padding: var(--space-lg);
 			padding-top: max(var(--space-lg), var(--safe-top));
@@ -449,7 +449,7 @@
 		}
 	}
 
-	@media (max-width: 768px) and (orientation: landscape) {
+	@media (orientation: landscape) and (max-height: 500px) {
 		.connection-screen {
 			align-items: flex-start;
 			overflow-y: auto;

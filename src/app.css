@@ -358,7 +358,7 @@ input, textarea, select {
 }
 
 /* ── Mobile Responsive ─────────────────────────────────────────────── */
-@media (max-width: 768px) {
+@media (max-width: 768px), (orientation: landscape) and (max-height: 500px) {
 	body {
 		font-size: 14px;
 		line-height: 1.45;

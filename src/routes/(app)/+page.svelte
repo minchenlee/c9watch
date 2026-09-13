@@ -1333,7 +1333,7 @@
 	}
 
 	/* ── Mobile Responsive ─────────────────────────────────────── */
-	@media (max-width: 768px) {
+	@media (max-width: 768px), (orientation: landscape) and (max-height: 500px) {
 		.tab-bar {
 			height: 48px;
 			overflow-x: auto;
@@ -1454,7 +1454,7 @@
 	}
 
 	/* Landscape phones: use the extra width for cards / status columns */
-	@media (max-width: 768px) and (orientation: landscape) {
+	@media (orientation: landscape) and (max-height: 500px) {
 		.tab-bar {
 			height: 40px;
 		}
@@ -1482,12 +1482,13 @@
 
 		.status-groups {
 			flex-direction: row;
-			overflow-x: auto;
+			overflow-x: visible;
 			padding-bottom: var(--space-sm);
 		}
 
 		.status-group {
-			min-width: 260px;
+			min-width: 0;
+			flex: 1 1 0;
 			max-width: none;
 		}
 

@@ -692,7 +692,7 @@
 	}
 
 	/* ── Mobile Responsive ─────────────────────────────────────── */
-	@media (max-width: 768px) {
+	@media (max-width: 768px), (orientation: landscape) and (max-height: 500px) {
 		.overlay-backdrop {
 			padding: 0;
 		}
