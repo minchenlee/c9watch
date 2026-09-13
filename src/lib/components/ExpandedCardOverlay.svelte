@@ -481,6 +481,7 @@
 							<h2
 								id="overlay-title"
 								class="project-name"
+								title={session.customTitle || session.officialName || session.codexTitle || session.cursorTitle || session.summary || session.firstPrompt || 'New Session'}
 								onmouseenter={() => tipEnter(session.id)}
 								onmouseleave={tipLeave}
 								onmousemove={tipMove}
@@ -523,7 +524,7 @@
 						<div class="header-meta">
 							<span class="status-label" style="color: {getSessionStatusColor(session.status)}">{getSessionStatusLabel(session.status, session.pendingToolName)}</span>
 							<span class="separator">·</span>
-							<span class="session-name-badge">{session.sessionName}</span>
+							<span class="session-name-badge" title={session.sessionName}>{session.sessionName}</span>
 							<span class="separator">·</span>
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
 							{#if loadLabel}
@@ -1097,6 +1098,7 @@
 		display: flex;
 		align-items: center;
 		gap: var(--space-sm);
+		min-width: 0;
 	}
 
 	.copy-id-btn {
@@ -1155,6 +1157,7 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 		max-width: 500px;
+		min-width: 0;
 	}
 
 	.session-name-badge {
@@ -1167,6 +1170,10 @@
 		border: 1px solid var(--border-default);
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		max-width: 180px;
 	}
 
 	.cost-breakdown {
@@ -1446,7 +1453,8 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
-		max-width: 200px;
+		max-width: min(280px, 40vw);
+		min-width: 0;
 	}
 
 	.header-meta {
@@ -1638,7 +1646,7 @@
 		}
 
 		.project-name {
-			font-size: 13px;
+			font-size: 14px;
 			max-width: none;
 		}
 
@@ -1646,6 +1654,11 @@
 			flex-wrap: wrap;
 			font-size: 11px;
 			gap: var(--space-xs);
+		}
+
+		.session-name-badge,
+		.branch-name {
+			max-width: 100%;
 		}
 
 		.header-actions {
@@ -1657,18 +1670,24 @@
 		}
 
 		.header-button {
-			width: 28px;
-			height: 28px;
+			width: var(--touch-min);
+			height: var(--touch-min);
 		}
 
 		.close-button {
-			width: 28px;
-			height: 28px;
+			width: var(--touch-min);
+			height: var(--touch-min);
+		}
+
+		.copy-id-btn {
+			opacity: 0.55;
+			width: 32px;
+			height: 32px;
 		}
 
 		.conversation-area {
 			padding: var(--space-md);
-			padding-bottom: 72px; /* Space for FAB */
+			padding-bottom: calc(72px + var(--safe-bottom));
 		}
 
 		/* ── FAB (Floating Action Button) ────────────── */
@@ -1677,8 +1696,8 @@
 			align-items: center;
 			justify-content: center;
 			position: fixed;
-			bottom: 20px;
-			right: 20px;
+			bottom: max(20px, var(--safe-bottom));
+			right: max(20px, var(--safe-right));
 			width: 48px;
 			height: 48px;
 			background: var(--bg-card);
@@ -1726,6 +1745,7 @@
 			right: 0;
 			bottom: 0;
 			height: 55vh;
+			padding-bottom: var(--safe-bottom);
 			background: var(--bg-card);
 			border-top: 1px solid var(--border-default);
 			z-index: 1030;

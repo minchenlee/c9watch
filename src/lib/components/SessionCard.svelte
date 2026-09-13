@@ -194,6 +194,7 @@
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<h3
 				class="card-main-title"
+				title={cardTitle}
 				onmouseenter={() => tipEnter(session.id)}
 				onmouseleave={tipLeave}
 				onmousemove={tipMove}
@@ -228,7 +229,7 @@
 			<div class="stats-row">
 				<div class="badge-group">
 					<ProviderBadge provider={session.provider} surface={session.surface} {compact} />
-					<span class="session-name-badge">{session.sessionName}</span>
+					<span class="session-name-badge" title={session.sessionName}>{session.sessionName}</span>
 				{#if PM_ORCHESTRATION_ENABLED && session.workerOf && !workersView}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<span
@@ -286,7 +287,7 @@
 						<circle cx="6" cy="18" r="3" />
 						<path d="M18 9a9 9 0 0 1-9 9" />
 					</svg>
-					<span class="branch-name">{session.gitBranch}</span>
+					<span class="branch-name" title={session.gitBranch}>{session.gitBranch}</span>
 				</div>
 			{/if}
 
@@ -385,6 +386,7 @@
 		display: flex;
 		align-items: center;
 		gap: var(--space-sm);
+		min-width: 0;
 	}
 
 	.card-main-title {
@@ -401,6 +403,8 @@
 		line-clamp: 2;
 		-webkit-box-orient: vertical;
 		cursor: default;
+		min-width: 0;
+		flex: 1;
 	}
 
 	.copy-id-btn {
@@ -548,7 +552,7 @@
 		white-space: nowrap;
 		text-overflow: ellipsis;
 		min-width: 0;
-		max-width: 200px;
+		max-width: min(280px, 100%);
 	}
 
 	.time-badge {
@@ -747,39 +751,136 @@
 		border-radius: 4px;
 	}
 
+	/* Coarse pointers (phones): keep the copy control visible without hover */
+	@media (hover: none) {
+		.copy-id-btn {
+			opacity: 0.55;
+			width: 32px;
+			height: 32px;
+		}
+	}
+
 	/* ── Mobile Responsive ─────────────────────────────────────── */
 	@media (max-width: 768px) {
 		.session-card {
 			height: auto;
-			min-height: auto;
-			padding: var(--space-md);
+			min-height: 0;
+			padding: 14px;
+			gap: var(--space-md);
+		}
+
+		.card-body {
+			gap: 10px;
 		}
 
 		.card-main-title {
-			font-size: 13px;
+			font-size: 15px;
+			letter-spacing: 0.02em;
+			line-height: 1.35;
 		}
 
 		.stats-row {
+			flex-direction: column;
+			align-items: stretch;
+			flex-wrap: nowrap;
+			gap: 8px;
+		}
+
+		.badge-group {
 			flex-wrap: wrap;
-			gap: var(--space-xs);
+			max-width: 100%;
 		}
 
 		.session-name-badge {
-			max-width: 60%;
+			max-width: 100%;
+		}
+
+		.stats-group {
+			flex-wrap: wrap;
+			justify-content: flex-start;
+			gap: var(--space-sm) var(--space-md);
+		}
+
+		.git-branch {
+			width: 100%;
 		}
 
 		.branch-name {
-			max-width: 150px;
+			max-width: none;
+			flex: 1;
+		}
+
+		.status-label {
+			font-size: 12px;
 		}
 
 		.task-preview {
 			font-size: 13px;
-			-webkit-line-clamp: 2;
-			line-clamp: 2;
+			line-height: 1.45;
+			-webkit-line-clamp: 3;
+			line-clamp: 3;
+			margin: 0;
+		}
+
+		.card-actions-container {
+			justify-content: stretch;
+			padding-top: var(--space-md);
 		}
 
 		.card-actions {
-			flex-wrap: wrap;
+			width: 100%;
+			flex-wrap: nowrap;
+			gap: var(--space-sm);
+		}
+
+		.action-btn {
+			flex: 1;
+			min-height: var(--touch-min);
+			min-width: 0;
+			justify-content: center;
+			padding: 10px 12px;
+			font-size: 11px;
+			gap: 8px;
+		}
+
+		.session-card.compact {
+			padding: 12px 14px;
+		}
+
+		.session-card.compact .card-body {
+			padding-right: 48px;
+		}
+
+		.compact-actions .action-btn {
+			min-width: var(--touch-min);
+			min-height: var(--touch-min);
+			width: var(--touch-min);
+			height: var(--touch-min);
+		}
+	}
+
+	/* Landscape phones: keep cards shorter so more sessions fit */
+	@media (max-width: 768px) and (orientation: landscape) {
+		.session-card {
+			padding: 10px 12px;
+		}
+
+		.card-body {
+			gap: 6px;
+		}
+
+		.task-preview {
+			-webkit-line-clamp: 1;
+			line-clamp: 1;
+		}
+
+		.card-actions-container {
+			padding-top: var(--space-sm);
+		}
+
+		.action-btn {
+			min-height: 40px;
+			padding: 8px 10px;
 		}
 	}
 

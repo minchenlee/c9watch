@@ -137,6 +137,13 @@
 	--transition-normal: 150ms linear;
 	--transition-slow: 250ms linear;
 	--transition-spring: 200ms linear;
+
+	/* Touch / safe area (used on mobile web; no-ops on desktop) */
+	--touch-min: 44px;
+	--safe-top: env(safe-area-inset-top, 0px);
+	--safe-right: env(safe-area-inset-right, 0px);
+	--safe-bottom: env(safe-area-inset-bottom, 0px);
+	--safe-left: env(safe-area-inset-left, 0px);
 }
 
 /* CSS Reset */
@@ -165,6 +172,9 @@ body {
 	background-color: var(--bg-base);
 	-webkit-font-smoothing: antialiased;
 	-moz-osx-font-smoothing: grayscale;
+	-webkit-text-size-adjust: 100%;
+	text-size-adjust: 100%;
+	-webkit-tap-highlight-color: transparent;
 }
 
 
@@ -350,13 +360,14 @@ input, textarea, select {
 /* ── Mobile Responsive ─────────────────────────────────────────────── */
 @media (max-width: 768px) {
 	body {
-		font-size: 13px;
+		font-size: 14px;
+		line-height: 1.45;
 	}
+}
 
-	/* Larger touch targets */
+@media (hover: none) {
 	button,
 	[role="button"] {
-		min-height: 36px;
-		min-width: 36px;
+		-webkit-tap-highlight-color: transparent;
 	}
 }
