@@ -22,6 +22,8 @@ export interface ConversationProgressEvent {
 	bytesTotal: number;
 }
 
+export const conversationError = writable<{ key: string; message: string } | null>(null);
+
 export const conversationLoad = writable<ConversationLoadState | null>(null);
 
 /** Session whose in-memory conversation already includes tool dumps. */

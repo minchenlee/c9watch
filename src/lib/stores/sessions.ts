@@ -3,6 +3,7 @@
  */
 
 import { writable, derived, get } from 'svelte/store';
+import { codexInteractions, projectCodexSession, startCodexInteractions } from './codex-interactions';
 import { listen } from '@tauri-apps/api/event';
 import { isPermissionGranted, requestPermission } from '@tauri-apps/plugin-notification';
 import type { Session, Conversation } from '../types';
@@ -16,7 +17,10 @@ import { initConversationProgressListener } from './conversation-loader';
 /**
  * Store containing all active sessions
  */
-export const sessions = writable<Session[]>([]);
+const rawSessions = writable<Session[]>([]);
+const projectedSessions = derived([rawSessions, codexInteractions, isDemoMode], ([all, snapshots, demo]) =>
+ demo ? all : all.map(session => projectCodexSession(session, snapshots)));
+export const sessions = { subscribe: projectedSessions.subscribe, set: rawSessions.set, update: rawSessions.update };
 
 /**
  * Store containing the currently expanded provider-scoped session key.
@@ -199,6 +203,7 @@ async function initWebSocketListeners() {
 // ── Tauri IPC mode ──────────────────────────────────────────────────
 
 async function initTauriListeners() {
+	startCodexInteractions();
 	await listen<Session[]>('sessions-updated', (event) => {
 		if (!get(isDemoMode)) {
 			sessions.set(event.payload);

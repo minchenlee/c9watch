@@ -4,6 +4,10 @@ use tokio::sync::Semaphore;
 
 pub(crate) static DISCOVERY: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(1)));
+// Conversation/archive/image I/O must not consume the single discovery slot.
+// Native and WebSocket callers share this gate, not per-transport pools.
+pub(crate) static SESSION_IO: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(4)));
 pub(crate) static SUBAGENTS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(1)));
 pub(crate) static SUBAGENT_TRANSCRIPT: LazyLock<Arc<Semaphore>> =

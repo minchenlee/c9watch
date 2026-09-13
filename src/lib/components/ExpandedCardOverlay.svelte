@@ -62,6 +62,8 @@
 		withConversationLoader
 	} from '$lib/stores/conversation-loader';
 	import ConversationLoadBar from './ConversationLoadBar.svelte';
+	import CodexMessageComposer from './CodexMessageComposer.svelte';
+	import CodexPendingInteractions from './CodexPendingInteractions.svelte';
 
 	interface Props {
 		session: Session;
@@ -610,6 +612,9 @@
 				</div>
 			{/if}
 
+			{#if conversation && loadError}
+				<p class="sync-error" role="status">Conversation update failed: {loadError}. Showing the last loaded messages. <button class="retry-conversation" onclick={onretry}>Retry</button></p>
+			{/if}
 			<!-- Conversation Area -->
 			<div class="conversation-area" bind:this={messagesContainer} onscroll={handleScroll}>
 				{#if previewedSubagent}
@@ -679,7 +684,6 @@
 					</div>
 				{:else if !conversation}
 					<div class="loading-state">
-
 						<p>Loading conversation...</p>
 					</div>
 				{:else if conversation.messages.length === 0}
@@ -709,6 +713,14 @@
 					</div>
 				{/if}
 			</div>
+
+			<!-- Mobile: FAB to open nav sheet -->
+			{#if providerOf(session) === 'codex' && isTauri()}
+				{#key sessionKeyOf(session)}
+					<CodexPendingInteractions sessionId={session.id} />
+					<CodexMessageComposer sessionId={session.id} />
+				{/key}
+			{/if}
 
 			<!-- Mobile: FAB to open nav sheet -->
 			<button
@@ -868,6 +880,13 @@
 </div>
 
 <style>
+	.sync-error {
+		margin: 0;
+		padding: 8px 16px;
+		color: var(--text-secondary);
+		font-size: 12px;
+		border-bottom: 1px solid var(--border-default);
+	}
 	.retry-conversation { padding: 8px 12px; border: 1px solid var(--border-default); border-radius: var(--radius-sm); background: var(--bg-elevated); color: var(--text-primary); font: 11px var(--font-mono); cursor: pointer; }
 
 	.overlay-backdrop {

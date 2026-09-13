@@ -4,6 +4,14 @@
 
 // ── Core modules (always compiled) ──────────────────────────────────
 pub mod actions;
+#[cfg(all(unix, feature = "gui"))]
+pub mod codex_bridge;
+#[cfg(all(unix, feature = "gui"))]
+pub mod codex_messaging;
+#[cfg(feature = "gui")]
+mod codex_images;
+#[cfg(all(unix, feature = "gui"))]
+pub mod codex_interactions;
 pub mod claude_usage;
 pub mod debug_log;
 pub mod session;
@@ -57,6 +65,53 @@ use tauri_nspanel::{
 
 // ── GUI-only: Tauri commands ─────────────────────────────────────────
 
+// Native and WebSocket history/conversation scans share bounded admission.
+// Keep the permit in the worker: cancelling an IPC future cannot cancel filesystem
+// I/O and must not admit another scan before that I/O actually finishes.
+#[cfg(all(not(mobile), feature = "gui"))]
+async fn run_session_scan<T: Send + 'static>(
+    scan: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    blocking::scan(&blocking::SESSION_IO, scan).await
+}
+
+#[cfg(all(test, not(mobile), feature = "gui"))]
+#[tokio::test(flavor = "current_thread")]
+async fn native_scans_leave_async_timers_live_and_bound_cancelled_work() {
+    let mut releases = Vec::new();
+    let mut jobs = Vec::new();
+    for _ in 0..4 {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (began, running) = tokio::sync::oneshot::channel();
+        releases.push(release);
+        jobs.push(tokio::spawn(async move {
+            run_session_scan(move || {
+                let _ = began.send(());
+                wait.recv_timeout(Duration::from_secs(2)).map_err(|e| e.to_string())
+            }).await
+        }));
+        running.await.unwrap();
+    }
+    let started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(jobs.iter().all(|job| !job.is_finished()), "scan blocked the async worker until its watchdog expired");
+    assert!(run_session_scan(|| Ok(())).await.unwrap_err().contains("in progress"));
+    // Discovery retains main's independent single-flight budget.
+    let discovery = blocking::DISCOVERY.clone().try_acquire_owned().unwrap();
+    web_server::assert_scan_requests_are_busy().await;
+    drop(discovery);
+    for job in jobs { job.abort(); let _ = job.await; }
+    assert!(run_session_scan(|| Ok(())).await.unwrap_err().contains("in progress"), "cancellation released slots while I/O was still running");
+    eprintln!("native scan gate: 4 held workers, timer {:?}, fifth scan rejected, cancelled workers retain permits", started.elapsed());
+    for release in releases { release.send(()).unwrap(); }
+    let mut recovered = false;
+    for _ in 0..100 {
+        if run_session_scan(|| Ok(())).await.is_ok() { recovered = true; break; }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(recovered);
+}
+
 #[cfg(feature = "gui")]
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
@@ -98,7 +153,7 @@ async fn get_conversation(
     include_tools: Option<bool>,
 ) -> Result<Conversation, String> {
     let include_tools = include_tools.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || {
+    run_session_scan(move || {
         let emit_id = session_id.clone();
         get_conversation_data_for_provider_with_progress(
             &session_id,
@@ -118,13 +173,12 @@ async fn get_conversation(
         )
     })
     .await
-    .map_err(|error| format!("Failed to load conversation: {error}"))?
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_session_history() -> Result<Vec<session::HistoryEntry>, String> {
-    session::get_history()
+    run_session_scan(session::get_history).await
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -137,17 +191,15 @@ async fn deep_search_sessions(
     if query.trim().is_empty() {
         return Ok(vec![]);
     }
-    session::deep_search(
-        &query,
-        caseSensitive.unwrap_or(false),
-        wholeWord.unwrap_or(false),
-    )
+    run_session_scan(move || {
+        session::deep_search(&query, caseSensitive.unwrap_or(false), wholeWord.unwrap_or(false))
+    }).await
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_cost_data() -> Result<session::CostData, String> {
-    session::get_cost_data()
+    run_session_scan(session::get_cost_data).await
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -736,6 +788,14 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            codex_interactions::codex_interaction_snapshots,
+            codex_interactions::answer_codex_question,
+            codex_interactions::decide_codex_interaction,
+            codex_interactions::interrupt_codex_turn,
+            codex_messaging::codex_message_capability,
+            codex_messaging::send_codex_message,
+            codex_messaging::validate_codex_images,
+            codex_bridge::launch_codex_desktop_bridge,
             session::opencode::opencode_connection_status,
             session::opencode::opencode_connect,
             session::opencode::opencode_session_children,

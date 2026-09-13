@@ -1,6 +1,7 @@
 <script lang="ts">
 	import ProviderBadge from './ProviderBadge.svelte';
 	import OpenCodeConnection from './OpenCodeConnection.svelte';
+	import CodexDesktopSupport from './CodexDesktopSupport.svelte';
 	import type { SessionProvider } from '$lib/types';
 
 	type LocalIntegration = {
@@ -21,7 +22,7 @@
 			provider: 'codex',
 			name: 'Codex',
 			description: 'Local Codex sessions are detected automatically.',
-			detail: 'c9watch reads the local Codex session archive; there is no separate connection to configure.'
+			detail: 'Archive monitoring is automatic. Optional Desktop messaging support is available below.'
 		},
 		{
 			provider: 'cursor',
@@ -65,6 +66,7 @@
 				</article>
 			{/each}
 		</div>
+		<CodexDesktopSupport />
 	</div>
 
 	<div class="section-block remote-block" aria-labelledby="remote-integrations-title">

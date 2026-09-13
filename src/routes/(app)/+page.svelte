@@ -12,7 +12,8 @@
 		visibleTopLevelSessionIds
 	} from '$lib/stores/sessions';
 	import { getConversation, stopSession, openSession } from '$lib/api';
-	import { toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
+	import { refreshCodexInteractions } from '$lib/stores/codex-interactions';
+	import { conversationError, toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
 	import { get } from 'svelte/store';
 	import { isDemoMode, toggleDemoMode } from '$lib/demo';
 	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
@@ -328,23 +329,32 @@
 	// Polling replaces session objects; only a provider-qualified selection change
 	// should clear/reload the conversation. Read the current object untracked.
 	let conversationTarget = $derived(expandedSession ? sessionKeyOf(expandedSession) : null);
+	let conversationRevision = $derived(expandedSession && providerOf(expandedSession) === 'codex'
+		? JSON.stringify([sessionKeyOf(expandedSession), expandedSession.modified, expandedSession.messageCount]) : null);
 	let conversationRequestId = 0;
-	let conversationError = $state<string | null>(null);
-	let conversationRetry = $state(0);
-	function retryConversation() { conversationRetry += 1; }
+	let refreshSelected = () => {};
+	let refreshRevision = (_revision: string | null) => {};
+	function retryConversation() { refreshSelected(); }
 	$effect(() => {
 		const sessionId = conversationTarget;
-		conversationRetry;
-		conversationError = null;
 		const requestId = ++conversationRequestId;
 		currentConversation.set(null);
+		conversationError.set(null);
 		const selected = untrack(() => expandedSession);
 		let cancelled = false;
+		let refreshInFlight = false;
+		let revisionQueued = false;
+		let observedRevision = untrack(() => conversationRevision);
+		let wake = () => {};
 		let timer: ReturnType<typeof setTimeout>;
 		if (sessionId && selected) {
 			const selectedKey = sessionKeyOf(selected);
 			toolsLoadedFor.set(null);
 			async function refresh(initial: boolean) {
+				if (cancelled || refreshInFlight) return;
+				refreshInFlight = true;
+				clearTimeout(timer);
+				conversationError.set(null);
 				const includeTools = get(toolsLoadedFor) === selectedKey;
 				try {
 					const task = () => getConversation(selected!.id, selected!.provider, includeTools);
@@ -354,22 +364,58 @@
 					if (cancelled || requestId !== conversationRequestId) return;
 					if (includeTools !== (get(toolsLoadedFor) === selectedKey)) return;
 					if (providerSessionKey(conv.provider ?? providerOf(selected!), conv.sessionId) !== selectedKey) return;
-					conversationError = null;
 					currentConversation.set(conv);
+					conversationError.set(null);
 				} catch (error) {
-					if (!cancelled && requestId === conversationRequestId) conversationError = String(error);
 					console.error('Failed to fetch conversation:', error);
+					if (!cancelled && requestId === conversationRequestId) {
+						conversationError.set({ key: selectedKey, message: String(error) });
+					}
 					// Keep the last successful preview during transient refresh failures.
 				} finally {
-					// Local providers parse transcripts in full; only OpenCode needs HTTP polling.
-					if (providerOf(selected!) === 'opencode' && !cancelled && requestId === conversationRequestId) {
-						timer = setTimeout(() => void refresh(false), 2000);
+					refreshInFlight = false;
+					if (!cancelled && requestId === conversationRequestId) {
+						if (revisionQueued) {
+							revisionQueued = false;
+							void refresh(false);
+						} else if (providerOf(selected!) === 'opencode') {
+							// Local providers must not repeatedly parse unchanged transcripts.
+							timer = setTimeout(() => void refresh(false), 2000);
+						}
 					}
 				}
 			}
+			refreshSelected = () => { void refresh(true); };
+			refreshRevision = (revision) => {
+				if (revision === observedRevision) return;
+				observedRevision = revision;
+				if (document.visibilityState === 'hidden') return;
+				// Coalesce changes that arrive while parsing into one trailing read.
+				if (refreshInFlight) revisionQueued = true;
+				else void refresh(false);
+			};
+			wake = () => {
+				if (document.visibilityState === 'hidden') return;
+				if (!['codex', 'opencode'].includes(providerOf(selected!))) return;
+				void refresh(false);
+				if (isTauri() && providerOf(selected!) === 'codex') void refreshCodexInteractions();
+			};
+			window.addEventListener('focus', wake);
+			document.addEventListener('visibilitychange', wake);
 			void refresh(true);
 		}
-		return () => { cancelled = true; clearTimeout(timer); };
+		return () => {
+			cancelled = true;
+			refreshSelected = () => {};
+			refreshRevision = () => {};
+			clearTimeout(timer);
+			window.removeEventListener('focus', wake);
+			document.removeEventListener('visibilitychange', wake);
+		};
+	});
+	$effect(() => {
+		const revision = conversationRevision;
+		untrack(() => refreshRevision(revision));
 	});
 
 	function handleExpand(session: Session) {
@@ -811,7 +857,7 @@
 		<ExpandedCardOverlay
 			session={expandedSession}
 			{conversation}
-			loadError={conversationError}
+			loadError={$conversationError?.key === sessionKeyOf(expandedSession) ? $conversationError.message : null}
 			onretry={retryConversation}
 			onclose={handleClose}
 			onstop={() => handleStop(expandedSession.pid)}

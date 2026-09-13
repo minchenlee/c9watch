@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-const CACHE_VERSION: u32 = 6;
+const CACHE_VERSION: u32 = 7;
 const MAX_DISPLAY_CHARS: usize = 400;
 const MAX_INDEXED_MESSAGES: usize = 20_000;
 const MAX_INDEXED_MESSAGE_CHARS: usize = 16_384;
@@ -206,6 +206,10 @@ struct ProcessArchive {
 static ARCHIVE_STATE: OnceLock<Mutex<HashMap<(PathBuf, PathBuf), ProcessArchive>>> =
     OnceLock::new();
 
+#[cfg(test)]
+#[path = "codex_archive_perf.rs"]
+mod messaging_performance;
+
 fn archive_state() -> &'static Mutex<HashMap<(PathBuf, PathBuf), ProcessArchive>> {
     ARCHIVE_STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -287,6 +291,11 @@ fn message_text(value: &Value) -> Option<(String, String)> {
             if text.trim().is_empty() {
                 return None;
             }
+            let text = if role == "user" {
+                super::codex::display_user_text(&text)?
+            } else {
+                text
+            };
             Some((role.to_string(), text))
         }
         Some("response_item") => super::codex::response_item_message_text(payload)
@@ -911,9 +920,9 @@ pub(crate) fn load_listing_snapshots(root: &Path, cache_path: &Path) -> Vec<Code
 pub(crate) fn cached_thread_paths(sessions_root: &Path, thread_id: &str) -> Option<Vec<PathBuf>> {
     let cache_path = sessions_root.parent()?.join("c9watch-archive-cache.json");
     let key = (sessions_root.to_path_buf(), cache_path);
-    let state = archive_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // This is an optional path hint. History/Cost may be rebuilding the archive
+    // under this lock; a conversation can instead use its complete filename walk.
+    let state = archive_state().try_lock().ok()?;
     let snapshot = state
         .get(&key)?
         .merged
