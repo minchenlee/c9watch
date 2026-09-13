@@ -321,6 +321,7 @@ pub fn supported_form(schema: &Value) -> bool {
             "enum",
             "enumNames",
             "oneOf",
+            "anyOf",
             "items",
             "minItems",
             "maxItems",
@@ -557,6 +558,10 @@ mod tests {
         let mut unsupported = schema.clone();
         unsupported["properties"]["name"]["pattern"] = json!(".*");
         assert!(!supported_form(&unsupported));
+        let scalar = json!({"type":"object","properties":{"choice":{"type":"string","anyOf":[{"const":"a","title":"Alpha"},{"const":"b","title":"Beta"}]}}});
+        assert!(supported_form(&scalar));
+        validate_form(&scalar, &json!({"choice":"a"})).unwrap();
+        assert!(validate_form(&scalar, &json!({"choice":"nope"})).is_err());
     }
     #[test]
     fn mcp_url_is_explicit_and_never_opens_executable_schemes() {

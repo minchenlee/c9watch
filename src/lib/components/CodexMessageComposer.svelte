@@ -37,10 +37,11 @@
  const waiting = $derived(snapshot?.statuses[sessionId] === 'waiting' || snapshot?.pending.some(p => p.threadId === sessionId && !p.submitted));
  const stopping = $derived(active && (turn?.stopping || ['sending', 'submitted'].includes(stopState?.status ?? '')));
  const hasContent = $derived(!!draft.text.trim() || !!draft.images?.length);
- const stopDisabled = $derived(live.length !== 1 || !snapshot?.connected || !active || !!turn?.stopping || !!stopState);
+ const stopLocked = $derived(['sending', 'submitted', 'unknown'].includes(stopState?.status ?? ''));
+ const stopDisabled = $derived(live.length !== 1 || !snapshot?.connected || !active || !!turn?.stopping || stopLocked);
  const turnLabel = $derived(live.length > 1 ? 'Multiple connections · check Codex' : snapshot && !snapshot.connected ? 'Disconnected · status may be outdated' : stopping ? 'Stopping…' : active && stopState?.status === 'unknown' ? 'Stop delivery unknown · check Codex' : waiting ? 'Waiting for your response' : active ? 'Running' : turn?.status === 'failed' ? 'Failed' : turn?.status === 'interrupted' ? 'Stopped' : available ? 'Ready' : 'Disconnected');
  async function stop() {
-  if (stopDisabled || !turn || !snapshot || stops.has(stopKey)) return;
+  if (stopDisabled || !turn || !snapshot || ['sending', 'submitted', 'unknown'].includes(stops.get(stopKey)?.status ?? '')) return;
   if (stops.size >= 1024) {
    update({notice: 'Stop history is full. Stop this turn in Codex, then restart c9watch to reset the local history.'});
    return;

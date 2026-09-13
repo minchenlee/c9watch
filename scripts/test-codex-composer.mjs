@@ -159,6 +159,15 @@ test('stop is sent once for the exact turn and late receipts do not disable a ne
 test('unavailable stop cannot invoke the backend',async()=>{
  const h=stopHarness();h.disable();await h.stop();assert.equal(h.requests.length,0);
 });
+test('definite rejected and not-sent stop receipts remain retryable',async()=>{
+ for(const status of ['rejected','not_sent']) {
+  const h=stopHarness();const first=h.stop();
+  h.requests[0].resolve({status,detail:'failed'});await first;
+  const retry=h.stop();assert.equal(h.requests.length,2);
+  assert.deepEqual(h.requests[1].args,{endpoint:'local',threadId:'A',turnId:'one'});
+  h.requests[1].resolve({status:'submitted',detail:'Stopping'});await retry;
+ }
+});
 
 test('stop retention is bounded without evicting uncertain turn identities',async()=>{
  const h=stopHarness();for(let i=0;i<1024;i++)h.stops.set(String(i),{status:'unknown'});

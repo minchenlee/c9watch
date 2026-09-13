@@ -1658,25 +1658,26 @@ fn response_item_content_text(content: &Value) -> Option<String> {
     }
 }
 
-const CODEX_CONTEXT_PREFIXES: &[&str] = &[
-    "<app-context>",
-    "<recommended_plugins>",
-    "<environment_context>",
-    "<permissions instructions>",
-    "<collaboration_mode>",
-    "<apps_instructions>",
-    "<plugins_instructions>",
-    "<skills_instructions>",
-    "# AGENTS.md instructions",
-    "## Memory",
-    "# Memory",
+const CODEX_CONTEXT_TAGS: &[&str] = &[
+    "app-context",
+    "recommended_plugins",
+    "environment_context",
+    "permissions instructions",
+    "collaboration_mode",
+    "apps_instructions",
+    "plugins_instructions",
+    "skills_instructions",
 ];
 
 fn is_codex_context_message(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    CODEX_CONTEXT_PREFIXES
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix))
+    let trimmed = content.trim();
+    CODEX_CONTEXT_TAGS.iter().any(|tag| {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        trimmed.starts_with(&open)
+            && trimmed.ends_with(&close)
+            && trimmed.len() >= open.len() + close.len()
+    })
 }
 
 /// Strip Desktop-generated attachment preambles; do not relabel them as user prose.
@@ -2448,6 +2449,19 @@ mod tests {
         assert_eq!(
             display_user_text("Explain environment_context please").as_deref(),
             Some("Explain environment_context please")
+        );
+        assert_eq!(
+            display_user_text("# Memory\nplease remember the API key rotation").as_deref(),
+            Some("# Memory\nplease remember the API key rotation")
+        );
+        assert_eq!(
+            display_user_text("<environment_context> what does this tag mean?").as_deref(),
+            Some("<environment_context> what does this tag mean?")
+        );
+        let user_memory = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":"# Memory\nkeep this"}],"internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"]}});
+        assert_eq!(
+            response_item_message_text(&user_memory).unwrap().1,
+            "# Memory\nkeep this"
         );
         let p = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":"runtime-only text"}],"internal_chat_message_metadata_passthrough":{"content_item_kinds":["environments.environment_context"]}});
         assert!(response_item_message_text(&p).is_none());
