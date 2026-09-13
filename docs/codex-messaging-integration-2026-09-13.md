@@ -4,8 +4,9 @@
 
 Local implementation and automated/fixture gates pass; **PR #128 is not yet
 merge-ready**. The tested candidate has resolved the current main conflicts,
-but has not been pushed. Post-disconnect native Recheck and controlled native
-startup/memory comparison remain incomplete. Real Desktop/model compatibility
+but has not been pushed. Post-disconnect native Recheck and live history refresh
+are now verified in the unlock follow-up below; controlled native startup/memory
+comparison remains incomplete. Real Desktop/model compatibility
 and release acceptance are explicitly unverified, not inferred from fixtures.
 
 This supersedes the integration and image-picker blockers in
@@ -259,15 +260,88 @@ against an equivalent baseline remains unverified.
 
 ## Remaining gates / smallest next actions
 
-1. Manually unlock the Mac, then finish exact-bundle post-disconnect Recheck,
-   live revision refresh and close/reopen QA. Earlier bundle's 24->26 live
-   history observation is historical; it does not validate the newly merged
-   revision-trigger contract. Automated refresh/coalescing tests do pass.
-2. Complete controlled native startup/first-load and WebKit-inclusive resource
-   comparison. Existing synthetic results and RSS snapshots are not a substitute.
+1. Post-disconnect Recheck, live history and close/reopen QA completed after
+   unlock; see the exact-bundle evidence below. Real provider/model acceptance
+   is not implied.
+2. Obtain action-time confirmation to launch both unsigned local QA bundles,
+   then complete controlled native startup/first-load and WebKit-inclusive
+   resource comparison. Existing synthetic results and RSS snapshots are not
+   a substitute. The baseline launch was rejected by safety review; do not
+   bypass it via a shell or another launching mechanism.
 3. User decides when real Desktop tasks may be stopped/relaunched for a real
    approval/model compatibility gate. Current running Desktop was not disturbed.
 4. Obtain separate explicit permission to push this candidate to PR #128's
    source branch, then obtain fresh GitHub CI/review. Never merge automatically.
 5. Signing/notarization, release packaging and release gate remain unverified
    and separate from local development-preview acceptance.
+
+## Unlock follow-up: September 13, 08:58-09:05 Asia/Taipei
+
+User reported the Mac unlocked. Candidate HEAD `9b66f1b` was clean; implementation
+remains `000043a` and executable hash remains `479faaffe9e37004a78d6d96867ae702ce1c5534c8fd53275f2abd091118278d`.
+Main tracked dirty diff hash was again unchanged. No source or runtime policy
+changed for these checks, and there was no push/PR mutation.
+
+### Newly accepted on the exact integrated native bundle
+
+- Reopened the same bundle by full path (old PID 69833 no longer existed).
+  New PID 12134 showed a working monitor and the 27-message parent history.
+  Tool acquisition took 8454 ms; a subsequent observation at 31,317 ms showed
+  the working monitor. This is a coarse observation interval, **not** measured
+  app-only startup latency or a completed before/after comparison.
+- With no fake owner, Recheck completed at 08:59:01 and explicitly remained
+  not connected; no composer/send action appeared and no thread was resumed.
+- Started the existing no-model fixture for parent thread
+  `01a0958d-91c9-7730-ab96-f80741a67a2b`. Recheck on the open view discovered it
+  and showed the composer plus seven synthetic pending cards.
+- Stopped only the freshly verified fixture PID 12452 with SIGTERM. All
+  answer/form controls became disabled, approval actions were replaced with
+  connection-lost/stale notices, and Stop became disabled/disconnected.
+- Escape closed the detail. Reopening it and pressing Recheck completed at
+  09:00:40 with explicit not-connected status. No delivery was attempted and
+  no automatic retry/resume occurred.
+- Opened the active Tesla child through its native parent sidebar and jumped
+  to the latest user message, `解鎖了`. The 57-message history included the
+  current turn's first two commentary messages. While the detail remained
+  open, the newly emitted commentary beginning `斷線後的卡片與 Stop 已失效` appeared
+  in the native accessibility tree without another navigation, manual retry,
+  close/reopen or transcript edit. This witnesses the integrated live-refresh
+  path (not just the earlier bundle's history behavior).
+- Native Cmd-Q ended candidate PID 12134 and all four launch-correlated WebKit
+  helpers 12137/12138/12139/12140. The post-quit UI lookup reported procNotFound,
+  and read-only `ps` confirmed all five absent; other pre-existing WebKit
+  processes remained. This establishes this bundle's exit cleanup.
+
+Fixture command: `python3 scripts/experimental/codex-interaction-ui-fixture.py
+01a0958d-91c9-7730-ab96-f80741a67a2b`. Local diagnostic directory:
+`/tmp/c9watch-codex-501/6925e527-26e4-4a92-9369-b649ec19e774/`.
+It exited 0, removed its sockets/ready marker, and retained only its image
+fixture. No message/answer/decision log was produced. Its one no-close-frame
+exception is not a clean WebSocket closing-handshake claim.
+
+RSS observations for PID 12134 plus the four lifecycle-verified helpers (KiB):
+
+| Process age | Main | GPU | Networking | WebContent 1 | WebContent 2 | Sum |
+|---|---:|---:|---:|---:|---:|---:|
+| 25 s | 112,144 | 23,968 | 8,496 | 50,000 | 17,568 | 212,176 |
+| 3m31s, active history | 111,632 | 63,872 | 11,120 | 93,680 | 44,944 | 325,248 |
+
+Different UI content makes these observations unsuitable for a leak slope or
+native non-regression conclusion. Shared pages may be counted more than once.
+
+### New action-time permission boundary
+
+Before starting the controlled alternating comparison, the integrated candidate
+was fully closed. The local baseline hash was verified as
+`a874666c4837d4d38a361d5994b11d93a1cb0e31515b6888fddc35f37da0556e` at
+`/private/tmp/c9watch-messaging-ready/src-tauri/target/debug/bundle/macos/c9watch Messaging Candidate.app`.
+Computer Use rejected its launch as an unsigned locally built executable from
+an unrecognized source and required **confirmation at action time**. This is
+a safety-review boundary despite earlier general candidate-QA authorization,
+not a baseline startup/performance failure. No fallback launcher was used.
+
+Next approval must explicitly cover launching both that baseline and
+`c9watch Messaging Integrated Candidate.app` from the same bundle directory for
+local no-model comparison. This grants neither real Desktop/model execution,
+push/PR update, nor signing/release authority. Until the comparison and remaining
+remote/real-provider gates are resolved, PR #128 remains not merge-ready.
