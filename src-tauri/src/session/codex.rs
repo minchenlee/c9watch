@@ -67,6 +67,8 @@ pub enum CodexLifecycle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexMessage {
+    #[serde(skip)]
+    pub images: Vec<super::parser::ImageBlock>,
     pub timestamp: String,
     pub role: String,
     pub message_type: MessageType,
@@ -456,7 +458,7 @@ impl CodexSessionSource {
             loop {
                 let line_start = entry.offset;
                 line.clear();
-                let bytes_read = reader.read_until(b'\n', &mut line)?;
+                let bytes_read = read_conversation_line(&mut reader, &mut line)?;
                 if bytes_read == 0 {
                     break;
                 }
@@ -469,6 +471,7 @@ impl CodexSessionSource {
                 }
 
                 entry.offset = line_start + bytes_read as u64;
+                if entry.offset > MAX_CONVERSATION_BYTES { return Err(io::Error::new(io::ErrorKind::InvalidData, "Conversation exceeds 128 MiB preview limit")); }
                 entry.logical_prefix_hash = hash_bytes(entry.logical_prefix_hash, &line);
                 apply_rollout_line(&mut entry.summary, &line, self.include_tools);
                 if let Some(cb) = on_progress.as_mut() {
@@ -884,6 +887,7 @@ fn apply_rollout_line(summary: &mut CodexRolloutSummary, line: &[u8], capture_to
     struct PayloadHeader {
         #[serde(rename = "type")]
         kind: Option<String>,
+        name: Option<String>,
     }
     #[derive(Deserialize)]
     struct ConversationHeader {
@@ -906,6 +910,10 @@ fn apply_rollout_line(summary: &mut CodexRolloutSummary, line: &[u8], capture_to
         Some("response_item") => {
             capture_tool_messages
                 || header.payload.as_ref().and_then(|p| p.kind.as_deref()) == Some("message")
+                || header.payload.as_ref().is_some_and(|p| {
+                    p.kind.as_deref() == Some("function_call")
+                        && is_codex_question_tool(p.name.as_deref().unwrap_or_default())
+                })
         }
         _ => false,
     };
@@ -968,6 +976,7 @@ fn push_codex_message(
         content
     };
     summary.messages.push(CodexMessage {
+        images: Vec::new(),
         timestamp: timestamp.to_string(),
         role: role.to_string(),
         message_type,
@@ -1202,6 +1211,33 @@ fn read_monitor_line(
     })
 }
 
+const MAX_CONVERSATION_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_CONVERSATION_RECORD: u64 = 8 * 1024 * 1024;
+
+fn read_conversation_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<usize> {
+    let size = reader.take(MAX_CONVERSATION_RECORD + 1).read_until(b'\n', line)?;
+    if size as u64 > MAX_CONVERSATION_RECORD {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Conversation record exceeds 8 MiB preview limit. Open the original session in Codex."));
+    }
+    Ok(size)
+}
+
+fn limit_conversation_images(messages: &mut [CodexMessage]) {
+    let mut count = 0;
+    let mut bytes = 0;
+    for message in messages {
+        let before = message.images.len();
+        message.images.retain(|image| {
+            if count >= 8 || bytes + image.data.len() > 12 * 1024 * 1024 { return false; }
+            count += 1; bytes += image.data.len(); true
+        });
+        if before != message.images.len() {
+            message.content.push_str("\n[Image unavailable: preview limit reached]");
+            message.content = message.content.trim().to_string();
+        }
+    }
+}
+
 fn read_line_at(path: &Path, offset: u64, bytes: u64) -> io::Result<Vec<u8>> {
     // Rare fallback for a relevant record whose header appears beyond the
     // bounded capture prefix. Ordinary records are captured and parsed once.
@@ -1295,7 +1331,11 @@ fn thread_rollout_suffix(thread_id: &str) -> String {
 fn path_matches_thread(path: &Path, suffix: &str) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(suffix))
+        .is_some_and(|name| name.starts_with("rollout-") && (name.ends_with(suffix) || {
+            let prefix = suffix.trim_end_matches(".jsonl");
+            name.strip_suffix(".jsonl").and_then(|stem| stem.rsplit_once('_'))
+                .is_some_and(|(stem, revision)| stem.ends_with(prefix) && uuid::Uuid::parse_str(revision).is_ok())
+        }))
 }
 
 fn collect_thread_rollouts(sessions_root: &Path, suffix: &str) -> Vec<PathBuf> {
@@ -1334,6 +1374,9 @@ fn resolve_thread_rollout_paths_with_cache(
 
 fn thread_id_from_rollout_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
+    let stem = stem.rsplit_once('_')
+        .filter(|(_, revision)| uuid::Uuid::parse_str(revision).is_ok())
+        .map_or(stem, |(base, _)| base);
     if stem.len() < 36 {
         return None;
     }
@@ -1401,9 +1444,13 @@ fn apply_rollout_event_with_tools(
     match event_type {
         Some("session_meta") => apply_session_meta(summary, timestamp, payload),
         Some("event_msg") => apply_event_message(summary, timestamp, payload, compact_for_monitor),
-        Some("response_item") => {
-            apply_response_item(summary, timestamp, payload, capture_tool_messages)
-        }
+        Some("response_item") => apply_response_item(
+            summary,
+            timestamp,
+            payload,
+            capture_tool_messages,
+            compact_for_monitor,
+        ),
         _ => {}
     }
 }
@@ -1512,6 +1559,16 @@ fn apply_event_message(
                 "assistant"
             };
             if let Some(content) = payload.get("message").and_then(Value::as_str) {
+                let normalized;
+                let content = if role == "user" {
+                    let Some(text) = display_user_text(content) else {
+                        return;
+                    };
+                    normalized = text;
+                    normalized.as_str()
+                } else {
+                    content
+                };
                 push_codex_message(
                     summary,
                     timestamp,
@@ -1601,25 +1658,40 @@ fn response_item_content_text(content: &Value) -> Option<String> {
     }
 }
 
-const CODEX_CONTEXT_PREFIXES: &[&str] = &[
-    "<app-context>",
-    "<recommended_plugins>",
-    "<environment_context>",
-    "<permissions instructions>",
-    "<collaboration_mode>",
-    "<apps_instructions>",
-    "<plugins_instructions>",
-    "<skills_instructions>",
-    "# AGENTS.md instructions",
-    "## Memory",
-    "# Memory",
+const CODEX_CONTEXT_TAGS: &[&str] = &[
+    "app-context",
+    "recommended_plugins",
+    "environment_context",
+    "permissions instructions",
+    "collaboration_mode",
+    "apps_instructions",
+    "plugins_instructions",
+    "skills_instructions",
 ];
 
 fn is_codex_context_message(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    CODEX_CONTEXT_PREFIXES
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix))
+    let trimmed = content.trim();
+    CODEX_CONTEXT_TAGS.iter().any(|tag| {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        trimmed.starts_with(&open)
+            && trimmed.ends_with(&close)
+            && trimmed.len() >= open.len() + close.len()
+    })
+}
+
+/// Strip Desktop-generated attachment preambles; do not relabel them as user prose.
+pub(crate) fn display_user_text(content: &str) -> Option<String> {
+    let mut text = content.trim();
+    if text.starts_with("# Files mentioned by the user:") {
+        if let Some((_, request)) = text.split_once("## My request:") {
+            text = request.trim();
+        }
+    }
+    if is_codex_context_message(text) {
+        return None;
+    }
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 fn response_item_title_candidate(payload: &Value, role: &str, content: &str) -> bool {
@@ -1650,12 +1722,208 @@ pub(crate) fn response_item_message_text(payload: &Value) -> Option<(String, Str
         // conversation content.
         _ => return None,
     };
-    let content = response_item_content_text(payload.get("content")?)?;
+    let content = response_item_content_text(payload.get("content")?).or_else(|| {
+        (role == "user"
+            && payload["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "input_image")))
+        .then(|| "[Image attached]".to_string())
+    })?;
     if content.trim().is_empty() {
         return None;
     }
     let title_candidate = response_item_title_candidate(payload, role, &content);
+    if role == "user" {
+        let kinds = payload
+            .pointer("/internal_chat_message_metadata_passthrough/content_item_kinds")
+            .and_then(Value::as_array);
+        if kinds.is_some_and(|k| {
+            !k.is_empty()
+                && !k
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|v| v.starts_with("user."))
+        }) {
+            return None;
+        }
+        return Some((role.into(), display_user_text(&content)?, title_candidate));
+    }
     Some((role.to_string(), content, title_candidate))
+}
+
+// Resolve only explicit image blocks/markup while opening a conversation, never
+// during monitor discovery. Bound encoded images across the entire preview.
+fn attach_codex_images(summary: &mut CodexRolloutSummary, payload: &Value, timestamp: &str) {
+    let identity = response_item_message_text(payload).map(|(_, text, _)| message_identity(&text));
+    let Some(index) = summary.messages.iter().rposition(|m| {
+        m.timestamp == timestamp && Some(m.content_identity) == identity
+    }) else {
+        return;
+    };
+    if summary.messages[index].role != "user" || !summary.messages[index].images.is_empty() {
+        return;
+    }
+    #[cfg(feature = "gui")]
+    {
+        use base64::Engine;
+        let used: usize = summary
+            .messages
+            .iter()
+            .flat_map(|m| &m.images)
+            .map(|i| i.data.len())
+            .sum();
+        let mut remaining = (12 * 1024 * 1024usize).saturating_sub(used);
+        let mut remaining_count = 8usize.saturating_sub(summary.messages.iter().map(|m| m.images.len()).sum());
+        let message = &mut summary.messages[index];
+        let mut sources = Vec::new();
+        if let Some(blocks) = payload["content"].as_array() {
+            for block in blocks {
+                if block["type"] == "input_image" {
+                    if let Some(url) = block["image_url"].as_str() {
+                        sources.push(url.to_string());
+                    }
+                }
+            }
+        }
+        let content = message.content.clone();
+        for part in content.split("<image ").skip(1) {
+            if let Some(tag) = part.split_once('>').map(|p| p.0) {
+                if let Some(path) = tag
+                    .split_once("path=\"")
+                    .and_then(|p| p.1.split_once('"'))
+                    .map(|p| p.0)
+                {
+                    sources.push(path.to_string());
+                }
+            }
+        }
+        for source in sources.into_iter().take(4) {
+            if remaining_count == 0 { break; }
+            let loaded = (|| -> Option<super::parser::ImageBlock> {
+                let bytes = if source.starts_with("data:image/") {
+                    let (header, data) = source.split_once(',')?;
+                    if !header.ends_with(";base64") || data.len() > remaining.min(6 * 1024 * 1024) {
+                        return None;
+                    }
+                    base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .ok()?
+                } else {
+                    let path = Path::new(&source);
+                    if !path.is_absolute() {
+                        return None;
+                    }
+                    // Check before opening, then verify the opened descriptor as well.
+                    // O_NONBLOCK prevents a raced replacement with a FIFO from hanging.
+                    if !fs::metadata(path).ok()?.is_file() {
+                        return None;
+                    }
+                    let mut options = fs::OpenOptions::new();
+                    options.read(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        options.custom_flags(libc::O_NONBLOCK);
+                    }
+                    let mut file = options.open(path).ok()?;
+                    let meta = file.metadata().ok()?;
+                    if !meta.is_file() || meta.len() > 4 * 1024 * 1024 {
+                        return None;
+                    }
+                    let mut bytes = Vec::new();
+                    (&mut file)
+                        .take(4 * 1024 * 1024 + 1)
+                        .read_to_end(&mut bytes)
+                        .ok()?;
+                    if bytes.len() > 4 * 1024 * 1024 {
+                        return None;
+                    }
+                    bytes
+                };
+                let mime = crate::codex_images::validate(&bytes).ok()?;
+                let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                if data.len() > remaining {
+                    return None;
+                }
+                Some(super::parser::ImageBlock {
+                    media_type: mime.into(),
+                    data,
+                })
+            })();
+            if let Some(image) = loaded {
+                if message.images.contains(&image) {
+                    continue;
+                }
+                remaining -= image.data.len();
+                remaining_count -= 1;
+                message.images.push(image);
+            }
+        }
+    }
+    // Normalization is part of the conversation contract in every build. CLI
+    // builds do not read images, but must not leak generated path markup either.
+    let message = &mut summary.messages[index];
+    let fallback = if message.images.is_empty() { "[Image unavailable]" } else { "" };
+    let mut text = message.content.clone();
+    while let Some(start) = text.find("<image ") {
+        let Some(end) = text[start..].find("</image>").map(|i| start + i + 8) else {
+            break;
+        };
+        text.replace_range(start..end, fallback);
+    }
+    if text.trim() == "[Image attached]" {
+        text = fallback.into();
+    }
+    message.content = text.trim().to_string();
+}
+
+fn is_codex_question_tool(name: &str) -> bool {
+    matches!(
+        name.rsplit('.').next(),
+        Some("request_user_input" | "request_user_input_async")
+    )
+}
+
+fn codex_question_text(payload: &Value) -> Option<String> {
+    if !is_codex_question_tool(payload.get("name")?.as_str()?) {
+        return None;
+    }
+    let args = payload.get("arguments")?;
+    let parsed;
+    let args = if let Some(raw) = args.as_str() {
+        parsed = serde_json::from_str::<Value>(raw).ok()?;
+        &parsed
+    } else {
+        args
+    };
+    let mut parts = Vec::new();
+    for question in args.get("questions")?.as_array()? {
+        let title = question
+            .get("question")
+            .or_else(|| question.get("title"))
+            .and_then(Value::as_str)?;
+        let mut part = format!("### Question\n\n{title}");
+        if let Some(options) = question.get("options").and_then(Value::as_array) {
+            for (index, option) in options.iter().enumerate() {
+                let label = option
+                    .as_str()
+                    .or_else(|| option.get("label").and_then(Value::as_str))
+                    .unwrap_or_default();
+                part.push_str(&format!("\n\n{}. {}", index + 1, label));
+                if let Some(description) = option.get("description").and_then(Value::as_str) {
+                    part.push_str(&format!(" — {description}"));
+                }
+            }
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}\n\n_Question from Codex · respond in the original Codex session._",
+        parts.join("\n\n")
+    ))
 }
 
 fn apply_response_item(
@@ -1663,10 +1931,25 @@ fn apply_response_item(
     timestamp: &str,
     payload: &Value,
     capture_tool_messages: bool,
+    compact_for_monitor: bool,
 ) {
     let Some(kind) = payload.get("type").and_then(Value::as_str) else {
         return;
     };
+    if kind == "function_call" {
+        if let Some(content) = codex_question_text(payload) {
+            push_codex_message(
+                summary,
+                timestamp,
+                "assistant",
+                MessageType::Assistant,
+                content,
+                compact_for_monitor,
+                false,
+            );
+            return;
+        }
+    }
     let (message_type, role, content) = match kind {
         "message" => {
             let Some((role, content, title_candidate)) = response_item_message_text(payload) else {
@@ -1682,9 +1965,12 @@ fn apply_response_item(
                     MessageType::Assistant
                 },
                 content,
-                !capture_tool_messages,
+                compact_for_monitor,
                 title_candidate,
             );
+            if !compact_for_monitor {
+                attach_codex_images(summary, payload, timestamp);
+            }
             return;
         }
         _ if !capture_tool_messages => return,
@@ -1803,7 +2089,7 @@ fn find_codex_conversation_under(
     )
 }
 
-fn find_codex_conversation_under_with_progress(
+pub(super) fn find_codex_conversation_under_with_progress(
     sessions_root: &Path,
     thread_id: &str,
     include_tools: bool,
@@ -1812,6 +2098,14 @@ fn find_codex_conversation_under_with_progress(
     let paths = resolve_thread_rollout_paths(sessions_root, thread_id);
     if paths.is_empty() {
         return Err(format!("Codex session {thread_id} not found"));
+    }
+    let size = paths.iter().filter_map(|p| fs::metadata(p).ok()).fold(0u64, |n, m| n.saturating_add(m.len()));
+    if paths.len() > 512 || size > MAX_CONVERSATION_BYTES {
+        return Err("Conversation exceeds the 512-segment / 128 MiB preview limit. Open the original session in Codex.".into());
+    }
+
+    if paths.iter().any(|path| path.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.contains('_'))) {
+        return paginated_conversation(&paths, thread_id, include_tools, on_progress);
     }
 
     let mut source =
@@ -1834,9 +2128,14 @@ fn find_codex_conversation_under_with_progress(
             }),
         ) {
             Ok(mut summary) => {
+                // This source only lives for one preview; do not retain another
+                // cloned transcript/image set for every history segment.
+                source.cache.remove(&path);
                 parsed_any = true;
                 messages.append(&mut summary.messages);
+                limit_conversation_images(&mut messages);
             }
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => return Err(error.to_string()),
             Err(error) => last_error = Some(error.to_string()),
         }
         read_acc = read_acc.saturating_add(file_len);
@@ -1854,6 +2153,69 @@ fn find_codex_conversation_under_with_progress(
     });
     dedup_codex_messages(&mut messages);
     Ok(messages)
+}
+
+// Edited paginated histories are new segments, not independent conversations.
+// Later history_base cutoffs also remove superseded portions of earlier edits.
+fn paginated_conversation(
+    paths: &[PathBuf], thread_id: &str, include_tools: bool,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Vec<CodexMessage>, String> {
+    let mut available = HashMap::new();
+    let mut latest = None;
+    for path in paths {
+        let mut first = Vec::new();
+        read_conversation_line(&mut BufReader::new(File::open(path).map_err(|e| e.to_string())?), &mut first).map_err(|e| e.to_string())?;
+        let meta: Value = serde_json::from_slice(&first).map_err(|e| e.to_string())?;
+        if meta["type"] != "session_meta" || meta["payload"]["id"] != thread_id {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).ok_or("Invalid rollout filename")?;
+        let rollout_id = stem.rsplit_once('_').map(|(_, id)| id).unwrap_or(thread_id).to_string();
+        let base = &meta["payload"]["history_base"];
+        let parent = if base.is_object() {
+            Some((base["thread_id"].as_str().ok_or("Missing history parent")?.to_string(),
+                base["end_ordinal_exclusive"].as_u64().ok_or("Missing history cutoff")?))
+        } else { None };
+        available.insert(rollout_id.clone(), (path, parent));
+        latest = Some(rollout_id);
+    }
+    // Follow the selected rollout's ancestry; sibling edits are abandoned history.
+    let mut next = latest;
+    let mut visited = HashSet::new();
+    let mut segments = Vec::new();
+    let mut ceiling = u64::MAX;
+    while let Some(id) = next {
+        if !visited.insert(id.clone()) { return Err("Cycle in conversation history".into()); }
+        let (path, parent) = available.get(&id).ok_or_else(|| format!("Missing conversation history segment: {id}"))?;
+        segments.push((*path, ceiling));
+        next = parent.as_ref().map(|(id, cutoff)| {
+            ceiling = ceiling.min(*cutoff);
+            id.clone()
+        });
+    }
+    segments.reverse();
+    let total = segments.iter().filter_map(|(p, _)| fs::metadata(p).ok()).map(|m| m.len()).sum();
+    let mut read = 0;
+    let mut summary = CodexRolloutSummary::default();
+    for (path, end) in segments {
+        let mut reader = BufReader::new(File::open(path).map_err(|e| e.to_string())?);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let size = read_conversation_line(&mut reader, &mut line).map_err(|e| e.to_string())?;
+            if size == 0 { break; }
+            read += size as u64; on_progress(read, total);
+            if read > MAX_CONVERSATION_BYTES { return Err("Conversation exceeds 128 MiB preview limit".into()); }
+            if line.last() != Some(&b'\n') { break; }
+            let Ok(value) = serde_json::from_slice::<Value>(&line) else { continue; };
+            let ordinal = value["ordinal"].as_u64().ok_or("Missing ordinal in paginated history")?;
+            if ordinal >= end { continue; }
+            apply_rollout_event_with_tools(&mut summary, &value, include_tools, false);
+        }
+    }
+    dedup_codex_messages(&mut summary.messages);
+    Ok(summary.messages)
 }
 
 #[cfg(test)]
@@ -1928,6 +2290,186 @@ mod tests {
             .iter()
             .filter_map(|session| session.session_id.as_deref())
             .collect()
+    }
+
+    #[cfg(all(feature = "gui", unix))]
+    #[test]
+    #[ignore = "read-only diagnostic for a caller-selected local Codex task"]
+    fn local_edited_conversation_diagnostic() {
+        let id = std::env::var("C9WATCH_QA_THREAD").unwrap();
+        let messages = find_codex_conversation(&id, false).unwrap();
+        eprintln!("Loaded {} messages for {}", messages.len(), id);
+        for message in messages.iter().rev().take(2) {
+            eprintln!("{} {}", message.timestamp, message.content.chars().take(160).collect::<String>());
+        }
+        assert!(!messages.is_empty());
+    }
+
+    #[test]
+    fn edited_paginated_history_replaces_old_tail_and_survives_a_second_edit() {
+        let temp = TempDir::new().unwrap();
+        let id = "11111111-1111-4111-8111-111111111111";
+        let original = temp.path().join(format!("rollout-2026-09-08T00-00-00-{id}.jsonl"));
+        let revision = temp.path().join(format!("rollout-2026-09-08T00-01-00-{id}_22222222-2222-4222-8222-222222222222.jsonl"));
+        let meta = |ordinal, cutoff: Option<u64>| {
+            let mut p = serde_json::json!({"id":id,"cwd":"/tmp","history_mode":"paginated"});
+            if let Some(cutoff) = cutoff {p["history_base"] = serde_json::json!({"thread_id":id,"end_ordinal_exclusive":cutoff});}
+            serde_json::json!({"ordinal":ordinal,"type":"session_meta","payload":p}).to_string()
+        };
+        let message = |ordinal, text: &str| serde_json::json!({"ordinal":ordinal,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}}).to_string();
+        write_lines(&original, &[meta(0,None),message(1,"keep"),message(2,"old")], true);
+        write_lines(&revision, &[meta(2,Some(2)),message(3,"edited")], true);
+        assert_eq!(thread_id_from_rollout_filename(&revision).as_deref(), Some(id));
+        let contents = || find_codex_conversation_under(temp.path(),id,false).unwrap().into_iter().map(|m|m.content).collect::<Vec<_>>();
+        assert_eq!(contents(), vec!["keep", "edited"]);
+        let second = temp.path().join(format!("rollout-2026-09-08T00-02-00-{id}_33333333-3333-4333-8333-333333333333.jsonl"));
+        let mut chained: Value = serde_json::from_str(&meta(4, Some(4))).unwrap();
+        chained["payload"]["history_base"]["thread_id"] = serde_json::json!("22222222-2222-4222-8222-222222222222");
+        write_lines(&second, &[chained.to_string(), message(5,"second edit")], true);
+        assert_eq!(contents(), vec!["keep", "edited", "second edit"]);
+        write_lines(&second, &[meta(1,Some(1)),message(2,"replacement")], true);
+        assert_eq!(contents(), vec!["replacement"]);
+        chained["payload"]["history_base"]["thread_id"] = serde_json::json!("missing");
+        write_lines(&second, &[chained.to_string()], true);
+        assert!(find_codex_conversation_under(temp.path(),id,false).unwrap_err().contains("Missing conversation history segment"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conversation_rejects_fifo_image_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("image.png");
+        let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+        let payload = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":format!("<image path=\"{}\"></image>", path.display())}]});
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut summary = CodexRolloutSummary::default();
+            apply_response_item(&mut summary, "now", &payload, false, false);
+            tx.send(summary).ok();
+        });
+        let summary = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("FIFO image must not block conversation loading");
+        assert!(summary.messages[0].images.is_empty());
+        assert_eq!(summary.messages[0].content, "[Image unavailable]");
+    }
+
+    #[test]
+    fn conversation_unavailable_images_have_a_fallback_in_every_build() {
+        let temp = TempDir::new().unwrap();
+        let invalid = temp.path().join("invalid.png");
+        fs::write(&invalid, b"not an image").unwrap();
+        let truncated = temp.path().join("header-only.png");
+        fs::write(&truncated, b"\x89PNG\r\n\x1a\n").unwrap();
+        let oversized = temp.path().join("large.png");
+        let file = fs::File::create(&oversized).unwrap();
+        file.set_len(4 * 1024 * 1024 + 1).unwrap();
+        for path in [invalid, truncated, oversized, temp.path().join("missing.png"), temp.path().to_path_buf()] {
+            let payload = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":format!("Look\n<image path=\"{}\"></image>", path.display())}]});
+            let mut summary = CodexRolloutSummary::default();
+            apply_response_item(&mut summary, "now", &payload, false, false);
+            assert!(summary.messages[0].images.is_empty());
+            assert_eq!(summary.messages[0].content, "Look\n[Image unavailable]");
+        }
+        let payload = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,bad!"}]});
+        let mut summary = CodexRolloutSummary::default();
+        apply_response_item(&mut summary, "now", &payload, false, false);
+        assert!(summary.messages[0].images.is_empty());
+        assert_eq!(summary.messages[0].content, "[Image unavailable]");
+    }
+
+    #[test]
+    fn conversation_preview_rejects_oversized_records_and_files() {
+        for paginated in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let id = "00000000-0000-0000-0000-000000000001";
+            let suffix = if paginated { format!("_{id}") } else { String::new() };
+            let path = temp.path().join(format!("rollout-2026-09-12T00-00-00-{id}{suffix}.jsonl"));
+            let mut file = fs::File::create(&path).unwrap();
+            writeln!(file, "{}", serde_json::json!({"ordinal":0,"type":"session_meta","payload":{"id":id,"cwd":"/tmp"}})).unwrap();
+            io::copy(&mut io::repeat(b'x').take(MAX_CONVERSATION_RECORD + 1), &mut file).unwrap();
+            writeln!(file).unwrap();
+            let error = find_codex_conversation_under(temp.path(), id, false).unwrap_err();
+            assert!(error.contains("8 MiB preview limit"), "{error}");
+            file.set_len(MAX_CONVERSATION_BYTES + 1).unwrap();
+            let error = find_codex_conversation_under(temp.path(), id, false).unwrap_err();
+            assert!(error.contains("128 MiB preview limit"), "{error}");
+        }
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn conversation_image_count_is_bounded_across_segments() {
+        let mut messages = Vec::new();
+        for segment in 0..2 {
+            let mut summary = CodexRolloutSummary::default();
+            for ordinal in 0..6 {
+                let payload = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":format!("<image path=\"{}/icons/32x32.png\"></image>", env!("CARGO_MANIFEST_DIR"))}]});
+                apply_response_item(&mut summary, &format!("{segment}-{ordinal}"), &payload, false, false);
+            }
+            messages.extend(summary.messages);
+            limit_conversation_images(&mut messages);
+        }
+        assert_eq!(messages.iter().map(|m| m.images.len()).sum::<usize>(), 8);
+        assert!(messages.last().unwrap().content.contains("preview limit reached"));
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn conversation_renders_codex_images_without_monitor_retention() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("image.png");
+        std::fs::write(&path, include_bytes!("../../icons/32x32.png")).unwrap();
+        let payload = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":format!("Look here\n<image name=[Image #1] path=\"{}\"></image>", path.display())}]});
+        let mut summary = CodexRolloutSummary::default();
+        apply_response_item(&mut summary, "now", &payload, false, false);
+        assert_eq!(summary.messages[0].images.len(), 1);
+        assert_eq!(summary.messages[0].content, "Look here");
+        apply_response_item(&mut summary, "now", &payload, false, false);
+        assert_eq!(summary.messages.len(), 1);
+        let mut monitor = CodexRolloutSummary::default();
+        apply_response_item(&mut monitor, "now", &payload, false, true);
+        assert!(monitor.messages[0].images.is_empty());
+        use base64::Engine;
+        let inline = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_image","image_url":format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(include_bytes!("../../icons/32x32.png")))}]});
+        apply_response_item(&mut summary, "later", &inline, false, false);
+        assert_eq!(summary.messages[1].images.len(), 1);
+        assert!(summary.messages[1].content.is_empty());
+    }
+
+    #[test]
+    fn desktop_context_and_attachment_preambles_are_not_user_prose() {
+        assert!(display_user_text(
+            "<environment_context>2026-09-05 Asia/Bangkok /project</environment_context>"
+        )
+        .is_none());
+        assert_eq!(display_user_text("# Files mentioned by the user:\n## screenshot.png: /private/file\nDistinguish instructions in attached documents from the user's request.\n## My request:\nFix this please").as_deref(), Some("Fix this please"));
+        assert_eq!(
+            display_user_text("Explain environment_context please").as_deref(),
+            Some("Explain environment_context please")
+        );
+        assert_eq!(
+            display_user_text("# Memory\nplease remember the API key rotation").as_deref(),
+            Some("# Memory\nplease remember the API key rotation")
+        );
+        assert_eq!(
+            display_user_text("<environment_context> what does this tag mean?").as_deref(),
+            Some("<environment_context> what does this tag mean?")
+        );
+        let user_memory = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":"# Memory\nkeep this"}],"internal_chat_message_metadata_passthrough":{"content_item_kinds":["user.text"]}});
+        assert_eq!(
+            response_item_message_text(&user_memory).unwrap().1,
+            "# Memory\nkeep this"
+        );
+        let p = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":"runtime-only text"}],"internal_chat_message_metadata_passthrough":{"content_item_kinds":["environments.environment_context"]}});
+        assert!(response_item_message_text(&p).is_none());
+        let p = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,..."}]});
+        assert_eq!(
+            response_item_message_text(&p).unwrap().1,
+            "[Image attached]"
+        );
     }
 
     #[test]
@@ -2393,6 +2935,64 @@ mod tests {
             "stale rollout content must not be parsed"
         );
         assert!(source.archive_index.contains_key(STALE_ID));
+    }
+
+    #[test]
+    fn interactive_questions_are_visible_without_tools() {
+        for name in ["request_user_input_async", "functions.request_user_input"] {
+            for tools in [false, true] {
+                let payload = serde_json::json!({"type":"function_call","name":name,"arguments":serde_json::json!({"questions":[{"title":"支援既有 session？","options":["是","否"]},{"question":"Which mode?","options":[{"label":"Local","description":"Keep context"}]}]}).to_string()});
+                let mut summary = CodexRolloutSummary::default();
+                let line = serde_json::to_vec(&serde_json::json!({"type":"response_item","timestamp":"now","payload":payload})).unwrap();
+                apply_rollout_line(&mut summary, &line, tools);
+                assert_eq!(summary.messages.len(), 1);
+                assert_eq!(summary.messages[0].message_type, MessageType::Assistant);
+                assert!(summary.messages[0].content.contains("支援既有 session？"));
+                assert!(summary.messages[0].content.contains("2. 否"));
+                assert!(summary.messages[0].content.contains("Local — Keep context"));
+            }
+        }
+        assert!(!is_codex_question_tool("request_user_input_fake"));
+        assert!(codex_question_text(
+            &serde_json::json!({"name":"request_user_input","arguments":"invalid"})
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn response_item_conversation_preserves_long_markdown_without_tools() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("rollout-long-response.jsonl");
+        let text = format!(
+            "{}[官方說明](https://example.com/docs)\n\n```text\n完整 code block\n```\n\n最後一段",
+            "長訊息🦀".repeat(100)
+        );
+        for role in ["user", "assistant"] {
+            write_lines(
+                &path,
+                &[event(
+                    "2026-07-13T00:00:01Z",
+                    "response_item",
+                    serde_json::json!({"type":"message","role":role,"content":[{"type":"output_text","text":text}]}),
+                )],
+                true,
+            );
+            let mut monitor = CodexSessionSource::at_root(temp.path().to_path_buf());
+            assert_eq!(
+                monitor.summary_for(&path).unwrap().messages[0].content,
+                truncate_monitor_message(&text)
+            );
+            for include_tools in [false, true] {
+                let mut conversation = CodexSessionSource::conversation_at_root(
+                    temp.path().to_path_buf(),
+                    include_tools,
+                );
+                assert_eq!(
+                    conversation.summary_for(&path).unwrap().messages[0].content,
+                    text
+                );
+            }
+        }
     }
 
     #[test]
@@ -3074,7 +3674,8 @@ mod tests {
         let mut source = CodexSessionSource::at_root(temp.path().to_path_buf());
         let summary = source.summary_for(&path).unwrap();
         assert_eq!(summary.first_prompt(), Some("first prompt"));
-        assert_eq!(summary.messages.len(), 2);
+        assert_eq!(summary.messages.len(), 1);
+        assert_eq!(summary.messages[0].content, "first prompt");
     }
 
     #[test]
