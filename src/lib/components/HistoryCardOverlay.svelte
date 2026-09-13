@@ -225,7 +225,7 @@
 					<div class="header-info">
 						<div class="header-title">
 							<ProviderBadge provider={entry.provider} surface={entry.surface} />
-							<h2 id="overlay-title" class="project-name">{entry.customTitle || entry.codexTitle || entry.cursorTitle || entry.projectName}</h2>
+							<h2 id="overlay-title" class="project-name" title={entry.customTitle || entry.codexTitle || entry.cursorTitle || entry.projectName}>{entry.customTitle || entry.codexTitle || entry.cursorTitle || entry.projectName}</h2>
 						</div>
 						<div class="header-meta">
 							<span class="message-count">{#if conversation && conversation.messages.length > BATCH_SIZE}{sw.startIndex + 1}–{sw.endIndex} / {/if}{conversation?.messages.length ?? 0} messages</span>
@@ -448,6 +448,7 @@
 		display: flex;
 		align-items: center;
 		gap: var(--space-md);
+		min-width: 0;
 	}
 
 	.project-name {
@@ -461,6 +462,7 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 		max-width: 300px;
+		min-width: 0;
 	}
 
 	.header-meta {
@@ -690,7 +692,7 @@
 	}
 
 	/* ── Mobile Responsive ─────────────────────────────────────── */
-	@media (max-width: 768px) {
+	@media (max-width: 768px), (orientation: landscape) and (max-height: 500px) {
 		.overlay-backdrop {
 			padding: 0;
 		}
@@ -722,7 +724,7 @@
 		}
 
 		.project-name {
-			font-size: 13px;
+			font-size: 14px;
 			max-width: none;
 		}
 
@@ -747,18 +749,18 @@
 		}
 
 		.header-button {
-			width: 28px;
-			height: 28px;
+			width: var(--touch-min);
+			height: var(--touch-min);
 		}
 
 		.close-button {
-			width: 28px;
-			height: 28px;
+			width: var(--touch-min);
+			height: var(--touch-min);
 		}
 
 		.conversation-area {
 			padding: var(--space-md);
-			padding-bottom: 72px; /* Space for FAB */
+			padding-bottom: calc(72px + var(--safe-bottom));
 		}
 
 		/* ── FAB (Floating Action Button) ────────────── */
@@ -767,8 +769,8 @@
 			align-items: center;
 			justify-content: center;
 			position: fixed;
-			bottom: 20px;
-			right: 20px;
+			bottom: max(20px, var(--safe-bottom));
+			right: max(20px, var(--safe-right));
 			width: 48px;
 			height: 48px;
 			background: var(--bg-card);
@@ -816,6 +818,7 @@
 			right: 0;
 			bottom: 0;
 			height: 55vh;
+			padding-bottom: var(--safe-bottom);
 			background: var(--bg-card);
 			border-top: 1px solid var(--border-default);
 			z-index: 1030;

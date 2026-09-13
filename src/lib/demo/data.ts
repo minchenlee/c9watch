@@ -78,7 +78,7 @@ export function getDemoSessions(): Session[] {
 			sessionName: 'web-app',
 			customTitle: null,
 			projectPath: '/Users/demo/projects/web-app',
-			gitBranch: 'feat/auth-flow',
+			gitBranch: 'feat/oauth2-google-github-provider-callback-handler',
 			firstPrompt: 'Add OAuth2 login with Google and GitHub providers',
 			summary: 'Implementing OAuth2 authentication flow with multiple providers',
 			messageCount: 34,

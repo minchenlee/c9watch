@@ -15,6 +15,7 @@
 	import { toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
 	import { get } from 'svelte/store';
 	import { isDemoMode, toggleDemoMode } from '$lib/demo';
+	import { isPersistedDemoMode } from '$lib/demo/mode';
 	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 	import { isTauri } from '$lib/ws';
 	import StatusBar from '$lib/components/StatusBar.svelte';
@@ -69,6 +70,15 @@
 
 	onMount(() => {
 		if (browser) {
+			if (!isTauri()) {
+				const wantDemo =
+					new URLSearchParams(window.location.search).get('demo') === '1' ||
+					isPersistedDemoMode();
+				if (wantDemo) {
+					needsConnection = false;
+					if (!get(isDemoMode)) toggleDemoMode();
+				}
+			}
 			const saved = localStorage.getItem('sessionViewMode');
 			if (saved === 'project' || saved === 'all') {
 				viewMode = saved;
@@ -440,7 +450,7 @@
 {#if needsConnection}
 	<ConnectionScreen onconnected={() => (needsConnection = false)} />
 {:else}
-<div class="dashboard">
+<div class="dashboard" class:runtime-web={!isTauri()}>
 	<FdaBanner {fdaLikelyNeeded} />
 	<div class="tab-bar" class:fullscreen={isFullscreen} data-tauri-drag-region>
 		<button
@@ -679,7 +689,7 @@
 						{@const baseIdx = projectOffsets[gi] ?? 0}
 						<section class="project-section" in:flyIn|global={{ index: baseIdx }} animate:flip={{ duration: 400 }}>
 							<div class="project-header">
-								<span class="project-name">{group.displayName}</span>
+								<span class="project-name" title={group.path}>{group.displayName}</span>
 								<span class="project-count">
 									{group.attention.length + group.idle.length + group.working.length}
 								</span>
@@ -994,6 +1004,10 @@
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
 		line-height: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.project-count {
@@ -1319,17 +1333,56 @@
 	}
 
 	/* ── Mobile Responsive ─────────────────────────────────────── */
-	@media (max-width: 768px) {
+	@media (max-width: 768px), (orientation: landscape) and (max-height: 500px) {
 		.tab-bar {
-			height: 28px;
+			height: 48px;
+			overflow-x: auto;
+			overflow-y: hidden;
+			-webkit-overflow-scrolling: touch;
+			scrollbar-width: none;
+			padding-left: var(--space-md);
+			padding-right: var(--space-md);
+		}
+
+		.tab-bar.fullscreen {
+			padding-left: var(--space-md);
 		}
 
 		.tab-btn {
+			display: flex;
+			flex-shrink: 0;
+			min-height: var(--touch-min);
+			padding: 0 10px;
+		}
+
+		.tab-label {
+			font-size: 9px;
+		}
+
+		.tab-drag-region {
+			flex: 0 0 0;
+			min-width: 0;
+			overflow: hidden;
+		}
+
+		.drag-dots {
+			display: none;
+		}
+
+		.runtime-web .tab-bar {
+			padding-top: var(--safe-top);
+			padding-left: max(var(--space-sm), var(--safe-left));
+			padding-right: max(var(--space-sm), var(--safe-right));
+			height: calc(48px + var(--safe-top));
+		}
+
+		.runtime-web .tab-drag-region {
 			display: none;
 		}
 
 		.grid-container {
 			padding: var(--space-md);
+			padding-bottom: max(var(--space-md), var(--safe-bottom));
 		}
 
 		.sections-container {
@@ -1339,17 +1392,19 @@
 		.project-header {
 			flex-wrap: wrap;
 			gap: var(--space-sm);
+			row-gap: 10px;
 		}
 
 		.project-name {
 			font-size: 16px;
+			max-width: 100%;
 		}
 
 		.project-count {
 			font-size: 14px;
 		}
 
-		/* Stack status groups vertically on mobile */
+		/* Stack status groups vertically in portrait */
 		.status-groups {
 			flex-direction: column;
 			overflow-x: visible;
@@ -1375,12 +1430,78 @@
 		}
 
 		.toggle-btn {
-			width: 32px;
-			height: 32px;
+			width: var(--touch-min);
+			height: var(--touch-min);
+			min-width: var(--touch-min);
+			min-height: var(--touch-min);
 		}
 
-		.demo-toggle {
-			padding: 0 var(--space-xs);
+		.demo-toggle,
+		.mobile-connect-btn {
+			padding: 0 var(--space-sm);
+			min-width: 0;
+		}
+
+		.rename-hint-modal {
+			max-width: calc(100vw - 32px);
+			margin: var(--space-md);
+		}
+
+		.rename-hint-close {
+			min-height: var(--touch-min);
+			padding: 10px 24px;
+		}
+	}
+
+	/* Landscape phones: use the extra width for cards / status columns */
+	@media (orientation: landscape) and (max-height: 500px) {
+		.tab-bar {
+			height: 40px;
+		}
+
+		.runtime-web .tab-bar {
+			height: calc(40px + var(--safe-top));
+		}
+
+		.tab-btn {
+			min-height: 36px;
+		}
+
+		.grid-container {
+			padding: var(--space-sm) var(--space-md);
+		}
+
+		.sections-container {
+			gap: var(--space-lg);
+		}
+
+		.project-header {
+			padding-bottom: var(--space-sm);
+			margin-bottom: var(--space-sm);
+		}
+
+		.status-groups {
+			flex-direction: row;
+			overflow-x: visible;
+			padding-bottom: var(--space-sm);
+		}
+
+		.status-group {
+			min-width: 0;
+			flex: 1 1 0;
+			max-width: none;
+		}
+
+		.all-sessions-grid,
+		.all-sessions-grid.compact {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+
+		.toggle-btn {
+			width: 36px;
+			height: 36px;
+			min-width: 36px;
+			min-height: 36px;
 		}
 	}
 

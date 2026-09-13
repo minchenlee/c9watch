@@ -255,13 +255,19 @@
 	}
 
 	/* ── Mobile Responsive ─────────────────────────────────────── */
-	@media (max-width: 768px) {
+	@media (max-width: 768px), (orientation: landscape) and (max-height: 500px) {
 		.system-status-bar {
 			padding: var(--space-md);
+			gap: var(--space-sm);
 		}
 
 		.legend {
-			gap: var(--space-md);
+			flex-wrap: wrap;
+			gap: var(--space-sm) var(--space-lg);
+		}
+
+		.legend-item {
+			gap: 6px;
 		}
 
 		.legend-item .label {
@@ -270,6 +276,17 @@
 
 		.legend-item .count {
 			font-size: 13px;
+		}
+	}
+
+	@media (orientation: landscape) and (max-height: 500px) {
+		.system-status-bar {
+			padding: var(--space-sm) var(--space-md);
+			gap: 6px;
+		}
+
+		.progress-track {
+			height: 12px;
 		}
 	}
 

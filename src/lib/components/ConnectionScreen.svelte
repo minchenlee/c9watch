@@ -184,9 +184,14 @@
 		align-items: center;
 		justify-content: center;
 		height: 100vh;
+		height: 100dvh;
 		width: 100vw;
 		background: var(--bg-base);
 		padding: var(--space-xl);
+		padding-top: max(var(--space-xl), var(--safe-top));
+		padding-right: max(var(--space-xl), var(--safe-right));
+		padding-bottom: max(var(--space-xl), var(--safe-bottom));
+		padding-left: max(var(--space-xl), var(--safe-left));
 	}
 
 	.content {
@@ -423,9 +428,48 @@
 		text-align: center;
 	}
 
-	@media (max-width: 768px) {
+	@media (max-width: 768px), (orientation: landscape) and (max-height: 500px) {
 		.connection-screen {
 			padding: var(--space-lg);
+			padding-top: max(var(--space-lg), var(--safe-top));
+			padding-right: max(var(--space-lg), var(--safe-right));
+			padding-bottom: max(var(--space-lg), var(--safe-bottom));
+			padding-left: max(var(--space-lg), var(--safe-left));
+		}
+
+		.option-btn,
+		.back-btn,
+		.connect-btn {
+			min-height: var(--touch-min);
+		}
+
+		.url-input {
+			min-height: var(--touch-min);
+			font-size: 16px; /* avoid iOS zoom on focus */
+		}
+	}
+
+	@media (orientation: landscape) and (max-height: 500px) {
+		.connection-screen {
+			align-items: flex-start;
+			overflow-y: auto;
+			padding: var(--space-md);
+			padding-top: max(var(--space-md), var(--safe-top));
+		}
+
+		.content {
+			gap: var(--space-lg);
+			max-width: 480px;
+		}
+
+		.logo-box {
+			width: 40px;
+			height: 40px;
+			margin-bottom: 0;
+		}
+
+		.title {
+			font-size: 18px;
 		}
 	}
 </style>
