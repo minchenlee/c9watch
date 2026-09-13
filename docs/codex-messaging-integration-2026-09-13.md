@@ -4,9 +4,12 @@
 
 Local implementation and automated/fixture gates pass; **PR #128 is not yet
 merge-ready**. The tested candidate has resolved the current main conflicts,
-but has not been pushed. Post-disconnect native Recheck and live history refresh
-are now verified in the unlock follow-up below; controlled native startup/memory
-comparison remains incomplete. Real Desktop/model compatibility
+but has not been pushed. Post-disconnect native Recheck, live history refresh,
+image preview and repeat history opens are verified. The authorized native
+comparison below includes 520 successful backend reads, all slow samples and
+lifecycle-checked RSS. It is **not an unqualified native performance pass**:
+live-host tail/RSS variability and app-only cold-start timing remain unresolved.
+Real Desktop/model compatibility
 and release acceptance are explicitly unverified, not inferred from fixtures.
 
 This supersedes the integration and image-picker blockers in
@@ -263,11 +266,11 @@ against an equivalent baseline remains unverified.
 1. Post-disconnect Recheck, live history and close/reopen QA completed after
    unlock; see the exact-bundle evidence below. Real provider/model acceptance
    is not implied.
-2. Obtain action-time confirmation to launch both unsigned local QA bundles,
-   then complete controlled native startup/first-load and WebKit-inclusive
-   resource comparison. Existing synthetic results and RSS snapshots are not
-   a substitute. The baseline launch was rejected by safety review; do not
-   bypass it via a shell or another launching mechanism.
+2. Action-time confirmation was subsequently obtained for both unsigned local
+   QA bundles; the native comparison is recorded below. Preserve the observed
+   slow tails and varying RSS as limitations. A controlled app-only cold-start,
+   matched-age memory and long-duration/real-provider run is still needed for
+   an unrestricted native performance claim; do not relabel these gates green.
 3. User decides when real Desktop tasks may be stopped/relaunched for a real
    approval/model compatibility gate. Current running Desktop was not disturbed.
 4. Obtain separate explicit permission to push this candidate to PR #128's
@@ -340,8 +343,165 @@ an unrecognized source and required **confirmation at action time**. This is
 a safety-review boundary despite earlier general candidate-QA authorization,
 not a baseline startup/performance failure. No fallback launcher was used.
 
-Next approval must explicitly cover launching both that baseline and
+At that point, the next approval needed to explicitly cover launching both the baseline and
 `c9watch Messaging Integrated Candidate.app` from the same bundle directory for
 local no-model comparison. This grants neither real Desktop/model execution,
-push/PR update, nor signing/release authority. Until the comparison and remaining
-remote/real-provider gates are resolved, PR #128 remains not merge-ready.
+push/PR update, nor signing/release authority. The user subsequently gave that
+specific confirmation; the next section records the authorized work.
+
+## Authorized native comparison: September 13, 09:55-10:25 Asia/Taipei
+
+The user's action-time confirmation covered both exact unsigned bundles above.
+Both executable hashes were verified again after testing and are unchanged.
+Implementation remains `000043a`; no production source was changed in this
+follow-up. The only new executable source is the read-only diagnostic
+`scripts/experimental/benchmark-native-codex-history.py`.
+
+### Method and reproducibility
+
+- Alternate the baseline and integrated apps, one at a time. Before every
+  measurement, use `lsof -nP -iTCP:9210 -sTCP:LISTEN` and `ps` to verify that the
+  listener belongs to the exact authorized bundle, not another c9watch app.
+- Open the same existing, read-only Codex history in the native UI first:
+  thread `01a0958d-91c9-7730-ab96-f80741a67a2b`, 27 messages, approximately
+  4.8 MiB on disk. Its file was not edited; the normal user workspace remained
+  live. Obtain the app's ephemeral token from its native Mobile panel.
+- The probe sends only provider-qualified `getConversation`, serially, through
+  `ws://127.0.0.1:9210`. It checks request/provider/session identity and hashes
+  canonical response data. It never sends a turn, answer, approval or stop.
+- Bounds: 2-100 samples, one request in flight, 10 s/request, 90 s total,
+  5 s connect, 2 s close, 16 MiB received frame, four-frame receive queue.
+  Output contains no token or conversation body. The script requires Python's
+  `websockets` package (already installed on this host).
+- These measurements cover native backend parsing, serialization and local
+  transport, **not WebKit painting, a cold OS page cache or real model work**.
+  First request means first probe request after UI warm-up, not cold history.
+
+```sh
+cd /private/tmp/c9watch-messaging-ready
+# Launch only with action-time approval; verify exact listener PID first.
+lsof -nP -iTCP:9210 -sTCP:LISTEN
+# Set C9WATCH_QA_WS_TOKEN to the current native Mobile-panel token locally.
+# Do not put the token in a report, checked-in script or shared command log.
+python3 scripts/experimental/benchmark-native-codex-history.py \
+  01a0958d-91c9-7730-ab96-f80741a67a2b --samples 20
+python3 scripts/experimental/benchmark-native-codex-history.py \
+  01a0958d-91c9-7730-ab96-f80741a67a2b --samples 100
+# Diagnostic, only for the two explicitly labelled profiled runs below:
+/usr/bin/sample VERIFIED_QA_PID 5 1 -file /private/tmp/c9watch-native-history.sample.txt
+```
+
+All **520/520** requests succeeded, 27 messages / 12,191 canonical JSON bytes
+each, identical SHA-256
+`e680eb8649ccdc72ce313fb63f1b354eea2df8ef2d68fdb8c4afea8b738a782c`.
+No automatic retries are implemented. The connection context exited each run;
+the final baseline listener had no remaining probe connection before app quit.
+This does not erase the separate fake-owner no-close-frame limitation above.
+
+### Every run, including slow tails
+
+Rows are in measurement order. Warm statistics exclude the first request only;
+no slow sample is discarded. p95 uses nearest rank (19 warm samples in a
+20-request run therefore make p95 equal the maximum).
+
+| Run | Samples | First ms | Warm median ms | Warm p95 ms | Warm max ms | Reads >500 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| Integrated after1 | 20 | 122.369 | 70.649 | 130.121 | 130.121 | 0 |
+| Baseline before2 | 20 | 75.631 | 69.308 | 152.517 | 152.517 | 0 |
+| Integrated after2 | 20 | 74.449 | 73.369 | 758.228 | 758.228 | 5 |
+| Baseline before3 | 20 | 76.760 | 71.324 | 96.369 | 96.369 | 0 |
+| Integrated after3 | 20 | 938.927 | 82.501 | 1006.497 | 1006.497 | 9 |
+| Integrated after3, partly profiled | 100 | 693.915 | 594.141 | 1284.971 | 2198.641 | 94 |
+| Baseline before4 | 20 | 650.511 | 82.767 | 1095.410 | 1095.410 | 6 |
+| Baseline before4, partly profiled | 100 | 507.804 | 616.918 | 853.488 | 961.312 | 83 |
+| Integrated after4, no profiler | 100 | 73.455 | 69.896 | 78.309 | 91.763 | 0 |
+| Baseline before5, no profiler | 100 | 70.463 | 69.590 | 74.020 | 77.828 | 0 |
+
+The last unprofiled pair differs by +0.306 ms median (+0.44%) and +4.289 ms
+p95 (+5.79%). The slow 100-read control also degrades to 617 ms median versus
+594 ms integrated, but integrated's p95/max are worse. This is evidence of
+large live-host/debug variability, **not proof that all tail regressions are
+absent**. Profiling only overlapped part of each labelled run; it is not proven
+to explain the entire slowdown. Neither App Nap nor thermal throttling was
+established as the cause. `pmset -g therm` recorded no warning. Other user apps,
+including an unrelated older QA app, were left untouched.
+
+Read-only five-second profiles show Codex conversation parsing and filename
+walks on `tokio::runtime::blocking::pool`, and monitor detection on its separate
+polling thread. Some threads are named `tokio-runtime-worker` despite the
+blocking-pool stack; they must not be mistaken for core async workers. The
+integrated profile also contains background subagent parsing in the blocking
+pool. No dominant archive-mutex wait was identified. `codex.rs` differs from
+the baseline only by the added `opencode_summary: None` output field; the
+conversation parser is unchanged. These observations do not justify an
+unrelated provider rewrite or silently broadening this feature's scope.
+
+Logs: `/private/tmp/c9watch-native-{after1,before2,after2,before3,after3,before4}-ws.json`,
+`/private/tmp/c9watch-native-{after3,before4}-stress-ws.json`,
+`/private/tmp/c9watch-native-{after4,before5}-unprofiled-ws.json`, and
+`/private/tmp/c9watch-native-{after3,before4}-history.sample.txt`.
+
+### Native UI, RSS and process lifecycle
+
+The fixed history's actual message body, not only its monitor-card summary,
+was observed in both bundles. Integrated after4 then passed three consecutive
+close/reopen cycles, with the actual body visible in the first post-click
+observation: **1146, 790, 818 ms**. Those are automation-inclusive observation
+bounds, not app-only render timings. Earlier integrated opens briefly showed
+Loading and subsequently completed. An earlier baseline pilot stayed at
+`27 EARLIER MESSAGES` without a body after a rapid reopen; that pilot is not
+counted as a successful warm-read timing and was not observed in these three
+integrated reopens.
+
+Initial app acquisition ranged roughly 3-10 s in this campaign, sometimes
+returning an empty window or a zero-session monitor. Later monitor observations
+included variable tool/reasoning gaps (one was 58.8 s). They cannot establish
+app-only startup latency; **no 58.8 s startup regression is asserted**. No
+page-cache purge, other-app termination or real Desktop restart was performed.
+
+RSS is KiB, summed across the QA process and four launch-correlated WebKit
+helpers. Exit checks confirmed these helpers disappear with that exact app;
+pre-existing helpers were excluded. Shared pages can still be double-counted.
+
+| Run / point | App age | App RSS | WebKit-inclusive sum |
+|---|---:|---:|---:|
+| Baseline before2, after 20 | 1m09s | 127,664 | 266,464 |
+| Integrated after2, after 20 | 1m10s | 149,440 | 287,696 |
+| Baseline before3, after 20 | 58s | 109,296 | 212,864 |
+| Integrated after3, after 20 | 1m43s | 131,008 | 263,648 |
+| Integrated after3, after 100 | 4m22s | 108,992 | 234,688 |
+| Baseline before4, after 100 | 5m48s | 110,848 | 197,936 |
+| Integrated after4, after 100 | 1m07s | 154,544 | 307,136 |
+| Baseline before5, after 100 | 1m26s | 117,920 | 241,952 |
+
+The last unmatched-age sum is 26.9% higher integrated; it is **not normalized
+away**. Other initial snapshots were higher for baseline (398,768 KiB app at
+12 s versus integrated 318,240 at 22 s). Profiles reported main-process peak
+physical footprint 293.9 MiB baseline / 291.2 MiB integrated, a different metric
+from RSS. There is no demonstrated monotonic growth in these short observations,
+but neither a hard native RSS bound, leak-freedom proof nor a reliable matched-age
+memory non-regression conclusion. Retained-cache bounds and isolated peak RSS
+are established separately by the fixture tests, not by these native snapshots.
+
+Every campaign app was quit through native Cmd-Q. Read-only `ps` verified each
+app and its four helpers absent: baseline 23461, 27820, 28813, 30534, 33909;
+integrated 25708, 28356, 29235, 33072. The last listener on 9210 was gone.
+No unrelated app was stopped. Runtime tokens expired with their owning apps.
+
+The new probe passes `py_compile` and `--help`; missing token exits 1 without
+leaking details, and `--samples 101` exits 2 before connecting. Its real positive
+path is covered by the 520 measurements above. Production Rust/frontend source
+and exact bundle hashes did not change, so the earlier full integrated suites
+remain tied to the same implementation; this follow-up does not claim new full
+suite execution.
+
+### Current handoff boundary
+
+Read-only GitHub recheck after the campaign still reports PR #128 OPEN,
+non-draft, CONFLICTING/DIRTY at `f906bff`, with the September 8 failed check;
+main remains `69e2288b`. The local candidate contains both refs as ancestors and
+can be pushed by fast-forward, without force. Main's tracked dirty diff hash
+remained unchanged. **No push, remote PR update, merge, real-model/approval
+execution, signing or release was performed.** Separate push authorization is
+needed to obtain fresh remote CI; the native limitations and real-provider /
+release gates must remain visible even if that CI passes.
