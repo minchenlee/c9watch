@@ -1,0 +1,38 @@
+name: C9WatchWidgets
+options:
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "0.8.1"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGNING_ALLOWED: NO
+targets:
+  C9WatchWidgetHost:
+    type: application
+    platform: macOS
+    sources:
+      - path: Host
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.minchenlee.c9watch.widgethost
+      INFOPLIST_KEY_CFBundleDisplayName: c9watch
+      INFOPLIST_KEY_LSUIElement: YES
+      CODE_SIGN_ENTITLEMENTS: Host/Host.entitlements
+  C9WatchWidget:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Widget
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.minchenlee.c9watch.widget
+      INFOPLIST_FILE: Widget/Info.plist
+      CODE_SIGN_ENTITLEMENTS: Widget/Widget.entitlements
+      APPLICATION_EXTENSION_API_ONLY: YES
+schemes:
+  C9WatchWidgets:
+    build:
+      targets:
+        C9WatchWidget: all

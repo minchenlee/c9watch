@@ -9,6 +9,8 @@ node_modules
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 Icon Exports/
+macos-widget/build/
+macos-widget/C9WatchWidgets.xcodeproj/
 .worktrees/
 
 # Local development notes (not tracked)
