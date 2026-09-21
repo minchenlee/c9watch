@@ -1,6 +1,6 @@
 use crate::session::enrichment::enrich_detected_sessions;
 pub use crate::session::enrichment::{detect_and_enrich_sessions, truncate_string, Session};
-use crate::session::{DetectorState, SessionStatus};
+use crate::session::{pid_is_alive, DetectorState, SessionStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -29,19 +29,6 @@ struct WorkerMetaOverlay {
     spawned_by: Option<String>,
     stopped_at: Option<String>,
     pid: Option<u64>,
-}
-
-#[cfg(unix)]
-fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-}
-
-#[cfg(not(unix))]
-fn pid_is_alive(_pid: u32) -> bool {
-    true
 }
 
 fn load_workers_overlay() -> Arc<HashMap<String, String>> {
@@ -432,24 +419,6 @@ fn fire_notification(
 mod tests {
     use super::*;
     use crate::session::SessionSource;
-
-    #[cfg(unix)]
-    #[test]
-    fn pid_is_alive_detects_dead_pid() {
-        // PID 0 is never a real process.
-        assert!(!pid_is_alive(0));
-        // PID 999999 is extremely unlikely to be live (kernel default pid_max
-        // on macOS is 99999, and even on Linux systems with expanded range
-        // it's highly unlikely to hit this).
-        assert!(!pid_is_alive(999_999));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pid_is_alive_detects_live_pid() {
-        // Our own pid must be alive.
-        assert!(pid_is_alive(std::process::id()));
-    }
 
     #[test]
     fn synthetic_cursor_detection_and_enrichment_uses_fixture_cursor_root() {

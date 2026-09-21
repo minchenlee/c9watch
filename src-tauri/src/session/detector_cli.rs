@@ -1,4 +1,5 @@
 use super::detector::encode_path_for_matching;
+use super::pid_is_alive;
 use super::source::{
     CliActivity, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionKind,
     SessionSource,
@@ -152,6 +153,14 @@ impl SessionSource for CliSessionSource {
         let agents: Vec<CliAgent> =
             serde_json::from_slice(&buf).map_err(|e| SessionDetectorError::Parse(e.to_string()))?;
 
+        // `claude agents --json` is a registry Claude Code writes and prunes itself;
+        // pruning runs in the agent's own exit path, so a hard kill (an external
+        // SIGKILL, or a process wedged in an uninterruptible syscall no signal can
+        // interrupt) can leave a stale entry pointing at a pid that no longer exists,
+        // reported as busy/idle/waiting like any live agent. Drop those before they
+        // ever reach status inference.
+        let agents = filter_live_agents(agents, pid_is_alive);
+
         // Filter out non-CLI entrypoints (e.g. sdk-ts from Zed/IDE integrations).
         // `claude agents --json` lists every live agent including SDK-driven ones,
         // but those don't write project JSONLs and aren't what c9watch monitors.
@@ -169,6 +178,13 @@ impl SessionSource for CliSessionSource {
     fn backend_name(&self) -> &'static str {
         "cli"
     }
+}
+
+/// Drops any agent whose reported pid is no longer an actual running process.
+/// Takes the liveness check as a parameter so tests can fake it without
+/// spawning/killing real processes.
+fn filter_live_agents(agents: Vec<CliAgent>, is_alive: impl Fn(u32) -> bool) -> Vec<CliAgent> {
+    agents.into_iter().filter(|a| is_alive(a.pid)).collect()
 }
 
 /// Returns true if the agent at this pid was launched as a `claude` CLI (not via
@@ -322,6 +338,30 @@ mod tests {
         let json = r#"[{"pid":1,"cwd":"/tmp","startedAt":1,"sessionId":"x"}]"#;
         let agents: Vec<CliAgent> = serde_json::from_str(json).unwrap();
         assert_eq!(agents[0].kind, "interactive");
+    }
+
+    #[test]
+    fn filter_live_agents_drops_dead_pids() {
+        let agents: Vec<CliAgent> = serde_json::from_str(full_schema_json()).unwrap();
+        assert_eq!(agents.len(), 2);
+        // sid-a's pid (1) reported alive, sid-b's pid (2) reported dead.
+        let filtered = filter_live_agents(agents, |pid| pid == 1);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].session_id, "sid-a");
+    }
+
+    #[test]
+    fn filter_live_agents_keeps_all_when_all_alive() {
+        let agents: Vec<CliAgent> = serde_json::from_str(full_schema_json()).unwrap();
+        let filtered = filter_live_agents(agents, |_| true);
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn filter_live_agents_drops_all_when_none_alive() {
+        let agents: Vec<CliAgent> = serde_json::from_str(full_schema_json()).unwrap();
+        let filtered = filter_live_agents(agents, |_| false);
+        assert!(filtered.is_empty());
     }
 
     #[test]
