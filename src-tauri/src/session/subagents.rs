@@ -9,7 +9,11 @@
 //! `tool_result` has appeared yet — that's how we detect "running" subagents
 //! without requiring users to install a hook.
 
-use crate::session::cache::{read_lines_from_offset, FileVersion};
+use crate::session::cache::{
+    can_incrementally_read, extend_prefix_snapshot, hash_file_prefix, next_full_verify_offset,
+    read_lines_from_offset, validate_cached_prefix, FileVersion, PrefixSnapshot,
+    PrefixValidationKind,
+};
 use crate::session::parser::{parse_jsonl_entries, MessageContent, SessionEntry};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -18,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 
 // JSONL entry type constants
 const ENTRY_TYPE_TOOL_USE: &str = "tool_use";
@@ -293,6 +298,12 @@ struct SubagentCacheEntry {
     stamp: FileVersion,
     offset: u64,
     subagents: Vec<SubagentInfo>,
+    prefix: Option<PrefixSnapshot>,
+    next_full_verify_offset: u64,
+    last_full_validation_at: Instant,
+    #[cfg(test)]
+    last_prefix_validation_bytes: u64,
+    last_access: Instant,
 }
 
 /// Caches `active_subagents_for_path` results per file, so neither an
@@ -308,17 +319,39 @@ struct SubagentCacheEntry {
 static SUBAGENT_CACHE: LazyLock<Mutex<HashMap<PathBuf, SubagentCacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Same as `active_subagents_for_path`, but backed by `SUBAGENT_CACHE`:
-///
-/// - Stamp unchanged (and strong enough to trust) → return the cached result
-///   as-is, no I/O at all.
-/// - Stamp changed, but it's still the same file (same inode) and it only
-///   grew (new length >= last-scanned offset) → read just the new bytes and
-///   fold them into the cached list via `merge_new_subagents`, instead of
-///   re-reading and re-parsing the whole file.
-/// - Anything else (no cache entry, weak/missing stamp, truncated, or a
-///   different file now at this path) → full re-parse from byte zero.
+/// Bound path-level cache growth. Per-file subagent vectors are still kept for
+/// live sessions so append deltas can be folded cheaply; stale/non-live paths
+/// are pruned after each directory walk below.
+const SUBAGENT_CACHE_MAX_ENTRIES: usize = 512;
+
+fn evict_oldest_subagent_cache_entries(cache: &mut HashMap<PathBuf, SubagentCacheEntry>) {
+    while cache.len() > SUBAGENT_CACHE_MAX_ENTRIES {
+        let Some(oldest_path) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access)
+            .map(|(path, _)| path.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_path);
+    }
+}
+
+/// Same as `active_subagents_for_path`, but backed by `SUBAGENT_CACHE`.
+/// Small prefixes are fully verified; large prefixes use fixed head/tail
+/// guards between geometric checkpoints and a 60-second full-revalidation
+/// deadline. The deadline is checked on lookup, not in the background, so a
+/// large middle rewrite has a bounded consistency delay without making every
+/// poll reparse the whole transcript.
 fn cached_active_subagents_for_path(session_id: &str, path: &Path) -> Vec<SubagentInfo> {
+    cached_active_subagents_for_path_at(session_id, path, Instant::now())
+}
+
+fn cached_active_subagents_for_path_at(
+    session_id: &str,
+    path: &Path,
+    now: Instant,
+) -> Vec<SubagentInfo> {
     let Ok(stamp) = FileVersion::read(path) else {
         if let Ok(mut cache) = SUBAGENT_CACHE.lock() {
             cache.remove(path);
@@ -331,29 +364,113 @@ fn cached_active_subagents_for_path(session_id: &str, path: &Path) -> Vec<Subage
         Err(_) => return active_subagents_for_path(session_id, path),
     };
 
-    if let Some(existing) = cache.get(path) {
-        if existing.stamp == stamp && stamp.supports_unchanged_fast_path() {
-            return existing.subagents.clone();
-        }
-
-        let same_file = stamp.identity != 0 && stamp.identity == existing.stamp.identity;
-        let grew_only = stamp.len >= existing.offset;
-        if same_file && grew_only {
-            if let Ok((new_lines, new_offset)) = read_lines_from_offset(path, existing.offset) {
-                let mut subagents = existing.subagents.clone();
-                if !new_lines.is_empty() {
-                    let new_entries = parse_jsonl_entries(new_lines.clone());
-                    merge_new_subagents(&mut subagents, &new_entries, &new_lines, session_id);
+    if let Some((
+        previous_stamp,
+        previous_offset,
+        previous_subagents,
+        previous_prefix,
+        previous_next_full_verify_offset,
+        previous_last_full_validation_at,
+    )) = cache.get(path).map(|existing| {
+        (
+            existing.stamp,
+            existing.offset,
+            existing.subagents.clone(),
+            existing.prefix,
+            existing.next_full_verify_offset,
+            existing.last_full_validation_at,
+        )
+    }) {
+        if let Some(previous_prefix) = previous_prefix {
+            if previous_stamp == stamp && stamp.supports_unchanged_fast_path() {
+                if now.saturating_duration_since(previous_last_full_validation_at)
+                    < crate::session::cache::PREFIX_FULL_REVALIDATION_INTERVAL
+                {
+                    if let Some(existing) = cache.get_mut(path) {
+                        existing.last_access = now;
+                    }
+                    return previous_subagents;
                 }
-                cache.insert(
-                    path.to_path_buf(),
-                    SubagentCacheEntry {
-                        stamp,
-                        offset: new_offset,
-                        subagents: subagents.clone(),
-                    },
-                );
-                return subagents;
+
+                if let Some(validation) = validate_cached_prefix(
+                    path,
+                    previous_prefix,
+                    previous_next_full_verify_offset,
+                    previous_last_full_validation_at,
+                    now,
+                ) {
+                    if let Some(existing) = cache.get_mut(path) {
+                        existing.prefix = Some(validation.snapshot);
+                        if validation.kind == PrefixValidationKind::Full {
+                            existing.last_full_validation_at = now;
+                            existing.next_full_verify_offset =
+                                next_full_verify_offset(existing.offset);
+                        }
+                        #[cfg(test)]
+                        {
+                            existing.last_prefix_validation_bytes = validation.bytes_read;
+                        }
+                        existing.last_access = now;
+                    }
+                    return previous_subagents;
+                }
+            }
+
+            if can_incrementally_read(previous_stamp, stamp) {
+                if let Some(validation) = validate_cached_prefix(
+                    path,
+                    previous_prefix,
+                    previous_next_full_verify_offset,
+                    previous_last_full_validation_at,
+                    now,
+                ) {
+                    if let Ok((new_lines, new_offset)) =
+                        read_lines_from_offset(path, previous_offset)
+                    {
+                        if let Ok(prefix) = extend_prefix_snapshot(
+                            path,
+                            previous_offset,
+                            new_offset,
+                            validation.snapshot,
+                        ) {
+                            let mut subagents = previous_subagents;
+                            if !new_lines.is_empty() {
+                                let new_entries = parse_jsonl_entries(new_lines.clone());
+                                merge_new_subagents(
+                                    &mut subagents,
+                                    &new_entries,
+                                    &new_lines,
+                                    session_id,
+                                );
+                            }
+                            let full_validation = validation.kind == PrefixValidationKind::Full;
+                            cache.insert(
+                                path.to_path_buf(),
+                                SubagentCacheEntry {
+                                    stamp,
+                                    offset: new_offset,
+                                    subagents: subagents.clone(),
+                                    prefix: Some(prefix),
+                                    next_full_verify_offset: if full_validation {
+                                        next_full_verify_offset(new_offset)
+                                    } else {
+                                        previous_next_full_verify_offset
+                                    },
+                                    last_full_validation_at: if full_validation {
+                                        now
+                                    } else {
+                                        previous_last_full_validation_at
+                                    },
+                                    #[cfg(test)]
+                                    last_prefix_validation_bytes: validation.bytes_read,
+                                    last_access: now,
+                                },
+                            );
+                            evict_oldest_subagent_cache_entries(&mut cache);
+                            return subagents;
+                        }
+                    }
+                }
             }
         }
     }
@@ -369,8 +486,15 @@ fn cached_active_subagents_for_path(session_id: &str, path: &Path) -> Vec<Subage
             stamp,
             offset,
             subagents: subagents.clone(),
+            prefix: hash_file_prefix(path, offset).ok(),
+            next_full_verify_offset: next_full_verify_offset(offset),
+            last_full_validation_at: now,
+            #[cfg(test)]
+            last_prefix_validation_bytes: 0,
+            last_access: now,
         },
     );
+    evict_oldest_subagent_cache_entries(&mut cache);
     subagents
 }
 
@@ -857,17 +981,51 @@ fn is_relevant(sa: &SubagentInfo, now: DateTime<Utc>) -> bool {
     }
 }
 
-/// True if this path's last-cached subagent snapshot still has at least one
-/// relevant (running, or recently-completed) entry — used to keep watching a
-/// session for the rest of the retention window even after its process has
-/// exited, without needing a stat/read for every other, truly-quiet file.
-fn cache_has_relevant_entry(path: &Path, now: DateTime<Utc>) -> bool {
+/// True if this path's last-cached subagent snapshot still has an entry worth
+/// checking when the parent is not currently live. Running entries are only
+/// retained while their parent is live; otherwise a crashed/stopped parent
+/// could remain visible forever just because its last transcript row lacked a
+/// completion result. Recently completed entries remain eligible for the
+/// frontend retention window after the parent disappears.
+fn cache_has_relevant_entry(path: &Path, now: DateTime<Utc>, parent_is_live: bool) -> bool {
     let Ok(cache) = SUBAGENT_CACHE.lock() else {
         return false;
     };
     cache
         .get(path)
-        .is_some_and(|entry| entry.subagents.iter().any(|sa| is_relevant(sa, now)))
+        .is_some_and(|entry| {
+            entry.subagents.iter().any(|sa| {
+                is_relevant(sa, now)
+                    && (parent_is_live || sa.status == SubagentStatus::Completed)
+            })
+        })
+}
+
+/// Remove cache entries that can no longer affect the next response. A live
+/// parent keeps its snapshot so a future append can be read incrementally;
+/// non-live parents keep only recently completed rows for the explicit UI
+/// retention window. Missing paths are removed as well. This is a bounded
+/// retention policy, not a correctness shortcut for file invalidation.
+fn prune_subagent_cache(
+    cache: &mut HashMap<PathBuf, SubagentCacheEntry>,
+    seen_paths: &HashSet<PathBuf>,
+    live_session_ids: &HashSet<String>,
+    now: DateTime<Utc>,
+) {
+    cache.retain(|path, entry| {
+        if !seen_paths.contains(path) {
+            return false;
+        }
+        let parent_is_live = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| live_session_ids.contains(stem));
+        parent_is_live
+            || entry.subagents.iter().any(|sa| {
+                sa.status == SubagentStatus::Completed && is_relevant(sa, now)
+            })
+    });
+    evict_oldest_subagent_cache_entries(cache);
 }
 
 /// Build a map of provider-scoped parent identity -> subagents for all Claude
@@ -895,6 +1053,7 @@ pub fn all_subagents_by_session(
         return out;
     };
     let now = Utc::now();
+    let mut seen_paths = HashSet::new();
     for project_entry in project_iter.flatten() {
         let project_path = project_entry.path();
         if !project_path.is_dir() {
@@ -908,6 +1067,7 @@ pub fn all_subagents_by_session(
             if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                 continue;
             }
+            seen_paths.insert(path.clone());
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
@@ -917,7 +1077,8 @@ pub fn all_subagents_by_session(
             // relevant — this is what keeps the cost of this function
             // bounded by active session count instead of a user's entire
             // lifetime history of session files.
-            if !live_session_ids.contains(stem) && !cache_has_relevant_entry(&path, now) {
+            let parent_is_live = live_session_ids.contains(stem);
+            if !parent_is_live && !cache_has_relevant_entry(&path, now, false) {
                 continue;
             }
 
@@ -930,6 +1091,9 @@ pub fn all_subagents_by_session(
             }
         }
     }
+    if let Ok(mut cache) = SUBAGENT_CACHE.lock() {
+        prune_subagent_cache(&mut cache, &seen_paths, live_session_ids, now);
+    }
     out
 }
 
@@ -937,6 +1101,7 @@ pub fn all_subagents_by_session(
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::Duration;
     use tempfile::NamedTempFile;
 
     fn write_jsonl(lines: &[&str]) -> NamedTempFile {
@@ -1054,23 +1219,23 @@ mod tests {
     }
 
     #[test]
-    fn cache_has_relevant_entry_reflects_last_cached_snapshot() {
+    fn cache_has_relevant_entry_requires_live_parent_for_running_rows() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("relevance-check.jsonl");
         let now = Utc::now();
 
         // Never scanned -- nothing cached, not relevant.
-        assert!(!cache_has_relevant_entry(&path, now));
+        assert!(!cache_has_relevant_entry(&path, now, false));
 
-        // A running subagent populates the cache via the real lookup path
-        // and must be reported relevant afterward.
+        // A running subagent populates the cache via the real lookup path.
         std::fs::write(
             &path,
             format!("{}\n", r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"x","description":"one"}}],"stop_reason":null,"stop_sequence":null}}"#),
         )
         .unwrap();
         let _ = cached_active_subagents_for_path("s1", &path);
-        assert!(cache_has_relevant_entry(&path, now));
+        assert!(!cache_has_relevant_entry(&path, now, false));
+        assert!(cache_has_relevant_entry(&path, now, true));
     }
 
     #[test]
@@ -1106,6 +1271,64 @@ mod tests {
         let subs = cached_active_subagents_for_path("s1", &path);
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].status, SubagentStatus::Completed);
+    }
+
+    #[test]
+    fn cached_lookup_unchanged_fast_path_skips_validation_until_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("unchanged-budget.jsonl");
+        let line = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"budget-agent","name":"Agent","input":{"subagent_type":"x","description":"budget"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        assert!(FileVersion::read(&path)
+            .unwrap()
+            .supports_unchanged_fast_path());
+
+        let t0 = Instant::now();
+        assert_eq!(cached_active_subagents_for_path_at("s1", &path, t0).len(), 1);
+        assert_eq!(
+            SUBAGENT_CACHE
+                .lock()
+                .unwrap()
+                .get(&path)
+                .unwrap()
+                .last_prefix_validation_bytes,
+            0
+        );
+
+        // An unchanged strong stamp before the deadline must not hash even a
+        // small exact-prefix file on the production cache path.
+        assert_eq!(
+            cached_active_subagents_for_path_at("s1", &path, t0 + Duration::from_secs(1)).len(),
+            1
+        );
+        assert_eq!(
+            SUBAGENT_CACHE
+                .lock()
+                .unwrap()
+                .get(&path)
+                .unwrap()
+                .last_prefix_validation_bytes,
+            0
+        );
+
+        // At the deadline the unchanged file is fully verified.
+        assert_eq!(
+            cached_active_subagents_for_path_at(
+                "s1",
+                &path,
+                t0 + crate::session::cache::PREFIX_FULL_REVALIDATION_INTERVAL
+                    + Duration::from_secs(1),
+            )
+            .len(),
+            1
+        );
+        let cache = SUBAGENT_CACHE.lock().unwrap();
+        let entry = cache.get(&path).unwrap();
+        assert_eq!(
+            entry.last_prefix_validation_bytes,
+            entry.offset * 2,
+            "deadline must perform a full small-prefix validation"
+        );
     }
 
     #[test]
@@ -1165,6 +1388,213 @@ mod tests {
     }
 
     #[test]
+    fn cached_lookup_reparses_same_inode_equal_length_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("same-length-rewrite.jsonl");
+        let first = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"x","description":"one"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        let replacement = first.replace("a1", "b1");
+        assert_eq!(first.len(), replacement.len());
+        std::fs::write(&path, format!("{first}\n")).unwrap();
+        let before = FileVersion::read(&path).unwrap();
+        assert_eq!(cached_active_subagents_for_path("s1", &path)[0].id, "a1");
+
+        std::fs::write(&path, format!("{replacement}\n")).unwrap();
+        let after = FileVersion::read(&path).unwrap();
+        #[cfg(unix)]
+        assert_eq!(before.identity, after.identity, "rewrite should keep the inode");
+
+        let subs = cached_active_subagents_for_path("s1", &path);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].id, "b1");
+    }
+
+    #[test]
+    fn cached_lookup_large_middle_rewrite_revalidates_after_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("large-middle-rewrite.jsonl");
+        let filler = format!(r#"{{"type":"system","padding":"{}"}}"#, "x".repeat(1024));
+        let filler_line = format!("{filler}\n");
+        let middle_old = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"agent-old","name":"Agent","input":{"subagent_type":"x","description":"middle"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        let middle_new = middle_old.replace("agent-old", "agent-new");
+        assert_eq!(middle_old.len(), middle_new.len());
+
+        let mut original = String::new();
+        while original.len() < 2 * 1024 * 1024 {
+            original.push_str(&filler_line);
+        }
+        let middle_offset = original.len();
+        original.push_str(&middle_old);
+        original.push('\n');
+        while original.len()
+            < crate::session::cache::EXACT_PREFIX_VERIFY_LIMIT as usize + 256 * 1024
+        {
+            original.push_str(&filler_line);
+        }
+        std::fs::write(&path, &original).unwrap();
+        let before = FileVersion::read(&path).unwrap();
+        assert!(before.len > crate::session::cache::EXACT_PREFIX_VERIFY_LIMIT);
+
+        let t0 = Instant::now();
+        let initial = cached_active_subagents_for_path_at("s1", &path, t0);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].id, "agent-old");
+
+        let mut rewritten = original.clone();
+        rewritten.replace_range(middle_offset..middle_offset + middle_old.len(), &middle_new);
+        rewritten.push_str(&filler_line);
+        std::fs::write(&path, &rewritten).unwrap();
+        let after = FileVersion::read(&path).unwrap();
+        #[cfg(unix)]
+        assert_eq!(before.identity, after.identity, "rewrite should keep the inode");
+        assert!(after.len > before.len);
+
+        // The fixed guard intentionally misses this middle rewrite until the
+        // bounded consistency deadline, so the early lookup still exposes the
+        // cached identity while only reading the append delta.
+        let early = cached_active_subagents_for_path_at("s1", &path, t0 + Duration::from_secs(1));
+        assert_eq!(early.len(), 1);
+        assert_eq!(early[0].id, "agent-old");
+
+        let fresh = cached_active_subagents_for_path_at(
+            "s1",
+            &path,
+            t0 + crate::session::cache::PREFIX_FULL_REVALIDATION_INTERVAL + Duration::from_secs(1),
+        );
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].id, "agent-new");
+    }
+
+    #[test]
+    fn cached_lookup_reparses_same_inode_shrink_after_partial_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shrink-after-partial.jsonl");
+        let first = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"x","description":"one"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        let replacement = first.replace("a1", "b1");
+        std::fs::write(&path, format!("{first}\nold trailing bytes")).unwrap();
+        assert_eq!(cached_active_subagents_for_path("s1", &path)[0].id, "a1");
+
+        // The new length is still at least the previous complete-line offset,
+        // which is why checking `len >= offset` alone is insufficient.
+        std::fs::write(&path, format!("{replacement}\nX")).unwrap();
+        let subs = cached_active_subagents_for_path("s1", &path);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].id, "b1");
+    }
+
+    #[test]
+    fn cached_lookup_retries_partial_completion_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("partial-completion.jsonl");
+        let assistant = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"x","description":"one"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        let completion = r#"{"type":"user","uuid":"u2","timestamp":"2026-01-01T00:01:00Z","sessionId":"s1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"a1","content":"done"}]}}"#;
+        std::fs::write(&path, format!("{assistant}\n")).unwrap();
+        assert_eq!(
+            cached_active_subagents_for_path("s1", &path)[0].status,
+            SubagentStatus::Running
+        );
+
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{completion}").unwrap();
+        drop(file);
+        assert_eq!(
+            cached_active_subagents_for_path("s1", &path)[0].status,
+            SubagentStatus::Running
+        );
+
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file).unwrap();
+        drop(file);
+        assert_eq!(
+            cached_active_subagents_for_path("s1", &path)[0].status,
+            SubagentStatus::Completed
+        );
+    }
+
+    #[test]
+    fn subagent_cache_prunes_non_live_running_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stale_path = tmp.path().join("stale-running.jsonl");
+        let recent_path = tmp.path().join("recent-completed.jsonl");
+        let now = Utc::now();
+        let completed_at = (now - chrono::Duration::seconds(30)).to_rfc3339();
+        let mut cache = HashMap::new();
+        cache.insert(
+            stale_path.clone(),
+            SubagentCacheEntry {
+                stamp: FileVersion {
+                    len: 1,
+                    modified_nanos: 1,
+                    changed_nanos: 1_000_000_001,
+                    identity: 1,
+                },
+                offset: 1,
+                subagents: vec![subagent_info(SubagentStatus::Running, None)],
+                prefix: None,
+                next_full_verify_offset: 0,
+                last_full_validation_at: Instant::now(),
+                last_prefix_validation_bytes: 0,
+                last_access: Instant::now(),
+            },
+        );
+        cache.insert(
+            recent_path.clone(),
+            SubagentCacheEntry {
+                stamp: FileVersion {
+                    len: 2,
+                    modified_nanos: 1,
+                    changed_nanos: 1_000_000_001,
+                    identity: 2,
+                },
+                offset: 2,
+                subagents: vec![subagent_info(
+                    SubagentStatus::Completed,
+                    Some(&completed_at),
+                )],
+                prefix: None,
+                next_full_verify_offset: 0,
+                last_full_validation_at: Instant::now(),
+                last_prefix_validation_bytes: 0,
+                last_access: Instant::now(),
+            },
+        );
+        let seen = HashSet::from([stale_path.clone(), recent_path.clone()]);
+        let live = HashSet::new();
+        prune_subagent_cache(&mut cache, &seen, &live, now);
+        assert!(!cache.contains_key(&stale_path));
+        assert!(cache.contains_key(&recent_path));
+    }
+
+    #[test]
+    fn subagent_cache_evicts_oldest_paths() {
+        let mut cache = HashMap::new();
+        for i in 0..=SUBAGENT_CACHE_MAX_ENTRIES {
+            cache.insert(
+                PathBuf::from(format!("/synthetic/subagent-{i}.jsonl")),
+                SubagentCacheEntry {
+                    stamp: FileVersion {
+                        len: i as u64,
+                        modified_nanos: 1,
+                        changed_nanos: 1_000_000_001,
+                        identity: i as u64 + 1,
+                    },
+                    offset: i as u64,
+                    subagents: Vec::new(),
+                    prefix: None,
+                    next_full_verify_offset: 0,
+                    last_full_validation_at: Instant::now(),
+                    last_prefix_validation_bytes: 0,
+                    last_access: Instant::now()
+                        - std::time::Duration::from_secs(
+                            (SUBAGENT_CACHE_MAX_ENTRIES - i + 1) as u64,
+                        ),
+                },
+            );
+        }
+        evict_oldest_subagent_cache_entries(&mut cache);
+        assert_eq!(cache.len(), SUBAGENT_CACHE_MAX_ENTRIES);
+        assert!(!cache.contains_key(&PathBuf::from("/synthetic/subagent-0.jsonl")));
+    }
+
     #[test]
     fn cached_lookup_falls_back_to_full_reparse_when_file_replaced() {
         let tmp = tempfile::tempdir().unwrap();

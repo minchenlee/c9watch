@@ -159,12 +159,16 @@ async fn get_memory_files() -> Result<Vec<session::ProjectMemory>, String> {
 /// Returns a map of parent_session_id -> subagent invocations detected by
 /// parsing each session's JSONL transcript for Agent/Task tool_use entries.
 ///
-/// `session_ids` is the frontend's already-known live session id list (from
-/// its own `sessions` store, which is what triggers this call in the first
-/// place) — passing it in lets the scan skip a stat/cache-lookup entirely
-/// for any session file that isn't live and has nothing relevant cached,
-/// without needing a second `claude agents --json` call on this side to
-/// re-derive the same live set the main polling loop already has.
+/// `session_ids` is the frontend's already-known set of *raw Claude Code*
+/// session IDs (from its own `sessions` store, which is what triggers this
+/// call in the first place). It is not a set of provider-scoped UI keys such
+/// as `claudeCode:<id>` and it must not include Codex/Cursor/Pi/OpenCode IDs.
+/// Passing this set in lets the scan skip a stat/cache-lookup entirely for any
+/// session file that isn't live and has nothing relevant cached, without
+/// needing a second `claude agents --json` call on this side to re-derive the
+/// same live set the main polling loop already has. The WebSocket protocol is
+/// desktop-session-only for this store and does not expose this Tauri command;
+/// no provider-scoped live-id payload is inferred there.
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_subagents(

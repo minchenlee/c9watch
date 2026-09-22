@@ -1,4 +1,8 @@
-use crate::session::cache::{read_lines_from_offset, FileVersion};
+use crate::session::cache::{
+    can_incrementally_read, extend_prefix_snapshot, hash_file_prefix, next_full_verify_offset,
+    read_lines_from_offset, validate_cached_prefix, FileVersion, PrefixSnapshot,
+    PrefixValidationKind,
+};
 use crate::session::codex::CodexLifecycle;
 use crate::session::cursor::CursorLifecycle;
 use crate::session::owners::global_provider_source_owners;
@@ -18,6 +22,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 
 /// Combined session information
 #[derive(Debug, Clone, Serialize)]
@@ -830,6 +835,12 @@ struct MessageCountCacheEntry {
     stamp: FileVersion,
     offset: u64,
     count: u32,
+    prefix: Option<PrefixSnapshot>,
+    next_full_verify_offset: u64,
+    last_full_validation_at: Instant,
+    #[cfg(test)]
+    last_prefix_validation_bytes: u64,
+    last_access: Instant,
 }
 
 /// A live session's transcript grows every poll by definition, so a plain
@@ -841,11 +852,37 @@ struct MessageCountCacheEntry {
 static MESSAGE_COUNT_CACHE: LazyLock<Mutex<HashMap<PathBuf, MessageCountCacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Message-count cache entries are cheap, but a long-running process can see
+/// more transcript paths than the active session set. Keep the optimization
+/// bounded instead of retaining every path for the process lifetime.
+const MESSAGE_COUNT_CACHE_MAX_ENTRIES: usize = 512;
+
+fn evict_oldest_message_count_entries(cache: &mut HashMap<PathBuf, MessageCountCacheEntry>) {
+    while cache.len() > MESSAGE_COUNT_CACHE_MAX_ENTRIES {
+        let Some(oldest_path) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access)
+            .map(|(path, _)| path.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_path);
+    }
+}
+
 /// Count user/assistant messages in a JSONL file, using `MESSAGE_COUNT_CACHE`
 /// so an unchanged file isn't re-read, and a grown one only has its new
-/// bytes counted rather than the whole file re-scanned. Falls back to a full
-/// recount when the file was replaced (different inode) or shrank.
+/// bytes counted rather than the whole file re-scanned. Small cached prefixes
+/// are fully verified; large prefixes use fixed head/tail guards between
+/// geometric checkpoints, plus a 60-second full-revalidation deadline. The
+/// deadline is enforced on the next lookup after it expires, not by a
+/// background task, so large middle rewrites have a bounded consistency delay
+/// without turning every poll into a full-history scan.
 pub fn count_messages_in_jsonl(path: &Path) -> u32 {
+    count_messages_in_jsonl_at(path, Instant::now())
+}
+
+fn count_messages_in_jsonl_at(path: &Path, now: Instant) -> u32 {
     let Ok(stamp) = FileVersion::read(path) else {
         if let Ok(mut cache) = MESSAGE_COUNT_CACHE.lock() {
             cache.remove(path);
@@ -863,25 +900,104 @@ pub fn count_messages_in_jsonl(path: &Path) -> u32 {
         }
     };
 
-    if let Some(existing) = cache.get(path) {
-        if existing.stamp == stamp && stamp.supports_unchanged_fast_path() {
-            return existing.count;
-        }
+    if let Some((
+        previous_stamp,
+        previous_offset,
+        previous_count,
+        previous_prefix,
+        previous_next_full_verify_offset,
+        previous_last_full_validation_at,
+    )) = cache.get(path).map(|existing| {
+        (
+            existing.stamp,
+            existing.offset,
+            existing.count,
+            existing.prefix,
+            existing.next_full_verify_offset,
+            existing.last_full_validation_at,
+        )
+    }) {
+        if let Some(previous_prefix) = previous_prefix {
+            if previous_stamp == stamp && stamp.supports_unchanged_fast_path() {
+                if now.saturating_duration_since(previous_last_full_validation_at)
+                    < crate::session::cache::PREFIX_FULL_REVALIDATION_INTERVAL
+                {
+                    if let Some(existing) = cache.get_mut(path) {
+                        existing.last_access = now;
+                    }
+                    return previous_count;
+                }
 
-        let same_file = stamp.identity != 0 && stamp.identity == existing.stamp.identity;
-        let grew_only = stamp.len >= existing.offset;
-        if same_file && grew_only {
-            if let Ok((new_lines, new_offset)) = read_lines_from_offset(path, existing.offset) {
-                let count = existing.count + count_messages_in_lines(&new_lines);
-                cache.insert(
-                    path.to_path_buf(),
-                    MessageCountCacheEntry {
-                        stamp,
-                        offset: new_offset,
-                        count,
-                    },
-                );
-                return count;
+                if let Some(validation) = validate_cached_prefix(
+                    path,
+                    previous_prefix,
+                    previous_next_full_verify_offset,
+                    previous_last_full_validation_at,
+                    now,
+                ) {
+                    if let Some(existing) = cache.get_mut(path) {
+                        existing.prefix = Some(validation.snapshot);
+                        if validation.kind == PrefixValidationKind::Full {
+                            existing.last_full_validation_at = now;
+                            existing.next_full_verify_offset =
+                                next_full_verify_offset(existing.offset);
+                        }
+                        #[cfg(test)]
+                        {
+                            existing.last_prefix_validation_bytes = validation.bytes_read;
+                        }
+                        existing.last_access = now;
+                    }
+                    return previous_count;
+                }
+            }
+
+            if can_incrementally_read(previous_stamp, stamp) {
+                if let Some(validation) = validate_cached_prefix(
+                    path,
+                    previous_prefix,
+                    previous_next_full_verify_offset,
+                    previous_last_full_validation_at,
+                    now,
+                ) {
+                    if let Ok((new_lines, new_offset)) =
+                        read_lines_from_offset(path, previous_offset)
+                    {
+                        if let Ok(prefix) = extend_prefix_snapshot(
+                            path,
+                            previous_offset,
+                            new_offset,
+                            validation.snapshot,
+                        ) {
+                            let count = previous_count + count_messages_in_lines(&new_lines);
+                            let full_validation = validation.kind == PrefixValidationKind::Full;
+                            cache.insert(
+                                path.to_path_buf(),
+                                MessageCountCacheEntry {
+                                    stamp,
+                                    offset: new_offset,
+                                    count,
+                                    prefix: Some(prefix),
+                                    next_full_verify_offset: if full_validation {
+                                        next_full_verify_offset(new_offset)
+                                    } else {
+                                        previous_next_full_verify_offset
+                                    },
+                                    last_full_validation_at: if full_validation {
+                                        now
+                                    } else {
+                                        previous_last_full_validation_at
+                                    },
+                                    #[cfg(test)]
+                                    last_prefix_validation_bytes: validation.bytes_read,
+                                    last_access: now,
+                                },
+                            );
+                            evict_oldest_message_count_entries(&mut cache);
+                            return count;
+                        }
+                    }
+                }
             }
         }
     }
@@ -897,8 +1013,15 @@ pub fn count_messages_in_jsonl(path: &Path) -> u32 {
             stamp,
             offset,
             count,
+            prefix: hash_file_prefix(path, offset).ok(),
+            next_full_verify_offset: next_full_verify_offset(offset),
+            last_full_validation_at: now,
+            #[cfg(test)]
+            last_prefix_validation_bytes: 0,
+            last_access: now,
         },
     );
+    evict_oldest_message_count_entries(&mut cache);
     count
 }
 
@@ -1022,6 +1145,7 @@ mod placeholder_tests {
     use crate::session::source::{DetectedSession, DetectionDiagnostics, SessionKind};
     use std::io::Write;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     #[test]
     fn cli_placeholder_session_has_valid_modified_from_started_at_ms() {
@@ -1198,6 +1322,66 @@ mod placeholder_tests {
     }
 
     #[test]
+    fn count_messages_in_jsonl_unchanged_fast_path_skips_validation_until_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-unchanged-budget.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                r#"{"type":"user","message":{"content":"hello"}}"#
+            ),
+        )
+        .unwrap();
+        assert!(FileVersion::read(&path)
+            .unwrap()
+            .supports_unchanged_fast_path());
+
+        let t0 = Instant::now();
+        assert_eq!(count_messages_in_jsonl_at(&path, t0), 1);
+        assert_eq!(
+            MESSAGE_COUNT_CACHE
+                .lock()
+                .unwrap()
+                .get(&path)
+                .unwrap()
+                .last_prefix_validation_bytes,
+            0
+        );
+
+        // An unchanged strong stamp before the deadline must be a true
+        // zero-content-I/O fast path, including for a small exact-prefix file.
+        assert_eq!(count_messages_in_jsonl_at(&path, t0 + Duration::from_secs(1)), 1);
+        assert_eq!(
+            MESSAGE_COUNT_CACHE
+                .lock()
+                .unwrap()
+                .get(&path)
+                .unwrap()
+                .last_prefix_validation_bytes,
+            0
+        );
+
+        // The same unchanged file is fully verified once the injectable clock
+        // crosses the deadline; no wall-clock sleep is needed.
+        assert_eq!(
+            count_messages_in_jsonl_at(
+                &path,
+                t0 + crate::session::cache::PREFIX_FULL_REVALIDATION_INTERVAL
+                    + Duration::from_secs(1),
+            ),
+            1
+        );
+        let cache = MESSAGE_COUNT_CACHE.lock().unwrap();
+        let entry = cache.get(&path).unwrap();
+        assert_eq!(
+            entry.last_prefix_validation_bytes,
+            entry.offset * 2,
+            "deadline must perform a full small-prefix validation"
+        );
+    }
+
+    #[test]
     fn count_messages_in_jsonl_counts_only_new_lines_on_append() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("count-incremental.jsonl");
@@ -1217,6 +1401,63 @@ mod placeholder_tests {
     }
 
     #[test]
+    fn count_messages_in_jsonl_reparses_same_inode_equal_length_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-rewrite.jsonl");
+        let original = concat!(
+            r#"{"type":"user","message":{"content":"one"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":"two"}}"#,
+            "\n",
+        );
+        std::fs::write(&path, original).unwrap();
+        let before = FileVersion::read(&path).unwrap();
+        assert_eq!(count_messages_in_jsonl(&path), 2);
+
+        // Rewrite in place with exactly the same byte length but only one
+        // counted message. This must not be mistaken for an empty append.
+        let replacement_line = r#"{"type":"assistant","message":{"content":"new"}}"#;
+        let replacement = format!(
+            "{}{}\n",
+            replacement_line,
+            " ".repeat(original.len() - replacement_line.len() - 1)
+        );
+        assert_eq!(replacement.len(), original.len());
+        std::fs::write(&path, replacement).unwrap();
+        let after = FileVersion::read(&path).unwrap();
+        #[cfg(unix)]
+        assert_eq!(before.identity, after.identity, "rewrite should keep the inode");
+
+        assert_eq!(count_messages_in_jsonl(&path), 1);
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_retries_partial_trailing_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-partial.jsonl");
+        let first = r#"{"type":"user","message":{"content":"one"}}"#;
+        let second = r#"{"type":"assistant","message":{"content":"two"}}"#;
+        std::fs::write(&path, format!("{first}\n")).unwrap();
+        assert_eq!(count_messages_in_jsonl(&path), 1);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(file, "{second}").unwrap();
+        drop(file);
+        assert_eq!(count_messages_in_jsonl(&path), 1);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file).unwrap();
+        drop(file);
+        assert_eq!(count_messages_in_jsonl(&path), 2);
+    }
+
+    #[test]
     fn count_messages_in_jsonl_skips_system_injected_user_messages() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("count-system.jsonl");
@@ -1231,7 +1472,6 @@ mod placeholder_tests {
         assert_eq!(count_messages_in_jsonl(&path), 0);
     }
 
-    #[test]
     #[test]
     fn count_messages_in_jsonl_missing_file_returns_zero() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1262,6 +1502,99 @@ mod placeholder_tests {
         )
         .unwrap();
         assert_eq!(count_messages_in_jsonl(&path), 1);
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_large_middle_rewrite_revalidates_after_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-large-middle-rewrite.jsonl");
+        let filler = format!(r#"{{"type":"system","padding":"{}"}}"#, "x".repeat(1024));
+        let filler_line = format!("{filler}\n");
+        let first_message = r#"{"type":"user","message":{"content":"first"}}"#;
+        let middle_old = r#"{"type":"assistant","message":{"content":"middle"}}"#;
+        let middle_new = middle_old.replace("\"assistant\"", "\"system   \"");
+        assert_eq!(middle_old.len(), middle_new.len());
+
+        let mut original = format!("{first_message}\n");
+        while original.len() < 2 * 1024 * 1024 {
+            original.push_str(&filler_line);
+        }
+        let middle_offset = original.len();
+        original.push_str(&middle_old);
+        original.push('\n');
+        while original.len()
+            < crate::session::cache::EXACT_PREFIX_VERIFY_LIMIT as usize + 256 * 1024
+        {
+            original.push_str(&filler_line);
+        }
+        std::fs::write(&path, &original).unwrap();
+        let before = FileVersion::read(&path).unwrap();
+        assert!(before.len > crate::session::cache::EXACT_PREFIX_VERIFY_LIMIT);
+
+        let t0 = Instant::now();
+        assert_eq!(count_messages_in_jsonl_at(&path, t0), 2);
+
+        let mut rewritten = original.clone();
+        rewritten.replace_range(middle_offset..middle_offset + middle_old.len(), &middle_new);
+        rewritten.push_str(&filler_line);
+        std::fs::write(&path, &rewritten).unwrap();
+        let after = FileVersion::read(&path).unwrap();
+        #[cfg(unix)]
+        assert_eq!(before.identity, after.identity, "rewrite should keep the inode");
+        assert!(after.len > before.len);
+
+        // The bounded guard deliberately does not inspect the middle. This
+        // is the documented, short-lived stale window before the deadline.
+        assert_eq!(
+            count_messages_in_jsonl_at(&path, t0 + Duration::from_secs(1)),
+            2
+        );
+
+        // No wall-clock sleep: the injectable clock forces the deadline and
+        // the full prefix validation must discover the changed assistant row.
+        assert_eq!(
+            count_messages_in_jsonl_at(
+                &path,
+                t0 + crate::session::cache::PREFIX_FULL_REVALIDATION_INTERVAL
+                    + Duration::from_secs(1),
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn message_count_cache_evicts_oldest_paths() {
+        let mut cache = HashMap::new();
+        for i in 0..=MESSAGE_COUNT_CACHE_MAX_ENTRIES {
+            let path = PathBuf::from(format!("/synthetic/message-count-{i}.jsonl"));
+            cache.insert(
+                path,
+                MessageCountCacheEntry {
+                    stamp: FileVersion {
+                        len: i as u64,
+                        modified_nanos: 1,
+                        changed_nanos: 1_000_000_001,
+                        identity: i as u64 + 1,
+                    },
+                    offset: i as u64,
+                    count: i as u32,
+                    prefix: None,
+                    next_full_verify_offset: 0,
+                    last_full_validation_at: Instant::now(),
+                    last_prefix_validation_bytes: 0,
+                    last_access: Instant::now()
+                        - std::time::Duration::from_secs(
+                            (MESSAGE_COUNT_CACHE_MAX_ENTRIES - i + 1) as u64,
+                        ),
+                },
+            );
+        }
+        evict_oldest_message_count_entries(&mut cache);
+
+        assert_eq!(cache.len(), MESSAGE_COUNT_CACHE_MAX_ENTRIES);
+        assert!(!cache.contains_key(&PathBuf::from(
+            "/synthetic/message-count-0.jsonl"
+        )));
     }
 }
 
