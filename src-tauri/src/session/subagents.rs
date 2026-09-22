@@ -11,6 +11,7 @@
 
 use crate::session::cache::FileVersion;
 use crate::session::parser::{parse_jsonl_entries, MessageContent, SessionEntry};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -862,8 +863,41 @@ pub fn get_subagent_transcript(
     None
 }
 
+/// How long a completed subagent stays relevant after finishing. Mirrors the
+/// frontend's own `COMPLETED_RETENTION_MS` (`src/lib/stores/subagents.ts`),
+/// which discards anything older on receipt anyway — filtering here means
+/// the backend doesn't build and JSON-serialize an entry, over IPC, on every
+/// poll, for every subagent a session has EVER run. A session can easily
+/// carry decades of history-old completed subagents that are otherwise never
+/// dropped from `all_subagents_by_session`'s output.
+const COMPLETED_RETENTION_SECONDS: i64 = 60;
+
+/// True for a running subagent, or one that completed within the retention
+/// window. An unparseable `completed_at` is treated as expired (not
+/// relevant), matching both `status.rs`'s `is_entry_recent` convention and
+/// the frontend's actual behavior (`new Date(bad).getTime()` is `NaN`, and
+/// any comparison against `NaN` is `false`).
+fn is_relevant(sa: &SubagentInfo, now: DateTime<Utc>) -> bool {
+    match sa.status {
+        SubagentStatus::Running => true,
+        SubagentStatus::Completed => match sa.completed_at.as_deref() {
+            Some(ts) => match DateTime::parse_from_rfc3339(ts) {
+                Ok(completed) => {
+                    now.signed_duration_since(completed.with_timezone(&Utc)).num_seconds()
+                        < COMPLETED_RETENTION_SECONDS
+                }
+                Err(_) => false,
+            },
+            None => false,
+        },
+    }
+}
+
 /// Build a map of provider-scoped parent identity -> subagents for all Claude
 /// sessions found under `~/.claude/projects/`. Caller filters/joins as needed.
+///
+/// Only running subagents, and completed ones still within the retention
+/// window, are included — see `is_relevant`.
 pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
     let mut out: HashMap<String, Vec<SubagentInfo>> = HashMap::new();
     let Some(home) = dirs::home_dir() else {
@@ -873,6 +907,7 @@ pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
     let Ok(project_iter) = fs::read_dir(&projects_dir) else {
         return out;
     };
+    let now = Utc::now();
     for project_entry in project_iter.flatten() {
         let project_path = project_entry.path();
         if !project_path.is_dir() {
@@ -889,7 +924,10 @@ pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let subs = cached_active_subagents_for_path(stem, &path);
+            let subs: Vec<SubagentInfo> = cached_active_subagents_for_path(stem, &path)
+                .into_iter()
+                .filter(|sa| is_relevant(sa, now))
+                .collect();
             if !subs.is_empty() {
                 out.insert(format!("claudeCode:{stem}"), subs);
             }
@@ -970,6 +1008,52 @@ mod tests {
         let by_id: HashMap<&str, &SubagentInfo> = subs.iter().map(|s| (s.id.as_str(), s)).collect();
         assert_eq!(by_id["a1"].status, SubagentStatus::Completed);
         assert_eq!(by_id["a2"].status, SubagentStatus::Running);
+    }
+
+    fn subagent_info(status: SubagentStatus, completed_at: Option<&str>) -> SubagentInfo {
+        SubagentInfo {
+            id: "a1".to_string(),
+            agent_type: "x".to_string(),
+            description: "d".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            completed_at: completed_at.map(str::to_string),
+            parent_session_id: "s1".to_string(),
+            status,
+        }
+    }
+
+    #[test]
+    fn is_relevant_running_is_always_relevant_regardless_of_age() {
+        let sa = subagent_info(SubagentStatus::Running, None);
+        assert!(is_relevant(&sa, Utc::now()));
+    }
+
+    #[test]
+    fn is_relevant_recently_completed_is_relevant() {
+        let now = Utc::now();
+        let completed_at = (now - chrono::Duration::seconds(30)).to_rfc3339();
+        let sa = subagent_info(SubagentStatus::Completed, Some(&completed_at));
+        assert!(is_relevant(&sa, now));
+    }
+
+    #[test]
+    fn is_relevant_old_completion_is_not_relevant() {
+        let now = Utc::now();
+        let completed_at = (now - chrono::Duration::seconds(300)).to_rfc3339();
+        let sa = subagent_info(SubagentStatus::Completed, Some(&completed_at));
+        assert!(!is_relevant(&sa, now));
+    }
+
+    #[test]
+    fn is_relevant_completed_with_no_timestamp_is_not_relevant() {
+        let sa = subagent_info(SubagentStatus::Completed, None);
+        assert!(!is_relevant(&sa, Utc::now()));
+    }
+
+    #[test]
+    fn is_relevant_completed_with_unparseable_timestamp_is_not_relevant() {
+        let sa = subagent_info(SubagentStatus::Completed, Some("not-a-timestamp"));
+        assert!(!is_relevant(&sa, Utc::now()));
     }
 
     #[test]
