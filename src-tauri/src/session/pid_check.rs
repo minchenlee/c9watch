@@ -12,7 +12,16 @@ pub(crate) fn pid_is_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+
+    // EPERM means the process exists but is not inspectable by this caller.
+    // Treating it as dead would incorrectly clear a real session when c9watch
+    // lacks permission to inspect the process.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(not(unix))]

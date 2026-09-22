@@ -31,6 +31,25 @@ struct WorkerMetaOverlay {
     pid: Option<u64>,
 }
 
+fn hash_serialized_session_payload(serialized: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    serialized.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Return whether a serialized session payload should be emitted.
+///
+/// An empty array is a valid successful result and must compare differently
+/// from a previously non-empty payload so the frontend can clear stale cards.
+fn session_payload_changed(previous_hash: &mut Option<u64>, serialized: Option<&str>) -> bool {
+    let current_hash = serialized.map(hash_serialized_session_payload);
+    let changed = current_hash != *previous_hash;
+    if changed {
+        *previous_hash = current_hash;
+    }
+    changed
+}
+
 fn load_workers_overlay() -> Arc<HashMap<String, String>> {
     let workers_dir = match dirs::home_dir() {
         Some(h) => h.join(".claude").join("c9watch").join("workers"),
@@ -248,13 +267,12 @@ pub fn start_polling(
                     // Serialize once; skip emit/broadcast when payload is unchanged
                     // so idle dashboards don't rerender every poll cycle.
                     let serialized = serde_json::to_string(&sessions).ok();
-                    let current_hash = serialized.as_ref().map(|s| {
-                        let mut h = DefaultHasher::new();
-                        s.hash(&mut h);
-                        h.finish()
-                    });
-                    let changed = current_hash != prev_sessions_hash;
+                    let changed =
+                        session_payload_changed(&mut prev_sessions_hash, serialized.as_deref());
                     if changed {
+                        // A successful empty result is meaningful: it replaces
+                        // stale cards after all process-backed sessions exit.
+                        // Only the Err branch below retains the last payload.
                         if let Err(e) = app_handle.emit("sessions-updated", &sessions) {
                             crate::debug_log::log_error(&format!(
                                 "Failed to emit sessions-updated: {}",
@@ -264,7 +282,6 @@ pub fn start_polling(
                         if let Some(json) = serialized {
                             let _ = sessions_tx.send(json);
                         }
-                        prev_sessions_hash = current_hash;
                     }
 
                     // Emit diagnostics only when changed
@@ -419,6 +436,30 @@ fn fire_notification(
 mod tests {
     use super::*;
     use crate::session::SessionSource;
+
+    #[test]
+    fn empty_session_payload_after_nonempty_payload_is_emitted_as_change() {
+        let nonempty = serde_json::to_string(&serde_json::json!([
+            {"sessionKey": "claudeCode:stale", "status": "working"}
+        ]))
+        .unwrap();
+        let empty = serde_json::to_string(&serde_json::json!([])).unwrap();
+        let mut previous_hash = None;
+
+        assert!(session_payload_changed(
+            &mut previous_hash,
+            Some(nonempty.as_str())
+        ));
+        assert!(session_payload_changed(
+            &mut previous_hash,
+            Some(empty.as_str())
+        ));
+        assert!(!session_payload_changed(
+            &mut previous_hash,
+            Some(empty.as_str())
+        ));
+        assert_eq!(empty, "[]");
+    }
 
     #[test]
     fn synthetic_cursor_detection_and_enrichment_uses_fixture_cursor_root() {
