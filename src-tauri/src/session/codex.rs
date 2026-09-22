@@ -618,6 +618,7 @@ impl CodexSessionSource {
                 session_id: Some(summary.thread_id.clone()),
                 project_name,
                 kind: SessionKind::Interactive,
+                entrypoint: None,
                 started_at_ms: summary.started_at_ms,
                 official_name: summary.agent_nickname.clone(),
                 cli_activity: None,

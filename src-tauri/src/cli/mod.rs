@@ -1900,6 +1900,7 @@ mod session_formatter_tests {
             provider: SessionProvider::Codex,
             surface: SessionSurface::App,
             kind: SessionKind::Interactive,
+            entrypoint: None,
             agent_kind: AgentKind::Subagent,
             parent_thread_id: Some("parent-thread".to_string()),
             root_session_id: Some("root-thread".to_string()),

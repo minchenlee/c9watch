@@ -53,7 +53,7 @@ impl CliSessionSource {
         lookup_with_cache(&home, &mut self.path_cache, cwd, session_id)
     }
 
-    fn map_agent_to_session(&mut self, a: CliAgent) -> DetectedSession {
+    fn map_agent_to_session(&mut self, a: CliAgent, entrypoint: Option<String>) -> DetectedSession {
         let project_path = self.project_path_for_session(&a.cwd, &a.session_id);
         DetectedSession {
             pid: a.pid,
@@ -70,6 +70,7 @@ impl CliSessionSource {
                 "background" => SessionKind::Background,
                 _ => SessionKind::Unknown,
             },
+            entrypoint,
             started_at_ms: Some(a.started_at),
             official_name: a.name,
             cli_activity: match a.status.as_deref() {
@@ -157,10 +158,18 @@ impl SessionSource for CliSessionSource {
         // but those don't write project JSONLs and aren't what c9watch monitors.
         // The per-pid metadata at ~/.claude/sessions/<pid>.json carries `entrypoint`.
         // If the file is missing or unreadable, keep the agent (older CC versions).
+        // Read once per agent and reuse for both the filter decision and the
+        // DetectedSession field, instead of reading the file twice.
         let sessions: Vec<DetectedSession> = agents
             .into_iter()
-            .filter(|a| is_cli_entrypoint(a.pid))
-            .map(|a| self.map_agent_to_session(a))
+            .filter_map(|a| {
+                let entrypoint = pid_entrypoint(a.pid);
+                let is_monitored = entrypoint
+                    .as_deref()
+                    .map(|ep| !NON_MONITORED_SDK_ENTRYPOINTS.contains(&ep))
+                    .unwrap_or(true);
+                is_monitored.then(|| self.map_agent_to_session(a, entrypoint))
+            })
             .collect();
 
         Ok((sessions, DetectionDiagnostics::default()))

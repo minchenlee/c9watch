@@ -67,6 +67,11 @@ pub struct Session {
     /// Interactive vs. background-pinned (`claude agents --json`'s `kind`).
     /// Providers other than Claude Code always report `Interactive`.
     pub kind: SessionKind,
+    /// Raw `entrypoint` from `~/.claude/sessions/<pid>.json` (e.g. "cli", "sdk-cli",
+    /// "claude-vscode", "mcp", "remote_desktop"...). Only the CLI backend populates
+    /// this; `None` covers the legacy backend and non-Claude-Code providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
     pub agent_kind: AgentKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -317,6 +322,7 @@ pub fn enrich_detected_sessions(
                 provider: detected.provider,
                 surface: detected.surface,
                 kind: detected.kind,
+                entrypoint: detected.entrypoint.clone(),
                 agent_kind: detected.agent_kind,
                 parent_thread_id: detected.parent_thread_id.clone(),
                 root_session_id: detected.root_session_id.clone(),
@@ -397,6 +403,7 @@ pub fn enrich_detected_sessions(
                 provider: detected.provider,
                 surface: detected.surface,
                 kind: detected.kind,
+                entrypoint: detected.entrypoint.clone(),
                 agent_kind: detected.agent_kind,
                 parent_thread_id: detected.parent_thread_id.clone(),
                 root_session_id: detected.root_session_id.clone(),
@@ -442,6 +449,7 @@ pub fn enrich_detected_sessions(
                 provider: detected.provider,
                 surface: detected.surface,
                 kind: detected.kind,
+                entrypoint: detected.entrypoint.clone(),
                 agent_kind: detected.agent_kind,
                 parent_thread_id: detected.parent_thread_id.clone(),
                 root_session_id: detected.root_session_id.clone(),
@@ -515,6 +523,7 @@ pub fn enrich_detected_sessions(
                 provider: detected.provider,
                 surface: detected.surface,
                 kind: detected.kind,
+                entrypoint: detected.entrypoint.clone(),
                 agent_kind: detected.agent_kind,
                 parent_thread_id: detected.parent_thread_id.clone(),
                 root_session_id: detected.root_session_id.clone(),
@@ -680,6 +689,7 @@ pub fn enrich_detected_sessions(
             provider: detected.provider,
             surface: detected.surface,
             kind: detected.kind,
+            entrypoint: detected.entrypoint.clone(),
             agent_kind: detected.agent_kind,
             parent_thread_id: detected.parent_thread_id.clone(),
             root_session_id: detected.root_session_id.clone(),
@@ -973,6 +983,7 @@ mod placeholder_tests {
             session_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
             project_name: "nonexistent".to_string(),
             kind: SessionKind::Interactive,
+            entrypoint: None,
             started_at_ms: Some(1_700_000_000_000),
             official_name: None,
             cli_activity: None,
