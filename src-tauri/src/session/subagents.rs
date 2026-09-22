@@ -9,12 +9,14 @@
 //! `tool_result` has appeared yet — that's how we detect "running" subagents
 //! without requiring users to install a hook.
 
+use crate::session::cache::FileVersion;
 use crate::session::parser::{parse_all_entries, MessageContent, SessionEntry};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 // JSONL entry type constants
 const ENTRY_TYPE_TOOL_USE: &str = "tool_use";
@@ -203,6 +205,42 @@ pub fn active_subagents_for_path<P: AsRef<Path>>(
     }
 
     subagents
+}
+
+/// Caches `active_subagents_for_path` results per file, keyed by a strong
+/// file-version stamp (same primitive `get_cached_native_title` uses), so an
+/// unchanged transcript isn't fully re-parsed on every poll.
+/// `all_subagents_by_session` walks every session file under
+/// `~/.claude/projects/` on each call; without this, that cost scales with a
+/// user's entire lifetime history rather than with active session count.
+static SUBAGENT_CACHE: LazyLock<Mutex<HashMap<PathBuf, (FileVersion, Vec<SubagentInfo>)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Same as `active_subagents_for_path`, but reuses the cached result when the
+/// file's strong version stamp is unchanged since the last call. Falls back
+/// to a full re-parse when the stamp is missing, weak (e.g. a filesystem
+/// without sub-second mtime resolution), or a cache miss.
+fn cached_active_subagents_for_path(session_id: &str, path: &Path) -> Vec<SubagentInfo> {
+    let Ok(stamp) = FileVersion::read(path) else {
+        if let Ok(mut cache) = SUBAGENT_CACHE.lock() {
+            cache.remove(path);
+        }
+        return active_subagents_for_path(session_id, path);
+    };
+
+    if let Ok(mut cache) = SUBAGENT_CACHE.lock() {
+        if let Some((cached_stamp, cached_subagents)) = cache.get(path) {
+            if *cached_stamp == stamp && stamp.supports_unchanged_fast_path() {
+                return cached_subagents.clone();
+            }
+        }
+        let subagents = active_subagents_for_path(session_id, path);
+        cache.insert(path.to_path_buf(), (stamp, subagents.clone()));
+        subagents
+    } else {
+        // Mutex poisoned — fall back to a direct (uncached) parse.
+        active_subagents_for_path(session_id, path)
+    }
 }
 
 /// Full transcript of a single subagent invocation — the prompt (Agent tool
@@ -685,7 +723,7 @@ pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let subs = active_subagents_for_path(stem, &path);
+            let subs = cached_active_subagents_for_path(stem, &path);
             if !subs.is_empty() {
                 out.insert(format!("claudeCode:{stem}"), subs);
             }
@@ -766,6 +804,48 @@ mod tests {
         let by_id: HashMap<&str, &SubagentInfo> = subs.iter().map(|s| (s.id.as_str(), s)).collect();
         assert_eq!(by_id["a1"].status, SubagentStatus::Completed);
         assert_eq!(by_id["a2"].status, SubagentStatus::Running);
+    }
+
+    #[test]
+    fn cached_lookup_reuses_result_until_file_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("synthetic-cache.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n", r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"toolu_cache","name":"Agent","input":{"subagent_type":"x","description":"d"}}],"stop_reason":null,"stop_sequence":null}}"#),
+        )
+        .unwrap();
+
+        let subs = cached_active_subagents_for_path("s1", &path);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].status, SubagentStatus::Running);
+
+        // Second lookup with no file change should return the cached result.
+        let subs = cached_active_subagents_for_path("s1", &path);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].status, SubagentStatus::Running);
+
+        // Appending a completing tool_result changes the file's version
+        // stamp, so the next lookup must re-parse rather than serve stale
+        // cached data.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","uuid":"u2","timestamp":"2026-01-01T00:01:00Z","sessionId":"s1","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_cache","content":"done"}}]}}}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        let subs = cached_active_subagents_for_path("s1", &path);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].status, SubagentStatus::Completed);
+    }
+
+    #[test]
+    fn cached_lookup_handles_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("does-not-exist.jsonl");
+        assert!(cached_active_subagents_for_path("s1", &path).is_empty());
     }
 
     #[test]
