@@ -164,11 +164,8 @@ impl SessionSource for CliSessionSource {
             .into_iter()
             .filter_map(|a| {
                 let entrypoint = pid_entrypoint(a.pid);
-                let is_monitored = entrypoint
-                    .as_deref()
-                    .map(|ep| !NON_MONITORED_SDK_ENTRYPOINTS.contains(&ep))
-                    .unwrap_or(true);
-                is_monitored.then(|| self.map_agent_to_session(a, entrypoint))
+                is_monitored_entrypoint(entrypoint.as_deref())
+                    .then(|| self.map_agent_to_session(a, entrypoint))
             })
             .collect();
 
@@ -180,44 +177,45 @@ impl SessionSource for CliSessionSource {
     }
 }
 
-/// Returns true if the agent at this pid was launched as a `claude` CLI (not via
-/// the TypeScript/Python SDK). Reads `~/.claude/sessions/<pid>.json` and inspects
-/// the `entrypoint` field. Missing/unreadable file → keep (older CC builds didn't
-/// write this metadata; better to over-report than drop real CLIs).
-fn is_cli_entrypoint(pid: u32) -> bool {
-    match dirs::home_dir() {
-        Some(home) => is_cli_entrypoint_under(&home, pid),
-        None => true,
-    }
-}
-
 /// `entrypoint` values known to be third-party SDK integrations (Zed/IDE)
-/// that never write project JSONLs — the thing this filter actually needs
-/// to exclude. Everything else is kept, including CLI-launched entrypoints
-/// we don't recognize yet: CC has already added new ones without notice
-/// (e.g. "sdk-cli" for headless `claude -p`, alongside the interactive
+/// that never write project JSONLs — the thing the entrypoint filter actually
+/// needs to exclude. Everything else is kept, including CLI-launched
+/// entrypoints we don't recognize yet: CC has already added new ones without
+/// notice (e.g. "sdk-cli" for headless `claude -p`, alongside the interactive
 /// "cli", as of 2.1.278) and a real CLI process writes a real transcript
 /// regardless of which entrypoint label it gets, so failing open here is
 /// safer than an allowlist that silently drops CLI runs on every CC bump.
 const NON_MONITORED_SDK_ENTRYPOINTS: &[&str] = &["sdk-ts", "sdk-py"];
 
-fn is_cli_entrypoint_under(home: &Path, pid: u32) -> bool {
+/// Reads `~/.claude/sessions/<pid>.json`'s `entrypoint` field (e.g. "cli",
+/// "sdk-cli", "claude-vscode", "mcp", "remote_desktop"...), for both the
+/// non-monitored-SDK filter and surfacing the raw value to the frontend.
+/// `None` on a missing/unreadable/malformed file or missing field (older CC
+/// builds didn't write this metadata) — callers treat that as "unknown, but
+/// still a real CLI process" rather than excluding it.
+fn pid_entrypoint(pid: u32) -> Option<String> {
+    dirs::home_dir().and_then(|home| pid_entrypoint_under(&home, pid))
+}
+
+fn pid_entrypoint_under(home: &Path, pid: u32) -> Option<String> {
     let path = home
         .join(".claude")
         .join("sessions")
         .join(format!("{pid}.json"));
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return true,
-    };
-    let value: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => return true,
-    };
-    match value.get("entrypoint").and_then(|v| v.as_str()) {
-        Some(ep) => !NON_MONITORED_SDK_ENTRYPOINTS.contains(&ep),
-        None => true,
-    }
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("entrypoint")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Whether an agent with this resolved `entrypoint` should be monitored (kept
+/// in the detected list) — i.e. not one of `NON_MONITORED_SDK_ENTRYPOINTS`.
+fn is_monitored_entrypoint(entrypoint: Option<&str>) -> bool {
+    entrypoint
+        .map(|ep| !NON_MONITORED_SDK_ENTRYPOINTS.contains(&ep))
+        .unwrap_or(true)
 }
 
 /// Stateless resolver used by both production code (with real `home_dir()`) and
@@ -415,6 +413,12 @@ mod tests {
         assert_eq!(cache.len(), 1, "cache size unchanged on hit");
     }
 
+    /// Combines `pid_entrypoint_under` + `is_monitored_entrypoint`, mirroring
+    /// what `detect()`'s filter_map does per-agent.
+    fn is_cli_entrypoint_under(home: &Path, pid: u32) -> bool {
+        is_monitored_entrypoint(pid_entrypoint_under(home, pid).as_deref())
+    }
+
     fn write_session_meta(home: &Path, pid: u32, entrypoint: Option<&str>) {
         let dir = home.join(".claude").join("sessions");
         std::fs::create_dir_all(&dir).unwrap();
@@ -486,6 +490,22 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("5.json"), "not json").unwrap();
         assert!(is_cli_entrypoint_under(tmp.path(), 5));
+    }
+
+    #[test]
+    fn pid_entrypoint_returns_raw_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_session_meta(tmp.path(), 8, Some("claude-vscode"));
+        assert_eq!(
+            pid_entrypoint_under(tmp.path(), 8),
+            Some("claude-vscode".to_string())
+        );
+    }
+
+    #[test]
+    fn pid_entrypoint_none_when_meta_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(pid_entrypoint_under(tmp.path(), 999), None);
     }
 
     #[test]

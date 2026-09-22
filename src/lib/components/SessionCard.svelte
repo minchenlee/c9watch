@@ -27,6 +27,12 @@
 	);
 
 	let isBackground = $derived(session.kind === 'background');
+	// "cli" is the plain-terminal default and the overwhelming common case;
+	// only call out entrypoints that mean something was launched differently
+	// (headless `-p`, an IDE extension, MCP, a remote/enterprise surface...).
+	let entrypointLabel = $derived(
+		session.entrypoint && session.entrypoint !== 'cli' ? session.entrypoint : null
+	);
 	let isPermission = $derived(session.status === SessionStatus.NeedsAttention);
 	let isWaitingInput = $derived(session.status === SessionStatus.WaitingForInput);
 	let isWorking = $derived(session.status === SessionStatus.Working);
@@ -238,6 +244,15 @@
 						onmouseleave={tipLeave}
 						onmousemove={tipMove}
 					>BG</span>
+				{/if}
+				{#if entrypointLabel}
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
+					<span
+						class="entrypoint-badge"
+						onmouseenter={() => tipEnter(`Entrypoint: ${entrypointLabel}`)}
+						onmouseleave={tipLeave}
+						onmousemove={tipMove}
+					>{entrypointLabel}</span>
 				{/if}
 				{#if PM_ORCHESTRATION_ENABLED && session.workerOf && !workersView}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -495,6 +510,24 @@
 		letter-spacing: 0.1em;
 		display: inline-block;
 		vertical-align: middle;
+	}
+
+	.entrypoint-badge {
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		font-weight: 500;
+		color: var(--accent-purple);
+		background: color-mix(in srgb, var(--accent-purple) 12%, transparent);
+		padding: 2px 6px;
+		border: 1px solid color-mix(in srgb, var(--accent-purple) 40%, transparent);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		display: inline-block;
+		vertical-align: middle;
+		max-width: 140px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.worker-badge {

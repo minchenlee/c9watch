@@ -94,6 +94,14 @@ export interface Session {
   provider?: SessionProvider;
   surface?: SessionSurface;
   kind?: SessionKind;
+  /**
+   * Raw `entrypoint` from `claude`'s own per-pid session metadata (e.g. "cli",
+   * "sdk-cli", "claude-vscode", "mcp", "remote_desktop"...). Only the CLI
+   * backend populates this. Not an enum here on purpose — Claude Code adds
+   * new values without notice, so this is rendered as-is rather than mapped
+   * through a hardcoded label list that would silently miss new ones.
+   */
+  entrypoint?: string | null;
   agentKind?: AgentKind;
   parentThreadId?: string | null;
   rootSessionId?: string | null;
