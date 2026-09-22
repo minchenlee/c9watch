@@ -607,17 +607,27 @@ pub fn enrich_detected_sessions(
             }
         };
 
-        // Parse the session JSONL file to determine status and get latest message
+        // Parse the session JSONL file to determine status and get latest message.
+        // A missing file is expected here, not an error: `detected.project_path` can
+        // be a guessed-but-unverified path (CLI backend's `fallback_path_under`, for
+        // a session whose JSONL hasn't been flushed yet, or that never gets one), and
+        // the sibling lookups just above (`get_first_prompt_from_jsonl`,
+        // `count_messages_in_jsonl`) already treat "no file" as silently empty rather
+        // than logging. Only warn when the file exists but fails to open/parse.
         let session_file_path = detected.project_path.join(format!("{}.jsonl", session_id));
-        let entries = match parse_last_n_entries(&session_file_path, 20) {
-            Ok(entries) => entries,
-            Err(e) => {
-                crate::debug_log::log_warn(&format!(
-                    "Failed to parse session file for {}: {}",
-                    session_id, e
-                ));
-                vec![]
+        let entries = if session_file_path.is_file() {
+            match parse_last_n_entries(&session_file_path, 20) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    crate::debug_log::log_warn(&format!(
+                        "Failed to parse session file for {}: {}",
+                        session_id, e
+                    ));
+                    vec![]
+                }
             }
+        } else {
+            vec![]
         };
 
         let pending_tool_name = get_pending_tool_name(&entries);
@@ -1016,6 +1026,16 @@ mod placeholder_tests {
             s.modified
         );
         assert_eq!(s.started_at_ms, Some(1_700_000_000_000));
+
+        // A JSONL that simply hasn't been flushed yet is an expected state for a
+        // freshly-detected CLI session, not an error — it shouldn't spam the log
+        // on every ~3.5s poll for as long as the session is running.
+        assert!(
+            !crate::debug_log::get_logs()
+                .iter()
+                .any(|entry| entry.message.contains("11111111-2222-3333-4444-555555555555")),
+            "missing JSONL must not log a warning"
+        );
     }
 
     #[test]
