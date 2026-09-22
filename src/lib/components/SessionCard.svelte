@@ -26,6 +26,7 @@
 			session.status === SessionStatus.WaitingForInput
 	);
 
+	let isBackground = $derived(session.kind === 'background');
 	let isPermission = $derived(session.status === SessionStatus.NeedsAttention);
 	let isWaitingInput = $derived(session.status === SessionStatus.WaitingForInput);
 	let isWorking = $derived(session.status === SessionStatus.Working);
@@ -229,6 +230,15 @@
 				<div class="badge-group">
 					<ProviderBadge provider={session.provider} surface={session.surface} {compact} />
 					<span class="session-name-badge">{session.sessionName}</span>
+				{#if isBackground}
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
+					<span
+						class="kind-badge"
+						onmouseenter={() => tipEnter('Background-pinned session (claude agents)')}
+						onmouseleave={tipLeave}
+						onmousemove={tipMove}
+					>BG</span>
+				{/if}
 				{#if PM_ORCHESTRATION_ENABLED && session.workerOf && !workersView}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<span
@@ -471,6 +481,20 @@
 		align-items: center;
 		gap: var(--space-xs);
 		min-width: 0;
+	}
+
+	.kind-badge {
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		font-weight: 500;
+		color: var(--accent-blue);
+		background: color-mix(in srgb, var(--accent-blue) 12%, transparent);
+		padding: 2px 6px;
+		border: 1px solid color-mix(in srgb, var(--accent-blue) 40%, transparent);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		display: inline-block;
+		vertical-align: middle;
 	}
 
 	.worker-badge {

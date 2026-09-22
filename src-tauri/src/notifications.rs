@@ -368,6 +368,7 @@ mod tests {
             started_at_ms: Some(1_752_364_800_000),
             provider: SessionProvider::Codex,
             surface: crate::session::SessionSurface::App,
+            kind: crate::session::SessionKind::Interactive,
             agent_kind: crate::session::AgentKind::Subagent,
             parent_thread_id: Some("parent-thread".to_string()),
             root_session_id: Some("root-thread".to_string()),

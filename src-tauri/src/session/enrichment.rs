@@ -4,7 +4,7 @@ use crate::session::cursor::CursorLifecycle;
 use crate::session::owners::global_provider_source_owners;
 use crate::session::pi::PiLifecycle;
 use crate::session::source::{
-    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionIdentity,
+    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionIdentity, SessionKind,
     SessionProvider, SessionSource, SessionSurface,
 };
 use crate::session::{
@@ -64,6 +64,9 @@ pub struct Session {
     pub started_at_ms: Option<i64>,
     pub provider: SessionProvider,
     pub surface: SessionSurface,
+    /// Interactive vs. background-pinned (`claude agents --json`'s `kind`).
+    /// Providers other than Claude Code always report `Interactive`.
+    pub kind: SessionKind,
     pub agent_kind: AgentKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -313,6 +316,7 @@ pub fn enrich_detected_sessions(
                 started_at_ms: detected.started_at_ms,
                 provider: detected.provider,
                 surface: detected.surface,
+                kind: detected.kind,
                 agent_kind: detected.agent_kind,
                 parent_thread_id: detected.parent_thread_id.clone(),
                 root_session_id: detected.root_session_id.clone(),
@@ -392,6 +396,7 @@ pub fn enrich_detected_sessions(
                 started_at_ms: detected.started_at_ms,
                 provider: detected.provider,
                 surface: detected.surface,
+                kind: detected.kind,
                 agent_kind: detected.agent_kind,
                 parent_thread_id: detected.parent_thread_id.clone(),
                 root_session_id: detected.root_session_id.clone(),
@@ -436,6 +441,7 @@ pub fn enrich_detected_sessions(
                 started_at_ms: detected.started_at_ms,
                 provider: detected.provider,
                 surface: detected.surface,
+                kind: detected.kind,
                 agent_kind: detected.agent_kind,
                 parent_thread_id: detected.parent_thread_id.clone(),
                 root_session_id: detected.root_session_id.clone(),
@@ -508,6 +514,7 @@ pub fn enrich_detected_sessions(
                 started_at_ms: detected.started_at_ms,
                 provider: detected.provider,
                 surface: detected.surface,
+                kind: detected.kind,
                 agent_kind: detected.agent_kind,
                 parent_thread_id: detected.parent_thread_id.clone(),
                 root_session_id: detected.root_session_id.clone(),
@@ -672,6 +679,7 @@ pub fn enrich_detected_sessions(
             started_at_ms: detected.started_at_ms,
             provider: detected.provider,
             surface: detected.surface,
+            kind: detected.kind,
             agent_kind: detected.agent_kind,
             parent_thread_id: detected.parent_thread_id.clone(),
             root_session_id: detected.root_session_id.clone(),

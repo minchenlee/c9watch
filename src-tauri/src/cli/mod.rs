@@ -1858,7 +1858,7 @@ fn resolve_session_reference_matches(
 #[cfg(test)]
 mod session_formatter_tests {
     use super::*;
-    use crate::session::source::{AgentKind, SessionProvider, SessionSurface};
+    use crate::session::source::{AgentKind, SessionKind, SessionProvider, SessionSurface};
     use crate::session::SessionStatus;
 
     #[test]
@@ -1899,6 +1899,7 @@ mod session_formatter_tests {
             started_at_ms: Some(1_752_364_800_000),
             provider: SessionProvider::Codex,
             surface: SessionSurface::App,
+            kind: SessionKind::Interactive,
             agent_kind: AgentKind::Subagent,
             parent_thread_id: Some("parent-thread".to_string()),
             root_session_id: Some("root-thread".to_string()),

@@ -15,6 +15,8 @@ export enum SessionStatus {
 export type SessionProvider = 'claudeCode' | 'codex' | 'cursor' | 'pi' | 'opencode';
 export type SessionSurface = 'claudeCode' | 'app' | 'cli' | 'exec' | 'integration' | 'cursor' | 'unknown';
 export type AgentKind = 'root' | 'subagent' | 'internal';
+/** Interactive vs. background-pinned (`claude agents --json`'s `kind`). Non-Claude-Code providers are always 'interactive'. */
+export type SessionKind = 'interactive' | 'background' | 'unknown';
 
 export interface SessionActionCapabilities {
   open?: boolean;
@@ -91,6 +93,7 @@ export interface Session {
   /** Provider metadata is optional for compatibility; missing means Claude Code. */
   provider?: SessionProvider;
   surface?: SessionSurface;
+  kind?: SessionKind;
   agentKind?: AgentKind;
   parentThreadId?: string | null;
   rootSessionId?: string | null;
