@@ -7,8 +7,11 @@ pub mod parser;
 pub mod permissions;
 pub mod pi;
 pub mod opencode;
+mod pid_check;
 pub mod source;
 pub mod status;
+
+pub(crate) use pid_check::pid_is_alive;
 
 pub use custom_names::{CustomNames, CustomTitles};
 pub use detector::LegacySessionSource;

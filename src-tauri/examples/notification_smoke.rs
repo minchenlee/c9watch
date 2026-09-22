@@ -22,6 +22,8 @@ fn fixture() -> Session {
         message_count: 3,
         modified: "2026-07-13T00:00:00Z".to_string(),
         status: SessionStatus::Working,
+        kind: c9watch_lib::session::SessionKind::Interactive,
+        entrypoint: None,
         notification_preview: None,
         latest_message: String::new(),
         pending_tool_name: None,

@@ -124,6 +124,11 @@ pub struct DetectedSession {
     pub session_id: Option<String>,
     pub project_name: String,
     pub kind: SessionKind,
+    /// Raw `entrypoint` from `~/.claude/sessions/<pid>.json` (e.g. "cli", "sdk-cli",
+    /// "claude-vscode", "mcp", "remote_desktop", ...). Only populated by the CLI
+    /// backend; other providers/backends leave this `None`.
+    #[serde(default)]
+    pub entrypoint: Option<String>,
     pub started_at_ms: Option<i64>,
     pub official_name: Option<String>,
     pub cli_activity: Option<CliActivity>,
@@ -191,6 +196,7 @@ impl DetectedSession {
             session_id,
             project_name,
             kind: SessionKind::Interactive,
+            entrypoint: None,
             started_at_ms: None,
             official_name: None,
             cli_activity: None,

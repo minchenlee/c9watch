@@ -1,6 +1,6 @@
 use crate::session::enrichment::enrich_detected_sessions;
 pub use crate::session::enrichment::{detect_and_enrich_sessions, truncate_string, Session};
-use crate::session::{DetectorState, SessionStatus};
+use crate::session::{pid_is_alive, DetectorState, SessionStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -31,17 +31,23 @@ struct WorkerMetaOverlay {
     pid: Option<u64>,
 }
 
-#[cfg(unix)]
-fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+fn hash_serialized_session_payload(serialized: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    serialized.hash(&mut hasher);
+    hasher.finish()
 }
 
-#[cfg(not(unix))]
-fn pid_is_alive(_pid: u32) -> bool {
-    true
+/// Return whether a serialized session payload should be emitted.
+///
+/// An empty array is a valid successful result and must compare differently
+/// from a previously non-empty payload so the frontend can clear stale cards.
+fn session_payload_changed(previous_hash: &mut Option<u64>, serialized: Option<&str>) -> bool {
+    let current_hash = serialized.map(hash_serialized_session_payload);
+    let changed = current_hash != *previous_hash;
+    if changed {
+        *previous_hash = current_hash;
+    }
+    changed
 }
 
 fn load_workers_overlay() -> Arc<HashMap<String, String>> {
@@ -261,13 +267,12 @@ pub fn start_polling(
                     // Serialize once; skip emit/broadcast when payload is unchanged
                     // so idle dashboards don't rerender every poll cycle.
                     let serialized = serde_json::to_string(&sessions).ok();
-                    let current_hash = serialized.as_ref().map(|s| {
-                        let mut h = DefaultHasher::new();
-                        s.hash(&mut h);
-                        h.finish()
-                    });
-                    let changed = current_hash != prev_sessions_hash;
+                    let changed =
+                        session_payload_changed(&mut prev_sessions_hash, serialized.as_deref());
                     if changed {
+                        // A successful empty result is meaningful: it replaces
+                        // stale cards after all process-backed sessions exit.
+                        // Only the Err branch below retains the last payload.
                         if let Err(e) = app_handle.emit("sessions-updated", &sessions) {
                             crate::debug_log::log_error(&format!(
                                 "Failed to emit sessions-updated: {}",
@@ -277,7 +282,6 @@ pub fn start_polling(
                         if let Some(json) = serialized {
                             let _ = sessions_tx.send(json);
                         }
-                        prev_sessions_hash = current_hash;
                     }
 
                     // Emit diagnostics only when changed
@@ -433,22 +437,28 @@ mod tests {
     use super::*;
     use crate::session::SessionSource;
 
-    #[cfg(unix)]
     #[test]
-    fn pid_is_alive_detects_dead_pid() {
-        // PID 0 is never a real process.
-        assert!(!pid_is_alive(0));
-        // PID 999999 is extremely unlikely to be live (kernel default pid_max
-        // on macOS is 99999, and even on Linux systems with expanded range
-        // it's highly unlikely to hit this).
-        assert!(!pid_is_alive(999_999));
-    }
+    fn empty_session_payload_after_nonempty_payload_is_emitted_as_change() {
+        let nonempty = serde_json::to_string(&serde_json::json!([
+            {"sessionKey": "claudeCode:stale", "status": "working"}
+        ]))
+        .unwrap();
+        let empty = serde_json::to_string(&serde_json::json!([])).unwrap();
+        let mut previous_hash = None;
 
-    #[cfg(unix)]
-    #[test]
-    fn pid_is_alive_detects_live_pid() {
-        // Our own pid must be alive.
-        assert!(pid_is_alive(std::process::id()));
+        assert!(session_payload_changed(
+            &mut previous_hash,
+            Some(nonempty.as_str())
+        ));
+        assert!(session_payload_changed(
+            &mut previous_hash,
+            Some(empty.as_str())
+        ));
+        assert!(!session_payload_changed(
+            &mut previous_hash,
+            Some(empty.as_str())
+        ));
+        assert_eq!(empty, "[]");
     }
 
     #[test]
