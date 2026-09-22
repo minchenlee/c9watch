@@ -182,6 +182,16 @@ fn is_cli_entrypoint(pid: u32) -> bool {
     }
 }
 
+/// `entrypoint` values known to be third-party SDK integrations (Zed/IDE)
+/// that never write project JSONLs — the thing this filter actually needs
+/// to exclude. Everything else is kept, including CLI-launched entrypoints
+/// we don't recognize yet: CC has already added new ones without notice
+/// (e.g. "sdk-cli" for headless `claude -p`, alongside the interactive
+/// "cli", as of 2.1.278) and a real CLI process writes a real transcript
+/// regardless of which entrypoint label it gets, so failing open here is
+/// safer than an allowlist that silently drops CLI runs on every CC bump.
+const NON_MONITORED_SDK_ENTRYPOINTS: &[&str] = &["sdk-ts", "sdk-py"];
+
 fn is_cli_entrypoint_under(home: &Path, pid: u32) -> bool {
     let path = home
         .join(".claude")
@@ -196,7 +206,7 @@ fn is_cli_entrypoint_under(home: &Path, pid: u32) -> bool {
         Err(_) => return true,
     };
     match value.get("entrypoint").and_then(|v| v.as_str()) {
-        Some(ep) => ep == "cli",
+        Some(ep) => !NON_MONITORED_SDK_ENTRYPOINTS.contains(&ep),
         None => true,
     }
 }
@@ -425,6 +435,26 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_session_meta(tmp.path(), 3, Some("sdk-py"));
         assert!(!is_cli_entrypoint_under(tmp.path(), 3));
+    }
+
+    #[test]
+    fn entrypoint_filter_keeps_sdk_cli() {
+        // "sdk-cli" is CC 2.1.278's entrypoint for headless `claude -p`
+        // launches (e.g. scheduled jobs) — a real CLI process that writes
+        // a real transcript, not a third-party SDK integration.
+        let tmp = tempfile::tempdir().unwrap();
+        write_session_meta(tmp.path(), 6, Some("sdk-cli"));
+        assert!(is_cli_entrypoint_under(tmp.path(), 6));
+    }
+
+    #[test]
+    fn entrypoint_filter_keeps_unrecognized_value() {
+        // Fail open on any future entrypoint value we don't know about yet,
+        // rather than requiring this excludelist to be updated on every CC
+        // release that adds one.
+        let tmp = tempfile::tempdir().unwrap();
+        write_session_meta(tmp.path(), 7, Some("some-future-entrypoint"));
+        assert!(is_cli_entrypoint_under(tmp.path(), 7));
     }
 
     #[test]
