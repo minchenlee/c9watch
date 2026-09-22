@@ -4,7 +4,7 @@ use crate::session::cursor::CursorLifecycle;
 use crate::session::owners::global_provider_source_owners;
 use crate::session::pi::PiLifecycle;
 use crate::session::source::{
-    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionIdentity,
+    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionIdentity, SessionKind,
     SessionProvider, SessionSource, SessionSurface,
 };
 use crate::session::{
@@ -64,6 +64,14 @@ pub struct Session {
     pub started_at_ms: Option<i64>,
     pub provider: SessionProvider,
     pub surface: SessionSurface,
+    /// Interactive vs. background-pinned (`claude agents --json`'s `kind`).
+    /// Providers other than Claude Code always report `Interactive`.
+    pub kind: SessionKind,
+    /// Raw `entrypoint` from `~/.claude/sessions/<pid>.json` (e.g. "cli", "sdk-cli",
+    /// "claude-vscode", "mcp", "remote_desktop"...). Only the CLI backend populates
+    /// this; `None` covers the legacy backend and non-Claude-Code providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
     pub agent_kind: AgentKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -313,6 +321,8 @@ pub fn enrich_detected_sessions(
                 started_at_ms: detected.started_at_ms,
                 provider: detected.provider,
                 surface: detected.surface,
+                kind: detected.kind,
+                entrypoint: detected.entrypoint.clone(),
                 agent_kind: detected.agent_kind,
                 parent_thread_id: detected.parent_thread_id.clone(),
                 root_session_id: detected.root_session_id.clone(),
@@ -392,6 +402,8 @@ pub fn enrich_detected_sessions(
                 started_at_ms: detected.started_at_ms,
                 provider: detected.provider,
                 surface: detected.surface,
+                kind: detected.kind,
+                entrypoint: detected.entrypoint.clone(),
                 agent_kind: detected.agent_kind,
                 parent_thread_id: detected.parent_thread_id.clone(),
                 root_session_id: detected.root_session_id.clone(),
@@ -436,6 +448,8 @@ pub fn enrich_detected_sessions(
                 started_at_ms: detected.started_at_ms,
                 provider: detected.provider,
                 surface: detected.surface,
+                kind: detected.kind,
+                entrypoint: detected.entrypoint.clone(),
                 agent_kind: detected.agent_kind,
                 parent_thread_id: detected.parent_thread_id.clone(),
                 root_session_id: detected.root_session_id.clone(),
@@ -508,6 +522,8 @@ pub fn enrich_detected_sessions(
                 started_at_ms: detected.started_at_ms,
                 provider: detected.provider,
                 surface: detected.surface,
+                kind: detected.kind,
+                entrypoint: detected.entrypoint.clone(),
                 agent_kind: detected.agent_kind,
                 parent_thread_id: detected.parent_thread_id.clone(),
                 root_session_id: detected.root_session_id.clone(),
@@ -591,17 +607,27 @@ pub fn enrich_detected_sessions(
             }
         };
 
-        // Parse the session JSONL file to determine status and get latest message
+        // Parse the session JSONL file to determine status and get latest message.
+        // A missing file is expected here, not an error: `detected.project_path` can
+        // be a guessed-but-unverified path (CLI backend's `fallback_path_under`, for
+        // a session whose JSONL hasn't been flushed yet, or that never gets one), and
+        // the sibling lookups just above (`get_first_prompt_from_jsonl`,
+        // `count_messages_in_jsonl`) already treat "no file" as silently empty rather
+        // than logging. Only warn when the file exists but fails to open/parse.
         let session_file_path = detected.project_path.join(format!("{}.jsonl", session_id));
-        let entries = match parse_last_n_entries(&session_file_path, 20) {
-            Ok(entries) => entries,
-            Err(e) => {
-                crate::debug_log::log_warn(&format!(
-                    "Failed to parse session file for {}: {}",
-                    session_id, e
-                ));
-                vec![]
+        let entries = if session_file_path.is_file() {
+            match parse_last_n_entries(&session_file_path, 20) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    crate::debug_log::log_warn(&format!(
+                        "Failed to parse session file for {}: {}",
+                        session_id, e
+                    ));
+                    vec![]
+                }
             }
+        } else {
+            vec![]
         };
 
         let pending_tool_name = get_pending_tool_name(&entries);
@@ -672,6 +698,8 @@ pub fn enrich_detected_sessions(
             started_at_ms: detected.started_at_ms,
             provider: detected.provider,
             surface: detected.surface,
+            kind: detected.kind,
+            entrypoint: detected.entrypoint.clone(),
             agent_kind: detected.agent_kind,
             parent_thread_id: detected.parent_thread_id.clone(),
             root_session_id: detected.root_session_id.clone(),
@@ -965,6 +993,7 @@ mod placeholder_tests {
             session_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
             project_name: "nonexistent".to_string(),
             kind: SessionKind::Interactive,
+            entrypoint: None,
             started_at_ms: Some(1_700_000_000_000),
             official_name: None,
             cli_activity: None,
@@ -997,6 +1026,16 @@ mod placeholder_tests {
             s.modified
         );
         assert_eq!(s.started_at_ms, Some(1_700_000_000_000));
+
+        // A JSONL that simply hasn't been flushed yet is an expected state for a
+        // freshly-detected CLI session, not an error — it shouldn't spam the log
+        // on every ~3.5s poll for as long as the session is running.
+        assert!(
+            !crate::debug_log::get_logs()
+                .iter()
+                .any(|entry| entry.message.contains("11111111-2222-3333-4444-555555555555")),
+            "missing JSONL must not log a warning"
+        );
     }
 
     #[test]

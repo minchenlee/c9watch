@@ -252,6 +252,7 @@ impl SessionSource for PiSessionSource {
                     session_id: Some(summary.session_id.clone()),
                     project_name,
                     kind: SessionKind::Interactive,
+                    entrypoint: None,
                     started_at_ms: summary.started_at_ms,
                     official_name: None,
                     cli_activity: None,
