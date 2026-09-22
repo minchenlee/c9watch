@@ -237,22 +237,10 @@
 					<ProviderBadge provider={session.provider} surface={session.surface} {compact} />
 					<span class="session-name-badge">{session.sessionName}</span>
 				{#if isBackground}
-					<!-- svelte-ignore a11y_no_static_element_interactions -->
-					<span
-						class="kind-badge"
-						onmouseenter={() => tipEnter('Background-pinned session (claude agents)')}
-						onmouseleave={tipLeave}
-						onmousemove={tipMove}
-					>BG</span>
+					<span class="kind-badge" aria-label="Background-pinned session" title="Background-pinned session">BG</span>
 				{/if}
 				{#if entrypointLabel}
-					<!-- svelte-ignore a11y_no_static_element_interactions -->
-					<span
-						class="entrypoint-badge"
-						onmouseenter={() => tipEnter(`Entrypoint: ${entrypointLabel}`)}
-						onmouseleave={tipLeave}
-						onmousemove={tipMove}
-					>{entrypointLabel}</span>
+					<span class="entrypoint-badge" aria-label={`Entrypoint: ${entrypointLabel}`} title={`Entrypoint: ${entrypointLabel}`}>{entrypointLabel}</span>
 				{/if}
 				{#if PM_ORCHESTRATION_ENABLED && session.workerOf && !workersView}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->

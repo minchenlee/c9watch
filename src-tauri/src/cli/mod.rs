@@ -1398,6 +1398,10 @@ fn insert_session_contract(json: &mut serde_json::Value, session: &session::enri
     );
     object.insert("provider".to_string(), serde_json::json!(session.provider));
     object.insert("surface".to_string(), serde_json::json!(session.surface));
+    object.insert("kind".to_string(), serde_json::json!(session.kind));
+    if let Some(entrypoint) = &session.entrypoint {
+        object.insert("entrypoint".to_string(), serde_json::json!(entrypoint));
+    }
     object.insert(
         "agentKind".to_string(),
         serde_json::json!(session.agent_kind),
@@ -1911,6 +1915,26 @@ mod session_formatter_tests {
             can_open: false,
             can_stop: false,
             can_rename: false,
+        }
+    }
+
+    #[test]
+    fn session_formatters_preserve_kind_and_optional_raw_entrypoint() {
+        for (kind, expected) in [
+            (SessionKind::Interactive, "interactive"),
+            (SessionKind::Background, "background"),
+            (SessionKind::Unknown, "unknown"),
+        ] {
+            let mut session = codex_subagent();
+            session.kind = kind;
+            session.entrypoint = Some("sdk-cli".to_string());
+            for value in [compact_session(&session), full_session(session.clone())] {
+                assert_eq!(value["kind"], expected);
+                assert_eq!(value["entrypoint"], "sdk-cli");
+            }
+            session.entrypoint = None;
+            assert!(compact_session(&session).get("entrypoint").is_none());
+            assert!(full_session(session).get("entrypoint").is_none());
         }
     }
 
