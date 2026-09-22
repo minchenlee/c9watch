@@ -62,7 +62,14 @@ async function refreshOnce() {
 	refreshInFlight = true;
 	const requestGeneration = generation;
 	try {
-		const raw = await invoke<Record<string, SubagentInfo[]>>('get_subagents');
+		// The backend only stat/cache-checks session files that are either
+		// currently live or already known to have something relevant, so it
+		// needs to know which sessions are live right now. We already have
+		// that here — it's exactly what triggered this refresh — so pass it
+		// along instead of making the backend spawn a second `claude agents
+		// --json` per poll to re-derive the same set.
+		const sessionIds = get(sessions).map((s) => s.id);
+		const raw = await invoke<Record<string, SubagentInfo[]>>('get_subagents', { sessionIds });
 			const m = new Map<string, SubagentInfo[]>();
 			for (const [k, v] of Object.entries(raw)) {
 				// Accept the provider-scoped key from current backends and normalize

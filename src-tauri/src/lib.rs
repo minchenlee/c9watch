@@ -158,14 +158,26 @@ async fn get_memory_files() -> Result<Vec<session::ProjectMemory>, String> {
 
 /// Returns a map of parent_session_id -> subagent invocations detected by
 /// parsing each session's JSONL transcript for Agent/Task tool_use entries.
+///
+/// `session_ids` is the frontend's already-known live session id list (from
+/// its own `sessions` store, which is what triggers this call in the first
+/// place) — passing it in lets the scan skip a stat/cache-lookup entirely
+/// for any session file that isn't live and has nothing relevant cached,
+/// without needing a second `claude agents --json` call on this side to
+/// re-derive the same live set the main polling loop already has.
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_subagents(
+    session_ids: Vec<String>,
 ) -> Result<std::collections::HashMap<String, Vec<session::SubagentInfo>>, String> {
     // Transcript scans perform blocking disk I/O and JSON parsing. Running them
     // directly on Tokio workers can starve subscription IPC, pipes and timers.
     // Hold the permit inside the blocking job so cancellation cannot overlap scans.
-    blocking::scan(&blocking::SUBAGENTS, || Ok(session::all_subagents_by_session())).await
+    blocking::scan(&blocking::SUBAGENTS, move || {
+        let live: std::collections::HashSet<String> = session_ids.into_iter().collect();
+        Ok(session::all_subagents_by_session(&live))
+    })
+    .await
 }
 
 /// Returns the prompt + final result (plus usage stats when available) for a

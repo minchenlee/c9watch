@@ -893,12 +893,35 @@ fn is_relevant(sa: &SubagentInfo, now: DateTime<Utc>) -> bool {
     }
 }
 
+/// True if this path's last-cached subagent snapshot still has at least one
+/// relevant (running, or recently-completed) entry — used to keep watching a
+/// session for the rest of the retention window even after its process has
+/// exited, without needing a stat/read for every other, truly-quiet file.
+fn cache_has_relevant_entry(path: &Path, now: DateTime<Utc>) -> bool {
+    let Ok(cache) = SUBAGENT_CACHE.lock() else {
+        return false;
+    };
+    cache
+        .get(path)
+        .is_some_and(|entry| entry.subagents.iter().any(|sa| is_relevant(sa, now)))
+}
+
 /// Build a map of provider-scoped parent identity -> subagents for all Claude
 /// sessions found under `~/.claude/projects/`. Caller filters/joins as needed.
 ///
+/// `live_session_ids` is the caller's already-known set of currently-live
+/// Claude Code session ids (the frontend has this on hand from its own
+/// `sessions` store on every call, since a subagent refresh is triggered by
+/// that store changing) — used only to decide which files are worth a
+/// stat/cache-lookup at all. Deriving this set independently in here would
+/// mean spawning a second `claude agents --json` per poll on top of the one
+/// the main session-polling loop already does.
+///
 /// Only running subagents, and completed ones still within the retention
 /// window, are included — see `is_relevant`.
-pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
+pub fn all_subagents_by_session(
+    live_session_ids: &HashSet<String>,
+) -> HashMap<String, Vec<SubagentInfo>> {
     let mut out: HashMap<String, Vec<SubagentInfo>> = HashMap::new();
     let Some(home) = dirs::home_dir() else {
         return out;
@@ -924,6 +947,16 @@ pub fn all_subagents_by_session() -> HashMap<String, Vec<SubagentInfo>> {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
+
+            // Skip the stat/cache-lookup entirely for a session that's
+            // neither currently live nor already known to have something
+            // relevant — this is what keeps the cost of this function
+            // bounded by active session count instead of a user's entire
+            // lifetime history of session files.
+            if !live_session_ids.contains(stem) && !cache_has_relevant_entry(&path, now) {
+                continue;
+            }
+
             let subs: Vec<SubagentInfo> = cached_active_subagents_for_path(stem, &path)
                 .into_iter()
                 .filter(|sa| is_relevant(sa, now))
@@ -1057,6 +1090,26 @@ mod tests {
     }
 
     #[test]
+    fn cache_has_relevant_entry_reflects_last_cached_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("relevance-check.jsonl");
+        let now = Utc::now();
+
+        // Never scanned -- nothing cached, not relevant.
+        assert!(!cache_has_relevant_entry(&path, now));
+
+        // A running subagent populates the cache via the real lookup path
+        // and must be reported relevant afterward.
+        std::fs::write(
+            &path,
+            format!("{}\n", r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"x","description":"one"}}],"stop_reason":null,"stop_sequence":null}}"#),
+        )
+        .unwrap();
+        let _ = cached_active_subagents_for_path("s1", &path);
+        assert!(cache_has_relevant_entry(&path, now));
+    }
+
+    #[test]
     fn cached_lookup_reuses_result_until_file_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("synthetic-cache.jsonl");
@@ -1147,6 +1200,7 @@ mod tests {
         assert_eq!(by_id["a2"].status, SubagentStatus::Completed);
     }
 
+    #[test]
     #[test]
     fn cached_lookup_falls_back_to_full_reparse_when_file_replaced() {
         let tmp = tempfile::tempdir().unwrap();
