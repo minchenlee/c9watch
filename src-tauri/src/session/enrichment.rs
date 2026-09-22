@@ -1,4 +1,4 @@
-use crate::session::cache::FileVersion;
+use crate::session::cache::{read_lines_from_offset, FileVersion};
 use crate::session::codex::CodexLifecycle;
 use crate::session::cursor::CursorLifecycle;
 use crate::session::owners::global_provider_source_owners;
@@ -16,7 +16,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 /// Combined session information
@@ -792,18 +792,12 @@ pub fn get_latest_message_from_entries(entries: &[crate::session::parser::Sessio
     String::new()
 }
 
-/// Count user/assistant messages in a JSONL file.
+/// Counts user/assistant messages among the given raw JSONL lines.
 /// Skips system-injected user messages (local commands, slash commands, etc.)
-pub fn count_messages_in_jsonl(path: &Path) -> u32 {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return 0,
-    };
-    let reader = BufReader::new(file);
+fn count_messages_in_lines(lines: &[String]) -> u32 {
     let mut count = 0u32;
-
-    for line in reader.lines().map_while(Result::ok) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+    for line in lines {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
             if let Some(msg_type) = value.get("type").and_then(|t| t.as_str()) {
                 match msg_type {
                     "assistant" => count += 1,
@@ -827,7 +821,84 @@ pub fn count_messages_in_jsonl(path: &Path) -> u32 {
             }
         }
     }
+    count
+}
 
+/// Cached message count for one file: the version stamp and byte offset the
+/// count is current as of.
+struct MessageCountCacheEntry {
+    stamp: FileVersion,
+    offset: u64,
+    count: u32,
+}
+
+/// A live session's transcript grows every poll by definition, so a plain
+/// unchanged-file cache can't help it — this also tracks the scanned byte
+/// offset so a growing file only has its newly-appended lines counted,
+/// instead of the whole transcript being re-read and re-counted from byte
+/// zero every ~3.5s for as long as the session stays active. Same shape as
+/// `session::subagents::SUBAGENT_CACHE`.
+static MESSAGE_COUNT_CACHE: LazyLock<Mutex<HashMap<PathBuf, MessageCountCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Count user/assistant messages in a JSONL file, using `MESSAGE_COUNT_CACHE`
+/// so an unchanged file isn't re-read, and a grown one only has its new
+/// bytes counted rather than the whole file re-scanned. Falls back to a full
+/// recount when the file was replaced (different inode) or shrank.
+pub fn count_messages_in_jsonl(path: &Path) -> u32 {
+    let Ok(stamp) = FileVersion::read(path) else {
+        if let Ok(mut cache) = MESSAGE_COUNT_CACHE.lock() {
+            cache.remove(path);
+        }
+        return 0;
+    };
+
+    let mut cache = match MESSAGE_COUNT_CACHE.lock() {
+        Ok(cache) => cache,
+        Err(_) => {
+            let Ok((lines, _)) = read_lines_from_offset(path, 0) else {
+                return 0;
+            };
+            return count_messages_in_lines(&lines);
+        }
+    };
+
+    if let Some(existing) = cache.get(path) {
+        if existing.stamp == stamp && stamp.supports_unchanged_fast_path() {
+            return existing.count;
+        }
+
+        let same_file = stamp.identity != 0 && stamp.identity == existing.stamp.identity;
+        let grew_only = stamp.len >= existing.offset;
+        if same_file && grew_only {
+            if let Ok((new_lines, new_offset)) = read_lines_from_offset(path, existing.offset) {
+                let count = existing.count + count_messages_in_lines(&new_lines);
+                cache.insert(
+                    path.to_path_buf(),
+                    MessageCountCacheEntry {
+                        stamp,
+                        offset: new_offset,
+                        count,
+                    },
+                );
+                return count;
+            }
+        }
+    }
+
+    let Ok((lines, offset)) = read_lines_from_offset(path, 0) else {
+        cache.remove(path);
+        return 0;
+    };
+    let count = count_messages_in_lines(&lines);
+    cache.insert(
+        path.to_path_buf(),
+        MessageCountCacheEntry {
+            stamp,
+            offset,
+            count,
+        },
+    );
     count
 }
 
@@ -1104,6 +1175,93 @@ mod placeholder_tests {
         assert_eq!(get_cached_native_title(&path).as_deref(), Some("second"));
         std::fs::remove_file(&path).unwrap();
         assert_eq!(get_cached_native_title(&path), None);
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_counts_and_caches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"content":"hello"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":"hi"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(count_messages_in_jsonl(&path), 2);
+        // Same file, unchanged -- must return the cached count, not recount.
+        assert_eq!(count_messages_in_jsonl(&path), 2);
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_counts_only_new_lines_on_append() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-incremental.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n", r#"{"type":"user","message":{"content":"one"}}"#),
+        )
+        .unwrap();
+        assert_eq!(count_messages_in_jsonl(&path), 1);
+
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, r#"{{"type":"assistant","message":{{"content":"two"}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"assistant","message":{{"content":"three"}}}}"#).unwrap();
+        drop(file);
+
+        assert_eq!(count_messages_in_jsonl(&path), 3);
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_skips_system_injected_user_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-system.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                r#"{"type":"user","message":{"content":"<command-name>/exit</command-name>"}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(count_messages_in_jsonl(&path), 0);
+    }
+
+    #[test]
+    #[test]
+    fn count_messages_in_jsonl_missing_file_returns_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("does-not-exist.jsonl");
+        assert_eq!(count_messages_in_jsonl(&path), 0);
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_falls_back_to_full_recount_when_file_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-replaced.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"content":"a"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":"b"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(count_messages_in_jsonl(&path), 2);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\n", r#"{"type":"user","message":{"content":"replaced"}}"#),
+        )
+        .unwrap();
+        assert_eq!(count_messages_in_jsonl(&path), 1);
     }
 }
 

@@ -96,8 +96,13 @@ export function initializeSubagentPolling() {
 		refreshOnce();
 	});
 	// Fixed-interval backstop in case sessions are quiet but a long-running
-	// subagent finishes mid-cycle.
-	pollHandle = setInterval(refreshOnce, 4000);
+	// subagent finishes mid-cycle (the parent session's own status can stay
+	// unchanged across a subagent's whole run, so the sessions-store trigger
+	// above won't always catch it). 20s rather than 4s: the primary trigger
+	// already covers the common case at roughly the main poll's ~3.5s
+	// cadence, so a tight fixed interval here was mostly firing redundant,
+	// near-duplicate refreshes rather than adding real responsiveness.
+	pollHandle = setInterval(refreshOnce, 20_000);
 	// Initial fetch
 	refreshOnce();
 	// Return a teardown for tests/HMR.

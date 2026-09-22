@@ -9,14 +9,13 @@
 //! `tool_result` has appeared yet — that's how we detect "running" subagents
 //! without requiring users to install a hook.
 
-use crate::session::cache::FileVersion;
+use crate::session::cache::{read_lines_from_offset, FileVersion};
 use crate::session::parser::{parse_jsonl_entries, MessageContent, SessionEntry};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
@@ -175,41 +174,6 @@ fn collect_user_tool_result_ids_from_lines(lines: &[String]) -> HashMap<String, 
         }
     }
     completed
-}
-
-/// Reads non-empty JSONL lines starting at `offset` bytes into the file, up
-/// to EOF. Returns the lines plus the byte offset immediately after the last
-/// *complete* line consumed.
-///
-/// A trailing line with no terminating newline (the file was read mid-write)
-/// is left unconsumed rather than parsed: its bytes are not counted in the
-/// returned offset, so the next call re-reads it from the start once it's
-/// actually complete, instead of the incremental reader silently resuming
-/// from the middle of a line.
-fn read_lines_from_offset(path: &Path, offset: u64) -> io::Result<(Vec<String>, u64)> {
-    let mut file = fs::File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut reader = BufReader::new(file);
-    let mut lines = Vec::new();
-    let mut consumed = offset;
-    let mut buf = String::new();
-    loop {
-        buf.clear();
-        let n = reader.read_line(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        if !buf.ends_with('\n') {
-            // Incomplete trailing line — stop without consuming it.
-            break;
-        }
-        consumed += n as u64;
-        let trimmed = buf.trim_end_matches(['\n', '\r']);
-        if !trimmed.trim().is_empty() {
-            lines.push(trimmed.to_string());
-        }
-    }
-    Ok((lines, consumed))
 }
 
 /// Builds subagent info from a full (or full-so-far) set of raw JSONL lines.

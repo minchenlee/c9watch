@@ -5,9 +5,47 @@
 //! that a cached transcript summary is still current.
 
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
+
+/// Reads non-empty JSONL lines starting at `offset` bytes into the file, up
+/// to EOF. Returns the lines plus the byte offset immediately after the last
+/// *complete* line consumed.
+///
+/// A trailing line with no terminating newline (the file was read mid-write)
+/// is left unconsumed rather than parsed: its bytes are not counted in the
+/// returned offset, so the next call re-reads it from the start once it's
+/// actually complete, instead of an incremental reader silently resuming
+/// from the middle of a line.
+///
+/// Shared by any incremental, offset-tracking file cache (subagent
+/// detection, message counting); a full read is just `offset: 0`.
+pub(crate) fn read_lines_from_offset(path: &Path, offset: u64) -> io::Result<(Vec<String>, u64)> {
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    let mut consumed = offset;
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if !buf.ends_with('\n') {
+            // Incomplete trailing line — stop without consuming it.
+            break;
+        }
+        consumed += n as u64;
+        let trimmed = buf.trim_end_matches(['\n', '\r']);
+        if !trimmed.trim().is_empty() {
+            lines.push(trimmed.to_string());
+        }
+    }
+    Ok((lines, consumed))
+}
 
 /// Provider-neutral metadata version used by file-backed caches.
 ///
