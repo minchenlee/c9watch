@@ -53,9 +53,27 @@ export const visibleSubagentsBySession = derived(subagentsBySession, ($map) => {
 	return out;
 });
 
-let pollHandle: ReturnType<typeof setInterval> | null = null;
+/**
+ * Backstop: if nothing has triggered a refresh in this long, do one anyway.
+ * Covers a subagent finishing while its parent session's own status never
+ * changes (so the sessions-store trigger below wouldn't otherwise catch it).
+ * The timer is reset by every completed refresh, from whatever triggered
+ * it, so it only ever fires during a genuinely quiet period — it's never
+ * racing or duplicating the sessions-store trigger, which is what lets it
+ * run this tight without adding back the redundant-refresh cost a fixed,
+ * independent interval had.
+ */
+const BACKSTOP_MS = 5000;
+
+let backstopTimer: ReturnType<typeof setTimeout> | null = null;
 let refreshInFlight = false;
 let generation = 0;
+let initialized = false;
+
+function scheduleBackstop() {
+	if (backstopTimer !== null) clearTimeout(backstopTimer);
+	backstopTimer = setTimeout(refreshOnce, BACKSTOP_MS);
+}
 
 async function refreshOnce() {
 	if (!isTauri() || refreshInFlight) return;
@@ -81,36 +99,32 @@ async function refreshOnce() {
 		// Backend may be unavailable in non-Tauri contexts; ignore.
 	} finally {
 		refreshInFlight = false;
+		if (requestGeneration === generation) scheduleBackstop();
 	}
 }
 
 /**
  * Start polling for subagent updates. Triggered by the sessions store update
- * (re-fetch when sessions change) and on a slower fixed interval as a backstop.
+ * (re-fetch when sessions change), with a reset-on-activity backstop so a
+ * quiet period still gets refreshed — see `scheduleBackstop`.
  */
 export function initializeSubagentPolling() {
-	if (pollHandle !== null) return;
+	if (initialized) return;
+	initialized = true;
 	// Re-fetch when the sessions list changes — that's our cheapest signal that
 	// new transcript entries may have appeared.
 	const unsub = sessions.subscribe(() => {
 		refreshOnce();
 	});
-	// Fixed-interval backstop in case sessions are quiet but a long-running
-	// subagent finishes mid-cycle (the parent session's own status can stay
-	// unchanged across a subagent's whole run, so the sessions-store trigger
-	// above won't always catch it). 20s rather than 4s: the primary trigger
-	// already covers the common case at roughly the main poll's ~3.5s
-	// cadence, so a tight fixed interval here was mostly firing redundant,
-	// near-duplicate refreshes rather than adding real responsiveness.
-	pollHandle = setInterval(refreshOnce, 20_000);
-	// Initial fetch
+	// Initial fetch (also schedules the first backstop, in its `finally`).
 	refreshOnce();
 	// Return a teardown for tests/HMR.
 	return () => {
 		generation++;
-		if (pollHandle !== null) {
-			clearInterval(pollHandle);
-			pollHandle = null;
+		initialized = false;
+		if (backstopTimer !== null) {
+			clearTimeout(backstopTimer);
+			backstopTimer = null;
 		}
 		unsub();
 	};
