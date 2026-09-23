@@ -1,3 +1,4 @@
+use crate::claude_hooks::{HookSessionState, PendingPermission};
 use crate::session::cache::{
     can_incrementally_read, extend_prefix_snapshot, hash_file_prefix, next_full_verify_offset,
     read_lines_from_offset, validate_cached_prefix, FileVersion, PrefixSnapshot,
@@ -6,15 +7,17 @@ use crate::session::cache::{
 use crate::session::codex::CodexLifecycle;
 use crate::session::cursor::CursorLifecycle;
 use crate::session::owners::global_provider_source_owners;
+use crate::session::permissions::PermissionChecker;
 use crate::session::pi::PiLifecycle;
 use crate::session::source::{
     AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionIdentity, SessionKind,
     SessionProvider, SessionSource, SessionSurface,
 };
-use crate::session::{
-    determine_status, get_pending_tool_input, get_pending_tool_name, parse_last_n_entries,
-    parse_sessions_index, SessionStatus,
+use crate::session::status::{
+    determine_status_with, get_pending_tool_input_with, get_pending_tool_name_with,
+    unresolved_tool_uses,
 };
+use crate::session::{parse_last_n_entries, parse_sessions_index, SessionEntry, SessionStatus};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -159,13 +162,34 @@ pub(crate) fn get_cached_native_title(path: &Path) -> Option<String> {
 
 /// Combines the existing heuristic-based SessionStatus with the CLI activity signal.
 ///
-/// CLI activity NEVER overrides NeedsAttention or Connecting — those stay driven by
-/// JSONL content + PermissionChecker. It only refines Working vs WaitingForInput.
+/// `Waiting` means Claude Code itself is showing a prompt, so it always wins.
+/// When `reports_prompts` (the Claude Code version reports every prompt as
+/// `Waiting`), `Busy`/`Idle` also rule out a prompt: `Busy` overrides any
+/// NeedsAttention inferred from the transcript or hooks, and `Idle` overrides
+/// one that stands for a prompt. A trailing text question (`pending_tool` of
+/// "Question") leaves Claude Code idle, so it stays NeedsAttention while idle.
+/// Otherwise CLI activity never overrides NeedsAttention or Connecting and only
+/// refines Working vs WaitingForInput.
 pub fn merge_cli_activity(
     heuristic: SessionStatus,
     cli: Option<CliActivity>,
-    has_pending_tool: bool,
+    reports_prompts: bool,
+    pending_tool: Option<&str>,
 ) -> SessionStatus {
+    let text_question = pending_tool == Some("Question");
+    match (&heuristic, cli) {
+        (_, Some(CliActivity::Waiting)) => return SessionStatus::NeedsAttention,
+        (SessionStatus::NeedsAttention, Some(CliActivity::Busy)) if reports_prompts => {
+            return SessionStatus::Working;
+        }
+        (SessionStatus::NeedsAttention, Some(CliActivity::Idle))
+            if reports_prompts && !text_question =>
+        {
+            return SessionStatus::WaitingForInput;
+        }
+        _ => {}
+    }
+    let has_pending_tool = pending_tool.is_some();
     match (heuristic, cli) {
         (SessionStatus::NeedsAttention, _) => SessionStatus::NeedsAttention,
         (SessionStatus::Connecting, _) => SessionStatus::Connecting,
@@ -635,12 +659,28 @@ pub fn enrich_detected_sessions(
             vec![]
         };
 
-        let pending_tool_name = get_pending_tool_name(&entries);
+        // With hook data, permission prompts come from Claude Code itself and a
+        // pending tool alone never implies one; otherwise infer from allow rules.
+        let hook_state = crate::claude_hooks::session_state(&session_id);
+        let checker = match hook_state {
+            Some(_) => std::sync::Arc::new(PermissionChecker::assume_approved()),
+            None => PermissionChecker::cached_for(Some(&detected.cwd)),
+        };
+        let hook_prompt = hook_state
+            .as_ref()
+            .and_then(|state| open_hook_prompt(state, &session_file_path));
 
-        let heuristic_status = if entries.is_empty() {
+        let pending_tool_name = match &hook_prompt {
+            Some(prompt) => Some(prompt.tool_name.clone()),
+            None => get_pending_tool_name_with(&entries, &checker),
+        };
+
+        let heuristic_status = if hook_prompt.is_some() {
+            SessionStatus::NeedsAttention
+        } else if entries.is_empty() {
             SessionStatus::Connecting
         } else {
-            let raw_status = determine_status(&entries);
+            let raw_status = determine_status_with(&entries, &checker);
             // Override WaitingForInput if the JSONL file was recently modified.
             if raw_status == SessionStatus::WaitingForInput
                 && is_file_recently_modified(&session_file_path, 8)
@@ -653,12 +693,19 @@ pub fn enrich_detected_sessions(
         let status = merge_cli_activity(
             heuristic_status,
             detected.cli_activity,
-            pending_tool_name.is_some(),
+            detected.cli_reports_prompts,
+            pending_tool_name.as_deref(),
         );
 
         let latest_message = get_latest_message_from_entries(&entries);
         let notification_preview = notification_preview_from_entries(&entries);
-        let pending_tool_input = get_pending_tool_input(&entries);
+        let pending_tool_input = match &hook_prompt {
+            Some(prompt) if prompt.agent_id.is_none() => {
+                pending_input_named(&entries, &prompt.tool_name)
+            }
+            Some(_) => None,
+            None => get_pending_tool_input_with(&entries, &checker),
+        };
 
         // Skip empty sessions (0 messages) UNLESS CLI-sourced — `claude agents --json`
         // confirms the agent is live even when no project JSONL exists (SDK-based
@@ -719,6 +766,66 @@ pub fn enrich_detected_sessions(
     }
 
     Ok((sessions, diagnostics))
+}
+
+/// The first hook-reported permission prompt that its transcript still shows as
+/// an unresolved call of the same tool. Hooks can miss the event that resolves
+/// a prompt (a rejected dialog fires none), so the transcript is the tiebreaker.
+/// A prompt with no readable transcript is trusted as reported.
+fn open_hook_prompt(state: &HookSessionState, session_file: &Path) -> Option<PendingPermission> {
+    if state.pending.is_empty() {
+        return None;
+    }
+    let unresolved_names = |path: &Path| -> Option<Vec<String>> {
+        if !path.is_file() {
+            return None;
+        }
+        let entries = parse_last_n_entries(path, 50).ok()?;
+        Some(
+            unresolved_tool_uses(&entries)
+                .into_iter()
+                .map(|(name, _)| name.to_string())
+                .collect(),
+        )
+    };
+    let main = unresolved_names(session_file);
+    state
+        .pending
+        .iter()
+        .find(|prompt| {
+            let transcript = match &prompt.agent_id {
+                None => main.clone(),
+                Some(agent_id) => subagent_transcript(session_file, agent_id)
+                    .and_then(|path| unresolved_names(&path)),
+            };
+            transcript.is_none_or(|names| names.contains(&prompt.tool_name))
+        })
+        .cloned()
+}
+
+/// `<project>/<session>/subagents/agent-<id>.jsonl` for `<project>/<session>.jsonl`.
+fn subagent_transcript(session_file: &Path, agent_id: &str) -> Option<PathBuf> {
+    if !agent_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let session_dir = session_file.with_extension("");
+    Some(
+        session_dir
+            .join("subagents")
+            .join(format!("agent-{agent_id}.jsonl")),
+    )
+}
+
+/// Input of the last unresolved call to `tool_name`.
+fn pending_input_named(entries: &[SessionEntry], tool_name: &str) -> Option<serde_json::Value> {
+    unresolved_tool_uses(entries)
+        .into_iter()
+        .rev()
+        .find(|(name, _)| *name == tool_name)
+        .map(|(_, input)| input.clone())
 }
 
 /// Checks if a file was modified within the last N seconds
@@ -1116,6 +1223,7 @@ mod merge_tests {
             SessionStatus::NeedsAttention,
             Some(CliActivity::Busy),
             false,
+            None,
         );
         assert_eq!(merged, SessionStatus::NeedsAttention);
     }
@@ -1126,13 +1234,19 @@ mod merge_tests {
             SessionStatus::NeedsAttention,
             Some(CliActivity::Idle),
             false,
+            None,
         );
         assert_eq!(merged, SessionStatus::NeedsAttention);
     }
 
     #[test]
     fn merge_preserves_connecting() {
-        let merged = merge_cli_activity(SessionStatus::Connecting, Some(CliActivity::Busy), false);
+        let merged = merge_cli_activity(
+            SessionStatus::Connecting,
+            Some(CliActivity::Busy),
+            false,
+            None,
+        );
         assert_eq!(merged, SessionStatus::Connecting);
     }
 
@@ -1142,27 +1256,107 @@ mod merge_tests {
             SessionStatus::WaitingForInput,
             Some(CliActivity::Busy),
             false,
+            None,
         );
         assert_eq!(merged, SessionStatus::Working);
     }
 
     #[test]
     fn merge_idle_downgrades_working_without_pending_tool() {
-        let merged = merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), false);
+        let merged =
+            merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), false, None);
         assert_eq!(merged, SessionStatus::WaitingForInput);
     }
 
     #[test]
     fn merge_idle_keeps_working_when_pending_tool() {
-        let merged = merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), true);
+        let merged = merge_cli_activity(
+            SessionStatus::Working,
+            Some(CliActivity::Idle),
+            false,
+            Some("Bash"),
+        );
         assert_eq!(merged, SessionStatus::Working);
     }
 
     #[test]
     fn merge_none_returns_heuristic_unchanged() {
-        let merged = merge_cli_activity(SessionStatus::Working, None, false);
+        let merged = merge_cli_activity(SessionStatus::Working, None, false, None);
         assert_eq!(merged, SessionStatus::Working);
-        let merged = merge_cli_activity(SessionStatus::WaitingForInput, None, true);
+        let merged = merge_cli_activity(SessionStatus::WaitingForInput, None, false, Some("Bash"));
+        assert_eq!(merged, SessionStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn merge_waiting_always_needs_attention() {
+        for heuristic in [
+            SessionStatus::Working,
+            SessionStatus::WaitingForInput,
+            SessionStatus::Connecting,
+        ] {
+            let merged = merge_cli_activity(heuristic, Some(CliActivity::Waiting), false, None);
+            assert_eq!(merged, SessionStatus::NeedsAttention);
+        }
+    }
+
+    #[test]
+    fn merge_busy_clears_inferred_needs_attention_when_prompts_reported() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Busy),
+            true,
+            Some("Bash"),
+        );
+        assert_eq!(merged, SessionStatus::Working);
+    }
+
+    #[test]
+    fn merge_idle_clears_inferred_needs_attention_when_prompts_reported() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Idle),
+            true,
+            None,
+        );
+        assert_eq!(merged, SessionStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn merge_keeps_needs_attention_without_cli_activity() {
+        let merged = merge_cli_activity(SessionStatus::NeedsAttention, None, true, Some("Bash"));
+        assert_eq!(merged, SessionStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn merge_idle_keeps_text_question_needing_attention() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Idle),
+            true,
+            Some("Question"),
+        );
+        assert_eq!(merged, SessionStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn merge_busy_clears_text_question() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Busy),
+            true,
+            Some("Question"),
+        );
+        assert_eq!(merged, SessionStatus::Working);
+    }
+
+    #[test]
+    fn merge_idle_clears_inferred_prompt_even_with_pending_tool() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Idle),
+            true,
+            Some("Bash"),
+        );
         assert_eq!(merged, SessionStatus::WaitingForInput);
     }
 }
@@ -1192,6 +1386,7 @@ mod placeholder_tests {
             started_at_ms: Some(1_700_000_000_000),
             official_name: None,
             cli_activity: None,
+            cli_reports_prompts: false,
             provider: SessionProvider::ClaudeCode,
             surface: SessionSurface::ClaudeCode,
             agent_kind: AgentKind::Root,
@@ -1685,5 +1880,68 @@ mod notification_preview_tests {
         )
         .unwrap();
         assert_eq!(notification_preview_from_entries(&[assistant, user]), None);
+    }
+}
+
+#[cfg(test)]
+mod hook_prompt_tests {
+    use super::*;
+
+    const PENDING_BASH: &str = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-09-23T00:00:00Z","message":{"model":"m","id":"msg1","role":"assistant","content":[{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"make"}}],"stop_reason":null,"stop_sequence":null}}"#;
+    const BASH_RESULT: &str = r#"{"type":"user","uuid":"u2","timestamp":"2026-09-23T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_b","content":"The user doesn't want to proceed","is_error":true}]}}"#;
+
+    fn prompt(agent_id: Option<&str>, tool_name: &str) -> PendingPermission {
+        PendingPermission {
+            agent_id: agent_id.map(str::to_owned),
+            tool_name: tool_name.to_owned(),
+            requested_at: 1,
+        }
+    }
+
+    fn state(pending: Vec<PendingPermission>) -> HookSessionState {
+        HookSessionState { pending }
+    }
+
+    #[test]
+    fn main_thread_prompt_needs_matching_unresolved_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("s1.jsonl");
+        std::fs::write(&file, format!("{PENDING_BASH}\n")).unwrap();
+
+        let open = open_hook_prompt(&state(vec![prompt(None, "Bash")]), &file);
+        assert_eq!(open.map(|p| p.tool_name), Some("Bash".to_string()));
+        assert_eq!(open_hook_prompt(&state(vec![prompt(None, "Write")]), &file), None);
+
+        // A rejected dialog fires no hook, but the transcript records the result.
+        std::fs::write(&file, format!("{PENDING_BASH}\n{BASH_RESULT}\n")).unwrap();
+        assert_eq!(open_hook_prompt(&state(vec![prompt(None, "Bash")]), &file), None);
+    }
+
+    #[test]
+    fn subagent_prompt_checks_the_subagent_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("s1.jsonl");
+        std::fs::write(&file, "").unwrap();
+        let pending = state(vec![prompt(Some("a1"), "Bash")]);
+
+        // No subagent transcript on disk: trust the hook.
+        assert!(open_hook_prompt(&pending, &file).is_some());
+
+        let subagents = dir.path().join("s1").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let transcript = subagents.join("agent-a1.jsonl");
+        std::fs::write(&transcript, format!("{PENDING_BASH}\n")).unwrap();
+        assert!(open_hook_prompt(&pending, &file).is_some());
+        std::fs::write(&transcript, format!("{PENDING_BASH}\n{BASH_RESULT}\n")).unwrap();
+        assert!(open_hook_prompt(&pending, &file).is_none());
+    }
+
+    #[test]
+    fn subagent_ids_cannot_escape_the_session_directory() {
+        assert_eq!(subagent_transcript(Path::new("/p/s1.jsonl"), "../x"), None);
+        assert_eq!(
+            subagent_transcript(Path::new("/p/s1.jsonl"), "a1"),
+            Some(PathBuf::from("/p/s1/subagents/agent-a1.jsonl"))
+        );
     }
 }

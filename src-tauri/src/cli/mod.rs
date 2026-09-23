@@ -67,6 +67,17 @@ pub enum Commands {
         #[arg(long)]
         passthrough: bool,
     },
+    /// Report Claude Code permission prompts to c9watch through hooks
+    ///
+    /// With no flags, reads one hook event from stdin (Claude Code runs this).
+    Hooks {
+        /// Back up settings and register the c9watch hooks
+        #[arg(long, conflicts_with = "uninstall")]
+        install: bool,
+        /// Back up settings and remove the c9watch hooks
+        #[arg(long)]
+        uninstall: bool,
+    },
     /// List all active Claude Code sessions
     List {
         /// Filter by project path (substring match)
@@ -287,6 +298,7 @@ pub fn run(cli: Cli) {
 
     let result = match cli.command {
         Commands::UsageBridge { install, passthrough } => crate::claude_usage::run(install, passthrough),
+        Commands::Hooks { install, uninstall } => crate::claude_hooks::run(install, uninstall),
         Commands::List {
             project,
             status,

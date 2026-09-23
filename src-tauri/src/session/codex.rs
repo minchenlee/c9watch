@@ -622,6 +622,7 @@ impl CodexSessionSource {
                 started_at_ms: summary.started_at_ms,
                 official_name: summary.agent_nickname.clone(),
                 cli_activity: None,
+                cli_reports_prompts: false,
                 provider: SessionProvider::Codex,
                 surface: summary.surface,
                 agent_kind: summary.agent_kind,

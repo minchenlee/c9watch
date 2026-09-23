@@ -205,6 +205,8 @@ See [SKILLS.md](SKILLS.md) for more install options.
 **Live monitoring** -- A background thread polls every 2 seconds, scanning for running `claude` processes using `sysinfo`. Each process is matched to its session file in `~/.claude/projects/` via path encoding and timestamp correlation. The last N entries of each session's JSONL file are parsed to determine status:
 - **Working** -- Claude is generating a response or executing tools
 - **Needs Attention** -- A tool requires user approval, or Claude is asking the user a question
+
+Run `c9watch hooks --install` to have Claude Code report permission prompts directly, instead of c9watch inferring them from the transcript. See [docs/claude-hooks.md](docs/claude-hooks.md).
 - **Idle** -- Session is waiting for your next prompt
 
 Status updates are pushed to the Svelte frontend via Tauri events. The UI reactively updates, sorting sessions by priority (permission requests surface first).

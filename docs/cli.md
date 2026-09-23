@@ -236,6 +236,16 @@ c9watch workers --all --pretty
 {"ok":true,"workers":[{"sessionId":"...","pid":54321,"name":"researcher","cwd":"/path","spawnedAt":"...","alive":true}]}
 ```
 
+### `hooks` — Report Permission Prompts
+
+```bash
+c9watch hooks --install     # register c9watch hooks in ~/.claude/settings.json
+c9watch hooks --uninstall   # remove them
+```
+
+With no flags, reads one Claude Code hook event from stdin; Claude Code runs it.
+See [Claude Code hooks](claude-hooks.md).
+
 ## Global Flags
 
 | Flag | Description |

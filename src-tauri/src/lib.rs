@@ -4,6 +4,7 @@
 
 // ── Core modules (always compiled) ──────────────────────────────────
 pub mod actions;
+pub mod claude_hooks;
 pub mod claude_usage;
 pub mod debug_log;
 pub mod session;

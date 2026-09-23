@@ -256,6 +256,7 @@ impl SessionSource for PiSessionSource {
                     started_at_ms: summary.started_at_ms,
                     official_name: None,
                     cli_activity: None,
+                    cli_reports_prompts: false,
                     provider: SessionProvider::Pi,
                     surface: SessionSurface::Cli,
                     agent_kind: AgentKind::Root,

@@ -2,13 +2,11 @@ use super::parser::{AssistantMessage, MessageContent, SessionEntry};
 use super::permissions::PermissionChecker;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
+use std::sync::Arc;
 
-/// Global permission checker (loaded once from settings)
-static PERMISSION_CHECKER: OnceLock<PermissionChecker> = OnceLock::new();
-
-fn get_permission_checker() -> &'static PermissionChecker {
-    PERMISSION_CHECKER.get_or_init(PermissionChecker::from_settings_file)
+/// Checker built from the user-level settings files.
+fn get_permission_checker() -> Arc<PermissionChecker> {
+    PermissionChecker::cached_for(None)
 }
 
 /// Represents the current status of a Claude Code session
@@ -36,6 +34,15 @@ pub enum SessionStatus {
 /// # Returns
 /// The determined session status
 pub fn determine_status(entries: &[SessionEntry]) -> SessionStatus {
+    determine_status_with(entries, &get_permission_checker())
+}
+
+/// [`determine_status`] using `checker` to decide whether a pending tool is
+/// waiting on a permission prompt.
+pub fn determine_status_with(
+    entries: &[SessionEntry],
+    checker: &PermissionChecker,
+) -> SessionStatus {
     // If no entries, session is likely starting up
     if entries.is_empty() {
         return SessionStatus::Connecting;
@@ -95,7 +102,7 @@ pub fn determine_status(entries: &[SessionEntry]) -> SessionStatus {
         }
         SessionEntry::Assistant { base, message } => {
             // Analyze the assistant message content
-            let raw_status = analyze_assistant_message(message);
+            let raw_status = analyze_assistant_message(message, checker);
 
             // Check if the assistant is asking the user a question.
             // - AskUserQuestion tool: trigger immediately (no recency delay)
@@ -234,7 +241,10 @@ fn is_assistant_asking_question(message: &AssistantMessage) -> bool {
 }
 
 /// Analyzes an assistant message to determine status
-fn analyze_assistant_message(message: &AssistantMessage) -> SessionStatus {
+fn analyze_assistant_message(
+    message: &AssistantMessage,
+    checker: &PermissionChecker,
+) -> SessionStatus {
     // Check if the message contains any tool uses
     let has_tool_use = message
         .content
@@ -260,7 +270,7 @@ fn analyze_assistant_message(message: &AssistantMessage) -> SessionStatus {
         } else {
             // Tool use present but not all completed
             // Check if pending tools are auto-approved
-            if are_pending_tools_auto_approved(&message.content) {
+            if are_pending_tools_auto_approved(&message.content, checker) {
                 // All pending tools will be auto-approved, so status is Working
                 SessionStatus::Working
             } else {
@@ -283,9 +293,10 @@ fn analyze_assistant_message(message: &AssistantMessage) -> SessionStatus {
 }
 
 /// Checks if all pending (incomplete) tool uses are auto-approved
-fn are_pending_tools_auto_approved(content: &[MessageContent]) -> bool {
-    let checker = get_permission_checker();
-
+fn are_pending_tools_auto_approved(
+    content: &[MessageContent],
+    checker: &PermissionChecker,
+) -> bool {
     // Get IDs of tools that have results
     let completed_ids: Vec<&str> = content
         .iter()
@@ -326,6 +337,14 @@ fn are_pending_tools_auto_approved(content: &[MessageContent]) -> bool {
 /// - "Question" if Claude's last text ends with a question mark
 /// - None if the session doesn't need attention
 pub fn get_pending_tool_name(entries: &[SessionEntry]) -> Option<String> {
+    get_pending_tool_name_with(entries, &get_permission_checker())
+}
+
+/// [`get_pending_tool_name`] using `checker` for permission decisions.
+pub fn get_pending_tool_name_with(
+    entries: &[SessionEntry],
+    checker: &PermissionChecker,
+) -> Option<String> {
     // Find the last assistant message entry
     let last_assistant = entries.iter().rev().find_map(|entry| {
         if let SessionEntry::Assistant { message, .. } = entry {
@@ -334,8 +353,6 @@ pub fn get_pending_tool_name(entries: &[SessionEntry]) -> Option<String> {
             None
         }
     })?;
-
-    let checker = get_permission_checker();
 
     // Get IDs of tools that have results
     let completed_ids: Vec<&str> = last_assistant
@@ -381,6 +398,14 @@ pub fn get_pending_tool_name(entries: &[SessionEntry]) -> Option<String> {
 /// Gets the input of the first pending tool that needs permission.
 /// Returns the full tool_use JSON value so the agent knows what action is being requested.
 pub fn get_pending_tool_input(entries: &[SessionEntry]) -> Option<serde_json::Value> {
+    get_pending_tool_input_with(entries, &get_permission_checker())
+}
+
+/// [`get_pending_tool_input`] using `checker` for permission decisions.
+pub fn get_pending_tool_input_with(
+    entries: &[SessionEntry],
+    checker: &PermissionChecker,
+) -> Option<serde_json::Value> {
     let last_assistant = entries.iter().rev().find_map(|entry| {
         if let SessionEntry::Assistant { message, .. } = entry {
             Some(message)
@@ -388,8 +413,6 @@ pub fn get_pending_tool_input(entries: &[SessionEntry]) -> Option<serde_json::Va
             None
         }
     })?;
-
-    let checker = get_permission_checker();
 
     let completed_ids: Vec<&str> = last_assistant
         .content
@@ -415,6 +438,41 @@ pub fn get_pending_tool_input(entries: &[SessionEntry]) -> Option<serde_json::Va
     }
 
     None
+}
+
+/// Tool uses in `entries` that have no matching tool_result, in order, as
+/// `(name, input)`. Unlike the single-message checks above, this follows results
+/// written in later user entries, which is where Claude Code records them.
+pub fn unresolved_tool_uses(entries: &[SessionEntry]) -> Vec<(&str, &serde_json::Value)> {
+    let mut resolved: Vec<&str> = Vec::new();
+    for entry in entries {
+        match entry {
+            SessionEntry::User { message, .. } => {
+                resolved.extend(message.tool_result_ids.iter().map(String::as_str))
+            }
+            SessionEntry::Assistant { message, .. } => {
+                resolved.extend(message.content.iter().filter_map(|c| match c {
+                    MessageContent::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                    _ => None,
+                }))
+            }
+            _ => {}
+        }
+    }
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Assistant { message, .. } => Some(&message.content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|c| match c {
+            MessageContent::ToolUse { id, name, input } if !resolved.contains(&id.as_str()) => {
+                Some((name.as_str(), input))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Checks if there are any pending (incomplete) tool uses
@@ -553,6 +611,7 @@ mod tests {
                 content: "Hello".to_string(),
                 is_tool_result: false,
                 images: vec![],
+                tool_result_ids: vec![],
             },
         }];
         assert_eq!(determine_status(&entries), SessionStatus::Working);
@@ -842,6 +901,7 @@ mod tests {
                     content: "Hello".to_string(),
                     is_tool_result: false,
                     images: vec![],
+                    tool_result_ids: vec![],
                 },
             },
             SessionEntry::Unknown,
@@ -909,6 +969,7 @@ mod tests {
                 content: "Hello".to_string(),
                 is_tool_result: false,
                 images: vec![],
+                tool_result_ids: vec![],
             },
         }];
         assert_eq!(determine_status(&entries), SessionStatus::WaitingForInput);
@@ -1047,6 +1108,7 @@ mod tests {
                 content: "Hello".to_string(),
                 is_tool_result: false,
                 images: vec![],
+                tool_result_ids: vec![],
             },
         }];
         assert_eq!(get_pending_tool_name(&entries), None);
@@ -1244,5 +1306,60 @@ mod tests {
             },
         }];
         assert_eq!(determine_status(&entries), SessionStatus::NeedsAttention);
+    }
+
+    fn pending_tool(name: &str, base: SessionEntryBase) -> SessionEntry {
+        SessionEntry::Assistant {
+            base,
+            message: AssistantMessage {
+                model: "claude-opus-5-5".to_string(),
+                id: "msg_test".to_string(),
+                role: "assistant".to_string(),
+                content: vec![MessageContent::ToolUse {
+                    id: "toolu_1".to_string(),
+                    name: name.to_string(),
+                    input: serde_json::json!({"command": "cargo build"}),
+                }],
+                stop_reason: Some("tool_use".to_string()),
+                stop_sequence: None,
+                usage: None,
+            },
+        }
+    }
+
+    #[test]
+    fn test_long_running_subagent_is_working_not_needs_attention() {
+        let entries = vec![pending_tool("Agent", create_old_base())];
+        assert_eq!(determine_status(&entries), SessionStatus::Working);
+        assert_eq!(get_pending_tool_name(&entries), None);
+    }
+
+    #[test]
+    fn test_assume_approved_checker_never_infers_a_prompt() {
+        let entries = vec![pending_tool("Bash", create_old_base())];
+        let checker = PermissionChecker::assume_approved();
+        assert_eq!(
+            determine_status_with(&entries, &checker),
+            SessionStatus::Working
+        );
+        assert_eq!(get_pending_tool_name_with(&entries, &checker), None);
+        assert_eq!(get_pending_tool_input_with(&entries, &checker), None);
+    }
+
+    #[test]
+    fn test_unresolved_tool_uses_follow_results_in_later_user_entries() {
+        let lines = [
+            r#"{"type":"assistant","uuid":"u1","timestamp":"2026-09-23T00:00:00Z","message":{"model":"m","id":"msg1","role":"assistant","content":[{"type":"tool_use","id":"toolu_a","name":"Read","input":{}}],"stop_reason":null,"stop_sequence":null}}"#,
+            r#"{"type":"assistant","uuid":"u2","timestamp":"2026-09-23T00:00:00Z","message":{"model":"m","id":"msg1","role":"assistant","content":[{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"make"}}],"stop_reason":null,"stop_sequence":null}}"#,
+            r#"{"type":"user","uuid":"u3","timestamp":"2026-09-23T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a","content":"ok"}]}}"#,
+        ];
+        let entries = crate::session::parser::parse_jsonl_entries(
+            lines.iter().map(|l| l.to_string()).collect(),
+        );
+        assert_eq!(entries.len(), 3);
+        let unresolved = unresolved_tool_uses(&entries);
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].0, "Bash");
+        assert_eq!(unresolved[0].1["command"], "make");
     }
 }

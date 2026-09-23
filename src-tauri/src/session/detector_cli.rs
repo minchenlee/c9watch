@@ -55,7 +55,7 @@ impl CliSessionSource {
         lookup_with_cache(&home, &mut self.path_cache, cwd, session_id)
     }
 
-    fn map_agent_to_session(&mut self, a: CliAgent, entrypoint: Option<String>) -> DetectedSession {
+    fn map_agent_to_session(&mut self, a: CliAgent, meta: PidMeta) -> DetectedSession {
         let project_path = self.project_path_for_session(&a.cwd, &a.session_id);
         DetectedSession {
             pid: a.pid,
@@ -72,14 +72,11 @@ impl CliSessionSource {
                 "background" => SessionKind::Background,
                 _ => SessionKind::Unknown,
             },
-            entrypoint,
+            entrypoint: meta.entrypoint,
             started_at_ms: Some(a.started_at),
             official_name: a.name,
-            cli_activity: match a.status.as_deref() {
-                Some("busy") => Some(CliActivity::Busy),
-                Some("idle") => Some(CliActivity::Idle),
-                _ => None,
-            },
+            cli_activity: cli_activity(a.status.as_deref()),
+            cli_reports_prompts: meta.version.is_some_and(reports_prompts_as_waiting),
             cwd: a.cwd,
             provider: super::source::SessionProvider::ClaudeCode,
             surface: super::source::SessionSurface::ClaudeCode,
@@ -172,9 +169,9 @@ impl SessionSource for CliSessionSource {
         let sessions: Vec<DetectedSession> = agents
             .into_iter()
             .filter_map(|a| {
-                let entrypoint = pid_entrypoint(a.pid);
-                is_monitored_entrypoint(entrypoint.as_deref())
-                    .then(|| self.map_agent_to_session(a, entrypoint))
+                let meta = pid_meta(a.pid);
+                is_monitored_entrypoint(meta.entrypoint.as_deref())
+                    .then(|| self.map_agent_to_session(a, meta))
             })
             .collect();
 
@@ -248,27 +245,58 @@ fn is_known_blocked_background(object: &Map<String, Value>) -> bool {
 /// safer than an allowlist that silently drops CLI runs on every CC bump.
 const NON_MONITORED_SDK_ENTRYPOINTS: &[&str] = &["sdk-ts", "sdk-py"];
 
-/// Reads `~/.claude/sessions/<pid>.json`'s `entrypoint` field (e.g. "cli",
-/// "sdk-cli", "claude-vscode", "mcp", "remote_desktop"...), for both the
-/// non-monitored-SDK filter and surfacing the raw value to the frontend.
-/// `None` on a missing/unreadable/malformed file or missing field (older CC
-/// builds didn't write this metadata) — callers treat that as "unknown, but
-/// still a real CLI process" rather than excluding it.
-fn pid_entrypoint(pid: u32) -> Option<String> {
-    dirs::home_dir().and_then(|home| pid_entrypoint_under(&home, pid))
+/// Fields c9watch reads from `~/.claude/sessions/<pid>.json`. Each is `None`
+/// on a missing/unreadable/malformed file or missing field (older CC builds
+/// didn't write this metadata).
+#[derive(Debug, Default, PartialEq)]
+struct PidMeta {
+    /// Raw `entrypoint` (e.g. "cli", "sdk-cli", "claude-vscode", "mcp",
+    /// "remote_desktop"...), for both the non-monitored-SDK filter and
+    /// surfacing the raw value to the frontend. `None` is treated as "unknown,
+    /// but still a real CLI process" rather than excluded.
+    entrypoint: Option<String>,
+    /// Claude Code version that wrote the file.
+    version: Option<(u32, u32, u32)>,
 }
 
-fn pid_entrypoint_under(home: &Path, pid: u32) -> Option<String> {
+fn pid_meta(pid: u32) -> PidMeta {
+    dirs::home_dir()
+        .map(|home| pid_meta_under(&home, pid))
+        .unwrap_or_default()
+}
+
+fn pid_meta_under(home: &Path, pid: u32) -> PidMeta {
     let path = home
         .join(".claude")
         .join("sessions")
         .join(format!("{pid}.json"));
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    value
-        .get("entrypoint")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    let Some(value) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    else {
+        return PidMeta::default();
+    };
+    let field = |name: &str| value.get(name).and_then(Value::as_str);
+    PidMeta {
+        entrypoint: field("entrypoint").map(str::to_string),
+        version: field("version").and_then(super::parse_semver),
+    }
+}
+
+fn cli_activity(status: Option<&str>) -> Option<CliActivity> {
+    match status {
+        Some("busy") => Some(CliActivity::Busy),
+        Some("idle") => Some(CliActivity::Idle),
+        Some("waiting") => Some(CliActivity::Waiting),
+        _ => None,
+    }
+}
+
+/// Permission prompts already reported `waiting` before 2.1.212, which added
+/// the remaining sandbox, MCP-input and managed-settings prompts. From then
+/// on, `busy`/`idle` mean nothing is waiting on the user.
+fn reports_prompts_as_waiting(version: (u32, u32, u32)) -> bool {
+    version >= (2, 1, 212)
 }
 
 /// Whether an agent with this resolved `entrypoint` should be monitored (kept
@@ -358,10 +386,48 @@ mod tests {
                 name: None,
                 status: None,
             },
-            Some("sdk-cli".to_string()),
+            PidMeta {
+                entrypoint: Some("sdk-cli".to_string()),
+                version: Some((2, 1, 280)),
+            },
         );
 
         assert_eq!(session.entrypoint.as_deref(), Some("sdk-cli"));
+        assert!(session.cli_reports_prompts);
+    }
+
+    #[test]
+    fn cli_activity_maps_waiting() {
+        assert_eq!(cli_activity(Some("waiting")), Some(CliActivity::Waiting));
+        assert_eq!(cli_activity(Some("busy")), Some(CliActivity::Busy));
+        assert_eq!(cli_activity(Some("idle")), Some(CliActivity::Idle));
+        assert_eq!(cli_activity(Some("on_fire")), None);
+    }
+
+    #[test]
+    fn prompts_reported_as_waiting_from_2_1_212() {
+        assert!(!reports_prompts_as_waiting((2, 1, 211)));
+        assert!(reports_prompts_as_waiting((2, 1, 212)));
+        assert!(reports_prompts_as_waiting((2, 2, 0)));
+    }
+
+    #[test]
+    fn pid_meta_reads_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("9.json"),
+            r#"{"pid":9,"entrypoint":"cli","version":"2.1.280","status":"waiting","waitingFor":"permission prompt"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pid_meta_under(tmp.path(), 9),
+            PidMeta {
+                entrypoint: Some("cli".to_string()),
+                version: Some((2, 1, 280)),
+            }
+        );
     }
 
     #[test]
@@ -544,10 +610,10 @@ mod tests {
         assert_eq!(cache.len(), 1, "cache size unchanged on hit");
     }
 
-    /// Combines `pid_entrypoint_under` + `is_monitored_entrypoint`, mirroring
+    /// Combines `pid_meta_under` + `is_monitored_entrypoint`, mirroring
     /// what `detect()`'s filter_map does per-agent.
     fn is_cli_entrypoint_under(home: &Path, pid: u32) -> bool {
-        is_monitored_entrypoint(pid_entrypoint_under(home, pid).as_deref())
+        is_monitored_entrypoint(pid_meta_under(home, pid).entrypoint.as_deref())
     }
 
     fn write_session_meta(home: &Path, pid: u32, entrypoint: Option<&str>) {
@@ -628,7 +694,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_session_meta(tmp.path(), 8, Some("claude-vscode"));
         assert_eq!(
-            pid_entrypoint_under(tmp.path(), 8),
+            pid_meta_under(tmp.path(), 8).entrypoint,
             Some("claude-vscode".to_string())
         );
     }
@@ -636,7 +702,7 @@ mod tests {
     #[test]
     fn pid_entrypoint_none_when_meta_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(pid_entrypoint_under(tmp.path(), 999), None);
+        assert_eq!(pid_meta_under(tmp.path(), 999), PidMeta::default());
     }
 
     #[test]

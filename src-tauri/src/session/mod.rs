@@ -127,7 +127,7 @@ fn parse_mode(value: Option<&str>) -> BackendMode {
     }
 }
 
-fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
+pub(crate) fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {

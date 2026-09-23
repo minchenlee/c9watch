@@ -35,6 +35,9 @@ pub enum SessionKind {
 pub enum CliActivity {
     Busy,
     Idle,
+    /// Claude Code is blocked on the user: a permission prompt, dialog,
+    /// elicitation or other input request.
+    Waiting,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
@@ -132,6 +135,10 @@ pub struct DetectedSession {
     pub started_at_ms: Option<i64>,
     pub official_name: Option<String>,
     pub cli_activity: Option<CliActivity>,
+    /// Whether this Claude Code version reports every user-blocking prompt as
+    /// `CliActivity::Waiting`, so `Busy`/`Idle` also mean no prompt is open.
+    #[serde(default)]
+    pub cli_reports_prompts: bool,
     #[serde(default)]
     pub provider: SessionProvider,
     #[serde(default)]
@@ -200,6 +207,7 @@ impl DetectedSession {
             started_at_ms: None,
             official_name: None,
             cli_activity: None,
+            cli_reports_prompts: false,
             provider: SessionProvider::ClaudeCode,
             surface: SessionSurface::ClaudeCode,
             agent_kind: AgentKind::Root,
