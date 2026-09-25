@@ -652,15 +652,42 @@ pub fn get_native_custom_title(entries: &[SessionEntry]) -> Option<String> {
 /// Scans the file for lines containing `"custom-title"` and parses only those.
 /// Returns the last (most recent) custom title found.
 pub fn get_native_custom_title_from_file(path: &std::path::Path) -> Option<String> {
-    use std::io::BufRead;
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
+    let bytes = std::fs::read(path).ok()?;
+    match std::str::from_utf8(&bytes) {
+        Ok(text) => last_custom_title_in(text),
+        // Stop at the first invalid line, as a line-by-line UTF-8 read would.
+        Err(error) => last_custom_title_in_lines(&bytes[..error.valid_up_to()]),
+    }
+}
 
+/// Search for the marker instead of splitting every line, so a long
+/// transcript is scanned without a per-line allocation.
+fn last_custom_title_in(text: &str) -> Option<String> {
+    const MARKER: &str = "\"custom-title\"";
     let mut last_title: Option<String> = None;
-    for line in reader.lines().map_while(Result::ok) {
+    let mut search_from = 0;
+    while let Some(found) = text[search_from..].find(MARKER) {
+        let at = search_from + found;
+        let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+        if let Ok(SessionEntry::CustomTitle { custom_title, .. }) =
+            serde_json::from_str::<SessionEntry>(&text[line_start..line_end])
+        {
+            last_title = Some(custom_title);
+        }
+        search_from = line_end;
+    }
+    last_title
+}
+
+fn last_custom_title_in_lines(valid_prefix: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(valid_prefix).ok()?;
+    let complete_lines = text.rfind('\n').map_or("", |i| &text[..i]);
+    let mut last_title: Option<String> = None;
+    for line in complete_lines.lines() {
         if line.contains("\"custom-title\"") {
             if let Ok(SessionEntry::CustomTitle { custom_title, .. }) =
-                serde_json::from_str::<SessionEntry>(&line)
+                serde_json::from_str::<SessionEntry>(line)
             {
                 last_title = Some(custom_title);
             }
@@ -1298,6 +1325,45 @@ mod tests {
         } else {
             panic!("Expected CustomTitle entry");
         }
+    }
+
+    #[test]
+    fn native_custom_title_from_file_returns_the_last_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"custom-title","customTitle":"first","sessionId":"s"}"#,
+                "\r\n",
+                r#"{"type":"user","note":"mentions \"custom-title\" in text"}"#,
+                "\n",
+                r#"{"type":"custom-title","customTitle":"second","sessionId":"s"}"#,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_native_custom_title_from_file(&path),
+            Some("second".to_string())
+        );
+    }
+
+    #[test]
+    fn native_custom_title_from_file_stops_at_the_first_invalid_utf8_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut bytes = br#"{"type":"custom-title","customTitle":"kept","sessionId":"s"}"#.to_vec();
+        bytes.extend_from_slice(b"\n{\"type\":\"user\",\"bad\":\"\xff\"}\n");
+        bytes.extend_from_slice(
+            br#"{"type":"custom-title","customTitle":"unread","sessionId":"s"}"#,
+        );
+        std::fs::write(&path, bytes).unwrap();
+
+        assert_eq!(
+            get_native_custom_title_from_file(&path),
+            Some("kept".to_string())
+        );
     }
 
     #[test]

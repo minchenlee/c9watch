@@ -28,8 +28,24 @@ export interface SubagentInfo {
 	sessionId?: string;
 }
 
-/** Raw map: parent session id -> subagents */
-export const subagentsBySession = writable<Map<string, SubagentInfo[]>>(new Map());
+let pollingEnabled = false;
+let watched = false;
+let stopPolling: (() => void) | null = null;
+
+/**
+ * Raw map: parent session id -> subagents. Polling runs only while the map
+ * has subscribers (the expanded card overlay), so a dashboard that shows no
+ * subagents doesn't pay for a backend scan on every session change.
+ */
+export const subagentsBySession = writable<Map<string, SubagentInfo[]>>(new Map(), () => {
+	watched = true;
+	if (pollingEnabled && stopPolling === null) stopPolling = startPolling();
+	return () => {
+		watched = false;
+		stopPolling?.();
+		stopPolling = null;
+	};
+});
 
 /** How long to keep completed subagents visible after they finish, in ms. */
 const COMPLETED_RETENTION_MS = 60_000;
@@ -135,12 +151,24 @@ async function refreshOnce() {
 }
 
 /**
- * Start polling for subagent updates. Triggered by the sessions store update
- * (re-fetch when sessions change), with a reset-on-activity backstop so a
- * quiet period still gets refreshed — see `scheduleBackstop`.
+ * Enable subagent polling. Polling itself runs only while
+ * `subagentsBySession` has subscribers: it re-fetches when the sessions store
+ * changes, with a reset-on-activity backstop so a quiet period still gets
+ * refreshed — see `scheduleBackstop`.
  */
 export function initializeSubagentPolling() {
-	if (initialized) return;
+	if (pollingEnabled) return;
+	pollingEnabled = true;
+	if (watched && stopPolling === null) stopPolling = startPolling();
+	return () => {
+		pollingEnabled = false;
+		stopPolling?.();
+		stopPolling = null;
+		subagentsBySession.set(new Map());
+	};
+}
+
+function startPolling(): () => void {
 	initialized = true;
 	// Re-fetch when the sessions list changes — that's our cheapest signal that
 	// new transcript entries may have appeared.
@@ -149,7 +177,6 @@ export function initializeSubagentPolling() {
 	});
 	// Svelte subscriptions synchronously receive the current value, so the
 	// subscription above performs the initial fetch and coalesces it naturally.
-	// Return a teardown for tests/HMR.
 	return () => {
 		generation++;
 		initialized = false;
@@ -159,7 +186,6 @@ export function initializeSubagentPolling() {
 			backstopTimer = null;
 		}
 		unsub();
-		subagentsBySession.set(new Map());
 	};
 }
 

@@ -21,6 +21,7 @@ pub(crate) const PREFIX_FULL_REVALIDATION_INTERVAL: Duration = Duration::from_se
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
+const HASH_LANES: usize = 8;
 
 /// Reads non-empty JSONL lines starting at `offset` bytes into the file, up
 /// to EOF. Returns the lines plus the byte offset immediately after the last
@@ -63,13 +64,13 @@ pub(crate) fn read_lines_from_offset(path: &Path, offset: u64) -> io::Result<(Ve
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PrefixGuard {
     pub(crate) len: u64,
-    pub(crate) head_hash: u64,
-    pub(crate) tail_hash: u64,
+    pub(crate) head_hash: ContentHash,
+    pub(crate) tail_hash: ContentHash,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PrefixSnapshot {
-    pub(crate) hash: u64,
+    pub(crate) hash: ContentHash,
     pub(crate) guard: PrefixGuard,
 }
 
@@ -86,15 +87,41 @@ pub(crate) struct PrefixValidation {
     pub(crate) bytes_read: u64,
 }
 
-fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
+/// FNV-1a over eight interleaved lanes: lane `i` hashes the bytes whose file
+/// offset is congruent to `i` modulo eight. The lanes are independent multiply
+/// chains, so hashing runs several times faster than single-lane FNV, and
+/// keying lanes by file offset keeps the result independent of how reads
+/// split the range, which `extend_prefix_snapshot` relies on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentHash([u64; HASH_LANES]);
+
+impl ContentHash {
+    fn new() -> Self {
+        Self([FNV_OFFSET_BASIS; HASH_LANES])
     }
-    hash
+
+    fn feed(&mut self, offset: u64, bytes: &[u8]) {
+        let lanes = &mut self.0;
+        let misalignment = (offset % HASH_LANES as u64) as usize;
+        let lead = ((HASH_LANES - misalignment) % HASH_LANES).min(bytes.len());
+        let (head, rest) = bytes.split_at(lead);
+        for (i, byte) in head.iter().enumerate() {
+            let lane = &mut lanes[misalignment + i];
+            *lane = (*lane ^ u64::from(*byte)).wrapping_mul(FNV_PRIME);
+        }
+        let mut chunks = rest.chunks_exact(HASH_LANES);
+        for chunk in &mut chunks {
+            for (lane, byte) in lanes.iter_mut().zip(chunk) {
+                *lane = (*lane ^ u64::from(*byte)).wrapping_mul(FNV_PRIME);
+            }
+        }
+        for (lane, byte) in lanes.iter_mut().zip(chunks.remainder()) {
+            *lane = (*lane ^ u64::from(*byte)).wrapping_mul(FNV_PRIME);
+        }
+    }
 }
 
-fn hash_range(path: &Path, start: u64, end: u64) -> io::Result<(u64, u64)> {
+fn hash_range(path: &Path, start: u64, end: u64) -> io::Result<(ContentHash, u64)> {
     if end < start {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -110,7 +137,7 @@ fn hash_range(path: &Path, start: u64, end: u64) -> io::Result<(u64, u64)> {
 
     let mut file = fs::File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
-    let mut hash = FNV_OFFSET_BASIS;
+    let mut hash = ContentHash::new();
     let mut remaining = end - start;
     let mut bytes_read = 0;
     let mut buffer = [0u8; 64 * 1024];
@@ -123,7 +150,7 @@ fn hash_range(path: &Path, start: u64, end: u64) -> io::Result<(u64, u64)> {
                 "file ended while hashing a prefix range",
             ));
         }
-        hash = hash_bytes(hash, &buffer[..read]);
+        hash.feed(start + bytes_read, &buffer[..read]);
         remaining -= read as u64;
         bytes_read += read as u64;
     }
@@ -195,6 +222,7 @@ pub(crate) fn extend_prefix_snapshot(
         let mut file = fs::File::open(path)?;
         file.seek(SeekFrom::Start(start))?;
         let mut remaining = suffix_len;
+        let mut position = start;
         let mut buffer = [0u8; 64 * 1024];
         while remaining > 0 {
             let want = buffer.len().min(remaining as usize);
@@ -205,7 +233,8 @@ pub(crate) fn extend_prefix_snapshot(
                     "file ended while extending a prefix hash",
                 ));
             }
-            hash = hash_bytes(hash, &buffer[..read]);
+            hash.feed(position, &buffer[..read]);
+            position += read as u64;
             remaining -= read as u64;
         }
     }
@@ -403,6 +432,42 @@ mod tests {
         assert!(version.modified_nanos > 0);
         #[cfg(unix)]
         assert!(version.identity > 0);
+    }
+
+    #[test]
+    fn extended_prefix_hash_matches_full_hash_across_unaligned_splits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("growing.jsonl");
+        let bytes: Vec<u8> = (0..200_003u32).map(|i| (i * 31 % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let len = bytes.len() as u64;
+
+        let full = hash_file_prefix(&path, len).unwrap();
+        for split in [0, 1, 7, 9, 65_541, len - 3, len] {
+            let prefix = hash_file_prefix(&path, split).unwrap();
+            let extended = super::extend_prefix_snapshot(&path, split, len, prefix).unwrap();
+            assert_eq!(extended, full, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn prefix_hash_detects_a_single_changed_byte() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rewritten.jsonl");
+        let mut bytes = vec![b'a'; 10_000];
+        std::fs::write(&path, &bytes).unwrap();
+        let before = hash_file_prefix(&path, 10_000).unwrap();
+
+        for index in [0, 5, 4_099, 9_999] {
+            bytes[index] = b'b';
+            std::fs::write(&path, &bytes).unwrap();
+            assert_ne!(
+                hash_file_prefix(&path, 10_000).unwrap().hash,
+                before.hash,
+                "byte {index}"
+            );
+            bytes[index] = b'a';
+        }
     }
 
     #[test]

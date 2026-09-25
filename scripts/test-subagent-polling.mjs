@@ -45,6 +45,8 @@ sessions.set([
   { id: 'codex-live', provider: 'codex' }
 ]);
 const stop = exports.initializeSubagentPolling();
+assert.equal(requests.length, 0, 'polling must not run without a subagentsBySession subscriber');
+const unwatch = exports.subagentsBySession.subscribe(() => {});
 assert.equal(requests.length, 1, 'initial subscription and initial refresh must coalesce');
 assertPayload(requests[0].args, { sessionIds: ['claude-live'] }, 'backend receives raw Claude IDs only');
 for (let i = 0; i < 100; i++) { sessions.set([]); tick(); }
@@ -71,4 +73,9 @@ await settle();
 assert(exports._snapshotForTests().has('claudeCode:new'));
 restart();
 assert.equal(timers.size, 0);
-console.log('PASS: bounded polling, resume, failure recovery, raw live IDs, teardown reinitialize');
+unwatch();
+const idle = exports.initializeSubagentPolling();
+sessions.set([{ id: 'claude-late', provider: 'claudeCode' }]);
+assert.equal(requests.length, 4, 'unsubscribing must stop polling');
+idle();
+console.log('PASS: subscriber-gated polling, bounded polling, resume, failure recovery, raw live IDs, teardown reinitialize');

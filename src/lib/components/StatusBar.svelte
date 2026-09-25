@@ -29,7 +29,7 @@
 			isSweeping = true;
 			setTimeout(() => {
 				isSweeping = false;
-			}, 6000); // 6s duration to cover ripple delay across all blocks
+			}, 2000);
 		}
 		prevSummaryKey = currentKey;
 	});
@@ -90,9 +90,9 @@
 <div class="system-status-bar">
 
 	<div class="progress-track" class:empty={total === 0} bind:clientWidth={trackWidth}>
-		<div class="grid-container" style="grid-template-columns: repeat({columns}, 1fr);">
-			{#each statusArray as status, i}
-				<div class="rect {status}" class:sweeping={isSweeping} style="animation-delay: {i * 10}ms; transition-delay: {i * 25}ms"></div>
+		<div class="grid-container" class:sweeping={isSweeping} style="grid-template-columns: repeat({columns}, 1fr);">
+			{#each statusArray as status}
+				<div class="rect {status}"></div>
 			{/each}
 		</div>
 	</div>
@@ -170,6 +170,7 @@
 	}
 
 	.grid-container {
+		position: relative;
 		display: grid;
 		grid-template-rows: 1fr;
 		gap: 2px;
@@ -184,24 +185,54 @@
 		background: rgba(255, 255, 255, 0.05); /* Slightly darker base */
 		border-radius: 1px;
 		opacity: 1; /* Normal visibility by default */
-		transition: background-color 0.4s, box-shadow 0.4s;
+		/* Every block changes color at once, with no per-block delay or glow: a
+		   staggered ripple across 100+ blocks keeps WebKit restyling and
+		   repainting the grid on every frame for seconds after each change. */
+		transition: background-color 0.4s;
 	}
 
-	/* Sweep animation only plays on status change */
-	.rect.sweeping {
+	/* Brightness flash as a white overlay's opacity */
+	.grid-container::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		background: #fff;
+		opacity: 0;
+		pointer-events: none;
+	}
+
+	/* The sweep plays once on the whole bar, animating only transform and
+	   opacity, which WebKit composites without repainting. */
+	.grid-container.sweeping {
 		animation: monitor-sweep 2s ease-out forwards;
 	}
 
-	@keyframes monitor-sweep {
-		0% { transform: scale(1); filter: brightness(1); }
-		20% { transform: scale(0.95); filter: brightness(1.1); }
-		40% { transform: scale(1.1); filter: brightness(1.4) drop-shadow(0 0 2px currentColor); }
-		100% { transform: scale(1); filter: brightness(1); }
+	.grid-container.sweeping::after {
+		animation: monitor-flash 2s ease-out forwards;
 	}
 
-	.rect.working { background-color: var(--status-working); color: var(--status-working); box-shadow: 0 0 4px var(--status-working-glow); }
-	.rect.permission { background-color: var(--status-permission); color: var(--status-permission); box-shadow: 0 0 4px var(--status-permission-glow); }
-	.rect.input { background-color: var(--status-input); color: var(--status-input); box-shadow: 0 0 4px var(--status-input-glow); }
+	@keyframes monitor-sweep {
+		0% { transform: scale(1); }
+		20% { transform: scale(0.99); }
+		40% { transform: scale(1.01); }
+		100% { transform: scale(1); }
+	}
+
+	@keyframes monitor-flash {
+		0% { opacity: 0; }
+		20% { opacity: 0.05; }
+		40% { opacity: 0.25; }
+		100% { opacity: 0; }
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.grid-container.sweeping,
+		.grid-container.sweeping::after { animation: none; }
+	}
+
+	.rect.working { background-color: var(--status-working); color: var(--status-working); }
+	.rect.permission { background-color: var(--status-permission); color: var(--status-permission); }
+	.rect.input { background-color: var(--status-input); color: var(--status-input); }
 
 	.legend {
 		display: flex;

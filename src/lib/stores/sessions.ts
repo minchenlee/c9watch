@@ -198,9 +198,26 @@ async function initWebSocketListeners() {
 
 // ── Tauri IPC mode ──────────────────────────────────────────────────
 
+// A hidden window (the popover, or a closed or hidden main window) holds the
+// latest payload instead of applying it: applying re-renders every card and
+// makes store subscribers re-query the backend. It is applied when the window
+// becomes visible again.
+let heldSessions: Session[] | null = null;
+
 async function initTauriListeners() {
+	document.addEventListener('visibilitychange', () => {
+		if (!document.hidden && heldSessions) {
+			sessions.set(heldSessions);
+			heldSessions = null;
+		}
+	});
+
 	await listen<Session[]>('sessions-updated', (event) => {
-		if (!get(isDemoMode)) {
+		if (get(isDemoMode)) return;
+		if (document.hidden) {
+			heldSessions = event.payload;
+		} else {
+			heldSessions = null;
 			sessions.set(event.payload);
 		}
 	});
