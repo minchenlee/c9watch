@@ -124,10 +124,25 @@ struct TranscriptRef {
 }
 
 #[derive(Default)]
+/// Composer title/cwd overlay, loaded off the critical path.
+///
+/// Cursor's global `state.vscdb` can be gigabytes; a synchronous full-table
+/// scan on every poll blocks first paint for minutes. The cache serves the
+/// last good map (or an empty one on cold start) while a background thread
+/// reloads on file change, so detection never waits on the database.
+struct ComposerCache {
+    stamp: Option<(SystemTime, u64)>,
+    map: std::sync::Arc<HashMap<String, ComposerOverlay>>,
+    pending: Option<
+        std::sync::mpsc::Receiver<(Option<(SystemTime, u64)>, HashMap<String, ComposerOverlay>)>,
+    >,
+}
+
 pub struct CursorSessionSource {
     projects_root: PathBuf,
     vscdb_path: Option<PathBuf>,
     cache: HashMap<PathBuf, CacheEntry>,
+    composer_cache: ComposerCache,
     #[cfg(test)]
     parse_count: u32,
     #[cfg(test)]
@@ -162,6 +177,7 @@ impl CursorSessionSource {
             projects_root,
             vscdb_path,
             cache: HashMap::new(),
+            composer_cache: ComposerCache::default(),
             #[cfg(test)]
             parse_count: 0,
             #[cfg(test)]
@@ -201,7 +217,7 @@ impl CursorSessionSource {
             live.push((transcript.path.clone(), summary, age));
         }
 
-        let composers = load_composer_map(self.vscdb_path.as_deref());
+        let composers = self.composer_overlays();
         for (_path, summary, _age) in &mut live {
             apply_composer_overlay(summary, composers.get(&summary.session_id));
         }
@@ -1071,6 +1087,77 @@ fn apply_composer_overlay(
     if overlay.generating {
         summary.lifecycle = CursorLifecycle::Working;
     }
+}
+
+impl CursorSessionSource {
+    /// Serve the composer overlay without blocking on the database.
+    ///
+    /// Fast path: the database file is unchanged, reuse the cached map.
+    /// Slow path: a background thread reloads; meanwhile serve the previous
+    /// map (or empty on cold start). A short grace wait lets small databases
+    /// resolve synchronously so titles don't flicker for typical users.
+    fn composer_overlays(&mut self) -> std::sync::Arc<HashMap<String, ComposerOverlay>> {
+        // Harvest a finished background reload, if any.
+        if let Some(rx) = self.composer_cache.pending.take() {
+            match rx.try_recv() {
+                Ok((stamp, map)) => {
+                    // Discard the result if the file moved on while loading.
+                    if stamp == composer_db_stamp(self.vscdb_path.as_deref()) {
+                        self.composer_cache.stamp = stamp;
+                        self.composer_cache.map = std::sync::Arc::new(map);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.composer_cache.pending = Some(rx);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        let stamp = composer_db_stamp(self.vscdb_path.as_deref());
+        if stamp == self.composer_cache.stamp {
+            return self.composer_cache.map.clone();
+        }
+        if self.composer_cache.pending.is_none() {
+            if let Some(path) = self.vscdb_path.clone() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.composer_cache.pending = Some(rx);
+                std::thread::Builder::new()
+                    .name("cursor-composer-map".into())
+                    .spawn(move || {
+                        let map = load_composer_map(Some(path.as_path()));
+                        let _ = tx.send((composer_db_stamp(Some(path.as_path())), map));
+                    })
+                    .ok();
+                // Grace wait: small databases finish immediately; huge ones
+                // fall through and backfill on a later poll.
+                if let Some(rx) = self.composer_cache.pending.take() {
+                    match rx.recv_timeout(Duration::from_millis(300)) {
+                        Ok((stamp, map)) => {
+                            if stamp == composer_db_stamp(self.vscdb_path.as_deref()) {
+                                self.composer_cache.stamp = stamp;
+                                self.composer_cache.map = std::sync::Arc::new(map);
+                            }
+                            return self.composer_cache.map.clone();
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            self.composer_cache.pending = Some(rx);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                    }
+                }
+            } else {
+                self.composer_cache.stamp = stamp;
+            }
+        }
+        self.composer_cache.map.clone()
+    }
+}
+
+/// (mtime, size) stamp of the composer database; None when absent.
+fn composer_db_stamp(path: Option<&Path>) -> Option<(SystemTime, u64)> {
+    let path = path?;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 fn load_composer_map(vscdb_path: Option<&Path>) -> HashMap<String, ComposerOverlay> {
