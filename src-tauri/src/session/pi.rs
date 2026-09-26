@@ -1981,6 +1981,54 @@ mod tests {
     }
 
     #[test]
+    fn killed_agent_with_unresulted_tool_lingers_until_expiry() {
+        // Pi has no process-anchored identity: an agent killed mid-tool keeps
+        // its unresulted toolCall on disk, so it keeps polling as Working
+        // until the 4h working window expires. This test locks that behavior
+        // (and its bound) so the lingering window stays deliberate.
+        use std::time::{Duration, SystemTime};
+        let dir = TempDir::new().unwrap();
+        let root = dir
+            .path()
+            .join(".pi")
+            .join("agent")
+            .join("sessions")
+            .join("encoded-cwd");
+        std::fs::create_dir_all(&root).unwrap();
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let lines = format!(
+            "{{\"type\":\"session\",\"session\":{{\"id\":\"killed1\",\"timestamp\":{now_ms},\"cwd\":\"/tmp/demo\"}}}}\n\
+             {{\"id\":\"m\",\"timestamp\":{now_ms},\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"model\":\"m\",\"content\":[{{\"type\":\"toolCall\",\"id\":\"c1\",\"name\":\"bash\",\"arguments\":{{}}}}]}}}}\n",
+        );
+        let path = root.join("2026-08-16T07-07-48-328Z_killed1.jsonl");
+        std::fs::write(&path, lines).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+
+        let mut source =
+            PiSessionSource::at_root(dir.path().join(".pi").join("agent").join("sessions"));
+        // Killed 10min ago: still listed (lingering Working).
+        file.set_modified(SystemTime::now() - Duration::from_secs(10 * 60))
+            .unwrap();
+        let (sessions, _) = source.detect().unwrap();
+        assert!(sessions
+            .iter()
+            .any(|s| s.session_id.as_deref() == Some("killed1")));
+        let summary = summarize_pi_transcript(&path).unwrap();
+        assert_eq!(summary.lifecycle, PiLifecycle::Working);
+        assert_eq!(summary.pending_tool_name.as_deref(), Some("bash"));
+        // Killed 5h ago: expired and gone.
+        file.set_modified(SystemTime::now() - Duration::from_secs(5 * 60 * 60))
+            .unwrap();
+        let (sessions, _) = source.detect().unwrap();
+        assert!(!sessions
+            .iter()
+            .any(|s| s.session_id.as_deref() == Some("killed1")));
+    }
+
+    #[test]
     fn history_and_cost_carry_pi_provider_namespace() {
         let dir = TempDir::new().unwrap();
         write_transcript(
