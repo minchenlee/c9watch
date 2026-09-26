@@ -349,7 +349,7 @@ async fn load_conversation_response(
     request_id: Option<u64>,
 ) -> ServerMsg {
     let emit_id = session_id.clone();
-    match tokio::task::spawn_blocking(move || {
+    match crate::run_session_scan(move || {
         crate::get_conversation_data_for_provider_with_progress(
             &session_id,
             provider,
@@ -368,18 +368,29 @@ async fn load_conversation_response(
     })
     .await
     {
-        Ok(Ok(conv)) => ServerMsg::Conversation {
+        Ok(conv) => ServerMsg::Conversation {
             data: serde_json::to_value(&conv).unwrap_or_default(),
         },
-        Ok(Err(e)) => ServerMsg::Error { message: e },
-        Err(e) => ServerMsg::Error {
-            message: format!("Failed to load conversation: {e}"),
-        },
+        Err(e) => ServerMsg::Error { message: e },
     }
 }
 
 async fn handle_message(msg: ClientMsg) -> ServerMsg {
     handle_message_with_owners(msg, crate::session::global_provider_source_owners()).await
+}
+
+// Called while session I/O and the independent discovery slot are occupied.
+// Check actual dispatch without scanning user data or racing another gate test.
+#[cfg(test)]
+pub(super) async fn assert_scan_requests_are_busy() {
+    for request in [ClientMsg::GetSessions, ClientMsg::GetConversation {
+        session_id: "synthetic".into(),
+        provider: Some(crate::session::SessionProvider::Codex),
+        include_tools: false,
+    }] {
+        let response = handle_message(request).await;
+        assert!(matches!(response, ServerMsg::Error { ref message } if message.contains("in progress")), "{response:?}");
+    }
 }
 
 async fn handle_message_with_owners(

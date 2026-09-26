@@ -98,7 +98,7 @@
 				}
 				return 'Approval Required';
 			case SessionStatus.WaitingForInput:
-				return 'Ready';
+				return session.provider === 'codex' && session.pendingToolName ? session.pendingToolName : 'Ready';
 			case SessionStatus.Connecting:
 				return 'Connecting';
 			default:

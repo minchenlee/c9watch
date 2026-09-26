@@ -6,6 +6,18 @@
 )]
 
 fn main() {
+    #[cfg(all(unix, feature = "gui"))]
+    {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if args.get(1).is_some_and(|a| a == "--codex-bridge-reaper") {
+            c9watch_lib::codex_bridge::reaper(&args[2..]);
+            return;
+        }
+        if args.get(1).is_some_and(|a| a == "--codex-desktop-bridge") {
+            let code = c9watch_lib::codex_bridge::entry(&args[2..]);
+            std::process::exit(code);
+        }
+    }
     // CLI mode: if the first arg is a known subcommand or --help/--version,
     // route to the CLI handler instead of launching the GUI.
     #[cfg(feature = "cli")]
