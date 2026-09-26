@@ -21,7 +21,7 @@ const MAX_CONVERSATION_MESSAGES: usize = 10_000;
 const MAX_PAGES: usize = 128;
 const MAX_SESSIONS: usize = 512;
 const MAX_DIRECTORIES: usize = 32;
-const IDLE_FRESHNESS_MS: i64 = 30 * 60 * 1000;
+pub(crate) const IDLE_FRESHNESS_MS: i64 = 30 * 60 * 1000;
 
 /// Shared by every request in an operation, including oversized-page retries.
 struct Budget {

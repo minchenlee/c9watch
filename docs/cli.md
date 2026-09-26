@@ -69,7 +69,9 @@ c9watch list --compact --pretty                 # Readable compact output
 | `modified` | string | ISO 8601 last modification time |
 | `latestMessage` | string | Most recent message content (omitted if empty) |
 | `pendingToolName` | string | Tool waiting for approval (omitted if none) |
-| `pendingToolInput` | object | Full input of pending tool (omitted if none) |
+| `sourceHealth` | string | Source observation health: `fresh`, `stale`, `partial`, `unavailable`, `unknown` (omitted for older backends) |
+
+Pending tool *inputs* are never emitted: only the tool name leaves the backend. Tool arguments can carry commands, paths, or secrets.
 | `customTitle` | string | User-set session name (omitted if none) |
 | `gitBranch` | string | Git branch (omitted if unknown) |
 | `summary` | string | Session summary (omitted if none) |

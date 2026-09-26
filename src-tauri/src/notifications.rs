@@ -359,6 +359,7 @@ mod tests {
             message_count: 3,
             modified: "2026-07-13T00:00:00Z".to_string(),
             status: SessionStatus::Working,
+            source_health: None,
             notification_preview: None,
             latest_message: String::new(),
             pending_tool_name: None,
@@ -381,6 +382,22 @@ mod tests {
             can_stop: false,
             can_rename: false,
         }
+    }
+
+    #[test]
+    fn serialized_session_never_carries_tool_arguments() {
+        let mut s = fixture();
+        s.status = SessionStatus::NeedsAttention;
+        s.pending_tool_name = Some("Bash".into());
+        s.pending_tool_input = Some(serde_json::json!({"sentinel": "rm -rf /tmp/sentinel-secret"}));
+        // The struct field still exists for internal native-notification use.
+        assert!(s.pending_tool_input.is_some());
+        // But no serialization path (Tauri command, WebSocket, CLI) may emit it.
+        let json = serde_json::to_value(&s).unwrap();
+        let raw = serde_json::to_string(&json).unwrap();
+        assert!(json.get("pendingToolInput").is_none());
+        assert!(!raw.contains("sentinel-secret"));
+        assert_eq!(json["pendingToolName"], "Bash");
     }
 
     #[test]

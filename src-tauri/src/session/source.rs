@@ -48,6 +48,44 @@ pub enum SessionProvider {
     Opencode,
 }
 
+/// Health of the source observation used to produce a session card.
+///
+/// This is deliberately separate from `SessionStatus`: a session can be
+/// waiting for input while its source is fresh, partial, or unavailable.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SourceHealth {
+    Fresh,
+    Stale,
+    Partial,
+    Unavailable,
+    Unknown,
+}
+
+/// Classify a successfully read source by the age of its last event.
+///
+/// `stale_after_secs` should be the provider's own retention/freshness
+/// window for the current lifecycle: an observation older than the window in
+/// which the detector still surfaces the session may no longer reflect
+/// reality, so it is `Stale` rather than `Fresh`.
+pub fn health_from_last_timestamp(last_timestamp: &str, stale_after_secs: u64) -> SourceHealth {
+    if last_timestamp.is_empty() {
+        return SourceHealth::Partial;
+    }
+    let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(last_timestamp) else {
+        return SourceHealth::Partial;
+    };
+    let age_secs = chrono::Utc::now()
+        .signed_duration_since(timestamp.with_timezone(&chrono::Utc))
+        .num_seconds()
+        .max(0) as u64;
+    if age_secs > stale_after_secs {
+        SourceHealth::Stale
+    } else {
+        SourceHealth::Fresh
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionSurface {
@@ -256,6 +294,46 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&CliActivity::Idle).unwrap(),
             "\"idle\""
+        );
+    }
+
+    #[test]
+    fn health_from_last_timestamp_classifies_age() {
+        assert_eq!(
+            super::health_from_last_timestamp("", 60),
+            super::SourceHealth::Partial
+        );
+        assert_eq!(
+            super::health_from_last_timestamp("not-a-timestamp", 60),
+            super::SourceHealth::Partial
+        );
+        let now = chrono::Utc::now().to_rfc3339();
+        assert_eq!(
+            super::health_from_last_timestamp(&now, 3600),
+            super::SourceHealth::Fresh
+        );
+        // Comfortable margins on both sides of the threshold so the wall clock
+        // cannot flip the assertion mid-test.
+        let old = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        assert_eq!(
+            super::health_from_last_timestamp(&old, 3600),
+            super::SourceHealth::Stale
+        );
+        assert_eq!(
+            super::health_from_last_timestamp(&old, 4 * 3600),
+            super::SourceHealth::Fresh
+        );
+    }
+
+    #[test]
+    fn source_health_serializes_as_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&SourceHealth::Fresh).unwrap(),
+            "\"fresh\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SourceHealth::Unavailable).unwrap(),
+            "\"unavailable\""
         );
     }
 

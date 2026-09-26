@@ -46,7 +46,7 @@ Status values: `Working`, `WaitingForInput`, `NeedsAttention`, `Idle`
 
 Compact output fields: `id`, `pid`, `status`, `projectPath`, `sessionName`, `pendingToolName`
 
-Full output adds: `firstPrompt`, `messageCount`, `modified`, `customTitle`, `gitBranch`, `summary`, `latestMessage`, `pendingToolInput`, `taskProgress`
+Full output adds: `firstPrompt`, `messageCount`, `modified`, `customTitle`, `gitBranch`, `summary`, `latestMessage`, `sourceHealth`, `taskProgress` (pending tool *inputs* are never emitted — only the tool name)
 
 ### Status overview
 

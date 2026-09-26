@@ -17,8 +17,8 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const IDLE_FRESHNESS_SECS: u64 = 30 * 60;
-const WORKING_FRESHNESS_SECS: u64 = 4 * 60 * 60;
+pub(crate) const IDLE_FRESHNESS_SECS: u64 = 30 * 60;
+pub(crate) const WORKING_FRESHNESS_SECS: u64 = 4 * 60 * 60;
 const LINKED_PARENT_CEILING_SECS: u64 = 24 * 60 * 60;
 const MONITOR_MESSAGE_CHARS: usize = 200;
 const EXACT_PREFIX_VERIFY_LIMIT: u64 = 4 * 1024 * 1024;

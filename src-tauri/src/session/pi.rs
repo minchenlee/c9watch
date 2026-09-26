@@ -29,9 +29,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Idle pi transcripts older than this are treated as expired.
-const PI_FRESHNESS_IDLE_SECS: u64 = 30 * 60;
+pub(crate) const PI_FRESHNESS_IDLE_SECS: u64 = 30 * 60;
 /// Working pi transcripts older than this are treated as expired.
-const PI_FRESHNESS_WORKING_SECS: u64 = 4 * 60 * 60;
+pub(crate) const PI_FRESHNESS_WORKING_SECS: u64 = 4 * 60 * 60;
 /// A transcript counts as actively generating when its last *message*
 /// is this recent. Ledger lines (`compaction`, `model_change`) bump the
 /// file mtime without moving the conversation forward, so file mtime

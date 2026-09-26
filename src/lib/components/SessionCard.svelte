@@ -40,6 +40,16 @@
 	let canOpen = $derived(canSessionAction(session, 'open'));
 	let canStop = $derived(canSessionAction(session, 'stop'));
 	let canRename = $derived(canSessionAction(session, 'rename'));
+	let sourceHealthMeta = $derived.by(() => {
+		switch (session.sourceHealth) {
+			case 'fresh': return { label: 'LIVE', title: 'Source observation is current', modifier: 'fresh' };
+			case 'stale': return { label: 'STALE', title: 'Source observation may be out of date', modifier: 'stale' };
+			case 'partial': return { label: 'PARTIAL', title: 'Source observation is incomplete', modifier: 'partial' };
+			case 'unavailable': return { label: 'NO SOURCE', title: 'Source observation is unavailable', modifier: 'unavailable' };
+			case 'unknown': return { label: 'UNKNOWN', title: 'Source health is unknown', modifier: 'unknown' };
+			default: return null;
+		}
+	});
 
 	let tooltipText = $state('');
 	let tooltipX = $state(0);
@@ -235,6 +245,9 @@
 			<div class="stats-row">
 				<div class="badge-group">
 					<ProviderBadge provider={session.provider} surface={session.surface} {compact} />
+					{#if sourceHealthMeta}
+						<span class="source-health-badge {sourceHealthMeta.modifier}" title={sourceHealthMeta.title}>{sourceHealthMeta.label}</span>
+					{/if}
 					<span class="session-name-badge">{session.sessionName}</span>
 				{#if isBackground}
 					<span class="kind-badge" aria-label="Background-pinned session" title="Background-pinned session">BG</span>
@@ -484,6 +497,21 @@
 		align-items: center;
 		gap: var(--space-xs);
 		min-width: 0;
+	}
+
+	/* Single-color health badges: state is carried by the text label, not hue. */
+	.source-health-badge {
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		font-weight: 500;
+		padding: 2px 6px;
+		border: 1px solid var(--border-default);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		display: inline-block;
+		vertical-align: middle;
+		color: var(--text-secondary);
+		background: transparent;
 	}
 
 	.kind-badge {
