@@ -936,7 +936,7 @@ pub(crate) fn pi_history_entries(home: &Path) -> Vec<crate::session::history::Hi
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Some(summary) = summarize_pi_transcript(&path) else {
+            let Some(summary) = summarize_pi_history(&path) else {
                 continue;
             };
             if summary.session_id.is_empty() {
@@ -975,6 +975,68 @@ pub(crate) fn pi_history_entries(home: &Path) -> Vec<crate::session::history::Hi
         }
     }
     entries
+}
+
+/// Read only the header and first user prompt for a history row. The regular
+/// summary intentionally parses the complete transcript for live monitoring,
+/// but History does not need its message counts, tool state, or usage ledger.
+fn summarize_pi_history(path: &Path) -> Option<PiTranscriptSummary> {
+    let reader = BufReader::new(File::open(path).ok()?);
+    let mut summary = PiTranscriptSummary {
+        session_id: pi_session_id_from_filename(path)?,
+        ..PiTranscriptSummary::default()
+    };
+    for line in reader.lines() {
+        let line = line.ok()?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("session") => {
+                if let Some(session) = value.get("session") {
+                    if let Some(cwd) = session.get("cwd").and_then(|v| v.as_str()) {
+                        summary.project_path = cwd.to_string();
+                    }
+                    if summary.started_at_ms.is_none() {
+                        summary.started_at_ms =
+                            session.get("timestamp").and_then(parse_pi_timestamp_ms);
+                    }
+                } else {
+                    if summary.project_path.is_empty() {
+                        summary.project_path = value
+                            .get("cwd")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                    }
+                    if summary.started_at_ms.is_none() {
+                        summary.started_at_ms =
+                            value.get("timestamp").and_then(parse_pi_timestamp_ms);
+                    }
+                }
+            }
+            Some("message") => {
+                let Some(message) = value.get("message") else {
+                    continue;
+                };
+                if message.get("role").and_then(|r| r.as_str()) != Some("user") {
+                    continue;
+                }
+                for text in message_texts(message) {
+                    if !text.trim().is_empty() {
+                        summary.first_prompt = Some(truncate_chars(&text, PI_MAX_SUMMARY_CHARS));
+                        return Some(summary);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(summary)
 }
 
 pub(crate) fn pi_deep_search(

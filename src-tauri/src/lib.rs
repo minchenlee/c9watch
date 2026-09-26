@@ -124,7 +124,13 @@ async fn get_conversation(
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_session_history() -> Result<Vec<session::HistoryEntry>, String> {
-    session::get_history()
+    // History scans provider archives and must not run on a Tokio worker used
+    // by the Tauri IPC runtime. In particular, Cursor's large composer DB is
+    // intentionally warmed in the background, but the remaining bounded disk
+    // reads and JSON metadata parsing are still blocking work.
+    tauri::async_runtime::spawn_blocking(session::get_history)
+        .await
+        .map_err(|error| format!("Failed to load history: {error}"))?
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]

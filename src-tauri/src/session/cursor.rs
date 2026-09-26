@@ -487,22 +487,25 @@ pub fn find_cursor_conversation_under(
 
 pub fn cursor_history_entries(home_dir: &Path) -> Vec<crate::session::history::HistoryEntry> {
     let projects_root = home_dir.join(".cursor").join("projects");
-    let composers = load_composer_map(default_vscdb_path(home_dir).as_deref());
+    // Cursor's state.vscdb is a global, frequently multi-gigabyte database.
+    // The overlay is only a title/cwd nicety, so never scan it on the History
+    // request's critical path. The background loader fills the cache for the
+    // next refresh; small databases still get a short compatibility grace wait.
+    let composers = cursor_history_composer_overlays(default_vscdb_path(home_dir).as_deref());
     collect_transcript_refs(&projects_root)
         .into_iter()
         .filter(|item| item.agent_kind == AgentKind::Root)
         .filter_map(|item| {
-            let mut summary = parse_transcript(&item.path, &item, true).ok()?;
-            apply_composer_overlay(&mut summary, composers.get(&item.session_id));
-            let display = summary
-                .first_prompt()
-                .unwrap_or("(No conversation yet)")
-                .to_string();
-            let cwd = if summary.cwd.as_os_str().is_empty() {
-                decode_cursor_project_key(&item.project_key)
-            } else {
-                summary.cwd
-            };
+            let display = cursor_history_first_prompt(&item.path)
+                .unwrap_or_else(|| "(No conversation yet)".to_string());
+            let mut cwd = decode_cursor_project_key(&item.project_key);
+            let mut cursor_title = None;
+            if let Some(overlay) = composers.get(&item.session_id) {
+                if let Some(overlay_cwd) = &overlay.cwd {
+                    cwd = overlay_cwd.clone();
+                }
+                cursor_title = overlay.name.clone();
+            }
             let project_name = cwd
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -522,13 +525,110 @@ pub fn cursor_history_entries(home_dir: &Path) -> Vec<crate::session::history::H
                 project_name,
                 custom_title: None,
                 codex_title: None,
-                cursor_title: summary.cursor_title,
+                cursor_title,
                 provider: "cursor".to_string(),
                 surface: Some("cursor".to_string()),
                 agent_kind: Some("root".to_string()),
             })
         })
         .collect()
+}
+
+/// Read only through the first user turn for a history row. The conversation
+/// parser also indexes every message and tool result, which is unnecessary for
+/// a row that only needs its first prompt and can dominate a large archive.
+fn cursor_history_first_prompt(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) else {
+            continue;
+        };
+        let raw = collect_text_blocks(blocks);
+        let prompt = extract_user_query(&raw);
+        if !prompt.is_empty() {
+            return Some(prompt);
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct HistoryComposerCache {
+    stamp: Option<(SystemTime, u64)>,
+    map: std::sync::Arc<HashMap<String, ComposerOverlay>>,
+    pending: Option<
+        std::sync::mpsc::Receiver<(Option<(SystemTime, u64)>, HashMap<String, ComposerOverlay>)>,
+    >,
+}
+
+static HISTORY_COMPOSER_CACHE: std::sync::LazyLock<std::sync::Mutex<HistoryComposerCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HistoryComposerCache::default()));
+
+fn cursor_history_composer_overlays(
+    path: Option<&Path>,
+) -> std::sync::Arc<HashMap<String, ComposerOverlay>> {
+    let mut cache = HISTORY_COMPOSER_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(rx) = cache.pending.take() {
+        match rx.try_recv() {
+            Ok((stamp, map)) => {
+                if stamp == composer_db_stamp(path) {
+                    cache.stamp = stamp;
+                    cache.map = std::sync::Arc::new(map);
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => cache.pending = Some(rx),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
+    }
+    let stamp = composer_db_stamp(path);
+    if stamp == cache.stamp {
+        return cache.map.clone();
+    }
+    if let Some(path) = path.filter(|path| path.is_file()) {
+        if cache.pending.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            cache.pending = Some(rx);
+            let path = path.to_path_buf();
+            std::thread::Builder::new()
+                .name("cursor-history-composer-map".into())
+                .spawn(move || {
+                    let map = load_composer_map(Some(&path));
+                    let _ = tx.send((composer_db_stamp(Some(&path)), map));
+                })
+                .ok();
+        }
+        // Preserve synchronous behavior for ordinary small databases and
+        // tests; never make a multi-gigabyte database delay the request.
+        let small = fs::metadata(path)
+            .map(|meta| meta.len() <= 32 * 1024 * 1024)
+            .unwrap_or(false);
+        if small {
+            if let Some(rx) = cache.pending.take() {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok((loaded_stamp, map)) => {
+                        if loaded_stamp == composer_db_stamp(Some(path)) {
+                            cache.stamp = loaded_stamp;
+                            cache.map = std::sync::Arc::new(map);
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => cache.pending = Some(rx),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                }
+            }
+        }
+    } else {
+        cache.stamp = stamp;
+    }
+    cache.map.clone()
 }
 
 pub fn list_session_ids(home_dir: &Path, prefix: &str) -> Vec<String> {
