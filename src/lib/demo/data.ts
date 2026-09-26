@@ -86,6 +86,7 @@ export function getDemoSessions(): Session[] {
 			status: SessionStatus.NeedsAttention,
 			latestMessage: 'I need to write to src/auth/providers.ts — may I proceed?',
 			pendingToolName: 'Write',
+			sourceHealth: 'fresh',
 			provider: 'claudeCode',
 			surface: 'claudeCode',
 			agentKind: 'root'
@@ -123,7 +124,8 @@ export function getDemoSessions(): Session[] {
 			modified: minutesAgo(1),
 			status: SessionStatus.NeedsAttention,
 			latestMessage: 'I need to run `npm install ioredis` — allow?',
-			pendingToolName: 'Bash'
+			pendingToolName: 'Bash',
+			sourceHealth: 'fresh'
 		},
 		{
 			id: 'demo-4',

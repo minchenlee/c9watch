@@ -6,6 +6,7 @@
 	import { browser } from '$app/environment';
 	import {
 		sortedSessions,
+		attentionInbox,
 		expandedSessionId,
 		currentConversation,
 		statusSummary,
@@ -48,6 +49,14 @@
 	let sessions = $derived($sortedSessions);
 	let activeSessionIds = $derived(new Set(sessions.map((s) => sessionKeyOf(s))));
 	let summary = $derived($statusSummary);
+	let attentionItems = $derived(
+		$attentionInbox.filter((item) => matchesProvider(item.session, $providerFilter))
+	);
+	let attentionReturnTitle = $derived.by(() => {
+		const native = attentionItems.filter((item) => item.returnKind === 'native').length;
+		const conversation = attentionItems.length - native;
+		return `Provider-scoped high-confidence attention items — ${native} native return, ${conversation} conversation return`;
+	});
 	let expandedId = $derived($expandedSessionId);
 	let conversation = $derived($currentConversation);
 
@@ -396,6 +405,21 @@
 		}
 	}
 
+	/**
+	 * Dispatch the newest attention item through its declared return path:
+	 * native focus for terminal/IDE-backed sessions, exact provider-scoped
+	 * conversation expansion otherwise.
+	 */
+	async function jumpToAttention() {
+		const item = attentionItems[0];
+		if (!item) return;
+		if (item.returnKind === 'native') {
+			await handleOpen(item.session.pid, item.session.projectPath);
+		} else {
+			expandedSessionId.set(item.key);
+		}
+	}
+
 	function handleKeydown(e: KeyboardEvent) {
 		const tag = (e.target as HTMLElement)?.tagName;
 		if (tag === 'INPUT' || tag === 'TEXTAREA') return;
@@ -519,6 +543,15 @@
 			<section class="system-section" in:flyIn|global={{ index: 0 }}>
 				<div class="project-header">
 					<span class="project-name">System status</span>
+					<button
+						class="attention-inbox-count"
+						class:empty={attentionItems.length === 0}
+						title={attentionItems.length === 0 ? 'No high-confidence attention items' : `${attentionReturnTitle} — activate to jump to the newest item`}
+						onclick={jumpToAttention}
+						disabled={attentionItems.length === 0}
+					>
+						{attentionItems.length} attention item{attentionItems.length === 1 ? '' : 's'}
+					</button>
 					<span class="project-count">{filteredSessions.length}</span>
 					<button
 						class="toggle-btn demo-toggle"
@@ -994,6 +1027,31 @@
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
 		line-height: 1;
+	}
+
+	/* Single-color like the health badges: count text carries the meaning. */
+	.attention-inbox-count {
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		font-weight: 500;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--text-secondary);
+		border: 1px solid var(--border-default);
+		background: transparent;
+		padding: 3px 6px;
+		white-space: nowrap;
+		cursor: pointer;
+	}
+
+	.attention-inbox-count:disabled {
+		cursor: default;
+	}
+
+	.attention-inbox-count.empty {
+		color: var(--text-muted);
+		border-color: var(--border-default);
+		background: transparent;
 	}
 
 	.project-count {

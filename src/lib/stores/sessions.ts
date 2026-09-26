@@ -10,7 +10,7 @@ import { SessionStatus } from '../types';
 import { isDemoMode } from '../demo/mode';
 import { openSession } from '../api';
 import { wsClient, useWebSocket, getStoredWsUrl, isTauri } from '../ws';
-import { providerSessionKey, resolveCodexHierarchy, sessionKeyOf } from '../provider';
+import { canSessionAction, providerOf, providerSessionKey, resolveCodexHierarchy, sessionKeyOf } from '../provider';
 import { initConversationProgressListener } from './conversation-loader';
 
 /**
@@ -120,6 +120,86 @@ export const attentionCount = derived(sessions, ($sessions) => {
 	return $sessions.filter(
 		(s) => s.status === SessionStatus.NeedsAttention || s.status === SessionStatus.WaitingForInput
 	).length;
+});
+
+export type AttentionReason = 'approval' | 'question' | 'attention';
+
+export type AttentionReturnKind = 'native' | 'conversation';
+
+export interface AttentionItem {
+	key: string;
+	session: Session;
+	reason: AttentionReason;
+	source: {
+		provider: Session['provider'];
+		surface: Session['surface'];
+		health: Session['sourceHealth'];
+		observedAt: string;
+	};
+	/**
+	 * How selecting this item returns to the originating session.
+	 * `native` focuses the originating terminal/IDE; `conversation` opens
+	 * the exact provider-scoped conversation view (Codex/Pi honest
+	 * degradation: no native focus is offered, but the conversation target
+	 * is still exact).
+	 */
+	returnKind: AttentionReturnKind;
+}
+
+/**
+ * High-confidence attention inbox contract.
+ *
+ * Sessions are already provider-scoped by the backend, but keep the key
+ * boundary here as a defensive UI invariant: a repeated observation must not
+ * create a second actionable item, while same-ID sessions from different
+ * providers remain distinct.
+ */
+function attentionTime(session: Session): number {
+	const time = new Date(session.modified).getTime();
+	// Empty or malformed timestamps sort as oldest so they can never win.
+	return Number.isFinite(time) ? time : 0;
+}
+
+export const attentionInbox = derived(sessions, ($sessions) => {
+	const seen = new Set<string>();
+	// Sort a copy: never mutate the array owned by the sessions store.
+	return [...$sessions]
+		// Dedup across ALL observations first (newest wins), then keep the
+		// winner only if it still needs attention. Otherwise an older
+		// NeedsAttention record could shadow a newer resolved observation.
+		.sort((a, b) => {
+			const delta = attentionTime(b) - attentionTime(a);
+			if (delta !== 0) return delta;
+			if (sessionKeyOf(a) === sessionKeyOf(b)) return 0;
+			return sessionKeyOf(a) < sessionKeyOf(b) ? -1 : 1;
+		})
+		.filter((session) => {
+			const key = sessionKeyOf(session);
+			if (seen.has(key)) return false;
+			seen.add(key);
+			return true;
+		})
+		.filter((session) => session.status === SessionStatus.NeedsAttention)
+		.map((session): AttentionItem => {
+			const pendingTool = session.pendingToolName?.toLowerCase() ?? '';
+			const reason: AttentionReason = pendingTool.includes('question')
+				? 'question'
+				: pendingTool
+					? 'approval'
+					: 'attention';
+			return {
+				key: sessionKeyOf(session),
+				session,
+				reason,
+				source: {
+					provider: providerOf(session),
+					surface: session.surface,
+					health: session.sourceHealth,
+					observedAt: session.modified
+				},
+				returnKind: canSessionAction(session, 'open') ? 'native' : 'conversation'
+			};
+		});
 });
 
 /**
