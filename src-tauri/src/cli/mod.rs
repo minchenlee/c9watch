@@ -286,7 +286,10 @@ pub fn run(cli: Cli) {
     crate::debug_log::set_quiet(true);
 
     let result = match cli.command {
-        Commands::UsageBridge { install, passthrough } => crate::claude_usage::run(install, passthrough),
+        Commands::UsageBridge {
+            install,
+            passthrough,
+        } => crate::claude_usage::run(install, passthrough),
         Commands::List {
             project,
             status,
@@ -1798,7 +1801,8 @@ fn resolve_session_reference_lightweight_under(
 
     if provider_filter.is_none() || provider_filter == Some(session::SessionProvider::Opencode) {
         matches.extend(
-            session::opencode::detect_once().into_iter()
+            session::opencode::detect_once()
+                .into_iter()
                 .filter_map(|s| s.identity())
                 .filter(|s| s.session_id.starts_with(prefix)),
         );
@@ -1873,11 +1877,17 @@ mod session_formatter_tests {
         let home = tempfile::tempdir().unwrap();
         let id = "ses_f835ea1f8ffelnS2uzHgkM9qUq";
         let result = super::resolve_session_reference_lightweight_under(
-            &format!("opencode:{id}"), home.path()).unwrap();
+            &format!("opencode:{id}"),
+            home.path(),
+        )
+        .unwrap();
         assert_eq!(result, (id.to_string(), Some(SessionProvider::Opencode)));
         let scoped = format!("{id}?directory=%2Farchive%2F%E4%B8%AD%E6%96%87");
         let result = super::resolve_session_reference_lightweight_under(
-            &format!("opencode:{scoped}"), home.path()).unwrap();
+            &format!("opencode:{scoped}"),
+            home.path(),
+        )
+        .unwrap();
         assert_eq!(result, (scoped, Some(SessionProvider::Opencode)));
     }
 

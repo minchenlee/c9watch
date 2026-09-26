@@ -1631,10 +1631,7 @@ mod placeholder_tests {
         let path = tmp.path().join("count-unchanged-budget.jsonl");
         std::fs::write(
             &path,
-            format!(
-                "{}\n",
-                r#"{"type":"user","message":{"content":"hello"}}"#
-            ),
+            format!("{}\n", r#"{"type":"user","message":{"content":"hello"}}"#),
         )
         .unwrap();
         assert!(FileVersion::read(&path)
@@ -1655,7 +1652,10 @@ mod placeholder_tests {
 
         // An unchanged strong stamp before the deadline must be a true
         // zero-content-I/O fast path, including for a small exact-prefix file.
-        assert_eq!(count_messages_in_jsonl_at(&path, t0 + Duration::from_secs(1)), 1);
+        assert_eq!(
+            count_messages_in_jsonl_at(&path, t0 + Duration::from_secs(1)),
+            1
+        );
         assert_eq!(
             MESSAGE_COUNT_CACHE
                 .lock()
@@ -1696,9 +1696,20 @@ mod placeholder_tests {
         .unwrap();
         assert_eq!(count_messages_in_jsonl(&path), 1);
 
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(file, r#"{{"type":"assistant","message":{{"content":"two"}}}}"#).unwrap();
-        writeln!(file, r#"{{"type":"assistant","message":{{"content":"three"}}}}"#).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":"two"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":"three"}}}}"#
+        )
+        .unwrap();
         drop(file);
 
         assert_eq!(count_messages_in_jsonl(&path), 3);
@@ -1730,7 +1741,10 @@ mod placeholder_tests {
         std::fs::write(&path, replacement).unwrap();
         let after = FileVersion::read(&path).unwrap();
         #[cfg(unix)]
-        assert_eq!(before.identity, after.identity, "rewrite should keep the inode");
+        assert_eq!(
+            before.identity, after.identity,
+            "rewrite should keep the inode"
+        );
 
         assert_eq!(count_messages_in_jsonl(&path), 1);
     }
@@ -1802,7 +1816,10 @@ mod placeholder_tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::write(
             &path,
-            format!("{}\n", r#"{"type":"user","message":{"content":"replaced"}}"#),
+            format!(
+                "{}\n",
+                r#"{"type":"user","message":{"content":"replaced"}}"#
+            ),
         )
         .unwrap();
         assert_eq!(count_messages_in_jsonl(&path), 1);
@@ -1844,7 +1861,10 @@ mod placeholder_tests {
         std::fs::write(&path, &rewritten).unwrap();
         let after = FileVersion::read(&path).unwrap();
         #[cfg(unix)]
-        assert_eq!(before.identity, after.identity, "rewrite should keep the inode");
+        assert_eq!(
+            before.identity, after.identity,
+            "rewrite should keep the inode"
+        );
         assert!(after.len > before.len);
 
         // The bounded guard deliberately does not inspect the middle. This
@@ -1896,9 +1916,7 @@ mod placeholder_tests {
         evict_oldest_message_count_entries(&mut cache);
 
         assert_eq!(cache.len(), MESSAGE_COUNT_CACHE_MAX_ENTRIES);
-        assert!(!cache.contains_key(&PathBuf::from(
-            "/synthetic/message-count-0.jsonl"
-        )));
+        assert!(!cache.contains_key(&PathBuf::from("/synthetic/message-count-0.jsonl")));
     }
 }
 
