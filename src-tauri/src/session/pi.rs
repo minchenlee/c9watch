@@ -943,7 +943,7 @@ pub(crate) fn pi_history_entries(home: &Path) -> Vec<crate::session::history::Hi
                 continue;
             }
             let project = if summary.project_path.is_empty() {
-                decode_pi_cwd_dir(&dir)
+                pi_dir_cwd(&dir)
             } else {
                 summary.project_path.clone()
             };
@@ -2026,6 +2026,21 @@ mod tests {
         assert!(!sessions
             .iter()
             .any(|s| s.session_id.as_deref() == Some("killed1")));
+    }
+
+    #[test]
+    fn history_headerless_transcript_recovers_exact_cwd_from_sibling() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join(".pi/agent/sessions/--tmp-my-project--");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("time_sibling.jsonl"),
+            r#"{"type":"session","cwd":"/tmp/my-project"}"#).unwrap();
+        std::fs::write(dir.join("time_headerless.jsonl"),
+            r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#).unwrap();
+        let entries = pi_history_entries(temp.path());
+        let entry = entries.iter().find(|entry| entry.session_id == "headerless").unwrap();
+        assert_eq!(entry.project, "/tmp/my-project");
+        assert_eq!(entry.project_name, "my-project");
     }
 
     #[test]
