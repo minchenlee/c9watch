@@ -59,8 +59,7 @@ pub struct Session {
     ///
     /// Never serialized: tool arguments can carry commands, paths, questions,
     /// or secrets. Only the tool *name* (`pending_tool_name`) leaves the
-    /// backend. Internal consumers (native notification bodies) read the field
-    /// directly from the struct.
+    /// backend. Retained internally for status inference only.
     #[serde(skip)]
     pub pending_tool_input: Option<serde_json::Value>,
     /// Session ID of the PM that spawned this session (if it's a c9watch worker).

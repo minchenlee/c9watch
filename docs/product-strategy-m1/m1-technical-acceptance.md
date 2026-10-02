@@ -60,8 +60,10 @@ not acceptance of subsequent fixes or live behavior.
   attention actions also select the exact conversation and disclose manual
   terminal selection. Unknown/older capabilities and Codex/Pi use conversation
   only; no unreliable terminal-selection mechanism was added.
-- Privacy: `pending_tool_input` is `#[serde(skip)]` — tool arguments leave through
-  no serialization path; CLI contract carries `sourceHealth`; docs updated.
+- Privacy: `pending_tool_input` is `#[serde(skip)]`; tool notification bodies
+  expose only tool names and Claude tool-use messages expose only name/id,
+  including web/mobile requests with `includeTools=true`. Ordinary assistant
+  question/reply previews remain available. CLI contract carries `sourceHealth`.
 - Cursor/OpenCode changes are additive health plumbing only, excluded from M1
   acceptance per the matrix.
 
