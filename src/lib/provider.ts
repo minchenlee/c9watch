@@ -146,3 +146,14 @@ export function canSessionAction(session: Session, action: SessionAction): boole
 	if (providerOf(session) === 'claudeCode') return true;
 	return action === 'conversation';
 }
+
+/** Exact native return requires a backend-declared tty mechanism. */
+export function sessionReturnKind(session: Session): 'native' | 'project' | 'application' | 'conversation' {
+	if (!canSessionAction(session, 'open')) return 'conversation';
+	switch (session.openTarget) {
+		case 'terminal': return 'native';
+		case 'project': return 'project';
+		case 'application': return 'application';
+		default: return 'conversation';
+	}
+}

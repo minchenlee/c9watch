@@ -378,6 +378,7 @@ mod tests {
             agent_nickname: Some("Scout".to_string()),
             agent_role: Some("investigator".to_string()),
             internal_kind: Some("spawned".to_string()),
+            open_target: None,
             can_open: false,
             can_stop: false,
             can_rename: false,

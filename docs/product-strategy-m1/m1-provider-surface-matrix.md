@@ -18,7 +18,7 @@ M1 changes are additive/optional and must not claim new Cursor/OpenCode coverage
 | M1-R1 | A declared matrix covers supported high-confidence approval/question waits and relevant non-actionable controls. |
 | M1-R2 | Every attention item exposes source evidence and health/freshness explaining why it is actionable. |
 | M1-R3 | Multiple observations of one session produce one item; same-ID sessions across providers and reconnect/reuse cases do not merge unrelated sessions. |
-| M1-R4 | Selecting an item returns to the exact originating session; no wrong-session target. |
+| M1-R4 | Selecting an item exposes the guaranteed target: exact tty/conversation, project only, or application only; no claim that an IDE project open selects the originating terminal. |
 | M1-R5 | A high-confidence wait is handled end to end in the originating environment (synthetic dispatch alone does not prove live behavior). |
 | M1-R6 | Product comparison against a participant baseline stays unmeasured; no workflow-shortening claim. |
 | M1-R7 | Precision/recall/latency/four-week-use targets stay targets until measured. |
@@ -34,7 +34,12 @@ M1 changes are additive/optional and must not claim new Cursor/OpenCode coverage
   - assistant text question after the 20s grace period (`status.rs:106`, tests at `1097-1140`).
   - pending tool needing permission (not auto-approved) (`status.rs:262-268`, tests at `623-641`, `707-737`).
 - Evidence: `pendingToolName` = tool name / `AskUserQuestion` / `Question` (`status.rs:321-381`); assistant-only `notification_preview` (`enrichment.rs:52-60`).
-- Capabilities: `can_open=true` for CLI-sourced sessions (`detector_cli.rs:93`); open focuses the originating terminal/IDE by pid+project (`src-tauri/src/actions.rs:8-78`).
+- Capabilities: `can_open=true` for CLI-sourced sessions; optional `openTarget` declares the existing native mechanism's guarantee (`actions.rs`, `session_open_target`).
+  - macOS Terminal/iTerm2 with a resolved tty: `terminal`, exact tty/tab selection; missing tty/tab or failed script is an error, never successful app-only fallback.
+  - VS Code / Cursor / Windsurf and other IDE CLI openers (including Zed): `project`, opens/reuses the project only. Multiple terminals in the same project require manual selection; pid does not select an IDE terminal.
+  - JetBrains: `project` via URL scheme, no originating-terminal selection.
+  - Other application fallback / Supacode: conservative `application` guarantee; no exact native-session claim.
+  - No declared target / older backend: attention selection uses the exact provider-scoped conversation.
 - Health: file missing + CLI-sourced → `partial`; missing + not CLI-sourced → `unavailable`; empty entries → `partial`; otherwise the transcript file's age decides: modified within 24h → `fresh`, older → `stale` (`enrichment.rs`, `health_from_last_timestamp` in `source.rs`).
 
 ### Codex
@@ -63,14 +68,16 @@ M1 changes are additive/optional and must not claim new Cursor/OpenCode coverage
 - Frontend re-derives keys from `provider + id` and never trusts a stale serialized `sessionKey` (`src/lib/provider.ts:21-26`).
 - The inbox dedups across *all* observations newest-first (malformed timestamps sort as oldest, key tiebreak), then keeps the winner only if it still needs attention — a stale attention record can never shadow a newer resolved observation (`sessions.ts`).
 - Providerless conversation lookup rejects cross-provider collisions instead of guessing (`src-tauri/src/session/conversation.rs:182-195`, tests at `288-321`).
-- High-confidence inbox (`src/lib/stores/sessions.ts`): `NeedsAttention` only, deduped by provider-scoped key with newest-observation-wins (store array is copied before sorting; malformed timestamps sort as oldest); each item carries provider, surface, health, observed time, reason, and `returnKind` (`native` = focus originating terminal/IDE, `conversation` = exact provider-scoped conversation view). The monitor header badge dispatches the newest item through its `returnKind` (`jumpToAttention` in `+page.svelte`).
+- High-confidence inbox (`src/lib/stores/sessions.ts`): `NeedsAttention` only, deduped by provider-scoped key with newest-observation-wins (store array is copied before sorting; malformed timestamps sort as oldest); each item carries provider, surface, health, observed time, reason, and `returnKind` (`native` = exact tty focus, `project` = project only, `application` = app only, `conversation` = exact provider-scoped conversation view). The monitor header badge dispatches the newest item through its `returnKind` (`jumpToAttention` in `+page.svelte`).
 
-## Exact return contract (M1-R4)
+## Declared return guarantee (M1-R4)
 
 - Expansion sets provider-qualified selection (`+page.svelte:380`); conversation fetch passes provider explicitly (`+page.svelte:354`, `src/lib/api.ts:28-44`).
 - Stale/foreign responses are discarded when the returned `provider:sessionId` does not match the selection (`+page.svelte:360`).
 - Backend conversation lookup is provider-namespaced with ambiguity rejection (`conversation.rs:196-232`).
-- Native open is offered only where `canSessionAction(session,'open')` is true (`SessionCard.svelte:40`, `provider.ts:126-151`); Claude opens by pid+project, Codex/Pi offer no open control.
+- Native open is offered only where `canSessionAction(session,'open')` is true; exact native return additionally requires `openTarget=terminal`. Codex/Pi offer no native open control.
+- Project/application attention selection also expands the exact conversation and labels the weaker native target. IDE CLI success proves only project opening, never that session A rather than session B is selected.
+- Unknown/older payloads degrade to exact conversation selection. Live OS focus remains unverified; the declared mechanism is not a measured success rate.
 
 ## Source health contract (M1-R2)
 

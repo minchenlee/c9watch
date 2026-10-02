@@ -114,6 +114,7 @@ export interface Session {
   agentRole?: string | null;
   internalKind?: string | null;
   /** Backend-provided action capabilities (serialized from Rust snake_case fields). */
+  openTarget?: 'terminal' | 'project' | 'application';
   canOpen?: boolean;
   canStop?: boolean;
   canRename?: boolean;

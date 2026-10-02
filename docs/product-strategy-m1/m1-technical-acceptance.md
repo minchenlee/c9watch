@@ -15,16 +15,17 @@ Requirements: `m1-provider-surface-matrix.md` (M1-R1..M1-R8).
 | M1-R1 declared matrix | PASS |
 | M1-R2 evidence + health | PASS |
 | M1-R3 identity / dedup | PASS |
-| M1-R4 exact return | PASS |
+| M1-R4 declared return guarantee | PASS for capability/selection contract; exact live native focus UNVERIFIED |
 | M1-R5 live end-to-end handling | UNVERIFIED (not authorized: no live providers) |
 | M1-R6 participant baseline comparison | PASS (correctly held open, no claim made) |
 | M1-R7 metric targets | PASS (kept as targets, no claim made) |
 | M1-R8 no scope expansion | PASS |
 
-The only open technical requirement is M1-R5, which cannot be closed without
-running live providers / OS notification sessions — explicitly out of bounds
-for this build. Everything else the plan allows to be built and checked is
-built, independently reviewed, and independently verified.
+Live M1-R4 native focus and M1-R5 remain unverified without running live
+providers / OS sessions. IDE project open cannot satisfy exact terminal return:
+its declared guarantee is project only, with manual terminal selection.
+The historical verification runs below are evidence from that candidate,
+not acceptance of subsequent fixes or live behavior.
 
 ## Verification runs (final round, observed by verifier)
 
@@ -51,8 +52,14 @@ built, independently reviewed, and independently verified.
   across all observations, each item carrying provider/surface/health/observed
   time/reason/`returnKind`; monitor header badge dispatches the newest item.
 - Backend duplicate identities collapse newest-wins by parsed instant.
-- Exact return: provider-qualified conversation selection with stale/foreign
-  response rejection; native open capability-gated (Codex/Pi: conversation only).
+- Return guarantees: provider-qualified conversation selection with stale/foreign
+  response rejection. Terminal/iTerm2 on macOS use exact tty selection and fail
+  when the tty/tab cannot be selected. VS Code/Cursor/Windsurf/Zed CLI and
+  JetBrains URL openers target only the project, never a specific IDE terminal.
+  Other native fallback surfaces declare application only. Project/application
+  attention actions also select the exact conversation and disclose manual
+  terminal selection. Unknown/older capabilities and Codex/Pi use conversation
+  only; no unreliable terminal-selection mechanism was added.
 - Privacy: `pending_tool_input` is `#[serde(skip)]` — tool arguments leave through
   no serialization path; CLI contract carries `sourceHealth`; docs updated.
 - Cursor/OpenCode changes are additive health plumbing only, excluded from M1

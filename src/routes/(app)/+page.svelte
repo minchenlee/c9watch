@@ -54,8 +54,10 @@
 	);
 	let attentionReturnTitle = $derived.by(() => {
 		const native = attentionItems.filter((item) => item.returnKind === 'native').length;
-		const conversation = attentionItems.length - native;
-		return `Provider-scoped high-confidence attention items — ${native} native return, ${conversation} conversation return`;
+		const project = attentionItems.filter((item) => item.returnKind === 'project').length;
+		const application = attentionItems.filter((item) => item.returnKind === 'application').length;
+		const conversation = attentionItems.length - native - project - application;
+		return `High-confidence attention items — ${native} exact terminal, ${project} project only (select terminal manually), ${application} application only, ${conversation} exact conversation`;
 	});
 	let expandedId = $derived($expandedSessionId);
 	let conversation = $derived($currentConversation);
@@ -407,8 +409,8 @@
 
 	/**
 	 * Dispatch the newest attention item through its declared return path:
-	 * native focus for terminal/IDE-backed sessions, exact provider-scoped
-	 * conversation expansion otherwise.
+	 * exact terminal focus where supported. Project/application openers
+	 * also expand the exact conversation; they do not select an IDE terminal.
 	 */
 	async function jumpToAttention() {
 		const item = attentionItems[0];
@@ -417,6 +419,9 @@
 			await handleOpen(item.session.pid, item.session.projectPath);
 		} else {
 			expandedSessionId.set(item.key);
+			if (item.returnKind === 'project' || item.returnKind === 'application') {
+				await handleOpen(item.session.pid, item.session.projectPath);
+			}
 		}
 	}
 

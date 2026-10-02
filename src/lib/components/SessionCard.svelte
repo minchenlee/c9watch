@@ -7,7 +7,7 @@
 	import { isCostAvailable } from '$lib/cost-semantics';
 	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 	import ProviderBadge from './ProviderBadge.svelte';
-	import { canSessionAction, sessionKeyOf } from '$lib/provider';
+	import { canSessionAction, sessionReturnKind, sessionKeyOf } from '$lib/provider';
 
 	interface Props {
 		session: Session;
@@ -38,6 +38,9 @@
 	let isWorking = $derived(session.status === SessionStatus.Working);
 	let canExpand = $derived(canSessionAction(session, 'conversation'));
 	let canOpen = $derived(canSessionAction(session, 'open'));
+	let openTitle = $derived(sessionReturnKind(session) === 'native' ? 'Focus exact terminal'
+		: session.openTarget === 'project' ? 'Open project only — select the session terminal manually'
+		: 'Activate application — exact session focus unavailable');
 	let canStop = $derived(canSessionAction(session, 'stop'));
 	let canRename = $derived(canSessionAction(session, 'rename'));
 	let sourceHealthMeta = $derived.by(() => {
@@ -347,13 +350,13 @@
 						</button>
 						{/if}
 						{#if canOpen}
-						<button type="button" class="action-btn primary" onclick={handleOpen} title="Open">
+						<button type="button" class="action-btn primary" onclick={handleOpen} title={openTitle}>
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 							<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
 							<polyline points="15 3 21 3 21 9" />
 							<line x1="10" y1="14" x2="21" y2="3" />
 						</svg>
-						OPEN
+						{session.openTarget === 'project' ? 'PROJECT' : sessionReturnKind(session) === 'native' ? 'FOCUS' : 'APP'}
 						</button>
 						{/if}
 					</div>
@@ -361,7 +364,7 @@
 			{:else}
 				<div class="compact-actions">
 					{#if canOpen}
-					<button type="button" class="action-btn icon-only" onclick={handleOpen} title="Open">
+					<button type="button" class="action-btn icon-only" onclick={handleOpen} title={openTitle}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 						<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
 						<polyline points="15 3 21 3 21 9" />

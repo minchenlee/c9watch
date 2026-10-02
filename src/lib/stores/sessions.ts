@@ -10,7 +10,7 @@ import { SessionStatus } from '../types';
 import { isDemoMode } from '../demo/mode';
 import { openSession } from '../api';
 import { wsClient, useWebSocket, getStoredWsUrl, isTauri } from '../ws';
-import { canSessionAction, providerOf, providerSessionKey, resolveCodexHierarchy, sessionKeyOf } from '../provider';
+import { providerOf, providerSessionKey, resolveCodexHierarchy, sessionReturnKind, sessionKeyOf } from '../provider';
 import { initConversationProgressListener } from './conversation-loader';
 
 /**
@@ -124,7 +124,7 @@ export const attentionCount = derived(sessions, ($sessions) => {
 
 export type AttentionReason = 'approval' | 'question' | 'attention';
 
-export type AttentionReturnKind = 'native' | 'conversation';
+export type AttentionReturnKind = ReturnType<typeof sessionReturnKind>;
 
 export interface AttentionItem {
 	key: string;
@@ -137,11 +137,9 @@ export interface AttentionItem {
 		observedAt: string;
 	};
 	/**
-	 * How selecting this item returns to the originating session.
-	 * `native` focuses the originating terminal/IDE; `conversation` opens
-	 * the exact provider-scoped conversation view (Codex/Pi honest
-	 * degradation: no native focus is offered, but the conversation target
-	 * is still exact).
+	 * `native` selects the exact tty; `project` opens only the project;
+	 * `application` activates only the app. `conversation` selects the
+	 * exact provider-scoped conversation (also used for older payloads).
 	 */
 	returnKind: AttentionReturnKind;
 }
@@ -197,7 +195,7 @@ export const attentionInbox = derived(sessions, ($sessions) => {
 					health: session.sourceHealth,
 					observedAt: session.modified
 				},
-				returnKind: canSessionAction(session, 'open') ? 'native' : 'conversation'
+				returnKind: sessionReturnKind(session)
 			};
 		});
 });
