@@ -270,10 +270,14 @@ fn group_has_bridge(group: &Value) -> bool {
 
 /// A hook entry written by [`configured`], for any c9watch executable path.
 fn is_bridge_hook(hook: &Value) -> bool {
-    hook["type"] == "command"
-        && hook["command"]
-            .as_str()
-            .is_some_and(|c| c.ends_with("' hooks") && c.contains("c9watch"))
+    let Some(command) = hook["command"].as_str() else { return false; };
+    let Some(quoted) = command.strip_suffix(" hooks") else { return false; };
+    let Some(path) = quoted.strip_prefix('\'').and_then(|p| p.strip_suffix('\'')) else { return false; };
+    let decoded = path.replace("'\\''", "'");
+    let executable = Path::new(&decoded);
+    executable.is_absolute() && executable.file_name().is_some_and(|name| name == "c9watch")
+        && bridge_command(executable).is_ok_and(|expected| expected == command)
+        && *hook == json!({"type": "command", "command": command, "async": true})
 }
 
 fn bridge_command(executable: &Path) -> Result<String, String> {
@@ -296,12 +300,12 @@ pub fn unconfigured(mut settings: Value) -> Result<Value, String> {
         let Some(groups) = hooks.get_mut(*event).and_then(Value::as_array_mut) else {
             continue;
         };
-        for group in groups.iter_mut() {
-            if let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) {
-                entries.retain(|hook| !is_bridge_hook(hook));
-            }
-        }
-        groups.retain(|group| !group["hooks"].as_array().is_some_and(Vec::is_empty));
+        groups.retain_mut(|group| {
+            let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) else { return true; };
+            let owned = entries.iter().any(is_bridge_hook);
+            entries.retain(|hook| !is_bridge_hook(hook));
+            !owned || !entries.is_empty()
+        });
         if groups.is_empty() {
             hooks.remove(*event);
         }
@@ -598,5 +602,25 @@ mod tests {
         let restored: Value =
             serde_json::from_slice(&fs::read(dir.path().join("settings.json")).unwrap()).unwrap();
         assert_eq!(restored, json!({"model": "opus"}));
+    }
+}
+
+#[cfg(test)]
+mod repair_regressions {
+    use super::*;
+    #[test]
+    fn exact_hook_ownership_preserves_unrelated_commands_and_custom_options() {
+        let other=json!({"type":"command","command":"'/Users/alice/c9watch-project/audit' hooks","async":true});
+        let custom=json!({"type":"command","command":"'/usr/local/bin/c9watch' hooks","async":false,"timeout":10});
+        let settings=json!({"hooks":{"Stop":[{"matcher":"*","hooks":[other,custom]},{"hooks":[]}]},"model":"opus"});
+        let next=configured(settings.clone(),Path::new("/new/c9watch")).unwrap();
+        assert_eq!(unconfigured(next).unwrap(),settings,"unrelated hook or empty group was removed");
+    }
+    #[test]
+    fn exact_escaped_bridge_command_is_owned_and_idempotent() {
+        let next=configured(json!({}),Path::new("/tmp/it's/c9watch")).unwrap();
+        assert!(installed(&next));
+        assert_eq!(configured(next.clone(),Path::new("/tmp/it's/c9watch")).unwrap(),next);
+        assert_eq!(unconfigured(next).unwrap(),json!({}));
     }
 }
