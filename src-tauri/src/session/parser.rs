@@ -652,8 +652,6 @@ pub fn get_native_custom_title(entries: &[SessionEntry]) -> Option<String> {
 /// Scans the file for lines containing `"custom-title"` and parses only those.
 /// Returns the last (most recent) custom title found.
 pub fn get_native_custom_title_from_file(path: &std::path::Path) -> Option<String> {
-    // Preserve the title found before a malformed UTF-8 line for callers
-    // without a cache; cache callers use the checked scan below.
     scan_native_custom_title(File::open(path).ok()?).0
 }
 
@@ -666,6 +664,8 @@ pub(crate) fn try_get_native_custom_title_from_file(
 }
 
 /// Retain one line at a time, and keep I/O failure separate from no title.
+/// A line that isn't valid UTF-8 ends the scan with the titles found so far,
+/// as a complete result: rescanning an unchanged file gives the same answer.
 fn scan_native_custom_title(reader: impl Read) -> (Option<String>, std::io::Result<()>) {
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -675,6 +675,9 @@ fn scan_native_custom_title(reader: impl Read) -> (Option<String>, std::io::Resu
         match reader.read_line(&mut line) {
             Ok(0) => return (last_title, Ok(())),
             Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return (last_title, Ok(()))
+            }
             Err(error) => return (last_title, Err(error)),
         }
         if line.contains("\"custom-title\"") {
@@ -1329,6 +1332,17 @@ mod tests {
         let (title, result) = scan_native_custom_title(FailingReader);
         assert!(title.is_none());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn native_custom_title_checked_scan_keeps_title_before_invalid_utf8() {
+        let mut bytes = br#"{"type":"custom-title","customTitle":"kept","sessionId":"s"}"#.to_vec();
+        bytes.extend_from_slice(b"\n\xff\n");
+        bytes
+            .extend_from_slice(br#"{"type":"custom-title","customTitle":"after","sessionId":"s"}"#);
+        let (title, result) = scan_native_custom_title(std::io::Cursor::new(bytes));
+        result.unwrap();
+        assert_eq!(title, Some("kept".to_string()));
     }
 
     #[test]
