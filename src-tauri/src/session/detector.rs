@@ -459,6 +459,16 @@ fn is_claude_code_process(name: &str, exe: Option<&Path>, cmd: &[String]) -> boo
         }
     }
 
+    // The package entry script identifies Claude Code even when Node is named
+    // nodejs, versioned, or explicitly renamed.
+    if cmd
+        .iter()
+        .skip(1)
+        .any(|arg| Path::new(&arg.replace('\\', "/")).ends_with("@anthropic-ai/claude-code/cli.js"))
+    {
+        return true;
+    }
+
     let is_runtime = ["node", "node.exe", "bun", "bun.exe"]
         .iter()
         .any(|r| name == *r || argv0 == *r);
@@ -572,6 +582,27 @@ mod tests {
                 "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"
             ])
         ));
+    }
+
+    #[test]
+    fn matches_claude_code_entry_script_with_alternative_runtime_names() {
+        for (name, exe) in [
+            ("nodejs", "/usr/bin/nodejs"),
+            ("node-22", "/opt/node/bin/node-22"),
+            ("renamed-runtime", "/opt/custom/renamed-runtime"),
+        ] {
+            assert!(
+                is_claude_code_process(
+                    name,
+                    Some(Path::new(exe)),
+                    &cmd(&[
+                        name,
+                        "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+                    ])
+                ),
+                "runtime {name}"
+            );
+        }
     }
 
     #[test]
