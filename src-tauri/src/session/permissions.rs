@@ -14,9 +14,10 @@ pub struct ClaudeSettings {
 #[derive(Debug, Deserialize)]
 pub struct Permissions {
     pub allow: Option<Vec<String>>,
+    pub ask: Option<Vec<String>>,
 }
 
-/// Tools that never show a permission prompt, whatever the settings say.
+/// Tools normally inferred as approved. Explicit Agent ask rules are checked first.
 const NEVER_PROMPTING_TOOLS: &[&str] = &[
     "Read",
     "Glob",
@@ -53,6 +54,7 @@ static CHECKER_CACHE: LazyLock<Mutex<CheckerCache>> = LazyLock::new(|| Mutex::ne
 #[derive(Debug, Clone, Default)]
 pub struct PermissionChecker {
     allowed_patterns: Vec<AllowPattern>,
+    asked_agent_patterns: Vec<String>,
     /// Treat every pending tool as approved. Used for sessions whose permission
     /// prompts are reported by Claude Code hooks instead of inferred here.
     assume_approved: bool,
@@ -85,29 +87,27 @@ impl PermissionChecker {
     /// Load and merge the allow rules from several settings files. Missing or
     /// unparseable files contribute nothing.
     pub fn from_files(paths: &[PathBuf]) -> Self {
-        let allowed_patterns = paths
-            .iter()
+        let mut allowed_patterns = Vec::new();
+        let mut asked_agent_patterns = Vec::new();
+        for settings in paths.iter()
             .filter_map(|path| fs::read_to_string(path).ok())
             .filter_map(|content| serde_json::from_str::<ClaudeSettings>(&content).ok())
-            .flat_map(|settings| {
-                settings
-                    .permissions
-                    .and_then(|p| p.allow)
-                    .unwrap_or_default()
-            })
-            .filter_map(|s| Self::parse_pattern(&s))
-            .collect();
-
-        Self {
-            allowed_patterns,
-            assume_approved: false,
+        {
+            if let Some(permissions) = settings.permissions {
+                allowed_patterns.extend(permissions.allow.unwrap_or_default().iter()
+                    .filter_map(|rule| Self::parse_pattern(rule)));
+                asked_agent_patterns.extend(permissions.ask.unwrap_or_default().into_iter()
+                    .filter(|rule| rule == "Agent" || (rule.starts_with("Agent(") && rule.ends_with(')'))));
+            }
         }
+        Self { allowed_patterns, asked_agent_patterns, assume_approved: false }
     }
 
     /// A checker that reports every tool as approved.
     pub fn assume_approved() -> Self {
         Self {
             allowed_patterns: Vec::new(),
+            asked_agent_patterns: Vec::new(),
             assume_approved: true,
         }
     }
@@ -182,6 +182,15 @@ impl PermissionChecker {
     /// # Returns
     /// true if the tool is auto-approved, false if it needs user permission
     pub fn is_auto_approved(&self, tool_name: &str, tool_input: &serde_json::Value) -> bool {
+        // Ordinary running Agent calls stay excluded, but explicit top-level
+        // ask rules take precedence over the default and over an allow rule.
+        if tool_name == "Agent" && self.asked_agent_patterns.iter().any(|rule| {
+            if rule == "Agent" { return true; }
+            let agent = &rule[6..rule.len() - 1];
+            agent == "*" || tool_input.get("subagent_type").and_then(|v| v.as_str()) == Some(agent)
+        }) {
+            return false;
+        }
         if self.assume_approved || NEVER_PROMPTING_TOOLS.contains(&tool_name) {
             return true;
         }
@@ -315,6 +324,7 @@ mod tests {
     fn test_bash_command_matching() {
         let checker = PermissionChecker {
             assume_approved: false,
+            asked_agent_patterns: Vec::new(),
             allowed_patterns: vec![
                 AllowPattern::Bash {
                     prefix: "git add".to_string(),
@@ -389,6 +399,7 @@ mod tests {
     fn test_plain_tool_allow_applies_to_bash_and_other_tools() {
         let checker = PermissionChecker {
             assume_approved: false,
+            asked_agent_patterns: Vec::new(),
             allowed_patterns: vec![
                 AllowPattern::Tool {
                     name: "Bash".to_string(),
@@ -409,5 +420,38 @@ mod tests {
 
         // Just verify it loads without crashing
         println!("Loaded {} patterns", checker.allowed_patterns.len());
+    }
+}
+
+#[cfg(test)]
+mod repair_regressions {
+    use super::*;
+    fn fixture() -> tempfile::TempDir {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        tempfile::tempdir_in(parent).unwrap()
+    }
+
+    #[test]
+    fn explicit_agent_ask_overrides_default_and_allow_across_files() {
+        let dir=fixture();let allow=dir.path().join("allow.json");let ask=dir.path().join("ask.json");
+        fs::write(&allow,r#"{"permissions":{"allow":["Agent","Bash"]}}"#).unwrap();
+        fs::write(&ask,r#"{"permissions":{"ask":["Agent"]}}"#).unwrap();
+        let checker=PermissionChecker::from_files(&[allow,ask]);
+        assert!(!checker.is_auto_approved("Agent",&serde_json::json!({"subagent_type":"Explore"})),"explicit Agent ask was ignored");
+        assert!(checker.is_auto_approved("Bash",&serde_json::json!({"command":"make"})));
+    }
+    #[test]
+    fn agent_subtype_and_wildcard_ask_rules_are_honored_without_flagging_other_agents() {
+        let dir=fixture();let path=dir.path().join("settings.json");
+        fs::write(&path,r#"{"permissions":{"ask":["Agent(Explore)"]}}"#).unwrap();
+        let checker=PermissionChecker::from_file(&path);
+        assert!(!checker.is_auto_approved("Agent",&serde_json::json!({"subagent_type":"Explore"})));
+        assert!(checker.is_auto_approved("Agent",&serde_json::json!({"subagent_type":"Plan"})));
+        fs::write(&path,r#"{"permissions":{"ask":["Agent(*)"]}}"#).unwrap();
+        assert!(!PermissionChecker::from_file(&path).is_auto_approved("Agent",&serde_json::json!({})));
+    }
+    #[test]
+    fn normal_agent_without_ask_stays_approved() {
+        assert!(PermissionChecker::default().is_auto_approved("Agent",&serde_json::json!({})));
     }
 }
