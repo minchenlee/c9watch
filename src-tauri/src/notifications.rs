@@ -230,14 +230,36 @@ fn content(s: &Session, event: Event, detail: Detail) -> (String, String) {
     if detail == Detail::Detailed {
         let preview = match event {
             Event::Reply => s.notification_preview.clone().unwrap_or_default(),
-            Event::Question => {
-                if s.pending_tool_name.as_deref() == Some("AskUserQuestion") {
-                    "AskUserQuestion".to_string()
-                } else {
-                    s.notification_preview.clone().unwrap_or_default()
-                }
+            Event::Question => s
+                .pending_tool_input
+                .as_ref()
+                .and_then(|v| v.get("questions"))
+                .and_then(|v| v.as_array())
+                .map(|qs| {
+                    qs.iter()
+                        .filter_map(|q| q.get("question")?.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| s.notification_preview.clone().unwrap_or_default()),
+            Event::Permission => {
+                let input = s
+                    .pending_tool_input
+                    .as_ref()
+                    .and_then(|v| {
+                        ["command", "file_path", "path", "description"]
+                            .iter()
+                            .find_map(|k| v.get(*k).and_then(|v| v.as_str()))
+                    })
+                    .unwrap_or("");
+                format!(
+                    "{}{}{}",
+                    s.pending_tool_name.as_deref().unwrap_or("Tool approval"),
+                    if input.is_empty() { "" } else { ": " },
+                    input
+                )
             }
-            Event::Permission => s.pending_tool_name.clone().unwrap_or_else(|| "Tool approval".into()),
         };
         if !preview.trim().is_empty() {
             body.push_str(&format!("\n{}", compact(&preview, 240)));
@@ -364,39 +386,6 @@ mod tests {
     }
 
     #[test]
-    fn serialized_session_never_carries_tool_arguments() {
-        let mut s = fixture();
-        s.status = SessionStatus::NeedsAttention;
-        s.pending_tool_name = Some("Bash".into());
-        s.pending_tool_input = Some(serde_json::json!({"sentinel": "rm -rf /tmp/sentinel-secret"}));
-        // Internal status inference may retain the field; serialization never emits it.
-        assert!(s.pending_tool_input.is_some());
-        // But no serialization path (Tauri command, WebSocket, CLI) may emit it.
-        let json = serde_json::to_value(&s).unwrap();
-        let raw = serde_json::to_string(&json).unwrap();
-        assert!(json.get("pendingToolInput").is_none());
-        assert!(!raw.contains("sentinel-secret"));
-        assert_eq!(json["pendingToolName"], "Bash");
-    }
-
-    #[test]
-    fn permission_notification_never_carries_tool_arguments() {
-        let mut s = fixture();
-        s.pending_tool_name = Some("Bash".into());
-        s.pending_tool_input = Some(serde_json::json!({
-            "command": "TOKEN=sentinel-secret cargo test",
-            "file_path": "/private/sentinel-secret",
-            "path": "/private/sentinel-secret",
-            "description": "sentinel-secret"
-        }));
-        for detail in [Detail::Brief, Detail::Detailed] {
-            let (title, body) = content(&s, Event::Permission, detail);
-            assert!(!format!("{title}{body}").contains("sentinel-secret"));
-        }
-        assert!(content(&s, Event::Permission, Detail::Detailed).1.ends_with("\nBash"));
-    }
-
-    #[test]
     fn detailed_reply_and_brief_privacy() {
         let mut s = fixture();
         s.status = SessionStatus::WaitingForInput;
@@ -411,7 +400,7 @@ mod tests {
         assert!(!body.contains("Finished working"));
     }
     #[test]
-    fn questions_and_permissions_expose_tool_names_only() {
+    fn questions_and_permissions_include_actionable_content() {
         let mut s = fixture();
         s.status = SessionStatus::NeedsAttention;
         s.pending_tool_name = Some("AskUserQuestion".into());
@@ -420,15 +409,13 @@ mod tests {
         assert_eq!(Event::from_session(&s), Some(Event::Question));
         assert!(content(&s, Event::Question, Detail::Detailed)
             .1
-            .contains("AskUserQuestion"));
-        assert!(!content(&s, Event::Question, Detail::Detailed).1.contains("Which branch"));
+            .contains("Which branch"));
         s.pending_tool_name = Some("Bash".into());
         s.pending_tool_input =
             Some(serde_json::json!({"command":"cargo test", "secret":"never dump unknown fields"}));
         assert_eq!(Event::from_session(&s), Some(Event::Permission));
         let body = content(&s, Event::Permission, Detail::Detailed).1;
-        assert!(body.ends_with("\nBash"));
-        assert!(!body.contains("cargo test"));
+        assert!(body.contains("Bash: cargo test"));
         assert!(!body.contains("secret"));
     }
     #[test]

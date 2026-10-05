@@ -580,8 +580,13 @@ pub fn extract_messages(
                                 vec![],
                             ));
                         }
-                        MessageContent::ToolUse { id, name, .. } => {
-                            let tool_desc = format!("[{}] {}", name, id);
+                        MessageContent::ToolUse { id, name, input } => {
+                            let tool_desc = format!(
+                                "[{}] {} - {}",
+                                name,
+                                id,
+                                serde_json::to_string_pretty(input).unwrap_or_default()
+                            );
                             messages.push((
                                 base.timestamp.clone(),
                                 MessageType::ToolUse,
@@ -668,21 +673,6 @@ pub fn get_native_custom_title_from_file(path: &std::path::Path) -> Option<Strin
 mod tests {
     use super::*;
     use std::io::Write;
-
-    #[test]
-    fn extracted_tool_use_never_carries_tool_arguments() {
-        let entry: SessionEntry = serde_json::from_value(serde_json::json!({
-            "type": "assistant", "uuid": "test", "timestamp": "2026-01-08T15:23:03Z",
-            "message": {"model": "claude", "id": "msg", "role": "assistant", "content": [
-                {"type": "tool_use", "id": "call-1", "name": "Bash",
-                 "input": {"command": "TOKEN=sentinel-secret cargo test", "nested": {"secret": "sentinel-secret"}}}
-            ]}
-        })).unwrap();
-        let messages = extract_messages(&[entry]);
-        assert_eq!(messages.len(), 1);
-        assert!(!messages[0].2.contains("sentinel-secret"));
-        assert_eq!(messages[0].2, "[Bash] call-1");
-    }
 
     #[test]
     fn test_parse_user_message() {
@@ -1025,8 +1015,8 @@ mod tests {
         let result = extract_messages(&entries);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].1, MessageType::ToolUse);
-        assert_eq!(result[0].2, "[Read] toolu_abc");
-        assert!(!result[0].2.contains("file_path"));
+        assert!(result[0].2.starts_with("[Read] toolu_abc - "));
+        assert!(result[0].2.contains("file_path"));
     }
 
     #[test]

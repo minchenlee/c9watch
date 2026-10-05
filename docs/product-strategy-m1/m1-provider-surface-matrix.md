@@ -84,7 +84,6 @@ M1 changes are additive/optional and must not claim new Cursor/OpenCode coverage
 - `SourceHealth`: fresh / stale / partial / unavailable / unknown (`source.rs:52-65`).
 - Serialized as optional camelCase `sourceHealth`; older backends omit it (`enrichment.rs`, `src/lib/types.ts`). The CLI contract (`insert_session_contract` in `cli/mod.rs`) also carries it.
 - Rendered per session card with explanatory tooltip (`SessionCard.svelte`).
-- Privacy: `pending_tool_input` is `#[serde(skip)]` on the backend struct, so it leaves through **no** serialization path (Tauri command, WebSocket, or CLI) — only the tool *name* is exposed. Native tool notifications expose only the tool name (including `AskUserQuestion`); ordinary assistant question/reply previews remain available. Claude tool-use message extraction retains only name/id even with `includeTools=true`. Regression tests `serialized_session_never_carries_tool_arguments`, `permission_notification_never_carries_tool_arguments`, `questions_and_permissions_expose_tool_names_only`, and `extracted_tool_use_never_carries_tool_arguments` cover these paths.
 
 ## Explicitly unmeasured (M1-R5–R7)
 

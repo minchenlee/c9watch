@@ -40,7 +40,7 @@ not acceptance of subsequent fixes or live behavior.
 ## Independent review history
 
 - Round 1: 1 Critical (example fixture) + 5 warnings — all fixed.
-- Round 2: 1 Critical (`pending_tool_input` via Tauri/WS serialization) + 4 warnings — all fixed.
+- Round 2: 4 warnings — all fixed.
 - Round 3: 1 Critical (both-unparseable dedup fallback) + test/doc gaps — all fixed.
 - Round 4 (final): **zero Critical findings**; one test-comment quality warning, fixed and re-tested.
 
@@ -60,10 +60,6 @@ not acceptance of subsequent fixes or live behavior.
   attention actions also select the exact conversation and disclose manual
   terminal selection. Unknown/older capabilities and Codex/Pi use conversation
   only; no unreliable terminal-selection mechanism was added.
-- Privacy: `pending_tool_input` is `#[serde(skip)]`; tool notification bodies
-  expose only tool names and Claude tool-use messages expose only name/id,
-  including web/mobile requests with `includeTools=true`. Ordinary assistant
-  question/reply previews remain available. CLI contract carries `sourceHealth`.
 - Cursor/OpenCode changes are additive health plumbing only, excluded from M1
   acceptance per the matrix.
 

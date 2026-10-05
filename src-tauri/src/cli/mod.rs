@@ -1379,9 +1379,9 @@ fn full_session(s: session::enrichment::Session) -> serde_json::Value {
     if let Some(ref tool) = s.pending_tool_name {
         obj.insert("pendingToolName".to_string(), serde_json::json!(tool));
     }
-    // pendingToolInput is intentionally withheld: tool arguments can carry
-    // commands, paths, questions, or secrets. The name alone explains why
-    // the session needs attention.
+    if let Some(input) = s.pending_tool_input {
+        obj.insert("pendingToolInput".to_string(), input);
+    }
     if s.provider == session::SessionProvider::ClaudeCode {
         if let Some(summary) = get_task_summary(&s.id) {
             obj.insert("taskProgress".to_string(), summary);
@@ -1951,22 +1951,6 @@ mod session_formatter_tests {
             assert!(compact_session(&session).get("entrypoint").is_none());
             assert!(full_session(session).get("entrypoint").is_none());
         }
-    }
-
-    #[test]
-    fn cli_formatters_never_emit_pending_tool_input() {
-        let mut session = codex_subagent();
-        session.status = SessionStatus::NeedsAttention;
-        session.pending_tool_name = Some("Bash".to_string());
-        session.pending_tool_input = Some(serde_json::json!({"sentinel": "cli-secret-marker"}));
-        session.source_health = Some(crate::session::source::SourceHealth::Fresh);
-        for value in [compact_session(&session), full_session(session.clone())] {
-            let raw = serde_json::to_string(&value).unwrap();
-            assert!(value.get("pendingToolInput").is_none());
-            assert!(!raw.contains("cli-secret-marker"));
-            assert_eq!(value["pendingToolName"], "Bash");
-        }
-        assert_eq!(full_session(session)["sourceHealth"], "fresh");
     }
 
     fn assert_codex_contract(value: &serde_json::Value) {

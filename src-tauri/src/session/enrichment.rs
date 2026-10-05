@@ -55,12 +55,8 @@ pub struct Session {
     #[serde(skip)]
     pub notification_preview: Option<String>,
     pub pending_tool_name: Option<String>,
-    /// The input/arguments of the pending tool (when status is NeedsPermission).
-    ///
-    /// Never serialized: tool arguments can carry commands, paths, questions,
-    /// or secrets. Only the tool *name* (`pending_tool_name`) leaves the
-    /// backend. Retained internally for status inference only.
-    #[serde(skip)]
+    /// The input/arguments of the pending tool (when status is NeedsPermission)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_tool_input: Option<serde_json::Value>,
     /// Session ID of the PM that spawned this session (if it's a c9watch worker).
     /// Populated in polling.rs by overlay from `~/.claude/c9watch/workers/*/meta.json`.
