@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::collections::HashMap;
+#[cfg(any(test, not(unix)))]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -90,8 +91,13 @@ impl PermissionChecker {
         let mut allowed_patterns = Vec::new();
         let mut asked_agent_patterns = Vec::new();
         for settings in paths.iter()
-            .filter_map(|path| fs::read_to_string(path).ok())
-            .filter_map(|content| serde_json::from_str::<ClaudeSettings>(&content).ok())
+            .filter_map(|path| {
+                #[cfg(unix)]
+                { crate::claude_hooks::read_settings(path).ok() }
+                #[cfg(not(unix))]
+                { fs::read(path).ok() }
+            })
+            .filter_map(|content| serde_json::from_slice::<ClaudeSettings>(&content).ok())
         {
             if let Some(permissions) = settings.permissions {
                 allowed_patterns.extend(permissions.allow.unwrap_or_default().iter()
@@ -116,16 +122,15 @@ impl PermissionChecker {
     /// that project's settings), cached for [`CACHE_TTL`].
     pub fn cached_for(project_dir: Option<&Path>) -> Arc<Self> {
         let key = project_dir.map(Path::to_path_buf);
-        let Ok(mut cache) = CHECKER_CACHE.lock() else {
-            return Arc::new(Self::from_files(&settings_files(project_dir)));
-        };
-        if let Some((loaded, checker)) = cache.get(&key) {
-            if loaded.elapsed() < CACHE_TTL {
-                return checker.clone();
+        if let Ok(cache) = CHECKER_CACHE.try_lock() {
+            if let Some((loaded, checker)) = cache.get(&key) {
+                if loaded.elapsed() < CACHE_TTL { return checker.clone(); }
             }
         }
         let checker = Arc::new(Self::from_files(&settings_files(project_dir)));
-        cache.insert(key, (Instant::now(), checker.clone()));
+        if let Ok(mut cache) = CHECKER_CACHE.try_lock() {
+            cache.insert(key, (Instant::now(), checker.clone()));
+        }
         checker
     }
 
@@ -287,6 +292,11 @@ fn settings_files(project_dir: Option<&Path>) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    fn fixture() -> tempfile::TempDir {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        tempfile::tempdir_in(parent).unwrap()
+    }
+
     #[test]
     fn test_parse_bash_pattern_with_wildcard() {
         let pattern = PermissionChecker::parse_pattern("Bash(git add:*)");
@@ -381,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_from_files_merges_allow_rules() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture();
         let user = dir.path().join("settings.json");
         let local = dir.path().join("settings.local.json");
         std::fs::write(&user, r#"{"permissions":{"allow":["Bash(git status)"]}}"#).unwrap();
@@ -453,5 +463,44 @@ mod repair_regressions {
     #[test]
     fn normal_agent_without_ask_stays_approved() {
         assert!(PermissionChecker::default().is_auto_approved("Agent",&serde_json::json!({})));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod settings_io_regressions_v3 {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+    #[test]
+    fn permission_settings_fifo_symlink_and_size_do_not_block_or_grant_rules() {
+        let dir=tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let fifo=dir.path().join("fifo.json");
+        let name=std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe {libc::mkfifo(name.as_ptr(),0o600)},0);
+        let valid=dir.path().join("valid.json");fs::write(&valid,br#"{"permissions":{"allow":["Bash"]}}"#).unwrap();
+        let link=dir.path().join("link.json");std::os::unix::fs::symlink(&valid,&link).unwrap();
+        let large=dir.path().join("large.json");fs::write(&large,vec![b' ';256*1024+1]).unwrap();
+        let start=Instant::now();
+        for path in [link,large,fifo] { assert!(!PermissionChecker::from_file(&path).is_auto_approved("Bash",&serde_json::json!({"command":"make"}))); }
+        assert!(start.elapsed()<Duration::from_millis(250));
+        assert!(PermissionChecker::from_file(&valid).is_auto_approved("Bash",&serde_json::json!({"command":"make"})));
+    }
+    #[test]
+    fn checker_does_not_wait_for_global_cache_while_loading_fixture() {
+        let dir=tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        fs::create_dir(dir.path().join(".claude")).unwrap();
+        fs::write(dir.path().join(".claude/settings.json"),br#"{"permissions":{"allow":["Bash"]}}"#).unwrap();
+        let held=CHECKER_CACHE.lock().unwrap();let project=dir.path().to_path_buf();
+        let (tx,rx)=std::sync::mpsc::channel();
+        let reader=std::thread::spawn(move || tx.send(PermissionChecker::cached_for(Some(&project)).is_auto_approved("Bash",&serde_json::json!({"command":"make"}))).unwrap());
+        let timely=rx.recv_timeout(Duration::from_millis(250));drop(held);reader.join().unwrap();
+        assert!(timely.is_ok_and(|approved|approved),"permission loader waited for global cache");
+    }
+    #[test]
+    fn oversized_valid_permission_settings_do_not_grant_rules() {
+        let dir=tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let path=dir.path().join("settings.json");let mut bytes=br#"{"permissions":{"allow":["Bash"]}}"#.to_vec();
+        bytes.extend(vec![b' ';256*1024]);fs::write(&path,&bytes).unwrap();
+        assert!(!PermissionChecker::from_file(&path).is_auto_approved("Bash",&serde_json::json!({"command":"make"})),"oversized valid permission settings granted rules");
+        assert_eq!(fs::read(path).unwrap(),bytes);
     }
 }

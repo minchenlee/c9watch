@@ -10,9 +10,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 
 /// Events the bridge registers for. Permission/completion call evidence is folded;
 /// lifecycle events without call identity cannot resolve a pending prompt.
@@ -143,47 +145,135 @@ fn state_path(dir: &Path, session_id: &str) -> Option<PathBuf> {
 }
 
 const MAX_STATE_BYTES: u64 = 128 * 1024;
+const MAX_INPUT_BYTES: u64 = 256 * 1024;
 const MAX_TRANSCRIPT_BYTES: u64 = 512 * 1024;
 const MAX_PERMISSIONS: usize = 256;
+const MAX_SETTINGS_BYTES: u64 = 256 * 1024;
+// Async hook writers retain their input while brief reader/writer contention clears.
+// Every acquisition remains nonblocking; an indefinitely held lock has a finite budget.
+const WRITE_LOCK_BUDGET: Duration = Duration::from_millis(250);
 
 #[cfg(unix)]
-fn lock(file: &fs::File, exclusive: bool) {
-    use std::os::unix::io::AsRawFd;
-    let op = if exclusive {
-        libc::LOCK_EX
-    } else {
-        libc::LOCK_SH
-    };
-    // Best effort: an unlocked read at worst sees a torn write, which parses as
-    // invalid and is treated as "no hook data" for one poll.
-    unsafe {
-        libc::flock(file.as_raw_fd(), op);
+fn safe_directory(path: &Path, create: bool) -> Result<fs::File, String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let absolute = if path.is_absolute() { path.to_path_buf() }
+        else { std::env::current_dir().map_err(|_| "Cannot locate hook directory")?.join(path) };
+    let mut directory = fs::File::open("/").map_err(|_| "Cannot open root directory")?;
+    for component in absolute.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(component, std::path::Component::ParentDir) { return Err("Invalid directory path".into()); }
+            continue;
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| "Invalid directory component")?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let mut fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 && create && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            let made = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+            if made < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
+                return Err("Cannot create hook directory".into());
+            }
+            fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        }
+        if fd < 0 { return Err("Hook directory must contain no symlinks".into()); }
+        directory = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn safe_file(directory: &fs::File, name: &std::ffi::OsStr, write: bool) -> Result<fs::File, String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let name = CString::new(name.as_bytes()).map_err(|_| "Invalid file name")?;
+    let access = if write { libc::O_RDWR | libc::O_CREAT } else { libc::O_RDONLY };
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(),
+        access | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC, 0o600) };
+    if fd < 0 { return Err("Cannot safely open hook file".into()); }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(|_| "Cannot inspect hook file")?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err("Hook file must be regular and have one link".into());
+    }
+    Ok(file)
+}
+
+/// Owns both descriptor and lock. Closing the parent descriptor alone is not
+/// enough when a concurrent fork inherits its open-file description before exec.
+#[cfg(unix)]
+struct LockedFile(fs::File);
+
+#[cfg(unix)]
+impl std::ops::Deref for LockedFile {
+    type Target = fs::File;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+#[cfg(unix)]
+impl std::ops::DerefMut for LockedFile {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+}
+
+#[cfg(unix)]
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        // Unlock before close on success and every early error. Each attempt is
+        // nonblocking; a signal interruption may be retried without an open-ended loop.
+        for _ in 0..3 {
+            if unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN | libc::LOCK_NB) } == 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+        }
     }
 }
 
-#[cfg(not(unix))]
-fn lock(_file: &fs::File, _exclusive: bool) {}
+#[cfg(unix)]
+fn lock(file: fs::File, exclusive: bool) -> Result<LockedFile, String> {
+    let op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
+    if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } != 0 {
+        return Err("Hook state is busy".into());
+    }
+    Ok(LockedFile(file))
+}
 
-/// Records one hook event under `dir`.
+#[cfg(unix)]
+fn lock_writer(file: fs::File) -> Result<LockedFile, String> {
+    let started = Instant::now();
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(LockedFile(file));
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted)
+            || started.elapsed() >= WRITE_LOCK_BUDGET {
+            return Err("Hook state is busy or cannot be locked".into());
+        }
+        std::thread::sleep(Duration::from_millis(5).min(WRITE_LOCK_BUDGET.saturating_sub(started.elapsed())));
+    }
+}
+
+fn bounded_read(file: &mut fs::File, limit: u64) -> Result<Vec<u8>, String> {
+    if file.metadata().map_err(|_| "Cannot inspect file")?.len() > limit {
+        return Err("Hook file exceeds size limit".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes).map_err(|_| "Cannot read hook file")?;
+    if bytes.len() as u64 > limit { return Err("Hook file exceeds size limit".into()); }
+    Ok(bytes)
+}
+
+/// Records one hook event under `dir`, without following any symlink components.
+#[cfg(unix)]
 pub fn record(input: &HookInput, dir: &Path, now_ms: i64) -> Result<(), String> {
     let path = state_path(dir, &input.session_id).ok_or("Invalid session id")?;
-    if input.hook_event_name == "SessionStart" {
-        prune_stale(dir);
-    }
-    fs::create_dir_all(dir).map_err(|_| "Cannot create hook state directory")?;
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&path).map_err(|_| "Cannot open hook state")?;
-    lock(&file, true);
-    let mut content = String::new();
-    file.read_to_string(&mut content)
-        .map_err(|_| "Cannot read hook state")?;
-    let current: HookSessionState = serde_json::from_str(&content).unwrap_or_default();
+    let directory = safe_directory(dir, true)?;
+    if input.hook_event_name == "SessionStart" { prune_stale(dir, &directory); }
+    let file = safe_file(&directory, path.file_name().ok_or("Invalid state path")?, true)?;
+    let mut file = lock_writer(file)?;
+    let content = bounded_read(&mut file, MAX_STATE_BYTES)?;
+    let current: HookSessionState = serde_json::from_slice(&content).unwrap_or_default();
     let mut correlated = input.clone();
     if input.hook_event_name == "PermissionRequest" {
         // This event has no tool_use_id. Bind only a unique exact transcript
@@ -211,52 +301,61 @@ pub fn record(input: &HookInput, dir: &Path, now_ms: i64) -> Result<(), String> 
         }
         if bytes.len() as u64 > MAX_STATE_BYTES { return Err("Hook state exceeds size limit".into()); }
         file.set_len(0).map_err(|_| "Cannot write hook state")?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|_| "Cannot write hook state")?;
-        file.write_all(&bytes)
-            .map_err(|_| "Cannot write hook state")?;
+        file.seek(SeekFrom::Start(0)).map_err(|_| "Cannot write hook state")?;
+        file.write_all(&bytes).map_err(|_| "Cannot write hook state")?;
     }
     Ok(())
 }
 
-fn prune_stale(dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
+#[cfg(not(unix))]
+pub fn record(_input: &HookInput, _dir: &Path, _now_ms: i64) -> Result<(), String> {
+    Err("Safe hook state IO requires Unix".into())
+}
+
+#[cfg(unix)]
+fn prune_stale(path: &Path, directory: &fs::File) {
+    let Ok(entries) = fs::read_dir(path) else { return; };
     for entry in entries.flatten() {
-        let stale = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > STALE_STATE_AGE);
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".json")) else { continue; };
+        if state_path(path, id).is_none() { continue; }
+        let Ok(file) = safe_file(directory, &name, false) else { continue; };
+        let Ok(file) = lock(file, true) else { continue; };
+        let stale = file.metadata().and_then(|m| m.modified()).ok()
+            .and_then(|modified| modified.elapsed().ok()).is_some_and(|age| age > STALE_STATE_AGE);
         if stale {
-            let _ = fs::remove_file(entry.path());
+            use std::os::unix::ffi::OsStrExt;
+            if let Ok(name) = std::ffi::CString::new(name.as_bytes()) {
+                unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0); }
+            }
         }
     }
 }
 
-/// Reads a session's hook state from `dir`. `None` means the session has never
-/// reported a hook event (or the file is unreadable).
+/// Bounded regular-file state read. Invalid/busy state contributes no hook evidence.
+#[cfg(unix)]
 pub fn read_state_in(dir: &Path, session_id: &str) -> Option<HookSessionState> {
     let path = state_path(dir, session_id)?;
-    let mut file = fs::File::open(path).ok()?;
-    lock(&file, false);
-    let mut content = String::new();
-    file.read_to_string(&mut content).ok()?;
-    if content.is_empty() {
-        return Some(HookSessionState::default());
-    }
-    serde_json::from_str(&content).ok()
+    let directory = safe_directory(dir, false).ok()?;
+    let file = safe_file(&directory, path.file_name()?, false).ok()?;
+    let mut file = lock(file, false).ok()?;
+    let bytes = bounded_read(&mut file, MAX_STATE_BYTES).ok()?;
+    let state: HookSessionState = serde_json::from_slice(&bytes).ok()?;
+    (state.pending.len() <= MAX_PERMISSIONS && state.resolved.len() <= MAX_PERMISSIONS).then_some(state)
 }
+
+#[cfg(not(unix))]
+pub fn read_state_in(_dir: &Path, _session_id: &str) -> Option<HookSessionState> { None }
 
 struct TranscriptCalls {
     calls: Vec<(String, String, Value)>, resolved: Vec<String>,
     ambiguous: Vec<String>, complete: bool,
 }
 
+#[cfg(unix)]
 fn transcript_calls(path: &Path) -> Option<TranscriptCalls> {
-    let mut file = fs::File::open(path).ok()?;
+    let directory = safe_directory(path.parent()?, false).ok()?;
+    let mut file = safe_file(&directory, path.file_name()?, false).ok()?;
     // A partial bounded prefix is useful for explicit results but not for binding.
     let before = file.metadata().ok()?;
     let size = before.len();
@@ -344,6 +443,9 @@ fn transcript_calls(path: &Path) -> Option<TranscriptCalls> {
     Some(out)
 }
 
+#[cfg(not(unix))]
+fn transcript_calls(_path: &Path) -> Option<TranscriptCalls> { None }
+
 fn correlate_request(input: &HookInput) -> Option<String> {
     // Common transcript_path points at the parent transcript for subagent events.
     let mut path = input.transcript_path.clone()?;
@@ -378,6 +480,17 @@ pub(crate) fn prompt_input(prompt: &PendingPermission, transcript: &Path) -> Opt
         .map(|(_, _, input)| input)
 }
 
+fn read_input(reader: &mut impl Read) -> Result<HookInput, String> {
+    let mut bytes = Vec::new();
+    reader.take(MAX_INPUT_BYTES + 1).read_to_end(&mut bytes).map_err(|_| "Cannot read hook input")?;
+    if bytes.len() as u64 > MAX_INPUT_BYTES { return Err("Hook input exceeds size limit".into()); }
+    let input: HookInput = serde_json::from_slice(&bytes).map_err(|_| "Invalid hook JSON")?;
+    if input.hook_event_name == "PermissionRequest" && input.tool_name.as_ref().is_none_or(|name| name.is_empty()) {
+        return Err("PermissionRequest requires tool_name".into());
+    }
+    Ok(input)
+}
+
 /// Hook state for a session whose permission prompts are reported by hooks:
 /// the bridge must be installed and the session must have sent an event.
 pub fn session_state(session_id: &str) -> Option<HookSessionState> {
@@ -388,32 +501,39 @@ pub fn session_state(session_id: &str) -> Option<HookSessionState> {
     read_state_in(&config.join("c9watch/hooks"), session_id)
 }
 
-/// Settings path, its mtime when read, and whether the bridge was installed.
-type InstalledStamp = (PathBuf, Option<SystemTime>, bool);
+/// Settings reads use the same explicit no-symlink, regular/single-link policy
+/// as state IO. Unknown/unreadable evidence is not a durable disabled installation.
+#[cfg(unix)]
+pub(crate) fn read_settings(path: &Path) -> Result<Vec<u8>, String> {
+    let directory = safe_directory(path.parent().ok_or("Invalid settings path")?, false)?;
+    let mut file = safe_file(&directory, path.file_name().ok_or("Invalid settings path")?, false)?;
+    bounded_read(&mut file, MAX_SETTINGS_BYTES)
+}
 
+#[cfg(not(unix))]
+pub(crate) fn read_settings(_path: &Path) -> Result<Vec<u8>, String> {
+    Err("Safe settings IO requires Unix".into())
+}
+
+// Only successful observations are cached. File IO never holds this global mutex.
+type InstalledStamp = (PathBuf, Vec<u8>, bool);
 static INSTALLED_CACHE: LazyLock<Mutex<Option<InstalledStamp>>> =
     LazyLock::new(|| Mutex::new(None));
 
-/// [`installed`] for `<config>/settings.json`, re-read only when its mtime changes.
 fn installed_cached(config: &Path) -> bool {
     let path = config.join("settings.json");
-    let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
-    let read = || {
-        fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .is_some_and(|settings| installed(&settings))
-    };
-    let Ok(mut cache) = INSTALLED_CACHE.lock() else {
-        return read();
-    };
-    if let Some((cached_path, cached_mtime, value)) = cache.as_ref() {
-        if *cached_path == path && *cached_mtime == mtime {
-            return *value;
+    let Ok(bytes) = read_settings(&path) else { return false; };
+    // Compare the bounded bytes, not mtime: mode recovery or same-mtime rewrites
+    // must be observable. Safe IO is retried on every call, even a cached miss.
+    if let Ok(cache) = INSTALLED_CACHE.try_lock() {
+        if let Some((cached_path, cached_bytes, value)) = cache.as_ref() {
+            if *cached_path == path && *cached_bytes == bytes { return *value; }
         }
     }
-    let value = read();
-    *cache = Some((path, mtime, value));
+    let Ok(settings) = serde_json::from_slice::<Value>(&bytes) else { return false; };
+    if !settings.is_object() { return false; }
+    let value = installed(&settings);
+    if let Ok(mut cache) = INSTALLED_CACHE.try_lock() { *cache = Some((path, bytes, value)); }
     value
 }
 
@@ -575,15 +695,20 @@ pub fn run(install_hooks: bool, uninstall_hooks: bool) -> Result<(), String> {
         return Ok(());
     }
     let mut stdin = std::io::stdin().lock();
-    let input: HookInput = serde_json::from_reader(&mut stdin).map_err(|_| "Invalid hook JSON")?;
-    // Drain anything after the payload so Claude Code never sees a broken pipe.
-    let _ = std::io::copy(&mut stdin, &mut std::io::sink());
+    let input = read_input(&mut stdin)?;
     record(&input, &state_dir()?, chrono::Utc::now().timestamp_millis())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture() -> tempfile::TempDir {
+        // macOS exposes its temporary root through /var -> /private/var.
+        // Fixtures use a real parent; product IO must still reject symlinks.
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        tempfile::tempdir_in(parent).unwrap()
+    }
 
     // Internal fold fixture: call ids have already been correlated by record.
     fn event(name: &str, agent: Option<&str>, tool: Option<&str>) -> HookInput {
@@ -676,7 +801,7 @@ mod tests {
 
     #[test]
     fn record_round_trips_and_rejects_path_like_ids() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture();
         assert_eq!(read_state_in(dir.path(), "s1"), None);
         record(&event("SessionStart", None, None), dir.path(), 1).unwrap();
         assert_eq!(
@@ -755,7 +880,7 @@ mod tests {
 
     #[test]
     fn install_writes_settings_with_backup() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture();
         fs::write(dir.path().join("settings.json"), br#"{"model":"opus"}"#).unwrap();
         let exe = Path::new("/x/c9watch");
         let message = install(dir.path(), exe).unwrap();
@@ -850,6 +975,57 @@ mod repair_regressions {
         assert!(prompt_input(&p,&transcript).is_none(),"arguments came from an unrelated call");
     }
     #[test]
+    fn symlink_state_cannot_read_or_overwrite_an_unrelated_file() {
+        let dir=fixture();let target=dir.path().join("settings.json");fs::write(&target,b"keep").unwrap();
+        std::os::unix::fs::symlink(&target,dir.path().join("s1.json")).unwrap();
+        assert!(record(&wire("PermissionRequest",Some("Bash"),None,None,None),dir.path(),1).is_err());
+        assert_eq!(fs::read(&target).unwrap(),b"keep");
+        assert!(read_state_in(dir.path(),"s1").is_none());
+    }
+    #[test]
+    fn symlink_directory_component_is_rejected() {
+        let dir=fixture();let actual=dir.path().join("actual");fs::create_dir(&actual).unwrap();
+        let link=dir.path().join("link");std::os::unix::fs::symlink(&actual,&link).unwrap();
+        assert!(record(&wire("SessionStart",None,None,None,None),&link.join("nested"),1).is_err());
+        assert!(!actual.join("nested").exists());
+    }
+    #[test]
+    fn nonregular_directory_state_is_rejected() {
+        let dir=fixture();fs::create_dir(dir.path().join("s1.json")).unwrap();
+        assert!(read_state_in(dir.path(),"s1").is_none());
+        assert!(record(&wire("SessionStart",None,None,None,None),dir.path(),1).is_err());
+    }
+    #[test]
+    fn fifo_state_is_rejected_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir=fixture();let path=dir.path().join("s1.json");let c=std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe {libc::mkfifo(c.as_ptr(),0o600)},0);
+        assert!(read_state_in(dir.path(),"s1").is_none());
+        assert!(record(&wire("SessionStart",None,None,None,None),dir.path(),1).is_err());
+    }
+    #[test]
+    fn oversized_state_is_rejected_without_rewriting_it() {
+        let dir=fixture();let path=dir.path().join("s1.json");let bytes=vec![b' ';128*1024+1];fs::write(&path,&bytes).unwrap();
+        assert!(read_state_in(dir.path(),"s1").is_none(),"oversized state was read as empty authority");
+        assert!(record(&wire("PermissionRequest",Some("Bash"),None,None,None),dir.path(),1).is_err());
+        assert_eq!(fs::read(path).unwrap(),bytes);
+    }
+    #[test]
+    fn streaming_input_is_bounded_even_for_unknown_fields() {
+        let payload=json!({"session_id":"s1","hook_event_name":"SessionStart","extra":"x".repeat(256*1024)}).to_string();
+        let mut cursor=std::io::Cursor::new(payload.as_bytes());
+        assert!(read_input(&mut cursor).is_err(),"oversized unknown field bypassed input bound");
+        assert!(cursor.position()<=256*1024+1,"read past input bound");
+    }
+    #[test]
+    fn permission_request_schema_requires_a_nonempty_tool_name() {
+        for payload in [r#"{"session_id":"s1","hook_event_name":"PermissionRequest"}"#,
+            r#"{"session_id":"s1","hook_event_name":"PermissionRequest","tool_name":""}"#,
+            r#"{"session_id":"s1","hook_event_name":"PermissionRequest","tool_name":23}"#] {
+            assert!(read_input(&mut payload.as_bytes()).is_err(),"schema error accepted");
+        }
+    }
+    #[test]
     fn exact_hook_ownership_preserves_unrelated_commands_and_custom_options() {
         let other=json!({"type":"command","command":"'/Users/alice/c9watch-project/audit' hooks","async":true});
         let custom=json!({"type":"command","command":"'/usr/local/bin/c9watch' hooks","async":false,"timeout":10});
@@ -895,6 +1071,23 @@ mod repair_additional_regressions {
         assert!(uncertain.pending[0].tool_use_id.is_none());
     }
     #[test]
+    fn hardlink_state_cannot_overwrite_an_unrelated_file() {
+        let dir=fixture();let target=dir.path().join("settings.json");fs::write(&target,b"keep").unwrap();
+        fs::hard_link(&target,dir.path().join("s1.json")).unwrap();
+        assert!(record(&event("PermissionRequest",None,None),dir.path(),1).is_err());
+        assert_eq!(fs::read(target).unwrap(),b"keep");
+        assert!(read_state_in(dir.path(),"s1").is_none());
+    }
+    #[test]
+    fn held_state_lock_does_not_block_the_reader_or_writer() {
+        use std::os::unix::io::AsRawFd;
+        let dir=fixture();let path=dir.path().join("s1.json");fs::write(&path,b"{\"pending\":[]}").unwrap();
+        let file=fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+        assert_eq!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        assert!(read_state_in(dir.path(),"s1").is_none());
+        assert!(record(&event("PermissionRequest",None,None),dir.path(),1).is_err());
+    }
+    #[test]
     fn compaction_marker_prevents_claiming_a_unique_call_association() {
         let dir=fixture();let transcript=dir.path().join("s1.jsonl");
         fs::write(&transcript,format!("{{\"type\":\"summary\",\"summary\":\"older calls omitted\"}}\n{}\n",call("new"))).unwrap();
@@ -908,6 +1101,8 @@ mod repair_additional_regressions {
 #[cfg(all(test, unix))]
 mod review_regressions_v3 {
     use super::*;
+    use std::os::unix::{io::AsRawFd, fs::PermissionsExt};
+    use std::sync::mpsc;
 
     fn fixture() -> tempfile::TempDir {
         tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
@@ -924,6 +1119,10 @@ mod review_regressions_v3 {
     }
     fn bound(id: &str) -> PendingPermission {
         PendingPermission { agent_id:None, tool_name:"Bash".into(), requested_at:1, tool_use_id:Some(id.into()) }
+    }
+    fn installed_settings() -> Vec<u8> {
+        serde_json::to_vec(&json!({"hooks":{"PermissionRequest":[{"hooks":[{
+            "type":"command","command":"'/fixture/c9watch' hooks","async":true}]}]}})).unwrap()
     }
     #[test]
     fn lagging_transcript_new_request_must_not_bind_to_completed_old_call() {
@@ -943,6 +1142,51 @@ mod review_regressions_v3 {
         record(&wire("PermissionRequest","Bash",None,Some(&path)),dir.path(),2).unwrap();
         let state=read_state_in(dir.path(),"s1").unwrap();
         assert_eq!(state.pending.len(),1);assert!(state.pending[0].tool_use_id.is_none());
+    }
+    #[test]
+    fn reader_contention_eventually_persists_hook_only_read_prompt() {
+        let dir=fixture();record(&wire("SessionStart","Read",None,None),dir.path(),1).unwrap();
+        let held=fs::OpenOptions::new().read(true).open(dir.path().join("s1.json")).unwrap();
+        assert_eq!(unsafe {libc::flock(held.as_raw_fd(),libc::LOCK_SH|libc::LOCK_NB)},0);
+        let path=dir.path().to_path_buf();let (tx,rx)=mpsc::channel();
+        let writer=std::thread::spawn(move || {tx.send(record(&wire("PermissionRequest","Read",None,None),&path,2)).unwrap();});
+        let early=rx.recv_timeout(Duration::from_millis(30)).ok();
+        drop(held); // A normal poll reader releases while the async hook is still alive.
+        let result=early.unwrap_or_else(|| rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        writer.join().unwrap();
+        let state=read_state_in(dir.path(),"s1").unwrap();
+        assert_eq!(state.pending.len(),1,"ordinary reader collision permanently lost request: {result:?}");
+        assert_eq!(state.pending[0].tool_name,"Read");assert!(result.is_ok());
+        assert!(crate::session::permissions::PermissionChecker::default().is_auto_approved("Read",&json!({})),
+            "this signal is hook-only; fallback whitelist cannot rescue its loss");
+    }
+    #[test]
+    fn two_writers_after_short_exclusive_contention_preserve_both_requests() {
+        let dir=fixture();record(&wire("SessionStart","Read",None,None),dir.path(),1).unwrap();
+        let held=fs::OpenOptions::new().read(true).write(true).open(dir.path().join("s1.json")).unwrap();
+        assert_eq!(unsafe {libc::flock(held.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        let (tx,rx)=mpsc::channel();let mut writers=Vec::new();
+        for tool in ["Read","Glob"] {
+            let path=dir.path().to_path_buf();let tx=tx.clone();
+            writers.push(std::thread::spawn(move || tx.send(record(&wire("PermissionRequest",tool,None,None),&path,2)).unwrap()));
+        }
+        std::thread::sleep(Duration::from_millis(30));drop(held);
+        let results=[rx.recv_timeout(Duration::from_secs(1)).unwrap(),rx.recv_timeout(Duration::from_secs(1)).unwrap()];
+        for writer in writers {writer.join().unwrap();}
+        let state=read_state_in(dir.path(),"s1").unwrap();
+        assert_eq!(state.pending.len(),2,"ordinary writer collisions lost evidence: {results:?}");
+        assert!(results.iter().all(Result::is_ok));
+    }
+    #[test]
+    fn indefinitely_held_lock_has_finite_writer_budget_and_immediate_reader() {
+        let dir=fixture();record(&wire("SessionStart","Read",None,None),dir.path(),1).unwrap();
+        let held=fs::OpenOptions::new().read(true).write(true).open(dir.path().join("s1.json")).unwrap();
+        assert_eq!(unsafe {libc::flock(held.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        let start=Instant::now();assert!(read_state_in(dir.path(),"s1").is_none());
+        assert!(start.elapsed()<WRITE_LOCK_BUDGET,"reader must not wait for hostile lock");
+        let start=Instant::now();let result=record(&wire("PermissionRequest","Read",None,None),dir.path(),2);
+        assert!(result.is_err());assert!(start.elapsed()<Duration::from_secs(1),"hostile lock waits indefinitely");
+        drop(held);
     }
     #[test]
     fn malformed_message_schema_must_not_establish_unique_call_binding() {
@@ -993,6 +1237,63 @@ mod review_regressions_v3 {
         assert!(prompt_input(&bound("same"),&path).is_none(),"same-ID invalid evidence must not select first input");
     }
     #[test]
+    fn installed_loader_fifo_is_unknown_without_waiting_for_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir=fixture();let path=dir.path().join("settings.json");
+        let name=std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe {libc::mkfifo(name.as_ptr(),0o600)},0);
+        let cfg=dir.path().to_path_buf();let (tx,rx)=mpsc::channel();
+        let reader=std::thread::spawn(move || tx.send(installed_cached(&cfg)).unwrap());
+        let timely=rx.recv_timeout(Duration::from_millis(250));
+        if timely.is_err() {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut writer=fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&path).unwrap();
+            writer.write_all(&installed_settings()).unwrap();drop(writer);
+        }
+        reader.join().unwrap();
+        assert!(timely.is_ok(),"settings FIFO blocked eligibility before secure state/fallback");
+        assert!(!timely.unwrap());
+    }
+    #[test]
+    fn installed_loader_rejects_symlink_nonregular_hardlink_and_size() {
+        let dir=fixture();let source=dir.path().join("real.json");fs::write(&source,installed_settings()).unwrap();
+        let linkdir=dir.path().join("link");fs::create_dir(&linkdir).unwrap();
+        std::os::unix::fs::symlink(&source,linkdir.join("settings.json")).unwrap();assert!(!installed_cached(&linkdir));
+        let hard=dir.path().join("hard");fs::create_dir(&hard).unwrap();fs::hard_link(&source,hard.join("settings.json")).unwrap();assert!(!installed_cached(&hard));
+        let nonregular=dir.path().join("directory");fs::create_dir_all(nonregular.join("settings.json")).unwrap();assert!(!installed_cached(&nonregular));
+        let oversized=dir.path().join("large");fs::create_dir(&oversized).unwrap();fs::write(oversized.join("settings.json"),vec![b' ';MAX_SETTINGS_BYTES as usize+1]).unwrap();assert!(!installed_cached(&oversized));
+        let actual=dir.path().join("actual");fs::create_dir(&actual).unwrap();fs::write(actual.join("settings.json"),installed_settings()).unwrap();
+        let alias=dir.path().join("alias");std::os::unix::fs::symlink(&actual,&alias).unwrap();assert!(!installed_cached(&alias));assert!(installed_cached(&actual));
+    }
+    #[test]
+    fn settings_io_does_not_hold_or_wait_for_global_installed_cache() {
+        let dir=fixture();fs::write(dir.path().join("settings.json"),installed_settings()).unwrap();
+        let held=INSTALLED_CACHE.lock().unwrap();let cfg=dir.path().to_path_buf();let (tx,rx)=mpsc::channel();
+        let reader=std::thread::spawn(move || tx.send(installed_cached(&cfg)).unwrap());
+        let timely=rx.recv_timeout(Duration::from_millis(250));drop(held);reader.join().unwrap();
+        assert!(timely.is_ok_and(|installed|installed),"settings loader waited for global cache");
+    }
+    #[test]
+    fn installed_loader_retries_read_failure_after_permission_recovery_without_mtime_change() {
+        let dir=fixture();let path=dir.path().join("settings.json");fs::write(&path,installed_settings()).unwrap();
+        let mtime=fs::metadata(&path).unwrap().modified().unwrap();
+        fs::set_permissions(&path,fs::Permissions::from_mode(0)).unwrap();
+        assert!(fs::read(&path).is_err(),"hermetic basis must actually deny this uid");
+        assert!(!installed_cached(dir.path()));
+        fs::set_permissions(&path,fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(),mtime);
+        assert!(installed_cached(dir.path()));
+    }
+    #[test]
+    fn installed_loader_observes_same_mtime_settings_rewrite_and_invalid_json_recovery() {
+        let dir=fixture();let path=dir.path().join("settings.json");fs::write(&path,b"malformed").unwrap();assert!(!installed_cached(dir.path()));
+        fs::write(&path,installed_settings()).unwrap();assert!(installed_cached(dir.path()));
+        let mtime=fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path,br#"{"disableAllHooks":true}"#).unwrap();
+        fs::OpenOptions::new().write(true).open(&path).unwrap().set_times(fs::FileTimes::new().set_modified(mtime)).unwrap();
+        assert!(!installed_cached(dir.path()));
+    }
+    #[test]
     fn resolved_identity_limit_must_not_prevent_exact_current_completion() {
         let dir=fixture();let path=dir.path().join("s1.jsonl");
         for n in 0..256 {record(&wire("PostToolUse","Bash",Some(&format!("old-{n}")),None),dir.path(),n).unwrap();}
@@ -1025,6 +1326,100 @@ mod review_regressions_v3 {
         assert!(result.is_ok());assert!(fs::metadata(dir.path().join("s1.json")).unwrap().len()<=MAX_STATE_BYTES);
     }
 
+}
+
+#[cfg(all(test, unix))]
+mod settings_size_regression_v3 {
+    use super::*;
+    #[test]
+    fn oversized_valid_installed_settings_are_unknown_and_not_rewritten() {
+        let dir=tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let path=dir.path().join("settings.json");
+        let mut bytes=serde_json::to_vec(&json!({"hooks":{"PermissionRequest":[{"hooks":[{
+            "type":"command","command":"'/fixture/c9watch' hooks","async":true}]}]}})).unwrap();
+        bytes.extend(vec![b' ';256*1024]);fs::write(&path,&bytes).unwrap();
+        assert!(!installed_cached(dir.path()),"oversized valid settings were accepted");
+        assert_eq!(fs::read(path).unwrap(),bytes);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod inherited_lock_regressions_v4 {
+    use super::*;
+
+    // The child deliberately parks before exec. O_CLOEXEC does not close a fork
+    // child's descriptor until exec; only async-signal-safe libc runs there.
+    struct FixtureChild { pid: libc::pid_t, release: fs::File }
+    impl FixtureChild {
+        fn inherit(locked_fd: i32) -> Self {
+            unsafe {
+                assert_ne!(libc::fcntl(locked_fd,libc::F_GETFD)&libc::FD_CLOEXEC,0);
+                let mut ready=[0;2];let mut finish=[0;2];
+                assert_eq!(libc::pipe(ready.as_mut_ptr()),0);assert_eq!(libc::pipe(finish.as_mut_ptr()),0);
+                let pid=libc::fork();assert!(pid>=0);
+                if pid==0 {
+                    libc::close(ready[0]);libc::close(finish[1]);
+                    let byte=1u8;libc::write(ready[1],(&byte as *const u8).cast(),1);
+                    let mut byte=0u8;
+                    loop {
+                        let n=libc::read(finish[0],(&mut byte as *mut u8).cast(),1);
+                        if n>=0 || *libc_errno()!=libc::EINTR {break;}
+                    }
+                    libc::_exit(0);
+                }
+                libc::close(ready[1]);libc::close(finish[0]);
+                let child=Self {pid,release:fs::File::from_raw_fd(finish[1])};
+                let mut ready=fs::File::from_raw_fd(ready[0]);let mut byte=[0];
+                ready.read_exact(&mut byte).unwrap();child
+            }
+        }
+    }
+    // Access errno without invoking Rust/allocator machinery after fork.
+    #[cfg(target_os="macos")]
+    unsafe fn libc_errno() -> *mut i32 {libc::__error()}
+    #[cfg(not(target_os="macos"))]
+    unsafe fn libc_errno() -> *mut i32 {libc::__errno_location()}
+    impl Drop for FixtureChild {
+        fn drop(&mut self) {
+            self.release.write_all(&[1]).unwrap();
+            loop {
+                let mut status=0;let waited=unsafe {libc::waitpid(self.pid,&mut status,0)};
+                if waited==self.pid {assert_eq!(status,0);break;}
+                assert_eq!(std::io::Error::last_os_error().kind(),std::io::ErrorKind::Interrupted);
+            }
+        }
+    }
+    fn acquire(file: fs::File, exclusive: bool) -> Result<LockedFile,String> {
+        if exclusive {lock_writer(file)} else {lock(file,false)}
+    }
+    fn check(exclusive: bool, early_error: bool) {
+        let dir=tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let event:HookInput=serde_json::from_value(json!({"session_id":"s1","hook_event_name":"SessionStart"})).unwrap();
+        record(&event,dir.path(),1).unwrap();
+        let directory=safe_directory(dir.path(),false).unwrap();
+        let file=safe_file(&directory,std::ffi::OsStr::new("s1.json"),exclusive).unwrap();
+        let guarded=acquire(file,exclusive).unwrap();let child=FixtureChild::inherit(guarded.as_raw_fd());
+        if early_error {
+            let result=(move || -> Result<(),String> {
+                let mut file=guarded;bounded_read(&mut file,0)?;Ok(())
+            })();
+            assert!(result.is_err());
+        } else {drop(guarded);}
+        let observed=if exclusive {
+            read_state_in(dir.path(),"s1").is_some()
+        } else {
+            let request:HookInput=serde_json::from_value(json!({"session_id":"s1","hook_event_name":"PermissionRequest","tool_name":"Read"})).unwrap();
+            record(&request,dir.path(),2).is_ok()
+        };
+        drop(child); // Clean up/join even when observing the old lifetime defect.
+        assert!(read_state_in(dir.path(),"s1").is_some());
+        assert!(observed,"completed scope left an inherited {} lock held (early_error={early_error})",if exclusive {"writer"} else {"reader"});
+        if !exclusive {assert_eq!(read_state_in(dir.path(),"s1").unwrap().pending.len(),1);}
+    }
+    #[test] fn inherited_writer_lock_releases_on_success(){check(true,false);}
+    #[test] fn inherited_writer_lock_releases_on_early_error(){check(true,true);}
+    #[test] fn inherited_reader_lock_releases_on_success(){check(false,false);}
+    #[test] fn inherited_reader_lock_releases_on_early_error(){check(false,true);}
 }
 
 #[cfg(all(test, unix))]
