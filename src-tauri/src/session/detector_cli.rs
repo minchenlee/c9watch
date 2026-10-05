@@ -370,8 +370,9 @@ fn without_status_fields(mut record: Value) -> Value {
 /// cached signature and `new` to the cached rows. Returns false, leaving the
 /// cache possibly partially updated, when the change needs a full
 /// `claude agents --json` run instead: files were added or removed, a changed
-/// file is unreadable, it belongs to no cached row, or a field outside
-/// `STATUS_FIELDS` differs.
+/// file is unreadable, it belongs to no cached row, a field outside
+/// `STATUS_FIELDS` differs, or its `status` isn't one the CLI reports
+/// verbatim (it maps registry `shell` to `busy`, for example).
 fn refresh_changed_rows(dir: &Path, cache: &mut AgentsCache, new: &RegistrySignature) -> bool {
     let old = &cache.signature;
     if old.len() != new.len() || old.iter().zip(new).any(|(a, b)| a.0 != b.0) {
@@ -381,10 +382,10 @@ fn refresh_changed_rows(dir: &Path, cache: &mut AgentsCache, new: &RegistrySigna
         let Some(record) = read_record(&dir.join(&entry.0)) else {
             return false;
         };
-        let status = record
-            .get("status")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let status = match record.get("status").and_then(Value::as_str) {
+            Some(status @ ("busy" | "idle")) => status.to_string(),
+            _ => return false,
+        };
         let name = record
             .get("name")
             .and_then(Value::as_str)
@@ -400,7 +401,7 @@ fn refresh_changed_rows(dir: &Path, cache: &mut AgentsCache, new: &RegistrySigna
         else {
             return false;
         };
-        agent.status = status;
+        agent.status = Some(status);
         agent.name = name;
     }
     true
@@ -883,14 +884,39 @@ mod tests {
             1,
             &ROW_A_IDLE.replace(
                 r#""status":"idle""#,
-                r#""status":"waiting","name":"renamed","updatedAt":5,"statusUpdatedAt":5"#,
+                r#""status":"busy","name":"renamed","updatedAt":5,"statusUpdatedAt":5"#,
             ),
             5,
         );
         let agents = source.agents_in_registry(Some(&registry)).unwrap();
         assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].status.as_deref(), Some("waiting"));
+        assert_eq!(agents[0].status.as_deref(), Some("busy"));
         assert_eq!(agents[0].name.as_deref(), Some("renamed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_status_change_requeries_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut source, registry, output) = cached_row_a(tmp.path());
+        write_registry_row(
+            &registry,
+            1,
+            &ROW_A_IDLE.replace(r#""status":"idle""#, r#""status":"shell""#),
+            5,
+        );
+        // The CLI reports a registry `shell` status as `busy`.
+        std::fs::write(
+            &output,
+            format!(
+                "[{}]\n",
+                ROW_A_IDLE.replace(r#""status":"idle""#, r#""status":"busy""#)
+            ),
+        )
+        .unwrap();
+        let agents = source.agents_in_registry(Some(&registry)).unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status.as_deref(), Some("busy"));
     }
 
     #[cfg(unix)]
