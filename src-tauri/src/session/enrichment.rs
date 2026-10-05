@@ -134,6 +134,16 @@ fn claude_custom_title(
 /// Look up the native custom title for a session JSONL, using a strong file
 /// stamp when the platform provides one and a safe re-scan otherwise.
 pub(crate) fn get_cached_native_title(path: &Path) -> Option<String> {
+    get_cached_native_title_with(
+        path,
+        crate::session::parser::try_get_native_custom_title_from_file,
+    )
+}
+
+fn get_cached_native_title_with(
+    path: &Path,
+    read_title: impl FnOnce(&Path) -> std::io::Result<Option<String>>,
+) -> Option<String> {
     let Some(stamp) = native_title_stamp(path) else {
         if let Ok(mut cache) = NATIVE_TITLE_CACHE.lock() {
             cache.remove(path);
@@ -148,12 +158,18 @@ pub(crate) fn get_cached_native_title(path: &Path) -> Option<String> {
             }
         }
         // Cache miss or stale — re-scan
-        let title = crate::session::parser::get_native_custom_title_from_file(path);
+        let title = match read_title(path) {
+            Ok(title) => title,
+            Err(_) => {
+                cache.remove(path);
+                return None;
+            }
+        };
         cache.insert(path.to_path_buf(), (stamp, title.clone()));
         title
     } else {
         // Mutex poisoned — fallback to direct read
-        crate::session::parser::get_native_custom_title_from_file(path)
+        read_title(path).ok().flatten()
     }
 }
 
@@ -1307,6 +1323,24 @@ mod placeholder_tests {
         assert_eq!(sessions[1].session_key, "cursor:same-provider-id");
         assert_eq!(sessions[2].session_key, "pi:same-provider-id");
         assert_eq!(sessions[2].provider, SessionProvider::Pi);
+    }
+
+    #[test]
+    fn native_title_cache_retries_after_read_failure_without_file_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("read-failure.jsonl");
+        std::fs::write(
+            &path,
+            br#"{"type":"custom-title","customTitle":"recovered","sessionId":"s"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            get_cached_native_title_with(&path, |_| {
+                Err(std::io::Error::other("injected read failure"))
+            }),
+            None
+        );
+        assert_eq!(get_cached_native_title(&path).as_deref(), Some("recovered"));
     }
 
     #[test]

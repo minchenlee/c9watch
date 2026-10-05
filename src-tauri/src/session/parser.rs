@@ -652,48 +652,39 @@ pub fn get_native_custom_title(entries: &[SessionEntry]) -> Option<String> {
 /// Scans the file for lines containing `"custom-title"` and parses only those.
 /// Returns the last (most recent) custom title found.
 pub fn get_native_custom_title_from_file(path: &std::path::Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    match std::str::from_utf8(&bytes) {
-        Ok(text) => last_custom_title_in(text),
-        // Stop at the first invalid line, as a line-by-line UTF-8 read would.
-        Err(error) => last_custom_title_in_lines(&bytes[..error.valid_up_to()]),
-    }
+    // Preserve the title found before a malformed UTF-8 line for callers
+    // without a cache; cache callers use the checked scan below.
+    scan_native_custom_title(File::open(path).ok()?).0
 }
 
-/// Search for the marker instead of splitting every line, so a long
-/// transcript is scanned without a per-line allocation.
-fn last_custom_title_in(text: &str) -> Option<String> {
-    const MARKER: &str = "\"custom-title\"";
-    let mut last_title: Option<String> = None;
-    let mut search_from = 0;
-    while let Some(found) = text[search_from..].find(MARKER) {
-        let at = search_from + found;
-        let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
-        let line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
-        if let Ok(SessionEntry::CustomTitle { custom_title, .. }) =
-            serde_json::from_str::<SessionEntry>(&text[line_start..line_end])
-        {
-            last_title = Some(custom_title);
+pub(crate) fn try_get_native_custom_title_from_file(
+    path: &Path,
+) -> std::io::Result<Option<String>> {
+    let (title, result) = scan_native_custom_title(File::open(path)?);
+    result?;
+    Ok(title)
+}
+
+/// Retain one line at a time, and keep I/O failure separate from no title.
+fn scan_native_custom_title(reader: impl Read) -> (Option<String>, std::io::Result<()>) {
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    let mut last_title = None;
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return (last_title, Ok(())),
+            Ok(_) => {}
+            Err(error) => return (last_title, Err(error)),
         }
-        search_from = line_end;
-    }
-    last_title
-}
-
-fn last_custom_title_in_lines(valid_prefix: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(valid_prefix).ok()?;
-    let complete_lines = text.rfind('\n').map_or("", |i| &text[..i]);
-    let mut last_title: Option<String> = None;
-    for line in complete_lines.lines() {
         if line.contains("\"custom-title\"") {
             if let Ok(SessionEntry::CustomTitle { custom_title, .. }) =
-                serde_json::from_str::<SessionEntry>(line)
+                serde_json::from_str::<SessionEntry>(&line)
             {
                 last_title = Some(custom_title);
             }
         }
     }
-    last_title
 }
 
 #[cfg(test)]
@@ -1325,6 +1316,35 @@ mod tests {
         } else {
             panic!("Expected CustomTitle entry");
         }
+    }
+
+    #[test]
+    fn native_custom_title_checked_scan_reports_read_failure() {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected read failure"))
+            }
+        }
+        let (title, result) = scan_native_custom_title(FailingReader);
+        assert!(title.is_none());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn native_custom_title_scans_with_bounded_read_buffers() {
+        struct BoundedReads(std::io::Cursor<Vec<u8>>);
+        impl Read for BoundedReads {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(buf.len() <= 8192, "scan attempted a file-sized read buffer");
+                self.0.read(buf)
+            }
+        }
+        let mut bytes = b"{}\n".repeat(100_000);
+        bytes.extend_from_slice(br#"{"type":"custom-title","customTitle":"kept","sessionId":"s"}"#);
+        let (title, result) = scan_native_custom_title(BoundedReads(std::io::Cursor::new(bytes)));
+        result.unwrap();
+        assert_eq!(title, Some("kept".to_string()));
     }
 
     #[test]
