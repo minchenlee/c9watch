@@ -12,11 +12,16 @@
 //!   no conversation state and are ignored.
 //!
 //! pi exposes no turn lifecycle events and no process-anchored identity (every
-//! session is driven by a shared `pi` binary), so liveness is file-based like
+//! session is driven by a shared `pi` binary), so lifecycle is file-based like
 //! the Cursor provider: message timestamps + file mtime drive Working/Idle,
-//! and the pid is reported as 0.
+//! and the pid is reported as 0. Liveness adds process evidence: per cwd,
+//! live `pi` processes keep only that many of the newest fresh transcripts
+//! (see `pi_liveness`), so a killed session ends instead of lingering.
 
 use super::cache::FileVersion;
+use super::pi_liveness::{
+    pi_alive_flags, NoPiProcessProbe, PiLivenessCandidate, PiProcessProbe, SysinfoPiProcessProbe,
+};
 use super::source::{DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource};
 use super::{AgentKind, SessionKind, SessionProvider, SessionSurface};
 use crate::session::parser::MessageType;
@@ -51,6 +56,9 @@ const PI_MAX_CACHED_SUMMARIES: usize = 128;
 pub struct PiTranscriptSummary {
     pub session_id: String,
     pub project_path: String,
+    /// `project_path` came from a session header (own or sibling), not from
+    /// lossy dirname decoding. Only exact paths are matched to processes.
+    project_path_exact: bool,
     pub started_at_ms: Option<i64>,
     pub last_timestamp: String,
     pub first_prompt: Option<String>,
@@ -90,6 +98,7 @@ pub struct PiConversationMessage {
 pub struct PiSessionSource {
     root: PathBuf,
     cache: HashMap<PathBuf, CachedSummary>,
+    process_probe: Box<dyn PiProcessProbe>,
     #[cfg(test)]
     parse_count: usize,
 }
@@ -102,16 +111,25 @@ struct CachedSummary {
 impl PiSessionSource {
     pub fn new() -> Result<Self, SessionDetectorError> {
         let home = dirs::home_dir().ok_or(SessionDetectorError::HomeDirectoryNotFound)?;
-        Ok(Self::at_root(pi_sessions_root(&home)))
+        Ok(Self::at_root(pi_sessions_root(&home))
+            .with_process_probe(Box::new(SysinfoPiProcessProbe::new())))
     }
 
+    /// A source without process evidence (mtime-only liveness). Production
+    /// goes through [`Self::new`], which attaches the sysinfo probe.
     pub(crate) fn at_root(root: PathBuf) -> Self {
         Self {
             root,
             cache: HashMap::new(),
+            process_probe: Box::new(NoPiProcessProbe),
             #[cfg(test)]
             parse_count: 0,
         }
+    }
+
+    pub(crate) fn with_process_probe(mut self, probe: Box<dyn PiProcessProbe>) -> Self {
+        self.process_probe = probe;
+        self
     }
 
     pub(crate) fn contains_session_id(&self, session_id: &str) -> bool {
@@ -197,6 +215,7 @@ impl SessionSource for PiSessionSource {
         };
         let now = SystemTime::now();
         let mut recent_paths = HashSet::new();
+        let mut fresh_sessions: Vec<(PiTranscriptSummary, i64, PathBuf)> = Vec::new();
         for dir_entry in dirs.flatten() {
             let dir = dir_entry.path();
             if !dir.is_dir() {
@@ -212,9 +231,8 @@ impl SessionSource for PiSessionSource {
                 }
                 // Even pending tools expire after four hours. Gate before any
                 // transcript read so historical archives do not enter polling.
-                let age_secs = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok()
+                let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                let age_secs = modified
                     .and_then(|t| now.duration_since(t).ok())
                     .map(|d| d.as_secs())
                     .unwrap_or(u64::MAX);
@@ -235,47 +253,82 @@ impl SessionSource for PiSessionSource {
                 if !fresh {
                     continue;
                 }
-                let project_path = if summary.project_path.is_empty() {
-                    decode_pi_cwd_dir(&dir)
-                } else {
-                    summary.project_path.clone()
-                };
-                let project_name = Path::new(&project_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                sessions.push(DetectedSession {
-                    pid: 0,
-                    cwd: PathBuf::from(&project_path),
-                    project_path: PathBuf::from(&project_path),
-                    session_id: Some(summary.session_id.clone()),
-                    project_name,
-                    kind: SessionKind::Interactive,
-                    entrypoint: None,
-                    started_at_ms: summary.started_at_ms,
-                    official_name: None,
-                    cli_activity: None,
-                    provider: SessionProvider::Pi,
-                    surface: SessionSurface::Cli,
-                    agent_kind: AgentKind::Root,
-                    parent_thread_id: None,
-                    root_session_id: None,
-                    agent_path: None,
-                    agent_nickname: None,
-                    agent_role: None,
-                    internal_kind: None,
-                    can_open: false,
-                    can_stop: false,
-                    can_rename: false,
-                    codex_summary: None,
-                    cursor_summary: None,
-                    pi_summary: Some(summary),
-                    opencode_summary: None,
-                });
+                let modified_ms = modified
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                fresh_sessions.push((summary, modified_ms, dir.clone()));
             }
         }
         self.cache.retain(|path, _| recent_paths.contains(path));
+
+        // Process evidence is gathered only when a card could be shown, so
+        // the process table is never read while no pi session is fresh.
+        let alive = if fresh_sessions.is_empty() {
+            Vec::new()
+        } else {
+            let evidence = self.process_probe.scan();
+            let candidates: Vec<PiLivenessCandidate<'_>> = fresh_sessions
+                .iter()
+                .map(|(summary, modified_ms, _)| PiLivenessCandidate {
+                    cwd: summary
+                        .project_path_exact
+                        .then_some(summary.project_path.as_str()),
+                    modified_ms: *modified_ms,
+                })
+                .collect();
+            let now_ms = now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            pi_alive_flags(&candidates, &evidence, now_ms)
+        };
+
+        for ((summary, _, dir), alive) in fresh_sessions.into_iter().zip(alive) {
+            // An ended session leaves the monitor the same way an expired
+            // one does; history still lists its transcript.
+            if !alive {
+                continue;
+            }
+            let project_path = if summary.project_path.is_empty() {
+                decode_pi_cwd_dir(&dir)
+            } else {
+                summary.project_path.clone()
+            };
+            let project_name = Path::new(&project_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            sessions.push(DetectedSession {
+                pid: 0,
+                cwd: PathBuf::from(&project_path),
+                project_path: PathBuf::from(&project_path),
+                session_id: Some(summary.session_id.clone()),
+                project_name,
+                kind: SessionKind::Interactive,
+                entrypoint: None,
+                started_at_ms: summary.started_at_ms,
+                official_name: None,
+                cli_activity: None,
+                provider: SessionProvider::Pi,
+                surface: SessionSurface::Cli,
+                agent_kind: AgentKind::Root,
+                parent_thread_id: None,
+                root_session_id: None,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+                internal_kind: None,
+                can_open: false,
+                can_stop: false,
+                can_rename: false,
+                codex_summary: None,
+                cursor_summary: None,
+                pi_summary: Some(summary),
+                opencode_summary: None,
+            });
+        }
         Ok((sessions, DetectionDiagnostics::default()))
     }
 
@@ -307,18 +360,22 @@ fn decode_pi_cwd_dir(dir: &Path) -> String {
 /// session header (same cwd by construction). Falls back to lossy dirname
 /// decoding when no sibling carries a cwd.
 fn pi_dir_cwd(dir: &Path) -> String {
-    if let Ok(files) = std::fs::read_dir(dir) {
-        for entry in files.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            if let Some(cwd) = read_pi_header_cwd(&path) {
-                return cwd;
-            }
+    pi_dir_header_cwd(dir).unwrap_or_else(|| decode_pi_cwd_dir(dir))
+}
+
+/// Exact cwd from the first sibling transcript header, if any carries one.
+fn pi_dir_header_cwd(dir: &Path) -> Option<String> {
+    let files = std::fs::read_dir(dir).ok()?;
+    for entry in files.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Some(cwd) = read_pi_header_cwd(&path) {
+            return Some(cwd);
         }
     }
-    decode_pi_cwd_dir(dir)
+    None
 }
 
 /// cwd from a transcript's session header (either schema), scanning only
@@ -529,8 +586,10 @@ pub(crate) fn summarize_pi_transcript(path: &Path) -> Option<PiTranscriptSummary
     // Sibling headers share this directory's cwd, so a header-less file
     // still resolves dash-containing paths exactly; dirname decoding is
     // the last resort.
-    summary.project_path = header_cwd
-        .or_else(|| path.parent().map(pi_dir_cwd))
+    let exact_cwd = header_cwd.or_else(|| path.parent().and_then(pi_dir_header_cwd));
+    summary.project_path_exact = exact_cwd.is_some();
+    summary.project_path = exact_cwd
+        .or_else(|| path.parent().map(decode_pi_cwd_dir))
         .unwrap_or_default();
     summary.started_at_ms = header_ts;
     summary.empty = summary.message_count == 0;
@@ -1334,6 +1393,7 @@ pub(crate) fn pi_cost_records(home: &Path) -> Vec<crate::session::cost::SessionC
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn write_transcript(dir: &TempDir, name: &str, lines: &[&str]) -> PathBuf {
@@ -1981,11 +2041,11 @@ mod tests {
     }
 
     #[test]
-    fn killed_agent_with_unresulted_tool_lingers_until_expiry() {
-        // Pi has no process-anchored identity: an agent killed mid-tool keeps
-        // its unresulted toolCall on disk, so it keeps polling as Working
-        // until the 4h working window expires. This test locks that behavior
-        // (and its bound) so the lingering window stays deliberate.
+    fn killed_agent_without_process_evidence_lingers_until_expiry() {
+        // Without process evidence (listing failed or unattributable), an
+        // agent killed mid-tool keeps its unresulted toolCall on disk, so it
+        // keeps polling as Working until the 4h working window expires. This
+        // test locks that fallback (and its bound) so it stays deliberate.
         use std::time::{Duration, SystemTime};
         let dir = TempDir::new().unwrap();
         let root = dir
@@ -2026,6 +2086,155 @@ mod tests {
         assert!(!sessions
             .iter()
             .any(|s| s.session_id.as_deref() == Some("killed1")));
+    }
+
+    /// Probe returning fixed evidence and counting scans.
+    struct FakeProbe {
+        evidence: crate::session::pi_liveness::PiProcessEvidence,
+        scans: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PiProcessProbe for FakeProbe {
+        fn scan(&mut self) -> crate::session::pi_liveness::PiProcessEvidence {
+            self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.evidence.clone()
+        }
+    }
+
+    fn probe_with(
+        pairs: &[(&str, usize)],
+    ) -> (
+        Box<FakeProbe>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let scans = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let evidence = crate::session::pi_liveness::PiProcessEvidence::Live(
+            pairs
+                .iter()
+                .map(|(cwd, n)| (cwd.to_string(), vec![None; *n]))
+                .collect(),
+        );
+        let probe = Box::new(FakeProbe {
+            evidence,
+            scans: scans.clone(),
+        });
+        (probe, scans)
+    }
+
+    /// Writes a Working transcript (unresulted toolCall) with an mtime
+    /// `age` in the past and returns the sessions root.
+    fn write_killed_mid_tool(dir: &TempDir, id: &str, cwd: &str, age: Duration) -> PathBuf {
+        let root = dir.path().join(".pi").join("agent").join("sessions");
+        let cwd_dir = root.join(format!("--{}--", cwd.trim_matches('/').replace('/', "-")));
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let lines = format!(
+            "{{\"type\":\"session\",\"session\":{{\"id\":\"{id}\",\"timestamp\":{now_ms},\"cwd\":\"{cwd}\"}}}}\n\
+             {{\"id\":\"m\",\"timestamp\":{now_ms},\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"model\":\"m\",\"content\":[{{\"type\":\"toolCall\",\"id\":\"c1\",\"name\":\"bash\",\"arguments\":{{}}}}]}}}}\n",
+        );
+        let path = cwd_dir.join(format!("2026-10-05T00-00-00-000Z_{id}.jsonl"));
+        std::fs::write(&path, lines).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+        root
+    }
+
+    fn detected_ids(source: &mut PiSessionSource) -> Vec<String> {
+        let (sessions, _) = source.detect().unwrap();
+        sessions.into_iter().filter_map(|s| s.session_id).collect()
+    }
+
+    #[test]
+    fn killed_agent_with_unresulted_tool_ends_without_live_process() {
+        // F1: a pi killed mid-tool stays Working on disk. With no live pi
+        // process in its cwd, the session ends instead of lingering 4h.
+        let dir = TempDir::new().unwrap();
+        let root = write_killed_mid_tool(&dir, "killed1", "/tmp/demo", Duration::from_secs(600));
+        let summary = summarize_pi_transcript(
+            &root
+                .join("--tmp-demo--")
+                .join("2026-10-05T00-00-00-000Z_killed1.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(summary.lifecycle, PiLifecycle::Working);
+
+        let (probe, _) = probe_with(&[]);
+        let mut source = PiSessionSource::at_root(root.clone()).with_process_probe(probe);
+        assert!(detected_ids(&mut source).is_empty());
+
+        let (probe, _) = probe_with(&[("/tmp/demo", 1)]);
+        let mut source = PiSessionSource::at_root(root).with_process_probe(probe);
+        assert_eq!(detected_ids(&mut source), vec!["killed1".to_string()]);
+    }
+
+    #[test]
+    fn one_live_process_keeps_only_its_newest_transcript_per_cwd() {
+        let dir = TempDir::new().unwrap();
+        write_killed_mid_tool(&dir, "old1", "/tmp/a", Duration::from_secs(900));
+        write_killed_mid_tool(&dir, "old2", "/tmp/a", Duration::from_secs(600));
+        write_killed_mid_tool(&dir, "new1", "/tmp/a", Duration::from_secs(60));
+        let root = write_killed_mid_tool(&dir, "other", "/tmp/b", Duration::from_secs(60));
+        let (probe, _) = probe_with(&[("/tmp/a", 1), ("/tmp/b", 1)]);
+        let mut source = PiSessionSource::at_root(root).with_process_probe(probe);
+        let mut ids = detected_ids(&mut source);
+        ids.sort();
+        assert_eq!(ids, vec!["new1".to_string(), "other".to_string()]);
+    }
+
+    #[test]
+    fn process_probe_runs_only_while_a_transcript_is_fresh() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join(".pi").join("agent").join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let (probe, scans) = probe_with(&[("/tmp/demo", 1)]);
+        let mut source = PiSessionSource::at_root(root).with_process_probe(probe);
+        // A live pi with no transcript yet: no card, and no scan either.
+        assert!(detected_ids(&mut source).is_empty());
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // An expired transcript does not wake the probe.
+        write_killed_mid_tool(
+            &dir,
+            "stale1",
+            "/tmp/demo",
+            Duration::from_secs(5 * 60 * 60),
+        );
+        assert!(detected_ids(&mut source).is_empty());
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+        write_killed_mid_tool(&dir, "fresh1", "/tmp/demo", Duration::from_secs(60));
+        assert_eq!(detected_ids(&mut source), vec!["fresh1".to_string()]);
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn transcript_with_only_a_decoded_cwd_is_not_ended() {
+        // No header in the file or its siblings: the cwd is a lossy dirname
+        // decode, so process evidence cannot be matched and is not applied.
+        let dir = TempDir::new().unwrap();
+        let path = write_transcript(
+            &dir,
+            "2026-10-05T00-00-00-000Z_naked2.jsonl",
+            &[
+                r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+            ],
+        );
+        // Older than the grace window, so only the cwd rule can keep it.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        let summary = summarize_pi_transcript(&path).unwrap();
+        assert!(!summary.project_path_exact);
+        let (probe, _) = probe_with(&[]);
+        let mut source =
+            PiSessionSource::at_root(dir.path().join(".pi").join("agent").join("sessions"))
+                .with_process_probe(probe);
+        assert_eq!(detected_ids(&mut source), vec!["naked2".to_string()]);
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub mod detector;
 pub mod parser;
 pub mod permissions;
 pub mod pi;
+mod pi_liveness;
 pub mod opencode;
 mod pid_check;
 pub mod source;
