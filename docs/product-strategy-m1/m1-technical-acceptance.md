@@ -85,20 +85,25 @@ not acceptance of subsequent fixes or live behavior.
   (sysinfo reports `name()` = `node`; argv[0] = `pi` after pi's title
   rewrite) with cwd and start time. Per exact header cwd, each live
   process keeps one fresh transcript modified after its start (10 s
-  grace). Other transcripts end and leave the monitor like expired ones;
+  grace). Processes left over after that per-cwd pass may each keep one
+  more transcript from another cwd, so a session resumed from another
+  project stays alive. Other transcripts end and leave the monitor like
+  expired ones;
   history keeps them. Listing failure, an unreadable pi cwd/argv, or a
   lossy decoded cwd keep the previous mtime behaviour. The 4h / 30m
   windows stay the upper limit.
-- Verification (2026-10-05, this machine): `cargo test --lib` **520
-  passed, 0 failed, 10 ignored**; `npm run check` **0 errors, 0
+- Verification (2026-10-06, this machine, after the cross-project resume
+  fix): `cargo test --lib` **523 passed, 0 failed, 10 ignored**; `npm run check` **0 errors, 0
   warnings**; `git diff --check` passed. Manual probe with a stand-in
   process (`node` with `process.title = 'pi'`, 654 processes listed):
   first gated scan 81 ms, second 66 ms, then 7–9.5 ms per poll.
 - Known limits: a session resumed with `pi -c` / `--resume` shows as
   ended until its next write (pi 0.87.1 loads the transcript without
-  writing to it); transcripts in one cwd are matched to processes by
-  time only; live acceptance with a real Pi session was not run (needs
-  owner approval for model calls).
+  writing to it); transcripts are matched to processes by cwd and time
+  only, and one process keeps at most one transcript; a killed card can
+  flicker back for one poll when an unreadable node/bun row makes that
+  poll fall back to the mtime windows; live acceptance with a real Pi
+  session was not run (needs owner approval for model calls).
 
 ## Explicitly not claimed
 
