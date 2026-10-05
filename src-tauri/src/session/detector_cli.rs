@@ -124,8 +124,18 @@ impl CliSessionSource {
     /// `AGENTS_CACHE_MAX_AGE`. Each spawn costs ~0.2s of CPU, so running it on
     /// every poll dominated c9watch's energy use.
     fn agents(&mut self) -> Result<Vec<CliAgent>, SessionDetectorError> {
-        let dir = dirs::home_dir().map(|home| sessions_dir(&home));
-        let signature = dir.as_deref().and_then(registry_signature);
+        let dir = cache_registry_dir(
+            dirs::home_dir().as_deref(),
+            std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+        );
+        self.agents_in_registry(dir.as_deref())
+    }
+
+    fn agents_in_registry(
+        &mut self,
+        dir: Option<&Path>,
+    ) -> Result<Vec<CliAgent>, SessionDetectorError> {
+        let signature = dir.and_then(registry_signature);
         if let Some(cache) = &mut self.agents_cache {
             let now = Instant::now();
             if cache_is_fresh(cache, signature.as_ref(), now) {
@@ -134,7 +144,7 @@ impl CliSessionSource {
             // Claude Code rewrites a session's file on every status change. When
             // only existing files changed, apply their new status in place
             // rather than spawning the command.
-            if let (Some(dir), Some(signature)) = (&dir, &signature) {
+            if let (Some(dir), Some(signature)) = (dir, &signature) {
                 if now.saturating_duration_since(cache.fetched_at) < AGENTS_CACHE_MAX_AGE
                     && refresh_changed_rows(dir, &mut cache.agents, &cache.signature, signature)
                 {
@@ -244,6 +254,19 @@ impl SessionSource for CliSessionSource {
 
     fn backend_name(&self) -> &'static str {
         "cli"
+    }
+}
+
+/// An explicit config override changes the CLI's registry. Until that
+/// location is established, query the CLI each cycle instead of watching home.
+fn cache_registry_dir(
+    home: Option<&Path>,
+    config_dir: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if config_dir.is_some() {
+        None
+    } else {
+        home.map(sessions_dir)
     }
 }
 
@@ -454,6 +477,46 @@ fn lookup_with_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn fixture_cli(dir: &Path) -> CliSessionSource {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("claude-fixture");
+        // Only shell builtins and an absolute fixture path; no installed CLI,
+        // PATH lookup, home directory, or global environment mutation.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nIFS= read -r row < \"${0%/*}/cli-output.json\"\nprintf '%s\\n' \"$row\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut source = CliSessionSource::new();
+        source.claude_bin = script;
+        source
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_registry_does_not_reuse_empty_default_registry_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default_dir = sessions_dir(tmp.path());
+        std::fs::create_dir_all(&default_dir).unwrap();
+        let configured = tmp.path().join("configured");
+        std::fs::create_dir_all(configured.join("sessions")).unwrap();
+        let dir = cache_registry_dir(Some(tmp.path()), Some(configured.as_os_str()));
+        let mut source = fixture_cli(tmp.path());
+        let output = tmp.path().join("cli-output.json");
+        std::fs::write(&output, "[]\n").unwrap();
+        assert!(source
+            .agents_in_registry(dir.as_deref())
+            .unwrap()
+            .is_empty());
+        // CLI discovers a session in its configured registry; the default
+        // registry remains present and unchanged.
+        write_registry_row(&configured.join("sessions"), 1, ROW_A_IDLE, 0);
+        std::fs::write(&output, full_schema_json().replace('\n', "") + "\n").unwrap();
+        assert_eq!(source.agents_in_registry(dir.as_deref()).unwrap().len(), 2);
+    }
 
     fn full_schema_json() -> &'static str {
         r#"[
