@@ -69,8 +69,10 @@ not acceptance of subsequent fixes or live behavior.
   scan of Cursor's global `state.vscdb` (observed at 1.5GB) on every detect,
   blocking first paint for minutes. The composer overlay now loads in a
   background thread with stamp-based caching and a 300ms grace wait
-  (`cursor.rs` `ComposerCache`): first paint never waits on the database,
-  titles backfill on the next poll. Existing cursor overlay tests pass
+  (`cursor.rs` `ComposerCache`): no full-table scan blocks first paint;
+  detection can wait up to 300ms for the overlay before returning. Titles
+  backfill on the next poll if the background load is still pending.
+  Existing cursor overlay tests pass
   unchanged (small test DBs resolve within the grace wait).
 
 ## Explicitly not claimed
