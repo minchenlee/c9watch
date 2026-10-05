@@ -120,7 +120,7 @@ impl CliSessionSource {
     }
 
     /// `claude agents --json` rows, reusing the previous result while the
-    /// session registry is unchanged and the result is younger than
+    /// session registry is unchanged, the result is empty and it is younger than
     /// `AGENTS_CACHE_MAX_AGE`. Each spawn costs ~0.2s of CPU, so running it on
     /// every poll dominated c9watch's energy use.
     fn agents(&mut self) -> Result<Vec<CliAgent>, SessionDetectorError> {
@@ -136,7 +136,7 @@ impl CliSessionSource {
         dir: Option<&Path>,
     ) -> Result<Vec<CliAgent>, SessionDetectorError> {
         let signature = dir.and_then(registry_signature);
-        if let Some(cache) = &mut self.agents_cache {
+        if let Some(cache) = &self.agents_cache {
             let now = Instant::now();
             if cache_is_fresh(cache, signature.as_ref(), now) {
                 return Ok(cache.agents.clone());
@@ -146,7 +146,10 @@ impl CliSessionSource {
         let agents = self.run_agents_command()?;
         // Taken before the spawn: a change that lands mid-spawn makes the next
         // poll's signature differ, so it's picked up then.
-        if let Some(signature) = signature {
+        // A cached live row would bypass the CLI's process-start identity
+        // validation after PID reuse. Only empty results are safe to reuse;
+        // nonempty results are validated by the CLI on every poll.
+        if let Some(signature) = signature.filter(|_| agents.is_empty()) {
             self.agents_cache = Some(AgentsCache {
                 signature,
                 agents: agents.clone(),
@@ -657,6 +660,34 @@ mod tests {
     }
 
     const ROW_A_IDLE: &str = r#"{"pid":1,"cwd":"/tmp/a","kind":"interactive","startedAt":100,"sessionId":"sid-a","status":"idle","entrypoint":"cli"}"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_registry_requeries_cli_to_reject_reused_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = tmp.path().join("sessions");
+        std::fs::create_dir(&registry).unwrap();
+        write_registry_row(&registry, 1, ROW_A_IDLE, 0);
+        let output = tmp.path().join("cli-output.json");
+        std::fs::write(&output, format!("[{ROW_A_IDLE}]\n")).unwrap();
+        let mut source = fixture_cli(tmp.path());
+        assert_eq!(source.agents_in_registry(Some(&registry)).unwrap().len(), 1);
+        let signature = registry_signature(&registry).unwrap();
+
+        // Simulate the CLI rejecting a surviving record after PID reuse.
+        // No actual PID reuse, machine process table, or installed CLI needed.
+        std::fs::write(&output, "[]\n").unwrap();
+        assert_eq!(registry_signature(&registry).unwrap(), signature);
+        assert!(source
+            .agents_in_registry(Some(&registry))
+            .unwrap()
+            .is_empty());
+        // The rejected row must not resurrect on another unchanged poll.
+        assert!(source
+            .agents_in_registry(Some(&registry))
+            .unwrap()
+            .is_empty());
+    }
 
     #[cfg(unix)]
     #[test]
