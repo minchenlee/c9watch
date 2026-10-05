@@ -658,13 +658,10 @@ pub fn enrich_detected_sessions(
             vec![]
         };
 
-        // With hook data, permission prompts come from Claude Code itself and a
-        // pending tool alone never implies one; otherwise infer from allow rules.
+        // Hooks are complementary: missing events or schema errors must never
+        // turn an empty state file into approval of every pending transcript tool.
         let hook_state = crate::claude_hooks::session_state(&session_id);
-        let checker = match hook_state {
-            Some(_) => std::sync::Arc::new(PermissionChecker::assume_approved()),
-            None => PermissionChecker::cached_for(Some(&detected.cwd)),
-        };
+        let checker = PermissionChecker::cached_for(Some(&detected.cwd));
         let hook_prompt = hook_state
             .as_ref()
             .and_then(|state| open_hook_prompt(state, &session_file_path));
@@ -1975,5 +1972,13 @@ mod repair_regressions {
         assert!(open_hook_prompt(&pending(Some("old"),Some("a1")),&path).is_some());
         std::fs::write(&child,format!("{CALL}\n{DONE}\n")).unwrap();
         assert!(open_hook_prompt(&pending(Some("old"),Some("a1")),&path).is_none());
+    }
+    #[test]
+    fn cli_precedence_and_idle_text_questions_stay_unchanged() {
+        assert_eq!(merge_cli_activity(SessionStatus::Working,Some(CliActivity::Waiting),true,None),SessionStatus::NeedsAttention);
+        assert_eq!(merge_cli_activity(SessionStatus::NeedsAttention,Some(CliActivity::Busy),true,Some("Bash")),SessionStatus::Working);
+        assert_eq!(merge_cli_activity(SessionStatus::NeedsAttention,Some(CliActivity::Idle),true,Some("Bash")),SessionStatus::WaitingForInput);
+        assert_eq!(merge_cli_activity(SessionStatus::NeedsAttention,Some(CliActivity::Idle),true,Some("Question")),SessionStatus::NeedsAttention);
+        assert_eq!(merge_cli_activity(SessionStatus::NeedsAttention,None,false,Some("Bash")),SessionStatus::NeedsAttention);
     }
 }

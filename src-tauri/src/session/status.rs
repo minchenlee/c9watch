@@ -884,9 +884,9 @@ mod tests {
             SessionEntry::Unknown,
         ];
         // Should NOT be WaitingForInput - should see the pending Bash tool
-        let status = determine_status(&entries);
+        let status = determine_status_with(&entries, &PermissionChecker::default());
         assert_ne!(status, SessionStatus::WaitingForInput);
-        // Bash with a dangerous command is never in any auto-approved list
+        // Explicit empty rules keep this assertion independent of user allow settings.
         assert_eq!(status, SessionStatus::NeedsAttention);
     }
 
@@ -1152,7 +1152,10 @@ mod tests {
                 usage: None,
             },
         }];
-        assert_eq!(get_pending_tool_name(&entries), Some("Bash".to_string()));
+        assert_eq!(
+            get_pending_tool_name_with(&entries, &PermissionChecker::default()),
+            Some("Bash".to_string())
+        );
     }
 
     #[test]
