@@ -8,6 +8,9 @@
 //! A process can only keep a transcript written after it started, so a `pi`
 //! restarted in the same cwd does not revive the killed session's card
 //! before its own first prompt.
+//! Processes left over after that per-cwd pass may keep one transcript from
+//! another cwd, because a session resumed from another project keeps its
+//! original header cwd while the process keeps its launch cwd.
 //!
 //! Any uncertainty (listing failed, a candidate cwd or argv unreadable, a
 //! transcript without an exact header cwd) keeps the mtime-based freshness
@@ -68,30 +71,69 @@ pub(crate) fn pi_alive_flags(
             None => alive[index] = true,
         }
     }
+    // Unknown start times may claim any transcript (never end on doubt).
+    let mut pools: HashMap<&str, Vec<i64>> = live
+        .iter()
+        .map(|(cwd, starts)| {
+            let mut starts: Vec<i64> = starts.iter().map(|s| s.unwrap_or(i64::MIN)).collect();
+            starts.sort_unstable();
+            (cwd.as_str(), starts)
+        })
+        .collect();
+    // Pass 1: a process keeps transcripts recorded in its own cwd.
     for (cwd, mut indexes) in by_cwd {
-        let Some(starts) = live.get(&cwd) else {
+        let Some(pool) = pools.get_mut(cwd.as_str()) else {
             continue;
         };
-        // Unknown start times may claim any transcript (never end on doubt).
-        let mut starts: Vec<i64> = starts.iter().map(|s| s.unwrap_or(i64::MIN)).collect();
-        starts.sort_unstable();
-        // Newest transcript first; ties keep input order (deterministic).
-        indexes.sort_by_key(|&index| std::cmp::Reverse(candidates[index].modified_ms));
+        sort_newest_first(&mut indexes, candidates);
         for index in indexes {
-            // Give each transcript the latest-started process that could have
-            // written it, so earlier-started processes stay free for older
-            // transcripts. This greedy order maximizes kept transcripts.
-            let limit = candidates[index]
-                .modified_ms
-                .saturating_add(PI_PROCESS_GRACE_MS);
-            let fits = starts.partition_point(|&start| start <= limit);
-            if fits > 0 {
-                starts.remove(fits - 1);
+            if claim_latest_fitting(pool, candidates[index].modified_ms) {
                 alive[index] = true;
             }
         }
     }
+    // Pass 2: pi records the session's cwd, not the process cwd, so a
+    // session resumed from another project (`--resume`, `/resume`,
+    // `--session`) never matches its process by cwd. A process left over
+    // from pass 1 keeps one otherwise-ended transcript it could have written.
+    // The start-time rule still stops a restarted pi from reviving a killed
+    // session, and a wrong keep only errs toward "alive".
+    let mut leftover: Vec<i64> = pools.into_values().flatten().collect();
+    leftover.sort_unstable();
+    let mut unmatched: Vec<usize> = (0..candidates.len())
+        .filter(|&index| !alive[index] && candidates[index].cwd.is_some())
+        .collect();
+    sort_newest_first(&mut unmatched, candidates);
+    for index in unmatched {
+        if claim_latest_fitting(&mut leftover, candidates[index].modified_ms) {
+            alive[index] = true;
+        }
+    }
     alive
+}
+
+/// Newest transcript first; ties keep input order (deterministic).
+fn sort_newest_first(indexes: &mut [usize], candidates: &[PiLivenessCandidate<'_>]) {
+    indexes.sort_by_key(|&index| std::cmp::Reverse(candidates[index].modified_ms));
+}
+
+/// Remove the latest-started process (from ascending `starts`) that could
+/// have written a transcript last modified at `modified_ms`. Taking the
+/// latest fit leaves earlier-started processes free for older transcripts,
+/// which maximizes how many transcripts are kept.
+fn claim_latest_fitting(starts: &mut Vec<i64>, modified_ms: i64) -> bool {
+    let limit = modified_ms.saturating_add(PI_PROCESS_GRACE_MS);
+    let fits = starts.partition_point(|&start| start <= limit);
+    if fits == 0 {
+        return false;
+    }
+    starts.remove(fits - 1);
+    true
+}
+
+/// sysinfo reports process start in whole seconds; 0 means unknown.
+fn started_ms_from_secs(secs: u64) -> Option<i64> {
+    (secs > 0).then(|| i64::try_from(secs).unwrap_or(i64::MAX).saturating_mul(1000))
 }
 
 /// What one process-table row says about pi.
@@ -261,8 +303,7 @@ impl PiProcessProbe for SysinfoPiProcessProbe {
                 .collect();
             let argv: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
             let cwd = process.cwd().map(|cwd| cwd.to_string_lossy().into_owned());
-            let start_secs = process.start_time();
-            let started_ms = (start_secs > 0).then(|| (start_secs as i64).saturating_mul(1000));
+            let started_ms = started_ms_from_secs(process.start_time());
             let same_user = match (own_uid, process.user_id()) {
                 (Some(own), Some(uid)) => uid_matches(uid, own),
                 _ => true,
@@ -438,8 +479,56 @@ mod tests {
         // A fresh `pi` with no prompt yet has a cwd but no transcript.
         let flags = pi_alive_flags(&[], &live(&[("/w/a", 1)]), NOW);
         assert!(flags.is_empty());
-        let flags = pi_alive_flags(&[candidate("/w/b", 60_000)], &live(&[("/w/a", 1)]), NOW);
+        // It cannot keep another cwd's transcript last written before it
+        // started, either.
+        let flags = pi_alive_flags(
+            &[candidate("/w/b", 60_000)],
+            &started("/w/a", &[30_000]),
+            NOW,
+        );
         assert_eq!(flags, vec![false]);
+    }
+
+    #[test]
+    fn cross_project_resume_keeps_the_session_alive() {
+        // `cd /w/a && pi --resume` into a session recorded in /w/b: the
+        // header cwd is /w/b, the process cwd stays /w/a. While it runs a
+        // long tool call (no write for over the grace window) it must stay.
+        let candidates = [candidate("/w/b", 60_000)];
+        let flags = pi_alive_flags(&candidates, &started("/w/a", &[3_600_000]), NOW);
+        assert_eq!(flags, vec![true]);
+        // A process already keeping a transcript in its own cwd is not a
+        // leftover; an extra process in that cwd is.
+        let candidates = [candidate("/w/a", 30_000), candidate("/w/b", 60_000)];
+        let flags = pi_alive_flags(&candidates, &started("/w/a", &[3_600_000]), NOW);
+        assert_eq!(flags, vec![true, false]);
+        let flags = pi_alive_flags(&candidates, &started("/w/a", &[3_600_000, 3_600_000]), NOW);
+        assert_eq!(flags, vec![true, true]);
+    }
+
+    #[test]
+    fn leftover_process_keeps_only_the_newest_ownable_foreign_transcript() {
+        let candidates = [
+            candidate("/w/b", 600_000),
+            candidate("/w/c", 60_000),
+            candidate("/w/b", 120_000),
+        ];
+        let flags = pi_alive_flags(&candidates, &started("/w/a", &[3_600_000]), NOW);
+        assert_eq!(flags, vec![false, true, false]);
+        // A pi restarted in another cwd does not revive a killed session.
+        let flags = pi_alive_flags(
+            &[candidate("/w/b", 300_000)],
+            &started("/w/a", &[60_000]),
+            NOW,
+        );
+        assert_eq!(flags, vec![false]);
+    }
+
+    #[test]
+    fn start_seconds_convert_to_milliseconds() {
+        assert_eq!(started_ms_from_secs(0), None);
+        assert_eq!(started_ms_from_secs(1_791_210_625), Some(1_791_210_625_000));
+        assert_eq!(started_ms_from_secs(u64::MAX), Some(i64::MAX));
     }
 
     #[test]
