@@ -560,20 +560,32 @@ fn lookup_with_cache(
 mod tests {
     use super::*;
 
+    /// A fake `claude` that prints the first line of `cli-output.json` from
+    /// its invocation path's directory. Each test gets a symlink to one shared
+    /// script: macOS scans every newly written executable on first exec, one
+    /// at a time system-wide, so a fresh script per test slows every other
+    /// test that execs a fresh file.
     #[cfg(unix)]
     fn fixture_cli(dir: &Path) -> CliSessionSource {
         use std::os::unix::fs::PermissionsExt;
-        let script = dir.join("claude-fixture");
-        // Only shell builtins and an absolute fixture path; no installed CLI,
-        // PATH lookup, home directory, or global environment mutation.
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nIFS= read -r row < \"${0%/*}/cli-output.json\"\nprintf '%s\\n' \"$row\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        static SCRIPT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let shared = SCRIPT.get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("claude-fixture");
+            // Only shell builtins; no installed CLI, PATH lookup, home
+            // directory, or global environment mutation.
+            std::fs::write(
+                &script,
+                "#!/bin/sh\nIFS= read -r row < \"${0%/*}/cli-output.json\"\nprintf '%s\\n' \"$row\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            dir
+        });
+        let link = dir.join("claude-fixture");
+        std::os::unix::fs::symlink(shared.path().join("claude-fixture"), &link).unwrap();
         let mut source = CliSessionSource::new();
-        source.claude_bin = script;
+        source.claude_bin = link;
         source.start_times = Box::new(|pids| pids.iter().map(|&pid| (pid, 1)).collect());
         source
     }
