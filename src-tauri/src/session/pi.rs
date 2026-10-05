@@ -2242,12 +2242,18 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let dir = temp.path().join(".pi/agent/sessions/--tmp-my-project--");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("time_sibling.jsonl"),
-            r#"{"type":"session","cwd":"/tmp/my-project"}"#).unwrap();
+        std::fs::write(
+            dir.join("time_sibling.jsonl"),
+            r#"{"type":"session","cwd":"/tmp/my-project"}"#,
+        )
+        .unwrap();
         std::fs::write(dir.join("time_headerless.jsonl"),
             r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#).unwrap();
         let entries = pi_history_entries(temp.path());
-        let entry = entries.iter().find(|entry| entry.session_id == "headerless").unwrap();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.session_id == "headerless")
+            .unwrap();
         assert_eq!(entry.project, "/tmp/my-project");
         assert_eq!(entry.project_name, "my-project");
     }
