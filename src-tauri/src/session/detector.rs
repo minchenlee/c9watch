@@ -446,15 +446,7 @@ fn is_claude_code_process(name: &str, exe: Option<&Path>, cmd: &[String]) -> boo
         // Native installer: `~/.local/bin/claude` symlinks to
         // `~/.local/share/claude/versions/<version>`, so the resolved exe is
         // named after the version.
-        let parent = exe.parent();
-        if parent
-            .and_then(Path::file_name)
-            .is_some_and(|d| d == "versions")
-            && parent
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .is_some_and(|d| d == "claude")
-        {
+        if dirs::home_dir().is_some_and(|home| is_native_claude_executable(exe, &home)) {
             return true;
         }
     }
@@ -477,6 +469,18 @@ fn is_claude_code_process(name: &str, exe: Option<&Path>, cmd: &[String]) -> boo
             is_claude_name(&base(arg))
                 || arg.replace('\\', "/").contains("@anthropic-ai/claude-code")
         })
+}
+
+fn is_native_claude_executable(exe: &Path, home: &Path) -> bool {
+    if exe.parent() != Some(home.join(".local/share/claude/versions").as_path()) {
+        return false;
+    }
+    let Some(version) = exe.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let mut parts = version.split('.');
+    parts.clone().count() == 3
+        && parts.all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
 pub(crate) fn encode_path_for_matching(path: &str) -> String {
@@ -559,10 +563,9 @@ mod tests {
             Some(Path::new("/Users/u/.local/share/claude/versions/2.1.283")),
             &cmd(&["/Users/u/.local/bin/claude", "-p"])
         ));
-        assert!(is_claude_code_process(
-            "2.1.283",
-            Some(Path::new("/Users/u/.local/share/claude/versions/2.1.283")),
-            &cmd(&[])
+        assert!(is_native_claude_executable(
+            Path::new("/Users/u/.local/share/claude/versions/2.1.283"),
+            Path::new("/Users/u")
         ));
         assert!(is_claude_code_process("claude.exe", None, &cmd(&[])));
     }
@@ -602,6 +605,32 @@ mod tests {
                 ),
                 "runtime {name}"
             );
+        }
+    }
+
+    #[test]
+    fn rejects_unrelated_executable_in_claude_versions_directory() {
+        assert!(!is_claude_code_process(
+            "server",
+            Some(Path::new("/tmp/claude/versions/server")),
+            &cmd(&[])
+        ));
+    }
+
+    #[test]
+    fn native_version_fallback_requires_installer_location_and_version_filename() {
+        let home = Path::new("/fixture/home");
+        assert!(is_native_claude_executable(
+            &home.join(".local/share/claude/versions/2.1.283"),
+            home
+        ));
+        for exe in [
+            "/tmp/claude/versions/2.1.283",
+            "/other/home/.local/share/claude/versions/2.1.283",
+            "/fixture/home/.local/share/claude/versions/server",
+            "/fixture/home/.local/share/claude/versions/2..283",
+        ] {
+            assert!(!is_native_claude_executable(Path::new(exe), home), "{exe}");
         }
     }
 
