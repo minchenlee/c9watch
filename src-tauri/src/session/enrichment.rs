@@ -15,7 +15,6 @@ use crate::session::source::{
 };
 use crate::session::status::{
     determine_status_with, get_pending_tool_input_with, get_pending_tool_name_with,
-    unresolved_tool_uses,
 };
 use crate::session::{parse_last_n_entries, parse_sessions_index, SessionEntry, SessionStatus};
 use chrono::{DateTime, Utc};
@@ -701,7 +700,7 @@ pub fn enrich_detected_sessions(
         let notification_preview = notification_preview_from_entries(&entries);
         let pending_tool_input = match &hook_prompt {
             Some(prompt) if prompt.agent_id.is_none() => {
-                pending_input_named(&entries, &prompt.tool_name)
+                crate::claude_hooks::prompt_input(prompt, &session_file_path)
             }
             Some(_) => None,
             None => get_pending_tool_input_with(&entries, &checker),
@@ -768,44 +767,21 @@ pub fn enrich_detected_sessions(
     Ok((sessions, diagnostics))
 }
 
-/// The first hook-reported permission prompt that its transcript still shows as
-/// an unresolved call of the same tool. Hooks can miss the event that resolves
-/// a prompt (a rejected dialog fires none), so the transcript is the tiebreaker.
-/// A prompt with no readable transcript is trusted as reported.
+/// A hook prompt remains evidence unless the exact correlated call has a result.
+/// A bounded/missing transcript cannot establish resolution by absence.
 fn open_hook_prompt(state: &HookSessionState, session_file: &Path) -> Option<PendingPermission> {
-    if state.pending.is_empty() {
-        return None;
-    }
-    let unresolved_names = |path: &Path| -> Option<Vec<String>> {
-        if !path.is_file() {
-            return None;
-        }
-        let entries = parse_last_n_entries(path, 50).ok()?;
-        Some(
-            unresolved_tool_uses(&entries)
-                .into_iter()
-                .map(|(name, _)| name.to_string())
-                .collect(),
-        )
-    };
-    let main = unresolved_names(session_file);
-    state
-        .pending
-        .iter()
-        .find(|prompt| {
-            let transcript = match &prompt.agent_id {
-                None => main.clone(),
-                Some(agent_id) => subagent_transcript(session_file, agent_id)
-                    .and_then(|path| unresolved_names(&path)),
-            };
-            transcript.is_none_or(|names| names.contains(&prompt.tool_name))
-        })
-        .cloned()
+    state.pending.iter().find(|prompt| {
+        let transcript = match &prompt.agent_id {
+            None => Some(session_file.to_path_buf()),
+            Some(agent_id) => subagent_transcript(session_file, agent_id),
+        };
+        transcript.is_none_or(|path| crate::claude_hooks::prompt_is_open(prompt, &path))
+    }).cloned()
 }
 
 /// `<project>/<session>/subagents/agent-<id>.jsonl` for `<project>/<session>.jsonl`.
 fn subagent_transcript(session_file: &Path, agent_id: &str) -> Option<PathBuf> {
-    if !agent_id
+    if agent_id.is_empty() || !agent_id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
@@ -817,15 +793,6 @@ fn subagent_transcript(session_file: &Path, agent_id: &str) -> Option<PathBuf> {
             .join("subagents")
             .join(format!("agent-{agent_id}.jsonl")),
     )
-}
-
-/// Input of the last unresolved call to `tool_name`.
-fn pending_input_named(entries: &[SessionEntry], tool_name: &str) -> Option<serde_json::Value> {
-    unresolved_tool_uses(entries)
-        .into_iter()
-        .rev()
-        .find(|(name, _)| *name == tool_name)
-        .map(|(_, input)| input.clone())
 }
 
 /// Checks if a file was modified within the last N seconds
@@ -1887,6 +1854,13 @@ mod notification_preview_tests {
 mod hook_prompt_tests {
     use super::*;
 
+    fn fixture() -> tempfile::TempDir {
+        // macOS exposes its temporary root through /var -> /private/var.
+        // Fixtures use a real parent; product IO must still reject symlinks.
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        tempfile::tempdir_in(parent).unwrap()
+    }
+
     const PENDING_BASH: &str = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-09-23T00:00:00Z","message":{"model":"m","id":"msg1","role":"assistant","content":[{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"make"}}],"stop_reason":null,"stop_sequence":null}}"#;
     const BASH_RESULT: &str = r#"{"type":"user","uuid":"u2","timestamp":"2026-09-23T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_b","content":"The user doesn't want to proceed","is_error":true}]}}"#;
 
@@ -1895,22 +1869,25 @@ mod hook_prompt_tests {
             agent_id: agent_id.map(str::to_owned),
             tool_name: tool_name.to_owned(),
             requested_at: 1,
+            tool_use_id: Some("toolu_b".into()),
         }
     }
 
     fn state(pending: Vec<PendingPermission>) -> HookSessionState {
-        HookSessionState { pending }
+        HookSessionState { pending, ..Default::default() }
     }
 
     #[test]
     fn main_thread_prompt_needs_matching_unresolved_call() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture();
         let file = dir.path().join("s1.jsonl");
         std::fs::write(&file, format!("{PENDING_BASH}\n")).unwrap();
 
         let open = open_hook_prompt(&state(vec![prompt(None, "Bash")]), &file);
         assert_eq!(open.map(|p| p.tool_name), Some("Bash".to_string()));
-        assert_eq!(open_hook_prompt(&state(vec![prompt(None, "Write")]), &file), None);
+        // A different call id absent from this window is uncertain, not resolved.
+        let mut other = prompt(None, "Write"); other.tool_use_id = Some("missing-call".into());
+        assert!(open_hook_prompt(&state(vec![other]), &file).is_some());
 
         // A rejected dialog fires no hook, but the transcript records the result.
         std::fs::write(&file, format!("{PENDING_BASH}\n{BASH_RESULT}\n")).unwrap();
@@ -1919,7 +1896,7 @@ mod hook_prompt_tests {
 
     #[test]
     fn subagent_prompt_checks_the_subagent_transcript() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture();
         let file = dir.path().join("s1.jsonl");
         std::fs::write(&file, "").unwrap();
         let pending = state(vec![prompt(Some("a1"), "Bash")]);
@@ -1943,5 +1920,60 @@ mod hook_prompt_tests {
             subagent_transcript(Path::new("/p/s1.jsonl"), "a1"),
             Some(PathBuf::from("/p/s1/subagents/agent-a1.jsonl"))
         );
+    }
+}
+
+#[cfg(test)]
+mod repair_regressions {
+    use super::*;
+
+    fn fixture() -> tempfile::TempDir {
+        // macOS exposes its temporary root through /var -> /private/var.
+        // Fixtures use a real parent; product IO must still reject symlinks.
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        tempfile::tempdir_in(parent).unwrap()
+    }
+    fn pending(id: Option<&str>, agent: Option<&str>) -> HookSessionState {
+        serde_json::from_value(serde_json::json!({"pending":[{"toolName":"Bash","agentId":agent,"requestedAt":1,"toolUseId":id}]})).unwrap()
+    }
+    const CALL:&str=r#"{"type":"assistant","uuid":"u1","timestamp":"2026-09-23T00:00:00Z","message":{"model":"m","id":"msg1","role":"assistant","content":[{"type":"tool_use","id":"old","name":"Bash","input":{"command":"make"}}]}}"#;
+    const DONE:&str=r#"{"type":"user","uuid":"u2","timestamp":"2026-09-23T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"old","content":"done"}]}}"#;
+    #[test]
+    fn unresolved_call_outside_fifty_line_tail_remains_attention() {
+        let dir=fixture();let path=dir.path().join("s1.jsonl");
+        let progress="{\"type\":\"progress\"}\n".repeat(60);
+        std::fs::write(&path,format!("{CALL}\n{progress}")).unwrap();
+        assert!(open_hook_prompt(&pending(Some("old"),None),&path).is_some(),"tail absence was treated as resolution");
+    }
+    #[test]
+    fn malformed_or_truncated_transcript_is_uncertain_not_resolved() {
+        let dir=fixture();let path=dir.path().join("s1.jsonl");
+        std::fs::write(&path,"malformed\n").unwrap();
+        assert!(open_hook_prompt(&pending(Some("old"),None),&path).is_some());
+        std::fs::write(&path,format!("{}\n{CALL}\n","{\"type\":\"progress\"}\n".repeat(40_000))).unwrap();
+        assert!(open_hook_prompt(&pending(Some("old"),None),&path).is_some());
+    }
+    #[test]
+    fn resolved_old_call_does_not_attach_to_new_bash_call() {
+        let dir=fixture();let path=dir.path().join("s1.jsonl");
+        std::fs::write(&path,format!("{CALL}\n{DONE}\n{}\n",CALL.replace("\"old\"","\"new\""))).unwrap();
+        assert!(open_hook_prompt(&pending(Some("old"),None),&path).is_none(),"resolved request attached to a newer Bash");
+    }
+    #[test]
+    fn uncorrelated_prompt_does_not_acquire_an_unrelated_calls_arguments() {
+        let dir=fixture();let path=dir.path().join("s1.jsonl");std::fs::write(&path,CALL).unwrap();
+        let p=pending(None,None).pending.remove(0);
+        assert!(crate::claude_hooks::prompt_input(&p,&path).is_none());
+        let p=pending(Some("old"),None).pending.remove(0);
+        assert_eq!(crate::claude_hooks::prompt_input(&p,&path).unwrap()["command"],"make","bound tool input must stay exposed");
+    }
+    #[test]
+    fn genuine_subagent_prompt_is_preserved_and_its_exact_result_resolves_it() {
+        let dir=fixture();let path=dir.path().join("s1.jsonl");
+        let sub=dir.path().join("s1/subagents");std::fs::create_dir_all(&sub).unwrap();
+        let child=sub.join("agent-a1.jsonl");std::fs::write(&child,CALL).unwrap();
+        assert!(open_hook_prompt(&pending(Some("old"),Some("a1")),&path).is_some());
+        std::fs::write(&child,format!("{CALL}\n{DONE}\n")).unwrap();
+        assert!(open_hook_prompt(&pending(Some("old"),Some("a1")),&path).is_none());
     }
 }
