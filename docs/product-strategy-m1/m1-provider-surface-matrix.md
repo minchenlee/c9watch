@@ -54,12 +54,15 @@ M1 changes are additive/optional and must not claim new Cursor/OpenCode coverage
 
 ### Pi
 
-- Surfaces: `cli` (`src-tauri/src/session/pi.rs:260`).
-- Lifecycle: pending tool call, trailing user message, or recent activity → Working, else Idle (`pi.rs:550-558`); enrichment maps Working→`Working` (empty→`Connecting`), Idle→`WaitingForInput` (`enrichment.rs:511-519`).
-- Evidence: `pending_tool_name` = latest unresulted tool call (`pi.rs:538-544`, tests at `1682-1692`, `1847-1848`).
+- Surfaces: `cli` (`src-tauri/src/session/pi.rs`, `PiSessionSource::detect`).
+- Lifecycle: pending tool call, trailing user message, or recent activity → Working, else Idle (`PiTranscriptSummary::refresh_lifecycle`); enrichment maps Working→`Working` (empty→`Connecting`), Idle→`WaitingForInput` (`enrichment.rs:511-519`).
+- Evidence: `pending_tool_name` = latest unresulted tool call (end of `summarize_pi_transcript`; tests `pending_tool_call_reports_working`, `reissued_tool_call_pends_again_after_result`).
 - Declared limit: a pending Pi tool call means in-flight work (Working), not a user approval wait; it is exposed as evidence, not promoted to `NeedsAttention`.
-- Return: `can_open=false` (`pi.rs:268`); exact return is the provider-scoped conversation view. No wrong-target open is offered.
-- Health: `health_from_last_timestamp` against the Pi window — Working → 4h, Idle → 30m (`pi.rs:32-34`); the detector additionally drops transcripts older than those windows (`pi.rs:199-233`).
+- Return: `can_open=false` (`PiSessionSource::detect`); exact return is the provider-scoped conversation view. No wrong-target open is offered.
+- Health: `health_from_last_timestamp` against the Pi window — Working → 4h, Idle → 30m (`PI_FRESHNESS_WORKING_SECS` / `PI_FRESHNESS_IDLE_SECS`); the detector additionally drops transcripts older than those windows (`PiSessionSource::detect`).
+- Liveness (process evidence, `src-tauri/src/session/pi_liveness.rs`): when at least one transcript passes the freshness windows, the detector lists live `pi` processes (sysinfo; name `node`/`bun`/`pi`, decided by argv[0] or argv[1] basename `pi`) with their cwd and start time. Per exact header cwd, N live processes keep the N newest fresh transcripts that each process could have written (modified after its start, 10 s grace); the others end and leave the monitor like expired sessions (history keeps them). A transcript modified within the 10 s grace stays. A live `pi` with no transcript yet creates no card. A killed Pi session (for example Working with an unresulted tool call) therefore ends within a few polls instead of after 4h (tests `killed_agent_with_unresulted_tool_ends_without_live_process`, `pi_liveness::tests`).
+- Liveness fallback: if the process listing fails, a pi candidate's cwd or argv cannot be read, or a transcript has only a lossy dirname-decoded cwd, process evidence is not applied and the 4h / 30m windows above decide (test `killed_agent_without_process_evidence_lingers_until_expiry`). The windows stay the upper limit; process evidence never extends a session.
+- Liveness limit: a session resumed with `pi -c` / `--resume` shows as ended until its next write, because pi loads the old transcript without writing to it (pi 0.87.1 source; test `resumed_session_shows_ended_until_its_first_write`).
 
 ## Identity / deduplication contract (M1-R3)
 

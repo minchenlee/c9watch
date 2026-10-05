@@ -75,6 +75,31 @@ not acceptance of subsequent fixes or live behavior.
   Existing cursor overlay tests pass
   unchanged (small test DBs resolve within the grace wait).
 
+## Pi liveness fix (F1, same branch)
+
+- Problem: a killed Pi session (for example `kill -9` during a tool call)
+  stayed LIVE and Working for up to the 4h freshness window, because Pi
+  has no pid file, lock or session variable.
+- Fix: process evidence (`src-tauri/src/session/pi_liveness.rs`). Only
+  while a Pi transcript is fresh, the detector lists live `pi` processes
+  (sysinfo reports `name()` = `node`; argv[0] = `pi` after pi's title
+  rewrite) with cwd and start time. Per exact header cwd, each live
+  process keeps one fresh transcript modified after its start (10 s
+  grace). Other transcripts end and leave the monitor like expired ones;
+  history keeps them. Listing failure, an unreadable pi cwd/argv, or a
+  lossy decoded cwd keep the previous mtime behaviour. The 4h / 30m
+  windows stay the upper limit.
+- Verification (2026-10-05, this machine): `cargo test --lib` **520
+  passed, 0 failed, 10 ignored**; `npm run check` **0 errors, 0
+  warnings**; `git diff --check` passed. Manual probe with a stand-in
+  process (`node` with `process.title = 'pi'`, 654 processes listed):
+  first gated scan 81 ms, second 66 ms, then 7–9.5 ms per poll.
+- Known limits: a session resumed with `pi -c` / `--resume` shows as
+  ended until its next write (pi 0.87.1 loads the transcript without
+  writing to it); transcripts in one cwd are matched to processes by
+  time only; live acceptance with a real Pi session was not run (needs
+  owner approval for model calls).
+
 ## Explicitly not claimed
 
 - Live provider detection quality, OS notification presentation, end-to-end
