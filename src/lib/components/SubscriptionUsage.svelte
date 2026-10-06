@@ -5,7 +5,7 @@
 	import { getSubscriptionUsage } from '$lib/api';
 	import { isDemoMode } from '$lib/demo/mode';
 	import { isTauri } from '$lib/ws';
-	import type { SubscriptionUsage } from '$lib/subscription-usage';
+	import type { SubscriptionUsage, UsageWindow } from '$lib/subscription-usage';
 
 	let { showPercentage = true, placement = 'bottom' }: { showPercentage?: boolean; placement?: 'top' | 'bottom' } = $props();
 	let tooltipBottom = $state(8);
@@ -40,6 +40,11 @@
 		tooltipBottom = window.innerHeight - rect.top + 8;
 		tooltipMaxHeight = Math.max(0, placement === 'top' ? rect.top - 16 : window.innerHeight - tooltipTop - 8);
 		active = provider;
+	}
+	function elapsedFraction(window: UsageWindow) {
+		if (window.resetsAt === null || !window.windowSeconds) return null;
+		const remaining = window.resetsAt - now / 1000;
+		return Math.max(0, Math.min(1, 1 - remaining / window.windowSeconds));
 	}
 	function resetLabel(timestamp: number | null) {
 		if (timestamp === null) return 'Reset time unavailable';
@@ -111,14 +116,16 @@
 				<p>Reading subscription usage…</p>
 			{:else if selected.windows.length}
 				{#each selected.windows as window}
+					{@const elapsed = elapsedFraction(window)}
 					<div class="window">
 						<div class="window-heading"><span>{window.label}</span><strong>{Math.round(window.usedPercent)}% used</strong></div>
-						<div class="meter" class:warning={window.usedPercent >= 80} class:exhausted={window.usedPercent >= 100} aria-hidden="true">
+						<div class="meter" class:has-elapsed={elapsed !== null} class:warning={window.usedPercent >= 80} class:exhausted={window.usedPercent >= 100} aria-hidden="true">
 							{#each Array(32) as _, index}
 								<span class="meter-cell"><span style:width={`${Math.max(0, Math.min(1, window.usedPercent / 100 * 32 - index)) * 100}%`}></span></span>
 							{/each}
+							{#if elapsed !== null}<span class="elapsed-marker" style:--elapsed={elapsed}></span>{/if}
 						</div>
-						<div class="reset">{resetLabel(window.resetsAt)}</div>
+						<div class="reset"><span>{resetLabel(window.resetsAt)}</span>{#if elapsed !== null}<span>{Math.round(elapsed * 100)}% elapsed</span>{/if}</div>
 					</div>
 				{/each}
 				<p class="footnote">{selected.message ?? (expired(selected) ? 'Outdated snapshot · refreshing automatically' : selected.provider === 'claudeCode' ? 'Last reported by Claude Code. Outline shows the most-used limit.' : 'Outline shows the most-used limit.')}</p>
@@ -162,8 +169,13 @@
 	.meter { display: grid; grid-template-columns: repeat(32, minmax(0, 1fr)); gap: 2px; margin: 8px 0; padding: 2px; border: 1px solid var(--border-default, #333); color: var(--usage-color, var(--text-primary)); }
 	.meter.warning { color: #ffb547; }
 	.meter.exhausted { color: #ff6369; }
+	.meter.has-elapsed { position: relative; margin-bottom: 14px; }
+	/* Absolute offsets are from the padding box, so inset by the meter's 2px padding to line up with the cells. */
+	.elapsed-marker { position: absolute; top: calc(100% + 3px); left: calc(2px + (100% - 4px) * var(--elapsed)); width: 0; height: 0; transform: translateX(-50%);
+		border-left: 4px solid transparent; border-right: 4px solid transparent; border-bottom: 5px solid var(--text-primary); }
 	.meter-cell { display: block; height: 6px; background: var(--border-default, #333); }
 	.meter-cell > span { display: block; height: 100%; background: currentColor; }
+	.reset { display: flex; justify-content: space-between; gap: 12px; }
 	.reset, p { color: #aaa; font-size: 11px; line-height: 1.6; }
 	p { margin: 12px 0 0; }
 	.footnote { border-top: 1px solid var(--border-default, #333); padding-top: 12px; }

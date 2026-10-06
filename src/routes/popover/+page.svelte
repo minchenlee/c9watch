@@ -36,8 +36,7 @@
 			// allowing the CSS animation to replay even for rapid back-to-back changes.
 			setTimeout(() => {
 				isSweeping = true;
-				// Last block starts at (columns-1)*20ms, animation runs 2s → ~2500ms max.
-				setTimeout(() => { isSweeping = false; }, 2500);
+				setTimeout(() => { isSweeping = false; }, 2000);
 			}, 0);
 		}
 		prevSummaryKey = currentKey;
@@ -156,9 +155,9 @@
 	</header>
 
 	<div class="pixel-grid" class:empty={totalSessions === 0} bind:clientWidth={trackWidth}>
-		<div class="grid-inner" style="grid-template-columns: repeat({columns}, 1fr);">
-			{#each statusArray as status, i}
-				<div class="block {status}" class:sweeping={isSweeping} style="animation-delay: {i * 20}ms; transition-delay: {i * 50}ms"></div>
+		<div class="grid-inner" class:sweeping={isSweeping} style="grid-template-columns: repeat({columns}, 1fr);">
+			{#each statusArray as status}
+				<div class="block {status}"></div>
 			{/each}
 		</div>
 	</div>
@@ -275,6 +274,7 @@
 	}
 
 	.grid-inner {
+		position: relative;
 		display: grid;
 		grid-template-rows: 1fr;
 		gap: 2px;
@@ -284,23 +284,54 @@
 	.block {
 		background: rgba(255, 255, 255, 0.06);
 		border-radius: 1px;
-		transition: background-color 0.4s, box-shadow 0.4s;
+		/* Every block changes color at once, with no per-block delay or glow: a
+		   staggered ripple keeps WebKit restyling and repainting the grid on
+		   every frame for seconds after each change. */
+		transition: background-color 0.4s;
 	}
 
-	.block.sweeping {
+	/* Brightness flash as a white overlay's opacity */
+	.grid-inner::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		background: #fff;
+		opacity: 0;
+		pointer-events: none;
+	}
+
+	/* The sweep plays once on the whole bar, animating only transform and
+	   opacity, which WebKit composites without repainting. */
+	.grid-inner.sweeping {
 		animation: monitor-sweep 2s ease-out forwards;
 	}
 
-	@keyframes monitor-sweep {
-		0%   { transform: scale(1);    filter: brightness(1); }
-		20%  { transform: scale(0.95); filter: brightness(1.1); }
-		40%  { transform: scale(1.1);  filter: brightness(1.4) drop-shadow(0 0 2px currentColor); }
-		100% { transform: scale(1);    filter: brightness(1); }
+	.grid-inner.sweeping::after {
+		animation: monitor-flash 2s ease-out forwards;
 	}
 
-	.block.working    { background-color: var(--status-working);    color: var(--status-working);    box-shadow: 0 0 3px var(--status-working-glow); }
-	.block.permission { background-color: var(--status-permission); color: var(--status-permission); box-shadow: 0 0 3px var(--status-permission-glow); }
-	.block.input      { background-color: var(--status-input);      color: var(--status-input);      box-shadow: 0 0 3px var(--status-input-glow); }
+	@keyframes monitor-sweep {
+		0%   { transform: scale(1); }
+		20%  { transform: scale(0.99); }
+		40%  { transform: scale(1.01); }
+		100% { transform: scale(1); }
+	}
+
+	@keyframes monitor-flash {
+		0%   { opacity: 0; }
+		20%  { opacity: 0.05; }
+		40%  { opacity: 0.25; }
+		100% { opacity: 0; }
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.grid-inner.sweeping,
+		.grid-inner.sweeping::after { animation: none; }
+	}
+
+	.block.working    { background-color: var(--status-working);    color: var(--status-working); }
+	.block.permission { background-color: var(--status-permission); color: var(--status-permission); }
+	.block.input      { background-color: var(--status-input);      color: var(--status-input); }
 
 	.popover-content {
 		flex: 1;

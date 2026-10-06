@@ -6,6 +6,8 @@
 )]
 
 fn main() {
+    c9watch_lib::claude_path::ensure_claude_on_path();
+
     // CLI mode: if the first arg is a known subcommand or --help/--version,
     // route to the CLI handler instead of launching the GUI.
     #[cfg(feature = "cli")]
