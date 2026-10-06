@@ -26,6 +26,7 @@ export default defineConfig({
           label: 'Reference',
           items: [
             { label: 'Features', slug: 'features' },
+            { label: 'Compatibility', slug: 'compatibility' },
             { label: 'How It Works', slug: 'how-it-works' },
           ],
         },
