@@ -7,33 +7,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.10.0] - 2026-08-24
+## [0.10.0] - TBD
 
 ### Added
-- **Cursor Agent monitoring.** Detect Cursor Agent root and subagent sessions,
-  expose Cursor lifecycle and provider metadata, and include Cursor sessions in
-  Monitor, History, conversation search, and provider filtering.
+- **Cursor Agent monitoring (monitor-only).** Detect Cursor Agent root and
+  subagent sessions, show their lifecycle and provider metadata, and include
+  them in Monitor, History, conversation search, and the provider filter
+  ([#120](https://github.com/minchenlee/c9watch/pull/120)).
 - **Provider-scoped session identity.** Claude Code, Codex, and Cursor session
-  IDs are isolated across detection, enrichment, CLI output, notifications, and
-  frontend selection state.
-- **Cursor transcript resilience coverage.** Synthetic tests cover lifecycle
-  transitions, deleted and renamed transcripts, large transcripts, and reads
-  concurrent with an incomplete write.
+  IDs no longer collide across detection, enrichment, CLI output,
+  notifications, and frontend selection
+  ([#120](https://github.com/minchenlee/c9watch/pull/120)).
+- **Pi Agent monitoring (read-only).** Monitor, History, conversation, search,
+  Cost, and CLI support for Pi, with provider-reported cost data. Pi sessions
+  cannot be opened, stopped, or renamed from c9watch
+  ([#121](https://github.com/minchenlee/c9watch/pull/121)).
+- **OpenCode monitoring (preview).** Connect c9watch to one OpenCode HTTP server
+  you start yourself (`opencode --port 4096`) in Settings → Integration. Adds
+  session cards, an OpenCode filter and badge, parent/child grouping, and
+  on-demand conversation reads. It does not discover servers on its own. See
+  [docs/opencode-preview.md](docs/opencode-preview.md)
+  ([#127](https://github.com/minchenlee/c9watch/pull/127)).
+- **Attention inbox and source health.** A deduplicated inbox on the Monitor
+  page for sessions that wait for you, a per-session health badge (`fresh`,
+  `stale`, `partial`, `unavailable`, `unknown`) so an old observation no longer
+  looks live, and a declared return target for attention notifications
+  ([#141](https://github.com/minchenlee/c9watch/pull/141)).
+- **Subscription usage indicators.** Per-provider quota meters in the toolbar and
+  tray for Claude Code, Codex, and Cursor, with reset times and a Settings →
+  Usage page. Claude Code needs an optional status-line bridge
+  ([#126](https://github.com/minchenlee/c9watch/pull/126)).
+- **Elapsed-window marker under usage meters.** A small triangle shows how far
+  through each quota window you are, and the reset line shows "N% elapsed"
+  ([#140](https://github.com/minchenlee/c9watch/pull/140)).
+- **Native notification settings.** Choose which events notify you, brief or
+  detailed content, sound, and a per-session cooldown. Reply notifications show
+  a short excerpt of the assistant's reply
+  ([#125](https://github.com/minchenlee/c9watch/pull/125)).
+- **Full-screen chat layout** in Monitor and History, and a resizable Monitor
+  sidebar ([#126](https://github.com/minchenlee/c9watch/pull/126)).
+- **Session kind and entrypoint badges.** Background-pinned Claude Code sessions
+  show a `BG` badge. Sessions not launched from the plain `cli` entrypoint show
+  that entrypoint ([#134](https://github.com/minchenlee/c9watch/pull/134)).
+- **Claude Code hook bridge (opt-in).** `c9watch hooks --install` registers async
+  hooks so Claude Code reports permission prompts directly. Hooks never delay
+  Claude Code or affect permission decisions. `--uninstall` removes only
+  c9watch's entries. Not available on Windows. See
+  [docs/claude-hooks.md](docs/claude-hooks.md)
+  ([#136](https://github.com/minchenlee/c9watch/pull/136)).
 
 ### Fixed
-- **Cursor incremental transcript cache correctness.** Appends now verify the
-  cached prefix before reusing the prior summary, so truncate-and-rewrite and
-  prefix-mismatch changes fall back to a full parse. Incomplete final JSONL
-  records remain pending until a complete line is available.
-- **Provider collision safety for rename requests.** Explicit Codex/Cursor
-  rename targets are rejected, and providerless legacy requests are rejected
-  before writing when the raw ID is also detected under another provider.
-- **Codex archive cache correctness.** Persistent archive snapshots now reject
-  weak/coarse file metadata, detect same-length and middle rewrites, and retry
-  when a rollout changes while it is being read.
-- **Shared provider source lifetime.** GUI polling and CLI/Web enrichment reuse
-  the same Codex and Cursor incremental sources instead of silently reparsing
-  from a cold cache on every request.
+- **Needs Attention accuracy.** Running sub-agents no longer flag their parent
+  session. c9watch now uses the `waiting` status that `claude agents --json`
+  reports, and merges allow rules from user and project `settings.json`
+  ([#136](https://github.com/minchenlee/c9watch/pull/136)).
+- **Claude Code not found when launched from Finder, the Dock, or a login
+  item.** c9watch adds the usual install directories to `PATH` at startup. The
+  fallback scanner no longer matches Claude Desktop helper processes, so STOP can
+  no longer kill one ([#139](https://github.com/minchenlee/c9watch/pull/139)).
+- **Dead sessions in `claude agents --json`.** Entries whose process is gone are
+  dropped before status inference. Rows with a missing PID no longer cause a
+  parse error ([#132](https://github.com/minchenlee/c9watch/pull/132)).
+- **Pi sessions end when the process ends.** A killed Pi session no longer shows
+  LIVE for up to 4 hours. When the process evidence is unclear, the old
+  freshness rule stays ([#141](https://github.com/minchenlee/c9watch/pull/141)).
+- **Cursor detection** no longer blocks on the composer database. WAL changes
+  invalidate the cache, failed composer loads retry, and stale overlays clear
+  ([#141](https://github.com/minchenlee/c9watch/pull/141)).
+- **Cursor transcript cache.** Appends verify the cached prefix, so a rewrite
+  falls back to a full parse. An incomplete final line stays pending until it is
+  complete ([#120](https://github.com/minchenlee/c9watch/pull/120)).
+- **Codex archive memory and cache.** Bounded archive memory, released consumed
+  buffers, and a persistent cache that detects same-length and middle rewrites
+  ([#122](https://github.com/minchenlee/c9watch/pull/122),
+  [#123](https://github.com/minchenlee/c9watch/pull/123)).
+- **Codex conversation content** is kept across filtering and polling
+  ([#124](https://github.com/minchenlee/c9watch/pull/124)).
+- **Rename safety across providers.** Explicit Codex and Cursor rename targets
+  are rejected. A request without a provider is rejected before writing when
+  the raw ID exists under another provider
+  ([#120](https://github.com/minchenlee/c9watch/pull/120)).
+- **OpenCode conversation loading** is single-flight and bounded, and shows an
+  explicit Retry error. Window transitions complete at once in the native app,
+  so a hidden window no longer stalls animations
+  ([#127](https://github.com/minchenlee/c9watch/pull/127)).
+
+### Improved
+- **Lower energy use.** c9watch no longer runs `claude agents --json` on every
+  poll, holds updates while a window is hidden, and animates the status bar
+  with `transform` and `opacity`. The contributor measured with `powermetrics`,
+  against an earlier commit in the same PR (not against v0.9.0): energy use
+  fell 97% with the dashboard open and 93% with it closed. The status bar no
+  longer has a per-block glow or a left-to-right ripple
+  ([#138](https://github.com/minchenlee/c9watch/pull/138)).
+- **Less work per poll.** Subagent detection and message counts are cached per
+  file and read incrementally, so old sessions are not re-parsed
+  ([#133](https://github.com/minchenlee/c9watch/pull/133)).
+- **Codex archive reads** reuse a cache, and conversation tools load on demand
+  ([#122](https://github.com/minchenlee/c9watch/pull/122)).
+- **History** reads the first prompt with a bound and scans history off the main
+  thread ([#141](https://github.com/minchenlee/c9watch/pull/141)).
+
+### Known limits
+- OpenCode is a preview. It needs a manual server connection.
+- Pi is read-only. It cannot be opened, stopped, or renamed from c9watch.
+- Cursor is monitor-only.
+- Codex shows working and idle only. It has no approval or question state.
+- Pi: one process keeps at most one transcript. If pi writes in its own project
+  and then `/resume`s into another project, the resumed card shows ended until
+  that pi exits.
+- Pi: an idle pi in another working directory, or a process whose start time
+  cannot be read, can keep a killed card alive.
+- Pi: a killed card can reappear for one poll if a node or bun process cannot be
+  read.
 
 ## [0.9.0] - 2026-08-16
 
