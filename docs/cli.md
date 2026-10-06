@@ -70,6 +70,7 @@ c9watch list --compact --pretty                 # Readable compact output
 | `latestMessage` | string | Most recent message content (omitted if empty) |
 | `pendingToolName` | string | Tool waiting for approval (omitted if none) |
 | `pendingToolInput` | object | Full input of pending tool (omitted if none) |
+| `sourceHealth` | string | Source observation health: `fresh`, `stale`, `partial`, `unavailable`, `unknown` (omitted for older backends) |
 | `customTitle` | string | User-set session name (omitted if none) |
 | `gitBranch` | string | Git branch (omitted if unknown) |
 | `summary` | string | Session summary (omitted if none) |

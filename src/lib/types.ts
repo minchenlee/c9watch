@@ -17,6 +17,7 @@ export type SessionSurface = 'claudeCode' | 'app' | 'cli' | 'exec' | 'integratio
 export type AgentKind = 'root' | 'subagent' | 'internal';
 /** Interactive vs. background-pinned (`claude agents --json`'s `kind`). Non-Claude-Code providers are always 'interactive'. */
 export type SessionKind = 'interactive' | 'background' | 'unknown';
+export type SessionSourceHealth = 'fresh' | 'stale' | 'partial' | 'unavailable' | 'unknown';
 
 export interface SessionActionCapabilities {
   open?: boolean;
@@ -75,6 +76,9 @@ export interface Session {
   /** Current status of the session */
   status: SessionStatus;
 
+  /** Health of the source observation; omitted by older backends. */
+  sourceHealth?: SessionSourceHealth;
+
   /** Content of the latest message */
   latestMessage: string;
 
@@ -110,6 +114,7 @@ export interface Session {
   agentRole?: string | null;
   internalKind?: string | null;
   /** Backend-provided action capabilities (serialized from Rust snake_case fields). */
+  openTarget?: 'terminal' | 'project' | 'application';
   canOpen?: boolean;
   canStop?: boolean;
   canRename?: boolean;

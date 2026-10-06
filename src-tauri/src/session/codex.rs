@@ -18,8 +18,8 @@ use super::source::{
 /// Rollouts do not expose a supported process-liveness API. Keep recently idle
 /// roots long enough to remain useful, but apply finite ceilings so crashed or
 /// closed sessions eventually age out.
-const IDLE_FRESHNESS_SECS: u64 = 30 * 60;
-const WORKING_FRESHNESS_SECS: u64 = 4 * 60 * 60;
+pub(crate) const IDLE_FRESHNESS_SECS: u64 = 30 * 60;
+pub(crate) const WORKING_FRESHNESS_SECS: u64 = 4 * 60 * 60;
 const LINKED_PARENT_CEILING_SECS: u64 = 24 * 60 * 60;
 // Discovery only needs to cover sessions that could survive the active-session
 // freshness filter. Older linked parents are resolved on demand through the

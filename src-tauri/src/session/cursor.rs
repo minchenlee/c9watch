@@ -17,8 +17,8 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const IDLE_FRESHNESS_SECS: u64 = 30 * 60;
-const WORKING_FRESHNESS_SECS: u64 = 4 * 60 * 60;
+pub(crate) const IDLE_FRESHNESS_SECS: u64 = 30 * 60;
+pub(crate) const WORKING_FRESHNESS_SECS: u64 = 4 * 60 * 60;
 const LINKED_PARENT_CEILING_SECS: u64 = 24 * 60 * 60;
 const MONITOR_MESSAGE_CHARS: usize = 200;
 const EXACT_PREFIX_VERIFY_LIMIT: u64 = 4 * 1024 * 1024;
@@ -124,10 +124,25 @@ struct TranscriptRef {
 }
 
 #[derive(Default)]
+/// Composer title/cwd overlay, loaded off the critical path.
+///
+/// Cursor's global `state.vscdb` can be gigabytes; a synchronous full-table
+/// scan on every poll blocks first paint for minutes. The cache serves the
+/// last good map (or an empty one on cold start) while a background thread
+/// reloads on file change, with at most a 300ms compatibility grace wait.
+struct ComposerCache {
+    stamp: Option<ComposerDbStamp>,
+    map: std::sync::Arc<HashMap<String, ComposerOverlay>>,
+    pending: Option<
+        std::sync::mpsc::Receiver<(Option<ComposerDbStamp>, HashMap<String, ComposerOverlay>)>,
+    >,
+}
+
 pub struct CursorSessionSource {
     projects_root: PathBuf,
     vscdb_path: Option<PathBuf>,
     cache: HashMap<PathBuf, CacheEntry>,
+    composer_cache: ComposerCache,
     #[cfg(test)]
     parse_count: u32,
     #[cfg(test)]
@@ -162,6 +177,7 @@ impl CursorSessionSource {
             projects_root,
             vscdb_path,
             cache: HashMap::new(),
+            composer_cache: ComposerCache::default(),
             #[cfg(test)]
             parse_count: 0,
             #[cfg(test)]
@@ -201,7 +217,7 @@ impl CursorSessionSource {
             live.push((transcript.path.clone(), summary, age));
         }
 
-        let composers = load_composer_map(self.vscdb_path.as_deref());
+        let composers = self.composer_overlays();
         for (_path, summary, _age) in &mut live {
             apply_composer_overlay(summary, composers.get(&summary.session_id));
         }
@@ -472,22 +488,25 @@ pub fn find_cursor_conversation_under(
 
 pub fn cursor_history_entries(home_dir: &Path) -> Vec<crate::session::history::HistoryEntry> {
     let projects_root = home_dir.join(".cursor").join("projects");
-    let composers = load_composer_map(default_vscdb_path(home_dir).as_deref());
+    // Cursor's state.vscdb is a global, frequently multi-gigabyte database.
+    // The overlay is only a title/cwd nicety, so never scan it on the History
+    // request's critical path. The background loader fills the cache for the
+    // next refresh; small databases still get a short compatibility grace wait.
+    let composers = cursor_history_composer_overlays(default_vscdb_path(home_dir).as_deref());
     collect_transcript_refs(&projects_root)
         .into_iter()
         .filter(|item| item.agent_kind == AgentKind::Root)
         .filter_map(|item| {
-            let mut summary = parse_transcript(&item.path, &item, true).ok()?;
-            apply_composer_overlay(&mut summary, composers.get(&item.session_id));
-            let display = summary
-                .first_prompt()
-                .unwrap_or("(No conversation yet)")
-                .to_string();
-            let cwd = if summary.cwd.as_os_str().is_empty() {
-                decode_cursor_project_key(&item.project_key)
-            } else {
-                summary.cwd
-            };
+            let display = cursor_history_first_prompt(&item.path)
+                .unwrap_or_else(|| "(No conversation yet)".to_string());
+            let mut cwd = decode_cursor_project_key(&item.project_key);
+            let mut cursor_title = None;
+            if let Some(overlay) = composers.get(&item.session_id) {
+                if let Some(overlay_cwd) = &overlay.cwd {
+                    cwd = overlay_cwd.clone();
+                }
+                cursor_title = overlay.name.clone();
+            }
             let project_name = cwd
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -507,13 +526,125 @@ pub fn cursor_history_entries(home_dir: &Path) -> Vec<crate::session::history::H
                 project_name,
                 custom_title: None,
                 codex_title: None,
-                cursor_title: summary.cursor_title,
+                cursor_title,
                 provider: "cursor".to_string(),
                 surface: Some("cursor".to_string()),
                 agent_kind: Some("root".to_string()),
             })
         })
         .collect()
+}
+
+/// Read only through the first user turn for a history row. The conversation
+/// parser also indexes every message and tool result, which is unnecessary for
+/// a row that only needs its first prompt and can dominate a large archive.
+fn cursor_history_first_prompt(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) else {
+            continue;
+        };
+        let raw = collect_text_blocks(blocks);
+        let prompt = extract_user_query(&raw);
+        if !prompt.is_empty() {
+            return Some(prompt);
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct HistoryComposerCache {
+    stamp: Option<ComposerDbStamp>,
+    map: std::sync::Arc<HashMap<String, ComposerOverlay>>,
+    pending: Option<
+        std::sync::mpsc::Receiver<(Option<ComposerDbStamp>, HashMap<String, ComposerOverlay>)>,
+    >,
+}
+
+static HISTORY_COMPOSER_CACHE: std::sync::LazyLock<std::sync::Mutex<HistoryComposerCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HistoryComposerCache::default()));
+
+fn cursor_history_composer_overlays(
+    path: Option<&Path>,
+) -> std::sync::Arc<HashMap<String, ComposerOverlay>> {
+    let mut cache = HISTORY_COMPOSER_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    history_composer_overlays(&mut cache, path)
+}
+
+fn history_composer_overlays(
+    cache: &mut HistoryComposerCache,
+    path: Option<&Path>,
+) -> std::sync::Arc<HashMap<String, ComposerOverlay>> {
+    if composer_db_missing(path) {
+        // Retire any pre-disappearance worker before accepting its result.
+        *cache = HistoryComposerCache::default();
+        return cache.map.clone();
+    }
+    if let Some(rx) = cache.pending.take() {
+        match rx.try_recv() {
+            Ok((stamp, map)) => {
+                if stamp.is_some() && stamp == composer_db_stamp(path) {
+                    cache.stamp = stamp;
+                    cache.map = std::sync::Arc::new(map);
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => cache.pending = Some(rx),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
+    }
+    let stamp = composer_db_stamp(path);
+    if stamp == cache.stamp {
+        return cache.map.clone();
+    }
+    if let Some(path) = path.filter(|path| path.is_file()) {
+        if cache.pending.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            cache.pending = Some(rx);
+            let path = path.to_path_buf();
+            std::thread::Builder::new()
+                .name("cursor-history-composer-map".into())
+                .spawn(move || {
+                    if let Ok(snapshot) = load_composer_snapshot(&path, load_composer_map) {
+                        let _ = tx.send(snapshot);
+                    }
+                })
+                .ok();
+        }
+        // Preserve synchronous behavior for ordinary small databases and
+        // tests; never make a multi-gigabyte database delay the request.
+        let small = fs::metadata(path)
+            .map(|meta| meta.len() <= 32 * 1024 * 1024)
+            .unwrap_or(false);
+        if small {
+            if let Some(rx) = cache.pending.take() {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok((loaded_stamp, map)) => {
+                        if loaded_stamp.is_some() && loaded_stamp == composer_db_stamp(Some(path)) {
+                            cache.stamp = loaded_stamp;
+                            cache.map = std::sync::Arc::new(map);
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => cache.pending = Some(rx),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                }
+            }
+        }
+    }
+    // The database may also disappear during the compatibility grace wait.
+    if composer_db_missing(path) {
+        *cache = HistoryComposerCache::default();
+    }
+    cache.map.clone()
 }
 
 pub fn list_session_ids(home_dir: &Path, prefix: &str) -> Vec<String> {
@@ -1074,14 +1205,119 @@ fn apply_composer_overlay(
     }
 }
 
-fn load_composer_map(vscdb_path: Option<&Path>) -> HashMap<String, ComposerOverlay> {
-    let Some(path) = vscdb_path else {
-        return HashMap::new();
-    };
-    if !path.is_file() {
-        return HashMap::new();
+impl CursorSessionSource {
+    /// Serve the composer overlay without a blocking full-table scan.
+    ///
+    /// Fast path: the database file is unchanged, reuse the cached map.
+    /// Slow path: a background thread reloads; meanwhile serve the previous
+    /// map (or empty on cold start). A short grace wait lets small databases
+    /// resolve synchronously so titles don't flicker for typical users.
+    fn composer_overlays(&mut self) -> std::sync::Arc<HashMap<String, ComposerOverlay>> {
+        if composer_db_missing(self.vscdb_path.as_deref()) {
+            // Drop the receiver too, so a previous worker cannot restore stale data.
+            self.composer_cache = ComposerCache::default();
+            return self.composer_cache.map.clone();
+        }
+        // Harvest a finished background reload, if any.
+        if let Some(rx) = self.composer_cache.pending.take() {
+            match rx.try_recv() {
+                Ok((stamp, map)) => {
+                    // Discard the result if the file moved on while loading.
+                    if stamp.is_some() && stamp == composer_db_stamp(self.vscdb_path.as_deref()) {
+                        self.composer_cache.stamp = stamp;
+                        self.composer_cache.map = std::sync::Arc::new(map);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.composer_cache.pending = Some(rx);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        let stamp = composer_db_stamp(self.vscdb_path.as_deref());
+        if stamp == self.composer_cache.stamp {
+            return self.composer_cache.map.clone();
+        }
+        if self.composer_cache.pending.is_none() {
+            if let Some(path) = self.vscdb_path.clone() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.composer_cache.pending = Some(rx);
+                std::thread::Builder::new()
+                    .name("cursor-composer-map".into())
+                    .spawn(move || {
+                        if let Ok(snapshot) = load_composer_snapshot(&path, load_composer_map) {
+                            let _ = tx.send(snapshot);
+                        }
+                    })
+                    .ok();
+                // Grace wait: small databases finish immediately; huge ones
+                // fall through and backfill on a later poll.
+                if let Some(rx) = self.composer_cache.pending.take() {
+                    match rx.recv_timeout(Duration::from_millis(300)) {
+                        Ok((stamp, map)) => {
+                            if stamp.is_some()
+                                && stamp == composer_db_stamp(self.vscdb_path.as_deref())
+                            {
+                                self.composer_cache.stamp = stamp;
+                                self.composer_cache.map = std::sync::Arc::new(map);
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            self.composer_cache.pending = Some(rx);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                    }
+                }
+            }
+        }
+        if composer_db_missing(self.vscdb_path.as_deref()) {
+            self.composer_cache = ComposerCache::default();
+        }
+        self.composer_cache.map.clone()
     }
-    read_composer_overlays(path).unwrap_or_default()
+}
+
+// An unavailable stamp alone is not proof of deletion: preserve the last-good
+// overlay on permission/metadata/read failures, and let the next poll retry.
+fn composer_db_missing(path: Option<&Path>) -> bool {
+    match path {
+        None => true,
+        Some(path) => {
+            matches!(fs::metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        }
+    }
+}
+
+/// Two metadata reads, independent of database size. WAL commits can leave
+/// the main database untouched; include WAL creation, writes and removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComposerDbStamp {
+    database: FileVersion,
+    wal: Option<FileVersion>,
+}
+
+fn composer_db_stamp(path: Option<&Path>) -> Option<ComposerDbStamp> {
+    let path = path?;
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    Some(ComposerDbStamp {
+        database: FileVersion::read(path).ok()?,
+        wal: FileVersion::read(Path::new(&wal_path)).ok(),
+    })
+}
+
+fn load_composer_snapshot(
+    path: &Path,
+    load: impl FnOnce(&Path) -> Result<HashMap<String, ComposerOverlay>, rusqlite::Error>,
+) -> Result<(Option<ComposerDbStamp>, HashMap<String, ComposerOverlay>), rusqlite::Error> {
+    // Stamp before reading so harvest rejects a database changed during load.
+    let stamp = composer_db_stamp(Some(path));
+    let map = load(path)?;
+    Ok((stamp, map))
+}
+
+fn load_composer_map(path: &Path) -> Result<HashMap<String, ComposerOverlay>, rusqlite::Error> {
+    read_composer_overlays(path)
 }
 
 fn read_composer_overlays(
@@ -1092,7 +1328,7 @@ fn read_composer_overlays(
         &uri,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
-    let _ = conn.busy_timeout(Duration::from_millis(50));
+    conn.busy_timeout(Duration::from_millis(50))?;
     let mut stmt =
         conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")?;
     let rows = stmt.query_map([], |row| {
@@ -1101,7 +1337,8 @@ fn read_composer_overlays(
         Ok((key, value))
     })?;
     let mut map = HashMap::new();
-    for row in rows.flatten() {
+    for row in rows {
+        let row = row?;
         let Some(id) = row.0.strip_prefix("composerData:") else {
             continue;
         };
@@ -1163,7 +1400,7 @@ fn parse_composer_overlay(raw: &str) -> Option<ComposerOverlay> {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const PARENT: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const CHILD_RUNNING: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -1204,6 +1441,412 @@ mod tests {
             .join(PARENT);
         fs::create_dir_all(transcripts.join("subagents")).unwrap();
         transcripts
+    }
+
+    // Background caches are allowed to return the previous map during the
+    // grace wait. Test eventual data rather than scheduler speed under --lib.
+    fn wait_for_composer_map(
+        mut load: impl FnMut() -> std::sync::Arc<HashMap<String, ComposerOverlay>>,
+        ready: impl Fn(&HashMap<String, ComposerOverlay>) -> bool,
+    ) -> std::sync::Arc<HashMap<String, ComposerOverlay>> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let map = load();
+            if ready(&map) {
+                return map;
+            }
+            assert!(Instant::now() < deadline, "composer map did not recover");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_composer_title(
+        load: impl FnMut() -> std::sync::Arc<HashMap<String, ComposerOverlay>>,
+        expected: &str,
+    ) {
+        wait_for_composer_map(load, |map| {
+            map.get("test").and_then(|overlay| overlay.name.as_deref()) == Some(expected)
+        });
+    }
+
+    fn composer_test_db(path: &Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO cursorDiskKV VALUES ('composerData:test', '{"name":"before"}')"#,
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn composer_stamp_detects_wal_only_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.vscdb");
+        let conn = composer_test_db(&path);
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        let mut source =
+            CursorSessionSource::at_root_with_vscdb(temp.path().to_path_buf(), path.clone());
+        let mut history = HistoryComposerCache::default();
+        wait_for_composer_title(|| source.composer_overlays(), "before");
+        wait_for_composer_title(
+            || history_composer_overlays(&mut history, Some(&path)),
+            "before",
+        );
+        let main_before = FileVersion::read(&path).unwrap();
+        let before = composer_db_stamp(Some(&path));
+        conn.execute("UPDATE cursorDiskKV SET value = '{\"name\":\"after\"}'", [])
+            .unwrap();
+        assert_eq!(FileVersion::read(&path).unwrap(), main_before);
+        assert_ne!(composer_db_stamp(Some(&path)), before);
+        wait_for_composer_title(|| source.composer_overlays(), "after");
+        wait_for_composer_title(
+            || history_composer_overlays(&mut history, Some(&path)),
+            "after",
+        );
+    }
+
+    #[test]
+    fn live_composer_cache_retries_busy_read_without_database_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.vscdb");
+        let conn = composer_test_db(&path);
+        let mut source =
+            CursorSessionSource::at_root_with_vscdb(temp.path().to_path_buf(), path.clone());
+        conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let locked_stamp = composer_db_stamp(Some(&path));
+        assert!(source.composer_overlays().is_empty());
+        assert!(source.composer_cache.stamp.is_none());
+        conn.execute_batch("ROLLBACK;").unwrap();
+        assert_eq!(composer_db_stamp(Some(&path)), locked_stamp);
+        wait_for_composer_title(|| source.composer_overlays(), "before");
+        assert_eq!(source.composer_cache.stamp, locked_stamp);
+    }
+
+    #[test]
+    fn composer_snapshot_uses_version_before_read_and_discards_interleaved_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.vscdb");
+        let conn = composer_test_db(&path);
+        let before = composer_db_stamp(Some(&path));
+        let snapshot = load_composer_snapshot(&path, |path| {
+            let map = load_composer_map(path)?;
+            conn.execute("UPDATE cursorDiskKV SET value = '{\"name\":\"after\"}'", [])
+                .unwrap();
+            Ok(map)
+        })
+        .unwrap();
+        assert_eq!(snapshot.0, before);
+        assert_ne!(snapshot.0, composer_db_stamp(Some(&path)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(snapshot.clone()).unwrap();
+        let mut source =
+            CursorSessionSource::at_root_with_vscdb(temp.path().to_path_buf(), path.clone());
+        source.composer_cache.pending = Some(rx);
+        wait_for_composer_title(|| source.composer_overlays(), "after");
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(snapshot).unwrap();
+        let mut cache = HistoryComposerCache {
+            pending: Some(rx),
+            ..Default::default()
+        };
+        wait_for_composer_title(
+            || history_composer_overlays(&mut cache, Some(&path)),
+            "after",
+        );
+    }
+
+    #[test]
+    fn history_composer_cache_retries_busy_read_without_database_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.vscdb");
+        let conn = composer_test_db(&path);
+        let mut cache = HistoryComposerCache::default();
+        conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let locked_stamp = composer_db_stamp(Some(&path));
+        assert!(history_composer_overlays(&mut cache, Some(&path)).is_empty());
+        // Harvest the failed worker while the lock is still held.
+        for _ in 0..20 {
+            history_composer_overlays(&mut cache, Some(&path));
+            if cache.stamp.is_some() || cache.pending.is_none() {
+                break;
+            }
+        }
+        assert!(cache.pending.is_none());
+        assert!(cache.stamp.is_none());
+        conn.execute_batch("ROLLBACK;").unwrap();
+        assert_eq!(composer_db_stamp(Some(&path)), locked_stamp);
+        wait_for_composer_title(
+            || history_composer_overlays(&mut cache, Some(&path)),
+            "before",
+        );
+        assert_eq!(cache.stamp, locked_stamp);
+    }
+
+    #[test]
+    fn composer_caches_preserve_last_good_map_on_failure_and_cache_genuine_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.vscdb");
+        let conn = composer_test_db(&path);
+        let mut source =
+            CursorSessionSource::at_root_with_vscdb(temp.path().to_path_buf(), path.clone());
+        let mut history = HistoryComposerCache::default();
+        wait_for_composer_title(|| source.composer_overlays(), "before");
+        wait_for_composer_title(
+            || history_composer_overlays(&mut history, Some(&path)),
+            "before",
+        );
+        let good_stamp = source.composer_cache.stamp;
+        conn.execute("DELETE FROM cursorDiskKV", []).unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        assert_eq!(
+            source.composer_overlays()["test"].name.as_deref(),
+            Some("before")
+        );
+        assert_eq!(
+            history_composer_overlays(&mut history, Some(&path))["test"]
+                .name
+                .as_deref(),
+            Some("before")
+        );
+        assert_eq!(source.composer_cache.stamp, good_stamp);
+        assert_eq!(history.stamp, good_stamp);
+        conn.execute_batch("ROLLBACK;").unwrap();
+        assert!(
+            wait_for_composer_map(|| source.composer_overlays(), |map| map.is_empty()).is_empty()
+        );
+        assert!(wait_for_composer_map(
+            || history_composer_overlays(&mut history, Some(&path)),
+            |map| map.is_empty()
+        )
+        .is_empty());
+        assert_eq!(source.composer_cache.stamp, composer_db_stamp(Some(&path)));
+        assert_eq!(history.stamp, composer_db_stamp(Some(&path)));
+        assert!(source.composer_cache.pending.is_none());
+        assert!(history.pending.is_none());
+    }
+
+    #[test]
+    fn live_composer_cache_clears_missing_db_and_reverts_overlay_working() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.vscdb");
+        let conn = composer_test_db(&path);
+        conn.execute(
+            "UPDATE cursorDiskKV SET key = ?1, value = ?2",
+            rusqlite::params![
+                format!("composerData:{PARENT}"),
+                r#"{"name":"stale title","workspaceIdentifier":{"uri":{"fsPath":"/stale/cwd"}},"generatingBubbleIds":["pending"]}"#
+            ],
+        ).unwrap();
+        drop(conn);
+        let transcripts = layout(temp.path(), "demo-project");
+        write_jsonl(
+            &transcripts.join(format!("{PARENT}.jsonl")),
+            &[
+                &user_line("finished"),
+                r#"{"type":"turn_ended","status":"success"}"#,
+            ],
+        );
+        let mut source =
+            CursorSessionSource::at_root_with_vscdb(temp.path().to_path_buf(), path.clone());
+        wait_for_composer_map(
+            || source.composer_overlays(),
+            |map| map.contains_key(PARENT),
+        );
+        let (warm, _) = source.detect().unwrap();
+        assert_eq!(warm.len(), 1);
+        assert_eq!(warm[0].cwd, PathBuf::from("/stale/cwd"));
+        assert_eq!(
+            warm[0]
+                .cursor_summary
+                .as_ref()
+                .unwrap()
+                .cursor_title
+                .as_deref(),
+            Some("stale title")
+        );
+        assert_eq!(
+            warm[0].cursor_summary.as_ref().unwrap().lifecycle,
+            CursorLifecycle::Working
+        );
+
+        let transcript_cwd = source.cache[&transcripts.join(format!("{PARENT}.jsonl"))]
+            .summary
+            .cwd
+            .clone();
+        fs::remove_file(&path).unwrap();
+        for _ in 0..2 {
+            let (sessions, _) = source.detect().unwrap();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].cwd, transcript_cwd);
+            let summary = sessions[0].cursor_summary.as_ref().unwrap();
+            assert_eq!(summary.cursor_title, None);
+            assert_eq!(summary.agent_nickname, None);
+            assert_eq!(summary.lifecycle, CursorLifecycle::Idle);
+            assert!(source.composer_cache.map.is_empty());
+            assert!(source.composer_cache.stamp.is_none());
+            assert!(source.composer_cache.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn history_composer_cache_clears_missing_db_title_and_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.vscdb");
+        let conn = composer_test_db(&path);
+        conn.execute(
+            "UPDATE cursorDiskKV SET value = ?1",
+            [r#"{"name":"stale title","workspaceIdentifier":{"uri":{"fsPath":"/stale/cwd"}}}"#],
+        )
+        .unwrap();
+        drop(conn);
+        let mut cache = HistoryComposerCache::default();
+        let warm = wait_for_composer_map(
+            || history_composer_overlays(&mut cache, Some(&path)),
+            |map| map.contains_key("test"),
+        );
+        assert_eq!(warm["test"].name.as_deref(), Some("stale title"));
+        assert_eq!(warm["test"].cwd, Some(PathBuf::from("/stale/cwd")));
+
+        fs::remove_file(&path).unwrap();
+        for _ in 0..2 {
+            assert!(history_composer_overlays(&mut cache, Some(&path)).is_empty());
+            assert!(cache.stamp.is_none());
+            assert!(cache.pending.is_none());
+        }
+        // Reappearance must load the new database, not hit a None == None cache.
+        let conn = composer_test_db(&path);
+        conn.execute(
+            "UPDATE cursorDiskKV SET value = '{\"name\":\"returned\"}'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        wait_for_composer_title(
+            || history_composer_overlays(&mut cache, Some(&path)),
+            "returned",
+        );
+    }
+
+    #[test]
+    fn composer_caches_retire_pending_results_across_db_disappearance() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.vscdb");
+        let conn = composer_test_db(&path);
+        drop(conn);
+        let mut source =
+            CursorSessionSource::at_root_with_vscdb(temp.path().to_path_buf(), path.clone());
+        let mut history = HistoryComposerCache::default();
+        wait_for_composer_title(|| source.composer_overlays(), "before");
+        wait_for_composer_title(
+            || history_composer_overlays(&mut history, Some(&path)),
+            "before",
+        );
+        let snapshot = (
+            source.composer_cache.stamp,
+            (*source.composer_cache.map).clone(),
+        );
+        let (live_tx, live_rx) = std::sync::mpsc::channel();
+        let (history_tx, history_rx) = std::sync::mpsc::channel();
+        source.composer_cache.pending = Some(live_rx);
+        history.pending = Some(history_rx);
+
+        fs::remove_file(&path).unwrap();
+        assert!(source.composer_overlays().is_empty());
+        assert!(history_composer_overlays(&mut history, Some(&path)).is_empty());
+        assert!(source.composer_cache.pending.is_none());
+        assert!(history.pending.is_none());
+        // A delayed worker from the old generation no longer has a receiver.
+        assert!(live_tx.send(snapshot.clone()).is_err());
+        assert!(history_tx.send(snapshot).is_err());
+        let conn = composer_test_db(&path);
+        conn.execute(
+            "UPDATE cursorDiskKV SET value = '{\"name\":\"returned\"}'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        wait_for_composer_title(|| source.composer_overlays(), "returned");
+        wait_for_composer_title(
+            || history_composer_overlays(&mut history, Some(&path)),
+            "returned",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn composer_caches_preserve_last_good_map_on_non_missing_metadata_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        fs::create_dir(&storage).unwrap();
+        let path = storage.join("state.vscdb");
+        let conn = composer_test_db(&path);
+        drop(conn);
+        let mut source =
+            CursorSessionSource::at_root_with_vscdb(temp.path().to_path_buf(), path.clone());
+        let mut history = HistoryComposerCache::default();
+        wait_for_composer_title(|| source.composer_overlays(), "before");
+        wait_for_composer_title(
+            || history_composer_overlays(&mut history, Some(&path)),
+            "before",
+        );
+        let good_stamp = source.composer_cache.stamp;
+        let saved = temp.path().join("saved-storage");
+        fs::rename(&storage, &saved).unwrap();
+        fs::write(&storage, b"not a directory").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        // An unstamped result cannot displace the last-good map merely because
+        // both its stamp and the failed metadata read return None.
+        let mut unstamped = HashMap::new();
+        unstamped.insert(
+            "test".to_string(),
+            ComposerOverlay {
+                name: Some("unstamped".to_string()),
+                ..Default::default()
+            },
+        );
+        let (live_tx, live_rx) = std::sync::mpsc::channel();
+        let (history_tx, history_rx) = std::sync::mpsc::channel();
+        live_tx.send((None, unstamped.clone())).unwrap();
+        history_tx.send((None, unstamped)).unwrap();
+        source.composer_cache.pending = Some(live_rx);
+        history.pending = Some(history_rx);
+        assert_eq!(
+            source.composer_overlays()["test"].name.as_deref(),
+            Some("before")
+        );
+        assert_eq!(
+            history_composer_overlays(&mut history, Some(&path))["test"]
+                .name
+                .as_deref(),
+            Some("before")
+        );
+        assert_eq!(source.composer_cache.stamp, good_stamp);
+        assert_eq!(history.stamp, good_stamp);
+
+        fs::remove_file(&storage).unwrap();
+        fs::rename(&saved, &storage).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE cursorDiskKV SET value = '{\"name\":\"returned\"}'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        wait_for_composer_title(|| source.composer_overlays(), "returned");
+        wait_for_composer_title(
+            || history_composer_overlays(&mut history, Some(&path)),
+            "returned",
+        );
     }
 
     #[test]

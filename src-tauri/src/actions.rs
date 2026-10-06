@@ -1,9 +1,40 @@
 use std::process::Command;
 
-/// Open a session by focusing its terminal or IDE window
-///
-/// This finds the parent application of the Claude process and activates it.
-/// Works with Terminal, iTerm2, Zed, VS Code, Cursor, and other applications.
+/// The strongest native target supported by the existing focus mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OpenTarget {
+    Terminal,
+    Project,
+    Application,
+}
+
+fn open_target_for_app(app: &str, exact_tty: bool, project_opener: bool) -> OpenTarget {
+    if exact_tty && matches!(app, "Terminal" | "iTerm" | "iTerm2") {
+        OpenTarget::Terminal
+    } else if project_opener {
+        OpenTarget::Project
+    } else {
+        OpenTarget::Application
+    }
+}
+
+pub fn session_open_target(pid: u32, can_open: bool) -> Option<OpenTarget> {
+    if !can_open || pid == 0 {
+        return None;
+    }
+    let app = find_parent_app(pid).ok()?;
+    #[cfg(target_os = "macos")]
+    let exact_tty = matches!(app.as_str(), "Terminal" | "iTerm" | "iTerm2")
+        && get_session_tty(pid).is_some();
+    #[cfg(not(target_os = "macos"))]
+    let exact_tty = false;
+    let project_opener = is_jetbrains_ide(&app) || get_app_cli(&app).is_some();
+    Some(open_target_for_app(&app, exact_tty, project_opener))
+}
+
+/// Open the native target: exact tty for Terminal/iTerm2, project for IDE
+/// openers, application otherwise. A project open never selects an IDE terminal.
 pub fn open_session(pid: u32, project_path: String) -> Result<(), String> {
     if pid == 0 {
         return Err("This session does not expose a focusable terminal process".to_string());
@@ -80,6 +111,7 @@ pub fn open_session(pid: u32, project_path: String) -> Result<(), String> {
                 crate::debug_log::log_error(&format!("[open_session] Failed to run CLI: {}", e));
             }
         }
+        return Err("Could not open the session's project".to_string());
     }
 
     // Platform-specific fallback to activate the app
@@ -246,12 +278,7 @@ fn focus_iterm2_session(pid: u32) -> Result<(), String> {
     ));
 
     let Some(tty) = tty else {
-        // No tty found — just activate iTerm2
-        let _ = Command::new("osascript")
-            .arg("-e")
-            .arg(r#"tell application "iTerm2" to activate"#)
-            .output();
-        return Ok(());
+        return Err("The session's exact iTerm2 tty is unavailable".to_string());
     };
 
     // AppleScript: iterate all iTerm2 sessions, match by tty, focus it
@@ -289,6 +316,9 @@ fn focus_iterm2_session(pid: u32) -> Result<(), String> {
         result
     ));
 
+    if !output.status.success() || result != "found" {
+        return Err("The session's exact iTerm2 tab was not found".to_string());
+    }
     Ok(())
 }
 
@@ -314,8 +344,7 @@ fn focus_terminal_session(pid: u32) -> Result<(), String> {
     ));
 
     let Some(tty) = tty else {
-        // No tty found — fall back to app activation
-        return activate_app_fallback("Terminal");
+        return Err("The session's exact Terminal tty is unavailable".to_string());
     };
 
     // AppleScript: find the tab by tty, select it, raise its window by id,
@@ -359,9 +388,8 @@ fn focus_terminal_session(pid: u32) -> Result<(), String> {
         result
     ));
 
-    if result != "found" {
-        // Tab no longer exists (or tty changed) — fall back to app activation
-        return activate_app_fallback("Terminal");
+    if !output.status.success() || result != "found" {
+        return Err("The session's exact Terminal tab was not found".to_string());
     }
 
     Ok(())
@@ -1109,6 +1137,20 @@ pub fn stop_session(pid: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_return_guarantee_matches_the_surface() {
+        for app in ["Visual Studio Code", "Cursor", "Windsurf", "Zed"] {
+            assert_eq!(open_target_for_app(app, true, true), OpenTarget::Project);
+        }
+        for app in ["Terminal", "iTerm", "iTerm2"] {
+            assert_eq!(open_target_for_app(app, true, false), OpenTarget::Terminal);
+            assert_eq!(open_target_for_app(app, false, false), OpenTarget::Application);
+        }
+        assert_eq!(open_target_for_app("supacode", false, false), OpenTarget::Application);
+        assert_eq!(session_open_target(0, true), None);
+        assert_eq!(session_open_target(123, false), None);
+    }
 
     #[test]
     fn test_stop_session_invalid_pid() {

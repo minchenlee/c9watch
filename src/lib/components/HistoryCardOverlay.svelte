@@ -38,6 +38,9 @@
 	let showThinking = $state(true);
 	let navSheetOpen = $state(false);
 	let copied = $state(false);
+	// The navigation map indexes every milestone in a transcript. Keep the
+	// message viewport responsive while that secondary sidebar is prepared.
+	let navMapReady = $state(false);
 
 	const sw = createSlidingWindow();
 
@@ -109,13 +112,19 @@
 	});
 
 	onMount(() => {
+		const navMapFrame = requestAnimationFrame(() => {
+			navMapReady = true;
+		});
 		const handleKeydown = (e: KeyboardEvent) => {
 			if (e.key === 'Escape') {
 				handleClose();
 			}
 		};
 		window.addEventListener('keydown', handleKeydown);
-		return () => window.removeEventListener('keydown', handleKeydown);
+		return () => {
+			cancelAnimationFrame(navMapFrame);
+			window.removeEventListener('keydown', handleKeydown);
+		};
 	});
 
 	function handleScroll() {
@@ -351,7 +360,9 @@
 
 		<!-- Desktop: sidebar nav -->
 		<div class="nav-map-side nav-desktop" in:scale={{ start: 0.95, duration: 300, easing: quintOut }}>
-			<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking {onExpandToIndex} embedded />
+			{#if navMapReady}
+				<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking {onExpandToIndex} embedded />
+			{/if}
 		</div>
 
 		<!-- Mobile: bottom sheet nav -->
@@ -364,7 +375,9 @@
 			<div class="nav-sheet-handle">
 				<div class="handle-bar"></div>
 			</div>
-			<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking {onExpandToIndex} />
+			{#if navMapReady}
+				<MessageNavMap {conversation} scrollContainer={messagesContainer} bind:showTools bind:showThinking {onExpandToIndex} />
+			{/if}
 		</div>
 	</div>
 </div>

@@ -297,7 +297,10 @@ pub fn run(cli: Cli) {
     crate::debug_log::set_quiet(true);
 
     let result = match cli.command {
-        Commands::UsageBridge { install, passthrough } => crate::claude_usage::run(install, passthrough),
+        Commands::UsageBridge {
+            install,
+            passthrough,
+        } => crate::claude_usage::run(install, passthrough),
         Commands::Hooks { install, uninstall } => crate::claude_hooks::run(install, uninstall),
         Commands::List {
             project,
@@ -1424,6 +1427,9 @@ fn insert_session_contract(json: &mut serde_json::Value, session: &session::enri
         "canRename".to_string(),
         serde_json::json!(session.can_rename),
     );
+    if let Some(health) = &session.source_health {
+        object.insert("sourceHealth".to_string(), serde_json::json!(health));
+    }
     for (key, value) in [
         ("parentThreadId", session.parent_thread_id.as_ref()),
         ("rootSessionId", session.root_session_id.as_ref()),
@@ -1807,7 +1813,8 @@ fn resolve_session_reference_lightweight_under(
 
     if provider_filter.is_none() || provider_filter == Some(session::SessionProvider::Opencode) {
         matches.extend(
-            session::opencode::detect_once().into_iter()
+            session::opencode::detect_once()
+                .into_iter()
                 .filter_map(|s| s.identity())
                 .filter(|s| s.session_id.starts_with(prefix)),
         );
@@ -1882,11 +1889,17 @@ mod session_formatter_tests {
         let home = tempfile::tempdir().unwrap();
         let id = "ses_f835ea1f8ffelnS2uzHgkM9qUq";
         let result = super::resolve_session_reference_lightweight_under(
-            &format!("opencode:{id}"), home.path()).unwrap();
+            &format!("opencode:{id}"),
+            home.path(),
+        )
+        .unwrap();
         assert_eq!(result, (id.to_string(), Some(SessionProvider::Opencode)));
         let scoped = format!("{id}?directory=%2Farchive%2F%E4%B8%AD%E6%96%87");
         let result = super::resolve_session_reference_lightweight_under(
-            &format!("opencode:{scoped}"), home.path()).unwrap();
+            &format!("opencode:{scoped}"),
+            home.path(),
+        )
+        .unwrap();
         assert_eq!(result, (scoped, Some(SessionProvider::Opencode)));
     }
 
@@ -1906,6 +1919,7 @@ mod session_formatter_tests {
             message_count: 3,
             modified: "2026-07-13T00:00:00Z".to_string(),
             status: SessionStatus::Working,
+            source_health: None,
             notification_preview: None,
             latest_message: String::new(),
             pending_tool_name: None,
@@ -1924,6 +1938,7 @@ mod session_formatter_tests {
             agent_nickname: Some("Scout".to_string()),
             agent_role: Some("investigator".to_string()),
             internal_kind: Some("spawned".to_string()),
+            open_target: None,
             can_open: false,
             can_stop: false,
             can_rename: false,

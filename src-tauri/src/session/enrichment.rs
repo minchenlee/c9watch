@@ -10,8 +10,8 @@ use crate::session::owners::global_provider_source_owners;
 use crate::session::permissions::PermissionChecker;
 use crate::session::pi::PiLifecycle;
 use crate::session::source::{
-    AgentKind, CliActivity, DetectedSession, DetectionDiagnostics, SessionIdentity, SessionKind,
-    SessionProvider, SessionSource, SessionSurface,
+    health_from_last_timestamp, AgentKind, CliActivity, DetectedSession, DetectionDiagnostics,
+    SessionIdentity, SessionKind, SessionProvider, SessionSource, SessionSurface, SourceHealth,
 };
 use crate::session::status::{
     determine_status_with, get_pending_tool_input_with, get_pending_tool_name_with,
@@ -19,7 +19,7 @@ use crate::session::status::{
 use crate::session::{parse_last_n_entries, parse_sessions_index, SessionEntry, SessionStatus};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -49,6 +49,9 @@ pub struct Session {
     pub message_count: u32,
     pub modified: String,
     pub status: SessionStatus,
+    /// Health of the source observation, independent of the session status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_health: Option<SourceHealth>,
     pub latest_message: String,
     /// Assistant text only, bounded during enrichment for native notification previews.
     #[serde(skip)]
@@ -92,6 +95,9 @@ pub struct Session {
     pub agent_role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub internal_kind: Option<String>,
+    /// Native target guarantee; absent means no verified exact native target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_target: Option<crate::actions::OpenTarget>,
     pub can_open: bool,
     pub can_stop: bool,
     pub can_rename: bool,
@@ -287,7 +293,6 @@ pub fn enrich_detected_sessions(
     let custom_names = crate::session::CustomNames::load();
     let custom_titles = crate::session::CustomTitles::load();
     let mut sessions = Vec::new();
-    let mut seen_ids: HashSet<SessionIdentity> = HashSet::new();
 
     for detected in detected_sessions {
         // Get session ID - if not found, skip this session
@@ -298,12 +303,6 @@ pub fn enrich_detected_sessions(
             }
         };
         let session_id = identity.session_id.clone();
-
-        // Skip duplicate provider-scoped identities (the same session can
-        // appear in multiple project dirs without collapsing other providers).
-        if !seen_ids.insert(identity) {
-            continue;
-        }
 
         if let Some(summary) = detected.codex_summary.as_ref() {
             let first_prompt = summary
@@ -356,6 +355,14 @@ pub fn enrich_detected_sessions(
                 } else {
                     SessionStatus::WaitingForInput
                 },
+                source_health: Some(health_from_last_timestamp(
+                    &summary.last_timestamp,
+                    if summary.lifecycle == CodexLifecycle::Working {
+                        crate::session::codex::WORKING_FRESHNESS_SECS
+                    } else {
+                        crate::session::codex::IDLE_FRESHNESS_SECS
+                    },
+                )),
                 latest_message,
                 notification_preview,
                 pending_tool_name: None,
@@ -374,6 +381,7 @@ pub fn enrich_detected_sessions(
                 agent_nickname: detected.agent_nickname.clone(),
                 agent_role: detected.agent_role.clone(),
                 internal_kind: detected.internal_kind.clone(),
+                open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
                 can_open: detected.can_open,
                 can_stop: detected.can_stop,
                 can_rename: detected.can_rename,
@@ -437,6 +445,14 @@ pub fn enrich_detected_sessions(
                 message_count: summary.messages.len() as u32,
                 modified,
                 status,
+                source_health: Some(health_from_last_timestamp(
+                    &summary.last_timestamp,
+                    if summary.lifecycle == CursorLifecycle::Working {
+                        crate::session::cursor::WORKING_FRESHNESS_SECS
+                    } else {
+                        crate::session::cursor::IDLE_FRESHNESS_SECS
+                    },
+                )),
                 latest_message,
                 notification_preview,
                 pending_tool_name: None,
@@ -455,6 +471,7 @@ pub fn enrich_detected_sessions(
                 agent_nickname: detected.agent_nickname.clone(),
                 agent_role: detected.agent_role.clone(),
                 internal_kind: detected.internal_kind.clone(),
+                open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
                 can_open: detected.can_open,
                 can_stop: detected.can_stop,
                 can_rename: detected.can_rename,
@@ -483,6 +500,13 @@ pub fn enrich_detected_sessions(
                 message_count: 0,
                 modified,
                 status,
+                // The OpenCode preview is HTTP-polled, not transcript-backed; treat
+                // the snapshot as fresh when it carries a timestamp, partial when not.
+                // The window matches the detector's snapshot freshness bound.
+                source_health: Some(health_from_last_timestamp(
+                    &summary.modified,
+                    (crate::session::opencode::IDLE_FRESHNESS_MS / 1000) as u64,
+                )),
                 latest_message,
                 notification_preview: None,
                 pending_tool_name: None,
@@ -501,6 +525,7 @@ pub fn enrich_detected_sessions(
                 agent_nickname: detected.agent_nickname.clone(),
                 agent_role: detected.agent_role.clone(),
                 internal_kind: detected.internal_kind.clone(),
+                open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
                 can_open: detected.can_open,
                 can_stop: detected.can_stop,
                 can_rename: detected.can_rename,
@@ -557,6 +582,14 @@ pub fn enrich_detected_sessions(
                 message_count: summary.message_count as u32,
                 modified,
                 status,
+                source_health: Some(health_from_last_timestamp(
+                    &summary.last_timestamp,
+                    if summary.lifecycle == PiLifecycle::Working {
+                        crate::session::pi::PI_FRESHNESS_WORKING_SECS
+                    } else {
+                        crate::session::pi::PI_FRESHNESS_IDLE_SECS
+                    },
+                )),
                 latest_message,
                 notification_preview,
                 pending_tool_name: summary.pending_tool_name.clone(),
@@ -575,6 +608,7 @@ pub fn enrich_detected_sessions(
                 agent_nickname: detected.agent_nickname.clone(),
                 agent_role: detected.agent_role.clone(),
                 internal_kind: detected.internal_kind.clone(),
+                open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
                 can_open: detected.can_open,
                 can_stop: detected.can_stop,
                 can_rename: detected.can_rename,
@@ -724,6 +758,19 @@ pub fn enrich_detected_sessions(
         // interactive sessions never write to ~/.claude/projects/). Render a
         // placeholder card so the dashboard count matches `claude agents --json`.
         let cli_sourced = detected.started_at_ms.is_some();
+        let source_health = if !session_file_path.is_file() {
+            if cli_sourced {
+                SourceHealth::Partial
+            } else {
+                SourceHealth::Unavailable
+            }
+        } else if entries.is_empty() {
+            SourceHealth::Partial
+        } else if is_file_recently_modified(&session_file_path, 24 * 60 * 60) {
+            SourceHealth::Fresh
+        } else {
+            SourceHealth::Stale
+        };
         if message_count == 0 && !cli_sourced {
             continue;
         }
@@ -753,6 +800,7 @@ pub fn enrich_detected_sessions(
             message_count,
             modified,
             status,
+            source_health: Some(source_health),
             latest_message,
             notification_preview,
             pending_tool_name,
@@ -771,13 +819,63 @@ pub fn enrich_detected_sessions(
             agent_nickname: detected.agent_nickname.clone(),
             agent_role: detected.agent_role.clone(),
             internal_kind: detected.internal_kind.clone(),
+            open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
             can_open: detected.can_open,
             can_stop: detected.can_stop,
             can_rename: detected.can_rename,
         });
     }
 
-    Ok((sessions, diagnostics))
+    Ok((dedup_newest_wins(sessions), diagnostics))
+}
+
+/// Collapse duplicate provider-scoped identities, newest observation wins.
+///
+/// The same session can appear in multiple project dirs (or be re-observed
+/// after reconnect/reuse). Timestamps compare as instants, so differing
+/// RFC3339 offsets order correctly. An unparseable timestamp always loses to
+/// a parseable one; when neither parses (or the instants tie), the first
+/// observation is kept for determinism. Cross-provider identities never
+/// collide because the key is namespaced by provider.
+/// Parse an RFC3339 `modified` stamp as an instant. Timezone offsets are
+/// normalized, so `00:30:00+02:00` correctly compares earlier than
+/// `23:00:00Z` — something a lexicographic string compare gets wrong.
+fn modified_instant(modified: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(modified)
+        .ok()
+        .map(|ts| ts.with_timezone(&chrono::Utc))
+}
+
+fn dedup_newest_wins(sessions: Vec<Session>) -> Vec<Session> {
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<Session> = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        match index.get(&session.session_key) {
+            Some(&i) => {
+                let keep_existing = match (
+                    modified_instant(&out[i].modified),
+                    modified_instant(&session.modified),
+                ) {
+                    // Both parse: newest instant wins; exact ties keep the
+                    // first observation for determinism.
+                    (Some(existing), Some(incoming)) => existing >= incoming,
+                    // Unparseable stamps always lose to a real timestamp.
+                    (None, Some(_)) => false,
+                    (Some(_), None) => true,
+                    // Neither parses: keep the first observation.
+                    (None, None) => true,
+                };
+                if !keep_existing {
+                    out[i] = session;
+                }
+            }
+            None => {
+                index.insert(session.session_key.clone(), out.len());
+                out.push(session);
+            }
+        }
+    }
+    out
 }
 
 /// A hook prompt remains evidence unless the exact correlated call has a result.
@@ -1396,14 +1494,15 @@ mod placeholder_tests {
             s.modified
         );
         assert_eq!(s.started_at_ms, Some(1_700_000_000_000));
+        assert_eq!(s.source_health, Some(SourceHealth::Partial));
 
         // A JSONL that simply hasn't been flushed yet is an expected state for a
         // freshly-detected CLI session, not an error — it shouldn't spam the log
         // on every ~3.5s poll for as long as the session is running.
         assert!(
-            !crate::debug_log::get_logs()
-                .iter()
-                .any(|entry| entry.message.contains("11111111-2222-3333-4444-555555555555")),
+            !crate::debug_log::get_logs().iter().any(|entry| entry
+                .message
+                .contains("11111111-2222-3333-4444-555555555555")),
             "missing JSONL must not log a warning"
         );
     }
@@ -1482,6 +1581,175 @@ mod placeholder_tests {
         assert_eq!(sessions[1].session_key, "cursor:same-provider-id");
         assert_eq!(sessions[2].session_key, "pi:same-provider-id");
         assert_eq!(sessions[2].provider, SessionProvider::Pi);
+        assert_eq!(sessions[0].source_health, Some(SourceHealth::Partial));
+        assert_eq!(sessions[1].source_health, Some(SourceHealth::Partial));
+        assert_eq!(sessions[2].source_health, Some(SourceHealth::Partial));
+    }
+
+    fn codex_detected(dir: &std::path::Path, last_timestamp: &str) -> DetectedSession {
+        let mut detected = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/codex-dedup"),
+            dir.join("codex"),
+            Some("dup-thread".to_string()),
+            "codex".to_string(),
+        );
+        detected.provider = SessionProvider::Codex;
+        detected.surface = SessionSurface::App;
+        let mut summary = crate::session::codex::CodexRolloutSummary::default();
+        summary.thread_id = "dup-thread".to_string();
+        summary.last_timestamp = last_timestamp.to_string();
+        detected.codex_summary = Some(summary);
+        detected
+    }
+
+    #[test]
+    fn duplicate_observation_keeps_newest_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_ts = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        let new_ts = chrono::Utc::now().to_rfc3339();
+
+        // Stale observation first, fresh re-observation second.
+        let (sessions, _) = enrich_detected_sessions(
+            vec![
+                codex_detected(tmp.path(), &old_ts),
+                codex_detected(tmp.path(), &new_ts),
+            ],
+            DetectionDiagnostics::default(),
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_key, "codex:dup-thread");
+        assert_eq!(sessions[0].modified, new_ts);
+
+        // Order must not matter: fresh first, stale reconnect second.
+        let (sessions, _) = enrich_detected_sessions(
+            vec![
+                codex_detected(tmp.path(), &new_ts),
+                codex_detected(tmp.path(), &old_ts),
+            ],
+            DetectionDiagnostics::default(),
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].modified, new_ts);
+    }
+
+    #[test]
+    fn duplicate_observation_handles_offsets_and_malformed_timestamps() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Different instants in different offsets: 00:30Z beats 00:00Z either
+        // way round. (A lexicographic compare would also pass this; the
+        // equivalent-instant case below is what pins offset normalization.)
+        let earlier_z = "2026-07-13T00:00:00Z";
+        let later_offset = "2026-07-13T02:30:00+02:00";
+        for (first, second, winner) in [
+            (earlier_z, later_offset, later_offset),
+            (later_offset, earlier_z, later_offset),
+        ] {
+            let (sessions, _) = enrich_detected_sessions(
+                vec![
+                    codex_detected(tmp.path(), first),
+                    codex_detected(tmp.path(), second),
+                ],
+                DetectionDiagnostics::default(),
+            )
+            .unwrap();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].modified, winner);
+        }
+        // Same instant, different offsets: exact tie keeps the first
+        // observation in both orders. Only an instant comparison gets this
+        // right — lexicographically the strings differ.
+        let same_z = "2026-07-13T00:00:00Z";
+        let same_offset = "2026-07-13T02:00:00+02:00";
+        for (first, second) in [(same_z, same_offset), (same_offset, same_z)] {
+            let (sessions, _) = enrich_detected_sessions(
+                vec![
+                    codex_detected(tmp.path(), first),
+                    codex_detected(tmp.path(), second),
+                ],
+                DetectionDiagnostics::default(),
+            )
+            .unwrap();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].modified, first);
+        }
+
+        // Malformed always loses to a real timestamp.
+        let (sessions, _) = enrich_detected_sessions(
+            vec![
+                codex_detected(tmp.path(), "not-a-timestamp"),
+                codex_detected(tmp.path(), earlier_z),
+            ],
+            DetectionDiagnostics::default(),
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].modified, earlier_z);
+
+        // Both malformed, or exact tie: first observation is kept.
+        for stamps in [["bad-a", "bad-b"], [earlier_z, earlier_z]] {
+            let (sessions, _) = enrich_detected_sessions(
+                vec![
+                    codex_detected(tmp.path(), stamps[0]),
+                    codex_detected(tmp.path(), stamps[1]),
+                ],
+                DetectionDiagnostics::default(),
+            )
+            .unwrap();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].modified, stamps[0]);
+        }
+    }
+
+    #[test]
+    fn provider_health_wiring_marks_stale_codex_and_pi() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_ts = (chrono::Utc::now() - chrono::Duration::hours(5)).to_rfc3339();
+        let fresh_ts = chrono::Utc::now().to_rfc3339();
+
+        // Idle Codex rollout older than the 30-minute idle window is stale.
+        let stale_codex = codex_detected(tmp.path(), &old_ts);
+        // Idle Pi transcript older than the 30-minute idle window is stale.
+        let mut pi = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/pi-stale"),
+            tmp.path().join("pi"),
+            Some("stale-pi".to_string()),
+            "pi".to_string(),
+        );
+        pi.provider = SessionProvider::Pi;
+        pi.surface = SessionSurface::Cli;
+        let mut pi_summary = crate::session::pi::PiTranscriptSummary::default();
+        pi_summary.session_id = "stale-pi".to_string();
+        pi_summary.last_timestamp = old_ts.clone();
+        pi.pi_summary = Some(pi_summary);
+        // Fresh Pi transcript stays fresh.
+        let mut pi_fresh = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/pi-fresh"),
+            tmp.path().join("pi-fresh"),
+            Some("fresh-pi".to_string()),
+            "pi".to_string(),
+        );
+        pi_fresh.provider = SessionProvider::Pi;
+        pi_fresh.surface = SessionSurface::Cli;
+        let mut pi_fresh_summary = crate::session::pi::PiTranscriptSummary::default();
+        pi_fresh_summary.session_id = "fresh-pi".to_string();
+        pi_fresh_summary.last_timestamp = fresh_ts;
+        pi_fresh_summary.message_count = 1;
+        pi_fresh.pi_summary = Some(pi_fresh_summary);
+
+        let (sessions, _) = enrich_detected_sessions(
+            vec![stale_codex, pi, pi_fresh],
+            DetectionDiagnostics::default(),
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions[0].source_health, Some(SourceHealth::Stale));
+        assert_eq!(sessions[1].source_health, Some(SourceHealth::Stale));
+        assert_eq!(sessions[2].source_health, Some(SourceHealth::Fresh));
     }
 
     #[test]
@@ -1559,10 +1827,7 @@ mod placeholder_tests {
         let path = tmp.path().join("count-unchanged-budget.jsonl");
         std::fs::write(
             &path,
-            format!(
-                "{}\n",
-                r#"{"type":"user","message":{"content":"hello"}}"#
-            ),
+            format!("{}\n", r#"{"type":"user","message":{"content":"hello"}}"#),
         )
         .unwrap();
         assert!(FileVersion::read(&path)
@@ -1583,7 +1848,10 @@ mod placeholder_tests {
 
         // An unchanged strong stamp before the deadline must be a true
         // zero-content-I/O fast path, including for a small exact-prefix file.
-        assert_eq!(count_messages_in_jsonl_at(&path, t0 + Duration::from_secs(1)), 1);
+        assert_eq!(
+            count_messages_in_jsonl_at(&path, t0 + Duration::from_secs(1)),
+            1
+        );
         assert_eq!(
             MESSAGE_COUNT_CACHE
                 .lock()
@@ -1624,9 +1892,20 @@ mod placeholder_tests {
         .unwrap();
         assert_eq!(count_messages_in_jsonl(&path), 1);
 
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(file, r#"{{"type":"assistant","message":{{"content":"two"}}}}"#).unwrap();
-        writeln!(file, r#"{{"type":"assistant","message":{{"content":"three"}}}}"#).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":"two"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":"three"}}}}"#
+        )
+        .unwrap();
         drop(file);
 
         assert_eq!(count_messages_in_jsonl(&path), 3);
@@ -1658,7 +1937,10 @@ mod placeholder_tests {
         std::fs::write(&path, replacement).unwrap();
         let after = FileVersion::read(&path).unwrap();
         #[cfg(unix)]
-        assert_eq!(before.identity, after.identity, "rewrite should keep the inode");
+        assert_eq!(
+            before.identity, after.identity,
+            "rewrite should keep the inode"
+        );
 
         assert_eq!(count_messages_in_jsonl(&path), 1);
     }
@@ -1730,7 +2012,10 @@ mod placeholder_tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::write(
             &path,
-            format!("{}\n", r#"{"type":"user","message":{"content":"replaced"}}"#),
+            format!(
+                "{}\n",
+                r#"{"type":"user","message":{"content":"replaced"}}"#
+            ),
         )
         .unwrap();
         assert_eq!(count_messages_in_jsonl(&path), 1);
@@ -1772,7 +2057,10 @@ mod placeholder_tests {
         std::fs::write(&path, &rewritten).unwrap();
         let after = FileVersion::read(&path).unwrap();
         #[cfg(unix)]
-        assert_eq!(before.identity, after.identity, "rewrite should keep the inode");
+        assert_eq!(
+            before.identity, after.identity,
+            "rewrite should keep the inode"
+        );
         assert!(after.len > before.len);
 
         // The bounded guard deliberately does not inspect the middle. This
@@ -1824,9 +2112,7 @@ mod placeholder_tests {
         evict_oldest_message_count_entries(&mut cache);
 
         assert_eq!(cache.len(), MESSAGE_COUNT_CACHE_MAX_ENTRIES);
-        assert!(!cache.contains_key(&PathBuf::from(
-            "/synthetic/message-count-0.jsonl"
-        )));
+        assert!(!cache.contains_key(&PathBuf::from("/synthetic/message-count-0.jsonl")));
     }
 }
 
