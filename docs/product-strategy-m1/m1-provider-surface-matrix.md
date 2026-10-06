@@ -66,6 +66,7 @@ M1 changes are additive/optional and must not claim new Cursor/OpenCode coverage
   - A session resumed with `pi -c` / `--resume` shows as ended until its next write, because pi loads the old transcript without writing to it (pi 0.87.1 source; test `resumed_session_shows_ended_until_its_first_write`).
   - One process keeps at most one transcript. If a pi writes in its own cwd and then switches with in-app `/resume` to a session from another project, the own-cwd transcript is kept and the resumed one ends until that pi exits.
   - An idle pi in another cwd can keep a killed session's card alive (the leftover pass errs toward "alive").
+  - A process with an unknown start time may keep one transcript from any cwd (errs toward "alive"; rare, because sysinfo reports a start time on macOS).
   - Flicker: one unreadable pi or same-user node/bun row (for example a short-lived node child) makes that whole poll fall back to the mtime windows, so a killed card can reappear for one poll and hide again in the next.
 
 ## Identity / deduplication contract (M1-R3)

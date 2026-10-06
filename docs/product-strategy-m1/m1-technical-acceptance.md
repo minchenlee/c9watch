@@ -100,7 +100,10 @@ not acceptance of subsequent fixes or live behavior.
 - Known limits: a session resumed with `pi -c` / `--resume` shows as
   ended until its next write (pi 0.87.1 loads the transcript without
   writing to it); transcripts are matched to processes by cwd and time
-  only, and one process keeps at most one transcript; a killed card can
+  only, and one process keeps at most one transcript; an idle pi in
+  another cwd can keep a killed session's card alive, and a process with
+  an unknown start time may keep one transcript from any cwd (both err
+  toward "alive"); a killed card can
   flicker back for one poll when an unreadable node/bun row makes that
   poll fall back to the mtime windows; live acceptance with a real Pi
   session was not run (needs owner approval for model calls).
