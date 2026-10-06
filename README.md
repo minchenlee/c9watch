@@ -4,11 +4,15 @@
 
 <h1 align="center">c9watch</h1>
 
-<p align="center">Monitor and control Claude Code sessions, with Codex and Cursor Agent visibility — built for both humans and agents.</p>
+<p align="center">See every Claude Code, Codex, Cursor Agent and Pi session on your machine — one dashboard for you, one JSON CLI for your agents.</p>
 
-**c9watch** (short for **c**laude cod**e** watch, like k8s for Kubernetes) gives you a real-time view of every Claude Code, Codex, and Cursor Agent session running on your machine. A **desktop dashboard** for you, and a **JSON CLI** for your agents — both watching the same sessions at the same time.
+**c9watch** (short for **c**laude cod**e** watch, like k8s for Kubernetes) gives you a real-time view of every Claude Code, Codex, Cursor Agent, and Pi session running on your machine. A **desktop dashboard** for you, and a **JSON CLI** for your agents — both watching the same sessions at the same time.
 
 You see which agent needs permission, which one is working, and which one is idle. Your agents can do the same — querying session status, searching past work, and coordinating with each other — all through the same tool.
+
+Claude Code and Codex are fully monitored. Cursor Agent is monitor-only. Pi is read-only. OpenCode is a preview that needs a manual server connection. See [Compatibility](https://c9watch.mclee.dev/compatibility/) for what each one supports.
+
+From the same author: [rmdv](https://rmdv.mclee.dev)
 
 ## Demo
 
@@ -18,7 +22,7 @@ You see which agent needs permission, which one is working, and which one is idl
 
 Unlike other Claude Code management tools that require you to launch sessions from within their app, **c9watch doesn't care where you start your sessions**. It discovers them automatically by scanning running processes at the OS level.
 
-Start Claude Code from any terminal or IDE you already use -- VS Code, Zed, iTerm2, Antigravity, you name it -- and c9watch picks them all up. No plugins to install. No workflows to change. No vendor lock-in.
+Start Claude Code or Codex from any terminal or IDE you already use -- VS Code, Zed, iTerm2, Antigravity, you name it -- and c9watch picks them all up. No plugins to install. No workflows to change. No vendor lock-in.
 
 Just open c9watch and see everything.
 
@@ -182,7 +186,9 @@ See [SKILLS.md](SKILLS.md) for more install options.
 ## Features
 
 - **Zero-integration setup** -- Works with any terminal or IDE, no plugins or extensions required
-- **Auto-discovery** -- Detects all running Claude Code sessions by scanning processes at the OS level
+- **Auto-discovery** -- Detects running Claude Code, Codex, Cursor Agent, and Pi sessions automatically. OpenCode (preview) connects to one server you start yourself
+- **Provider filter** -- Switch between All and each agent in Monitor, History, Cost, and Memory
+- **Attention inbox** -- One list of the sessions that wait for you, with a health badge so a stale session does not look live
 - **Real-time status** -- See at a glance which sessions are Working, Need Attention (permission requests or user questions), or Idle
 - **Conversation viewer** -- Expand any session to view the full conversation with formatted markdown, code blocks, and inline images
 - **Session control** -- Stop sessions, open their parent terminal/IDE, or rename them for easier tracking
@@ -191,8 +197,10 @@ See [SKILLS.md](SKILLS.md) for more install options.
 - **Status notifications** -- Get a native macOS notification when a session needs your attention
 - **Mobile/Web client** -- Connect from any browser or mobile device via WebSocket; scan the QR code to monitor sessions remotely
 - **Session history** -- Browse and search all past sessions with instant metadata filter and deep content search; click a result to scroll to and highlight the matching message
-- **Memory viewer** -- Browse and inspect Claude Code memory files with a two-panel layout and quick Claude command access
-- **Cost tracker** -- Track Claude Code spending with daily, per-project, and per-model breakdowns; click any session to preview the conversation; sort by date or cost
+- **Memory viewer** -- Browse and inspect Claude Code and Codex memory files with a two-panel layout and quick Claude command access
+- **Cost tracker** -- Track Claude Code spending, plus Codex and Pi cost data, with daily, per-project, and per-model breakdowns; click any session to preview the conversation; sort by date or cost
+- **Subscription usage** -- Quota meters for Claude Code, Codex, and Cursor in the toolbar and tray, with an elapsed-time marker for each window
+- **Claude Code hook bridge** _(opt-in)_ -- `c9watch hooks --install` lets Claude Code report permission prompts directly; see [docs/claude-hooks.md](docs/claude-hooks.md)
 - **CLI for agents** -- `c9watch list`, `view`, `history`, `search`, `stop`, `watch`, `cost` commands for scriptable session management and agent-to-agent monitoring
 - **PM orchestration** _(disabled by default)_ -- Spawn, message, and manage child Claude Code "worker" sessions from a parent "PM" session via `c9watch spawn`, `send`, `workers`, `adopt`, `inbox`, `tasks`. WORKER and PM badges on session cards and a Workers panel in the overlay. Now that Claude Code and Codex spawn agents natively, this is opt-in: build the CLI with `--features cli,pm-orchestration` and set `PM_ORCHESTRATION_ENABLED = true` in `src/lib/feature-flags.ts` for the dashboard. Workers run as `claude --bg` background-pinned sessions, billed against your Pro/Max chat quota (not the separate Agent SDK credit pool that took effect 2026-06-15), falling back to legacy `--print` mode on older CC.
 - **Subagent visibility** -- Detect and display Task-tool subagents spawned inside any session, with click-to-preview transcripts
