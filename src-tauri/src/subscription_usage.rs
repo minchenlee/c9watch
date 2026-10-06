@@ -17,6 +17,8 @@ pub struct UsageWindow {
     label: String,
     used_percent: f64,
     resets_at: Option<i64>,
+    /// Full window length, so the UI can show how far into the window `now` is.
+    window_seconds: Option<i64>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,7 +64,8 @@ fn parse_snapshot(value: &Value) -> SubscriptionUsage {
         else {
             continue;
         };
-        let label = match window["windowDurationMins"].as_u64() {
+        let duration_mins = window["windowDurationMins"].as_u64();
+        let label = match duration_mins {
             Some(10080) => "Weekly".into(),
             Some(mins) if mins > 0 && mins % 1440 == 0 => format!("{}-day", mins / 1440),
             Some(mins) if mins > 0 && mins % 60 == 0 => format!("{}-hour", mins / 60),
@@ -73,6 +76,7 @@ fn parse_snapshot(value: &Value) -> SubscriptionUsage {
             label,
             used_percent: percent,
             resets_at: window["resetsAt"].as_i64(),
+            window_seconds: duration_mins.filter(|m| *m > 0).map(|m| m as i64 * 60),
         });
     }
     if !usage.windows.is_empty() {
@@ -245,11 +249,18 @@ fn parse_cursor_snapshot(value: &Value, plan: Option<String>) -> SubscriptionUsa
     );
     usage.plan = plan;
     // Cursor billing timestamps are milliseconds, unlike Codex's seconds.
-    let resets_at = value["billingCycleEnd"]
-        .as_i64()
-        .or_else(|| value["billingCycleEnd"].as_str()?.parse::<i64>().ok())
-        .filter(|n| *n > 0)
-        .map(|n| n / 1000);
+    let cycle_secs = |key: &str| {
+        value[key]
+            .as_i64()
+            .or_else(|| value[key].as_str()?.parse::<i64>().ok())
+            .filter(|n| *n > 0)
+            .map(|n| n / 1000)
+    };
+    let resets_at = cycle_secs("billingCycleEnd");
+    let window_seconds = resets_at
+        .zip(cycle_secs("billingCycleStart"))
+        .map(|(end, start)| end - start)
+        .filter(|n| *n > 0);
     let plan_usage = &value["planUsage"];
     let mut add = |label: &str, percent: Option<f64>| {
         if let Some(used_percent) = percent.filter(|v| v.is_finite() && *v >= 0.0) {
@@ -257,6 +268,7 @@ fn parse_cursor_snapshot(value: &Value, plan: Option<String>) -> SubscriptionUsa
                 label: label.into(),
                 used_percent,
                 resets_at,
+                window_seconds,
             });
         }
     };
@@ -319,10 +331,10 @@ fn parse_claude_snapshot(value: &Value, now: i64) -> SubscriptionUsage {
     if value["schemaVersion"] != 1 { return usage; }
     usage.updated_at = Some(updated);
     let clean = crate::claude_usage::sanitize(value, now);
-    for (key, label) in [("five_hour", "5-hour"), ("seven_day", "Weekly"), ("spend_limit", "Spend limit")] {
+    for (key, label, window_seconds) in [("five_hour", "5-hour", Some(5 * 3600)), ("seven_day", "Weekly", Some(7 * 86400)), ("spend_limit", "Spend limit", None)] {
         let w = &clean["rate_limits"][key];
         if let Some(percent) = w["used_percentage"].as_f64() {
-            usage.windows.push(UsageWindow { label: label.into(), used_percent: percent, resets_at: w["resets_at"].as_i64() });
+            usage.windows.push(UsageWindow { label: label.into(), used_percent: percent, resets_at: w["resets_at"].as_i64(), window_seconds });
         }
     }
     if !usage.windows.is_empty() {
@@ -381,6 +393,8 @@ mod tests {
         assert_eq!(usage.windows[0].used_percent, 24.5);
         assert_eq!(usage.windows[1].used_percent, 103.0);
         assert_eq!(usage.windows[1].label, "Weekly");
+        assert_eq!(usage.windows[0].window_seconds, Some(18000));
+        assert_eq!(usage.windows[1].window_seconds, Some(604800));
         assert!(usage.message.is_none());
     }
     #[test]
@@ -399,7 +413,7 @@ mod tests {
     #[test]
     fn cursor_prefers_quota_pools_over_bonus_spend() {
         let usage = parse_cursor_snapshot(
-            &json!({"billingCycleEnd":"1789396090000", "planUsage": {
+            &json!({"billingCycleStart":"1786717690000", "billingCycleEnd":"1789396090000", "planUsage": {
             "includedSpend":2000, "bonusSpend":16000, "limit":2000,
             "totalPercentUsed":36.9, "autoPercentUsed":40.6, "apiPercentUsed":0
         }, "spendLimitUsage":{"individualLimit":500}}),
@@ -410,6 +424,7 @@ mod tests {
         assert_eq!(usage.windows[1].used_percent, 40.6);
         assert_eq!(usage.windows[2].used_percent, 0.0);
         assert_eq!(usage.windows[0].resets_at, Some(1789396090));
+        assert_eq!(usage.windows[0].window_seconds, Some(2678400));
         assert_eq!(usage.windows[3].used_percent, 0.0);
     }
     #[test]
@@ -457,6 +472,8 @@ mod tests {
         let fresh = parse_claude_snapshot(&saved, 1010);
         assert_eq!(fresh.windows.len(), 2);
         assert_eq!(fresh.windows[0].used_percent, 0.0);
+        assert_eq!(fresh.windows[0].window_seconds, Some(18000));
+        assert_eq!(fresh.windows[1].window_seconds, Some(604800));
         assert!(fresh.message.is_none());
         assert!(parse_claude_snapshot(&saved, 1300).message.is_some());
         let partial = parse_claude_snapshot(&saved, 2500);

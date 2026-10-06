@@ -6,6 +6,8 @@
 )]
 
 fn main() {
+    c9watch_lib::claude_path::ensure_claude_on_path();
+
     // CLI mode: if the first arg is a known subcommand or --help/--version,
     // route to the CLI handler instead of launching the GUI.
     #[cfg(feature = "cli")]
@@ -19,7 +21,7 @@ fn main() {
             // unexpectedly launching the GUI.
             let known_commands = [
                 "list", "status", "self", "view", "history", "search", "stop", "watch", "tasks",
-                "spawn", "send", "workers", "inbox", "adopt", "daemon", "cost", "usage-bridge", "help",
+                "spawn", "send", "workers", "inbox", "adopt", "daemon", "cost", "usage-bridge", "hooks", "help",
             ];
             let is_cli = known_commands.contains(&first)
                 || first == "--help"

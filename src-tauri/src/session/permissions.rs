@@ -1,6 +1,10 @@
 use serde::Deserialize;
+use std::collections::HashMap;
+#[cfg(any(test, not(unix)))]
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 /// Claude Code settings structure (partial - only what we need)
 #[derive(Debug, Deserialize)]
@@ -11,12 +15,50 @@ pub struct ClaudeSettings {
 #[derive(Debug, Deserialize)]
 pub struct Permissions {
     pub allow: Option<Vec<String>>,
+    pub ask: Option<Vec<String>>,
 }
+
+/// Tools normally inferred as approved. Explicit Agent ask rules are checked first.
+const NEVER_PROMPTING_TOOLS: &[&str] = &[
+    "Read",
+    "Glob",
+    "Grep",
+    "WebFetch",
+    "WebSearch",
+    "Agent",
+    "Task",
+    "TaskList",
+    "TaskGet",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskOutput",
+    "TaskStop",
+    "TodoWrite",
+    "Workflow",
+    "Skill",
+    "ToolSearch",
+    "SendMessage",
+    "ListAgents",
+    "ScheduleWakeup",
+    "AskUserQuestion",
+];
+
+/// How long a cached checker is trusted before its settings files are re-read.
+const CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Checkers keyed by project directory (`None` for user-level settings only).
+type CheckerCache = HashMap<Option<PathBuf>, (Instant, Arc<PermissionChecker>)>;
+
+static CHECKER_CACHE: LazyLock<Mutex<CheckerCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Cached permissions for quick lookup
 #[derive(Debug, Clone, Default)]
 pub struct PermissionChecker {
     allowed_patterns: Vec<AllowPattern>,
+    asked_agent_patterns: Vec<String>,
+    /// Treat every pending tool as approved. Used for sessions whose permission
+    /// prompts are reported by Claude Code hooks instead of inferred here.
+    assume_approved: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -33,42 +75,63 @@ enum AllowPattern {
 }
 
 impl PermissionChecker {
-    /// Load permissions from settings file
+    /// Load permissions from the user-level settings files
     pub fn from_settings_file() -> Self {
-        let home_dir = match dirs::home_dir() {
-            Some(dir) => dir,
-            None => return Self::default(),
-        };
-
-        let settings_path = home_dir.join(".claude").join("settings.json");
-        Self::from_file(&settings_path)
+        Self::from_files(&settings_files(None))
     }
 
     /// Load permissions from a specific file
     pub fn from_file(path: &Path) -> Self {
-        let content = match fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return Self::default(),
-        };
+        Self::from_files(&[path.to_path_buf()])
+    }
 
-        let settings: ClaudeSettings = match serde_json::from_str(&content) {
-            Ok(s) => s,
-            Err(_) => return Self::default(),
-        };
-
-        let allowed = settings
-            .permissions
-            .and_then(|p| p.allow)
-            .unwrap_or_default();
-
-        let patterns = allowed
-            .iter()
-            .filter_map(|s| Self::parse_pattern(s))
-            .collect();
-
-        Self {
-            allowed_patterns: patterns,
+    /// Load and merge the allow rules from several settings files. Missing or
+    /// unparseable files contribute nothing.
+    pub fn from_files(paths: &[PathBuf]) -> Self {
+        let mut allowed_patterns = Vec::new();
+        let mut asked_agent_patterns = Vec::new();
+        for settings in paths.iter()
+            .filter_map(|path| {
+                #[cfg(unix)]
+                { crate::claude_hooks::read_settings(path).ok() }
+                #[cfg(not(unix))]
+                { fs::read(path).ok() }
+            })
+            .filter_map(|content| serde_json::from_slice::<ClaudeSettings>(&content).ok())
+        {
+            if let Some(permissions) = settings.permissions {
+                allowed_patterns.extend(permissions.allow.unwrap_or_default().iter()
+                    .filter_map(|rule| Self::parse_pattern(rule)));
+                asked_agent_patterns.extend(permissions.ask.unwrap_or_default().into_iter()
+                    .filter(|rule| rule == "Agent" || (rule.starts_with("Agent(") && rule.ends_with(')'))));
+            }
         }
+        Self { allowed_patterns, asked_agent_patterns, assume_approved: false }
+    }
+
+    /// A checker that reports every tool as approved.
+    pub fn assume_approved() -> Self {
+        Self {
+            allowed_patterns: Vec::new(),
+            asked_agent_patterns: Vec::new(),
+            assume_approved: true,
+        }
+    }
+
+    /// Checker for a session running in `project_dir` (user settings merged with
+    /// that project's settings), cached for [`CACHE_TTL`].
+    pub fn cached_for(project_dir: Option<&Path>) -> Arc<Self> {
+        let key = project_dir.map(Path::to_path_buf);
+        if let Ok(cache) = CHECKER_CACHE.try_lock() {
+            if let Some((loaded, checker)) = cache.get(&key) {
+                if loaded.elapsed() < CACHE_TTL { return checker.clone(); }
+            }
+        }
+        let checker = Arc::new(Self::from_files(&settings_files(project_dir)));
+        if let Ok(mut cache) = CHECKER_CACHE.try_lock() {
+            cache.insert(key, (Instant::now(), checker.clone()));
+        }
+        checker
     }
 
     /// Parse a permission pattern string into an AllowPattern
@@ -124,13 +187,17 @@ impl PermissionChecker {
     /// # Returns
     /// true if the tool is auto-approved, false if it needs user permission
     pub fn is_auto_approved(&self, tool_name: &str, tool_input: &serde_json::Value) -> bool {
-        // These tools are always auto-approved (read-only operations)
-        match tool_name {
-            "Read" | "Glob" | "Grep" | "WebFetch" | "WebSearch" | "Task" | "TaskList"
-            | "TaskGet" | "TaskCreate" | "TaskUpdate" | "AskUserQuestion" => {
-                return true;
-            }
-            _ => {}
+        // Ordinary running Agent calls stay excluded, but explicit top-level
+        // ask rules take precedence over the default and over an allow rule.
+        if tool_name == "Agent" && self.asked_agent_patterns.iter().any(|rule| {
+            if rule == "Agent" { return true; }
+            let agent = &rule[6..rule.len() - 1];
+            agent == "*" || tool_input.get("subagent_type").and_then(|v| v.as_str()) == Some(agent)
+        }) {
+            return false;
+        }
+        if self.assume_approved || NEVER_PROMPTING_TOOLS.contains(&tool_name) {
+            return true;
         }
 
         // For Bash, check against allowed patterns
@@ -140,7 +207,7 @@ impl PermissionChecker {
                 .and_then(|c| c.as_str())
                 .unwrap_or("");
 
-            return self.is_bash_allowed(command);
+            return self.is_tool_allowed("Bash") || self.is_bash_allowed(command);
         }
 
         // For Write/Edit, check if explicitly allowed
@@ -154,8 +221,8 @@ impl PermissionChecker {
             return self.is_mcp_allowed(tool_name);
         }
 
-        // Default: assume needs permission
-        false
+        // Default: needs permission unless the tool is allowed by name
+        self.is_tool_allowed(tool_name)
     }
 
     /// Check if a bash command matches any allowed pattern
@@ -206,9 +273,29 @@ impl PermissionChecker {
     }
 }
 
+/// Settings files whose `permissions.allow` rules apply to a session in
+/// `project_dir`, in Claude Code's precedence order (all of them are merged).
+fn settings_files(project_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(config_dir) = crate::claude_usage::config_dir() {
+        files.push(config_dir.join("settings.json"));
+        files.push(config_dir.join("settings.local.json"));
+    }
+    if let Some(dir) = project_dir {
+        files.push(dir.join(".claude").join("settings.json"));
+        files.push(dir.join(".claude").join("settings.local.json"));
+    }
+    files
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture() -> tempfile::TempDir {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        tempfile::tempdir_in(parent).unwrap()
+    }
 
     #[test]
     fn test_parse_bash_pattern_with_wildcard() {
@@ -246,6 +333,8 @@ mod tests {
     #[test]
     fn test_bash_command_matching() {
         let checker = PermissionChecker {
+            assume_approved: false,
+            asked_agent_patterns: Vec::new(),
             allowed_patterns: vec![
                 AllowPattern::Bash {
                     prefix: "git add".to_string(),
@@ -275,11 +364,143 @@ mod tests {
     }
 
     #[test]
+    fn test_subagent_and_orchestration_tools_never_prompt() {
+        let checker = PermissionChecker::default();
+        for tool in [
+            "Agent",
+            "Task",
+            "Workflow",
+            "Skill",
+            "ToolSearch",
+            "SendMessage",
+        ] {
+            assert!(
+                checker.is_auto_approved(tool, &serde_json::json!({})),
+                "{tool}"
+            );
+        }
+        assert!(!checker.is_auto_approved("ExitPlanMode", &serde_json::json!({})));
+    }
+
+    #[test]
+    fn test_assume_approved_approves_everything() {
+        let checker = PermissionChecker::assume_approved();
+        assert!(checker.is_auto_approved("Bash", &serde_json::json!({"command": "rm -rf /"})));
+        assert!(checker.is_auto_approved("Write", &serde_json::json!({})));
+    }
+
+    #[test]
+    fn test_from_files_merges_allow_rules() {
+        let dir = fixture();
+        let user = dir.path().join("settings.json");
+        let local = dir.path().join("settings.local.json");
+        std::fs::write(&user, r#"{"permissions":{"allow":["Bash(git status)"]}}"#).unwrap();
+        std::fs::write(&local, r#"{"permissions":{"allow":["Write","mcp__x__y"]}}"#).unwrap();
+        let checker =
+            PermissionChecker::from_files(&[user, local, dir.path().join("missing.json")]);
+        let bash = serde_json::json!({"command": "git status"});
+        assert!(checker.is_auto_approved("Bash", &bash));
+        assert!(checker.is_auto_approved("Write", &serde_json::json!({})));
+        assert!(checker.is_auto_approved("mcp__x__y", &serde_json::json!({})));
+        assert!(!checker.is_auto_approved("Edit", &serde_json::json!({})));
+    }
+
+    #[test]
+    fn test_plain_tool_allow_applies_to_bash_and_other_tools() {
+        let checker = PermissionChecker {
+            assume_approved: false,
+            asked_agent_patterns: Vec::new(),
+            allowed_patterns: vec![
+                AllowPattern::Tool {
+                    name: "Bash".to_string(),
+                },
+                AllowPattern::Tool {
+                    name: "ExitPlanMode".to_string(),
+                },
+            ],
+        };
+        assert!(checker.is_auto_approved("Bash", &serde_json::json!({"command": "anything"})));
+        assert!(checker.is_auto_approved("ExitPlanMode", &serde_json::json!({})));
+    }
+
+    #[test]
     fn test_load_from_real_settings() {
         // This test uses the real settings file if available
         let checker = PermissionChecker::from_settings_file();
 
         // Just verify it loads without crashing
         println!("Loaded {} patterns", checker.allowed_patterns.len());
+    }
+}
+
+#[cfg(test)]
+mod repair_regressions {
+    use super::*;
+    fn fixture() -> tempfile::TempDir {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        tempfile::tempdir_in(parent).unwrap()
+    }
+
+    #[test]
+    fn explicit_agent_ask_overrides_default_and_allow_across_files() {
+        let dir=fixture();let allow=dir.path().join("allow.json");let ask=dir.path().join("ask.json");
+        fs::write(&allow,r#"{"permissions":{"allow":["Agent","Bash"]}}"#).unwrap();
+        fs::write(&ask,r#"{"permissions":{"ask":["Agent"]}}"#).unwrap();
+        let checker=PermissionChecker::from_files(&[allow,ask]);
+        assert!(!checker.is_auto_approved("Agent",&serde_json::json!({"subagent_type":"Explore"})),"explicit Agent ask was ignored");
+        assert!(checker.is_auto_approved("Bash",&serde_json::json!({"command":"make"})));
+    }
+    #[test]
+    fn agent_subtype_and_wildcard_ask_rules_are_honored_without_flagging_other_agents() {
+        let dir=fixture();let path=dir.path().join("settings.json");
+        fs::write(&path,r#"{"permissions":{"ask":["Agent(Explore)"]}}"#).unwrap();
+        let checker=PermissionChecker::from_file(&path);
+        assert!(!checker.is_auto_approved("Agent",&serde_json::json!({"subagent_type":"Explore"})));
+        assert!(checker.is_auto_approved("Agent",&serde_json::json!({"subagent_type":"Plan"})));
+        fs::write(&path,r#"{"permissions":{"ask":["Agent(*)"]}}"#).unwrap();
+        assert!(!PermissionChecker::from_file(&path).is_auto_approved("Agent",&serde_json::json!({})));
+    }
+    #[test]
+    fn normal_agent_without_ask_stays_approved() {
+        assert!(PermissionChecker::default().is_auto_approved("Agent",&serde_json::json!({})));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod settings_io_regressions_v3 {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+    #[test]
+    fn permission_settings_fifo_symlink_and_size_do_not_block_or_grant_rules() {
+        let dir=tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let fifo=dir.path().join("fifo.json");
+        let name=std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe {libc::mkfifo(name.as_ptr(),0o600)},0);
+        let valid=dir.path().join("valid.json");fs::write(&valid,br#"{"permissions":{"allow":["Bash"]}}"#).unwrap();
+        let link=dir.path().join("link.json");std::os::unix::fs::symlink(&valid,&link).unwrap();
+        let large=dir.path().join("large.json");fs::write(&large,vec![b' ';256*1024+1]).unwrap();
+        let start=Instant::now();
+        for path in [link,large,fifo] { assert!(!PermissionChecker::from_file(&path).is_auto_approved("Bash",&serde_json::json!({"command":"make"}))); }
+        assert!(start.elapsed()<Duration::from_millis(250));
+        assert!(PermissionChecker::from_file(&valid).is_auto_approved("Bash",&serde_json::json!({"command":"make"})));
+    }
+    #[test]
+    fn checker_does_not_wait_for_global_cache_while_loading_fixture() {
+        let dir=tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        fs::create_dir(dir.path().join(".claude")).unwrap();
+        fs::write(dir.path().join(".claude/settings.json"),br#"{"permissions":{"allow":["Bash"]}}"#).unwrap();
+        let held=CHECKER_CACHE.lock().unwrap();let project=dir.path().to_path_buf();
+        let (tx,rx)=std::sync::mpsc::channel();
+        let reader=std::thread::spawn(move || tx.send(PermissionChecker::cached_for(Some(&project)).is_auto_approved("Bash",&serde_json::json!({"command":"make"}))).unwrap());
+        let timely=rx.recv_timeout(Duration::from_millis(250));drop(held);reader.join().unwrap();
+        assert!(timely.is_ok_and(|approved|approved),"permission loader waited for global cache");
+    }
+    #[test]
+    fn oversized_valid_permission_settings_do_not_grant_rules() {
+        let dir=tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let path=dir.path().join("settings.json");let mut bytes=br#"{"permissions":{"allow":["Bash"]}}"#.to_vec();
+        bytes.extend(vec![b' ';256*1024]);fs::write(&path,&bytes).unwrap();
+        assert!(!PermissionChecker::from_file(&path).is_auto_approved("Bash",&serde_json::json!({"command":"make"})),"oversized valid permission settings granted rules");
+        assert_eq!(fs::read(path).unwrap(),bytes);
     }
 }

@@ -36,7 +36,7 @@ pub fn sanitize(value: &Value, now: i64) -> Value {
     }
     json!({"schemaVersion":1,"updatedAt":now,"rate_limits":limits})
 }
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or("Invalid snapshot path")?;
     fs::create_dir_all(parent).map_err(|_| "Cannot create usage directory")?;
     let temp = parent.join(format!(".usage-{}.tmp", uuid::Uuid::new_v4()));
@@ -73,7 +73,7 @@ pub fn record(input: &[u8], path: &Path, now: i64) -> Result<Value, String> {
     )?;
     Ok(snapshot)
 }
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 pub fn configured(mut settings: Value, executable: &Path) -> Result<Value, String> {
@@ -101,6 +101,55 @@ pub fn configured(mut settings: Value, executable: &Path) -> Result<Value, Strin
     }
     Ok(settings)
 }
+/// Result of [`update_settings`].
+pub(crate) enum SettingsUpdate {
+    /// The transform left the settings unchanged; nothing was written.
+    Unchanged,
+    /// Settings were rewritten. `backup` holds the previous file, if one existed.
+    Written { backup: Option<PathBuf> },
+}
+
+/// Applies `transform` to `<directory>/settings.json`, backing up the previous
+/// file and writing atomically. Refuses to touch a symlinked settings file.
+pub(crate) fn update_settings(
+    directory: &Path,
+    transform: impl FnOnce(Value) -> Result<Value, String>,
+) -> Result<SettingsUpdate, String> {
+    let path = directory.join("settings.json");
+    if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("Claude settings is a symlink; configure c9watch manually".into());
+    }
+    let original = match fs::read(&path) {
+        Ok(v) => Some(v),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err("Cannot read Claude settings".into()),
+    };
+    let settings = match original.as_ref() {
+        Some(bytes) => serde_json::from_slice(bytes).map_err(|_| "Invalid Claude settings JSON")?,
+        None => json!({}),
+    };
+    let next = transform(settings.clone())?;
+    if next == settings {
+        return Ok(SettingsUpdate::Unchanged);
+    }
+    let backup = match original {
+        Some(bytes) => {
+            let backup = directory.join(format!(
+                "settings.c9watch-backup-{}.json",
+                uuid::Uuid::new_v4()
+            ));
+            atomic_write(&backup, &bytes)?;
+            Some(backup)
+        }
+        None => None,
+    };
+    atomic_write(
+        &path,
+        &serde_json::to_vec_pretty(&next).map_err(|_| "Cannot encode settings")?,
+    )?;
+    Ok(SettingsUpdate::Written { backup })
+}
+
 pub fn install(directory: &Path, executable: &Path) -> Result<String, String> {
     #[cfg(windows)]
     {
@@ -109,45 +158,20 @@ pub fn install(directory: &Path, executable: &Path) -> Result<String, String> {
     }
     #[cfg(not(windows))]
     {
-        let path = directory.join("settings.json");
-        if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err("Claude settings is a symlink; configure bridge manually".into());
-        }
-        let original = match fs::read(&path) {
-            Ok(v) => Some(v),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => return Err("Cannot read Claude settings".into()),
-        };
-        let settings = match original.as_ref() {
-            Some(bytes) => {
-                serde_json::from_slice(bytes).map_err(|_| "Invalid Claude settings JSON")?
-            }
-            None => json!({}),
-        };
-        let next = configured(settings.clone(), executable)?;
-        if next == settings {
-            return Ok("Claude usage bridge is already enabled".into());
-        }
-        let backup = directory.join(format!(
-            "settings.c9watch-backup-{}.json",
-            uuid::Uuid::new_v4()
-        ));
-        let had_settings = original.is_some();
-        if let Some(bytes) = original {
-            atomic_write(&backup, &bytes)?;
-        }
-        atomic_write(
-            &path,
-            &serde_json::to_vec_pretty(&next).map_err(|_| "Cannot encode settings")?,
-        )?;
-        Ok(if had_settings {
-            format!(
-                "Claude usage bridge enabled. Previous settings backup: {}",
-                backup.display()
-            )
-        } else {
-            "Claude usage bridge enabled. No previous settings file existed.".into()
-        })
+        Ok(
+            match update_settings(directory, |settings| configured(settings, executable))? {
+                SettingsUpdate::Unchanged => "Claude usage bridge is already enabled".into(),
+                SettingsUpdate::Written {
+                    backup: Some(backup),
+                } => format!(
+                    "Claude usage bridge enabled. Previous settings backup: {}",
+                    backup.display()
+                ),
+                SettingsUpdate::Written { backup: None } => {
+                    "Claude usage bridge enabled. No previous settings file existed.".into()
+                }
+            },
+        )
     }
 }
 pub fn run(install_bridge: bool, passthrough: bool) -> Result<(), String> {

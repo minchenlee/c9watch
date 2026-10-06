@@ -102,6 +102,8 @@ pub struct UserMessage {
     pub is_tool_result: bool,
     /// Base64-encoded images attached to this message
     pub images: Vec<ImageBlock>,
+    /// `tool_use_id`s of the tool_result blocks in this entry
+    pub tool_result_ids: Vec<String>,
 }
 
 impl<'de> Deserialize<'de> for UserMessage {
@@ -121,6 +123,7 @@ impl<'de> Deserialize<'de> for UserMessage {
         let content_value = value.get("content");
 
         let mut images = Vec::new();
+        let mut tool_result_ids = Vec::new();
         let (content, is_tool_result) = match content_value {
             Some(Value::String(s)) => (s.clone(), false),
             Some(Value::Array(arr)) => {
@@ -130,6 +133,9 @@ impl<'de> Deserialize<'de> for UserMessage {
                     match item.get("type").and_then(|t| t.as_str()) {
                         Some("tool_result") => {
                             has_tool_result = true;
+                            if let Some(id) = item.get("tool_use_id").and_then(|v| v.as_str()) {
+                                tool_result_ids.push(id.to_string());
+                            }
                             if let Some(content) = item.get("content") {
                                 match content {
                                     Value::String(s) => parts.push(s.clone()),
@@ -186,6 +192,7 @@ impl<'de> Deserialize<'de> for UserMessage {
             content,
             is_tool_result,
             images,
+            tool_result_ids,
         })
     }
 }
@@ -652,12 +659,34 @@ pub fn get_native_custom_title(entries: &[SessionEntry]) -> Option<String> {
 /// Scans the file for lines containing `"custom-title"` and parses only those.
 /// Returns the last (most recent) custom title found.
 pub fn get_native_custom_title_from_file(path: &std::path::Path) -> Option<String> {
-    use std::io::BufRead;
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
+    scan_native_custom_title(File::open(path).ok()?).0
+}
 
-    let mut last_title: Option<String> = None;
-    for line in reader.lines().map_while(Result::ok) {
+pub(crate) fn try_get_native_custom_title_from_file(
+    path: &Path,
+) -> std::io::Result<Option<String>> {
+    let (title, result) = scan_native_custom_title(File::open(path)?);
+    result?;
+    Ok(title)
+}
+
+/// Retain one line at a time, and keep I/O failure separate from no title.
+/// A line that isn't valid UTF-8 ends the scan with the titles found so far,
+/// as a complete result: rescanning an unchanged file gives the same answer.
+fn scan_native_custom_title(reader: impl Read) -> (Option<String>, std::io::Result<()>) {
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    let mut last_title = None;
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return (last_title, Ok(())),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return (last_title, Ok(()))
+            }
+            Err(error) => return (last_title, Err(error)),
+        }
         if line.contains("\"custom-title\"") {
             if let Ok(SessionEntry::CustomTitle { custom_title, .. }) =
                 serde_json::from_str::<SessionEntry>(&line)
@@ -666,7 +695,6 @@ pub fn get_native_custom_title_from_file(path: &std::path::Path) -> Option<Strin
             }
         }
     }
-    last_title
 }
 
 #[cfg(test)]
@@ -922,6 +950,7 @@ mod tests {
                 content: "Hello Claude".to_string(),
                 is_tool_result: false,
                 images: vec![],
+                tool_result_ids: vec![],
             },
         }];
         let result = extract_messages(&entries);
@@ -940,6 +969,7 @@ mod tests {
                 content: "tool output here".to_string(),
                 is_tool_result: true,
                 images: vec![],
+                tool_result_ids: vec![],
             },
         }];
         let result = extract_messages(&entries);
@@ -1102,6 +1132,7 @@ mod tests {
                     content: "hi".to_string(),
                     is_tool_result: false,
                     images: vec![],
+                    tool_result_ids: vec![],
                 },
             },
             SessionEntry::Unknown,
@@ -1240,6 +1271,7 @@ mod tests {
                     .to_string(),
                 is_tool_result: false,
                 images: vec![],
+                tool_result_ids: vec![],
             },
         }];
         let result = extract_messages(&entries);
@@ -1257,6 +1289,7 @@ mod tests {
                 content: "<local-command-caveat>Caveat: DO NOT respond to these messages.</local-command-caveat>".to_string(),
                 is_tool_result: false,
                 images: vec![],
+                tool_result_ids: vec![],
             },
         }];
         let result = extract_messages(&entries);
@@ -1273,6 +1306,7 @@ mod tests {
                 content: "<command-name>/exit</command-name>\n<command-message>exit</command-message>\n<command-args></command-args>".to_string(),
                 is_tool_result: false,
                 images: vec![],
+                tool_result_ids: vec![],
             },
         }];
         let result = extract_messages(&entries);
@@ -1298,6 +1332,85 @@ mod tests {
         } else {
             panic!("Expected CustomTitle entry");
         }
+    }
+
+    #[test]
+    fn native_custom_title_checked_scan_reports_read_failure() {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected read failure"))
+            }
+        }
+        let (title, result) = scan_native_custom_title(FailingReader);
+        assert!(title.is_none());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn native_custom_title_checked_scan_keeps_title_before_invalid_utf8() {
+        let mut bytes = br#"{"type":"custom-title","customTitle":"kept","sessionId":"s"}"#.to_vec();
+        bytes.extend_from_slice(b"\n\xff\n");
+        bytes
+            .extend_from_slice(br#"{"type":"custom-title","customTitle":"after","sessionId":"s"}"#);
+        let (title, result) = scan_native_custom_title(std::io::Cursor::new(bytes));
+        result.unwrap();
+        assert_eq!(title, Some("kept".to_string()));
+    }
+
+    #[test]
+    fn native_custom_title_scans_with_bounded_read_buffers() {
+        struct BoundedReads(std::io::Cursor<Vec<u8>>);
+        impl Read for BoundedReads {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(buf.len() <= 8192, "scan attempted a file-sized read buffer");
+                self.0.read(buf)
+            }
+        }
+        let mut bytes = b"{}\n".repeat(100_000);
+        bytes.extend_from_slice(br#"{"type":"custom-title","customTitle":"kept","sessionId":"s"}"#);
+        let (title, result) = scan_native_custom_title(BoundedReads(std::io::Cursor::new(bytes)));
+        result.unwrap();
+        assert_eq!(title, Some("kept".to_string()));
+    }
+
+    #[test]
+    fn native_custom_title_from_file_returns_the_last_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"custom-title","customTitle":"first","sessionId":"s"}"#,
+                "\r\n",
+                r#"{"type":"user","note":"mentions \"custom-title\" in text"}"#,
+                "\n",
+                r#"{"type":"custom-title","customTitle":"second","sessionId":"s"}"#,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_native_custom_title_from_file(&path),
+            Some("second".to_string())
+        );
+    }
+
+    #[test]
+    fn native_custom_title_from_file_stops_at_the_first_invalid_utf8_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut bytes = br#"{"type":"custom-title","customTitle":"kept","sessionId":"s"}"#.to_vec();
+        bytes.extend_from_slice(b"\n{\"type\":\"user\",\"bad\":\"\xff\"}\n");
+        bytes.extend_from_slice(
+            br#"{"type":"custom-title","customTitle":"unread","sessionId":"s"}"#,
+        );
+        std::fs::write(&path, bytes).unwrap();
+
+        assert_eq!(
+            get_native_custom_title_from_file(&path),
+            Some("kept".to_string())
+        );
     }
 
     #[test]

@@ -10,10 +10,10 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use wait_timeout::ChildExt;
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct CliAgent {
     pid: u32,
     cwd: PathBuf,
@@ -35,9 +35,51 @@ fn default_kind() -> String {
     "interactive".to_string()
 }
 
+/// Longest a cached `claude agents --json` result is reused while the session
+/// registry looks unchanged. Bounds staleness for anything the command reports
+/// that doesn't touch `~/.claude/sessions/`.
+const AGENTS_CACHE_MAX_AGE: Duration = Duration::from_secs(120);
+
+/// Name, mtime and size of each `*.json` file in the session registry,
+/// sorted by name. Claude Code rewrites a session's file on start, exit and
+/// every status change, so an unchanged signature means the registry input to
+/// `claude agents --json` is unchanged.
+type RegistrySignature = Vec<(String, Option<SystemTime>, u64)>;
+
+/// Registry record fields Claude Code rewrites on a status change. A change
+/// confined to these is applied to the cached rows; a change to any other
+/// field, including ones this detector doesn't know about, may affect the
+/// CLI's eligibility rules and needs a fresh `claude agents --json` run.
+const STATUS_FIELDS: &[&str] = &[
+    "status",
+    "statusUpdatedAt",
+    "updatedAt",
+    "name",
+    "nameSource",
+    "nameSince",
+];
+
+/// Process start time (seconds since the epoch) for each pid, absent for a
+/// pid that isn't running.
+type StartTimes = HashMap<u32, u64>;
+
+struct AgentsCache {
+    signature: RegistrySignature,
+    /// Each registry file's record with `STATUS_FIELDS` removed, as read
+    /// before the spawn that produced `agents`.
+    records: HashMap<String, Value>,
+    agents: Vec<CliAgent>,
+    /// Start times of `agents`' pids when the CLI last validated them. A
+    /// different start time means the pid was reused after a hard kill.
+    start_times: StartTimes,
+    fetched_at: Instant,
+}
+
 pub struct CliSessionSource {
     claude_bin: PathBuf,
     path_cache: HashMap<String, PathBuf>,
+    agents_cache: Option<AgentsCache>,
+    start_times: Box<dyn Fn(&[u32]) -> StartTimes + Send>,
 }
 
 impl CliSessionSource {
@@ -47,6 +89,8 @@ impl CliSessionSource {
         Self {
             claude_bin: PathBuf::from("claude"),
             path_cache: HashMap::new(),
+            agents_cache: None,
+            start_times: Box::new(process_start_times),
         }
     }
 
@@ -55,7 +99,7 @@ impl CliSessionSource {
         lookup_with_cache(&home, &mut self.path_cache, cwd, session_id)
     }
 
-    fn map_agent_to_session(&mut self, a: CliAgent, entrypoint: Option<String>) -> DetectedSession {
+    fn map_agent_to_session(&mut self, a: CliAgent, meta: PidMeta) -> DetectedSession {
         let project_path = self.project_path_for_session(&a.cwd, &a.session_id);
         DetectedSession {
             pid: a.pid,
@@ -72,14 +116,11 @@ impl CliSessionSource {
                 "background" => SessionKind::Background,
                 _ => SessionKind::Unknown,
             },
-            entrypoint,
+            entrypoint: meta.entrypoint,
             started_at_ms: Some(a.started_at),
             official_name: a.name,
-            cli_activity: match a.status.as_deref() {
-                Some("busy") => Some(CliActivity::Busy),
-                Some("idle") => Some(CliActivity::Idle),
-                _ => None,
-            },
+            cli_activity: cli_activity(a.status.as_deref()),
+            cli_reports_prompts: meta.version.is_some_and(reports_prompts_as_waiting),
             cwd: a.cwd,
             provider: super::source::SessionProvider::ClaudeCode,
             surface: super::source::SessionSurface::ClaudeCode,
@@ -99,12 +140,77 @@ impl CliSessionSource {
             opencode_summary: None,
         }
     }
-}
 
-impl SessionSource for CliSessionSource {
-    fn detect(
+    /// `claude agents --json` rows, reusing the previous result while it is
+    /// younger than `AGENTS_CACHE_MAX_AGE`, the session registry changed at
+    /// most in `STATUS_FIELDS`, and every cached pid keeps its start time.
+    /// Each spawn costs ~0.2s of CPU, so running it on every poll dominated
+    /// c9watch's energy use.
+    fn agents(&mut self) -> Result<Vec<CliAgent>, SessionDetectorError> {
+        let dir = registry_dir(
+            dirs::home_dir().as_deref(),
+            std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+        );
+        self.agents_in_registry(dir.as_deref())
+    }
+
+    fn agents_in_registry(
         &mut self,
-    ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
+        dir: Option<&Path>,
+    ) -> Result<Vec<CliAgent>, SessionDetectorError> {
+        let signature = dir.and_then(registry_signature);
+        if let (Some(dir), Some(signature), Some(mut cache)) =
+            (dir, &signature, self.agents_cache.take())
+        {
+            if self.cache_still_valid(dir, signature, &mut cache) {
+                let agents = cache.agents.clone();
+                self.agents_cache = Some(cache);
+                return Ok(agents);
+            }
+        }
+        self.agents_cache = None;
+        // Taken before the spawn: a change that lands mid-spawn makes the next
+        // poll's signature differ, so it's picked up then.
+        let records = dir.map(registry_records).unwrap_or_default();
+        let agents = self.run_agents_command()?;
+        if let Some(signature) = signature {
+            let pids: Vec<u32> = agents.iter().map(|a| a.pid).collect();
+            self.agents_cache = Some(AgentsCache {
+                signature,
+                records,
+                start_times: (self.start_times)(&pids),
+                agents: agents.clone(),
+                fetched_at: Instant::now(),
+            });
+        }
+        Ok(agents)
+    }
+
+    /// Brings `cache` up to date with `signature` without spawning the CLI,
+    /// returning false when that isn't safe.
+    fn cache_still_valid(
+        &self,
+        dir: &Path,
+        signature: &RegistrySignature,
+        cache: &mut AgentsCache,
+    ) -> bool {
+        if Instant::now().saturating_duration_since(cache.fetched_at) >= AGENTS_CACHE_MAX_AGE {
+            return false;
+        }
+        if *signature != cache.signature {
+            if !refresh_changed_rows(dir, cache, signature) {
+                return false;
+            }
+            cache.signature = signature.clone();
+        }
+        if cache.agents.is_empty() {
+            return true;
+        }
+        let pids: Vec<u32> = cache.agents.iter().map(|a| a.pid).collect();
+        (self.start_times)(&pids) == cache.start_times
+    }
+
+    fn run_agents_command(&self) -> Result<Vec<CliAgent>, SessionDetectorError> {
         let mut child = Command::new(&self.claude_bin)
             .args(["agents", "--json"])
             .stdout(Stdio::piped())
@@ -152,7 +258,15 @@ impl SessionSource for CliSessionSource {
             )));
         }
 
-        let agents = parse_cli_agents(&buf)?;
+        parse_cli_agents(&buf)
+    }
+}
+
+impl SessionSource for CliSessionSource {
+    fn detect(
+        &mut self,
+    ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
+        let agents = self.agents()?;
 
         // `claude agents --json` is a registry Claude Code writes and prunes itself;
         // pruning runs in the agent's own exit path, so a hard kill (an external
@@ -172,9 +286,9 @@ impl SessionSource for CliSessionSource {
         let sessions: Vec<DetectedSession> = agents
             .into_iter()
             .filter_map(|a| {
-                let entrypoint = pid_entrypoint(a.pid);
-                is_monitored_entrypoint(entrypoint.as_deref())
-                    .then(|| self.map_agent_to_session(a, entrypoint))
+                let meta = pid_meta(a.pid);
+                is_monitored_entrypoint(meta.entrypoint.as_deref())
+                    .then(|| self.map_agent_to_session(a, meta))
             })
             .collect();
 
@@ -184,6 +298,124 @@ impl SessionSource for CliSessionSource {
     fn backend_name(&self) -> &'static str {
         "cli"
     }
+}
+
+/// The session registry the spawned CLI reads: `$CLAUDE_CONFIG_DIR/sessions`
+/// when set, `~/.claude/sessions` otherwise.
+fn registry_dir(home: Option<&Path>, config_dir: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    match config_dir {
+        Some(config_dir) => Some(Path::new(config_dir).join("sessions")),
+        None => home.map(sessions_dir),
+    }
+}
+
+fn sessions_dir(home: &Path) -> PathBuf {
+    home.join(".claude").join("sessions")
+}
+
+/// `None` when the directory can't be listed, which disables caching.
+fn registry_signature(dir: &Path) -> Option<RegistrySignature> {
+    let mut signature: RegistrySignature = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if !name.ends_with(".json") {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            Some((name, meta.modified().ok(), meta.len()))
+        })
+        .collect();
+    signature.sort();
+    Some(signature)
+}
+
+/// Each registry file's record with `STATUS_FIELDS` removed. Unreadable or
+/// malformed files are left out, so any later change to them needs a spawn.
+fn registry_records(dir: &Path) -> HashMap<String, Value> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return HashMap::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if !name.ends_with(".json") {
+                return None;
+            }
+            let record = read_record(&entry.path())?;
+            Some((name, without_status_fields(record)))
+        })
+        .collect()
+}
+
+fn read_record(path: &Path) -> Option<Value> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+fn without_status_fields(mut record: Value) -> Value {
+    if let Some(object) = record.as_object_mut() {
+        for field in STATUS_FIELDS {
+            object.remove(*field);
+        }
+    }
+    record
+}
+
+/// Applies `status` and `name` from registry files that changed between the
+/// cached signature and `new` to the cached rows. Returns false, leaving the
+/// cache possibly partially updated, when the change needs a full
+/// `claude agents --json` run instead: files were added or removed, a changed
+/// file is unreadable, it belongs to no cached row, a field outside
+/// `STATUS_FIELDS` differs, or its `status` isn't one the CLI reports
+/// verbatim (it maps registry `shell` to `busy`, for example).
+fn refresh_changed_rows(dir: &Path, cache: &mut AgentsCache, new: &RegistrySignature) -> bool {
+    let old = &cache.signature;
+    if old.len() != new.len() || old.iter().zip(new).any(|(a, b)| a.0 != b.0) {
+        return false;
+    }
+    for (_, entry) in old.iter().zip(new).filter(|(a, b)| a != b) {
+        let Some(record) = read_record(&dir.join(&entry.0)) else {
+            return false;
+        };
+        let status = match record.get("status").and_then(Value::as_str) {
+            Some(status @ ("busy" | "idle")) => status.to_string(),
+            _ => return false,
+        };
+        let name = record
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let pid = record.get("pid").and_then(Value::as_u64);
+        if cache.records.get(&entry.0) != Some(&without_status_fields(record)) {
+            return false;
+        }
+        let Some(agent) = cache
+            .agents
+            .iter_mut()
+            .find(|a| Some(u64::from(a.pid)) == pid)
+        else {
+            return false;
+        };
+        agent.status = Some(status);
+        agent.name = name;
+    }
+    true
+}
+
+fn process_start_times(pids: &[u32]) -> StartTimes {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let pids: Vec<Pid> = pids.iter().map(|&pid| Pid::from_u32(pid)).collect();
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&pids),
+        true,
+        ProcessRefreshKind::new(),
+    );
+    pids.iter()
+        .filter_map(|&pid| Some((pid.as_u32(), system.process(pid)?.start_time())))
+        .collect()
 }
 
 /// Drops any agent whose reported pid is no longer an actual running process.
@@ -248,27 +480,55 @@ fn is_known_blocked_background(object: &Map<String, Value>) -> bool {
 /// safer than an allowlist that silently drops CLI runs on every CC bump.
 const NON_MONITORED_SDK_ENTRYPOINTS: &[&str] = &["sdk-ts", "sdk-py"];
 
-/// Reads `~/.claude/sessions/<pid>.json`'s `entrypoint` field (e.g. "cli",
-/// "sdk-cli", "claude-vscode", "mcp", "remote_desktop"...), for both the
-/// non-monitored-SDK filter and surfacing the raw value to the frontend.
-/// `None` on a missing/unreadable/malformed file or missing field (older CC
-/// builds didn't write this metadata) — callers treat that as "unknown, but
-/// still a real CLI process" rather than excluding it.
-fn pid_entrypoint(pid: u32) -> Option<String> {
-    dirs::home_dir().and_then(|home| pid_entrypoint_under(&home, pid))
+/// Fields c9watch reads from `~/.claude/sessions/<pid>.json`. Each is `None`
+/// on a missing/unreadable/malformed file or missing field (older CC builds
+/// didn't write this metadata).
+#[derive(Debug, Default, PartialEq)]
+struct PidMeta {
+    /// Raw `entrypoint` (e.g. "cli", "sdk-cli", "claude-vscode", "mcp",
+    /// "remote_desktop"...), for both the non-monitored-SDK filter and
+    /// surfacing the raw value to the frontend. `None` is treated as "unknown,
+    /// but still a real CLI process" rather than excluded.
+    entrypoint: Option<String>,
+    /// Claude Code version that wrote the file.
+    version: Option<(u32, u32, u32)>,
 }
 
-fn pid_entrypoint_under(home: &Path, pid: u32) -> Option<String> {
-    let path = home
-        .join(".claude")
-        .join("sessions")
-        .join(format!("{pid}.json"));
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    value
-        .get("entrypoint")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+fn pid_meta(pid: u32) -> PidMeta {
+    dirs::home_dir()
+        .map(|home| pid_meta_under(&home, pid))
+        .unwrap_or_default()
+}
+
+fn pid_meta_under(home: &Path, pid: u32) -> PidMeta {
+    let path = sessions_dir(home).join(format!("{pid}.json"));
+    let Some(value) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    else {
+        return PidMeta::default();
+    };
+    let field = |name: &str| value.get(name).and_then(Value::as_str);
+    PidMeta {
+        entrypoint: field("entrypoint").map(str::to_string),
+        version: field("version").and_then(super::parse_semver),
+    }
+}
+
+fn cli_activity(status: Option<&str>) -> Option<CliActivity> {
+    match status {
+        Some("busy") => Some(CliActivity::Busy),
+        Some("idle") => Some(CliActivity::Idle),
+        Some("waiting") => Some(CliActivity::Waiting),
+        _ => None,
+    }
+}
+
+/// Permission prompts already reported `waiting` before 2.1.212, which added
+/// the remaining sandbox, MCP-input and managed-settings prompts. From then
+/// on, `busy`/`idle` mean nothing is waiting on the user.
+fn reports_prompts_as_waiting(version: (u32, u32, u32)) -> bool {
+    version >= (2, 1, 212)
 }
 
 /// Whether an agent with this resolved `entrypoint` should be monitored (kept
@@ -329,6 +589,80 @@ fn lookup_with_cache(
 mod tests {
     use super::*;
 
+    /// A fake `claude` that prints the first line of `cli-output.json` from
+    /// its invocation path's directory. Each test gets a symlink to one shared
+    /// script: macOS scans every newly written executable on first exec, one
+    /// at a time system-wide, so a fresh script per test slows every other
+    /// test that execs a fresh file.
+    #[cfg(unix)]
+    fn fixture_cli(dir: &Path) -> CliSessionSource {
+        use std::os::unix::fs::PermissionsExt;
+        static SCRIPT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let shared = SCRIPT.get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("claude-fixture");
+            // Only shell builtins; no installed CLI, PATH lookup, home
+            // directory, or global environment mutation.
+            std::fs::write(
+                &script,
+                "#!/bin/sh\nIFS= read -r row < \"${0%/*}/cli-output.json\"\nprintf '%s\\n' \"$row\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            dir
+        });
+        let link = dir.join("claude-fixture");
+        std::os::unix::fs::symlink(shared.path().join("claude-fixture"), &link).unwrap();
+        let mut source = CliSessionSource::new();
+        source.claude_bin = link;
+        source.start_times = Box::new(|pids| pids.iter().map(|&pid| (pid, 1)).collect());
+        source
+    }
+
+    #[test]
+    fn process_start_times_reports_running_pids_only() {
+        let me = std::process::id();
+        let times = process_start_times(&[me, u32::MAX - 1]);
+        assert!(times.contains_key(&me));
+        assert!(!times.contains_key(&(u32::MAX - 1)));
+    }
+
+    #[test]
+    fn registry_dir_follows_claude_config_dir() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            registry_dir(Some(home), None),
+            Some(PathBuf::from("/home/u/.claude/sessions"))
+        );
+        assert_eq!(
+            registry_dir(Some(home), Some(std::ffi::OsStr::new("/cfg"))),
+            Some(PathBuf::from("/cfg/sessions"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_registry_does_not_reuse_empty_default_registry_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default_dir = sessions_dir(tmp.path());
+        std::fs::create_dir_all(&default_dir).unwrap();
+        let configured = tmp.path().join("configured");
+        std::fs::create_dir_all(configured.join("sessions")).unwrap();
+        let dir = registry_dir(Some(tmp.path()), Some(configured.as_os_str()));
+        let mut source = fixture_cli(tmp.path());
+        let output = tmp.path().join("cli-output.json");
+        std::fs::write(&output, "[]\n").unwrap();
+        assert!(source
+            .agents_in_registry(dir.as_deref())
+            .unwrap()
+            .is_empty());
+        // CLI discovers a session in its configured registry; the default
+        // registry remains present and unchanged.
+        write_registry_row(&configured.join("sessions"), 1, ROW_A_IDLE, 0);
+        std::fs::write(&output, full_schema_json().replace('\n', "") + "\n").unwrap();
+        assert_eq!(source.agents_in_registry(dir.as_deref()).unwrap().len(), 2);
+    }
+
     fn full_schema_json() -> &'static str {
         r#"[
           {"pid":1,"cwd":"/tmp/a","kind":"interactive","startedAt":100,"sessionId":"sid-a","status":"busy"},
@@ -358,10 +692,48 @@ mod tests {
                 name: None,
                 status: None,
             },
-            Some("sdk-cli".to_string()),
+            PidMeta {
+                entrypoint: Some("sdk-cli".to_string()),
+                version: Some((2, 1, 280)),
+            },
         );
 
         assert_eq!(session.entrypoint.as_deref(), Some("sdk-cli"));
+        assert!(session.cli_reports_prompts);
+    }
+
+    #[test]
+    fn cli_activity_maps_waiting() {
+        assert_eq!(cli_activity(Some("waiting")), Some(CliActivity::Waiting));
+        assert_eq!(cli_activity(Some("busy")), Some(CliActivity::Busy));
+        assert_eq!(cli_activity(Some("idle")), Some(CliActivity::Idle));
+        assert_eq!(cli_activity(Some("on_fire")), None);
+    }
+
+    #[test]
+    fn prompts_reported_as_waiting_from_2_1_212() {
+        assert!(!reports_prompts_as_waiting((2, 1, 211)));
+        assert!(reports_prompts_as_waiting((2, 1, 212)));
+        assert!(reports_prompts_as_waiting((2, 2, 0)));
+    }
+
+    #[test]
+    fn pid_meta_reads_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("9.json"),
+            r#"{"pid":9,"entrypoint":"cli","version":"2.1.280","status":"waiting","waitingFor":"permission prompt"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pid_meta_under(tmp.path(), 9),
+            PidMeta {
+                entrypoint: Some("cli".to_string()),
+                version: Some((2, 1, 280)),
+            }
+        );
     }
 
     #[test]
@@ -419,6 +791,240 @@ mod tests {
         let json = r#"[{"pid":1,"cwd":"/tmp","startedAt":1,"sessionId":"x"}]"#;
         let agents = parse_cli_agents(json.as_bytes()).unwrap();
         assert_eq!(agents[0].kind, "interactive");
+    }
+
+    fn cache_with(signature: RegistrySignature, fetched_at: Instant) -> AgentsCache {
+        AgentsCache {
+            signature,
+            records: HashMap::new(),
+            agents: parse_cli_agents(full_schema_json().as_bytes()).unwrap(),
+            start_times: HashMap::new(),
+            fetched_at,
+        }
+    }
+
+    #[test]
+    fn registry_signature_lists_only_json_files_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("20.json"), "{}").unwrap();
+        std::fs::write(tmp.path().join("10.json"), "{\"a\":1}").unwrap();
+        std::fs::write(tmp.path().join("10.abc.key"), "secret").unwrap();
+        let names: Vec<String> = registry_signature(tmp.path())
+            .unwrap()
+            .into_iter()
+            .map(|(name, _, len)| format!("{name}:{len}"))
+            .collect();
+        assert_eq!(names, ["10.json:7", "20.json:2"]);
+    }
+
+    #[test]
+    fn registry_signature_is_none_for_missing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(registry_signature(&tmp.path().join("absent")).is_none());
+    }
+
+    #[test]
+    fn registry_signature_changes_on_rewrite_add_and_remove() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("10.json");
+        std::fs::write(&file, r#"{"status":"idle"}"#).unwrap();
+        let initial = registry_signature(tmp.path()).unwrap();
+        assert_eq!(registry_signature(tmp.path()).unwrap(), initial);
+
+        std::fs::write(&file, r#"{"status":"busy"}"#).unwrap();
+        let t = SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+        let rewritten = registry_signature(tmp.path()).unwrap();
+        assert_ne!(rewritten, initial);
+
+        std::fs::write(tmp.path().join("20.json"), "{}").unwrap();
+        let added = registry_signature(tmp.path()).unwrap();
+        assert_ne!(added, rewritten);
+
+        std::fs::remove_file(tmp.path().join("20.json")).unwrap();
+        assert_eq!(registry_signature(tmp.path()).unwrap(), rewritten);
+    }
+
+    #[test]
+    fn cache_expires_after_max_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("10.json"), "{}").unwrap();
+        let signature = registry_signature(tmp.path()).unwrap();
+        let source = CliSessionSource::new();
+
+        let mut fresh = cache_with(signature.clone(), Instant::now());
+        fresh.agents.clear();
+        assert!(source.cache_still_valid(tmp.path(), &signature, &mut fresh));
+
+        let Some(expired_at) = Instant::now().checked_sub(AGENTS_CACHE_MAX_AGE) else {
+            return;
+        };
+        let mut expired = cache_with(signature.clone(), expired_at);
+        expired.agents.clear();
+        assert!(!source.cache_still_valid(tmp.path(), &signature, &mut expired));
+    }
+
+    /// Writes a registry file for one of `full_schema_json`'s rows and bumps its
+    /// mtime so the signature changes even within one timestamp tick.
+    fn write_registry_row(dir: &Path, pid: u32, body: &str, bump_secs: u64) {
+        let file = dir.join(format!("{pid}.json"));
+        std::fs::write(&file, body).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(bump_secs))
+            .unwrap();
+    }
+
+    const ROW_A_IDLE: &str = r#"{"pid":1,"cwd":"/tmp/a","kind":"interactive","startedAt":100,"sessionId":"sid-a","status":"idle","entrypoint":"cli"}"#;
+
+    /// A registry with one live row whose CLI fixture output can then be
+    /// changed to tell whether the next lookup spawned the CLI.
+    #[cfg(unix)]
+    fn cached_row_a(tmp: &Path) -> (CliSessionSource, PathBuf, PathBuf) {
+        let registry = tmp.join("sessions");
+        std::fs::create_dir(&registry).unwrap();
+        write_registry_row(&registry, 1, ROW_A_IDLE, 0);
+        let output = tmp.join("cli-output.json");
+        std::fs::write(&output, format!("[{ROW_A_IDLE}]\n")).unwrap();
+        let mut source = fixture_cli(tmp);
+        assert_eq!(source.agents_in_registry(Some(&registry)).unwrap().len(), 1);
+        std::fs::write(&output, "[]\n").unwrap();
+        (source, registry, output)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_registry_and_start_times_reuse_cached_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut source, registry, _) = cached_row_a(tmp.path());
+        assert_eq!(source.agents_in_registry(Some(&registry)).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_pid_requeries_cli_even_with_unchanged_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut source, registry, _) = cached_row_a(tmp.path());
+        let signature = registry_signature(&registry).unwrap();
+
+        // Same pid, different process: the CLI rejects the stale record.
+        source.start_times = Box::new(|pids| pids.iter().map(|&pid| (pid, 2)).collect());
+        assert_eq!(registry_signature(&registry).unwrap(), signature);
+        assert!(source
+            .agents_in_registry(Some(&registry))
+            .unwrap()
+            .is_empty());
+        // The rejected row must not resurrect on another unchanged poll.
+        assert!(source
+            .agents_in_registry(Some(&registry))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_pid_requeries_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut source, registry, _) = cached_row_a(tmp.path());
+        source.start_times = Box::new(|_| HashMap::new());
+        assert!(source
+            .agents_in_registry(Some(&registry))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_only_registry_change_applies_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut source, registry, _) = cached_row_a(tmp.path());
+        write_registry_row(
+            &registry,
+            1,
+            &ROW_A_IDLE.replace(
+                r#""status":"idle""#,
+                r#""status":"busy","name":"renamed","updatedAt":5,"statusUpdatedAt":5"#,
+            ),
+            5,
+        );
+        let agents = source.agents_in_registry(Some(&registry)).unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status.as_deref(), Some("busy"));
+        assert_eq!(agents[0].name.as_deref(), Some("renamed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_status_change_requeries_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut source, registry, output) = cached_row_a(tmp.path());
+        write_registry_row(
+            &registry,
+            1,
+            &ROW_A_IDLE.replace(r#""status":"idle""#, r#""status":"shell""#),
+            5,
+        );
+        // The CLI reports a registry `shell` status as `busy`.
+        std::fs::write(
+            &output,
+            format!(
+                "[{}]\n",
+                ROW_A_IDLE.replace(r#""status":"idle""#, r#""status":"busy""#)
+            ),
+        )
+        .unwrap();
+        let agents = source.agents_in_registry(Some(&registry)).unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status.as_deref(), Some("busy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn added_registry_file_requeries_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut source, registry, _) = cached_row_a(tmp.path());
+        write_registry_row(&registry, 2, ROW_A_IDLE, 5);
+        assert!(source
+            .agents_in_registry(Some(&registry))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_registry_requeries_cli_when_record_is_parked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = tmp.path().join("sessions");
+        std::fs::create_dir(&registry).unwrap();
+        write_registry_row(&registry, 1, ROW_A_IDLE, 0);
+        let output = tmp.path().join("cli-output.json");
+        std::fs::write(&output, format!("[{ROW_A_IDLE}]\n")).unwrap();
+        let mut source = fixture_cli(tmp.path());
+        assert_eq!(source.agents_in_registry(Some(&registry)).unwrap().len(), 1);
+
+        write_registry_row(
+            &registry,
+            1,
+            &ROW_A_IDLE.replace(
+                r#""status":"idle""#,
+                r#""status":"idle","parkedJobId":"job""#,
+            ),
+            5,
+        );
+        // Claude excludes parked interactive records even while their pid,
+        // session id, cwd, kind and start time remain unchanged.
+        std::fs::write(&output, "[]\n").unwrap();
+        assert!(source
+            .agents_in_registry(Some(&registry))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -544,10 +1150,10 @@ mod tests {
         assert_eq!(cache.len(), 1, "cache size unchanged on hit");
     }
 
-    /// Combines `pid_entrypoint_under` + `is_monitored_entrypoint`, mirroring
+    /// Combines `pid_meta_under` + `is_monitored_entrypoint`, mirroring
     /// what `detect()`'s filter_map does per-agent.
     fn is_cli_entrypoint_under(home: &Path, pid: u32) -> bool {
-        is_monitored_entrypoint(pid_entrypoint_under(home, pid).as_deref())
+        is_monitored_entrypoint(pid_meta_under(home, pid).entrypoint.as_deref())
     }
 
     fn write_session_meta(home: &Path, pid: u32, entrypoint: Option<&str>) {
@@ -628,7 +1234,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_session_meta(tmp.path(), 8, Some("claude-vscode"));
         assert_eq!(
-            pid_entrypoint_under(tmp.path(), 8),
+            pid_meta_under(tmp.path(), 8).entrypoint,
             Some("claude-vscode".to_string())
         );
     }
@@ -636,7 +1242,7 @@ mod tests {
     #[test]
     fn pid_entrypoint_none_when_meta_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(pid_entrypoint_under(tmp.path(), 999), None);
+        assert_eq!(pid_meta_under(tmp.path(), 999), PidMeta::default());
     }
 
     #[test]
