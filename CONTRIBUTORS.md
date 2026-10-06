@@ -27,11 +27,16 @@ We appreciate all contributions, big and small. Thank you to the following peopl
 - **Grimmer Kang** ([@grimmerk](https://github.com/grimmerk)) - Custom title and ACTIVE badge in history ([#52](https://github.com/minchenlee/c9watch/pull/52))
 - **Jeff Carey** ([@jeff-carey](https://github.com/jeff-carey)) - Added exact Terminal.app window and tab focusing via TTY matching ([#109](https://github.com/minchenlee/c9watch/pull/109))
 - **Mamed** ([@mamedium](https://github.com/mamedium)) - Added exact Supacode tab and surface focusing when opening a session ([#114](https://github.com/minchenlee/c9watch/pull/114))
+- **Jamie Goodfellow** ([@boogle42](https://github.com/boogle42)) - Show background and entrypoint badges on session cards ([#134](https://github.com/minchenlee/c9watch/pull/134))
+- **Jamie Goodfellow** ([@boogle42](https://github.com/boogle42)) - Added an opt-in Claude Code hook bridge and fixed false Needs Attention from sub-agents ([#136](https://github.com/minchenlee/c9watch/pull/136))
+- **Jamie Goodfellow** ([@boogle42](https://github.com/boogle42)) - Show an elapsed-window marker under usage meters ([#140](https://github.com/minchenlee/c9watch/pull/140))
 
 ### Performance
 
 - **Grimmer Kang** ([@grimmerk](https://github.com/grimmerk)) - Reduce CPU usage by optimizing sysinfo process scanning ([#14](https://github.com/minchenlee/c9watch/pull/14))
 - **Grimmer Kang** ([@grimmerk](https://github.com/grimmerk)) - Sliding window rendering for large conversations ([#53](https://github.com/minchenlee/c9watch/pull/53))
+- **Jamie Goodfellow** ([@boogle42](https://github.com/boogle42)) - Cache subagent detection and message counts so old sessions are not re-parsed every poll ([#133](https://github.com/minchenlee/c9watch/pull/133))
+- **Jamie Goodfellow** ([@boogle42](https://github.com/boogle42)) - Cut dashboard and idle energy use: fewer CLI spawns, no updates for hidden windows, lighter status-bar animation ([#138](https://github.com/minchenlee/c9watch/pull/138))
 
 ### UI/UX
 
@@ -44,6 +49,8 @@ We appreciate all contributions, big and small. Thank you to the following peopl
 - **josh.dev** ([@josh-dev-cho](https://github.com/josh-dev-cho)) - Fix dot character in path encoding for session matching ([#57](https://github.com/minchenlee/c9watch/pull/57))
 - **Vladan** ([@vladan-me](https://github.com/vladan-me)) - Focus existing JetBrains window instead of opening new one ([#69](https://github.com/minchenlee/c9watch/pull/69))
 - **Alex Jones-Wolsey** ([@ajonesw](https://github.com/ajonesw)) - Detect claude processes by cmd args on macOS ([#77](https://github.com/minchenlee/c9watch/pull/77))
+- **Jamie Goodfellow** ([@boogle42](https://github.com/boogle42)) - Drop dead pids from `claude agents --json` before status inference ([#132](https://github.com/minchenlee/c9watch/pull/132))
+- **Jamie Goodfellow** ([@boogle42](https://github.com/boogle42)) - Find `claude` outside the launchd PATH and stop matching Claude Desktop helpers ([#139](https://github.com/minchenlee/c9watch/pull/139))
 
 ---
 

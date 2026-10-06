@@ -103,6 +103,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "boogle42",
+      "name": "Jamie Goodfellow",
+      "avatar_url": "https://github.com/boogle42.png",
+      "profile": "https://github.com/boogle42",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "contributorsPerLine": 7,
