@@ -12,7 +12,7 @@ head:
 c9watch v0.10.0 monitors **Claude Code**, **Codex** (app and CLI), **Cursor Agent** (monitor-only) and **Pi** (read-only). **OpenCode** is a preview that needs a manual server connection.
 :::
 
-*Applies to v0.10.0. Last checked against the release notes on the release date.*
+*Applies to v0.10.0. Last checked on 2026-10-08.*
 
 ## Agents
 
