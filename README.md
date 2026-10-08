@@ -34,6 +34,16 @@ Built with **Tauri**, **Rust**, and **Svelte** -- not Electron. The app binary i
 
 ### Desktop app (macOS)
 
+With [Homebrew](https://brew.sh):
+
+```bash
+brew install --cask minchenlee/tap/c9watch
+```
+
+The cask installs the app only. To use the CLI, symlink it: `ln -s /Applications/c9watch.app/Contents/MacOS/c9watch ~/.local/bin/c9watch`.
+
+Or with the install script, which also sets up the CLI:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash
 ```
