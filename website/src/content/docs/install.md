@@ -1,6 +1,6 @@
 ---
 title: Install
-description: How to install c9watch — desktop app for macOS or standalone CLI for macOS & Linux. One-command install, download, or build from source.
+description: "How to install c9watch: desktop app for macOS or standalone CLI for macOS & Linux. Homebrew, one-command install, download, or build from source."
 head:
   - tag: script
     attrs:
@@ -9,15 +9,24 @@ head:
 ---
 
 :::note[TL;DR]
-**Desktop app (macOS):** `curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash`
-**CLI only (macOS & Linux):** `curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install-cli.sh | bash`
+- **Desktop app (macOS), Homebrew:** `brew install --cask minchenlee/tap/c9watch`
+- **Desktop app (macOS), with CLI:** `curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash`
+- **CLI only (macOS & Linux):** `curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install-cli.sh | bash`
 :::
 
 c9watch comes in two forms: a **desktop app** with a full GUI dashboard, and a **standalone CLI** for scriptable session management.
 
 ## Desktop app (macOS)
 
-### Quick install
+### Homebrew
+
+```bash
+brew install --cask minchenlee/tap/c9watch
+```
+
+This installs `c9watch.app` to `/Applications`. It does not link the CLI. To use the CLI too, run the curl script below or symlink the bundled binary as shown under "Download manually".
+
+### Quick install (curl)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash
@@ -36,7 +45,7 @@ mkdir -p ~/.local/bin
 ln -s /Applications/c9watch.app/Contents/MacOS/c9watch ~/.local/bin/c9watch
 ```
 
-On first launch, macOS may show a security warning because the app is not notarized by Apple. Go to **System Settings → Privacy & Security** and click **"Open Anyway"**.
+The app is signed with a Developer ID certificate and notarized by Apple (v0.10.0 passes `spctl` as "Notarized Developer ID"), so macOS opens it without a security override.
 
 ## CLI only (macOS & Linux)
 

@@ -1,0 +1,120 @@
+---
+// website/src/components/InstallRows.astro
+const { cli = false } = Astro.props;
+const rows = [
+  {
+    label: 'Homebrew',
+    command: 'brew install --cask minchenlee/tap/c9watch',
+  },
+  {
+    label: 'curl',
+    command: 'curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash',
+  },
+  ...(cli ? [{
+    label: 'CLI only (macOS & Linux)',
+    command: 'curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install-cli.sh | bash',
+  }] : []),
+];
+---
+
+<div class="install-rows">
+  {rows.map(row => (
+    <div class="install-row">
+      <span class="install-label">{row.label}</span>
+      <div class="install-box">
+        <code>{row.command}</code>
+        <button class="copy-btn" data-copy={row.command} aria-label={`Copy ${row.label} install command`}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="9" y="9" width="13" height="13" rx="0"></rect>
+            <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"></path>
+          </svg>
+        </button>
+      </div>
+    </div>
+  ))}
+  <p class="install-note">The curl script also links the <code>c9watch</code> CLI into <code>~/.local/bin</code>. Homebrew installs the app only.</p>
+</div>
+
+<script>
+  document.querySelectorAll<HTMLButtonElement>('.install-rows .copy-btn').forEach((btn) => {
+    const label = btn.getAttribute('aria-label') ?? 'Copy install command';
+    btn.addEventListener('click', () => {
+      navigator.clipboard.writeText(btn.dataset.copy ?? '');
+      btn.setAttribute('aria-label', 'Copied!');
+      setTimeout(() => btn.setAttribute('aria-label', label), 2000);
+    });
+  });
+</script>
+
+<style>
+  .install-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    width: 100%;
+    max-width: 640px;
+    margin: 0 auto;
+    text-align: left;
+  }
+
+  .install-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .install-label {
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .install-box {
+    display: flex;
+    align-items: center;
+    background: var(--bg-card);
+    border: 1px solid var(--border-default);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text-secondary);
+    min-width: 0;
+  }
+
+  .install-box code {
+    flex: 1;
+    min-width: 0;
+    padding: 0.75rem 1rem;
+    white-space: nowrap;
+    overflow-x: auto;
+    background: none;
+    border: none;
+  }
+
+  .copy-btn {
+    flex-shrink: 0;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 0.75rem;
+    background: var(--bg-card);
+    border: none;
+    border-left: 1px solid var(--border-muted);
+    transition: color var(--transition-fast);
+  }
+
+  .copy-btn:hover {
+    color: var(--text-primary);
+  }
+
+  .install-note {
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1.5;
+    margin: 0;
+  }
+
+  .install-note code {
+    font-size: 12px;
+  }
+</style>
