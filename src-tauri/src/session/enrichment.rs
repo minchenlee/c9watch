@@ -881,20 +881,25 @@ fn dedup_newest_wins(sessions: Vec<Session>) -> Vec<Session> {
 /// A hook prompt remains evidence unless the exact correlated call has a result.
 /// A bounded/missing transcript cannot establish resolution by absence.
 fn open_hook_prompt(state: &HookSessionState, session_file: &Path) -> Option<PendingPermission> {
-    state.pending.iter().find(|prompt| {
-        let transcript = match &prompt.agent_id {
-            None => Some(session_file.to_path_buf()),
-            Some(agent_id) => subagent_transcript(session_file, agent_id),
-        };
-        transcript.is_none_or(|path| crate::claude_hooks::prompt_is_open(prompt, &path))
-    }).cloned()
+    state
+        .pending
+        .iter()
+        .find(|prompt| {
+            let transcript = match &prompt.agent_id {
+                None => Some(session_file.to_path_buf()),
+                Some(agent_id) => subagent_transcript(session_file, agent_id),
+            };
+            transcript.is_none_or(|path| crate::claude_hooks::prompt_is_open(prompt, &path))
+        })
+        .cloned()
 }
 
 /// `<project>/<session>/subagents/agent-<id>.jsonl` for `<project>/<session>.jsonl`.
 fn subagent_transcript(session_file: &Path, agent_id: &str) -> Option<PathBuf> {
-    if agent_id.is_empty() || !agent_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    if agent_id.is_empty()
+        || !agent_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         return None;
     }
@@ -2191,7 +2196,10 @@ mod hook_prompt_tests {
     }
 
     fn state(pending: Vec<PendingPermission>) -> HookSessionState {
-        HookSessionState { pending, ..Default::default() }
+        HookSessionState {
+            pending,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -2203,12 +2211,16 @@ mod hook_prompt_tests {
         let open = open_hook_prompt(&state(vec![prompt(None, "Bash")]), &file);
         assert_eq!(open.map(|p| p.tool_name), Some("Bash".to_string()));
         // A different call id absent from this window is uncertain, not resolved.
-        let mut other = prompt(None, "Write"); other.tool_use_id = Some("missing-call".into());
+        let mut other = prompt(None, "Write");
+        other.tool_use_id = Some("missing-call".into());
         assert!(open_hook_prompt(&state(vec![other]), &file).is_some());
 
         // A rejected dialog fires no hook, but the transcript records the result.
         std::fs::write(&file, format!("{PENDING_BASH}\n{BASH_RESULT}\n")).unwrap();
-        assert_eq!(open_hook_prompt(&state(vec![prompt(None, "Bash")]), &file), None);
+        assert_eq!(
+            open_hook_prompt(&state(vec![prompt(None, "Bash")]), &file),
+            None
+        );
     }
 
     #[test]
@@ -2253,52 +2265,113 @@ mod repair_regressions {
     fn pending(id: Option<&str>, agent: Option<&str>) -> HookSessionState {
         serde_json::from_value(serde_json::json!({"pending":[{"toolName":"Bash","agentId":agent,"requestedAt":1,"toolUseId":id}]})).unwrap()
     }
-    const CALL:&str=r#"{"type":"assistant","uuid":"u1","timestamp":"2026-09-23T00:00:00Z","message":{"model":"m","id":"msg1","role":"assistant","content":[{"type":"tool_use","id":"old","name":"Bash","input":{"command":"make"}}]}}"#;
-    const DONE:&str=r#"{"type":"user","uuid":"u2","timestamp":"2026-09-23T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"old","content":"done"}]}}"#;
+    const CALL: &str = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-09-23T00:00:00Z","message":{"model":"m","id":"msg1","role":"assistant","content":[{"type":"tool_use","id":"old","name":"Bash","input":{"command":"make"}}]}}"#;
+    const DONE: &str = r#"{"type":"user","uuid":"u2","timestamp":"2026-09-23T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"old","content":"done"}]}}"#;
     #[test]
     fn unresolved_call_outside_fifty_line_tail_remains_attention() {
-        let dir=fixture();let path=dir.path().join("s1.jsonl");
-        let progress="{\"type\":\"progress\"}\n".repeat(60);
-        std::fs::write(&path,format!("{CALL}\n{progress}")).unwrap();
-        assert!(open_hook_prompt(&pending(Some("old"),None),&path).is_some(),"tail absence was treated as resolution");
+        let dir = fixture();
+        let path = dir.path().join("s1.jsonl");
+        let progress = "{\"type\":\"progress\"}\n".repeat(60);
+        std::fs::write(&path, format!("{CALL}\n{progress}")).unwrap();
+        assert!(
+            open_hook_prompt(&pending(Some("old"), None), &path).is_some(),
+            "tail absence was treated as resolution"
+        );
     }
     #[test]
     fn malformed_or_truncated_transcript_is_uncertain_not_resolved() {
-        let dir=fixture();let path=dir.path().join("s1.jsonl");
-        std::fs::write(&path,"malformed\n").unwrap();
-        assert!(open_hook_prompt(&pending(Some("old"),None),&path).is_some());
-        std::fs::write(&path,format!("{}\n{CALL}\n","{\"type\":\"progress\"}\n".repeat(40_000))).unwrap();
-        assert!(open_hook_prompt(&pending(Some("old"),None),&path).is_some());
+        let dir = fixture();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(&path, "malformed\n").unwrap();
+        assert!(open_hook_prompt(&pending(Some("old"), None), &path).is_some());
+        std::fs::write(
+            &path,
+            format!("{}\n{CALL}\n", "{\"type\":\"progress\"}\n".repeat(40_000)),
+        )
+        .unwrap();
+        assert!(open_hook_prompt(&pending(Some("old"), None), &path).is_some());
     }
     #[test]
     fn resolved_old_call_does_not_attach_to_new_bash_call() {
-        let dir=fixture();let path=dir.path().join("s1.jsonl");
-        std::fs::write(&path,format!("{CALL}\n{DONE}\n{}\n",CALL.replace("\"old\"","\"new\""))).unwrap();
-        assert!(open_hook_prompt(&pending(Some("old"),None),&path).is_none(),"resolved request attached to a newer Bash");
+        let dir = fixture();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(
+            &path,
+            format!("{CALL}\n{DONE}\n{}\n", CALL.replace("\"old\"", "\"new\"")),
+        )
+        .unwrap();
+        assert!(
+            open_hook_prompt(&pending(Some("old"), None), &path).is_none(),
+            "resolved request attached to a newer Bash"
+        );
     }
     #[test]
     fn uncorrelated_prompt_does_not_acquire_an_unrelated_calls_arguments() {
-        let dir=fixture();let path=dir.path().join("s1.jsonl");std::fs::write(&path,CALL).unwrap();
-        let p=pending(None,None).pending.remove(0);
-        assert!(crate::claude_hooks::prompt_input(&p,&path).is_none());
-        let p=pending(Some("old"),None).pending.remove(0);
-        assert_eq!(crate::claude_hooks::prompt_input(&p,&path).unwrap()["command"],"make","bound tool input must stay exposed");
+        let dir = fixture();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(&path, CALL).unwrap();
+        let p = pending(None, None).pending.remove(0);
+        assert!(crate::claude_hooks::prompt_input(&p, &path).is_none());
+        let p = pending(Some("old"), None).pending.remove(0);
+        assert_eq!(
+            crate::claude_hooks::prompt_input(&p, &path).unwrap()["command"],
+            "make",
+            "bound tool input must stay exposed"
+        );
     }
     #[test]
     fn genuine_subagent_prompt_is_preserved_and_its_exact_result_resolves_it() {
-        let dir=fixture();let path=dir.path().join("s1.jsonl");
-        let sub=dir.path().join("s1/subagents");std::fs::create_dir_all(&sub).unwrap();
-        let child=sub.join("agent-a1.jsonl");std::fs::write(&child,CALL).unwrap();
-        assert!(open_hook_prompt(&pending(Some("old"),Some("a1")),&path).is_some());
-        std::fs::write(&child,format!("{CALL}\n{DONE}\n")).unwrap();
-        assert!(open_hook_prompt(&pending(Some("old"),Some("a1")),&path).is_none());
+        let dir = fixture();
+        let path = dir.path().join("s1.jsonl");
+        let sub = dir.path().join("s1/subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let child = sub.join("agent-a1.jsonl");
+        std::fs::write(&child, CALL).unwrap();
+        assert!(open_hook_prompt(&pending(Some("old"), Some("a1")), &path).is_some());
+        std::fs::write(&child, format!("{CALL}\n{DONE}\n")).unwrap();
+        assert!(open_hook_prompt(&pending(Some("old"), Some("a1")), &path).is_none());
     }
     #[test]
     fn cli_precedence_and_idle_text_questions_stay_unchanged() {
-        assert_eq!(merge_cli_activity(SessionStatus::Working,Some(CliActivity::Waiting),true,None),SessionStatus::NeedsAttention);
-        assert_eq!(merge_cli_activity(SessionStatus::NeedsAttention,Some(CliActivity::Busy),true,Some("Bash")),SessionStatus::Working);
-        assert_eq!(merge_cli_activity(SessionStatus::NeedsAttention,Some(CliActivity::Idle),true,Some("Bash")),SessionStatus::WaitingForInput);
-        assert_eq!(merge_cli_activity(SessionStatus::NeedsAttention,Some(CliActivity::Idle),true,Some("Question")),SessionStatus::NeedsAttention);
-        assert_eq!(merge_cli_activity(SessionStatus::NeedsAttention,None,false,Some("Bash")),SessionStatus::NeedsAttention);
+        assert_eq!(
+            merge_cli_activity(
+                SessionStatus::Working,
+                Some(CliActivity::Waiting),
+                true,
+                None
+            ),
+            SessionStatus::NeedsAttention
+        );
+        assert_eq!(
+            merge_cli_activity(
+                SessionStatus::NeedsAttention,
+                Some(CliActivity::Busy),
+                true,
+                Some("Bash")
+            ),
+            SessionStatus::Working
+        );
+        assert_eq!(
+            merge_cli_activity(
+                SessionStatus::NeedsAttention,
+                Some(CliActivity::Idle),
+                true,
+                Some("Bash")
+            ),
+            SessionStatus::WaitingForInput
+        );
+        assert_eq!(
+            merge_cli_activity(
+                SessionStatus::NeedsAttention,
+                Some(CliActivity::Idle),
+                true,
+                Some("Question")
+            ),
+            SessionStatus::NeedsAttention
+        );
+        assert_eq!(
+            merge_cli_activity(SessionStatus::NeedsAttention, None, false, Some("Bash")),
+            SessionStatus::NeedsAttention
+        );
     }
 }

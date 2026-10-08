@@ -288,7 +288,10 @@ mod tests {
     fn providerless_probe_finds_opencode_and_still_rejects_collisions() {
         let load = |provider| {
             if provider == SessionProvider::Opencode {
-                Ok(Conversation { provider, ..conversation("remote-id") })
+                Ok(Conversation {
+                    provider,
+                    ..conversation("remote-id")
+                })
             } else {
                 Err("not found".into())
             }
@@ -297,11 +300,15 @@ mod tests {
         assert_eq!(result.provider, SessionProvider::Opencode);
         let error = probe_providerless_conversation("remote-id", |provider| {
             if provider == SessionProvider::Pi {
-                Ok(Conversation { provider, ..conversation("remote-id") })
+                Ok(Conversation {
+                    provider,
+                    ..conversation("remote-id")
+                })
             } else {
                 load(provider)
             }
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert!(error.contains("ambiguous across providers"));
     }
 

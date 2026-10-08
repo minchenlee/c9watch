@@ -25,8 +25,8 @@ pub fn session_open_target(pid: u32, can_open: bool) -> Option<OpenTarget> {
     }
     let app = find_parent_app(pid).ok()?;
     #[cfg(target_os = "macos")]
-    let exact_tty = matches!(app.as_str(), "Terminal" | "iTerm" | "iTerm2")
-        && get_session_tty(pid).is_some();
+    let exact_tty =
+        matches!(app.as_str(), "Terminal" | "iTerm" | "iTerm2") && get_session_tty(pid).is_some();
     #[cfg(not(target_os = "macos"))]
     let exact_tty = false;
     let project_opener = is_jetbrains_ide(&app) || get_app_cli(&app).is_some();
@@ -1145,9 +1145,15 @@ mod tests {
         }
         for app in ["Terminal", "iTerm", "iTerm2"] {
             assert_eq!(open_target_for_app(app, true, false), OpenTarget::Terminal);
-            assert_eq!(open_target_for_app(app, false, false), OpenTarget::Application);
+            assert_eq!(
+                open_target_for_app(app, false, false),
+                OpenTarget::Application
+            );
         }
-        assert_eq!(open_target_for_app("supacode", false, false), OpenTarget::Application);
+        assert_eq!(
+            open_target_for_app("supacode", false, false),
+            OpenTarget::Application
+        );
         assert_eq!(session_open_target(0, true), None);
         assert_eq!(session_open_target(123, false), None);
     }
