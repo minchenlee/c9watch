@@ -327,18 +327,38 @@ fn resolve_snapshot(
 
 fn parse_claude_snapshot(value: &Value, now: i64) -> SubscriptionUsage {
     let mut usage = unavailable("claudeCode", "Claude Code", "No subscription limits reported. Requires an eligible Claude plan and a response in Claude Code.");
-    let Some(updated) = value["updatedAt"].as_i64().filter(|t| *t > 0 && *t <= now + 60) else { return usage; };
-    if value["schemaVersion"] != 1 { return usage; }
+    let Some(updated) = value["updatedAt"]
+        .as_i64()
+        .filter(|t| *t > 0 && *t <= now + 60)
+    else {
+        return usage;
+    };
+    if value["schemaVersion"] != 1 {
+        return usage;
+    }
     usage.updated_at = Some(updated);
     let clean = crate::claude_usage::sanitize(value, now);
-    for (key, label, window_seconds) in [("five_hour", "5-hour", Some(5 * 3600)), ("seven_day", "Weekly", Some(7 * 86400)), ("spend_limit", "Spend limit", None)] {
+    for (key, label, window_seconds) in [
+        ("five_hour", "5-hour", Some(5 * 3600)),
+        ("seven_day", "Weekly", Some(7 * 86400)),
+        ("spend_limit", "Spend limit", None),
+    ] {
         let w = &clean["rate_limits"][key];
         if let Some(percent) = w["used_percentage"].as_f64() {
-            usage.windows.push(UsageWindow { label: label.into(), used_percent: percent, resets_at: w["resets_at"].as_i64(), window_seconds });
+            usage.windows.push(UsageWindow {
+                label: label.into(),
+                used_percent: percent,
+                resets_at: w["resets_at"].as_i64(),
+                window_seconds,
+            });
         }
     }
     if !usage.windows.is_empty() {
-        usage.message = if now - updated > 180 { Some("Last reported by Claude Code. Open a session to update usage.".into()) } else { None };
+        usage.message = if now - updated > 180 {
+            Some("Last reported by Claude Code. Open a session to update usage.".into())
+        } else {
+            None
+        };
     }
     usage
 }
@@ -351,10 +371,18 @@ async fn read_claude() -> Result<SubscriptionUsage, String> {
         Err(_) => return Err("Cannot read Claude Code usage snapshot".into()),
     };
     let mut bytes = Vec::new();
-    file.take(16_385).read_to_end(&mut bytes).await.map_err(|_| "Cannot read Claude usage")?;
-    if bytes.len() > 16_384 { return Err("Claude usage snapshot is too large".into()); }
+    file.take(16_385)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| "Cannot read Claude usage")?;
+    if bytes.len() > 16_384 {
+        return Err("Claude usage snapshot is too large".into());
+    }
     let value = serde_json::from_slice(&bytes).map_err(|_| "Invalid Claude usage snapshot")?;
-    Ok(parse_claude_snapshot(&value, chrono::Utc::now().timestamp()))
+    Ok(parse_claude_snapshot(
+        &value,
+        chrono::Utc::now().timestamp(),
+    ))
 }
 
 /// Shared cache coalesces desktop/mobile polling and bounds subprocess creation.
@@ -372,10 +400,14 @@ pub async fn get_subscription_usage() -> Vec<SubscriptionUsage> {
         .as_ref()
         .map(|(_, entries)| entries.as_slice())
         .unwrap_or(&[]);
-    let data = [("claudeCode", "Claude Code", claude), ("codex", "Codex", codex), ("cursor", "Cursor", cursor)]
-        .into_iter()
-        .map(|(provider, name, result)| resolve_snapshot(provider, name, result, previous))
-        .collect::<Vec<_>>();
+    let data = [
+        ("claudeCode", "Claude Code", claude),
+        ("codex", "Codex", codex),
+        ("cursor", "Cursor", cursor),
+    ]
+    .into_iter()
+    .map(|(provider, name, result)| resolve_snapshot(provider, name, result, previous))
+    .collect::<Vec<_>>();
     *cache = Some((Instant::now(), data.clone()));
     data
 }
@@ -481,11 +513,19 @@ mod tests {
         assert_eq!(partial.windows[0].label, "Weekly");
         assert!(parse_claude_snapshot(&saved, 4500).windows.is_empty());
         assert!(parse_claude_snapshot(&saved, 10).windows.is_empty());
-        assert!(parse_claude_snapshot(&json!({"schemaVersion":1,"updatedAt":1000,"rate_limits":{}}), 1010).windows.is_empty());
+        assert!(parse_claude_snapshot(
+            &json!({"schemaVersion":1,"updatedAt":1000,"rate_limits":{}}),
+            1010
+        )
+        .windows
+        .is_empty());
     }
     #[test]
     fn claude_authoritative_empty_snapshot_clears_previous_windows() {
-        let saved = crate::claude_usage::sanitize(&json!({"rate_limits":{"five_hour":{"used_percentage":60,"resets_at":2000}}}), 1000);
+        let saved = crate::claude_usage::sanitize(
+            &json!({"rate_limits":{"five_hour":{"used_percentage":60,"resets_at":2000}}}),
+            1000,
+        );
         let previous = parse_claude_snapshot(&saved, 1010);
         let expired = parse_claude_snapshot(&saved, 2100);
         let resolved = resolve_snapshot("claudeCode", "Claude Code", Ok(expired), &[previous]);

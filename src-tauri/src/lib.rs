@@ -14,15 +14,15 @@ pub mod session;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod auth;
 #[cfg(all(not(mobile), feature = "gui"))]
+mod blocking;
+#[cfg(all(not(mobile), feature = "gui"))]
 pub mod notifications;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod polling;
 #[cfg(all(not(mobile), feature = "gui"))]
-mod blocking;
+pub mod subscription_usage;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod web_server;
-#[cfg(all(not(mobile), feature = "gui"))]
-pub mod subscription_usage;
 
 // ── CLI module ──────────────────────────────────────────────────────
 #[cfg(feature = "cli")]

@@ -90,23 +90,44 @@ impl PermissionChecker {
     pub fn from_files(paths: &[PathBuf]) -> Self {
         let mut allowed_patterns = Vec::new();
         let mut asked_agent_patterns = Vec::new();
-        for settings in paths.iter()
+        for settings in paths
+            .iter()
             .filter_map(|path| {
                 #[cfg(unix)]
-                { crate::claude_hooks::read_settings(path).ok() }
+                {
+                    crate::claude_hooks::read_settings(path).ok()
+                }
                 #[cfg(not(unix))]
-                { fs::read(path).ok() }
+                {
+                    fs::read(path).ok()
+                }
             })
             .filter_map(|content| serde_json::from_slice::<ClaudeSettings>(&content).ok())
         {
             if let Some(permissions) = settings.permissions {
-                allowed_patterns.extend(permissions.allow.unwrap_or_default().iter()
-                    .filter_map(|rule| Self::parse_pattern(rule)));
-                asked_agent_patterns.extend(permissions.ask.unwrap_or_default().into_iter()
-                    .filter(|rule| rule == "Agent" || (rule.starts_with("Agent(") && rule.ends_with(')'))));
+                allowed_patterns.extend(
+                    permissions
+                        .allow
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|rule| Self::parse_pattern(rule)),
+                );
+                asked_agent_patterns.extend(
+                    permissions
+                        .ask
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|rule| {
+                            rule == "Agent" || (rule.starts_with("Agent(") && rule.ends_with(')'))
+                        }),
+                );
             }
         }
-        Self { allowed_patterns, asked_agent_patterns, assume_approved: false }
+        Self {
+            allowed_patterns,
+            asked_agent_patterns,
+            assume_approved: false,
+        }
     }
 
     /// A checker that reports every tool as approved.
@@ -124,7 +145,9 @@ impl PermissionChecker {
         let key = project_dir.map(Path::to_path_buf);
         if let Ok(cache) = CHECKER_CACHE.try_lock() {
             if let Some((loaded, checker)) = cache.get(&key) {
-                if loaded.elapsed() < CACHE_TTL { return checker.clone(); }
+                if loaded.elapsed() < CACHE_TTL {
+                    return checker.clone();
+                }
             }
         }
         let checker = Arc::new(Self::from_files(&settings_files(project_dir)));
@@ -189,11 +212,16 @@ impl PermissionChecker {
     pub fn is_auto_approved(&self, tool_name: &str, tool_input: &serde_json::Value) -> bool {
         // Ordinary running Agent calls stay excluded, but explicit top-level
         // ask rules take precedence over the default and over an allow rule.
-        if tool_name == "Agent" && self.asked_agent_patterns.iter().any(|rule| {
-            if rule == "Agent" { return true; }
-            let agent = &rule[6..rule.len() - 1];
-            agent == "*" || tool_input.get("subagent_type").and_then(|v| v.as_str()) == Some(agent)
-        }) {
+        if tool_name == "Agent"
+            && self.asked_agent_patterns.iter().any(|rule| {
+                if rule == "Agent" {
+                    return true;
+                }
+                let agent = &rule[6..rule.len() - 1];
+                agent == "*"
+                    || tool_input.get("subagent_type").and_then(|v| v.as_str()) == Some(agent)
+            })
+        {
             return false;
         }
         if self.assume_approved || NEVER_PROMPTING_TOOLS.contains(&tool_name) {
@@ -443,26 +471,34 @@ mod repair_regressions {
 
     #[test]
     fn explicit_agent_ask_overrides_default_and_allow_across_files() {
-        let dir=fixture();let allow=dir.path().join("allow.json");let ask=dir.path().join("ask.json");
-        fs::write(&allow,r#"{"permissions":{"allow":["Agent","Bash"]}}"#).unwrap();
-        fs::write(&ask,r#"{"permissions":{"ask":["Agent"]}}"#).unwrap();
-        let checker=PermissionChecker::from_files(&[allow,ask]);
-        assert!(!checker.is_auto_approved("Agent",&serde_json::json!({"subagent_type":"Explore"})),"explicit Agent ask was ignored");
-        assert!(checker.is_auto_approved("Bash",&serde_json::json!({"command":"make"})));
+        let dir = fixture();
+        let allow = dir.path().join("allow.json");
+        let ask = dir.path().join("ask.json");
+        fs::write(&allow, r#"{"permissions":{"allow":["Agent","Bash"]}}"#).unwrap();
+        fs::write(&ask, r#"{"permissions":{"ask":["Agent"]}}"#).unwrap();
+        let checker = PermissionChecker::from_files(&[allow, ask]);
+        assert!(
+            !checker.is_auto_approved("Agent", &serde_json::json!({"subagent_type":"Explore"})),
+            "explicit Agent ask was ignored"
+        );
+        assert!(checker.is_auto_approved("Bash", &serde_json::json!({"command":"make"})));
     }
     #[test]
     fn agent_subtype_and_wildcard_ask_rules_are_honored_without_flagging_other_agents() {
-        let dir=fixture();let path=dir.path().join("settings.json");
-        fs::write(&path,r#"{"permissions":{"ask":["Agent(Explore)"]}}"#).unwrap();
-        let checker=PermissionChecker::from_file(&path);
-        assert!(!checker.is_auto_approved("Agent",&serde_json::json!({"subagent_type":"Explore"})));
-        assert!(checker.is_auto_approved("Agent",&serde_json::json!({"subagent_type":"Plan"})));
-        fs::write(&path,r#"{"permissions":{"ask":["Agent(*)"]}}"#).unwrap();
-        assert!(!PermissionChecker::from_file(&path).is_auto_approved("Agent",&serde_json::json!({})));
+        let dir = fixture();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"permissions":{"ask":["Agent(Explore)"]}}"#).unwrap();
+        let checker = PermissionChecker::from_file(&path);
+        assert!(!checker.is_auto_approved("Agent", &serde_json::json!({"subagent_type":"Explore"})));
+        assert!(checker.is_auto_approved("Agent", &serde_json::json!({"subagent_type":"Plan"})));
+        fs::write(&path, r#"{"permissions":{"ask":["Agent(*)"]}}"#).unwrap();
+        assert!(
+            !PermissionChecker::from_file(&path).is_auto_approved("Agent", &serde_json::json!({}))
+        );
     }
     #[test]
     fn normal_agent_without_ask_stays_approved() {
-        assert!(PermissionChecker::default().is_auto_approved("Agent",&serde_json::json!({})));
+        assert!(PermissionChecker::default().is_auto_approved("Agent", &serde_json::json!({})));
     }
 }
 
@@ -472,35 +508,64 @@ mod settings_io_regressions_v3 {
     use std::os::unix::ffi::OsStrExt;
     #[test]
     fn permission_settings_fifo_symlink_and_size_do_not_block_or_grant_rules() {
-        let dir=tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-        let fifo=dir.path().join("fifo.json");
-        let name=std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe {libc::mkfifo(name.as_ptr(),0o600)},0);
-        let valid=dir.path().join("valid.json");fs::write(&valid,br#"{"permissions":{"allow":["Bash"]}}"#).unwrap();
-        let link=dir.path().join("link.json");std::os::unix::fs::symlink(&valid,&link).unwrap();
-        let large=dir.path().join("large.json");fs::write(&large,vec![b' ';256*1024+1]).unwrap();
-        let start=Instant::now();
-        for path in [link,large,fifo] { assert!(!PermissionChecker::from_file(&path).is_auto_approved("Bash",&serde_json::json!({"command":"make"}))); }
-        assert!(start.elapsed()<Duration::from_millis(250));
-        assert!(PermissionChecker::from_file(&valid).is_auto_approved("Bash",&serde_json::json!({"command":"make"})));
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let fifo = dir.path().join("fifo.json");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let valid = dir.path().join("valid.json");
+        fs::write(&valid, br#"{"permissions":{"allow":["Bash"]}}"#).unwrap();
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&valid, &link).unwrap();
+        let large = dir.path().join("large.json");
+        fs::write(&large, vec![b' '; 256 * 1024 + 1]).unwrap();
+        let start = Instant::now();
+        for path in [link, large, fifo] {
+            assert!(!PermissionChecker::from_file(&path)
+                .is_auto_approved("Bash", &serde_json::json!({"command":"make"})));
+        }
+        assert!(start.elapsed() < Duration::from_millis(250));
+        assert!(PermissionChecker::from_file(&valid)
+            .is_auto_approved("Bash", &serde_json::json!({"command":"make"})));
     }
     #[test]
     fn checker_does_not_wait_for_global_cache_while_loading_fixture() {
-        let dir=tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         fs::create_dir(dir.path().join(".claude")).unwrap();
-        fs::write(dir.path().join(".claude/settings.json"),br#"{"permissions":{"allow":["Bash"]}}"#).unwrap();
-        let held=CHECKER_CACHE.lock().unwrap();let project=dir.path().to_path_buf();
-        let (tx,rx)=std::sync::mpsc::channel();
-        let reader=std::thread::spawn(move || tx.send(PermissionChecker::cached_for(Some(&project)).is_auto_approved("Bash",&serde_json::json!({"command":"make"}))).unwrap());
-        let timely=rx.recv_timeout(Duration::from_millis(250));drop(held);reader.join().unwrap();
-        assert!(timely.is_ok_and(|approved|approved),"permission loader waited for global cache");
+        fs::write(
+            dir.path().join(".claude/settings.json"),
+            br#"{"permissions":{"allow":["Bash"]}}"#,
+        )
+        .unwrap();
+        let held = CHECKER_CACHE.lock().unwrap();
+        let project = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            tx.send(
+                PermissionChecker::cached_for(Some(&project))
+                    .is_auto_approved("Bash", &serde_json::json!({"command":"make"})),
+            )
+            .unwrap()
+        });
+        let timely = rx.recv_timeout(Duration::from_millis(250));
+        drop(held);
+        reader.join().unwrap();
+        assert!(
+            timely.is_ok_and(|approved| approved),
+            "permission loader waited for global cache"
+        );
     }
     #[test]
     fn oversized_valid_permission_settings_do_not_grant_rules() {
-        let dir=tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-        let path=dir.path().join("settings.json");let mut bytes=br#"{"permissions":{"allow":["Bash"]}}"#.to_vec();
-        bytes.extend(vec![b' ';256*1024]);fs::write(&path,&bytes).unwrap();
-        assert!(!PermissionChecker::from_file(&path).is_auto_approved("Bash",&serde_json::json!({"command":"make"})),"oversized valid permission settings granted rules");
-        assert_eq!(fs::read(path).unwrap(),bytes);
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let path = dir.path().join("settings.json");
+        let mut bytes = br#"{"permissions":{"allow":["Bash"]}}"#.to_vec();
+        bytes.extend(vec![b' '; 256 * 1024]);
+        fs::write(&path, &bytes).unwrap();
+        assert!(
+            !PermissionChecker::from_file(&path)
+                .is_auto_approved("Bash", &serde_json::json!({"command":"make"})),
+            "oversized valid permission settings granted rules"
+        );
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
 }

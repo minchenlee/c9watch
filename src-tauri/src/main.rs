@@ -20,8 +20,25 @@ fn main() {
             // so Clap reports an unknown command instead of falling through and
             // unexpectedly launching the GUI.
             let known_commands = [
-                "list", "status", "self", "view", "history", "search", "stop", "watch", "tasks",
-                "spawn", "send", "workers", "inbox", "adopt", "daemon", "cost", "usage-bridge", "hooks", "help",
+                "list",
+                "status",
+                "self",
+                "view",
+                "history",
+                "search",
+                "stop",
+                "watch",
+                "tasks",
+                "spawn",
+                "send",
+                "workers",
+                "inbox",
+                "adopt",
+                "daemon",
+                "cost",
+                "usage-bridge",
+                "hooks",
+                "help",
             ];
             let is_cli = known_commands.contains(&first)
                 || first == "--help"

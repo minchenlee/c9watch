@@ -971,7 +971,8 @@ fn is_relevant(sa: &SubagentInfo, now: DateTime<Utc>) -> bool {
         SubagentStatus::Completed => match sa.completed_at.as_deref() {
             Some(ts) => match DateTime::parse_from_rfc3339(ts) {
                 Ok(completed) => {
-                    now.signed_duration_since(completed.with_timezone(&Utc)).num_seconds()
+                    now.signed_duration_since(completed.with_timezone(&Utc))
+                        .num_seconds()
                         < COMPLETED_RETENTION_SECONDS
                 }
                 Err(_) => false,
@@ -991,14 +992,11 @@ fn cache_has_relevant_entry(path: &Path, now: DateTime<Utc>, parent_is_live: boo
     let Ok(cache) = SUBAGENT_CACHE.lock() else {
         return false;
     };
-    cache
-        .get(path)
-        .is_some_and(|entry| {
-            entry.subagents.iter().any(|sa| {
-                is_relevant(sa, now)
-                    && (parent_is_live || sa.status == SubagentStatus::Completed)
-            })
+    cache.get(path).is_some_and(|entry| {
+        entry.subagents.iter().any(|sa| {
+            is_relevant(sa, now) && (parent_is_live || sa.status == SubagentStatus::Completed)
         })
+    })
 }
 
 /// Remove cache entries that can no longer affect the next response. A live
@@ -1021,9 +1019,10 @@ fn prune_subagent_cache(
             .and_then(|stem| stem.to_str())
             .is_some_and(|stem| live_session_ids.contains(stem));
         parent_is_live
-            || entry.subagents.iter().any(|sa| {
-                sa.status == SubagentStatus::Completed && is_relevant(sa, now)
-            })
+            || entry
+                .subagents
+                .iter()
+                .any(|sa| sa.status == SubagentStatus::Completed && is_relevant(sa, now))
     });
     evict_oldest_subagent_cache_entries(cache);
 }
@@ -1260,7 +1259,10 @@ mod tests {
         // Appending a completing tool_result changes the file's version
         // stamp, so the next lookup must re-parse rather than serve stale
         // cached data.
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(
             file,
             r#"{{"type":"user","uuid":"u2","timestamp":"2026-01-01T00:01:00Z","sessionId":"s1","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_cache","content":"done"}}]}}}}"#
@@ -1284,7 +1286,10 @@ mod tests {
             .supports_unchanged_fast_path());
 
         let t0 = Instant::now();
-        assert_eq!(cached_active_subagents_for_path_at("s1", &path, t0).len(), 1);
+        assert_eq!(
+            cached_active_subagents_for_path_at("s1", &path, t0).len(),
+            1
+        );
         assert_eq!(
             SUBAGENT_CACHE
                 .lock()
@@ -1354,7 +1359,10 @@ mod tests {
 
         // Append: complete a1, AND launch a brand-new second subagent, in one
         // batch of new bytes — exercises both merge paths at once.
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(
             file,
             r#"{{"type":"user","uuid":"u2","timestamp":"2026-01-01T00:01:00Z","sessionId":"s1","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"a1","content":"done"}}]}}}}"#
@@ -1373,7 +1381,10 @@ mod tests {
 
         // A second, independent incremental step on top of the first must
         // still work: complete a2 without disturbing a1.
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(
             file,
             r#"{{"type":"user","uuid":"u4","timestamp":"2026-01-01T00:03:00Z","sessionId":"s1","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"a2","content":"done too"}}]}}}}"#
@@ -1401,7 +1412,10 @@ mod tests {
         std::fs::write(&path, format!("{replacement}\n")).unwrap();
         let after = FileVersion::read(&path).unwrap();
         #[cfg(unix)]
-        assert_eq!(before.identity, after.identity, "rewrite should keep the inode");
+        assert_eq!(
+            before.identity, after.identity,
+            "rewrite should keep the inode"
+        );
 
         let subs = cached_active_subagents_for_path("s1", &path);
         assert_eq!(subs.len(), 1);
@@ -1445,7 +1459,10 @@ mod tests {
         std::fs::write(&path, &rewritten).unwrap();
         let after = FileVersion::read(&path).unwrap();
         #[cfg(unix)]
-        assert_eq!(before.identity, after.identity, "rewrite should keep the inode");
+        assert_eq!(
+            before.identity, after.identity,
+            "rewrite should keep the inode"
+        );
         assert!(after.len > before.len);
 
         // The fixed guard intentionally misses this middle rewrite until the
@@ -1493,7 +1510,10 @@ mod tests {
             SubagentStatus::Running
         );
 
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         write!(file, "{completion}").unwrap();
         drop(file);
         assert_eq!(
@@ -1501,7 +1521,10 @@ mod tests {
             SubagentStatus::Running
         );
 
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(file).unwrap();
         drop(file);
         assert_eq!(
