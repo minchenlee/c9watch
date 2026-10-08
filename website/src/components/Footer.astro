@@ -3,43 +3,69 @@
 ---
 
 <footer class="footer">
-  <div class="footer-links">
-    <a href="https://github.com/minchenlee/c9watch/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
-    <span class="footer-sep">/</span>
-    <a href="https://github.com/minchenlee/c9watch" target="_blank" rel="noopener">GitHub</a>
-    <span class="footer-sep">/</span>
-    <a href="https://github.com/minchenlee" target="_blank" rel="noopener">@minchenlee</a>
-    <span class="footer-sep">/</span>
-    <a href="https://rmdv.mclee.dev" target="_blank" rel="noopener">From the same author: rmdv</a>
+  <div class="footer-cols">
+    <div class="footer-col">
+      <h3 class="footer-heading">Product</h3>
+      <a href="/install/">Install</a>
+      <a href="/features/">Features</a>
+      <a href="/changelog/">Changelog</a>
+      <a href="/compatibility/">Compatibility</a>
+    </div>
+    <div class="footer-col">
+      <h3 class="footer-heading">Project</h3>
+      <a href="https://github.com/minchenlee/c9watch" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/minchenlee/c9watch/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
+      <a href="https://github.com/minchenlee" target="_blank" rel="noopener">@minchenlee</a>
+    </div>
   </div>
+  <p class="footer-aside">
+    Also by the author: <a href="https://rmdv.mclee.dev" target="_blank" rel="noopener">rmdv</a>
+  </p>
 </footer>
 
 <style>
   .footer {
-    padding: 2rem;
-    text-align: center;
+    padding: 2.5rem 1.5rem 2rem;
     border-top: 1px solid var(--border-muted);
   }
 
-  .footer-links {
+  .footer-cols {
     display: flex;
     justify-content: center;
-    align-items: center;
-    gap: 0.5rem;
-    font-size: 13px;
+    gap: 4rem;
   }
 
-  .footer-links a {
+  .footer-col {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    font-size: 13px;
+    min-width: 120px;
+  }
+
+  .footer-heading {
+    margin: 0 0 0.25rem;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+  }
+
+  .footer a {
     color: var(--text-muted);
     text-decoration: none;
     transition: color var(--transition-fast);
   }
 
-  .footer-links a:hover {
+  .footer a:hover {
     color: var(--text-secondary);
   }
 
-  .footer-sep {
+  .footer-aside {
+    margin: 2rem 0 0;
+    text-align: center;
+    font-size: 12px;
     color: var(--text-muted);
   }
 </style>

@@ -7,9 +7,9 @@ const tools = [
 ---
 
 <section class="compat">
-  <p class="compat-heading">Works with everything. Tied to nothing.</p>
+  <p class="compat-heading">Start agents wherever you already do.</p>
   <p class="compat-sub">
-    Start Claude Code or Codex from any terminal or IDE you already use — c9watch picks them up. <a href="/compatibility/">See what each agent supports.</a>
+    c9watch reads the sessions, not your terminal. Ghostty, iTerm2, VS Code, tmux and the rest all work. <a href="/compatibility/">See what each agent supports.</a>
   </p>
   <div class="compat-strip">
     {tools.map(name => <span class="compat-item">{name}</span>)}
@@ -51,12 +51,11 @@ const tools = [
     color: var(--text-secondary);
     font-size: 13px;
     font-family: var(--font-mono);
-    transition: color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+    transition: color 0.2s ease, border-color 0.2s ease;
   }
 
   .compat-item:hover {
     color: var(--text-primary);
     border-color: var(--text-muted);
-    box-shadow: 0 0 20px rgba(255, 255, 255, 0.04);
   }
 </style>

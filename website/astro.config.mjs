@@ -6,8 +6,9 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'c9watch',
+      favicon: '/icon-48.png',
       logo: {
-        src: './public/icon.png',
+        src: './public/icon-48.png',
       },
       social: [
         { icon: 'github', label: 'GitHub', href: 'https://github.com/minchenlee/c9watch' },

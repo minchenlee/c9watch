@@ -17,7 +17,7 @@ import DotGrid from './DotGrid.astro';
     "description": "A free, open-source macOS desktop app that provides a real-time dashboard for monitoring your Claude Code, Codex, Cursor Agent and Pi sessions across different projects.",
     "url": "https://c9watch.mclee.dev",
     "applicationCategory": "DeveloperApplication",
-    "operatingSystem": "macOS",
+    "operatingSystem": "macOS, Linux (CLI only)",
     "license": "https://opensource.org/licenses/MIT",
     "offers": {
       "@type": "Offer",
@@ -37,37 +37,27 @@ import DotGrid from './DotGrid.astro';
   })} />
   <nav class="c9-nav">
     <a href="/" class="c9-nav-logo">
-      <img src="/icon.png" alt="c9watch" width="24" height="24" />
+      <img src="/icon-48.png" alt="c9watch" width="24" height="24" />
       <span>c9watch</span>
     </a>
     <div class="c9-nav-links">
-      <a href="/install/">Docs</a>
-      <a href="https://github.com/minchenlee/c9watch" target="_blank" rel="noopener">GitHub</a>
+      <a href="/features/" class="c9-nav-text">Features</a>
+      <a href="/changelog/" class="c9-nav-text">Changelog</a>
+      <a href="https://github.com/minchenlee/c9watch" target="_blank" rel="noopener" class="c9-nav-gh">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .587l3.668 7.568 8.332 1.151-6.064 5.828 1.48 8.279L12 19.446l-7.416 3.967 1.48-8.279L0 9.306l8.332-1.151z"></path></svg>
+        GitHub
+      </a>
+      <a href="/install/" class="c9-nav-download">Download</a>
     </div>
   </nav>
   <div class="hero-wrapper">
     <DotGrid />
     <Hero />
   </div>
-  <div class="glow-divider">
-    <div class="glow-orb orb-1"></div>
-  </div>
   <div class="fade-in"><Compatibility /></div>
-  <div class="glow-divider">
-    <div class="glow-orb orb-2"></div>
-  </div>
   <div class="fade-in"><Features /></div>
-  <div class="glow-divider">
-    <div class="glow-orb orb-3"></div>
-  </div>
   <div class="fade-in"><TechStack /></div>
-  <div class="glow-divider">
-    <div class="glow-orb orb-4"></div>
-  </div>
   <div class="fade-in"><InstallCTA /></div>
-  <div class="glow-divider">
-    <div class="glow-orb orb-5"></div>
-  </div>
   <div class="fade-in"><FAQ /></div>
   <Footer />
 </div>
@@ -142,97 +132,44 @@ import DotGrid from './DotGrid.astro';
     text-decoration: none;
   }
 
+  .c9-nav-links {
+    align-items: center;
+  }
+
+  .c9-nav-gh {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .c9-nav-links a.c9-nav-download {
+    padding: 0.35rem 0.9rem;
+    background: var(--text-primary);
+    color: var(--bg-base);
+    font-weight: 500;
+  }
+
+  .c9-nav-links a.c9-nav-download:hover {
+    color: var(--bg-base);
+    background: var(--text-secondary);
+  }
+
+  @media (max-width: 640px) {
+    .c9-nav {
+      padding: 0 1rem;
+    }
+
+    .c9-nav-links {
+      gap: 1rem;
+    }
+
+    .c9-nav-text {
+      display: none;
+    }
+  }
+
   .hero-wrapper {
     position: relative;
     overflow: hidden;
-  }
-
-  .glow-divider {
-    position: relative;
-    height: 1px;
-    display: flex;
-    justify-content: center;
-    overflow: visible;
-  }
-
-  .glow-orb {
-    position: absolute;
-    top: 50%;
-    border-radius: 50%;
-  }
-
-  .orb-1 {
-    background: var(--accent-blue);
-    width: 350px;
-    height: 90px;
-    filter: blur(55px);
-    left: 55%;
-    transform: translate(-50%, -50%);
-    animation: pulse-1 6s ease-in-out infinite;
-  }
-
-  .orb-2 {
-    background: var(--accent-amber);
-    width: 450px;
-    height: 110px;
-    filter: blur(70px);
-    left: 40%;
-    transform: translate(-50%, -50%);
-    animation: pulse-2 8s ease-in-out 1.5s infinite;
-  }
-
-  .orb-3 {
-    background: var(--text-primary, #fff);
-    width: 280px;
-    height: 70px;
-    filter: blur(50px);
-    left: 60%;
-    transform: translate(-50%, -50%);
-    animation: pulse-3 5s ease-in-out 0.8s infinite;
-  }
-
-  .orb-4 {
-    background: var(--accent-blue);
-    width: 380px;
-    height: 95px;
-    filter: blur(65px);
-    left: 45%;
-    transform: translate(-50%, -50%);
-    animation: pulse-4 7s ease-in-out 2.5s infinite;
-  }
-
-  @keyframes pulse-1 {
-    0%, 100% { opacity: 0.12; transform: translate(-50%, -50%) scale(1); }
-    40% { opacity: 0.28; transform: translate(-50%, -50%) scale(1.25); }
-    70% { opacity: 0.18; transform: translate(-50%, -50%) scale(1.08); }
-  }
-
-  @keyframes pulse-2 {
-    0%, 100% { opacity: 0.1; transform: translate(-50%, -50%) scale(1.05); }
-    30% { opacity: 0.22; transform: translate(-50%, -50%) scale(1.1); }
-    60% { opacity: 0.32; transform: translate(-50%, -50%) scale(1.3); }
-    85% { opacity: 0.14; transform: translate(-50%, -50%) scale(0.95); }
-  }
-
-  @keyframes pulse-3 {
-    0%, 100% { opacity: 0.05; transform: translate(-50%, -50%) scale(0.9); }
-    50% { opacity: 0.14; transform: translate(-50%, -50%) scale(1.15); }
-  }
-
-  @keyframes pulse-4 {
-    0%, 100% { opacity: 0.1; transform: translate(-50%, -50%) scale(1); }
-    25% { opacity: 0.25; transform: translate(-50%, -50%) scale(1.2); }
-    55% { opacity: 0.12; transform: translate(-50%, -50%) scale(1.05); }
-    80% { opacity: 0.3; transform: translate(-50%, -50%) scale(1.15); }
-  }
-
-  .orb-5 {
-    background: var(--accent-green);
-    width: 320px;
-    height: 80px;
-    filter: blur(60px);
-    left: 50%;
-    transform: translate(-50%, -50%);
-    animation: pulse-1 7s ease-in-out 1s infinite;
   }
 </style>

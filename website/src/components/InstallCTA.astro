@@ -1,56 +1,21 @@
 ---
 // website/src/components/InstallCTA.astro
+import InstallRows from './InstallRows.astro';
 ---
 
 <section class="cta">
   <h2 class="cta-heading">Get started</h2>
-  <div class="cta-install-box">
-    <code>curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash</code>
-    <button class="cta-copy-btn" aria-label="Copy install command">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <rect x="9" y="9" width="13" height="13" rx="0" />
-        <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
-      </svg>
-    </button>
-  </div>
-  <p class="cta-label">CLI only (macOS & Linux):</p>
-  <div class="cta-install-box cta-install-cli">
-    <code>curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install-cli.sh | bash</code>
-    <button class="cta-copy-btn-cli" aria-label="Copy CLI install command">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <rect x="9" y="9" width="13" height="13" rx="0" />
-        <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
-      </svg>
-    </button>
-  </div>
+  <InstallRows cli />
   <a href="https://github.com/minchenlee/c9watch/releases" class="cta-releases" target="_blank" rel="noopener">
     Or download from GitHub Releases
   </a>
 </section>
 
-<script>
-  const btn = document.querySelector('.cta-copy-btn');
-  btn?.addEventListener('click', () => {
-    navigator.clipboard.writeText('curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash');
-    btn.setAttribute('aria-label', 'Copied!');
-    setTimeout(() => btn.setAttribute('aria-label', 'Copy install command'), 2000);
-  });
-  const btnCli = document.querySelector('.cta-copy-btn-cli');
-  btnCli?.addEventListener('click', () => {
-    navigator.clipboard.writeText('curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install-cli.sh | bash');
-    btnCli.setAttribute('aria-label', 'Copied!');
-    setTimeout(() => btnCli.setAttribute('aria-label', 'Copy CLI install command'), 2000);
-  });
-</script>
-
 <style>
   .cta {
-    position: relative;
-    padding: 4rem 2rem;
+    padding: 4rem 1.5rem;
     text-align: center;
     border-top: 1px solid var(--border-muted);
-    /* Radial glow behind the CTA */
-    background: radial-gradient(ellipse at 50% 0%, rgba(0, 112, 243, 0.04) 0%, transparent 70%);
   }
 
   .cta-heading {
@@ -59,95 +24,9 @@
     margin-bottom: 1.5rem;
   }
 
-  .cta-install-box {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.75rem;
-    padding: 0.75rem 1rem;
-    font-family: var(--font-mono);
-    font-size: 13px;
-    color: var(--text-secondary);
-    margin-bottom: 1rem;
-    background: var(--bg-card);
-    border: 1px solid var(--border-default);
-    overflow: hidden;
-    transition: border-color 0.5s ease, color 0.5s ease, box-shadow 0.5s ease;
-  }
-
-  /* Sweeping highlight across the border on hover */
-  .cta-install-box::before {
-    content: '';
-    position: absolute;
-    top: -1px;
-    left: -100%;
-    width: 60%;
-    height: calc(100% + 2px);
-    background: linear-gradient(90deg,
-      transparent,
-      rgba(0, 112, 243, 0.25),
-      rgba(255, 130, 20, 0.2),
-      transparent
-    );
-    transition: none;
-  }
-
-  .cta-install-box:hover {
-    border-color: rgba(0, 112, 243, 0.4);
-    color: var(--text-primary);
-    box-shadow:
-      0 0 20px rgba(0, 112, 243, 0.08),
-      0 0 60px rgba(0, 112, 243, 0.04);
-  }
-
-  .cta-install-box:hover::before {
-    animation: sweep 2.5s ease-in-out infinite;
-  }
-
-  @keyframes sweep {
-    0% { left: -60%; }
-    100% { left: 120%; }
-  }
-
-  .cta-copy-btn {
-    color: var(--text-muted);
-    cursor: pointer;
-    padding: 4px;
-    background: none;
-    border: none;
-    transition: color var(--transition-fast);
-  }
-
-  .cta-copy-btn:hover {
-    color: var(--text-primary);
-  }
-
-  .cta-label {
-    color: var(--text-muted);
-    font-size: 13px;
-    margin-bottom: 0.5rem;
-    margin-top: 0.5rem;
-  }
-
-  .cta-install-cli {
-    margin-bottom: 1.5rem;
-  }
-
-  .cta-copy-btn-cli {
-    color: var(--text-muted);
-    cursor: pointer;
-    padding: 4px;
-    background: none;
-    border: none;
-    transition: color var(--transition-fast);
-  }
-
-  .cta-copy-btn-cli:hover {
-    color: var(--text-primary);
-  }
-
   .cta-releases {
     display: block;
+    margin-top: 1.5rem;
     color: var(--text-muted);
     font-size: 14px;
     text-decoration: none;
@@ -156,11 +35,5 @@
 
   .cta-releases:hover {
     color: var(--text-secondary);
-  }
-
-  @media (max-width: 640px) {
-    .cta-install-box {
-      font-size: 11px;
-    }
   }
 </style>

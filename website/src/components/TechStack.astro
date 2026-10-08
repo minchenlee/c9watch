@@ -5,7 +5,7 @@ const techs = ['Tauri', 'Rust', 'Svelte'];
 <section class="techstack">
   <p class="techstack-heading">Lightweight by design</p>
   <p class="techstack-sub">
-    Built with Tauri, Rust, and Svelte — not Electron. Your monitoring tool shouldn't add to the pile.
+    Built with Tauri, Rust, and Svelte, not Electron. Your monitoring tool shouldn't add to the pile.
   </p>
   <div class="techstack-badges">
     {techs.map(name => <span class="techstack-badge">{name}</span>)}
@@ -47,12 +47,11 @@ const techs = ['Tauri', 'Rust', 'Svelte'];
     color: var(--text-secondary);
     font-size: 14px;
     font-family: var(--font-mono);
-    transition: color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+    transition: color 0.2s ease, border-color 0.2s ease;
   }
 
   .techstack-badge:hover {
     color: var(--text-primary);
     border-color: var(--accent-blue);
-    box-shadow: 0 0 24px rgba(0, 112, 243, 0.1);
   }
 </style>

@@ -8,7 +8,7 @@ const features = [
   },
   {
     title: 'Real-time status',
-    description: 'See at a glance which sessions are Working, Need Permission, or Idle. Permission requests surface first.',
+    description: 'See at a glance which sessions are Working, Need Attention, or Ready. Sessions that wait for you surface first.',
     image: '/screenshots/monitor-tab.png',
   },
   {
@@ -18,12 +18,12 @@ const features = [
   },
   {
     title: 'Cost tracker',
-    description: 'Daily, per-project, and per-model spending breakdowns across all your Claude Code sessions.',
+    description: 'Daily, per-project, and per-model spending across your Claude Code, Codex and Pi sessions.',
     image: '/screenshots/cost-tab.png',
   },
   {
     title: 'Tray popover',
-    description: 'Click the menu bar icon for a quick-glance overlay with session status directly from the menu bar.',
+    description: 'Click the menu bar icon for a quick-glance overlay of session status.',
     image: '/screenshots/tray-popover.jpeg',
   },
   {
@@ -33,7 +33,7 @@ const features = [
   },
   {
     title: 'Memory viewer',
-    description: 'Browse and inspect Claude Code memory files in a two-panel layout with quick access to Claude commands.',
+    description: 'Browse and inspect memory files in a two-panel layout with quick access to Claude commands.',
     image: '/screenshots/memory-tab.png',
   },
   {
@@ -43,7 +43,7 @@ const features = [
   },
   {
     title: 'CLI for agents',
-    description: 'Scriptable session management with JSON output — list, view, search, watch, and stop sessions from other coding agents or scripts.',
+    description: 'Scriptable session management with JSON output. List, view, search, watch, and stop sessions from other coding agents or scripts.',
   },
 ];
 ---
@@ -92,32 +92,14 @@ const features = [
   }
 
   .feature-card {
-    position: relative;
     background: var(--bg-card);
     border: 1px solid var(--border-default);
     padding: 1.5rem;
-    transition: border-color 0.2s ease, box-shadow 0.2s ease;
-    overflow: hidden;
-  }
-
-  .feature-card::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: -100%;
-    width: 100%;
-    height: 100%;
-    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.03), transparent);
-    transition: left 0.5s ease;
+    transition: border-color 0.2s ease;
   }
 
   .feature-card:hover {
     border-color: var(--border-focus);
-    box-shadow: 0 0 30px rgba(0, 112, 243, 0.06);
-  }
-
-  .feature-card:hover::before {
-    left: 100%;
   }
 
   .feature-title {
