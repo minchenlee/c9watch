@@ -36,6 +36,22 @@ const links = [
     const ctx = canvas.getContext('2d')!;
     const dpr = window.devicePixelRatio || 1;
 
+    // Tuned by the owner (c9-footer-tuner, engine ported from the r6 footer).
+    const PARAMS = {
+      cell: 5, gap: 1, stroke: 0, margin: 6, blur: 2,
+      levels: 10, gMin: 15, gMax: 92, tint: 5, contrast: 0.82,
+      sway: 0.15, swaySpeed: 2.8, fold: 0.26, ripple: 0.07, rippleSpeed: 0.6,
+      gustSpeed: 0.6, gustCalm: 0.06, gustGain: 2.2, windDir: 1,
+      erodeTries: 22, erodeBase: 0.015, erodeGust: 0.9, erodeDepth: 0.84, refillMin: 620, refillMax: 1800,
+      grainSpeed: 1.5, grainSink: 2.55, grainTurb: 2.75, grainLife: 1250, grainMax: 600, grainBright: 0.85,
+      tailAt: 0.55, tailGain: 0.28, tailLen: 3, dustFade: 380,
+      pushMin: 9, pushMax: 18, pushAmp: 1.1, pushRadius: 40, pushDur: 1100,
+      colorMax: 20, colorChance: 1, glowFade: 500,
+      fps: 30,
+    };
+    const P = { ...PARAMS };
+    const SMALL_CELL = 4;             // viewports <= 640px; drops to 3 if the word would lose its 2-cell side margins
+
     // 5-wide glyphs; c, w, a have 5 rows and sit on the baseline of the 7-row grid.
     const FONT: Record<string, string[]> = {
       c: ['.###.', '#...#', '#....', '#...#', '.###.'],
@@ -45,81 +61,78 @@ const links = [
       t: ['.#...', '.#...', '####.', '.#...', '.#...', '.#..#', '..##.'],
       h: ['#....', '#....', '####.', '#...#', '#...#', '#...#', '#...#'],
     };
-    const WORD = 'c9watch';
     const GLYPH_ROWS = 7;
-    const base = WORD.split('').map((ch) => {
-      const g = FONT[ch];
-      return [...Array(GLYPH_ROWS - g.length).fill('.....'), ...g];
-    });
-    const word = Array.from({ length: GLYPH_ROWS }, (_, r) => base.map((g) => g[r]).join('.'));
+    const word = (() => {
+      const base = 'c9watch'.split('').map((ch) => [...Array(GLYPH_ROWS - FONT[ch].length).fill('.....'), ...FONT[ch]]);
+      return Array.from({ length: GLYPH_ROWS }, (_, r) => base.map((g) => g[r]).join('.'));
+    })();
     const WORD_COLS = word[0].length; // 41
 
     // App status tokens: Working, Needs Attention, Ready
     const STATUS: [number, number, number][] = [[121, 40, 202], [255, 102, 0], [0, 255, 136]];
-    const LEVELS = 10;                 // discrete brightness steps
-    const G_MIN = 15, G_MAX = 92;      // grey range of the steps
-    const PALETTE = Array.from({ length: LEVELS }, (_, q) => {
-      const t = q / (LEVELS - 1);
-      const g = G_MIN + t * (G_MAX - G_MIN);
-      return [g - t * 2, g, g + 2 + t * 5] as [number, number, number]; // faint cool tint
-    });
-    const PAL_CSS = PALETTE.map((p) => `rgb(${p[0] | 0},${p[1] | 0},${p[2] | 0})`);
-    const SS = 3;                      // field samples per cell
-    const FRAME_MS = 33;
-    const MAX_GRAINS = 140;
+    const SS = 3; // field samples per cell
 
-    let S = 7, GAP = 1, P = 8;
-    let cols = 0, rows = 0, offX = 0, W = 0, H = 0;
-    let FW = 0, FH = 0;
-    let field: Float32Array;      // blurred word coverage, SS samples per cell
-    let glow: Float32Array;       // 0..1 status-colour intensity, decays per cell
-    let hue: Uint8Array;
-    let rate: Float32Array;
-    let erode: Float32Array;      // 0..1 how much a cell has been blown off (refills over time)
-    let erodeRate: Float32Array;
-    let dust: Float32Array;       // 0..1 brightness of sand in flight / dust trail
-    let edgeIdx: number[] = [];   // word cells on the windward edge
-    let leeIdx: number[] = [];    // word cells on the leeward edge
-    let wordIdx: number[] = [];
+    let PALETTE: number[][] = [];
+    let PAL_CSS: string[] = [];
+    let S = 5, GAP = 1, PITCH = 6;
+    let cols = 0, rows = 0, offX = 0, W = 0, H = 0, FW = 0, FH = 0;
+    let field: Float32Array, glow: Float32Array, hue: Uint8Array, rate: Float32Array;
+    let erode: Float32Array, erodeRate: Float32Array, dust: Float32Array;
+    let edgeIdx: number[] = [], leeIdx: number[] = [];
     type Grain = { x: number; y: number; vx: number; vy: number; born: number; life: number; b: number; c: number };
     let grains: Grain[] = [];
     let push: { x: number; y: number; start: number; dur: number } | null = null;
     let nextPush = 0, nextColor = 0;
-    let timer = 0, lastDraw = 0, lastFrame = 0;
+    let timer = 0, lastDraw = 0, lastFrame = 0, clock = 0;
     let perfSum = 0, perfN = 0, perfMax = 0;
+
+    function palette() {
+      PALETTE = Array.from({ length: P.levels }, (_, q) => {
+        const t = P.levels > 1 ? q / (P.levels - 1) : 1;
+        const g = P.gMin + t * (P.gMax - P.gMin);
+        return [g - t * 2, g, g + 2 + t * P.tint];
+      });
+      PAL_CSS = PALETTE.map((p) => `rgb(${p[0] | 0},${p[1] | 0},${p[2] | 0})`);
+    }
 
     function blur(src: Float32Array, dst: Float32Array, w: number, h: number, rad: number) {
       const inv = 1 / (2 * rad + 1);
-      for (let y = 0; y < h; y++) { // horizontal
-        for (let x = 0; x < w; x++) {
-          let s = 0;
-          for (let d = -rad; d <= rad; d++) s += src[y * w + Math.min(w - 1, Math.max(0, x + d))];
-          dst[y * w + x] = s * inv;
-        }
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        let s = 0;
+        for (let d = -rad; d <= rad; d++) s += src[y * w + Math.min(w - 1, Math.max(0, x + d))];
+        dst[y * w + x] = s * inv;
       }
-      for (let x = 0; x < w; x++) { // vertical, back into src
-        for (let y = 0; y < h; y++) {
-          let s = 0;
-          for (let d = -rad; d <= rad; d++) s += dst[Math.min(h - 1, Math.max(0, y + d)) * w + x];
-          src[y * w + x] = s * inv;
-        }
+      for (let x = 0; x < w; x++) for (let y = 0; y < h; y++) {
+        let s = 0;
+        for (let d = -rad; d <= rad; d++) s += dst[Math.min(h - 1, Math.max(0, y + d)) * w + x];
+        src[y * w + x] = s * inv;
       }
     }
 
+    // Bilinear sample of the coverage field at a position given in cell units.
+    function sample(fx: number, fy: number) {
+      const u = Math.min(FW - 1.001, Math.max(0, fx * SS - 0.5));
+      const v = Math.min(FH - 1.001, Math.max(0, fy * SS - 0.5));
+      const x = u | 0, y = v | 0, a = u - x, b = v - y, i = y * FW + x;
+      return (field[i] * (1 - a) + field[i + 1] * a) * (1 - b) + (field[i + FW] * (1 - a) + field[i + FW + 1] * a) * b;
+    }
+
     function layout() {
+      palette();
       const w = panel!.clientWidth;
       const small = w <= 640;
-      S = small ? 4 : 7;
-      GAP = 1;
-      P = S + GAP;
-      cols = Math.floor((w + GAP) / P);
-      const k = Math.max(1, Math.floor((cols - 4) / WORD_COLS)); // cells per stroke
+      S = small ? SMALL_CELL : P.cell;
+      GAP = P.gap;
+      PITCH = S + GAP;
+      cols = Math.floor((w + GAP) / PITCH);
+      if (small && cols < WORD_COLS + 4) { S = 3; PITCH = S + GAP; cols = Math.floor((w + GAP) / PITCH); }
+      cols = Math.max(WORD_COLS + 2, cols);
+      const k = P.stroke > 0 ? P.stroke : Math.max(1, Math.floor((cols - 4) / WORD_COLS));
       const wordW = WORD_COLS * k, wordH = GLYPH_ROWS * k;
-      const margin = small ? 4 : 6;
-      rows = wordH + margin * 2;
-      W = w;
-      H = rows * P - GAP;
-      offX = (w - (cols * P - GAP)) / 2;
+      rows = wordH + P.margin * 2;
+      W = Math.min(w, cols * PITCH - GAP);
+      H = rows * PITCH - GAP;
+      offX = (W - (cols * PITCH - GAP)) / 2;
       canvas!.style.width = W + 'px';
       canvas!.style.height = H + 'px';
       canvas!.width = Math.round(W * dpr);
@@ -128,106 +141,84 @@ const links = [
       canvas!.dataset.cell = `${S}`;
       canvas!.dataset.grid = `${cols}x${rows}`;
 
-      // Word as a continuous coverage field: rasterise glyph pixels, then blur (~1 cell).
       FW = cols * SS; FH = rows * SS;
       field = new Float32Array(FW * FH);
       const tmp = new Float32Array(FW * FH);
-      const x0 = Math.floor((cols - wordW) / 2), y0 = margin;
-      for (let r = 0; r < GLYPH_ROWS; r++) {
-        for (let c = 0; c < WORD_COLS; c++) {
-          if (word[r][c] !== '#') continue;
-          const fx0 = (x0 + c * k) * SS, fy0 = (y0 + r * k) * SS;
-          for (let y = fy0; y < fy0 + k * SS; y++) for (let x = fx0; x < fx0 + k * SS; x++) field[y * FW + x] = 1;
-        }
+      const x0 = Math.floor((cols - wordW) / 2), y0 = P.margin;
+      for (let r = 0; r < GLYPH_ROWS; r++) for (let c = 0; c < WORD_COLS; c++) {
+        if (word[r][c] !== '#') continue;
+        const fx0 = (x0 + c * k) * SS, fy0 = (y0 + r * k) * SS;
+        for (let y = fy0; y < fy0 + k * SS; y++) for (let x = fx0; x < fx0 + k * SS; x++) if (x >= 0 && x < FW) field[y * FW + x] = 1;
       }
-      blur(field, tmp, FW, FH, 1);
-      blur(field, tmp, FW, FH, 1);
+      for (let n = 0; n < P.blur; n++) blur(field, tmp, FW, FH, 1);
 
-      wordIdx = []; edgeIdx = []; leeIdx = [];
+      edgeIdx = []; leeIdx = [];
+      const up = P.windDir > 0 ? -1 : 1; // windward neighbour column
       const cov = (c: number, r: number) => (c < 0 || r < 0 || c >= cols || r >= rows ? 0 : sample(c + 0.5, r + 0.5));
-      for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-          const v = cov(c, r);
-          if (v > 0.9) wordIdx.push(r * cols + c);
-          if (v > 0.55) {
-            if (cov(c - 1, r) < 0.35 || cov(c, r - 1) < 0.35) edgeIdx.push(r * cols + c);
-            if (cov(c + 1, r) < 0.35) leeIdx.push(r * cols + c);
-          }
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+        if (cov(c, r) > 0.55) {
+          if (cov(c + up, r) < 0.35 || cov(c, r - 1) < 0.35) edgeIdx.push(r * cols + c);
+          if (cov(c - up, r) < 0.35) leeIdx.push(r * cols + c);
         }
       }
       const n = cols * rows;
-      glow = new Float32Array(n);
-      hue = new Uint8Array(n);
-      rate = new Float32Array(n);
-      erode = new Float32Array(n);
-      erodeRate = new Float32Array(n);
-      dust = new Float32Array(n);
-      grains = [];
-      push = null;
-    }
-
-    // Bilinear sample of the coverage field at a position given in cell units.
-    function sample(fx: number, fy: number) {
-      const u = Math.min(FW - 1.001, Math.max(0, fx * SS - 0.5));
-      const v = Math.min(FH - 1.001, Math.max(0, fy * SS - 0.5));
-      const x = u | 0, y = v | 0, a = u - x, b = v - y;
-      const i = y * FW + x;
-      return (field[i] * (1 - a) + field[i + 1] * a) * (1 - b) + (field[i + FW] * (1 - a) + field[i + FW + 1] * a) * b;
-    }
-
-    function ignite(i: number, amount: number, color: number) {
-      if (i < 0 || i >= glow.length) return;
-      if (amount > glow[i]) {
-        glow[i] = amount;
-        hue[i] = color;
-        rate[i] = 1 / (600 + Math.random() * 900);
-      }
+      glow = new Float32Array(n); hue = new Uint8Array(n); rate = new Float32Array(n);
+      erode = new Float32Array(n); erodeRate = new Float32Array(n); dust = new Float32Array(n);
+      grains = []; push = null;
     }
 
     // Irregular gust, 0..1: two slow waves multiplied, so calm spells and strong spells alternate.
     function gustAt(t: number, c: number) {
-      const a = 0.5 + 0.5 * Math.sin(t * 0.0006);
-      const b = 0.5 + 0.5 * Math.sin(t * 0.00131 + 2);
-      const g = Math.min(1, Math.max(0, (a * b - 0.06) * 2.2));
-      return g * (0.65 + 0.35 * Math.sin(c * 0.05 - t * 0.0008));
+      const s = P.gustSpeed;
+      const a = 0.5 + 0.5 * Math.sin(t * 0.001 * s);
+      const b = 0.5 + 0.5 * Math.sin(t * 0.00218 * s + 2);
+      const g = Math.min(1, Math.max(0, (a * b - P.gustCalm) * P.gustGain));
+      return g * (0.65 + 0.35 * Math.sin(c * 0.05 * P.windDir - t * 0.0008 * s));
     }
 
     function spawnGrain(i: number, t: number, g: number, colored: number) {
-      if (grains.length >= MAX_GRAINS) return;
+      if (grains.length >= P.grainMax) return;
       erode[i] = Math.max(erode[i], 0.5 + Math.random() * 0.5);
-      erodeRate[i] = 1 / (400 + Math.random() * 1400);
+      const lo = Math.min(P.refillMin, P.refillMax), hi = Math.max(P.refillMin, P.refillMax);
+      erodeRate[i] = 1 / (lo + Math.random() * (hi - lo));
       grains.push({
         x: i % cols, y: Math.floor(i / cols),
-        vx: (0.004 + Math.random() * 0.008) * (0.5 + g), vy: 0.0015 + Math.random() * 0.002,
-        born: t, life: 700 + Math.random() * 1100, b: 0.75 + Math.random() * 0.2, c: colored,
+        vx: P.windDir * (0.004 + Math.random() * 0.008) * (0.5 + g) * P.grainSpeed,
+        vy: (0.0015 + Math.random() * 0.002) * P.grainSink,
+        born: t, life: P.grainLife * (0.56 + Math.random() * 0.88), b: P.grainBright * (0.9 + Math.random() * 0.2), c: colored,
       });
+    }
+
+    function bigGust(now: number) {
+      if (!edgeIdx.length) return;
+      const i = edgeIdx[(Math.random() * edgeIdx.length) | 0];
+      push = { x: i % cols, y: Math.floor(i / cols), start: now, dur: P.pushDur };
     }
 
     function step(now: number, dt: number) {
       for (let i = 0; i < glow.length; i++) {
         if (glow[i] > 0) glow[i] = Math.max(0, glow[i] - rate[i] * dt);
         if (erode[i] > 0) erode[i] = Math.max(0, erode[i] - erodeRate[i] * dt);
-        if (dust[i] > 0) dust[i] = Math.max(0, dust[i] - dt / 380);
+        if (dust[i] > 0) dust[i] = Math.max(0, dust[i] - dt / P.dustFade);
       }
-      // erosion on the windward edge, driven by the gust
       let coloredNow = 0;
       for (const gr of grains) if (gr.c >= 0) coloredNow++;
-      for (let n = 0; n < 5; n++) {
+      if (edgeIdx.length) for (let n = 0; n < P.erodeTries; n++) {
         const i = edgeIdx[(Math.random() * edgeIdx.length) | 0];
         const g = gustAt(now, i % cols);
-        if (Math.random() < 0.015 + 0.9 * g * g) {
-          const wantColor = coloredNow < 4 && now >= nextColor && Math.random() < 0.15;
-          if (wantColor) { nextColor = now + 500 + Math.random() * 1200; coloredNow++; }
-          spawnGrain(i, now, g, wantColor ? (Math.random() * STATUS.length) | 0 : -1);
+        if (Math.random() < P.erodeBase + P.erodeGust * g * g) {
+          const want = coloredNow < P.colorMax && now >= nextColor && Math.random() < P.colorChance;
+          if (want) { nextColor = now + 500 + Math.random() * 1200; coloredNow++; }
+          spawnGrain(i, now, g, want ? (Math.random() * STATUS.length) | 0 : -1);
         }
       }
-      // strong wind: a faint dust tail behind the leeward edge
       const gl = gustAt(now, cols / 2);
-      if (gl > 0.55 && leeIdx.length) {
-        for (let n = 0; n < 4; n++) {
-          const i = leeIdx[(Math.random() * leeIdx.length) | 0];
-          const len = 1 + ((Math.random() * 3) | 0);
-          for (let d = 1; d <= len; d++) if (i + d < dust.length) dust[i + d] = Math.max(dust[i + d], 0.28 * gl * (1 - d / (len + 1)));
+      if (gl > P.tailAt && leeIdx.length) for (let n = 0; n < 4; n++) {
+        const i = leeIdx[(Math.random() * leeIdx.length) | 0];
+        const len = 1 + ((Math.random() * P.tailLen) | 0);
+        for (let d = 1; d <= len; d++) {
+          const j = i + d * P.windDir;
+          if (j >= 0 && j < dust.length) dust[j] = Math.max(dust[j], P.tailGain * gl * (1 - d / (len + 1)));
         }
       }
       grains = grains.filter((gr) => {
@@ -235,64 +226,55 @@ const links = [
         if (age > gr.life) return false;
         const g = gustAt(now, gr.x);
         gr.x += gr.vx * dt * (0.6 + g);
-        gr.y += (gr.vy + 0.003 * Math.sin(age * 0.012 + gr.x)) * dt;
+        gr.y += (gr.vy + 0.003 * P.grainTurb * Math.sin(age * 0.012 + gr.x)) * dt;
         const cx = Math.round(gr.x), cy = Math.round(gr.y);
         if (cx >= 0 && cx < cols && cy >= 0 && cy < rows) {
-          const i = cy * cols + cx;
-          const f = 1 - age / gr.life;
-          if (gr.c >= 0) { if (f * 0.9 > glow[i]) { glow[i] = f * 0.9; hue[i] = gr.c; rate[i] = 1 / 500; } }
-          else dust[i] = Math.max(dust[i], gr.b * f);
+          const i = cy * cols + cx, f = 1 - age / gr.life;
+          if (gr.c >= 0) { if (f * 0.9 > glow[i]) { glow[i] = f * 0.9; hue[i] = gr.c; rate[i] = 1 / P.glowFade; } }
+          else dust[i] = Math.max(dust[i], Math.min(1, gr.b * f));
         }
         return true;
       });
-      // rare big gust: a patch of the word is pushed one cell downwind, then settles back
       if (!push && now >= nextPush) {
-        if (nextPush > 0 && edgeIdx.length) {
-          const i = edgeIdx[(Math.random() * edgeIdx.length) | 0];
-          push = { x: i % cols, y: Math.floor(i / cols), start: now, dur: 1100 };
-        }
-        nextPush = now + 9000 + Math.random() * 9000;
+        if (nextPush > 0) bigGust(now);
+        const lo = Math.min(P.pushMin, P.pushMax), hi = Math.max(P.pushMin, P.pushMax);
+        nextPush = now + (lo + Math.random() * (hi - lo)) * 1000;
       }
       if (push && now - push.start > push.dur) push = null;
     }
 
     function draw(now: number) {
       ctx.clearRect(0, 0, W, H);
-      const top = LEVELS - 1;
+      const top = P.levels - 1;
       const pEnv = push ? Math.sin(((now - push.start) / push.dur) * Math.PI) : 0;
-      for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-          let dx = 0.15 * Math.sin(r * 0.3 + now * 0.0012); // barely-there sway
-          if (push) {
-            const ddx = c - push.x, ddy = r - push.y;
-            dx -= 1.1 * pEnv * Math.exp(-(ddx * ddx + ddy * ddy) / 40);
-          }
-          const cov = sample(c + 0.5 + dx, r + 0.5);
-          const i = r * cols + c;
-          const fold = 0.04 * Math.sin(c * 0.1 + r * 0.08 - now * 0.0007);
-          const rip = 0.5 + 0.5 * Math.sin(c * 0.07 + r * 0.11 - now * 0.0006);
-          let v = cov * (0.82 + fold) + (1 - cov) * rip * 0.07 - erode[i] * 0.4 * cov + dust[i] * 0.6;
-          v = v < 0 ? 0 : v > 1 ? 1 : v;
-          const a = glow[i];
-          const q = Math.round(v * top);
-          if (a > 0) {
-            const k = a * a * (3 - 2 * a);
-            const p = PALETTE[q], s = STATUS[hue[i]];
-            ctx.fillStyle = `rgb(${(p[0] + (s[0] - p[0]) * k) | 0},${(p[1] + (s[1] - p[1]) * k) | 0},${(p[2] + (s[2] - p[2]) * k) | 0})`;
-          } else ctx.fillStyle = PAL_CSS[q];
-          ctx.fillRect(offX + c * P, r * P, S, S);
-        }
+      const sw = P.swaySpeed * 0.001, rs = P.rippleSpeed * 0.001;
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+        let dx = P.sway * Math.sin(r * 0.3 + now * sw);
+        if (push) { const ddx = c - push.x, ddy = r - push.y; dx -= P.windDir * P.pushAmp * pEnv * Math.exp(-(ddx * ddx + ddy * ddy) / P.pushRadius); }
+        const cov = sample(c + 0.5 + dx, r + 0.5);
+        const i = r * cols + c;
+        const fold = P.fold * Math.sin(c * 0.1 + r * 0.08 - now * 0.0007);
+        const rip = 0.5 + 0.5 * Math.sin(c * 0.07 * P.windDir + r * 0.11 - now * rs);
+        let v = cov * (P.contrast + fold) + (1 - cov) * rip * P.ripple - erode[i] * P.erodeDepth * cov + dust[i] * 0.6;
+        v = v < 0 ? 0 : v > 1 ? 1 : v;
+        const q = Math.round(v * top), a = glow[i];
+        if (a > 0) {
+          const k = a * a * (3 - 2 * a), p = PALETTE[q], s = STATUS[hue[i]];
+          ctx.fillStyle = `rgb(${(p[0] + (s[0] - p[0]) * k) | 0},${(p[1] + (s[1] - p[1]) * k) | 0},${(p[2] + (s[2] - p[2]) * k) | 0})`;
+        } else ctx.fillStyle = PAL_CSS[q];
+        ctx.fillRect(offX + c * PITCH, r * PITCH, S, S);
       }
     }
 
-    function frame(now: number) {
+    function frame(ts: number) {
       timer = requestAnimationFrame(frame);
-      if (now - lastDraw < FRAME_MS) return;
+      if (ts - lastDraw < 1000 / P.fps) return;
+      const dt = Math.min(100, lastFrame ? ts - lastFrame : 33);
+      lastFrame = ts; lastDraw = ts;
+      clock += dt;
       const t0 = performance.now();
-      const dt = Math.min(100, lastFrame ? now - lastFrame : FRAME_MS);
-      lastFrame = now; lastDraw = now;
-      step(now, dt);
-      draw(now);
+      step(clock, dt);
+      draw(clock);
       const cost = performance.now() - t0;
       perfSum += cost; perfN++; perfMax = Math.max(perfMax, cost);
       canvas!.dataset.perf = `${(perfSum / perfN).toFixed(2)}ms avg, ${perfMax.toFixed(2)}ms max, n=${perfN}`;
@@ -300,14 +282,15 @@ const links = [
 
     function staticFrame() {
       // one settled frame: a few eroded edge cells and a little dust downwind of them
+      if (!edgeIdx.length) { draw(4000); return; }
       for (let n = 0; n < 12; n++) {
         const i = edgeIdx[Math.floor(((n + 0.5) / 12) * edgeIdx.length)];
         erode[i] = 0.7;
-        dust[i + 1] = 0.45; dust[i + 2] = 0.3; dust[i + 3] = 0.15;
+        for (let d = 1; d <= 3; d++) { const j = i + d * P.windDir; if (j >= 0 && j < dust.length) dust[j] = 0.6 - d * 0.15; }
       }
       [0.2, 0.5, 0.8].forEach((f, n) => {
-        const i = edgeIdx[Math.floor(f * edgeIdx.length)] + 4;
-        glow[i] = 0.85; hue[i] = n % STATUS.length;
+        const i = edgeIdx[Math.floor(f * edgeIdx.length)] + 4 * P.windDir;
+        if (i >= 0 && i < glow.length) { glow[i] = 0.85; hue[i] = n % STATUS.length; }
       });
       draw(4000);
     }
@@ -321,7 +304,7 @@ const links = [
     };
 
     layout();
-    if (reduced) staticFrame(); else draw(performance.now());
+    if (reduced) staticFrame(); else draw(0);
 
     // Keep bitmap size, grid and CSS size in sync when the panel width changes (same fix as DotGrid).
     let lastW = panel.clientWidth;
@@ -332,7 +315,7 @@ const links = [
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {
         layout();
-        if (reduced) staticFrame(); else draw(performance.now());
+        if (reduced) staticFrame(); else draw(clock);
       }, 100);
     }).observe(panel);
 
