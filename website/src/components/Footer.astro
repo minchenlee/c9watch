@@ -56,37 +56,60 @@ const links = [
 
     // App status tokens: Working, Needs Attention, Ready
     const STATUS: [number, number, number][] = [[121, 40, 202], [255, 102, 0], [0, 255, 136]];
-    const BG = 20;          // dark cell grey level
-    const INK = 66;         // wordmark cell grey level
-    const WIND_BG = 5;      // +- grey levels of the wind on background cells
-    const WIND_INK = 3;     // +- grey levels of the wind on wordmark cells
+    const LEVELS = 10;                 // discrete brightness steps
+    const G_MIN = 15, G_MAX = 92;      // grey range of the steps
+    const PALETTE = Array.from({ length: LEVELS }, (_, q) => {
+      const t = q / (LEVELS - 1);
+      const g = G_MIN + t * (G_MAX - G_MIN);
+      return [g - t * 2, g, g + 2 + t * 5] as [number, number, number]; // faint cool tint
+    });
+    const PAL_CSS = PALETTE.map((p) => `rgb(${p[0] | 0},${p[1] | 0},${p[2] | 0})`);
+    const SS = 3;                      // field samples per cell
+    let AMP = 1.1;                   // cloth amplitude, in cells
     const FRAME_MS = 33;
-    const WIND_X = 1, WIND_Y = 0.35; // drift direction (cells per second scale below)
 
     let S = 7, GAP = 1, P = 8;
     let cols = 0, rows = 0, offX = 0, W = 0, H = 0;
-    let isWord: Uint8Array;
+    let FW = 0, FH = 0;
+    let field: Float32Array;      // blurred word coverage, SS samples per cell
     let glow: Float32Array;       // 0..1 status-colour intensity, decays per cell
-    let hue: Uint8Array;          // status index per cell
-    let rate: Float32Array;       // decay per ms per cell (1 / 600..1500 ms)
-    let ghost: Float32Array;      // 0..1 grey lift from ghosting / scan line
+    let hue: Uint8Array;
+    let rate: Float32Array;
     let wordIdx: number[] = [];
     let sparks: { x: number; y: number; vx: number; vy: number; born: number; life: number; c: number }[] = [];
-    let scan: { start: number; dur: number } | null = null;
-    let nextSpark = 0, nextGhost = 0;
+    let nextSpark = 0;
     let timer = 0, lastDraw = 0, lastFrame = 0;
     let perfSum = 0, perfN = 0, perfMax = 0;
+
+    function blur(src: Float32Array, dst: Float32Array, w: number, h: number, rad: number) {
+      const inv = 1 / (2 * rad + 1);
+      for (let y = 0; y < h; y++) { // horizontal
+        for (let x = 0; x < w; x++) {
+          let s = 0;
+          for (let d = -rad; d <= rad; d++) s += src[y * w + Math.min(w - 1, Math.max(0, x + d))];
+          dst[y * w + x] = s * inv;
+        }
+      }
+      for (let x = 0; x < w; x++) { // vertical, back into src
+        for (let y = 0; y < h; y++) {
+          let s = 0;
+          for (let d = -rad; d <= rad; d++) s += dst[Math.min(h - 1, Math.max(0, y + d)) * w + x];
+          src[y * w + x] = s * inv;
+        }
+      }
+    }
 
     function layout() {
       const w = panel!.clientWidth;
       const small = w <= 640;
       S = small ? 5 : 7;
+      AMP = small ? 0.6 : 1.1;
       GAP = 1;
       P = S + GAP;
       cols = Math.floor((w + GAP) / P);
       const k = Math.max(1, Math.floor(cols / WORD_COLS)); // cells per stroke
       const wordW = WORD_COLS * k, wordH = GLYPH_ROWS * k;
-      const margin = small ? 3 : 5;
+      const margin = small ? 4 : 6;
       rows = wordH + margin * 2;
       W = w;
       H = rows * P - GAP;
@@ -99,28 +122,41 @@ const links = [
       canvas!.dataset.cell = `${S}`;
       canvas!.dataset.grid = `${cols}x${rows}`;
 
-      const n = cols * rows;
-      isWord = new Uint8Array(n);
-      wordIdx = [];
+      // Word as a continuous coverage field: rasterise glyph pixels, then blur (~1 cell).
+      FW = cols * SS; FH = rows * SS;
+      field = new Float32Array(FW * FH);
+      const tmp = new Float32Array(FW * FH);
       const x0 = Math.floor((cols - wordW) / 2), y0 = margin;
       for (let r = 0; r < GLYPH_ROWS; r++) {
         for (let c = 0; c < WORD_COLS; c++) {
           if (word[r][c] !== '#') continue;
-          for (let dy = 0; dy < k; dy++) {
-            for (let dx = 0; dx < k; dx++) {
-              const i = (y0 + r * k + dy) * cols + (x0 + c * k + dx);
-              isWord[i] = 1;
-              wordIdx.push(i);
-            }
-          }
+          const fx0 = (x0 + c * k) * SS, fy0 = (y0 + r * k) * SS;
+          for (let y = fy0; y < fy0 + k * SS; y++) for (let x = fx0; x < fx0 + k * SS; x++) field[y * FW + x] = 1;
         }
       }
+      blur(field, tmp, FW, FH, 1);
+      blur(field, tmp, FW, FH, 1);
+
+      wordIdx = [];
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          if (sample(c + 0.5, r + 0.5) > 0.9) wordIdx.push(r * cols + c);
+        }
+      }
+      const n = cols * rows;
       glow = new Float32Array(n);
       hue = new Uint8Array(n);
       rate = new Float32Array(n);
-      ghost = new Float32Array(n);
       sparks = [];
-      scan = null;
+    }
+
+    // Bilinear sample of the coverage field at a position given in cell units.
+    function sample(fx: number, fy: number) {
+      const u = Math.min(FW - 1.001, Math.max(0, fx * SS - 0.5));
+      const v = Math.min(FH - 1.001, Math.max(0, fy * SS - 0.5));
+      const x = u | 0, y = v | 0, a = u - x, b = v - y;
+      const i = y * FW + x;
+      return (field[i] * (1 - a) + field[i + 1] * a) * (1 - b) + (field[i + FW] * (1 - a) + field[i + FW + 1] * a) * b;
     }
 
     function ignite(i: number, amount: number, color: number) {
@@ -132,29 +168,16 @@ const links = [
       }
     }
 
-    // Drifting wind: two slow diagonal waves, 0..1
-    function wind(c: number, r: number, t: number) {
-      return 0.5 + 0.28 * Math.sin(c * 0.07 + r * 0.11 - t * 0.0006)
-                 + 0.22 * Math.sin(c * 0.031 - r * 0.07 - t * 0.00037 + 1.7);
-    }
-
     function step(now: number, dt: number) {
-      // decay glow + ghost
-      for (let i = 0; i < glow.length; i++) {
-        if (glow[i] > 0) glow[i] = Math.max(0, glow[i] - rate[i] * dt);
-        if (ghost[i] > 0) ghost[i] = Math.max(0, ghost[i] - dt / 600);
-      }
-      // sparks spawn near the wordmark and drift with the wind
+      for (let i = 0; i < glow.length; i++) if (glow[i] > 0) glow[i] = Math.max(0, glow[i] - rate[i] * dt);
       if (now >= nextSpark) {
-        nextSpark = now + 180 + Math.random() * 320;
-        if (sparks.length < 16) {
+        nextSpark = now + 350 + Math.random() * 700;
+        if (sparks.length < 8) {
           const i = wordIdx[(Math.random() * wordIdx.length) | 0];
           sparks.push({
             x: i % cols, y: Math.floor(i / cols),
-            vx: (WIND_X * (0.5 + Math.random() * 0.7)) * 0.006,
-            vy: (WIND_Y * (Math.random() - 0.3)) * 0.006,
-            born: now, life: 1800 + Math.random() * 1800,
-            c: (Math.random() * STATUS.length) | 0,
+            vx: (0.5 + Math.random() * 0.7) * 0.006, vy: (Math.random() - 0.3) * 0.002,
+            born: now, life: 1800 + Math.random() * 1800, c: (Math.random() * STATUS.length) | 0,
           });
         }
       }
@@ -162,67 +185,39 @@ const links = [
         const age = now - s.born;
         if (age > s.life) return false;
         s.x += s.vx * dt; s.y += s.vy * dt;
-        const e = Math.sin((age / s.life) * Math.PI); // fade in, fade out
+        const e = Math.sin((age / s.life) * Math.PI);
         const cx = Math.round(s.x), cy = Math.round(s.y);
-        if (cx >= 0 && cx < cols && cy >= 0 && cy < rows) {
-          const i = cy * cols + cx;
-          ignite(i, (isWord[i] ? 0.9 : 0.6) * e, s.c);
-        }
+        if (cx >= 0 && cx < cols && cy >= 0 && cy < rows) ignite(cy * cols + cx, 0.85 * e, s.c);
         return true;
       });
-      // occasional ghosting: shifted afterimage chunk, or a short scan line
-      if (now >= nextGhost) {
-        nextGhost = now + 2500 + Math.random() * 3500;
-        if (Math.random() < 0.5) {
-          scan = { start: now, dur: 900 };
-        } else {
-          const n = 1 + ((Math.random() * 2) | 0);
-          for (let m = 0; m < n; m++) {
-            const i0 = wordIdx[(Math.random() * wordIdx.length) | 0];
-            const off = Math.random() < 0.5 ? -1 : 1;
-            for (let j = 0; j < 7; j++) {
-              const i = i0 + j;
-              if (isWord[i] && Math.floor(i / cols) === Math.floor(i0 / cols)) {
-                const g = i + off * (1 + ((Math.random() * 2) | 0));
-                if (g >= 0 && g < ghost.length && !isWord[g]) ghost[g] = Math.max(ghost[g], 0.5);
-              }
-            }
-          }
-        }
-      }
-      if (scan) {
-        const p = (now - scan.start) / scan.dur;
-        if (p >= 1) scan = null;
-        else {
-          const c = Math.floor(p * (cols + 6)) - 3;
-          for (let r = 0; r < rows; r++) {
-            for (let d = 0; d < 2; d++) {
-              const cc = c - d;
-              if (cc < 0 || cc >= cols) continue;
-              const i = r * cols + cc;
-              if (isWord[i]) ghost[i] = Math.max(ghost[i], d === 0 ? 0.55 : 0.3);
-            }
-          }
-        }
-      }
     }
 
     function draw(now: number) {
       ctx.clearRect(0, 0, W, H);
+      const top = LEVELS - 1;
       for (let r = 0; r < rows; r++) {
+        const rowPhase = Math.sin(r * 0.33 + now * 0.0016);
         for (let c = 0; c < cols; c++) {
+          // regional gust: the flag only really waves where the gust is
+          const gust = 0.55 + 0.45 * Math.sin(c * 0.045 - now * 0.00045 + r * 0.02);
+          const d2 = (c + r) * 0.16 + now * 0.0011;
+          const dx = AMP * gust * rowPhase + 0.35 * Math.sin(d2);
+          const dy = 0.4 * AMP * gust * Math.sin(c * 0.21 - now * 0.0013 + r * 0.05);
+          const cov = sample(c + 0.5 + dx, r + 0.5 + dy);
+          // fold lighting from the slope of the displacement
+          const slope = AMP * gust * 0.33 * Math.cos(r * 0.33 + now * 0.0016) + 0.35 * 0.16 * Math.cos(d2);
+          // background: faint wind ripple, 1-2 steps
+          const rip = 0.5 + 0.5 * Math.sin(c * 0.07 + r * 0.11 - now * 0.0006);
+          let v = cov * (0.78 + 0.32 * slope / AMP * 2.2) + (1 - cov) * rip * 0.1;
+          v = v < 0 ? 0 : v > 1 ? 1 : v;
           const i = r * cols + c;
-          const w = isWord[i];
-          const wv = wind(c, r, now) - 0.5;
-          let g = (w ? INK : BG) + wv * 2 * (w ? WIND_INK : WIND_BG) + ghost[i] * 30;
-          let cr = g, cg = g, cb = g;
           const a = glow[i];
+          const q = Math.round(v * top);
           if (a > 0) {
-            const k = a * a * (3 - 2 * a) * (w ? 1 : 0.7); // smooth ease, status colour -> cell base
-            const s = STATUS[hue[i]];
-            cr += (s[0] - cr) * k; cg += (s[1] - cg) * k; cb += (s[2] - cb) * k;
-          }
-          ctx.fillStyle = `rgb(${cr | 0},${cg | 0},${cb | 0})`;
+            const k = a * a * (3 - 2 * a) * (cov > 0.5 ? 1 : 0.7);
+            const p = PALETTE[q], s = STATUS[hue[i]];
+            ctx.fillStyle = `rgb(${(p[0] + (s[0] - p[0]) * k) | 0},${(p[1] + (s[1] - p[1]) * k) | 0},${(p[2] + (s[2] - p[2]) * k) | 0})`;
+          } else ctx.fillStyle = PAL_CSS[q];
           ctx.fillRect(offX + c * P, r * P, S, S);
         }
       }
@@ -242,11 +237,10 @@ const links = [
     }
 
     function staticFrame() {
-      const now = 4000;
       [0.12, 0.31, 0.5, 0.68, 0.87].forEach((f, n) => {
-        ignite(wordIdx[Math.floor(f * wordIdx.length)], 0.9, n % STATUS.length);
+        ignite(wordIdx[Math.floor(f * wordIdx.length)], 0.85, n % STATUS.length);
       });
-      draw(now);
+      draw(4000);
     }
 
     const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
