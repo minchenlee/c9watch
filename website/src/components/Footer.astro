@@ -65,8 +65,8 @@ const links = [
     });
     const PAL_CSS = PALETTE.map((p) => `rgb(${p[0] | 0},${p[1] | 0},${p[2] | 0})`);
     const SS = 3;                      // field samples per cell
-    let AMP = 1.1;                   // cloth amplitude, in cells
     const FRAME_MS = 33;
+    const MAX_GRAINS = 140;
 
     let S = 7, GAP = 1, P = 8;
     let cols = 0, rows = 0, offX = 0, W = 0, H = 0;
@@ -75,9 +75,16 @@ const links = [
     let glow: Float32Array;       // 0..1 status-colour intensity, decays per cell
     let hue: Uint8Array;
     let rate: Float32Array;
+    let erode: Float32Array;      // 0..1 how much a cell has been blown off (refills over time)
+    let erodeRate: Float32Array;
+    let dust: Float32Array;       // 0..1 brightness of sand in flight / dust trail
+    let edgeIdx: number[] = [];   // word cells on the windward edge
+    let leeIdx: number[] = [];    // word cells on the leeward edge
     let wordIdx: number[] = [];
-    let sparks: { x: number; y: number; vx: number; vy: number; born: number; life: number; c: number }[] = [];
-    let nextSpark = 0;
+    type Grain = { x: number; y: number; vx: number; vy: number; born: number; life: number; b: number; c: number };
+    let grains: Grain[] = [];
+    let push: { x: number; y: number; start: number; dur: number } | null = null;
+    let nextPush = 0, nextColor = 0;
     let timer = 0, lastDraw = 0, lastFrame = 0;
     let perfSum = 0, perfN = 0, perfMax = 0;
 
@@ -102,12 +109,11 @@ const links = [
     function layout() {
       const w = panel!.clientWidth;
       const small = w <= 640;
-      S = small ? 5 : 7;
-      AMP = small ? 0.6 : 1.1;
+      S = small ? 4 : 7;
       GAP = 1;
       P = S + GAP;
       cols = Math.floor((w + GAP) / P);
-      const k = Math.max(1, Math.floor(cols / WORD_COLS)); // cells per stroke
+      const k = Math.max(1, Math.floor((cols - 4) / WORD_COLS)); // cells per stroke
       const wordW = WORD_COLS * k, wordH = GLYPH_ROWS * k;
       const margin = small ? 4 : 6;
       rows = wordH + margin * 2;
@@ -137,17 +143,27 @@ const links = [
       blur(field, tmp, FW, FH, 1);
       blur(field, tmp, FW, FH, 1);
 
-      wordIdx = [];
+      wordIdx = []; edgeIdx = []; leeIdx = [];
+      const cov = (c: number, r: number) => (c < 0 || r < 0 || c >= cols || r >= rows ? 0 : sample(c + 0.5, r + 0.5));
       for (let r = 0; r < rows; r++) {
         for (let c = 0; c < cols; c++) {
-          if (sample(c + 0.5, r + 0.5) > 0.9) wordIdx.push(r * cols + c);
+          const v = cov(c, r);
+          if (v > 0.9) wordIdx.push(r * cols + c);
+          if (v > 0.55) {
+            if (cov(c - 1, r) < 0.35 || cov(c, r - 1) < 0.35) edgeIdx.push(r * cols + c);
+            if (cov(c + 1, r) < 0.35) leeIdx.push(r * cols + c);
+          }
         }
       }
       const n = cols * rows;
       glow = new Float32Array(n);
       hue = new Uint8Array(n);
       rate = new Float32Array(n);
-      sparks = [];
+      erode = new Float32Array(n);
+      erodeRate = new Float32Array(n);
+      dust = new Float32Array(n);
+      grains = [];
+      push = null;
     }
 
     // Bilinear sample of the coverage field at a position given in cell units.
@@ -168,53 +184,99 @@ const links = [
       }
     }
 
+    // Irregular gust, 0..1: two slow waves multiplied, so calm spells and strong spells alternate.
+    function gustAt(t: number, c: number) {
+      const a = 0.5 + 0.5 * Math.sin(t * 0.0006);
+      const b = 0.5 + 0.5 * Math.sin(t * 0.00131 + 2);
+      const g = Math.min(1, Math.max(0, (a * b - 0.06) * 2.2));
+      return g * (0.65 + 0.35 * Math.sin(c * 0.05 - t * 0.0008));
+    }
+
+    function spawnGrain(i: number, t: number, g: number, colored: number) {
+      if (grains.length >= MAX_GRAINS) return;
+      erode[i] = Math.max(erode[i], 0.5 + Math.random() * 0.5);
+      erodeRate[i] = 1 / (400 + Math.random() * 1400);
+      grains.push({
+        x: i % cols, y: Math.floor(i / cols),
+        vx: (0.004 + Math.random() * 0.008) * (0.5 + g), vy: 0.0015 + Math.random() * 0.002,
+        born: t, life: 700 + Math.random() * 1100, b: 0.75 + Math.random() * 0.2, c: colored,
+      });
+    }
+
     function step(now: number, dt: number) {
-      for (let i = 0; i < glow.length; i++) if (glow[i] > 0) glow[i] = Math.max(0, glow[i] - rate[i] * dt);
-      if (now >= nextSpark) {
-        nextSpark = now + 350 + Math.random() * 700;
-        if (sparks.length < 8) {
-          const i = wordIdx[(Math.random() * wordIdx.length) | 0];
-          sparks.push({
-            x: i % cols, y: Math.floor(i / cols),
-            vx: (0.5 + Math.random() * 0.7) * 0.006, vy: (Math.random() - 0.3) * 0.002,
-            born: now, life: 1800 + Math.random() * 1800, c: (Math.random() * STATUS.length) | 0,
-          });
+      for (let i = 0; i < glow.length; i++) {
+        if (glow[i] > 0) glow[i] = Math.max(0, glow[i] - rate[i] * dt);
+        if (erode[i] > 0) erode[i] = Math.max(0, erode[i] - erodeRate[i] * dt);
+        if (dust[i] > 0) dust[i] = Math.max(0, dust[i] - dt / 380);
+      }
+      // erosion on the windward edge, driven by the gust
+      let coloredNow = 0;
+      for (const gr of grains) if (gr.c >= 0) coloredNow++;
+      for (let n = 0; n < 5; n++) {
+        const i = edgeIdx[(Math.random() * edgeIdx.length) | 0];
+        const g = gustAt(now, i % cols);
+        if (Math.random() < 0.015 + 0.9 * g * g) {
+          const wantColor = coloredNow < 4 && now >= nextColor && Math.random() < 0.15;
+          if (wantColor) { nextColor = now + 500 + Math.random() * 1200; coloredNow++; }
+          spawnGrain(i, now, g, wantColor ? (Math.random() * STATUS.length) | 0 : -1);
         }
       }
-      sparks = sparks.filter((s) => {
-        const age = now - s.born;
-        if (age > s.life) return false;
-        s.x += s.vx * dt; s.y += s.vy * dt;
-        const e = Math.sin((age / s.life) * Math.PI);
-        const cx = Math.round(s.x), cy = Math.round(s.y);
-        if (cx >= 0 && cx < cols && cy >= 0 && cy < rows) ignite(cy * cols + cx, 0.85 * e, s.c);
+      // strong wind: a faint dust tail behind the leeward edge
+      const gl = gustAt(now, cols / 2);
+      if (gl > 0.55 && leeIdx.length) {
+        for (let n = 0; n < 4; n++) {
+          const i = leeIdx[(Math.random() * leeIdx.length) | 0];
+          const len = 1 + ((Math.random() * 3) | 0);
+          for (let d = 1; d <= len; d++) if (i + d < dust.length) dust[i + d] = Math.max(dust[i + d], 0.28 * gl * (1 - d / (len + 1)));
+        }
+      }
+      grains = grains.filter((gr) => {
+        const age = now - gr.born;
+        if (age > gr.life) return false;
+        const g = gustAt(now, gr.x);
+        gr.x += gr.vx * dt * (0.6 + g);
+        gr.y += (gr.vy + 0.003 * Math.sin(age * 0.012 + gr.x)) * dt;
+        const cx = Math.round(gr.x), cy = Math.round(gr.y);
+        if (cx >= 0 && cx < cols && cy >= 0 && cy < rows) {
+          const i = cy * cols + cx;
+          const f = 1 - age / gr.life;
+          if (gr.c >= 0) { if (f * 0.9 > glow[i]) { glow[i] = f * 0.9; hue[i] = gr.c; rate[i] = 1 / 500; } }
+          else dust[i] = Math.max(dust[i], gr.b * f);
+        }
         return true;
       });
+      // rare big gust: a patch of the word is pushed one cell downwind, then settles back
+      if (!push && now >= nextPush) {
+        if (nextPush > 0 && edgeIdx.length) {
+          const i = edgeIdx[(Math.random() * edgeIdx.length) | 0];
+          push = { x: i % cols, y: Math.floor(i / cols), start: now, dur: 1100 };
+        }
+        nextPush = now + 9000 + Math.random() * 9000;
+      }
+      if (push && now - push.start > push.dur) push = null;
     }
 
     function draw(now: number) {
       ctx.clearRect(0, 0, W, H);
       const top = LEVELS - 1;
+      const pEnv = push ? Math.sin(((now - push.start) / push.dur) * Math.PI) : 0;
       for (let r = 0; r < rows; r++) {
-        const rowPhase = Math.sin(r * 0.33 + now * 0.0016);
         for (let c = 0; c < cols; c++) {
-          // regional gust: the flag only really waves where the gust is
-          const gust = 0.55 + 0.45 * Math.sin(c * 0.045 - now * 0.00045 + r * 0.02);
-          const d2 = (c + r) * 0.16 + now * 0.0011;
-          const dx = AMP * gust * rowPhase + 0.35 * Math.sin(d2);
-          const dy = 0.4 * AMP * gust * Math.sin(c * 0.21 - now * 0.0013 + r * 0.05);
-          const cov = sample(c + 0.5 + dx, r + 0.5 + dy);
-          // fold lighting from the slope of the displacement
-          const slope = AMP * gust * 0.33 * Math.cos(r * 0.33 + now * 0.0016) + 0.35 * 0.16 * Math.cos(d2);
-          // background: faint wind ripple, 1-2 steps
-          const rip = 0.5 + 0.5 * Math.sin(c * 0.07 + r * 0.11 - now * 0.0006);
-          let v = cov * (0.78 + 0.32 * slope / AMP * 2.2) + (1 - cov) * rip * 0.1;
-          v = v < 0 ? 0 : v > 1 ? 1 : v;
+          let dx = 0.15 * Math.sin(r * 0.3 + now * 0.0012); // barely-there sway
+          if (push) {
+            const ddx = c - push.x, ddy = r - push.y;
+            dx -= 1.1 * pEnv * Math.exp(-(ddx * ddx + ddy * ddy) / 40);
+          }
+          const cov = sample(c + 0.5 + dx, r + 0.5);
           const i = r * cols + c;
+          const fold = 0.04 * Math.sin(c * 0.1 + r * 0.08 - now * 0.0007);
+          const rip = 0.5 + 0.5 * Math.sin(c * 0.07 + r * 0.11 - now * 0.0006);
+          let v = cov * (0.82 + fold) + (1 - cov) * rip * 0.07 - erode[i] * 0.4 * cov + dust[i] * 0.6;
+          v = v < 0 ? 0 : v > 1 ? 1 : v;
           const a = glow[i];
           const q = Math.round(v * top);
           if (a > 0) {
-            const k = a * a * (3 - 2 * a) * (cov > 0.5 ? 1 : 0.7);
+            const k = a * a * (3 - 2 * a);
             const p = PALETTE[q], s = STATUS[hue[i]];
             ctx.fillStyle = `rgb(${(p[0] + (s[0] - p[0]) * k) | 0},${(p[1] + (s[1] - p[1]) * k) | 0},${(p[2] + (s[2] - p[2]) * k) | 0})`;
           } else ctx.fillStyle = PAL_CSS[q];
@@ -237,8 +299,15 @@ const links = [
     }
 
     function staticFrame() {
-      [0.12, 0.31, 0.5, 0.68, 0.87].forEach((f, n) => {
-        ignite(wordIdx[Math.floor(f * wordIdx.length)], 0.85, n % STATUS.length);
+      // one settled frame: a few eroded edge cells and a little dust downwind of them
+      for (let n = 0; n < 12; n++) {
+        const i = edgeIdx[Math.floor(((n + 0.5) / 12) * edgeIdx.length)];
+        erode[i] = 0.7;
+        dust[i + 1] = 0.45; dust[i + 2] = 0.3; dust[i + 3] = 0.15;
+      }
+      [0.2, 0.5, 0.8].forEach((f, n) => {
+        const i = edgeIdx[Math.floor(f * edgeIdx.length)] + 4;
+        glow[i] = 0.85; hue[i] = n % STATUS.length;
       });
       draw(4000);
     }
