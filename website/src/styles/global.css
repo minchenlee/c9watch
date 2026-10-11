@@ -204,6 +204,11 @@ starlight-theme-select {
     margin-top: 0 !important;
 }
 
+/* Splash page: nothing after the landing content (no empty Starlight footer band) */
+[data-has-hero] .sl-container > :not(.sl-markdown-content) {
+    display: none !important;
+}
+
 /* Splash page: no Starlight borders or heading underlines in landing sections */
 [data-has-hero] .content-panel,
 [data-has-hero] .content-panel + .content-panel {

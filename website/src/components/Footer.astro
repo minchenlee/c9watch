@@ -1,21 +1,23 @@
 ---
 // website/src/components/Footer.astro
 // Terminal-style closing block. Glyphs tick in the app's status colours while in view.
+// 5-wide pixel glyphs. x-height letters (c, w, a) have 5 rows and sit on the baseline of the 7-row grid.
 const FONT: Record<string, string[]> = {
-  c: [' ████', '█    ', '█    ', '█    ', ' ████'],
-  '9': [' ███ ', '█   █', ' ████', '    █', ' ███ '],
-  w: ['█   █', '█   █', '█ █ █', '██ ██', '█   █'],
-  a: [' ███ ', '    █', ' ████', '█   █', ' ████'],
-  t: ['  █  ', '█████', '  █  ', '  █  ', '   ██'],
-  h: ['█    ', '█    ', '████ ', '█   █', '█   █'],
+  c: ['.###.', '#...#', '#....', '#...#', '.###.'],
+  '9': ['.###.', '#...#', '#...#', '.####', '....#', '#...#', '.###.'],
+  w: ['#...#', '#...#', '#.#.#', '#.#.#', '.#.#.'],
+  a: ['.###.', '....#', '.####', '#...#', '.####'],
+  t: ['.#...', '.#...', '####.', '.#...', '.#...', '.#..#', '..##.'],
+  h: ['#....', '#....', '####.', '#...#', '#...#', '#...#', '#...#'],
 };
 const WORD = 'c9watch';
-const GAP = '  ';
-const rows = Array.from({ length: 5 }, (_, r) =>
-  WORD.split('').map((ch) => FONT[ch][r]).join(GAP)
-);
+const ROWS = 7;
+const pad = (g: string[]) => [...Array(ROWS - g.length).fill('.....'), ...g];
+const glyphs = WORD.split('').map((ch) => pad(FONT[ch]));
+// 5 columns per letter, 1 blank column between letters
+const rows = Array.from({ length: ROWS }, (_, r) => glyphs.map((g) => g[r]).join('.'));
 const COLS = rows[0].length;
-const artHtml = rows.map((row) => row.replace(/█/g, '<span class="g">█</span>')).join('\n');
+const cells = rows.flatMap((row) => row.split('').map((c) => c === '#'));
 const links = [
   { label: 'Install', href: '/install/' },
   { label: 'Features', href: '/features/' },
@@ -33,31 +35,29 @@ const links = [
       <span>c9watch: every agent session, one dashboard</span>
       <span aria-hidden="true">[EOF]</span>
     </div>
-    <div class="term-art" role="img" aria-label="c9watch" style={`--cols:${COLS}`}><span aria-hidden="true" set:html={artHtml}></span></div>
-    <p class="term-meta">
-      {links.map((l, i) => (
-        <Fragment>
-          {i > 0 && <span class="sep" aria-hidden="true">·</span>}
-          <a href={l.href} target={l.external ? '_blank' : undefined} rel={l.external ? 'noopener' : undefined}>{l.label}</a>
-        </Fragment>
+    <div class="term-art" role="img" aria-label="c9watch" style={`--cols:${COLS}`}>
+      {cells.map((on) => <i class={on ? 'px on' : 'px'} aria-hidden="true"></i>)}
+    </div>
+    <ul class="term-meta">
+      {links.map((l) => (
+        <li><a href={l.href} target={l.external ? '_blank' : undefined} rel={l.external ? 'noopener' : undefined}>{l.label}</a></li>
       ))}
-      <span class="sep" aria-hidden="true">·</span>
-      <span>Also by the author: <a href="https://rmdv.mclee.dev" target="_blank" rel="noopener">rmdv</a></span>
-    </p>
+      <li>Also by the author: <a href="https://rmdv.mclee.dev" target="_blank" rel="noopener">rmdv</a></li>
+    </ul>
   </div>
 </footer>
 
 <script>
   const footer = document.querySelector<HTMLElement>('.term');
-  const glyphs = footer ? Array.from(footer.querySelectorAll<HTMLElement>('.g')) : [];
+  const glyphs = footer ? Array.from(footer.querySelectorAll<HTMLElement>('.px.on')) : [];
   // App status tokens: Working, Needs Attention, Ready
   const COLORS = ['#7928ca', '#ff6600', '#00ff88'];
   const LIT_MS = 1100;
   const TICK_MS = 160;
 
   function light(el: HTMLElement) {
-    el.style.color = COLORS[(Math.random() * COLORS.length) | 0];
-    window.setTimeout(() => { el.style.color = ''; }, LIT_MS);
+    el.style.background = COLORS[(Math.random() * COLORS.length) | 0];
+    window.setTimeout(() => { el.style.background = ''; }, LIT_MS);
   }
 
   if (footer && glyphs.length) {
@@ -66,7 +66,7 @@ const links = [
       // One static frame: a few fixed glyphs lit.
       [8, 31, 57, 83, 104].forEach((n, i) => {
         const el = glyphs[n % glyphs.length];
-        el.style.color = COLORS[i % COLORS.length];
+        el.style.background = COLORS[i % COLORS.length];
       });
     } else {
       let timer = 0;
@@ -91,7 +91,6 @@ const links = [
     background: var(--bg-elevated, #0a0a0a);
     border-top: 1px solid var(--border-muted);
     padding: var(--section-y) 1.5rem 2.5rem;
-    container-type: inline-size;
   }
 
   .term-inner {
@@ -108,35 +107,48 @@ const links = [
     border-bottom: 1px solid var(--border-muted);
     font-size: 12px;
     color: var(--text-muted);
+    white-space: nowrap;
   }
 
-  .term-art {
-    margin: 2.5rem 0;
-    padding: 0;
-    background: none;
-    border: none;
-    text-align: center;
-    white-space: pre;
-    line-height: 1.05;
-    /* fit COLS monospace cells (~0.6em wide) into the container width */
-    font-size: calc(min(100cqw - 3rem, 1000px) / (var(--cols) * 0.62));
-    font-family: var(--font-mono);
-    color: #262626;
+  .term-bar span:first-child {
+    min-width: 0;
     overflow: hidden;
+    text-overflow: ellipsis;
   }
 
-  .g {
-    transition: color 0.6s ease;
+  /* Square pixels: equal-width columns, every cell aspect-ratio 1 */
+  .term-art {
+    display: grid;
+    grid-template-columns: repeat(var(--cols), 1fr);
+    gap: 2px;
+    margin: 2.5rem 0;
+  }
+
+  .px {
+    display: block;
+    aspect-ratio: 1;
+  }
+
+  .px.on {
+    background: #262626;
+    transition: background-color 0.6s ease;
   }
 
   .term-meta {
     display: flex;
     flex-wrap: wrap;
     justify-content: center;
-    gap: 0.4rem 0.6rem;
+    gap: 0.4rem 1.25rem;
     margin: 0;
+    padding: 0;
+    list-style: none;
     font-size: 12px;
     color: var(--text-muted);
+  }
+
+  .term-meta li {
+    margin: 0;
+    padding: 0;
   }
 
   .term-meta a {
@@ -149,19 +161,14 @@ const links = [
     color: var(--text-primary);
   }
 
-  .sep {
-    color: var(--border-default);
-  }
-
   @media (max-width: 640px) {
     .term {
       padding-left: 1rem;
       padding-right: 1rem;
     }
 
-    .term-bar {
-      flex-direction: column;
-      gap: 0.25rem;
+    .term-art {
+      gap: 1px;
     }
   }
 </style>
