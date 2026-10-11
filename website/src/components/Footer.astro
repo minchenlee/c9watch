@@ -1,71 +1,167 @@
 ---
 // website/src/components/Footer.astro
+// Terminal-style closing block. Glyphs tick in the app's status colours while in view.
+const FONT: Record<string, string[]> = {
+  c: [' ████', '█    ', '█    ', '█    ', ' ████'],
+  '9': [' ███ ', '█   █', ' ████', '    █', ' ███ '],
+  w: ['█   █', '█   █', '█ █ █', '██ ██', '█   █'],
+  a: [' ███ ', '    █', ' ████', '█   █', ' ████'],
+  t: ['  █  ', '█████', '  █  ', '  █  ', '   ██'],
+  h: ['█    ', '█    ', '████ ', '█   █', '█   █'],
+};
+const WORD = 'c9watch';
+const GAP = '  ';
+const rows = Array.from({ length: 5 }, (_, r) =>
+  WORD.split('').map((ch) => FONT[ch][r]).join(GAP)
+);
+const COLS = rows[0].length;
+const artHtml = rows.map((row) => row.replace(/█/g, '<span class="g">█</span>')).join('\n');
+const links = [
+  { label: 'Install', href: '/install/' },
+  { label: 'Features', href: '/features/' },
+  { label: 'Changelog', href: '/changelog/' },
+  { label: 'Compatibility', href: '/compatibility/' },
+  { label: 'GitHub', href: 'https://github.com/minchenlee/c9watch', external: true },
+  { label: 'MIT', href: 'https://github.com/minchenlee/c9watch/blob/main/LICENSE', external: true },
+  { label: '@minchenlee', href: 'https://github.com/minchenlee', external: true },
+];
 ---
 
-<footer class="footer">
-  <div class="footer-cols">
-    <div class="footer-col">
-      <p class="footer-heading">Product</p>
-      <a href="/install/">Install</a>
-      <a href="/features/">Features</a>
-      <a href="/changelog/">Changelog</a>
-      <a href="/compatibility/">Compatibility</a>
+<footer class="term" data-cols={COLS}>
+  <div class="term-inner">
+    <div class="term-bar">
+      <span>c9watch: every agent session, one dashboard</span>
+      <span aria-hidden="true">[EOF]</span>
     </div>
-    <div class="footer-col">
-      <p class="footer-heading">Project</p>
-      <a href="https://github.com/minchenlee/c9watch" target="_blank" rel="noopener">GitHub</a>
-      <a href="https://github.com/minchenlee/c9watch/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
-      <a href="https://github.com/minchenlee" target="_blank" rel="noopener">@minchenlee</a>
-    </div>
+    <div class="term-art" role="img" aria-label="c9watch" style={`--cols:${COLS}`}><span aria-hidden="true" set:html={artHtml}></span></div>
+    <p class="term-meta">
+      {links.map((l, i) => (
+        <Fragment>
+          {i > 0 && <span class="sep" aria-hidden="true">·</span>}
+          <a href={l.href} target={l.external ? '_blank' : undefined} rel={l.external ? 'noopener' : undefined}>{l.label}</a>
+        </Fragment>
+      ))}
+      <span class="sep" aria-hidden="true">·</span>
+      <span>Also by the author: <a href="https://rmdv.mclee.dev" target="_blank" rel="noopener">rmdv</a></span>
+    </p>
   </div>
-  <p class="footer-aside">
-    Also by the author: <a href="https://rmdv.mclee.dev" target="_blank" rel="noopener">rmdv</a>
-  </p>
 </footer>
 
+<script>
+  const footer = document.querySelector<HTMLElement>('.term');
+  const glyphs = footer ? Array.from(footer.querySelectorAll<HTMLElement>('.g')) : [];
+  // App status tokens: Working, Needs Attention, Ready
+  const COLORS = ['#7928ca', '#ff6600', '#00ff88'];
+  const LIT_MS = 1100;
+  const TICK_MS = 160;
+
+  function light(el: HTMLElement) {
+    el.style.color = COLORS[(Math.random() * COLORS.length) | 0];
+    window.setTimeout(() => { el.style.color = ''; }, LIT_MS);
+  }
+
+  if (footer && glyphs.length) {
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduced) {
+      // One static frame: a few fixed glyphs lit.
+      [8, 31, 57, 83, 104].forEach((n, i) => {
+        const el = glyphs[n % glyphs.length];
+        el.style.color = COLORS[i % COLORS.length];
+      });
+    } else {
+      let timer = 0;
+      let inView = false;
+      const tick = () => { for (let i = 0; i < 2; i++) light(glyphs[(Math.random() * glyphs.length) | 0]); };
+      const sync = () => {
+        const run = inView && !document.hidden;
+        if (run && !timer) timer = window.setInterval(tick, TICK_MS);
+        if (!run && timer) { clearInterval(timer); timer = 0; }
+      };
+      new IntersectionObserver((entries) => {
+        inView = entries[0].isIntersecting;
+        sync();
+      }, { threshold: 0.1 }).observe(footer);
+      document.addEventListener('visibilitychange', sync);
+    }
+  }
+</script>
+
 <style>
-  .footer {
-    padding: 2.5rem 1.5rem 2rem;
+  .term {
+    background: var(--bg-elevated, #0a0a0a);
     border-top: 1px solid var(--border-muted);
+    padding: var(--section-y) 1.5rem 2.5rem;
+    container-type: inline-size;
   }
 
-  .footer-cols {
+  .term-inner {
+    max-width: 1000px;
+    margin: 0 auto;
+    font-family: var(--font-mono);
+  }
+
+  .term-bar {
     display: flex;
-    justify-content: center;
-    gap: 4rem;
-  }
-
-  .footer-col {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    font-size: 13px;
-    min-width: 120px;
-  }
-
-  .footer-heading {
-    margin: 0 0 0.25rem;
+    justify-content: space-between;
+    gap: 1rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border-muted);
     font-size: 12px;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--text-secondary);
+    color: var(--text-muted);
   }
 
-  .footer a {
+  .term-art {
+    margin: 2.5rem 0;
+    padding: 0;
+    background: none;
+    border: none;
+    text-align: center;
+    white-space: pre;
+    line-height: 1.05;
+    /* fit COLS monospace cells (~0.6em wide) into the container width */
+    font-size: calc(min(100cqw - 3rem, 1000px) / (var(--cols) * 0.62));
+    font-family: var(--font-mono);
+    color: #262626;
+    overflow: hidden;
+  }
+
+  .g {
+    transition: color 0.6s ease;
+  }
+
+  .term-meta {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 0.4rem 0.6rem;
+    margin: 0;
+    font-size: 12px;
     color: var(--text-muted);
+  }
+
+  .term-meta a {
+    color: var(--text-secondary);
     text-decoration: none;
     transition: color var(--transition-fast);
   }
 
-  .footer a:hover {
-    color: var(--text-secondary);
+  .term-meta a:hover {
+    color: var(--text-primary);
   }
 
-  .footer-aside {
-    margin: 2rem 0 0;
-    text-align: center;
-    font-size: 12px;
-    color: var(--text-muted);
+  .sep {
+    color: var(--border-default);
+  }
+
+  @media (max-width: 640px) {
+    .term {
+      padding-left: 1rem;
+      padding-right: 1rem;
+    }
+
+    .term-bar {
+      flex-direction: column;
+      gap: 0.25rem;
+    }
   }
 </style>
