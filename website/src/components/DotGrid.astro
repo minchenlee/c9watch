@@ -177,11 +177,13 @@
     spawnRipple(); spawnRipple();
     setInterval(() => { spawnRipple(); if (Math.random() > 0.4) spawnRipple(); }, 1500);
 
+    // The hero grows after load (fonts, video, install block). Re-measure on every
+    // size change, or the bitmap keeps its old size and CSS stretches it off the cursor.
     let resizeTimer: ReturnType<typeof setTimeout>;
-    window.addEventListener('resize', () => {
+    new ResizeObserver(() => {
       clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(resize, 150);
-    });
+      resizeTimer = setTimeout(resize, 100);
+    }).observe(canvas);
 
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) cancelAnimationFrame(animId);
