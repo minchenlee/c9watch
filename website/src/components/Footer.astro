@@ -1,23 +1,7 @@
 ---
 // website/src/components/Footer.astro
-// Terminal-style closing block. Glyphs tick in the app's status colours while in view.
-// 5-wide pixel glyphs. x-height letters (c, w, a) have 5 rows and sit on the baseline of the 7-row grid.
-const FONT: Record<string, string[]> = {
-  c: ['.###.', '#...#', '#....', '#...#', '.###.'],
-  '9': ['.###.', '#...#', '#...#', '.####', '....#', '#...#', '.###.'],
-  w: ['#...#', '#...#', '#.#.#', '#.#.#', '.#.#.'],
-  a: ['.###.', '....#', '.####', '#...#', '.####'],
-  t: ['.#...', '.#...', '####.', '.#...', '.#...', '.#..#', '..##.'],
-  h: ['#....', '#....', '####.', '#...#', '#...#', '#...#', '#...#'],
-};
-const WORD = 'c9watch';
-const ROWS = 7;
-const pad = (g: string[]) => [...Array(ROWS - g.length).fill('.....'), ...g];
-const glyphs = WORD.split('').map((ch) => pad(FONT[ch]));
-// 5 columns per letter, 1 blank column between letters
-const rows = Array.from({ length: ROWS }, (_, r) => glyphs.map((g) => g[r]).join('.'));
-const COLS = rows[0].length;
-const cells = rows.flatMap((row) => row.split('').map((c) => c === '#'));
+// LED-board footer: one canvas of square pixels. The c9watch wordmark is made of brighter
+// cells; status colours (Working, Needs Attention, Ready) tick across the whole panel.
 const links = [
   { label: 'Install', href: '/install/' },
   { label: 'Features', href: '/features/' },
@@ -29,58 +13,179 @@ const links = [
 ];
 ---
 
-<footer class="term" data-cols={COLS}>
-  <div class="term-inner">
-    <div class="term-bar">
-      <span>c9watch: every agent session, one dashboard</span>
-      <span aria-hidden="true">[EOF]</span>
-    </div>
-    <div class="term-art" role="img" aria-label="c9watch" style={`--cols:${COLS}`}>
-      {cells.map((on) => <i class={on ? 'px on' : 'px'} aria-hidden="true"></i>)}
-    </div>
-    <ul class="term-meta">
-      {links.map((l) => (
-        <li><a href={l.href} target={l.external ? '_blank' : undefined} rel={l.external ? 'noopener' : undefined}>{l.label}</a></li>
-      ))}
-      <li>Also by the author: <a href="https://rmdv.mclee.dev" target="_blank" rel="noopener">rmdv</a></li>
-    </ul>
+<footer class="term">
+  <div class="term-pad term-bar">
+    <span>c9watch: every agent session, one dashboard</span>
+    <span aria-hidden="true">[EOF]</span>
   </div>
+  <div class="term-panel">
+    <canvas class="term-canvas" role="img" aria-label="c9watch"></canvas>
+  </div>
+  <ul class="term-pad term-meta">
+    {links.map((l) => (
+      <li><a href={l.href} target={l.external ? '_blank' : undefined} rel={l.external ? 'noopener' : undefined}>{l.label}</a></li>
+    ))}
+    <li>Also by the author: <a href="https://rmdv.mclee.dev" target="_blank" rel="noopener">rmdv</a></li>
+  </ul>
 </footer>
 
 <script>
-  const footer = document.querySelector<HTMLElement>('.term');
-  const glyphs = footer ? Array.from(footer.querySelectorAll<HTMLElement>('.px.on')) : [];
-  // App status tokens: Working, Needs Attention, Ready
-  const COLORS = ['#7928ca', '#ff6600', '#00ff88'];
-  const LIT_MS = 1100;
-  const TICK_MS = 160;
+  const canvas = document.querySelector<HTMLCanvasElement>('.term-canvas');
+  const panel = canvas?.parentElement;
+  if (canvas && panel) {
+    const ctx = canvas.getContext('2d')!;
+    const dpr = window.devicePixelRatio || 1;
 
-  function light(el: HTMLElement) {
-    el.style.background = COLORS[(Math.random() * COLORS.length) | 0];
-    window.setTimeout(() => { el.style.background = ''; }, LIT_MS);
-  }
+    // 5-wide glyphs; c, w, a have 5 rows and sit on the baseline of the 7-row grid.
+    const FONT: Record<string, string[]> = {
+      c: ['.###.', '#...#', '#....', '#...#', '.###.'],
+      '9': ['.###.', '#...#', '#...#', '.####', '....#', '#...#', '.###.'],
+      w: ['#...#', '#...#', '#.#.#', '#.#.#', '.#.#.'],
+      a: ['.###.', '....#', '.####', '#...#', '.####'],
+      t: ['.#...', '.#...', '####.', '.#...', '.#...', '.#..#', '..##.'],
+      h: ['#....', '#....', '####.', '#...#', '#...#', '#...#', '#...#'],
+    };
+    const WORD = 'c9watch';
+    const GLYPH_ROWS = 7;
+    const base = WORD.split('').map((ch) => {
+      const g = FONT[ch];
+      return [...Array(GLYPH_ROWS - g.length).fill('.....'), ...g];
+    });
+    const word = Array.from({ length: GLYPH_ROWS }, (_, r) => base.map((g) => g[r]).join('.'));
+    const WORD_COLS = word[0].length; // 41
 
-  if (footer && glyphs.length) {
-    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    if (reduced) {
-      // One static frame: a few fixed glyphs lit.
-      [8, 31, 57, 83, 104].forEach((n, i) => {
-        const el = glyphs[n % glyphs.length];
-        el.style.background = COLORS[i % COLORS.length];
+    // App status tokens: Working, Needs Attention, Ready
+    const STATUS: [number, number, number][] = [[121, 40, 202], [255, 102, 0], [0, 255, 136]];
+    const BG: [number, number, number] = [22, 22, 22];     // dark cell, just above the panel colour
+    const INK: [number, number, number] = [74, 74, 74];    // wordmark cell
+    const LIT_MS = 1100;
+    const FRAME_MS = 60;
+
+    let S = 9, GAP = 2, P = 11;
+    let cols = 0, rows = 0, offX = 0, W = 0, H = 0;
+    let isWord: Uint8Array;
+    let litAt: Float64Array;      // timestamp a cell was lit, 0 = not lit
+    let litColor: Uint8Array;
+    let wordIdx: number[] = [];
+    let timer = 0;
+    let lastDraw = 0;
+
+    function layout() {
+      const w = panel!.clientWidth;
+      const small = w <= 640;
+      S = small ? 5 : 9;
+      GAP = small ? 1 : 2;
+      P = S + GAP;
+      cols = Math.floor((w + GAP) / P);
+      const k = Math.max(1, Math.floor(cols / WORD_COLS)); // cells per stroke
+      const wordW = WORD_COLS * k, wordH = GLYPH_ROWS * k;
+      const margin = small ? 3 : 4;
+      rows = wordH + margin * 2;
+      W = w;
+      H = rows * P - GAP;
+      offX = (w - (cols * P - GAP)) / 2;
+      canvas!.style.width = W + 'px';
+      canvas!.style.height = H + 'px';
+      canvas!.width = Math.round(W * dpr);
+      canvas!.height = Math.round(H * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      canvas!.dataset.cell = `${S}`;
+      canvas!.dataset.grid = `${cols}x${rows}`;
+
+      isWord = new Uint8Array(cols * rows);
+      wordIdx = [];
+      const x0 = Math.floor((cols - wordW) / 2), y0 = margin;
+      for (let r = 0; r < GLYPH_ROWS; r++) {
+        for (let c = 0; c < WORD_COLS; c++) {
+          if (word[r][c] !== '#') continue;
+          for (let dy = 0; dy < k; dy++) {
+            for (let dx = 0; dx < k; dx++) {
+              const i = (y0 + r * k + dy) * cols + (x0 + c * k + dx);
+              isWord[i] = 1;
+              wordIdx.push(i);
+            }
+          }
+        }
+      }
+      litAt = new Float64Array(cols * rows);
+      litColor = new Uint8Array(cols * rows);
+    }
+
+    function draw(now: number) {
+      ctx.clearRect(0, 0, W, H);
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const i = r * cols + c;
+          const b = isWord[i] ? INK : BG;
+          let cr = b[0], cg = b[1], cb = b[2];
+          if (litAt[i]) {
+            const t = 1 - (now - litAt[i]) / LIT_MS;
+            if (t <= 0) litAt[i] = 0;
+            else {
+              const s = STATUS[litColor[i]];
+              const k = isWord[i] ? t : t * 0.55; // dimmer off the wordmark
+              cr += (s[0] - cr) * k; cg += (s[1] - cg) * k; cb += (s[2] - cb) * k;
+            }
+          }
+          ctx.fillStyle = `rgb(${cr | 0},${cg | 0},${cb | 0})`;
+          ctx.fillRect(offX + c * P, r * P, S, S);
+        }
+      }
+    }
+
+    function light(i: number, now: number) {
+      litAt[i] = now;
+      litColor[i] = (Math.random() * STATUS.length) | 0;
+    }
+
+    function tick(now: number) {
+      if (now - lastDraw >= FRAME_MS) {
+        lastDraw = now;
+        for (let n = 0; n < 6; n++) light((Math.random() * cols * rows) | 0, now);
+        for (let n = 0; n < 5; n++) light(wordIdx[(Math.random() * wordIdx.length) | 0], now);
+        draw(now);
+      }
+      timer = requestAnimationFrame(tick);
+    }
+
+    function staticFrame() {
+      const now = performance.now();
+      [0.12, 0.31, 0.5, 0.68, 0.87].forEach((f, n) => {
+        light(wordIdx[Math.floor(f * wordIdx.length)], now);
+        litColor[wordIdx[Math.floor(f * wordIdx.length)]] = n % STATUS.length;
       });
-    } else {
-      let timer = 0;
-      let inView = false;
-      const tick = () => { for (let i = 0; i < 2; i++) light(glyphs[(Math.random() * glyphs.length) | 0]); };
-      const sync = () => {
-        const run = inView && !document.hidden;
-        if (run && !timer) timer = window.setInterval(tick, TICK_MS);
-        if (!run && timer) { clearInterval(timer); timer = 0; }
-      };
+      draw(now);
+    }
+
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let inView = false;
+    const sync = () => {
+      const run = !reduced && inView && !document.hidden;
+      if (run && !timer) timer = requestAnimationFrame(tick);
+      if (!run && timer) { cancelAnimationFrame(timer); timer = 0; }
+    };
+
+    layout();
+    if (reduced) staticFrame(); else draw(performance.now());
+
+    // Keep bitmap size, grid and CSS size in sync when the panel width changes (same fix as DotGrid).
+    let lastW = panel.clientWidth;
+    let resizeTimer: ReturnType<typeof setTimeout>;
+    new ResizeObserver(() => {
+      if (panel.clientWidth === lastW) return;
+      lastW = panel.clientWidth;
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        layout();
+        if (reduced) staticFrame(); else draw(performance.now());
+      }, 100);
+    }).observe(panel);
+
+    if (!reduced) {
       new IntersectionObserver((entries) => {
         inView = entries[0].isIntersecting;
         sync();
-      }, { threshold: 0.1 }).observe(footer);
+      }, { threshold: 0.1 }).observe(panel);
       document.addEventListener('visibilitychange', sync);
     }
   }
@@ -90,13 +195,17 @@ const links = [
   .term {
     background: var(--bg-elevated, #0a0a0a);
     border-top: 1px solid var(--border-muted);
-    padding: var(--section-y) 1.5rem 2.5rem;
+    padding: var(--section-y) 0 2.5rem;
+    font-family: var(--font-mono);
   }
 
-  .term-inner {
+  .term-pad {
     max-width: 1000px;
-    margin: 0 auto;
-    font-family: var(--font-mono);
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 1.5rem;
+    padding-right: 1.5rem;
+    box-sizing: content-box;
   }
 
   .term-bar {
@@ -104,7 +213,6 @@ const links = [
     justify-content: space-between;
     gap: 1rem;
     padding-bottom: 0.75rem;
-    border-bottom: 1px solid var(--border-muted);
     font-size: 12px;
     color: var(--text-muted);
     white-space: nowrap;
@@ -116,22 +224,14 @@ const links = [
     text-overflow: ellipsis;
   }
 
-  /* Square pixels: equal-width columns, every cell aspect-ratio 1 */
-  .term-art {
-    display: grid;
-    grid-template-columns: repeat(var(--cols), 1fr);
-    gap: 2px;
-    margin: 2.5rem 0;
+  .term-panel {
+    width: 100%;
+    margin: 1rem 0 1.75rem;
+    line-height: 0;
   }
 
-  .px {
+  .term-canvas {
     display: block;
-    aspect-ratio: 1;
-  }
-
-  .px.on {
-    background: #262626;
-    transition: background-color 0.6s ease;
   }
 
   .term-meta {
@@ -139,8 +239,8 @@ const links = [
     flex-wrap: wrap;
     justify-content: center;
     gap: 0.4rem 1.25rem;
-    margin: 0;
-    padding: 0;
+    margin-top: 0;
+    margin-bottom: 0;
     list-style: none;
     font-size: 12px;
     color: var(--text-muted);
@@ -162,13 +262,9 @@ const links = [
   }
 
   @media (max-width: 640px) {
-    .term {
+    .term-pad {
       padding-left: 1rem;
       padding-right: 1rem;
-    }
-
-    .term-art {
-      gap: 1px;
     }
   }
 </style>
