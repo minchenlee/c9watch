@@ -9,7 +9,7 @@ import Footer from './Footer.astro';
 import DotGrid from './DotGrid.astro';
 ---
 
-<div class="landing-wrapper">
+<div class="landing-wrapper not-content">
   <script type="application/ld+json" set:html={JSON.stringify({
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
@@ -81,6 +81,10 @@ import DotGrid from './DotGrid.astro';
 <style>
   .landing-wrapper {
     margin: 0 auto;
+  }
+
+  .landing-wrapper > :global(.fade-in) {
+    border-top: 1px solid var(--border-muted);
   }
 
   .c9-nav {

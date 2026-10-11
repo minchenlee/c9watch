@@ -19,6 +19,8 @@
 
 /* Design tokens — used by custom landing page components */
 :root {
+    --landing-w: 760px;
+    --section-y: 4rem;
     --bg-base: #000000;
     --bg-elevated: #0a0a0a;
     --bg-card: #111111;
@@ -200,6 +202,18 @@ starlight-theme-select {
 
 [data-has-hero] .sl-markdown-content > :first-child {
     margin-top: 0 !important;
+}
+
+/* Splash page: no Starlight borders or heading underlines in landing sections */
+[data-has-hero] .content-panel,
+[data-has-hero] .content-panel + .content-panel {
+    border-top: none !important;
+}
+
+[data-has-hero] .sl-markdown-content h2 {
+    border-bottom: none;
+    padding-bottom: 0;
+    margin-top: 0;
 }
 
 /* Docs sidebar: white text active state instead of blue highlight */

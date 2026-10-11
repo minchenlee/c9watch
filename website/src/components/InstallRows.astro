@@ -9,6 +9,7 @@ const rows = [
   {
     label: 'curl',
     command: 'curl -fsSL https://raw.githubusercontent.com/minchenlee/c9watch/main/install.sh | bash',
+    note: 'The curl script also links the c9watch CLI into ~/.local/bin. Homebrew installs the app only.',
   },
   ...(cli ? [{
     label: 'CLI only (macOS & Linux)',
@@ -30,9 +31,9 @@ const rows = [
           </svg>
         </button>
       </div>
+      {row.note && <p class="install-note">{row.note}</p>}
     </div>
   ))}
-  <p class="install-note">The curl script also links the <code>c9watch</code> CLI into <code>~/.local/bin</code>. Homebrew installs the app only.</p>
 </div>
 
 <script>
@@ -52,7 +53,7 @@ const rows = [
     flex-direction: column;
     gap: 0.75rem;
     width: 100%;
-    max-width: 640px;
+    max-width: var(--landing-w);
     margin: 0 auto;
     text-align: left;
   }
@@ -85,8 +86,10 @@ const rows = [
   .install-box code {
     flex: 1;
     min-width: 0;
-    padding: 0.75rem 1rem;
+    padding: 0.75rem 2rem 0.75rem 1rem;
     white-space: nowrap;
+    -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 24px), transparent);
+    mask-image: linear-gradient(90deg, #000 calc(100% - 24px), transparent);
     overflow-x: auto;
     background: none;
     border: none;
@@ -114,7 +117,4 @@ const rows = [
     margin: 0;
   }
 
-  .install-note code {
-    font-size: 12px;
-  }
 </style>

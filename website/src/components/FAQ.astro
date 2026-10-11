@@ -34,7 +34,10 @@ const faqSchema = {
 
 <section class="faq-section">
   <script type="application/ld+json" set:html={JSON.stringify(faqSchema)} />
-  <h2 class="faq-title">Frequently Asked Questions</h2>
+  <div class="faq-intro">
+    <h2 class="faq-title">Frequently Asked Questions</h2>
+    <p class="faq-lede">Short answers about detection, supported tools, price and install.</p>
+  </div>
   <div class="faq-list">
     {faqs.map((faq) => (
       <details class="faq-item">
@@ -47,9 +50,20 @@ const faqSchema = {
 
 <style>
   .faq-section {
-    max-width: 720px;
+    max-width: var(--landing-w);
     margin: 0 auto;
-    padding: 4rem 1.5rem;
+    padding: var(--section-y) 1.5rem;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 2rem;
+    text-align: left;
+  }
+
+  @media (min-width: 900px) {
+    .faq-section {
+      grid-template-columns: 200px 1fr;
+      gap: 3rem;
+    }
   }
 
   .faq-title {
@@ -58,18 +72,19 @@ const faqSchema = {
     font-weight: 600;
     color: var(--text-primary);
     letter-spacing: -0.02em;
-    margin-bottom: 2rem;
-    text-align: center;
+    margin: 0 0 0.75rem;
   }
 
-  .faq-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0;
+  .faq-lede {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 14px;
+    line-height: 1.6;
   }
 
   .faq-item {
     border-top: 1px solid var(--border-muted);
+    border-left: none;
   }
 
   .faq-item:last-child {
@@ -87,6 +102,11 @@ const faqSchema = {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    text-align: left;
+  }
+
+  .faq-question::marker {
+    content: '';
   }
 
   .faq-question::-webkit-details-marker {
@@ -97,7 +117,6 @@ const faqSchema = {
     content: '+';
     font-size: 1.25rem;
     color: var(--text-muted);
-    transition: transform 200ms linear;
     flex-shrink: 0;
     margin-left: 1rem;
   }
@@ -113,5 +132,6 @@ const faqSchema = {
     line-height: 1.7;
     padding: 0 0 1rem 0;
     margin: 0;
+    text-align: left;
   }
 </style>
