@@ -56,30 +56,37 @@ const links = [
 
     // App status tokens: Working, Needs Attention, Ready
     const STATUS: [number, number, number][] = [[121, 40, 202], [255, 102, 0], [0, 255, 136]];
-    const BG: [number, number, number] = [22, 22, 22];     // dark cell, just above the panel colour
-    const INK: [number, number, number] = [74, 74, 74];    // wordmark cell
-    const LIT_MS = 1100;
-    const FRAME_MS = 60;
+    const BG = 20;          // dark cell grey level
+    const INK = 66;         // wordmark cell grey level
+    const WIND_BG = 5;      // +- grey levels of the wind on background cells
+    const WIND_INK = 3;     // +- grey levels of the wind on wordmark cells
+    const FRAME_MS = 33;
+    const WIND_X = 1, WIND_Y = 0.35; // drift direction (cells per second scale below)
 
-    let S = 9, GAP = 2, P = 11;
+    let S = 7, GAP = 1, P = 8;
     let cols = 0, rows = 0, offX = 0, W = 0, H = 0;
     let isWord: Uint8Array;
-    let litAt: Float64Array;      // timestamp a cell was lit, 0 = not lit
-    let litColor: Uint8Array;
+    let glow: Float32Array;       // 0..1 status-colour intensity, decays per cell
+    let hue: Uint8Array;          // status index per cell
+    let rate: Float32Array;       // decay per ms per cell (1 / 600..1500 ms)
+    let ghost: Float32Array;      // 0..1 grey lift from ghosting / scan line
     let wordIdx: number[] = [];
-    let timer = 0;
-    let lastDraw = 0;
+    let sparks: { x: number; y: number; vx: number; vy: number; born: number; life: number; c: number }[] = [];
+    let scan: { start: number; dur: number } | null = null;
+    let nextSpark = 0, nextGhost = 0;
+    let timer = 0, lastDraw = 0, lastFrame = 0;
+    let perfSum = 0, perfN = 0, perfMax = 0;
 
     function layout() {
       const w = panel!.clientWidth;
       const small = w <= 640;
-      S = small ? 5 : 9;
-      GAP = small ? 1 : 2;
+      S = small ? 5 : 7;
+      GAP = 1;
       P = S + GAP;
       cols = Math.floor((w + GAP) / P);
       const k = Math.max(1, Math.floor(cols / WORD_COLS)); // cells per stroke
       const wordW = WORD_COLS * k, wordH = GLYPH_ROWS * k;
-      const margin = small ? 3 : 4;
+      const margin = small ? 3 : 5;
       rows = wordH + margin * 2;
       W = w;
       H = rows * P - GAP;
@@ -92,7 +99,8 @@ const links = [
       canvas!.dataset.cell = `${S}`;
       canvas!.dataset.grid = `${cols}x${rows}`;
 
-      isWord = new Uint8Array(cols * rows);
+      const n = cols * rows;
+      isWord = new Uint8Array(n);
       wordIdx = [];
       const x0 = Math.floor((cols - wordW) / 2), y0 = margin;
       for (let r = 0; r < GLYPH_ROWS; r++) {
@@ -107,8 +115,96 @@ const links = [
           }
         }
       }
-      litAt = new Float64Array(cols * rows);
-      litColor = new Uint8Array(cols * rows);
+      glow = new Float32Array(n);
+      hue = new Uint8Array(n);
+      rate = new Float32Array(n);
+      ghost = new Float32Array(n);
+      sparks = [];
+      scan = null;
+    }
+
+    function ignite(i: number, amount: number, color: number) {
+      if (i < 0 || i >= glow.length) return;
+      if (amount > glow[i]) {
+        glow[i] = amount;
+        hue[i] = color;
+        rate[i] = 1 / (600 + Math.random() * 900);
+      }
+    }
+
+    // Drifting wind: two slow diagonal waves, 0..1
+    function wind(c: number, r: number, t: number) {
+      return 0.5 + 0.28 * Math.sin(c * 0.07 + r * 0.11 - t * 0.0006)
+                 + 0.22 * Math.sin(c * 0.031 - r * 0.07 - t * 0.00037 + 1.7);
+    }
+
+    function step(now: number, dt: number) {
+      // decay glow + ghost
+      for (let i = 0; i < glow.length; i++) {
+        if (glow[i] > 0) glow[i] = Math.max(0, glow[i] - rate[i] * dt);
+        if (ghost[i] > 0) ghost[i] = Math.max(0, ghost[i] - dt / 600);
+      }
+      // sparks spawn near the wordmark and drift with the wind
+      if (now >= nextSpark) {
+        nextSpark = now + 180 + Math.random() * 320;
+        if (sparks.length < 16) {
+          const i = wordIdx[(Math.random() * wordIdx.length) | 0];
+          sparks.push({
+            x: i % cols, y: Math.floor(i / cols),
+            vx: (WIND_X * (0.5 + Math.random() * 0.7)) * 0.006,
+            vy: (WIND_Y * (Math.random() - 0.3)) * 0.006,
+            born: now, life: 1800 + Math.random() * 1800,
+            c: (Math.random() * STATUS.length) | 0,
+          });
+        }
+      }
+      sparks = sparks.filter((s) => {
+        const age = now - s.born;
+        if (age > s.life) return false;
+        s.x += s.vx * dt; s.y += s.vy * dt;
+        const e = Math.sin((age / s.life) * Math.PI); // fade in, fade out
+        const cx = Math.round(s.x), cy = Math.round(s.y);
+        if (cx >= 0 && cx < cols && cy >= 0 && cy < rows) {
+          const i = cy * cols + cx;
+          ignite(i, (isWord[i] ? 0.9 : 0.6) * e, s.c);
+        }
+        return true;
+      });
+      // occasional ghosting: shifted afterimage chunk, or a short scan line
+      if (now >= nextGhost) {
+        nextGhost = now + 2500 + Math.random() * 3500;
+        if (Math.random() < 0.5) {
+          scan = { start: now, dur: 900 };
+        } else {
+          const n = 1 + ((Math.random() * 2) | 0);
+          for (let m = 0; m < n; m++) {
+            const i0 = wordIdx[(Math.random() * wordIdx.length) | 0];
+            const off = Math.random() < 0.5 ? -1 : 1;
+            for (let j = 0; j < 7; j++) {
+              const i = i0 + j;
+              if (isWord[i] && Math.floor(i / cols) === Math.floor(i0 / cols)) {
+                const g = i + off * (1 + ((Math.random() * 2) | 0));
+                if (g >= 0 && g < ghost.length && !isWord[g]) ghost[g] = Math.max(ghost[g], 0.5);
+              }
+            }
+          }
+        }
+      }
+      if (scan) {
+        const p = (now - scan.start) / scan.dur;
+        if (p >= 1) scan = null;
+        else {
+          const c = Math.floor(p * (cols + 6)) - 3;
+          for (let r = 0; r < rows; r++) {
+            for (let d = 0; d < 2; d++) {
+              const cc = c - d;
+              if (cc < 0 || cc >= cols) continue;
+              const i = r * cols + cc;
+              if (isWord[i]) ghost[i] = Math.max(ghost[i], d === 0 ? 0.55 : 0.3);
+            }
+          }
+        }
+      }
     }
 
     function draw(now: number) {
@@ -116,16 +212,15 @@ const links = [
       for (let r = 0; r < rows; r++) {
         for (let c = 0; c < cols; c++) {
           const i = r * cols + c;
-          const b = isWord[i] ? INK : BG;
-          let cr = b[0], cg = b[1], cb = b[2];
-          if (litAt[i]) {
-            const t = 1 - (now - litAt[i]) / LIT_MS;
-            if (t <= 0) litAt[i] = 0;
-            else {
-              const s = STATUS[litColor[i]];
-              const k = isWord[i] ? t : t * 0.55; // dimmer off the wordmark
-              cr += (s[0] - cr) * k; cg += (s[1] - cg) * k; cb += (s[2] - cb) * k;
-            }
+          const w = isWord[i];
+          const wv = wind(c, r, now) - 0.5;
+          let g = (w ? INK : BG) + wv * 2 * (w ? WIND_INK : WIND_BG) + ghost[i] * 30;
+          let cr = g, cg = g, cb = g;
+          const a = glow[i];
+          if (a > 0) {
+            const k = a * a * (3 - 2 * a) * (w ? 1 : 0.7); // smooth ease, status colour -> cell base
+            const s = STATUS[hue[i]];
+            cr += (s[0] - cr) * k; cg += (s[1] - cg) * k; cb += (s[2] - cb) * k;
           }
           ctx.fillStyle = `rgb(${cr | 0},${cg | 0},${cb | 0})`;
           ctx.fillRect(offX + c * P, r * P, S, S);
@@ -133,26 +228,23 @@ const links = [
       }
     }
 
-    function light(i: number, now: number) {
-      litAt[i] = now;
-      litColor[i] = (Math.random() * STATUS.length) | 0;
-    }
-
-    function tick(now: number) {
-      if (now - lastDraw >= FRAME_MS) {
-        lastDraw = now;
-        for (let n = 0; n < 6; n++) light((Math.random() * cols * rows) | 0, now);
-        for (let n = 0; n < 5; n++) light(wordIdx[(Math.random() * wordIdx.length) | 0], now);
-        draw(now);
-      }
-      timer = requestAnimationFrame(tick);
+    function frame(now: number) {
+      timer = requestAnimationFrame(frame);
+      if (now - lastDraw < FRAME_MS) return;
+      const t0 = performance.now();
+      const dt = Math.min(100, lastFrame ? now - lastFrame : FRAME_MS);
+      lastFrame = now; lastDraw = now;
+      step(now, dt);
+      draw(now);
+      const cost = performance.now() - t0;
+      perfSum += cost; perfN++; perfMax = Math.max(perfMax, cost);
+      canvas!.dataset.perf = `${(perfSum / perfN).toFixed(2)}ms avg, ${perfMax.toFixed(2)}ms max, n=${perfN}`;
     }
 
     function staticFrame() {
-      const now = performance.now();
+      const now = 4000;
       [0.12, 0.31, 0.5, 0.68, 0.87].forEach((f, n) => {
-        light(wordIdx[Math.floor(f * wordIdx.length)], now);
-        litColor[wordIdx[Math.floor(f * wordIdx.length)]] = n % STATUS.length;
+        ignite(wordIdx[Math.floor(f * wordIdx.length)], 0.9, n % STATUS.length);
       });
       draw(now);
     }
@@ -161,7 +253,7 @@ const links = [
     let inView = false;
     const sync = () => {
       const run = !reduced && inView && !document.hidden;
-      if (run && !timer) timer = requestAnimationFrame(tick);
+      if (run && !timer) { lastFrame = 0; timer = requestAnimationFrame(frame); }
       if (!run && timer) { cancelAnimationFrame(timer); timer = 0; }
     };
 
