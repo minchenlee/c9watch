@@ -220,6 +220,19 @@ See [SKILLS.md](SKILLS.md) for more install options.
 - **Token distance visualizer** -- See your token usage as a rice stack towering past 22 real-world landmarks, with animated stacking, native share sheet, and Instagram-ready PNG export
 - **Debug console** -- Hidden diagnostic panel (`Cmd+Shift+D`) for troubleshooting session detection issues
 
+### Where Open takes you
+
+For Claude Code sessions (other agents have no process to focus yet):
+
+| Session runs in | Open goes to |
+|---|---|
+| Terminal.app, iTerm2, tmux, Herdr | The exact tab or pane |
+| Ghostty 1.3+ | The exact tab if only one tab is in that directory, else the app |
+| VS Code, Cursor, Zed, JetBrains | The project window, not the terminal panel |
+| Warp, kitty, WezTerm, others | The app only |
+
+Details, limits, and how each cell was checked: [docs/jump-matrix.md](docs/jump-matrix.md).
+
 ## How it works
 
 **Live monitoring** -- A background thread polls every 2 seconds, scanning for running `claude` processes using `sysinfo`. Each process is matched to its session file in `~/.claude/projects/` via path encoding and timestamp correlation. The last N entries of each session's JSONL file are parsed to determine status:
