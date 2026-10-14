@@ -2,7 +2,7 @@
  * Demo session and conversation data for UI exploration
  */
 
-import type { Session, Conversation, HistoryEntry, CostData, SessionCostRecord } from '../types';
+import type { Session, Conversation, HistoryEntry, CostData, SessionCostRecord, AwayActivity, AwayRequest, WaitingFor } from '../types';
 import { SessionStatus } from '../types';
 
 function minutesAgo(minutes: number): string {
@@ -69,7 +69,52 @@ export const statusTransitions: Record<SessionStatus, SessionStatus[]> = {
  * Returns 6 demo sessions with dynamic timestamps relative to now.
  * Spread across 3 project paths to showcase project grouping.
  */
+/** Mirrors the backend's `waiting_for` derivation for demo sessions. */
+export function demoWaitingFor(status: SessionStatus, pendingToolName: string | null): WaitingFor | undefined {
+	if (status === SessionStatus.WaitingForInput) return { kind: 'input' };
+	if (status !== SessionStatus.NeedsAttention) return undefined;
+	if (pendingToolName === 'Question' || pendingToolName === 'AskUserQuestion') return { kind: 'question' };
+	return pendingToolName ? { kind: 'approval', tool: pendingToolName } : { kind: 'attention' };
+}
+
+/** Last assistant line per demo session (what the backend would send). */
+const demoLastAssistant: Record<string, string> = {
+	'demo-1': 'Google and GitHub providers are wired; next I write src/auth/providers.ts.',
+	'demo-3': 'Cache layer is ready. It needs the ioredis package before tests can run.',
+	'demo-5': 'Done! The wizard is at src/commands/init.ts. Run `cli-tools init` to try it.',
+	'demo-6': 'All 14 command handlers have been migrated to the Result pattern. Tests pass.'
+};
+
+/** Activity "while you were away" per demo session (Claude Code only, like the backend). */
+const demoAway: Record<string, Omit<AwayActivity, 'sinceMs'>> = {
+	'demo-1': { toolCalls: 18, filesEdited: 4, commandsRun: 6, subagentsCompleted: 2, partial: false },
+	'demo-3': { toolCalls: 7, filesEdited: 2, commandsRun: 3, subagentsCompleted: 0, partial: false },
+	'demo-5': { toolCalls: 31, filesEdited: 9, commandsRun: 11, subagentsCompleted: 1, partial: false },
+	'demo-6': { toolCalls: 0, filesEdited: 0, commandsRun: 0, subagentsCompleted: 0, partial: false }
+};
+
+export function getDemoAwayActivity(requests: AwayRequest[]): Record<string, AwayActivity> {
+	const out: Record<string, AwayActivity> = {};
+	for (const { sessionKey, sinceMs } of requests) {
+		const activity = demoAway[sessionKey.slice(sessionKey.indexOf(':') + 1)];
+		if (activity) out[sessionKey] = { ...activity, sinceMs };
+	}
+	return out;
+}
+
+export function withDemoAwayFields(session: Session): Session {
+	return {
+		...session,
+		waitingFor: demoWaitingFor(session.status, session.pendingToolName),
+		lastAssistantMessage: demoLastAssistant[session.id]
+	};
+}
+
 export function getDemoSessions(): Session[] {
+	return demoSessions().map(withDemoAwayFields);
+}
+
+function demoSessions(): Session[] {
 	return [
 		// Project 1: web-app — NeedsAttention + Working
 		{

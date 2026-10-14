@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **"While you were away" summary on waiting cards.** A card that waits for you now shows what it waits for (for example "Approval: Bash" or "Question"; the tool name only, never its arguments), the last line the agent said, and what it did since you last opened it, pressed FOCUS, or left the c9watch window: files edited, commands run, subagents done, and tool calls. The counts come from the local transcript (no AI summary, no network) through a bounded index that reads only new bytes each poll. Claude Code only; other agents show "—".
+
 ## [0.10.1] - 2026-10-14
 
 ### Fixed

@@ -19,6 +19,29 @@ export type AgentKind = 'root' | 'subagent' | 'internal';
 export type SessionKind = 'interactive' | 'background' | 'unknown';
 export type SessionSourceHealth = 'fresh' | 'stale' | 'partial' | 'unavailable' | 'unknown';
 
+/** What a session needs from the user. Carries the tool name only, never its arguments. */
+export type WaitingFor =
+  | { kind: 'approval'; tool: string }
+  | { kind: 'question' }
+  | { kind: 'attention' }
+  | { kind: 'input' };
+
+/** What a session did after `sinceMs`, counted from its transcript (Claude Code only). */
+export interface AwayActivity {
+  sinceMs: number;
+  toolCalls: number;
+  filesEdited: number;
+  commandsRun: number;
+  subagentsCompleted: number;
+  /** Counts are a lower bound: the bounded index dropped older events. */
+  partial: boolean;
+}
+
+export interface AwayRequest {
+  sessionKey: string;
+  sinceMs: number;
+}
+
 export interface SessionActionCapabilities {
   open?: boolean;
   stop?: boolean;
@@ -84,6 +107,12 @@ export interface Session {
 
   /** Name of the tool or reason awaiting attention (if status is NeedsAttention) */
   pendingToolName: string | null;
+
+  /** What the session waits for; omitted while it works or by older backends. */
+  waitingFor?: WaitingFor;
+
+  /** One-line, tag-free preview of the last assistant text. */
+  lastAssistantMessage?: string;
 
   /** Session ID of the PM that spawned this session (if it's a c9watch worker) */
   workerOf?: string | null;

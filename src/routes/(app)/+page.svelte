@@ -29,6 +29,7 @@
 	import SessionHistory from '$lib/components/SessionHistory.svelte';
 	import CostTracker from '$lib/components/CostTracker.svelte';
 	import { refreshCostData } from '$lib/stores/cost';
+	import { initAwayTracking, markPidSeen } from '$lib/stores/away';
 	import { refreshSessionHistory } from '$lib/stores/history';
 	import MemoryViewer from '$lib/components/MemoryViewer.svelte';
 	import SettingsTab from '$lib/components/SettingsTab.svelte';
@@ -383,6 +384,9 @@
 		return () => { cancelled = true; clearTimeout(timer); };
 	});
 
+	// "While you were away" summary on waiting cards.
+	onMount(() => initAwayTracking());
+
 	function handleExpand(session: Session) {
 		expandedSessionId.set(sessionKeyOf(session));
 	}
@@ -400,6 +404,7 @@
 	}
 
 	async function handleOpen(pid: number, projectPath: string) {
+		markPidSeen(pid);
 		try {
 			await openSession(pid, projectPath);
 		} catch (error) {

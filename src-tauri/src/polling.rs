@@ -1,5 +1,18 @@
 use crate::session::enrichment::enrich_detected_sessions;
 pub use crate::session::enrichment::{detect_and_enrich_sessions, truncate_string, Session};
+
+/// Keep the per-transcript away-activity index current and drop indexes for
+/// sessions that ended. Lives in the GUI poll (not enrichment) so one-shot CLI
+/// commands never build it.
+fn refresh_away_index(sessions: &[Session]) {
+    for session in sessions {
+        if let Some(path) = &session.transcript_path {
+            crate::session::away::refresh(&session.session_key, path);
+        }
+    }
+    let live: HashSet<&str> = sessions.iter().map(|s| s.session_key.as_str()).collect();
+    crate::session::away::retain_sessions(&live);
+}
 use crate::session::{pid_is_alive, DetectorState, SessionStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -169,6 +182,8 @@ pub fn start_polling(
                     // Track current session IDs to clean up stale entries
                     let current_session_ids: HashSet<String> =
                         sessions.iter().map(|s| s.session_key.clone()).collect();
+
+                    refresh_away_index(&sessions);
 
                     // Process status transitions and fire notifications
                     match previous_status.lock() {

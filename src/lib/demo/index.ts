@@ -6,7 +6,7 @@ import { get } from 'svelte/store';
 import { sessions } from '../stores/sessions';
 import type { Session } from '../types';
 import type { SessionStatus } from '../types';
-import { getDemoSessions, statusMessages, statusTransitions } from './data';
+import { getDemoSessions, statusMessages, statusTransitions, withDemoAwayFields } from './data';
 import { isDemoMode, isPersistedDemoMode, persistDemoMode } from './mode';
 
 export { isDemoMode } from './mode';
@@ -40,13 +40,13 @@ function tick() {
 	if (newStatus === session.status) return;
 
 	const msgs = statusMessages[session.id];
-	const updated: Session = {
+	const updated: Session = withDemoAwayFields({
 		...session,
 		status: newStatus,
 		modified: new Date().toISOString(),
 		messageCount: session.messageCount + (newStatus === session.status ? 0 : 1),
 		latestMessage: msgs ? msgs[newStatus] : session.latestMessage
-	};
+	});
 
 	const next = [...current];
 	next[idx] = updated;
