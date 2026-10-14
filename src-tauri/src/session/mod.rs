@@ -88,6 +88,7 @@ pub(crate) fn pi_session_ids(home: &std::path::Path, prefix: &str) -> Vec<String
 pub mod memory;
 pub use memory::{get_memory_files, MemoryFile, ProjectMemory};
 
+mod only_path;
 mod owners;
 pub(crate) use owners::{global_provider_source_owners, ProviderSourceOwners};
 

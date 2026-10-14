@@ -298,6 +298,18 @@ c9watch/
 
 Press `Cmd+D` to toggle demo mode, which loads simulated sessions with animated status transitions. Useful for testing the UI without running real Claude Code sessions.
 
+## Recording mode
+
+Set `C9WATCH_ONLY_PATH` to show only the sessions inside one folder. Every other session on your Mac stays hidden, so a screen recording shows no private projects. List several folders with `:`. Unset, c9watch shows everything.
+
+Quit c9watch first, then start it from a terminal so it sees the variable:
+
+```bash
+C9WATCH_ONLY_PATH=/tmp/c9-demo /Applications/c9watch.app/Contents/MacOS/c9watch
+```
+
+The filter applies to MONITOR, the tray, notifications and the CLI. HISTORY, COST and MEMORY are not filtered.
+
 ## How this was built
 
 c9watch is developed mostly with AI coding agents: Claude Code (Anthropic) and Codex (OpenAI). Most of the code in this repository was written by them. The repository is open; read the code and judge it on its merits. Pull requests from outside contributors (listed below) are their own work.
