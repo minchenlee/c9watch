@@ -130,43 +130,80 @@ Process table during the test:
 
 ## Process evidence (step 3)
 
-Code: `src-tauri/src/session/agent_liveness.rs` (classifiers, md5, probes),
-matcher and sysinfo scan shared from `pi_liveness.rs`.
+Code: `src-tauri/src/session/open_files.rs` (open files of one pid),
+`src-tauri/src/session/agent_liveness.rs` (classifiers, keys, probes, rule).
 
-- Same rules as pi: per cwd, N live processes keep the N newest fresh
-  sessions; a process keeps only sessions written after it started (10 s
-  grace); a session written in the last 10 s stays; evidence only ends a
-  session early; no usable evidence (table unreadable, an unattributable
-  candidate process) keeps the mtime windows unchanged.
-- Codex candidates (`codex.rs`, `is_process_liveness_candidate`): root
-  rollouts with `originator` `codex_exec`, or `codex-tui` except a
-  daemon-run thread (`source` is not `cli`) that is Working. The daemon keeps
-  that turn running after its TUI exits, so its card stays until the turn
-  completes; then the Idle thread has no attached TUI and ends. Desktop
-  (`Codex Desktop`) and IDE threads, sub-agents and linked parents keep the
-  mtime rule. Session processes: native `codex` binary except `app-server`,
-  `mcp-server`, `exec-server`.
-- Cursor candidates (`cursor.rs`): root chats that have an Agent CLI store
-  `~/.cursor/chats/<hash>/<session-id>/`. Processes: `node` (or
-  `cursor-agent`/`agent`) whose argv[0] basename is `cursor-agent` or whose
-  argv has a `/cursor-agent/` path; keyed by md5(cwd), which equals `<hash>`
-  (checked on 3 local chats). IDE chats keep the mtime rule.
-- Result: a `kill -9` CLI session ends 10 s after its last write (a few
-  3.5 s polls) instead of after 30 min (Idle) or 4 h (Working).
+### Rule
 
-### Live result (2026-10-14 22:27) and open issue
+An agent process holds its transcript open while the session is loaded:
 
-`kill -9 56197` (in-process TUI, Idle): 15 s later both probe sessions were
-still listed. Cause: pi's pass 2 lets a process whose own cwd has no fresh
-session keep one session from another cwd (needed for cross-cwd resume:
-`tui/src/cwd_prompt.rs` lets resume use the session's cwd, and Codex never
-calls `set_current_dir`). This machine had 9 such `codex` processes
-(`~/Demo/*` stand-ins, idle TUIs from earlier days), so pass 2 kept the
-killed sessions. Unit tests cover the cwd rules, but in this environment the
-evidence rarely ends a session.
+- Codex: the rollout writer keeps the rollout JSONL open for the whole life
+  of a loaded thread (`rollout/src/recorder.rs:1763-1783` `open_log_file`,
+  `:1953-1985` `rollout_writer`; the handle is dropped only on shutdown or an
+  I/O error, `:1865-1878`).
+- Cursor Agent CLI: keeps `~/.cursor/chats/<md5(cwd)>/<session-id>/store.db`
+  (and `-wal`, `-shm`) open (seen with `lsof` on pid 72326, idle since
+  Oct 10).
 
-Better evidence seen with `lsof`: every session-owning `codex` process holds
-its rollout open (TUI 56197 held run B's rollout as fd 48u; the daemon closed
-run A's rollout after its TUI left and kept only a still-loaded thread open).
-Decision pending (asked c9-main-orch): read open files per `codex` process
-(libproc / `/proc/<pid>/fd`), or `lsof`, or keep the cwd rule.
+So a candidate session is alive when any agent process has its transcript
+open, or when the transcript was written in the last 10 s. Otherwise it is
+ended (removed from the monitor; history keeps it).
+
+- Codex key: the rollout file name. Processes: every native `codex` process
+  of the current user, **including** `codex app-server` (the daemon holds the
+  rollouts of the threads it runs). Candidates (`codex.rs`,
+  `is_process_liveness_candidate`): root rollouts with `originator`
+  `codex-tui` (in-process or daemon-run) or `codex_exec`. Desktop and IDE
+  threads, sub-agents and linked parents keep the mtime rule.
+- Cursor key: the `<session-id>` directory of an open `store.db*`. Processes:
+  `node`/`cursor-agent`/`agent` whose argv[0] basename is `cursor-agent` or
+  whose argv has a `/cursor-agent/` path. Candidates (`cursor.rs`): root chats
+  that have an Agent CLI chat store. IDE chats keep the mtime rule.
+- No evidence means no change: if the process table is empty, a candidate's
+  argv is unreadable, or listing any agent's open files fails (permission,
+  process gone, short read), every session keeps the mtime windows for that
+  poll.
+- Only recognized agent pids are inspected (10 `codex` pids and 2 Cursor
+  pids on this machine), never the whole process table.
+- macOS reads files with `proc_pidinfo(PROC_PIDLISTFDS)` and
+  `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` (layout checked against the SDK
+  header: size 1200, path offset 176). A vnode without a path (`ENOENT`, an
+  unlinked file; the app-server daemon has one) and a descriptor closed during
+  the read (`EBADF`) are skipped. Linux reads `/proc/<pid>/fd`. The `libproc`
+  crate was not used: 0.14.11 has no vnode-path type, and its build script
+  needs bindgen and libclang.
+
+This replaced the first version of step 3 (pi's cwd + start-time matcher).
+That version did not end killed sessions on this machine: pi's pass 2 let
+unrelated `codex` processes (`~/Demo/*` stand-ins, idle TUIs from earlier
+days) keep sessions from other cwds.
+
+### Live result (2026-10-14, cwd = scratchpad `codex-probe`)
+
+The live process evidence at the start matched `lsof`: open rollouts
+`…01a12403…` (TUI 50747), `…01a139cc…` (TUI 42048), `…01a13146…` (daemon
+56798); Cursor chat `0bddd9b1…` (cursor-agent 72326). The killed probe
+session from the first version (`…01a13ad8…`) was no longer listed.
+
+| Test | Result |
+|---|---|
+| In-process TUI (`codex -c approvals_reviewer=user …`, pid 15789), idle, `kill -9` | Gone at the first 1 s poll after the kill (last write was >10 s old). |
+| Plain TUI (`codex -a never -s read-only`, pid 16956, thread in daemon 56798, `source: "vscode"`), `kill -9` during `sleep 75` | Card stayed during the whole turn (daemon held the rollout open). Turn ended 14:44:24.6Z; card gone about 40 s later. The daemon closed the rollout about 30 s after the turn ended (observed, not checked in the source). |
+| Cursor Agent CLI (`cursor-agent --trust`, pid 48361), idle, `kill -9` | Gone at the first 1 s poll after the kill. Its orphaned `index.js worker-server` child (pid 50375) did not hold the chat store; I stopped it after the test. |
+
+Cost per poll (debug build, this machine): one Codex scan 2.4 ms, one Cursor
+scan 2.6 ms; most of it is the sysinfo process-table refresh. Reading the open
+files of all 10 `codex` pids: 0.9 ms. A full Codex `detect` pass with the
+probe: 3–7 ms. Release builds are faster; not measured.
+
+Known limits:
+
+- Codex rollout writer I/O error: the writer drops the file handle until the
+  next write (`recorder.rs:1865-1878`). An idle session in that state ends
+  early.
+- A daemon-run thread stays listed for about 30 s after its last client
+  leaves and the turn ends (the daemon keeps it loaded).
+
+Side effects of the live tests: the probe trusted the scratchpad
+`codex-probe` folder in the Codex config and in the Cursor workspace trust
+list.

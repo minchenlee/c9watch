@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
-use super::agent_liveness::SysinfoCodexProcessProbe;
+use super::agent_liveness::{
+    codex_rollout_key, open_file_alive_flags, OpenFileCandidate, OpenFileProbe,
+    SysinfoCodexOpenFileProbe,
+};
 use super::parser::MessageType;
-use super::pi_liveness::{pi_alive_flags, PiLivenessCandidate, PiProcessProbe};
 use super::source::{
     AgentKind, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionKind,
     SessionProvider, SessionSource, SessionSurface,
@@ -291,8 +293,9 @@ pub struct CodexSessionSource {
     capture_tool_messages: bool,
     /// When true (and using the full-parse path), keep Codex tool use/result records.
     include_tools: bool,
-    /// Live `codex` processes; `None` keeps the mtime-only behaviour.
-    process_probe: Option<Box<dyn PiProcessProbe>>,
+    /// Rollouts that `codex` processes hold open; `None` keeps the
+    /// mtime-only behaviour.
+    process_probe: Option<Box<dyn OpenFileProbe>>,
     #[cfg(test)]
     parse_count: usize,
     #[cfg(test)]
@@ -303,10 +306,10 @@ impl CodexSessionSource {
     pub fn new() -> Result<Self, SessionDetectorError> {
         let home = dirs::home_dir().ok_or(SessionDetectorError::HomeDirectoryNotFound)?;
         Ok(Self::at_root(home.join(".codex").join("sessions"))
-            .with_process_probe(Box::new(SysinfoCodexProcessProbe::new())))
+            .with_process_probe(Box::new(SysinfoCodexOpenFileProbe::new())))
     }
 
-    pub(crate) fn with_process_probe(mut self, probe: Box<dyn PiProcessProbe>) -> Self {
+    pub(crate) fn with_process_probe(mut self, probe: Box<dyn OpenFileProbe>) -> Self {
         self.process_probe = Some(probe);
         self
     }
@@ -731,68 +734,54 @@ impl CodexSessionSource {
 }
 
 impl CodexSessionSource {
-    /// For each fresh rollout, whether it stays alive under process evidence.
-    /// Only rollouts that a terminal `codex` process owns are candidates; the
-    /// process table is read only when one exists.
+    /// For each fresh rollout, whether it stays alive under open-file
+    /// evidence: a candidate ends when no `codex` process holds it open and
+    /// it was not written in the last 10 s. The process table is read only
+    /// when a candidate exists.
     fn process_alive_flags(
         &mut self,
         fresh: &[(PathBuf, CodexRolloutSummary, bool)],
         wall_now: SystemTime,
     ) -> Vec<bool> {
         let mut alive = vec![true; fresh.len()];
-        let candidate_indexes: Vec<usize> = fresh
+        let candidates: Vec<(usize, String)> = fresh
             .iter()
             .enumerate()
             .filter(|(_, (_, summary, linked_parent))| {
                 !linked_parent && is_process_liveness_candidate(summary)
             })
-            .map(|(index, _)| index)
+            .filter_map(|(index, (path, _, _))| Some((index, codex_rollout_key(path)?)))
             .collect();
         let Some(probe) = self.process_probe.as_mut() else {
             return alive;
         };
-        if candidate_indexes.is_empty() {
+        if candidates.is_empty() {
             return alive;
         }
         let evidence = probe.scan();
-        let candidates: Vec<PiLivenessCandidate<'_>> = candidate_indexes
+        let liveness: Vec<OpenFileCandidate<'_>> = candidates
             .iter()
-            .map(|&index| {
-                let (path, summary, _) = &fresh[index];
-                PiLivenessCandidate {
-                    cwd: summary.cwd.to_str().filter(|cwd| !cwd.is_empty()),
-                    modified_ms: rollout_modified_ms(path),
-                }
+            .map(|(index, key)| OpenFileCandidate {
+                key,
+                modified_ms: rollout_modified_ms(&fresh[*index].0),
             })
             .collect();
-        let flags = pi_alive_flags(&candidates, &evidence, system_time_ms(wall_now));
-        for (index, flag) in candidate_indexes.into_iter().zip(flags) {
+        let flags = open_file_alive_flags(&liveness, &evidence, system_time_ms(wall_now));
+        for ((index, _), flag) in candidates.into_iter().zip(flags) {
             alive[index] = flag;
         }
         alive
     }
 }
 
-/// Whether a live `codex` process in the session cwd is the only thing that
-/// keeps this rollout open. Desktop and IDE threads have no such process and
-/// keep the mtime rule; spawned sub-agents follow their root.
-///
-/// A plain TUI runs its thread inside the shared app-server daemon (the
-/// rollout then records `source: "vscode"` with `originator: "codex-tui"`),
-/// and the daemon continues a running turn after the TUI exits. Such a turn
-/// is never ended by process evidence while it is Working.
+/// Whether open-file evidence may end this rollout: terminal sessions only
+/// (the TUI, including a TUI thread run by the app-server daemon, and
+/// `codex exec`). Desktop and IDE threads keep the mtime rule, because their
+/// app may unload a thread it still shows. Spawned sub-agents follow their
+/// root.
 fn is_process_liveness_candidate(summary: &CodexRolloutSummary) -> bool {
-    if summary.agent_kind != AgentKind::Root {
-        return false;
-    }
-    match summary.originator.as_str() {
-        "codex_exec" => true,
-        "codex-tui" => {
-            let runs_in_daemon = summary.source != "cli";
-            !(runs_in_daemon && summary.lifecycle == CodexLifecycle::Working)
-        }
-        _ => false,
-    }
+    summary.agent_kind == AgentKind::Root
+        && matches!(summary.originator.as_str(), "codex-tui" | "codex_exec")
 }
 
 fn rollout_modified_ms(path: &Path) -> i64 {
@@ -3782,36 +3771,45 @@ mod tests {
         assert_eq!(summary.latest_message(), Some("after"));
     }
 
-    // ── Process evidence (codex_liveness) ─────────────────────────────
+    // ── Open-file evidence (agent_liveness) ───────────────────────────
 
-    use crate::session::pi_liveness::PiProcessEvidence;
+    use crate::session::agent_liveness::OpenFileEvidence;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    const ROLLOUT_KEY: &str = "rollout-liveness.jsonl";
 
     struct FakeProbe {
-        evidence: PiProcessEvidence,
+        evidence: Arc<StdMutex<OpenFileEvidence>>,
         scans: Arc<AtomicUsize>,
     }
 
-    impl PiProcessProbe for FakeProbe {
-        fn scan(&mut self) -> PiProcessEvidence {
+    impl OpenFileProbe for FakeProbe {
+        fn scan(&mut self) -> OpenFileEvidence {
             self.scans.fetch_add(1, Ordering::SeqCst);
-            self.evidence.clone()
+            self.evidence.lock().unwrap().clone()
         }
     }
 
-    /// Live `codex` processes in `/tmp/project`, started at the given times.
-    fn processes(starts: &[Option<SystemTime>]) -> PiProcessEvidence {
-        PiProcessEvidence::Live(HashMap::from([(
-            "/tmp/project".to_string(),
-            starts.iter().map(|s| s.map(system_time_ms)).collect(),
-        )]))
+    /// Some `codex` process holds the rollout open.
+    fn held_open() -> OpenFileEvidence {
+        OpenFileEvidence::Open(HashSet::from([ROLLOUT_KEY.to_string()]))
+    }
+
+    /// `codex` processes run, but none holds the rollout (other rollouts are
+    /// open, as on a machine with unrelated TUIs).
+    fn not_open() -> OpenFileEvidence {
+        OpenFileEvidence::Open(HashSet::from([
+            "rollout-2026-10-14T17-44-45-other.jsonl".to_string()
+        ]))
     }
 
     struct LivenessCase {
         _temp: TempDir,
         path: PathBuf,
         source: CodexSessionSource,
+        evidence: Arc<StdMutex<OpenFileEvidence>>,
         scans: Arc<AtomicUsize>,
         now: DateTime<Local>,
         wall_now: SystemTime,
@@ -3824,14 +3822,14 @@ mod tests {
         originator: &str,
         idle: bool,
         age: Duration,
-        evidence: PiProcessEvidence,
+        evidence: OpenFileEvidence,
     ) -> LivenessCase {
         let temp = TempDir::new().unwrap();
         let now = Local::now();
         let wall_now = SystemTime::now();
         let day = temp.path().join(now.format("%Y/%m/%d").to_string());
         fs::create_dir_all(&day).unwrap();
-        let path = day.join("rollout-liveness.jsonl");
+        let path = day.join(ROLLOUT_KEY);
         let mut lines = root_fixture(Value::String(source_kind.into()), originator);
         if idle {
             lines.push(event(
@@ -3843,9 +3841,10 @@ mod tests {
         write_lines(&path, &lines, true);
         set_modified_age(&path, wall_now, age);
         let scans = Arc::new(AtomicUsize::new(0));
+        let evidence = Arc::new(StdMutex::new(evidence));
         let source = CodexSessionSource::at_root(temp.path().to_path_buf()).with_process_probe(
             Box::new(FakeProbe {
-                evidence,
+                evidence: evidence.clone(),
                 scans: scans.clone(),
             }),
         );
@@ -3853,6 +3852,7 @@ mod tests {
             _temp: temp,
             path,
             source,
+            evidence,
             scans,
             now,
             wall_now,
@@ -3867,65 +3867,63 @@ mod tests {
                 .unwrap();
             session_ids(&sessions).contains("root-id")
         }
+
+        fn set_evidence(&self, evidence: OpenFileEvidence) {
+            *self.evidence.lock().unwrap() = evidence;
+        }
     }
 
     const MINUTE: Duration = Duration::from_secs(60);
 
     #[test]
     fn killed_cli_session_ends_within_a_few_polls() {
-        // Idle TUI, process gone: ended instead of lingering 30 minutes.
-        let mut case = liveness_case("cli", "codex-tui", true, MINUTE, processes(&[]));
+        // Idle in-process TUI, process gone: ended instead of lingering 30 min.
+        let mut case = liveness_case("cli", "codex-tui", true, MINUTE, not_open());
         assert!(!case.visible());
         // In-process TUI killed mid-turn: ended instead of lingering 4 hours.
-        let mut case = liveness_case("cli", "codex-tui", false, MINUTE, processes(&[]));
+        let mut case = liveness_case("cli", "codex-tui", false, MINUTE, not_open());
         assert!(!case.visible());
         // `codex exec` that exited.
-        let mut case = liveness_case("exec", "codex_exec", false, MINUTE, processes(&[]));
+        let mut case = liveness_case("exec", "codex_exec", false, MINUTE, not_open());
+        assert!(!case.visible());
+        // No `codex` process at all.
+        let mut case = liveness_case(
+            "cli",
+            "codex-tui",
+            true,
+            MINUTE,
+            OpenFileEvidence::Open(HashSet::new()),
+        );
         assert!(!case.visible());
     }
 
     #[test]
-    fn live_process_in_cwd_keeps_its_session() {
-        let started = SystemTime::now() - 10 * MINUTE;
-        let mut case = liveness_case(
-            "cli",
-            "codex-tui",
-            true,
-            MINUTE,
-            processes(&[Some(started)]),
-        );
+    fn process_holding_the_rollout_keeps_its_session() {
+        let mut case = liveness_case("cli", "codex-tui", true, 20 * MINUTE, held_open());
         assert!(case.visible());
-        let mut case = liveness_case("cli", "codex-tui", true, MINUTE, processes(&[None]));
-        assert!(case.visible(), "unknown start time never ends a session");
+        let mut case = liveness_case("exec", "codex_exec", false, 3 * 60 * MINUTE, held_open());
+        assert!(case.visible());
     }
 
     #[test]
-    fn restarted_tui_does_not_revive_a_killed_session() {
-        // The new process started after the old rollout's last write.
-        let started = SystemTime::now() - Duration::from_secs(5);
-        let mut case = liveness_case(
-            "cli",
-            "codex-tui",
-            true,
-            MINUTE,
-            processes(&[Some(started)]),
-        );
+    fn reused_pid_or_restarted_tui_does_not_keep_a_killed_session() {
+        // A new `codex` (possibly on the old pid, in the same cwd) holds its
+        // own rollout, not the killed one.
+        let mut case = liveness_case("cli", "codex-tui", true, MINUTE, not_open());
         assert!(!case.visible());
     }
 
     #[test]
     fn daemon_turn_survives_its_tui_until_the_turn_ends() {
         // A plain TUI runs its thread in the app-server daemon (source
-        // "vscode"); the daemon keeps the turn running after the TUI dies.
-        let mut case = liveness_case("vscode", "codex-tui", false, 30 * MINUTE, processes(&[]));
+        // "vscode"). After the TUI is killed the daemon keeps the turn
+        // running and the rollout open, with no write for 30 minutes.
+        let mut case = liveness_case("vscode", "codex-tui", false, 30 * MINUTE, held_open());
         assert!(case.visible());
-        assert_eq!(
-            case.scans.load(Ordering::SeqCst),
-            0,
-            "no candidate, no scan"
-        );
+        assert_eq!(case.scans.load(Ordering::SeqCst), 1);
 
-        // The turn completes in the daemon; no TUI is attached any more.
+        // The turn completes; with no client left the daemon unloads the
+        // thread and closes the rollout.
         let mut file = fs::OpenOptions::new()
             .append(true)
             .open(&case.path)
@@ -3941,17 +3939,24 @@ mod tests {
         )
         .unwrap();
         drop(file);
+        set_modified_age(&case.path, case.wall_now, Duration::from_secs(2));
+        case.set_evidence(not_open());
+        assert!(case.visible(), "the final write is within the grace window");
         set_modified_age(&case.path, case.wall_now, MINUTE);
         assert!(!case.visible());
     }
 
     #[test]
     fn desktop_and_ide_threads_keep_the_mtime_rule() {
-        let mut case = liveness_case("vscode", "Codex Desktop", true, MINUTE, processes(&[]));
+        let mut case = liveness_case("vscode", "Codex Desktop", true, MINUTE, not_open());
         assert!(case.visible());
-        let mut case = liveness_case("vscode", "codex_vscode", true, MINUTE, processes(&[]));
+        let mut case = liveness_case("vscode", "codex_vscode", true, MINUTE, not_open());
         assert!(case.visible());
-        assert_eq!(case.scans.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            case.scans.load(Ordering::SeqCst),
+            0,
+            "no candidate, no scan"
+        );
     }
 
     #[test]
@@ -3961,26 +3966,13 @@ mod tests {
             "codex-tui",
             true,
             MINUTE,
-            PiProcessEvidence::Unavailable,
+            OpenFileEvidence::Unavailable,
         );
         assert!(case.visible());
-        let mut case = liveness_case(
-            "cli",
-            "codex-tui",
-            true,
-            Duration::from_secs(2),
-            processes(&[]),
-        );
+        let mut case = liveness_case("cli", "codex-tui", true, Duration::from_secs(2), not_open());
         assert!(case.visible(), "written within the grace window");
         // Evidence never extends past the freshness window.
-        let started = SystemTime::now() - 60 * MINUTE;
-        let mut case = liveness_case(
-            "cli",
-            "codex-tui",
-            true,
-            31 * MINUTE,
-            processes(&[Some(started)]),
-        );
+        let mut case = liveness_case("cli", "codex-tui", true, 31 * MINUTE, held_open());
         assert!(!case.visible());
     }
 }

@@ -331,23 +331,23 @@ pub(crate) fn scan_processes(
 }
 
 #[cfg(unix)]
-fn current_uid() -> Option<u32> {
+pub(crate) fn current_uid() -> Option<u32> {
     // SAFETY: getuid has no preconditions and cannot fail.
     Some(unsafe { libc::getuid() })
 }
 
 #[cfg(not(unix))]
-fn current_uid() -> Option<u32> {
+pub(crate) fn current_uid() -> Option<u32> {
     None
 }
 
 #[cfg(unix)]
-fn uid_matches(uid: &sysinfo::Uid, own: u32) -> bool {
+pub(crate) fn uid_matches(uid: &sysinfo::Uid, own: u32) -> bool {
     **uid == own
 }
 
 #[cfg(not(unix))]
-fn uid_matches(_uid: &sysinfo::Uid, _own: u32) -> bool {
+pub(crate) fn uid_matches(_uid: &sysinfo::Uid, _own: u32) -> bool {
     true
 }
 

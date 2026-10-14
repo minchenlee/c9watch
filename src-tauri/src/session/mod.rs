@@ -6,6 +6,7 @@ pub mod codex;
 pub mod cursor;
 pub mod custom_names;
 pub mod detector;
+mod open_files;
 pub mod opencode;
 pub mod parser;
 pub mod permissions;

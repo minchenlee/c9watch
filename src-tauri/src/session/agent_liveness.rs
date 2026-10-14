@@ -1,70 +1,183 @@
-//! Process evidence for Codex CLI and Cursor Agent CLI session liveness.
+//! Open-file evidence for Codex CLI and Cursor Agent CLI session liveness.
 //!
-//! Same model as `pi_liveness`: per cwd, N live agent processes keep the N
-//! newest fresh transcripts, a process only keeps a transcript written after
-//! it started, and evidence only ends a session early. When the process table
-//! cannot be read, or one candidate process cannot be attributed, every
-//! session keeps the mtime freshness windows.
+//! An agent process holds its transcript open while the session is loaded:
+//! Codex keeps the rollout JSONL open in its rollout writer, and the Cursor
+//! Agent CLI keeps its chat store (`store.db`, `-wal`, `-shm`) open. So a
+//! candidate session is alive when any agent process has its transcript
+//! open, or when the transcript was written in the last 10 s. Evidence only
+//! ends a session early: when the process table or any agent's open files
+//! cannot be read, every session keeps the mtime freshness windows.
 //!
-//! Codex: the session process is the native `codex` binary (TUI, `resume`,
-//! `exec`). `codex app-server` (the shared daemon, also used by Codex Desktop
-//! and the IDE extensions) and the other servers are not sessions. Since
-//! codex 0.162 a plain TUI runs its thread inside the daemon, so the TUI is
-//! only the attachment: see `codex.rs` for which rollouts are candidates.
+//! Only processes recognized as agents are inspected, never the whole table.
+//!
+//! Codex: every native `codex` process, servers included. Since codex 0.162 a
+//! plain TUI runs its thread inside the shared `codex app-server` daemon,
+//! which holds that rollout open while the thread is loaded (also after the
+//! TUI exits, while a turn still runs).
 //!
 //! Cursor: the Agent CLI is `node …/cursor-agent/versions/<v>/index.js` with
-//! argv[0] `…/bin/cursor-agent` (or the `agent` alias). Each CLI chat has a
-//! store at `~/.cursor/chats/<md5(cwd)>/<session-id>/`, so the md5 of the
-//! process cwd is an exact key for its transcripts. IDE chats have no store.
+//! argv[0] `…/bin/cursor-agent` (or the `agent` alias). Its chat store is
+//! `~/.cursor/chats/<md5(cwd)>/<session-id>/store.db`. IDE chats have none.
 //!
 //! Evidence: `docs/research/codex-approval-signal-2026-10.md`.
 
-use super::pi_liveness::{
-    basename, normalize_cwd, scan_processes, PiProcessClass, PiProcessEvidence, PiProcessProbe,
-    PiProcessRow,
-};
-use std::collections::HashMap;
+use super::open_files::open_file_paths;
+use super::pi_liveness::{basename, current_uid, uid_matches, PI_PROCESS_GRACE_MS};
+use std::collections::HashSet;
+use std::path::Path;
+
+/// Transcript keys that some agent process has open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenFileEvidence {
+    /// The process table or one agent's open files could not be read.
+    Unavailable,
+    /// Keys (see `codex_rollout_key`, `cursor_chat_key`) of open transcripts.
+    Open(HashSet<String>),
+}
+
+pub(crate) trait OpenFileProbe: Send {
+    fn scan(&mut self) -> OpenFileEvidence;
+}
+
+/// One fresh transcript that open-file evidence may end.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OpenFileCandidate<'a> {
+    pub key: &'a str,
+    pub modified_ms: i64,
+}
+
+/// For each candidate, whether it stays alive.
+pub(crate) fn open_file_alive_flags(
+    candidates: &[OpenFileCandidate<'_>],
+    evidence: &OpenFileEvidence,
+    now_ms: i64,
+) -> Vec<bool> {
+    let OpenFileEvidence::Open(open) = evidence else {
+        return vec![true; candidates.len()];
+    };
+    candidates
+        .iter()
+        .map(|candidate| {
+            now_ms.saturating_sub(candidate.modified_ms) < PI_PROCESS_GRACE_MS
+                || open.contains(candidate.key)
+        })
+        .collect()
+}
+
+/// What one process-table row is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentProcess {
+    Agent,
+    NotAgent,
+    /// Could be an agent, but its argv is unreadable.
+    Unknown,
+}
+
+/// One process-table row, as the classifiers see it.
+pub(crate) struct AgentProcessRow<'a> {
+    pub name: &'a str,
+    pub argv: &'a [&'a str],
+}
+
+/// Reads the open files of every same-user process that `classify` calls an
+/// agent and maps them through `key`.
+fn scan_open_files(
+    system: &mut sysinfo::System,
+    is_candidate_name: fn(&str) -> bool,
+    needs_argv: bool,
+    classify: fn(&AgentProcessRow<'_>) -> AgentProcess,
+    key: fn(&Path) -> Option<String>,
+) -> OpenFileEvidence {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+    if !sysinfo::IS_SUPPORTED_SYSTEM {
+        return OpenFileEvidence::Unavailable;
+    }
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::new().with_user(UpdateKind::OnlyIfNotSet),
+    );
+    // The table always contains c9watch itself; empty means it failed.
+    if system.processes().is_empty() {
+        return OpenFileEvidence::Unavailable;
+    }
+    let own_uid = current_uid();
+    let candidates: Vec<sysinfo::Pid> = system
+        .processes()
+        .iter()
+        .filter(|(_, process)| process.name().to_str().is_some_and(is_candidate_name))
+        // Other users' processes cannot be read and do not own our sessions.
+        .filter(|(_, process)| match (own_uid, process.user_id()) {
+            (Some(own), Some(uid)) => uid_matches(uid, own),
+            _ => true,
+        })
+        .map(|(pid, _)| *pid)
+        .collect();
+    if needs_argv && !candidates.is_empty() {
+        // A pid may be reused between polls, so argv is re-read.
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&candidates),
+            false,
+            ProcessRefreshKind::new().with_cmd(UpdateKind::Always),
+        );
+    }
+    let mut open = HashSet::new();
+    for pid in candidates {
+        let Some(process) = system.process(pid) else {
+            return OpenFileEvidence::Unavailable;
+        };
+        let name = process.name().to_string_lossy();
+        let argv_owned: Vec<String> = process
+            .cmd()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let argv: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        match classify(&AgentProcessRow {
+            name: name.as_ref(),
+            argv: &argv,
+        }) {
+            AgentProcess::NotAgent => continue,
+            AgentProcess::Unknown => return OpenFileEvidence::Unavailable,
+            AgentProcess::Agent => {}
+        }
+        let Ok(paths) = open_file_paths(pid.as_u32()) else {
+            return OpenFileEvidence::Unavailable;
+        };
+        open.extend(paths.iter().filter_map(|path| key(path)));
+    }
+    OpenFileEvidence::Open(open)
+}
 
 // ── Codex ───────────────────────────────────────────────────────────
-
-/// `codex` subcommands that run a server, not a session.
-const CODEX_SERVER_SUBCOMMANDS: &[&str] = &["app-server", "mcp-server", "exec-server"];
 
 pub(crate) fn is_codex_candidate_name(name: &str) -> bool {
     name == "codex"
 }
 
-pub(crate) fn classify_codex_process(row: &PiProcessRow<'_>) -> PiProcessClass {
-    if !is_codex_candidate_name(row.name) {
-        return PiProcessClass::NotPi;
-    }
-    if row.argv.is_empty() {
-        // Codex always runs as the user, so only same-user rows can hide one.
-        return if row.same_user {
-            PiProcessClass::Unknown
-        } else {
-            PiProcessClass::NotPi
-        };
-    }
-    if row
-        .argv
-        .get(1)
-        .is_some_and(|arg| CODEX_SERVER_SUBCOMMANDS.contains(arg))
-    {
-        return PiProcessClass::NotPi;
-    }
-    PiProcessClass::Pi {
-        cwd: row.cwd.map(str::to_string),
-        started_ms: row.started_ms,
+/// Every native `codex` process may hold a rollout: the TUI, `exec`,
+/// `resume`, and the `app-server` daemon that runs TUI and Desktop threads.
+fn classify_codex_process(row: &AgentProcessRow<'_>) -> AgentProcess {
+    if is_codex_candidate_name(row.name) {
+        AgentProcess::Agent
+    } else {
+        AgentProcess::NotAgent
     }
 }
 
-/// Live Codex session processes per normalized cwd.
-pub(crate) struct SysinfoCodexProcessProbe {
+/// Key of a rollout: its file name, `rollout-<timestamp>-<thread-id>.jsonl`.
+/// The file name is unique, and does not depend on symlinks in the path.
+pub(crate) fn codex_rollout_key(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    (name.starts_with("rollout-") && name.ends_with(".jsonl")).then(|| name.to_string())
+}
+
+/// Open Codex rollouts.
+pub(crate) struct SysinfoCodexOpenFileProbe {
     system: sysinfo::System,
 }
 
-impl SysinfoCodexProcessProbe {
+impl SysinfoCodexOpenFileProbe {
     pub(crate) fn new() -> Self {
         Self {
             system: sysinfo::System::new(),
@@ -72,12 +185,14 @@ impl SysinfoCodexProcessProbe {
     }
 }
 
-impl PiProcessProbe for SysinfoCodexProcessProbe {
-    fn scan(&mut self) -> PiProcessEvidence {
-        scan_processes(
+impl OpenFileProbe for SysinfoCodexOpenFileProbe {
+    fn scan(&mut self) -> OpenFileEvidence {
+        scan_open_files(
             &mut self.system,
             is_codex_candidate_name,
+            false,
             classify_codex_process,
+            codex_rollout_key,
         )
     }
 }
@@ -89,9 +204,9 @@ pub(crate) fn is_cursor_candidate_name(name: &str) -> bool {
     matches!(name, "node" | "cursor-agent" | "agent")
 }
 
-pub(crate) fn classify_cursor_process(row: &PiProcessRow<'_>) -> PiProcessClass {
+pub(crate) fn classify_cursor_process(row: &AgentProcessRow<'_>) -> AgentProcess {
     if !is_cursor_candidate_name(row.name) {
-        return PiProcessClass::NotPi;
+        return AgentProcess::NotAgent;
     }
     let is_cursor_agent = row
         .argv
@@ -99,45 +214,34 @@ pub(crate) fn classify_cursor_process(row: &PiProcessRow<'_>) -> PiProcessClass 
         .is_some_and(|arg| basename(arg) == "cursor-agent")
         || row.argv.iter().any(|arg| arg.contains("/cursor-agent/"));
     if is_cursor_agent {
-        return PiProcessClass::Pi {
-            cwd: row.cwd.map(str::to_string),
-            started_ms: row.started_ms,
-        };
-    }
-    if row.argv.is_empty() && row.same_user {
-        return PiProcessClass::Unknown;
-    }
-    PiProcessClass::NotPi
-}
-
-/// Re-key cwd evidence by Cursor's chat-store directory name, md5(cwd).
-pub(crate) fn rekey_by_chat_hash(evidence: PiProcessEvidence) -> PiProcessEvidence {
-    match evidence {
-        PiProcessEvidence::Unavailable => PiProcessEvidence::Unavailable,
-        PiProcessEvidence::Live(live) => {
-            let mut rekeyed: HashMap<String, Vec<Option<i64>>> = HashMap::new();
-            for (cwd, starts) in live {
-                rekeyed
-                    .entry(cursor_chat_hash(&cwd))
-                    .or_default()
-                    .extend(starts);
-            }
-            PiProcessEvidence::Live(rekeyed)
-        }
+        AgentProcess::Agent
+    } else if row.argv.is_empty() {
+        AgentProcess::Unknown
+    } else {
+        AgentProcess::NotAgent
     }
 }
 
-/// Cursor names a CLI chat-store directory by the md5 of the session cwd.
-pub(crate) fn cursor_chat_hash(cwd: &str) -> String {
-    md5_hex(normalize_cwd(cwd).as_bytes())
+/// Key of an Agent CLI chat: the `<session-id>` of an open
+/// `…/chats/<hash>/<session-id>/store.db*` file.
+pub(crate) fn cursor_chat_key(path: &Path) -> Option<String> {
+    if !path.file_name()?.to_str()?.starts_with("store.db") {
+        return None;
+    }
+    let chat_dir = path.parent()?;
+    let chats_dir = chat_dir.parent()?.parent()?;
+    if chats_dir.file_name()? != "chats" {
+        return None;
+    }
+    chat_dir.file_name()?.to_str().map(str::to_string)
 }
 
-/// Live Cursor Agent CLI processes keyed by `cursor_chat_hash(cwd)`.
-pub(crate) struct SysinfoCursorProcessProbe {
+/// Open Cursor Agent CLI chat stores.
+pub(crate) struct SysinfoCursorOpenFileProbe {
     system: sysinfo::System,
 }
 
-impl SysinfoCursorProcessProbe {
+impl SysinfoCursorOpenFileProbe {
     pub(crate) fn new() -> Self {
         Self {
             system: sysinfo::System::new(),
@@ -145,142 +249,103 @@ impl SysinfoCursorProcessProbe {
     }
 }
 
-impl PiProcessProbe for SysinfoCursorProcessProbe {
-    fn scan(&mut self) -> PiProcessEvidence {
-        rekey_by_chat_hash(scan_processes(
+impl OpenFileProbe for SysinfoCursorOpenFileProbe {
+    fn scan(&mut self) -> OpenFileEvidence {
+        scan_open_files(
             &mut self.system,
             is_cursor_candidate_name,
+            true,
             classify_cursor_process,
-        ))
+            cursor_chat_key,
+        )
     }
-}
-
-/// MD5 (RFC 1321) as lowercase hex. Used only to name Cursor's chat-store
-/// directories, not for security.
-fn md5_hex(input: &[u8]) -> String {
-    const S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
-        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
-        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-    ];
-    let k: Vec<u32> = (0..64)
-        .map(|i| ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32)
-        .collect();
-    let mut message = input.to_vec();
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&bit_len.to_le_bytes());
-
-    let mut state: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
-    for chunk in message.chunks_exact(64) {
-        let words: Vec<u32> = chunk
-            .chunks_exact(4)
-            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-            .collect();
-        let [mut a, mut b, mut c, mut d] = state;
-        for i in 0..64 {
-            let (f, g) = match i / 16 {
-                0 => ((b & c) | (!b & d), i),
-                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
-                2 => (b ^ c ^ d, (3 * i + 5) % 16),
-                _ => (c ^ (b | !d), (7 * i) % 16),
-            };
-            let rotated = a
-                .wrapping_add(f)
-                .wrapping_add(k[i])
-                .wrapping_add(words[g])
-                .rotate_left(S[i]);
-            a = d;
-            d = c;
-            c = b;
-            b = b.wrapping_add(rotated);
-        }
-        state[0] = state[0].wrapping_add(a);
-        state[1] = state[1].wrapping_add(b);
-        state[2] = state[2].wrapping_add(c);
-        state[3] = state[3].wrapping_add(d);
-    }
-    state
-        .iter()
-        .flat_map(|word| word.to_le_bytes())
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
-    fn row<'a>(name: &'a str, argv: &'a [&'a str], cwd: Option<&'a str>) -> PiProcessRow<'a> {
-        PiProcessRow {
-            name,
-            argv,
-            cwd,
-            started_ms: Some(1_000),
-            same_user: true,
-        }
+    fn row<'a>(name: &'a str, argv: &'a [&'a str]) -> AgentProcessRow<'a> {
+        AgentProcessRow { name, argv }
     }
 
-    fn live(cwd: &str) -> PiProcessClass {
-        PiProcessClass::Pi {
-            cwd: Some(cwd.into()),
-            started_ms: Some(1_000),
-        }
-    }
-
-    /// Manual probe: prints the live Codex and Cursor evidence.
+    /// Manual probe: prints each `codex` pid's open-file result, the live
+    /// evidence, and the time one scan takes.
     /// `cargo test --lib agent_liveness::tests::live_probe_report -- --ignored --nocapture`
     #[test]
     #[ignore = "reads the live process table"]
     fn live_probe_report() {
-        eprintln!("codex={:?}", SysinfoCodexProcessProbe::new().scan());
-        eprintln!("cursor={:?}", SysinfoCursorProcessProbe::new().scan());
+        let mut codex = SysinfoCodexOpenFileProbe::new();
+        let mut cursor = SysinfoCursorOpenFileProbe::new();
+        let pids: Vec<u32> = std::process::Command::new("pgrep")
+            .args(["-x", "codex"])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect();
+        let started = Instant::now();
+        for pid in &pids {
+            match open_file_paths(*pid) {
+                Ok(paths) => eprintln!("pid {pid}: {} open files", paths.len()),
+                Err(error) => eprintln!("pid {pid}: {error}"),
+            }
+        }
+        eprintln!(
+            "open files of {} codex pids: {:?}",
+            pids.len(),
+            started.elapsed()
+        );
+        eprintln!("codex={:?}", codex.scan());
+        eprintln!("cursor={:?}", cursor.scan());
+        for (name, probe) in [
+            ("codex", &mut codex as &mut dyn OpenFileProbe),
+            ("cursor", &mut cursor),
+        ] {
+            let started = Instant::now();
+            const RUNS: u32 = 20;
+            for _ in 0..RUNS {
+                probe.scan();
+            }
+            eprintln!("{name}: {:?} per scan", started.elapsed() / RUNS);
+        }
+    }
+
+    fn candidate(key: &str, modified_ms: i64) -> OpenFileCandidate<'_> {
+        OpenFileCandidate { key, modified_ms }
     }
 
     #[test]
-    fn md5_matches_rfc_1321_vectors() {
-        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
-        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+    fn open_or_recently_written_transcripts_stay() {
+        let now = 1_000_000;
+        let evidence = OpenFileEvidence::Open(HashSet::from(["open".to_string()]));
+        let candidates = [
+            candidate("open", now - 3_600_000),
+            candidate("closed-old", now - PI_PROCESS_GRACE_MS),
+            candidate("closed-recent", now - PI_PROCESS_GRACE_MS + 1),
+        ];
         assert_eq!(
-            md5_hex(
-                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"
-            ),
-            "57edf4a22be3c955ac49da2e2107b67a"
+            open_file_alive_flags(&candidates, &evidence, now),
+            vec![true, false, true]
         );
     }
 
     #[test]
-    fn cursor_chat_hash_matches_observed_store_directories() {
-        // Observed on 2026-10-14: ~/.cursor/chats/<hash>/<session-id>/store.db.
+    fn unavailable_evidence_keeps_every_transcript() {
+        let candidates = [candidate("a", 0), candidate("b", 0)];
         assert_eq!(
-            cursor_chat_hash("/Users/liminchen/Documents/GitHub/pi"),
-            "12e6c3832807165cd48a898645c411ad"
-        );
-        assert_eq!(
-            cursor_chat_hash("/private/var/folders/lh/qf0ljlb96ps80nc6mlc49rvw0000gn/T/dsh-cursor-acp-probe-QXVcYk/"),
-            "09811535cd5d9fd3047b6556d12cb950"
+            open_file_alive_flags(&candidates, &OpenFileEvidence::Unavailable, 10_000_000),
+            vec![true, true]
         );
     }
 
     #[test]
-    fn codex_tui_and_exec_are_sessions_but_servers_are_not() {
-        let cwd = Some("/w/a");
-        assert_eq!(
-            classify_codex_process(&row("codex", &["codex", "-a", "on-request"], cwd)),
-            live("/w/a")
-        );
-        assert_eq!(
-            classify_codex_process(&row("codex", &["/opt/bin/codex", "exec", "hi"], cwd)),
-            live("/w/a")
-        );
-        assert_eq!(
-            classify_codex_process(&row("codex", &["codex", "resume", "id"], cwd)),
-            live("/w/a")
-        );
-        for server in [
+    fn every_codex_process_is_inspected() {
+        for argv in [
+            &["codex", "-a", "on-request"][..],
+            &["/opt/bin/codex", "exec", "hi"][..],
             &[
                 "codex",
                 "app-server",
@@ -288,29 +353,36 @@ mod tests {
                 "unix://",
                 "--managed-daemon",
             ][..],
-            &["codex", "app-server", "daemon", "pid-update-loop"][..],
-            &["codex", "mcp-server"][..],
+            &[][..],
         ] {
             assert_eq!(
-                classify_codex_process(&row("codex", server, cwd)),
-                PiProcessClass::NotPi
+                classify_codex_process(&row("codex", argv)),
+                AgentProcess::Agent
             );
         }
         assert_eq!(
-            classify_codex_process(&row("codex-code-mode-host", &["x"], cwd)),
-            PiProcessClass::NotPi
+            classify_codex_process(&row("codex-code-mode-host", &["x"])),
+            AgentProcess::NotAgent
         );
     }
 
     #[test]
-    fn unreadable_codex_argv_is_unknown_for_same_user_only() {
+    fn codex_rollout_key_is_the_file_name() {
         assert_eq!(
-            classify_codex_process(&row("codex", &[], Some("/w"))),
-            PiProcessClass::Unknown
+            codex_rollout_key(Path::new(
+                "/Users/u/.codex/sessions/2026/10/14/rollout-2026-10-14T17-44-45-01a139cc.jsonl"
+            ))
+            .as_deref(),
+            Some("rollout-2026-10-14T17-44-45-01a139cc.jsonl")
         );
-        let mut other = row("codex", &[], Some("/w"));
-        other.same_user = false;
-        assert_eq!(classify_codex_process(&other), PiProcessClass::NotPi);
+        assert_eq!(
+            codex_rollout_key(Path::new("/Users/u/.codex/logs_2.sqlite")),
+            None
+        );
+        assert_eq!(
+            codex_rollout_key(Path::new("/Users/u/rollout-a.jsonl.zst")),
+            None
+        );
     }
 
     #[test]
@@ -322,43 +394,50 @@ mod tests {
             "/Users/me/.local/share/cursor-agent/versions/2026.10.01-e373342/index.js",
         ];
         assert_eq!(
-            classify_cursor_process(&row("node", &argv, Some("/w/a"))),
-            live("/w/a")
+            classify_cursor_process(&row("node", &argv)),
+            AgentProcess::Agent
         );
         let alias = [
             "/Users/me/.local/bin/agent",
             "/Users/me/.local/share/cursor-agent/versions/v/index.js",
         ];
         assert_eq!(
-            classify_cursor_process(&row("node", &alias, Some("/w/a"))),
-            live("/w/a")
+            classify_cursor_process(&row("node", &alias)),
+            AgentProcess::Agent
         );
         assert_eq!(
-            classify_cursor_process(&row("node", &["node", "server.js"], Some("/w"))),
-            PiProcessClass::NotPi
+            classify_cursor_process(&row("node", &["node", "server.js"])),
+            AgentProcess::NotAgent
         );
         assert_eq!(
-            classify_cursor_process(&row("node", &[], Some("/w"))),
-            PiProcessClass::Unknown
+            classify_cursor_process(&row("node", &[])),
+            AgentProcess::Unknown
+        );
+        assert_eq!(
+            classify_cursor_process(&row("zsh", &["zsh"])),
+            AgentProcess::NotAgent
         );
     }
 
     #[test]
-    fn cursor_evidence_is_rekeyed_by_chat_hash() {
-        let evidence = PiProcessEvidence::Live(HashMap::from([(
-            "/Users/liminchen/Documents/GitHub/pi".to_string(),
-            vec![Some(5)],
-        )]));
+    fn cursor_chat_key_is_the_store_directory() {
+        // Observed open files of cursor-agent pid 72326 on 2026-10-14.
+        let chat = "/Users/u/.cursor/chats/317f6f418cdadd651e8088e7cadc2bac/0bddd9b1-011c-4ba4-bf5f-c3d717c5cc81";
+        for file in ["store.db", "store.db-wal", "store.db-shm"] {
+            assert_eq!(
+                cursor_chat_key(&Path::new(chat).join(file)).as_deref(),
+                Some("0bddd9b1-011c-4ba4-bf5f-c3d717c5cc81")
+            );
+        }
         assert_eq!(
-            rekey_by_chat_hash(evidence),
-            PiProcessEvidence::Live(HashMap::from([(
-                "12e6c3832807165cd48a898645c411ad".to_string(),
-                vec![Some(5)],
-            )]))
+            cursor_chat_key(Path::new(
+                "/Users/u/.cursor/ai-tracking/ai-code-tracking.db"
+            )),
+            None
         );
         assert_eq!(
-            rekey_by_chat_hash(PiProcessEvidence::Unavailable),
-            PiProcessEvidence::Unavailable
+            cursor_chat_key(Path::new("/Users/u/.cursor/other/h/id/store.db")),
+            None
         );
     }
 }
