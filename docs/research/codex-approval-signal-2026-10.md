@@ -106,12 +106,19 @@ Process table during the test:
   record (other than `token_usage_record`) and either:
   - it calls `request_user_input` / `request_permissions` (at once), or
   - it carries `require_escalated` and is older than 35 s.
-- Known false positive: a code-mode `exec` script that runs an escalated
+- This cell is a **heuristic**. Constant:
+  `CODEX_ESCALATION_APPROVAL_DELAY_MS` in `src-tauri/src/session/codex.rs`.
+- Known false positive 1: the 35 s clock starts when the call is written, not
+  when the user approves. If approval delay + the command's yield (up to
+  30 s) is over 35 s, the card shows NeedsAttention for a short time after the
+  user already approved. It returns to Working at the next record.
+- Known false positive 2: a code-mode `exec` script that runs an escalated
   command and then keeps polling it inside the same script can stay silent
-  longer than 35 s after approval. Rare; the status returns to Working at the
-  next record.
-- Known false negative: approvals without a marker (see above), and the
-  first 35 s of an escalated approval.
+  longer than 35 s after approval. Same recovery.
+- Known false negative: approvals without a marker (`apply_patch` outside the
+  writable roots, `untrusted`-style prompts for commands without
+  `require_escalated`), and the first 35 s of an escalated approval. These
+  stay Working.
 
 ## Alternatives (not implemented)
 

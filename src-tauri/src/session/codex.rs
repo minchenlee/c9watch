@@ -32,6 +32,19 @@ const FULL_DISCOVERY_INTERVAL_SECS: u64 = 60;
 // conversations continue to be parsed on demand.
 const MONITOR_MESSAGE_CHARS: usize = 200;
 const MONITOR_HEADER_CAPTURE_BYTES: usize = 4096;
+/// Tool-call records are read in full only to look for an approval marker.
+/// Larger calls (big patches) are skipped; they never carry one in practice.
+const MONITOR_TOOL_CALL_CAPTURE_BYTES: usize = 64 * 1024;
+/// Codex persists no record for an approval request (`rollout/src/policy.rs`
+/// lists `ExecApprovalRequest` as transient), only the tool call before it.
+/// An escalated `exec_command` that is approved answers within the yield
+/// clamp (`MAX_YIELD_TIME_MS = 30_000`, `core/src/unified_exec/mod.rs:73-77`
+/// in codex 0.162.1; run C in
+/// `docs/research/codex-approval-signal-2026-10.md` saw 31.0 s). A call still
+/// unanswered after this long is waiting for the user. Heuristic: the clock
+/// starts at the call, not at the approval, so approval delay + yield over
+/// this window shows NeedsAttention briefly after the user already approved.
+pub(crate) const CODEX_ESCALATION_APPROVAL_DELAY_MS: i64 = 35_000;
 const FILE_SIGNATURE_SAMPLE_BYTES: u64 = 4096;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -111,9 +124,52 @@ pub struct CodexRolloutSummary {
     pub messages: Vec<CodexMessage>,
     pub started_at_ms: Option<i64>,
     pub last_timestamp: String,
+    /// `session_meta.originator` (`codex-tui`, `codex_exec`, `Codex Desktop`…).
+    pub originator: String,
+    /// `session_meta.source` when it is a plain string (`cli`, `vscode`…).
+    pub source: String,
+    /// The last record is a tool call that may be waiting for the user.
+    pub pending_action: Option<CodexPendingAction>,
+}
+
+/// Why the last tool call may be waiting for the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexPendingKind {
+    /// `request_user_input` / `request_permissions`: waits by definition.
+    UserInput,
+    /// Escalated command: waits for approval, or runs after approval.
+    Escalation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexPendingAction {
+    pub kind: CodexPendingKind,
+    pub tool_name: String,
+    /// Record timestamp of the call; `None` when it could not be parsed.
+    pub since_ms: Option<i64>,
 }
 
 impl CodexRolloutSummary {
+    /// The turn is blocked on the user (approval or question) at `now_ms`.
+    pub fn needs_attention_at(&self, now_ms: i64) -> bool {
+        self.pending_tool_name(now_ms).is_some()
+    }
+
+    /// Name of the tool that waits for the user at `now_ms`.
+    pub fn pending_tool_name(&self, now_ms: i64) -> Option<&str> {
+        if self.lifecycle != CodexLifecycle::Working {
+            return None;
+        }
+        let action = self.pending_action.as_ref()?;
+        let waiting = match action.kind {
+            CodexPendingKind::UserInput => true,
+            CodexPendingKind::Escalation => action.since_ms.is_some_and(|since| {
+                now_ms.saturating_sub(since) >= CODEX_ESCALATION_APPROVAL_DELAY_MS
+            }),
+        };
+        waiting.then_some(action.tool_name.as_str())
+    }
+
     pub fn first_prompt(&self) -> Option<&str> {
         self.messages
             .iter()
@@ -492,6 +548,13 @@ impl CodexSessionSource {
                 let Some(header) = record.header else {
                     continue;
                 };
+                track_pending_action(
+                    &mut entry.summary,
+                    header.event_type.as_deref(),
+                    header.payload_type.as_deref(),
+                    header.timestamp.as_deref(),
+                    record.line.as_deref(),
+                );
                 let relevant = monitor_record_is_relevant(&header);
                 if relevant {
                     let line = match record.line {
@@ -879,6 +942,70 @@ fn monitor_record_is_relevant(header: &RolloutEventHeader) -> bool {
     }
 }
 
+fn monitor_record_is_tool_call(header: &RolloutEventHeader) -> bool {
+    header.event_type.as_deref() == Some("response_item")
+        && header
+            .payload_type
+            .as_deref()
+            .is_some_and(is_tool_call_payload)
+}
+
+fn is_tool_call_payload(payload_type: &str) -> bool {
+    matches!(payload_type, "function_call" | "custom_tool_call")
+}
+
+/// Keep `summary.pending_action` equal to "the last record is a tool call
+/// that may wait for the user". Codex writes the call, then nothing until
+/// the user answers, so any later record (except the token record written
+/// right after every call) means the call is no longer waiting.
+fn track_pending_action(
+    summary: &mut CodexRolloutSummary,
+    event_type: Option<&str>,
+    payload_type: Option<&str>,
+    timestamp: Option<&str>,
+    line: Option<&[u8]>,
+) {
+    match event_type {
+        Some("token_usage_record") => {}
+        Some("response_item") if payload_type.is_some_and(is_tool_call_payload) => {
+            summary.pending_action =
+                line.and_then(|line| pending_action_from_call(line, timestamp));
+        }
+        _ => summary.pending_action = None,
+    }
+}
+
+/// Classify one tool-call record. Code mode wraps every tool in an `exec`
+/// script, so the script text is searched as well as the tool name.
+fn pending_action_from_call(line: &[u8], timestamp: Option<&str>) -> Option<CodexPendingAction> {
+    let value = serde_json::from_slice::<Value>(line).ok()?;
+    let payload = value.get("payload")?;
+    let tool_name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let body = payload
+        .get("arguments")
+        .or_else(|| payload.get("input"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let asks_user = matches!(tool_name, "request_user_input" | "request_permissions")
+        || body.contains("tools.request_user_input(")
+        || body.contains("tools.request_permissions(");
+    let kind = if asks_user {
+        CodexPendingKind::UserInput
+    } else if body.contains("require_escalated") {
+        CodexPendingKind::Escalation
+    } else {
+        return None;
+    };
+    Some(CodexPendingAction {
+        kind,
+        tool_name: tool_name.to_string(),
+        since_ms: timestamp.and_then(parse_timestamp_millis),
+    })
+}
+
 fn apply_rollout_line(summary: &mut CodexRolloutSummary, line: &[u8], capture_tool_messages: bool) {
     // The monitor scanner populates payload_type separately; its serde-skipped
     // field cannot classify a response_item in the full conversation reader.
@@ -901,6 +1028,13 @@ fn apply_rollout_line(summary: &mut CodexRolloutSummary, line: &[u8], capture_to
         summary.last_timestamp = timestamp.to_string();
     }
     let event_type = header.event_type.as_deref();
+    track_pending_action(
+        summary,
+        event_type,
+        header.payload.as_ref().and_then(|p| p.kind.as_deref()),
+        header.timestamp.as_deref(),
+        Some(line),
+    );
     let relevant = match event_type {
         Some("session_meta" | "event_msg") => true,
         // Message response items are user-visible even when tool records are
@@ -1092,6 +1226,7 @@ struct JsonlLineReader<'a> {
     eof: bool,
     captured: Vec<u8>,
     capture_all: bool,
+    capture_limit: usize,
     capture_overflowed: bool,
 }
 
@@ -1105,13 +1240,17 @@ impl<'a> JsonlLineReader<'a> {
             eof: false,
             captured: Vec::new(),
             capture_all: false,
+            capture_limit: usize::MAX,
             capture_overflowed: false,
         }
     }
 
-    fn drain_to_newline(&mut self, capture_remainder: bool) -> io::Result<()> {
-        if capture_remainder {
+    /// Consume the rest of the line, capturing it when `capture_limit` is set.
+    /// A line longer than the limit is dropped (`capture_overflowed`).
+    fn drain_to_newline(&mut self, capture_limit: Option<usize>) -> io::Result<()> {
+        if let Some(limit) = capture_limit {
             self.capture_all = true;
+            self.capture_limit = limit;
         } else {
             self.captured.clear();
             self.capture_overflowed = true;
@@ -1145,7 +1284,12 @@ impl Read for JsonlLineReader<'_> {
         self.reader.consume(bytes_to_copy);
         if !self.capture_overflowed {
             if self.capture_all {
-                self.captured.extend_from_slice(&output[..bytes_to_copy]);
+                if self.captured.len() + bytes_to_copy > self.capture_limit {
+                    self.captured.clear();
+                    self.capture_overflowed = true;
+                } else {
+                    self.captured.extend_from_slice(&output[..bytes_to_copy]);
+                }
             } else {
                 let remaining_capacity =
                     MONITOR_HEADER_CAPTURE_BYTES.saturating_sub(self.captured.len());
@@ -1189,8 +1333,17 @@ fn read_monitor_line(
         header = scan_monitor_header(&line_reader.captured);
     }
     let relevant = header.as_ref().is_some_and(monitor_record_is_relevant);
-    line_reader.drain_to_newline(relevant)?;
-    let line = if relevant && line_reader.complete && !line_reader.capture_overflowed {
+    let tool_call = !relevant && header.as_ref().is_some_and(monitor_record_is_tool_call);
+    let capture_limit = if relevant {
+        Some(usize::MAX)
+    } else if tool_call {
+        Some(MONITOR_TOOL_CALL_CAPTURE_BYTES)
+    } else {
+        None
+    };
+    line_reader.drain_to_newline(capture_limit)?;
+    let line = if (relevant || tool_call) && line_reader.complete && !line_reader.capture_overflowed
+    {
         Some(std::mem::take(&mut line_reader.captured))
     } else {
         None
@@ -1451,6 +1604,8 @@ fn apply_session_meta(summary: &mut CodexRolloutSummary, timestamp: &str, payloa
         .unwrap_or_default();
     let source = payload.get("source").unwrap_or(&Value::Null);
     summary.surface = classify_surface(source, originator);
+    summary.originator = originator.to_string();
+    summary.source = source.as_str().unwrap_or_default().to_string();
     summary.agent_kind = AgentKind::Root;
 
     if let Some(subagent) = source.get("subagent") {
@@ -3384,5 +3539,146 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "first prompt");
         assert_eq!(messages[1].content, "resumed answer");
+    }
+
+    // ── Pending user action (approval / question) ─────────────────────
+
+    const PENDING_T0: &str = "2026-07-13T00:00:10Z";
+
+    fn pending_fixture(tool_call: Value) -> Vec<String> {
+        let mut lines = root_fixture(Value::String("cli".into()), "codex-tui");
+        lines.push(event(PENDING_T0, "response_item", tool_call));
+        // Codex writes a token record right after the call; it must not
+        // count as the tool's answer.
+        lines.push(event(
+            "2026-07-13T00:00:10.030Z",
+            "token_usage_record",
+            serde_json::json!({}),
+        ));
+        lines
+    }
+
+    fn escalated_exec_call() -> Value {
+        // Shape recorded live from codex-cli 0.162.1 (code mode).
+        serde_json::json!({
+            "type": "custom_tool_call", "call_id": "call_esc", "name": "exec",
+            "input": "const r = await tools.exec_command({cmd:\"touch probe2.txt\",sandbox_permissions:\"require_escalated\",justification:\"Allow?\",\"yield_time_ms\":10000}); text(r.output);\n"
+        })
+    }
+
+    fn at(offset_secs: i64) -> i64 {
+        parse_timestamp_millis(PENDING_T0).unwrap() + offset_secs * 1000
+    }
+
+    fn summary_from(lines: &[String]) -> (TempDir, PathBuf, CodexSessionSource) {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("rollout-pending.jsonl");
+        write_lines(&path, lines, true);
+        let source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        (temp, path, source)
+    }
+
+    #[test]
+    fn escalated_call_needs_attention_only_after_approval_delay() {
+        let (_temp, path, mut source) = summary_from(&pending_fixture(escalated_exec_call()));
+        let summary = source.summary_for(&path).unwrap();
+        assert_eq!(summary.lifecycle, CodexLifecycle::Working);
+        assert!(!summary.needs_attention_at(at(34)), "34 s: still Working");
+        assert!(summary.needs_attention_at(at(36)), "36 s: NeedsAttention");
+        assert_eq!(summary.pending_tool_name(at(36)), Some("exec"));
+        assert_eq!(summary.pending_tool_name(at(34)), None);
+    }
+
+    #[test]
+    fn tool_output_after_escalated_call_returns_to_working_at_once() {
+        let mut lines = pending_fixture(escalated_exec_call());
+        let (_temp, path, mut source) = summary_from(&lines);
+        assert!(source
+            .summary_for(&path)
+            .unwrap()
+            .needs_attention_at(at(60)));
+        // Incremental append of the tool output (the cached prefix is reused).
+        let output = event(
+            "2026-07-13T00:01:10Z",
+            "response_item",
+            serde_json::json!({"type": "custom_tool_call_output", "call_id": "call_esc", "output": "ok"}),
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{output}").unwrap();
+        drop(file);
+        let summary = source.summary_for(&path).unwrap();
+        assert_eq!(summary.lifecycle, CodexLifecycle::Working);
+        assert!(!summary.needs_attention_at(at(61)));
+        assert!(!summary.needs_attention_at(at(3600)));
+        // A full reparse agrees with the incremental path.
+        lines.push(output);
+        let (_temp, path, mut fresh) = summary_from(&lines);
+        assert!(!fresh
+            .summary_for(&path)
+            .unwrap()
+            .needs_attention_at(at(3600)));
+    }
+
+    #[test]
+    fn request_user_input_needs_attention_at_once() {
+        let call = serde_json::json!({
+            "type": "function_call", "call_id": "call_q", "name": "request_user_input",
+            "arguments": "{\"questions\":[]}"
+        });
+        let (_temp, path, mut source) = summary_from(&pending_fixture(call));
+        let summary = source.summary_for(&path).unwrap();
+        assert!(summary.needs_attention_at(at(0)));
+        assert_eq!(summary.pending_tool_name(at(0)), Some("request_user_input"));
+
+        // Code mode wraps the same tool inside an `exec` script.
+        let call = serde_json::json!({
+            "type": "custom_tool_call", "call_id": "call_q2", "name": "exec",
+            "input": "const a = await tools.request_user_input({questions: []}); text(a);"
+        });
+        let (_temp, path, mut source) = summary_from(&pending_fixture(call));
+        assert!(source.summary_for(&path).unwrap().needs_attention_at(at(1)));
+    }
+
+    #[test]
+    fn plain_tool_calls_and_finished_turns_never_need_attention() {
+        let plain = serde_json::json!({
+            "type": "function_call", "call_id": "call_p", "name": "exec_command",
+            "arguments": "{\"cmd\":\"cargo build\",\"yield_time_ms\":30000}"
+        });
+        let (_temp, path, mut source) = summary_from(&pending_fixture(plain));
+        assert!(!source
+            .summary_for(&path)
+            .unwrap()
+            .needs_attention_at(at(3600)));
+
+        // A turn that ends (aborted while the approval was open) clears it.
+        let mut lines = pending_fixture(escalated_exec_call());
+        lines.push(event(
+            "2026-07-13T00:00:20Z",
+            "event_msg",
+            serde_json::json!({"type": "turn_aborted"}),
+        ));
+        let (_temp, path, mut source) = summary_from(&lines);
+        let summary = source.summary_for(&path).unwrap();
+        assert_eq!(summary.lifecycle, CodexLifecycle::Idle);
+        assert!(!summary.needs_attention_at(at(3600)));
+    }
+
+    #[test]
+    fn oversized_tool_call_is_skipped_without_breaking_offsets() {
+        let huge = serde_json::json!({
+            "type": "custom_tool_call", "call_id": "call_big", "name": "apply_patch",
+            "input": format!("require_escalated {}", "x".repeat(MONITOR_TOOL_CALL_CAPTURE_BYTES * 2))
+        });
+        let mut lines = pending_fixture(huge);
+        lines.push(event(
+            "2026-07-13T00:00:11Z",
+            "event_msg",
+            serde_json::json!({"type": "agent_message", "message": "after"}),
+        ));
+        let (_temp, path, mut source) = summary_from(&lines);
+        let summary = source.summary_for(&path).unwrap();
+        assert!(!summary.needs_attention_at(at(3600)));
+        assert_eq!(summary.latest_message(), Some("after"));
     }
 }

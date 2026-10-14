@@ -293,6 +293,7 @@ pub fn enrich_detected_sessions(
     let custom_names = crate::session::CustomNames::load();
     let custom_titles = crate::session::CustomTitles::load();
     let mut sessions = Vec::new();
+    let now_ms = Utc::now().timestamp_millis();
 
     for detected in detected_sessions {
         // Get session ID - if not found, skip this session
@@ -350,11 +351,7 @@ pub fn enrich_detected_sessions(
                 summary: None,
                 message_count: summary.messages.len() as u32,
                 modified,
-                status: if summary.lifecycle == CodexLifecycle::Working {
-                    SessionStatus::Working
-                } else {
-                    SessionStatus::WaitingForInput
-                },
+                status: codex_status(summary, now_ms),
                 source_health: Some(health_from_last_timestamp(
                     &summary.last_timestamp,
                     if summary.lifecycle == CodexLifecycle::Working {
@@ -365,7 +362,7 @@ pub fn enrich_detected_sessions(
                 )),
                 latest_message,
                 notification_preview,
-                pending_tool_name: None,
+                pending_tool_name: summary.pending_tool_name(now_ms).map(str::to_string),
                 pending_tool_input: None,
                 worker_of: None,
                 official_name: detected.official_name.clone(),
@@ -840,6 +837,20 @@ pub fn enrich_detected_sessions(
 /// Parse an RFC3339 `modified` stamp as an instant. Timezone offsets are
 /// normalized, so `00:30:00+02:00` correctly compares earlier than
 /// `23:00:00Z` — something a lexicographic string compare gets wrong.
+/// Codex status from the rollout lifecycle plus the pending tool call.
+fn codex_status(
+    summary: &crate::session::codex::CodexRolloutSummary,
+    now_ms: i64,
+) -> SessionStatus {
+    if summary.needs_attention_at(now_ms) {
+        SessionStatus::NeedsAttention
+    } else if summary.lifecycle == CodexLifecycle::Working {
+        SessionStatus::Working
+    } else {
+        SessionStatus::WaitingForInput
+    }
+}
+
 fn modified_instant(modified: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(modified)
         .ok()
@@ -1246,6 +1257,34 @@ fn count_messages_in_jsonl_at(path: &Path, now: Instant) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_pending_user_input_maps_to_needs_attention() {
+        use crate::session::codex::{
+            CodexPendingAction, CodexPendingKind, CodexRolloutSummary,
+            CODEX_ESCALATION_APPROVAL_DELAY_MS,
+        };
+        let mut summary = CodexRolloutSummary {
+            lifecycle: CodexLifecycle::Working,
+            ..Default::default()
+        };
+        assert_eq!(codex_status(&summary, 0), SessionStatus::Working);
+        summary.pending_action = Some(CodexPendingAction {
+            kind: CodexPendingKind::Escalation,
+            tool_name: "exec".into(),
+            since_ms: Some(0),
+        });
+        assert_eq!(codex_status(&summary, 1_000), SessionStatus::Working);
+        assert_eq!(
+            codex_status(&summary, CODEX_ESCALATION_APPROVAL_DELAY_MS),
+            SessionStatus::NeedsAttention
+        );
+        summary.lifecycle = CodexLifecycle::Idle;
+        assert_eq!(
+            codex_status(&summary, CODEX_ESCALATION_APPROVAL_DELAY_MS),
+            SessionStatus::WaitingForInput
+        );
+    }
 
     #[test]
     fn test_truncate_string_no_truncation() {
