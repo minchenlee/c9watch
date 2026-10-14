@@ -165,6 +165,18 @@ impl LegacySessionSource {
         let mut used_session_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
+        // Sessions some process names explicitly: a registry row in
+        // ~/.claude/sessions/ or a `--resume <id>` argument. Only that process
+        // may claim them. A hard-killed process leaves its row behind, so its
+        // session stays named here and the cwd fallback below cannot hand it
+        // to another live process in the same directory (issue #131).
+        let mut named_session_ids = self.registry_session_ids();
+        named_session_ids.extend(
+            processes
+                .iter()
+                .filter_map(|proc| proc.resumed_session_id.clone()),
+        );
+
         // Sort processes by start_time (newest first) to match newest processes first
         let mut sorted_processes: Vec<&ClaudeProcess> = processes.iter().collect();
         sorted_processes.sort_by(|a, b| b.start_time.cmp(&a.start_time));
@@ -175,28 +187,39 @@ impl LegacySessionSource {
                 None => continue, // Skip processes without cwd
             };
 
-            // Primary: try to resolve session ID from ~/.claude/sessions/<pid>.json
-            // This file is the authoritative source and is updated after /clear,
-            // so we always get the correct current session.
-            if let Some(meta) = self.read_session_metadata(proc.pid) {
-                if !used_session_ids.contains(&meta.session_id) {
-                    // Find the matching session file and project info
-                    if let Some((_, _, project_dir, _, project_name, _)) =
-                        session_files.iter().find(|(_, path, _, _, _, _)| {
-                            path.file_stem().and_then(|s| s.to_str()) == Some(&meta.session_id)
-                        })
-                    {
-                        used_session_ids.insert(meta.session_id.clone());
-                        sessions.push(DetectedSession::with_legacy_defaults(
-                            proc.pid,
-                            proc_cwd.clone(),
-                            project_dir.clone(),
-                            Some(meta.session_id),
-                            project_name.clone(),
-                        ));
-                        continue;
-                    }
+            // Primary: the session this process names. ~/.claude/sessions/<pid>.json
+            // is authoritative and is updated after /clear; `--resume <id>`
+            // covers a process without a registry row.
+            let named = self
+                .read_session_metadata(proc.pid)
+                .map(|meta| meta.session_id)
+                .into_iter()
+                .chain(proc.resumed_session_id.clone());
+            let mut claimed_named = false;
+            for session_id in named {
+                if used_session_ids.contains(&session_id) {
+                    continue;
                 }
+                // Find the matching session file and project info
+                if let Some((_, _, project_dir, _, project_name, _)) =
+                    session_files.iter().find(|(_, path, _, _, _, _)| {
+                        path.file_stem().and_then(|s| s.to_str()) == Some(session_id.as_str())
+                    })
+                {
+                    used_session_ids.insert(session_id.clone());
+                    sessions.push(DetectedSession::with_legacy_defaults(
+                        proc.pid,
+                        proc_cwd.clone(),
+                        project_dir.clone(),
+                        Some(session_id),
+                        project_name.clone(),
+                    ));
+                    claimed_named = true;
+                    break;
+                }
+            }
+            if claimed_named {
+                continue;
             }
 
             // Fallback: heuristic matching by encoded CWD + modification time.
@@ -225,10 +248,11 @@ impl LegacySessionSource {
                     direct_match || encoded_match
                 };
 
-            // Helper closure to check if session is not already used
+            // Helper closure to check if session is not already used or named
+            // by another process
             let session_available = |path: &Path| -> bool {
                 match path.file_stem().and_then(|s| s.to_str()) {
-                    Some(id) => !used_session_ids.contains(id),
+                    Some(id) => !used_session_ids.contains(id) && !named_session_ids.contains(id),
                     None => false,
                 }
             };
@@ -285,6 +309,21 @@ impl LegacySessionSource {
         }
 
         sessions
+    }
+
+    /// Session ids named by any registry row in ~/.claude/sessions/, live or not.
+    fn registry_session_ids(&self) -> std::collections::HashSet<String> {
+        let Ok(entries) = fs::read_dir(&self.claude_sessions_dir) else {
+            return std::collections::HashSet::new();
+        };
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .filter_map(|path| fs::read_to_string(path).ok())
+            .filter_map(|raw| serde_json::from_str::<PidSessionMeta>(&raw).ok())
+            .map(|meta| meta.session_id)
+            .collect()
     }
 
     /// Reads session metadata from ~/.claude/sessions/<pid>.json if it exists.
@@ -365,6 +404,7 @@ impl LegacySessionSource {
                     pid: pid.as_u32(),
                     cwd,
                     start_time,
+                    resumed_session_id: resumed_session_id(&cmd),
                 });
             }
         }
@@ -483,6 +523,26 @@ fn is_native_claude_executable(exe: &Path, home: &Path) -> bool {
         && parts.all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// The session id passed as `--resume <id>`, `--resume=<id>` or `-r <id>`.
+/// A bare `--resume` opens a picker and names no session.
+fn resumed_session_id(cmd: &[String]) -> Option<String> {
+    let mut args = cmd.iter().skip(1);
+    while let Some(arg) = args.next() {
+        let value = match arg.as_str() {
+            "--resume" | "-r" => args.next().map(String::as_str),
+            other => other.strip_prefix("--resume="),
+        };
+        if let Some(id) = value.filter(|id| looks_like_session_id(id)) {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+fn looks_like_session_id(value: &str) -> bool {
+    value.len() == 36 && value.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
 pub(crate) fn encode_path_for_matching(path: &str) -> String {
     path.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -495,6 +555,8 @@ struct ClaudeProcess {
     pid: u32,
     cwd: Option<PathBuf>,
     start_time: u64, // Process start time (seconds since epoch)
+    /// Session named on the command line by `--resume <id>`.
+    resumed_session_id: Option<String>,
 }
 
 /// Session metadata from ~/.claude/sessions/<pid>.json
@@ -663,6 +725,157 @@ mod tests {
             None,
             &cmd(&["node", "/Users/u/claude-tools/server.js"])
         ));
+    }
+
+    const KILLED: &str = "11111111-1111-1111-1111-111111111111";
+    const UNOWNED: &str = "22222222-2222-2222-2222-222222222222";
+
+    /// A legacy source rooted at a tempdir with one project dir for `cwd`.
+    fn legacy_fixture(
+        cwd: &Path,
+        transcripts: &[&str],
+    ) -> (tempfile::TempDir, LegacySessionSource, Vec<PathBuf>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp
+            .path()
+            .join("projects")
+            .join(encode_path_for_matching(&cwd.to_string_lossy()));
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        for id in transcripts {
+            fs::write(
+                project_dir.join(format!("{id}.jsonl")),
+                "{\"type\":\"user\"}\n",
+            )
+            .unwrap();
+        }
+        let source = LegacySessionSource {
+            system: System::new(),
+            claude_projects_dir: tmp.path().join("projects"),
+            claude_sessions_dir: tmp.path().join("sessions"),
+        };
+        (tmp, source, vec![project_dir])
+    }
+
+    fn write_registry_row(tmp: &Path, pid: u32, session_id: &str) {
+        fs::write(
+            tmp.join("sessions").join(format!("{pid}.json")),
+            format!("{{\"pid\":{pid},\"sessionId\":\"{session_id}\",\"entrypoint\":\"sdk-cli\"}}"),
+        )
+        .unwrap();
+    }
+
+    fn process(pid: u32, cwd: &Path, started_secs_ago: u64) -> ClaudeProcess {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        ClaudeProcess {
+            pid,
+            cwd: Some(cwd.to_path_buf()),
+            start_time: now - started_secs_ago,
+            resumed_session_id: None,
+        }
+    }
+
+    fn claimed(sessions: &[DetectedSession]) -> Vec<(u32, String)> {
+        sessions
+            .iter()
+            .map(|s| (s.pid, s.session_id.clone().unwrap_or_default()))
+            .collect()
+    }
+
+    /// Issue #131: a hard-killed `claude -p` leaves its registry row
+    /// (`~/.claude/sessions/<pid>.json`) and transcript behind. Another live
+    /// Claude process in the same cwd without its own registry row must not
+    /// adopt that transcript through the cwd + mtime fallback, or the dead
+    /// session is shown as live for as long as the claimant runs.
+    #[test]
+    fn cwd_fallback_does_not_adopt_a_session_owned_by_a_dead_pid() {
+        let cwd = Path::new("/fixture/wma");
+        let (tmp, source, dirs) = legacy_fixture(cwd, &[KILLED]);
+        write_registry_row(tmp.path(), 999_999, KILLED);
+        let live_without_row = process(4242, cwd, 3600);
+
+        let sessions = source.find_active_sessions(&[live_without_row], &dirs);
+
+        assert_eq!(claimed(&sessions), vec![]);
+    }
+
+    /// The owner of a registry row keeps its session even when a newer
+    /// process without a row is matched first.
+    #[test]
+    fn cwd_fallback_leaves_a_registry_owned_session_to_its_owner() {
+        let cwd = Path::new("/fixture/wma");
+        let (tmp, source, dirs) = legacy_fixture(cwd, &[KILLED]);
+        write_registry_row(tmp.path(), 5000, KILLED);
+        let owner = process(5000, cwd, 7200);
+        let newer_without_row = process(6000, cwd, 3600);
+
+        let sessions = source.find_active_sessions(&[owner, newer_without_row], &dirs);
+
+        assert_eq!(claimed(&sessions), vec![(5000, KILLED.to_string())]);
+    }
+
+    /// Older Claude Code builds write no registry row; the cwd fallback still
+    /// pairs such a process with an unowned transcript.
+    #[test]
+    fn cwd_fallback_still_claims_an_unowned_session() {
+        let cwd = Path::new("/fixture/wma");
+        let (tmp, source, dirs) = legacy_fixture(cwd, &[KILLED, UNOWNED]);
+        write_registry_row(tmp.path(), 999_999, KILLED);
+        let live_without_row = process(4242, cwd, 3600);
+
+        let sessions = source.find_active_sessions(&[live_without_row], &dirs);
+
+        assert_eq!(claimed(&sessions), vec![(4242, UNOWNED.to_string())]);
+    }
+
+    /// A process started as `claude --resume <id>` with no registry row
+    /// writes to `<id>.jsonl`, wherever that lives. The cwd fallback must not
+    /// pair it with an unrelated transcript in its cwd instead.
+    #[test]
+    fn resumed_process_claims_its_named_session_not_a_cwd_neighbour() {
+        let cwd = Path::new("/fixture/home");
+        let (_tmp, source, dirs) = legacy_fixture(cwd, &[UNOWNED, KILLED]);
+        // The neighbour is the newest transcript written since the process
+        // started, so it is the one the cwd heuristic would pick.
+        let older = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        fs::File::options()
+            .write(true)
+            .open(dirs[0].join(format!("{KILLED}.jsonl")))
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
+        let mut resumed = process(4242, cwd, 3600);
+        resumed.resumed_session_id = Some(KILLED.to_string());
+
+        let sessions = source.find_active_sessions(&[resumed], &dirs);
+
+        assert_eq!(claimed(&sessions), vec![(4242, KILLED.to_string())]);
+    }
+
+    #[test]
+    fn resumed_session_id_reads_the_named_session_only() {
+        let id = KILLED;
+        assert_eq!(
+            resumed_session_id(&cmd(&["claude", "--resume", id])).as_deref(),
+            Some(id)
+        );
+        assert_eq!(
+            resumed_session_id(&cmd(&["claude", &format!("--resume={id}")])).as_deref(),
+            Some(id)
+        );
+        assert_eq!(
+            resumed_session_id(&cmd(&["claude", "-r", id])).as_deref(),
+            Some(id)
+        );
+        assert_eq!(resumed_session_id(&cmd(&["claude", "--resume"])), None);
+        assert_eq!(
+            resumed_session_id(&cmd(&["claude", "--resume", "--model", "x"])),
+            None
+        );
+        assert_eq!(resumed_session_id(&cmd(&["claude", "-p", id])), None);
     }
 
     #[test]
