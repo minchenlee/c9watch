@@ -133,9 +133,31 @@ mod tests {
         }
 
         fn claude(dir: &Path, script: &str, mode: u32) {
-            let exe = dir.join(CLAUDE_EXE);
-            fs::write(&exe, script).unwrap();
+            Self::script(dir, CLAUDE_EXE, script, mode);
+            Self::prime(dir);
+        }
+
+        /// Writes `dir/name` without running it.
+        fn script(dir: &Path, name: &str, body: &str, mode: u32) {
+            let exe = dir.join(name);
+            fs::write(&exe, body).unwrap();
             fs::set_permissions(exe, fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        /// Runs `dir/claude` once, with no deadline, before a test probes it.
+        /// macOS checks each newly written executable on its first run, one
+        /// at a time across the system: a probe measured ~0.3s alone and
+        /// ~0.1s more per concurrent probe, so parallel tests pushed
+        /// `can_run_claude` past its 2s deadline. Installed CLIs were checked
+        /// long before c9watch starts, so the deadline itself stays.
+        fn prime(dir: &Path) {
+            let _ = Command::new(dir.join(CLAUDE_EXE))
+                .arg("--version")
+                .env("PATH", dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
         }
 
         fn working(dir: &Path) {
@@ -226,18 +248,24 @@ mod tests {
     #[test]
     fn probes_with_candidate_directory_on_path() {
         let installs = Installations::new();
+        Installations::script(
+            &installs.candidates[0],
+            "node",
+            "#!/bin/sh\nprintf 'fixture-claude\\n'\n",
+            0o755,
+        );
+        // Priming `claude` also runs `node` through `env`.
         Installations::claude(&installs.candidates[0], "#!/usr/bin/env node\n", 0o755);
-        let node = installs.candidates[0].join("node");
-        fs::write(&node, "#!/bin/sh\nprintf 'fixture-claude\\n'\n").unwrap();
-        fs::set_permissions(node, fs::Permissions::from_mode(0o755)).unwrap();
         installs.assert_resolves_to(&installs.candidates[0]);
     }
 
     #[test]
     fn skips_candidate_that_hangs_during_version_probe() {
         let installs = Installations::new();
-        Installations::claude(
+        // Not primed: priming would never return.
+        Installations::script(
             &installs.candidates[0],
+            CLAUDE_EXE,
             "#!/bin/sh\nwhile :; do :; done\n",
             0o755,
         );
