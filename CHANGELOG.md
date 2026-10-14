@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-14
+
+### Fixed
+- **Killed sessions no longer stay active.** A session killed outside c9watch (for example a `claude -p` stopped by a timeout wrapper) could keep showing as Needs Attention or Working when Auto mode had fallen back to the legacy detector. The legacy detector no longer hands a session that another process names (a registry row or `--resume <id>`) to a different live process in the same folder ([#148](https://github.com/minchenlee/c9watch/pull/148), [#131](https://github.com/minchenlee/c9watch/issues/131)).
+- **Auto mode returns to the CLI detector on its own.** After falling back to the legacy detector, Auto mode now retries `claude agents --json` every 5 minutes instead of only when the window gains focus. The CLI detector and forced modes still never probe on a poll ([#148](https://github.com/minchenlee/c9watch/pull/148)).
+
 ## [0.10.0] - 2026-10-08
 
 ### Added
