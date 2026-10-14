@@ -3,10 +3,29 @@ use super::owners::{global_provider_source_owners, ProviderSourceOwners};
 use super::source::{DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource};
 use super::{create_session_source, mode_from_env, BackendMode};
 use crate::session::detector::LegacySessionSource;
+use crate::session::detector_cli::CliSessionSource;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const DOWNGRADE_THRESHOLD: u32 = 5;
+
+/// How often Auto mode, while on the legacy backend, probes whether
+/// `claude agents --json` works again. Each probe spawns `claude` twice, so it
+/// runs on this interval rather than every poll (#138).
+const LEGACY_RECHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+type Clock = Box<dyn Fn() -> Instant + Send>;
+type CliProbe = Box<dyn Fn() -> bool + Send>;
+type SourceFactory = Box<dyn Fn(bool) -> Box<dyn SessionSource> + Send>;
+
+fn backend_source(supports_cli: bool) -> Box<dyn SessionSource> {
+    if supports_cli {
+        Box::new(CliSessionSource::new())
+    } else {
+        Box::new(LegacySessionSource::new().expect("legacy ctor"))
+    }
+}
 
 pub struct DetectorState {
     source: Box<dyn SessionSource>,
@@ -14,6 +33,11 @@ pub struct DetectorState {
     telemetry_counter: Arc<AtomicU32>,
     mode: BackendMode,
     provider_sources: ProviderSourceOwners,
+    /// When the backend was last chosen: start, downgrade, or recheck.
+    last_backend_check: Instant,
+    now: Clock,
+    probe_cli: CliProbe,
+    make_source: SourceFactory,
 }
 
 impl DetectorState {
@@ -24,12 +48,19 @@ impl DetectorState {
             telemetry_counter: Arc::new(AtomicU32::new(0)),
             mode: mode_from_env(),
             provider_sources: global_provider_source_owners(),
+            last_backend_check: Instant::now(),
+            now: Box::new(Instant::now),
+            probe_cli: Box::new(super::probe_claude_supports_agents_json),
+            make_source: Box::new(backend_source),
         }
     }
 
     pub fn detect(
         &mut self,
     ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
+        if self.legacy_recheck_due() {
+            self.recheck_and_maybe_swap();
+        }
         let claude_result = self.source.detect();
         let codex_result = self.provider_sources.detect_codex();
         let cursor_result = self.provider_sources.detect_cursor();
@@ -81,6 +112,16 @@ impl DetectorState {
         }
     }
 
+    /// Auto mode on the legacy backend retries the CLI backend every
+    /// `LEGACY_RECHECK_INTERVAL`, so a transient CLI failure doesn't leave the
+    /// legacy heuristics in charge until the window next gains focus.
+    fn legacy_recheck_due(&self) -> bool {
+        self.mode == BackendMode::Auto
+            && self.source.backend_name() == "legacy"
+            && (self.now)().saturating_duration_since(self.last_backend_check)
+                >= LEGACY_RECHECK_INTERVAL
+    }
+
     fn should_downgrade(&self) -> bool {
         self.mode == BackendMode::Auto
             && self.source.backend_name() == "cli"
@@ -88,8 +129,9 @@ impl DetectorState {
     }
 
     fn downgrade_to_legacy(&mut self) {
-        self.source = Box::new(LegacySessionSource::new().expect("legacy ctor"));
+        self.source = (self.make_source)(false);
         self.consecutive_failures = 0;
+        self.last_backend_check = (self.now)();
         self.telemetry_counter.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -97,10 +139,11 @@ impl DetectorState {
         if self.mode != BackendMode::Auto {
             return;
         }
-        let supports_cli = super::probe_claude_supports_agents_json();
+        self.last_backend_check = (self.now)();
+        let supports_cli = (self.probe_cli)();
         let want = if supports_cli { "cli" } else { "legacy" };
         if self.source.backend_name() != want {
-            self.source = create_session_source();
+            self.source = (self.make_source)(supports_cli);
             self.consecutive_failures = 0;
             self.telemetry_counter.fetch_add(1, Ordering::Relaxed);
         }
@@ -125,7 +168,23 @@ impl DetectorState {
             telemetry_counter: Arc::new(AtomicU32::new(0)),
             mode,
             provider_sources: ProviderSourceOwners::from_test_sources(None, None, None),
+            last_backend_check: Instant::now(),
+            now: Box::new(Instant::now),
+            probe_cli: Box::new(|| false),
+            make_source: Box::new(|cli| {
+                Box::new(TestSource {
+                    name: if cli { "cli" } else { "legacy" },
+                })
+            }),
         }
+    }
+
+    /// Test-only: replace the clock, the CLI probe, and the backend factory.
+    pub fn with_test_backends(mut self, now: Clock, probe_cli: CliProbe) -> Self {
+        self.last_backend_check = now();
+        self.now = now;
+        self.probe_cli = probe_cli;
+        self
     }
 
     /// Test-only helper to replace the underlying source mid-test (e.g. to
@@ -133,6 +192,24 @@ impl DetectorState {
     pub fn replace_source(&mut self, src: Box<dyn SessionSource>) {
         self.source = src;
         self.consecutive_failures = 0;
+    }
+}
+
+/// Backend the test factory hands out on a swap: always succeeds, empty.
+#[cfg(test)]
+struct TestSource {
+    name: &'static str,
+}
+
+#[cfg(test)]
+impl SessionSource for TestSource {
+    fn detect(
+        &mut self,
+    ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
+        Ok((Vec::new(), DetectionDiagnostics::default()))
+    }
+    fn backend_name(&self) -> &'static str {
+        self.name
     }
 }
 
@@ -229,6 +306,124 @@ mod tests {
             let _ = s.detect();
         }
         assert_eq!(s.backend_name(), "cli");
+    }
+
+    /// A fake clock the test advances by hand, and a probe that counts calls.
+    fn fake_backends(
+        cli_works: bool,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<Instant>>,
+        Arc<AtomicU32>,
+        Clock,
+        CliProbe,
+    ) {
+        let clock = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let probes = Arc::new(AtomicU32::new(0));
+        let now = {
+            let clock = clock.clone();
+            Box::new(move || *clock.lock().unwrap()) as Clock
+        };
+        let probe = {
+            let probes = probes.clone();
+            Box::new(move || {
+                probes.fetch_add(1, Ordering::Relaxed);
+                cli_works
+            }) as CliProbe
+        };
+        (clock, probes, now, probe)
+    }
+
+    fn advance(clock: &std::sync::Mutex<Instant>, by: Duration) {
+        let mut t = clock.lock().unwrap();
+        *t += by;
+    }
+
+    fn downgraded_state(
+        cli_works: bool,
+    ) -> (
+        DetectorState,
+        Arc<std::sync::Mutex<Instant>>,
+        Arc<AtomicU32>,
+    ) {
+        let (clock, probes, now, probe) = fake_backends(cli_works);
+        let mut s = DetectorState::for_test(Box::new(FakeSource::new("cli", 5)), BackendMode::Auto)
+            .with_test_backends(now, probe);
+        for _ in 0..5 {
+            let _ = s.detect();
+        }
+        assert_eq!(s.backend_name(), "legacy");
+        (s, clock, probes)
+    }
+
+    #[test]
+    fn legacy_after_downgrade_rechecks_cli_after_interval_and_swaps_back() {
+        let (mut s, clock, probes) = downgraded_state(true);
+
+        advance(&clock, LEGACY_RECHECK_INTERVAL);
+        let _ = s.detect();
+
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+        assert_eq!(s.backend_name(), "cli");
+    }
+
+    #[test]
+    fn legacy_does_not_probe_cli_on_every_poll() {
+        let (mut s, clock, probes) = downgraded_state(true);
+
+        for _ in 0..10 {
+            advance(&clock, Duration::from_secs(20));
+            let _ = s.detect();
+        }
+
+        assert_eq!(probes.load(Ordering::Relaxed), 0);
+        assert_eq!(s.backend_name(), "legacy");
+    }
+
+    #[test]
+    fn failed_recheck_stays_legacy_and_waits_another_interval() {
+        let (mut s, clock, probes) = downgraded_state(false);
+
+        advance(&clock, LEGACY_RECHECK_INTERVAL);
+        let _ = s.detect();
+        advance(&clock, LEGACY_RECHECK_INTERVAL / 2);
+        let _ = s.detect();
+
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+        assert_eq!(s.backend_name(), "legacy");
+
+        advance(&clock, LEGACY_RECHECK_INTERVAL / 2);
+        let _ = s.detect();
+        assert_eq!(probes.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn cli_backend_never_probes_on_detect() {
+        let (clock, probes, now, probe) = fake_backends(true);
+        let mut s = DetectorState::for_test(Box::new(FakeSource::new("cli", 0)), BackendMode::Auto)
+            .with_test_backends(now, probe);
+
+        for _ in 0..3 {
+            advance(&clock, LEGACY_RECHECK_INTERVAL);
+            let _ = s.detect();
+        }
+
+        assert_eq!(probes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn force_legacy_never_probes_on_detect() {
+        let (clock, probes, now, probe) = fake_backends(true);
+        let mut s = DetectorState::for_test(
+            Box::new(FakeSource::new("legacy", 0)),
+            BackendMode::ForceLegacy,
+        )
+        .with_test_backends(now, probe);
+
+        advance(&clock, LEGACY_RECHECK_INTERVAL * 2);
+        let _ = s.detect();
+
+        assert_eq!(probes.load(Ordering::Relaxed), 0);
+        assert_eq!(s.backend_name(), "legacy");
     }
 
     #[test]
