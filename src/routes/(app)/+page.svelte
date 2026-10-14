@@ -79,6 +79,9 @@
 	// is queried after the transition has settled (avoids stale values).
 	let isFullscreen = $state(false);
 
+	// "While you were away" summary on waiting cards.
+	onMount(() => initAwayTracking());
+
 	onMount(() => {
 		if (browser) {
 			const saved = localStorage.getItem('sessionViewMode');
@@ -383,9 +386,6 @@
 		}
 		return () => { cancelled = true; clearTimeout(timer); };
 	});
-
-	// "While you were away" summary on waiting cards.
-	onMount(() => initAwayTracking());
 
 	function handleExpand(session: Session) {
 		expandedSessionId.set(sessionKeyOf(session));
