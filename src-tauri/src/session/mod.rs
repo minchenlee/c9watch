@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod accuracy_matrix;
 mod cache;
 pub mod codex;
 pub mod cursor;

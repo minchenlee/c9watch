@@ -1,4 +1,5 @@
 use super::detector::encode_path_for_matching;
+use super::pid_check::{pid_was_reused, RecordedStart};
 use super::pid_is_alive;
 use super::source::{
     CliActivity, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionKind,
@@ -61,7 +62,7 @@ const STATUS_FIELDS: &[&str] = &[
 
 /// Process start time (seconds since the epoch) for each pid, absent for a
 /// pid that isn't running.
-type StartTimes = HashMap<u32, u64>;
+pub(crate) type StartTimes = HashMap<u32, u64>;
 
 struct AgentsCache {
     signature: RegistrySignature,
@@ -80,6 +81,11 @@ pub struct CliSessionSource {
     path_cache: HashMap<String, PathBuf>,
     agents_cache: Option<AgentsCache>,
     start_times: Box<dyn Fn(&[u32]) -> StartTimes + Send>,
+    is_alive: fn(u32) -> bool,
+    /// Home directory holding `.claude/`; `None` reads the real one (and
+    /// honours `CLAUDE_CONFIG_DIR` for the registry). Tests point it at a
+    /// tempdir.
+    home: Option<PathBuf>,
 }
 
 impl CliSessionSource {
@@ -91,11 +97,17 @@ impl CliSessionSource {
             path_cache: HashMap::new(),
             agents_cache: None,
             start_times: Box::new(process_start_times),
+            is_alive: pid_is_alive,
+            home: None,
         }
     }
 
+    fn home(&self) -> Option<PathBuf> {
+        self.home.clone().or_else(dirs::home_dir)
+    }
+
     fn project_path_for_session(&mut self, cwd: &Path, session_id: &str) -> PathBuf {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let home = self.home().unwrap_or_else(|| PathBuf::from("/"));
         lookup_with_cache(&home, &mut self.path_cache, cwd, session_id)
     }
 
@@ -147,10 +159,13 @@ impl CliSessionSource {
     /// Each spawn costs ~0.2s of CPU, so running it on every poll dominated
     /// c9watch's energy use.
     fn agents(&mut self) -> Result<Vec<CliAgent>, SessionDetectorError> {
-        let dir = registry_dir(
-            dirs::home_dir().as_deref(),
-            std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
-        );
+        let dir = match &self.home {
+            Some(home) => Some(sessions_dir(home)),
+            None => registry_dir(
+                dirs::home_dir().as_deref(),
+                std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+            ),
+        };
         self.agents_in_registry(dir.as_deref())
     }
 
@@ -274,7 +289,14 @@ impl SessionSource for CliSessionSource {
         // interrupt) can leave a stale entry pointing at a pid that no longer exists,
         // reported as busy/idle/waiting like any live agent. Drop those before they
         // ever reach status inference.
-        let agents = filter_live_agents(agents, pid_is_alive);
+        let agents = filter_live_agents(agents, self.is_alive);
+        let home = self.home();
+        let pids: Vec<u32> = agents.iter().map(|a| a.pid).collect();
+        let start_times = if pids.is_empty() {
+            StartTimes::new()
+        } else {
+            (self.start_times)(&pids)
+        };
 
         // Filter out non-CLI entrypoints (e.g. sdk-ts from Zed/IDE integrations).
         // `claude agents --json` lists every live agent including SDK-driven ones,
@@ -286,7 +308,19 @@ impl SessionSource for CliSessionSource {
         let sessions: Vec<DetectedSession> = agents
             .into_iter()
             .filter_map(|a| {
-                let meta = pid_meta(a.pid);
+                let meta = home
+                    .as_deref()
+                    .map(|home| pid_meta_under(home, a.pid))
+                    .unwrap_or_default();
+                // A live pid can still be a different process: after a hard
+                // kill the OS may hand the pid to a newer one.
+                let recorded = RecordedStart {
+                    started_at_ms: meta.start.started_at_ms.or(Some(a.started_at)),
+                    ..meta.start
+                };
+                if pid_was_reused(&recorded, start_times.get(&a.pid).copied()) {
+                    return None;
+                }
                 is_monitored_entrypoint(meta.entrypoint.as_deref())
                     .then(|| self.map_agent_to_session(a, meta))
             })
@@ -492,12 +526,8 @@ struct PidMeta {
     entrypoint: Option<String>,
     /// Claude Code version that wrote the file.
     version: Option<(u32, u32, u32)>,
-}
-
-fn pid_meta(pid: u32) -> PidMeta {
-    dirs::home_dir()
-        .map(|home| pid_meta_under(&home, pid))
-        .unwrap_or_default()
+    /// `procStart` / `startedAt` of the process that wrote the file.
+    start: RecordedStart,
 }
 
 fn pid_meta_under(home: &Path, pid: u32) -> PidMeta {
@@ -512,6 +542,7 @@ fn pid_meta_under(home: &Path, pid: u32) -> PidMeta {
     PidMeta {
         entrypoint: field("entrypoint").map(str::to_string),
         version: field("version").and_then(super::parse_semver),
+        start: RecordedStart::from_record(&value),
     }
 }
 
@@ -585,8 +616,9 @@ fn lookup_with_cache(
     fallback_path_under(home, cwd)
 }
 
+/// Test doubles shared with `accuracy_matrix`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
 
     /// A fake `claude` that prints the first line of `cli-output.json` from
@@ -595,7 +627,7 @@ mod tests {
     /// at a time system-wide, so a fresh script per test slows every other
     /// test that execs a fresh file.
     #[cfg(unix)]
-    fn fixture_cli(dir: &Path) -> CliSessionSource {
+    pub(crate) fn fixture_cli(dir: &Path) -> CliSessionSource {
         use std::os::unix::fs::PermissionsExt;
         static SCRIPT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         let shared = SCRIPT.get_or_init(|| {
@@ -618,6 +650,26 @@ mod tests {
         source.start_times = Box::new(|pids| pids.iter().map(|&pid| (pid, 1)).collect());
         source
     }
+
+    /// Points `source` at a fake home and fakes the process table: `alive`
+    /// decides liveness, `start_times` reports each pid's start time.
+    pub(crate) fn with_process_table(
+        mut source: CliSessionSource,
+        home: PathBuf,
+        alive: fn(u32) -> bool,
+        start_times: impl Fn(&[u32]) -> StartTimes + Send + 'static,
+    ) -> CliSessionSource {
+        source.home = Some(home);
+        source.is_alive = alive;
+        source.start_times = Box::new(start_times);
+        source
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
 
     #[test]
     fn process_start_times_reports_running_pids_only() {
@@ -695,6 +747,7 @@ mod tests {
             PidMeta {
                 entrypoint: Some("sdk-cli".to_string()),
                 version: Some((2, 1, 280)),
+                start: RecordedStart::default(),
             },
         );
 
@@ -732,6 +785,7 @@ mod tests {
             PidMeta {
                 entrypoint: Some("cli".to_string()),
                 version: Some((2, 1, 280)),
+                start: RecordedStart::default(),
             }
         );
     }
@@ -1025,6 +1079,75 @@ mod tests {
             .agents_in_registry(Some(&registry))
             .unwrap()
             .is_empty());
+    }
+
+    /// 2026-10-14T13:35:57Z.
+    const PROC_START: u64 = 1_791_984_957;
+    const LIVE_ROW: &str = r#"{"pid":41,"cwd":"/tmp/reuse","kind":"interactive","startedAt":1791984959765,"sessionId":"sid-reuse","status":"idle"}"#;
+
+    /// A CLI source whose fake `claude agents --json` lists `LIVE_ROW`, with
+    /// `registry` as pid 41's `~/.claude/sessions/41.json`, pid 41 alive and
+    /// started at `actual_start`.
+    #[cfg(unix)]
+    fn reuse_fixture(tmp: &Path, registry: &str, actual_start: u64) -> CliSessionSource {
+        let sessions = sessions_dir(tmp);
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("41.json"), registry).unwrap();
+        std::fs::write(tmp.join("cli-output.json"), format!("[{LIVE_ROW}]\n")).unwrap();
+        with_process_table(
+            fixture_cli(tmp),
+            tmp.to_path_buf(),
+            |_| true,
+            move |pids| pids.iter().map(|&pid| (pid, actual_start)).collect(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn detected_ids(source: &mut CliSessionSource) -> Vec<String> {
+        let (sessions, _) = source.detect().unwrap();
+        sessions.into_iter().filter_map(|s| s.session_id).collect()
+    }
+
+    const REGISTRY_WITH_PROC_START: &str = r#"{"pid":41,"sessionId":"sid-reuse","startedAt":1791984959765,"procStart":"Wed Oct 14 13:35:57 2026","entrypoint":"cli","version":"2.1.299","status":"idle"}"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_drops_an_agent_whose_pid_now_belongs_to_a_newer_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = reuse_fixture(tmp.path(), REGISTRY_WITH_PROC_START, PROC_START + 3600);
+        assert!(detected_ids(&mut source).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_keeps_an_agent_whose_process_start_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = reuse_fixture(tmp.path(), REGISTRY_WITH_PROC_START, PROC_START);
+        assert_eq!(detected_ids(&mut source), ["sid-reuse"]);
+    }
+
+    /// Older Claude Code writes no `procStart`; the CLI row's `startedAt`
+    /// still bounds the start, and a matching process is kept.
+    #[cfg(unix)]
+    #[test]
+    fn detect_without_proc_start_keeps_the_original_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = reuse_fixture(
+            tmp.path(),
+            r#"{"pid":41,"sessionId":"sid-reuse","entrypoint":"cli"}"#,
+            PROC_START,
+        );
+        assert_eq!(detected_ids(&mut source), ["sid-reuse"]);
+    }
+
+    /// A start time c9watch can't read (sysinfo has no row) is no evidence.
+    #[cfg(unix)]
+    #[test]
+    fn detect_keeps_an_agent_with_an_unknown_start_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = reuse_fixture(tmp.path(), REGISTRY_WITH_PROC_START, 0);
+        source.start_times = Box::new(|_| HashMap::new());
+        assert_eq!(detected_ids(&mut source), ["sid-reuse"]);
     }
 
     #[test]
