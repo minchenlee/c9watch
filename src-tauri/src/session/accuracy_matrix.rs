@@ -28,12 +28,13 @@
 //! scenario or source; `matrix_has_one_cell_per_source_and_scenario` checks
 //! the grid is complete.
 
+use super::agent_liveness::{OpenFileEvidence, OpenFileProbe};
 use super::detector::encode_path_for_matching;
 use super::enrichment::enrich_detected_sessions;
 use super::pi_liveness::{PiProcessEvidence, PiProcessProbe};
 use super::source::{AgentKind, DetectedSession, DetectionDiagnostics, SessionSource};
 use super::SessionStatus;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -113,6 +114,8 @@ enum Expect {
     /// No row for the session. For a Claude Code subagent this is correct:
     /// it shows in its parent's subagent panel, not as its own row.
     Hidden,
+    /// The source has no such situation; the cell has no test.
+    NotApplicable(&'static str),
 }
 
 struct Cell {
@@ -121,6 +124,9 @@ struct Cell {
     expect: Expect,
     /// Why the code can't meet `expect` yet; the cell's test is ignored.
     gap: Option<&'static str>,
+    /// The cell passes, but the detection is a heuristic with these known
+    /// errors.
+    heuristic: Option<&'static str>,
 }
 
 const fn cell(source: Source, scenario: Scenario, expect: Expect) -> Cell {
@@ -129,6 +135,7 @@ const fn cell(source: Source, scenario: Scenario, expect: Expect) -> Cell {
         scenario,
         expect,
         gap: None,
+        heuristic: None,
     }
 }
 
@@ -138,6 +145,32 @@ const fn gap(source: Source, scenario: Scenario, expect: Expect, why: &'static s
         scenario,
         expect,
         gap: Some(why),
+        heuristic: None,
+    }
+}
+
+const fn heuristic(
+    source: Source,
+    scenario: Scenario,
+    expect: Expect,
+    errors: &'static str,
+) -> Cell {
+    Cell {
+        source,
+        scenario,
+        expect,
+        gap: None,
+        heuristic: Some(errors),
+    }
+}
+
+const fn not_applicable(source: Source, scenario: Scenario, why: &'static str) -> Cell {
+    Cell {
+        source,
+        scenario,
+        expect: Expect::NotApplicable(why),
+        gap: None,
+        heuristic: None,
     }
 }
 
@@ -146,10 +179,12 @@ use Scenario as Sc;
 use SessionStatus::{NeedsAttention, WaitingForInput, Working};
 use Source as So;
 
-const CODEX_NO_PROCESS: &str =
-    "no process evidence for Codex; a killed rollout stays Working until the 4h freshness window ends";
-const CURSOR_NO_PROCESS: &str =
-    "no process evidence for Cursor; a killed transcript stays Working until the freshness window ends";
+const CODEX_APPROVAL_HEURISTIC: &str = "an escalated tool call with no later record for 35 s \
+(`CODEX_ESCALATION_APPROVAL_DELAY_MS`) counts as waiting for approval. Known errors: (a) after \
+the user approves, approval delay + the command's 30 s yield can pass 35 s and show \
+NeedsAttention for a short time; (b) approvals without a marker (`apply_patch` outside the \
+writable roots, untrusted-mode prompts) stay Working. `request_user_input` is exact. See \
+docs/research/codex-approval-signal-2026-10.md";
 
 const MATRIX: &[Cell] = &[
     cell(So::ClaudeCli, Sc::Working, Listed(Working)),
@@ -165,42 +200,45 @@ const MATRIX: &[Cell] = &[
     cell(So::ClaudeLegacy, Sc::PidReuse, Hidden),
     cell(So::ClaudeLegacy, Sc::Subagent, Hidden),
     cell(So::Codex, Sc::Working, Listed(Working)),
-    gap(
+    heuristic(
         So::Codex,
         Sc::Waiting,
         Listed(NeedsAttention),
-        "Codex approval requests are not detected; needs the rollout signal and a fixture",
+        CODEX_APPROVAL_HEURISTIC,
     ),
     cell(So::Codex, Sc::Idle, Listed(WaitingForInput)),
-    gap(So::Codex, Sc::Killed, Hidden, CODEX_NO_PROCESS),
-    gap(So::Codex, Sc::PidReuse, Hidden, CODEX_NO_PROCESS),
+    cell(So::Codex, Sc::Killed, Hidden),
+    cell(So::Codex, Sc::PidReuse, Hidden),
     cell(So::Codex, Sc::Subagent, Listed(Working)),
     cell(So::Cursor, Sc::Working, Listed(Working)),
     gap(
         So::Cursor,
         Sc::Waiting,
         Listed(NeedsAttention),
-        "Cursor approval prompts are not detected; needs the transcript signal and a fixture",
+        "no approval signal is known in the Cursor transcript (records are role messages and \
+`turn_ended`); not yet checked whether a pending `tool_use` is written before the prompt",
     ),
     cell(So::Cursor, Sc::Idle, Listed(WaitingForInput)),
-    gap(So::Cursor, Sc::Killed, Hidden, CURSOR_NO_PROCESS),
-    gap(So::Cursor, Sc::PidReuse, Hidden, CURSOR_NO_PROCESS),
+    cell(So::Cursor, Sc::Killed, Hidden),
+    cell(So::Cursor, Sc::PidReuse, Hidden),
     cell(So::Cursor, Sc::Subagent, Listed(Working)),
     cell(So::Pi, Sc::Working, Listed(Working)),
-    gap(
+    not_applicable(
         So::Pi,
         Sc::Waiting,
-        Listed(NeedsAttention),
-        "no waiting-on-user signal is known for Pi; confirm whether Pi has one, then add a fixture",
+        "Pi 0.87.1 has no approval step: tools run with the process's OS permissions \
+(pi-coding-agent docs/security.md:33, docs/how-pi-works.md:49), and the transcript has only \
+user, assistant and toolResult messages (pi.rs:8-10). Only an extension can ask the user \
+(docs/extensions.md:7); c9watch does not model extensions",
     ),
     cell(So::Pi, Sc::Idle, Listed(WaitingForInput)),
     cell(So::Pi, Sc::Killed, Hidden),
     cell(So::Pi, Sc::PidReuse, Hidden),
-    gap(
+    not_applicable(
         So::Pi,
         Sc::Subagent,
-        Listed(Working),
-        "Pi subagent sessions are not modelled; confirm the transcript layout, then add a fixture",
+        "Pi 0.87.1 has no built-in subagents (none in its docs); every Pi session is a root \
+(pi.rs:317)",
     ),
 ];
 
@@ -214,6 +252,10 @@ fn lookup(source: Source, scenario: Scenario) -> &'static Cell {
 /// Runs one cell and asserts its expectation.
 fn check(source: Source, scenario: Scenario) {
     let cell = lookup(source, scenario);
+    assert!(
+        !matches!(cell.expect, Expect::NotApplicable(_)),
+        "{source:?} × {scenario:?} is not applicable; it has no test"
+    );
     let observed = observe(source, scenario);
     assert_eq!(
         observed,
@@ -489,6 +531,19 @@ fn codex_rollout(day: &Path, id: &str, meta: serde_json::Value, events: &[&str])
     );
 }
 
+/// Open rollouts that injected `codex` processes hold.
+struct FixedOpenFiles(OpenFileEvidence);
+
+impl OpenFileProbe for FixedOpenFiles {
+    fn scan(&mut self) -> OpenFileEvidence {
+        self.0.clone()
+    }
+}
+
+fn codex_rollout_name(id: &str) -> String {
+    format!("rollout-2026-10-14T00-00-00-{id}.jsonl")
+}
+
 fn codex(tmp: &Path, scenario: Scenario) -> Fixture {
     let day = tmp.join(chrono::Local::now().format("%Y/%m/%d").to_string());
     let root_meta = serde_json::json!({
@@ -497,12 +552,29 @@ fn codex(tmp: &Path, scenario: Scenario) -> Fixture {
     });
     let events: &[&str] = match scenario {
         Sc::Idle => &["task_started", "task_complete"],
-        Sc::Waiting => panic!("route1-B: write the Codex approval-request fixture"),
-        // Killed / PidReuse: the rollout is left mid-turn and no process
-        // remains; the matrix has no Codex process evidence to inject yet.
+        // Killed / PidReuse: the rollout is left mid-turn.
         _ => &["task_started"],
     };
     codex_rollout(&day, CODEX_ROOT, root_meta, events);
+    let root_path = day.join(codex_rollout_name(CODEX_ROOT));
+    if scenario == Sc::Waiting {
+        // An escalated command, written 60 s ago, with no output yet: the
+        // approval dialog is open.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&root_path)
+            .unwrap();
+        // Codex writes `timestamp`, `type`, `payload` in this order, and the
+        // monitor scanner relies on it (`json!` would sort the keys).
+        let payload = serde_json::json!({"type": "function_call", "call_id": "call_matrix",
+            "name": "exec_command",
+            "arguments": r#"{"cmd":"touch probe.txt","sandbox_permissions":"require_escalated"}"#});
+        let call = format!(
+            r#"{{"timestamp":"{}","type":"response_item","payload":{payload}}}"#,
+            now_rfc3339(60)
+        );
+        std::io::Write::write_all(&mut file, format!("{call}\n").as_bytes()).unwrap();
+    }
     if scenario == Sc::Subagent {
         codex_rollout(
             &day,
@@ -518,7 +590,18 @@ fn codex(tmp: &Path, scenario: Scenario) -> Fixture {
             &["task_started"],
         );
     }
-    let mut source = super::codex::CodexSessionSource::at_root(tmp.to_path_buf());
+    // The root rollout was last written a minute ago.
+    set_age(&root_path, Duration::from_secs(60));
+    let open = match scenario {
+        // No `codex` process holds the rollout any more.
+        Sc::Killed => HashSet::new(),
+        // A new `codex` in the same cwd (possibly on the old pid) holds its
+        // own rollout.
+        Sc::PidReuse => HashSet::from([codex_rollout_name("019f0000-0000-7000-8000-0000000000ff")]),
+        _ => HashSet::from([codex_rollout_name(CODEX_ROOT)]),
+    };
+    let mut source = super::codex::CodexSessionSource::at_root(tmp.to_path_buf())
+        .with_process_probe(Box::new(FixedOpenFiles(OpenFileEvidence::Open(open))));
     let (detected, _) = source.detect().unwrap();
     subject_fixture(detected, scenario, CODEX_ROOT, CODEX_CHILD)
 }
@@ -565,10 +648,21 @@ fn cursor(tmp: &Path, scenario: Scenario) -> Fixture {
     let mut lines = vec![cursor_user("fix it"), cursor_assistant("on it")];
     match scenario {
         Sc::Idle => lines.push(r#"{"type":"turn_ended","status":"success"}"#.into()),
-        Sc::Waiting => panic!("route1-B: write the Cursor approval-prompt fixture"),
+        Sc::Waiting => panic!("route1-B: no Cursor approval signal is known yet"),
         _ => {}
     }
-    write_lines(&session_dir.join(format!("{CURSOR_ROOT}.jsonl")), &lines);
+    let transcript = session_dir.join(format!("{CURSOR_ROOT}.jsonl"));
+    write_lines(&transcript, &lines);
+    // The transcript was last written a minute ago.
+    set_age(&transcript, Duration::from_secs(60));
+    // An Agent CLI chat: it has a chat store, `chats/<md5(cwd)>/<id>/`.
+    let chats = tmp.join("cli-chats");
+    std::fs::create_dir_all(
+        chats
+            .join("0b5e5d5b0ec0f4f2f7f5a1c3b0d0c0de")
+            .join(CURSOR_ROOT),
+    )
+    .unwrap();
     if scenario == Sc::Subagent {
         write_lines(
             &session_dir
@@ -577,7 +671,19 @@ fn cursor(tmp: &Path, scenario: Scenario) -> Fixture {
             &[cursor_user("explore"), cursor_assistant("looking")],
         );
     }
-    let mut source = super::cursor::CursorSessionSource::at_root(tmp.to_path_buf());
+    let open: HashSet<String> = match scenario {
+        // No Agent CLI process holds the chat store any more.
+        Sc::Killed => HashSet::new(),
+        // A new Agent CLI in the same cwd (possibly on the old pid) holds
+        // its own chat.
+        Sc::PidReuse => HashSet::from(["c0000000-0000-4000-8000-0000000000ff".to_string()]),
+        _ => HashSet::from([CURSOR_ROOT.to_string()]),
+    };
+    let mut source = super::cursor::CursorSessionSource::at_root(tmp.to_path_buf())
+        .with_process_probe(
+            Box::new(FixedOpenFiles(OpenFileEvidence::Open(open))),
+            chats,
+        );
     let (detected, _) = source.detect().unwrap();
     subject_fixture(detected, scenario, CURSOR_ROOT, CURSOR_CHILD)
 }
@@ -606,8 +712,7 @@ fn pi(tmp: &Path, scenario: Scenario) -> Fixture {
         Sc::Idle => serde_json::json!({"id": "m2", "timestamp": now_ms - 580_000,
             "type": "message", "message": {"role": "assistant", "model": "m",
             "content": [{"type": "text", "text": "Done."}], "stopReason": "stop"}}),
-        Sc::Waiting => panic!("route1-B: write the Pi waiting fixture"),
-        Sc::Subagent => panic!("route1-B: write the Pi subagent fixture"),
+        Sc::Waiting | Sc::Subagent => unreachable!("not applicable to Pi"),
         // Mid-tool: the toolCall has no result yet.
         _ => serde_json::json!({"id": "m2", "timestamp": now_ms - 580_000,
             "type": "message", "message": {"role": "assistant", "model": "m",
@@ -646,10 +751,12 @@ fn render_cell(cell: &Cell) -> String {
     let expect = match &cell.expect {
         Listed(status) => format!("{status:?}"),
         Hidden => "hidden".to_string(),
+        Expect::NotApplicable(_) => return "➖ n/a".to_string(),
     };
-    match cell.gap {
-        None => format!("✅ {expect}"),
-        Some(_) => format!("❌ gap (want {expect})"),
+    match (cell.gap, cell.heuristic) {
+        (Some(_), _) => format!("❌ gap (want {expect})"),
+        (None, Some(_)) => format!("⚠️ {expect} (heuristic)"),
+        (None, None) => format!("✅ {expect}"),
     }
 }
 
@@ -668,15 +775,35 @@ fn render_table() -> String {
         }
         out += "\n";
     }
-    out += "\nGaps (each is an `#[ignore = \"route1-B: …\"]` test):\n\n";
-    for cell in MATRIX.iter().filter(|c| c.gap.is_some()) {
-        out += &format!(
-            "- {} × {}: {}\n",
-            cell.source.label(),
-            cell.scenario.label(),
-            cell.gap.unwrap()
-        );
-    }
+    let section = |out: &mut String, title: &str, why: fn(&Cell) -> Option<&'static str>| {
+        let cells: Vec<&Cell> = MATRIX.iter().filter(|c| why(c).is_some()).collect();
+        if cells.is_empty() {
+            return;
+        }
+        *out += &format!("\n{title}\n\n");
+        for cell in cells {
+            *out += &format!(
+                "- {} × {}: {}\n",
+                cell.source.label(),
+                cell.scenario.label(),
+                why(cell).unwrap()
+            );
+        }
+    };
+    section(
+        &mut out,
+        "Gaps (each is an `#[ignore = \"route1-B: …\"]` test):",
+        |c| c.gap,
+    );
+    section(
+        &mut out,
+        "Heuristic cells (the test passes; known errors):",
+        |c| c.heuristic,
+    );
+    section(&mut out, "Not applicable (no test):", |c| match c.expect {
+        Expect::NotApplicable(why) => Some(why),
+        _ => None,
+    });
     out
 }
 
@@ -767,7 +894,6 @@ fn codex_working() {
     check(So::Codex, Sc::Working);
 }
 #[test]
-#[ignore = "route1-B: Codex approval requests are not detected; needs the rollout signal and a fixture"]
 fn codex_waiting() {
     check(So::Codex, Sc::Waiting);
 }
@@ -776,12 +902,10 @@ fn codex_idle() {
     check(So::Codex, Sc::Idle);
 }
 #[test]
-#[ignore = "route1-B: no process evidence for Codex; a killed rollout stays Working until the 4h freshness window ends"]
 fn codex_killed() {
     check(So::Codex, Sc::Killed);
 }
 #[test]
-#[ignore = "route1-B: no process evidence for Codex; a killed rollout stays Working until the 4h freshness window ends"]
 fn codex_pid_reuse() {
     check(So::Codex, Sc::PidReuse);
 }
@@ -795,7 +919,8 @@ fn cursor_working() {
     check(So::Cursor, Sc::Working);
 }
 #[test]
-#[ignore = "route1-B: Cursor approval prompts are not detected; needs the transcript signal and a fixture"]
+#[ignore = "route1-B: no approval signal is known in the Cursor transcript (records are role messages and \
+`turn_ended`); not yet checked whether a pending `tool_use` is written before the prompt"]
 fn cursor_waiting() {
     check(So::Cursor, Sc::Waiting);
 }
@@ -804,12 +929,10 @@ fn cursor_idle() {
     check(So::Cursor, Sc::Idle);
 }
 #[test]
-#[ignore = "route1-B: no process evidence for Cursor; a killed transcript stays Working until the freshness window ends"]
 fn cursor_killed() {
     check(So::Cursor, Sc::Killed);
 }
 #[test]
-#[ignore = "route1-B: no process evidence for Cursor; a killed transcript stays Working until the freshness window ends"]
 fn cursor_pid_reuse() {
     check(So::Cursor, Sc::PidReuse);
 }
@@ -823,11 +946,6 @@ fn pi_working() {
     check(So::Pi, Sc::Working);
 }
 #[test]
-#[ignore = "route1-B: no waiting-on-user signal is known for Pi; confirm whether Pi has one, then add a fixture"]
-fn pi_waiting() {
-    check(So::Pi, Sc::Waiting);
-}
-#[test]
 fn pi_idle() {
     check(So::Pi, Sc::Idle);
 }
@@ -838,9 +956,4 @@ fn pi_killed() {
 #[test]
 fn pi_pid_reuse() {
     check(So::Pi, Sc::PidReuse);
-}
-#[test]
-#[ignore = "route1-B: Pi subagent sessions are not modelled; confirm the transcript layout, then add a fixture"]
-fn pi_subagent() {
-    check(So::Pi, Sc::Subagent);
 }

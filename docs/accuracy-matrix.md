@@ -27,23 +27,29 @@ Scenarios:
 
 Status names: `Working`, `NeedsAttention` (needs you), `WaitingForInput` (idle), `hidden` (no row).
 
+Marks: ✅ proven by a test; ⚠️ proven by a test, but the detection is a heuristic with known errors; ❌ gap (ignored test); ➖ the situation does not exist for that source (no test).
+
+Codex and Cursor killed / pid reuse: an Agent CLI session ends when no agent process holds its transcript open and it was not written in the last 10 s (`session/agent_liveness.rs`). The cells inject the open-file evidence.
+
 <!-- accuracy-matrix:start -->
 | Source | working | waiting | idle | killed | pid reuse | subagent |
 |---|---|---|---|---|---|---|
 | Claude Code (CLI backend) | ✅ Working | ✅ NeedsAttention | ✅ WaitingForInput | ✅ hidden | ✅ hidden | ✅ hidden |
 | Claude Code (legacy backend) | ✅ Working | ✅ NeedsAttention | ✅ WaitingForInput | ✅ hidden | ✅ hidden | ✅ hidden |
-| Codex | ✅ Working | ❌ gap (want NeedsAttention) | ✅ WaitingForInput | ❌ gap (want hidden) | ❌ gap (want hidden) | ✅ Working |
-| Cursor | ✅ Working | ❌ gap (want NeedsAttention) | ✅ WaitingForInput | ❌ gap (want hidden) | ❌ gap (want hidden) | ✅ Working |
-| Pi | ✅ Working | ❌ gap (want NeedsAttention) | ✅ WaitingForInput | ✅ hidden | ✅ hidden | ❌ gap (want Working) |
+| Codex | ✅ Working | ⚠️ NeedsAttention (heuristic) | ✅ WaitingForInput | ✅ hidden | ✅ hidden | ✅ Working |
+| Cursor | ✅ Working | ❌ gap (want NeedsAttention) | ✅ WaitingForInput | ✅ hidden | ✅ hidden | ✅ Working |
+| Pi | ✅ Working | ➖ n/a | ✅ WaitingForInput | ✅ hidden | ✅ hidden | ➖ n/a |
 
 Gaps (each is an `#[ignore = "route1-B: …"]` test):
 
-- Codex × waiting: Codex approval requests are not detected; needs the rollout signal and a fixture
-- Codex × killed: no process evidence for Codex; a killed rollout stays Working until the 4h freshness window ends
-- Codex × pid reuse: no process evidence for Codex; a killed rollout stays Working until the 4h freshness window ends
-- Cursor × waiting: Cursor approval prompts are not detected; needs the transcript signal and a fixture
-- Cursor × killed: no process evidence for Cursor; a killed transcript stays Working until the freshness window ends
-- Cursor × pid reuse: no process evidence for Cursor; a killed transcript stays Working until the freshness window ends
-- Pi × waiting: no waiting-on-user signal is known for Pi; confirm whether Pi has one, then add a fixture
-- Pi × subagent: Pi subagent sessions are not modelled; confirm the transcript layout, then add a fixture
+- Cursor × waiting: no approval signal is known in the Cursor transcript (records are role messages and `turn_ended`); not yet checked whether a pending `tool_use` is written before the prompt
+
+Heuristic cells (the test passes; known errors):
+
+- Codex × waiting: an escalated tool call with no later record for 35 s (`CODEX_ESCALATION_APPROVAL_DELAY_MS`) counts as waiting for approval. Known errors: (a) after the user approves, approval delay + the command's 30 s yield can pass 35 s and show NeedsAttention for a short time; (b) approvals without a marker (`apply_patch` outside the writable roots, untrusted-mode prompts) stay Working. `request_user_input` is exact. See docs/research/codex-approval-signal-2026-10.md
+
+Not applicable (no test):
+
+- Pi × waiting: Pi 0.87.1 has no approval step: tools run with the process's OS permissions (pi-coding-agent docs/security.md:33, docs/how-pi-works.md:49), and the transcript has only user, assistant and toolResult messages (pi.rs:8-10). Only an extension can ask the user (docs/extensions.md:7); c9watch does not model extensions
+- Pi × subagent: Pi 0.87.1 has no built-in subagents (none in its docs); every Pi session is a root (pi.rs:317)
 <!-- accuracy-matrix:end -->
