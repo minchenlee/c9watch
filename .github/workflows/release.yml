@@ -136,7 +136,8 @@ jobs:
           trap cleanup EXIT
           for _ in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:9210/health >/dev/null; then
-              curl --fail --silent http://127.0.0.1:9210/info | grep -q '"version":"0.10.0"'
+              VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+              curl --fail --silent http://127.0.0.1:9210/info | grep -q "\"version\":\"$VERSION\""
               exit 0
             fi
             if ! kill -0 "$PID" 2>/dev/null; then
