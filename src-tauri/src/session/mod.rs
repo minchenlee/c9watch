@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod accuracy_matrix;
+mod agent_liveness;
 mod cache;
 pub mod codex;
 pub mod cursor;

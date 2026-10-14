@@ -130,14 +130,43 @@ Process table during the test:
 
 ## Process evidence (step 3)
 
-- Codex: a live `codex` process whose `argv[1]` is not `app-server` (and not
-  another non-session subcommand) attaches to sessions in its cwd, like
-  `pi_liveness.rs`. Applies only to root rollouts with
-  `originator` = `codex-tui` or `codex_exec`. Desktop (`Codex Desktop`) and
-  IDE threads keep the mtime rule. Note: a daemon-run TUI thread records
-  `source: "vscode"`, so the originator, not the source, decides.
-- Because a daemon-run turn continues after its TUI exits, a Working
-  rollout keeps a longer grace than an Idle one.
-- Cursor: a `node` process whose argv[0] basename is `cursor-agent` or
-  `agent` attaches to CLI transcripts under `chats/<md5(cwd)>/`. IDE
-  transcripts keep the mtime rule.
+Code: `src-tauri/src/session/agent_liveness.rs` (classifiers, md5, probes),
+matcher and sysinfo scan shared from `pi_liveness.rs`.
+
+- Same rules as pi: per cwd, N live processes keep the N newest fresh
+  sessions; a process keeps only sessions written after it started (10 s
+  grace); a session written in the last 10 s stays; evidence only ends a
+  session early; no usable evidence (table unreadable, an unattributable
+  candidate process) keeps the mtime windows unchanged.
+- Codex candidates (`codex.rs`, `is_process_liveness_candidate`): root
+  rollouts with `originator` `codex_exec`, or `codex-tui` except a
+  daemon-run thread (`source` is not `cli`) that is Working. The daemon keeps
+  that turn running after its TUI exits, so its card stays until the turn
+  completes; then the Idle thread has no attached TUI and ends. Desktop
+  (`Codex Desktop`) and IDE threads, sub-agents and linked parents keep the
+  mtime rule. Session processes: native `codex` binary except `app-server`,
+  `mcp-server`, `exec-server`.
+- Cursor candidates (`cursor.rs`): root chats that have an Agent CLI store
+  `~/.cursor/chats/<hash>/<session-id>/`. Processes: `node` (or
+  `cursor-agent`/`agent`) whose argv[0] basename is `cursor-agent` or whose
+  argv has a `/cursor-agent/` path; keyed by md5(cwd), which equals `<hash>`
+  (checked on 3 local chats). IDE chats keep the mtime rule.
+- Result: a `kill -9` CLI session ends 10 s after its last write (a few
+  3.5 s polls) instead of after 30 min (Idle) or 4 h (Working).
+
+### Live result (2026-10-14 22:27) and open issue
+
+`kill -9 56197` (in-process TUI, Idle): 15 s later both probe sessions were
+still listed. Cause: pi's pass 2 lets a process whose own cwd has no fresh
+session keep one session from another cwd (needed for cross-cwd resume:
+`tui/src/cwd_prompt.rs` lets resume use the session's cwd, and Codex never
+calls `set_current_dir`). This machine had 9 such `codex` processes
+(`~/Demo/*` stand-ins, idle TUIs from earlier days), so pass 2 kept the
+killed sessions. Unit tests cover the cwd rules, but in this environment the
+evidence rarely ends a session.
+
+Better evidence seen with `lsof`: every session-owning `codex` process holds
+its rollout open (TUI 56197 held run B's rollout as fd 48u; the daemon closed
+run A's rollout after its TUI left and kept only a still-loaded thread open).
+Decision pending (asked c9-main-orch): read open files per `codex` process
+(libproc / `/proc/<pid>/fd`), or `lsof`, or keep the cwd rule.

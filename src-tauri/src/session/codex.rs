@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
+use super::agent_liveness::SysinfoCodexProcessProbe;
 use super::parser::MessageType;
+use super::pi_liveness::{pi_alive_flags, PiLivenessCandidate, PiProcessProbe};
 use super::source::{
     AgentKind, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionKind,
     SessionProvider, SessionSource, SessionSurface,
@@ -289,6 +291,8 @@ pub struct CodexSessionSource {
     capture_tool_messages: bool,
     /// When true (and using the full-parse path), keep Codex tool use/result records.
     include_tools: bool,
+    /// Live `codex` processes; `None` keeps the mtime-only behaviour.
+    process_probe: Option<Box<dyn PiProcessProbe>>,
     #[cfg(test)]
     parse_count: usize,
     #[cfg(test)]
@@ -298,7 +302,13 @@ pub struct CodexSessionSource {
 impl CodexSessionSource {
     pub fn new() -> Result<Self, SessionDetectorError> {
         let home = dirs::home_dir().ok_or(SessionDetectorError::HomeDirectoryNotFound)?;
-        Ok(Self::at_root(home.join(".codex").join("sessions")))
+        Ok(Self::at_root(home.join(".codex").join("sessions"))
+            .with_process_probe(Box::new(SysinfoCodexProcessProbe::new())))
+    }
+
+    pub(crate) fn with_process_probe(mut self, probe: Box<dyn PiProcessProbe>) -> Self {
+        self.process_probe = Some(probe);
+        self
     }
 
     pub(crate) fn at_root(sessions_root: PathBuf) -> Self {
@@ -309,6 +319,7 @@ impl CodexSessionSource {
             last_full_discovery: None,
             capture_tool_messages: false,
             include_tools: false,
+            process_probe: None,
             #[cfg(test)]
             parse_count: 0,
             #[cfg(test)]
@@ -652,8 +663,8 @@ impl CodexSessionSource {
 
         self.cache.retain(|path, _| existing_paths.contains(path));
 
-        let mut sessions = Vec::new();
-        for (_path, summary, age_secs) in summaries {
+        let mut fresh = Vec::new();
+        for (path, summary, age_secs) in summaries {
             if summary.thread_id.is_empty() || summary.agent_kind == AgentKind::Internal {
                 continue;
             }
@@ -665,6 +676,17 @@ impl CodexSessionSource {
             let linked_parent = linked_parent_ids.contains(&summary.thread_id)
                 && age_secs <= LINKED_PARENT_CEILING_SECS;
             if age_secs > freshness && !linked_parent {
+                continue;
+            }
+            fresh.push((path, summary, linked_parent));
+        }
+        let alive = self.process_alive_flags(&fresh, wall_now);
+
+        let mut sessions = Vec::new();
+        for ((_path, summary, _), alive) in fresh.into_iter().zip(alive) {
+            // An ended session leaves the monitor the same way an expired one
+            // does; history still lists its rollout.
+            if !alive {
                 continue;
             }
 
@@ -706,6 +728,84 @@ impl CodexSessionSource {
         }
         Ok((sessions, DetectionDiagnostics::default()))
     }
+}
+
+impl CodexSessionSource {
+    /// For each fresh rollout, whether it stays alive under process evidence.
+    /// Only rollouts that a terminal `codex` process owns are candidates; the
+    /// process table is read only when one exists.
+    fn process_alive_flags(
+        &mut self,
+        fresh: &[(PathBuf, CodexRolloutSummary, bool)],
+        wall_now: SystemTime,
+    ) -> Vec<bool> {
+        let mut alive = vec![true; fresh.len()];
+        let candidate_indexes: Vec<usize> = fresh
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, summary, linked_parent))| {
+                !linked_parent && is_process_liveness_candidate(summary)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let Some(probe) = self.process_probe.as_mut() else {
+            return alive;
+        };
+        if candidate_indexes.is_empty() {
+            return alive;
+        }
+        let evidence = probe.scan();
+        let candidates: Vec<PiLivenessCandidate<'_>> = candidate_indexes
+            .iter()
+            .map(|&index| {
+                let (path, summary, _) = &fresh[index];
+                PiLivenessCandidate {
+                    cwd: summary.cwd.to_str().filter(|cwd| !cwd.is_empty()),
+                    modified_ms: rollout_modified_ms(path),
+                }
+            })
+            .collect();
+        let flags = pi_alive_flags(&candidates, &evidence, system_time_ms(wall_now));
+        for (index, flag) in candidate_indexes.into_iter().zip(flags) {
+            alive[index] = flag;
+        }
+        alive
+    }
+}
+
+/// Whether a live `codex` process in the session cwd is the only thing that
+/// keeps this rollout open. Desktop and IDE threads have no such process and
+/// keep the mtime rule; spawned sub-agents follow their root.
+///
+/// A plain TUI runs its thread inside the shared app-server daemon (the
+/// rollout then records `source: "vscode"` with `originator: "codex-tui"`),
+/// and the daemon continues a running turn after the TUI exits. Such a turn
+/// is never ended by process evidence while it is Working.
+fn is_process_liveness_candidate(summary: &CodexRolloutSummary) -> bool {
+    if summary.agent_kind != AgentKind::Root {
+        return false;
+    }
+    match summary.originator.as_str() {
+        "codex_exec" => true,
+        "codex-tui" => {
+            let runs_in_daemon = summary.source != "cli";
+            !(runs_in_daemon && summary.lifecycle == CodexLifecycle::Working)
+        }
+        _ => false,
+    }
+}
+
+fn rollout_modified_ms(path: &Path) -> i64 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map(system_time_ms)
+        .unwrap_or(0)
+}
+
+fn system_time_ms(time: SystemTime) -> i64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Deserialize)]
@@ -3680,5 +3780,207 @@ mod tests {
         let summary = source.summary_for(&path).unwrap();
         assert!(!summary.needs_attention_at(at(3600)));
         assert_eq!(summary.latest_message(), Some("after"));
+    }
+
+    // ── Process evidence (codex_liveness) ─────────────────────────────
+
+    use crate::session::pi_liveness::PiProcessEvidence;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct FakeProbe {
+        evidence: PiProcessEvidence,
+        scans: Arc<AtomicUsize>,
+    }
+
+    impl PiProcessProbe for FakeProbe {
+        fn scan(&mut self) -> PiProcessEvidence {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            self.evidence.clone()
+        }
+    }
+
+    /// Live `codex` processes in `/tmp/project`, started at the given times.
+    fn processes(starts: &[Option<SystemTime>]) -> PiProcessEvidence {
+        PiProcessEvidence::Live(HashMap::from([(
+            "/tmp/project".to_string(),
+            starts.iter().map(|s| s.map(system_time_ms)).collect(),
+        )]))
+    }
+
+    struct LivenessCase {
+        _temp: TempDir,
+        path: PathBuf,
+        source: CodexSessionSource,
+        scans: Arc<AtomicUsize>,
+        now: DateTime<Local>,
+        wall_now: SystemTime,
+    }
+
+    /// One root rollout written `age` ago, with `idle` choosing whether the
+    /// turn has completed, observed through `evidence`.
+    fn liveness_case(
+        source_kind: &str,
+        originator: &str,
+        idle: bool,
+        age: Duration,
+        evidence: PiProcessEvidence,
+    ) -> LivenessCase {
+        let temp = TempDir::new().unwrap();
+        let now = Local::now();
+        let wall_now = SystemTime::now();
+        let day = temp.path().join(now.format("%Y/%m/%d").to_string());
+        fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout-liveness.jsonl");
+        let mut lines = root_fixture(Value::String(source_kind.into()), originator);
+        if idle {
+            lines.push(event(
+                "2026-07-13T00:00:03Z",
+                "event_msg",
+                serde_json::json!({"type":"task_complete"}),
+            ));
+        }
+        write_lines(&path, &lines, true);
+        set_modified_age(&path, wall_now, age);
+        let scans = Arc::new(AtomicUsize::new(0));
+        let source = CodexSessionSource::at_root(temp.path().to_path_buf()).with_process_probe(
+            Box::new(FakeProbe {
+                evidence,
+                scans: scans.clone(),
+            }),
+        );
+        LivenessCase {
+            _temp: temp,
+            path,
+            source,
+            scans,
+            now,
+            wall_now,
+        }
+    }
+
+    impl LivenessCase {
+        fn visible(&mut self) -> bool {
+            let (sessions, _) = self
+                .source
+                .detect_at_with_clock(self.now, self.wall_now)
+                .unwrap();
+            session_ids(&sessions).contains("root-id")
+        }
+    }
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn killed_cli_session_ends_within_a_few_polls() {
+        // Idle TUI, process gone: ended instead of lingering 30 minutes.
+        let mut case = liveness_case("cli", "codex-tui", true, MINUTE, processes(&[]));
+        assert!(!case.visible());
+        // In-process TUI killed mid-turn: ended instead of lingering 4 hours.
+        let mut case = liveness_case("cli", "codex-tui", false, MINUTE, processes(&[]));
+        assert!(!case.visible());
+        // `codex exec` that exited.
+        let mut case = liveness_case("exec", "codex_exec", false, MINUTE, processes(&[]));
+        assert!(!case.visible());
+    }
+
+    #[test]
+    fn live_process_in_cwd_keeps_its_session() {
+        let started = SystemTime::now() - 10 * MINUTE;
+        let mut case = liveness_case(
+            "cli",
+            "codex-tui",
+            true,
+            MINUTE,
+            processes(&[Some(started)]),
+        );
+        assert!(case.visible());
+        let mut case = liveness_case("cli", "codex-tui", true, MINUTE, processes(&[None]));
+        assert!(case.visible(), "unknown start time never ends a session");
+    }
+
+    #[test]
+    fn restarted_tui_does_not_revive_a_killed_session() {
+        // The new process started after the old rollout's last write.
+        let started = SystemTime::now() - Duration::from_secs(5);
+        let mut case = liveness_case(
+            "cli",
+            "codex-tui",
+            true,
+            MINUTE,
+            processes(&[Some(started)]),
+        );
+        assert!(!case.visible());
+    }
+
+    #[test]
+    fn daemon_turn_survives_its_tui_until_the_turn_ends() {
+        // A plain TUI runs its thread in the app-server daemon (source
+        // "vscode"); the daemon keeps the turn running after the TUI dies.
+        let mut case = liveness_case("vscode", "codex-tui", false, 30 * MINUTE, processes(&[]));
+        assert!(case.visible());
+        assert_eq!(
+            case.scans.load(Ordering::SeqCst),
+            0,
+            "no candidate, no scan"
+        );
+
+        // The turn completes in the daemon; no TUI is attached any more.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&case.path)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            event(
+                "2026-07-13T00:10:00Z",
+                "event_msg",
+                serde_json::json!({"type":"task_complete"})
+            )
+        )
+        .unwrap();
+        drop(file);
+        set_modified_age(&case.path, case.wall_now, MINUTE);
+        assert!(!case.visible());
+    }
+
+    #[test]
+    fn desktop_and_ide_threads_keep_the_mtime_rule() {
+        let mut case = liveness_case("vscode", "Codex Desktop", true, MINUTE, processes(&[]));
+        assert!(case.visible());
+        let mut case = liveness_case("vscode", "codex_vscode", true, MINUTE, processes(&[]));
+        assert!(case.visible());
+        assert_eq!(case.scans.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn missing_evidence_or_a_fresh_write_keeps_the_session() {
+        let mut case = liveness_case(
+            "cli",
+            "codex-tui",
+            true,
+            MINUTE,
+            PiProcessEvidence::Unavailable,
+        );
+        assert!(case.visible());
+        let mut case = liveness_case(
+            "cli",
+            "codex-tui",
+            true,
+            Duration::from_secs(2),
+            processes(&[]),
+        );
+        assert!(case.visible(), "written within the grace window");
+        // Evidence never extends past the freshness window.
+        let started = SystemTime::now() - 60 * MINUTE;
+        let mut case = liveness_case(
+            "cli",
+            "codex-tui",
+            true,
+            31 * MINUTE,
+            processes(&[Some(started)]),
+        );
+        assert!(!case.visible());
     }
 }
