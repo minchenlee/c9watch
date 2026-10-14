@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::process::Command;
+
+use crate::jump::{self, plan_jump, AppSurface, JumpPlan, JumpStep, Location, Multiplexer};
 
 /// The strongest native target supported by the existing focus mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -23,6 +26,9 @@ pub fn session_open_target(pid: u32, can_open: bool) -> Option<OpenTarget> {
     if !can_open || pid == 0 {
         return None;
     }
+    if session_multiplexer(pid).is_some() {
+        return Some(OpenTarget::Terminal);
+    }
     let app = find_parent_app(pid).ok()?;
     #[cfg(target_os = "macos")]
     let exact_tty =
@@ -33,91 +39,313 @@ pub fn session_open_target(pid: u32, can_open: bool) -> Option<OpenTarget> {
     Some(open_target_for_app(&app, exact_tty, project_opener))
 }
 
-/// Open the native target: exact tty for Terminal/iTerm2, project for IDE
-/// openers, application otherwise. A project open never selects an IDE terminal.
+/// Open the native target: the exact tmux/Herdr pane plus the terminal that
+/// shows it, the exact tty for Terminal/iTerm2, a unique working directory for
+/// Ghostty, the project for IDE openers, the application otherwise. A project
+/// open never selects an IDE terminal. See `crate::jump` for the decisions.
 pub fn open_session(pid: u32, project_path: String) -> Result<(), String> {
     if pid == 0 {
         return Err("This session does not expose a focusable terminal process".to_string());
     }
-    // Find the parent application by walking up the process tree
-    let app_name = find_parent_app(pid)?;
-
-    // Extract project name from path for window matching
-    let project_name = std::path::Path::new(&project_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let location = resolve_location(pid, Some(&project_path), 0)?;
 
     crate::debug_log::log_info(&format!(
-        "[open_session] App: {}, Project: {}, Path: {}",
-        app_name, project_name, project_path
+        "[open_session] PID {} path {} -> {:?}",
+        pid, project_path, location
     ));
 
     // Supacode: the session's env carries its worktree/tab/surface IDs,
     // so we can focus the exact surface via the bundled `supacode` CLI (macOS only)
     #[cfg(target_os = "macos")]
-    if app_name == "supacode" {
+    if matches!(&location, Location::App(s) if s.app == "supacode") {
         return focus_supacode_session(pid);
     }
 
-    // iTerm2: use tty matching to focus the correct tab (macOS only)
-    #[cfg(target_os = "macos")]
-    if app_name == "iTerm" || app_name == "iTerm2" {
-        return focus_iterm2_session(pid);
+    run_jump_plan(&plan_jump(&location))
+}
+
+/// Nesting limit for multiplexers (tmux in Herdr in tmux ...).
+const MAX_JUMP_DEPTH: u8 = 3;
+
+/// The multiplexer that owns this process's pane, if any, with its env.
+fn session_multiplexer(pid: u32) -> Option<(Multiplexer, HashMap<String, String>)> {
+    let env = process_env(pid);
+    let tmux_server = env.get("TMUX").and_then(|t| jump::tmux_server_pid(t));
+    let herdr_pane = env.contains_key("HERDR_PANE_ID");
+    if tmux_server.is_none() && !herdr_pane {
+        return None;
     }
+    let kind = jump::innermost_multiplexer(&process_ancestors(pid), tmux_server, herdr_pane)?;
+    Some((kind, env))
+}
 
-    // macOS Terminal.app: use tty matching to focus the correct tab (macOS only)
-    #[cfg(target_os = "macos")]
-    if app_name == "Terminal" {
-        return focus_terminal_session(pid);
-    }
-
-    // JetBrains IDEs: use URL scheme to focus the correct project window
-    if is_jetbrains_ide(&app_name) {
-        return focus_jetbrains_window(&app_name, &project_path);
-    }
-
-    // Try to use app-specific CLI to open/focus the correct window
-    if let Some(cli_path) = get_app_cli(&app_name) {
-        crate::debug_log::log_info(&format!(
-            "[open_session] Using CLI: {} to open: {}",
-            cli_path, project_path
-        ));
-
-        // VS Code family uses -r flag to reuse window, -g to not open new if exists
-        let output =
-            if app_name == "Visual Studio Code" || app_name == "Cursor" || app_name == "Windsurf" {
-                Command::new(&cli_path)
-                    .arg("-r") // Reuse existing window
-                    .arg("-g") // Don't grab focus for new file (but we want focus)
-                    .arg(&project_path)
-                    .output()
-            } else {
-                // Zed and others just take the path
-                Command::new(&cli_path).arg(&project_path).output()
-            };
-
-        match output {
-            Ok(out) => {
-                if out.status.success() {
-                    crate::debug_log::log_info("[open_session] CLI succeeded");
-                    return Ok(());
-                } else {
-                    let error = String::from_utf8_lossy(&out.stderr);
-                    crate::debug_log::log_error(&format!("[open_session] CLI error: {}", error));
+/// Gather the facts `plan_jump` needs, from the session process outwards.
+fn resolve_location(pid: u32, project_path: Option<&str>, depth: u8) -> Result<Location, String> {
+    if depth < MAX_JUMP_DEPTH {
+        match session_multiplexer(pid) {
+            Some((Multiplexer::Tmux, env)) => {
+                if let Some(location) = resolve_tmux(&env, depth) {
+                    return Ok(location);
                 }
             }
-            Err(e) => {
-                crate::debug_log::log_error(&format!("[open_session] Failed to run CLI: {}", e));
+            Some((Multiplexer::Herdr, env)) => {
+                if let Some(pane) = env.get("HERDR_PANE_ID") {
+                    let socket = env.get("HERDR_SOCKET_PATH").cloned();
+                    let outer = herdr_client_pid(socket.as_deref())
+                        .and_then(|client| resolve_location(client, None, depth + 1).ok())
+                        .map(Box::new);
+                    return Ok(Location::Herdr {
+                        bin: env
+                            .get("HERDR_BIN_PATH")
+                            .cloned()
+                            .unwrap_or_else(|| "herdr".to_string()),
+                        socket,
+                        pane: pane.clone(),
+                        outer,
+                    });
+                }
             }
+            None => {}
         }
-        return Err("Could not open the session's project".to_string());
     }
 
-    // Platform-specific fallback to activate the app
-    activate_app_fallback(&app_name)?;
+    let app = find_parent_app(pid)?;
+    #[cfg(target_os = "macos")]
+    let tty = if matches!(app.as_str(), "Terminal" | "iTerm" | "iTerm2") {
+        get_session_tty(pid)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let tty = None;
 
+    // Only the session itself is tied to the project; a multiplexer client's
+    // cwd says nothing about which window or tab it is in.
+    let mut surface = AppSurface {
+        app: app.clone(),
+        tty,
+        ..Default::default()
+    };
+    if let Some(path) = project_path {
+        if is_jetbrains_ide(&app) {
+            let scheme = jetbrains_url_scheme(&app).unwrap_or("idea");
+            let root = find_jetbrains_project_root(path);
+            surface.jetbrains_url = Some(format!(
+                "{}://open?file={}",
+                scheme,
+                encode_path_for_url(&root)
+            ));
+        } else if let Some(cli) = get_app_cli(&app) {
+            surface.cli = Some(cli);
+            surface.project_path = Some(path.to_string());
+        } else if cfg!(target_os = "macos") && app == "Ghostty" {
+            surface.ghostty_cwd = Some(path.to_string());
+        }
+    }
+    Ok(Location::App(surface))
+}
+
+fn resolve_tmux(env: &HashMap<String, String>, depth: u8) -> Option<Location> {
+    let socket = jump::tmux_socket(env.get("TMUX")?)?.to_string();
+    let pane = env.get("TMUX_PANE")?.clone();
+    let bin = find_tmux_bin();
+    let tmux = |args: &[&str]| -> Option<String> {
+        let out = Command::new(&bin)
+            .arg("-S")
+            .arg(&socket)
+            .args(args)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    let pane_session = tmux(&["display-message", "-p", "-t", &pane, "#{session_name}"])?;
+    let clients = tmux(&[
+        "list-clients",
+        "-F",
+        "#{client_tty}\t#{session_name}\t#{client_activity}",
+    ])
+    .unwrap_or_default();
+    let chosen = jump::choose_tmux_client(&clients, pane_session.trim());
+    let outer = chosen
+        .as_ref()
+        .and_then(|(tty, _)| process_on_tty(tty, "tmux"))
+        .and_then(|client| resolve_location(client, None, depth + 1).ok())
+        .map(Box::new);
+    Some(Location::Tmux {
+        bin,
+        socket,
+        pane,
+        switch_client: chosen.and_then(|(tty, switch)| switch.then_some(tty)),
+        outer,
+    })
+}
+
+/// GUI apps do not inherit a shell PATH, so look in the usual install places.
+fn find_tmux_bin() -> String {
+    [
+        "/opt/homebrew/bin/tmux",
+        "/usr/local/bin/tmux",
+        "/usr/bin/tmux",
+        "/run/current-system/sw/bin/tmux",
+    ]
+    .iter()
+    .find(|p| std::path::Path::new(p).exists())
+    .map(|p| p.to_string())
+    .unwrap_or_else(|| "tmux".to_string())
+}
+
+/// First Herdr client attached to the session that owns `socket`.
+fn herdr_client_pid(socket: Option<&str>) -> Option<u32> {
+    let out = Command::new("ps")
+        .args(["-axo", "pid=,tty=,command="])
+        .output()
+        .ok()?;
+    let session = jump::herdr_session_name(socket);
+    jump::herdr_clients(&String::from_utf8_lossy(&out.stdout), session.as_deref())
+        .first()
+        .map(|(pid, _)| *pid)
+}
+
+/// The pid of a process named `name` whose controlling tty is `tty`.
+fn process_on_tty(tty: &str, name: &str) -> Option<u32> {
+    let tty = tty.strip_prefix("/dev/").unwrap_or(tty);
+    let out = Command::new("ps")
+        .args(["-t", tty, "-o", "pid=,comm="])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| {
+            let (pid, comm) = line.trim().split_once(char::is_whitespace)?;
+            let base = comm.trim().rsplit('/').next()?;
+            (base == name).then(|| pid.parse().ok()).flatten()
+        })
+}
+
+/// `(pid, command)` for the process and its ancestors, nearest first.
+fn process_ancestors(pid: u32) -> Vec<(u32, String)> {
+    let mut chain = Vec::new();
+    let mut current = pid;
+    for _ in 0..20 {
+        let Ok(out) = Command::new("ps")
+            .args(["-o", "ppid=,comm=", "-p", &current.to_string()])
+            .output()
+        else {
+            break;
+        };
+        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let Some((ppid, comm)) = line.split_once(char::is_whitespace) else {
+            break;
+        };
+        chain.push((current, comm.trim().to_string()));
+        match ppid.trim().parse::<u32>() {
+            Ok(ppid) if ppid > 1 => current = ppid,
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// Run the steps of a jump plan in order; stop at the first failure.
+fn run_jump_plan(plan: &JumpPlan) -> Result<(), String> {
+    for step in &plan.steps {
+        match step {
+            JumpStep::Run {
+                program,
+                args,
+                env,
+                fallback_app,
+            } => {
+                let out = Command::new(program)
+                    .args(args)
+                    .envs(env.iter().map(|(k, v)| (k, v)))
+                    .output()
+                    .map_err(|e| format!("Failed to run {}: {}", program, e))?;
+                if !out.status.success() {
+                    let error = String::from_utf8_lossy(&out.stderr);
+                    crate::debug_log::log_error(&format!(
+                        "[open_session] {} {:?} failed: {}",
+                        program, args, error
+                    ));
+                    match fallback_app {
+                        Some(app) => activate_app_fallback(app)?,
+                        None => return Err(format!("Could not jump to the session: {}", error)),
+                    }
+                }
+            }
+            JumpStep::AppleScript {
+                script,
+                require_found,
+            } => {
+                let result = run_applescript(script)?;
+                crate::debug_log::log_info(&format!("[open_session] AppleScript: {}", result));
+                if *require_found && result != "found" {
+                    return Err("The session's exact terminal tab was not found".to_string());
+                }
+            }
+            JumpStep::Activate(app) => activate_app_fallback(app)?,
+        }
+    }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_applescript(script: &str) -> Result<String, String> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|e| format!("Failed to run AppleScript: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_applescript(_script: &str) -> Result<String, String> {
+    Err("AppleScript is only available on macOS".to_string())
+}
+
+/// All environment variables of a running process (current user only).
+#[cfg(target_os = "macos")]
+fn process_env(pid: u32) -> HashMap<String, String> {
+    let Ok(output) = Command::new("ps")
+        .args(["eww", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return HashMap::new();
+    };
+    // `ps eww` appends env as space-separated KEY=VALUE words after the
+    // command. Later words win, so env overrides look-alike arguments.
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter_map(|word| word.split_once('='))
+        .filter(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn process_env(pid: u32) -> HashMap<String, String> {
+    std::fs::read(format!("/proc/{}/environ", pid))
+        .map(|raw| {
+            raw.split(|b| *b == 0)
+                .filter_map(|kv| {
+                    let kv = String::from_utf8_lossy(kv);
+                    let (k, v) = kv.split_once('=')?;
+                    Some((k.to_string(), v.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_env(_pid: u32) -> HashMap<String, String> {
+    HashMap::new()
 }
 
 /// Get the controlling tty of a process via `ps -o tty=`
@@ -165,25 +393,12 @@ fn get_session_tty(pid: u32) -> Option<String> {
     None
 }
 
-/// Read a single environment variable from a running process via `ps eww`.
+/// Read a single environment variable from a running process.
 /// Only visible for processes owned by the current user, which is the case
-/// for the Claude sessions c9watch monitors.
+/// for the sessions c9watch monitors.
 #[cfg(target_os = "macos")]
 fn get_process_env(pid: u32, key: &str) -> Option<String> {
-    let output = Command::new("ps")
-        .arg("eww")
-        .arg("-o")
-        .arg("command=")
-        .arg("-p")
-        .arg(pid.to_string())
-        .output()
-        .ok()?;
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let prefix = format!("{}=", key);
-    // `ps eww` appends env as space-separated KEY=VALUE words. Supacode IDs are
-    // URL-encoded / UUIDs, so they never contain spaces.
-    raw.split_whitespace()
-        .find_map(|word| word.strip_prefix(prefix.as_str()).map(|v| v.to_string()))
+    process_env(pid).remove(key)
 }
 
 /// Locate the `supacode` CLI bundled with the app
@@ -265,171 +480,6 @@ fn focus_supacode_session(pid: u32) -> Result<(), String> {
         }
     }
 
-    Ok(())
-}
-
-/// Focus the correct iTerm2 tab/session by matching tty
-#[cfg(target_os = "macos")]
-fn focus_iterm2_session(pid: u32) -> Result<(), String> {
-    let tty = get_session_tty(pid);
-    crate::debug_log::log_info(&format!(
-        "[open_session] iTerm2 tty for PID {}: {:?}",
-        pid, tty
-    ));
-
-    let Some(tty) = tty else {
-        return Err("The session's exact iTerm2 tty is unavailable".to_string());
-    };
-
-    // AppleScript: iterate all iTerm2 sessions, match by tty, focus it
-    let script = format!(
-        r#"
-        tell application "iTerm2"
-            activate
-            repeat with w in windows
-                repeat with t in tabs of w
-                    repeat with s in sessions of t
-                        if tty of s ends with "{tty}" then
-                            select s
-                            select t
-                            set index of w to 1
-                            return "found"
-                        end if
-                    end repeat
-                end repeat
-            end repeat
-            return "not found"
-        end tell
-        "#,
-        tty = tty
-    );
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .map_err(|e| format!("Failed to run AppleScript: {}", e))?;
-
-    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    crate::debug_log::log_info(&format!(
-        "[open_session] iTerm2 tty match result: {}",
-        result
-    ));
-
-    if !output.status.success() || result != "found" {
-        return Err("The session's exact iTerm2 tab was not found".to_string());
-    }
-    Ok(())
-}
-
-/// Focus the correct macOS Terminal.app tab by matching tty
-///
-/// Terminal.app tabs expose their tty (e.g. "/dev/ttys004") in the scripting
-/// dictionary, so the exact tab can be selected instead of just activating
-/// the app. Unlike iTerm2 there is no session layer — windows contain tabs.
-/// `miniaturized` is a native window property here, so no Accessibility
-/// permission is needed to restore a Dock-minimized window.
-///
-/// Ordering matters: select the tab and raise its window (referenced by a
-/// stable window id, not the loop variable) BEFORE calling `activate`. Calling
-/// `activate` first surfaces whatever window was already frontmost, and a
-/// subsequent raise of a background window does not reliably re-order the
-/// display — so a session in a non-frontmost window would be missed.
-#[cfg(target_os = "macos")]
-fn focus_terminal_session(pid: u32) -> Result<(), String> {
-    let tty = get_session_tty(pid);
-    crate::debug_log::log_info(&format!(
-        "[open_session] Terminal tty for PID {}: {:?}",
-        pid, tty
-    ));
-
-    let Some(tty) = tty else {
-        return Err("The session's exact Terminal tty is unavailable".to_string());
-    };
-
-    // AppleScript: find the tab by tty, select it, raise its window by id,
-    // then activate the app last.
-    let script = format!(
-        r#"
-        tell application "Terminal"
-            set targetWinId to missing value
-            repeat with w in windows
-                repeat with t in tabs of w
-                    if tty of t ends with "{tty}" then
-                        set selected of t to true
-                        set targetWinId to id of w
-                        exit repeat
-                    end if
-                end repeat
-                if targetWinId is not missing value then exit repeat
-            end repeat
-            if targetWinId is missing value then return "not found"
-            try
-                if miniaturized of (window id targetWinId) then set miniaturized of (window id targetWinId) to false
-            end try
-            set index of (window id targetWinId) to 1
-            set frontmost of (window id targetWinId) to true
-            activate
-            return "found"
-        end tell
-        "#,
-        tty = tty
-    );
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .map_err(|e| format!("Failed to run AppleScript: {}", e))?;
-
-    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    crate::debug_log::log_info(&format!(
-        "[open_session] Terminal tty match result: {}",
-        result
-    ));
-
-    if !output.status.success() || result != "found" {
-        return Err("The session's exact Terminal tab was not found".to_string());
-    }
-
-    Ok(())
-}
-
-/// Focus the correct JetBrains IDE project window using the IDE's URL scheme.
-///
-/// JetBrains IDEs register custom URL schemes (e.g., phpstorm://, idea://) that
-/// can open files and focus the correct project window. Using the system URL
-/// opener brings the right window to front without requiring Accessibility or
-/// Screen Recording permissions.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn focus_jetbrains_window(app_name: &str, project_path: &str) -> Result<(), String> {
-    let scheme = jetbrains_url_scheme(app_name).unwrap_or("idea");
-    let root = find_jetbrains_project_root(project_path);
-
-    crate::debug_log::log_info(&format!(
-        "[open_session] JetBrains URL scheme: {}://open?file={} (from: {})",
-        scheme, root, project_path
-    ));
-
-    let encoded_path = encode_path_for_url(&root);
-    let url = format!("{}://open?file={}", scheme, encoded_path);
-    let cmd = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let output = Command::new(cmd)
-        .arg(&url)
-        .output()
-        .map_err(|e| format!("Failed to open JetBrains URL: {}", e))?;
-
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        crate::debug_log::log_error(&format!("[open_session] URL scheme failed: {}", error));
-        return activate_app_fallback(app_name);
-    }
-
-    crate::debug_log::log_info("[open_session] JetBrains URL scheme succeeded");
     Ok(())
 }
 
@@ -576,11 +626,6 @@ fn activate_app_fallback(app_name: &str) -> Result<(), String> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn activate_app_fallback(_app_name: &str) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn focus_jetbrains_window(_app_name: &str, _project_path: &str) -> Result<(), String> {
     Ok(())
 }
 
@@ -1163,6 +1208,15 @@ mod tests {
         // Try to stop a non-existent process
         let result = stop_session(999999);
         assert!(result.is_err());
+    }
+
+    /// Read-only: prints the plan for this test process without running it.
+    /// `cargo test --lib print_jump_plan -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn print_jump_plan_for_current_process() {
+        let location = resolve_location(std::process::id(), Some("/tmp"), 0);
+        println!("{:#?}", location.map(|l| plan_jump(&l)));
     }
 
     #[test]
