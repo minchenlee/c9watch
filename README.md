@@ -6,6 +6,8 @@
 
 <p align="center">See every Claude Code, Codex, Cursor Agent and Pi session on your machine — one dashboard for you, one JSON CLI for your agents.</p>
 
+<p align="center"><b>Built with AI (Claude Code and Codex). A human sets direction, tests, and reviews.</b> <a href="#how-this-was-built">How this was built</a></p>
+
 **c9watch** (short for **c**laude cod**e** watch, like k8s for Kubernetes) gives you a real-time view of every Claude Code, Codex, Cursor Agent, and Pi session running on your machine. A **desktop dashboard** for you, and a **JSON CLI** for your agents — both watching the same sessions at the same time.
 
 You see which agent needs permission, which one is working, and which one is idle. Your agents can do the same — querying session status, searching past work, and coordinating with each other — all through the same tool.
@@ -295,6 +297,24 @@ c9watch/
 ## Demo mode
 
 Press `Cmd+D` to toggle demo mode, which loads simulated sessions with animated status transitions. Useful for testing the UI without running real Claude Code sessions.
+
+## How this was built
+
+c9watch is developed mostly with AI coding agents: Claude Code (Anthropic) and Codex (OpenAI). Most of the code in this repository was written by them. The repository is open; read the code and judge it on its merits. Pull requests from outside contributors (listed below) are their own work.
+
+<details>
+<summary>About the process</summary>
+
+My role is direction, not authorship:
+
+- Product direction: deciding what to build, what not to build, and why
+- Testing: running the app every day with my own sessions, finding bugs, checking that features behave
+- Review: reading the generated code and the diffs before they land
+- Measurement: numbers in the release notes come from real runs; where a number comes from a contributor or a single machine, the notes say so
+
+I'm disclosing this because it's true, and so that anyone who prefers to avoid AI-built software can decide for themselves. If something is wrong, [open an issue](https://github.com/minchenlee/c9watch/issues).
+
+</details>
 
 ## Contributing
 
