@@ -290,6 +290,7 @@ pub fn enrich_detected_sessions(
     detected_sessions: Vec<DetectedSession>,
     diagnostics: DetectionDiagnostics,
 ) -> Result<(Vec<Session>, DetectionDiagnostics), String> {
+    let detected_sessions = super::only_path::apply_env_filter(detected_sessions);
     let custom_names = crate::session::CustomNames::load();
     let custom_titles = crate::session::CustomTitles::load();
     let mut sessions = Vec::new();

@@ -113,6 +113,18 @@ This starts both the Vite dev server (hot-reload for the Svelte frontend) and th
 
 Press `Cmd+D` to toggle demo mode, which loads simulated sessions with animated status transitions. Useful for exploring the UI without running real Claude Code sessions.
 
+## Recording mode
+
+Set `C9WATCH_ONLY_PATH` to show only the sessions inside one folder. Every other session on your Mac stays hidden, so a screen recording shows no private projects. List several folders with `:`. Unset, c9watch shows everything.
+
+Quit c9watch first, then start it from a terminal so it sees the variable:
+
+```bash
+C9WATCH_ONLY_PATH=/tmp/c9-demo /Applications/c9watch.app/Contents/MacOS/c9watch
+```
+
+The filter applies to MONITOR, the tray, notifications and the CLI. HISTORY, COST and MEMORY are not filtered.
+
 ## Auto-updates
 
 c9watch checks for updates automatically using the Tauri updater plugin. When a new version is available, you'll see an update notification in the app.

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Recording mode.** Set `C9WATCH_ONLY_PATH` to a folder (or several, separated by `:`) and c9watch shows only the sessions inside it, so demos and screen recordings show no private projects. Unset, nothing changes.
+
 ## [0.10.1] - 2026-10-14
 
 ### Fixed
