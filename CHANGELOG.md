@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`c9watch wait`.** Blocks until a live session needs you (`--until needs-input`), finishes its turn (`done`), stops (`ended`), or changes at all (`any-change`), then prints that event. `--timeout` exits 124 like `timeout(1)`; an unknown session exits 2. Scripts and orchestrator agents can use it in place of reading a terminal pane in a loop. See [docs/cli-events.md](docs/cli-events.md).
+- **Stable `watch` event format.** Every `c9watch watch` line now has `"schema": 1`, a top-level `status`, and `previousStatus`. Existing fields are unchanged. `--json` is accepted as a no-op for scripts.
+
 ## [0.10.1] - 2026-10-14
 
 ### Fixed

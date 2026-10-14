@@ -18,6 +18,8 @@ pub enum CostSortDir {
 }
 
 // PM/worker orchestration modules — opt-in only. Compiled out of default builds.
+pub mod watch;
+
 #[cfg(feature = "pm-orchestration")]
 pub mod adoption;
 #[cfg(feature = "pm-orchestration")]
@@ -40,6 +42,40 @@ pub mod pm_rpc;
 pub mod pm_worker;
 #[cfg(feature = "pm-orchestration")]
 pub mod worker_backend;
+
+/// First arguments that make the app binary run the CLI instead of the GUI.
+///
+/// Every subcommand must be listed, or the desktop binary launches the GUI
+/// for it (v0.8.1 shipped that bug for `inbox`/`cost`/`adopt`). PM command
+/// names are listed even when the `pm-orchestration` feature is off, so Clap
+/// reports an unknown command instead of launching the GUI.
+pub const CLI_COMMANDS: &[&str] = &[
+    "list",
+    "status",
+    "self",
+    "view",
+    "history",
+    "search",
+    "stop",
+    "watch",
+    "wait",
+    "tasks",
+    "spawn",
+    "send",
+    "workers",
+    "inbox",
+    "adopt",
+    "daemon",
+    "cost",
+    "usage-bridge",
+    "hooks",
+    "help",
+];
+
+/// Whether `first` (the first argument) selects the CLI.
+pub fn is_cli_invocation(first: &str) -> bool {
+    CLI_COMMANDS.contains(&first) || matches!(first, "--help" | "-h" | "--version" | "-V")
+}
 
 #[derive(Parser)]
 #[command(
@@ -177,6 +213,32 @@ pub enum Commands {
         /// Skip initial "started" burst, only emit changes and stops
         #[arg(long)]
         changes_only: bool,
+
+        /// Accepted for scripts; output is always NDJSON (see docs/cli-events.md)
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Wait until a live session meets a condition, then print that event
+    ///
+    /// Exit codes: 0 condition met, 2 no (or more than one) live session
+    /// matches, 3 the session stopped before `needs-input`, 124 timeout.
+    /// `done` is met at once when the session is not Working at the start.
+    Wait {
+        /// Session key (`provider:id`), session ID, or unique prefix of a live session
+        session_id: String,
+
+        /// Condition to wait for
+        #[arg(long, value_enum)]
+        until: watch::Until,
+
+        /// Give up after this many seconds (exit 124). Default: wait forever
+        #[arg(long)]
+        timeout: Option<u64>,
+
+        /// Poll interval in seconds
+        #[arg(short, long, default_value = "2")]
+        interval: u64,
     },
 
     /// Show tasks/todos for a session
@@ -331,7 +393,18 @@ pub fn run(cli: Cli) {
             project,
             compact,
             changes_only,
+            json: _,
         } => cmd_watch(interval, project.as_deref(), compact, changes_only),
+        Commands::Wait {
+            session_id,
+            until,
+            timeout,
+            interval,
+        } => match cmd_wait(&session_id, until, timeout, interval) {
+            Ok(0) => Ok(()),
+            Ok(code) => process::exit(code),
+            Err(e) => Err(e),
+        },
         Commands::Tasks { session_id } => cmd_tasks(&session_id, cli.pretty),
         #[cfg(feature = "pm-orchestration")]
         Commands::Spawn {
@@ -731,108 +804,141 @@ fn try_resolve_worker(target: &str) -> Option<String> {
     pm_daemon::resolve_worker_id_from_keys(ids.iter().map(|s| s.as_str()), target).ok()
 }
 
+/// One poll of live sessions as `watch`/`wait` snapshots, keyed by the
+/// provider-scoped key so a Codex/Cursor session never overwrites a Claude
+/// session with the same opaque id.
+fn poll_sessions(
+    project_filter: Option<&str>,
+) -> Option<(Vec<watch::Snapshot>, Vec<session::enrichment::Session>)> {
+    let (sessions, _) = session::enrichment::detect_and_enrich_sessions().ok()?;
+    let sessions: Vec<_> = sessions
+        .into_iter()
+        .filter(|s| project_filter.is_none_or(|f| s.project_path.contains(f)))
+        .collect();
+    let snapshots = sessions
+        .iter()
+        .map(|s| watch::Snapshot {
+            key: s.session_key.clone(),
+            id: s.id.clone(),
+            status: s.status.clone(),
+            pending_tool: s.pending_tool_name.clone(),
+        })
+        .collect();
+    Some((snapshots, sessions))
+}
+
+/// The event line for `change`, with the live session payload when it exists.
+fn change_line(
+    change: &watch::Change,
+    sessions: &[session::enrichment::Session],
+    compact: bool,
+) -> serde_json::Value {
+    let live = sessions.iter().find(|s| s.session_key == change.key);
+    watch::event_json(
+        change,
+        live.map(|s| serde_json::json!(s.provider)),
+        live.map(|s| {
+            if compact {
+                compact_session(s)
+            } else {
+                full_session(s.clone())
+            }
+        }),
+        &chrono::Utc::now().to_rfc3339(),
+    )
+}
+
+fn print_line(line: &serde_json::Value) {
+    use std::io::Write;
+    println!("{}", serde_json::to_string(line).unwrap_or_default());
+    let _ = std::io::stdout().flush();
+}
+
 fn cmd_watch(
     interval_secs: u64,
     project_filter: Option<&str>,
     compact: bool,
     changes_only: bool,
 ) -> Result<(), String> {
-    use std::collections::HashMap;
-    use std::io::Write;
-
     let interval = std::time::Duration::from_secs(interval_secs);
-    // Provider-scoped key prevents a Codex/Cursor session from overwriting a
-    // Claude session with the same opaque ID in the watch state.
-    let mut prev_state: HashMap<String, (String, Option<String>, String)> = HashMap::new();
+    let mut prev = std::collections::HashMap::new();
 
     loop {
-        let (sessions, _) = match session::enrichment::detect_and_enrich_sessions() {
-            Ok(result) => result,
-            Err(_) => {
-                std::thread::sleep(interval);
-                continue;
+        if let Some((snapshots, sessions)) = poll_sessions(project_filter) {
+            for change in watch::diff_sessions(&mut prev, snapshots, !changes_only) {
+                print_line(&change_line(&change, &sessions, compact));
             }
-        };
-
-        let mut current_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for s in &sessions {
-            if let Some(filter) = project_filter {
-                if !s.project_path.contains(filter) {
-                    continue;
-                }
-            }
-
-            current_ids.insert(s.session_key.clone());
-
-            let status_str = serde_json::to_string(&s.status).unwrap_or_default();
-            let prev = prev_state.get(&s.session_key);
-
-            let event = match prev {
-                None => {
-                    if changes_only {
-                        None // Skip initial "started" burst
-                    } else {
-                        Some("started")
-                    }
-                }
-                Some((old_status, old_tool, _)) => {
-                    if *old_status != status_str || *old_tool != s.pending_tool_name {
-                        Some("status_changed")
-                    } else {
-                        None
-                    }
-                }
-            };
-
-            if let Some(event_name) = event {
-                let session_data = if compact {
-                    compact_session(s)
-                } else {
-                    full_session(s.clone())
-                };
-                let line = serde_json::json!({
-                    "event": event_name,
-                    "sessionId": s.id,
-                    "sessionKey": s.session_key,
-                    "provider": s.provider,
-                    "session": session_data,
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                });
-                println!("{}", serde_json::to_string(&line).unwrap_or_default());
-                let _ = std::io::stdout().flush();
-            }
-
-            prev_state.insert(
-                s.session_key.clone(),
-                (status_str, s.pending_tool_name.clone(), s.id.clone()),
-            );
         }
-
-        // Detect stopped sessions
-        let stopped: Vec<(String, String)> = prev_state
-            .keys()
-            .filter(|session_key| !current_ids.contains(*session_key))
-            .filter_map(|session_key| {
-                prev_state
-                    .get(session_key)
-                    .map(|state| (session_key.clone(), state.2.clone()))
-            })
-            .collect();
-
-        for (session_key, session_id) in &stopped {
-            let line = serde_json::json!({
-                "event": "stopped",
-                "sessionId": session_id,
-                "sessionKey": session_key,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            });
-            println!("{}", serde_json::to_string(&line).unwrap_or_default());
-            let _ = std::io::stdout().flush();
-            prev_state.remove(session_key);
-        }
-
         std::thread::sleep(interval);
+    }
+}
+
+/// `c9watch wait`: returns the process exit code (see `watch::EXIT_*`).
+///
+/// Polls run on a background thread: one poll can take many seconds with
+/// many sessions, and `--timeout` must still end the wait on time.
+fn cmd_wait(
+    reference: &str,
+    until: watch::Until,
+    timeout_secs: Option<u64>,
+    interval_secs: u64,
+) -> Result<i32, String> {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::{Duration, Instant};
+
+    let deadline = timeout_secs.map(|t| Instant::now() + Duration::from_secs(t));
+    let interval = Duration::from_secs(interval_secs.max(1));
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || loop {
+        if tx.send(poll_sessions(None)).is_err() {
+            return;
+        }
+        std::thread::sleep(interval);
+    });
+
+    let mut key: Option<String> = None;
+    let mut prev = std::collections::HashMap::new();
+    loop {
+        let poll = match deadline {
+            Some(deadline) => {
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(poll) => poll,
+                    Err(RecvTimeoutError::Timeout) => return Ok(watch::EXIT_TIMEOUT),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err("The session poller stopped".to_string())
+                    }
+                }
+            }
+            None => rx
+                .recv()
+                .map_err(|_| "The session poller stopped".to_string())?,
+        };
+        let Some((snapshots, sessions)) = poll else {
+            if key.is_none() {
+                return Err("Failed to read the live sessions".to_string());
+            }
+            continue;
+        };
+        let target = match &key {
+            Some(target) => target.clone(),
+            None => match watch::resolve_live_session(reference, &snapshots) {
+                Ok(target) => key.insert(target).clone(),
+                Err(e) => {
+                    eprintln!("{}", serde_json::json!({ "error": e }));
+                    return Ok(watch::EXIT_NOT_FOUND);
+                }
+            },
+        };
+        let mine = snapshots.into_iter().filter(|s| s.key == target).collect();
+        for change in watch::diff_sessions(&mut prev, mine, true) {
+            if let Some(outcome) = watch::wait_outcome(until, &change) {
+                print_line(&change_line(&change, &sessions, true));
+                return Ok(match outcome {
+                    watch::WaitOutcome::Met => 0,
+                    watch::WaitOutcome::EndedFirst => watch::EXIT_ENDED_FIRST,
+                });
+            }
+        }
     }
 }
 
@@ -1875,6 +1981,62 @@ fn resolve_session_reference_matches(
             "Ambiguous session ID prefix '{}' matches {} sessions across Claude Code, Codex, and Cursor",
             reference, n
         )),
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The app binary routes only allowlisted first arguments to the CLI.
+    /// A subcommand missing from the list would launch the GUI instead.
+    #[test]
+    fn every_subcommand_routes_to_the_cli() {
+        for sub in Cli::command().get_subcommands() {
+            let name = sub.get_name();
+            assert!(
+                is_cli_invocation(name),
+                "`c9watch {name}` would launch the GUI: add it to CLI_COMMANDS"
+            );
+        }
+    }
+
+    #[test]
+    fn wait_routes_to_the_cli_and_the_gui_still_launches_without_args() {
+        assert!(is_cli_invocation("wait"));
+        assert!(is_cli_invocation("--version"));
+        assert!(!is_cli_invocation("--some-tauri-flag"));
+        assert!(!is_cli_invocation(""));
+    }
+
+    #[test]
+    fn wait_parses_its_arguments() {
+        let cli = Cli::try_parse_from([
+            "c9watch",
+            "wait",
+            "abc",
+            "--until",
+            "needs-input",
+            "--timeout",
+            "5",
+        ])
+        .unwrap();
+        let Commands::Wait {
+            session_id,
+            until,
+            timeout,
+            interval,
+        } = cli.command
+        else {
+            panic!("not a wait command");
+        };
+        assert_eq!(session_id, "abc");
+        assert_eq!(until, watch::Until::NeedsInput);
+        assert_eq!(timeout, Some(5));
+        assert_eq!(interval, 2);
+        assert!(Cli::try_parse_from(["c9watch", "wait", "abc"]).is_err());
+        assert!(Cli::try_parse_from(["c9watch", "watch", "--json"]).is_ok());
     }
 }
 
