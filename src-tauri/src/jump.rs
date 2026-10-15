@@ -212,7 +212,9 @@ pub fn applescript_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// iTerm2: match the session by tty, select it, raise its window.
+/// iTerm2: match the session by tty, select it, raise its window. The tab is
+/// selected first: `select t` focuses the pane the tab last had, so selecting
+/// it after the session would undo the pane choice in a split tab.
 pub fn iterm_tty_script(tty: &str) -> String {
     format!(
         r#"
@@ -222,8 +224,8 @@ pub fn iterm_tty_script(tty: &str) -> String {
                 repeat with t in tabs of w
                     repeat with s in sessions of t
                         if tty of s ends with {tty} then
-                            select s
                             select t
+                            select s
                             set index of w to 1
                             return "found"
                         end if
@@ -426,6 +428,16 @@ mod tests {
             tty: Some(tty.into()),
             ..app("iTerm")
         })))
+    }
+
+    /// `select t` focuses the pane the tab last had, so in a split tab it
+    /// must run before `select s`, or the jump lands on the wrong pane.
+    #[test]
+    fn iterm_selects_the_tab_before_the_split_pane() {
+        let script = iterm_tty_script("ttys060");
+        let tab = script.find("select t").expect("selects the tab");
+        let pane = script.find("select s").expect("selects the pane");
+        assert!(tab < pane, "select t must come before select s:\n{script}");
     }
 
     #[test]
