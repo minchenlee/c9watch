@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **`c9watch wait`.** Blocks until a live session needs you (`--until needs-input`), finishes its turn (`done`), stops (`ended`), or changes at all (`any-change`), then prints that event. `--timeout` exits 124 like `timeout(1)`; an unknown session exits 2. Scripts and orchestrator agents can use it in place of reading a terminal pane in a loop. See [docs/cli-events.md](docs/cli-events.md).
 - **Stable `watch` event format.** Every `c9watch watch` line now has `"schema": 1`, a top-level `status`, and `previousStatus`. Existing fields are unchanged. `--json` is accepted as a no-op for scripts.
+- **"While you were away" summary on waiting cards.** A card that waits for you now shows what it waits for (for example "Approval: Bash" or "Question"; the tool name only, never its arguments), the last line the agent said, and what it did since you last opened it, pressed FOCUS, or left the c9watch window: files edited, commands run, subagents done, and tool calls. The counts come from the local transcript (no AI summary, no network) through a bounded index that reads only new bytes each poll. Claude Code only; other agents show "—".
 
 ## [0.10.1] - 2026-10-14
 

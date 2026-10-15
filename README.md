@@ -204,6 +204,7 @@ See [SKILLS.md](SKILLS.md) for more install options.
 - **Auto-discovery** -- Detects running Claude Code, Codex, Cursor Agent, and Pi sessions automatically. OpenCode (preview) connects to one server you start yourself
 - **Provider filter** -- Switch between All and each agent in Monitor, History, Cost, and Memory
 - **Attention inbox** -- One list of the sessions that wait for you, with a health badge so a stale session does not look live
+- **While you were away** -- Each waiting card shows what it waits for (approval of a named tool, a question, or your next prompt), the last thing the agent said, and what it did since you last looked (files edited, commands run, subagents done). Counted from the transcript on your machine, no AI summary. Activity counts are Claude Code only; other agents show "—"
 - **Real-time status** -- See at a glance which sessions are Working, Need Attention (permission requests or user questions), or Idle
 - **Status accuracy matrix** -- Every agent × situation cell (working, waiting, idle, killed, pid reuse, subagent) is backed by a test; known gaps are listed in [docs/accuracy-matrix.md](docs/accuracy-matrix.md)
 - **Conversation viewer** -- Expand any session to view the full conversation with formatted markdown, code blocks, and inline images

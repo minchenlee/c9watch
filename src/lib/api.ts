@@ -5,9 +5,9 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { get } from 'svelte/store';
-import type { Session, Conversation, HistoryEntry, DeepSearchHit, CostData, ProjectMemory, LogEntry, SessionProvider } from './types';
+import type { Session, Conversation, AwayActivity, AwayRequest, HistoryEntry, DeepSearchHit, CostData, ProjectMemory, LogEntry, SessionProvider } from './types';
 import { isDemoMode } from './demo/mode';
-import { getDemoSessions, getDemoHistoryEntries, getDemoCostData, demoConversations } from './demo/data';
+import { getDemoSessions, getDemoHistoryEntries, getDemoCostData, demoConversations, getDemoAwayActivity } from './demo/data';
 import { wsClient, useWebSocket } from './ws';
 
 /**
@@ -42,6 +42,20 @@ export async function getConversation(
 		});
 	}
 	return await invoke<Conversation>('get_conversation', { sessionId, provider, includeTools });
+}
+
+/**
+ * Away-activity counts keyed by session key. Sessions the backend has no
+ * transcript index for (non-Claude-Code providers) are absent.
+ */
+export async function getAwayActivity(requests: AwayRequest[]): Promise<Record<string, AwayActivity>> {
+	if (requests.length === 0) return {};
+	if (get(isDemoMode)) return getDemoAwayActivity(requests);
+
+	if (useWebSocket()) {
+		return await wsClient.request<Record<string, AwayActivity>>('getAwayActivity', { requests });
+	}
+	return await invoke<Record<string, AwayActivity>>('get_away_activity', { requests });
 }
 
 /**

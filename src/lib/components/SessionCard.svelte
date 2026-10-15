@@ -8,6 +8,8 @@
 	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 	import ProviderBadge from './ProviderBadge.svelte';
 	import { canSessionAction, sessionReturnKind, sessionKeyOf } from '$lib/provider';
+	import { awayActivity } from '$lib/stores/away';
+	import { awayActivityLabel, waitingForLabel } from '$lib/session-utils';
 
 	interface Props {
 		session: Session;
@@ -53,6 +55,15 @@
 			default: return null;
 		}
 	});
+
+	// Away summary: only for sessions that wait on the user.
+	let waitingLabel = $derived(waitingForLabel(session.waitingFor));
+	let away = $derived(session.waitingFor ? $awayActivity[sessionKeyOf(session)] : undefined);
+	let awayTitle = $derived(
+		away
+			? `Since ${new Date(away.sinceMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}${away.partial ? ' (older activity not counted)' : ''}`
+			: 'No activity data for this provider'
+	);
 
 	let tooltipText = $state('');
 	let tooltipX = $state(0);
@@ -102,6 +113,7 @@
 	}
 
 	function getStatusLabel(): string {
+		if (waitingLabel) return waitingLabel;
 		switch (session.status) {
 			case SessionStatus.Working:
 				return 'Working';
@@ -327,7 +339,23 @@
 
 		{#if !compact}
 			<!-- Message Preview -->
-			<p class="task-preview">{session.latestMessage || session.firstPrompt}</p>
+			{#if session.waitingFor}
+				<!-- Away summary: last assistant line + activity since the user last looked -->
+				<div class="away-summary">
+					<p class="away-line away-message" title={session.lastAssistantMessage ?? ''}>
+						{session.lastAssistantMessage || session.latestMessage || session.firstPrompt}
+					</p>
+					<p class="away-line away-activity" title={awayTitle}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+							<circle cx="12" cy="12" r="9" />
+							<polyline points="12 7 12 12 15 14" />
+						</svg>
+						<span>{awayActivityLabel(away)}</span>
+					</p>
+				</div>
+			{:else}
+				<p class="task-preview">{session.latestMessage || session.firstPrompt}</p>
+			{/if}
 
 			<!-- Bottom Actions -->
 				<div class="card-actions-container">
@@ -644,6 +672,47 @@
 		font-weight: 500;
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
+	}
+
+	/* Away Summary (replaces the 2-line task preview, so the card does not grow) */
+	.away-summary {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		margin: var(--space-xs) 0;
+		min-width: 0;
+	}
+
+	.away-line {
+		margin: 0;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		min-width: 0;
+	}
+
+	.away-message {
+		font-size: 14px;
+		line-height: 1.5;
+		color: var(--text-secondary);
+	}
+
+	.away-activity {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-muted);
+	}
+
+	.away-activity svg {
+		flex-shrink: 0;
+	}
+
+	.away-activity span {
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 
 	/* Task Preview */

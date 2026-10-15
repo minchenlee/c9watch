@@ -29,6 +29,7 @@
 	import SessionHistory from '$lib/components/SessionHistory.svelte';
 	import CostTracker from '$lib/components/CostTracker.svelte';
 	import { refreshCostData } from '$lib/stores/cost';
+	import { initAwayTracking, markPidSeen } from '$lib/stores/away';
 	import { refreshSessionHistory } from '$lib/stores/history';
 	import MemoryViewer from '$lib/components/MemoryViewer.svelte';
 	import SettingsTab from '$lib/components/SettingsTab.svelte';
@@ -77,6 +78,9 @@
 	// We use Tauri's window resize event + a short delay so isFullscreen()
 	// is queried after the transition has settled (avoids stale values).
 	let isFullscreen = $state(false);
+
+	// "While you were away" summary on waiting cards.
+	onMount(() => initAwayTracking());
 
 	onMount(() => {
 		if (browser) {
@@ -400,6 +404,7 @@
 	}
 
 	async function handleOpen(pid: number, projectPath: string) {
+		markPidSeen(pid);
 		try {
 			await openSession(pid, projectPath);
 		} catch (error) {

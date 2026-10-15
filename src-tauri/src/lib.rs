@@ -123,6 +123,18 @@ async fn get_conversation(
     .map_err(|error| format!("Failed to load conversation: {error}"))?
 }
 
+/// Away-activity counts for the requested sessions. Reads the poll-maintained
+/// index only; it never parses a conversation.
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn get_away_activity(
+    requests: Vec<session::away::AwayRequest>,
+) -> Result<std::collections::HashMap<String, session::away::AwayActivity>, String> {
+    tauri::async_runtime::spawn_blocking(move || session::away::away_activity(&requests))
+        .await
+        .map_err(|error| format!("Failed to read away activity: {error}"))
+}
+
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_session_history() -> Result<Vec<session::HistoryEntry>, String> {
@@ -770,6 +782,7 @@ pub fn run() {
             get_sessions,
             get_subscription_usage,
             get_conversation,
+            get_away_activity,
             get_session_history,
             deep_search_sessions,
             get_cost_data,
