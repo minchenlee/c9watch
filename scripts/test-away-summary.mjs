@@ -42,6 +42,18 @@ test('away summary lists only non-zero counts with singular forms', () => {
   );
 });
 
+test('short away summary for dense rows', () => {
+  assert.equal(utils.awayActivityShortLabel(undefined), null);
+  assert.equal(utils.awayActivityShortLabel(activity()), null);
+  assert.equal(
+    utils.awayActivityShortLabel(activity({ toolCalls: 12, filesEdited: 4, commandsRun: 6, subagentsCompleted: 2 })),
+    '4 files · 6 cmds · 2 agents'
+  );
+  assert.equal(utils.awayActivityShortLabel(activity({ filesEdited: 1, commandsRun: 1 })), '1 file · 1 cmd');
+  assert.equal(utils.awayActivityShortLabel(activity({ toolCalls: 3 })), '3 tool calls');
+  assert.equal(utils.awayActivityShortLabel(activity({ commandsRun: 3, partial: true })), '≥ 3 cmds');
+});
+
 test('away start: last look, else window blur, else session start', () => {
   const session = { id: 's1', provider: 'claudeCode', startedAtMs: 100 };
   assert.equal(utils.awaySinceMs(session, 'claudeCode:s1', { 'claudeCode:s1': 300 }, 200), 300);
