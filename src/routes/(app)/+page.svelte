@@ -1509,13 +1509,14 @@
 			max-width: 100%;
 		}
 
-		/* Single column grid */
+		/* Single column grid. minmax(0, …) lets the column shrink below the
+		   cards' unwrapped text width instead of pushing them off screen. */
 		.all-sessions-grid {
-			grid-template-columns: 1fr;
+			grid-template-columns: minmax(0, 1fr);
 		}
 
 		.all-sessions-grid.compact {
-			grid-template-columns: 1fr;
+			grid-template-columns: minmax(0, 1fr);
 		}
 
 		.view-toggle {
