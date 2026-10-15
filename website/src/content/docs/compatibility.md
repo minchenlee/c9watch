@@ -1,6 +1,6 @@
 ---
 title: Compatibility — supported agents and terminals
-description: Which coding agents c9watch supports in v0.11.0, what each one can do, and which terminals, IDEs and platforms work.
+description: Which coding agents c9watch supports in v0.11.1, what each one can do, and which terminals, IDEs and platforms work.
 head:
   - tag: script
     attrs:
@@ -9,10 +9,10 @@ head:
 ---
 
 :::note[TL;DR]
-c9watch v0.11.0 monitors **Claude Code**, **Codex** (app and CLI), **Cursor Agent** (monitor-only) and **Pi** (read-only). **OpenCode** is a preview that needs a manual server connection.
+c9watch v0.11.1 monitors **Claude Code**, **Codex** (app and CLI), **Cursor Agent** (monitor-only) and **Pi** (read-only). **OpenCode** is a preview that needs a manual server connection.
 :::
 
-*Applies to v0.11.0. Last checked on 2026-10-15.*
+*Applies to v0.11.1. Last checked on 2026-10-15.*
 
 ## Agents
 
