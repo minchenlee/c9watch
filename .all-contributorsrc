@@ -112,6 +112,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "pax",
+      "name": "Alex Popescu",
+      "avatar_url": "https://github.com/pax.png",
+      "profile": "https://github.com/pax",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "contributorsPerLine": 7,

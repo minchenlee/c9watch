@@ -51,6 +51,7 @@ We appreciate all contributions, big and small. Thank you to the following peopl
 - **Alex Jones-Wolsey** ([@ajonesw](https://github.com/ajonesw)) - Detect claude processes by cmd args on macOS ([#77](https://github.com/minchenlee/c9watch/pull/77))
 - **Jamie Goodfellow** ([@boogle42](https://github.com/boogle42)) - Drop dead pids from `claude agents --json` before status inference ([#132](https://github.com/minchenlee/c9watch/pull/132))
 - **Jamie Goodfellow** ([@boogle42](https://github.com/boogle42)) - Find `claude` outside the launchd PATH and stop matching Claude Desktop helpers ([#139](https://github.com/minchenlee/c9watch/pull/139))
+- **Alex Popescu** ([@pax](https://github.com/pax)) - Fix the web dashboard getSessions reply ([#162](https://github.com/minchenlee/c9watch/pull/162))
 
 ---
 

@@ -352,6 +352,7 @@ Thanks to these wonderful people who have contributed to c9watch:
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/jeff-carey"><img src="https://github.com/jeff-carey.png?s=100" width="100px;" alt="Jeff Carey"/><br /><sub><b>Jeff Carey</b></sub></a><br /><a href="#code-jeff-carey" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/mamedium"><img src="https://github.com/mamedium.png?s=100" width="100px;" alt="Mamed"/><br /><sub><b>Mamed</b></sub></a><br /><a href="#code-mamedium" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/boogle42"><img src="https://github.com/boogle42.png?s=100" width="100px;" alt="Jamie Goodfellow"/><br /><sub><b>Jamie Goodfellow</b></sub></a><br /><a href="#code-boogle42" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/pax"><img src="https://github.com/pax.png?s=100" width="100px;" alt="Alex Popescu"/><br /><sub><b>Alex Popescu</b></sub></a><br /><a href="#code-pax" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>
