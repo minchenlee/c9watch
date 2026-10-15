@@ -886,7 +886,7 @@ fn extract_user_message_text(content: Option<&Value>) -> String {
 /// Extract the inner body of the first `<tag>…</tag>` found in `haystack`.
 /// Non-greedy: stops at the first matching close tag. Returns `None` if the
 /// tag is not present or unclosed.
-fn extract_tag(haystack: &str, tag: &str) -> Option<String> {
+pub(crate) fn extract_tag(haystack: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = haystack.find(&open)? + open.len();

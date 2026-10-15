@@ -1,8 +1,12 @@
+#[cfg(test)]
+mod accuracy_matrix;
+mod agent_liveness;
 mod cache;
 pub mod codex;
 pub mod cursor;
 pub mod custom_names;
 pub mod detector;
+mod open_files;
 pub mod opencode;
 pub mod parser;
 pub mod permissions;
@@ -100,6 +104,7 @@ pub use sanitize::strip_system_tags;
 pub mod conversation;
 pub use conversation::{get_conversation_data, Conversation, ConversationMessage};
 
+pub mod away;
 pub mod subagents;
 pub use subagents::{
     active_subagents_for_path, all_subagents_by_session, get_subagent_transcript, SubagentInfo,

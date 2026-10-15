@@ -72,6 +72,11 @@ enum ClientMsg {
 
     #[serde(rename = "getMemoryFiles")]
     GetMemoryFiles,
+
+    #[serde(rename = "getAwayActivity")]
+    GetAwayActivity {
+        requests: Vec<crate::session::away::AwayRequest>,
+    },
 }
 
 /// Server → Client messages
@@ -103,6 +108,9 @@ enum ServerMsg {
 
     #[serde(rename = "memoryFiles")]
     MemoryFiles { data: serde_json::Value },
+
+    #[serde(rename = "awayActivity")]
+    AwayActivity { data: serde_json::Value },
 }
 
 // ── Server entrypoint ───────────────────────────────────────────────
@@ -456,6 +464,18 @@ async fn handle_message_with_owners(
                 data: serde_json::to_value(&files).unwrap_or_default(),
             },
             Err(e) => ServerMsg::Error { message: e },
+        },
+        ClientMsg::GetAwayActivity { requests } => match tokio::task::spawn_blocking(move || {
+            crate::session::away::away_activity(&requests)
+        })
+        .await
+        {
+            Ok(activity) => ServerMsg::AwayActivity {
+                data: serde_json::to_value(&activity).unwrap_or_default(),
+            },
+            Err(e) => ServerMsg::Error {
+                message: format!("Failed to read away activity: {e}"),
+            },
         },
     }
 }

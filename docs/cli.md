@@ -146,20 +146,26 @@ c9watch watch --changes-only                     # Skip initial "started" burst
 c9watch watch --compact --changes-only -i 1      # Optimal for agent polling
 ```
 
-**Event types:**
+**Event types:** `started`, `status_changed`, `stopped`. Every line has `"schema": 1`, `event`, `sessionId`, `sessionKey`, and `timestamp`; see [cli-events.md](cli-events.md) for all fields. `--json` is accepted and changes nothing.
 
-| Event | When | Payload |
-|-------|------|---------|
-| `started` | New session detected | Full or compact session data |
-| `status_changed` | Status or pendingToolName changed | Full or compact session data |
-| `stopped` | Session disappeared | `{sessionId}` only |
-
-Each event line includes a top-level `sessionId` for easy filtering without parsing the nested session object:
 ```json
-{"event": "status_changed", "sessionId": "46fe2af3-...", "session": {...}, "timestamp": "2026-03-16T12:00:00+00:00"}
+{"schema": 1, "event": "status_changed", "sessionId": "46fe2af3-...", "sessionKey": "claudeCode:46fe2af3-...", "status": "NeedsAttention", "previousStatus": "Working", "session": {...}, "timestamp": "2026-03-16T12:00:00+00:00"}
 ```
 
 **Tip:** Use `--changes-only` when you already have state from `list`. Use `--compact` to minimize context window usage.
+
+### `wait` — Block Until a Session Changes
+
+Waits until one live session meets a condition, prints that event, and exits.
+
+```bash
+c9watch wait abc123 --until needs-input            # NeedsAttention or WaitingForInput
+c9watch wait codex:01a1 --until done --timeout 600 # Working -> anything else
+c9watch wait abc123 --until ended                  # the session stops
+c9watch wait abc123 --until any-change -i 1
+```
+
+Exit codes: `0` met, `2` no single live session matches, `3` stopped before `needs-input`, `124` timeout. `done` is met at once when the session is not Working. Details: [cli-events.md](cli-events.md).
 
 ### `tasks` — Session Tasks/Todos
 

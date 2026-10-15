@@ -3,6 +3,9 @@
 //! JSONL transcripts are the source of truth for discovery and liveness.
 //! `state.vscdb` is an optional read-only overlay for title, cwd, and model.
 
+use super::agent_liveness::{
+    open_file_alive_flags, OpenFileCandidate, OpenFileProbe, SysinfoCursorOpenFileProbe,
+};
 use super::cache::FileVersion;
 use super::parser::MessageType;
 use super::source::{
@@ -143,6 +146,10 @@ pub struct CursorSessionSource {
     vscdb_path: Option<PathBuf>,
     cache: HashMap<PathBuf, CacheEntry>,
     composer_cache: ComposerCache,
+    /// Chat stores that Cursor Agent CLI processes hold open, and the CLI
+    /// chat-store root (`~/.cursor/chats`); `None` keeps the mtime-only
+    /// behaviour.
+    process_evidence: Option<(Box<dyn OpenFileProbe>, PathBuf)>,
     #[cfg(test)]
     parse_count: u32,
     #[cfg(test)]
@@ -155,7 +162,20 @@ impl CursorSessionSource {
         Ok(Self::at_roots(
             home.join(".cursor").join("projects"),
             default_vscdb_path(&home),
+        )
+        .with_process_probe(
+            Box::new(SysinfoCursorOpenFileProbe::new()),
+            home.join(".cursor").join("chats"),
         ))
+    }
+
+    pub(crate) fn with_process_probe(
+        mut self,
+        probe: Box<dyn OpenFileProbe>,
+        chats_root: PathBuf,
+    ) -> Self {
+        self.process_evidence = Some((probe, chats_root));
+        self
     }
 
     pub fn at_root(projects_root: PathBuf) -> Self {
@@ -178,6 +198,7 @@ impl CursorSessionSource {
             vscdb_path,
             cache: HashMap::new(),
             composer_cache: ComposerCache::default(),
+            process_evidence: None,
             #[cfg(test)]
             parse_count: 0,
             #[cfg(test)]
@@ -247,8 +268,8 @@ impl CursorSessionSource {
         self.cache
             .retain(|path, _| existing_paths.contains(path) && cacheable_paths.contains(path));
 
-        let mut sessions = Vec::new();
-        for (_path, summary, age_secs) in live {
+        let mut fresh = Vec::new();
+        for (path, summary, age_secs) in live {
             if summary.session_id.is_empty() {
                 continue;
             }
@@ -260,6 +281,16 @@ impl CursorSessionSource {
             let linked_parent = working_parent_ids.contains(&summary.session_id)
                 && age_secs <= LINKED_PARENT_CEILING_SECS;
             if age_secs > freshness && !linked_parent {
+                continue;
+            }
+            fresh.push((path, summary, linked_parent));
+        }
+        let alive = self.process_alive_flags(&fresh, wall_now);
+
+        let mut sessions = Vec::new();
+        for ((_path, summary, _), alive) in fresh.into_iter().zip(alive) {
+            // An ended CLI chat leaves the monitor like an expired one.
+            if !alive {
                 continue;
             }
 
@@ -304,6 +335,57 @@ impl CursorSessionSource {
             });
         }
         Ok((sessions, DetectionDiagnostics::default()))
+    }
+
+    /// For each fresh transcript, whether it stays alive under open-file
+    /// evidence. Only Agent CLI root chats are candidates: they have a store
+    /// at `chats/<md5(cwd)>/<session-id>/`, which the CLI holds open while
+    /// the chat is loaded. IDE chats keep the mtime rule.
+    fn process_alive_flags(
+        &mut self,
+        fresh: &[(PathBuf, CursorTranscriptSummary, bool)],
+        wall_now: SystemTime,
+    ) -> Vec<bool> {
+        let mut alive = vec![true; fresh.len()];
+        let Some((probe, chats_root)) = self.process_evidence.as_mut() else {
+            return alive;
+        };
+        let roots: Vec<usize> = fresh
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, summary, linked_parent))| {
+                !linked_parent && summary.agent_kind == AgentKind::Root
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if roots.is_empty() {
+            return alive;
+        }
+        let cli_chats = cli_chat_ids(chats_root);
+        let candidates: Vec<usize> = roots
+            .into_iter()
+            .filter(|&index| cli_chats.contains(&fresh[index].1.session_id))
+            .collect();
+        if candidates.is_empty() {
+            return alive;
+        }
+        let evidence = probe.scan();
+        let liveness: Vec<OpenFileCandidate<'_>> = candidates
+            .iter()
+            .map(|&index| OpenFileCandidate {
+                key: &fresh[index].1.session_id,
+                modified_ms: file_modified_ms(&fresh[index].0),
+            })
+            .collect();
+        let now_ms = wall_now
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0);
+        let flags = open_file_alive_flags(&liveness, &evidence, now_ms);
+        for (index, flag) in candidates.into_iter().zip(flags) {
+            alive[index] = flag;
+        }
+        alive
     }
 
     fn summary_for(
@@ -727,6 +809,34 @@ fn default_vscdb_path(home: &Path) -> Option<PathBuf> {
         let _ = home;
         None
     }
+}
+
+/// Session ids of every Agent CLI chat (`chats/<hash>/<session-id>/`).
+fn cli_chat_ids(chats_root: &Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Ok(hash_dirs) = fs::read_dir(chats_root) else {
+        return ids;
+    };
+    for hash_dir in hash_dirs.flatten() {
+        let Ok(chats) = fs::read_dir(hash_dir.path()) else {
+            continue;
+        };
+        for chat in chats.flatten() {
+            if let Some(session_id) = chat.file_name().to_str() {
+                ids.insert(session_id.to_string());
+            }
+        }
+    }
+    ids
+}
+
+fn file_modified_ms(path: &Path) -> i64 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn collect_transcript_refs(projects_root: &Path) -> Vec<TranscriptRef> {
@@ -1432,6 +1542,130 @@ mod tests {
         format!(
             r#"{{"role":"assistant","message":{{"content":[{{"type":"tool_use","name":"{name}","input":{extra}}}]}}}}"#
         )
+    }
+
+    // ── Open-file evidence (Agent CLI) ────────────────────────────────
+
+    use crate::session::agent_liveness::OpenFileEvidence;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// md5("/w/demo"), as the CLI names the chat-store directory.
+    const CLI_CHAT_HASH: &str = "1b8f22aeabcb398013648f7154e8d9ac";
+
+    struct FakeProbe {
+        evidence: OpenFileEvidence,
+        scans: Arc<AtomicUsize>,
+    }
+
+    impl OpenFileProbe for FakeProbe {
+        fn scan(&mut self) -> OpenFileEvidence {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            self.evidence.clone()
+        }
+    }
+
+    /// Agent CLI processes hold these chat stores open.
+    fn open_chats(ids: &[&str]) -> OpenFileEvidence {
+        OpenFileEvidence::Open(ids.iter().map(|id| id.to_string()).collect())
+    }
+
+    /// One root chat written `age` ago; `cli` adds its Agent CLI chat store.
+    fn liveness_source(
+        tmp: &Path,
+        cli: bool,
+        working: bool,
+        age: Duration,
+        evidence: OpenFileEvidence,
+    ) -> (CursorSessionSource, Arc<AtomicUsize>) {
+        let projects = tmp.join("projects");
+        let chats = tmp.join("chats");
+        fs::create_dir_all(&chats).unwrap();
+        let path = layout(&projects, "w-demo").join(format!("{PARENT}.jsonl"));
+        let mut lines = vec![user_line("hi")];
+        if !working {
+            lines.push(r#"{"type":"turn_ended","status":"success"}"#.to_string());
+        }
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_jsonl(&path, &lines);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::now() - age))
+            .unwrap();
+        if cli {
+            fs::create_dir_all(chats.join(CLI_CHAT_HASH).join(PARENT)).unwrap();
+        }
+        let scans = Arc::new(AtomicUsize::new(0));
+        let source = CursorSessionSource::at_root(projects).with_process_probe(
+            Box::new(FakeProbe {
+                evidence,
+                scans: scans.clone(),
+            }),
+            chats,
+        );
+        (source, scans)
+    }
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn killed_agent_cli_chat_ends_within_a_few_polls() {
+        for working in [false, true] {
+            // Another Agent CLI (possibly on the reused pid) holds its own chat.
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut source, _) = liveness_source(
+                tmp.path(),
+                true,
+                working,
+                MINUTE,
+                open_chats(&["other-chat"]),
+            );
+            let (sessions, _) = source.detect_at(SystemTime::now()).unwrap();
+            assert!(sessions.is_empty(), "working={working}");
+        }
+    }
+
+    #[test]
+    fn live_agent_cli_keeps_its_chat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut source, _) =
+            liveness_source(tmp.path(), true, false, 20 * MINUTE, open_chats(&[PARENT]));
+        let (sessions, _) = source.detect_at(SystemTime::now()).unwrap();
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn ide_chat_or_missing_evidence_keeps_the_mtime_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut source, scans) =
+            liveness_source(tmp.path(), false, false, MINUTE, open_chats(&[]));
+        let (sessions, _) = source.detect_at(SystemTime::now()).unwrap();
+        assert_eq!(sessions.len(), 1, "IDE chat has no chat store");
+        assert_eq!(scans.load(Ordering::SeqCst), 0, "no candidate, no scan");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut source, _) = liveness_source(
+            tmp.path(),
+            true,
+            false,
+            MINUTE,
+            OpenFileEvidence::Unavailable,
+        );
+        let (sessions, _) = source.detect_at(SystemTime::now()).unwrap();
+        assert_eq!(sessions.len(), 1);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut source, _) = liveness_source(
+            tmp.path(),
+            true,
+            false,
+            Duration::from_secs(2),
+            open_chats(&[]),
+        );
+        let (sessions, _) = source.detect_at(SystemTime::now()).unwrap();
+        assert_eq!(sessions.len(), 1, "written within the grace window");
     }
 
     fn layout(root: &Path, project_key: &str) -> PathBuf {

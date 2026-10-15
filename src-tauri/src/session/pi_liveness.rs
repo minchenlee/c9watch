@@ -16,6 +16,9 @@
 //! transcript without an exact header cwd) keeps the mtime-based freshness
 //! windows in `pi.rs`. Process evidence only ever ends a session early; it
 //! never extends one past those windows.
+//!
+//! The matcher (`pi_alive_flags`) and the sysinfo scan (`scan_processes`) are
+//! shared with Codex and Cursor; their classifiers live in `agent_liveness`.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -212,14 +215,14 @@ pub(crate) fn evidence_from_classes(
     PiProcessEvidence::Live(live)
 }
 
-fn basename(arg: &str) -> &str {
+pub(crate) fn basename(arg: &str) -> &str {
     Path::new(arg)
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or(arg)
 }
 
-fn normalize_cwd(cwd: &str) -> String {
+pub(crate) fn normalize_cwd(cwd: &str) -> String {
     let trimmed = cwd.trim_end_matches('/');
     if trimmed.is_empty() {
         cwd.to_string()
@@ -261,83 +264,90 @@ impl SysinfoPiProcessProbe {
 
 impl PiProcessProbe for SysinfoPiProcessProbe {
     fn scan(&mut self) -> PiProcessEvidence {
-        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
-        if !sysinfo::IS_SUPPORTED_SYSTEM {
-            return PiProcessEvidence::Unavailable;
-        }
-        self.system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::new(),
-        );
-        // The table always contains c9watch itself; empty means it failed.
-        if self.system.processes().is_empty() {
-            return PiProcessEvidence::Unavailable;
-        }
-        let candidates: Vec<sysinfo::Pid> = self
-            .system
-            .processes()
-            .iter()
-            .filter(|(_, process)| process.name().to_str().is_some_and(is_pi_candidate_name))
-            .map(|(pid, _)| *pid)
-            .collect();
-        if candidates.is_empty() {
-            return PiProcessEvidence::Live(HashMap::new());
-        }
-        // A pid may be reused between polls, so argv and cwd are re-read.
-        self.system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&candidates),
-            false,
-            ProcessRefreshKind::new()
-                .with_cmd(UpdateKind::Always)
-                .with_cwd(UpdateKind::Always),
-        );
-        let own_uid = current_uid();
-        let classes = candidates.iter().filter_map(|pid| {
-            let process = self.system.process(*pid)?;
-            let name = process.name().to_string_lossy();
-            let argv_owned: Vec<String> = process
-                .cmd()
-                .iter()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect();
-            let argv: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
-            let cwd = process.cwd().map(|cwd| cwd.to_string_lossy().into_owned());
-            let started_ms = started_ms_from_secs(process.start_time());
-            let same_user = match (own_uid, process.user_id()) {
-                (Some(own), Some(uid)) => uid_matches(uid, own),
-                _ => true,
-            };
-            Some(classify_pi_process(&PiProcessRow {
-                name: name.as_ref(),
-                argv: &argv,
-                cwd: cwd.as_deref(),
-                started_ms,
-                same_user,
-            }))
-        });
-        evidence_from_classes(classes.collect::<Vec<_>>())
+        scan_processes(&mut self.system, is_pi_candidate_name, classify_pi_process)
     }
 }
 
+/// List every pid with the minimal refresh kind, then read argv and cwd only
+/// for rows whose name passes `is_candidate_name`, and fold the classified
+/// rows into evidence. `system` persists across polls so sysinfo only creates
+/// rows for new pids.
+pub(crate) fn scan_processes(
+    system: &mut sysinfo::System,
+    is_candidate_name: fn(&str) -> bool,
+    classify: fn(&PiProcessRow<'_>) -> PiProcessClass,
+) -> PiProcessEvidence {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+    if !sysinfo::IS_SUPPORTED_SYSTEM {
+        return PiProcessEvidence::Unavailable;
+    }
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
+    // The table always contains c9watch itself; empty means it failed.
+    if system.processes().is_empty() {
+        return PiProcessEvidence::Unavailable;
+    }
+    let candidates: Vec<sysinfo::Pid> = system
+        .processes()
+        .iter()
+        .filter(|(_, process)| process.name().to_str().is_some_and(is_candidate_name))
+        .map(|(pid, _)| *pid)
+        .collect();
+    if candidates.is_empty() {
+        return PiProcessEvidence::Live(HashMap::new());
+    }
+    // A pid may be reused between polls, so argv and cwd are re-read.
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&candidates),
+        false,
+        ProcessRefreshKind::new()
+            .with_cmd(UpdateKind::Always)
+            .with_cwd(UpdateKind::Always),
+    );
+    let own_uid = current_uid();
+    let classes = candidates.iter().filter_map(|pid| {
+        let process = system.process(*pid)?;
+        let name = process.name().to_string_lossy();
+        let argv_owned: Vec<String> = process
+            .cmd()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let argv: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        let cwd = process.cwd().map(|cwd| cwd.to_string_lossy().into_owned());
+        let started_ms = started_ms_from_secs(process.start_time());
+        let same_user = match (own_uid, process.user_id()) {
+            (Some(own), Some(uid)) => uid_matches(uid, own),
+            _ => true,
+        };
+        Some(classify(&PiProcessRow {
+            name: name.as_ref(),
+            argv: &argv,
+            cwd: cwd.as_deref(),
+            started_ms,
+            same_user,
+        }))
+    });
+    evidence_from_classes(classes.collect::<Vec<_>>())
+}
+
 #[cfg(unix)]
-fn current_uid() -> Option<u32> {
+pub(crate) fn current_uid() -> Option<u32> {
     // SAFETY: getuid has no preconditions and cannot fail.
     Some(unsafe { libc::getuid() })
 }
 
 #[cfg(not(unix))]
-fn current_uid() -> Option<u32> {
+pub(crate) fn current_uid() -> Option<u32> {
     None
 }
 
 #[cfg(unix)]
-fn uid_matches(uid: &sysinfo::Uid, own: u32) -> bool {
+pub(crate) fn uid_matches(uid: &sysinfo::Uid, own: u32) -> bool {
     **uid == own
 }
 
 #[cfg(not(unix))]
-fn uid_matches(_uid: &sysinfo::Uid, _own: u32) -> bool {
+pub(crate) fn uid_matches(_uid: &sysinfo::Uid, _own: u32) -> bool {
     true
 }
 

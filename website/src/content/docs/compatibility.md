@@ -1,6 +1,6 @@
 ---
 title: Compatibility — supported agents and terminals
-description: Which coding agents c9watch supports in v0.10.0, what each one can do, and which terminals, IDEs and platforms work.
+description: Which coding agents c9watch supports in v0.11.0, what each one can do, and which terminals, IDEs and platforms work.
 head:
   - tag: script
     attrs:
@@ -9,17 +9,17 @@ head:
 ---
 
 :::note[TL;DR]
-c9watch v0.10.0 monitors **Claude Code**, **Codex** (app and CLI), **Cursor Agent** (monitor-only) and **Pi** (read-only). **OpenCode** is a preview that needs a manual server connection.
+c9watch v0.11.0 monitors **Claude Code**, **Codex** (app and CLI), **Cursor Agent** (monitor-only) and **Pi** (read-only). **OpenCode** is a preview that needs a manual server connection.
 :::
 
-*Applies to v0.10.0. Last checked on 2026-10-08.*
+*Applies to v0.11.0. Last checked on 2026-10-15.*
 
 ## Agents
 
 | Agent | Status | What you get |
 |---|---|---|
 | Claude Code | Supported | Live status, needs-attention alerts, history, search, cost, memory files, subagents, JSON CLI. An optional hook bridge reports permission prompts directly. |
-| Codex (app and CLI) | Supported | Live status with a `CODEX` badge, subagents grouped under the parent, history, search, cost estimates. Shows working and idle only. There is no approval or question state. |
+| Codex (app and CLI) | Supported | Live status with a `CODEX` badge, subagents grouped under the parent, history, search, cost estimates. Shows working, idle and needs-you. A question or permission request shows at once; an approval for a command outside the sandbox shows after 35 s (a heuristic, because Codex does not record approval prompts). |
 | Cursor Agent | Supported (monitor-only) | Root sessions and subagents in Monitor, History, search and the provider filter. c9watch does not approve prompts or jump to a Cursor session. |
 | Pi | Supported (read-only) | Monitor, History, conversation, search, Cost and CLI. You cannot open, stop or rename a Pi session from c9watch. |
 | OpenCode | Preview | Connect to one OpenCode server that you start with `opencode --port 4096`, in Settings → Integration. c9watch does not discover servers. See [the preview guide](https://github.com/minchenlee/c9watch/blob/main/docs/opencode-preview.md). |
@@ -38,7 +38,8 @@ c9watch finds sessions by scanning running processes. You do not need a plugin. 
 
 ## Known limits
 
-- Codex: no approval or question state.
+- Codex: an approval prompt is detected by a heuristic and can be missed or shown late. See [the accuracy matrix](https://github.com/minchenlee/c9watch/blob/main/docs/accuracy-matrix.md).
+- Cursor Agent: no needs-you state yet.
 - Pi: a session started in one project and resumed into another can show as ended until that Pi exits. An idle Pi in another folder can keep a killed card alive.
 - Subscription usage meters cover Claude Code, Codex and Cursor. Claude Code needs an optional status-line bridge.
 - The Claude Code hook bridge (`c9watch hooks --install`) is opt-in and not available on Windows. See [the hooks guide](https://github.com/minchenlee/c9watch/blob/main/docs/claude-hooks.md).

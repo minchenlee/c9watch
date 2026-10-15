@@ -152,8 +152,11 @@ c9watch self
 # Stop a session
 c9watch stop 12345
 
-# Watch for status changes (NDJSON stream)
+# Watch for status changes (NDJSON stream, see docs/cli-events.md)
 c9watch watch --interval 2 --compact --changes-only
+
+# Block until a session needs you, finishes, or ends (exit 124 on timeout)
+c9watch wait abc123 --until needs-input --timeout 600
 
 # View tasks/todos for a session
 c9watch tasks abc123
@@ -201,7 +204,9 @@ See [SKILLS.md](SKILLS.md) for more install options.
 - **Auto-discovery** -- Detects running Claude Code, Codex, Cursor Agent, and Pi sessions automatically. OpenCode (preview) connects to one server you start yourself
 - **Provider filter** -- Switch between All and each agent in Monitor, History, Cost, and Memory
 - **Attention inbox** -- One list of the sessions that wait for you, with a health badge so a stale session does not look live
+- **While you were away** -- Each waiting card shows what it waits for (approval of a named tool, a question, or your next prompt), the last thing the agent said, and what it did since you last looked (files edited, commands run, subagents done). Counted from the transcript on your machine, no AI summary. Activity counts are Claude Code only; other agents show "—"
 - **Real-time status** -- See at a glance which sessions are Working, Need Attention (permission requests or user questions), or Idle
+- **Status accuracy matrix** -- Every agent × situation cell (working, waiting, idle, killed, pid reuse, subagent) is backed by a test; known gaps are listed in [docs/accuracy-matrix.md](docs/accuracy-matrix.md)
 - **Conversation viewer** -- Expand any session to view the full conversation with formatted markdown, code blocks, and inline images
 - **Session control** -- Stop sessions, open their parent terminal/IDE, or rename them for easier tracking
 - **Multi-project view** -- Sessions grouped by project with git branch info
@@ -213,7 +218,7 @@ See [SKILLS.md](SKILLS.md) for more install options.
 - **Cost tracker** -- Track Claude Code spending, plus Codex and Pi cost data, with daily, per-project, and per-model breakdowns; click any session to preview the conversation; sort by date or cost
 - **Subscription usage** -- Quota meters for Claude Code, Codex, and Cursor in the toolbar and tray, with an elapsed-time marker for each window
 - **Claude Code hook bridge** _(opt-in)_ -- `c9watch hooks --install` lets Claude Code report permission prompts directly; see [docs/claude-hooks.md](docs/claude-hooks.md)
-- **CLI for agents** -- `c9watch list`, `view`, `history`, `search`, `stop`, `watch`, `cost` commands for scriptable session management and agent-to-agent monitoring
+- **CLI for agents** -- `c9watch list`, `view`, `history`, `search`, `stop`, `watch`, `wait`, `cost` commands for scriptable session management and agent-to-agent monitoring
 - **PM orchestration** _(disabled by default)_ -- Spawn, message, and manage child Claude Code "worker" sessions from a parent "PM" session via `c9watch spawn`, `send`, `workers`, `adopt`, `inbox`, `tasks`. WORKER and PM badges on session cards and a Workers panel in the overlay. Now that Claude Code and Codex spawn agents natively, this is opt-in: build the CLI with `--features cli,pm-orchestration` and set `PM_ORCHESTRATION_ENABLED = true` in `src/lib/feature-flags.ts` for the dashboard. Workers run as `claude --bg` background-pinned sessions, billed against your Pro/Max chat quota (not the separate Agent SDK credit pool that took effect 2026-06-15), falling back to legacy `--print` mode on older CC.
 - **Subagent visibility** -- Detect and display Task-tool subagents spawned inside any session, with click-to-preview transcripts
 - **Entry animations** -- Staggered cascade transitions across tabs and overlay panels for fluid navigation

@@ -60,6 +60,15 @@ pub struct Session {
     /// The input/arguments of the pending tool (when status is NeedsPermission)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_tool_input: Option<serde_json::Value>,
+    /// What the session needs from the user (tool name only, never arguments).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<crate::session::away::WaitingFor>,
+    /// One-line, tag-free preview of the last assistant text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_assistant_message: Option<String>,
+    /// Claude Code transcript backing this card, for the away-activity index.
+    #[serde(skip)]
+    pub transcript_path: Option<PathBuf>,
     /// Session ID of the PM that spawned this session (if it's a c9watch worker).
     /// Populated in polling.rs by overlay from `~/.claude/c9watch/workers/*/meta.json`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -293,6 +302,7 @@ pub fn enrich_detected_sessions(
     let custom_names = crate::session::CustomNames::load();
     let custom_titles = crate::session::CustomTitles::load();
     let mut sessions = Vec::new();
+    let now_ms = Utc::now().timestamp_millis();
 
     for detected in detected_sessions {
         // Get session ID - if not found, skip this session
@@ -350,11 +360,7 @@ pub fn enrich_detected_sessions(
                 summary: None,
                 message_count: summary.messages.len() as u32,
                 modified,
-                status: if summary.lifecycle == CodexLifecycle::Working {
-                    SessionStatus::Working
-                } else {
-                    SessionStatus::WaitingForInput
-                },
+                status: codex_status(summary, now_ms),
                 source_health: Some(health_from_last_timestamp(
                     &summary.last_timestamp,
                     if summary.lifecycle == CodexLifecycle::Working {
@@ -365,8 +371,11 @@ pub fn enrich_detected_sessions(
                 )),
                 latest_message,
                 notification_preview,
-                pending_tool_name: None,
+                pending_tool_name: summary.pending_tool_name(now_ms).map(str::to_string),
                 pending_tool_input: None,
+                waiting_for: None,
+                last_assistant_message: None,
+                transcript_path: None,
                 worker_of: None,
                 official_name: detected.official_name.clone(),
                 started_at_ms: detected.started_at_ms,
@@ -457,6 +466,9 @@ pub fn enrich_detected_sessions(
                 notification_preview,
                 pending_tool_name: None,
                 pending_tool_input: None,
+                waiting_for: None,
+                last_assistant_message: None,
+                transcript_path: None,
                 worker_of: None,
                 official_name: detected.official_name.clone(),
                 started_at_ms: detected.started_at_ms,
@@ -511,6 +523,9 @@ pub fn enrich_detected_sessions(
                 notification_preview: None,
                 pending_tool_name: None,
                 pending_tool_input: None,
+                waiting_for: None,
+                last_assistant_message: None,
+                transcript_path: None,
                 worker_of: None,
                 official_name: detected.official_name.clone(),
                 started_at_ms: detected.started_at_ms,
@@ -594,6 +609,9 @@ pub fn enrich_detected_sessions(
                 notification_preview,
                 pending_tool_name: summary.pending_tool_name.clone(),
                 pending_tool_input: None,
+                waiting_for: None,
+                last_assistant_message: None,
+                transcript_path: None,
                 worker_of: None,
                 official_name: detected.official_name.clone(),
                 started_at_ms: detected.started_at_ms,
@@ -805,6 +823,11 @@ pub fn enrich_detected_sessions(
             notification_preview,
             pending_tool_name,
             pending_tool_input,
+            waiting_for: None,
+            last_assistant_message: None,
+            transcript_path: session_file_path
+                .is_file()
+                .then(|| session_file_path.clone()),
             worker_of: None,
             official_name: detected.official_name.clone(),
             started_at_ms: detected.started_at_ms,
@@ -826,7 +849,21 @@ pub fn enrich_detected_sessions(
         });
     }
 
-    Ok((dedup_newest_wins(sessions), diagnostics))
+    let mut sessions = dedup_newest_wins(sessions);
+    fill_away_fields(&mut sessions);
+    Ok((sessions, diagnostics))
+}
+
+/// Derive the card's away fields from what enrichment already computed.
+fn fill_away_fields(sessions: &mut [Session]) {
+    for session in sessions.iter_mut() {
+        session.waiting_for = crate::session::away::waiting_for(
+            &session.status,
+            session.pending_tool_name.as_deref(),
+        );
+        session.last_assistant_message =
+            crate::session::away::last_assistant_line(session.notification_preview.as_deref());
+    }
 }
 
 /// Collapse duplicate provider-scoped identities, newest observation wins.
@@ -840,6 +877,20 @@ pub fn enrich_detected_sessions(
 /// Parse an RFC3339 `modified` stamp as an instant. Timezone offsets are
 /// normalized, so `00:30:00+02:00` correctly compares earlier than
 /// `23:00:00Z` — something a lexicographic string compare gets wrong.
+/// Codex status from the rollout lifecycle plus the pending tool call.
+fn codex_status(
+    summary: &crate::session::codex::CodexRolloutSummary,
+    now_ms: i64,
+) -> SessionStatus {
+    if summary.needs_attention_at(now_ms) {
+        SessionStatus::NeedsAttention
+    } else if summary.lifecycle == CodexLifecycle::Working {
+        SessionStatus::Working
+    } else {
+        SessionStatus::WaitingForInput
+    }
+}
+
 fn modified_instant(modified: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(modified)
         .ok()
@@ -1248,6 +1299,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn codex_pending_user_input_maps_to_needs_attention() {
+        use crate::session::codex::{
+            CodexPendingAction, CodexPendingKind, CodexRolloutSummary,
+            CODEX_ESCALATION_APPROVAL_DELAY_MS,
+        };
+        let mut summary = CodexRolloutSummary {
+            lifecycle: CodexLifecycle::Working,
+            ..Default::default()
+        };
+        assert_eq!(codex_status(&summary, 0), SessionStatus::Working);
+        summary.pending_action = Some(CodexPendingAction {
+            kind: CodexPendingKind::Escalation,
+            tool_name: "exec".into(),
+            since_ms: Some(0),
+        });
+        assert_eq!(codex_status(&summary, 1_000), SessionStatus::Working);
+        assert_eq!(
+            codex_status(&summary, CODEX_ESCALATION_APPROVAL_DELAY_MS),
+            SessionStatus::NeedsAttention
+        );
+        summary.lifecycle = CodexLifecycle::Idle;
+        assert_eq!(
+            codex_status(&summary, CODEX_ESCALATION_APPROVAL_DELAY_MS),
+            SessionStatus::WaitingForInput
+        );
+    }
+
+    #[test]
     fn test_truncate_string_no_truncation() {
         assert_eq!(truncate_string("hello", 10), "hello");
     }
@@ -1510,6 +1589,83 @@ mod placeholder_tests {
                 .contains("11111111-2222-3333-4444-555555555555")),
             "missing JSONL must not log a warning"
         );
+    }
+
+    #[test]
+    fn away_fields_are_filled_without_leaking_tool_arguments_or_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "aaaaaaaa-2222-3333-4444-555555555555";
+        let lines = [
+            serde_json::json!({"type": "user", "uuid": "u1", "timestamp": "2026-10-14T10:00:00Z",
+                "message": {"role": "user", "content": "run the tests"}}),
+            serde_json::json!({"type": "assistant", "uuid": "a1", "timestamp": "2026-10-14T10:00:05Z",
+                "message": {"model": "m", "id": "msg1", "role": "assistant", "content": [{"type": "text",
+                    "text": "<system-reminder>hidden</system-reminder>All tests pass,\nready for review."}]}}),
+            serde_json::json!({"type": "assistant", "uuid": "a2", "timestamp": "2026-10-14T10:00:06Z",
+                "message": {"model": "m", "id": "msg2", "role": "assistant", "content": [{"type": "tool_use", "id": "t1",
+                    "name": "Bash", "input": {"command": "cat ~/.secret-token"}}]}}),
+        ];
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(tmp.path().join(format!("{id}.jsonl")), body).unwrap();
+        let detected = DetectedSession {
+            pid: 12346,
+            cwd: PathBuf::from("/tmp/nonexistent"),
+            project_path: tmp.path().to_path_buf(),
+            session_id: Some(id.to_string()),
+            project_name: "nonexistent".to_string(),
+            kind: SessionKind::Interactive,
+            entrypoint: None,
+            started_at_ms: Some(1_700_000_000_000),
+            official_name: None,
+            cli_activity: None,
+            cli_reports_prompts: false,
+            provider: SessionProvider::ClaudeCode,
+            surface: SessionSurface::ClaudeCode,
+            agent_kind: AgentKind::Root,
+            parent_thread_id: None,
+            root_session_id: None,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+            internal_kind: None,
+            can_open: true,
+            can_stop: true,
+            can_rename: true,
+            codex_summary: None,
+            cursor_summary: None,
+            pi_summary: None,
+            opencode_summary: None,
+        };
+        let (sessions, _) =
+            enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
+        let s = &sessions[0];
+        assert_eq!(
+            s.last_assistant_message.as_deref(),
+            Some("All tests pass, ready for review.")
+        );
+        assert_eq!(
+            s.waiting_for,
+            crate::session::away::waiting_for(&s.status, s.pending_tool_name.as_deref())
+        );
+        assert_eq!(
+            s.transcript_path.as_deref(),
+            Some(tmp.path().join(format!("{id}.jsonl")).as_path())
+        );
+        let json = serde_json::to_value(s).unwrap();
+        assert_eq!(
+            json["lastAssistantMessage"],
+            "All tests pass, ready for review."
+        );
+        // The away fields name the tool only; arguments stay in their
+        // existing field (pendingToolInput) and are not copied anywhere new.
+        let away = format!("{}{}", json["waitingFor"], json["lastAssistantMessage"]);
+        assert!(
+            !away.contains("secret-token"),
+            "tool arguments copied: {away}"
+        );
+        let text = json.to_string();
+        assert!(!text.contains("transcriptPath"));
+        assert!(!text.contains(&tmp.path().to_string_lossy().to_string()));
     }
 
     #[test]

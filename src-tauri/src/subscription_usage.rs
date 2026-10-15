@@ -85,6 +85,10 @@ fn parse_snapshot(value: &Value) -> SubscriptionUsage {
     }
     usage
 }
+fn codex_initialize_request() -> Value {
+    json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"c9watch_usage","version":env!("CARGO_PKG_VERSION")}}})
+}
+
 async fn read_codex() -> Result<SubscriptionUsage, String> {
     // GUI launches may have a minimal PATH. Prefer the user's installed CLI.
     let home = dirs::home_dir().ok_or("Home directory unavailable")?;
@@ -108,7 +112,7 @@ async fn read_codex() -> Result<SubscriptionUsage, String> {
     let result = tokio::time::timeout(Duration::from_secs(15), async {
         let mut stdin = child.stdin.take().ok_or("Quota reader stdin unavailable")?;
         let mut lines = BufReader::new(child.stdout.take().ok_or("Quota reader stdout unavailable")?).lines();
-        let init = json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"c9watch_usage","version":"0.10.0"}}});
+        let init = codex_initialize_request();
         stdin.write_all(format!("{init}\n").as_bytes()).await.map_err(|e| format!("Quota reader I/O failed ({e})"))?;
         while let Some(line) = lines.next_line().await.map_err(|e| format!("Quota reader I/O failed ({e})"))? {
             let Ok(message) = serde_json::from_str::<Value>(&line) else { continue; };
@@ -415,6 +419,15 @@ pub async fn get_subscription_usage() -> Vec<SubscriptionUsage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn codex_initialize_reports_the_running_version() {
+        let init = codex_initialize_request();
+        assert_eq!(init["params"]["clientInfo"]["name"], "c9watch_usage");
+        assert_eq!(
+            init["params"]["clientInfo"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
+    }
     #[test]
     fn parses_windows_without_assuming_plan_limits() {
         let usage = parse_snapshot(
