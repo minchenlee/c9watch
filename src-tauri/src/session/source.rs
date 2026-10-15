@@ -154,6 +154,10 @@ pub struct DetectionDiagnostics {
     pub claude_processes_found: u32,
     pub processes_with_cwd: u32,
     pub fda_likely_needed: bool,
+    /// Live Claude Code sessions that Claude Code itself keeps out of its
+    /// registry, so c9watch can count them but not show them.
+    #[serde(default)]
+    pub hidden_claude_sessions: Vec<super::hidden_sessions::HiddenClaudeSession>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

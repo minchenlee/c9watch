@@ -6,6 +6,7 @@ pub mod codex;
 pub mod cursor;
 pub mod custom_names;
 pub mod detector;
+pub mod hidden_sessions;
 mod open_files;
 pub mod opencode;
 pub mod parser;
@@ -20,6 +21,7 @@ pub(crate) use pid_check::pid_is_alive;
 
 pub use custom_names::{CustomNames, CustomTitles};
 pub use detector::LegacySessionSource;
+pub use hidden_sessions::HiddenClaudeSession;
 pub mod detector_cli;
 pub use detector_cli::CliSessionSource;
 pub mod state;

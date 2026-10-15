@@ -346,10 +346,20 @@ export interface LogEntry {
   message: string;
 }
 
+/** A live Claude Code session that Claude Code keeps out of its registry. */
+export interface HiddenClaudeSession {
+  pid: number;
+  cwd: string | null;
+  reason: 'childSessionMarker';
+  /** The Claude Code process that opened the app this session runs in. */
+  parentClaudePid: number | null;
+}
+
 export interface DetectionDiagnostics {
   claudeProcessesFound: number;
   processesWithCwd: number;
   fdaLikelyNeeded: boolean;
+  hiddenClaudeSessions?: HiddenClaudeSession[];
 }
 
 export type TaskStatus = 'pending' | 'in_progress' | 'completed';

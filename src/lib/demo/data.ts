@@ -2,7 +2,7 @@
  * Demo session and conversation data for UI exploration
  */
 
-import type { Session, Conversation, HistoryEntry, CostData, SessionCostRecord, AwayActivity, AwayRequest, WaitingFor } from '../types';
+import type { Session, Conversation, HistoryEntry, CostData, SessionCostRecord, AwayActivity, AwayRequest, WaitingFor, DetectionDiagnostics } from '../types';
 import { SessionStatus } from '../types';
 
 function minutesAgo(minutes: number): string {
@@ -286,6 +286,19 @@ export function getDemoHistoryEntries(): HistoryEntry[] {
 			customTitle: 'Cursor agent detection', provider: 'cursor', surface: 'cursor'
 		}
 	];
+}
+
+/** Two sessions hidden by the child-session marker, so demo mode shows the notice. */
+export function getDemoDiagnostics(): DetectionDiagnostics {
+	return {
+		claudeProcessesFound: 0,
+		processesWithCwd: 0,
+		fdaLikelyNeeded: false,
+		hiddenClaudeSessions: [
+			{ pid: 48211, cwd: '/Users/demo/projects/api-server', reason: 'childSessionMarker', parentClaudePid: 47102 },
+			{ pid: 48230, cwd: '/Users/demo/projects/web-dashboard', reason: 'childSessionMarker', parentClaudePid: 47102 }
+		]
+	};
 }
 
 export function getDemoCostData(): CostData {

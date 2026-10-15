@@ -40,6 +40,7 @@ c9watch finds sessions by scanning running processes. You do not need a plugin. 
 
 - Codex: an approval prompt is detected by a heuristic and can be missed or shown late. See [the accuracy matrix](https://github.com/minchenlee/c9watch/blob/main/docs/accuracy-matrix.md).
 - Cursor Agent: no needs-you state yet.
+- Claude Code: a session in an app that another Claude Code session opened (for example with `open -a Terminal`) turns off its own registry entry and transcript. c9watch cannot show it; the Monitor tab counts these sessions and says how to fix it: quit that app and open it again from the Dock. See [the accuracy matrix](https://github.com/minchenlee/c9watch/blob/main/docs/accuracy-matrix.md#sessions-claude-code-hides).
 - Pi: a session started in one project and resumed into another can show as ended until that Pi exits. An idle Pi in another folder can keep a killed card alive.
 - Subscription usage meters cover Claude Code, Codex and Cursor. Claude Code needs an optional status-line bridge.
 - The Claude Code hook bridge (`c9watch hooks --install`) is opt-in and not available on Windows. See [the hooks guide](https://github.com/minchenlee/c9watch/blob/main/docs/claude-hooks.md).

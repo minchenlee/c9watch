@@ -93,6 +93,14 @@ async fn get_sessions(
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
+fn get_detection_diagnostics(
+    latest: tauri::State<'_, polling::LatestDiagnostics>,
+) -> session::DetectionDiagnostics {
+    latest.0.lock().map(|d| d.clone()).unwrap_or_default()
+}
+
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
 async fn get_conversation(
     app: tauri::AppHandle,
     session_id: String,
@@ -606,6 +614,7 @@ pub fn run() {
             let detector_state: Arc<Mutex<session::DetectorState>> =
                 Arc::new(Mutex::new(session::DetectorState::new()));
             app.manage(detector_state.clone());
+            app.manage(polling::LatestDiagnostics::default());
 
             // ── Polling loop ────────────────────────────────────
             start_polling(
@@ -780,6 +789,7 @@ pub fn run() {
             notifications::test_native_notification,
             greet,
             get_sessions,
+            get_detection_diagnostics,
             get_subscription_usage,
             get_conversation,
             get_away_activity,

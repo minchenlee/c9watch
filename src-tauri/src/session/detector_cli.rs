@@ -1,4 +1,5 @@
 use super::detector::encode_path_for_matching;
+use super::hidden_sessions::HiddenSessionScanner;
 use super::pid_check::{pid_was_reused, RecordedStart};
 use super::pid_is_alive;
 use super::source::{
@@ -86,6 +87,7 @@ pub struct CliSessionSource {
     /// honours `CLAUDE_CONFIG_DIR` for the registry). Tests point it at a
     /// tempdir.
     home: Option<PathBuf>,
+    hidden: HiddenSessionScanner,
 }
 
 impl CliSessionSource {
@@ -99,6 +101,7 @@ impl CliSessionSource {
             start_times: Box::new(process_start_times),
             is_alive: pid_is_alive,
             home: None,
+            hidden: HiddenSessionScanner::new(process_start_times),
         }
     }
 
@@ -159,14 +162,18 @@ impl CliSessionSource {
     /// Each spawn costs ~0.2s of CPU, so running it on every poll dominated
     /// c9watch's energy use.
     fn agents(&mut self) -> Result<Vec<CliAgent>, SessionDetectorError> {
-        let dir = match &self.home {
+        let dir = self.registry_dir();
+        self.agents_in_registry(dir.as_deref())
+    }
+
+    fn registry_dir(&self) -> Option<PathBuf> {
+        match &self.home {
             Some(home) => Some(sessions_dir(home)),
             None => registry_dir(
                 dirs::home_dir().as_deref(),
                 std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
             ),
-        };
-        self.agents_in_registry(dir.as_deref())
+        }
     }
 
     fn agents_in_registry(
@@ -326,7 +333,17 @@ impl SessionSource for CliSessionSource {
             })
             .collect();
 
-        Ok((sessions, DetectionDiagnostics::default()))
+        let hidden_claude_sessions = match (self.registry_dir(), home.as_deref()) {
+            (Some(dir), Some(home)) => self.hidden.scan(&dir, home),
+            _ => Vec::new(),
+        };
+        Ok((
+            sessions,
+            DetectionDiagnostics {
+                hidden_claude_sessions,
+                ..DetectionDiagnostics::default()
+            },
+        ))
     }
 
     fn backend_name(&self) -> &'static str {
@@ -438,7 +455,7 @@ fn refresh_changed_rows(dir: &Path, cache: &mut AgentsCache, new: &RegistrySigna
     true
 }
 
-fn process_start_times(pids: &[u32]) -> StartTimes {
+pub(crate) fn process_start_times(pids: &[u32]) -> StartTimes {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let pids: Vec<Pid> = pids.iter().map(|&pid| Pid::from_u32(pid)).collect();
     let mut system = System::new();
@@ -648,6 +665,9 @@ pub(crate) mod test_support {
         let mut source = CliSessionSource::new();
         source.claude_bin = link;
         source.start_times = Box::new(|pids| pids.iter().map(|&pid| (pid, 1)).collect());
+        // Never read the real process table from a test.
+        source.hidden =
+            HiddenSessionScanner::with_reader(|_| StartTimes::new(), |_| HashMap::new());
         source
     }
 
@@ -1106,6 +1126,41 @@ mod tests {
     fn detected_ids(source: &mut CliSessionSource) -> Vec<String> {
         let (sessions, _) = source.detect().unwrap();
         sessions.into_iter().filter_map(|s| s.session_id).collect()
+    }
+
+    /// A live Claude Code process with only a `.key` file and the inherited
+    /// child-session marker is listed in the diagnostics, not as a session.
+    #[cfg(unix)]
+    #[test]
+    fn detect_reports_child_marker_sessions_in_diagnostics() {
+        use crate::session::hidden_sessions::{HiddenReason, ProcessFacts};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = reuse_fixture(tmp.path(), REGISTRY_WITH_PROC_START, PROC_START);
+        std::fs::write(sessions_dir(tmp.path()).join("77.abc.key"), "").unwrap();
+        source.hidden = HiddenSessionScanner::with_reader(
+            |pids| pids.iter().map(|&pid| (pid, 1)).collect(),
+            |pids| {
+                pids.iter()
+                    .map(|&pid| {
+                        let facts = ProcessFacts {
+                            argv0: Some("claude".into()),
+                            cwd: Some(PathBuf::from("/tmp/hidden")),
+                            same_user: true,
+                            child_marker: true,
+                            ..ProcessFacts::default()
+                        };
+                        (pid, facts)
+                    })
+                    .collect()
+            },
+        );
+        let (sessions, diagnostics) = source.detect().unwrap();
+        assert_eq!(sessions.len(), 1);
+        let hidden = &diagnostics.hidden_claude_sessions;
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].pid, 77);
+        assert_eq!(hidden[0].cwd.as_deref(), Some("/tmp/hidden"));
+        assert_eq!(hidden[0].reason, HiddenReason::ChildSessionMarker);
     }
 
     const REGISTRY_WITH_PROC_START: &str = r#"{"pid":41,"sessionId":"sid-reuse","startedAt":1791984959765,"procStart":"Wed Oct 14 13:35:57 2026","entrypoint":"cli","version":"2.1.299","status":"idle"}"#;

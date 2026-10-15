@@ -3,7 +3,7 @@
  * scripts/test-*.mjs can transpile and test it directly.
  */
 
-import type { AwayActivity, Session, WaitingFor } from './types';
+import type { AwayActivity, HiddenClaudeSession, Session, WaitingFor } from './types';
 
 /** "Approval: Bash", "Question"... Tool arguments are never shown. */
 export function waitingForLabel(waitingFor: WaitingFor | null | undefined): string | null {
@@ -51,4 +51,17 @@ export function awaySinceMs(
 	windowBlurAt: number | null
 ): number {
 	return lastSeenAt[key] ?? windowBlurAt ?? session.startedAtMs ?? 0;
+}
+
+/**
+ * One-line notice for Claude Code sessions that Claude Code keeps out of its
+ * own registry (they run in an app another Claude session opened). `null`
+ * when there are none, so the notice is not shown at all.
+ */
+export function hiddenSessionsSummary(hidden: HiddenClaudeSession[] | null | undefined): string | null {
+	const count = hidden?.length ?? 0;
+	if (count === 0) return null;
+	const subject = count === 1 ? '1 Claude Code session is' : `${count} Claude Code sessions are`;
+	const app = count === 1 ? 'it runs in an app' : 'they run in an app';
+	return `${subject} hidden by Claude Code itself: ${app} that another Claude session opened. Quit that app and open it again from the Dock.`;
 }

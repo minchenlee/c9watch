@@ -58,6 +58,7 @@ impl LegacySessionSource {
             claude_processes_found: total,
             processes_with_cwd: with_cwd,
             fda_likely_needed: total > 0 && with_cwd == 0,
+            ..DetectionDiagnostics::default()
         };
 
         // If no Claude processes are running, return empty

@@ -12,7 +12,7 @@
 		statusSummary,
 		visibleTopLevelSessionIds
 	} from '$lib/stores/sessions';
-	import { getConversation, stopSession, openSession } from '$lib/api';
+	import { getConversation, stopSession, openSession, getDetectionDiagnostics } from '$lib/api';
 	import { toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
 	import { get } from 'svelte/store';
 	import { isDemoMode, toggleDemoMode } from '$lib/demo';
@@ -35,9 +35,10 @@
 	import SettingsTab from '$lib/components/SettingsTab.svelte';
 	import SubscriptionUsage from '$lib/components/SubscriptionUsage.svelte';
 	import FdaBanner from '$lib/components/FdaBanner.svelte';
+	import HiddenSessionsNotice from '$lib/components/HiddenSessionsNotice.svelte';
 	import UpdateBanner from '$lib/components/UpdateBanner.svelte';
 	import DebugConsole from '$lib/components/DebugConsole.svelte';
-	import type { DetectionDiagnostics } from '$lib/types';
+	import type { DetectionDiagnostics, HiddenClaudeSession } from '$lib/types';
 	import ProviderFilter from '$lib/components/ProviderFilter.svelte';
 	import { providerFilter } from '$lib/stores/provider-filter';
 	import { matchesProvider, providerFilterLabel, providerSessionKey, providerOf, sessionKeyOf } from '$lib/provider';
@@ -70,6 +71,7 @@
 
 	let activeTab = $state<'monitor' | 'history' | 'cost' | 'memory' | 'settings'>('monitor');
 	let fdaLikelyNeeded = $state(false);
+	let hiddenClaudeSessions = $state<HiddenClaudeSession[]>([]);
 	let showDebugConsole = $state(false);
 	let showRenameHint = $state(false);
 
@@ -130,6 +132,9 @@
 			import('@tauri-apps/api/event').then(({ listen }) => {
 				listen<DetectionDiagnostics>('diagnostic-update', (event) => {
 					fdaLikelyNeeded = event.payload.fdaLikelyNeeded;
+					if (!get(isDemoMode)) {
+						hiddenClaudeSessions = event.payload.hiddenClaudeSessions ?? [];
+					}
 				});
 			});
 		}
@@ -138,6 +143,22 @@
 			unlisten?.();
 			if (timer) clearTimeout(timer);
 		};
+	});
+
+	// Diagnostics for the hidden-sessions notice: real ones, or demo data.
+	// Only the newest request may write, so a slow answer from before a demo
+	// toggle can't overwrite the current one.
+	let diagnosticsRequest = 0;
+	$effect(() => {
+		if (!browser) return;
+		void demoActive;
+		const request = ++diagnosticsRequest;
+		const apply = (hidden: HiddenClaudeSession[]) => {
+			if (request === diagnosticsRequest) hiddenClaudeSessions = hidden;
+		};
+		getDetectionDiagnostics()
+			.then((d) => apply(d?.hiddenClaudeSessions ?? []))
+			.catch(() => apply([]));
 	});
 
 	$effect(() => {
@@ -673,6 +694,7 @@
 						<StatusBar total={filteredSessions.length} summary={filteredSummary} />
 					</div>
 				{/if}
+				<HiddenSessionsNotice hidden={hiddenClaudeSessions} />
 			</section>
 
 			{#if filteredSessions.length === 0}

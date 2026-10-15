@@ -53,3 +53,26 @@ Not applicable (no test):
 - Pi × waiting: Pi 0.87.1 has no approval step: tools run with the process's OS permissions (pi-coding-agent docs/security.md:33, docs/how-pi-works.md:49), and the transcript has only user, assistant and toolResult messages (pi.rs:8-10). Only an extension can ask the user (docs/extensions.md:7); c9watch does not model extensions
 - Pi × subagent: Pi 0.87.1 has no built-in subagents (none in its docs); every Pi session is a root (pi.rs:317)
 <!-- accuracy-matrix:end -->
+
+## Sessions Claude Code hides
+
+An app that a Claude Code process launched (with `open` or `osascript`)
+inherits `CLAUDE_CODE_CHILD_SESSION=1`. Every `claude` you start in that app
+treats itself as a child session: it shows "Transcript saving is off —
+inherited CLAUDE_CODE_CHILD_SESSION marker", writes only
+`~/.claude/sessions/<pid>.<hash>.key`, and writes no `<pid>.json` and no
+transcript. `claude agents --json` does not list it.
+
+c9watch has nothing to read for these sessions, so it cannot show them as
+cards. It counts them instead: a live Claude Code process with a `.key` file,
+no `.json` file, and the marker in its environment. The Monitor tab shows one
+line ("N Claude Code sessions are hidden by Claude Code itself …"; click it
+for each pid and folder), and `c9watch list` reports them in
+`diagnostics.hiddenClaudeSessions`. The line is not shown when there are none.
+
+Fix: quit the app and open it again from the Dock or Finder, so it does not
+inherit the marker. For one shell, `env -u CLAUDE_CODE_CHILD_SESSION -u CLAUDECODE claude`
+also works.
+
+A `.key` file without a `.json` file and without the marker is not counted;
+the cause is not known.

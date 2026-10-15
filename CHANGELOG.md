@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Hidden Claude Code sessions are counted.** A Claude Code session that runs in an app another Claude Code session opened (for example `open -a Terminal` from an agent) inherits `CLAUDE_CODE_CHILD_SESSION=1`, so Claude Code writes no registry entry and no transcript for it. c9watch cannot show these sessions. The Monitor tab now shows one line with how many there are and how to fix it (quit that app and open it again from the Dock); click it for each pid and folder. `c9watch list` reports them in `diagnostics.hiddenClaudeSessions`. See [docs/accuracy-matrix.md](docs/accuracy-matrix.md#sessions-claude-code-hides).
+
 ## [0.11.0] - 2026-10-15
 
 ### Added

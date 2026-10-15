@@ -5,9 +5,9 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { get } from 'svelte/store';
-import type { Session, Conversation, AwayActivity, AwayRequest, HistoryEntry, DeepSearchHit, CostData, ProjectMemory, LogEntry, SessionProvider } from './types';
+import type { Session, Conversation, AwayActivity, AwayRequest, HistoryEntry, DeepSearchHit, CostData, ProjectMemory, LogEntry, SessionProvider, DetectionDiagnostics } from './types';
 import { isDemoMode } from './demo/mode';
-import { getDemoSessions, getDemoHistoryEntries, getDemoCostData, demoConversations, getDemoAwayActivity } from './demo/data';
+import { getDemoSessions, getDemoHistoryEntries, getDemoCostData, demoConversations, getDemoAwayActivity, getDemoDiagnostics } from './demo/data';
 import { wsClient, useWebSocket } from './ws';
 
 /**
@@ -20,6 +20,18 @@ export async function getSessions(): Promise<Session[]> {
 		return await wsClient.request<Session[]>('getSessions');
 	}
 	return await invoke<Session[]>('get_sessions');
+}
+
+/**
+ * Latest detection diagnostics from the polling loop. The loop also emits
+ * `diagnostic-update` on change; this covers the first value, which can be
+ * emitted before the page starts listening. `null` over WebSocket, which has
+ * no diagnostics.
+ */
+export async function getDetectionDiagnostics(): Promise<DetectionDiagnostics | null> {
+	if (get(isDemoMode)) return getDemoDiagnostics();
+	if (useWebSocket()) return null;
+	return await invoke<DetectionDiagnostics | null>('get_detection_diagnostics');
 }
 
 /**

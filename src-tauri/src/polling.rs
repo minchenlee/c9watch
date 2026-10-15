@@ -21,7 +21,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 #[cfg(not(target_os = "macos"))]
 use tauri_plugin_notification::NotificationExt;
 
@@ -115,6 +115,11 @@ fn load_workers_overlay() -> Arc<HashMap<String, String>> {
     }
     map
 }
+
+/// The diagnostics from the latest poll, for pages that start listening for
+/// `diagnostic-update` after it was emitted.
+#[derive(Default)]
+pub struct LatestDiagnostics(pub Mutex<crate::session::DetectionDiagnostics>);
 
 /// Start the background polling loop
 ///
@@ -300,11 +305,12 @@ pub fn start_polling(
                     }
 
                     // Emit diagnostics only when changed
-                    let diag_changed = prev_diagnostics.as_ref().map_or(true, |prev| {
-                        prev.claude_processes_found != diagnostics.claude_processes_found
-                            || prev.processes_with_cwd != diagnostics.processes_with_cwd
-                    });
-                    if diag_changed {
+                    if prev_diagnostics.as_ref() != Some(&diagnostics) {
+                        if let Some(latest) = app_handle.try_state::<LatestDiagnostics>() {
+                            if let Ok(mut latest) = latest.0.lock() {
+                                *latest = diagnostics.clone();
+                            }
+                        }
                         crate::debug_log::log_info(&format!(
                             "Poll: found {} claude processes, {} with CWD",
                             diagnostics.claude_processes_found, diagnostics.processes_with_cwd
