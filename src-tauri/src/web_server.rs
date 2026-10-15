@@ -386,6 +386,17 @@ async fn load_conversation_response(
     }
 }
 
+/// `getSessions` reply. `data` is the session array, the same shape as
+/// `sessionsUpdated`; the detection diagnostics stay on the server.
+fn sessions_response<S: Serialize, D>(scan: Result<(Vec<S>, D), String>) -> ServerMsg {
+    match scan {
+        Ok((sessions, _diagnostics)) => ServerMsg::Sessions {
+            data: serde_json::to_value(&sessions).unwrap_or_default(),
+        },
+        Err(message) => ServerMsg::Error { message },
+    }
+}
+
 async fn handle_message(msg: ClientMsg) -> ServerMsg {
     handle_message_with_owners(msg, crate::session::global_provider_source_owners()).await
 }
@@ -399,17 +410,13 @@ async fn handle_message_with_owners(
             data: serde_json::to_value(crate::subscription_usage::get_subscription_usage().await)
                 .unwrap_or_default(),
         },
-        ClientMsg::GetSessions => match crate::blocking::scan(
-            &crate::blocking::DISCOVERY,
-            crate::polling::detect_and_enrich_sessions,
-        )
-        .await
-        {
-            Ok(sessions) => ServerMsg::Sessions {
-                data: serde_json::to_value(&sessions).unwrap_or_default(),
-            },
-            Err(e) => ServerMsg::Error { message: e },
-        },
+        ClientMsg::GetSessions => sessions_response(
+            crate::blocking::scan(
+                &crate::blocking::DISCOVERY,
+                crate::polling::detect_and_enrich_sessions,
+            )
+            .await,
+        ),
 
         ClientMsg::GetConversation {
             session_id,
@@ -627,5 +634,18 @@ mod protocol_tests {
                 ..
             }
         ));
+    }
+
+    /// The mobile client reads `data` as a session array; a `[sessions,
+    /// diagnostics]` pair left it stuck on "Connecting" (#161).
+    #[test]
+    fn get_sessions_reply_is_the_session_array() {
+        let session = serde_json::json!({ "id": "s1", "projectPath": "/tmp/p" });
+        let diagnostics = serde_json::json!({ "claudeProcessesFound": 1 });
+        let reply = sessions_response(Ok((vec![session.clone()], diagnostics)));
+        let value: serde_json::Value =
+            serde_json::from_str(&response_json(&reply, Some(1))).unwrap();
+        assert_eq!(value["type"], "sessions");
+        assert_eq!(value["data"], serde_json::json!([session]));
     }
 }
