@@ -10,6 +10,14 @@ head:
 
 All notable changes to c9watch are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.11.1 — 2026-10-15
+
+### Added
+- **Hidden Claude Code sessions are counted.** A Claude Code session that runs in an app another Claude Code session opened (for example `open -a Terminal` from an agent) inherits `CLAUDE_CODE_CHILD_SESSION=1`, so Claude Code writes no registry entry and no transcript for it. c9watch cannot show these sessions. The Monitor tab now shows one line with how many there are and how to fix it (quit that app and open it again from the Dock); click it for each pid and folder. `c9watch list` reports them in `diagnostics.hiddenClaudeSessions`. See [docs/accuracy-matrix.md](https://github.com/minchenlee/c9watch/blob/main/docs/accuracy-matrix.md#sessions-claude-code-hides) ([#160](https://github.com/minchenlee/c9watch/pull/160)).
+
+### Fixed
+- **The web dashboard loads sessions again.** The `getSessions` WebSocket reply sent the session list and the detection diagnostics as one pair, so the web page received `[[...], {...}]` and failed on `projectPath`. The reply is now the plain session array. The bug was there since v0.5.0; the desktop app was not affected. Thanks to [@pax](https://github.com/pax) for the report and the fix ([#161](https://github.com/minchenlee/c9watch/issues/161), [#162](https://github.com/minchenlee/c9watch/pull/162)).
+
 ## 0.11.0 — 2026-10-15
 
 ### Added
