@@ -205,6 +205,7 @@ See [SKILLS.md](SKILLS.md) for more install options.
 - **Provider filter** -- Switch between All and each agent in Monitor, History, Cost, and Memory
 - **Attention inbox** -- One list of the sessions that wait for you, with a health badge so a stale session does not look live
 - **Real-time status** -- See at a glance which sessions are Working, Need Attention (permission requests or user questions), or Idle
+- **Status accuracy matrix** -- Every agent × situation cell (working, waiting, idle, killed, pid reuse, subagent) is backed by a test; known gaps are listed in [docs/accuracy-matrix.md](docs/accuracy-matrix.md)
 - **Conversation viewer** -- Expand any session to view the full conversation with formatted markdown, code blocks, and inline images
 - **Session control** -- Stop sessions, open their parent terminal/IDE, or rename them for easier tracking
 - **Multi-project view** -- Sessions grouped by project with git branch info
