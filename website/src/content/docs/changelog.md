@@ -10,6 +10,20 @@ head:
 
 All notable changes to c9watch are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.11.0 — 2026-10-15
+
+### Added
+- **`c9watch wait`.** Blocks until a live session needs you (`--until needs-input`), finishes its turn (`done`), stops (`ended`), or changes at all (`any-change`), then prints that event. `--timeout` exits 124 like `timeout(1)`; an unknown session exits 2. Scripts and orchestrator agents can use it in place of reading a terminal pane in a loop. See [docs/cli-events.md](https://github.com/minchenlee/c9watch/blob/main/docs/cli-events.md) ([#155](https://github.com/minchenlee/c9watch/pull/155)).
+- **Stable `watch` event format.** Every `c9watch watch` line now has `"schema": 1`, a top-level `status`, and `previousStatus`. Existing fields are unchanged. `--json` is accepted as a no-op for scripts ([#155](https://github.com/minchenlee/c9watch/pull/155)).
+- **"While you were away" summary on waiting cards.** A card that waits for you now shows what it waits for (for example "Approval: Bash" or "Question"; the tool name only, never its arguments), the last line the agent said, and what it did since you last opened it, pressed FOCUS, or left the c9watch window: files edited, commands run, subagents done, and tool calls. The counts come from the local transcript (no AI summary, no network) through a bounded index that reads only new bytes each poll. Claude Code only; other agents show "—" ([#156](https://github.com/minchenlee/c9watch/pull/156)).
+- **Codex asks for you.** A Codex session that asks a question or requests permissions now shows as Needs Attention at once. A command that needs approval outside the sandbox shows as Needs Attention after 35 s; Codex does not record approval prompts, so this is a heuristic and can be late or wrong ([#157](https://github.com/minchenlee/c9watch/pull/157)).
+- **Status accuracy matrix.** Each agent source × situation (working, waiting, idle, killed, pid reuse, subagent) is now a test. Known gaps are listed in [docs/accuracy-matrix.md](https://github.com/minchenlee/c9watch/blob/main/docs/accuracy-matrix.md) ([#157](https://github.com/minchenlee/c9watch/pull/157)).
+
+### Fixed
+- **Killed Codex CLI and Cursor Agent CLI sessions disappear on the next poll.** Before, a killed session could stay on the dashboard for 30 minutes to 4 hours. c9watch now checks whether an agent process still holds the transcript open ([#157](https://github.com/minchenlee/c9watch/pull/157)).
+- **A reused pid no longer revives a dead session.** When a new process gets the pid of a dead session, c9watch compares the process start time with the session start time ([#157](https://github.com/minchenlee/c9watch/pull/157)).
+- **The Codex quota reader reports the running c9watch version** instead of a hard-coded 0.10.0 ([#153](https://github.com/minchenlee/c9watch/pull/153)).
+
 ## 0.10.1 — 2026-10-14
 
 ### Fixed
