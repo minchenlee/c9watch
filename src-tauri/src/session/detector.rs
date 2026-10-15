@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
 
+use super::pid_check::{pid_was_reused, RecordedStart};
 use super::source::{DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource};
 
 /// Session detector that finds running Claude processes and matches them to session files
@@ -190,8 +191,12 @@ impl LegacySessionSource {
             // Primary: the session this process names. ~/.claude/sessions/<pid>.json
             // is authoritative and is updated after /clear; `--resume <id>`
             // covers a process without a registry row.
+            // A registry row whose recorded start is older than this process
+            // was left by a hard-killed process whose pid was reused; it
+            // names that dead session, not this one's.
             let named = self
                 .read_session_metadata(proc.pid)
+                .filter(|meta| !pid_was_reused(&meta.recorded_start(), Some(proc.start_time)))
                 .map(|meta| meta.session_id)
                 .into_iter()
                 .chain(proc.resumed_session_id.clone());
@@ -565,6 +570,19 @@ struct ClaudeProcess {
 #[serde(rename_all = "camelCase")]
 struct PidSessionMeta {
     session_id: String,
+    #[serde(default)]
+    proc_start: Option<String>,
+    #[serde(default)]
+    started_at: Option<i64>,
+}
+
+impl PidSessionMeta {
+    fn recorded_start(&self) -> RecordedStart {
+        RecordedStart::from_record(&serde_json::json!({
+            "procStart": self.proc_start,
+            "startedAt": self.started_at,
+        }))
+    }
 }
 
 /// Structure of sessions-index.json
@@ -593,6 +611,36 @@ struct SessionEntry {
     git_branch: Option<String>,
     #[allow(dead_code)]
     modified: Option<String>,
+}
+
+/// Test doubles shared with `accuracy_matrix`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Runs the legacy matcher over `claude_dir/{projects,sessions}` with a
+    /// fake process table of `(pid, cwd, start_time_secs)` rows.
+    pub(crate) fn detect_with_processes(
+        claude_dir: &Path,
+        processes: &[(u32, PathBuf, u64)],
+    ) -> Vec<DetectedSession> {
+        let source = LegacySessionSource {
+            system: System::new(),
+            claude_projects_dir: claude_dir.join("projects"),
+            claude_sessions_dir: claude_dir.join("sessions"),
+        };
+        let processes: Vec<ClaudeProcess> = processes
+            .iter()
+            .map(|(pid, cwd, start_time)| ClaudeProcess {
+                pid: *pid,
+                cwd: Some(cwd.clone()),
+                start_time: *start_time,
+                resumed_session_id: None,
+            })
+            .collect();
+        let dirs = source.enumerate_project_directories().unwrap();
+        source.find_active_sessions(&processes, &dirs)
+    }
 }
 
 #[cfg(test)]
@@ -853,6 +901,51 @@ mod tests {
         let sessions = source.find_active_sessions(&[resumed], &dirs);
 
         assert_eq!(claimed(&sessions), vec![(4242, KILLED.to_string())]);
+    }
+
+    /// Registry row for `pid` as current Claude Code writes it, for a process
+    /// that started `started_secs_ago`.
+    fn write_timed_registry_row(tmp: &Path, pid: u32, session_id: &str, started_secs_ago: i64) {
+        let start = chrono::Utc::now() - chrono::Duration::seconds(started_secs_ago);
+        fs::write(
+            tmp.join("sessions").join(format!("{pid}.json")),
+            serde_json::json!({
+                "pid": pid,
+                "sessionId": session_id,
+                "procStart": start.format("%a %b %e %H:%M:%S %Y").to_string(),
+                "startedAt": start.timestamp_millis() + 2000,
+                "pidDomain": "darwin",
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// The pid of a hard-killed Claude Code was handed to a newer Claude
+    /// process in the same cwd. Its stale registry row must not bind the
+    /// dead session to the newcomer.
+    #[test]
+    fn reused_pid_does_not_inherit_the_dead_processes_session() {
+        let cwd = Path::new("/fixture/wma");
+        let (tmp, source, dirs) = legacy_fixture(cwd, &[KILLED]);
+        write_timed_registry_row(tmp.path(), 5000, KILLED, 7200);
+        let newcomer = process(5000, cwd, 60);
+
+        let sessions = source.find_active_sessions(&[newcomer], &dirs);
+
+        assert_eq!(claimed(&sessions), vec![]);
+    }
+
+    #[test]
+    fn registry_row_with_a_matching_start_still_names_the_session() {
+        let cwd = Path::new("/fixture/wma");
+        let (tmp, source, dirs) = legacy_fixture(cwd, &[KILLED]);
+        write_timed_registry_row(tmp.path(), 5000, KILLED, 7200);
+        let owner = process(5000, cwd, 7200);
+
+        let sessions = source.find_active_sessions(&[owner], &dirs);
+
+        assert_eq!(claimed(&sessions), vec![(5000, KILLED.to_string())]);
     }
 
     #[test]

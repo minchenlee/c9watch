@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
+use super::agent_liveness::{
+    codex_rollout_key, open_file_alive_flags, OpenFileCandidate, OpenFileProbe,
+    SysinfoCodexOpenFileProbe,
+};
 use super::parser::MessageType;
 use super::source::{
     AgentKind, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionKind,
@@ -32,6 +36,19 @@ const FULL_DISCOVERY_INTERVAL_SECS: u64 = 60;
 // conversations continue to be parsed on demand.
 const MONITOR_MESSAGE_CHARS: usize = 200;
 const MONITOR_HEADER_CAPTURE_BYTES: usize = 4096;
+/// Tool-call records are read in full only to look for an approval marker.
+/// Larger calls (big patches) are skipped; they never carry one in practice.
+const MONITOR_TOOL_CALL_CAPTURE_BYTES: usize = 64 * 1024;
+/// Codex persists no record for an approval request (`rollout/src/policy.rs`
+/// lists `ExecApprovalRequest` as transient), only the tool call before it.
+/// An escalated `exec_command` that is approved answers within the yield
+/// clamp (`MAX_YIELD_TIME_MS = 30_000`, `core/src/unified_exec/mod.rs:73-77`
+/// in codex 0.162.1; run C in
+/// `docs/research/codex-approval-signal-2026-10.md` saw 31.0 s). A call still
+/// unanswered after this long is waiting for the user. Heuristic: the clock
+/// starts at the call, not at the approval, so approval delay + yield over
+/// this window shows NeedsAttention briefly after the user already approved.
+pub(crate) const CODEX_ESCALATION_APPROVAL_DELAY_MS: i64 = 35_000;
 const FILE_SIGNATURE_SAMPLE_BYTES: u64 = 4096;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -111,9 +128,52 @@ pub struct CodexRolloutSummary {
     pub messages: Vec<CodexMessage>,
     pub started_at_ms: Option<i64>,
     pub last_timestamp: String,
+    /// `session_meta.originator` (`codex-tui`, `codex_exec`, `Codex Desktop`…).
+    pub originator: String,
+    /// `session_meta.source` when it is a plain string (`cli`, `vscode`…).
+    pub source: String,
+    /// The last record is a tool call that may be waiting for the user.
+    pub pending_action: Option<CodexPendingAction>,
+}
+
+/// Why the last tool call may be waiting for the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexPendingKind {
+    /// `request_user_input` / `request_permissions`: waits by definition.
+    UserInput,
+    /// Escalated command: waits for approval, or runs after approval.
+    Escalation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexPendingAction {
+    pub kind: CodexPendingKind,
+    pub tool_name: String,
+    /// Record timestamp of the call; `None` when it could not be parsed.
+    pub since_ms: Option<i64>,
 }
 
 impl CodexRolloutSummary {
+    /// The turn is blocked on the user (approval or question) at `now_ms`.
+    pub fn needs_attention_at(&self, now_ms: i64) -> bool {
+        self.pending_tool_name(now_ms).is_some()
+    }
+
+    /// Name of the tool that waits for the user at `now_ms`.
+    pub fn pending_tool_name(&self, now_ms: i64) -> Option<&str> {
+        if self.lifecycle != CodexLifecycle::Working {
+            return None;
+        }
+        let action = self.pending_action.as_ref()?;
+        let waiting = match action.kind {
+            CodexPendingKind::UserInput => true,
+            CodexPendingKind::Escalation => action.since_ms.is_some_and(|since| {
+                now_ms.saturating_sub(since) >= CODEX_ESCALATION_APPROVAL_DELAY_MS
+            }),
+        };
+        waiting.then_some(action.tool_name.as_str())
+    }
+
     pub fn first_prompt(&self) -> Option<&str> {
         self.messages
             .iter()
@@ -233,6 +293,9 @@ pub struct CodexSessionSource {
     capture_tool_messages: bool,
     /// When true (and using the full-parse path), keep Codex tool use/result records.
     include_tools: bool,
+    /// Rollouts that `codex` processes hold open; `None` keeps the
+    /// mtime-only behaviour.
+    process_probe: Option<Box<dyn OpenFileProbe>>,
     #[cfg(test)]
     parse_count: usize,
     #[cfg(test)]
@@ -242,7 +305,13 @@ pub struct CodexSessionSource {
 impl CodexSessionSource {
     pub fn new() -> Result<Self, SessionDetectorError> {
         let home = dirs::home_dir().ok_or(SessionDetectorError::HomeDirectoryNotFound)?;
-        Ok(Self::at_root(home.join(".codex").join("sessions")))
+        Ok(Self::at_root(home.join(".codex").join("sessions"))
+            .with_process_probe(Box::new(SysinfoCodexOpenFileProbe::new())))
+    }
+
+    pub(crate) fn with_process_probe(mut self, probe: Box<dyn OpenFileProbe>) -> Self {
+        self.process_probe = Some(probe);
+        self
     }
 
     pub(crate) fn at_root(sessions_root: PathBuf) -> Self {
@@ -253,6 +322,7 @@ impl CodexSessionSource {
             last_full_discovery: None,
             capture_tool_messages: false,
             include_tools: false,
+            process_probe: None,
             #[cfg(test)]
             parse_count: 0,
             #[cfg(test)]
@@ -492,6 +562,13 @@ impl CodexSessionSource {
                 let Some(header) = record.header else {
                     continue;
                 };
+                track_pending_action(
+                    &mut entry.summary,
+                    header.event_type.as_deref(),
+                    header.payload_type.as_deref(),
+                    header.timestamp.as_deref(),
+                    record.line.as_deref(),
+                );
                 let relevant = monitor_record_is_relevant(&header);
                 if relevant {
                     let line = match record.line {
@@ -589,8 +666,8 @@ impl CodexSessionSource {
 
         self.cache.retain(|path, _| existing_paths.contains(path));
 
-        let mut sessions = Vec::new();
-        for (_path, summary, age_secs) in summaries {
+        let mut fresh = Vec::new();
+        for (path, summary, age_secs) in summaries {
             if summary.thread_id.is_empty() || summary.agent_kind == AgentKind::Internal {
                 continue;
             }
@@ -602,6 +679,17 @@ impl CodexSessionSource {
             let linked_parent = linked_parent_ids.contains(&summary.thread_id)
                 && age_secs <= LINKED_PARENT_CEILING_SECS;
             if age_secs > freshness && !linked_parent {
+                continue;
+            }
+            fresh.push((path, summary, linked_parent));
+        }
+        let alive = self.process_alive_flags(&fresh, wall_now);
+
+        let mut sessions = Vec::new();
+        for ((_path, summary, _), alive) in fresh.into_iter().zip(alive) {
+            // An ended session leaves the monitor the same way an expired one
+            // does; history still lists its rollout.
+            if !alive {
                 continue;
             }
 
@@ -643,6 +731,70 @@ impl CodexSessionSource {
         }
         Ok((sessions, DetectionDiagnostics::default()))
     }
+}
+
+impl CodexSessionSource {
+    /// For each fresh rollout, whether it stays alive under open-file
+    /// evidence: a candidate ends when no `codex` process holds it open and
+    /// it was not written in the last 10 s. The process table is read only
+    /// when a candidate exists.
+    fn process_alive_flags(
+        &mut self,
+        fresh: &[(PathBuf, CodexRolloutSummary, bool)],
+        wall_now: SystemTime,
+    ) -> Vec<bool> {
+        let mut alive = vec![true; fresh.len()];
+        let candidates: Vec<(usize, String)> = fresh
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, summary, linked_parent))| {
+                !linked_parent && is_process_liveness_candidate(summary)
+            })
+            .filter_map(|(index, (path, _, _))| Some((index, codex_rollout_key(path)?)))
+            .collect();
+        let Some(probe) = self.process_probe.as_mut() else {
+            return alive;
+        };
+        if candidates.is_empty() {
+            return alive;
+        }
+        let evidence = probe.scan();
+        let liveness: Vec<OpenFileCandidate<'_>> = candidates
+            .iter()
+            .map(|(index, key)| OpenFileCandidate {
+                key,
+                modified_ms: rollout_modified_ms(&fresh[*index].0),
+            })
+            .collect();
+        let flags = open_file_alive_flags(&liveness, &evidence, system_time_ms(wall_now));
+        for ((index, _), flag) in candidates.into_iter().zip(flags) {
+            alive[index] = flag;
+        }
+        alive
+    }
+}
+
+/// Whether open-file evidence may end this rollout: terminal sessions only
+/// (the TUI, including a TUI thread run by the app-server daemon, and
+/// `codex exec`). Desktop and IDE threads keep the mtime rule, because their
+/// app may unload a thread it still shows. Spawned sub-agents follow their
+/// root.
+fn is_process_liveness_candidate(summary: &CodexRolloutSummary) -> bool {
+    summary.agent_kind == AgentKind::Root
+        && matches!(summary.originator.as_str(), "codex-tui" | "codex_exec")
+}
+
+fn rollout_modified_ms(path: &Path) -> i64 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map(system_time_ms)
+        .unwrap_or(0)
+}
+
+fn system_time_ms(time: SystemTime) -> i64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Deserialize)]
@@ -879,6 +1031,70 @@ fn monitor_record_is_relevant(header: &RolloutEventHeader) -> bool {
     }
 }
 
+fn monitor_record_is_tool_call(header: &RolloutEventHeader) -> bool {
+    header.event_type.as_deref() == Some("response_item")
+        && header
+            .payload_type
+            .as_deref()
+            .is_some_and(is_tool_call_payload)
+}
+
+fn is_tool_call_payload(payload_type: &str) -> bool {
+    matches!(payload_type, "function_call" | "custom_tool_call")
+}
+
+/// Keep `summary.pending_action` equal to "the last record is a tool call
+/// that may wait for the user". Codex writes the call, then nothing until
+/// the user answers, so any later record (except the token record written
+/// right after every call) means the call is no longer waiting.
+fn track_pending_action(
+    summary: &mut CodexRolloutSummary,
+    event_type: Option<&str>,
+    payload_type: Option<&str>,
+    timestamp: Option<&str>,
+    line: Option<&[u8]>,
+) {
+    match event_type {
+        Some("token_usage_record") => {}
+        Some("response_item") if payload_type.is_some_and(is_tool_call_payload) => {
+            summary.pending_action =
+                line.and_then(|line| pending_action_from_call(line, timestamp));
+        }
+        _ => summary.pending_action = None,
+    }
+}
+
+/// Classify one tool-call record. Code mode wraps every tool in an `exec`
+/// script, so the script text is searched as well as the tool name.
+fn pending_action_from_call(line: &[u8], timestamp: Option<&str>) -> Option<CodexPendingAction> {
+    let value = serde_json::from_slice::<Value>(line).ok()?;
+    let payload = value.get("payload")?;
+    let tool_name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let body = payload
+        .get("arguments")
+        .or_else(|| payload.get("input"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let asks_user = matches!(tool_name, "request_user_input" | "request_permissions")
+        || body.contains("tools.request_user_input(")
+        || body.contains("tools.request_permissions(");
+    let kind = if asks_user {
+        CodexPendingKind::UserInput
+    } else if body.contains("require_escalated") {
+        CodexPendingKind::Escalation
+    } else {
+        return None;
+    };
+    Some(CodexPendingAction {
+        kind,
+        tool_name: tool_name.to_string(),
+        since_ms: timestamp.and_then(parse_timestamp_millis),
+    })
+}
+
 fn apply_rollout_line(summary: &mut CodexRolloutSummary, line: &[u8], capture_tool_messages: bool) {
     // The monitor scanner populates payload_type separately; its serde-skipped
     // field cannot classify a response_item in the full conversation reader.
@@ -901,6 +1117,13 @@ fn apply_rollout_line(summary: &mut CodexRolloutSummary, line: &[u8], capture_to
         summary.last_timestamp = timestamp.to_string();
     }
     let event_type = header.event_type.as_deref();
+    track_pending_action(
+        summary,
+        event_type,
+        header.payload.as_ref().and_then(|p| p.kind.as_deref()),
+        header.timestamp.as_deref(),
+        Some(line),
+    );
     let relevant = match event_type {
         Some("session_meta" | "event_msg") => true,
         // Message response items are user-visible even when tool records are
@@ -1092,6 +1315,7 @@ struct JsonlLineReader<'a> {
     eof: bool,
     captured: Vec<u8>,
     capture_all: bool,
+    capture_limit: usize,
     capture_overflowed: bool,
 }
 
@@ -1105,13 +1329,17 @@ impl<'a> JsonlLineReader<'a> {
             eof: false,
             captured: Vec::new(),
             capture_all: false,
+            capture_limit: usize::MAX,
             capture_overflowed: false,
         }
     }
 
-    fn drain_to_newline(&mut self, capture_remainder: bool) -> io::Result<()> {
-        if capture_remainder {
+    /// Consume the rest of the line, capturing it when `capture_limit` is set.
+    /// A line longer than the limit is dropped (`capture_overflowed`).
+    fn drain_to_newline(&mut self, capture_limit: Option<usize>) -> io::Result<()> {
+        if let Some(limit) = capture_limit {
             self.capture_all = true;
+            self.capture_limit = limit;
         } else {
             self.captured.clear();
             self.capture_overflowed = true;
@@ -1145,7 +1373,12 @@ impl Read for JsonlLineReader<'_> {
         self.reader.consume(bytes_to_copy);
         if !self.capture_overflowed {
             if self.capture_all {
-                self.captured.extend_from_slice(&output[..bytes_to_copy]);
+                if self.captured.len() + bytes_to_copy > self.capture_limit {
+                    self.captured.clear();
+                    self.capture_overflowed = true;
+                } else {
+                    self.captured.extend_from_slice(&output[..bytes_to_copy]);
+                }
             } else {
                 let remaining_capacity =
                     MONITOR_HEADER_CAPTURE_BYTES.saturating_sub(self.captured.len());
@@ -1189,8 +1422,17 @@ fn read_monitor_line(
         header = scan_monitor_header(&line_reader.captured);
     }
     let relevant = header.as_ref().is_some_and(monitor_record_is_relevant);
-    line_reader.drain_to_newline(relevant)?;
-    let line = if relevant && line_reader.complete && !line_reader.capture_overflowed {
+    let tool_call = !relevant && header.as_ref().is_some_and(monitor_record_is_tool_call);
+    let capture_limit = if relevant {
+        Some(usize::MAX)
+    } else if tool_call {
+        Some(MONITOR_TOOL_CALL_CAPTURE_BYTES)
+    } else {
+        None
+    };
+    line_reader.drain_to_newline(capture_limit)?;
+    let line = if (relevant || tool_call) && line_reader.complete && !line_reader.capture_overflowed
+    {
         Some(std::mem::take(&mut line_reader.captured))
     } else {
         None
@@ -1451,6 +1693,8 @@ fn apply_session_meta(summary: &mut CodexRolloutSummary, timestamp: &str, payloa
         .unwrap_or_default();
     let source = payload.get("source").unwrap_or(&Value::Null);
     summary.surface = classify_surface(source, originator);
+    summary.originator = originator.to_string();
+    summary.source = source.as_str().unwrap_or_default().to_string();
     summary.agent_kind = AgentKind::Root;
 
     if let Some(subagent) = source.get("subagent") {
@@ -3384,5 +3628,351 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "first prompt");
         assert_eq!(messages[1].content, "resumed answer");
+    }
+
+    // ── Pending user action (approval / question) ─────────────────────
+
+    const PENDING_T0: &str = "2026-07-13T00:00:10Z";
+
+    fn pending_fixture(tool_call: Value) -> Vec<String> {
+        let mut lines = root_fixture(Value::String("cli".into()), "codex-tui");
+        lines.push(event(PENDING_T0, "response_item", tool_call));
+        // Codex writes a token record right after the call; it must not
+        // count as the tool's answer.
+        lines.push(event(
+            "2026-07-13T00:00:10.030Z",
+            "token_usage_record",
+            serde_json::json!({}),
+        ));
+        lines
+    }
+
+    fn escalated_exec_call() -> Value {
+        // Shape recorded live from codex-cli 0.162.1 (code mode).
+        serde_json::json!({
+            "type": "custom_tool_call", "call_id": "call_esc", "name": "exec",
+            "input": "const r = await tools.exec_command({cmd:\"touch probe2.txt\",sandbox_permissions:\"require_escalated\",justification:\"Allow?\",\"yield_time_ms\":10000}); text(r.output);\n"
+        })
+    }
+
+    fn at(offset_secs: i64) -> i64 {
+        parse_timestamp_millis(PENDING_T0).unwrap() + offset_secs * 1000
+    }
+
+    fn summary_from(lines: &[String]) -> (TempDir, PathBuf, CodexSessionSource) {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("rollout-pending.jsonl");
+        write_lines(&path, lines, true);
+        let source = CodexSessionSource::at_root(temp.path().to_path_buf());
+        (temp, path, source)
+    }
+
+    #[test]
+    fn escalated_call_needs_attention_only_after_approval_delay() {
+        let (_temp, path, mut source) = summary_from(&pending_fixture(escalated_exec_call()));
+        let summary = source.summary_for(&path).unwrap();
+        assert_eq!(summary.lifecycle, CodexLifecycle::Working);
+        assert!(!summary.needs_attention_at(at(34)), "34 s: still Working");
+        assert!(summary.needs_attention_at(at(36)), "36 s: NeedsAttention");
+        assert_eq!(summary.pending_tool_name(at(36)), Some("exec"));
+        assert_eq!(summary.pending_tool_name(at(34)), None);
+    }
+
+    #[test]
+    fn tool_output_after_escalated_call_returns_to_working_at_once() {
+        let mut lines = pending_fixture(escalated_exec_call());
+        let (_temp, path, mut source) = summary_from(&lines);
+        assert!(source
+            .summary_for(&path)
+            .unwrap()
+            .needs_attention_at(at(60)));
+        // Incremental append of the tool output (the cached prefix is reused).
+        let output = event(
+            "2026-07-13T00:01:10Z",
+            "response_item",
+            serde_json::json!({"type": "custom_tool_call_output", "call_id": "call_esc", "output": "ok"}),
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{output}").unwrap();
+        drop(file);
+        let summary = source.summary_for(&path).unwrap();
+        assert_eq!(summary.lifecycle, CodexLifecycle::Working);
+        assert!(!summary.needs_attention_at(at(61)));
+        assert!(!summary.needs_attention_at(at(3600)));
+        // A full reparse agrees with the incremental path.
+        lines.push(output);
+        let (_temp, path, mut fresh) = summary_from(&lines);
+        assert!(!fresh
+            .summary_for(&path)
+            .unwrap()
+            .needs_attention_at(at(3600)));
+    }
+
+    #[test]
+    fn request_user_input_needs_attention_at_once() {
+        let call = serde_json::json!({
+            "type": "function_call", "call_id": "call_q", "name": "request_user_input",
+            "arguments": "{\"questions\":[]}"
+        });
+        let (_temp, path, mut source) = summary_from(&pending_fixture(call));
+        let summary = source.summary_for(&path).unwrap();
+        assert!(summary.needs_attention_at(at(0)));
+        assert_eq!(summary.pending_tool_name(at(0)), Some("request_user_input"));
+
+        // Code mode wraps the same tool inside an `exec` script.
+        let call = serde_json::json!({
+            "type": "custom_tool_call", "call_id": "call_q2", "name": "exec",
+            "input": "const a = await tools.request_user_input({questions: []}); text(a);"
+        });
+        let (_temp, path, mut source) = summary_from(&pending_fixture(call));
+        assert!(source.summary_for(&path).unwrap().needs_attention_at(at(1)));
+    }
+
+    #[test]
+    fn plain_tool_calls_and_finished_turns_never_need_attention() {
+        let plain = serde_json::json!({
+            "type": "function_call", "call_id": "call_p", "name": "exec_command",
+            "arguments": "{\"cmd\":\"cargo build\",\"yield_time_ms\":30000}"
+        });
+        let (_temp, path, mut source) = summary_from(&pending_fixture(plain));
+        assert!(!source
+            .summary_for(&path)
+            .unwrap()
+            .needs_attention_at(at(3600)));
+
+        // A turn that ends (aborted while the approval was open) clears it.
+        let mut lines = pending_fixture(escalated_exec_call());
+        lines.push(event(
+            "2026-07-13T00:00:20Z",
+            "event_msg",
+            serde_json::json!({"type": "turn_aborted"}),
+        ));
+        let (_temp, path, mut source) = summary_from(&lines);
+        let summary = source.summary_for(&path).unwrap();
+        assert_eq!(summary.lifecycle, CodexLifecycle::Idle);
+        assert!(!summary.needs_attention_at(at(3600)));
+    }
+
+    #[test]
+    fn oversized_tool_call_is_skipped_without_breaking_offsets() {
+        let huge = serde_json::json!({
+            "type": "custom_tool_call", "call_id": "call_big", "name": "apply_patch",
+            "input": format!("require_escalated {}", "x".repeat(MONITOR_TOOL_CALL_CAPTURE_BYTES * 2))
+        });
+        let mut lines = pending_fixture(huge);
+        lines.push(event(
+            "2026-07-13T00:00:11Z",
+            "event_msg",
+            serde_json::json!({"type": "agent_message", "message": "after"}),
+        ));
+        let (_temp, path, mut source) = summary_from(&lines);
+        let summary = source.summary_for(&path).unwrap();
+        assert!(!summary.needs_attention_at(at(3600)));
+        assert_eq!(summary.latest_message(), Some("after"));
+    }
+
+    // ── Open-file evidence (agent_liveness) ───────────────────────────
+
+    use crate::session::agent_liveness::OpenFileEvidence;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    const ROLLOUT_KEY: &str = "rollout-liveness.jsonl";
+
+    struct FakeProbe {
+        evidence: Arc<StdMutex<OpenFileEvidence>>,
+        scans: Arc<AtomicUsize>,
+    }
+
+    impl OpenFileProbe for FakeProbe {
+        fn scan(&mut self) -> OpenFileEvidence {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            self.evidence.lock().unwrap().clone()
+        }
+    }
+
+    /// Some `codex` process holds the rollout open.
+    fn held_open() -> OpenFileEvidence {
+        OpenFileEvidence::Open(HashSet::from([ROLLOUT_KEY.to_string()]))
+    }
+
+    /// `codex` processes run, but none holds the rollout (other rollouts are
+    /// open, as on a machine with unrelated TUIs).
+    fn not_open() -> OpenFileEvidence {
+        OpenFileEvidence::Open(HashSet::from([
+            "rollout-2026-10-14T17-44-45-other.jsonl".to_string()
+        ]))
+    }
+
+    struct LivenessCase {
+        _temp: TempDir,
+        path: PathBuf,
+        source: CodexSessionSource,
+        evidence: Arc<StdMutex<OpenFileEvidence>>,
+        scans: Arc<AtomicUsize>,
+        now: DateTime<Local>,
+        wall_now: SystemTime,
+    }
+
+    /// One root rollout written `age` ago, with `idle` choosing whether the
+    /// turn has completed, observed through `evidence`.
+    fn liveness_case(
+        source_kind: &str,
+        originator: &str,
+        idle: bool,
+        age: Duration,
+        evidence: OpenFileEvidence,
+    ) -> LivenessCase {
+        let temp = TempDir::new().unwrap();
+        let now = Local::now();
+        let wall_now = SystemTime::now();
+        let day = temp.path().join(now.format("%Y/%m/%d").to_string());
+        fs::create_dir_all(&day).unwrap();
+        let path = day.join(ROLLOUT_KEY);
+        let mut lines = root_fixture(Value::String(source_kind.into()), originator);
+        if idle {
+            lines.push(event(
+                "2026-07-13T00:00:03Z",
+                "event_msg",
+                serde_json::json!({"type":"task_complete"}),
+            ));
+        }
+        write_lines(&path, &lines, true);
+        set_modified_age(&path, wall_now, age);
+        let scans = Arc::new(AtomicUsize::new(0));
+        let evidence = Arc::new(StdMutex::new(evidence));
+        let source = CodexSessionSource::at_root(temp.path().to_path_buf()).with_process_probe(
+            Box::new(FakeProbe {
+                evidence: evidence.clone(),
+                scans: scans.clone(),
+            }),
+        );
+        LivenessCase {
+            _temp: temp,
+            path,
+            source,
+            evidence,
+            scans,
+            now,
+            wall_now,
+        }
+    }
+
+    impl LivenessCase {
+        fn visible(&mut self) -> bool {
+            let (sessions, _) = self
+                .source
+                .detect_at_with_clock(self.now, self.wall_now)
+                .unwrap();
+            session_ids(&sessions).contains("root-id")
+        }
+
+        fn set_evidence(&self, evidence: OpenFileEvidence) {
+            *self.evidence.lock().unwrap() = evidence;
+        }
+    }
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn killed_cli_session_ends_within_a_few_polls() {
+        // Idle in-process TUI, process gone: ended instead of lingering 30 min.
+        let mut case = liveness_case("cli", "codex-tui", true, MINUTE, not_open());
+        assert!(!case.visible());
+        // In-process TUI killed mid-turn: ended instead of lingering 4 hours.
+        let mut case = liveness_case("cli", "codex-tui", false, MINUTE, not_open());
+        assert!(!case.visible());
+        // `codex exec` that exited.
+        let mut case = liveness_case("exec", "codex_exec", false, MINUTE, not_open());
+        assert!(!case.visible());
+        // No `codex` process at all.
+        let mut case = liveness_case(
+            "cli",
+            "codex-tui",
+            true,
+            MINUTE,
+            OpenFileEvidence::Open(HashSet::new()),
+        );
+        assert!(!case.visible());
+    }
+
+    #[test]
+    fn process_holding_the_rollout_keeps_its_session() {
+        let mut case = liveness_case("cli", "codex-tui", true, 20 * MINUTE, held_open());
+        assert!(case.visible());
+        let mut case = liveness_case("exec", "codex_exec", false, 3 * 60 * MINUTE, held_open());
+        assert!(case.visible());
+    }
+
+    #[test]
+    fn reused_pid_or_restarted_tui_does_not_keep_a_killed_session() {
+        // A new `codex` (possibly on the old pid, in the same cwd) holds its
+        // own rollout, not the killed one.
+        let mut case = liveness_case("cli", "codex-tui", true, MINUTE, not_open());
+        assert!(!case.visible());
+    }
+
+    #[test]
+    fn daemon_turn_survives_its_tui_until_the_turn_ends() {
+        // A plain TUI runs its thread in the app-server daemon (source
+        // "vscode"). After the TUI is killed the daemon keeps the turn
+        // running and the rollout open, with no write for 30 minutes.
+        let mut case = liveness_case("vscode", "codex-tui", false, 30 * MINUTE, held_open());
+        assert!(case.visible());
+        assert_eq!(case.scans.load(Ordering::SeqCst), 1);
+
+        // The turn completes; with no client left the daemon unloads the
+        // thread and closes the rollout.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&case.path)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            event(
+                "2026-07-13T00:10:00Z",
+                "event_msg",
+                serde_json::json!({"type":"task_complete"})
+            )
+        )
+        .unwrap();
+        drop(file);
+        set_modified_age(&case.path, case.wall_now, Duration::from_secs(2));
+        case.set_evidence(not_open());
+        assert!(case.visible(), "the final write is within the grace window");
+        set_modified_age(&case.path, case.wall_now, MINUTE);
+        assert!(!case.visible());
+    }
+
+    #[test]
+    fn desktop_and_ide_threads_keep_the_mtime_rule() {
+        let mut case = liveness_case("vscode", "Codex Desktop", true, MINUTE, not_open());
+        assert!(case.visible());
+        let mut case = liveness_case("vscode", "codex_vscode", true, MINUTE, not_open());
+        assert!(case.visible());
+        assert_eq!(
+            case.scans.load(Ordering::SeqCst),
+            0,
+            "no candidate, no scan"
+        );
+    }
+
+    #[test]
+    fn missing_evidence_or_a_fresh_write_keeps_the_session() {
+        let mut case = liveness_case(
+            "cli",
+            "codex-tui",
+            true,
+            MINUTE,
+            OpenFileEvidence::Unavailable,
+        );
+        assert!(case.visible());
+        let mut case = liveness_case("cli", "codex-tui", true, Duration::from_secs(2), not_open());
+        assert!(case.visible(), "written within the grace window");
+        // Evidence never extends past the freshness window.
+        let mut case = liveness_case("cli", "codex-tui", true, 31 * MINUTE, held_open());
+        assert!(!case.visible());
     }
 }
