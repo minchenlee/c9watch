@@ -178,20 +178,22 @@
 </div>
 
 <style>
+	/* Sizes are in em of the tile's font size (10px × the A−/A+ scale), so one
+	   variable scales the whole row. */
 	.row {
 		--tone: var(--status-working);
 		position: relative;
 		display: flex;
 		align-items: center;
 		gap: 6px;
-		min-height: 40px;
+		min-height: 4em;
 		padding: 4px 4px 4px 9px;
 		cursor: default;
 		outline: none;
 		transition: background-color var(--transition-fast);
 	}
 
-	.row.compact { min-height: 24px; padding-top: 2px; padding-bottom: 2px; }
+	.row.compact { min-height: 2.4em; padding-top: 2px; padding-bottom: 2px; }
 	.row.expandable { cursor: pointer; }
 	.row:hover { background: var(--bg-card-hover); }
 	.row:focus-visible { box-shadow: inset 0 0 0 1px var(--border-focus); }
@@ -247,19 +249,19 @@
 		align-items: center;
 		gap: 6px;
 		min-width: 0;
-		line-height: 16px;
+		line-height: 1.6em;
 	}
 
 	.chip {
 		flex-shrink: 0;
 		min-width: 8.6ch;
-		height: 14px;
+		height: 1.56em;
 		padding: 0 4px;
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
 		font-family: var(--font-mono);
-		font-size: 9px;
+		font-size: 0.9em;
 		font-weight: 700;
 		letter-spacing: 0.06em;
 		color: var(--tone);
@@ -274,7 +276,7 @@
 		border-color: var(--tone);
 	}
 
-	/* Purple on black is too dark for 9px type: lift it toward white. */
+	/* Purple on black is too dark for small type: lift it toward white. */
 	.row.working .chip { color: color-mix(in srgb, var(--tone) 45%, #fff); }
 	.row.connecting .chip { color: var(--text-secondary); }
 
@@ -285,7 +287,7 @@
 		white-space: nowrap;
 		text-overflow: ellipsis;
 		font-family: var(--font-sans);
-		font-size: 12.5px;
+		font-size: 1.25em;
 		font-weight: 600;
 		color: var(--text-primary);
 		letter-spacing: 0.01em;
@@ -299,7 +301,7 @@
 		white-space: nowrap;
 		text-overflow: ellipsis;
 		font-family: var(--font-mono);
-		font-size: 10px;
+		font-size: 1em;
 		color: var(--text-muted);
 	}
 
@@ -320,14 +322,16 @@
 		align-items: center;
 		gap: 3px;
 		font-family: var(--font-mono);
-		font-size: 10px;
+		font-size: 1em;
 		color: var(--text-muted);
 		white-space: nowrap;
 		font-variant-numeric: tabular-nums;
 	}
 
+	.msgs svg { width: 0.9em; height: 0.9em; }
+
 	.health {
-		font-size: 8px;
+		font-size: 0.8em;
 		letter-spacing: 0.06em;
 		padding: 0 3px;
 		border: 1px dashed var(--border-default);
@@ -336,18 +340,18 @@
 	/* Grey on purpose: provider colours would collide with status colours. */
 	.prov {
 		font-family: var(--font-mono);
-		font-size: 8px;
+		font-size: 0.8em;
 		font-weight: 700;
 		letter-spacing: 0.08em;
 		color: var(--text-secondary);
 	}
 
-	.sub { gap: 6px; line-height: 15px; }
+	.sub { gap: 6px; line-height: 1.5em; }
 
 	.need {
 		flex-shrink: 0;
 		font-family: var(--font-mono);
-		font-size: 10.5px;
+		font-size: 1.05em;
 		font-weight: 600;
 		color: var(--tone);
 	}
@@ -358,7 +362,7 @@
 		overflow: hidden;
 		white-space: nowrap;
 		text-overflow: ellipsis;
-		font-size: 11.5px;
+		font-size: 1.15em;
 		color: var(--text-secondary);
 	}
 
@@ -369,7 +373,7 @@
 		white-space: nowrap;
 		text-overflow: ellipsis;
 		font-family: var(--font-mono);
-		font-size: 10px;
+		font-size: 1em;
 		color: var(--text-muted);
 	}
 
@@ -406,25 +410,26 @@
 		.row:hover .act.open { color: var(--text-primary); }
 	}
 
-	/* Narrow tiles drop the least useful bits first. */
-	@container tile (max-width: 560px) {
+	/* Narrow tiles drop the least useful bits first. In em, so bigger type
+	   gives up detail sooner instead of squeezing the title. */
+	@container tile (max-width: 56em) {
 		.branch { display: none; }
 	}
 
-	@container tile (max-width: 420px) {
+	@container tile (max-width: 42em) {
 		.away { display: none; }
 	}
 
-	@container tile (max-width: 380px) {
+	@container tile (max-width: 38em) {
 		.cost, .msgs { display: none; }
 	}
 
 	/* Touch screens: a little more type; targets follow the global 36px. */
 	@media (max-width: 768px) {
-		.row { min-height: 44px; }
-		.row.compact { min-height: 36px; padding-top: 0; padding-bottom: 0; }
-		.title { font-size: 13px; }
-		.preview { font-size: 12px; }
+		.row { min-height: max(44px, 4em); }
+		.row.compact { min-height: max(36px, 2.4em); padding-top: 0; padding-bottom: 0; }
+		.title { font-size: 1.3em; }
+		.preview { font-size: 1.2em; }
 		.act { width: 36px; height: 36px; }
 	}
 </style>

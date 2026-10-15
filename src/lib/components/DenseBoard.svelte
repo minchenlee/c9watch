@@ -11,12 +11,14 @@
 		groups: ProjectGroupLike<Session>[];
 		/** One line per session. */
 		compact?: boolean;
+		/** Type size multiplier from the A−/A+ control. */
+		fontScale?: number;
 		onexpand: (session: Session) => void;
 		onstop: (session: Session) => void;
 		onopen: (session: Session) => void;
 	}
 
-	let { groups, compact = false, onexpand, onstop, onopen }: Props = $props();
+	let { groups, compact = false, fontScale = 1, onexpand, onstop, onopen }: Props = $props();
 
 	const MIN_COLUMN = 300;
 	const GAP = 6;
@@ -27,10 +29,11 @@
 
 	let width = $state(0);
 	let tiles = $derived(denseTiles(groups));
+	// Bigger type needs wider columns, so fewer of them.
 	let columns = $derived(
 		packColumns(
 			tiles,
-			columnCount(width, MIN_COLUMN, GAP, tiles.length),
+			columnCount(width, MIN_COLUMN * fontScale, GAP, tiles.length),
 			(tile) => HEAD + tile.sessions.length * (compact ? ROW_COMPACT : ROW)
 		)
 	);
@@ -47,7 +50,11 @@
 	}
 </script>
 
-<div class="board" bind:clientWidth={width} style="--cols: {columns.length}; --gap: {GAP}px;">
+<div
+	class="board"
+	bind:clientWidth={width}
+	style="--cols: {columns.length}; --gap: {GAP}px; --dense-fs: {fontScale};"
+>
 	{#each columns as column, ci (ci)}
 		<div class="column">
 			{#each column as tile (tile.path)}
@@ -101,6 +108,8 @@
 
 	.tile {
 		container: tile / inline-size;
+		/* Every size inside a tile is in em of this. */
+		font-size: calc(10px * var(--dense-fs, 1));
 		background: var(--bg-card);
 		border: 1px solid var(--border-default);
 		min-width: 0;
@@ -115,7 +124,7 @@
 		display: flex;
 		align-items: center;
 		gap: 6px;
-		height: 24px;
+		height: 2.4em;
 		padding: 0 8px;
 		background: var(--bg-elevated);
 		border-bottom: 1px solid var(--border-muted);
@@ -128,7 +137,7 @@
 		white-space: nowrap;
 		text-overflow: ellipsis;
 		font-family: var(--font-pixel);
-		font-size: 11px;
+		font-size: 1.1em;
 		font-weight: 600;
 		letter-spacing: 0.1em;
 		text-transform: uppercase;
@@ -138,7 +147,7 @@
 	.count {
 		flex-shrink: 0;
 		font-family: var(--font-pixel);
-		font-size: 11px;
+		font-size: 1.1em;
 		color: var(--text-muted);
 	}
 
@@ -172,7 +181,7 @@
 	}
 
 	@media (max-width: 768px) {
-		.tile-head { height: 26px; }
-		.name, .count { font-size: 12px; }
+		.tile-head { height: 2.6em; }
+		.name, .count { font-size: 1.2em; }
 	}
 </style>

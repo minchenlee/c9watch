@@ -71,6 +71,15 @@
 
 	let isCompact = $state(false);
 
+	// Dense view text size, stepped by the A−/A+ buttons.
+	const DENSE_FONT_SCALES = [0.9, 1, 1.1, 1.2, 1.35, 1.5];
+	let denseFontScale = $state(1);
+	let denseFontStep = $derived(DENSE_FONT_SCALES.indexOf(denseFontScale));
+	function stepDenseFont(delta: number) {
+		const next = DENSE_FONT_SCALES[denseFontStep + delta];
+		if (next !== undefined) denseFontScale = next;
+	}
+
 	let activeTab = $state<'monitor' | 'history' | 'cost' | 'memory' | 'settings'>('monitor');
 	let fdaLikelyNeeded = $state(false);
 	let hiddenClaudeSessions = $state<HiddenClaudeSession[]>([]);
@@ -95,6 +104,10 @@
 			const savedCompact = localStorage.getItem('sessionViewCompact');
 			if (savedCompact === 'true') {
 				isCompact = true;
+			}
+			const savedFontScale = Number(localStorage.getItem('denseFontScale'));
+			if (DENSE_FONT_SCALES.includes(savedFontScale)) {
+				denseFontScale = savedFontScale;
 			}
 			const savedFilter = localStorage.getItem('sessionFilter');
 			if (
@@ -166,6 +179,12 @@
 	$effect(() => {
 		if (browser) {
 			localStorage.setItem('sessionViewCompact', String(isCompact));
+		}
+	});
+
+	$effect(() => {
+		if (browser) {
+			localStorage.setItem('denseFontScale', String(denseFontScale));
 		}
 	});
 
@@ -583,7 +602,7 @@
 						onclick={jumpToAttention}
 						disabled={attentionItems.length === 0}
 					>
-						{attentionItems.length} attention item{attentionItems.length === 1 ? '' : 's'}
+						{attentionItems.length}{' '}<span class="attention-label">attention item{attentionItems.length === 1 ? '' : 's'}</span><span class="attention-label-short">attn</span>
 					</button>
 					<span class="project-count">{filteredSessions.length}</span>
 					<button
@@ -659,6 +678,26 @@
 							</svg>
 						</button>
 					</div>
+					{#if isDense}
+						<div class="view-toggle" role="group" aria-label="Text size">
+							<button
+								type="button"
+								class="toggle-btn font-btn smaller"
+								onclick={() => stepDenseFont(-1)}
+								disabled={denseFontStep <= 0}
+								title={`Smaller text (${Math.round(denseFontScale * 100)}%)`}
+								aria-label="Smaller text"
+							>A−</button>
+							<button
+								type="button"
+								class="toggle-btn font-btn larger"
+								onclick={() => stepDenseFont(1)}
+								disabled={denseFontStep >= DENSE_FONT_SCALES.length - 1}
+								title={`Larger text (${Math.round(denseFontScale * 100)}%)`}
+								aria-label="Larger text"
+							>A+</button>
+						</div>
+					{/if}
 					<div class="view-toggle">
 						<button 
 							class="toggle-btn" 
@@ -758,6 +797,7 @@
 					<DenseBoard
 						groups={projectGroups}
 						compact={isCompact}
+						fontScale={denseFontScale}
 						onexpand={handleExpand}
 						onstop={(session) => handleStop(session.pid)}
 						onopen={(session) => handleOpen(session.pid, session.projectPath)}
@@ -1459,6 +1499,24 @@
 		height: 24px;
 	}
 
+	.attention-label-short { display: none; }
+
+	.font-btn {
+		font-family: var(--font-mono);
+		font-weight: 700;
+		line-height: 1;
+		letter-spacing: -0.02em;
+	}
+
+	.font-btn.smaller { font-size: 10px; }
+	.font-btn.larger { font-size: 13px; }
+
+	.font-btn:disabled {
+		opacity: 0.35;
+		cursor: default;
+		background: transparent;
+	}
+
 	/* ── Fullscreen: align tab padding with content padding ────── */
 	/* In macOS native fullscreen the traffic lights are gone. Replace the
 	   80px clearance with var(--space-xl) to match the grid-container padding. */
@@ -1537,9 +1595,12 @@
 			padding: 6px;
 		}
 
-		.dense .system-section .project-header {
-			flex-wrap: nowrap;
-		}
+		.dense .attention-label { display: none; }
+		.dense .attention-label-short { display: inline; }
+
+		/* Tighter gaps keep all controls on one line down to 360px. */
+		.dense .system-section .project-header { gap: 4px; }
+		.dense .view-toggle { gap: 0; }
 
 		.dense .system-section .project-name,
 		.dense .system-section .project-count,
