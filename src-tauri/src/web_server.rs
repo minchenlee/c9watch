@@ -405,7 +405,7 @@ async fn handle_message_with_owners(
         )
         .await
         {
-            Ok(sessions) => ServerMsg::Sessions {
+            Ok((sessions, _diagnostics)) => ServerMsg::Sessions {
                 data: serde_json::to_value(&sessions).unwrap_or_default(),
             },
             Err(e) => ServerMsg::Error { message: e },
