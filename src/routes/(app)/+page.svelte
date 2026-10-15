@@ -20,6 +20,7 @@
 	import { isTauri } from '$lib/ws';
 	import StatusBar from '$lib/components/StatusBar.svelte';
 	import SessionCard from '$lib/components/SessionCard.svelte';
+	import DenseBoard from '$lib/components/DenseBoard.svelte';
 	import ExpandedCardOverlay from '$lib/components/ExpandedCardOverlay.svelte';
 	import ToastNotifications from '$lib/components/ToastNotifications.svelte';
 	import QRCodeModal from '$lib/components/QRCodeModal.svelte';
@@ -64,7 +65,8 @@
 	let expandedId = $derived($expandedSessionId);
 	let conversation = $derived($currentConversation);
 
-	let viewMode = $state<'project' | 'all'>('project');
+	let viewMode = $state<'project' | 'all' | 'dense'>('project');
+	let isDense = $derived(viewMode === 'dense');
 	let sessionFilter = $state<'humans' | 'workers'>('humans');
 
 	let isCompact = $state(false);
@@ -87,7 +89,7 @@
 	onMount(() => {
 		if (browser) {
 			const saved = localStorage.getItem('sessionViewMode');
-			if (saved === 'project' || saved === 'all') {
+			if (saved === 'project' || saved === 'all' || saved === 'dense') {
 				viewMode = saved;
 			}
 			const savedCompact = localStorage.getItem('sessionViewCompact');
@@ -569,7 +571,7 @@
 		<SettingsTab />
 	</main>
 	{:else}
-	<main class="grid-container" in:fadeIn>
+	<main class="grid-container" class:dense={isDense} in:fadeIn>
 		<div class="sections-container">
 			<section class="system-section" in:flyIn|global={{ index: 0 }}>
 				<div class="project-header">
@@ -647,7 +649,7 @@
 							class="toggle-btn"
 							class:active={isCompact}
 							onclick={() => isCompact = !isCompact}
-							title="Compact View"
+							title={isDense ? 'One line per session' : 'Compact View'}
 						>
 							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 								<polyline points="4 14 10 14 10 20" />
@@ -686,12 +688,25 @@
 								<rect x="3" y="14" width="7" height="7" rx="1" />
 							</svg>
 						</button>
+						<button
+							class="toggle-btn"
+							class:active={viewMode === 'dense'}
+							onclick={() => viewMode = 'dense'}
+							title="Dense: project tiles, one row per session"
+						>
+							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+								<rect x="3" y="3" width="7" height="9" rx="1" />
+								<rect x="14" y="3" width="7" height="5" rx="1" />
+								<rect x="14" y="12" width="7" height="9" rx="1" />
+								<rect x="3" y="16" width="7" height="5" rx="1" />
+							</svg>
+						</button>
 					</div>
 				</div>
 				
 				{#if filteredSessions.length > 0}
 					<div class="system-status-container">
-						<StatusBar total={filteredSessions.length} summary={filteredSummary} />
+						<StatusBar total={filteredSessions.length} summary={filteredSummary} dense={isDense} />
 					</div>
 				{/if}
 				<HiddenSessionsNotice hidden={hiddenClaudeSessions} />
@@ -739,7 +754,15 @@
 				</div>
 			{:else}
 
-				{#if viewMode === 'project'}
+				{#if viewMode === 'dense'}
+					<DenseBoard
+						groups={projectGroups}
+						compact={isCompact}
+						onexpand={handleExpand}
+						onstop={(session) => handleStop(session.pid)}
+						onopen={(session) => handleOpen(session.pid, session.projectPath)}
+					/>
+				{:else if viewMode === 'project'}
 					{#each projectGroups as group, gi (group.path)}
 						{@const baseIdx = projectOffsets[gi] ?? 0}
 						<section class="project-section" in:flyIn|global={{ index: baseIdx }} animate:flip={{ duration: 400 }}>
@@ -1401,6 +1424,41 @@
 		flex: 1;
 	}
 
+	/* ── Dense view: every pixel goes to sessions ─────────────── */
+	.grid-container.dense {
+		padding: var(--space-sm) var(--space-md) var(--space-md);
+	}
+
+	.dense .sections-container {
+		gap: 6px;
+	}
+
+	.dense .system-section {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+
+	.dense .system-section .project-header {
+		gap: var(--space-sm);
+		padding-bottom: 6px;
+		margin-bottom: 0;
+		border-bottom-color: var(--border-default);
+	}
+
+	.dense .system-section .project-name {
+		font-size: 14px;
+	}
+
+	.dense .system-section .project-count {
+		font-size: 13px;
+	}
+
+	.dense .view-toggle .toggle-btn {
+		width: 24px;
+		height: 24px;
+	}
+
 	/* ── Fullscreen: align tab padding with content padding ────── */
 	/* In macOS native fullscreen the traffic lights are gone. Replace the
 	   80px clearance with var(--space-xl) to match the grid-container padding. */
@@ -1471,6 +1529,27 @@
 
 		.demo-toggle {
 			padding: 0 var(--space-xs);
+		}
+
+		/* Dense: header controls on one line, tiles nearly edge to edge. */
+		.grid-container.dense {
+			padding: 6px;
+		}
+
+		.dense .system-section .project-header {
+			flex-wrap: nowrap;
+		}
+
+		.dense .system-section .project-name,
+		.dense .system-section .project-count,
+		.dense .demo-label,
+		.dense .mobile-label {
+			display: none;
+		}
+
+		.dense .view-toggle .toggle-btn {
+			width: 30px;
+			height: 30px;
 		}
 	}
 
