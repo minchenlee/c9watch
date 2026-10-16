@@ -4,12 +4,11 @@
  * the toggle is consistent across CostTracker, SessionCard, and overlays.
  */
 
-import { writable, derived, get } from 'svelte/store';
+import { writable, derived } from 'svelte/store';
 import { browser } from '$app/environment';
 import { getCostData } from '../api';
-import type { CostData, SessionCostRecord } from '../types';
+import type { CostData } from '../types';
 import { buildSessionCostMap, type CostMode } from '../cost-utils';
-import { providerSessionKey } from '../provider';
 
 const COST_MODE_KEY = 'c9watch.costMode';
 
@@ -49,9 +48,4 @@ export async function refreshCostData(): Promise<void> {
 		}
 	})();
 	return inFlight;
-}
-
-/** Convenience: snapshot the cost record for one session. */
-export function getSessionCost(sessionId: string, provider?: SessionCostRecord['provider']): SessionCostRecord | undefined {
-	return get(sessionCostMap).get(providerSessionKey(provider, sessionId));
 }
