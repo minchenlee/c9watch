@@ -39,6 +39,19 @@ export function awayActivityLabel(activity: AwayActivity | null | undefined): st
 	return parts.length > 0 ? parts.join(' · ') : 'No activity';
 }
 
+/** Terse form for one-line rows: "4 files · 6 cmds · 2 agents"; null when there is nothing to say. */
+export function awayActivityShortLabel(activity: AwayActivity | null | undefined): string | null {
+	if (!activity) return null;
+	const p = activity.partial;
+	const parts = [
+		count(activity.filesEdited, 'file', 'files', p),
+		count(activity.commandsRun, 'cmd', 'cmds', p),
+		count(activity.subagentsCompleted, 'agent', 'agents', p)
+	].filter((part): part is string => part !== null);
+	if (parts.length > 0) return parts.join(' · ');
+	return count(activity.toolCalls, 'tool call', 'tool calls', p);
+}
+
 /**
  * Start of the "away" window: when the user last looked at this session
  * (overlay or FOCUS), else when the c9watch window last lost focus, else

@@ -1,4 +1,5 @@
 import { SessionStatus } from '$lib/types';
+import type { WaitingFor } from '$lib/types';
 import type { SubagentInfo } from '$lib/stores/subagents';
 
 export function getSessionStatusColor(status: SessionStatus): string {
@@ -31,6 +32,30 @@ export function getSessionStatusLabel(status: SessionStatus, pendingToolName?: s
 			return 'Connecting';
 		default:
 			return 'Unknown';
+	}
+}
+
+/** One word that fits a fixed-width chip in the dense view. */
+export function getSessionStatusShortLabel(
+	status: SessionStatus,
+	waitingFor?: WaitingFor | null,
+	pendingToolName?: string | null
+): string {
+	switch (waitingFor?.kind) {
+		case 'approval': return 'APPROVE';
+		case 'question': return 'QUESTION';
+		case 'attention': return 'ATTN';
+		case 'input': return 'IDLE';
+	}
+	switch (status) {
+		case SessionStatus.Working: return 'WORKING';
+		case SessionStatus.NeedsAttention:
+			return pendingToolName === 'Question' || pendingToolName === 'AskUserQuestion'
+				? 'QUESTION'
+				: 'APPROVE';
+		case SessionStatus.WaitingForInput: return 'IDLE';
+		case SessionStatus.Connecting: return 'STARTING';
+		default: return 'UNKNOWN';
 	}
 }
 
