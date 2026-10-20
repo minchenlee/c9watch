@@ -10,6 +10,7 @@
 	import { canSessionAction, sessionReturnKind, sessionKeyOf } from '$lib/provider';
 	import { awayActivity } from '$lib/stores/away';
 	import { awayActivityLabel, waitingForLabel } from '$lib/session-utils';
+	import { formatTimeSince } from '$lib/time-utils';
 
 	interface Props {
 		session: Session;
@@ -130,21 +131,6 @@
 				return 'Unknown';
 		}
 	}
-
-	function formatTimeSince(isoTimestamp: string): string {
-		const now = new Date().getTime();
-		const then = new Date(isoTimestamp).getTime();
-		const diffMs = now - then;
-		const diffMins = Math.floor(diffMs / 60000);
-		const diffHours = Math.floor(diffMs / 3600000);
-		const diffDays = Math.floor(diffMs / 86400000);
-
-		if (diffMins < 1) return 'now';
-		if (diffMins < 60) return `${diffMins}m`;
-		if (diffHours < 24) return `${diffHours}h`;
-		return `${diffDays}d`;
-	}
-
 
 	function handleCardClick(e: MouseEvent) {
 		const target = e.target as HTMLElement;
