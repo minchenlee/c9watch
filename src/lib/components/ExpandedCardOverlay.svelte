@@ -51,7 +51,7 @@
 	import { getSessionStatusColor, getSessionStatusLabel, getSubagentStatusColor, getSubagentStatusLabel, getWorkerStatusColor, getWorkerStatusLabel } from '$lib/status-utils';
 	import { isTauri } from '$lib/ws';
 	import ProviderBadge from './ProviderBadge.svelte';
-	import { canSessionAction, providerOf, providerSessionKey, sessionKeyOf } from '$lib/provider';
+	import { canSessionAction, providerFilterLabel, providerOf, providerSessionKey, sessionKeyOf } from '$lib/provider';
 	import { getConversation } from '$lib/api';
 	import {
 		conversationLoad,
@@ -333,7 +333,7 @@
 			sessionId: child.id,
 			provider: providerOf(child),
 			agentType: child.agentRole || child.agentNickname || 'subagent',
-				description: child.agentNickname || child.codexTitle || child.cursorTitle || child.summary || child.firstPrompt || child.agentRole || (providerOf(child) === 'cursor' ? 'Cursor subagent' : providerOf(child) === 'pi' ? 'Pi subagent' : providerOf(child) === 'opencode' ? 'OpenCode subagent' : 'Codex subagent'),
+				description: child.agentNickname || child.codexTitle || child.cursorTitle || child.summary || child.firstPrompt || child.agentRole || `${providerFilterLabel(providerOf(child))} subagent`,
 			startedAt: child.startedAtMs ? new Date(child.startedAtMs).toISOString() : child.modified,
 			completedAt: child.status === SessionStatus.Working ? null : child.modified,
 			parentSessionId: session.id,
@@ -366,7 +366,7 @@
 	let previewError = $derived(previewState.error);
 
 	async function openSubagentPreview(sa: SubagentInfo) {
-		if ((sa.provider === 'codex' || sa.provider === 'cursor' || sa.provider === 'pi' || sa.provider === 'opencode') && sa.sessionId) {
+		if (providerOf(sa) !== 'claudeCode' && sa.sessionId) {
 			expandedSessionId.set(providerSessionKey(sa.provider, sa.sessionId));
 			return;
 		}
