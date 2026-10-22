@@ -120,17 +120,23 @@ pub fn open_session(pid: u32, project_path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Get the controlling tty of a process via `ps -o tty=`
-#[cfg(target_os = "macos")]
-fn get_process_tty(pid: u32) -> Option<String> {
+/// Read one `ps -o <field>=` column for a process, trimmed.
+/// Errors only when `ps` cannot be spawned; an unknown pid yields "".
+fn ps_field(pid: u32, field: &str) -> Result<String, String> {
     let output = Command::new("ps")
         .arg("-o")
-        .arg("tty=")
+        .arg(format!("{}=", field))
         .arg("-p")
         .arg(pid.to_string())
         .output()
-        .ok()?;
-    let tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        .map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Get the controlling tty of a process via `ps -o tty=`
+#[cfg(target_os = "macos")]
+fn get_process_tty(pid: u32) -> Option<String> {
+    let tty = ps_field(pid, "tty").ok()?;
     if tty.is_empty() || tty == "??" {
         None
     } else {
@@ -146,17 +152,7 @@ fn get_session_tty(pid: u32) -> Option<String> {
         if let Some(tty) = get_process_tty(current_pid) {
             return Some(tty);
         }
-        let ppid_output = Command::new("ps")
-            .arg("-o")
-            .arg("ppid=")
-            .arg("-p")
-            .arg(current_pid.to_string())
-            .output()
-            .ok()?;
-        let ppid: u32 = String::from_utf8_lossy(&ppid_output.stdout)
-            .trim()
-            .parse()
-            .ok()?;
+        let ppid: u32 = ps_field(current_pid, "ppid").ok()?.parse().ok()?;
         if ppid <= 1 {
             break;
         }
@@ -830,17 +826,8 @@ fn find_parent_app(pid: u32) -> Result<String, String> {
     // Walk up the process tree to find a GUI application
     for i in 0..20 {
         // Get the command/path for current process
-        let comm_output = Command::new("ps")
-            .arg("-o")
-            .arg("comm=")
-            .arg("-p")
-            .arg(current_pid.to_string())
-            .output()
+        let comm = ps_field(current_pid, "comm")
             .map_err(|e| format!("Failed to execute ps: {}", e))?;
-
-        let comm = String::from_utf8_lossy(&comm_output.stdout)
-            .trim()
-            .to_string();
         crate::debug_log::log_info(&format!(
             "[open_session] Step {}: PID {} -> comm: {}",
             i, current_pid, comm
@@ -853,18 +840,10 @@ fn find_parent_app(pid: u32) -> Result<String, String> {
         }
 
         // Get parent PID
-        let ppid_output = Command::new("ps")
-            .arg("-o")
-            .arg("ppid=")
-            .arg("-p")
-            .arg(current_pid.to_string())
-            .output()
-            .map_err(|e| format!("Failed to execute ps: {}", e))?;
-
-        let ppid_str = String::from_utf8_lossy(&ppid_output.stdout)
-            .trim()
-            .to_string();
-        let ppid: u32 = ppid_str.parse().unwrap_or(1);
+        let ppid: u32 = ps_field(current_pid, "ppid")
+            .map_err(|e| format!("Failed to execute ps: {}", e))?
+            .parse()
+            .unwrap_or(1);
         crate::debug_log::log_info(&format!("[open_session] Parent PID: {}", ppid));
 
         // Move to parent
@@ -1097,6 +1076,21 @@ pub fn stop_session(pid: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ps_field_reads_own_comm() {
+        let comm = ps_field(std::process::id(), "comm").expect("ps should run");
+        assert!(!comm.is_empty());
+    }
+
+    #[test]
+    fn ps_field_reads_own_ppid() {
+        let ppid: u32 = ps_field(std::process::id(), "ppid")
+            .expect("ps should run")
+            .parse()
+            .expect("ppid should parse as u32");
+        assert!(ppid > 0);
+    }
 
     #[test]
     fn native_return_guarantee_matches_the_surface() {
