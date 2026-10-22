@@ -724,6 +724,25 @@ async fn stdin_writer_task(
     }
 }
 
+/// Classify a print-path `result` event into the inbox status and error
+/// message. A turn is an error when `is_error` is set or the subtype is
+/// anything other than "success". The error message prefers the `subtype`
+/// (e.g. "error_during_execution", "error_max_turns") since `stop_reason` is
+/// typically only populated on success, then `stop_reason`, then "error".
+fn classify_result(
+    is_error: bool,
+    subtype: Option<&str>,
+    stop_reason: Option<&str>,
+) -> (crate::cli::pm_inbox::EventStatus, Option<String>) {
+    use crate::cli::pm_inbox::EventStatus;
+    if is_error || subtype.map(|s| s != "success").unwrap_or(false) {
+        let msg = subtype.or(stop_reason).unwrap_or("error").to_string();
+        (EventStatus::Error, Some(msg))
+    } else {
+        (EventStatus::Done, None)
+    }
+}
+
 /// Reads stdout line-by-line, appends to stdout.log, and sends TurnResults
 /// whenever a `"type":"result"` event is seen.
 ///
@@ -845,28 +864,10 @@ async fn stdout_tee_task(
                 saw_terminal_result = true;
 
                 if let Some(ref ctx) = inbox {
-                    use crate::cli::pm_inbox::{self, EventStatus, InboxEvent, TurnResult};
-                    let status = if is_error
-                        || subtype.as_deref().map(|s| s != "success").unwrap_or(false)
-                    {
-                        EventStatus::Error
-                    } else {
-                        EventStatus::Done
-                    };
+                    use crate::cli::pm_inbox::{self, InboxEvent, TurnResult};
+                    let (status, err_msg) =
+                        classify_result(is_error, subtype.as_deref(), stop_reason.as_deref());
                     let excerpt = result_text.as_ref().map(|s| pm_inbox::truncate_excerpt(s));
-                    let err_msg = if matches!(status, EventStatus::Error) {
-                        // Prefer the result `subtype` (e.g. "error_during_execution",
-                        // "error_max_turns") since `stop_reason` is typically only
-                        // populated on success.
-                        Some(
-                            subtype
-                                .clone()
-                                .or_else(|| stop_reason.clone())
-                                .unwrap_or_else(|| "error".to_string()),
-                        )
-                    } else {
-                        None
-                    };
                     let ev = InboxEvent::from_turn_result(
                         &ctx.session_id,
                         &ctx.spawned_by,
@@ -973,6 +974,42 @@ async fn stderr_tee_task(stderr: tokio::process::ChildStderr, log_path: PathBuf)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_result_success_is_done() {
+        use crate::cli::pm_inbox::EventStatus;
+        assert_eq!(
+            classify_result(false, Some("success"), Some("end_turn")),
+            (EventStatus::Done, None)
+        );
+    }
+
+    #[test]
+    fn classify_result_non_success_subtype_is_error_with_subtype() {
+        use crate::cli::pm_inbox::EventStatus;
+        assert_eq!(
+            classify_result(false, Some("error_max_turns"), Some("x")),
+            (EventStatus::Error, Some("error_max_turns".to_string()))
+        );
+    }
+
+    #[test]
+    fn classify_result_is_error_without_subtype_uses_stop_reason() {
+        use crate::cli::pm_inbox::EventStatus;
+        assert_eq!(
+            classify_result(true, None, Some("x")),
+            (EventStatus::Error, Some("x".to_string()))
+        );
+    }
+
+    #[test]
+    fn classify_result_is_error_alone_falls_back_to_error() {
+        use crate::cli::pm_inbox::EventStatus;
+        assert_eq!(
+            classify_result(true, None, None),
+            (EventStatus::Error, Some("error".to_string()))
+        );
+    }
 
     fn sample_args() -> SpawnArgs {
         SpawnArgs {
