@@ -2379,4 +2379,285 @@ mod repair_regressions {
             SessionStatus::NeedsAttention
         );
     }
+
+    /// Every detected-derived field set to a distinct value so a golden diff
+    /// shows any field that is dropped or swapped. `pid` is nonzero with
+    /// `can_open` false, so no process lookup runs for `open_target`.
+    fn golden_detected(provider: SessionProvider, surface: SessionSurface) -> DetectedSession {
+        let mut detected = DetectedSession::with_legacy_defaults(
+            4242,
+            PathBuf::from("/golden/cwd"),
+            PathBuf::from("/golden/project-path"),
+            Some("golden-id".to_string()),
+            "golden-project".to_string(),
+        );
+        detected.provider = provider;
+        detected.surface = surface;
+        detected.kind = SessionKind::Background;
+        detected.entrypoint = Some("golden-entry".to_string());
+        detected.started_at_ms = Some(1_600_000_000_000);
+        detected.official_name = Some("golden-official".to_string());
+        detected.agent_kind = AgentKind::Subagent;
+        detected.parent_thread_id = Some("golden-parent".to_string());
+        detected.root_session_id = Some("golden-root".to_string());
+        detected.agent_path = Some("golden/agent/path".to_string());
+        detected.agent_nickname = Some("golden-nick".to_string());
+        detected.agent_role = Some("golden-role".to_string());
+        detected.internal_kind = Some("golden-internal".to_string());
+        detected.can_open = false;
+        detected.can_stop = true;
+        detected.can_rename = false;
+        detected
+    }
+
+    /// Enrich one detected session; returns the serialized card (with the
+    /// on-disk Codex title cache masked) and the skipped notification preview.
+    fn golden_enrich(detected: DetectedSession) -> (serde_json::Value, Option<String>) {
+        let (sessions, _) =
+            enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert!(session.transcript_path.is_none());
+        let mut value = serde_json::to_value(session).unwrap();
+        value.as_object_mut().unwrap().remove("codexTitle");
+        (value, session.notification_preview.clone())
+    }
+
+    fn golden_codex_message(role: &str, content: &str) -> crate::session::codex::CodexMessage {
+        serde_json::from_value(serde_json::json!({
+            "timestamp": "2020-01-01T00:00:00Z",
+            "role": role,
+            "messageType": if role == "user" { "User" } else { "Assistant" },
+            "content": content,
+        }))
+        .unwrap()
+    }
+
+    fn golden_cursor_message(role: &str, content: &str) -> crate::session::cursor::CursorMessage {
+        crate::session::cursor::CursorMessage {
+            timestamp: "2020-01-01T00:00:00Z".to_string(),
+            role: role.to_string(),
+            message_type: if role == "user" {
+                crate::session::MessageType::User
+            } else {
+                crate::session::MessageType::Assistant
+            },
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn golden_codex_session_card() {
+        let mut detected = golden_detected(SessionProvider::Codex, SessionSurface::App);
+        detected.codex_summary = Some(crate::session::codex::CodexRolloutSummary {
+            thread_id: "golden-id".to_string(),
+            lifecycle: CodexLifecycle::Working,
+            messages: vec![
+                golden_codex_message("user", "codex question"),
+                golden_codex_message("assistant", "codex answer one"),
+                golden_codex_message("assistant", "  "),
+            ],
+            last_timestamp: "2020-01-02T03:04:05Z".to_string(),
+            ..Default::default()
+        });
+        let (value, preview) = golden_enrich(detected);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "agentKind": "subagent",
+                "agentNickname": "golden-nick",
+                "agentPath": "golden/agent/path",
+                "agentRole": "golden-role",
+                "canOpen": false,
+                "canRename": false,
+                "canStop": true,
+                "customTitle": null,
+                "entrypoint": "golden-entry",
+                "firstPrompt": "(No conversation yet)",
+                "gitBranch": null,
+                "id": "golden-id",
+                "internalKind": "golden-internal",
+                "kind": "background",
+                "lastAssistantMessage": "codex answer one",
+                "latestMessage": "  ",
+                "messageCount": 3,
+                "modified": "2020-01-02T03:04:05Z",
+                "officialName": "golden-official",
+                "parentThreadId": "golden-parent",
+                "pendingToolName": null,
+                "pid": 4242,
+                "projectPath": "/golden/cwd",
+                "provider": "codex",
+                "rootSessionId": "golden-root",
+                "sessionKey": "codex:golden-id",
+                "sessionName": "golden-nick",
+                "sourceHealth": "stale",
+                "startedAtMs": 1_600_000_000_000_i64,
+                "status": "Working",
+                "summary": null,
+                "surface": "app"
+            })
+        );
+        assert_eq!(preview.as_deref(), Some("codex answer one"));
+    }
+
+    #[test]
+    fn golden_cursor_session_card() {
+        let mut detected = golden_detected(SessionProvider::Cursor, SessionSurface::Cursor);
+        detected.cursor_summary = Some(crate::session::cursor::CursorTranscriptSummary {
+            session_id: "golden-id".to_string(),
+            cursor_title: Some("golden-cursor-title".to_string()),
+            lifecycle: CursorLifecycle::Working,
+            messages: vec![
+                golden_cursor_message("user", "cursor question"),
+                golden_cursor_message("assistant", "cursor answer"),
+            ],
+            last_timestamp: String::new(),
+            empty: false,
+            ..Default::default()
+        });
+        let (value, preview) = golden_enrich(detected);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "agentKind": "subagent",
+                "agentNickname": "golden-nick",
+                "agentPath": "golden/agent/path",
+                "agentRole": "golden-role",
+                "canOpen": false,
+                "canRename": false,
+                "canStop": true,
+                "cursorTitle": "golden-cursor-title",
+                "customTitle": "golden-official",
+                "entrypoint": "golden-entry",
+                "firstPrompt": "cursor question",
+                "gitBranch": null,
+                "id": "golden-id",
+                "internalKind": "golden-internal",
+                "kind": "background",
+                "lastAssistantMessage": "cursor answer",
+                "latestMessage": "cursor answer",
+                "messageCount": 2,
+                "modified": "2020-09-13T12:26:40+00:00",
+                "officialName": "golden-official",
+                "parentThreadId": "golden-parent",
+                "pendingToolName": null,
+                "pid": 4242,
+                "projectPath": "/golden/cwd",
+                "provider": "cursor",
+                "rootSessionId": "golden-root",
+                "sessionKey": "cursor:golden-id",
+                "sessionName": "golden-nick",
+                "sourceHealth": "partial",
+                "startedAtMs": 1_600_000_000_000_i64,
+                "status": "Working",
+                "summary": null,
+                "surface": "cursor"
+            })
+        );
+        assert_eq!(preview.as_deref(), Some("cursor answer"));
+    }
+
+    #[test]
+    fn golden_opencode_session_card() {
+        let mut detected = golden_detected(SessionProvider::Opencode, SessionSurface::Cli);
+        detected.opencode_summary = Some(crate::session::opencode::OpenCodeSummary {
+            modified: "2020-01-02T03:04:05Z".to_string(),
+            status: SessionStatus::Working,
+            diagnostic: "opencode diagnostic".to_string(),
+        });
+        let (value, preview) = golden_enrich(detected);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "agentKind": "subagent",
+                "agentNickname": "golden-nick",
+                "agentPath": "golden/agent/path",
+                "agentRole": "golden-role",
+                "canOpen": false,
+                "canRename": false,
+                "canStop": true,
+                "customTitle": null,
+                "entrypoint": "golden-entry",
+                "firstPrompt": "golden-official",
+                "gitBranch": null,
+                "id": "golden-id",
+                "internalKind": "golden-internal",
+                "kind": "background",
+                "latestMessage": "opencode diagnostic",
+                "messageCount": 0,
+                "modified": "2020-01-02T03:04:05Z",
+                "officialName": "golden-official",
+                "parentThreadId": "golden-parent",
+                "pendingToolName": null,
+                "pid": 4242,
+                "projectPath": "/golden/cwd",
+                "provider": "opencode",
+                "rootSessionId": "golden-root",
+                "sessionKey": "opencode:golden-id",
+                "sessionName": "golden-project",
+                "sourceHealth": "stale",
+                "startedAtMs": 1_600_000_000_000_i64,
+                "status": "Working",
+                "summary": null,
+                "surface": "cli"
+            })
+        );
+        assert_eq!(preview.as_deref(), None);
+    }
+
+    #[test]
+    fn golden_pi_session_card() {
+        let mut detected = golden_detected(SessionProvider::Pi, SessionSurface::Cli);
+        let mut summary = crate::session::pi::PiTranscriptSummary::default();
+        summary.session_id = "golden-id".to_string();
+        summary.first_prompt = Some("   ".to_string());
+        summary.latest_snippet = Some("pi snippet".to_string());
+        summary.latest_assistant_text = Some("pi assistant text".to_string());
+        summary.message_count = 7;
+        summary.lifecycle = PiLifecycle::Working;
+        summary.empty = true;
+        summary.pending_tool_name = Some("pi-tool".to_string());
+        summary.last_timestamp = "2020-01-02T03:04:05Z".to_string();
+        detected.pi_summary = Some(summary);
+        let (value, preview) = golden_enrich(detected);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "agentKind": "subagent",
+                "agentNickname": "golden-nick",
+                "agentPath": "golden/agent/path",
+                "agentRole": "golden-role",
+                "canOpen": false,
+                "canRename": false,
+                "canStop": true,
+                "customTitle": null,
+                "entrypoint": "golden-entry",
+                "firstPrompt": "(No conversation yet)",
+                "gitBranch": null,
+                "id": "golden-id",
+                "internalKind": "golden-internal",
+                "kind": "background",
+                "lastAssistantMessage": "pi assistant text",
+                "latestMessage": "pi snippet",
+                "messageCount": 7,
+                "modified": "2020-01-02T03:04:05Z",
+                "officialName": "golden-official",
+                "parentThreadId": "golden-parent",
+                "pendingToolName": "pi-tool",
+                "pid": 4242,
+                "projectPath": "/golden/cwd",
+                "provider": "pi",
+                "rootSessionId": "golden-root",
+                "sessionKey": "pi:golden-id",
+                "sessionName": "golden-nick",
+                "sourceHealth": "stale",
+                "startedAtMs": 1_600_000_000_000_i64,
+                "status": "Connecting",
+                "summary": null,
+                "surface": "cli"
+            })
+        );
+        assert_eq!(preview.as_deref(), Some("pi assistant text"));
+    }
 }
