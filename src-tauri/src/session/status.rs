@@ -65,21 +65,6 @@ pub fn determine_status_with(
         None => return SessionStatus::Connecting,
     };
 
-    // Also check if there are any recent progress entries AFTER the last meaningful entry.
-    // Progress entries (e.g., bash_progress) indicate active tool execution.
-    let last_meaningful_idx = entries
-        .iter()
-        .rposition(|entry| {
-            matches!(
-                entry,
-                SessionEntry::User { .. } | SessionEntry::Assistant { .. }
-            )
-        })
-        .unwrap_or(0);
-    let has_trailing_progress = entries[last_meaningful_idx + 1..]
-        .iter()
-        .any(|entry| matches!(entry, SessionEntry::Unknown));
-
     match last_entry {
         SessionEntry::User { base, message } => {
             // Check if this is a tool_result or an actual user prompt.
@@ -118,32 +103,19 @@ pub fn determine_status_with(
             match raw_status {
                 SessionStatus::Working => {
                     // "Working" from analyze_assistant_message means either:
-                    // 1. Pending tool_use (auto-approved) - check for trailing progress
+                    // 1. Pending tool_use (auto-approved) - the tool is running
                     // 2. Text with no stop_reason (but stop_reason is always None in JSONL)
                     //
-                    // Use recency + trailing progress to distinguish active from idle
-                    let has_pending_tools = has_pending_tool_uses(&message.content);
-
-                    if has_pending_tools {
-                        // Tool is pending - check if there's active progress or recent activity.
-                        // 20s threshold (increased from 10s) accommodates tool execution time.
-                        if has_trailing_progress || is_entry_recent(&base.timestamp, 20) {
-                            SessionStatus::Working
-                        } else {
-                            // Pending tool but no recent activity - likely stale
-                            SessionStatus::Working
-                        }
+                    // For text/thinking content, use recency: if the entry was written
+                    // recently, Claude is likely still streaming or about to write more.
+                    // If old, session is idle. 20s threshold accommodates streaming and
+                    // thinking pauses.
+                    if has_pending_tool_uses(&message.content)
+                        || is_entry_recent(&base.timestamp, 20)
+                    {
+                        SessionStatus::Working
                     } else {
-                        // No pending tools, just text/thinking content.
-                        // Since stop_reason is always None in JSONL, we use recency:
-                        // if the entry was written recently, Claude is likely still
-                        // streaming or about to write more. If old, session is idle.
-                        // 20s threshold (increased from 10s) accommodates streaming and thinking pauses.
-                        if is_entry_recent(&base.timestamp, 20) {
-                            SessionStatus::Working
-                        } else {
-                            SessionStatus::WaitingForInput
-                        }
+                        SessionStatus::WaitingForInput
                     }
                 }
                 SessionStatus::NeedsAttention => {
