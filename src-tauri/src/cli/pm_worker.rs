@@ -428,31 +428,13 @@ impl BgWorkerHandle {
 
             self.ready_fired = true;
 
+            if matches!(ev, SubscribeEvent::Stream { .. }) {
+                continue;
+            }
             // Extract any StatePatch payloads from this event so we can both
             // (a) update the detector and (b) inspect the tempo field for the
             // post-send active-gate check.
-            let mut patches: Vec<crate::cli::bg_protocol::StatePatch> = Vec::new();
-            match ev {
-                SubscribeEvent::Snapshot { record, .. } => {
-                    let nested = record.get("currentState").and_then(|v| {
-                        serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(v.clone())
-                            .ok()
-                    });
-                    let from_record =
-                        serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(
-                            record.clone(),
-                        )
-                        .ok();
-                    if let Some(p) = nested {
-                        patches.push(p);
-                    }
-                    if let Some(p) = from_record {
-                        patches.push(p);
-                    }
-                }
-                SubscribeEvent::State { patch } => patches.push(patch),
-                SubscribeEvent::Stream { .. } => continue,
-            }
+            let patches = ev.state_patches();
 
             // Lower the gate as soon as we see the worker enter the new turn.
             if gate_pending {
@@ -570,25 +552,11 @@ async fn settle_watcher_task(
                 continue;
             }
         };
-        match ev {
-            SubscribeEvent::Snapshot { ref record, .. } => {
-                let nested = record.get("currentState").and_then(|v| {
-                    serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(v.clone()).ok()
-                });
-                let from_record =
-                    serde_json::from_value::<crate::cli::bg_protocol::StatePatch>(record.clone())
-                        .ok();
-                if let Some(p) = nested {
-                    det.apply_patch(&p);
-                }
-                if let Some(p) = from_record {
-                    det.apply_patch(&p);
-                }
-            }
-            SubscribeEvent::State { ref patch } => {
-                det.apply_patch(patch);
-            }
-            SubscribeEvent::Stream { .. } => continue,
+        if matches!(ev, SubscribeEvent::Stream { .. }) {
+            continue;
+        }
+        for p in ev.state_patches() {
+            det.apply_patch(&p);
         }
         let current = det.last_settled_state().map(String::from);
         if !det.is_settled() {
