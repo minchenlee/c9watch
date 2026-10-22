@@ -133,28 +133,7 @@ impl PiSessionSource {
     }
 
     pub(crate) fn contains_session_id(&self, session_id: &str) -> bool {
-        let Ok(dirs) = std::fs::read_dir(&self.root) else {
-            return false;
-        };
-        for dir_entry in dirs.flatten() {
-            let dir = dir_entry.path();
-            if !dir.is_dir() {
-                continue;
-            }
-            let Ok(files) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for file_entry in files.flatten() {
-                let path = file_entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                if pi_session_id_from_filename(&path).as_deref() == Some(session_id) {
-                    return true;
-                }
-            }
-        }
-        false
+        find_transcript_by_id(&self.root, session_id).is_some()
     }
 
     fn summary_for(&mut self, path: &Path) -> Option<PiTranscriptSummary> {
@@ -209,56 +188,43 @@ impl SessionSource for PiSessionSource {
         &mut self,
     ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
         let mut sessions = Vec::new();
-        let Ok(dirs) = std::fs::read_dir(&self.root) else {
+        let Some(transcripts) = pi_transcripts(&self.root) else {
             self.cache.clear();
             return Ok((sessions, DetectionDiagnostics::default()));
         };
         let now = SystemTime::now();
         let mut recent_paths = HashSet::new();
         let mut fresh_sessions: Vec<(PiTranscriptSummary, i64, PathBuf)> = Vec::new();
-        for dir_entry in dirs.flatten() {
-            let dir = dir_entry.path();
-            if !dir.is_dir() {
+        for (dir, path) in transcripts {
+            // Even pending tools expire after four hours. Gate before any
+            // transcript read so historical archives do not enter polling.
+            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let age_secs = modified
+                .and_then(|t| now.duration_since(t).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(u64::MAX);
+            if age_secs >= PI_FRESHNESS_WORKING_SECS {
                 continue;
             }
-            let Ok(files) = std::fs::read_dir(&dir) else {
+            recent_paths.insert(path.clone());
+            let Some(summary) = self.summary_for(&path) else {
                 continue;
             };
-            for file_entry in files.flatten() {
-                let path = file_entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                // Even pending tools expire after four hours. Gate before any
-                // transcript read so historical archives do not enter polling.
-                let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-                let age_secs = modified
-                    .and_then(|t| now.duration_since(t).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(u64::MAX);
-                if age_secs >= PI_FRESHNESS_WORKING_SECS {
-                    continue;
-                }
-                recent_paths.insert(path.clone());
-                let Some(summary) = self.summary_for(&path) else {
-                    continue;
-                };
-                if summary.session_id.is_empty() {
-                    continue;
-                }
-                let fresh = match summary.lifecycle {
-                    PiLifecycle::Working => age_secs < PI_FRESHNESS_WORKING_SECS,
-                    PiLifecycle::Idle => age_secs < PI_FRESHNESS_IDLE_SECS,
-                };
-                if !fresh {
-                    continue;
-                }
-                let modified_ms = modified
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                fresh_sessions.push((summary, modified_ms, dir.clone()));
+            if summary.session_id.is_empty() {
+                continue;
             }
+            let fresh = match summary.lifecycle {
+                PiLifecycle::Working => age_secs < PI_FRESHNESS_WORKING_SECS,
+                PiLifecycle::Idle => age_secs < PI_FRESHNESS_IDLE_SECS,
+            };
+            if !fresh {
+                continue;
+            }
+            let modified_ms = modified
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            fresh_sessions.push((summary, modified_ms, dir.clone()));
         }
         self.cache.retain(|path, _| recent_paths.contains(path));
 
@@ -366,17 +332,7 @@ fn pi_dir_cwd(dir: &Path) -> String {
 
 /// Exact cwd from the first sibling transcript header, if any carries one.
 fn pi_dir_header_cwd(dir: &Path) -> Option<String> {
-    let files = std::fs::read_dir(dir).ok()?;
-    for entry in files.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        if let Some(cwd) = read_pi_header_cwd(&path) {
-            return Some(cwd);
-        }
-    }
-    None
+    pi_jsonl_files(dir)?.find_map(|path| read_pi_header_cwd(&path))
 }
 
 /// cwd from a transcript's session header (either schema), scanning only
@@ -413,6 +369,47 @@ fn pi_session_id_from_filename(path: &Path) -> Option<String> {
         return None;
     }
     Some(id.to_string())
+}
+
+/// Transcript directories under a pi sessions root, in `read_dir` order.
+/// `None` when the root itself cannot be read.
+fn pi_transcript_dirs(root: &Path) -> Option<impl Iterator<Item = PathBuf>> {
+    let dirs = std::fs::read_dir(root).ok()?;
+    Some(
+        dirs.flatten()
+            .map(|entry| entry.path())
+            .filter(|dir| dir.is_dir()),
+    )
+}
+
+/// `.jsonl` transcripts directly inside one directory, in `read_dir` order.
+/// `None` when the directory cannot be read.
+fn pi_jsonl_files(dir: &Path) -> Option<impl Iterator<Item = PathBuf>> {
+    let files = std::fs::read_dir(dir).ok()?;
+    Some(
+        files
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl")),
+    )
+}
+
+/// Every `<root>/<cwd-dir>/*.jsonl` transcript as `(dir, path)`. Unreadable
+/// directories are skipped; `None` when the root itself cannot be read.
+fn pi_transcripts(root: &Path) -> Option<impl Iterator<Item = (PathBuf, PathBuf)>> {
+    Some(pi_transcript_dirs(root)?.flat_map(|dir| {
+        pi_jsonl_files(&dir)
+            .into_iter()
+            .flatten()
+            .map(move |path| (dir.clone(), path))
+    }))
+}
+
+/// First transcript under `root` whose filename carries `session_id`.
+fn find_transcript_by_id(root: &Path, session_id: &str) -> Option<PathBuf> {
+    pi_transcripts(root)?
+        .map(|(_, path)| path)
+        .find(|path| pi_session_id_from_filename(path).as_deref() == Some(session_id))
 }
 
 // ── Transcript parsing ──────────────────────────────────────────────
@@ -878,18 +875,10 @@ fn read_pi_conversation_under_with_tools(
 
 pub(crate) fn pi_conversation_path_for_session(home: &Path, session_id: &str) -> Option<PathBuf> {
     let root = pi_sessions_root(home);
-    let dirs = std::fs::read_dir(&root).ok()?;
-    for dir_entry in dirs.flatten() {
-        let dir = dir_entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let files = std::fs::read_dir(&dir).ok()?;
-        for file_entry in files.flatten() {
-            let path = file_entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
+    // Unlike `find_transcript_by_id`, an unreadable directory visited before
+    // the match ends the lookup with `None`.
+    for dir in pi_transcript_dirs(&root)? {
+        for path in pi_jsonl_files(&dir)? {
             if pi_session_id_from_filename(&path).as_deref() == Some(session_id) {
                 return Some(path);
             }
@@ -902,26 +891,13 @@ pub(crate) fn pi_session_ids(home: &Path, prefix: &str) -> Vec<String> {
     let root = pi_sessions_root(home);
     let mut seen = std::collections::HashSet::new();
     let mut ids = Vec::new();
-    let Ok(dirs) = std::fs::read_dir(&root) else {
+    let Some(transcripts) = pi_transcripts(&root) else {
         return ids;
     };
-    for dir_entry in dirs.flatten() {
-        let dir = dir_entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let Ok(files) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for file_entry in files.flatten() {
-            let path = file_entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            if let Some(id) = pi_session_id_from_filename(&path) {
-                if id.starts_with(prefix) && seen.insert(id.clone()) {
-                    ids.push(id);
-                }
+    for (_, path) in transcripts {
+        if let Some(id) = pi_session_id_from_filename(&path) {
+            if id.starts_with(prefix) && seen.insert(id.clone()) {
+                ids.push(id);
             }
         }
     }
@@ -980,59 +956,46 @@ fn apply_pi_tool_filter(
 pub(crate) fn pi_history_entries(home: &Path) -> Vec<crate::session::history::HistoryEntry> {
     let root = pi_sessions_root(home);
     let mut entries = Vec::new();
-    let Ok(dirs) = std::fs::read_dir(&root) else {
+    let Some(transcripts) = pi_transcripts(&root) else {
         return entries;
     };
-    for dir_entry in dirs.flatten() {
-        let dir = dir_entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let Ok(files) = std::fs::read_dir(&dir) else {
+    for (dir, path) in transcripts {
+        let Some(summary) = summarize_pi_history(&path) else {
             continue;
         };
-        for file_entry in files.flatten() {
-            let path = file_entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Some(summary) = summarize_pi_history(&path) else {
-                continue;
-            };
-            if summary.session_id.is_empty() {
-                continue;
-            }
-            let project = if summary.project_path.is_empty() {
-                pi_dir_cwd(&dir)
-            } else {
-                summary.project_path.clone()
-            };
-            let project_name = Path::new(&project)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            entries.push(crate::session::history::HistoryEntry {
-                session_id: summary.session_id,
-                display: summary.first_prompt.unwrap_or_default(),
-                // Header-less transcripts fall back to file mtime so they
-                // do not all cluster at epoch in sorted history.
-                timestamp: summary
-                    .started_at_ms
-                    .filter(|ms| *ms > 0)
-                    .map(|ms| ms as u64)
-                    .or_else(|| file_mtime_ms(&path))
-                    .unwrap_or(0),
-                project,
-                project_name,
-                custom_title: None,
-                codex_title: None,
-                cursor_title: None,
-                provider: "pi".to_string(),
-                surface: Some("cli".to_string()),
-                agent_kind: Some("root".to_string()),
-            });
+        if summary.session_id.is_empty() {
+            continue;
         }
+        let project = if summary.project_path.is_empty() {
+            pi_dir_cwd(&dir)
+        } else {
+            summary.project_path.clone()
+        };
+        let project_name = Path::new(&project)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        entries.push(crate::session::history::HistoryEntry {
+            session_id: summary.session_id,
+            display: summary.first_prompt.unwrap_or_default(),
+            // Header-less transcripts fall back to file mtime so they
+            // do not all cluster at epoch in sorted history.
+            timestamp: summary
+                .started_at_ms
+                .filter(|ms| *ms > 0)
+                .map(|ms| ms as u64)
+                .or_else(|| file_mtime_ms(&path))
+                .unwrap_or(0),
+            project,
+            project_name,
+            custom_title: None,
+            codex_title: None,
+            cursor_title: None,
+            provider: "pi".to_string(),
+            surface: Some("cli".to_string()),
+            agent_kind: Some("root".to_string()),
+        });
     }
     entries
 }
@@ -1112,104 +1075,91 @@ pub(crate) fn pi_deep_search(
     };
     let root = pi_sessions_root(home);
     let mut hits = Vec::new();
-    let Ok(dirs) = std::fs::read_dir(&root) else {
+    let Some(transcripts) = pi_transcripts(&root) else {
         return hits;
     };
-    for dir_entry in dirs.flatten() {
-        let dir = dir_entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let Ok(files) = std::fs::read_dir(&dir) else {
+    'files: for (_, path) in transcripts {
+        let Ok(file) = File::open(&path) else {
             continue;
         };
-        'files: for file_entry in files.flatten() {
-            let path = file_entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        let mut snippet: Option<String> = None;
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else {
+                continue 'files;
+            };
+            // Finish validating UTF-8 without decoding more JSON once a
+            // match is found, preserving whole-file error semantics.
+            if snippet.is_some() {
                 continue;
             }
-            let Ok(file) = File::open(&path) else {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
-            let mut snippet: Option<String> = None;
-            for line in BufReader::new(file).lines() {
-                let Ok(line) = line else {
-                    continue 'files;
-                };
-                // Finish validating UTF-8 without decoding more JSON once a
-                // match is found, preserving whole-file error semantics.
-                if snippet.is_some() {
-                    continue;
-                }
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-                    continue;
-                };
-                if value.get("type").and_then(|t| t.as_str()) != Some("message") {
-                    continue;
-                }
-                let Some(message) = value.get("message") else {
-                    continue;
-                };
-                let mut candidates = message_texts(message);
-                if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                    if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
-                        for block in blocks {
-                            match block.get("type").and_then(|t| t.as_str()) {
-                                Some("thinking") => {
-                                    if let Some(text) = pi_thinking_text(block) {
-                                        candidates.push(text.to_string());
-                                    }
+            if value.get("type").and_then(|t| t.as_str()) != Some("message") {
+                continue;
+            }
+            let Some(message) = value.get("message") else {
+                continue;
+            };
+            let mut candidates = message_texts(message);
+            if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
+                    for block in blocks {
+                        match block.get("type").and_then(|t| t.as_str()) {
+                            Some("thinking") => {
+                                if let Some(text) = pi_thinking_text(block) {
+                                    candidates.push(text.to_string());
                                 }
-                                Some("text") => {
-                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                        candidates.push(text.to_string());
-                                    }
-                                }
-                                Some("toolCall") => {
-                                    if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
-                                        candidates.push(name.to_string());
-                                    }
-                                    // Tool arguments often carry the most
-                                    // searchable context (file paths, commands).
-                                    if let Some(args) = block.get("arguments") {
-                                        candidates.push(args.to_string());
-                                    }
-                                }
-                                _ => {}
                             }
+                            Some("text") => {
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    candidates.push(text.to_string());
+                                }
+                            }
+                            Some("toolCall") => {
+                                if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                                    candidates.push(name.to_string());
+                                }
+                                // Tool arguments often carry the most
+                                // searchable context (file paths, commands).
+                                if let Some(args) = block.get("arguments") {
+                                    candidates.push(args.to_string());
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
-                if message.get("role").and_then(|r| r.as_str()) == Some("toolResult") {
-                    let body = tool_result_text(message);
-                    if !body.is_empty() {
-                        candidates.push(body);
-                    }
-                }
-                for candidate in candidates {
-                    if pi_text_matches(&candidate, &needle, case_sensitive, whole_word) {
-                        snippet = Some(pi_snippet(&candidate, query));
-                        break;
-                    }
+            }
+            if message.get("role").and_then(|r| r.as_str()) == Some("toolResult") {
+                let body = tool_result_text(message);
+                if !body.is_empty() {
+                    candidates.push(body);
                 }
             }
-            let Some(snippet) = snippet else {
-                continue;
-            };
-            let Some(session_id) = pi_session_id_from_filename(&path) else {
-                continue;
-            };
-            let (project_path, modified) = pi_search_metadata(home, &session_id);
-            hits.push(crate::session::history::DeepSearchHit {
-                session_id,
-                snippet,
-                project_path,
-                modified,
-                provider: "pi".to_string(),
-                surface: Some("cli".to_string()),
-                agent_kind: "root".to_string(),
-            });
+            for candidate in candidates {
+                if pi_text_matches(&candidate, &needle, case_sensitive, whole_word) {
+                    snippet = Some(pi_snippet(&candidate, query));
+                    break;
+                }
+            }
         }
+        let Some(snippet) = snippet else {
+            continue;
+        };
+        let Some(session_id) = pi_session_id_from_filename(&path) else {
+            continue;
+        };
+        let (project_path, modified) = pi_search_metadata(home, &session_id);
+        hits.push(crate::session::history::DeepSearchHit {
+            session_id,
+            snippet,
+            project_path,
+            modified,
+            provider: "pi".to_string(),
+            surface: Some("cli".to_string()),
+            agent_kind: "root".to_string(),
+        });
     }
     hits
 }
@@ -1274,117 +1224,104 @@ struct PiCostDay {
 pub(crate) fn pi_cost_records(home: &Path) -> Vec<crate::session::cost::SessionCostRecord> {
     let root = pi_sessions_root(home);
     let mut records = Vec::new();
-    let Ok(dirs) = std::fs::read_dir(&root) else {
+    let Some(transcripts) = pi_transcripts(&root) else {
         return records;
     };
-    for dir_entry in dirs.flatten() {
-        let dir = dir_entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let Ok(files) = std::fs::read_dir(&dir) else {
+    'files: for (dir, path) in transcripts {
+        let Some(summary) = summarize_pi_transcript(&path) else {
             continue;
         };
-        'files: for file_entry in files.flatten() {
-            let path = file_entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Some(summary) = summarize_pi_transcript(&path) else {
+        if summary.session_id.is_empty() {
+            continue;
+        }
+        let project = if summary.project_path.is_empty() {
+            decode_pi_cwd_dir(&dir)
+        } else {
+            summary.project_path.clone()
+        };
+        let project_name = Path::new(&project)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let fallback_ms = summary
+            .started_at_ms
+            .or_else(|| file_mtime_ms(&path).map(|ms| ms as i64));
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
+        let mut days: std::collections::BTreeMap<String, PiCostDay> = Default::default();
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else {
+                continue 'files;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
-            if summary.session_id.is_empty() {
+            if value.get("type").and_then(|v| v.as_str()) != Some("message") {
                 continue;
             }
-            let project = if summary.project_path.is_empty() {
-                decode_pi_cwd_dir(&dir)
-            } else {
-                summary.project_path.clone()
-            };
-            let project_name = Path::new(&project)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let fallback_ms = summary
-                .started_at_ms
-                .or_else(|| file_mtime_ms(&path).map(|ms| ms as i64));
-            let Ok(file) = File::open(&path) else {
+            let Some(message) = value.get("message") else {
                 continue;
             };
-            let mut days: std::collections::BTreeMap<String, PiCostDay> = Default::default();
-            for line in BufReader::new(file).lines() {
-                let Ok(line) = line else {
-                    continue 'files;
-                };
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-                    continue;
-                };
-                if value.get("type").and_then(|v| v.as_str()) != Some("message") {
-                    continue;
-                }
-                let Some(message) = value.get("message") else {
-                    continue;
-                };
-                if message.get("role").and_then(|v| v.as_str()) != Some("assistant")
-                    || message.get("usage").is_none()
-                {
-                    continue;
-                }
-                let timestamp = value
-                    .get("timestamp")
-                    .and_then(parse_pi_timestamp_ms)
-                    .or_else(|| message.get("timestamp").and_then(parse_pi_timestamp_ms))
-                    .or(fallback_ms)
-                    .map(millis_to_rfc3339)
-                    .unwrap_or_default();
-                let date = timestamp.get(..10).unwrap_or("unknown").to_string();
-                let day = days.entry(date).or_default();
-                if day.timestamp.is_empty() || timestamp < day.timestamp {
-                    day.timestamp = timestamp;
-                }
-                let previous_cost = day.usage.total_cost;
-                apply_pi_usage(&mut day.usage, message);
-                let model = message.get("model").and_then(|m| m.as_str()).unwrap_or("");
-                *day.model_costs.entry(model.to_string()).or_default() +=
-                    day.usage.total_cost - previous_cost;
+            if message.get("role").and_then(|v| v.as_str()) != Some("assistant")
+                || message.get("usage").is_none()
+            {
+                continue;
             }
-            for (date, day) in days {
-                let total_tokens = day.usage.input_tokens + day.usage.output_tokens;
-                if total_tokens == 0 {
-                    continue;
-                }
-                let model = day
-                    .model_costs
-                    .into_iter()
-                    .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
-                    .map(|(model, _)| model)
-                    .unwrap_or_default();
-                records.push(crate::session::cost::SessionCostRecord {
-                    session_id: summary.session_id.clone(),
-                    project: project.clone(),
-                    project_name: project_name.clone(),
-                    model,
-                    provider: "pi".to_string(),
-                    surface: Some("cli".to_string()),
-                    agent_kind: Some("root".to_string()),
-                    cost: day.usage.total_cost,
-                    cost_available: total_tokens > 0,
-                    input_tokens: day.usage.input_tokens,
-                    cached_input_tokens: day.usage.cached_input_tokens,
-                    output_tokens: day.usage.output_tokens,
-                    reasoning_output_tokens: day.usage.reasoning_tokens,
-                    total_tokens,
-                    timestamp: day.timestamp,
-                    date,
-                    session_name: summary
-                        .first_prompt
-                        .as_ref()
-                        .map(|p| truncate_chars(p.trim(), 60))
-                        .filter(|p| !p.is_empty())
-                        .unwrap_or(summary.session_id.clone()),
-                });
+            let timestamp = value
+                .get("timestamp")
+                .and_then(parse_pi_timestamp_ms)
+                .or_else(|| message.get("timestamp").and_then(parse_pi_timestamp_ms))
+                .or(fallback_ms)
+                .map(millis_to_rfc3339)
+                .unwrap_or_default();
+            let date = timestamp.get(..10).unwrap_or("unknown").to_string();
+            let day = days.entry(date).or_default();
+            if day.timestamp.is_empty() || timestamp < day.timestamp {
+                day.timestamp = timestamp;
             }
+            let previous_cost = day.usage.total_cost;
+            apply_pi_usage(&mut day.usage, message);
+            let model = message.get("model").and_then(|m| m.as_str()).unwrap_or("");
+            *day.model_costs.entry(model.to_string()).or_default() +=
+                day.usage.total_cost - previous_cost;
+        }
+        for (date, day) in days {
+            let total_tokens = day.usage.input_tokens + day.usage.output_tokens;
+            if total_tokens == 0 {
+                continue;
+            }
+            let model = day
+                .model_costs
+                .into_iter()
+                .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+                .map(|(model, _)| model)
+                .unwrap_or_default();
+            records.push(crate::session::cost::SessionCostRecord {
+                session_id: summary.session_id.clone(),
+                project: project.clone(),
+                project_name: project_name.clone(),
+                model,
+                provider: "pi".to_string(),
+                surface: Some("cli".to_string()),
+                agent_kind: Some("root".to_string()),
+                cost: day.usage.total_cost,
+                cost_available: total_tokens > 0,
+                input_tokens: day.usage.input_tokens,
+                cached_input_tokens: day.usage.cached_input_tokens,
+                output_tokens: day.usage.output_tokens,
+                reasoning_output_tokens: day.usage.reasoning_tokens,
+                total_tokens,
+                timestamp: day.timestamp,
+                date,
+                session_name: summary
+                    .first_prompt
+                    .as_ref()
+                    .map(|p| truncate_chars(p.trim(), 60))
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or(summary.session_id.clone()),
+            });
         }
     }
     records
@@ -1773,6 +1710,57 @@ mod tests {
             pi_session_id_from_filename(&path).as_deref(),
             Some("01a06659-1111-2222-3333-444455556666")
         );
+    }
+
+    #[test]
+    fn transcript_walk_yields_only_jsonl_inside_cwd_dirs() {
+        let home = TempDir::new().unwrap();
+        let root = pi_sessions_root(home.path());
+        let a = root.join("--a");
+        let b = root.join("--b");
+        std::fs::create_dir_all(a.join("nested")).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(root.join("stray_root-id.jsonl"), "").unwrap();
+        std::fs::write(a.join("t_id-a.jsonl"), "").unwrap();
+        std::fs::write(a.join("notes.txt"), "").unwrap();
+        std::fs::write(a.join("nested").join("t_id-nested.jsonl"), "").unwrap();
+        std::fs::write(b.join("t_id-b.jsonl"), "").unwrap();
+
+        let mut found: Vec<(PathBuf, PathBuf)> = pi_transcripts(&root).unwrap().collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                (a.clone(), a.join("t_id-a.jsonl")),
+                (b.clone(), b.join("t_id-b.jsonl")),
+            ]
+        );
+
+        assert_eq!(find_transcript_by_id(&root, "id-b"), Some(b.join("t_id-b.jsonl")));
+        assert_eq!(find_transcript_by_id(&root, "id-nested"), None);
+        assert_eq!(find_transcript_by_id(&root, "root-id"), None);
+        let source = PiSessionSource::at_root(root.clone());
+        assert!(source.contains_session_id("id-a"));
+        assert!(!source.contains_session_id("id-missing"));
+        assert_eq!(
+            pi_conversation_path_for_session(home.path(), "id-a"),
+            Some(a.join("t_id-a.jsonl"))
+        );
+        let mut ids = pi_session_ids(home.path(), "id-");
+        ids.sort();
+        assert_eq!(ids, vec!["id-a".to_string(), "id-b".to_string()]);
+    }
+
+    #[test]
+    fn transcript_walk_reports_missing_root() {
+        let home = TempDir::new().unwrap();
+        let root = pi_sessions_root(home.path());
+        assert!(pi_transcripts(&root).is_none());
+        assert!(pi_transcript_dirs(&root).is_none());
+        assert!(pi_jsonl_files(&root).is_none());
+        assert!(pi_session_ids(home.path(), "").is_empty());
+        assert_eq!(pi_conversation_path_for_session(home.path(), "x"), None);
+        assert!(!PiSessionSource::at_root(root).contains_session_id("x"));
     }
 
     #[test]
