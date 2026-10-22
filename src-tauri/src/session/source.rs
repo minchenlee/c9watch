@@ -326,6 +326,26 @@ impl DetectedSession {
             opencode_summary: None,
         }
     }
+
+    /// Session found from files or an HTTP snapshot rather than a process c9watch
+    /// controls: pid 0, `project_path` equal to `cwd`, and no open, stop or
+    /// rename. Callers set provider-specific fields with struct-update syntax.
+    pub fn read_only(
+        provider: SessionProvider,
+        surface: SessionSurface,
+        cwd: PathBuf,
+        session_id: String,
+        project_name: String,
+    ) -> Self {
+        Self {
+            provider,
+            surface,
+            can_open: false,
+            can_stop: false,
+            can_rename: false,
+            ..Self::with_legacy_defaults(0, cwd.clone(), cwd, Some(session_id), project_name)
+        }
+    }
 }
 
 pub trait SessionSource: Send {
@@ -498,6 +518,35 @@ mod tests {
         assert_eq!(d.surface, SessionSurface::ClaudeCode);
         assert_eq!(d.agent_kind, AgentKind::Root);
         assert!(d.can_open && d.can_stop && d.can_rename);
+    }
+
+    #[test]
+    fn read_only_session_has_pid_zero_cwd_as_project_and_no_actions() {
+        let d = DetectedSession::read_only(
+            SessionProvider::Pi,
+            SessionSurface::Cli,
+            PathBuf::from("/tmp/proj"),
+            "uuid".to_string(),
+            "proj".to_string(),
+        );
+        let mut expected = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/proj"),
+            PathBuf::from("/tmp/proj"),
+            Some("uuid".to_string()),
+            "proj".to_string(),
+        );
+        expected.provider = SessionProvider::Pi;
+        expected.surface = SessionSurface::Cli;
+        expected.can_open = false;
+        expected.can_stop = false;
+        expected.can_rename = false;
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert!(d.codex_summary.is_none() && d.cursor_summary.is_none());
+        assert!(d.pi_summary.is_none() && d.opencode_summary.is_none());
     }
 
     #[test]
