@@ -283,51 +283,16 @@ pub fn enrich_detected_sessions(
         let session_id = identity.session_id.clone();
 
         if let Some(summary) = detected.codex_summary.as_ref() {
-            let first_prompt = summary
-                .first_prompt()
-                .map(|prompt| truncate_string(prompt, 100))
-                .unwrap_or_else(|| "(No conversation yet)".to_string());
-            let latest_message = summary
-                .latest_message()
-                .map(|message| truncate_string(message, 200))
-                .unwrap_or_default();
-            let notification_preview = summary
-                .messages
-                .iter()
-                .rev()
-                .take_while(|m| m.message_type != crate::session::MessageType::User)
-                .find(|m| {
-                    m.message_type == crate::session::MessageType::Assistant
-                        && !m.content.trim().is_empty()
-                })
-                .map(|m| truncate_string(&m.content, 240));
-            let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
-                .or_else(|| detected.agent_nickname.clone())
-                .unwrap_or_else(|| detected.project_name.clone());
-            let codex_title = crate::session::codex::get_cached_codex_thread_title(&session_id);
-            let modified = if summary.last_timestamp.is_empty() {
-                detected
-                    .started_at_ms
-                    .and_then(DateTime::<Utc>::from_timestamp_millis)
-                    .map(|timestamp| timestamp.to_rfc3339())
-                    .unwrap_or_default()
-            } else {
-                summary.last_timestamp.clone()
-            };
             sessions.push(Session {
-                id: session_id.clone(),
-                session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
-                pid: detected.pid,
-                session_name,
+                session_name: default_session_name(&detected, &custom_names, &session_id),
                 custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
-                codex_title,
-                cursor_title: None,
-                project_path: detected.cwd.to_string_lossy().to_string(),
-                git_branch: None,
-                first_prompt,
-                summary: None,
+                codex_title: crate::session::codex::get_cached_codex_thread_title(&session_id),
+                first_prompt: summary
+                    .first_prompt()
+                    .map(|prompt| truncate_string(prompt, 100))
+                    .unwrap_or_else(|| "(No conversation yet)".to_string()),
                 message_count: summary.messages.len() as u32,
-                modified,
+                modified: modified_or_started(&summary.last_timestamp, detected.started_at_ms),
                 status: codex_status(summary, now_ms),
                 source_health: Some(health_from_last_timestamp(
                     &summary.last_timestamp,
@@ -337,149 +302,67 @@ pub fn enrich_detected_sessions(
                         crate::session::codex::IDLE_FRESHNESS_SECS
                     },
                 )),
-                latest_message,
-                notification_preview,
+                latest_message: summary
+                    .latest_message()
+                    .map(|message| truncate_string(message, 200))
+                    .unwrap_or_default(),
+                notification_preview: assistant_preview_since_last_user(
+                    summary
+                        .messages
+                        .iter()
+                        .map(|m| (&m.message_type, m.content.as_str())),
+                ),
                 pending_tool_name: summary.pending_tool_name(now_ms).map(str::to_string),
-                pending_tool_input: None,
-                waiting_for: None,
-                last_assistant_message: None,
-                transcript_path: None,
-                worker_of: None,
-                official_name: detected.official_name.clone(),
-                started_at_ms: detected.started_at_ms,
-                provider: detected.provider,
-                surface: detected.surface,
-                kind: detected.kind,
-                entrypoint: detected.entrypoint.clone(),
-                agent_kind: detected.agent_kind,
-                parent_thread_id: detected.parent_thread_id.clone(),
-                root_session_id: detected.root_session_id.clone(),
-                agent_path: detected.agent_path.clone(),
-                agent_nickname: detected.agent_nickname.clone(),
-                agent_role: detected.agent_role.clone(),
-                internal_kind: detected.internal_kind.clone(),
-                open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
-                can_open: detected.can_open,
-                can_stop: detected.can_stop,
-                can_rename: detected.can_rename,
+                ..base_session(&detected, &session_id)
             });
             continue;
         }
 
         if let Some(summary) = detected.cursor_summary.as_ref() {
-            let first_prompt = summary
-                .first_prompt()
-                .map(|prompt| truncate_string(prompt, 100))
-                .unwrap_or_else(|| "(No conversation yet)".to_string());
-            let latest_message = summary
-                .latest_message()
-                .map(|message| truncate_string(message, 200))
-                .unwrap_or_default();
-            let notification_preview = summary
-                .messages
-                .iter()
-                .rev()
-                .take_while(|m| m.message_type != crate::session::MessageType::User)
-                .find(|m| {
-                    m.message_type == crate::session::MessageType::Assistant
-                        && !m.content.trim().is_empty()
-                })
-                .map(|m| truncate_string(&m.content, 240));
-            let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
-                .or_else(|| detected.agent_nickname.clone())
-                .unwrap_or_else(|| detected.project_name.clone());
-            let modified = if summary.last_timestamp.is_empty() {
-                detected
-                    .started_at_ms
-                    .and_then(DateTime::<Utc>::from_timestamp_millis)
-                    .map(|timestamp| timestamp.to_rfc3339())
-                    .unwrap_or_default()
-            } else {
-                summary.last_timestamp.clone()
-            };
-            let status = if summary.lifecycle == CursorLifecycle::Working {
-                if summary.empty {
-                    SessionStatus::Connecting
-                } else {
-                    SessionStatus::Working
-                }
-            } else {
-                SessionStatus::WaitingForInput
-            };
+            let working = summary.lifecycle == CursorLifecycle::Working;
             sessions.push(Session {
-                id: session_id.clone(),
-                session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
-                pid: detected.pid,
-                session_name,
+                session_name: default_session_name(&detected, &custom_names, &session_id),
                 custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id)
                     .or_else(|| detected.official_name.clone()),
-                codex_title: None,
                 cursor_title: summary.cursor_title.clone(),
-                project_path: detected.cwd.to_string_lossy().to_string(),
-                git_branch: None,
-                first_prompt,
-                summary: None,
+                first_prompt: summary
+                    .first_prompt()
+                    .map(|prompt| truncate_string(prompt, 100))
+                    .unwrap_or_else(|| "(No conversation yet)".to_string()),
                 message_count: summary.messages.len() as u32,
-                modified,
-                status,
+                modified: modified_or_started(&summary.last_timestamp, detected.started_at_ms),
+                status: transcript_status(working, summary.empty),
                 source_health: Some(health_from_last_timestamp(
                     &summary.last_timestamp,
-                    if summary.lifecycle == CursorLifecycle::Working {
+                    if working {
                         crate::session::cursor::WORKING_FRESHNESS_SECS
                     } else {
                         crate::session::cursor::IDLE_FRESHNESS_SECS
                     },
                 )),
-                latest_message,
-                notification_preview,
-                pending_tool_name: None,
-                pending_tool_input: None,
-                waiting_for: None,
-                last_assistant_message: None,
-                transcript_path: None,
-                worker_of: None,
-                official_name: detected.official_name.clone(),
-                started_at_ms: detected.started_at_ms,
-                provider: detected.provider,
-                surface: detected.surface,
-                kind: detected.kind,
-                entrypoint: detected.entrypoint.clone(),
-                agent_kind: detected.agent_kind,
-                parent_thread_id: detected.parent_thread_id.clone(),
-                root_session_id: detected.root_session_id.clone(),
-                agent_path: detected.agent_path.clone(),
-                agent_nickname: detected.agent_nickname.clone(),
-                agent_role: detected.agent_role.clone(),
-                internal_kind: detected.internal_kind.clone(),
-                open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
-                can_open: detected.can_open,
-                can_stop: detected.can_stop,
-                can_rename: detected.can_rename,
+                latest_message: summary
+                    .latest_message()
+                    .map(|message| truncate_string(message, 200))
+                    .unwrap_or_default(),
+                notification_preview: assistant_preview_since_last_user(
+                    summary
+                        .messages
+                        .iter()
+                        .map(|m| (&m.message_type, m.content.as_str())),
+                ),
+                ..base_session(&detected, &session_id)
             });
             continue;
         }
 
         if let Some(summary) = detected.opencode_summary.as_ref() {
-            let first_prompt = detected.official_name.clone().unwrap_or_default();
-            let latest_message = summary.diagnostic.clone();
-            let session_name = detected.project_name.clone();
-            let modified = summary.modified.clone();
-            let status = summary.status.clone();
             sessions.push(Session {
-                id: session_id.clone(),
-                session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
-                pid: detected.pid,
-                session_name,
+                session_name: detected.project_name.clone(),
                 custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
-                codex_title: None,
-                cursor_title: None,
-                project_path: detected.cwd.to_string_lossy().to_string(),
-                git_branch: None,
-                first_prompt,
-                summary: None,
+                first_prompt: detected.official_name.clone().unwrap_or_default(),
                 message_count: 0,
-                modified,
-                status,
+                modified: summary.modified.clone(),
+                status: summary.status.clone(),
                 // The OpenCode preview is HTTP-polled, not transcript-backed; treat
                 // the snapshot as fresh when it carries a timestamp, partial when not.
                 // The window matches the detector's snapshot freshness bound.
@@ -487,117 +370,42 @@ pub fn enrich_detected_sessions(
                     &summary.modified,
                     (crate::session::opencode::IDLE_FRESHNESS_MS / 1000) as u64,
                 )),
-                latest_message,
-                notification_preview: None,
-                pending_tool_name: None,
-                pending_tool_input: None,
-                waiting_for: None,
-                last_assistant_message: None,
-                transcript_path: None,
-                worker_of: None,
-                official_name: detected.official_name.clone(),
-                started_at_ms: detected.started_at_ms,
-                provider: detected.provider,
-                surface: detected.surface,
-                kind: detected.kind,
-                entrypoint: detected.entrypoint.clone(),
-                agent_kind: detected.agent_kind,
-                parent_thread_id: detected.parent_thread_id.clone(),
-                root_session_id: detected.root_session_id.clone(),
-                agent_path: detected.agent_path.clone(),
-                agent_nickname: detected.agent_nickname.clone(),
-                agent_role: detected.agent_role.clone(),
-                internal_kind: detected.internal_kind.clone(),
-                open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
-                can_open: detected.can_open,
-                can_stop: detected.can_stop,
-                can_rename: detected.can_rename,
+                latest_message: summary.diagnostic.clone(),
+                ..base_session(&detected, &session_id)
             });
             continue;
         }
 
         if let Some(summary) = detected.pi_summary.as_ref() {
-            let first_prompt = summary
-                .first_prompt
-                .as_deref()
-                .map(|prompt| truncate_string(prompt, 100))
-                .filter(|prompt| !prompt.trim().is_empty())
-                .unwrap_or_else(|| "(No conversation yet)".to_string());
-            let latest_message = summary
-                .latest_snippet
-                .as_deref()
-                .map(|message| truncate_string(message, 200))
-                .unwrap_or_default();
-            let notification_preview = summary.latest_assistant_text.clone();
-            let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
-                .or_else(|| detected.agent_nickname.clone())
-                .unwrap_or_else(|| detected.project_name.clone());
-            let modified = if summary.last_timestamp.is_empty() {
-                detected
-                    .started_at_ms
-                    .and_then(DateTime::<Utc>::from_timestamp_millis)
-                    .map(|timestamp| timestamp.to_rfc3339())
-                    .unwrap_or_default()
-            } else {
-                summary.last_timestamp.clone()
-            };
-            let status = if summary.lifecycle == PiLifecycle::Working {
-                if summary.empty {
-                    SessionStatus::Connecting
-                } else {
-                    SessionStatus::Working
-                }
-            } else {
-                SessionStatus::WaitingForInput
-            };
+            let working = summary.lifecycle == PiLifecycle::Working;
             sessions.push(Session {
-                id: session_id.clone(),
-                session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
-                pid: detected.pid,
-                session_name,
+                session_name: default_session_name(&detected, &custom_names, &session_id),
                 custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
-                codex_title: None,
-                cursor_title: None,
-                project_path: detected.cwd.to_string_lossy().to_string(),
-                git_branch: None,
-                first_prompt,
-                summary: None,
+                first_prompt: summary
+                    .first_prompt
+                    .as_deref()
+                    .map(|prompt| truncate_string(prompt, 100))
+                    .filter(|prompt| !prompt.trim().is_empty())
+                    .unwrap_or_else(|| "(No conversation yet)".to_string()),
                 message_count: summary.message_count as u32,
-                modified,
-                status,
+                modified: modified_or_started(&summary.last_timestamp, detected.started_at_ms),
+                status: transcript_status(working, summary.empty),
                 source_health: Some(health_from_last_timestamp(
                     &summary.last_timestamp,
-                    if summary.lifecycle == PiLifecycle::Working {
+                    if working {
                         crate::session::pi::PI_FRESHNESS_WORKING_SECS
                     } else {
                         crate::session::pi::PI_FRESHNESS_IDLE_SECS
                     },
                 )),
-                latest_message,
-                notification_preview,
+                latest_message: summary
+                    .latest_snippet
+                    .as_deref()
+                    .map(|message| truncate_string(message, 200))
+                    .unwrap_or_default(),
+                notification_preview: summary.latest_assistant_text.clone(),
                 pending_tool_name: summary.pending_tool_name.clone(),
-                pending_tool_input: None,
-                waiting_for: None,
-                last_assistant_message: None,
-                transcript_path: None,
-                worker_of: None,
-                official_name: detected.official_name.clone(),
-                started_at_ms: detected.started_at_ms,
-                provider: detected.provider,
-                surface: detected.surface,
-                kind: detected.kind,
-                entrypoint: detected.entrypoint.clone(),
-                agent_kind: detected.agent_kind,
-                parent_thread_id: detected.parent_thread_id.clone(),
-                root_session_id: detected.root_session_id.clone(),
-                agent_path: detected.agent_path.clone(),
-                agent_nickname: detected.agent_nickname.clone(),
-                agent_role: detected.agent_role.clone(),
-                internal_kind: detected.internal_kind.clone(),
-                open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
-                can_open: detected.can_open,
-                can_stop: detected.can_stop,
-                can_rename: detected.can_rename,
+                ..base_session(&detected, &session_id)
             });
             continue;
         }
@@ -820,6 +628,103 @@ pub fn enrich_detected_sessions(
     let mut sessions = dedup_newest_wins(sessions);
     fill_away_fields(&mut sessions);
     Ok((sessions, diagnostics))
+}
+
+/// Card fields that come straight from the detected session, plus empty
+/// defaults. Provider branches override the fields they compute
+/// (name, prompt, counts, status, health, previews) with struct-update syntax.
+fn base_session(detected: &DetectedSession, session_id: &str) -> Session {
+    Session {
+        id: session_id.to_string(),
+        session_key: SessionIdentity::new(detected.provider, session_id.to_string()).key(),
+        pid: detected.pid,
+        session_name: detected.project_name.clone(),
+        custom_title: None,
+        codex_title: None,
+        cursor_title: None,
+        project_path: detected.cwd.to_string_lossy().to_string(),
+        git_branch: None,
+        first_prompt: String::new(),
+        summary: None,
+        message_count: 0,
+        modified: String::new(),
+        status: SessionStatus::Connecting,
+        source_health: None,
+        latest_message: String::new(),
+        notification_preview: None,
+        pending_tool_name: None,
+        pending_tool_input: None,
+        waiting_for: None,
+        last_assistant_message: None,
+        transcript_path: None,
+        worker_of: None,
+        official_name: detected.official_name.clone(),
+        started_at_ms: detected.started_at_ms,
+        provider: detected.provider,
+        surface: detected.surface,
+        kind: detected.kind,
+        entrypoint: detected.entrypoint.clone(),
+        agent_kind: detected.agent_kind,
+        parent_thread_id: detected.parent_thread_id.clone(),
+        root_session_id: detected.root_session_id.clone(),
+        agent_path: detected.agent_path.clone(),
+        agent_nickname: detected.agent_nickname.clone(),
+        agent_role: detected.agent_role.clone(),
+        internal_kind: detected.internal_kind.clone(),
+        open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
+        can_open: detected.can_open,
+        can_stop: detected.can_stop,
+        can_rename: detected.can_rename,
+    }
+}
+
+/// c9watch custom name, then the agent nickname, then the project name.
+fn default_session_name(
+    detected: &DetectedSession,
+    custom_names: &crate::session::CustomNames,
+    session_id: &str,
+) -> String {
+    claude_custom_name(detected.provider, custom_names, session_id)
+        .or_else(|| detected.agent_nickname.clone())
+        .unwrap_or_else(|| detected.project_name.clone())
+}
+
+/// The transcript's last timestamp, or the start time when it has none yet.
+fn modified_or_started(last_timestamp: &str, started_at_ms: Option<i64>) -> String {
+    if last_timestamp.is_empty() {
+        started_at_ms
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
+            .map(|timestamp| timestamp.to_rfc3339())
+            .unwrap_or_default()
+    } else {
+        last_timestamp.to_string()
+    }
+}
+
+/// Status of a transcript-backed provider: an empty working transcript is
+/// still connecting.
+fn transcript_status(working: bool, empty: bool) -> SessionStatus {
+    if !working {
+        SessionStatus::WaitingForInput
+    } else if empty {
+        SessionStatus::Connecting
+    } else {
+        SessionStatus::Working
+    }
+}
+
+/// Newest non-blank assistant text after the last user message, truncated
+/// for a notification preview. Takes `(message_type, content)` in order.
+fn assistant_preview_since_last_user<'a>(
+    messages: impl DoubleEndedIterator<Item = (&'a crate::session::MessageType, &'a str)>,
+) -> Option<String> {
+    messages
+        .rev()
+        .take_while(|(message_type, _)| **message_type != crate::session::MessageType::User)
+        .find(|(message_type, content)| {
+            **message_type == crate::session::MessageType::Assistant && !content.trim().is_empty()
+        })
+        .map(|(_, content)| truncate_string(content, 240))
 }
 
 /// Derive the card's away fields from what enrichment already computed.
