@@ -157,8 +157,8 @@ fn codex_history_entries(home_dir: &std::path::Path) -> Vec<HistoryEntry> {
                 codex_title,
                 cursor_title: None,
                 provider: "codex".to_string(),
-                surface: Some(snapshot.surface),
-                agent_kind: Some(snapshot.agent_kind),
+                surface: Some(snapshot.surface.as_str().to_string()),
+                agent_kind: Some(snapshot.agent_kind.as_str().to_string()),
             }
         })
         .collect()
@@ -516,8 +516,8 @@ pub(crate) fn deep_search_under(
                             project_path,
                             modified,
                             provider: "codex".to_string(),
-                            surface: Some(snapshot.surface.clone()),
-                            agent_kind: snapshot.agent_kind.clone(),
+                            surface: Some(snapshot.surface.as_str().to_string()),
+                            agent_kind: snapshot.agent_kind.as_str().to_string(),
                         });
                     }
                 }

@@ -1,4 +1,5 @@
 use super::cache::FileVersion;
+use super::source::{AgentKind, SessionSurface};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -129,8 +130,8 @@ struct ArchivedTokenEvent {
 pub(crate) struct CodexRolloutSnapshot {
     pub thread_id: String,
     pub cwd: String,
-    pub surface: String,
-    pub agent_kind: String,
+    pub surface: SessionSurface,
+    pub agent_kind: AgentKind,
     pub parent_thread_id: Option<String>,
     pub display: String,
     pub created_at_ms: u64,
@@ -149,7 +150,7 @@ pub(crate) struct CodexRolloutSnapshot {
 
 impl CodexRolloutSnapshot {
     pub(crate) fn is_internal(&self) -> bool {
-        self.agent_kind == "internal"
+        self.agent_kind == AgentKind::Internal
     }
 }
 
@@ -295,45 +296,50 @@ fn message_text(value: &Value) -> Option<(String, String)> {
     }
 }
 
-fn classify_session(source: &Value, originator: &str) -> (String, String, Option<String>) {
+fn classify_session(
+    source: &Value,
+    originator: &str,
+) -> (SessionSurface, AgentKind, Option<String>) {
     if matches!(originator, "Claude Code" | "Claude Cowork") {
-        return classify_agent(source, "integration".to_string());
+        return classify_agent(source, SessionSurface::Integration);
     }
     let originator_lower = originator.to_ascii_lowercase();
     let surface = if originator_lower.contains("desktop") {
-        "app"
+        SessionSurface::App
     } else if originator_lower.contains("tui") {
-        "cli"
+        SessionSurface::Cli
     } else if originator_lower.contains("exec") {
-        "exec"
+        SessionSurface::Exec
     } else {
         match source.as_str().unwrap_or_default() {
-            "vscode" => "app",
-            "cli" => "cli",
-            "exec" => "exec",
-            "appServer" | "app_server" => "integration",
-            _ => "unknown",
+            "vscode" => SessionSurface::App,
+            "cli" => SessionSurface::Cli,
+            "exec" => SessionSurface::Exec,
+            "appServer" | "app_server" => SessionSurface::Integration,
+            _ => SessionSurface::Unknown,
         }
-    }
-    .to_string();
+    };
 
     classify_agent(source, surface)
 }
 
-fn classify_agent(source: &Value, surface: String) -> (String, String, Option<String>) {
+fn classify_agent(
+    source: &Value,
+    surface: SessionSurface,
+) -> (SessionSurface, AgentKind, Option<String>) {
     let Some(subagent) = source.get("subagent") else {
-        return (surface, "root".to_string(), None);
+        return (surface, AgentKind::Root, None);
     };
     if let Some(spawn) = subagent.get("thread_spawn") {
         let parent = spawn
             .get("parent_thread_id")
             .and_then(Value::as_str)
             .map(str::to_string);
-        return (surface, "subagent".to_string(), parent);
+        return (surface, AgentKind::Subagent, parent);
     }
     // User-spawned agents carry thread_spawn metadata. Every other subagent
     // source shape is a Codex-owned helper, including kinds added in the future.
-    (surface, "internal".to_string(), None)
+    (surface, AgentKind::Internal, None)
 }
 
 #[derive(Default)]
@@ -348,8 +354,8 @@ fn empty_cached(path: &Path, fingerprint: FileFingerprint) -> CachedRollout {
         snapshot: CodexRolloutSnapshot {
             thread_id: String::new(),
             cwd: String::new(),
-            surface: "unknown".to_string(),
-            agent_kind: "root".to_string(),
+            surface: SessionSurface::Unknown,
+            agent_kind: AgentKind::Root,
             parent_thread_id: None,
             display: String::new(),
             created_at_ms: 0,
@@ -804,8 +810,8 @@ fn listing_snapshot(snapshot: &CodexRolloutSnapshot) -> CodexRolloutSnapshot {
     CodexRolloutSnapshot {
         thread_id: snapshot.thread_id.clone(),
         cwd: snapshot.cwd.clone(),
-        surface: snapshot.surface.clone(),
-        agent_kind: snapshot.agent_kind.clone(),
+        surface: snapshot.surface,
+        agent_kind: snapshot.agent_kind,
         parent_thread_id: snapshot.parent_thread_id.clone(),
         display: snapshot.display.clone(),
         created_at_ms: snapshot.created_at_ms,
@@ -1086,6 +1092,44 @@ mod tests {
     }
 
     #[test]
+    fn v6_cache_json_round_trips_byte_identically() {
+        // A cache written before surface/agentKind became enums must parse and
+        // re-serialize unchanged, so CACHE_VERSION does not need a bump.
+        let json = concat!(
+            r#"{"version":6,"files":{"/tmp/a.jsonl":{"#,
+            r#""fingerprint":{"size":10,"modifiedNs":20,"changedNs":30,"identity":40},"#,
+            r#""snapshot":{"threadId":"t-1","cwd":"/tmp/app","surface":"app","#,
+            r#""agentKind":"subagent","parentThreadId":"p-1","display":"hi","#,
+            r#""createdAtMs":1,"updatedAtMs":2,"tokenDays":[],"path":"/tmp/a.jsonl","#,
+            r#""paths":["/tmp/a.jsonl"],"messagesComplete":true,"messages":[],"tokenEvents":[]},"#,
+            r#""offset":10,"currentModel":"gpt-5","indexedMessageBytes":0,"anchor":[1,2],"#,
+            r#""prefixHash":99}}}"#
+        );
+        let cache: ArchiveCache = serde_json::from_str(json).unwrap();
+        assert_eq!(cache.version, CACHE_VERSION);
+        let entry = &cache.files["/tmp/a.jsonl"];
+        assert_eq!(entry.snapshot.surface, SessionSurface::App);
+        assert_eq!(entry.snapshot.agent_kind, AgentKind::Subagent);
+        assert_eq!(serde_json::to_string(&cache).unwrap(), json);
+
+        for (surface, kind) in [
+            ("cli", "root"),
+            ("exec", "internal"),
+            ("integration", "root"),
+            ("unknown", "root"),
+        ] {
+            let json = json
+                .replace(r#""surface":"app""#, &format!(r#""surface":"{surface}""#))
+                .replace(
+                    r#""agentKind":"subagent""#,
+                    &format!(r#""agentKind":"{kind}""#),
+                );
+            let cache: ArchiveCache = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&cache).unwrap(), json);
+        }
+    }
+
+    #[test]
     fn parses_app_cli_subagent_and_internal_metadata() {
         let directory = tempfile::tempdir().unwrap();
         let app = directory.path().join("app.jsonl");
@@ -1131,14 +1175,17 @@ mod tests {
             ],
         );
 
-        assert_eq!(scan_rollout(&app).unwrap().surface, "app");
-        assert_eq!(scan_rollout(&cli).unwrap().surface, "cli");
+        assert_eq!(scan_rollout(&app).unwrap().surface, SessionSurface::App);
+        assert_eq!(scan_rollout(&cli).unwrap().surface, SessionSurface::Cli);
         let child = scan_rollout(&child).unwrap();
-        assert_eq!(child.agent_kind, "subagent");
+        assert_eq!(child.agent_kind, AgentKind::Subagent);
         assert_eq!(child.parent_thread_id.as_deref(), Some("app-1"));
         assert!(scan_rollout(&guardian).unwrap().is_internal());
         assert!(scan_rollout(&future_internal).unwrap().is_internal());
-        assert_eq!(scan_rollout(&integration).unwrap().surface, "integration");
+        assert_eq!(
+            scan_rollout(&integration).unwrap().surface,
+            SessionSurface::Integration
+        );
     }
 
     #[test]
