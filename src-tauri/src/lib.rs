@@ -72,16 +72,45 @@ async fn get_sessions(
 ) -> Result<Vec<Session>, String> {
     let detector = Arc::clone(detector.inner());
     blocking::scan(&blocking::DISCOVERY, move || {
-        let detect_result = {
-            let mut state = detector
-                .lock()
-                .map_err(|e| format!("Detector lock poisoned: {}", e))?;
-            state.detect()
-        };
-        let (detected, diag) = detect_result.map_err(|e| format!("Detect failed: {}", e))?;
-        session::enrichment::enrich_detected_sessions(detected, diag).map(|(sessions, _)| sessions)
+        detect_snapshot(&detector).and_then(|snapshot| snapshot)
     })
     .await
+}
+
+/// Detect and enrich the current sessions using the shared detector.
+///
+/// The outer `Err` means the detector lock is poisoned; the inner `Err`
+/// means detection or enrichment failed. Callers decide which errors to
+/// propagate. The lock guard is dropped before the enrichment pass.
+#[cfg(all(not(mobile), feature = "gui"))]
+fn detect_snapshot(
+    detector: &Mutex<session::DetectorState>,
+) -> Result<Result<Vec<Session>, String>, String> {
+    let detect_result = {
+        let mut state = detector
+            .lock()
+            .map_err(|e| format!("Detector lock poisoned: {}", e))?;
+        state.detect()
+    };
+    Ok(detect_result
+        .map_err(|e| format!("Detect failed: {}", e))
+        .and_then(|(detected, diag)| {
+            session::enrichment::enrich_detected_sessions(detected, diag)
+                .map(|(sessions, _)| sessions)
+        }))
+}
+
+/// Emit a fresh `sessions-updated` snapshot after a session action.
+/// Lock poison is returned; detect and enrich errors are ignored.
+#[cfg(all(not(mobile), feature = "gui"))]
+fn emit_sessions_snapshot(
+    app: &AppHandle,
+    detector: &Mutex<session::DetectorState>,
+) -> Result<(), String> {
+    if let Ok(sessions) = detect_snapshot(detector)? {
+        let _ = app.emit("sessions-updated", &sessions);
+    }
+    Ok(())
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -277,18 +306,7 @@ async fn stop_session(
     stop_session_action(pid)?;
     std::thread::sleep(Duration::from_millis(300));
 
-    let detect_result = {
-        let mut state = detector
-            .lock()
-            .map_err(|e| format!("Detector lock poisoned: {}", e))?;
-        state.detect()
-    };
-    if let Ok((detected, diag)) = detect_result {
-        if let Ok((sessions, _)) = session::enrichment::enrich_detected_sessions(detected, diag) {
-            let _ = app.emit("sessions-updated", &sessions);
-        }
-    }
-    Ok(())
+    emit_sessions_snapshot(&app, detector.inner())
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -325,18 +343,7 @@ async fn rename_session(
         write_session_title(&session_id, &new_name)
     })?;
 
-    let detect_result = {
-        let mut state = detector
-            .lock()
-            .map_err(|e| format!("Detector lock poisoned: {}", e))?;
-        state.detect()
-    };
-    if let Ok((detected, diag)) = detect_result {
-        if let Ok((sessions, _)) = session::enrichment::enrich_detected_sessions(detected, diag) {
-            let _ = app.emit("sessions-updated", &sessions);
-        }
-    }
-    Ok(())
+    emit_sessions_snapshot(&app, detector.inner())
 }
 
 /// Persist a session rename for both the Tauri command and the WebSocket
@@ -458,6 +465,68 @@ mod native_custom_title_tests {
         let temp = tempfile::tempdir().unwrap();
         write_native_custom_title_under(&temp.path().join("absent"), SESSION_ID, "synthetic title");
         assert!(!temp.path().join("absent").exists());
+    }
+}
+
+#[cfg(all(test, not(mobile), feature = "gui"))]
+mod detect_snapshot_tests {
+    use super::detect_snapshot;
+    use crate::session::source::{
+        DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource,
+    };
+    use crate::session::{BackendMode, DetectorState};
+    use std::sync::{Arc, Mutex};
+
+    struct StubSource {
+        fail: bool,
+    }
+
+    impl SessionSource for StubSource {
+        fn detect(
+            &mut self,
+        ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
+            if self.fail {
+                Err(SessionDetectorError::CliFailed("synthetic".into()))
+            } else {
+                Ok((Vec::new(), DetectionDiagnostics::default()))
+            }
+        }
+        fn backend_name(&self) -> &'static str {
+            "stub"
+        }
+    }
+
+    fn detector(fail: bool) -> Mutex<DetectorState> {
+        Mutex::new(DetectorState::for_test(
+            Box::new(StubSource { fail }),
+            BackendMode::ForceCli,
+        ))
+    }
+
+    #[test]
+    fn empty_detection_yields_empty_snapshot() {
+        let sessions = detect_snapshot(&detector(false)).unwrap().unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn detect_failure_is_the_inner_error() {
+        let message = detect_snapshot(&detector(true)).unwrap().unwrap_err();
+        assert!(message.starts_with("Detect failed: "), "{message}");
+    }
+
+    #[test]
+    fn lock_poison_is_the_outer_error() {
+        let detector = Arc::new(detector(false));
+        let poisoner = Arc::clone(&detector);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the detector lock");
+        })
+        .join();
+
+        let message = detect_snapshot(&detector).unwrap_err();
+        assert!(message.starts_with("Detector lock poisoned: "), "{message}");
     }
 }
 
