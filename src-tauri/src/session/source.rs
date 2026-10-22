@@ -111,6 +111,32 @@ pub enum AgentKind {
     Internal,
 }
 
+impl SessionSurface {
+    /// Wire name, identical to the serde encoding.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claudeCode",
+            Self::App => "app",
+            Self::Cli => "cli",
+            Self::Exec => "exec",
+            Self::Integration => "integration",
+            Self::Cursor => "cursor",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl AgentKind {
+    /// Wire name, identical to the serde encoding.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::Subagent => "subagent",
+            Self::Internal => "internal",
+        }
+    }
+}
+
 /// Stable identity for a detected session.
 ///
 /// A provider owns the namespace of its session IDs. Keeping the provider in
@@ -280,6 +306,30 @@ pub trait SessionSource: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surface_and_agent_kind_as_str_match_serde() {
+        for surface in [
+            SessionSurface::ClaudeCode,
+            SessionSurface::App,
+            SessionSurface::Cli,
+            SessionSurface::Exec,
+            SessionSurface::Integration,
+            SessionSurface::Cursor,
+            SessionSurface::Unknown,
+        ] {
+            assert_eq!(
+                serde_json::to_value(surface).unwrap(),
+                serde_json::Value::from(surface.as_str())
+            );
+        }
+        for kind in [AgentKind::Root, AgentKind::Subagent, AgentKind::Internal] {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::Value::from(kind.as_str())
+            );
+        }
+    }
 
     #[test]
     fn session_kind_serializes_as_lowercase() {
