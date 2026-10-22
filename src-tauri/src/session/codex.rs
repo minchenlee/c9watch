@@ -394,12 +394,13 @@ impl CodexSessionSource {
         if discovery_due {
             let mut next_index = HashMap::new();
             for path in collect_rollout_paths(&self.sessions_root) {
-                if rollout_age_secs(&path, wall_now) <= LINKED_PARENT_CEILING_SECS {
+                let age = rollout_age_secs(&path, wall_now);
+                if age <= LINKED_PARENT_CEILING_SECS {
                     if let Some(thread_id) = thread_id_from_rollout_filename(&path) {
                         index_rollout_path(&mut next_index, thread_id, path.clone());
                     }
                 }
-                if rollout_age_secs(&path, wall_now) <= DISCOVERY_RECENT_SECS {
+                if age <= DISCOVERY_RECENT_SECS {
                     paths.insert(path);
                 }
             }
