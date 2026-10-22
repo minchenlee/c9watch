@@ -412,23 +412,10 @@ async fn handle_message_with_owners(
             .await,
         ),
 
-        ClientMsg::GetConversation {
-            session_id,
-            provider,
-            include_tools,
-        } => {
-            load_conversation_response(
-                session_id,
-                provider,
-                include_tools,
-                {
-                    let (tx, _) = broadcast::channel(1);
-                    tx
-                },
-                None,
-            )
-            .await
-        }
+        // handle_socket owns getConversation (cancellation + progress).
+        ClientMsg::GetConversation { .. } => ServerMsg::Error {
+            message: "getConversation is handled by the socket loop".into(),
+        },
 
         ClientMsg::StopSession { pid } => match crate::actions::stop_session(pid) {
             Ok(()) => ServerMsg::Ok,
