@@ -33,16 +33,8 @@ pub(super) fn full_session(s: session::enrichment::Session) -> serde_json::Value
     let first_prompt = (s.provider == session::SessionProvider::ClaudeCode)
         .then(|| find_first_prompt_raw_for_session(&s.id))
         .flatten()
-        .map(|full| {
-            let clean = strip_system_tags(&full);
-            let trimmed = clean.trim().to_string();
-            if trimmed.is_empty() {
-                // First prompt was entirely a system tag — return empty
-                String::new()
-            } else {
-                session::enrichment::truncate_string(&trimmed, 100)
-            }
-        })
+        // A prompt that was entirely a system tag yields "", not the fallback.
+        .map(|full| clean_first_prompt(&full).unwrap_or_default())
         .unwrap_or_else(|| {
             let cleaned = strip_system_tags(&s.first_prompt);
             cleaned.trim().to_string()
@@ -153,15 +145,7 @@ pub(super) fn enrich_history_entry(entry: session::HistoryEntry) -> serde_json::
         .eq_ignore_ascii_case("claudeCode")
         .then(|| find_first_prompt_raw_for_session(&entry.session_id))
         .flatten()
-        .map(|full| {
-            let clean = strip_system_tags(&full);
-            let trimmed = clean.trim().to_string();
-            if trimmed.is_empty() {
-                strip_system_tags(&entry.display)
-            } else {
-                session::enrichment::truncate_string(&trimmed, 100)
-            }
-        })
+        .and_then(|full| clean_first_prompt(&full))
         .unwrap_or_else(|| strip_system_tags(&entry.display));
 
     let date = chrono::DateTime::from_timestamp_millis(entry.timestamp as i64)
@@ -287,60 +271,37 @@ fn decode_project_path(encoded: &str) -> String {
 }
 
 fn find_first_prompt_raw_for_session(session_id: &str) -> Option<String> {
-    let home_dir = dirs::home_dir()?;
-    let projects_dir = home_dir.join(".claude").join("projects");
-    let session_filename = format!("{}.jsonl", session_id);
+    let session_file = session::find_claude_session_file(session_id)?;
+    session::enrichment::get_first_prompt_from_jsonl_raw(&session_file)
+}
 
-    for entry in std::fs::read_dir(&projects_dir).ok()?.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let session_file = path.join(&session_filename);
-        if session_file.exists() {
-            return session::enrichment::get_first_prompt_from_jsonl_raw(&session_file);
-        }
-    }
-    None
+/// Strip system tags from a raw first prompt, trim it and truncate it to 100
+/// characters. Returns `None` when nothing is left.
+fn clean_first_prompt(raw: &str) -> Option<String> {
+    let clean = strip_system_tags(raw);
+    let trimmed = clean.trim();
+    (!trimmed.is_empty()).then(|| session::enrichment::truncate_string(trimmed, 100))
 }
 
 fn find_session_metadata(session_id: &str) -> (Option<String>, Option<String>) {
-    let home_dir = match dirs::home_dir() {
-        Some(h) => h,
-        None => return (None, None),
+    let Some(session_file) = session::find_claude_session_file(session_id) else {
+        return (None, None);
     };
-    let projects_dir = home_dir.join(".claude").join("projects");
-    let session_filename = format!("{}.jsonl", session_id);
+    let project_path = session_file
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string());
 
-    for entry in std::fs::read_dir(&projects_dir)
+    let modified = std::fs::metadata(&session_file)
+        .and_then(|m| m.modified())
         .ok()
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let project_dir = entry.path();
-        if !project_dir.is_dir() {
-            continue;
-        }
-        let session_file = project_dir.join(&session_filename);
-        if session_file.exists() {
-            let project_path = project_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_string());
+        .map(|t| {
+            let datetime: chrono::DateTime<chrono::Utc> = t.into();
+            datetime.to_rfc3339()
+        });
 
-            let modified = std::fs::metadata(&session_file)
-                .and_then(|m| m.modified())
-                .ok()
-                .map(|t| {
-                    let datetime: chrono::DateTime<chrono::Utc> = t.into();
-                    datetime.to_rfc3339()
-                });
-
-            return (project_path, modified);
-        }
-    }
-    (None, None)
+    (project_path, modified)
 }
 
 fn get_task_summary(session_id: &str) -> Option<serde_json::Value> {
@@ -381,6 +342,38 @@ mod session_formatter_tests {
     use crate::cli::cmd_search_output;
     use crate::session::source::{AgentKind, SessionKind, SessionProvider, SessionSurface};
     use crate::session::SessionStatus;
+
+    #[test]
+    fn clean_first_prompt_system_tag_only_is_none() {
+        assert_eq!(
+            clean_first_prompt("<system-reminder>internal</system-reminder>"),
+            None
+        );
+    }
+
+    #[test]
+    fn clean_first_prompt_whitespace_only_is_none() {
+        assert_eq!(clean_first_prompt("  \n\t "), None);
+    }
+
+    #[test]
+    fn clean_first_prompt_trims_normal_prompt() {
+        assert_eq!(
+            clean_first_prompt("  fix the bug  ").as_deref(),
+            Some("fix the bug")
+        );
+    }
+
+    #[test]
+    fn clean_first_prompt_truncates_long_prompt_at_100_chars() {
+        let long = "a".repeat(150);
+        assert_eq!(
+            clean_first_prompt(&long),
+            Some(format!("{}...", "a".repeat(100)))
+        );
+        let exact = "b".repeat(100);
+        assert_eq!(clean_first_prompt(&exact), Some(exact.clone()));
+    }
 
     fn codex_subagent() -> session::enrichment::Session {
         session::enrichment::Session {
