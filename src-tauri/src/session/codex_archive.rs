@@ -278,17 +278,11 @@ fn message_text(value: &Value) -> Option<(String, String)> {
     let payload = value.get("payload")?;
     match value.get("type").and_then(Value::as_str) {
         Some("event_msg") => {
-            let kind = payload.get("type").and_then(Value::as_str)?;
-            let role = match kind {
-                "user_message" => "user",
-                "agent_message" => "assistant",
-                _ => return None,
-            };
-            let text = payload.get("message").and_then(Value::as_str)?.to_string();
+            let (role, text) = super::codex::event_message_text(payload)?;
             if text.trim().is_empty() {
                 return None;
             }
-            Some((role.to_string(), text))
+            Some((role.to_string(), text.to_string()))
         }
         Some("response_item") => super::codex::response_item_message_text(payload)
             .map(|(role, content, _)| (role, content)),

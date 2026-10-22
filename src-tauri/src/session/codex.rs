@@ -1758,31 +1758,25 @@ fn apply_event_message(
     payload: &Value,
     compact_for_monitor: bool,
 ) {
-    match payload.get("type").and_then(Value::as_str) {
-        Some("user_message") | Some("agent_message") => {
-            let role = if payload.get("type").and_then(Value::as_str) == Some("user_message") {
-                "user"
+    if let Some((role, content)) = event_message_text(payload) {
+        push_codex_message(
+            summary,
+            timestamp,
+            role,
+            if role == "user" {
+                MessageType::User
             } else {
-                "assistant"
-            };
-            if let Some(content) = payload.get("message").and_then(Value::as_str) {
-                push_codex_message(
-                    summary,
-                    timestamp,
-                    role,
-                    if role == "user" {
-                        MessageType::User
-                    } else {
-                        MessageType::Assistant
-                    },
-                    content.to_string(),
-                    compact_for_monitor,
-                    role == "user"
-                        && !crate::session::parser::is_system_content(content)
-                        && !is_codex_context_message(content),
-                );
-            }
-        }
+                MessageType::Assistant
+            },
+            content.to_string(),
+            compact_for_monitor,
+            role == "user"
+                && !crate::session::parser::is_system_content(content)
+                && !is_codex_context_message(content),
+        );
+        return;
+    }
+    match payload.get("type").and_then(Value::as_str) {
         Some("task_started") => summary.lifecycle = CodexLifecycle::Working,
         Some("task_complete") | Some("turn_aborted") => summary.lifecycle = CodexLifecycle::Idle,
         Some("thread_rolled_back") => {
@@ -1891,6 +1885,19 @@ fn response_item_title_candidate(payload: &Value, role: &str, content: &str) -> 
                 .any(|kind| kind == "user.text")
         })
         .unwrap_or(!is_codex_context_message(content))
+}
+
+/// Role and text of an `event_msg` `user_message` / `agent_message` payload.
+///
+/// Does not filter empty text; callers decide what to do with it.
+pub(crate) fn event_message_text(payload: &Value) -> Option<(&'static str, &str)> {
+    let role = match payload.get("type").and_then(Value::as_str)? {
+        "user_message" => "user",
+        "agent_message" => "assistant",
+        _ => return None,
+    };
+    let content = payload.get("message").and_then(Value::as_str)?;
+    Some((role, content))
 }
 
 pub(crate) fn response_item_message_text(payload: &Value) -> Option<(String, String, bool)> {
@@ -3896,6 +3903,29 @@ mod tests {
         assert_eq!(contents, vec!["prompt", "answer"]);
         assert!(messages[0].title_candidate);
         assert!(!messages[1].title_candidate);
+    }
+
+    #[test]
+    fn event_message_text_maps_roles_and_keeps_empty_text() {
+        let text = |payload: Value| event_message_text(&payload).map(|(r, c)| (r, c.to_string()));
+        assert_eq!(
+            text(serde_json::json!({"type":"user_message","message":"hi"})),
+            Some(("user", "hi".to_string()))
+        );
+        assert_eq!(
+            text(serde_json::json!({"type":"agent_message","message":"yo"})),
+            Some(("assistant", "yo".to_string()))
+        );
+        assert_eq!(
+            text(serde_json::json!({"type":"agent_message","message":"  "})),
+            Some(("assistant", "  ".to_string()))
+        );
+        assert_eq!(text(serde_json::json!({"type":"user_message"})), None);
+        assert_eq!(
+            text(serde_json::json!({"type":"task_started","message":"x"})),
+            None
+        );
+        assert_eq!(text(serde_json::json!({"message":"x"})), None);
     }
 
     // ── Open-file evidence (agent_liveness) ───────────────────────────
