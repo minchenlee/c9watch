@@ -227,7 +227,7 @@ function demoSessions(): Session[] {
 				messageCount: 28, modified: minutesAgo(3), status: SessionStatus.Working,
 				latestMessage: 'Reviewing the frontend provider contract and rollout hierarchy...', pendingToolName: null,
 				provider: 'codex', surface: 'app', agentKind: 'root', rootSessionId: 'demo-codex-root',
-				actionCapabilities: { conversation: true, open: false, stop: false, rename: false }
+				canOpen: false, canStop: false, canRename: false
 		},
 		{
 				id: 'demo-codex-subagent', pid: 91002, sessionName: 'c9watch', customTitle: null,
@@ -237,7 +237,7 @@ function demoSessions(): Session[] {
 				latestMessage: 'Checking history and cost records for real provider filtering...', pendingToolName: null,
 				provider: 'codex', surface: 'exec', agentKind: 'subagent', parentThreadId: 'demo-codex-root',
 				rootSessionId: 'demo-codex-root', agentPath: '/root/provider-audit', agentNickname: 'provider-audit', agentRole: 'reviewer',
-				actionCapabilities: { conversation: true, open: false, stop: false, rename: false }
+				canOpen: false, canStop: false, canRename: false
 		},
 		{
 				id: 'demo-codex-guardian', pid: 91003, sessionName: 'c9watch', customTitle: null,
@@ -254,7 +254,7 @@ function demoSessions(): Session[] {
 				messageCount: 14, modified: minutesAgo(1), status: SessionStatus.Working,
 				latestMessage: 'Parsing agent-transcripts JSONL and grouping Task subagents...', pendingToolName: null,
 				provider: 'cursor', surface: 'cursor', agentKind: 'root', rootSessionId: 'demo-cursor-root',
-				actionCapabilities: { conversation: true, open: false, stop: false, rename: false }
+				canOpen: false, canStop: false, canRename: false
 		},
 		{
 				id: 'demo-cursor-subagent', pid: 92002, sessionName: 'c9watch', customTitle: null,
@@ -264,7 +264,7 @@ function demoSessions(): Session[] {
 				latestMessage: 'Reading ~/.cursor/projects/*/agent-transcripts...', pendingToolName: null,
 				provider: 'cursor', surface: 'cursor', agentKind: 'subagent', parentThreadId: 'demo-cursor-root',
 				rootSessionId: 'demo-cursor-root', agentNickname: 'Explore session discovery', agentRole: 'explore',
-				actionCapabilities: { conversation: true, open: false, stop: false, rename: false }
+				canOpen: false, canStop: false, canRename: false
 		}
 	];
 }

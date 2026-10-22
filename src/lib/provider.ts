@@ -142,17 +142,6 @@ export function canSessionAction(session: Session, action: SessionAction): boole
 	}[action];
 	if (typeof directCapability === 'boolean') return directCapability;
 
-	const caps = session.actionCapabilities ?? session.capabilities;
-	const aliases = {
-		open: ['open', 'canOpen'],
-		stop: ['stop', 'canStop'],
-		rename: ['rename', 'canRename'],
-		conversation: ['conversation', 'canReadConversation']
-	} as const;
-	for (const key of aliases[action]) {
-		const explicit = caps?.[key];
-		if (typeof explicit === 'boolean') return explicit;
-	}
 	if (providerOf(session) === 'claudeCode') return true;
 	return action === 'conversation';
 }

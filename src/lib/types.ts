@@ -42,17 +42,6 @@ export interface AwayRequest {
   sinceMs: number;
 }
 
-export interface SessionActionCapabilities {
-  open?: boolean;
-  stop?: boolean;
-  rename?: boolean;
-  conversation?: boolean;
-  canOpen?: boolean;
-  canStop?: boolean;
-  canRename?: boolean;
-  canReadConversation?: boolean;
-}
-
 /**
  * A Claude Code session
  */
@@ -147,8 +136,6 @@ export interface Session {
   canOpen?: boolean;
   canStop?: boolean;
   canRename?: boolean;
-  capabilities?: SessionActionCapabilities;
-  actionCapabilities?: SessionActionCapabilities;
 }
 
 /**
