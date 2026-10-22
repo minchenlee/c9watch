@@ -13,7 +13,7 @@ fn refresh_away_index(sessions: &[Session]) {
     let live: HashSet<&str> = sessions.iter().map(|s| s.session_key.as_str()).collect();
     crate::session::away::retain_sessions(&live);
 }
-use crate::session::{pid_is_alive, DetectorState, SessionStatus};
+use crate::session::{is_question_tool, pid_is_alive, DetectorState, SessionStatus};
 use serde::Deserialize;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -375,14 +375,11 @@ fn fire_notification(
     // Build the body based on the status
     let body = match status {
         SessionStatus::NeedsAttention => {
-            let tool_name = pending_tool_name.unwrap_or("unknown tool");
-            match tool_name {
-                "Question" | "AskUserQuestion" => {
-                    format!("❓ {}: Waiting for your response", session_name)
-                }
-                _ => {
-                    format!("🔐 {}: Needs permission for {}", session_name, tool_name)
-                }
+            if is_question_tool(pending_tool_name) {
+                format!("❓ {}: Waiting for your response", session_name)
+            } else {
+                let tool_name = pending_tool_name.unwrap_or("unknown tool");
+                format!("🔐 {}: Needs permission for {}", session_name, tool_name)
             }
         }
         SessionStatus::WaitingForInput => {

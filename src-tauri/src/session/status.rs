@@ -265,6 +265,12 @@ fn are_pending_tools_auto_approved(
     pending_tool_uses(content).all(|(name, input)| checker.is_auto_approved(name, input))
 }
 
+/// True when a pending tool name means Claude is asking the user a question
+/// ("Question" for a text question, "AskUserQuestion" for the tool).
+pub fn is_question_tool(name: Option<&str>) -> bool {
+    matches!(name, Some("Question" | "AskUserQuestion"))
+}
+
 /// Gets the name describing why the session needs attention.
 ///
 /// Returns one of:
@@ -363,6 +369,16 @@ fn check_all_tools_completed(content: &[MessageContent]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn is_question_tool_matches_only_question_names() {
+        assert!(super::is_question_tool(Some("Question")));
+        assert!(super::is_question_tool(Some("AskUserQuestion")));
+        assert!(!super::is_question_tool(Some("Bash")));
+        assert!(!super::is_question_tool(Some("question")));
+        assert!(!super::is_question_tool(Some("")));
+        assert!(!super::is_question_tool(None));
+    }
+
     use super::*;
     use crate::session::parser::{SessionEntryBase, UserMessage};
 

@@ -63,7 +63,7 @@ pub(crate) fn validate_rename_request(
     Ok(())
 }
 pub use state::DetectorState;
-pub use status::{determine_status, get_pending_tool_name, SessionStatus};
+pub use status::{determine_status, get_pending_tool_name, is_question_tool, SessionStatus};
 
 pub mod history;
 pub use history::{deep_search, get_history, DeepSearchHit, HistoryEntry};

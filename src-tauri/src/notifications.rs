@@ -1,5 +1,5 @@
 //! macOS notification preferences and content. Web notifications remain independent.
-use crate::session::{Session, SessionProvider, SessionStatus};
+use crate::session::{is_question_tool, Session, SessionProvider, SessionStatus};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -52,16 +52,13 @@ impl Event {
     fn from_session(s: &Session) -> Option<Self> {
         match s.status {
             SessionStatus::WaitingForInput => Some(Self::Reply),
-            SessionStatus::NeedsAttention => Some(
-                if matches!(
-                    s.pending_tool_name.as_deref(),
-                    Some("Question" | "AskUserQuestion")
-                ) {
+            SessionStatus::NeedsAttention => {
+                Some(if is_question_tool(s.pending_tool_name.as_deref()) {
                     Self::Question
                 } else {
                     Self::Permission
-                },
-            ),
+                })
+            }
             _ => None,
         }
     }
