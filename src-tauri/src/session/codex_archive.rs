@@ -2,6 +2,7 @@ use super::cache::FileVersion;
 use super::source::{AgentKind, SessionSurface};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -1017,19 +1018,21 @@ pub(crate) fn search_rollout<F>(
 where
     F: Fn(&str, &str, bool) -> bool,
 {
+    let matches = |text: &str| {
+        let normalized = if case_sensitive {
+            Cow::Borrowed(text)
+        } else {
+            Cow::Owned(text.to_lowercase())
+        };
+        phrase_match(&normalized, query, whole_word)
+    };
+
     if snapshot.messages_complete {
-        for message in &snapshot.messages {
-            let text = &message.text;
-            let normalized = if case_sensitive {
-                text.clone()
-            } else {
-                text.to_lowercase()
-            };
-            if phrase_match(&normalized, query, whole_word) {
-                return Some(text.clone());
-            }
-        }
-        return None;
+        return snapshot
+            .messages
+            .iter()
+            .find(|message| matches(&message.text))
+            .map(|message| message.text.clone());
     }
 
     // The persisted message cache is intentionally bounded. For an incomplete
@@ -1052,12 +1055,7 @@ where
             let Some((_, text)) = message_text(&value) else {
                 continue;
             };
-            let normalized = if case_sensitive {
-                text.clone()
-            } else {
-                text.to_lowercase()
-            };
-            if phrase_match(&normalized, query, whole_word) {
+            if matches(&text) {
                 return Some(text);
             }
         }
@@ -1068,18 +1066,11 @@ where
 
     // If a rollout disappeared after caching, retain the previous best-effort
     // behavior for its cached excerpts rather than dropping all searchability.
-    for message in &snapshot.messages {
-        let text = &message.text;
-        let normalized = if case_sensitive {
-            text.clone()
-        } else {
-            text.to_lowercase()
-        };
-        if phrase_match(&normalized, query, whole_word) {
-            return Some(text.clone());
-        }
-    }
-    None
+    snapshot
+        .messages
+        .iter()
+        .find(|message| matches(&message.text))
+        .map(|message| message.text.clone())
 }
 
 #[cfg(test)]
@@ -1354,6 +1345,84 @@ mod tests {
             },
         );
         assert!(hit.is_none());
+    }
+
+    fn mixed_case_rollout(directory: &Path) -> (PathBuf, CodexRolloutSnapshot) {
+        let path = directory.join("case-search.jsonl");
+        write_rollout(
+            &path,
+            &[
+                r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"case-1","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{"type":"agent_message","message":"Mixed NEEDLE Text"}}"#,
+            ],
+        );
+        let snapshot = scan_rollout(&path).unwrap();
+        (path, snapshot)
+    }
+
+    /// Records each haystack the matcher sees and matches on substring.
+    fn recording_matcher(
+        seen: &std::cell::RefCell<Vec<String>>,
+    ) -> impl Fn(&str, &str, bool) -> bool + '_ {
+        move |text, query, _| {
+            seen.borrow_mut().push(text.to_string());
+            text.contains(query)
+        }
+    }
+
+    #[test]
+    fn deep_search_normalizes_case_but_returns_original_text_on_every_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, complete) = mixed_case_rollout(directory.path());
+        assert!(complete.messages_complete);
+        let mut incomplete = complete.clone();
+        incomplete.messages_complete = false;
+
+        // Complete cache path and disk-stream path.
+        for snapshot in [&complete, &incomplete] {
+            let seen = std::cell::RefCell::new(Vec::new());
+            let hit = search_rollout(snapshot, "needle", false, false, recording_matcher(&seen));
+            assert_eq!(hit.as_deref(), Some("Mixed NEEDLE Text"));
+            assert_eq!(seen.borrow().as_slice(), ["mixed needle text"]);
+
+            let seen = std::cell::RefCell::new(Vec::new());
+            let hit = search_rollout(snapshot, "needle", true, false, recording_matcher(&seen));
+            assert!(hit.is_none());
+            assert_eq!(seen.borrow().as_slice(), ["Mixed NEEDLE Text"]);
+        }
+
+        // Fallback path: the rollout disappeared, so cached excerpts are used.
+        std::fs::remove_file(&path).unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let hit = search_rollout(
+            &incomplete,
+            "needle",
+            false,
+            false,
+            recording_matcher(&seen),
+        );
+        assert_eq!(hit.as_deref(), Some("Mixed NEEDLE Text"));
+        assert_eq!(seen.borrow().as_slice(), ["mixed needle text"]);
+        let hit = search_rollout(&incomplete, "NEEDLE", true, false, |text, query, _| {
+            text.contains(query)
+        });
+        assert_eq!(hit.as_deref(), Some("Mixed NEEDLE Text"));
+    }
+
+    #[test]
+    fn deep_search_passes_whole_word_flag_to_the_matcher() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_path, snapshot) = mixed_case_rollout(directory.path());
+        for whole_word in [false, true] {
+            let hit = search_rollout(
+                &snapshot,
+                "needle",
+                false,
+                whole_word,
+                |text, query, flag| flag == whole_word && text.contains(query),
+            );
+            assert_eq!(hit.as_deref(), Some("Mixed NEEDLE Text"));
+        }
     }
 
     #[test]
