@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { Conversation, Message } from '$lib/types';
 	import { flyIn } from '$lib/transitions';
+	import { isNavItem } from '$lib/message-filters';
 
 	interface Props {
 		conversation: Conversation | null;
@@ -19,12 +20,7 @@
 		if (!conversation) return [];
 		return conversation.messages
 			.map((msg, index) => ({ msg, index }))
-			.filter(({ msg }) =>
-				msg.messageType === 'User' ||
-				msg.messageType === 'System' ||
-				(showThinking && msg.messageType === 'Thinking') ||
-				(showTools && msg.messageType === 'ToolUse' && msg.content?.length > 0)
-			);
+			.filter(({ msg }) => isNavItem(msg, showTools, showThinking));
 	});
 
 	function getMessageIcon(message: Message): string {

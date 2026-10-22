@@ -60,6 +60,7 @@
 		loadToolsConversation,
 		toolsLoadedFor
 	} from '$lib/stores/conversation-loader';
+	import { isMessageVisible, isNavItem } from '$lib/message-filters';
 	import ConversationLoadBar from './ConversationLoadBar.svelte';
 
 	interface Props {
@@ -183,12 +184,7 @@
 
 	let navItemCount = $derived.by(() => {
 		if (!conversation) return 0;
-		return conversation.messages.filter(msg =>
-			msg.messageType === 'User' ||
-			msg.messageType === 'System' ||
-			(showThinking && msg.messageType === 'Thinking') ||
-			(showTools && msg.messageType === 'ToolUse' && (msg.content?.length ?? 0) > 0)
-		).length;
+		return conversation.messages.filter(msg => isNavItem(msg, showTools, showThinking)).length;
 	});
 
 	let toolsLoading = $derived(isToolsLoading(session.id, providerOf(session), $conversationLoad));
@@ -691,7 +687,7 @@
 							</div>
 						{/if}
 						{#each visibleMessages as message, i (sw.startIndex + i)}
-							{#if (showTools || (message.messageType !== 'ToolUse' && message.messageType !== 'ToolResult')) && (showThinking || message.messageType !== 'Thinking')}
+							{#if isMessageVisible(message, showTools, showThinking)}
 								<div data-msg-index={sw.startIndex + i} in:messageIn={{ index: Math.min(i, 15) }}>
 									<MessageBubble {message} />
 								</div>

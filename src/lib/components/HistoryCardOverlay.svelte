@@ -19,6 +19,7 @@
 		loadToolsConversation,
 		toolsLoadedFor
 	} from '$lib/stores/conversation-loader';
+	import { isMessageVisible } from '$lib/message-filters';
 	import ConversationLoadBar from './ConversationLoadBar.svelte';
 
 	interface Props {
@@ -323,7 +324,7 @@
 							</div>
 						{/if}
 						{#each visibleMessages as message, i (sw.startIndex + i)}
-							{#if (showTools || (message.messageType !== 'ToolUse' && message.messageType !== 'ToolResult')) && (showThinking || message.messageType !== 'Thinking')}
+							{#if isMessageVisible(message, showTools, showThinking)}
 								<div data-msg-index={sw.startIndex + i}>
 									<MessageBubble {message} />
 								</div>
