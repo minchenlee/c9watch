@@ -61,7 +61,6 @@ await openSession(sessionId);
 The stores automatically listen for Tauri events from the backend:
 
 - `sessions-updated`: Emitted when the backend polling loop detects session changes
-- `conversation-updated`: Emitted when a conversation is loaded or updated
 
 Make sure to call `initializeSessionListeners()` once when your app starts (e.g., in a top-level `+layout.svelte` or `+page.svelte`).
 

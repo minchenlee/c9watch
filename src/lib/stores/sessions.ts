@@ -218,22 +218,6 @@ export const statusSummary = derived(sessions, ($sessions) => {
 });
 
 /**
- * Notification metadata for click-to-focus
- */
-interface NotificationMetadata {
-	notificationId: number;
-	sessionId: string;
-	sessionKey?: string;
-	provider?: Session['provider'];
-	pid: number;
-	projectPath: string;
-	title: string;
-}
-
-const notificationMetadataMap = new Map<number, NotificationMetadata>();
-const MAX_NOTIFICATION_ENTRIES = 10;
-
-/**
  * Initialize event listeners for backend updates.
  * Automatically chooses Tauri IPC events or WebSocket depending on environment.
  */
@@ -297,24 +281,6 @@ async function initTauriListeners() {
 		} else {
 			heldSessions = null;
 			sessions.set(event.payload);
-		}
-	});
-
-	await listen<Conversation>('conversation-updated', (event) => {
-		currentConversation.set(event.payload);
-	});
-
-	await listen<NotificationMetadata>('notification-fired', (event) => {
-		if (!get(isDemoMode)) {
-			const metadata = event.payload;
-			notificationMetadataMap.set(metadata.notificationId, metadata);
-
-			while (notificationMetadataMap.size > MAX_NOTIFICATION_ENTRIES) {
-				const firstKey = notificationMetadataMap.keys().next().value;
-				if (firstKey !== undefined) {
-					notificationMetadataMap.delete(firstKey);
-				}
-			}
 		}
 	});
 }

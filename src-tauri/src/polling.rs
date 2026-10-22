@@ -14,7 +14,7 @@ fn refresh_away_index(sessions: &[Session]) {
     crate::session::away::retain_sessions(&live);
 }
 use crate::session::{pid_is_alive, DetectorState, SessionStatus};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -247,7 +247,6 @@ pub fn start_polling(
                                                             .pending_tool_name
                                                             .as_deref(),
                                                         pid: session.pid,
-                                                        project_path: &session.project_path,
                                                     },
                                                 );
                                                 last_notification_time.insert(
@@ -340,19 +339,6 @@ pub fn start_polling(
     });
 }
 
-/// Notification metadata for click-to-focus
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct NotificationMetadata {
-    notification_id: i32,
-    session_id: String,
-    session_key: String,
-    provider: crate::session::SessionProvider,
-    pid: u32,
-    project_path: String,
-    title: String,
-}
-
 /// Parameters for firing a notification
 struct NotificationParams<'a> {
     session_id: &'a str,
@@ -364,10 +350,10 @@ struct NotificationParams<'a> {
     status: &'a SessionStatus,
     pending_tool_name: Option<&'a str>,
     pid: u32,
-    project_path: &'a str,
 }
 
 /// Fire a notification for a status transition
+#[cfg_attr(target_os = "macos", allow(unused_variables))]
 fn fire_notification(
     app_handle: &AppHandle,
     notifications_tx: &tokio::sync::broadcast::Sender<String>,
@@ -383,7 +369,6 @@ fn fire_notification(
         status,
         pending_tool_name,
         pid,
-        project_path,
     } = params;
     let title = truncate_string(custom_title.unwrap_or(first_prompt), 60);
 
@@ -406,11 +391,6 @@ fn fire_notification(
         _ => return, // Should not happen based on the caller's logic
     };
 
-    // Generate a stable i32 ID from the provider-scoped key using hash
-    let mut hasher = DefaultHasher::new();
-    session_key.hash(&mut hasher);
-    let notification_id = (hasher.finish() as i32).abs();
-
     // Fire native notification via Tauri plugin
     // Note: Notifications work in production builds (.app) but may not appear in dev mode
     #[cfg(not(target_os = "macos"))]
@@ -422,21 +402,6 @@ fn fire_notification(
         .show()
     {
         crate::debug_log::log_error(&format!("Failed to show notification: {}", e));
-    }
-
-    // Emit event with session metadata for click-to-focus handling
-    let metadata = NotificationMetadata {
-        notification_id,
-        session_id: session_id.to_string(),
-        session_key: session_key.to_string(),
-        provider,
-        pid,
-        project_path: project_path.to_string(),
-        title: title.clone(),
-    };
-
-    if let Err(e) = app_handle.emit("notification-fired", &metadata) {
-        crate::debug_log::log_error(&format!("Failed to emit notification-fired: {}", e));
     }
 
     // Broadcast to WebSocket clients for web notifications
