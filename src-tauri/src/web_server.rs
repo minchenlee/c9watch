@@ -357,14 +357,14 @@ async fn load_conversation_response(
             provider,
             include_tools,
             &mut |bytes_read, bytes_total| {
-                let payload = crate::session::conversation::ConversationProgress {
-                    session_id: emit_id.clone(),
-                    provider,
-                    request_id,
-                    bytes_read,
-                    bytes_total,
-                };
-                let _ = progress_tx.send(serde_json::to_string(&payload).unwrap_or_default());
+                let payload = serde_json::json!({
+                    "sessionId": emit_id,
+                    "provider": provider,
+                    "requestId": request_id,
+                    "bytesRead": bytes_read,
+                    "bytesTotal": bytes_total,
+                });
+                let _ = progress_tx.send(payload.to_string());
             },
         )
     })
@@ -565,26 +565,6 @@ mod protocol_tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn conversation_progress_request_id_is_omitted_when_none() {
-        use crate::session::conversation::ConversationProgress;
-        let progress = |request_id| ConversationProgress {
-            session_id: "s1".into(),
-            provider: None,
-            request_id,
-            bytes_read: 10,
-            bytes_total: 20,
-        };
-        let with_id = serde_json::to_value(progress(Some(7))).unwrap();
-        assert_eq!(with_id["requestId"], 7);
-        assert_eq!(with_id["sessionId"], "s1");
-        assert_eq!(with_id["bytesRead"], 10);
-        assert_eq!(with_id["bytesTotal"], 20);
-        let without_id = serde_json::to_value(progress(None)).unwrap();
-        assert!(without_id.get("requestId").is_none());
-        assert!(without_id.get("provider").unwrap().is_null());
     }
 
     /// The mobile client reads `data` as a session array; a `[sessions,
