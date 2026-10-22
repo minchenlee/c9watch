@@ -305,7 +305,7 @@ pub struct CodexSessionSource {
 impl CodexSessionSource {
     pub fn new() -> Result<Self, SessionDetectorError> {
         let home = dirs::home_dir().ok_or(SessionDetectorError::HomeDirectoryNotFound)?;
-        Ok(Self::at_root(home.join(".codex").join("sessions"))
+        Ok(Self::at_root(super::codex_archive::default_sessions_root(&home))
             .with_process_probe(Box::new(SysinfoCodexOpenFileProbe::new())))
     }
 
@@ -2049,7 +2049,7 @@ pub fn find_codex_conversation_with_progress(
 ) -> Result<Vec<CodexMessage>, String> {
     let home = dirs::home_dir().ok_or("Failed to get home directory")?;
     find_codex_conversation_under_with_progress(
-        &home.join(".codex").join("sessions"),
+        &super::codex_archive::default_sessions_root(&home),
         thread_id,
         include_tools,
         on_progress,
