@@ -140,8 +140,7 @@ pub fn start_polling(
         let poll_interval = Duration::from_millis(3500);
 
         // Track previous status for each session
-        let previous_status: Arc<Mutex<HashMap<String, SessionStatus>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let mut previous_status: HashMap<String, SessionStatus> = HashMap::new();
 
         // Track last notification time per session to prevent duplicates.
         // If status flickers (Working → Ready → Working → Ready), this cooldown
@@ -191,97 +190,25 @@ pub fn start_polling(
                     refresh_away_index(&sessions);
 
                     // Process status transitions and fire notifications
-                    match previous_status.lock() {
-                        Ok(mut prev_status_map) => {
-                            if is_first_cycle {
-                                // First cycle: seed the map without notifications
-                                for session in &sessions {
-                                    prev_status_map.insert(
-                                        session.session_key.clone(),
-                                        session.status.clone(),
-                                    );
-                                }
-                                is_first_cycle = false;
-                            } else {
-                                // Check for status transitions
-                                for session in &sessions {
-                                    if let Some(prev_status) =
-                                        prev_status_map.get(&session.session_key)
-                                    {
-                                        // Check for notification-worthy transitions
-                                        let should_notify = matches!(
-                                            (prev_status, &session.status),
-                                            (
-                                                SessionStatus::Working,
-                                                SessionStatus::NeedsAttention
-                                                    | SessionStatus::WaitingForInput,
-                                            )
-                                        );
+                    for session in
+                        notification_transitions(&mut previous_status, is_first_cycle, &sessions)
+                    {
+                        crate::notifications::notify(&app_handle, session);
+                        // Check cooldown to prevent duplicate notifications
+                        // from status flickering across poll cycles
+                        let on_cooldown = last_notification_time
+                            .get(&session.session_key)
+                            .map(|t| t.elapsed() < notification_cooldown)
+                            .unwrap_or(false);
 
-                                        if should_notify {
-                                            crate::notifications::notify(&app_handle, session);
-                                            // Check cooldown to prevent duplicate notifications
-                                            // from status flickering across poll cycles
-                                            let on_cooldown = last_notification_time
-                                                .get(&session.session_key)
-                                                .map(|t| t.elapsed() < notification_cooldown)
-                                                .unwrap_or(false);
-
-                                            if !on_cooldown {
-                                                fire_notification(
-                                                    &app_handle,
-                                                    &notifications_tx,
-                                                    NotificationParams {
-                                                        session_id: &session.id,
-                                                        session_key: &session.session_key,
-                                                        provider: session.provider,
-                                                        first_prompt: &session.first_prompt,
-                                                        custom_title: session
-                                                            .custom_title
-                                                            .as_deref()
-                                                            .or(session.codex_title.as_deref())
-                                                            .or(session.cursor_title.as_deref()),
-                                                        session_name: &session.session_name,
-                                                        status: &session.status,
-                                                        pending_tool_name: session
-                                                            .pending_tool_name
-                                                            .as_deref(),
-                                                        pid: session.pid,
-                                                    },
-                                                );
-                                                last_notification_time.insert(
-                                                    session.session_key.clone(),
-                                                    Instant::now(),
-                                                );
-                                            }
-                                        }
-                                    }
-
-                                    // Update the status map
-                                    prev_status_map.insert(
-                                        session.session_key.clone(),
-                                        session.status.clone(),
-                                    );
-                                }
-                            }
-
-                            // Clean up disappeared sessions
-                            prev_status_map.retain(|id, _| current_session_ids.contains(id));
-                            last_notification_time.retain(|id, _| current_session_ids.contains(id));
-                        }
-                        Err(poisoned) => {
-                            crate::debug_log::log_error("Mutex poisoned, recovering...");
-                            let mut prev_status_map = poisoned.into_inner();
-                            prev_status_map.clear(); // Clear stale state
-
-                            // Seed the map with current sessions (no notifications after recovery)
-                            for session in &sessions {
-                                prev_status_map
-                                    .insert(session.session_key.clone(), session.status.clone());
-                            }
-                            is_first_cycle = false; // Mark as initialized
+                        if !on_cooldown {
+                            fire_notification(&app_handle, &notifications_tx, session);
+                            last_notification_time
+                                .insert(session.session_key.clone(), Instant::now());
                         }
                     }
+                    is_first_cycle = false;
+                    last_notification_time.retain(|id, _| current_session_ids.contains(id));
 
                     // Serialize once; skip emit/broadcast when payload is unchanged
                     // so idle dashboards don't rerender every poll cycle.
@@ -339,17 +266,35 @@ pub fn start_polling(
     });
 }
 
-/// Parameters for firing a notification
-struct NotificationParams<'a> {
-    session_id: &'a str,
-    session_key: &'a str,
-    provider: crate::session::SessionProvider,
-    first_prompt: &'a str,
-    custom_title: Option<&'a str>,
-    session_name: &'a str,
-    status: &'a SessionStatus,
-    pending_tool_name: Option<&'a str>,
-    pid: u32,
+/// Update `prev` with this cycle's statuses and return the sessions that
+/// moved from `Working` to `NeedsAttention` or `WaitingForInput`.
+///
+/// On the first cycle the map is only seeded and nothing is returned.
+/// Keys of sessions that are no longer present are pruned.
+fn notification_transitions<'a>(
+    prev: &mut HashMap<String, SessionStatus>,
+    first_cycle: bool,
+    sessions: &'a [Session],
+) -> Vec<&'a Session> {
+    let mut transitioned = Vec::new();
+    for session in sessions {
+        if !first_cycle {
+            let should_notify = matches!(
+                (prev.get(&session.session_key), &session.status),
+                (
+                    Some(SessionStatus::Working),
+                    SessionStatus::NeedsAttention | SessionStatus::WaitingForInput,
+                )
+            );
+            if should_notify {
+                transitioned.push(session);
+            }
+        }
+        prev.insert(session.session_key.clone(), session.status.clone());
+    }
+    let current: HashSet<&str> = sessions.iter().map(|s| s.session_key.as_str()).collect();
+    prev.retain(|id, _| current.contains(id.as_str()));
+    transitioned
 }
 
 /// Fire a notification for a status transition
@@ -357,23 +302,19 @@ struct NotificationParams<'a> {
 fn fire_notification(
     app_handle: &AppHandle,
     notifications_tx: &tokio::sync::broadcast::Sender<String>,
-    params: NotificationParams<'_>,
+    session: &Session,
 ) {
-    let NotificationParams {
-        session_id,
-        session_key,
-        provider,
-        first_prompt,
-        custom_title,
-        session_name,
-        status,
-        pending_tool_name,
-        pid,
-    } = params;
-    let title = truncate_string(custom_title.unwrap_or(first_prompt), 60);
+    let custom_title = session
+        .custom_title
+        .as_deref()
+        .or(session.codex_title.as_deref())
+        .or(session.cursor_title.as_deref());
+    let session_name = &session.session_name;
+    let pending_tool_name = session.pending_tool_name.as_deref();
+    let title = truncate_string(custom_title.unwrap_or(&session.first_prompt), 60);
 
     // Build the body based on the status
-    let body = match status {
+    let body = match session.status {
         SessionStatus::NeedsAttention => {
             if is_question_tool(pending_tool_name) {
                 format!("❓ {}: Waiting for your response", session_name)
@@ -405,10 +346,10 @@ fn fire_notification(
     let ws_notification = serde_json::json!({
         "title": title,
         "body": body,
-        "sessionId": session_id,
-        "sessionKey": session_key,
-        "provider": provider,
-        "pid": pid,
+        "sessionId": session.id,
+        "sessionKey": session.session_key,
+        "provider": session.provider,
+        "pid": session.pid,
     });
     if let Ok(json) = serde_json::to_string(&ws_notification) {
         let _ = notifications_tx.send(json);
