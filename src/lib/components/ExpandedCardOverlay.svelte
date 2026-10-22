@@ -52,14 +52,13 @@
 	import { isTauri } from '$lib/ws';
 	import ProviderBadge from './ProviderBadge.svelte';
 	import { canSessionAction, providerFilterLabel, providerOf, providerSessionKey, sessionKeyOf } from '$lib/provider';
-	import { getConversation } from '$lib/api';
 	import {
 		conversationLoad,
 		conversationLoadLabel,
 		isSessionLoading,
 		isToolsLoading,
-		toolsLoadedFor,
-		withConversationLoader
+		loadToolsConversation,
+		toolsLoadedFor
 	} from '$lib/stores/conversation-loader';
 	import ConversationLoadBar from './ConversationLoadBar.svelte';
 
@@ -222,20 +221,12 @@
 		const next = !showTools;
 		if (sessionLoading) return;
 		if (next && $toolsLoadedFor !== requestedKey) {
-			try {
-				const conv = await withConversationLoader(requestedId, requestedProvider, 'tools', () =>
-					getConversation(requestedId, requestedProvider, true)
-				);
-				if (disposed ||
-					providerSessionKey(providerOf(session), session.id) !== requestedKey ||
-					providerSessionKey(conv.provider ?? requestedProvider, conv.sessionId) !== requestedKey
-				) return;
-				currentConversation.set(conv);
-				toolsLoadedFor.set(requestedKey);
-			} catch (error) {
-				console.error('Failed to load tools:', error);
-				return;
-			}
+			const loaded = await loadToolsConversation(
+				{ sessionId: requestedId, provider: requestedProvider },
+				() => !disposed && providerSessionKey(providerOf(session), session.id) === requestedKey,
+				(conv) => currentConversation.set(conv)
+			);
+			if (!loaded) return;
 		}
 		if (disposed || session.id !== requestedId) return;
 		showTools = next;

@@ -11,14 +11,13 @@
 	import { isCostAvailable } from '$lib/cost-semantics';
 	import ProviderBadge from './ProviderBadge.svelte';
 	import { providerSessionKey } from '$lib/provider';
-	import { getConversation } from '$lib/api';
 	import {
 		conversationLoad,
 		conversationLoadLabel,
 		isSessionLoading,
 		isToolsLoading,
-		toolsLoadedFor,
-		withConversationLoader
+		loadToolsConversation,
+		toolsLoadedFor
 	} from '$lib/stores/conversation-loader';
 	import ConversationLoadBar from './ConversationLoadBar.svelte';
 
@@ -86,20 +85,12 @@
 		const next = !showTools;
 		if (sessionLoading) return;
 		if (next && $toolsLoadedFor !== requestedKey) {
-			try {
-				const conv = await withConversationLoader(requestedId, requestedProvider, 'tools', () =>
-					getConversation(requestedId, requestedProvider, true)
-				);
-				if (disposed ||
-					providerSessionKey(entry.provider, entry.sessionId) !== requestedKey ||
-					providerSessionKey(conv.provider ?? requestedProvider, conv.sessionId) !== requestedKey
-				) return;
-				onconversation?.(conv);
-				toolsLoadedFor.set(requestedKey);
-			} catch (error) {
-				console.error('Failed to load tools:', error);
-				return;
-			}
+			const loaded = await loadToolsConversation(
+				{ sessionId: requestedId, provider: requestedProvider },
+				() => !disposed && providerSessionKey(entry.provider, entry.sessionId) === requestedKey,
+				(conv) => onconversation?.(conv)
+			);
+			if (!loaded) return;
 		}
 		if (disposed || entry.sessionId !== requestedId) return;
 		showTools = next;

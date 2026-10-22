@@ -164,3 +164,33 @@ export async function loadPreviewConversation(
 		if (isCurrent()) console.error('Failed to load conversation:', e);
 	}
 }
+
+/**
+ * Load the conversation with tool dumps for a conversation overlay's
+ * "Show Tools" toggle. `apply` runs, and `toolsLoadedFor` is set, only when
+ * the overlay still wants the response (`isCurrent`: not disposed and still
+ * showing the requested session) and the response is for the requested
+ * session. Returns true when the tools were applied.
+ */
+export async function loadToolsConversation(
+	target: PreviewTarget,
+	isCurrent: () => boolean,
+	apply: (conv: Conversation) => void,
+	deps: PreviewLoaderDeps = defaultPreviewLoaderDeps
+): Promise<boolean> {
+	const requestedKey = providerSessionKey(target.provider, target.sessionId);
+	try {
+		const conv = await deps.withConversationLoader(target.sessionId, target.provider, 'tools', () =>
+			deps.getConversation(target.sessionId, target.provider, true)
+		);
+		if (!isCurrent() ||
+			providerSessionKey(conv.provider ?? target.provider, conv.sessionId) !== requestedKey
+		) return false;
+		apply(conv);
+		deps.toolsLoadedFor.set(requestedKey);
+		return true;
+	} catch (error) {
+		console.error('Failed to load tools:', error);
+		return false;
+	}
+}

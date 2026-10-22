@@ -116,3 +116,73 @@ test('acceptsConversation matches provider-scoped session keys', () => {
   assert.equal(loader.acceptsConversation({ sessionId: 'a', provider: 'codex' }, conv('a', 'cursor')), false);
   assert.equal(loader.acceptsConversation({ sessionId: 'a', provider: 'codex' }, conv('b', 'codex')), false);
 });
+
+function toolsHarness() {
+  const requests = [];
+  const deps = {
+    getConversation: (sessionId, provider, includeTools) =>
+      new Promise((resolve, reject) => requests.push({ sessionId, provider, includeTools, resolve, reject })),
+    withConversationLoader: (_id, _provider, kind, task) => { deps.kinds.push(kind); return task(); },
+    toolsLoadedFor: writable(null),
+    kinds: []
+  };
+  let current = true;
+  let conversation = null;
+  const load = target => loader.loadToolsConversation(target, () => current, conv => { conversation = conv; }, deps);
+  return { requests, deps, load, stale: () => { current = false; }, conversation: () => conversation };
+}
+
+test('loadToolsConversation applies tool dumps and marks the session loaded', async () => {
+  const h = toolsHarness();
+  const done = h.load({ sessionId: 'a', provider: 'codex' });
+  assert.deepEqual(h.requests.map(r => [r.sessionId, r.provider, r.includeTools]), [['a', 'codex', true]]);
+  assert.deepEqual(h.deps.kinds, ['tools']);
+  h.requests[0].resolve(conv('a', 'codex'));
+  assert.equal(await done, true);
+  assert.equal(h.conversation()?.sessionId, 'a');
+  assert.equal(get(h.deps.toolsLoadedFor), 'codex:a');
+});
+
+test('loadToolsConversation rejects a stale response', async () => {
+  const h = toolsHarness();
+  const done = h.load({ sessionId: 'a', provider: 'codex' });
+  h.stale();
+  h.requests[0].resolve(conv('a', 'codex'));
+  assert.equal(await done, false);
+  assert.equal(h.conversation(), null);
+  assert.equal(get(h.deps.toolsLoadedFor), null);
+});
+
+test('loadToolsConversation rejects a response for another provider', async () => {
+  const h = toolsHarness();
+  const done = h.load({ sessionId: 'same', provider: 'codex' });
+  h.requests[0].resolve(conv('same', 'cursor'));
+  assert.equal(await done, false);
+  assert.equal(h.conversation(), null);
+  assert.equal(get(h.deps.toolsLoadedFor), null);
+});
+
+test('loadToolsConversation falls back to the requested provider', async () => {
+  const h = toolsHarness();
+  const done = h.load({ sessionId: 'same', provider: 'codex' });
+  h.requests[0].resolve(conv('same', undefined));
+  assert.equal(await done, true);
+  assert.equal(get(h.deps.toolsLoadedFor), 'codex:same');
+});
+
+test('loadToolsConversation logs errors and reports failure', async () => {
+  const h = toolsHarness();
+  const logged = [];
+  const original = console.error;
+  console.error = (...args) => logged.push(args);
+  try {
+    const done = h.load({ sessionId: 'a' });
+    h.requests[0].reject(new Error('boom'));
+    assert.equal(await done, false);
+    assert.equal(logged.length, 1);
+    assert.equal(logged[0][0], 'Failed to load tools:');
+    assert.equal(get(h.deps.toolsLoadedFor), null);
+  } finally {
+    console.error = original;
+  }
+});
