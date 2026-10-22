@@ -1,8 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getConversation } from '$lib/api';
-	import { toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
-	import { get } from 'svelte/store';
+	import { acceptsConversation, loadPreviewConversation } from '$lib/stores/conversation-loader';
 	import type { HistoryEntry, Conversation, CostData, SessionCostRecord, SessionProvider } from '$lib/types';
 	import TokenDistanceVisualizer from './token-distance/TokenDistanceVisualizer.svelte';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
@@ -323,19 +321,9 @@
 			surface: session.surface,
 		};
 		conversation = null;
-		toolsLoadedFor.set(null);
-		try {
-			const requestedKey = providerSessionKey(session.provider, session.sessionId);
-			const conv = await withConversationLoader(session.sessionId, session.provider, 'conversation', () =>
-				getConversation(session.sessionId, session.provider, false)
-			);
-			if (requestId !== conversationRequestId) return;
-			if (get(toolsLoadedFor) === requestedKey) return;
-			if (providerSessionKey(conv.provider ?? session.provider, conv.sessionId) !== requestedKey) return;
+		await loadPreviewConversation(session, () => requestId === conversationRequestId, (conv) => {
 			conversation = conv;
-		} catch (e) {
-			console.error('Failed to load conversation:', e);
-		}
+		});
 	}
 
 	/** Returns the date range [startInclusive, endExclusive) for current time scale window */
@@ -919,7 +907,7 @@
 	/>
 {/if}
 {#if selectedEntry}
-	<HistoryCardOverlay entry={selectedEntry} {conversation} onclose={() => { selectedEntry = null; conversation = null; }} onconversation={(conv) => { if (selectedEntry && providerSessionKey(selectedEntry.provider, selectedEntry.sessionId) === providerSessionKey(conv.provider, conv.sessionId)) conversation = conv; }} />
+	<HistoryCardOverlay entry={selectedEntry} {conversation} onclose={() => { selectedEntry = null; conversation = null; }} onconversation={(conv) => { if (acceptsConversation(selectedEntry, conv)) conversation = conv; }} />
 {/if}
 </div>
 
