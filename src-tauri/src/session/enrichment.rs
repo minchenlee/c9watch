@@ -1,8 +1,6 @@
 use crate::claude_hooks::{HookSessionState, PendingPermission};
 use crate::session::cache::{
-    can_incrementally_read, extend_prefix_snapshot, hash_file_prefix, next_full_verify_offset,
-    read_lines_from_offset, validate_cached_prefix, FileVersion, PrefixSnapshot,
-    PrefixValidationKind,
+    read_lines_from_offset, refresh_incremental_entry, FileVersion, IncrementalEntry,
 };
 use crate::session::codex::CodexLifecycle;
 use crate::session::cursor::CursorLifecycle;
@@ -1069,18 +1067,8 @@ fn count_messages_in_lines(lines: &[String]) -> u32 {
 }
 
 /// Cached message count for one file: the version stamp and byte offset the
-/// count is current as of.
-struct MessageCountCacheEntry {
-    stamp: FileVersion,
-    offset: u64,
-    count: u32,
-    prefix: Option<PrefixSnapshot>,
-    next_full_verify_offset: u64,
-    last_full_validation_at: Instant,
-    #[cfg(test)]
-    last_prefix_validation_bytes: u64,
-    last_access: Instant,
-}
+/// count (`value`) is current as of.
+type MessageCountCacheEntry = IncrementalEntry<u32>;
 
 /// A live session's transcript grows every poll by definition, so a plain
 /// unchanged-file cache can't help it — this also tracks the scanned byte
@@ -1139,127 +1127,18 @@ fn count_messages_in_jsonl_at(path: &Path, now: Instant) -> u32 {
         }
     };
 
-    if let Some((
-        previous_stamp,
-        previous_offset,
-        previous_count,
-        previous_prefix,
-        previous_next_full_verify_offset,
-        previous_last_full_validation_at,
-    )) = cache.get(path).map(|existing| {
-        (
-            existing.stamp,
-            existing.offset,
-            existing.count,
-            existing.prefix,
-            existing.next_full_verify_offset,
-            existing.last_full_validation_at,
-        )
-    }) {
-        if let Some(previous_prefix) = previous_prefix {
-            if previous_stamp == stamp && stamp.supports_unchanged_fast_path() {
-                if now.saturating_duration_since(previous_last_full_validation_at)
-                    < crate::session::cache::PREFIX_FULL_REVALIDATION_INTERVAL
-                {
-                    if let Some(existing) = cache.get_mut(path) {
-                        existing.last_access = now;
-                    }
-                    return previous_count;
-                }
-
-                if let Some(validation) = validate_cached_prefix(
-                    path,
-                    previous_prefix,
-                    previous_next_full_verify_offset,
-                    previous_last_full_validation_at,
-                    now,
-                ) {
-                    if let Some(existing) = cache.get_mut(path) {
-                        existing.prefix = Some(validation.snapshot);
-                        if validation.kind == PrefixValidationKind::Full {
-                            existing.last_full_validation_at = now;
-                            existing.next_full_verify_offset =
-                                next_full_verify_offset(existing.offset);
-                        }
-                        #[cfg(test)]
-                        {
-                            existing.last_prefix_validation_bytes = validation.bytes_read;
-                        }
-                        existing.last_access = now;
-                    }
-                    return previous_count;
-                }
-            }
-
-            if can_incrementally_read(previous_stamp, stamp) {
-                if let Some(validation) = validate_cached_prefix(
-                    path,
-                    previous_prefix,
-                    previous_next_full_verify_offset,
-                    previous_last_full_validation_at,
-                    now,
-                ) {
-                    if let Ok((new_lines, new_offset)) =
-                        read_lines_from_offset(path, previous_offset)
-                    {
-                        if let Ok(prefix) = extend_prefix_snapshot(
-                            path,
-                            previous_offset,
-                            new_offset,
-                            validation.snapshot,
-                        ) {
-                            let count = previous_count + count_messages_in_lines(&new_lines);
-                            let full_validation = validation.kind == PrefixValidationKind::Full;
-                            cache.insert(
-                                path.to_path_buf(),
-                                MessageCountCacheEntry {
-                                    stamp,
-                                    offset: new_offset,
-                                    count,
-                                    prefix: Some(prefix),
-                                    next_full_verify_offset: if full_validation {
-                                        next_full_verify_offset(new_offset)
-                                    } else {
-                                        previous_next_full_verify_offset
-                                    },
-                                    last_full_validation_at: if full_validation {
-                                        now
-                                    } else {
-                                        previous_last_full_validation_at
-                                    },
-                                    #[cfg(test)]
-                                    last_prefix_validation_bytes: validation.bytes_read,
-                                    last_access: now,
-                                },
-                            );
-                            evict_oldest_message_count_entries(&mut cache);
-                            return count;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let Ok((lines, offset)) = read_lines_from_offset(path, 0) else {
-        cache.remove(path);
+    let Some(entry) = refresh_incremental_entry(
+        cache.remove(path),
+        path,
+        stamp,
+        now,
+        count_messages_in_lines,
+        |count, new_lines| count + count_messages_in_lines(new_lines),
+    ) else {
         return 0;
     };
-    let count = count_messages_in_lines(&lines);
-    cache.insert(
-        path.to_path_buf(),
-        MessageCountCacheEntry {
-            stamp,
-            offset,
-            count,
-            prefix: hash_file_prefix(path, offset).ok(),
-            next_full_verify_offset: next_full_verify_offset(offset),
-            last_full_validation_at: now,
-            #[cfg(test)]
-            last_prefix_validation_bytes: 0,
-            last_access: now,
-        },
-    );
+    let count = entry.value;
+    cache.insert(path.to_path_buf(), entry);
     evict_oldest_message_count_entries(&mut cache);
     count
 }
@@ -2228,7 +2107,7 @@ mod placeholder_tests {
                         identity: i as u64 + 1,
                     },
                     offset: i as u64,
-                    count: i as u32,
+                    value: i as u32,
                     prefix: None,
                     next_full_verify_offset: 0,
                     last_full_validation_at: Instant::now(),
