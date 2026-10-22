@@ -99,6 +99,25 @@ fn resolve_cost_session_id(
     resolve_cost_session_identity(sessions, needle, kind).map(|(session_id, _)| session_id)
 }
 
+/// Parse the `--since YYYY-MM-DD` flag. `cost` and `cost --session` share
+/// this, so they accept the same dates and print the same error text.
+fn parse_since(since: Option<&str>) -> Result<Option<chrono::NaiveDate>, String> {
+    since
+        .map(|s| {
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|e| format!("Invalid --since date '{}': {}", s, e))
+        })
+        .transpose()
+}
+
+/// True when the record's `YYYY-MM-DD` date is on or after `since`. A record
+/// whose date does not parse never matches.
+fn on_or_after(record: &session::cost::SessionCostRecord, since: chrono::NaiveDate) -> bool {
+    chrono::NaiveDate::parse_from_str(&record.date, "%Y-%m-%d")
+        .map(|d| d >= since)
+        .unwrap_or(false)
+}
+
 /// Rows returned by filtering cost data down to a single session.
 #[derive(Debug)]
 struct SessionCostBreakdown {
@@ -136,9 +155,7 @@ fn build_session_breakdown(
         .filter(|s| s.session_id == session_id)
         .filter(|s| s.provider == provider)
         .filter(|s| match since_date {
-            Some(since_d) => chrono::NaiveDate::parse_from_str(&s.date, "%Y-%m-%d")
-                .map(|d| d >= since_d)
-                .unwrap_or(false),
+            Some(since_d) => on_or_after(s, since_d),
             None => true,
         })
         .collect();
@@ -238,13 +255,7 @@ fn cmd_cost_session(
     since: Option<&str>,
     pretty: bool,
 ) -> Result<(), String> {
-    let since_date = match since {
-        Some(s) => Some(
-            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                .map_err(|e| format!("Invalid --since date '{}': {}", s, e))?,
-        ),
-        None => None,
-    };
+    let since_date = parse_since(since)?;
 
     let data = session::get_cost_data()?;
     let all_sessions: Vec<session::cost::SessionCostRecord> = data
@@ -296,13 +307,7 @@ pub(super) fn cmd_cost(
         return Err("--daily and --weekly are mutually exclusive".to_string());
     }
 
-    let since_date = match since {
-        Some(s) => Some(
-            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                .map_err(|e| format!("Invalid --since date '{}': {}", s, e))?,
-        ),
-        None => None,
-    };
+    let since_date = parse_since(since)?;
 
     let data = session::get_cost_data()?;
 
@@ -317,11 +322,7 @@ pub(super) fn cmd_cost(
         sessions.retain(|s| s.project == proj);
     }
     if let Some(since_d) = since_date {
-        sessions.retain(|s| {
-            chrono::NaiveDate::parse_from_str(&s.date, "%Y-%m-%d")
-                .map(|d| d >= since_d)
-                .unwrap_or(false)
-        });
+        sessions.retain(|s| on_or_after(s, since_d));
     }
 
     // Helper: apply sort to a rows vec that has a date key and a cost key.
@@ -786,5 +787,35 @@ mod cost_session_tests {
         use clap::Parser;
         let res = Cli::try_parse_from(["c9watch", "cost", "--session", "aaaa1111-bbbb"]);
         assert!(res.is_ok(), "parse failed: {:?}", res.err());
+    }
+
+    #[test]
+    fn parse_since_accepts_none_and_iso_dates() {
+        assert_eq!(parse_since(None).unwrap(), None);
+        assert_eq!(
+            parse_since(Some("2026-04-02")).unwrap(),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 4, 2).unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_since_keeps_the_cli_error_text() {
+        let err = parse_since(Some("04/02/2026")).unwrap_err();
+        let expected_cause = chrono::NaiveDate::parse_from_str("04/02/2026", "%Y-%m-%d")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!("Invalid --since date '04/02/2026': {}", expected_cause)
+        );
+    }
+
+    #[test]
+    fn on_or_after_includes_the_boundary_and_rejects_bad_dates() {
+        let since = chrono::NaiveDate::from_ymd_opt(2026, 4, 2).unwrap();
+        assert!(!on_or_after(&rec("a", "2026-04-01", 0.0, 0, "m"), since));
+        assert!(on_or_after(&rec("a", "2026-04-02", 0.0, 0, "m"), since));
+        assert!(on_or_after(&rec("a", "2026-04-03", 0.0, 0, "m"), since));
+        assert!(!on_or_after(&rec("a", "not-a-date", 0.0, 0, "m"), since));
     }
 }
