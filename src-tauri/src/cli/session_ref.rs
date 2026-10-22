@@ -26,7 +26,7 @@ fn resolve_session_reference_lightweight_under(
     reference: &str,
     home_dir: &std::path::Path,
 ) -> Result<(String, Option<session::SessionProvider>), String> {
-    let (provider_filter, prefix) = parse_provider_scoped_reference(reference)
+    let (provider_filter, prefix) = split_provider_scoped(reference)
         .map_or((None, reference), |(provider, raw_prefix)| {
             (Some(provider), raw_prefix)
         });
@@ -103,20 +103,14 @@ fn resolve_session_reference_lightweight_under(
 
 /// Parse the canonical provider-scoped key emitted by `list`/`watch`.
 /// Unknown prefixes remain ordinary raw references for backwards compatibility.
-fn parse_provider_scoped_reference(reference: &str) -> Option<(session::SessionProvider, &str)> {
+pub(super) fn split_provider_scoped(
+    reference: &str,
+) -> Option<(session::SessionProvider, &str)> {
     let (provider, raw_prefix) = reference.split_once(':')?;
     if raw_prefix.is_empty() {
         return None;
     }
-    let provider = match provider {
-        "claudeCode" => session::SessionProvider::ClaudeCode,
-        "codex" => session::SessionProvider::Codex,
-        "cursor" => session::SessionProvider::Cursor,
-        "pi" => session::SessionProvider::Pi,
-        "opencode" => session::SessionProvider::Opencode,
-        _ => return None,
-    };
-    Some((provider, raw_prefix))
+    Some((session::SessionProvider::from_key(provider)?, raw_prefix))
 }
 
 fn resolve_session_reference_matches(
@@ -156,6 +150,17 @@ fn resolve_session_reference_matches(
 mod tests {
     use super::*;
     use crate::session::source::SessionProvider;
+
+    #[test]
+    fn split_provider_scoped_accepts_every_provider_key() {
+        for provider in SessionProvider::ALL {
+            let reference = format!("{}:abc", provider.as_key());
+            assert_eq!(split_provider_scoped(&reference), Some((provider, "abc")));
+        }
+        assert_eq!(split_provider_scoped("bogus:abc"), None);
+        assert_eq!(split_provider_scoped("codex:"), None);
+        assert_eq!(split_provider_scoped("abc"), None);
+    }
 
     #[test]
     fn explicit_opencode_id_bypasses_recent_session_discovery() {

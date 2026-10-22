@@ -1,5 +1,6 @@
 //! `c9watch cost`: whole-dataset aggregation and per-session breakdowns.
 
+use super::session_ref::split_provider_scoped;
 use super::{print_json, CostSortDir, CostSortField};
 use crate::session;
 
@@ -81,13 +82,14 @@ fn resolve_cost_session_identity(
 }
 
 fn parse_provider_scoped_cost_reference(reference: &str) -> (Option<&str>, &str) {
-    let Some((provider, raw_id)) = reference.split_once(':') else {
-        return (None, reference);
-    };
-    if raw_id.is_empty() || !matches!(provider, "claudeCode" | "codex" | "cursor" | "pi") {
-        return (None, reference);
+    match split_provider_scoped(reference) {
+        // Cost data has no OpenCode records; `opencode:` stays a raw needle
+        // so `--session` length checks and messages are unchanged.
+        Some((provider, raw_id)) if provider != session::SessionProvider::Opencode => {
+            (Some(provider.as_key()), raw_id)
+        }
+        _ => (None, reference),
     }
-    (Some(provider), raw_id)
 }
 
 #[cfg(test)]
@@ -553,6 +555,23 @@ mod cost_session_tests {
         .unwrap();
         assert_eq!(session_id, "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee");
         assert_eq!(provider, "codex");
+    }
+
+    #[test]
+    fn provider_scoped_cost_reference_parsing() {
+        for (input, expected) in [
+            ("claudeCode:abc", (Some("claudeCode"), "abc")),
+            ("codex:abc", (Some("codex"), "abc")),
+            ("cursor:abc", (Some("cursor"), "abc")),
+            ("pi:abc", (Some("pi"), "abc")),
+            // Unchanged legacy behavior: no OpenCode cost namespace.
+            ("opencode:abc", (None, "opencode:abc")),
+            ("bogus:abc", (None, "bogus:abc")),
+            ("codex:", (None, "codex:")),
+            ("abc", (None, "abc")),
+        ] {
+            assert_eq!(parse_provider_scoped_cost_reference(input), expected, "{input}");
+        }
     }
 
     #[test]
