@@ -9,7 +9,6 @@
 		attentionInbox,
 		expandedSessionId,
 		currentConversation,
-		statusSummary,
 		visibleTopLevelSessionIds
 	} from '$lib/stores/sessions';
 	import { getConversation, stopSession, openSession, getDetectionDiagnostics } from '$lib/api';
@@ -50,7 +49,6 @@
 
 	let sessions = $derived($sortedSessions);
 	let activeSessionIds = $derived(new Set(sessions.map((s) => sessionKeyOf(s))));
-	let summary = $derived($statusSummary);
 	let attentionItems = $derived(
 		$attentionInbox.filter((item) => matchesProvider(item.session, $providerFilter))
 	);

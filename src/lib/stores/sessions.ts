@@ -201,23 +201,6 @@ export const attentionInbox = derived(sessions, ($sessions) => {
 });
 
 /**
- * Derived store: status summary for header
- */
-export const statusSummary = derived(sessions, ($sessions) => {
-	const working = $sessions.filter(
-		(s) => s.status === SessionStatus.Working || s.status === SessionStatus.Connecting
-	).length;
-	const permission = $sessions.filter(
-		(s) => s.status === SessionStatus.NeedsAttention
-	).length;
-	const input = $sessions.filter(
-		(s) => s.status === SessionStatus.WaitingForInput
-	).length;
-
-	return { working, permission, input };
-});
-
-/**
  * Initialize event listeners for backend updates.
  * Automatically chooses Tauri IPC events or WebSocket depending on environment.
  */
@@ -324,6 +307,3 @@ export async function requestNotificationPermission() {
 	notificationPermission.set('granted');
 	return true;
 }
-
-// Legacy alias for backward compatibility
-export const selectedSessionId = expandedSessionId;
