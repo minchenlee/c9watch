@@ -5,6 +5,7 @@
 	import { openSession, getSessions } from '$lib/api';
 	import { SessionStatus } from '$lib/types';
 	import { countStatusBuckets } from '$lib/status-utils';
+	import { sessionDisplayTitle } from '$lib/session-utils';
 	import type { Session } from '$lib/types';
 	import { invoke } from '@tauri-apps/api/core';
 	import { listen } from '@tauri-apps/api/event';
@@ -180,7 +181,7 @@
 							</svg>
 							{/if}
 						</div>
-						<div class="card-title">{session.customTitle || session.officialName || session.codexTitle || session.cursorTitle || session.summary || session.firstPrompt}</div>
+						<div class="card-title">{sessionDisplayTitle(session)}</div>
 						{#if session.latestMessage}
 							<div class="card-latest">{session.latestMessage}</div>
 						{/if}

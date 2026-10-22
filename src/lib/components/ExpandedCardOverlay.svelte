@@ -61,6 +61,7 @@
 		toolsLoadedFor
 	} from '$lib/stores/conversation-loader';
 	import { isMessageVisible, isNavItem } from '$lib/message-filters';
+	import { sessionDisplayTitle } from '$lib/session-utils';
 	import ConversationLoadBar from './ConversationLoadBar.svelte';
 
 	interface Props {
@@ -471,7 +472,7 @@
 								onmouseenter={() => tipEnter(session.id)}
 								onmouseleave={tipLeave}
 								onmousemove={tipMove}
-							>{session.customTitle || session.officialName || session.codexTitle || session.cursorTitle || session.summary || session.firstPrompt || 'New Session'}</h2>
+							>{sessionDisplayTitle(session) || 'New Session'}</h2>
 							{#if PM_ORCHESTRATION_ENABLED && session.workerOf}
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<span

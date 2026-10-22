@@ -9,7 +9,7 @@
 	import ProviderBadge from './ProviderBadge.svelte';
 	import { canSessionAction, sessionReturnKind, sessionKeyOf } from '$lib/provider';
 	import { awayActivity } from '$lib/stores/away';
-	import { awayActivityLabel, waitingForLabel } from '$lib/session-utils';
+	import { awayActivityLabel, sessionDisplayTitle, waitingForLabel } from '$lib/session-utils';
 	import { formatTimeSince } from '$lib/time-utils';
 	import { getSessionStatusColor, getSessionStatusLabel } from '$lib/status-utils';
 
@@ -75,14 +75,7 @@
 	function tipLeave() { tooltipText = ''; }
 	function tipMove(e: MouseEvent) { tooltipX = e.clientX + 12; tooltipY = e.clientY + 12; }
 
-	let cardTitle = $derived(
-		session.customTitle
-		|| session.officialName
-		|| session.codexTitle
-		|| session.cursorTitle
-		|| session.summary
-		|| session.firstPrompt
-	);
+	let cardTitle = $derived(sessionDisplayTitle(session));
 	let startedAtIso = $derived(
 		session.startedAtMs != null
 			? new Date(session.startedAtMs).toISOString()
