@@ -8,9 +8,8 @@ This directory contains the core TypeScript/Svelte libraries for the c9watch fro
 lib/
 ├── types.ts              # TypeScript type definitions
 ├── api.ts                # Tauri command wrappers
-├── stores/
-│   └── sessions.ts       # Svelte stores for state management
-└── index.ts              # Convenience re-exports
+└── stores/
+    └── sessions.ts       # Svelte stores for state management
 ```
 
 ## Usage
@@ -18,27 +17,28 @@ lib/
 ### Importing Types
 
 ```typescript
-import type { Session, Conversation, Message, SessionStatus } from '$lib';
+import type { Session, Conversation, Message } from '$lib/types';
+import { SessionStatus } from '$lib/types';
 ```
 
 ### Using Stores
 
 ```typescript
-import { sessions, selectedSessionId, currentConversation, initializeSessionListeners } from '$lib';
+import { sessions, expandedSessionId, currentConversation, initializeSessionListeners } from '$lib/stores/sessions';
 
 // Initialize event listeners (call once on app start)
 await initializeSessionListeners();
 
 // Subscribe to stores
 $: activeSessions = $sessions;
-$: selected = $selectedSessionId;
+$: selected = $expandedSessionId;
 $: conversation = $currentConversation;
 ```
 
 ### Calling API Functions
 
 ```typescript
-import { getSessions, getConversation, sendPrompt, stopSession, openSession } from '$lib';
+import { getSessions, getConversation, stopSession, openSession } from '$lib/api';
 
 // Get all sessions
 const allSessions = await getSessions();
@@ -46,14 +46,11 @@ const allSessions = await getSessions();
 // Get conversation for a session
 const conv = await getConversation(sessionId);
 
-// Send a prompt
-await sendPrompt(sessionId, "Add authentication to the API");
-
 // Stop a session
-await stopSession(sessionId);
+await stopSession(pid);
 
 // Open terminal/IDE window
-await openSession(sessionId);
+await openSession(pid, projectPath);
 ```
 
 ## Event Listeners
