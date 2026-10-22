@@ -596,6 +596,15 @@ fn jetbrains_url_scheme(app_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Map a JetBrains IDE app name to its macOS `.app` bundle name.
+/// Community Edition variants ("IntelliJ IDEA CE", "PyCharm CE") share the
+/// bundle name of the base IDE. The CLI binary name equals the URL scheme
+/// from `jetbrains_url_scheme`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn jetbrains_app_dir_name(app_name: &str) -> &str {
+    app_name.strip_suffix(" CE").unwrap_or(app_name)
+}
+
 /// Get the JetBrains Toolbox scripts directory
 #[cfg(target_os = "macos")]
 fn get_jetbrains_toolbox_scripts_dir() -> Option<String> {
@@ -646,22 +655,8 @@ fn get_app_cli(app_name: &str) -> Option<String> {
     }
 
     // JetBrains IDEs: check Toolbox scripts dir, then ~/Applications, then /Applications
-    let jetbrains_cli: Option<(&str, &str)> = match app_name {
-        "PhpStorm" => Some(("phpstorm", "PhpStorm")),
-        "IntelliJ IDEA" | "IntelliJ IDEA CE" => Some(("idea", "IntelliJ IDEA")),
-        "WebStorm" => Some(("webstorm", "WebStorm")),
-        "PyCharm" | "PyCharm CE" => Some(("pycharm", "PyCharm")),
-        "GoLand" => Some(("goland", "GoLand")),
-        "CLion" => Some(("clion", "CLion")),
-        "Rider" => Some(("rider", "Rider")),
-        "RubyMine" => Some(("rubymine", "RubyMine")),
-        "DataGrip" => Some(("datagrip", "DataGrip")),
-        "Android Studio" => Some(("studio", "Android Studio")),
-        "Aqua" => Some(("aqua", "Aqua")),
-        "Fleet" => Some(("fleet", "Fleet")),
-        "RustRover" => Some(("rustrover", "RustRover")),
-        _ => None,
-    };
+    let jetbrains_cli = jetbrains_url_scheme(app_name)
+        .map(|bin_name| (bin_name, jetbrains_app_dir_name(app_name)));
 
     if let Some((bin_name, app_dir_name)) = jetbrains_cli {
         // 1. JetBrains Toolbox scripts directory
@@ -740,22 +735,7 @@ fn get_app_cli(app_name: &str) -> Option<String> {
     }
 
     // JetBrains IDEs: check Toolbox scripts dir, then standard paths
-    let jetbrains_bin = match app_name {
-        "PhpStorm" => Some("phpstorm"),
-        "IntelliJ IDEA" | "IntelliJ IDEA CE" => Some("idea"),
-        "WebStorm" => Some("webstorm"),
-        "PyCharm" | "PyCharm CE" => Some("pycharm"),
-        "GoLand" => Some("goland"),
-        "CLion" => Some("clion"),
-        "Rider" => Some("rider"),
-        "RubyMine" => Some("rubymine"),
-        "DataGrip" => Some("datagrip"),
-        "Android Studio" => Some("studio"),
-        "Aqua" => Some("aqua"),
-        "Fleet" => Some("fleet"),
-        "RustRover" => Some("rustrover"),
-        _ => None,
-    };
+    let jetbrains_bin = jetbrains_url_scheme(app_name);
 
     if let Some(bin_name) = jetbrains_bin {
         // 1. JetBrains Toolbox scripts directory
@@ -1308,6 +1288,35 @@ mod tests {
             get_app_name("/Applications/PyCharm.app/Contents/MacOS/pycharm"),
             Some("PyCharm")
         );
+    }
+
+    #[test]
+    fn test_jetbrains_cli_bin_and_app_dir() {
+        // (app name, CLI binary, macOS .app bundle name) as previously
+        // hard-coded in get_app_cli on macOS and Linux.
+        let cases = [
+            ("PhpStorm", "phpstorm", "PhpStorm"),
+            ("IntelliJ IDEA", "idea", "IntelliJ IDEA"),
+            ("IntelliJ IDEA CE", "idea", "IntelliJ IDEA"),
+            ("WebStorm", "webstorm", "WebStorm"),
+            ("PyCharm", "pycharm", "PyCharm"),
+            ("PyCharm CE", "pycharm", "PyCharm"),
+            ("GoLand", "goland", "GoLand"),
+            ("CLion", "clion", "CLion"),
+            ("Rider", "rider", "Rider"),
+            ("RubyMine", "rubymine", "RubyMine"),
+            ("DataGrip", "datagrip", "DataGrip"),
+            ("Android Studio", "studio", "Android Studio"),
+            ("Aqua", "aqua", "Aqua"),
+            ("Fleet", "fleet", "Fleet"),
+            ("RustRover", "rustrover", "RustRover"),
+        ];
+        for (app, bin, dir) in cases {
+            assert_eq!(jetbrains_url_scheme(app), Some(bin), "bin for {app}");
+            assert_eq!(jetbrains_app_dir_name(app), dir, "app dir for {app}");
+        }
+        assert_eq!(jetbrains_url_scheme("Zed"), None);
+        assert_eq!(jetbrains_url_scheme("Visual Studio Code"), None);
     }
 
     #[test]
