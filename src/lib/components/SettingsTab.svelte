@@ -3,8 +3,7 @@
 	import IntegrationSettings from './IntegrationSettings.svelte';
 	import NotificationSettings from './NotificationSettings.svelte';
 	import UsageSettings from './UsageSettings.svelte';
-	import { marked } from 'marked';
-	import DOMPurify from 'dompurify';
+	import { renderPlainMarkdown } from '$lib/markdown';
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { isTauri } from '$lib/ws';
 	import {
@@ -54,11 +53,6 @@
 
 	function handleInstall() {
 		startDownloadAndInstall();
-	}
-
-	function renderMarkdown(content: string): string {
-		const html = marked.parse(content, { async: false, breaks: true, gfm: true });
-		return DOMPurify.sanitize(html as string);
 	}
 
 	function handleNotesClick(e: MouseEvent) {
@@ -182,7 +176,7 @@
 					{:else if notes}
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<!-- svelte-ignore a11y_click_events_have_key_events -->
-						<div class="markdown-body" onclick={handleNotesClick}>{@html renderMarkdown(notes)}</div>
+						<div class="markdown-body" onclick={handleNotesClick}>{@html renderPlainMarkdown(notes)}</div>
 					{:else}
 						<div class="notes-state">Release notes unavailable.</div>
 					{/if}
