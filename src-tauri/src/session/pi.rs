@@ -261,11 +261,7 @@ impl SessionSource for PiSessionSource {
             } else {
                 summary.project_path.clone()
             };
-            let project_name = Path::new(&project_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
+            let project_name = pi_project_name(&project_path);
             sessions.push(DetectedSession {
                 pid: 0,
                 cwd: PathBuf::from(&project_path),
@@ -410,6 +406,15 @@ fn find_transcript_by_id(root: &Path, session_id: &str) -> Option<PathBuf> {
     pi_transcripts(root)?
         .map(|(_, path)| path)
         .find(|path| pi_session_id_from_filename(path).as_deref() == Some(session_id))
+}
+
+/// Display name for a project path: its last component, or `"unknown"`.
+fn pi_project_name(project_path: &str) -> String {
+    Path::new(project_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 // ── Transcript parsing ──────────────────────────────────────────────
@@ -971,11 +976,7 @@ pub(crate) fn pi_history_entries(home: &Path) -> Vec<crate::session::history::Hi
         } else {
             summary.project_path.clone()
         };
-        let project_name = Path::new(&project)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+        let project_name = pi_project_name(&project);
         entries.push(crate::session::history::HistoryEntry {
             session_id: summary.session_id,
             display: summary.first_prompt.unwrap_or_default(),
@@ -1239,11 +1240,7 @@ pub(crate) fn pi_cost_records(home: &Path) -> Vec<crate::session::cost::SessionC
         } else {
             summary.project_path.clone()
         };
-        let project_name = Path::new(&project)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+        let project_name = pi_project_name(&project);
         let fallback_ms = summary
             .started_at_ms
             .or_else(|| file_mtime_ms(&path).map(|ms| ms as i64));
@@ -1761,6 +1758,13 @@ mod tests {
         assert!(pi_session_ids(home.path(), "").is_empty());
         assert_eq!(pi_conversation_path_for_session(home.path(), "x"), None);
         assert!(!PiSessionSource::at_root(root).contains_session_id("x"));
+    }
+
+    #[test]
+    fn project_name_is_last_path_component_or_unknown() {
+        assert_eq!(pi_project_name("/Users/me/my-app"), "my-app");
+        assert_eq!(pi_project_name("/"), "unknown");
+        assert_eq!(pi_project_name(""), "unknown");
     }
 
     #[test]
