@@ -60,3 +60,21 @@ test('provider registry keeps labels, order and known-provider checks stable', (
   assert.equal(provider.providerOf({ provider: 'foo' }), 'claudeCode');
   assert.equal(provider.providerSessionKey(undefined, 'x'), 'claudeCode:x');
 });
+
+test('canSessionAction uses direct booleans, then provider defaults', () => {
+  const claude = { id: 'c', provider: 'claudeCode' };
+  for (const action of ['open', 'stop', 'rename', 'conversation']) assert.equal(provider.canSessionAction(claude, action), true);
+  const locked = { ...claude, canOpen: false, canStop: false, canRename: false };
+  for (const action of ['open', 'stop', 'rename']) assert.equal(provider.canSessionAction(locked, action), false);
+  assert.equal(provider.canSessionAction(locked, 'conversation'), true);
+  const codex = { id: 'x', provider: 'codex', canOpen: true };
+  assert.equal(provider.canSessionAction(codex, 'open'), true);
+  assert.equal(provider.canSessionAction(codex, 'stop'), false);
+  assert.equal(provider.canSessionAction(codex, 'conversation'), true);
+});
+
+test('demo Codex and Cursor cards hide open, stop and rename', () => {
+  const demo = readFileSync(new URL('../src/lib/demo/data.ts', import.meta.url), 'utf8');
+  assert.equal(demo.includes('actionCapabilities'), false);
+  assert.equal(demo.match(/canOpen: false, canStop: false, canRename: false/g)?.length, 4);
+});
