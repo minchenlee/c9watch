@@ -2,6 +2,8 @@
 mod accuracy_matrix;
 mod agent_liveness;
 mod cache;
+pub mod claude_files;
+pub use claude_files::{find_claude_session_file, find_claude_session_file_under};
 pub mod codex;
 pub mod cursor;
 pub mod custom_names;

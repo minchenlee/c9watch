@@ -371,48 +371,42 @@ pub fn write_native_custom_title(session_id: &str, title: &str) {
 fn write_native_custom_title_under(projects_dir: &std::path::Path, session_id: &str, title: &str) {
     use std::io::Write;
 
-    // Search all project directories for the session JSONL
-    let entries = match std::fs::read_dir(projects_dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let jsonl_path = path.join(format!("{}.jsonl", session_id));
-        if jsonl_path.exists() {
-            let entry = serde_json::json!({
-                "type": "custom-title",
-                "customTitle": title,
-                "sessionId": session_id,
-            });
-            match std::fs::OpenOptions::new().append(true).open(&jsonl_path) {
-                Ok(mut file) => {
-                    if let Err(e) = writeln!(file, "{}", entry) {
-                        debug_log::log_warn(&format!(
-                            "Failed to write native custom-title for {}: {}",
-                            session_id, e
-                        ));
-                    }
-                }
-                Err(e) => {
-                    debug_log::log_warn(&format!(
-                        "Failed to open JSONL for native custom-title {}: {}",
-                        session_id, e
-                    ));
-                }
-            }
-            return;
-        }
+    // An unreadable projects root is a silent no-op (no warning), as before.
+    if std::fs::read_dir(projects_dir).is_err() {
+        return;
     }
 
-    debug_log::log_warn(&format!(
-        "Could not find JSONL file for session {} to write native custom-title",
-        session_id
-    ));
+    let Some(jsonl_path) =
+        session::claude_files::find_session_file_in_projects_dir(projects_dir, session_id)
+    else {
+        debug_log::log_warn(&format!(
+            "Could not find JSONL file for session {} to write native custom-title",
+            session_id
+        ));
+        return;
+    };
+
+    let entry = serde_json::json!({
+        "type": "custom-title",
+        "customTitle": title,
+        "sessionId": session_id,
+    });
+    match std::fs::OpenOptions::new().append(true).open(&jsonl_path) {
+        Ok(mut file) => {
+            if let Err(e) = writeln!(file, "{}", entry) {
+                debug_log::log_warn(&format!(
+                    "Failed to write native custom-title for {}: {}",
+                    session_id, e
+                ));
+            }
+        }
+        Err(e) => {
+            debug_log::log_warn(&format!(
+                "Failed to open JSONL for native custom-title {}: {}",
+                session_id, e
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
