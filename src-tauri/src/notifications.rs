@@ -332,10 +332,10 @@ pub fn test_native_notification(
     show(&app, "c9watch · Test notification", body, data.prefs.sound)
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::session::SessionProvider;
-    fn fixture() -> Session {
+    pub(crate) fn fixture() -> Session {
         Session {
             id: "child-thread".to_string(),
             session_key: "codex:child-thread".to_string(),
