@@ -4,17 +4,36 @@ export type ProviderFilter = 'all' | SessionProvider;
 export type SessionAction = 'open' | 'stop' | 'rename' | 'conversation';
 type ProviderRecord = { provider?: SessionProvider | null };
 
-const KNOWN_PROVIDERS: SessionProvider[] = ['claudeCode', 'codex', 'cursor', 'pi', 'opencode'];
+/**
+ * The single provider registry, in display order. `label` is the uppercase
+ * badge text; `filterLabel` is the title-case name used by the provider filter.
+ */
+export const PROVIDERS = [
+	{ id: 'claudeCode', label: 'CLAUDE CODE', filterLabel: 'Claude Code' },
+	{ id: 'codex', label: 'CODEX', filterLabel: 'Codex' },
+	{ id: 'cursor', label: 'CURSOR', filterLabel: 'Cursor' },
+	{ id: 'pi', label: 'PI', filterLabel: 'Pi' },
+	{ id: 'opencode', label: 'OPENCODE', filterLabel: 'OpenCode' }
+] as const satisfies ReadonlyArray<{ id: SessionProvider; label: string; filterLabel: string }>;
+
+const KNOWN_PROVIDERS: readonly string[] = PROVIDERS.map((p) => p.id);
+export const ALL_PROVIDERS_LABEL = 'All providers';
+
+export function isKnownProvider(value: unknown): value is SessionProvider {
+	return typeof value === 'string' && KNOWN_PROVIDERS.includes(value);
+}
+
+function providerEntry(provider: string) {
+	return PROVIDERS.find((p) => p.id === provider);
+}
 
 export function providerOf(record: ProviderRecord): SessionProvider {
-	return record.provider && KNOWN_PROVIDERS.includes(record.provider)
-		? record.provider
-		: 'claudeCode';
+	return isKnownProvider(record.provider) ? record.provider : 'claudeCode';
 }
 
 /** Build the identity used by maps and UI selection instead of raw IDs. */
 export function providerSessionKey(provider: SessionProvider | undefined, id: string): string {
-	const normalized = provider && KNOWN_PROVIDERS.includes(provider) ? provider : 'claudeCode';
+	const normalized = isKnownProvider(provider) ? provider : 'claudeCode';
 	return `${normalized}:${id}`;
 }
 
@@ -26,11 +45,7 @@ export function sessionKeyOf(session: Pick<Session, 'id' | 'provider' | 'session
 }
 
 export function providerLabel(provider: SessionProvider): string {
-	if (provider === 'codex') return 'CODEX';
-	if (provider === 'cursor') return 'CURSOR';
-	if (provider === 'pi') return 'PI';
-	if (provider === 'opencode') return 'OPENCODE';
-	return 'CLAUDE CODE';
+	return (providerEntry(provider) ?? PROVIDERS[0]).label;
 }
 
 export function surfaceLabel(surface?: SessionSurface): string | null {
@@ -45,12 +60,7 @@ export function matchesProvider(record: ProviderRecord, filter: ProviderFilter):
 }
 
 export function providerFilterLabel(filter: ProviderFilter): string {
-	if (filter === 'codex') return 'Codex';
-	if (filter === 'claudeCode') return 'Claude Code';
-	if (filter === 'cursor') return 'Cursor';
-	if (filter === 'pi') return 'Pi';
-	if (filter === 'opencode') return 'OpenCode';
-	return 'All providers';
+	return providerEntry(filter)?.filterLabel ?? ALL_PROVIDERS_LABEL;
 }
 
 export function isHiddenInternalSession(session: Session): boolean {
