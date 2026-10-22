@@ -270,6 +270,13 @@
 		if (bucket) group[bucket].push(session);
 	}
 
+	/** Count of a project's sessions in the buckets shown before `bucketIndex`. */
+	function bucketStart(group: ProjectGroup, bucketIndex: number): number {
+		let count = 0;
+		for (const { id } of STATUS_BUCKETS.slice(0, bucketIndex)) count += group[id].length;
+		return count;
+	}
+
 	function sortGroups(groups: ProjectGroup[]) {
 		// Sort groups: priority to those needing attention, then by modification time
 		return groups.sort((a, b) => {
@@ -724,17 +731,20 @@
 							</div>
 
 							<div class="status-groups">
-								<div class="status-group" class:empty={group.attention.length === 0} class:compact={isCompact}>
-									<div class="status-header attention">
-										<span class="status-indicator attention"></span>
-										<span class="status-title">Needs Attention</span>
-										<span class="status-count">{group.attention.length}</span>
+								{#each STATUS_BUCKETS as bucket, bi}
+									{@const bucketSessions = group[bucket.id]}
+									{@const bucketIdx = baseIdx + 1 + bucketStart(group, bi)}
+								<div class="status-group" class:empty={bucketSessions.length === 0} class:compact={isCompact}>
+									<div class="status-header {bucket.id}">
+										<span class="status-indicator {bucket.id}"></span>
+										<span class="status-title">{bucket.label}</span>
+										<span class="status-count">{bucketSessions.length}</span>
 									</div>
 									<div class="session-grid">
-						{#each group.attention as session, i (sessionKeyOf(session))}
+						{#each bucketSessions as session, i (sessionKeyOf(session))}
 											<div
 												class="card-wrapper"
-												in:flyIn|global={{ index: baseIdx + 1 + i }}
+												in:flyIn|global={{ index: bucketIdx + i }}
 												animate:flip={{ duration: 400 }}
 											>
 												<SessionCard
@@ -750,61 +760,7 @@
 										{/each}
 									</div>
 								</div>
-
-								<div class="status-group" class:empty={group.idle.length === 0} class:compact={isCompact}>
-									<div class="status-header idle">
-										<span class="status-indicator idle"></span>
-										<span class="status-title">Idle</span>
-										<span class="status-count">{group.idle.length}</span>
-									</div>
-									<div class="session-grid">
-						{#each group.idle as session, i (sessionKeyOf(session))}
-											<div
-												class="card-wrapper"
-												in:flyIn|global={{ index: baseIdx + 1 + group.attention.length + i }}
-												animate:flip={{ duration: 400 }}
-											>
-												<SessionCard
-													{session}
-													compact={isCompact}
-													workersView={sessionFilter === 'workers'}
-													onexpand={() => handleExpand(session)}
-													onstop={() => handleStop(session.pid)}
-													onopen={() => handleOpen(session.pid, session.projectPath)}
-													onrename={() => showRenameHint = true}
-												/>
-											</div>
-										{/each}
-									</div>
-								</div>
-
-								<div class="status-group" class:empty={group.working.length === 0} class:compact={isCompact}>
-									<div class="status-header working">
-										<span class="status-indicator working"></span>
-										<span class="status-title">Working</span>
-										<span class="status-count">{group.working.length}</span>
-									</div>
-									<div class="session-grid">
-						{#each group.working as session, i (sessionKeyOf(session))}
-											<div
-												class="card-wrapper"
-												in:flyIn|global={{ index: baseIdx + 1 + group.attention.length + group.idle.length + i }}
-												animate:flip={{ duration: 400 }}
-											>
-												<SessionCard
-													{session}
-													compact={isCompact}
-													workersView={sessionFilter === 'workers'}
-													onexpand={() => handleExpand(session)}
-													onstop={() => handleStop(session.pid)}
-													onopen={() => handleOpen(session.pid, session.projectPath)}
-													onrename={() => showRenameHint = true}
-												/>
-											</div>
-										{/each}
-									</div>
-								</div>
-
+								{/each}
 							</div>
 						</section>
 					{/each}
