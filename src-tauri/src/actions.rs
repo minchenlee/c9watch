@@ -433,46 +433,6 @@ fn focus_jetbrains_window(app_name: &str, project_path: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// Get the iTerm2 session title for a process by matching its tty
-#[cfg(target_os = "macos")]
-pub fn get_iterm2_session_title(pid: u32) -> Option<String> {
-    let tty = get_session_tty(pid)?;
-
-    let script = format!(
-        r#"
-        tell application "System Events"
-            if not (exists process "iTerm2") then return ""
-        end tell
-        tell application "iTerm2"
-            repeat with w in windows
-                repeat with t in tabs of w
-                    repeat with s in sessions of t
-                        if tty of s ends with "{tty}" then
-                            return name of s
-                        end if
-                    end repeat
-                end repeat
-            end repeat
-            return ""
-        end tell
-        "#,
-        tty = tty
-    );
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .ok()?;
-
-    let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if title.is_empty() {
-        None
-    } else {
-        Some(title)
-    }
-}
-
 /// Platform-specific fallback to activate/focus an application
 #[cfg(target_os = "macos")]
 fn activate_app_fallback(app_name: &str) -> Result<(), String> {

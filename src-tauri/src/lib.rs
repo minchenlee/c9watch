@@ -59,13 +59,6 @@ use tauri_nspanel::{
 
 // ── GUI-only: Tauri commands ─────────────────────────────────────────
 
-#[cfg(feature = "gui")]
-#[cfg(all(not(mobile), feature = "gui"))]
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_subscription_usage() -> Vec<subscription_usage::SubscriptionUsage> {
@@ -479,20 +472,6 @@ mod rename_collision_tests {
     }
 }
 
-/// Get the terminal title for a session (iTerm2 only, macOS)
-#[cfg(feature = "gui")]
-#[tauri::command]
-async fn get_terminal_title(pid: u32) -> Result<Option<String>, String> {
-    #[cfg(target_os = "macos")]
-    {
-        Ok(actions::get_iterm2_session_title(pid))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = pid;
-        Ok(None)
-    }
-}
 
 /// Show and focus the main application window
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -787,7 +766,6 @@ pub fn run() {
             notifications::get_notification_preferences,
             notifications::save_notification_preferences,
             notifications::test_native_notification,
-            greet,
             get_sessions,
             get_detection_diagnostics,
             get_subscription_usage,
@@ -805,7 +783,6 @@ pub fn run() {
             stop_session,
             open_session,
             rename_session,
-            get_terminal_title,
             show_main_window,
             get_server_info,
             get_debug_logs
