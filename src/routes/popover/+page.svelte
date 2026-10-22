@@ -4,6 +4,7 @@
 	import { sortedSessions, sessions as sessionsStore, initializeSessionListeners, visibleTopLevelSessionIds } from '$lib/stores/sessions';
 	import { openSession, getSessions } from '$lib/api';
 	import { SessionStatus } from '$lib/types';
+	import { countStatusBuckets } from '$lib/status-utils';
 	import type { Session } from '$lib/types';
 	import { invoke } from '@tauri-apps/api/core';
 	import { listen } from '@tauri-apps/api/event';
@@ -14,11 +15,7 @@
 	import ProviderBadge from '$lib/components/ProviderBadge.svelte';
 
 	let sessions = $derived($sortedSessions.filter((session) => $visibleTopLevelSessionIds.has(sessionKeyOf(session))).filter((session) => matchesProvider(session, $providerFilter)));
-	let summary = $derived({
-		working: sessions.filter((s) => s.status === SessionStatus.Working || s.status === SessionStatus.Connecting).length,
-		permission: sessions.filter((s) => s.status === SessionStatus.NeedsAttention).length,
-		input: sessions.filter((s) => s.status === SessionStatus.WaitingForInput).length
-	});
+	let summary = $derived(countStatusBuckets(sessions));
 	let totalSessions = $derived(sessions.length);
 
 	// Pixel grid state

@@ -25,6 +25,7 @@
 	import ConnectionScreen from '$lib/components/ConnectionScreen.svelte';
 	import type { Session } from '$lib/types';
 	import { SessionStatus } from '$lib/types';
+	import { STATUS_BUCKETS, countStatusBuckets, statusBucket, type StatusBucket } from '$lib/status-utils';
 	import SessionHistory from '$lib/components/SessionHistory.svelte';
 	import CostTracker from '$lib/components/CostTracker.svelte';
 	import { refreshCostData } from '$lib/stores/cost';
@@ -209,16 +210,15 @@
 		return () => window.removeEventListener('keydown', handler);
 	});
 
+	type ProjectGroup = Record<StatusBucket, Session[]> & {
+		path: string;
+		displayName: string;
+		lastModified: number;
+	};
+
 	// Helper function to group sessions by project path, then by status
 	function groupByProjectAndStatus(sessions: Session[]) {
-		const groups: Array<{
-			path: string;
-			displayName: string;
-			attention: Session[];
-			idle: Session[];
-			working: Session[];
-			lastModified: number;
-		}> = [];
+		const groups: ProjectGroup[] = [];
 
 		sessions.forEach(session => {
 			let group = groups.find(g => g.path === session.projectPath);
@@ -243,47 +243,34 @@
 	}
 
 	function groupSessionsByStatus(sessions: Session[]) {
-		const groups = {
-			attention: [] as Session[],
-			idle: [] as Session[],
-			working: [] as Session[]
-		};
+		const groups: Record<StatusBucket, Session[]> = { attention: [], idle: [], working: [] };
 
 		sessions.forEach(session => {
-			if (session.status === SessionStatus.NeedsAttention) {
-				groups.attention.push(session);
-			} else if (session.status === SessionStatus.WaitingForInput) {
-				groups.idle.push(session);
-			} else if (session.status === SessionStatus.Working || session.status === SessionStatus.Connecting) {
-				groups.working.push(session);
-			}
+			const bucket = statusBucket(session.status);
+			if (bucket) groups[bucket].push(session);
 		});
 
 		const sortSessions = (a: Session, b: Session) => new Date(a.modified).getTime() - new Date(b.modified).getTime();
 
-		return [
-			{ id: 'attention', label: 'Needs Attention', sessions: groups.attention.sort(sortSessions), type: 'attention' },
-			{ id: 'idle', label: 'Idle', sessions: groups.idle.sort(sortSessions), type: 'idle' },
-			{ id: 'working', label: 'Working', sessions: groups.working.sort(sortSessions), type: 'working' }
-		].filter(g => g.sessions.length > 0);
+		return STATUS_BUCKETS.map(({ id, label }) => ({
+			id,
+			label,
+			sessions: groups[id].sort(sortSessions),
+			type: id
+		})).filter(g => g.sessions.length > 0);
 	}
 
-	function addToGroup(group: any, session: Session) {
+	function addToGroup(group: ProjectGroup, session: Session) {
 		const modified = new Date(session.modified).getTime();
 		if (modified > group.lastModified) {
 			group.lastModified = modified;
 		}
 
-		if (session.status === SessionStatus.NeedsAttention) {
-			group.attention.push(session);
-		} else if (session.status === SessionStatus.WaitingForInput) {
-			group.idle.push(session);
-		} else if (session.status === SessionStatus.Working || session.status === SessionStatus.Connecting) {
-			group.working.push(session);
-		}
+		const bucket = statusBucket(session.status);
+		if (bucket) group[bucket].push(session);
 	}
 
-	function sortGroups(groups: any[]) {
+	function sortGroups(groups: ProjectGroup[]) {
 		// Sort groups: priority to those needing attention, then by modification time
 		return groups.sort((a, b) => {
 			const aNeedsAttention = a.attention.length > 0;
@@ -337,19 +324,7 @@
 		return offsets;
 	});
 
-	let filteredSummary = $derived({
-		working: filteredSessions.filter(
-			(s) =>
-				s.status === SessionStatus.Working ||
-				s.status === SessionStatus.Connecting
-		).length,
-		permission: filteredSessions.filter(
-			(s) => s.status === SessionStatus.NeedsAttention
-		).length,
-		input: filteredSessions.filter(
-			(s) => s.status === SessionStatus.WaitingForInput
-		).length
-	});
+	let filteredSummary = $derived(countStatusBuckets(filteredSessions));
 
 	let expandedSession = $derived(sessions.find((s) => sessionKeyOf(s) === expandedId) || null);
 
