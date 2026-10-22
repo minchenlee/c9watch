@@ -1365,4 +1365,86 @@ mod tests {
         assert_eq!(unresolved[0].0, "Bash");
         assert_eq!(unresolved[0].1["command"], "make");
     }
+
+    fn assistant_with(content: Vec<MessageContent>) -> SessionEntry {
+        SessionEntry::Assistant {
+            base: create_base(),
+            message: AssistantMessage {
+                model: "claude-opus-5-5".to_string(),
+                id: "msg_test".to_string(),
+                role: "assistant".to_string(),
+                content,
+                stop_reason: Some("tool_use".to_string()),
+                stop_sequence: None,
+                usage: None,
+            },
+        }
+    }
+
+    fn tool_use(id: &str, name: &str, input: serde_json::Value) -> MessageContent {
+        MessageContent::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+        }
+    }
+
+    fn tool_result(id: &str) -> MessageContent {
+        MessageContent::ToolResult {
+            tool_use_id: id.to_string(),
+            content: "ok".to_string(),
+            is_error: None,
+        }
+    }
+
+    /// Pins the contract of `get_pending_tool_input_with`: the input of the
+    /// first pending tool, in content order, that the checker does not
+    /// auto-approve, read from the last assistant message only. Completed and
+    /// auto-approved tools (including AskUserQuestion) are skipped.
+    #[test]
+    fn test_get_pending_tool_input_first_non_auto_approved_pending_tool() {
+        // No allow rules: Read and AskUserQuestion never prompt, Bash and Write do.
+        let checker = PermissionChecker::from_files(&[]);
+        let older = assistant_with(vec![tool_use(
+            "toolu_old",
+            "Bash",
+            serde_json::json!({"command": "old"}),
+        )]);
+        let last = assistant_with(vec![
+            tool_use("toolu_1", "Read", serde_json::json!({"file_path": "/a"})),
+            tool_use("toolu_2", "Bash", serde_json::json!({"command": "done"})),
+            tool_use("toolu_3", "AskUserQuestion", serde_json::json!({"q": 1})),
+            tool_use("toolu_4", "Write", serde_json::json!({"file_path": "/w"})),
+            tool_use("toolu_5", "Bash", serde_json::json!({"command": "later"})),
+            tool_result("toolu_2"),
+        ]);
+        let entries = vec![older, last];
+        assert_eq!(
+            get_pending_tool_input_with(&entries, &checker),
+            Some(serde_json::json!({"file_path": "/w"}))
+        );
+        // The name lookup short-circuits on the pending AskUserQuestion first.
+        assert_eq!(
+            get_pending_tool_name_with(&entries, &checker),
+            Some("AskUserQuestion".to_string())
+        );
+
+        // Every pending tool auto-approved, or all completed: no input.
+        let approved = vec![assistant_with(vec![
+            tool_use("toolu_1", "Read", serde_json::json!({})),
+            tool_use("toolu_2", "Bash", serde_json::json!({"command": "x"})),
+            tool_result("toolu_2"),
+        ])];
+        assert_eq!(get_pending_tool_input_with(&approved, &checker), None);
+        assert_eq!(get_pending_tool_name_with(&approved, &checker), None);
+        assert_eq!(get_pending_tool_input_with(&[], &checker), None);
+    }
+
+    #[test]
+    fn test_check_all_tools_completed_without_tool_uses() {
+        assert!(check_all_tools_completed(&[]));
+        assert!(check_all_tools_completed(&[MessageContent::Text {
+            text: "hi".to_string()
+        }]));
+    }
 }
