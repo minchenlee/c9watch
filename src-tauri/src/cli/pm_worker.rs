@@ -74,6 +74,35 @@ pub struct InboxContext {
     pub spawned_by: String,
 }
 
+/// Build the `WorkerMeta` persisted to `meta.json` for a freshly spawned
+/// worker. Shared by both backends so the GUI reads identical fields.
+fn build_meta(session_id: String, pid: u32, args: SpawnArgs, ctx: SpawnContext) -> WorkerMeta {
+    WorkerMeta {
+        session_id,
+        pid,
+        name: args.name,
+        cwd: args.cwd,
+        spawned_at: Utc::now().to_rfc3339(),
+        spawned_by: ctx.spawned_by,
+        pm_pid: ctx.pm_pid,
+        spawn_args: PersistedSpawnArgs {
+            append_system_prompt: args.append_system_prompt,
+            permission_mode: args.permission_mode,
+            model: args.model,
+            add_dirs: args.add_dirs,
+        },
+        stopped_at: None,
+    }
+}
+
+/// Inbox routing for a worker: `Some` only when a PM spawned it.
+fn inbox_context(meta: &WorkerMeta) -> Option<InboxContext> {
+    meta.spawned_by.as_ref().map(|pm| InboxContext {
+        session_id: meta.session_id.clone(),
+        spawned_by: pm.clone(),
+    })
+}
+
 pub struct WorkerHandle {
     pub meta: WorkerMeta,
     child: Child,
@@ -121,22 +150,7 @@ impl WorkerHandle {
             .ok_or("Failed to get PID of spawned claude process")?;
 
         // Build WorkerMeta and persist it
-        let meta = WorkerMeta {
-            session_id: session_id.clone(),
-            pid,
-            name: args.name,
-            cwd: args.cwd,
-            spawned_at: Utc::now().to_rfc3339(),
-            spawned_by: ctx.spawned_by,
-            pm_pid: ctx.pm_pid,
-            spawn_args: PersistedSpawnArgs {
-                append_system_prompt: args.append_system_prompt,
-                permission_mode: args.permission_mode,
-                model: args.model,
-                add_dirs: args.add_dirs,
-            },
-            stopped_at: None,
-        };
+        let meta = build_meta(session_id.clone(), pid, args, ctx);
         pm_fs::write_worker_meta(&meta)?;
 
         // Grab stdin/stdout/stderr pipes
@@ -164,10 +178,7 @@ impl WorkerHandle {
         let stderr_log_path = pm_fs::worker_stderr_log_path(&session_id)
             .map_err(|e| format!("Failed to resolve stderr log path: {}", e))?;
 
-        let inbox_ctx = meta.spawned_by.as_ref().map(|pm| InboxContext {
-            session_id: session_id.clone(),
-            spawned_by: pm.clone(),
-        });
+        let inbox_ctx = inbox_context(&meta);
 
         // Spawn background tasks
         tokio::spawn(stdin_writer_task(stdin_rx, child_stdin));
@@ -318,32 +329,14 @@ impl BgWorkerHandle {
         // `effective_session_id` is canonical.
         let effective_session_id = info.cc_session_id;
 
-        let meta = WorkerMeta {
-            session_id: effective_session_id.clone(),
-            // bg workers are daemon-managed; the CC daemon owns the actual PTY
-            // pid. We can't take ownership of the subprocess here, so leave
-            // pid=0 and rely on `claude agents --json` for live pid lookup
-            // (see detector refactor PR #107).
-            pid: 0,
-            name: args.name.clone(),
-            cwd: args.cwd.clone(),
-            spawned_at: Utc::now().to_rfc3339(),
-            spawned_by: ctx.spawned_by.clone(),
-            pm_pid: ctx.pm_pid,
-            spawn_args: PersistedSpawnArgs {
-                append_system_prompt: args.append_system_prompt,
-                permission_mode: args.permission_mode,
-                model: args.model,
-                add_dirs: args.add_dirs,
-            },
-            stopped_at: None,
-        };
+        // bg workers are daemon-managed; the CC daemon owns the actual PTY
+        // pid. We can't take ownership of the subprocess here, so leave
+        // pid=0 and rely on `claude agents --json` for live pid lookup
+        // (see detector refactor PR #107).
+        let meta = build_meta(effective_session_id, 0, args, ctx);
         pm_fs::write_worker_meta(&meta)?;
 
-        let inbox_ctx = ctx.spawned_by.as_ref().map(|pm| InboxContext {
-            session_id: effective_session_id.clone(),
-            spawned_by: pm.clone(),
-        });
+        let inbox_ctx = inbox_context(&meta);
 
         // Mint two receivers up-front when a PM is attached: one for the
         // long-lived settle watcher, one for `wait_for_turn` callers. Tokio
@@ -1027,5 +1020,41 @@ mod tests {
         let mut cmd = Command::new("claude");
         args.apply_optional_flags(&mut cmd);
         assert!(argv(&cmd).is_empty());
+    }
+
+    #[test]
+    fn build_meta_copies_args_and_ctx() {
+        let ctx = SpawnContext {
+            spawned_by: Some("pm-uuid".to_string()),
+            pm_pid: Some(42),
+        };
+        let meta = build_meta("sess-1".to_string(), 7, sample_args(), ctx);
+        assert_eq!(meta.session_id, "sess-1");
+        assert_eq!(meta.pid, 7);
+        assert_eq!(meta.name.as_deref(), Some("w1"));
+        assert_eq!(meta.cwd, "/tmp/proj");
+        assert_eq!(meta.spawned_by.as_deref(), Some("pm-uuid"));
+        assert_eq!(meta.pm_pid, Some(42));
+        assert_eq!(
+            meta.spawn_args,
+            PersistedSpawnArgs {
+                append_system_prompt: Some("be brief".to_string()),
+                permission_mode: "acceptEdits".to_string(),
+                model: Some("opus".to_string()),
+                add_dirs: vec!["/a".to_string(), "/b".to_string()],
+            }
+        );
+        assert!(meta.stopped_at.is_none());
+        assert!(chrono::DateTime::parse_from_rfc3339(&meta.spawned_at).is_ok());
+
+        let inbox = inbox_context(&meta).expect("PM-spawned worker has inbox ctx");
+        assert_eq!(inbox.session_id, "sess-1");
+        assert_eq!(inbox.spawned_by, "pm-uuid");
+    }
+
+    #[test]
+    fn inbox_context_none_without_pm() {
+        let meta = build_meta("s".to_string(), 0, sample_args(), SpawnContext::default());
+        assert!(inbox_context(&meta).is_none());
     }
 }
