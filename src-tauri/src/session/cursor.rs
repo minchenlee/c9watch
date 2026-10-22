@@ -12,8 +12,8 @@ use super::cache::{
 };
 use super::parser::MessageType;
 use super::source::{
-    AgentKind, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionKind,
-    SessionProvider, SessionSource, SessionSurface,
+    AgentKind, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionProvider,
+    SessionSource, SessionSurface,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -287,34 +287,23 @@ impl CursorSessionSource {
                 .and_then(|name| name.to_str())
                 .unwrap_or("Cursor")
                 .to_string();
-            sessions.push(DetectedSession {
-                pid: 0,
-                cwd: cwd.clone(),
-                project_path: cwd,
-                session_id: Some(summary.session_id.clone()),
+            let base = DetectedSession::read_only(
+                SessionProvider::Cursor,
+                SessionSurface::Cursor,
+                cwd,
+                summary.session_id.clone(),
                 project_name,
-                kind: SessionKind::Interactive,
-                entrypoint: None,
+            );
+            sessions.push(DetectedSession {
                 started_at_ms: summary.started_at_ms,
                 official_name: summary.agent_nickname.clone(),
-                cli_activity: None,
-                cli_reports_prompts: false,
-                provider: SessionProvider::Cursor,
-                surface: SessionSurface::Cursor,
                 agent_kind: summary.agent_kind,
                 parent_thread_id: summary.parent_thread_id.clone(),
                 root_session_id: summary.root_session_id.clone(),
-                agent_path: None,
                 agent_nickname: summary.agent_nickname.clone(),
                 agent_role: summary.agent_role.clone(),
-                internal_kind: None,
-                can_open: false,
-                can_stop: false,
-                can_rename: false,
-                codex_summary: None,
                 cursor_summary: Some(summary),
-                pi_summary: None,
-                opencode_summary: None,
+                ..base
             });
         }
         Ok((sessions, DetectionDiagnostics::default()))
@@ -2139,6 +2128,10 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].provider, SessionProvider::Cursor);
         assert!(!sessions[0].can_open);
+        assert!(!sessions[0].can_stop);
+        assert!(!sessions[0].can_rename);
+        assert_eq!(sessions[0].pid, 0);
+        assert_eq!(sessions[0].cwd, sessions[0].project_path);
     }
 
     #[test]

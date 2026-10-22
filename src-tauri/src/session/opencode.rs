@@ -291,15 +291,13 @@ fn snapshot(connection: &Connection, client: &Client) -> Result<Vec<DetectedSess
                     <= IDLE_FRESHNESS_MS
         })
         .map(|s| {
-            let mut detected = DetectedSession::with_legacy_defaults(
-                0,
+            let mut detected = DetectedSession::read_only(
+                SessionProvider::Opencode,
+                SessionSurface::Integration,
                 s.directory.clone().into(),
-                s.directory.clone().into(),
-                Some(scoped_id(&s.id, &s.directory)),
+                scoped_id(&s.id, &s.directory),
                 s.title.clone(),
             );
-            detected.provider = SessionProvider::Opencode;
-            detected.surface = SessionSurface::Integration;
             detected.official_name = Some(s.title);
             detected.started_at_ms = Some(s.time.created);
             detected.agent_kind = if s.parent_id.is_some() {
@@ -308,9 +306,6 @@ fn snapshot(connection: &Connection, client: &Client) -> Result<Vec<DetectedSess
                 AgentKind::Root
             };
             detected.parent_thread_id = s.parent_id.map(|id| scoped_id(&id, &s.directory));
-            detected.can_open = false;
-            detected.can_stop = false;
-            detected.can_rename = false;
             // Missing entries in the status map are idle; unknown future values
             // are explicitly Connecting, never guessed to mean completion.
             let kind = statuses_by_directory

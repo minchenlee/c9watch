@@ -15,8 +15,8 @@ use super::agent_liveness::{
 };
 use super::parser::MessageType;
 use super::source::{
-    AgentKind, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionKind,
-    SessionProvider, SessionSource, SessionSurface,
+    AgentKind, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionProvider,
+    SessionSource, SessionSurface,
 };
 
 /// Rollouts do not expose a supported process-liveness API. Keep recently idle
@@ -700,20 +700,16 @@ impl CodexSessionSource {
                 .and_then(|name| name.to_str())
                 .unwrap_or("Codex")
                 .to_string();
-            sessions.push(DetectedSession {
-                pid: 0,
-                cwd: cwd.clone(),
-                project_path: cwd,
-                session_id: Some(summary.thread_id.clone()),
+            let base = DetectedSession::read_only(
+                SessionProvider::Codex,
+                summary.surface,
+                cwd,
+                summary.thread_id.clone(),
                 project_name,
-                kind: SessionKind::Interactive,
-                entrypoint: None,
+            );
+            sessions.push(DetectedSession {
                 started_at_ms: summary.started_at_ms,
                 official_name: summary.agent_nickname.clone(),
-                cli_activity: None,
-                cli_reports_prompts: false,
-                provider: SessionProvider::Codex,
-                surface: summary.surface,
                 agent_kind: summary.agent_kind,
                 parent_thread_id: summary.parent_thread_id.clone(),
                 root_session_id: summary.root_session_id.clone(),
@@ -721,13 +717,8 @@ impl CodexSessionSource {
                 agent_nickname: summary.agent_nickname.clone(),
                 agent_role: summary.agent_role.clone(),
                 internal_kind: summary.internal_kind.clone(),
-                can_open: false,
-                can_stop: false,
-                can_rename: false,
                 codex_summary: Some(summary),
-                cursor_summary: None,
-                pi_summary: None,
-                opencode_summary: None,
+                ..base
             });
         }
         Ok((sessions, DetectionDiagnostics::default()))

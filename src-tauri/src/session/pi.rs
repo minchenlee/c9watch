@@ -24,7 +24,7 @@ use super::pi_liveness::{
 };
 use super::project_name_from_path;
 use super::source::{DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource};
-use super::{AgentKind, SessionKind, SessionProvider, SessionSurface};
+use super::{SessionProvider, SessionSurface};
 use crate::session::parser::MessageType;
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
@@ -263,34 +263,17 @@ impl SessionSource for PiSessionSource {
                 summary.project_path.clone()
             };
             let project_name = project_name_from_path(&project_path);
-            sessions.push(DetectedSession {
-                pid: 0,
-                cwd: PathBuf::from(&project_path),
-                project_path: PathBuf::from(&project_path),
-                session_id: Some(summary.session_id.clone()),
+            let base = DetectedSession::read_only(
+                SessionProvider::Pi,
+                SessionSurface::Cli,
+                PathBuf::from(&project_path),
+                summary.session_id.clone(),
                 project_name,
-                kind: SessionKind::Interactive,
-                entrypoint: None,
+            );
+            sessions.push(DetectedSession {
                 started_at_ms: summary.started_at_ms,
-                official_name: None,
-                cli_activity: None,
-                cli_reports_prompts: false,
-                provider: SessionProvider::Pi,
-                surface: SessionSurface::Cli,
-                agent_kind: AgentKind::Root,
-                parent_thread_id: None,
-                root_session_id: None,
-                agent_path: None,
-                agent_nickname: None,
-                agent_role: None,
-                internal_kind: None,
-                can_open: false,
-                can_stop: false,
-                can_rename: false,
-                codex_summary: None,
-                cursor_summary: None,
                 pi_summary: Some(summary),
-                opencode_summary: None,
+                ..base
             });
         }
         Ok((sessions, DetectionDiagnostics::default()))
@@ -2061,9 +2044,14 @@ mod tests {
         file.set_modified(SystemTime::now() - Duration::from_secs(10 * 60))
             .unwrap();
         let (sessions, _) = source.detect().unwrap();
-        assert!(sessions
+        let killed = sessions
             .iter()
-            .any(|s| s.session_id.as_deref() == Some("killed1")));
+            .find(|s| s.session_id.as_deref() == Some("killed1"))
+            .expect("killed1 still listed");
+        assert_eq!(killed.provider, SessionProvider::Pi);
+        assert_eq!(killed.pid, 0);
+        assert_eq!(killed.cwd, killed.project_path);
+        assert!(!killed.can_open && !killed.can_stop && !killed.can_rename);
         let summary = summarize_pi_transcript(&path).unwrap();
         assert_eq!(summary.lifecycle, PiLifecycle::Working);
         assert_eq!(summary.pending_tool_name.as_deref(), Some("bash"));
