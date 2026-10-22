@@ -337,6 +337,98 @@ mod tests {
         assert_eq!(s.backend_name(), "cli");
     }
 
+    fn session(name: &str) -> DetectedSession {
+        DetectedSession::with_legacy_defaults(
+            0,
+            std::path::PathBuf::from("/tmp"),
+            std::path::PathBuf::from("/tmp"),
+            Some(name.to_string()),
+            name.to_string(),
+        )
+    }
+
+    fn diag(found: u32, with_cwd: u32) -> DetectionDiagnostics {
+        DetectionDiagnostics {
+            claude_processes_found: found,
+            processes_with_cwd: with_cwd,
+            ..Default::default()
+        }
+    }
+
+    fn provider(name: &str, d: DetectionDiagnostics) -> ProviderResult {
+        Some((vec![session(name)], d))
+    }
+
+    fn ids(sessions: &[DetectedSession]) -> Vec<String> {
+        sessions
+            .iter()
+            .map(|s| s.session_id.clone().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn merge_ok_orders_claude_codex_cursor_pi_opencode() {
+        let (sessions, d) = merge_provider_results::<()>(
+            Ok((vec![session("claude")], diag(7, 1))),
+            provider("codex", diag(1, 1)),
+            provider("cursor", diag(2, 2)),
+            provider("pi", diag(3, 3)),
+            vec![session("opencode")],
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&sessions),
+            ["claude", "codex", "cursor", "pi", "opencode"]
+        );
+        assert_eq!(d, diag(7, 1));
+    }
+
+    #[test]
+    fn merge_err_codex_diagnostics_win() {
+        let (sessions, d) = merge_provider_results(
+            Err("boom"),
+            provider("codex", diag(4, 1)),
+            provider("cursor", diag(5, 2)),
+            provider("pi", diag(6, 3)),
+            vec![session("opencode")],
+        )
+        .unwrap();
+        assert_eq!(ids(&sessions), ["opencode", "codex", "cursor", "pi"]);
+        assert_eq!(d, diag(4, 1));
+    }
+
+    #[test]
+    fn merge_err_cursor_and_pi_apply_only_while_no_processes_found() {
+        // Codex reports 0 processes: cursor replaces it.
+        let (_, d) = merge_provider_results(
+            Err("boom"),
+            provider("codex", diag(0, 9)),
+            provider("cursor", diag(5, 2)),
+            provider("pi", diag(6, 3)),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(d, diag(5, 2));
+
+        // Cursor also reports 0: pi replaces it.
+        let (_, d) = merge_provider_results(
+            Err("boom"),
+            None,
+            provider("cursor", diag(0, 2)),
+            provider("pi", diag(6, 3)),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(d, diag(6, 3));
+    }
+
+    #[test]
+    fn merge_err_with_empty_fallback_returns_err() {
+        let empty = Some((Vec::new(), diag(3, 3)));
+        let result = merge_provider_results(Err("boom"), empty, None, None, Vec::new());
+        assert_eq!(result.unwrap_err(), "boom");
+    }
+
     /// A fake clock the test advances by hand, and a probe that counts calls.
     fn fake_backends(
         cli_works: bool,
