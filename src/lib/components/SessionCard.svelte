@@ -11,6 +11,7 @@
 	import { awayActivity } from '$lib/stores/away';
 	import { awayActivityLabel, waitingForLabel } from '$lib/session-utils';
 	import { formatTimeSince } from '$lib/time-utils';
+	import { getSessionStatusColor, getSessionStatusLabel } from '$lib/status-utils';
 
 	interface Props {
 		session: Session;
@@ -98,39 +99,8 @@
 		costRecord ? formatCostOrTokens(costRecord.cost, costRecord.totalTokens, $costMode, isCostAvailable(costRecord)) : null
 	);
 
-	function getStatusColor(): string {
-		switch (session.status) {
-			case SessionStatus.Working:
-				return 'var(--status-working)';
-			case SessionStatus.NeedsAttention:
-				return 'var(--status-permission)';
-			case SessionStatus.WaitingForInput:
-				return 'var(--status-input)';
-			case SessionStatus.Connecting:
-				return 'var(--status-working)';
-			default:
-				return 'var(--status-working)';
-		}
-	}
-
-	function getStatusLabel(): string {
-		if (waitingLabel) return waitingLabel;
-		switch (session.status) {
-			case SessionStatus.Working:
-				return 'Working';
-			case SessionStatus.NeedsAttention:
-				if (session.pendingToolName === 'Question' || session.pendingToolName === 'AskUserQuestion') {
-					return 'Waiting for Response';
-				}
-				return 'Approval Required';
-			case SessionStatus.WaitingForInput:
-				return 'Ready';
-			case SessionStatus.Connecting:
-				return 'Connecting';
-			default:
-				return 'Unknown';
-		}
-	}
+	let statusColor = $derived(getSessionStatusColor(session.status));
+	let statusLabel = $derived(waitingLabel || getSessionStatusLabel(session.status, session.pendingToolName));
 
 	function handleCardClick(e: MouseEvent) {
 		const target = e.target as HTMLElement;
@@ -297,8 +267,8 @@
 				{#if costLabel}
 					<span class="cost-pill compact-pill" title={$costMode === 'usd' ? 'Session cost' : 'Session tokens'}>{costLabel}</span>
 				{/if}
-				<div class="status-label" style="color: {getStatusColor()}">
-					{getStatusLabel()}
+				<div class="status-label" style="color: {statusColor}">
+					{statusLabel}
 				</div>
 			{/if}
 		</div>
@@ -318,8 +288,8 @@
 			{/if}
 
 			<!-- Status Label -->
-			<div class="status-label" style="color: {getStatusColor()}">
-				{getStatusLabel()}
+			<div class="status-label" style="color: {statusColor}">
+				{statusLabel}
 			</div>
 		{/if}
 
