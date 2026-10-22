@@ -397,11 +397,6 @@ pub fn get_pending_tool_name_with(
 
 /// Gets the input of the first pending tool that needs permission.
 /// Returns the full tool_use JSON value so the agent knows what action is being requested.
-pub fn get_pending_tool_input(entries: &[SessionEntry]) -> Option<serde_json::Value> {
-    get_pending_tool_input_with(entries, &get_permission_checker())
-}
-
-/// [`get_pending_tool_input`] using `checker` for permission decisions.
 pub fn get_pending_tool_input_with(
     entries: &[SessionEntry],
     checker: &PermissionChecker,
@@ -511,53 +506,6 @@ fn check_all_tools_completed(content: &[MessageContent]) -> bool {
     }
 
     true
-}
-
-/// Determines status with additional context from multiple entries
-///
-/// This function looks at the last few entries to get more context about
-/// the session state, which can be more accurate than just looking at the
-/// last entry alone.
-pub fn determine_status_with_context(entries: &[SessionEntry]) -> SessionStatus {
-    if entries.is_empty() {
-        return SessionStatus::Connecting;
-    }
-
-    // For minimal context, treat as connecting
-    if entries.len() <= 2 {
-        return SessionStatus::Connecting;
-    }
-
-    // Get the basic status from the last entry
-    let basic_status = determine_status(entries);
-
-    // If we detect Working status, but the previous entry was also an assistant
-    // message with completed tools, we might actually be waiting for input
-    if basic_status == SessionStatus::Working && entries.len() >= 2 {
-        let last_entry = &entries[entries.len() - 1];
-        let prev_entry = &entries[entries.len() - 2];
-
-        if let (
-            SessionEntry::Assistant {
-                message: last_msg, ..
-            },
-            SessionEntry::Assistant { .. },
-        ) = (last_entry, prev_entry)
-        {
-            // If both are assistant messages and last one has no tool use,
-            // might be waiting for input
-            let last_has_tools = last_msg
-                .content
-                .iter()
-                .any(|c| matches!(c, MessageContent::ToolUse { .. }));
-
-            if !last_has_tools && last_msg.stop_reason.is_some() {
-                return SessionStatus::WaitingForInput;
-            }
-        }
-    }
-
-    basic_status
 }
 
 #[cfg(test)]
