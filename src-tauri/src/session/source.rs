@@ -80,6 +80,8 @@ impl SessionProvider {
     }
 
     /// Human-readable product name for user-facing text.
+    // Only notifications.rs (GUI build) calls this.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::ClaudeCode => "Claude Code",
@@ -373,6 +375,24 @@ mod tests {
         assert_eq!(SessionProvider::from_key("bogus"), None);
         assert_eq!(SessionProvider::from_key(""), None);
         assert_eq!(SessionProvider::from_key("ClaudeCode"), None);
+    }
+
+    /// `ALL` is written by hand. serde's derived error lists every variant
+    /// in declaration order, so a variant missing from `ALL` fails here.
+    #[test]
+    fn provider_all_lists_every_serde_variant() {
+        let err = serde_json::from_str::<SessionProvider>("\"__not_a_provider__\"")
+            .unwrap_err()
+            .to_string();
+        let expected = SessionProvider::ALL
+            .iter()
+            .map(|p| format!("`{}`", p.as_key()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            err.contains(&format!("expected one of {expected} ")),
+            "SessionProvider::ALL is out of sync with the enum: {err}"
+        );
     }
 
     #[test]
