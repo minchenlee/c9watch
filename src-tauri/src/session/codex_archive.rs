@@ -221,12 +221,17 @@ fn fingerprint(path: &Path) -> Option<FileFingerprint> {
     })
 }
 
+/// File name of the archive cache, next to the sessions root in `~/.codex`.
+/// `default_cache_path` and `cached_thread_paths` must agree on it, or the
+/// warm-cache fast path silently misses.
+const ARCHIVE_CACHE_FILENAME: &str = "c9watch-archive-cache.json";
+
 pub(crate) fn default_sessions_root(home: &Path) -> PathBuf {
     home.join(".codex").join("sessions")
 }
 
 pub(crate) fn default_cache_path(home: &Path) -> PathBuf {
-    home.join(".codex").join("c9watch-archive-cache.json")
+    home.join(".codex").join(ARCHIVE_CACHE_FILENAME)
 }
 
 fn collect_rollouts(root: &Path) -> Vec<PathBuf> {
@@ -909,7 +914,7 @@ pub(crate) fn load_listing_snapshots(root: &Path, cache_path: &Path) -> Vec<Code
 
 /// Fast path for conversation loading when History/Cost already warmed the archive.
 pub(crate) fn cached_thread_paths(sessions_root: &Path, thread_id: &str) -> Option<Vec<PathBuf>> {
-    let cache_path = sessions_root.parent()?.join("c9watch-archive-cache.json");
+    let cache_path = sessions_root.parent()?.join(ARCHIVE_CACHE_FILENAME);
     let key = (sessions_root.to_path_buf(), cache_path);
     let state = archive_state()
         .lock()
@@ -1349,6 +1354,26 @@ mod tests {
             },
         );
         assert!(hit.is_none());
+    }
+
+    #[test]
+    fn cached_thread_paths_hits_the_cache_written_at_default_cache_path() {
+        let home = tempfile::tempdir().unwrap();
+        let root = default_sessions_root(home.path());
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-2026-07-13T01-00-00-warm.jsonl");
+        write_rollout(
+            &path,
+            &[
+                r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"warm","cwd":"/tmp/warm","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"warm prompt"}}"#,
+            ],
+        );
+
+        load_snapshots(&root, &default_cache_path(home.path()));
+
+        assert_eq!(cached_thread_paths(&root, "warm"), Some(vec![path]));
+        assert_eq!(cached_thread_paths(&root, "missing"), None);
     }
 
     #[test]
