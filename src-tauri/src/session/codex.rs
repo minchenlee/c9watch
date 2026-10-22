@@ -1596,17 +1596,6 @@ fn file_stamp(path: &Path) -> io::Result<FileStamp> {
     FileVersion::read(path)
 }
 
-#[cfg(unix)]
-fn file_identity(metadata: &fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.ino()
-}
-
-#[cfg(not(unix))]
-fn file_identity(_metadata: &fs::Metadata) -> u64 {
-    0
-}
-
 impl SessionSource for CodexSessionSource {
     fn detect(
         &mut self,
@@ -2048,19 +2037,6 @@ pub fn find_codex_conversation_with_progress(
     )
 }
 
-fn find_codex_conversation_under(
-    sessions_root: &Path,
-    thread_id: &str,
-    include_tools: bool,
-) -> Result<Vec<CodexMessage>, String> {
-    find_codex_conversation_under_with_progress(
-        sessions_root,
-        thread_id,
-        include_tools,
-        &mut |_, _| {},
-    )
-}
-
 fn find_codex_conversation_under_with_progress(
     sessions_root: &Path,
     thread_id: &str,
@@ -2116,6 +2092,30 @@ mod tests {
     use tempfile::TempDir;
 
     type Classified<'a> = (SessionSurface, AgentKind, Option<&'a str>);
+
+    #[cfg(unix)]
+    fn file_identity(metadata: &fs::Metadata) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        metadata.ino()
+    }
+
+    #[cfg(not(unix))]
+    fn file_identity(_metadata: &fs::Metadata) -> u64 {
+        0
+    }
+
+    fn find_codex_conversation_under(
+        sessions_root: &Path,
+        thread_id: &str,
+        include_tools: bool,
+    ) -> Result<Vec<CodexMessage>, String> {
+        find_codex_conversation_under_with_progress(
+            sessions_root,
+            thread_id,
+            include_tools,
+            &mut |_, _| {},
+        )
+    }
 
     #[test]
     fn live_and_archive_session_meta_classifiers_pin_known_divergences() {
