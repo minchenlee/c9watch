@@ -18,7 +18,8 @@
 //! never extends one past those windows.
 //!
 //! The matcher (`pi_alive_flags`) and the sysinfo scan (`scan_processes`) are
-//! shared with Codex and Cursor; their classifiers live in `agent_liveness`.
+//! pi-only. `agent_liveness` (Codex and Cursor) shares only the grace window
+//! (`PROCESS_GRACE_MS`) and the uid and basename helpers.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -32,7 +33,7 @@ use std::path::Path;
 /// resolution (1 s on HFS+, 2 s on FAT/SMB) and clock skew on network
 /// volumes. Ten seconds is under three 3.5 s polls, so a killed session
 /// still ends within a few polls of its last write.
-pub(crate) const PI_PROCESS_GRACE_MS: i64 = 10_000;
+pub(crate) const PROCESS_GRACE_MS: i64 = 10_000;
 
 /// Live pi processes per exact cwd, or no usable evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,7 +67,7 @@ pub(crate) fn pi_alive_flags(
     let mut alive = vec![false; candidates.len()];
     let mut by_cwd: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, candidate) in candidates.iter().enumerate() {
-        if now_ms.saturating_sub(candidate.modified_ms) < PI_PROCESS_GRACE_MS {
+        if now_ms.saturating_sub(candidate.modified_ms) < PROCESS_GRACE_MS {
             alive[index] = true;
         }
         match candidate.cwd {
@@ -125,7 +126,7 @@ fn sort_newest_first(indexes: &mut [usize], candidates: &[PiLivenessCandidate<'_
 /// latest fit leaves earlier-started processes free for older transcripts,
 /// which maximizes how many transcripts are kept.
 fn claim_latest_fitting(starts: &mut Vec<i64>, modified_ms: i64) -> bool {
-    let limit = modified_ms.saturating_add(PI_PROCESS_GRACE_MS);
+    let limit = modified_ms.saturating_add(PROCESS_GRACE_MS);
     let fits = starts.partition_point(|&start| start <= limit);
     if fits == 0 {
         return false;
@@ -272,7 +273,7 @@ impl PiProcessProbe for SysinfoPiProcessProbe {
 /// for rows whose name passes `is_candidate_name`, and fold the classified
 /// rows into evidence. `system` persists across polls so sysinfo only creates
 /// rows for new pids.
-pub(crate) fn scan_processes(
+fn scan_processes(
     system: &mut sysinfo::System,
     is_candidate_name: fn(&str) -> bool,
     classify: fn(&PiProcessRow<'_>) -> PiProcessClass,
@@ -468,8 +469,8 @@ mod tests {
     #[test]
     fn grace_window_keeps_a_just_written_transcript() {
         let candidates = [
-            candidate("/w/a", PI_PROCESS_GRACE_MS - 1),
-            candidate("/w/a", PI_PROCESS_GRACE_MS),
+            candidate("/w/a", PROCESS_GRACE_MS - 1),
+            candidate("/w/a", PROCESS_GRACE_MS),
         ];
         let flags = pi_alive_flags(&candidates, &live(&[]), NOW);
         assert_eq!(flags, vec![true, false]);
@@ -585,7 +586,7 @@ mod tests {
         // (whole-second start times) still owns it.
         let flags = pi_alive_flags(
             &[candidate("/w/a", 60_000)],
-            &started("/w/a", &[60_000 - PI_PROCESS_GRACE_MS]),
+            &started("/w/a", &[60_000 - PROCESS_GRACE_MS]),
             NOW,
         );
         assert_eq!(flags, vec![true]);
