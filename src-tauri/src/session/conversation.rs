@@ -19,6 +19,9 @@ pub struct Conversation {
 pub struct ConversationProgress {
     pub session_id: String,
     pub provider: Option<SessionProvider>,
+    /// WS request correlation id; omitted for Tauri events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u64>,
     pub bytes_read: u64,
     pub bytes_total: u64,
 }
