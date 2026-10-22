@@ -570,7 +570,11 @@ mod cost_session_tests {
             ("codex:", (None, "codex:")),
             ("abc", (None, "abc")),
         ] {
-            assert_eq!(parse_provider_scoped_cost_reference(input), expected, "{input}");
+            assert_eq!(
+                parse_provider_scoped_cost_reference(input),
+                expected,
+                "{input}"
+            );
         }
     }
 

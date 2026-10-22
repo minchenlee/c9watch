@@ -204,7 +204,6 @@ impl SessionIdentity {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DetectionDiagnostics {

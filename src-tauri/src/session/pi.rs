@@ -22,10 +22,10 @@ use super::cache::FileVersion;
 use super::pi_liveness::{
     pi_alive_flags, NoPiProcessProbe, PiLivenessCandidate, PiProcessProbe, SysinfoPiProcessProbe,
 };
+use super::project_name_from_path;
 use super::source::{DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource};
 use super::{AgentKind, SessionKind, SessionProvider, SessionSurface};
 use crate::session::parser::MessageType;
-use super::project_name_from_path;
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -408,7 +408,6 @@ fn find_transcript_by_id(root: &Path, session_id: &str) -> Option<PathBuf> {
         .map(|(_, path)| path)
         .find(|path| pi_session_id_from_filename(path).as_deref() == Some(session_id))
 }
-
 
 // ── Transcript parsing ──────────────────────────────────────────────
 
@@ -1726,7 +1725,10 @@ mod tests {
             ]
         );
 
-        assert_eq!(find_transcript_by_id(&root, "id-b"), Some(b.join("t_id-b.jsonl")));
+        assert_eq!(
+            find_transcript_by_id(&root, "id-b"),
+            Some(b.join("t_id-b.jsonl"))
+        );
         assert_eq!(find_transcript_by_id(&root, "id-nested"), None);
         assert_eq!(find_transcript_by_id(&root, "root-id"), None);
         let source = PiSessionSource::at_root(root.clone());

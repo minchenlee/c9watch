@@ -103,9 +103,7 @@ fn resolve_session_reference_lightweight_under(
 
 /// Parse the canonical provider-scoped key emitted by `list`/`watch`.
 /// Unknown prefixes remain ordinary raw references for backwards compatibility.
-pub(super) fn split_provider_scoped(
-    reference: &str,
-) -> Option<(session::SessionProvider, &str)> {
+pub(super) fn split_provider_scoped(reference: &str) -> Option<(session::SessionProvider, &str)> {
     let (provider, raw_prefix) = reference.split_once(':')?;
     if raw_prefix.is_empty() {
         return None;
