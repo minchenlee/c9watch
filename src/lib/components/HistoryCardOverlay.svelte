@@ -132,35 +132,22 @@
 	$effect(() => {
 		if (conversation && conversation.messages.length > 0 && messagesContainer) {
 			if (!hasScrolledToBottom) {
-				if (searchQuery) {
-					const queryLower = searchQuery.toLowerCase();
-					const matchIndex = conversation!.messages.findIndex(
+				// Case-insensitive phrase match — consistent with deep_search defaults.
+				const needle = searchQuery?.toLowerCase();
+				const matchIndex = needle
+					? conversation.messages.findIndex(
 						(m) => (m.messageType === 'User' || m.messageType === 'Assistant') &&
-							m.content.toLowerCase().includes(queryLower)
-					);
-					if (matchIndex >= 0) {
-						sw.reset(conversation.messages.length, Math.max(0, matchIndex - 10));
-					} else {
-						sw.reset(conversation.messages.length);
-					}
+							m.content.toLowerCase().includes(needle)
+					)
+					: -1;
+				if (matchIndex >= 0) {
+					sw.reset(conversation.messages.length, Math.max(0, matchIndex - 10));
 				} else {
 					sw.reset(conversation.messages.length);
 				}
 				tick().then(() => {
-					if (searchQuery) {
-						// Case-insensitive phrase match — consistent with deep_search defaults.
-						const needle = searchQuery.toLowerCase();
-						const matchIndex = conversation!.messages.findIndex(
-							(m) => {
-								if (m.messageType !== 'User' && m.messageType !== 'Assistant') return false;
-								return m.content.toLowerCase().includes(needle);
-							}
-						);
-						if (matchIndex >= 0) {
-							scrollToMessageIndex(matchIndex);
-						} else {
-							messagesContainer.scrollTop = messagesContainer.scrollHeight;
-						}
+					if (matchIndex >= 0) {
+						scrollToMessageIndex(matchIndex);
 					} else {
 						messagesContainer.scrollTop = messagesContainer.scrollHeight;
 					}
