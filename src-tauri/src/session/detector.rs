@@ -83,18 +83,13 @@ impl LegacySessionSource {
         project_dirs: &[PathBuf],
     ) -> Vec<DetectedSession> {
         // Collect all session files with their modification times and project path
-        // Tuple: (modified_time, jsonl_path, project_dir, project_path, project_name, has_reliable_path)
-        let mut session_files: Vec<(
-            std::time::SystemTime,
-            PathBuf,
-            PathBuf,
-            PathBuf,
-            String,
-            bool,
-        )> = Vec::new();
+        let mut session_files: Vec<SessionFile> = Vec::new();
 
         for project_dir in project_dirs {
             if let Ok(entries) = fs::read_dir(project_dir) {
+                // sessions-index.json is the ONLY reliable source of project
+                // path; read it once per project dir.
+                let index_entries = load_sessions_index_entries(project_dir);
                 for entry in entries.flatten() {
                     let path = entry.path();
 
@@ -115,41 +110,37 @@ impl LegacySessionSource {
                                     .and_then(|s| s.to_str())
                                     .map(|s| s.to_string())
                                 {
-                                    // Try to get project info from sessions-index.json
-                                    // This is the ONLY reliable source of project path
-                                    let (project_path, project_name, has_reliable_path) = match self
-                                        .get_project_info_from_index(project_dir, &session_id)
-                                    {
-                                        Some((path, name)) => (path, name, true),
-                                        None => {
-                                            // No reliable path available - use directory name as display only
-                                            // Don't try to decode it (decoding is ambiguous due to dashes)
-                                            let dir_name = project_dir
-                                                .file_name()
-                                                .and_then(|n| n.to_str())
-                                                .unwrap_or("unknown");
+                                    let (project_path, project_name, has_reliable_path) =
+                                        match index_entries.as_deref().and_then(|entries| {
+                                            project_info_from_index(entries, &session_id)
+                                        }) {
+                                            Some((path, name)) => (path, name, true),
+                                            None => {
+                                                // No reliable path available - use directory name as display only
+                                                // Don't try to decode it (decoding is ambiguous due to dashes)
+                                                let dir_name = dir_display_name(project_dir);
 
-                                            // Just use the last segment after splitting on dash as a rough name
-                                            // This is for display only, not for matching
-                                            let name = dir_name
-                                                .rsplit('-')
-                                                .next()
-                                                .unwrap_or("unknown")
-                                                .to_string();
+                                                // Just use the last segment after splitting on dash as a rough name
+                                                // This is for display only, not for matching
+                                                let name = dir_name
+                                                    .rsplit('-')
+                                                    .next()
+                                                    .unwrap_or("unknown")
+                                                    .to_string();
 
-                                            // Use the project_dir as a placeholder (will use fallback PID assignment)
-                                            (project_dir.clone(), name, false)
-                                        }
-                                    };
+                                                // Use the project_dir as a placeholder (will use fallback PID assignment)
+                                                (project_dir.clone(), name, false)
+                                            }
+                                        };
 
-                                    session_files.push((
+                                    session_files.push(SessionFile {
                                         modified,
-                                        path,
-                                        project_dir.clone(),
+                                        session_id,
+                                        project_dir: project_dir.clone(),
                                         project_path,
                                         project_name,
                                         has_reliable_path,
-                                    ));
+                                    });
                                 }
                             }
                         }
@@ -159,7 +150,7 @@ impl LegacySessionSource {
         }
 
         // Sort by modification time (most recent first)
-        session_files.sort_by(|a, b| b.0.cmp(&a.0));
+        session_files.sort_by(|a, b| b.modified.cmp(&a.modified));
 
         // Process-centric approach: for each process, find its matching session
         // This ensures we only show sessions that have actual running processes
@@ -207,18 +198,17 @@ impl LegacySessionSource {
                     continue;
                 }
                 // Find the matching session file and project info
-                if let Some((_, _, project_dir, _, project_name, _)) =
-                    session_files.iter().find(|(_, path, _, _, _, _)| {
-                        path.file_stem().and_then(|s| s.to_str()) == Some(session_id.as_str())
-                    })
+                if let Some(file) = session_files
+                    .iter()
+                    .find(|file| file.session_id == session_id)
                 {
                     used_session_ids.insert(session_id.clone());
                     sessions.push(DetectedSession::with_legacy_defaults(
                         proc.pid,
                         proc_cwd.clone(),
-                        project_dir.clone(),
+                        file.project_dir.clone(),
                         Some(session_id),
-                        project_name.clone(),
+                        file.project_name.clone(),
                     ));
                     claimed_named = true;
                     break;
@@ -256,55 +246,48 @@ impl LegacySessionSource {
 
             // Helper closure to check if session is not already used or named
             // by another process
-            let session_available = |path: &Path| -> bool {
-                match path.file_stem().and_then(|s| s.to_str()) {
-                    Some(id) => !used_session_ids.contains(id) && !named_session_ids.contains(id),
-                    None => false,
-                }
+            let session_available = |id: &str| -> bool {
+                !used_session_ids.contains(id) && !named_session_ids.contains(id)
             };
 
             // Find session with activity after process start
             // Only match sessions that were modified AFTER the process started
             // This prevents matching a new Claude instance (with no session file yet)
             // to an older session from the same project directory
-            let matching_session = session_files.iter().find(
-                |(modified, path, project_dir, project_path, _, has_reliable_path)| {
-                    if !session_available(path) {
-                        return false;
-                    }
-
-                    // Check if the session was modified after the process started
-                    let session_active_after_proc_start =
-                        match modified.duration_since(std::time::UNIX_EPOCH) {
-                            Ok(duration) => {
-                                let session_modified_secs = duration.as_secs();
-                                // Session must have been modified at or after process start (with 5s buffer)
-                                session_modified_secs + 5 >= proc.start_time
-                            }
-                            Err(_) => false,
-                        };
-
-                    session_active_after_proc_start
-                        && path_matches(project_dir, project_path, *has_reliable_path)
-                },
-            );
-
-            if let Some((_, path, project_dir, _, project_name, _)) = matching_session {
-                if let Some(session_id) = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-                {
-                    used_session_ids.insert(session_id.clone());
-
-                    sessions.push(DetectedSession::with_legacy_defaults(
-                        proc.pid,
-                        proc_cwd.clone(),
-                        project_dir.clone(),
-                        Some(session_id),
-                        project_name.clone(),
-                    ));
+            let matching_session = session_files.iter().find(|file| {
+                if !session_available(&file.session_id) {
+                    return false;
                 }
+
+                // Check if the session was modified after the process started
+                let session_active_after_proc_start =
+                    match file.modified.duration_since(std::time::UNIX_EPOCH) {
+                        Ok(duration) => {
+                            let session_modified_secs = duration.as_secs();
+                            // Session must have been modified at or after process start (with 5s buffer)
+                            session_modified_secs + 5 >= proc.start_time
+                        }
+                        Err(_) => false,
+                    };
+
+                session_active_after_proc_start
+                    && path_matches(
+                        &file.project_dir,
+                        &file.project_path,
+                        file.has_reliable_path,
+                    )
+            });
+
+            if let Some(file) = matching_session {
+                used_session_ids.insert(file.session_id.clone());
+
+                sessions.push(DetectedSession::with_legacy_defaults(
+                    proc.pid,
+                    proc_cwd.clone(),
+                    file.project_dir.clone(),
+                    Some(file.session_id.clone()),
+                    file.project_name.clone(),
+                ));
             } else {
                 crate::debug_log::log_warn(&format!(
                     "PID={}: no matching session found for cwd={}",
@@ -337,50 +320,6 @@ impl LegacySessionSource {
         let meta_path = self.claude_sessions_dir.join(format!("{}.json", pid));
         let content = fs::read_to_string(&meta_path).ok()?;
         serde_json::from_str::<PidSessionMeta>(&content).ok()
-    }
-
-    /// Get project info from sessions-index.json for a given session ID
-    fn get_project_info_from_index(
-        &self,
-        project_dir: &Path,
-        session_id: &str,
-    ) -> Option<(PathBuf, String)> {
-        let index_path = project_dir.join("sessions-index.json");
-
-        if let Ok(content) = fs::read_to_string(&index_path) {
-            if let Ok(index) = serde_json::from_str::<SessionsIndex>(&content) {
-                if let Some(entries) = &index.entries {
-                    for entry in entries {
-                        if entry.session_id == session_id {
-                            if let Some(proj_path) = &entry.project_path {
-                                let path = PathBuf::from(proj_path);
-                                let name = path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("unknown")
-                                    .to_string();
-                                return Some((path, name));
-                            }
-                        }
-                    }
-
-                    // If session not found in index, use first entry's project path as fallback
-                    if let Some(first) = entries.first() {
-                        if let Some(proj_path) = &first.project_path {
-                            let path = PathBuf::from(proj_path);
-                            let name = path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            return Some((path, name));
-                        }
-                    }
-                }
-            }
-        }
-
-        None
     }
 
     /// Finds all processes with name "claude" or whose command-line args contain "claude".
@@ -553,6 +492,57 @@ pub(crate) fn encode_path_for_matching(path: &str) -> String {
     path.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
+}
+
+/// A transcript file found under a project dir, with the project info the
+/// legacy matcher pairs with it.
+struct SessionFile {
+    modified: std::time::SystemTime,
+    /// The file stem of `<session_id>.jsonl`.
+    session_id: String,
+    project_dir: PathBuf,
+    /// From sessions-index.json, or `project_dir` as a placeholder.
+    project_path: PathBuf,
+    project_name: String,
+    /// Whether `project_path` came from sessions-index.json.
+    has_reliable_path: bool,
+}
+
+/// The entries of `<project_dir>/sessions-index.json`, or `None` when the
+/// file is missing, unparseable or has no `entries`.
+fn load_sessions_index_entries(project_dir: &Path) -> Option<Vec<SessionEntry>> {
+    let content = fs::read_to_string(project_dir.join("sessions-index.json")).ok()?;
+    serde_json::from_str::<SessionsIndex>(&content)
+        .ok()?
+        .entries
+}
+
+/// Project path and name for `session_id` from the index entries: the first
+/// entry for the session that has a project path, else the first entry's
+/// project path, if it has one.
+fn project_info_from_index(
+    entries: &[SessionEntry],
+    session_id: &str,
+) -> Option<(PathBuf, String)> {
+    let project_path = entries
+        .iter()
+        .filter(|entry| entry.session_id == session_id)
+        .find_map(|entry| entry.project_path.as_ref())
+        .or_else(|| {
+            entries
+                .first()
+                .and_then(|first| first.project_path.as_ref())
+        })?;
+    let path = PathBuf::from(project_path);
+    let name = dir_display_name(&path).to_string();
+    Some((path, name))
+}
+
+/// The last path component, or "unknown" when there is none.
+fn dir_display_name(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
 }
 
 /// Internal representation of a Claude process
