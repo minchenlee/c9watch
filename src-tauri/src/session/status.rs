@@ -2,6 +2,7 @@ use super::parser::{AssistantMessage, MessageContent, SessionEntry};
 use super::permissions::PermissionChecker;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Checker built from the user-level settings files.
@@ -171,55 +172,47 @@ fn is_entry_recent(timestamp: &str, seconds: i64) -> bool {
     }
 }
 
-/// Checks if the message content has a pending AskUserQuestion tool use
-fn has_pending_ask_user_question(content: &[MessageContent]) -> bool {
-    let completed_ids: Vec<&str> = content
-        .iter()
-        .filter_map(|c| {
-            if let MessageContent::ToolResult { tool_use_id, .. } = c {
-                Some(tool_use_id.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    content.iter().any(|c| {
-        if let MessageContent::ToolUse { id, name, .. } = c {
-            name == "AskUserQuestion" && !completed_ids.contains(&id.as_str())
-        } else {
-            false
-        }
+/// The message of the last assistant entry in `entries`.
+fn last_assistant(entries: &[SessionEntry]) -> Option<&AssistantMessage> {
+    entries.iter().rev().find_map(|entry| match entry {
+        SessionEntry::Assistant { message, .. } => Some(message),
+        _ => None,
     })
 }
 
-/// Checks if an assistant message is asking the user a question.
-///
-/// Detects two patterns:
-/// 1. The last text block ends with a question mark (e.g., "Want me to proceed?")
-/// 2. The message contains a pending `AskUserQuestion` tool use
-///
-/// Only triggers when the message has `stop_reason` of `end_turn` (for text questions)
-/// or when `AskUserQuestion` tool is pending, indicating Claude is waiting for user input.
-fn is_assistant_asking_question(message: &AssistantMessage) -> bool {
-    // Pattern 1: Check for pending AskUserQuestion tool use
-    let has_pending_ask = message.content.iter().any(|c| {
-        if let MessageContent::ToolUse { name, id, .. } = c {
-            if name == "AskUserQuestion" {
-                // Check if there's a corresponding tool result
-                return !message.content.iter().any(|r| {
-                    matches!(r, MessageContent::ToolResult { tool_use_id, .. } if tool_use_id == id)
-                });
-            }
+/// Tool uses in `content` with no matching tool_result in the same content,
+/// in order, as `(name, input)`.
+fn pending_tool_uses(
+    content: &[MessageContent],
+) -> impl Iterator<Item = (&str, &serde_json::Value)> {
+    let completed_ids: HashSet<&str> = content
+        .iter()
+        .filter_map(|c| match c {
+            MessageContent::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    content.iter().filter_map(move |c| match c {
+        MessageContent::ToolUse { id, name, input } if !completed_ids.contains(id.as_str()) => {
+            Some((name.as_str(), input))
         }
-        false
-    });
+        _ => None,
+    })
+}
 
-    if has_pending_ask {
-        return true;
-    }
+/// Checks if the message content has a pending AskUserQuestion tool use
+fn has_pending_ask_user_question(content: &[MessageContent]) -> bool {
+    pending_tool_uses(content).any(|(name, _)| name == "AskUserQuestion")
+}
 
-    // Pattern 2: Last text block ends with '?' and stop_reason is end_turn
+/// Checks if an assistant message is asking the user a question in text:
+/// the last text block ends with a question mark (e.g., "Want me to proceed?")
+/// and `stop_reason` is `end_turn`.
+///
+/// A pending `AskUserQuestion` tool use is detected separately, before this
+/// check runs, by [`has_pending_ask_user_question`] and
+/// [`get_pending_tool_name_with`].
+fn is_assistant_asking_question(message: &AssistantMessage) -> bool {
     if message.stop_reason.as_deref() == Some("end_turn") {
         let last_text = message.content.iter().rev().find_map(|c| {
             if let MessageContent::Text { text } = c {
@@ -297,36 +290,7 @@ fn are_pending_tools_auto_approved(
     content: &[MessageContent],
     checker: &PermissionChecker,
 ) -> bool {
-    // Get IDs of tools that have results
-    let completed_ids: Vec<&str> = content
-        .iter()
-        .filter_map(|c| {
-            if let MessageContent::ToolResult { tool_use_id, .. } = c {
-                Some(tool_use_id.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // Check each tool use - if it's pending (no result), check if auto-approved
-    for item in content {
-        if let MessageContent::ToolUse { id, name, input } = item {
-            // Skip if already completed
-            if completed_ids.contains(&id.as_str()) {
-                continue;
-            }
-
-            // This tool is pending - check if it's auto-approved
-            if !checker.is_auto_approved(name, input) {
-                // Found a tool that needs permission
-                return false;
-            }
-        }
-    }
-
-    // All pending tools are auto-approved
-    true
+    pending_tool_uses(content).all(|(name, input)| checker.is_auto_approved(name, input))
 }
 
 /// Gets the name describing why the session needs attention.
@@ -345,45 +309,18 @@ pub fn get_pending_tool_name_with(
     entries: &[SessionEntry],
     checker: &PermissionChecker,
 ) -> Option<String> {
-    // Find the last assistant message entry
-    let last_assistant = entries.iter().rev().find_map(|entry| {
-        if let SessionEntry::Assistant { message, .. } = entry {
-            Some(message)
-        } else {
-            None
-        }
-    })?;
-
-    // Get IDs of tools that have results
-    let completed_ids: Vec<&str> = last_assistant
-        .content
-        .iter()
-        .filter_map(|c| {
-            if let MessageContent::ToolResult { tool_use_id, .. } = c {
-                Some(tool_use_id.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
+    let last_assistant = last_assistant(entries)?;
 
     // Find the first pending tool that needs permission or AskUserQuestion
-    for item in &last_assistant.content {
-        if let MessageContent::ToolUse { id, name, input } = item {
-            // Skip if already completed
-            if completed_ids.contains(&id.as_str()) {
-                continue;
-            }
+    for (name, input) in pending_tool_uses(&last_assistant.content) {
+        // Pending AskUserQuestion → return it directly
+        if name == "AskUserQuestion" {
+            return Some("AskUserQuestion".to_string());
+        }
 
-            // Pending AskUserQuestion → return it directly
-            if name == "AskUserQuestion" {
-                return Some("AskUserQuestion".to_string());
-            }
-
-            // This tool is pending - check if it needs permission
-            if !checker.is_auto_approved(name, input) {
-                return Some(name.clone());
-            }
+        // This tool is pending - check if it needs permission
+        if !checker.is_auto_approved(name, input) {
+            return Some(name.to_string());
         }
     }
 
@@ -401,38 +338,9 @@ pub fn get_pending_tool_input_with(
     entries: &[SessionEntry],
     checker: &PermissionChecker,
 ) -> Option<serde_json::Value> {
-    let last_assistant = entries.iter().rev().find_map(|entry| {
-        if let SessionEntry::Assistant { message, .. } = entry {
-            Some(message)
-        } else {
-            None
-        }
-    })?;
-
-    let completed_ids: Vec<&str> = last_assistant
-        .content
-        .iter()
-        .filter_map(|c| {
-            if let MessageContent::ToolResult { tool_use_id, .. } = c {
-                Some(tool_use_id.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    for item in &last_assistant.content {
-        if let MessageContent::ToolUse { id, name, input } = item {
-            if completed_ids.contains(&id.as_str()) {
-                continue;
-            }
-            if !checker.is_auto_approved(name, input) {
-                return Some(input.clone());
-            }
-        }
-    }
-
-    None
+    pending_tool_uses(&last_assistant(entries)?.content)
+        .find(|(name, input)| !checker.is_auto_approved(name, input))
+        .map(|(_, input)| input.clone())
 }
 
 /// Tool uses in `entries` that have no matching tool_result, in order, as
@@ -476,36 +384,9 @@ fn has_pending_tool_uses(content: &[MessageContent]) -> bool {
 }
 
 /// Checks if all tool uses in the content have corresponding tool results
+/// (true when there are no tool uses).
 fn check_all_tools_completed(content: &[MessageContent]) -> bool {
-    // Collect all tool use IDs
-    let mut tool_use_ids = Vec::new();
-    for item in content {
-        if let MessageContent::ToolUse { id, .. } = item {
-            tool_use_ids.push(id.clone());
-        }
-    }
-
-    // If no tool uses, return true (nothing to check)
-    if tool_use_ids.is_empty() {
-        return true;
-    }
-
-    // Collect all tool result IDs
-    let mut tool_result_ids = Vec::new();
-    for item in content {
-        if let MessageContent::ToolResult { tool_use_id, .. } = item {
-            tool_result_ids.push(tool_use_id.clone());
-        }
-    }
-
-    // Check if all tool use IDs have corresponding results
-    for tool_id in &tool_use_ids {
-        if !tool_result_ids.contains(tool_id) {
-            return false;
-        }
-    }
-
-    true
+    pending_tool_uses(content).next().is_none()
 }
 
 #[cfg(test)]
