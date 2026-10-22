@@ -4,6 +4,7 @@
 
 import type { Session, Conversation, HistoryEntry, CostData, SessionCostRecord, AwayActivity, AwayRequest, WaitingFor, DetectionDiagnostics } from '../types';
 import { SessionStatus } from '../types';
+import { isQuestionTool } from '../status-utils';
 
 function minutesAgo(minutes: number): string {
 	return new Date(Date.now() - minutes * 60 * 1000).toISOString();
@@ -73,7 +74,7 @@ export const statusTransitions: Record<SessionStatus, SessionStatus[]> = {
 export function demoWaitingFor(status: SessionStatus, pendingToolName: string | null): WaitingFor | undefined {
 	if (status === SessionStatus.WaitingForInput) return { kind: 'input' };
 	if (status !== SessionStatus.NeedsAttention) return undefined;
-	if (pendingToolName === 'Question' || pendingToolName === 'AskUserQuestion') return { kind: 'question' };
+	if (isQuestionTool(pendingToolName)) return { kind: 'question' };
 	return pendingToolName ? { kind: 'approval', tool: pendingToolName } : { kind: 'attention' };
 }
 

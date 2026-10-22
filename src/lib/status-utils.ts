@@ -1,6 +1,11 @@
 import { SessionStatus } from '$lib/types';
 import type { SubagentInfo } from '$lib/stores/subagents';
 
+/** True for the pending-tool names that mean Claude is asking the user a question. */
+export function isQuestionTool(name: string | null | undefined): boolean {
+	return name === 'Question' || name === 'AskUserQuestion';
+}
+
 export function getSessionStatusColor(status: SessionStatus): string {
 	switch (status) {
 		case SessionStatus.Working:
@@ -21,7 +26,7 @@ export function getSessionStatusLabel(status: SessionStatus, pendingToolName?: s
 		case SessionStatus.Working:
 			return 'Working';
 		case SessionStatus.NeedsAttention:
-			if (pendingToolName === 'Question' || pendingToolName === 'AskUserQuestion') {
+			if (isQuestionTool(pendingToolName)) {
 				return 'Waiting for Response';
 			}
 			return 'Approval Required';
