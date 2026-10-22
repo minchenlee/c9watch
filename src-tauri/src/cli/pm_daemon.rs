@@ -60,6 +60,20 @@ fn turn_timeout_json(full_id: &str, callback_inbox: &str) -> serde_json::Value {
     })
 }
 
+/// Per-worker entry shared by `handle_list` and `handle_workers_all`.
+fn worker_json(session_id: &str, alive: bool, meta: &pm_fs::WorkerMeta) -> serde_json::Value {
+    serde_json::json!({
+        "sessionId": session_id,
+        "pid": meta.pid,
+        "name": meta.name,
+        "cwd": meta.cwd,
+        "spawnedAt": meta.spawned_at,
+        "spawnedBy": meta.spawned_by,
+        "pmPid": meta.pm_pid,
+        "alive": alive,
+    })
+}
+
 fn worker_crashed_json(full_id: &str, callback_inbox: &str) -> serde_json::Value {
     serde_json::json!({
         "ok": false,
@@ -553,17 +567,7 @@ async fn handle_list(state: Arc<Mutex<DaemonState>>) -> serde_json::Value {
         .iter_mut()
         .map(|(session_id, worker)| {
             let alive = worker.is_alive();
-            let meta = worker.meta();
-            serde_json::json!({
-                "sessionId": session_id,
-                "pid": meta.pid,
-                "name": meta.name,
-                "cwd": meta.cwd,
-                "spawnedAt": meta.spawned_at,
-                "spawnedBy": meta.spawned_by,
-                "pmPid": meta.pm_pid,
-                "alive": alive,
-            })
+            worker_json(session_id, alive, worker.meta())
         })
         .collect();
 
@@ -714,17 +718,9 @@ async fn handle_workers_all(
             let alive = worker.is_alive();
             let meta = worker.meta();
             let status = resolve_status(meta, caller_pm_pid, caller_pm_session_id.as_deref());
-            serde_json::json!({
-                "sessionId": session_id,
-                "pid": meta.pid,
-                "name": meta.name,
-                "cwd": meta.cwd,
-                "spawnedAt": meta.spawned_at,
-                "spawnedBy": meta.spawned_by,
-                "pmPid": meta.pm_pid,
-                "alive": alive,
-                "status": status.as_str(),
-            })
+            let mut entry = worker_json(session_id, alive, meta);
+            entry["status"] = serde_json::Value::from(status.as_str());
+            entry
         })
         .collect();
     serde_json::json!({ "ok": true, "workers": workers })
@@ -1094,6 +1090,51 @@ mod tests {
             },
             stopped_at: None,
         }
+    }
+
+    #[test]
+    fn worker_json_shape() {
+        let mut meta = make_meta("sid-1", Some(42));
+        meta.name = Some("w".to_string());
+        let v = worker_json("sid-1", true, &meta);
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "sessionId": "sid-1",
+                "pid": 1,
+                "name": "w",
+                "cwd": "/tmp",
+                "spawnedAt": "t",
+                "spawnedBy": "pm-audit",
+                "pmPid": 42,
+                "alive": true,
+            })
+        );
+        assert_eq!(
+            v.to_string(),
+            r#"{"alive":true,"cwd":"/tmp","name":"w","pid":1,"pmPid":42,"sessionId":"sid-1","spawnedAt":"t","spawnedBy":"pm-audit"}"#
+        );
+    }
+
+    #[test]
+    fn worker_json_with_status_matches_inline_shape() {
+        let meta = make_meta("sid-1", None);
+        let mut v = worker_json("sid-1", false, &meta);
+        v["status"] = serde_json::Value::from("orphaned");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "sessionId": "sid-1",
+                "pid": 1,
+                "name": null,
+                "cwd": "/tmp",
+                "spawnedAt": "t",
+                "spawnedBy": "pm-audit",
+                "pmPid": null,
+                "alive": false,
+                "status": "orphaned",
+            })
+        );
     }
 
     #[test]
