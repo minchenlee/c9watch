@@ -322,13 +322,7 @@ async fn rename_session(
 ) -> Result<(), String> {
     let owners = session::global_provider_source_owners();
     run_validated_rename(provider, &session_id, &owners, || {
-        // Write to Claude Code's native JSONL format (primary)
-        write_native_custom_title(&session_id, &new_name);
-
-        // Also write to c9watch's own custom titles (fallback for history view)
-        let mut custom_titles = session::CustomTitles::load();
-        custom_titles.set(session_id.clone(), new_name.clone());
-        custom_titles.save()
+        write_session_title(&session_id, &new_name)
     })?;
 
     let detect_result = {
@@ -345,19 +339,33 @@ async fn rename_session(
     Ok(())
 }
 
+/// Persist a session rename for both the Tauri command and the WebSocket
+/// handler: Claude Code's native JSONL entry (primary) plus c9watch's own
+/// custom titles file (fallback for the history view).
+#[cfg(all(not(mobile), feature = "gui"))]
+pub(crate) fn write_session_title(session_id: &str, new_name: &str) -> Result<(), String> {
+    write_native_custom_title(session_id, new_name);
+
+    let mut custom_titles = session::CustomTitles::load();
+    custom_titles.set(session_id.to_string(), new_name.to_string());
+    custom_titles.save()
+}
+
 /// Append a `custom-title` entry to the session's JSONL file in Claude Code's native format.
 /// This makes the rename visible to Claude Code itself (and persists across c9watch reinstalls).
 pub fn write_native_custom_title(session_id: &str, title: &str) {
-    use std::io::Write;
-
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => return,
     };
-    let projects_dir = home.join(".claude").join("projects");
+    write_native_custom_title_under(&home.join(".claude").join("projects"), session_id, title);
+}
+
+fn write_native_custom_title_under(projects_dir: &std::path::Path, session_id: &str, title: &str) {
+    use std::io::Write;
 
     // Search all project directories for the session JSONL
-    let entries = match std::fs::read_dir(&projects_dir) {
+    let entries = match std::fs::read_dir(projects_dir) {
         Ok(e) => e,
         Err(_) => return,
     };
@@ -398,6 +406,59 @@ pub fn write_native_custom_title(session_id: &str, title: &str) {
         "Could not find JSONL file for session {} to write native custom-title",
         session_id
     ));
+}
+
+#[cfg(test)]
+mod native_custom_title_tests {
+    use super::write_native_custom_title_under;
+
+    const SESSION_ID: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+
+    #[test]
+    fn appends_custom_title_entry_to_matching_project_jsonl() {
+        let temp = tempfile::tempdir().unwrap();
+        let other_dir = temp.path().join("-other-project");
+        let project_dir = temp.path().join("-synthetic-project");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let jsonl = project_dir.join(format!("{SESSION_ID}.jsonl"));
+        std::fs::write(&jsonl, "{\"type\":\"user\"}\n").unwrap();
+
+        write_native_custom_title_under(temp.path(), SESSION_ID, "synthetic title");
+
+        let content = std::fs::read_to_string(&jsonl).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "{\"type\":\"user\"}");
+        let entry: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(
+            entry,
+            serde_json::json!({
+                "type": "custom-title",
+                "customTitle": "synthetic title",
+                "sessionId": SESSION_ID,
+            })
+        );
+        assert_eq!(std::fs::read_dir(&other_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn missing_session_jsonl_creates_no_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().join("-synthetic-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        write_native_custom_title_under(temp.path(), SESSION_ID, "synthetic title");
+
+        assert_eq!(std::fs::read_dir(&project_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn missing_projects_root_is_a_no_op() {
+        let temp = tempfile::tempdir().unwrap();
+        write_native_custom_title_under(&temp.path().join("absent"), SESSION_ID, "synthetic title");
+        assert!(!temp.path().join("absent").exists());
+    }
 }
 
 #[cfg(all(test, not(mobile), feature = "gui"))]
@@ -471,7 +532,6 @@ mod rename_collision_tests {
         assert_no_write_for_collision(synthetic_codex_owner(&temp));
     }
 }
-
 
 /// Show and focus the main application window
 #[cfg(all(not(mobile), feature = "gui"))]

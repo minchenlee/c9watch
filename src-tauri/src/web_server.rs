@@ -448,12 +448,7 @@ async fn handle_message_with_owners(
             provider,
         } => {
             match crate::run_validated_rename(provider, &session_id, &owners, || {
-                // Write to Claude Code's native JSONL format
-                crate::write_native_custom_title(&session_id, &new_name);
-                // Also write to c9watch's own custom titles (fallback)
-                let mut custom_titles = crate::session::CustomTitles::load();
-                custom_titles.set(session_id.clone(), new_name.clone());
-                custom_titles.save()
+                crate::write_session_title(&session_id, &new_name)
             }) {
                 Ok(()) => ServerMsg::Ok,
                 Err(e) => ServerMsg::Error { message: e },
