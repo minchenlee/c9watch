@@ -242,45 +242,15 @@ pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, DetectionDiagnostic
     let cursor_result = owners.detect_cursor();
     let pi_result = owners.detect_pi();
     let opencode_sessions = super::opencode::detect_once();
-    match claude_result {
-        Ok((mut detected, diagnostics)) => {
-            if let Some((mut codex_sessions, _)) = codex_result {
-                detected.append(&mut codex_sessions);
-            }
-            if let Some((mut cursor_sessions, _)) = cursor_result {
-                detected.append(&mut cursor_sessions);
-            }
-            if let Some((mut pi_sessions, _)) = pi_result {
-                detected.append(&mut pi_sessions);
-            }
-            detected.extend(opencode_sessions);
-            enrich_detected_sessions(detected, diagnostics)
-        }
-        Err(error) => {
-            let mut fallback = opencode_sessions;
-            let mut diagnostics = DetectionDiagnostics::default();
-            if let Some((sessions, extra)) = codex_result {
-                fallback.extend(sessions);
-                diagnostics = extra;
-            }
-            if let Some((sessions, extra)) = cursor_result {
-                fallback.extend(sessions);
-                if diagnostics.claude_processes_found == 0 {
-                    diagnostics = extra;
-                }
-            }
-            if let Some((sessions, extra)) = pi_result {
-                fallback.extend(sessions);
-                if diagnostics.claude_processes_found == 0 {
-                    diagnostics = extra;
-                }
-            }
-            if !fallback.is_empty() {
-                return enrich_detected_sessions(fallback, diagnostics);
-            }
-            Err(format!("Failed to detect sessions: {error}"))
-        }
-    }
+    let (detected, diagnostics) = crate::session::state::merge_provider_results(
+        claude_result,
+        codex_result,
+        cursor_result,
+        pi_result,
+        opencode_sessions,
+    )
+    .map_err(|error| format!("Failed to detect sessions: {error}"))?;
+    enrich_detected_sessions(detected, diagnostics)
 }
 
 /// Detect sessions using a SessionSource trait object and enrich them.

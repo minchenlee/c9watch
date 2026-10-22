@@ -27,6 +27,63 @@ fn backend_source(supports_cli: bool) -> Box<dyn SessionSource> {
     }
 }
 
+type ProviderResult = Option<(Vec<DetectedSession>, DetectionDiagnostics)>;
+
+/// Merge one detection pass of every provider into one result.
+///
+/// On Claude success the sessions are ordered claude, codex, cursor, pi,
+/// opencode and the Claude diagnostics win. On Claude failure the other
+/// providers become the fallback: codex diagnostics win, then cursor and pi
+/// apply only while `claude_processes_found` is still 0. An empty fallback
+/// returns the Claude error.
+pub(crate) fn merge_provider_results<E>(
+    claude_result: Result<(Vec<DetectedSession>, DetectionDiagnostics), E>,
+    codex_result: ProviderResult,
+    cursor_result: ProviderResult,
+    pi_result: ProviderResult,
+    opencode_sessions: Vec<DetectedSession>,
+) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), E> {
+    match claude_result {
+        Ok((mut sessions, diagnostics)) => {
+            if let Some((mut extra, _)) = codex_result {
+                sessions.append(&mut extra);
+            }
+            if let Some((mut extra, _)) = cursor_result {
+                sessions.append(&mut extra);
+            }
+            if let Some((mut extra, _)) = pi_result {
+                sessions.append(&mut extra);
+            }
+            sessions.extend(opencode_sessions);
+            Ok((sessions, diagnostics))
+        }
+        Err(e) => {
+            let mut fallback = opencode_sessions;
+            let mut diagnostics = DetectionDiagnostics::default();
+            if let Some((sessions, extra)) = codex_result {
+                fallback.extend(sessions);
+                diagnostics = extra;
+            }
+            if let Some((sessions, extra)) = cursor_result {
+                fallback.extend(sessions);
+                if diagnostics.claude_processes_found == 0 {
+                    diagnostics = extra;
+                }
+            }
+            if let Some((sessions, extra)) = pi_result {
+                fallback.extend(sessions);
+                if diagnostics.claude_processes_found == 0 {
+                    diagnostics = extra;
+                }
+            }
+            if !fallback.is_empty() {
+                return Ok((fallback, diagnostics));
+            }
+            Err(e)
+        }
+    }
+}
+
 pub struct DetectorState {
     source: Box<dyn SessionSource>,
     consecutive_failures: u32,
@@ -66,50 +123,22 @@ impl DetectorState {
         let cursor_result = self.provider_sources.detect_cursor();
         let pi_result = self.provider_sources.detect_pi();
         let opencode_sessions = self.provider_sources.detect_opencode();
-        match claude_result {
-            Ok((mut sessions, diagnostics)) => {
-                self.consecutive_failures = 0;
-                if let Some((mut extra, _)) = codex_result {
-                    sessions.append(&mut extra);
-                }
-                if let Some((mut extra, _)) = cursor_result {
-                    sessions.append(&mut extra);
-                }
-                if let Some((mut extra, _)) = pi_result {
-                    sessions.append(&mut extra);
-                }
-                sessions.extend(opencode_sessions);
-                Ok((sessions, diagnostics))
-            }
-            Err(e) => {
+        match &claude_result {
+            Ok(_) => self.consecutive_failures = 0,
+            Err(_) => {
                 self.consecutive_failures += 1;
                 if self.should_downgrade() {
                     self.downgrade_to_legacy();
                 }
-                let mut fallback = opencode_sessions;
-                let mut diagnostics = DetectionDiagnostics::default();
-                if let Some((sessions, extra)) = codex_result {
-                    fallback.extend(sessions);
-                    diagnostics = extra;
-                }
-                if let Some((sessions, extra)) = cursor_result {
-                    fallback.extend(sessions);
-                    if diagnostics.claude_processes_found == 0 {
-                        diagnostics = extra;
-                    }
-                }
-                if let Some((sessions, extra)) = pi_result {
-                    fallback.extend(sessions);
-                    if diagnostics.claude_processes_found == 0 {
-                        diagnostics = extra;
-                    }
-                }
-                if !fallback.is_empty() {
-                    return Ok((fallback, diagnostics));
-                }
-                Err(e)
             }
         }
+        merge_provider_results(
+            claude_result,
+            codex_result,
+            cursor_result,
+            pi_result,
+            opencode_sessions,
+        )
     }
 
     /// Auto mode on the legacy backend retries the CLI backend every
