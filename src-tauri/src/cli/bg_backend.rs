@@ -149,16 +149,7 @@ pub async fn spawn_bg(
         .arg(worker_name)
         .arg("--permission-mode")
         .arg(&args.permission_mode);
-
-    if let Some(ref sp) = args.append_system_prompt {
-        cmd.arg("--append-system-prompt").arg(sp);
-    }
-    if let Some(ref model) = args.model {
-        cmd.arg("--model").arg(model);
-    }
-    for dir in &args.add_dirs {
-        cmd.arg("--add-dir").arg(dir);
-    }
+    args.apply_optional_flags(&mut cmd);
     cmd.arg(initial_prompt);
     cmd.current_dir(&args.cwd);
 

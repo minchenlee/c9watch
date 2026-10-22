@@ -20,6 +20,24 @@ pub struct SpawnArgs {
     pub add_dirs: Vec<String>,
 }
 
+impl SpawnArgs {
+    /// Append the optional `claude` flags shared by both worker backends, in
+    /// a fixed order: `--append-system-prompt`, `--model`, then one
+    /// `--add-dir` per directory. Each backend calls this right after its
+    /// `--permission-mode` flag so the print and bg argv cannot drift.
+    pub fn apply_optional_flags(&self, cmd: &mut Command) {
+        if let Some(ref system_prompt) = self.append_system_prompt {
+            cmd.arg("--append-system-prompt").arg(system_prompt);
+        }
+        if let Some(ref model) = self.model {
+            cmd.arg("--model").arg(model);
+        }
+        for dir in &self.add_dirs {
+            cmd.arg("--add-dir").arg(dir);
+        }
+    }
+}
+
 /// Runtime/context values assembled by the daemon at spawn time — identity of
 /// the PM that requested the spawn, used for ownership and inbox routing.
 #[derive(Debug, Clone, Default)]
@@ -87,18 +105,7 @@ impl WorkerHandle {
             .arg(format!("--session-id={}", session_id))
             .arg(format!("--permission-mode={}", args.permission_mode))
             .arg("--verbose");
-
-        if let Some(ref system_prompt) = args.append_system_prompt {
-            cmd.arg("--append-system-prompt").arg(system_prompt);
-        }
-
-        if let Some(ref model) = args.model {
-            cmd.arg("--model").arg(model);
-        }
-
-        for dir in &args.add_dirs {
-            cmd.arg("--add-dir").arg(dir);
-        }
+        args.apply_optional_flags(&mut cmd);
 
         cmd.current_dir(&args.cwd)
             .stdin(std::process::Stdio::piped())
@@ -967,5 +974,58 @@ async fn stderr_tee_task(stderr: tokio::process::ChildStderr, log_path: PathBuf)
                 eprintln!("[pm_worker] Failed to write to stderr log: {}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_args() -> SpawnArgs {
+        SpawnArgs {
+            cwd: "/tmp/proj".to_string(),
+            name: Some("w1".to_string()),
+            append_system_prompt: Some("be brief".to_string()),
+            permission_mode: "acceptEdits".to_string(),
+            model: Some("opus".to_string()),
+            add_dirs: vec!["/a".to_string(), "/b".to_string()],
+        }
+    }
+
+    fn argv(cmd: &Command) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn apply_optional_flags_pins_order() {
+        let mut cmd = Command::new("claude");
+        sample_args().apply_optional_flags(&mut cmd);
+        assert_eq!(
+            argv(&cmd),
+            vec![
+                "--append-system-prompt",
+                "be brief",
+                "--model",
+                "opus",
+                "--add-dir",
+                "/a",
+                "--add-dir",
+                "/b",
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_optional_flags_skips_unset() {
+        let mut args = sample_args();
+        args.append_system_prompt = None;
+        args.model = None;
+        args.add_dirs.clear();
+        let mut cmd = Command::new("claude");
+        args.apply_optional_flags(&mut cmd);
+        assert!(argv(&cmd).is_empty());
     }
 }
