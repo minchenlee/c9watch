@@ -10,9 +10,9 @@ use std::path::Path;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Keep small transcripts exact while avoiding a full-history read on every
-/// poll of a large live transcript. These values intentionally match the
-/// bounded prefix policy used by the Cursor transcript reader, but the
-/// Claude-specific caches own their validation state independently.
+/// poll of a large live transcript. The Claude-specific caches and the Cursor
+/// transcript reader share these values, but each cache owns its validation
+/// state independently.
 pub(crate) const EXACT_PREFIX_VERIFY_LIMIT: u64 = 4 * 1024 * 1024;
 pub(crate) const PREFIX_GUARD_BYTES: u64 = 64 * 1024;
 pub(crate) const MIN_FULL_VERIFY_GROWTH_BYTES: u64 = 1024 * 1024;
