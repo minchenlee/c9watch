@@ -70,9 +70,6 @@ enum ClientMsg {
         provider: Option<crate::session::SessionProvider>,
     },
 
-    #[serde(rename = "getMemoryFiles")]
-    GetMemoryFiles,
-
     #[serde(rename = "getAwayActivity")]
     GetAwayActivity {
         requests: Vec<crate::session::away::AwayRequest>,
@@ -105,9 +102,6 @@ enum ServerMsg {
 
     #[serde(rename = "conversationProgress")]
     ConversationProgress { data: serde_json::Value },
-
-    #[serde(rename = "memoryFiles")]
-    MemoryFiles { data: serde_json::Value },
 
     #[serde(rename = "awayActivity")]
     AwayActivity { data: serde_json::Value },
@@ -466,12 +460,6 @@ async fn handle_message_with_owners(
             }
         }
 
-        ClientMsg::GetMemoryFiles => match crate::session::get_memory_files() {
-            Ok(files) => ServerMsg::MemoryFiles {
-                data: serde_json::to_value(&files).unwrap_or_default(),
-            },
-            Err(e) => ServerMsg::Error { message: e },
-        },
         ClientMsg::GetAwayActivity { requests } => match tokio::task::spawn_blocking(move || {
             crate::session::away::away_activity(&requests)
         })
