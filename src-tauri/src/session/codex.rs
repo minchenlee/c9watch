@@ -2110,6 +2110,98 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    type Classified<'a> = (SessionSurface, AgentKind, Option<&'a str>);
+
+    #[test]
+    fn live_and_archive_session_meta_classifiers_pin_known_divergences() {
+        // Pins today's MONITOR (apply_session_meta) vs HISTORY/COST
+        // (codex_archive) split. Unifying the two classifiers needs an owner
+        // decision; until then a change to either output must update this table.
+        let rows: &[(&str, Classified, Classified)] = &[
+            (
+                r#"{"id":"a","source":"vscode","originator":"Codex Desktop"}"#,
+                (SessionSurface::App, AgentKind::Root, Some("a")),
+                (SessionSurface::App, AgentKind::Root, Some("a")),
+            ),
+            (
+                r#"{"id":"a","source":"cli","originator":"codex-tui"}"#,
+                (SessionSurface::Cli, AgentKind::Root, Some("a")),
+                (SessionSurface::Cli, AgentKind::Root, Some("a")),
+            ),
+            (
+                r#"{"id":"a","source":"vscode","originator":"Claude Code"}"#,
+                (SessionSurface::Integration, AgentKind::Root, Some("a")),
+                (SessionSurface::Integration, AgentKind::Root, Some("a")),
+            ),
+            (
+                r#"{"id":"a","originator":"Codex Desktop","source":{"subagent":{"thread_spawn":{"parent_thread_id":"p"}}}}"#,
+                (SessionSurface::App, AgentKind::Subagent, Some("a")),
+                (SessionSurface::App, AgentKind::Subagent, Some("a")),
+            ),
+            (
+                r#"{"id":"a","originator":"Codex Desktop","source":{"subagent":{"other":"guardian"}}}"#,
+                (SessionSurface::App, AgentKind::Internal, Some("a")),
+                (SessionSurface::App, AgentKind::Internal, Some("a")),
+            ),
+            // Divergence 1: live checks source before originator; the archive
+            // checks a case-insensitive originator substring first.
+            (
+                r#"{"id":"a","source":"cli","originator":"Codex Desktop"}"#,
+                (SessionSurface::Cli, AgentKind::Root, Some("a")),
+                (SessionSurface::App, AgentKind::Root, Some("a")),
+            ),
+            // Divergence 2: appServer maps to integration only in the archive.
+            (
+                r#"{"id":"a","source":"appServer","originator":"other"}"#,
+                (SessionSurface::Unknown, AgentKind::Root, Some("a")),
+                (SessionSurface::Integration, AgentKind::Root, Some("a")),
+            ),
+            // Divergence 3: an unknown subagent shape is internal only in the
+            // archive; live keeps it as root.
+            (
+                r#"{"id":"a","originator":"Codex Desktop","source":{"subagent":{"future_shape":{}}}}"#,
+                (SessionSurface::App, AgentKind::Root, Some("a")),
+                (SessionSurface::App, AgentKind::Internal, Some("a")),
+            ),
+            // Divergence 4: without `id`, only the archive falls back to
+            // `session_id` for the thread id.
+            (
+                r#"{"session_id":"s","source":"cli","originator":"codex-tui"}"#,
+                (SessionSurface::Cli, AgentKind::Root, None),
+                (SessionSurface::Cli, AgentKind::Root, Some("s")),
+            ),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        for (index, (payload_json, expected_live, expected_archive)) in rows.iter().enumerate() {
+            let payload: Value = serde_json::from_str(payload_json).unwrap();
+            let mut summary = CodexRolloutSummary::default();
+            apply_session_meta(&mut summary, "2026-07-13T01:00:00Z", &payload);
+            let live_id = (!summary.thread_id.is_empty()).then_some(summary.thread_id.as_str());
+            assert_eq!(
+                (summary.surface, summary.agent_kind, live_id),
+                *expected_live,
+                "live classifier: {payload_json}"
+            );
+
+            let path = directory.path().join(format!("rollout-{index}.jsonl"));
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{payload_json}}}"#
+                ),
+            )
+            .unwrap();
+            let snapshot = super::super::codex_archive::scan_rollout(&path).unwrap();
+            let archive_id =
+                (!snapshot.thread_id.is_empty()).then_some(snapshot.thread_id.as_str());
+            assert_eq!(
+                (snapshot.surface, snapshot.agent_kind, archive_id),
+                *expected_archive,
+                "archive classifier: {payload_json}"
+            );
+        }
+    }
+
     fn event(timestamp: &str, event_type: &str, payload: Value) -> String {
         ordered_event(timestamp, event_type, payload)
     }
