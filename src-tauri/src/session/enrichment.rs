@@ -739,17 +739,6 @@ fn fill_away_fields(sessions: &mut [Session]) {
     }
 }
 
-/// Collapse duplicate provider-scoped identities, newest observation wins.
-///
-/// The same session can appear in multiple project dirs (or be re-observed
-/// after reconnect/reuse). Timestamps compare as instants, so differing
-/// RFC3339 offsets order correctly. An unparseable timestamp always loses to
-/// a parseable one; when neither parses (or the instants tie), the first
-/// observation is kept for determinism. Cross-provider identities never
-/// collide because the key is namespaced by provider.
-/// Parse an RFC3339 `modified` stamp as an instant. Timezone offsets are
-/// normalized, so `00:30:00+02:00` correctly compares earlier than
-/// `23:00:00Z` — something a lexicographic string compare gets wrong.
 /// Codex status from the rollout lifecycle plus the pending tool call.
 fn codex_status(
     summary: &crate::session::codex::CodexRolloutSummary,
@@ -764,12 +753,23 @@ fn codex_status(
     }
 }
 
+/// Parse an RFC3339 `modified` stamp as an instant. Timezone offsets are
+/// normalized, so `00:30:00+02:00` correctly compares earlier than
+/// `23:00:00Z` — something a lexicographic string compare gets wrong.
 fn modified_instant(modified: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(modified)
         .ok()
         .map(|ts| ts.with_timezone(&chrono::Utc))
 }
 
+/// Collapse duplicate provider-scoped identities, newest observation wins.
+///
+/// The same session can appear in multiple project dirs (or be re-observed
+/// after reconnect/reuse). Timestamps compare as instants, so differing
+/// RFC3339 offsets order correctly. An unparseable timestamp always loses to
+/// a parseable one; when neither parses (or the instants tie), the first
+/// observation is kept for determinism. Cross-provider identities never
+/// collide because the key is namespaced by provider.
 fn dedup_newest_wins(sessions: Vec<Session>) -> Vec<Session> {
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut out: Vec<Session> = Vec::with_capacity(sessions.len());
