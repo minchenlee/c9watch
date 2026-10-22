@@ -609,6 +609,7 @@ pub fn cursor_history_entries(home_dir: &Path) -> Vec<crate::session::history::H
                 custom_title: None,
                 codex_title: None,
                 cursor_title,
+                ai_title: None,
                 provider: "cursor".to_string(),
                 surface: Some("cursor".to_string()),
                 agent_kind: Some("root".to_string()),

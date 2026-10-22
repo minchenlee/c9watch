@@ -1028,6 +1028,7 @@ pub(crate) fn pi_history_entries(home: &Path) -> Vec<crate::session::history::Hi
                 custom_title: None,
                 codex_title: None,
                 cursor_title: None,
+                ai_title: None,
                 provider: "pi".to_string(),
                 surface: Some("cli".to_string()),
                 agent_kind: Some("root".to_string()),
