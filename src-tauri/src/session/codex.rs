@@ -1202,6 +1202,21 @@ fn push_codex_message(
     });
 }
 
+/// Sort messages into display order, then drop adjacent duplicates.
+///
+/// `dedup_codex_messages` only removes adjacent duplicates, so every caller
+/// must use this exact sort first.
+fn sort_and_dedup_messages(messages: &mut Vec<CodexMessage>) {
+    messages.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.role.cmp(&right.role))
+            .then_with(|| left.content.cmp(&right.content))
+            .then_with(|| left.content_identity.cmp(&right.content_identity))
+    });
+    dedup_codex_messages(messages);
+}
+
 fn dedup_codex_messages(messages: &mut Vec<CodexMessage>) {
     let mut deduplicated: Vec<CodexMessage> = Vec::with_capacity(messages.len());
     for message in messages.drain(..) {
@@ -1259,14 +1274,7 @@ fn merge_live_rollout_summary(existing: &mut LiveRolloutSummary, mut incoming: L
     };
     let mut messages = std::mem::take(&mut existing.1.messages);
     messages.append(&mut incoming.1.messages);
-    messages.sort_by(|left, right| {
-        left.timestamp
-            .cmp(&right.timestamp)
-            .then_with(|| left.role.cmp(&right.role))
-            .then_with(|| left.content.cmp(&right.content))
-            .then_with(|| left.content_identity.cmp(&right.content_identity))
-    });
-    dedup_codex_messages(&mut messages);
+    sort_and_dedup_messages(&mut messages);
 
     if incoming_is_newer {
         *existing = incoming;
@@ -2091,14 +2099,7 @@ fn find_codex_conversation_under_with_progress(
     if !parsed_any {
         return Err(last_error.unwrap_or_else(|| format!("Codex session {thread_id} not found")));
     }
-    messages.sort_by(|left, right| {
-        left.timestamp
-            .cmp(&right.timestamp)
-            .then_with(|| left.role.cmp(&right.role))
-            .then_with(|| left.content.cmp(&right.content))
-            .then_with(|| left.content_identity.cmp(&right.content_identity))
-    });
-    dedup_codex_messages(&mut messages);
+    sort_and_dedup_messages(&mut messages);
     Ok(messages)
 }
 
@@ -3861,6 +3862,40 @@ mod tests {
         let summary = source.summary_for(&path).unwrap();
         assert!(!summary.needs_attention_at(at(3600)));
         assert_eq!(summary.latest_message(), Some("after"));
+    }
+
+    #[test]
+    fn sort_and_dedup_messages_removes_non_adjacent_duplicates() {
+        fn message(
+            timestamp: &str,
+            role: &str,
+            content: &str,
+            title_candidate: bool,
+        ) -> CodexMessage {
+            CodexMessage {
+                timestamp: timestamp.to_string(),
+                role: role.to_string(),
+                message_type: if role == "user" {
+                    MessageType::User
+                } else {
+                    MessageType::Assistant
+                },
+                content: content.to_string(),
+                content_identity: message_identity(content),
+                title_candidate,
+            }
+        }
+        let mut messages = vec![
+            message("2026-07-13T00:00:02Z", "assistant", "answer", false),
+            message("2026-07-13T00:00:01Z", "user", "prompt", false),
+            message("2026-07-13T00:00:02Z", "assistant", "answer", false),
+            message("2026-07-13T00:00:01Z", "user", "prompt", true),
+        ];
+        sort_and_dedup_messages(&mut messages);
+        let contents: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["prompt", "answer"]);
+        assert!(messages[0].title_candidate);
+        assert!(!messages[1].title_candidate);
     }
 
     // ── Open-file evidence (agent_liveness) ───────────────────────────
