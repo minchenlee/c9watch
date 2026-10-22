@@ -169,7 +169,7 @@ fn classify_codex_process(row: &AgentProcessRow<'_>) -> AgentProcess {
 /// The file name is unique, and does not depend on symlinks in the path.
 pub(crate) fn codex_rollout_key(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
-    (name.starts_with("rollout-") && name.ends_with(".jsonl")).then(|| name.to_string())
+    super::codex::is_rollout_file_name(name).then(|| name.to_string())
 }
 
 /// Open Codex rollouts.

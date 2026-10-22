@@ -377,7 +377,7 @@ impl CodexSessionSource {
                 let is_rollout = path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"));
+                    .is_some_and(is_rollout_file_name);
                 if path.is_file()
                     && is_rollout
                     && rollout_age_secs(&path, wall_now) <= DISCOVERY_RECENT_SECS
@@ -1531,13 +1531,18 @@ fn collect_rollout_paths(root: &Path) -> Vec<PathBuf> {
             } else if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+                .is_some_and(is_rollout_file_name)
             {
                 paths.push(path);
             }
         }
     }
     paths
+}
+
+/// Whether a file name is a Codex rollout: `rollout-<timestamp>-<thread-id>.jsonl`.
+pub(crate) fn is_rollout_file_name(name: &str) -> bool {
+    name.starts_with("rollout-") && name.ends_with(".jsonl")
 }
 
 fn thread_rollout_suffix(thread_id: &str) -> String {
