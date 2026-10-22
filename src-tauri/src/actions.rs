@@ -848,17 +848,8 @@ fn find_parent_app(pid: u32) -> Result<String, String> {
 
         // Move to parent
         if ppid <= 1 {
-            crate::debug_log::log_info(
-                "[open_session] Reached root, checking current comm one more time",
-            );
-            // Check current process one more time before giving up
-            if let Some(app_name) = get_app_name(&comm) {
-                crate::debug_log::log_info(&format!(
-                    "[open_session] Found app at root: {}",
-                    app_name
-                ));
-                return Ok(app_name.to_string());
-            }
+            // get_app_name(&comm) already returned None above, so stop here.
+            crate::debug_log::log_info("[open_session] Reached root");
             break;
         }
         current_pid = ppid;
