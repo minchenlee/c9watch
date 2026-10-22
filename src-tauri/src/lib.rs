@@ -530,23 +530,25 @@ mod detect_snapshot_tests {
     }
 }
 
+/// Provider-owner fixtures shared by the Tauri and WebSocket rename tests.
+/// Each one plants a synthetic `session_id` transcript under `temp`.
 #[cfg(all(test, not(mobile), feature = "gui"))]
-mod rename_collision_tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+pub(crate) mod rename_test_fixtures {
+    use crate::session;
     use tempfile::TempDir;
 
-    const SESSION_ID: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
-
-    fn synthetic_cursor_owner(temp: &TempDir) -> session::ProviderSourceOwners {
+    pub(crate) fn synthetic_cursor_owner(
+        temp: &TempDir,
+        session_id: &str,
+    ) -> session::ProviderSourceOwners {
         let transcript_dir = temp
             .path()
             .join("synthetic-project")
             .join("agent-transcripts")
-            .join(SESSION_ID);
+            .join(session_id);
         std::fs::create_dir_all(&transcript_dir).unwrap();
         std::fs::write(
-            transcript_dir.join(format!("{SESSION_ID}.jsonl")),
+            transcript_dir.join(format!("{session_id}.jsonl")),
             b"{\"role\":\"user\",\"message\":{\"content\":[]}}\n",
         )
         .unwrap();
@@ -560,11 +562,14 @@ mod rename_collision_tests {
         )
     }
 
-    fn synthetic_codex_owner(temp: &TempDir) -> session::ProviderSourceOwners {
+    pub(crate) fn synthetic_codex_owner(
+        temp: &TempDir,
+        session_id: &str,
+    ) -> session::ProviderSourceOwners {
         let rollout_dir = temp.path().join("2026").join("08").join("24");
         std::fs::create_dir_all(&rollout_dir).unwrap();
         std::fs::write(
-            rollout_dir.join(format!("rollout-synthetic-{SESSION_ID}.jsonl")),
+            rollout_dir.join(format!("rollout-synthetic-{session_id}.jsonl")),
             b"{}\n",
         )
         .unwrap();
@@ -577,6 +582,15 @@ mod rename_collision_tests {
             None,
         )
     }
+}
+
+#[cfg(all(test, not(mobile), feature = "gui"))]
+mod rename_collision_tests {
+    use super::rename_test_fixtures::{synthetic_codex_owner, synthetic_cursor_owner};
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const SESSION_ID: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
 
     fn assert_no_write_for_collision(owners: session::ProviderSourceOwners) {
         let writes = AtomicUsize::new(0);
@@ -592,13 +606,13 @@ mod rename_collision_tests {
     #[test]
     fn tauri_rename_collision_rejects_before_custom_title_write_for_cursor() {
         let temp = tempfile::tempdir().unwrap();
-        assert_no_write_for_collision(synthetic_cursor_owner(&temp));
+        assert_no_write_for_collision(synthetic_cursor_owner(&temp, SESSION_ID));
     }
 
     #[test]
     fn tauri_rename_collision_rejects_before_custom_title_write_for_codex() {
         let temp = tempfile::tempdir().unwrap();
-        assert_no_write_for_collision(synthetic_codex_owner(&temp));
+        assert_no_write_for_collision(synthetic_codex_owner(&temp, SESSION_ID));
     }
 }
 

@@ -473,48 +473,9 @@ async fn handle_message_with_owners(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rename_test_fixtures::{synthetic_codex_owner, synthetic_cursor_owner};
 
     const SESSION_ID: &str = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
-
-    fn synthetic_cursor_owner(temp: &tempfile::TempDir) -> crate::session::ProviderSourceOwners {
-        let transcript_dir = temp
-            .path()
-            .join("synthetic-project")
-            .join("agent-transcripts")
-            .join(SESSION_ID);
-        std::fs::create_dir_all(&transcript_dir).unwrap();
-        std::fs::write(
-            transcript_dir.join(format!("{SESSION_ID}.jsonl")),
-            b"{\"role\":\"user\",\"message\":{\"content\":[]}}\n",
-        )
-        .unwrap();
-
-        crate::session::ProviderSourceOwners::from_test_sources(
-            None,
-            Some(crate::session::cursor::CursorSessionSource::at_root(
-                temp.path().to_path_buf(),
-            )),
-            None,
-        )
-    }
-
-    fn synthetic_codex_owner(temp: &tempfile::TempDir) -> crate::session::ProviderSourceOwners {
-        let rollout_dir = temp.path().join("2026").join("08").join("24");
-        std::fs::create_dir_all(&rollout_dir).unwrap();
-        std::fs::write(
-            rollout_dir.join(format!("rollout-synthetic-{SESSION_ID}.jsonl")),
-            b"{}\n",
-        )
-        .unwrap();
-
-        crate::session::ProviderSourceOwners::from_test_sources(
-            Some(crate::session::codex::CodexSessionSource::at_root(
-                temp.path().to_path_buf(),
-            )),
-            None,
-            None,
-        )
-    }
 
     #[test]
     fn rename_message_keeps_provider_namespace_for_validation() {
@@ -558,8 +519,8 @@ mod tests {
         let cursor_temp = tempfile::tempdir().unwrap();
         let codex_temp = tempfile::tempdir().unwrap();
         let owners = [
-            synthetic_cursor_owner(&cursor_temp),
-            synthetic_codex_owner(&codex_temp),
+            synthetic_cursor_owner(&cursor_temp, SESSION_ID),
+            synthetic_codex_owner(&codex_temp, SESSION_ID),
         ];
 
         for owners in owners {
