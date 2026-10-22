@@ -28,6 +28,47 @@ fn callback_inbox_hint(worker_session_id: &str) -> String {
     format!("~/.claude/c9watch/inbox/{}/", worker_session_id)
 }
 
+// ── `send --wait` response shapes ─────────────────────────────────────────────
+//
+// Shared by the Bg and Print branches of `handle_send` so the
+// `turnCompleted` / `WORKER_CRASHED` contract is defined once.
+
+fn turn_completed_json(
+    full_id: &str,
+    assistant_text: &str,
+    ended_at: &str,
+    callback_inbox: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "sessionId": full_id,
+        "sent": true,
+        "turnCompleted": true,
+        "assistantText": assistant_text,
+        "endedAt": ended_at,
+        "callbackInbox": callback_inbox,
+    })
+}
+
+fn turn_timeout_json(full_id: &str, callback_inbox: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "sessionId": full_id,
+        "sent": true,
+        "turnCompleted": false,
+        "callbackInbox": callback_inbox,
+    })
+}
+
+fn worker_crashed_json(full_id: &str, callback_inbox: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "error": "WORKER_CRASHED",
+        "sessionId": full_id,
+        "callbackInbox": callback_inbox,
+    })
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Called by the CLI's `Daemon` subcommand. Starts the RPC server loop.
@@ -430,28 +471,16 @@ async fn handle_send(
         drop(st);
 
         return match result {
-            Ok(turn) => serde_json::json!({
-                "ok": true,
-                "sessionId": full_id,
-                "sent": true,
-                "turnCompleted": true,
-                "assistantText": turn.assistant_text,
-                "endedAt": turn.ended_at,
-                "callbackInbox": callback_inbox,
-            }),
-            Err(e) if e == "WAIT_TIMEOUT" && !still_alive => serde_json::json!({
-                "ok": false,
-                "error": "WORKER_CRASHED",
-                "sessionId": full_id,
-                "callbackInbox": callback_inbox,
-            }),
-            Err(e) if e == "WAIT_TIMEOUT" => serde_json::json!({
-                "ok": true,
-                "sessionId": full_id,
-                "sent": true,
-                "turnCompleted": false,
-                "callbackInbox": callback_inbox,
-            }),
+            Ok(turn) => turn_completed_json(
+                &full_id,
+                &turn.assistant_text,
+                &turn.ended_at,
+                &callback_inbox,
+            ),
+            Err(e) if e == "WAIT_TIMEOUT" && !still_alive => {
+                worker_crashed_json(&full_id, &callback_inbox)
+            }
+            Err(e) if e == "WAIT_TIMEOUT" => turn_timeout_json(&full_id, &callback_inbox),
             Err(e) => serde_json::json!({
                 "ok": false,
                 "error": e,
@@ -481,32 +510,18 @@ async fn handle_send(
     };
 
     match turn_result {
-        Ok(Some(turn)) => serde_json::json!({
-            "ok": true,
-            "sessionId": full_id,
-            "sent": true,
-            "turnCompleted": true,
-            "assistantText": turn.assistant_text,
-            "endedAt": turn.ended_at,
-            "callbackInbox": callback_inbox,
-        }),
+        Ok(Some(turn)) => turn_completed_json(
+            &full_id,
+            &turn.assistant_text,
+            &turn.ended_at,
+            &callback_inbox,
+        ),
         Ok(None) => serde_json::json!({
             "ok": false,
             "error": "result channel closed — worker stdout tee task exited",
         }),
-        Err(_timeout) if !still_alive => serde_json::json!({
-            "ok": false,
-            "error": "WORKER_CRASHED",
-            "sessionId": full_id,
-            "callbackInbox": callback_inbox,
-        }),
-        Err(_timeout) => serde_json::json!({
-            "ok": true,
-            "sessionId": full_id,
-            "sent": true,
-            "turnCompleted": false,
-            "callbackInbox": callback_inbox,
-        }),
+        Err(_timeout) if !still_alive => worker_crashed_json(&full_id, &callback_inbox),
+        Err(_timeout) => turn_timeout_json(&full_id, &callback_inbox),
     }
 }
 
@@ -964,6 +979,56 @@ fn resolve_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_completed_json_shape() {
+        let v = turn_completed_json("sid-1", "hello", "2026-01-01T00:00:00Z", "~/inbox/sid-1/");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "ok": true,
+                "sessionId": "sid-1",
+                "sent": true,
+                "turnCompleted": true,
+                "assistantText": "hello",
+                "endedAt": "2026-01-01T00:00:00Z",
+                "callbackInbox": "~/inbox/sid-1/",
+            })
+        );
+        assert_eq!(
+            v.to_string(),
+            r#"{"assistantText":"hello","callbackInbox":"~/inbox/sid-1/","endedAt":"2026-01-01T00:00:00Z","ok":true,"sent":true,"sessionId":"sid-1","turnCompleted":true}"#
+        );
+    }
+
+    #[test]
+    fn turn_timeout_json_shape() {
+        let v = turn_timeout_json("sid-1", "~/inbox/sid-1/");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "ok": true,
+                "sessionId": "sid-1",
+                "sent": true,
+                "turnCompleted": false,
+                "callbackInbox": "~/inbox/sid-1/",
+            })
+        );
+    }
+
+    #[test]
+    fn worker_crashed_json_shape() {
+        let v = worker_crashed_json("sid-1", "~/inbox/sid-1/");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "ok": false,
+                "error": "WORKER_CRASHED",
+                "sessionId": "sid-1",
+                "callbackInbox": "~/inbox/sid-1/",
+            })
+        );
+    }
 
     #[test]
     fn resolve_worker_id_rejects_empty_prefix() {
