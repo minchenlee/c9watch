@@ -72,6 +72,15 @@ mod codex_archive;
 pub mod cost;
 pub use cost::{get_cost_data, CostData};
 
+/// Display name for a project path: its last component, or `"unknown"`.
+pub(crate) fn project_name_from_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 pub(crate) fn codex_session_ids(home: &std::path::Path, prefix: &str) -> Vec<String> {
     codex_archive::load_default_listing(home)
         .into_iter()

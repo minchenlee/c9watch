@@ -1,5 +1,6 @@
 // src-tauri/src/session/cost.rs
 
+use super::project_name_from_path;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -406,15 +407,6 @@ fn model_display_name(model: &str) -> String {
     } else {
         model.to_string()
     }
-}
-
-/// Derive project name from a cwd path (last segment).
-fn project_name_from_path(path: &str) -> String {
-    PathBuf::from(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string()
 }
 
 /// Extract the date portion "YYYY-MM-DD" from an ISO 8601 timestamp.

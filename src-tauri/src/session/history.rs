@@ -1,3 +1,4 @@
+use super::project_name_from_path;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -90,11 +91,7 @@ pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
     let mut entries: Vec<HistoryEntry> = by_session
         .into_values()
         .map(|accum| {
-            let project_name = PathBuf::from(&accum.first.project)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
+            let project_name = project_name_from_path(&accum.first.project);
             HistoryEntry {
                 session_id: accum.first.session_id,
                 display: accum.last.display,
@@ -141,11 +138,7 @@ fn codex_history_entries(home_dir: &std::path::Path) -> Vec<HistoryEntry> {
         .into_iter()
         .filter(|snapshot| !snapshot.is_internal())
         .map(|snapshot| {
-            let project_name = PathBuf::from(&snapshot.cwd)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("unknown")
-                .to_string();
+            let project_name = project_name_from_path(&snapshot.cwd);
             let codex_title = super::codex::get_cached_codex_thread_title(&snapshot.thread_id);
             HistoryEntry {
                 session_id: snapshot.thread_id,
