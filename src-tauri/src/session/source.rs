@@ -51,6 +51,46 @@ pub enum SessionProvider {
     Opencode,
 }
 
+impl SessionProvider {
+    /// Every provider, in declaration order.
+    pub(crate) const ALL: [SessionProvider; 5] = [
+        Self::ClaudeCode,
+        Self::Codex,
+        Self::Cursor,
+        Self::Pi,
+        Self::Opencode,
+    ];
+
+    /// Wire key, identical to the serde encoding (`claudeCode`, `codex`, ...).
+    pub(crate) fn as_key(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claudeCode",
+            Self::Codex => "codex",
+            Self::Cursor => "cursor",
+            Self::Pi => "pi",
+            Self::Opencode => "opencode",
+        }
+    }
+
+    /// Inverse of [`SessionProvider::as_key`]. Unknown keys return `None`.
+    pub(crate) fn from_key(key: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|provider| provider.as_key() == key)
+    }
+
+    /// Human-readable product name for user-facing text.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Cursor => "Cursor",
+            Self::Pi => "Pi",
+            Self::Opencode => "OpenCode",
+        }
+    }
+}
+
 /// Health of the source observation used to produce a session card.
 ///
 /// This is deliberately separate from `SessionStatus`: a session can be
@@ -160,19 +200,10 @@ impl SessionIdentity {
     /// Opaque UI/storage key. The provider prefix is explicit so callers do
     /// not have to infer a namespace from a raw session ID.
     pub fn key(&self) -> String {
-        format!("{}:{}", provider_key(self.provider), self.session_id)
+        format!("{}:{}", self.provider.as_key(), self.session_id)
     }
 }
 
-fn provider_key(provider: SessionProvider) -> &'static str {
-    match provider {
-        SessionProvider::ClaudeCode => "claudeCode",
-        SessionProvider::Codex => "codex",
-        SessionProvider::Cursor => "cursor",
-        SessionProvider::Pi => "pi",
-        SessionProvider::Opencode => "opencode",
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -329,6 +360,38 @@ mod tests {
                 serde_json::Value::from(kind.as_str())
             );
         }
+    }
+
+    #[test]
+    fn provider_keys_match_serde_and_round_trip() {
+        for provider in SessionProvider::ALL {
+            assert_eq!(
+                serde_json::to_value(provider).unwrap(),
+                serde_json::Value::from(provider.as_key())
+            );
+            assert_eq!(SessionProvider::from_key(provider.as_key()), Some(provider));
+        }
+        assert_eq!(SessionProvider::from_key("bogus"), None);
+        assert_eq!(SessionProvider::from_key(""), None);
+        assert_eq!(SessionProvider::from_key("ClaudeCode"), None);
+    }
+
+    #[test]
+    fn provider_labels_are_product_names() {
+        let labels: Vec<_> = SessionProvider::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(labels, ["Claude Code", "Codex", "Cursor", "Pi", "OpenCode"]);
+    }
+
+    #[test]
+    fn identity_key_uses_provider_key_prefix() {
+        assert_eq!(
+            SessionIdentity::new(SessionProvider::ClaudeCode, "abc").key(),
+            "claudeCode:abc"
+        );
+        assert_eq!(
+            SessionIdentity::new(SessionProvider::Opencode, "ses_1").key(),
+            "opencode:ses_1"
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! macOS notification preferences and content. Web notifications remain independent.
-use crate::session::{is_question_tool, Session, SessionProvider, SessionStatus};
+use crate::session::{is_question_tool, Session, SessionStatus};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -207,13 +207,7 @@ fn content(s: &Session, event: Event, detail: Detail) -> (String, String) {
         },
         80,
     );
-    let provider = match s.provider {
-        SessionProvider::ClaudeCode => "Claude Code",
-        SessionProvider::Codex => "Codex",
-        SessionProvider::Cursor => "Cursor",
-        SessionProvider::Pi => "Pi",
-        SessionProvider::Opencode => "OpenCode",
-    };
+    let provider = s.provider.label();
     let project = std::path::Path::new(&s.project_path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -340,6 +334,7 @@ pub fn test_native_notification(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::SessionProvider;
     fn fixture() -> Session {
         Session {
             id: "child-thread".to_string(),
