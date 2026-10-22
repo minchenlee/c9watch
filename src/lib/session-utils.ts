@@ -5,6 +5,19 @@
 
 import type { AwayActivity, HiddenClaudeSession, Session, WaitingFor } from './types';
 
+type SessionTitleFields = Pick<
+	Session,
+	'customTitle' | 'officialName' | 'codexTitle' | 'cursorTitle' | 'summary' | 'firstPrompt'
+>;
+
+/**
+ * Title shown on the session card, overlay header and popover. Empty strings
+ * fall through to the next field; the raw `||` result is returned.
+ */
+export function sessionDisplayTitle(s: SessionTitleFields) {
+	return s.customTitle || s.officialName || s.codexTitle || s.cursorTitle || s.summary || s.firstPrompt;
+}
+
 /** "Approval: Bash", "Question"... Tool arguments are never shown. */
 export function waitingForLabel(waitingFor: WaitingFor | null | undefined): string | null {
 	switch (waitingFor?.kind) {
