@@ -949,6 +949,151 @@ mod tests {
         assert_eq!(claimed(&sessions), vec![(5000, KILLED.to_string())]);
     }
 
+    /// Project dir whose encoded name matches no process cwd below, so a
+    /// claim proves the sessions-index path was used for matching.
+    const INDEXED_DIR_CWD: &str = "/fixture/indexed-dir";
+
+    fn write_sessions_index(project_dir: &Path, content: &str) {
+        fs::write(project_dir.join("sessions-index.json"), content).unwrap();
+    }
+
+    fn index_entry(session_id: &str, project_path: Option<&str>) -> serde_json::Value {
+        serde_json::json!({ "sessionId": session_id, "projectPath": project_path })
+    }
+
+    fn write_index_entries(project_dir: &Path, entries: &[serde_json::Value]) {
+        write_sessions_index(
+            project_dir,
+            &serde_json::json!({ "version": 1, "entries": entries }).to_string(),
+        );
+    }
+
+    /// `(pid, session_id, project_name)` of each claim.
+    fn claimed_with_name(sessions: &[DetectedSession]) -> Vec<(u32, String, String)> {
+        sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.pid,
+                    s.session_id.clone().unwrap_or_default(),
+                    s.project_name.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// The index entry for the session gives a reliable project path: a
+    /// process in a subdirectory of it claims the session, and the project
+    /// name is that path's last segment, not the first entry's.
+    #[test]
+    fn index_entry_for_the_session_gives_a_reliable_project_path() {
+        let (_tmp, source, dirs) = legacy_fixture(Path::new(INDEXED_DIR_CWD), &[UNOWNED]);
+        write_index_entries(
+            &dirs[0],
+            &[
+                index_entry(KILLED, Some("/elsewhere/first")),
+                index_entry(UNOWNED, Some("/elsewhere/real")),
+            ],
+        );
+        let proc = process(4242, Path::new("/elsewhere/real/sub"), 3600);
+
+        let sessions = source.find_active_sessions(&[proc], &dirs);
+
+        assert_eq!(
+            claimed_with_name(&sessions),
+            vec![(4242, UNOWNED.to_string(), "real".to_string())]
+        );
+    }
+
+    /// A session missing from the index takes the first entry's project path.
+    #[test]
+    fn session_missing_from_index_falls_back_to_the_first_entry() {
+        let (_tmp, source, dirs) = legacy_fixture(Path::new(INDEXED_DIR_CWD), &[UNOWNED]);
+        write_index_entries(
+            &dirs[0],
+            &[
+                index_entry(KILLED, Some("/elsewhere/first")),
+                index_entry("33333333-3333-3333-3333-333333333333", Some("/elsewhere/x")),
+            ],
+        );
+        let proc = process(4242, Path::new("/elsewhere/first"), 3600);
+
+        let sessions = source.find_active_sessions(&[proc], &dirs);
+
+        assert_eq!(
+            claimed_with_name(&sessions),
+            vec![(4242, UNOWNED.to_string(), "first".to_string())]
+        );
+    }
+
+    /// A matching entry without a path is skipped; a later entry with the
+    /// same id and a path wins over the first-entry fallback.
+    #[test]
+    fn duplicate_index_entry_without_path_is_skipped() {
+        let (_tmp, source, dirs) = legacy_fixture(Path::new(INDEXED_DIR_CWD), &[UNOWNED]);
+        write_index_entries(
+            &dirs[0],
+            &[
+                index_entry(UNOWNED, None),
+                index_entry(UNOWNED, Some("/elsewhere/second")),
+            ],
+        );
+        let proc = process(4242, Path::new("/elsewhere/second"), 3600);
+
+        let sessions = source.find_active_sessions(&[proc], &dirs);
+
+        assert_eq!(
+            claimed_with_name(&sessions),
+            vec![(4242, UNOWNED.to_string(), "second".to_string())]
+        );
+    }
+
+    /// No matching entry and a first entry without a path: the index gives
+    /// nothing, so only the encoded dir name can match the process.
+    #[test]
+    fn first_entry_without_path_gives_no_index_fallback() {
+        let cwd = Path::new(INDEXED_DIR_CWD);
+        let (_tmp, source, dirs) = legacy_fixture(cwd, &[UNOWNED]);
+        write_index_entries(
+            &dirs[0],
+            &[
+                index_entry(KILLED, None),
+                index_entry("33333333-3333-3333-3333-333333333333", Some("/elsewhere/x")),
+            ],
+        );
+        let elsewhere = process(4242, Path::new("/elsewhere/x"), 3600);
+        assert_eq!(
+            claimed_with_name(&source.find_active_sessions(&[elsewhere], &dirs)),
+            vec![]
+        );
+
+        let in_dir = process(4242, cwd, 3600);
+        assert_eq!(
+            claimed_with_name(&source.find_active_sessions(&[in_dir], &dirs)),
+            vec![(4242, UNOWNED.to_string(), "dir".to_string())]
+        );
+    }
+
+    /// An unparseable index gives the dir-name fallback: the name is the last
+    /// dash segment of the dir name and the path is not trusted for matching.
+    #[test]
+    fn unparseable_index_falls_back_to_the_dir_name() {
+        let cwd = Path::new(INDEXED_DIR_CWD);
+        let (_tmp, source, dirs) = legacy_fixture(cwd, &[UNOWNED]);
+        write_sessions_index(&dirs[0], "{not json");
+        let project_dir_as_cwd = process(4242, &dirs[0], 3600);
+        assert_eq!(
+            claimed_with_name(&source.find_active_sessions(&[project_dir_as_cwd], &dirs)),
+            vec![]
+        );
+
+        let in_dir = process(4242, cwd, 3600);
+        assert_eq!(
+            claimed_with_name(&source.find_active_sessions(&[in_dir], &dirs)),
+            vec![(4242, UNOWNED.to_string(), "dir".to_string())]
+        );
+    }
+
     #[test]
     fn resumed_session_id_reads_the_named_session_only() {
         let id = KILLED;
