@@ -13,6 +13,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { sessions } from './sessions';
 import { isTauri } from '../ws';
 import { providerOf, providerSessionKey } from '../provider';
+import type { SessionProvider } from '../types';
 
 export type SubagentStatus = 'running' | 'completed';
 
@@ -24,7 +25,7 @@ export interface SubagentInfo {
 	completedAt: string | null;
 	parentSessionId: string;
 	status: SubagentStatus;
-	provider?: 'claudeCode' | 'codex' | 'cursor' | 'pi' | 'opencode';
+	provider?: SessionProvider;
 	sessionId?: string;
 }
 

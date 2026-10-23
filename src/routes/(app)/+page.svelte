@@ -9,7 +9,6 @@
 		attentionInbox,
 		expandedSessionId,
 		currentConversation,
-		statusSummary,
 		visibleTopLevelSessionIds
 	} from '$lib/stores/sessions';
 	import { getConversation, stopSession, openSession, getDetectionDiagnostics } from '$lib/api';
@@ -26,6 +25,7 @@
 	import ConnectionScreen from '$lib/components/ConnectionScreen.svelte';
 	import type { Session } from '$lib/types';
 	import { SessionStatus } from '$lib/types';
+	import { STATUS_BUCKETS, countStatusBuckets, statusBucket, type StatusBucket } from '$lib/status-utils';
 	import SessionHistory from '$lib/components/SessionHistory.svelte';
 	import CostTracker from '$lib/components/CostTracker.svelte';
 	import { refreshCostData } from '$lib/stores/cost';
@@ -50,7 +50,6 @@
 
 	let sessions = $derived($sortedSessions);
 	let activeSessionIds = $derived(new Set(sessions.map((s) => sessionKeyOf(s))));
-	let summary = $derived($statusSummary);
 	let attentionItems = $derived(
 		$attentionInbox.filter((item) => matchesProvider(item.session, $providerFilter))
 	);
@@ -211,16 +210,15 @@
 		return () => window.removeEventListener('keydown', handler);
 	});
 
+	type ProjectGroup = Record<StatusBucket, Session[]> & {
+		path: string;
+		displayName: string;
+		lastModified: number;
+	};
+
 	// Helper function to group sessions by project path, then by status
 	function groupByProjectAndStatus(sessions: Session[]) {
-		const groups: Array<{
-			path: string;
-			displayName: string;
-			attention: Session[];
-			idle: Session[];
-			working: Session[];
-			lastModified: number;
-		}> = [];
+		const groups: ProjectGroup[] = [];
 
 		sessions.forEach(session => {
 			let group = groups.find(g => g.path === session.projectPath);
@@ -245,47 +243,41 @@
 	}
 
 	function groupSessionsByStatus(sessions: Session[]) {
-		const groups = {
-			attention: [] as Session[],
-			idle: [] as Session[],
-			working: [] as Session[]
-		};
+		const groups: Record<StatusBucket, Session[]> = { attention: [], idle: [], working: [] };
 
 		sessions.forEach(session => {
-			if (session.status === SessionStatus.NeedsAttention) {
-				groups.attention.push(session);
-			} else if (session.status === SessionStatus.WaitingForInput) {
-				groups.idle.push(session);
-			} else if (session.status === SessionStatus.Working || session.status === SessionStatus.Connecting) {
-				groups.working.push(session);
-			}
+			const bucket = statusBucket(session.status);
+			if (bucket) groups[bucket].push(session);
 		});
 
 		const sortSessions = (a: Session, b: Session) => new Date(a.modified).getTime() - new Date(b.modified).getTime();
 
-		return [
-			{ id: 'attention', label: 'Needs Attention', sessions: groups.attention.sort(sortSessions), type: 'attention' },
-			{ id: 'idle', label: 'Idle', sessions: groups.idle.sort(sortSessions), type: 'idle' },
-			{ id: 'working', label: 'Working', sessions: groups.working.sort(sortSessions), type: 'working' }
-		].filter(g => g.sessions.length > 0);
+		return STATUS_BUCKETS.map(({ id, label }) => ({
+			id,
+			label,
+			sessions: groups[id].sort(sortSessions),
+			type: id
+		})).filter(g => g.sessions.length > 0);
 	}
 
-	function addToGroup(group: any, session: Session) {
+	function addToGroup(group: ProjectGroup, session: Session) {
 		const modified = new Date(session.modified).getTime();
 		if (modified > group.lastModified) {
 			group.lastModified = modified;
 		}
 
-		if (session.status === SessionStatus.NeedsAttention) {
-			group.attention.push(session);
-		} else if (session.status === SessionStatus.WaitingForInput) {
-			group.idle.push(session);
-		} else if (session.status === SessionStatus.Working || session.status === SessionStatus.Connecting) {
-			group.working.push(session);
-		}
+		const bucket = statusBucket(session.status);
+		if (bucket) group[bucket].push(session);
 	}
 
-	function sortGroups(groups: any[]) {
+	/** Count of a project's sessions in the buckets shown before `bucketIndex`. */
+	function bucketStart(group: ProjectGroup, bucketIndex: number): number {
+		let count = 0;
+		for (const { id } of STATUS_BUCKETS.slice(0, bucketIndex)) count += group[id].length;
+		return count;
+	}
+
+	function sortGroups(groups: ProjectGroup[]) {
 		// Sort groups: priority to those needing attention, then by modification time
 		return groups.sort((a, b) => {
 			const aNeedsAttention = a.attention.length > 0;
@@ -339,19 +331,7 @@
 		return offsets;
 	});
 
-	let filteredSummary = $derived({
-		working: filteredSessions.filter(
-			(s) =>
-				s.status === SessionStatus.Working ||
-				s.status === SessionStatus.Connecting
-		).length,
-		permission: filteredSessions.filter(
-			(s) => s.status === SessionStatus.NeedsAttention
-		).length,
-		input: filteredSessions.filter(
-			(s) => s.status === SessionStatus.WaitingForInput
-		).length
-	});
+	let filteredSummary = $derived(countStatusBuckets(filteredSessions));
 
 	let expandedSession = $derived(sessions.find((s) => sessionKeyOf(s) === expandedId) || null);
 
@@ -751,17 +731,20 @@
 							</div>
 
 							<div class="status-groups">
-								<div class="status-group" class:empty={group.attention.length === 0} class:compact={isCompact}>
-									<div class="status-header attention">
-										<span class="status-indicator attention"></span>
-										<span class="status-title">Needs Attention</span>
-										<span class="status-count">{group.attention.length}</span>
+								{#each STATUS_BUCKETS as bucket, bi}
+									{@const bucketSessions = group[bucket.id]}
+									{@const bucketIdx = baseIdx + 1 + bucketStart(group, bi)}
+								<div class="status-group" class:empty={bucketSessions.length === 0} class:compact={isCompact}>
+									<div class="status-header {bucket.id}">
+										<span class="status-indicator {bucket.id}"></span>
+										<span class="status-title">{bucket.label}</span>
+										<span class="status-count">{bucketSessions.length}</span>
 									</div>
 									<div class="session-grid">
-						{#each group.attention as session, i (sessionKeyOf(session))}
+						{#each bucketSessions as session, i (sessionKeyOf(session))}
 											<div
 												class="card-wrapper"
-												in:flyIn|global={{ index: baseIdx + 1 + i }}
+												in:flyIn|global={{ index: bucketIdx + i }}
 												animate:flip={{ duration: 400 }}
 											>
 												<SessionCard
@@ -777,61 +760,7 @@
 										{/each}
 									</div>
 								</div>
-
-								<div class="status-group" class:empty={group.idle.length === 0} class:compact={isCompact}>
-									<div class="status-header idle">
-										<span class="status-indicator idle"></span>
-										<span class="status-title">Idle</span>
-										<span class="status-count">{group.idle.length}</span>
-									</div>
-									<div class="session-grid">
-						{#each group.idle as session, i (sessionKeyOf(session))}
-											<div
-												class="card-wrapper"
-												in:flyIn|global={{ index: baseIdx + 1 + group.attention.length + i }}
-												animate:flip={{ duration: 400 }}
-											>
-												<SessionCard
-													{session}
-													compact={isCompact}
-													workersView={sessionFilter === 'workers'}
-													onexpand={() => handleExpand(session)}
-													onstop={() => handleStop(session.pid)}
-													onopen={() => handleOpen(session.pid, session.projectPath)}
-													onrename={() => showRenameHint = true}
-												/>
-											</div>
-										{/each}
-									</div>
-								</div>
-
-								<div class="status-group" class:empty={group.working.length === 0} class:compact={isCompact}>
-									<div class="status-header working">
-										<span class="status-indicator working"></span>
-										<span class="status-title">Working</span>
-										<span class="status-count">{group.working.length}</span>
-									</div>
-									<div class="session-grid">
-						{#each group.working as session, i (sessionKeyOf(session))}
-											<div
-												class="card-wrapper"
-												in:flyIn|global={{ index: baseIdx + 1 + group.attention.length + group.idle.length + i }}
-												animate:flip={{ duration: 400 }}
-											>
-												<SessionCard
-													{session}
-													compact={isCompact}
-													workersView={sessionFilter === 'workers'}
-													onexpand={() => handleExpand(session)}
-													onstop={() => handleStop(session.pid)}
-													onopen={() => handleOpen(session.pid, session.projectPath)}
-													onrename={() => showRenameHint = true}
-												/>
-											</div>
-										{/each}
-									</div>
-								</div>
-
+								{/each}
 							</div>
 						</section>
 					{/each}

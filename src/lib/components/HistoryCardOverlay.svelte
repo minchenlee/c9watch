@@ -11,15 +11,15 @@
 	import { isCostAvailable } from '$lib/cost-semantics';
 	import ProviderBadge from './ProviderBadge.svelte';
 	import { providerSessionKey } from '$lib/provider';
-	import { getConversation } from '$lib/api';
 	import {
 		conversationLoad,
 		conversationLoadLabel,
 		isSessionLoading,
 		isToolsLoading,
-		toolsLoadedFor,
-		withConversationLoader
+		loadToolsConversation,
+		toolsLoadedFor
 	} from '$lib/stores/conversation-loader';
+	import { isMessageVisible } from '$lib/message-filters';
 	import ConversationLoadBar from './ConversationLoadBar.svelte';
 
 	interface Props {
@@ -86,20 +86,12 @@
 		const next = !showTools;
 		if (sessionLoading) return;
 		if (next && $toolsLoadedFor !== requestedKey) {
-			try {
-				const conv = await withConversationLoader(requestedId, requestedProvider, 'tools', () =>
-					getConversation(requestedId, requestedProvider, true)
-				);
-				if (disposed ||
-					providerSessionKey(entry.provider, entry.sessionId) !== requestedKey ||
-					providerSessionKey(conv.provider ?? requestedProvider, conv.sessionId) !== requestedKey
-				) return;
-				onconversation?.(conv);
-				toolsLoadedFor.set(requestedKey);
-			} catch (error) {
-				console.error('Failed to load tools:', error);
-				return;
-			}
+			const loaded = await loadToolsConversation(
+				{ sessionId: requestedId, provider: requestedProvider },
+				() => !disposed && providerSessionKey(entry.provider, entry.sessionId) === requestedKey,
+				(conv) => onconversation?.(conv)
+			);
+			if (!loaded) return;
 		}
 		if (disposed || entry.sessionId !== requestedId) return;
 		showTools = next;
@@ -140,35 +132,22 @@
 	$effect(() => {
 		if (conversation && conversation.messages.length > 0 && messagesContainer) {
 			if (!hasScrolledToBottom) {
-				if (searchQuery) {
-					const queryLower = searchQuery.toLowerCase();
-					const matchIndex = conversation!.messages.findIndex(
+				// Case-insensitive phrase match — consistent with deep_search defaults.
+				const needle = searchQuery?.toLowerCase();
+				const matchIndex = needle
+					? conversation.messages.findIndex(
 						(m) => (m.messageType === 'User' || m.messageType === 'Assistant') &&
-							m.content.toLowerCase().includes(queryLower)
-					);
-					if (matchIndex >= 0) {
-						sw.reset(conversation.messages.length, Math.max(0, matchIndex - 10));
-					} else {
-						sw.reset(conversation.messages.length);
-					}
+							m.content.toLowerCase().includes(needle)
+					)
+					: -1;
+				if (matchIndex >= 0) {
+					sw.reset(conversation.messages.length, Math.max(0, matchIndex - 10));
 				} else {
 					sw.reset(conversation.messages.length);
 				}
 				tick().then(() => {
-					if (searchQuery) {
-						// Case-insensitive phrase match — consistent with deep_search defaults.
-						const needle = searchQuery.toLowerCase();
-						const matchIndex = conversation!.messages.findIndex(
-							(m) => {
-								if (m.messageType !== 'User' && m.messageType !== 'Assistant') return false;
-								return m.content.toLowerCase().includes(needle);
-							}
-						);
-						if (matchIndex >= 0) {
-							scrollToMessageIndex(matchIndex);
-						} else {
-							messagesContainer.scrollTop = messagesContainer.scrollHeight;
-						}
+					if (matchIndex >= 0) {
+						scrollToMessageIndex(matchIndex);
 					} else {
 						messagesContainer.scrollTop = messagesContainer.scrollHeight;
 					}
@@ -332,7 +311,7 @@
 							</div>
 						{/if}
 						{#each visibleMessages as message, i (sw.startIndex + i)}
-							{#if (showTools || (message.messageType !== 'ToolUse' && message.messageType !== 'ToolResult')) && (showThinking || message.messageType !== 'Thinking')}
+							{#if isMessageVisible(message, showTools, showThinking)}
 								<div data-msg-index={sw.startIndex + i}>
 									<MessageBubble {message} />
 								</div>

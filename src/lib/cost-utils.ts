@@ -5,6 +5,7 @@
 
 import type { CostData, SessionCostRecord } from './types';
 import { providerSessionKey } from './provider';
+import { isCostAvailable } from './cost-semantics';
 
 export type CostMode = 'usd' | 'tokens';
 
@@ -55,7 +56,7 @@ export function buildSessionCostMap(data: CostData | null): Map<string, SessionC
 				existing.cachedInputTokens = (existing.cachedInputTokens || 0) + (rec.cachedInputTokens || 0);
 				existing.outputTokens = (existing.outputTokens || 0) + (rec.outputTokens || 0);
 				existing.reasoningOutputTokens = (existing.reasoningOutputTokens || 0) + (rec.reasoningOutputTokens || 0);
-				existing.costAvailable = (existing.costAvailable ?? (existing.provider !== 'codex' && existing.provider !== 'cursor')) && (rec.costAvailable ?? (rec.provider !== 'codex' && rec.provider !== 'cursor'));
+				existing.costAvailable = isCostAvailable(existing) && isCostAvailable(rec);
 				if (rec.timestamp > existing.timestamp) {
 					existing.timestamp = rec.timestamp;
 					existing.model = rec.model;

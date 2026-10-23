@@ -59,13 +59,6 @@ use tauri_nspanel::{
 
 // ── GUI-only: Tauri commands ─────────────────────────────────────────
 
-#[cfg(feature = "gui")]
-#[cfg(all(not(mobile), feature = "gui"))]
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_subscription_usage() -> Vec<subscription_usage::SubscriptionUsage> {
@@ -79,16 +72,45 @@ async fn get_sessions(
 ) -> Result<Vec<Session>, String> {
     let detector = Arc::clone(detector.inner());
     blocking::scan(&blocking::DISCOVERY, move || {
-        let detect_result = {
-            let mut state = detector
-                .lock()
-                .map_err(|e| format!("Detector lock poisoned: {}", e))?;
-            state.detect()
-        };
-        let (detected, diag) = detect_result.map_err(|e| format!("Detect failed: {}", e))?;
-        session::enrichment::enrich_detected_sessions(detected, diag).map(|(sessions, _)| sessions)
+        detect_snapshot(&detector).and_then(|snapshot| snapshot)
     })
     .await
+}
+
+/// Detect and enrich the current sessions using the shared detector.
+///
+/// The outer `Err` means the detector lock is poisoned; the inner `Err`
+/// means detection or enrichment failed. Callers decide which errors to
+/// propagate. The lock guard is dropped before the enrichment pass.
+#[cfg(all(not(mobile), feature = "gui"))]
+fn detect_snapshot(
+    detector: &Mutex<session::DetectorState>,
+) -> Result<Result<Vec<Session>, String>, String> {
+    let detect_result = {
+        let mut state = detector
+            .lock()
+            .map_err(|e| format!("Detector lock poisoned: {}", e))?;
+        state.detect()
+    };
+    Ok(detect_result
+        .map_err(|e| format!("Detect failed: {}", e))
+        .and_then(|(detected, diag)| {
+            session::enrichment::enrich_detected_sessions(detected, diag)
+                .map(|(sessions, _)| sessions)
+        }))
+}
+
+/// Emit a fresh `sessions-updated` snapshot after a session action.
+/// Lock poison is returned; detect and enrich errors are ignored.
+#[cfg(all(not(mobile), feature = "gui"))]
+fn emit_sessions_snapshot(
+    app: &AppHandle,
+    detector: &Mutex<session::DetectorState>,
+) -> Result<(), String> {
+    if let Ok(sessions) = detect_snapshot(detector)? {
+        let _ = app.emit("sessions-updated", &sessions);
+    }
+    Ok(())
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -120,6 +142,7 @@ async fn get_conversation(
                     ConversationProgress {
                         session_id: emit_id.clone(),
                         provider,
+                        request_id: None,
                         bytes_read,
                         bytes_total,
                     },
@@ -284,18 +307,7 @@ async fn stop_session(
     stop_session_action(pid)?;
     std::thread::sleep(Duration::from_millis(300));
 
-    let detect_result = {
-        let mut state = detector
-            .lock()
-            .map_err(|e| format!("Detector lock poisoned: {}", e))?;
-        state.detect()
-    };
-    if let Ok((detected, diag)) = detect_result {
-        if let Ok((sessions, _)) = session::enrichment::enrich_detected_sessions(detected, diag) {
-            let _ = app.emit("sessions-updated", &sessions);
-        }
-    }
-    Ok(())
+    emit_sessions_snapshot(&app, detector.inner())
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -329,101 +341,209 @@ async fn rename_session(
 ) -> Result<(), String> {
     let owners = session::global_provider_source_owners();
     run_validated_rename(provider, &session_id, &owners, || {
-        // Write to Claude Code's native JSONL format (primary)
-        write_native_custom_title(&session_id, &new_name);
-
-        // Also write to c9watch's own custom titles (fallback for history view)
-        let mut custom_titles = session::CustomTitles::load();
-        custom_titles.set(session_id.clone(), new_name.clone());
-        custom_titles.save()
+        write_session_title(&session_id, &new_name)
     })?;
 
-    let detect_result = {
-        let mut state = detector
-            .lock()
-            .map_err(|e| format!("Detector lock poisoned: {}", e))?;
-        state.detect()
-    };
-    if let Ok((detected, diag)) = detect_result {
-        if let Ok((sessions, _)) = session::enrichment::enrich_detected_sessions(detected, diag) {
-            let _ = app.emit("sessions-updated", &sessions);
-        }
-    }
-    Ok(())
+    emit_sessions_snapshot(&app, detector.inner())
+}
+
+/// Persist a session rename for both the Tauri command and the WebSocket
+/// handler: Claude Code's native JSONL entry (primary) plus c9watch's own
+/// custom titles file (fallback for the history view).
+#[cfg(all(not(mobile), feature = "gui"))]
+pub(crate) fn write_session_title(session_id: &str, new_name: &str) -> Result<(), String> {
+    write_native_custom_title(session_id, new_name);
+
+    let mut custom_titles = session::CustomTitles::load();
+    custom_titles.set(session_id.to_string(), new_name.to_string());
+    custom_titles.save()
 }
 
 /// Append a `custom-title` entry to the session's JSONL file in Claude Code's native format.
 /// This makes the rename visible to Claude Code itself (and persists across c9watch reinstalls).
 pub fn write_native_custom_title(session_id: &str, title: &str) {
-    use std::io::Write;
-
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => return,
     };
-    let projects_dir = home.join(".claude").join("projects");
+    write_native_custom_title_under(&home.join(".claude").join("projects"), session_id, title);
+}
 
-    // Search all project directories for the session JSONL
-    let entries = match std::fs::read_dir(&projects_dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+fn write_native_custom_title_under(projects_dir: &std::path::Path, session_id: &str, title: &str) {
+    use std::io::Write;
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let jsonl_path = path.join(format!("{}.jsonl", session_id));
-        if jsonl_path.exists() {
-            let entry = serde_json::json!({
-                "type": "custom-title",
-                "customTitle": title,
-                "sessionId": session_id,
-            });
-            match std::fs::OpenOptions::new().append(true).open(&jsonl_path) {
-                Ok(mut file) => {
-                    if let Err(e) = writeln!(file, "{}", entry) {
-                        debug_log::log_warn(&format!(
-                            "Failed to write native custom-title for {}: {}",
-                            session_id, e
-                        ));
-                    }
-                }
-                Err(e) => {
-                    debug_log::log_warn(&format!(
-                        "Failed to open JSONL for native custom-title {}: {}",
-                        session_id, e
-                    ));
-                }
-            }
-            return;
-        }
+    // An unreadable projects root is a silent no-op (no warning), as before.
+    if std::fs::read_dir(projects_dir).is_err() {
+        return;
     }
 
-    debug_log::log_warn(&format!(
-        "Could not find JSONL file for session {} to write native custom-title",
-        session_id
-    ));
+    let Some(jsonl_path) =
+        session::claude_files::find_session_file_in_projects_dir(projects_dir, session_id)
+    else {
+        debug_log::log_warn(&format!(
+            "Could not find JSONL file for session {} to write native custom-title",
+            session_id
+        ));
+        return;
+    };
+
+    let entry = serde_json::json!({
+        "type": "custom-title",
+        "customTitle": title,
+        "sessionId": session_id,
+    });
+    match std::fs::OpenOptions::new().append(true).open(&jsonl_path) {
+        Ok(mut file) => {
+            if let Err(e) = writeln!(file, "{}", entry) {
+                debug_log::log_warn(&format!(
+                    "Failed to write native custom-title for {}: {}",
+                    session_id, e
+                ));
+            }
+        }
+        Err(e) => {
+            debug_log::log_warn(&format!(
+                "Failed to open JSONL for native custom-title {}: {}",
+                session_id, e
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_custom_title_tests {
+    use super::write_native_custom_title_under;
+
+    const SESSION_ID: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+
+    #[test]
+    fn appends_custom_title_entry_to_matching_project_jsonl() {
+        let temp = tempfile::tempdir().unwrap();
+        let other_dir = temp.path().join("-other-project");
+        let project_dir = temp.path().join("-synthetic-project");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let jsonl = project_dir.join(format!("{SESSION_ID}.jsonl"));
+        std::fs::write(&jsonl, "{\"type\":\"user\"}\n").unwrap();
+
+        write_native_custom_title_under(temp.path(), SESSION_ID, "synthetic title");
+
+        let content = std::fs::read_to_string(&jsonl).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "{\"type\":\"user\"}");
+        let entry: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(
+            entry,
+            serde_json::json!({
+                "type": "custom-title",
+                "customTitle": "synthetic title",
+                "sessionId": SESSION_ID,
+            })
+        );
+        assert_eq!(std::fs::read_dir(&other_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn missing_session_jsonl_creates_no_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().join("-synthetic-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        write_native_custom_title_under(temp.path(), SESSION_ID, "synthetic title");
+
+        assert_eq!(std::fs::read_dir(&project_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn missing_projects_root_is_a_no_op() {
+        let temp = tempfile::tempdir().unwrap();
+        write_native_custom_title_under(&temp.path().join("absent"), SESSION_ID, "synthetic title");
+        assert!(!temp.path().join("absent").exists());
+    }
 }
 
 #[cfg(all(test, not(mobile), feature = "gui"))]
-mod rename_collision_tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+mod detect_snapshot_tests {
+    use super::detect_snapshot;
+    use crate::session::source::{
+        DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource,
+    };
+    use crate::session::{BackendMode, DetectorState};
+    use std::sync::{Arc, Mutex};
+
+    struct StubSource {
+        fail: bool,
+    }
+
+    impl SessionSource for StubSource {
+        fn detect(
+            &mut self,
+        ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
+            if self.fail {
+                Err(SessionDetectorError::CliFailed("synthetic".into()))
+            } else {
+                Ok((Vec::new(), DetectionDiagnostics::default()))
+            }
+        }
+        fn backend_name(&self) -> &'static str {
+            "stub"
+        }
+    }
+
+    fn detector(fail: bool) -> Mutex<DetectorState> {
+        Mutex::new(DetectorState::for_test(
+            Box::new(StubSource { fail }),
+            BackendMode::ForceCli,
+        ))
+    }
+
+    #[test]
+    fn empty_detection_yields_empty_snapshot() {
+        let sessions = detect_snapshot(&detector(false)).unwrap().unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn detect_failure_is_the_inner_error() {
+        let message = detect_snapshot(&detector(true)).unwrap().unwrap_err();
+        assert!(message.starts_with("Detect failed: "), "{message}");
+    }
+
+    #[test]
+    fn lock_poison_is_the_outer_error() {
+        let detector = Arc::new(detector(false));
+        let poisoner = Arc::clone(&detector);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the detector lock");
+        })
+        .join();
+
+        let message = detect_snapshot(&detector).unwrap_err();
+        assert!(message.starts_with("Detector lock poisoned: "), "{message}");
+    }
+}
+
+/// Provider-owner fixtures shared by the Tauri and WebSocket rename tests.
+/// Each one plants a synthetic `session_id` transcript under `temp`.
+#[cfg(all(test, not(mobile), feature = "gui"))]
+pub(crate) mod rename_test_fixtures {
+    use crate::session;
     use tempfile::TempDir;
 
-    const SESSION_ID: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
-
-    fn synthetic_cursor_owner(temp: &TempDir) -> session::ProviderSourceOwners {
+    pub(crate) fn synthetic_cursor_owner(
+        temp: &TempDir,
+        session_id: &str,
+    ) -> session::ProviderSourceOwners {
         let transcript_dir = temp
             .path()
             .join("synthetic-project")
             .join("agent-transcripts")
-            .join(SESSION_ID);
+            .join(session_id);
         std::fs::create_dir_all(&transcript_dir).unwrap();
         std::fs::write(
-            transcript_dir.join(format!("{SESSION_ID}.jsonl")),
+            transcript_dir.join(format!("{session_id}.jsonl")),
             b"{\"role\":\"user\",\"message\":{\"content\":[]}}\n",
         )
         .unwrap();
@@ -437,11 +557,14 @@ mod rename_collision_tests {
         )
     }
 
-    fn synthetic_codex_owner(temp: &TempDir) -> session::ProviderSourceOwners {
+    pub(crate) fn synthetic_codex_owner(
+        temp: &TempDir,
+        session_id: &str,
+    ) -> session::ProviderSourceOwners {
         let rollout_dir = temp.path().join("2026").join("08").join("24");
         std::fs::create_dir_all(&rollout_dir).unwrap();
         std::fs::write(
-            rollout_dir.join(format!("rollout-synthetic-{SESSION_ID}.jsonl")),
+            rollout_dir.join(format!("rollout-synthetic-{session_id}.jsonl")),
             b"{}\n",
         )
         .unwrap();
@@ -454,6 +577,15 @@ mod rename_collision_tests {
             None,
         )
     }
+}
+
+#[cfg(all(test, not(mobile), feature = "gui"))]
+mod rename_collision_tests {
+    use super::rename_test_fixtures::{synthetic_codex_owner, synthetic_cursor_owner};
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const SESSION_ID: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
 
     fn assert_no_write_for_collision(owners: session::ProviderSourceOwners) {
         let writes = AtomicUsize::new(0);
@@ -469,28 +601,13 @@ mod rename_collision_tests {
     #[test]
     fn tauri_rename_collision_rejects_before_custom_title_write_for_cursor() {
         let temp = tempfile::tempdir().unwrap();
-        assert_no_write_for_collision(synthetic_cursor_owner(&temp));
+        assert_no_write_for_collision(synthetic_cursor_owner(&temp, SESSION_ID));
     }
 
     #[test]
     fn tauri_rename_collision_rejects_before_custom_title_write_for_codex() {
         let temp = tempfile::tempdir().unwrap();
-        assert_no_write_for_collision(synthetic_codex_owner(&temp));
-    }
-}
-
-/// Get the terminal title for a session (iTerm2 only, macOS)
-#[cfg(feature = "gui")]
-#[tauri::command]
-async fn get_terminal_title(pid: u32) -> Result<Option<String>, String> {
-    #[cfg(target_os = "macos")]
-    {
-        Ok(actions::get_iterm2_session_title(pid))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = pid;
-        Ok(None)
+        assert_no_write_for_collision(synthetic_codex_owner(&temp, SESSION_ID));
     }
 }
 
@@ -783,11 +900,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             session::opencode::opencode_connection_status,
             session::opencode::opencode_connect,
-            session::opencode::opencode_session_children,
             notifications::get_notification_preferences,
             notifications::save_notification_preferences,
             notifications::test_native_notification,
-            greet,
             get_sessions,
             get_detection_diagnostics,
             get_subscription_usage,
@@ -805,7 +920,6 @@ pub fn run() {
             stop_session,
             open_session,
             rename_session,
-            get_terminal_title,
             show_main_window,
             get_server_info,
             get_debug_logs

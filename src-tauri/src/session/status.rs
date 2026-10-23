@@ -2,6 +2,7 @@ use super::parser::{AssistantMessage, MessageContent, SessionEntry};
 use super::permissions::PermissionChecker;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Checker built from the user-level settings files.
@@ -64,21 +65,6 @@ pub fn determine_status_with(
         None => return SessionStatus::Connecting,
     };
 
-    // Also check if there are any recent progress entries AFTER the last meaningful entry.
-    // Progress entries (e.g., bash_progress) indicate active tool execution.
-    let last_meaningful_idx = entries
-        .iter()
-        .rposition(|entry| {
-            matches!(
-                entry,
-                SessionEntry::User { .. } | SessionEntry::Assistant { .. }
-            )
-        })
-        .unwrap_or(0);
-    let has_trailing_progress = entries[last_meaningful_idx + 1..]
-        .iter()
-        .any(|entry| matches!(entry, SessionEntry::Unknown));
-
     match last_entry {
         SessionEntry::User { base, message } => {
             // Check if this is a tool_result or an actual user prompt.
@@ -117,32 +103,19 @@ pub fn determine_status_with(
             match raw_status {
                 SessionStatus::Working => {
                     // "Working" from analyze_assistant_message means either:
-                    // 1. Pending tool_use (auto-approved) - check for trailing progress
+                    // 1. Pending tool_use (auto-approved) - the tool is running
                     // 2. Text with no stop_reason (but stop_reason is always None in JSONL)
                     //
-                    // Use recency + trailing progress to distinguish active from idle
-                    let has_pending_tools = has_pending_tool_uses(&message.content);
-
-                    if has_pending_tools {
-                        // Tool is pending - check if there's active progress or recent activity.
-                        // 20s threshold (increased from 10s) accommodates tool execution time.
-                        if has_trailing_progress || is_entry_recent(&base.timestamp, 20) {
-                            SessionStatus::Working
-                        } else {
-                            // Pending tool but no recent activity - likely stale
-                            SessionStatus::Working
-                        }
+                    // For text/thinking content, use recency: if the entry was written
+                    // recently, Claude is likely still streaming or about to write more.
+                    // If old, session is idle. 20s threshold accommodates streaming and
+                    // thinking pauses.
+                    if has_pending_tool_uses(&message.content)
+                        || is_entry_recent(&base.timestamp, 20)
+                    {
+                        SessionStatus::Working
                     } else {
-                        // No pending tools, just text/thinking content.
-                        // Since stop_reason is always None in JSONL, we use recency:
-                        // if the entry was written recently, Claude is likely still
-                        // streaming or about to write more. If old, session is idle.
-                        // 20s threshold (increased from 10s) accommodates streaming and thinking pauses.
-                        if is_entry_recent(&base.timestamp, 20) {
-                            SessionStatus::Working
-                        } else {
-                            SessionStatus::WaitingForInput
-                        }
+                        SessionStatus::WaitingForInput
                     }
                 }
                 SessionStatus::NeedsAttention => {
@@ -171,55 +144,47 @@ fn is_entry_recent(timestamp: &str, seconds: i64) -> bool {
     }
 }
 
-/// Checks if the message content has a pending AskUserQuestion tool use
-fn has_pending_ask_user_question(content: &[MessageContent]) -> bool {
-    let completed_ids: Vec<&str> = content
-        .iter()
-        .filter_map(|c| {
-            if let MessageContent::ToolResult { tool_use_id, .. } = c {
-                Some(tool_use_id.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    content.iter().any(|c| {
-        if let MessageContent::ToolUse { id, name, .. } = c {
-            name == "AskUserQuestion" && !completed_ids.contains(&id.as_str())
-        } else {
-            false
-        }
+/// The message of the last assistant entry in `entries`.
+fn last_assistant(entries: &[SessionEntry]) -> Option<&AssistantMessage> {
+    entries.iter().rev().find_map(|entry| match entry {
+        SessionEntry::Assistant { message, .. } => Some(message),
+        _ => None,
     })
 }
 
-/// Checks if an assistant message is asking the user a question.
-///
-/// Detects two patterns:
-/// 1. The last text block ends with a question mark (e.g., "Want me to proceed?")
-/// 2. The message contains a pending `AskUserQuestion` tool use
-///
-/// Only triggers when the message has `stop_reason` of `end_turn` (for text questions)
-/// or when `AskUserQuestion` tool is pending, indicating Claude is waiting for user input.
-fn is_assistant_asking_question(message: &AssistantMessage) -> bool {
-    // Pattern 1: Check for pending AskUserQuestion tool use
-    let has_pending_ask = message.content.iter().any(|c| {
-        if let MessageContent::ToolUse { name, id, .. } = c {
-            if name == "AskUserQuestion" {
-                // Check if there's a corresponding tool result
-                return !message.content.iter().any(|r| {
-                    matches!(r, MessageContent::ToolResult { tool_use_id, .. } if tool_use_id == id)
-                });
-            }
+/// Tool uses in `content` with no matching tool_result in the same content,
+/// in order, as `(name, input)`.
+fn pending_tool_uses(
+    content: &[MessageContent],
+) -> impl Iterator<Item = (&str, &serde_json::Value)> {
+    let completed_ids: HashSet<&str> = content
+        .iter()
+        .filter_map(|c| match c {
+            MessageContent::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    content.iter().filter_map(move |c| match c {
+        MessageContent::ToolUse { id, name, input } if !completed_ids.contains(id.as_str()) => {
+            Some((name.as_str(), input))
         }
-        false
-    });
+        _ => None,
+    })
+}
 
-    if has_pending_ask {
-        return true;
-    }
+/// Checks if the message content has a pending AskUserQuestion tool use
+fn has_pending_ask_user_question(content: &[MessageContent]) -> bool {
+    pending_tool_uses(content).any(|(name, _)| name == "AskUserQuestion")
+}
 
-    // Pattern 2: Last text block ends with '?' and stop_reason is end_turn
+/// Checks if an assistant message is asking the user a question in text:
+/// the last text block ends with a question mark (e.g., "Want me to proceed?")
+/// and `stop_reason` is `end_turn`.
+///
+/// A pending `AskUserQuestion` tool use is detected separately, before this
+/// check runs, by [`has_pending_ask_user_question`] and
+/// [`get_pending_tool_name_with`].
+fn is_assistant_asking_question(message: &AssistantMessage) -> bool {
     if message.stop_reason.as_deref() == Some("end_turn") {
         let last_text = message.content.iter().rev().find_map(|c| {
             if let MessageContent::Text { text } = c {
@@ -297,36 +262,13 @@ fn are_pending_tools_auto_approved(
     content: &[MessageContent],
     checker: &PermissionChecker,
 ) -> bool {
-    // Get IDs of tools that have results
-    let completed_ids: Vec<&str> = content
-        .iter()
-        .filter_map(|c| {
-            if let MessageContent::ToolResult { tool_use_id, .. } = c {
-                Some(tool_use_id.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
+    pending_tool_uses(content).all(|(name, input)| checker.is_auto_approved(name, input))
+}
 
-    // Check each tool use - if it's pending (no result), check if auto-approved
-    for item in content {
-        if let MessageContent::ToolUse { id, name, input } = item {
-            // Skip if already completed
-            if completed_ids.contains(&id.as_str()) {
-                continue;
-            }
-
-            // This tool is pending - check if it's auto-approved
-            if !checker.is_auto_approved(name, input) {
-                // Found a tool that needs permission
-                return false;
-            }
-        }
-    }
-
-    // All pending tools are auto-approved
-    true
+/// True when a pending tool name means Claude is asking the user a question
+/// ("Question" for a text question, "AskUserQuestion" for the tool).
+pub fn is_question_tool(name: Option<&str>) -> bool {
+    matches!(name, Some("Question" | "AskUserQuestion"))
 }
 
 /// Gets the name describing why the session needs attention.
@@ -345,45 +287,18 @@ pub fn get_pending_tool_name_with(
     entries: &[SessionEntry],
     checker: &PermissionChecker,
 ) -> Option<String> {
-    // Find the last assistant message entry
-    let last_assistant = entries.iter().rev().find_map(|entry| {
-        if let SessionEntry::Assistant { message, .. } = entry {
-            Some(message)
-        } else {
-            None
-        }
-    })?;
-
-    // Get IDs of tools that have results
-    let completed_ids: Vec<&str> = last_assistant
-        .content
-        .iter()
-        .filter_map(|c| {
-            if let MessageContent::ToolResult { tool_use_id, .. } = c {
-                Some(tool_use_id.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
+    let last_assistant = last_assistant(entries)?;
 
     // Find the first pending tool that needs permission or AskUserQuestion
-    for item in &last_assistant.content {
-        if let MessageContent::ToolUse { id, name, input } = item {
-            // Skip if already completed
-            if completed_ids.contains(&id.as_str()) {
-                continue;
-            }
+    for (name, input) in pending_tool_uses(&last_assistant.content) {
+        // Pending AskUserQuestion → return it directly
+        if name == "AskUserQuestion" {
+            return Some("AskUserQuestion".to_string());
+        }
 
-            // Pending AskUserQuestion → return it directly
-            if name == "AskUserQuestion" {
-                return Some("AskUserQuestion".to_string());
-            }
-
-            // This tool is pending - check if it needs permission
-            if !checker.is_auto_approved(name, input) {
-                return Some(name.clone());
-            }
+        // This tool is pending - check if it needs permission
+        if !checker.is_auto_approved(name, input) {
+            return Some(name.to_string());
         }
     }
 
@@ -397,82 +312,13 @@ pub fn get_pending_tool_name_with(
 
 /// Gets the input of the first pending tool that needs permission.
 /// Returns the full tool_use JSON value so the agent knows what action is being requested.
-pub fn get_pending_tool_input(entries: &[SessionEntry]) -> Option<serde_json::Value> {
-    get_pending_tool_input_with(entries, &get_permission_checker())
-}
-
-/// [`get_pending_tool_input`] using `checker` for permission decisions.
 pub fn get_pending_tool_input_with(
     entries: &[SessionEntry],
     checker: &PermissionChecker,
 ) -> Option<serde_json::Value> {
-    let last_assistant = entries.iter().rev().find_map(|entry| {
-        if let SessionEntry::Assistant { message, .. } = entry {
-            Some(message)
-        } else {
-            None
-        }
-    })?;
-
-    let completed_ids: Vec<&str> = last_assistant
-        .content
-        .iter()
-        .filter_map(|c| {
-            if let MessageContent::ToolResult { tool_use_id, .. } = c {
-                Some(tool_use_id.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    for item in &last_assistant.content {
-        if let MessageContent::ToolUse { id, name, input } = item {
-            if completed_ids.contains(&id.as_str()) {
-                continue;
-            }
-            if !checker.is_auto_approved(name, input) {
-                return Some(input.clone());
-            }
-        }
-    }
-
-    None
-}
-
-/// Tool uses in `entries` that have no matching tool_result, in order, as
-/// `(name, input)`. Unlike the single-message checks above, this follows results
-/// written in later user entries, which is where Claude Code records them.
-pub fn unresolved_tool_uses(entries: &[SessionEntry]) -> Vec<(&str, &serde_json::Value)> {
-    let mut resolved: Vec<&str> = Vec::new();
-    for entry in entries {
-        match entry {
-            SessionEntry::User { message, .. } => {
-                resolved.extend(message.tool_result_ids.iter().map(String::as_str))
-            }
-            SessionEntry::Assistant { message, .. } => {
-                resolved.extend(message.content.iter().filter_map(|c| match c {
-                    MessageContent::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-                    _ => None,
-                }))
-            }
-            _ => {}
-        }
-    }
-    entries
-        .iter()
-        .filter_map(|entry| match entry {
-            SessionEntry::Assistant { message, .. } => Some(&message.content),
-            _ => None,
-        })
-        .flatten()
-        .filter_map(|c| match c {
-            MessageContent::ToolUse { id, name, input } if !resolved.contains(&id.as_str()) => {
-                Some((name.as_str(), input))
-            }
-            _ => None,
-        })
-        .collect()
+    pending_tool_uses(&last_assistant(entries)?.content)
+        .find(|(name, input)| !checker.is_auto_approved(name, input))
+        .map(|(_, input)| input.clone())
 }
 
 /// Checks if there are any pending (incomplete) tool uses
@@ -481,87 +327,23 @@ fn has_pending_tool_uses(content: &[MessageContent]) -> bool {
 }
 
 /// Checks if all tool uses in the content have corresponding tool results
+/// (true when there are no tool uses).
 fn check_all_tools_completed(content: &[MessageContent]) -> bool {
-    // Collect all tool use IDs
-    let mut tool_use_ids = Vec::new();
-    for item in content {
-        if let MessageContent::ToolUse { id, .. } = item {
-            tool_use_ids.push(id.clone());
-        }
-    }
-
-    // If no tool uses, return true (nothing to check)
-    if tool_use_ids.is_empty() {
-        return true;
-    }
-
-    // Collect all tool result IDs
-    let mut tool_result_ids = Vec::new();
-    for item in content {
-        if let MessageContent::ToolResult { tool_use_id, .. } = item {
-            tool_result_ids.push(tool_use_id.clone());
-        }
-    }
-
-    // Check if all tool use IDs have corresponding results
-    for tool_id in &tool_use_ids {
-        if !tool_result_ids.contains(tool_id) {
-            return false;
-        }
-    }
-
-    true
-}
-
-/// Determines status with additional context from multiple entries
-///
-/// This function looks at the last few entries to get more context about
-/// the session state, which can be more accurate than just looking at the
-/// last entry alone.
-pub fn determine_status_with_context(entries: &[SessionEntry]) -> SessionStatus {
-    if entries.is_empty() {
-        return SessionStatus::Connecting;
-    }
-
-    // For minimal context, treat as connecting
-    if entries.len() <= 2 {
-        return SessionStatus::Connecting;
-    }
-
-    // Get the basic status from the last entry
-    let basic_status = determine_status(entries);
-
-    // If we detect Working status, but the previous entry was also an assistant
-    // message with completed tools, we might actually be waiting for input
-    if basic_status == SessionStatus::Working && entries.len() >= 2 {
-        let last_entry = &entries[entries.len() - 1];
-        let prev_entry = &entries[entries.len() - 2];
-
-        if let (
-            SessionEntry::Assistant {
-                message: last_msg, ..
-            },
-            SessionEntry::Assistant { .. },
-        ) = (last_entry, prev_entry)
-        {
-            // If both are assistant messages and last one has no tool use,
-            // might be waiting for input
-            let last_has_tools = last_msg
-                .content
-                .iter()
-                .any(|c| matches!(c, MessageContent::ToolUse { .. }));
-
-            if !last_has_tools && last_msg.stop_reason.is_some() {
-                return SessionStatus::WaitingForInput;
-            }
-        }
-    }
-
-    basic_status
+    pending_tool_uses(content).next().is_none()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn is_question_tool_matches_only_question_names() {
+        assert!(super::is_question_tool(Some("Question")));
+        assert!(super::is_question_tool(Some("AskUserQuestion")));
+        assert!(!super::is_question_tool(Some("Bash")));
+        assert!(!super::is_question_tool(Some("question")));
+        assert!(!super::is_question_tool(Some("")));
+        assert!(!super::is_question_tool(None));
+    }
+
     use super::*;
     use crate::session::parser::{SessionEntryBase, UserMessage};
 
@@ -1349,20 +1131,85 @@ mod tests {
         assert_eq!(get_pending_tool_input_with(&entries, &checker), None);
     }
 
+    fn assistant_with(content: Vec<MessageContent>) -> SessionEntry {
+        SessionEntry::Assistant {
+            base: create_base(),
+            message: AssistantMessage {
+                model: "claude-opus-5-5".to_string(),
+                id: "msg_test".to_string(),
+                role: "assistant".to_string(),
+                content,
+                stop_reason: Some("tool_use".to_string()),
+                stop_sequence: None,
+                usage: None,
+            },
+        }
+    }
+
+    fn tool_use(id: &str, name: &str, input: serde_json::Value) -> MessageContent {
+        MessageContent::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+        }
+    }
+
+    fn tool_result(id: &str) -> MessageContent {
+        MessageContent::ToolResult {
+            tool_use_id: id.to_string(),
+            content: "ok".to_string(),
+            is_error: None,
+        }
+    }
+
+    /// Pins the contract of `get_pending_tool_input_with`: the input of the
+    /// first pending tool, in content order, that the checker does not
+    /// auto-approve, read from the last assistant message only. Completed and
+    /// auto-approved tools (including AskUserQuestion) are skipped.
     #[test]
-    fn test_unresolved_tool_uses_follow_results_in_later_user_entries() {
-        let lines = [
-            r#"{"type":"assistant","uuid":"u1","timestamp":"2026-09-23T00:00:00Z","message":{"model":"m","id":"msg1","role":"assistant","content":[{"type":"tool_use","id":"toolu_a","name":"Read","input":{}}],"stop_reason":null,"stop_sequence":null}}"#,
-            r#"{"type":"assistant","uuid":"u2","timestamp":"2026-09-23T00:00:00Z","message":{"model":"m","id":"msg1","role":"assistant","content":[{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"make"}}],"stop_reason":null,"stop_sequence":null}}"#,
-            r#"{"type":"user","uuid":"u3","timestamp":"2026-09-23T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a","content":"ok"}]}}"#,
-        ];
-        let entries = crate::session::parser::parse_jsonl_entries(
-            lines.iter().map(|l| l.to_string()).collect(),
+    fn test_get_pending_tool_input_first_non_auto_approved_pending_tool() {
+        // No allow rules: Read and AskUserQuestion never prompt, Bash and Write do.
+        let checker = PermissionChecker::from_files(&[]);
+        let older = assistant_with(vec![tool_use(
+            "toolu_old",
+            "Bash",
+            serde_json::json!({"command": "old"}),
+        )]);
+        let last = assistant_with(vec![
+            tool_use("toolu_1", "Read", serde_json::json!({"file_path": "/a"})),
+            tool_use("toolu_2", "Bash", serde_json::json!({"command": "done"})),
+            tool_use("toolu_3", "AskUserQuestion", serde_json::json!({"q": 1})),
+            tool_use("toolu_4", "Write", serde_json::json!({"file_path": "/w"})),
+            tool_use("toolu_5", "Bash", serde_json::json!({"command": "later"})),
+            tool_result("toolu_2"),
+        ]);
+        let entries = vec![older, last];
+        assert_eq!(
+            get_pending_tool_input_with(&entries, &checker),
+            Some(serde_json::json!({"file_path": "/w"}))
         );
-        assert_eq!(entries.len(), 3);
-        let unresolved = unresolved_tool_uses(&entries);
-        assert_eq!(unresolved.len(), 1);
-        assert_eq!(unresolved[0].0, "Bash");
-        assert_eq!(unresolved[0].1["command"], "make");
+        // The name lookup short-circuits on the pending AskUserQuestion first.
+        assert_eq!(
+            get_pending_tool_name_with(&entries, &checker),
+            Some("AskUserQuestion".to_string())
+        );
+
+        // Every pending tool auto-approved, or all completed: no input.
+        let approved = vec![assistant_with(vec![
+            tool_use("toolu_1", "Read", serde_json::json!({})),
+            tool_use("toolu_2", "Bash", serde_json::json!({"command": "x"})),
+            tool_result("toolu_2"),
+        ])];
+        assert_eq!(get_pending_tool_input_with(&approved, &checker), None);
+        assert_eq!(get_pending_tool_name_with(&approved, &checker), None);
+        assert_eq!(get_pending_tool_input_with(&[], &checker), None);
+    }
+
+    #[test]
+    fn test_check_all_tools_completed_without_tool_uses() {
+        assert!(check_all_tools_completed(&[]));
+        assert!(check_all_tools_completed(&[MessageContent::Text {
+            text: "hi".to_string()
+        }]));
     }
 }

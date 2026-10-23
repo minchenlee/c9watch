@@ -2,6 +2,8 @@
 mod accuracy_matrix;
 mod agent_liveness;
 mod cache;
+pub mod claude_files;
+pub use claude_files::{find_claude_session_file, find_claude_session_file_under};
 pub mod codex;
 pub mod cursor;
 pub mod custom_names;
@@ -63,10 +65,7 @@ pub(crate) fn validate_rename_request(
     Ok(())
 }
 pub use state::DetectorState;
-pub use status::{
-    determine_status, determine_status_with_context, get_pending_tool_input, get_pending_tool_name,
-    SessionStatus,
-};
+pub use status::{determine_status, get_pending_tool_name, is_question_tool, SessionStatus};
 
 pub mod history;
 pub use history::{deep_search, get_history, DeepSearchHit, HistoryEntry};
@@ -74,6 +73,15 @@ pub use history::{deep_search, get_history, DeepSearchHit, HistoryEntry};
 mod codex_archive;
 pub mod cost;
 pub use cost::{get_cost_data, CostData};
+
+/// Display name for a project path: its last component, or `"unknown"`.
+pub(crate) fn project_name_from_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
 
 pub(crate) fn codex_session_ids(home: &std::path::Path, prefix: &str) -> Vec<String> {
     codex_archive::load_default_listing(home)

@@ -51,16 +51,17 @@
 	import { getSessionStatusColor, getSessionStatusLabel, getSubagentStatusColor, getSubagentStatusLabel, getWorkerStatusColor, getWorkerStatusLabel } from '$lib/status-utils';
 	import { isTauri } from '$lib/ws';
 	import ProviderBadge from './ProviderBadge.svelte';
-	import { canSessionAction, providerOf, providerSessionKey, sessionKeyOf } from '$lib/provider';
-	import { getConversation } from '$lib/api';
+	import { canSessionAction, providerFilterLabel, providerOf, providerSessionKey, sessionKeyOf } from '$lib/provider';
 	import {
 		conversationLoad,
 		conversationLoadLabel,
 		isSessionLoading,
 		isToolsLoading,
-		toolsLoadedFor,
-		withConversationLoader
+		loadToolsConversation,
+		toolsLoadedFor
 	} from '$lib/stores/conversation-loader';
+	import { isMessageVisible, isNavItem } from '$lib/message-filters';
+	import { sessionDisplayTitle } from '$lib/session-utils';
 	import ConversationLoadBar from './ConversationLoadBar.svelte';
 
 	interface Props {
@@ -184,12 +185,7 @@
 
 	let navItemCount = $derived.by(() => {
 		if (!conversation) return 0;
-		return conversation.messages.filter(msg =>
-			msg.messageType === 'User' ||
-			msg.messageType === 'System' ||
-			(showThinking && msg.messageType === 'Thinking') ||
-			(showTools && msg.messageType === 'ToolUse' && (msg.content?.length ?? 0) > 0)
-		).length;
+		return conversation.messages.filter(msg => isNavItem(msg, showTools, showThinking)).length;
 	});
 
 	let toolsLoading = $derived(isToolsLoading(session.id, providerOf(session), $conversationLoad));
@@ -222,20 +218,12 @@
 		const next = !showTools;
 		if (sessionLoading) return;
 		if (next && $toolsLoadedFor !== requestedKey) {
-			try {
-				const conv = await withConversationLoader(requestedId, requestedProvider, 'tools', () =>
-					getConversation(requestedId, requestedProvider, true)
-				);
-				if (disposed ||
-					providerSessionKey(providerOf(session), session.id) !== requestedKey ||
-					providerSessionKey(conv.provider ?? requestedProvider, conv.sessionId) !== requestedKey
-				) return;
-				currentConversation.set(conv);
-				toolsLoadedFor.set(requestedKey);
-			} catch (error) {
-				console.error('Failed to load tools:', error);
-				return;
-			}
+			const loaded = await loadToolsConversation(
+				{ sessionId: requestedId, provider: requestedProvider },
+				() => !disposed && providerSessionKey(providerOf(session), session.id) === requestedKey,
+				(conv) => currentConversation.set(conv)
+			);
+			if (!loaded) return;
 		}
 		if (disposed || session.id !== requestedId) return;
 		showTools = next;
@@ -333,7 +321,7 @@
 			sessionId: child.id,
 			provider: providerOf(child),
 			agentType: child.agentRole || child.agentNickname || 'subagent',
-				description: child.agentNickname || child.codexTitle || child.cursorTitle || child.summary || child.firstPrompt || child.agentRole || (providerOf(child) === 'cursor' ? 'Cursor subagent' : providerOf(child) === 'pi' ? 'Pi subagent' : providerOf(child) === 'opencode' ? 'OpenCode subagent' : 'Codex subagent'),
+				description: child.agentNickname || child.codexTitle || child.cursorTitle || child.summary || child.firstPrompt || child.agentRole || `${providerFilterLabel(providerOf(child))} subagent`,
 			startedAt: child.startedAtMs ? new Date(child.startedAtMs).toISOString() : child.modified,
 			completedAt: child.status === SessionStatus.Working ? null : child.modified,
 			parentSessionId: session.id,
@@ -366,7 +354,7 @@
 	let previewError = $derived(previewState.error);
 
 	async function openSubagentPreview(sa: SubagentInfo) {
-		if ((sa.provider === 'codex' || sa.provider === 'cursor' || sa.provider === 'pi' || sa.provider === 'opencode') && sa.sessionId) {
+		if (providerOf(sa) !== 'claudeCode' && sa.sessionId) {
 			expandedSessionId.set(providerSessionKey(sa.provider, sa.sessionId));
 			return;
 		}
@@ -484,7 +472,7 @@
 								onmouseenter={() => tipEnter(session.id)}
 								onmouseleave={tipLeave}
 								onmousemove={tipMove}
-							>{session.customTitle || session.officialName || session.codexTitle || session.cursorTitle || session.summary || session.firstPrompt || 'New Session'}</h2>
+							>{sessionDisplayTitle(session) || 'New Session'}</h2>
 							{#if PM_ORCHESTRATION_ENABLED && session.workerOf}
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<span
@@ -700,7 +688,7 @@
 							</div>
 						{/if}
 						{#each visibleMessages as message, i (sw.startIndex + i)}
-							{#if (showTools || (message.messageType !== 'ToolUse' && message.messageType !== 'ToolResult')) && (showThinking || message.messageType !== 'Thinking')}
+							{#if isMessageVisible(message, showTools, showThinking)}
 								<div data-msg-index={sw.startIndex + i} in:messageIn={{ index: Math.min(i, 15) }}>
 									<MessageBubble {message} />
 								</div>

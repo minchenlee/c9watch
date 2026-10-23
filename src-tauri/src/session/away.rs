@@ -11,7 +11,7 @@ use crate::session::cache::{
     read_lines_from_offset, validate_cached_prefix, FileVersion, PrefixSnapshot,
     PrefixValidationKind, PREFIX_FULL_REVALIDATION_INTERVAL,
 };
-use crate::session::status::SessionStatus;
+use crate::session::status::{is_question_tool, SessionStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
@@ -38,7 +38,7 @@ pub enum WaitingFor {
 pub fn waiting_for(status: &SessionStatus, pending_tool_name: Option<&str>) -> Option<WaitingFor> {
     match status {
         SessionStatus::NeedsAttention => Some(match pending_tool_name {
-            Some("Question") | Some("AskUserQuestion") => WaitingFor::Question,
+            name if is_question_tool(name) => WaitingFor::Question,
             Some(tool) if !tool.trim().is_empty() => WaitingFor::Approval {
                 tool: tool.to_string(),
             },

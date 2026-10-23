@@ -1,8 +1,9 @@
-import { get, writable } from 'svelte/store';
+import { get, writable, type Writable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
+import { getConversation } from '$lib/api';
 import { isTauri, useWebSocket, wsClient } from '$lib/ws';
 import { providerSessionKey } from '$lib/provider';
-import type { SessionProvider } from '$lib/types';
+import type { Conversation, SessionProvider } from '$lib/types';
 
 export type ConversationLoadKind = 'conversation' | 'tools';
 
@@ -105,5 +106,91 @@ export async function withConversationLoader<T>(
 		if (get(conversationLoad)?.generation === generation) {
 			conversationLoad.set(null);
 		}
+	}
+}
+
+export interface PreviewTarget {
+	sessionId: string;
+	provider?: SessionProvider;
+}
+
+/** True when a conversation pushed by the preview overlay belongs to the open entry. */
+export function acceptsConversation(
+	entry: PreviewTarget | null,
+	conv: Pick<Conversation, 'sessionId' | 'provider'>
+): boolean {
+	return (
+		!!entry &&
+		providerSessionKey(entry.provider, entry.sessionId) ===
+			providerSessionKey(conv.provider, conv.sessionId)
+	);
+}
+
+export interface PreviewLoaderDeps {
+	getConversation: typeof getConversation;
+	withConversationLoader: typeof withConversationLoader;
+	toolsLoadedFor: Writable<string | null>;
+}
+
+const defaultPreviewLoaderDeps: PreviewLoaderDeps = {
+	getConversation,
+	withConversationLoader,
+	toolsLoadedFor
+};
+
+/**
+ * Load the conversation for a HISTORY / COST preview overlay without tool
+ * dumps. `apply` runs only when the response is still wanted: the request is
+ * still current (`isCurrent`), the overlay has not already loaded tools for
+ * this session, and the response is for the requested session.
+ */
+export async function loadPreviewConversation(
+	entry: PreviewTarget,
+	isCurrent: () => boolean,
+	apply: (conv: Conversation) => void,
+	deps: PreviewLoaderDeps = defaultPreviewLoaderDeps
+): Promise<void> {
+	deps.toolsLoadedFor.set(null);
+	try {
+		const requestedKey = providerSessionKey(entry.provider, entry.sessionId);
+		const conv = await deps.withConversationLoader(entry.sessionId, entry.provider, 'conversation', () =>
+			deps.getConversation(entry.sessionId, entry.provider, false)
+		);
+		if (!isCurrent()) return;
+		if (get(deps.toolsLoadedFor) === requestedKey) return;
+		if (providerSessionKey(conv.provider ?? entry.provider, conv.sessionId) !== requestedKey) return;
+		apply(conv);
+	} catch (e) {
+		if (isCurrent()) console.error('Failed to load conversation:', e);
+	}
+}
+
+/**
+ * Load the conversation with tool dumps for a conversation overlay's
+ * "Show Tools" toggle. `apply` runs, and `toolsLoadedFor` is set, only when
+ * the overlay still wants the response (`isCurrent`: not disposed and still
+ * showing the requested session) and the response is for the requested
+ * session. Returns true when the tools were applied.
+ */
+export async function loadToolsConversation(
+	target: PreviewTarget,
+	isCurrent: () => boolean,
+	apply: (conv: Conversation) => void,
+	deps: PreviewLoaderDeps = defaultPreviewLoaderDeps
+): Promise<boolean> {
+	const requestedKey = providerSessionKey(target.provider, target.sessionId);
+	try {
+		const conv = await deps.withConversationLoader(target.sessionId, target.provider, 'tools', () =>
+			deps.getConversation(target.sessionId, target.provider, true)
+		);
+		if (!isCurrent() ||
+			providerSessionKey(conv.provider ?? target.provider, conv.sessionId) !== requestedKey
+		) return false;
+		apply(conv);
+		deps.toolsLoadedFor.set(requestedKey);
+		return true;
+	} catch (error) {
+		console.error('Failed to load tools:', error);
+		return false;
 	}
 }

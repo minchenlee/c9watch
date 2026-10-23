@@ -1,8 +1,6 @@
 use crate::claude_hooks::{HookSessionState, PendingPermission};
 use crate::session::cache::{
-    can_incrementally_read, extend_prefix_snapshot, hash_file_prefix, next_full_verify_offset,
-    read_lines_from_offset, validate_cached_prefix, FileVersion, PrefixSnapshot,
-    PrefixValidationKind,
+    read_lines_from_offset, refresh_incremental_entry, FileVersion, IncrementalEntry,
 };
 use crate::session::codex::CodexLifecycle;
 use crate::session::cursor::CursorLifecycle;
@@ -242,45 +240,15 @@ pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, DetectionDiagnostic
     let cursor_result = owners.detect_cursor();
     let pi_result = owners.detect_pi();
     let opencode_sessions = super::opencode::detect_once();
-    match claude_result {
-        Ok((mut detected, diagnostics)) => {
-            if let Some((mut codex_sessions, _)) = codex_result {
-                detected.append(&mut codex_sessions);
-            }
-            if let Some((mut cursor_sessions, _)) = cursor_result {
-                detected.append(&mut cursor_sessions);
-            }
-            if let Some((mut pi_sessions, _)) = pi_result {
-                detected.append(&mut pi_sessions);
-            }
-            detected.extend(opencode_sessions);
-            enrich_detected_sessions(detected, diagnostics)
-        }
-        Err(error) => {
-            let mut fallback = opencode_sessions;
-            let mut diagnostics = DetectionDiagnostics::default();
-            if let Some((sessions, extra)) = codex_result {
-                fallback.extend(sessions);
-                diagnostics = extra;
-            }
-            if let Some((sessions, extra)) = cursor_result {
-                fallback.extend(sessions);
-                if diagnostics.claude_processes_found == 0 {
-                    diagnostics = extra;
-                }
-            }
-            if let Some((sessions, extra)) = pi_result {
-                fallback.extend(sessions);
-                if diagnostics.claude_processes_found == 0 {
-                    diagnostics = extra;
-                }
-            }
-            if !fallback.is_empty() {
-                return enrich_detected_sessions(fallback, diagnostics);
-            }
-            Err(format!("Failed to detect sessions: {error}"))
-        }
-    }
+    let (detected, diagnostics) = crate::session::state::merge_provider_results(
+        claude_result,
+        codex_result,
+        cursor_result,
+        pi_result,
+        opencode_sessions,
+    )
+    .map_err(|error| format!("Failed to detect sessions: {error}"))?;
+    enrich_detected_sessions(detected, diagnostics)
 }
 
 /// Detect sessions using a SessionSource trait object and enrich them.
@@ -315,51 +283,16 @@ pub fn enrich_detected_sessions(
         let session_id = identity.session_id.clone();
 
         if let Some(summary) = detected.codex_summary.as_ref() {
-            let first_prompt = summary
-                .first_prompt()
-                .map(|prompt| truncate_string(prompt, 100))
-                .unwrap_or_else(|| "(No conversation yet)".to_string());
-            let latest_message = summary
-                .latest_message()
-                .map(|message| truncate_string(message, 200))
-                .unwrap_or_default();
-            let notification_preview = summary
-                .messages
-                .iter()
-                .rev()
-                .take_while(|m| m.message_type != crate::session::MessageType::User)
-                .find(|m| {
-                    m.message_type == crate::session::MessageType::Assistant
-                        && !m.content.trim().is_empty()
-                })
-                .map(|m| truncate_string(&m.content, 240));
-            let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
-                .or_else(|| detected.agent_nickname.clone())
-                .unwrap_or_else(|| detected.project_name.clone());
-            let codex_title = crate::session::codex::get_cached_codex_thread_title(&session_id);
-            let modified = if summary.last_timestamp.is_empty() {
-                detected
-                    .started_at_ms
-                    .and_then(DateTime::<Utc>::from_timestamp_millis)
-                    .map(|timestamp| timestamp.to_rfc3339())
-                    .unwrap_or_default()
-            } else {
-                summary.last_timestamp.clone()
-            };
             sessions.push(Session {
-                id: session_id.clone(),
-                session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
-                pid: detected.pid,
-                session_name,
+                session_name: default_session_name(&detected, &custom_names, &session_id),
                 custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
-                codex_title,
-                cursor_title: None,
-                project_path: detected.cwd.to_string_lossy().to_string(),
-                git_branch: None,
-                first_prompt,
-                summary: None,
+                codex_title: crate::session::codex::get_cached_codex_thread_title(&session_id),
+                first_prompt: summary
+                    .first_prompt()
+                    .map(|prompt| truncate_string(prompt, 100))
+                    .unwrap_or_else(|| "(No conversation yet)".to_string()),
                 message_count: summary.messages.len() as u32,
-                modified,
+                modified: modified_or_started(&summary.last_timestamp, detected.started_at_ms),
                 status: codex_status(summary, now_ms),
                 source_health: Some(health_from_last_timestamp(
                     &summary.last_timestamp,
@@ -369,149 +302,67 @@ pub fn enrich_detected_sessions(
                         crate::session::codex::IDLE_FRESHNESS_SECS
                     },
                 )),
-                latest_message,
-                notification_preview,
+                latest_message: summary
+                    .latest_message()
+                    .map(|message| truncate_string(message, 200))
+                    .unwrap_or_default(),
+                notification_preview: assistant_preview_since_last_user(
+                    summary
+                        .messages
+                        .iter()
+                        .map(|m| (&m.message_type, m.content.as_str())),
+                ),
                 pending_tool_name: summary.pending_tool_name(now_ms).map(str::to_string),
-                pending_tool_input: None,
-                waiting_for: None,
-                last_assistant_message: None,
-                transcript_path: None,
-                worker_of: None,
-                official_name: detected.official_name.clone(),
-                started_at_ms: detected.started_at_ms,
-                provider: detected.provider,
-                surface: detected.surface,
-                kind: detected.kind,
-                entrypoint: detected.entrypoint.clone(),
-                agent_kind: detected.agent_kind,
-                parent_thread_id: detected.parent_thread_id.clone(),
-                root_session_id: detected.root_session_id.clone(),
-                agent_path: detected.agent_path.clone(),
-                agent_nickname: detected.agent_nickname.clone(),
-                agent_role: detected.agent_role.clone(),
-                internal_kind: detected.internal_kind.clone(),
-                open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
-                can_open: detected.can_open,
-                can_stop: detected.can_stop,
-                can_rename: detected.can_rename,
+                ..base_session(&detected, &session_id)
             });
             continue;
         }
 
         if let Some(summary) = detected.cursor_summary.as_ref() {
-            let first_prompt = summary
-                .first_prompt()
-                .map(|prompt| truncate_string(prompt, 100))
-                .unwrap_or_else(|| "(No conversation yet)".to_string());
-            let latest_message = summary
-                .latest_message()
-                .map(|message| truncate_string(message, 200))
-                .unwrap_or_default();
-            let notification_preview = summary
-                .messages
-                .iter()
-                .rev()
-                .take_while(|m| m.message_type != crate::session::MessageType::User)
-                .find(|m| {
-                    m.message_type == crate::session::MessageType::Assistant
-                        && !m.content.trim().is_empty()
-                })
-                .map(|m| truncate_string(&m.content, 240));
-            let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
-                .or_else(|| detected.agent_nickname.clone())
-                .unwrap_or_else(|| detected.project_name.clone());
-            let modified = if summary.last_timestamp.is_empty() {
-                detected
-                    .started_at_ms
-                    .and_then(DateTime::<Utc>::from_timestamp_millis)
-                    .map(|timestamp| timestamp.to_rfc3339())
-                    .unwrap_or_default()
-            } else {
-                summary.last_timestamp.clone()
-            };
-            let status = if summary.lifecycle == CursorLifecycle::Working {
-                if summary.empty {
-                    SessionStatus::Connecting
-                } else {
-                    SessionStatus::Working
-                }
-            } else {
-                SessionStatus::WaitingForInput
-            };
+            let working = summary.lifecycle == CursorLifecycle::Working;
             sessions.push(Session {
-                id: session_id.clone(),
-                session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
-                pid: detected.pid,
-                session_name,
+                session_name: default_session_name(&detected, &custom_names, &session_id),
                 custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id)
                     .or_else(|| detected.official_name.clone()),
-                codex_title: None,
                 cursor_title: summary.cursor_title.clone(),
-                project_path: detected.cwd.to_string_lossy().to_string(),
-                git_branch: None,
-                first_prompt,
-                summary: None,
+                first_prompt: summary
+                    .first_prompt()
+                    .map(|prompt| truncate_string(prompt, 100))
+                    .unwrap_or_else(|| "(No conversation yet)".to_string()),
                 message_count: summary.messages.len() as u32,
-                modified,
-                status,
+                modified: modified_or_started(&summary.last_timestamp, detected.started_at_ms),
+                status: transcript_status(working, summary.empty),
                 source_health: Some(health_from_last_timestamp(
                     &summary.last_timestamp,
-                    if summary.lifecycle == CursorLifecycle::Working {
+                    if working {
                         crate::session::cursor::WORKING_FRESHNESS_SECS
                     } else {
                         crate::session::cursor::IDLE_FRESHNESS_SECS
                     },
                 )),
-                latest_message,
-                notification_preview,
-                pending_tool_name: None,
-                pending_tool_input: None,
-                waiting_for: None,
-                last_assistant_message: None,
-                transcript_path: None,
-                worker_of: None,
-                official_name: detected.official_name.clone(),
-                started_at_ms: detected.started_at_ms,
-                provider: detected.provider,
-                surface: detected.surface,
-                kind: detected.kind,
-                entrypoint: detected.entrypoint.clone(),
-                agent_kind: detected.agent_kind,
-                parent_thread_id: detected.parent_thread_id.clone(),
-                root_session_id: detected.root_session_id.clone(),
-                agent_path: detected.agent_path.clone(),
-                agent_nickname: detected.agent_nickname.clone(),
-                agent_role: detected.agent_role.clone(),
-                internal_kind: detected.internal_kind.clone(),
-                open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
-                can_open: detected.can_open,
-                can_stop: detected.can_stop,
-                can_rename: detected.can_rename,
+                latest_message: summary
+                    .latest_message()
+                    .map(|message| truncate_string(message, 200))
+                    .unwrap_or_default(),
+                notification_preview: assistant_preview_since_last_user(
+                    summary
+                        .messages
+                        .iter()
+                        .map(|m| (&m.message_type, m.content.as_str())),
+                ),
+                ..base_session(&detected, &session_id)
             });
             continue;
         }
 
         if let Some(summary) = detected.opencode_summary.as_ref() {
-            let first_prompt = detected.official_name.clone().unwrap_or_default();
-            let latest_message = summary.diagnostic.clone();
-            let session_name = detected.project_name.clone();
-            let modified = summary.modified.clone();
-            let status = summary.status.clone();
             sessions.push(Session {
-                id: session_id.clone(),
-                session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
-                pid: detected.pid,
-                session_name,
+                session_name: detected.project_name.clone(),
                 custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
-                codex_title: None,
-                cursor_title: None,
-                project_path: detected.cwd.to_string_lossy().to_string(),
-                git_branch: None,
-                first_prompt,
-                summary: None,
+                first_prompt: detected.official_name.clone().unwrap_or_default(),
                 message_count: 0,
-                modified,
-                status,
+                modified: summary.modified.clone(),
+                status: summary.status.clone(),
                 // The OpenCode preview is HTTP-polled, not transcript-backed; treat
                 // the snapshot as fresh when it carries a timestamp, partial when not.
                 // The window matches the detector's snapshot freshness bound.
@@ -519,117 +370,42 @@ pub fn enrich_detected_sessions(
                     &summary.modified,
                     (crate::session::opencode::IDLE_FRESHNESS_MS / 1000) as u64,
                 )),
-                latest_message,
-                notification_preview: None,
-                pending_tool_name: None,
-                pending_tool_input: None,
-                waiting_for: None,
-                last_assistant_message: None,
-                transcript_path: None,
-                worker_of: None,
-                official_name: detected.official_name.clone(),
-                started_at_ms: detected.started_at_ms,
-                provider: detected.provider,
-                surface: detected.surface,
-                kind: detected.kind,
-                entrypoint: detected.entrypoint.clone(),
-                agent_kind: detected.agent_kind,
-                parent_thread_id: detected.parent_thread_id.clone(),
-                root_session_id: detected.root_session_id.clone(),
-                agent_path: detected.agent_path.clone(),
-                agent_nickname: detected.agent_nickname.clone(),
-                agent_role: detected.agent_role.clone(),
-                internal_kind: detected.internal_kind.clone(),
-                open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
-                can_open: detected.can_open,
-                can_stop: detected.can_stop,
-                can_rename: detected.can_rename,
+                latest_message: summary.diagnostic.clone(),
+                ..base_session(&detected, &session_id)
             });
             continue;
         }
 
         if let Some(summary) = detected.pi_summary.as_ref() {
-            let first_prompt = summary
-                .first_prompt
-                .as_deref()
-                .map(|prompt| truncate_string(prompt, 100))
-                .filter(|prompt| !prompt.trim().is_empty())
-                .unwrap_or_else(|| "(No conversation yet)".to_string());
-            let latest_message = summary
-                .latest_snippet
-                .as_deref()
-                .map(|message| truncate_string(message, 200))
-                .unwrap_or_default();
-            let notification_preview = summary.latest_assistant_text.clone();
-            let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
-                .or_else(|| detected.agent_nickname.clone())
-                .unwrap_or_else(|| detected.project_name.clone());
-            let modified = if summary.last_timestamp.is_empty() {
-                detected
-                    .started_at_ms
-                    .and_then(DateTime::<Utc>::from_timestamp_millis)
-                    .map(|timestamp| timestamp.to_rfc3339())
-                    .unwrap_or_default()
-            } else {
-                summary.last_timestamp.clone()
-            };
-            let status = if summary.lifecycle == PiLifecycle::Working {
-                if summary.empty {
-                    SessionStatus::Connecting
-                } else {
-                    SessionStatus::Working
-                }
-            } else {
-                SessionStatus::WaitingForInput
-            };
+            let working = summary.lifecycle == PiLifecycle::Working;
             sessions.push(Session {
-                id: session_id.clone(),
-                session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
-                pid: detected.pid,
-                session_name,
+                session_name: default_session_name(&detected, &custom_names, &session_id),
                 custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
-                codex_title: None,
-                cursor_title: None,
-                project_path: detected.cwd.to_string_lossy().to_string(),
-                git_branch: None,
-                first_prompt,
-                summary: None,
+                first_prompt: summary
+                    .first_prompt
+                    .as_deref()
+                    .map(|prompt| truncate_string(prompt, 100))
+                    .filter(|prompt| !prompt.trim().is_empty())
+                    .unwrap_or_else(|| "(No conversation yet)".to_string()),
                 message_count: summary.message_count as u32,
-                modified,
-                status,
+                modified: modified_or_started(&summary.last_timestamp, detected.started_at_ms),
+                status: transcript_status(working, summary.empty),
                 source_health: Some(health_from_last_timestamp(
                     &summary.last_timestamp,
-                    if summary.lifecycle == PiLifecycle::Working {
+                    if working {
                         crate::session::pi::PI_FRESHNESS_WORKING_SECS
                     } else {
                         crate::session::pi::PI_FRESHNESS_IDLE_SECS
                     },
                 )),
-                latest_message,
-                notification_preview,
+                latest_message: summary
+                    .latest_snippet
+                    .as_deref()
+                    .map(|message| truncate_string(message, 200))
+                    .unwrap_or_default(),
+                notification_preview: summary.latest_assistant_text.clone(),
                 pending_tool_name: summary.pending_tool_name.clone(),
-                pending_tool_input: None,
-                waiting_for: None,
-                last_assistant_message: None,
-                transcript_path: None,
-                worker_of: None,
-                official_name: detected.official_name.clone(),
-                started_at_ms: detected.started_at_ms,
-                provider: detected.provider,
-                surface: detected.surface,
-                kind: detected.kind,
-                entrypoint: detected.entrypoint.clone(),
-                agent_kind: detected.agent_kind,
-                parent_thread_id: detected.parent_thread_id.clone(),
-                root_session_id: detected.root_session_id.clone(),
-                agent_path: detected.agent_path.clone(),
-                agent_nickname: detected.agent_nickname.clone(),
-                agent_role: detected.agent_role.clone(),
-                internal_kind: detected.internal_kind.clone(),
-                open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
-                can_open: detected.can_open,
-                can_stop: detected.can_stop,
-                can_rename: detected.can_rename,
+                ..base_session(&detected, &session_id)
             });
             continue;
         }
@@ -854,6 +630,103 @@ pub fn enrich_detected_sessions(
     Ok((sessions, diagnostics))
 }
 
+/// Card fields that come straight from the detected session, plus empty
+/// defaults. Provider branches override the fields they compute
+/// (name, prompt, counts, status, health, previews) with struct-update syntax.
+fn base_session(detected: &DetectedSession, session_id: &str) -> Session {
+    Session {
+        id: session_id.to_string(),
+        session_key: SessionIdentity::new(detected.provider, session_id.to_string()).key(),
+        pid: detected.pid,
+        session_name: detected.project_name.clone(),
+        custom_title: None,
+        codex_title: None,
+        cursor_title: None,
+        project_path: detected.cwd.to_string_lossy().to_string(),
+        git_branch: None,
+        first_prompt: String::new(),
+        summary: None,
+        message_count: 0,
+        modified: String::new(),
+        status: SessionStatus::Connecting,
+        source_health: None,
+        latest_message: String::new(),
+        notification_preview: None,
+        pending_tool_name: None,
+        pending_tool_input: None,
+        waiting_for: None,
+        last_assistant_message: None,
+        transcript_path: None,
+        worker_of: None,
+        official_name: detected.official_name.clone(),
+        started_at_ms: detected.started_at_ms,
+        provider: detected.provider,
+        surface: detected.surface,
+        kind: detected.kind,
+        entrypoint: detected.entrypoint.clone(),
+        agent_kind: detected.agent_kind,
+        parent_thread_id: detected.parent_thread_id.clone(),
+        root_session_id: detected.root_session_id.clone(),
+        agent_path: detected.agent_path.clone(),
+        agent_nickname: detected.agent_nickname.clone(),
+        agent_role: detected.agent_role.clone(),
+        internal_kind: detected.internal_kind.clone(),
+        open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
+        can_open: detected.can_open,
+        can_stop: detected.can_stop,
+        can_rename: detected.can_rename,
+    }
+}
+
+/// c9watch custom name, then the agent nickname, then the project name.
+fn default_session_name(
+    detected: &DetectedSession,
+    custom_names: &crate::session::CustomNames,
+    session_id: &str,
+) -> String {
+    claude_custom_name(detected.provider, custom_names, session_id)
+        .or_else(|| detected.agent_nickname.clone())
+        .unwrap_or_else(|| detected.project_name.clone())
+}
+
+/// The transcript's last timestamp, or the start time when it has none yet.
+fn modified_or_started(last_timestamp: &str, started_at_ms: Option<i64>) -> String {
+    if last_timestamp.is_empty() {
+        started_at_ms
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
+            .map(|timestamp| timestamp.to_rfc3339())
+            .unwrap_or_default()
+    } else {
+        last_timestamp.to_string()
+    }
+}
+
+/// Status of a transcript-backed provider: an empty working transcript is
+/// still connecting.
+fn transcript_status(working: bool, empty: bool) -> SessionStatus {
+    if !working {
+        SessionStatus::WaitingForInput
+    } else if empty {
+        SessionStatus::Connecting
+    } else {
+        SessionStatus::Working
+    }
+}
+
+/// Newest non-blank assistant text after the last user message, truncated
+/// for a notification preview. Takes `(message_type, content)` in order.
+fn assistant_preview_since_last_user<'a>(
+    messages: impl DoubleEndedIterator<Item = (&'a crate::session::MessageType, &'a str)>,
+) -> Option<String> {
+    messages
+        .rev()
+        .take_while(|(message_type, _)| **message_type != crate::session::MessageType::User)
+        .find(|(message_type, content)| {
+            **message_type == crate::session::MessageType::Assistant && !content.trim().is_empty()
+        })
+        .map(|(_, content)| truncate_string(content, 240))
+}
+
 /// Derive the card's away fields from what enrichment already computed.
 fn fill_away_fields(sessions: &mut [Session]) {
     for session in sessions.iter_mut() {
@@ -866,17 +739,6 @@ fn fill_away_fields(sessions: &mut [Session]) {
     }
 }
 
-/// Collapse duplicate provider-scoped identities, newest observation wins.
-///
-/// The same session can appear in multiple project dirs (or be re-observed
-/// after reconnect/reuse). Timestamps compare as instants, so differing
-/// RFC3339 offsets order correctly. An unparseable timestamp always loses to
-/// a parseable one; when neither parses (or the instants tie), the first
-/// observation is kept for determinism. Cross-provider identities never
-/// collide because the key is namespaced by provider.
-/// Parse an RFC3339 `modified` stamp as an instant. Timezone offsets are
-/// normalized, so `00:30:00+02:00` correctly compares earlier than
-/// `23:00:00Z` — something a lexicographic string compare gets wrong.
 /// Codex status from the rollout lifecycle plus the pending tool call.
 fn codex_status(
     summary: &crate::session::codex::CodexRolloutSummary,
@@ -891,12 +753,23 @@ fn codex_status(
     }
 }
 
+/// Parse an RFC3339 `modified` stamp as an instant. Timezone offsets are
+/// normalized, so `00:30:00+02:00` correctly compares earlier than
+/// `23:00:00Z` — something a lexicographic string compare gets wrong.
 fn modified_instant(modified: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(modified)
         .ok()
         .map(|ts| ts.with_timezone(&chrono::Utc))
 }
 
+/// Collapse duplicate provider-scoped identities, newest observation wins.
+///
+/// The same session can appear in multiple project dirs (or be re-observed
+/// after reconnect/reuse). Timestamps compare as instants, so differing
+/// RFC3339 offsets order correctly. An unparseable timestamp always loses to
+/// a parseable one; when neither parses (or the instants tie), the first
+/// observation is kept for determinism. Cross-provider identities never
+/// collide because the key is namespaced by provider.
 fn dedup_newest_wins(sessions: Vec<Session>) -> Vec<Session> {
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut out: Vec<Session> = Vec::with_capacity(sessions.len());
@@ -1099,18 +972,8 @@ fn count_messages_in_lines(lines: &[String]) -> u32 {
 }
 
 /// Cached message count for one file: the version stamp and byte offset the
-/// count is current as of.
-struct MessageCountCacheEntry {
-    stamp: FileVersion,
-    offset: u64,
-    count: u32,
-    prefix: Option<PrefixSnapshot>,
-    next_full_verify_offset: u64,
-    last_full_validation_at: Instant,
-    #[cfg(test)]
-    last_prefix_validation_bytes: u64,
-    last_access: Instant,
-}
+/// count (`value`) is current as of.
+type MessageCountCacheEntry = IncrementalEntry<u32>;
 
 /// A live session's transcript grows every poll by definition, so a plain
 /// unchanged-file cache can't help it — this also tracks the scanned byte
@@ -1169,127 +1032,18 @@ fn count_messages_in_jsonl_at(path: &Path, now: Instant) -> u32 {
         }
     };
 
-    if let Some((
-        previous_stamp,
-        previous_offset,
-        previous_count,
-        previous_prefix,
-        previous_next_full_verify_offset,
-        previous_last_full_validation_at,
-    )) = cache.get(path).map(|existing| {
-        (
-            existing.stamp,
-            existing.offset,
-            existing.count,
-            existing.prefix,
-            existing.next_full_verify_offset,
-            existing.last_full_validation_at,
-        )
-    }) {
-        if let Some(previous_prefix) = previous_prefix {
-            if previous_stamp == stamp && stamp.supports_unchanged_fast_path() {
-                if now.saturating_duration_since(previous_last_full_validation_at)
-                    < crate::session::cache::PREFIX_FULL_REVALIDATION_INTERVAL
-                {
-                    if let Some(existing) = cache.get_mut(path) {
-                        existing.last_access = now;
-                    }
-                    return previous_count;
-                }
-
-                if let Some(validation) = validate_cached_prefix(
-                    path,
-                    previous_prefix,
-                    previous_next_full_verify_offset,
-                    previous_last_full_validation_at,
-                    now,
-                ) {
-                    if let Some(existing) = cache.get_mut(path) {
-                        existing.prefix = Some(validation.snapshot);
-                        if validation.kind == PrefixValidationKind::Full {
-                            existing.last_full_validation_at = now;
-                            existing.next_full_verify_offset =
-                                next_full_verify_offset(existing.offset);
-                        }
-                        #[cfg(test)]
-                        {
-                            existing.last_prefix_validation_bytes = validation.bytes_read;
-                        }
-                        existing.last_access = now;
-                    }
-                    return previous_count;
-                }
-            }
-
-            if can_incrementally_read(previous_stamp, stamp) {
-                if let Some(validation) = validate_cached_prefix(
-                    path,
-                    previous_prefix,
-                    previous_next_full_verify_offset,
-                    previous_last_full_validation_at,
-                    now,
-                ) {
-                    if let Ok((new_lines, new_offset)) =
-                        read_lines_from_offset(path, previous_offset)
-                    {
-                        if let Ok(prefix) = extend_prefix_snapshot(
-                            path,
-                            previous_offset,
-                            new_offset,
-                            validation.snapshot,
-                        ) {
-                            let count = previous_count + count_messages_in_lines(&new_lines);
-                            let full_validation = validation.kind == PrefixValidationKind::Full;
-                            cache.insert(
-                                path.to_path_buf(),
-                                MessageCountCacheEntry {
-                                    stamp,
-                                    offset: new_offset,
-                                    count,
-                                    prefix: Some(prefix),
-                                    next_full_verify_offset: if full_validation {
-                                        next_full_verify_offset(new_offset)
-                                    } else {
-                                        previous_next_full_verify_offset
-                                    },
-                                    last_full_validation_at: if full_validation {
-                                        now
-                                    } else {
-                                        previous_last_full_validation_at
-                                    },
-                                    #[cfg(test)]
-                                    last_prefix_validation_bytes: validation.bytes_read,
-                                    last_access: now,
-                                },
-                            );
-                            evict_oldest_message_count_entries(&mut cache);
-                            return count;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let Ok((lines, offset)) = read_lines_from_offset(path, 0) else {
-        cache.remove(path);
+    let Some(entry) = refresh_incremental_entry(
+        cache.remove(path),
+        path,
+        stamp,
+        now,
+        count_messages_in_lines,
+        |count, new_lines| count + count_messages_in_lines(new_lines),
+    ) else {
         return 0;
     };
-    let count = count_messages_in_lines(&lines);
-    cache.insert(
-        path.to_path_buf(),
-        MessageCountCacheEntry {
-            stamp,
-            offset,
-            count,
-            prefix: hash_file_prefix(path, offset).ok(),
-            next_full_verify_offset: next_full_verify_offset(offset),
-            last_full_validation_at: now,
-            #[cfg(test)]
-            last_prefix_validation_bytes: 0,
-            last_access: now,
-        },
-    );
+    let count = entry.value;
+    cache.insert(path.to_path_buf(), entry);
     evict_oldest_message_count_entries(&mut cache);
     count
 }
@@ -2258,7 +2012,7 @@ mod placeholder_tests {
                         identity: i as u64 + 1,
                     },
                     offset: i as u64,
-                    count: i as u32,
+                    value: i as u32,
                     prefix: None,
                     next_full_verify_offset: 0,
                     last_full_validation_at: Instant::now(),
@@ -2529,5 +2283,286 @@ mod repair_regressions {
             merge_cli_activity(SessionStatus::NeedsAttention, None, false, Some("Bash")),
             SessionStatus::NeedsAttention
         );
+    }
+
+    /// Every detected-derived field set to a distinct value so a golden diff
+    /// shows any field that is dropped or swapped. `pid` is nonzero with
+    /// `can_open` false, so no process lookup runs for `open_target`.
+    fn golden_detected(provider: SessionProvider, surface: SessionSurface) -> DetectedSession {
+        let mut detected = DetectedSession::with_legacy_defaults(
+            4242,
+            PathBuf::from("/golden/cwd"),
+            PathBuf::from("/golden/project-path"),
+            Some("golden-id".to_string()),
+            "golden-project".to_string(),
+        );
+        detected.provider = provider;
+        detected.surface = surface;
+        detected.kind = SessionKind::Background;
+        detected.entrypoint = Some("golden-entry".to_string());
+        detected.started_at_ms = Some(1_600_000_000_000);
+        detected.official_name = Some("golden-official".to_string());
+        detected.agent_kind = AgentKind::Subagent;
+        detected.parent_thread_id = Some("golden-parent".to_string());
+        detected.root_session_id = Some("golden-root".to_string());
+        detected.agent_path = Some("golden/agent/path".to_string());
+        detected.agent_nickname = Some("golden-nick".to_string());
+        detected.agent_role = Some("golden-role".to_string());
+        detected.internal_kind = Some("golden-internal".to_string());
+        detected.can_open = false;
+        detected.can_stop = true;
+        detected.can_rename = false;
+        detected
+    }
+
+    /// Enrich one detected session; returns the serialized card (with the
+    /// on-disk Codex title cache masked) and the skipped notification preview.
+    fn golden_enrich(detected: DetectedSession) -> (serde_json::Value, Option<String>) {
+        let (sessions, _) =
+            enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert!(session.transcript_path.is_none());
+        let mut value = serde_json::to_value(session).unwrap();
+        value.as_object_mut().unwrap().remove("codexTitle");
+        (value, session.notification_preview.clone())
+    }
+
+    fn golden_codex_message(role: &str, content: &str) -> crate::session::codex::CodexMessage {
+        serde_json::from_value(serde_json::json!({
+            "timestamp": "2020-01-01T00:00:00Z",
+            "role": role,
+            "messageType": if role == "user" { "User" } else { "Assistant" },
+            "content": content,
+        }))
+        .unwrap()
+    }
+
+    fn golden_cursor_message(role: &str, content: &str) -> crate::session::cursor::CursorMessage {
+        crate::session::cursor::CursorMessage {
+            timestamp: "2020-01-01T00:00:00Z".to_string(),
+            role: role.to_string(),
+            message_type: if role == "user" {
+                crate::session::MessageType::User
+            } else {
+                crate::session::MessageType::Assistant
+            },
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn golden_codex_session_card() {
+        let mut detected = golden_detected(SessionProvider::Codex, SessionSurface::App);
+        detected.codex_summary = Some(crate::session::codex::CodexRolloutSummary {
+            thread_id: "golden-id".to_string(),
+            lifecycle: CodexLifecycle::Working,
+            messages: vec![
+                golden_codex_message("user", "codex question"),
+                golden_codex_message("assistant", "codex answer one"),
+                golden_codex_message("assistant", "  "),
+            ],
+            last_timestamp: "2020-01-02T03:04:05Z".to_string(),
+            ..Default::default()
+        });
+        let (value, preview) = golden_enrich(detected);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "agentKind": "subagent",
+                "agentNickname": "golden-nick",
+                "agentPath": "golden/agent/path",
+                "agentRole": "golden-role",
+                "canOpen": false,
+                "canRename": false,
+                "canStop": true,
+                "customTitle": null,
+                "entrypoint": "golden-entry",
+                "firstPrompt": "(No conversation yet)",
+                "gitBranch": null,
+                "id": "golden-id",
+                "internalKind": "golden-internal",
+                "kind": "background",
+                "lastAssistantMessage": "codex answer one",
+                "latestMessage": "  ",
+                "messageCount": 3,
+                "modified": "2020-01-02T03:04:05Z",
+                "officialName": "golden-official",
+                "parentThreadId": "golden-parent",
+                "pendingToolName": null,
+                "pid": 4242,
+                "projectPath": "/golden/cwd",
+                "provider": "codex",
+                "rootSessionId": "golden-root",
+                "sessionKey": "codex:golden-id",
+                "sessionName": "golden-nick",
+                "sourceHealth": "stale",
+                "startedAtMs": 1_600_000_000_000_i64,
+                "status": "Working",
+                "summary": null,
+                "surface": "app"
+            })
+        );
+        assert_eq!(preview.as_deref(), Some("codex answer one"));
+    }
+
+    #[test]
+    fn golden_cursor_session_card() {
+        let mut detected = golden_detected(SessionProvider::Cursor, SessionSurface::Cursor);
+        detected.cursor_summary = Some(crate::session::cursor::CursorTranscriptSummary {
+            session_id: "golden-id".to_string(),
+            cursor_title: Some("golden-cursor-title".to_string()),
+            lifecycle: CursorLifecycle::Working,
+            messages: vec![
+                golden_cursor_message("user", "cursor question"),
+                golden_cursor_message("assistant", "cursor answer"),
+            ],
+            last_timestamp: String::new(),
+            empty: false,
+            ..Default::default()
+        });
+        let (value, preview) = golden_enrich(detected);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "agentKind": "subagent",
+                "agentNickname": "golden-nick",
+                "agentPath": "golden/agent/path",
+                "agentRole": "golden-role",
+                "canOpen": false,
+                "canRename": false,
+                "canStop": true,
+                "cursorTitle": "golden-cursor-title",
+                "customTitle": "golden-official",
+                "entrypoint": "golden-entry",
+                "firstPrompt": "cursor question",
+                "gitBranch": null,
+                "id": "golden-id",
+                "internalKind": "golden-internal",
+                "kind": "background",
+                "lastAssistantMessage": "cursor answer",
+                "latestMessage": "cursor answer",
+                "messageCount": 2,
+                "modified": "2020-09-13T12:26:40+00:00",
+                "officialName": "golden-official",
+                "parentThreadId": "golden-parent",
+                "pendingToolName": null,
+                "pid": 4242,
+                "projectPath": "/golden/cwd",
+                "provider": "cursor",
+                "rootSessionId": "golden-root",
+                "sessionKey": "cursor:golden-id",
+                "sessionName": "golden-nick",
+                "sourceHealth": "partial",
+                "startedAtMs": 1_600_000_000_000_i64,
+                "status": "Working",
+                "summary": null,
+                "surface": "cursor"
+            })
+        );
+        assert_eq!(preview.as_deref(), Some("cursor answer"));
+    }
+
+    #[test]
+    fn golden_opencode_session_card() {
+        let mut detected = golden_detected(SessionProvider::Opencode, SessionSurface::Cli);
+        detected.opencode_summary = Some(crate::session::opencode::OpenCodeSummary {
+            modified: "2020-01-02T03:04:05Z".to_string(),
+            status: SessionStatus::Working,
+            diagnostic: "opencode diagnostic".to_string(),
+        });
+        let (value, preview) = golden_enrich(detected);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "agentKind": "subagent",
+                "agentNickname": "golden-nick",
+                "agentPath": "golden/agent/path",
+                "agentRole": "golden-role",
+                "canOpen": false,
+                "canRename": false,
+                "canStop": true,
+                "customTitle": null,
+                "entrypoint": "golden-entry",
+                "firstPrompt": "golden-official",
+                "gitBranch": null,
+                "id": "golden-id",
+                "internalKind": "golden-internal",
+                "kind": "background",
+                "latestMessage": "opencode diagnostic",
+                "messageCount": 0,
+                "modified": "2020-01-02T03:04:05Z",
+                "officialName": "golden-official",
+                "parentThreadId": "golden-parent",
+                "pendingToolName": null,
+                "pid": 4242,
+                "projectPath": "/golden/cwd",
+                "provider": "opencode",
+                "rootSessionId": "golden-root",
+                "sessionKey": "opencode:golden-id",
+                "sessionName": "golden-project",
+                "sourceHealth": "stale",
+                "startedAtMs": 1_600_000_000_000_i64,
+                "status": "Working",
+                "summary": null,
+                "surface": "cli"
+            })
+        );
+        assert_eq!(preview.as_deref(), None);
+    }
+
+    #[test]
+    fn golden_pi_session_card() {
+        let mut detected = golden_detected(SessionProvider::Pi, SessionSurface::Cli);
+        let mut summary = crate::session::pi::PiTranscriptSummary::default();
+        summary.session_id = "golden-id".to_string();
+        summary.first_prompt = Some("   ".to_string());
+        summary.latest_snippet = Some("pi snippet".to_string());
+        summary.latest_assistant_text = Some("pi assistant text".to_string());
+        summary.message_count = 7;
+        summary.lifecycle = PiLifecycle::Working;
+        summary.empty = true;
+        summary.pending_tool_name = Some("pi-tool".to_string());
+        summary.last_timestamp = "2020-01-02T03:04:05Z".to_string();
+        detected.pi_summary = Some(summary);
+        let (value, preview) = golden_enrich(detected);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "agentKind": "subagent",
+                "agentNickname": "golden-nick",
+                "agentPath": "golden/agent/path",
+                "agentRole": "golden-role",
+                "canOpen": false,
+                "canRename": false,
+                "canStop": true,
+                "customTitle": null,
+                "entrypoint": "golden-entry",
+                "firstPrompt": "(No conversation yet)",
+                "gitBranch": null,
+                "id": "golden-id",
+                "internalKind": "golden-internal",
+                "kind": "background",
+                "lastAssistantMessage": "pi assistant text",
+                "latestMessage": "pi snippet",
+                "messageCount": 7,
+                "modified": "2020-01-02T03:04:05Z",
+                "officialName": "golden-official",
+                "parentThreadId": "golden-parent",
+                "pendingToolName": "pi-tool",
+                "pid": 4242,
+                "projectPath": "/golden/cwd",
+                "provider": "pi",
+                "rootSessionId": "golden-root",
+                "sessionKey": "pi:golden-id",
+                "sessionName": "golden-nick",
+                "sourceHealth": "stale",
+                "startedAtMs": 1_600_000_000_000_i64,
+                "status": "Connecting",
+                "summary": null,
+                "surface": "cli"
+            })
+        );
+        assert_eq!(preview.as_deref(), Some("pi assistant text"));
     }
 }

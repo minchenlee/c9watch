@@ -52,6 +52,29 @@ pub enum SubscribeEvent {
     },
 }
 
+impl SubscribeEvent {
+    /// Decode the `StatePatch` payloads carried by this event, in the order
+    /// they must be applied to a settle detector.
+    ///
+    /// - `Snapshot`: the nested `record.currentState` patch first, then the
+    ///   whole record read as a patch. Either is dropped if it fails to parse.
+    /// - `State`: its single patch.
+    /// - `Stream`: none.
+    pub fn state_patches(&self) -> Vec<StatePatch> {
+        match self {
+            SubscribeEvent::Snapshot { record, .. } => {
+                let nested = record
+                    .get("currentState")
+                    .and_then(|v| serde_json::from_value::<StatePatch>(v.clone()).ok());
+                let from_record = serde_json::from_value::<StatePatch>(record.clone()).ok();
+                nested.into_iter().chain(from_record).collect()
+            }
+            SubscribeEvent::State { patch } => vec![patch.clone()],
+            SubscribeEvent::Stream { .. } => Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(default)]
 pub struct StatePatch {
@@ -146,5 +169,51 @@ mod tests {
         let raw = r#"{"type":"stream","line":"[2J[H"}"#;
         let ev: SubscribeEvent = serde_json::from_str(raw).unwrap();
         assert!(matches!(ev, SubscribeEvent::Stream { .. }));
+    }
+
+    #[test]
+    fn snapshot_state_patches_nested_first_then_record() {
+        let raw = r#"{"type":"snapshot","record":{"tempo":"idle","pid":7,"currentState":{"state":"working","tempo":"active"}}}"#;
+        let ev: SubscribeEvent = serde_json::from_str(raw).unwrap();
+        let patches = ev.state_patches();
+        assert_eq!(patches.len(), 2);
+        assert_eq!(patches[0].state.as_deref(), Some("working"));
+        assert_eq!(patches[0].tempo.as_deref(), Some("active"));
+        assert_eq!(patches[0].pid, None);
+        assert_eq!(patches[1].tempo.as_deref(), Some("idle"));
+        assert_eq!(patches[1].pid, Some(7));
+    }
+
+    #[test]
+    fn snapshot_without_current_state_gives_record_patch_only() {
+        let raw = r#"{"type":"snapshot","record":{"tempo":"idle"}}"#;
+        let ev: SubscribeEvent = serde_json::from_str(raw).unwrap();
+        let patches = ev.state_patches();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].tempo.as_deref(), Some("idle"));
+    }
+
+    #[test]
+    fn snapshot_drops_unparseable_patches() {
+        let raw = r#"{"type":"snapshot","record":{"currentState":"bogus","pid":"not-a-number"}}"#;
+        let ev: SubscribeEvent = serde_json::from_str(raw).unwrap();
+        assert!(ev.state_patches().is_empty());
+    }
+
+    #[test]
+    fn state_event_gives_one_patch() {
+        let raw = r#"{"type":"state","patch":{"state":"blocked","needs":"approve"}}"#;
+        let ev: SubscribeEvent = serde_json::from_str(raw).unwrap();
+        let patches = ev.state_patches();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].state.as_deref(), Some("blocked"));
+        assert_eq!(patches[0].needs.as_deref(), Some("approve"));
+    }
+
+    #[test]
+    fn stream_event_gives_no_patches() {
+        let raw = r#"{"type":"stream","line":"hello"}"#;
+        let ev: SubscribeEvent = serde_json::from_str(raw).unwrap();
+        assert!(ev.state_patches().is_empty());
     }
 }

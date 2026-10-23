@@ -70,9 +70,6 @@ enum ClientMsg {
         provider: Option<crate::session::SessionProvider>,
     },
 
-    #[serde(rename = "getMemoryFiles")]
-    GetMemoryFiles,
-
     #[serde(rename = "getAwayActivity")]
     GetAwayActivity {
         requests: Vec<crate::session::away::AwayRequest>,
@@ -105,9 +102,6 @@ enum ServerMsg {
 
     #[serde(rename = "conversationProgress")]
     ConversationProgress { data: serde_json::Value },
-
-    #[serde(rename = "memoryFiles")]
-    MemoryFiles { data: serde_json::Value },
 
     #[serde(rename = "awayActivity")]
     AwayActivity { data: serde_json::Value },
@@ -363,14 +357,14 @@ async fn load_conversation_response(
             provider,
             include_tools,
             &mut |bytes_read, bytes_total| {
-                let payload = serde_json::json!({
-                    "sessionId": emit_id,
-                    "provider": provider,
-                    "requestId": request_id,
-                    "bytesRead": bytes_read,
-                    "bytesTotal": bytes_total,
-                });
-                let _ = progress_tx.send(payload.to_string());
+                let payload = crate::session::conversation::ConversationProgress {
+                    session_id: emit_id.clone(),
+                    provider,
+                    request_id,
+                    bytes_read,
+                    bytes_total,
+                };
+                let _ = progress_tx.send(serde_json::to_string(&payload).unwrap_or_default());
             },
         )
     })
@@ -418,23 +412,10 @@ async fn handle_message_with_owners(
             .await,
         ),
 
-        ClientMsg::GetConversation {
-            session_id,
-            provider,
-            include_tools,
-        } => {
-            load_conversation_response(
-                session_id,
-                provider,
-                include_tools,
-                {
-                    let (tx, _) = broadcast::channel(1);
-                    tx
-                },
-                None,
-            )
-            .await
-        }
+        // handle_socket owns getConversation (cancellation + progress).
+        ClientMsg::GetConversation { .. } => ServerMsg::Error {
+            message: "getConversation is handled by the socket loop".into(),
+        },
 
         ClientMsg::StopSession { pid } => match crate::actions::stop_session(pid) {
             Ok(()) => ServerMsg::Ok,
@@ -454,24 +435,13 @@ async fn handle_message_with_owners(
             provider,
         } => {
             match crate::run_validated_rename(provider, &session_id, &owners, || {
-                // Write to Claude Code's native JSONL format
-                crate::write_native_custom_title(&session_id, &new_name);
-                // Also write to c9watch's own custom titles (fallback)
-                let mut custom_titles = crate::session::CustomTitles::load();
-                custom_titles.set(session_id.clone(), new_name.clone());
-                custom_titles.save()
+                crate::write_session_title(&session_id, &new_name)
             }) {
                 Ok(()) => ServerMsg::Ok,
                 Err(e) => ServerMsg::Error { message: e },
             }
         }
 
-        ClientMsg::GetMemoryFiles => match crate::session::get_memory_files() {
-            Ok(files) => ServerMsg::MemoryFiles {
-                data: serde_json::to_value(&files).unwrap_or_default(),
-            },
-            Err(e) => ServerMsg::Error { message: e },
-        },
         ClientMsg::GetAwayActivity { requests } => match tokio::task::spawn_blocking(move || {
             crate::session::away::away_activity(&requests)
         })
@@ -490,48 +460,9 @@ async fn handle_message_with_owners(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rename_test_fixtures::{synthetic_codex_owner, synthetic_cursor_owner};
 
     const SESSION_ID: &str = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
-
-    fn synthetic_cursor_owner(temp: &tempfile::TempDir) -> crate::session::ProviderSourceOwners {
-        let transcript_dir = temp
-            .path()
-            .join("synthetic-project")
-            .join("agent-transcripts")
-            .join(SESSION_ID);
-        std::fs::create_dir_all(&transcript_dir).unwrap();
-        std::fs::write(
-            transcript_dir.join(format!("{SESSION_ID}.jsonl")),
-            b"{\"role\":\"user\",\"message\":{\"content\":[]}}\n",
-        )
-        .unwrap();
-
-        crate::session::ProviderSourceOwners::from_test_sources(
-            None,
-            Some(crate::session::cursor::CursorSessionSource::at_root(
-                temp.path().to_path_buf(),
-            )),
-            None,
-        )
-    }
-
-    fn synthetic_codex_owner(temp: &tempfile::TempDir) -> crate::session::ProviderSourceOwners {
-        let rollout_dir = temp.path().join("2026").join("08").join("24");
-        std::fs::create_dir_all(&rollout_dir).unwrap();
-        std::fs::write(
-            rollout_dir.join(format!("rollout-synthetic-{SESSION_ID}.jsonl")),
-            b"{}\n",
-        )
-        .unwrap();
-
-        crate::session::ProviderSourceOwners::from_test_sources(
-            Some(crate::session::codex::CodexSessionSource::at_root(
-                temp.path().to_path_buf(),
-            )),
-            None,
-            None,
-        )
-    }
 
     #[test]
     fn rename_message_keeps_provider_namespace_for_validation() {
@@ -575,8 +506,8 @@ mod tests {
         let cursor_temp = tempfile::tempdir().unwrap();
         let codex_temp = tempfile::tempdir().unwrap();
         let owners = [
-            synthetic_cursor_owner(&cursor_temp),
-            synthetic_codex_owner(&codex_temp),
+            synthetic_cursor_owner(&cursor_temp, SESSION_ID),
+            synthetic_codex_owner(&codex_temp, SESSION_ID),
         ];
 
         for owners in owners {
@@ -634,6 +565,26 @@ mod protocol_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn conversation_progress_request_id_is_omitted_when_none() {
+        use crate::session::conversation::ConversationProgress;
+        let progress = |request_id| ConversationProgress {
+            session_id: "s1".into(),
+            provider: None,
+            request_id,
+            bytes_read: 10,
+            bytes_total: 20,
+        };
+        let with_id = serde_json::to_value(progress(Some(7))).unwrap();
+        assert_eq!(with_id["requestId"], 7);
+        assert_eq!(with_id["sessionId"], "s1");
+        assert_eq!(with_id["bytesRead"], 10);
+        assert_eq!(with_id["bytesTotal"], 20);
+        let without_id = serde_json::to_value(progress(None)).unwrap();
+        assert!(without_id.get("requestId").is_none());
+        assert!(without_id.get("provider").unwrap().is_null());
     }
 
     /// The mobile client reads `data` as a session array; a `[sessions,

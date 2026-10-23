@@ -22,7 +22,7 @@
 //! Evidence: `docs/research/codex-approval-signal-2026-10.md`.
 
 use super::open_files::open_file_paths;
-use super::pi_liveness::{basename, current_uid, uid_matches, PI_PROCESS_GRACE_MS};
+use super::pi_liveness::{basename, current_uid, uid_matches, PROCESS_GRACE_MS};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -58,7 +58,7 @@ pub(crate) fn open_file_alive_flags(
     candidates
         .iter()
         .map(|candidate| {
-            now_ms.saturating_sub(candidate.modified_ms) < PI_PROCESS_GRACE_MS
+            now_ms.saturating_sub(candidate.modified_ms) < PROCESS_GRACE_MS
                 || open.contains(candidate.key)
         })
         .collect()
@@ -169,7 +169,7 @@ fn classify_codex_process(row: &AgentProcessRow<'_>) -> AgentProcess {
 /// The file name is unique, and does not depend on symlinks in the path.
 pub(crate) fn codex_rollout_key(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
-    (name.starts_with("rollout-") && name.ends_with(".jsonl")).then(|| name.to_string())
+    super::codex::is_rollout_file_name(name).then(|| name.to_string())
 }
 
 /// Open Codex rollouts.
@@ -323,8 +323,8 @@ mod tests {
         let evidence = OpenFileEvidence::Open(HashSet::from(["open".to_string()]));
         let candidates = [
             candidate("open", now - 3_600_000),
-            candidate("closed-old", now - PI_PROCESS_GRACE_MS),
-            candidate("closed-recent", now - PI_PROCESS_GRACE_MS + 1),
+            candidate("closed-old", now - PROCESS_GRACE_MS),
+            candidate("closed-recent", now - PROCESS_GRACE_MS + 1),
         ];
         assert_eq!(
             open_file_alive_flags(&candidates, &evidence, now),

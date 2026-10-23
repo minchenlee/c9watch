@@ -28,6 +28,61 @@ fn callback_inbox_hint(worker_session_id: &str) -> String {
     format!("~/.claude/c9watch/inbox/{}/", worker_session_id)
 }
 
+// ── `send --wait` response shapes ─────────────────────────────────────────────
+//
+// Shared by the Bg and Print branches of `handle_send` so the
+// `turnCompleted` / `WORKER_CRASHED` contract is defined once.
+
+fn turn_completed_json(
+    full_id: &str,
+    assistant_text: &str,
+    ended_at: &str,
+    callback_inbox: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "sessionId": full_id,
+        "sent": true,
+        "turnCompleted": true,
+        "assistantText": assistant_text,
+        "endedAt": ended_at,
+        "callbackInbox": callback_inbox,
+    })
+}
+
+fn turn_timeout_json(full_id: &str, callback_inbox: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "sessionId": full_id,
+        "sent": true,
+        "turnCompleted": false,
+        "callbackInbox": callback_inbox,
+    })
+}
+
+/// Per-worker entry shared by `handle_list` and `handle_workers_all`.
+fn worker_json(session_id: &str, alive: bool, meta: &pm_fs::WorkerMeta) -> serde_json::Value {
+    serde_json::json!({
+        "sessionId": session_id,
+        "pid": meta.pid,
+        "name": meta.name,
+        "cwd": meta.cwd,
+        "spawnedAt": meta.spawned_at,
+        "spawnedBy": meta.spawned_by,
+        "pmPid": meta.pm_pid,
+        "alive": alive,
+    })
+}
+
+fn worker_crashed_json(full_id: &str, callback_inbox: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "error": "WORKER_CRASHED",
+        "sessionId": full_id,
+        "callbackInbox": callback_inbox,
+    })
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Called by the CLI's `Daemon` subcommand. Starts the RPC server loop.
@@ -430,28 +485,16 @@ async fn handle_send(
         drop(st);
 
         return match result {
-            Ok(turn) => serde_json::json!({
-                "ok": true,
-                "sessionId": full_id,
-                "sent": true,
-                "turnCompleted": true,
-                "assistantText": turn.assistant_text,
-                "endedAt": turn.ended_at,
-                "callbackInbox": callback_inbox,
-            }),
-            Err(e) if e == "WAIT_TIMEOUT" && !still_alive => serde_json::json!({
-                "ok": false,
-                "error": "WORKER_CRASHED",
-                "sessionId": full_id,
-                "callbackInbox": callback_inbox,
-            }),
-            Err(e) if e == "WAIT_TIMEOUT" => serde_json::json!({
-                "ok": true,
-                "sessionId": full_id,
-                "sent": true,
-                "turnCompleted": false,
-                "callbackInbox": callback_inbox,
-            }),
+            Ok(turn) => turn_completed_json(
+                &full_id,
+                &turn.assistant_text,
+                &turn.ended_at,
+                &callback_inbox,
+            ),
+            Err(e) if e == "WAIT_TIMEOUT" && !still_alive => {
+                worker_crashed_json(&full_id, &callback_inbox)
+            }
+            Err(e) if e == "WAIT_TIMEOUT" => turn_timeout_json(&full_id, &callback_inbox),
             Err(e) => serde_json::json!({
                 "ok": false,
                 "error": e,
@@ -481,32 +524,18 @@ async fn handle_send(
     };
 
     match turn_result {
-        Ok(Some(turn)) => serde_json::json!({
-            "ok": true,
-            "sessionId": full_id,
-            "sent": true,
-            "turnCompleted": true,
-            "assistantText": turn.assistant_text,
-            "endedAt": turn.ended_at,
-            "callbackInbox": callback_inbox,
-        }),
+        Ok(Some(turn)) => turn_completed_json(
+            &full_id,
+            &turn.assistant_text,
+            &turn.ended_at,
+            &callback_inbox,
+        ),
         Ok(None) => serde_json::json!({
             "ok": false,
             "error": "result channel closed — worker stdout tee task exited",
         }),
-        Err(_timeout) if !still_alive => serde_json::json!({
-            "ok": false,
-            "error": "WORKER_CRASHED",
-            "sessionId": full_id,
-            "callbackInbox": callback_inbox,
-        }),
-        Err(_timeout) => serde_json::json!({
-            "ok": true,
-            "sessionId": full_id,
-            "sent": true,
-            "turnCompleted": false,
-            "callbackInbox": callback_inbox,
-        }),
+        Err(_timeout) if !still_alive => worker_crashed_json(&full_id, &callback_inbox),
+        Err(_timeout) => turn_timeout_json(&full_id, &callback_inbox),
     }
 }
 
@@ -538,17 +567,7 @@ async fn handle_list(state: Arc<Mutex<DaemonState>>) -> serde_json::Value {
         .iter_mut()
         .map(|(session_id, worker)| {
             let alive = worker.is_alive();
-            let meta = worker.meta();
-            serde_json::json!({
-                "sessionId": session_id,
-                "pid": meta.pid,
-                "name": meta.name,
-                "cwd": meta.cwd,
-                "spawnedAt": meta.spawned_at,
-                "spawnedBy": meta.spawned_by,
-                "pmPid": meta.pm_pid,
-                "alive": alive,
-            })
+            worker_json(session_id, alive, worker.meta())
         })
         .collect();
 
@@ -699,17 +718,9 @@ async fn handle_workers_all(
             let alive = worker.is_alive();
             let meta = worker.meta();
             let status = resolve_status(meta, caller_pm_pid, caller_pm_session_id.as_deref());
-            serde_json::json!({
-                "sessionId": session_id,
-                "pid": meta.pid,
-                "name": meta.name,
-                "cwd": meta.cwd,
-                "spawnedAt": meta.spawned_at,
-                "spawnedBy": meta.spawned_by,
-                "pmPid": meta.pm_pid,
-                "alive": alive,
-                "status": status.as_str(),
-            })
+            let mut entry = worker_json(session_id, alive, meta);
+            entry["status"] = serde_json::Value::from(status.as_str());
+            entry
         })
         .collect();
     serde_json::json!({ "ok": true, "workers": workers })
@@ -966,6 +977,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn turn_completed_json_shape() {
+        let v = turn_completed_json("sid-1", "hello", "2026-01-01T00:00:00Z", "~/inbox/sid-1/");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "ok": true,
+                "sessionId": "sid-1",
+                "sent": true,
+                "turnCompleted": true,
+                "assistantText": "hello",
+                "endedAt": "2026-01-01T00:00:00Z",
+                "callbackInbox": "~/inbox/sid-1/",
+            })
+        );
+        assert_eq!(
+            v.to_string(),
+            r#"{"assistantText":"hello","callbackInbox":"~/inbox/sid-1/","endedAt":"2026-01-01T00:00:00Z","ok":true,"sent":true,"sessionId":"sid-1","turnCompleted":true}"#
+        );
+    }
+
+    #[test]
+    fn turn_timeout_json_shape() {
+        let v = turn_timeout_json("sid-1", "~/inbox/sid-1/");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "ok": true,
+                "sessionId": "sid-1",
+                "sent": true,
+                "turnCompleted": false,
+                "callbackInbox": "~/inbox/sid-1/",
+            })
+        );
+    }
+
+    #[test]
+    fn worker_crashed_json_shape() {
+        let v = worker_crashed_json("sid-1", "~/inbox/sid-1/");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "ok": false,
+                "error": "WORKER_CRASHED",
+                "sessionId": "sid-1",
+                "callbackInbox": "~/inbox/sid-1/",
+            })
+        );
+    }
+
+    #[test]
     fn resolve_worker_id_rejects_empty_prefix() {
         let keys = ["abc-123", "def-456"];
         let err = resolve_worker_id_from_keys(keys.iter().copied(), "").unwrap_err();
@@ -1029,6 +1090,51 @@ mod tests {
             },
             stopped_at: None,
         }
+    }
+
+    #[test]
+    fn worker_json_shape() {
+        let mut meta = make_meta("sid-1", Some(42));
+        meta.name = Some("w".to_string());
+        let v = worker_json("sid-1", true, &meta);
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "sessionId": "sid-1",
+                "pid": 1,
+                "name": "w",
+                "cwd": "/tmp",
+                "spawnedAt": "t",
+                "spawnedBy": "pm-audit",
+                "pmPid": 42,
+                "alive": true,
+            })
+        );
+        assert_eq!(
+            v.to_string(),
+            r#"{"alive":true,"cwd":"/tmp","name":"w","pid":1,"pmPid":42,"sessionId":"sid-1","spawnedAt":"t","spawnedBy":"pm-audit"}"#
+        );
+    }
+
+    #[test]
+    fn worker_json_with_status_matches_inline_shape() {
+        let meta = make_meta("sid-1", None);
+        let mut v = worker_json("sid-1", false, &meta);
+        v["status"] = serde_json::Value::from("orphaned");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "sessionId": "sid-1",
+                "pid": 1,
+                "name": null,
+                "cwd": "/tmp",
+                "spawnedAt": "t",
+                "spawnedBy": "pm-audit",
+                "pmPid": null,
+                "alive": false,
+                "status": "orphaned",
+            })
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::session::parser::parse_all_entries_with_progress;
-use crate::session::SessionProvider;
+use crate::session::{find_claude_session_file_under, SessionProvider};
 use crate::session::{extract_messages, ImageBlock, MessageType};
 use serde::Serialize;
 use std::time::{Duration, Instant};
@@ -19,6 +19,9 @@ pub struct Conversation {
 pub struct ConversationProgress {
     pub session_id: String,
     pub provider: Option<SessionProvider>,
+    /// WS request correlation id; omitted for Tauri events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u64>,
     pub bytes_read: u64,
     pub bytes_total: u64,
 }
@@ -41,52 +44,36 @@ fn claude_conversation(
     on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Conversation, String> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
-    let claude_projects_dir = home_dir.join(".claude").join("projects");
-    let session_filename = format!("{}.jsonl", session_id);
+    let Some(session_file) = find_claude_session_file_under(&home_dir, session_id) else {
+        return Err(format!(
+            "Claude Code session {} not found in any project directory",
+            session_id
+        ));
+    };
 
-    if let Ok(entries) = std::fs::read_dir(&claude_projects_dir) {
-        for entry in entries.flatten() {
-            let project_path = entry.path();
-            if !project_path.is_dir() {
-                continue;
-            }
+    let entries = parse_all_entries_with_progress(&session_file, on_progress)
+        .map_err(|e| format!("Failed to parse session file: {}", e))?;
+    let messages = extract_messages(&entries);
+    let conversation_messages = messages
+        .into_iter()
+        .filter(|(_, msg_type, _, _)| {
+            include_tools || !matches!(msg_type, MessageType::ToolUse | MessageType::ToolResult)
+        })
+        .map(
+            |(timestamp, msg_type, content, images)| ConversationMessage {
+                timestamp,
+                message_type: msg_type,
+                content,
+                images,
+            },
+        )
+        .collect();
 
-            let session_file = project_path.join(&session_filename);
-            if !session_file.exists() {
-                continue;
-            }
-
-            let entries = parse_all_entries_with_progress(&session_file, on_progress)
-                .map_err(|e| format!("Failed to parse session file: {}", e))?;
-            let messages = extract_messages(&entries);
-            let conversation_messages = messages
-                .into_iter()
-                .filter(|(_, msg_type, _, _)| {
-                    include_tools
-                        || !matches!(msg_type, MessageType::ToolUse | MessageType::ToolResult)
-                })
-                .map(
-                    |(timestamp, msg_type, content, images)| ConversationMessage {
-                        timestamp,
-                        message_type: msg_type,
-                        content,
-                        images,
-                    },
-                )
-                .collect();
-
-            return Ok(Conversation {
-                session_id: session_id.to_string(),
-                provider: SessionProvider::ClaudeCode,
-                messages: conversation_messages,
-            });
-        }
-    }
-
-    Err(format!(
-        "Claude Code session {} not found in any project directory",
-        session_id
-    ))
+    Ok(Conversation {
+        session_id: session_id.to_string(),
+        provider: SessionProvider::ClaudeCode,
+        messages: conversation_messages,
+    })
 }
 
 fn codex_conversation(

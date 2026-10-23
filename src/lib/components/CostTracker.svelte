@@ -1,8 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getConversation } from '$lib/api';
-	import { toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
-	import { get } from 'svelte/store';
+	import { acceptsConversation, loadPreviewConversation } from '$lib/stores/conversation-loader';
 	import type { HistoryEntry, Conversation, CostData, SessionCostRecord, SessionProvider } from '$lib/types';
 	import TokenDistanceVisualizer from './token-distance/TokenDistanceVisualizer.svelte';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
@@ -12,7 +10,16 @@
 	import { providerFilter } from '$lib/stores/provider-filter';
 	import { matchesProvider, providerFilterLabel, providerOf, providerSessionKey } from '$lib/provider';
 	import ProviderBadge from './ProviderBadge.svelte';
-	import { isCostAvailable, selectChartDays, summarizeCostSessions } from '$lib/cost-semantics';
+	import {
+		isCostAvailable,
+		PROVIDER_SERIES,
+		providerSeriesBlocks,
+		providerSeriesBreakdown,
+		providerSeriesGradient,
+		selectChartDays,
+		summarizeCostDays,
+		summarizeCostSessions
+	} from '$lib/cost-semantics';
 
 	type TimeScale = 'daily' | 'weekly' | 'monthly';
 	type CostSessionRow = SessionCostRecord & {
@@ -43,38 +50,17 @@
 			}, 0);
 	}
 
+	/** Usage per provider series, in PROVIDER_SERIES order. */
+	function providerSeriesValues(sessions: SessionCostRecord[]): number[] {
+		return PROVIDER_SERIES.map(({ provider }) => providerUsageValue(sessions, provider));
+	}
+
 	function providerUsageGradient(sessions: SessionCostRecord[]): string {
-		const providers: Array<{ color: string; value: number }> = [
-			{ color: 'var(--accent-amber)', value: providerUsageValue(sessions, 'claudeCode') },
-			{ color: 'var(--accent-blue)', value: providerUsageValue(sessions, 'codex') },
-			{ color: 'var(--accent-purple)', value: providerUsageValue(sessions, 'cursor') },
-			{ color: 'var(--accent-green)', value: providerUsageValue(sessions, 'pi') }
-		];
-		const total = providers.reduce((sum, provider) => sum + provider.value, 0);
-		let offset = 0;
-		const stops = providers.map(({ color, value }) => {
-			const start = total > 0 ? (offset / total) * 100 : 0;
-			offset += value;
-			const end = total > 0 ? (offset / total) * 100 : 100;
-			return `${color} ${start}% ${end}%`;
-		});
-		return `linear-gradient(to top, ${stops.join(', ')})`;
+		return providerSeriesGradient(providerSeriesValues(sessions));
 	}
 
 	function providerBreakdownLabel(sessions: SessionCostRecord[]): string {
-		const providers: Array<{ label: string; provider: SessionProvider }> = [
-			{ label: 'Claude Code', provider: 'claudeCode' },
-			{ label: 'Codex', provider: 'codex' },
-			{ label: 'Cursor', provider: 'cursor' },
-			{ label: 'Pi', provider: 'pi' }
-		];
-		const values = providers.map(({ provider }) => providerUsageValue(sessions, provider));
-		const total = values.reduce((sum, value) => sum + value, 0);
-		const format = mode === 'tokens' ? formatTokens : formatCost;
-		const percentage = (value: number) => total > 0 ? `${((value / total) * 100).toFixed(0)}%` : '0%';
-		return providers
-			.map(({ label }, index) => `${label} ${format(values[index])} (${percentage(values[index])})`)
-			.join(', ');
+		return providerSeriesBreakdown(providerSeriesValues(sessions), mode === 'tokens' ? formatTokens : formatCost);
 	}
 
 	function formatAggregate(cost: number, tokens: number, unpricedTokens: number): string {
@@ -204,6 +190,10 @@
 	let hasCodexUsage = $derived(costData?.dailyCosts.some((day) => day.sessions.some((session) => session.provider === 'codex')) ?? false);
 	let hasCursorUsage = $derived(costData?.dailyCosts.some((day) => day.sessions.some((session) => session.provider === 'cursor')) ?? false);
 	let hasPiUsage = $derived(costData?.dailyCosts.some((day) => day.sessions.some((session) => session.provider === 'pi')) ?? false);
+	/** Claude Code and Codex always show; Cursor and Pi only when they have usage. */
+	let legendSeries = $derived(PROVIDER_SERIES.filter((series) =>
+		series.alwaysInLegend || (series.provider === 'cursor' ? hasCursorUsage : hasPiUsage)
+	));
 	let collapsedProjects = $state<Set<string>>(new Set());
 	let modelTrackWidth = $state(0);
 	let projectTrackWidth = $state(0);
@@ -323,23 +313,13 @@
 			surface: session.surface,
 		};
 		conversation = null;
-		toolsLoadedFor.set(null);
-		try {
-			const requestedKey = providerSessionKey(session.provider, session.sessionId);
-			const conv = await withConversationLoader(session.sessionId, session.provider, 'conversation', () =>
-				getConversation(session.sessionId, session.provider, false)
-			);
-			if (requestId !== conversationRequestId) return;
-			if (get(toolsLoadedFor) === requestedKey) return;
-			if (providerSessionKey(conv.provider ?? session.provider, conv.sessionId) !== requestedKey) return;
+		await loadPreviewConversation(session, () => requestId === conversationRequestId, (conv) => {
 			conversation = conv;
-		} catch (e) {
-			console.error('Failed to load conversation:', e);
-		}
+		});
 	}
 
 	/** Returns the date range [startInclusive, endExclusive) for current time scale window */
-	function getTimeWindow(): { start: string; end: string } | null {
+	function getTimeWindow(): { start: string; end: string } {
 		const now = new Date();
 		const todayStr = toLocalDateStr(now);
 
@@ -487,7 +467,7 @@
 		const tw = getTimeWindow();
 
 		const sessions = costData.dailyCosts
-			.filter(d => !tw || (d.date >= tw.start && d.date < tw.end))
+			.filter(d => d.date >= tw.start && d.date < tw.end)
 			.flatMap(d => d.sessions);
 
 		const modelMap = new Map<string, { model: string; provider: import('$lib/types').SessionProvider; cost: number; tokens: number; unpricedTokens: number }>();
@@ -526,7 +506,7 @@
 
 		const projMap = new Map<string, { project: string; projectName: string; totalCost: number; totalTokens: number; unpricedTokens: number; sessions: SessionCostRecord[]; displaySessions: CostSessionRow[] }>();
 		for (const proj of costData.projectCosts) {
-			const filtered = tw ? proj.sessions.filter(s => s.date >= tw.start && s.date < tw.end) : proj.sessions;
+			const filtered = proj.sessions.filter(s => s.date >= tw.start && s.date < tw.end);
 			if (filtered.length === 0) continue;
 			const summary = summarizeCostSessions(filtered);
 			projMap.set(proj.project, { project: proj.project, projectName: proj.projectName, totalCost: summary.cost, totalTokens: summary.tokens, unpricedTokens: summary.unpricedTokens, sessions: filtered, displaySessions: mergeSessionRows(filtered) });
@@ -534,33 +514,15 @@
 		return Array.from(projMap.values()).sort((a, b) => mode === 'tokens' ? b.totalTokens - a.totalTokens : b.totalCost - a.totalCost);
 	});
 
-	/** Total cost filtered to the active time window */
-	let filteredTotalCost = $derived.by(() => {
-		if (!costData) return 0;
+	/** Cost, tokens and unpriced tokens of the active time window (per-day sums, in day order). */
+	let windowSummary = $derived.by(() => {
+		if (!costData) return { cost: 0, tokens: 0, unpricedTokens: 0 };
 		const tw = getTimeWindow();
-		if (!tw) return costData.totalCost;
-		return costData.dailyCosts
-			.filter(d => d.date >= tw.start && d.date < tw.end)
-			.reduce((sum, d) => sum + summarizeCostSessions(d.sessions).cost, 0);
+		return summarizeCostDays(costData.dailyCosts.filter(d => d.date >= tw.start && d.date < tw.end));
 	});
-
-	/** Total tokens filtered to the active time window */
-	let filteredTotalTokens = $derived.by(() => {
-		if (!costData) return 0;
-		const tw = getTimeWindow();
-		if (!tw) return costData.totalTokens;
-		return costData.dailyCosts
-			.filter(d => d.date >= tw.start && d.date < tw.end)
-			.reduce((sum, d) => sum + sumTokens(d.sessions), 0);
-	});
-
-	let filteredUnpricedTokens = $derived.by(() => {
-		if (!costData) return 0;
-		const tw = getTimeWindow();
-		return costData.dailyCosts
-			.filter(d => !tw || (d.date >= tw.start && d.date < tw.end))
-			.reduce((sum, d) => sum + summarizeCostSessions(d.sessions).unpricedTokens, 0);
-	});
+	let filteredTotalCost = $derived(windowSummary.cost);
+	let filteredTotalTokens = $derived(windowSummary.tokens);
+	let filteredUnpricedTokens = $derived(windowSummary.unpricedTokens);
 
 	let allCollapsed = $derived(
 		filteredProjectCosts.length > 0 &&
@@ -611,26 +573,7 @@
 
 	/** Build a project bar with provider-specific blocks, then fill the remainder. */
 	function buildProviderBarBlocks(fillPct: number, totalCols: number, sessions: SessionCostRecord[]): Array<{ type: string }> {
-		const filled = Math.round((fillPct / 100) * totalCols);
-		const providers = [
-			{ type: 'claude', value: providerUsageValue(sessions, 'claudeCode') },
-			{ type: 'codex', value: providerUsageValue(sessions, 'codex') },
-			{ type: 'cursor', value: providerUsageValue(sessions, 'cursor') },
-			{ type: 'pi', value: providerUsageValue(sessions, 'pi') }
-		];
-		const total = providers.reduce((sum, provider) => sum + provider.value, 0);
-		const arr: Array<{ type: string }> = [];
-		for (let i = 0; i < filled && total > 0; i++) {
-			const midpoint = ((i + 0.5) / filled) * total;
-			let cumulative = 0;
-			const provider = providers.find(({ value }) => {
-				cumulative += value;
-				return midpoint <= cumulative;
-			}) ?? providers[providers.length - 1];
-			arr.push({ type: provider.type });
-		}
-		while (arr.length < totalCols) arr.push({ type: 'empty' });
-		return arr;
+		return providerSeriesBlocks(providerSeriesValues(sessions), fillPct, totalCols);
 	}
 
 	// ── Actions ──────────────────────────────────────────────────────
@@ -742,10 +685,9 @@
 				</div>
 			{/if}
 			<div class="provider-usage-legend" aria-label="Cost chart provider colors">
-				<span class="provider-usage-legend-item"><span class="provider-usage-swatch claude" aria-hidden="true"></span>CLAUDE CODE</span>
-				<span class="provider-usage-legend-item"><span class="provider-usage-swatch codex" aria-hidden="true"></span>CODEX</span>
-				{#if hasCursorUsage}<span class="provider-usage-legend-item"><span class="provider-usage-swatch cursor" aria-hidden="true"></span>CURSOR</span>{/if}
-				{#if hasPiUsage}<span class="provider-usage-legend-item"><span class="provider-usage-swatch pi" aria-hidden="true"></span>PI</span>{/if}
+				{#each legendSeries as series (series.provider)}
+					<span class="provider-usage-legend-item"><span class="provider-usage-swatch {series.type}" aria-hidden="true"></span>{series.label.toUpperCase()}</span>
+				{/each}
 			</div>
 			{#if filteredProjectCosts.length === 0}
 				<div class="state-msg">No {providerFilterLabel($providerFilter)} usage data available.</div>
@@ -919,7 +861,7 @@
 	/>
 {/if}
 {#if selectedEntry}
-	<HistoryCardOverlay entry={selectedEntry} {conversation} onclose={() => { selectedEntry = null; conversation = null; }} onconversation={(conv) => { if (selectedEntry && providerSessionKey(selectedEntry.provider, selectedEntry.sessionId) === providerSessionKey(conv.provider, conv.sessionId)) conversation = conv; }} />
+	<HistoryCardOverlay entry={selectedEntry} {conversation} onclose={() => { selectedEntry = null; conversation = null; }} onconversation={(conv) => { if (acceptsConversation(selectedEntry, conv)) conversation = conv; }} />
 {/if}
 </div>
 
