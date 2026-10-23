@@ -321,41 +321,6 @@ pub fn get_pending_tool_input_with(
         .map(|(_, input)| input.clone())
 }
 
-/// Tool uses in `entries` that have no matching tool_result, in order, as
-/// `(name, input)`. Unlike the single-message checks above, this follows results
-/// written in later user entries, which is where Claude Code records them.
-pub fn unresolved_tool_uses(entries: &[SessionEntry]) -> Vec<(&str, &serde_json::Value)> {
-    let mut resolved: Vec<&str> = Vec::new();
-    for entry in entries {
-        match entry {
-            SessionEntry::User { message, .. } => {
-                resolved.extend(message.tool_result_ids.iter().map(String::as_str))
-            }
-            SessionEntry::Assistant { message, .. } => {
-                resolved.extend(message.content.iter().filter_map(|c| match c {
-                    MessageContent::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-                    _ => None,
-                }))
-            }
-            _ => {}
-        }
-    }
-    entries
-        .iter()
-        .filter_map(|entry| match entry {
-            SessionEntry::Assistant { message, .. } => Some(&message.content),
-            _ => None,
-        })
-        .flatten()
-        .filter_map(|c| match c {
-            MessageContent::ToolUse { id, name, input } if !resolved.contains(&id.as_str()) => {
-                Some((name.as_str(), input))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
 /// Checks if there are any pending (incomplete) tool uses
 fn has_pending_tool_uses(content: &[MessageContent]) -> bool {
     !check_all_tools_completed(content)
@@ -1164,23 +1129,6 @@ mod tests {
         );
         assert_eq!(get_pending_tool_name_with(&entries, &checker), None);
         assert_eq!(get_pending_tool_input_with(&entries, &checker), None);
-    }
-
-    #[test]
-    fn test_unresolved_tool_uses_follow_results_in_later_user_entries() {
-        let lines = [
-            r#"{"type":"assistant","uuid":"u1","timestamp":"2026-09-23T00:00:00Z","message":{"model":"m","id":"msg1","role":"assistant","content":[{"type":"tool_use","id":"toolu_a","name":"Read","input":{}}],"stop_reason":null,"stop_sequence":null}}"#,
-            r#"{"type":"assistant","uuid":"u2","timestamp":"2026-09-23T00:00:00Z","message":{"model":"m","id":"msg1","role":"assistant","content":[{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"make"}}],"stop_reason":null,"stop_sequence":null}}"#,
-            r#"{"type":"user","uuid":"u3","timestamp":"2026-09-23T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a","content":"ok"}]}}"#,
-        ];
-        let entries = crate::session::parser::parse_jsonl_entries(
-            lines.iter().map(|l| l.to_string()).collect(),
-        );
-        assert_eq!(entries.len(), 3);
-        let unresolved = unresolved_tool_uses(&entries);
-        assert_eq!(unresolved.len(), 1);
-        assert_eq!(unresolved[0].0, "Bash");
-        assert_eq!(unresolved[0].1["command"], "make");
     }
 
     fn assistant_with(content: Vec<MessageContent>) -> SessionEntry {

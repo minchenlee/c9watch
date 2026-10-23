@@ -603,69 +603,6 @@ fn session_detail(
     Ok(detail)
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OpenCodeChild {
-    session_id: String,
-    parent_thread_id: String,
-    directory: String,
-    title: String,
-}
-
-/// On-demand hierarchy reads share the same fail-fast HTTP gate as conversations.
-#[cfg(feature = "gui")]
-#[tauri::command]
-pub async fn opencode_session_children(session_id: String) -> Result<Vec<OpenCodeChild>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let connection = CACHE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .connection
-            .clone()
-            .ok_or("OpenCode is not configured")?;
-        let _guard = CONVERSATION_READER
-            .try_lock()
-            .map_err(|_| "OpenCode load already in progress; retry shortly")?;
-        read_children(&connection, &client()?, &session_id)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-#[cfg(any(feature = "gui", test))]
-fn read_children(
-    connection: &Connection,
-    client: &Client,
-    id: &str,
-) -> Result<Vec<OpenCodeChild>, String> {
-    let mut budget = Budget::new(10, MAX_RESPONSE);
-    let parent = session_detail(connection, client, id, &mut budget)?;
-    let (children, _): (Vec<RemoteSession>, _) = connection.get_page_bounded(
-        client,
-        &["session", &parent.id, "children"],
-        &[("directory", &parent.directory)],
-        &mut budget,
-    )?;
-    if children.len() > MAX_SESSIONS {
-        return Err("OpenCode children exceed 512 sessions".into());
-    }
-    children
-        .into_iter()
-        .map(|child| {
-            if child.directory != parent.directory || child.parent_id.as_deref() != Some(&parent.id)
-            {
-                return Err("OpenCode child does not match requested parent/directory".into());
-            }
-            Ok(OpenCodeChild {
-                session_id: scoped_id(&child.id, &child.directory),
-                parent_thread_id: scoped_id(&parent.id, &parent.directory),
-                directory: child.directory,
-                title: child.title,
-            })
-        })
-        .collect()
-}
-
 #[cfg(test)]
 fn read_conversation(
     connection: &Connection,

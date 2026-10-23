@@ -900,7 +900,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             session::opencode::opencode_connection_status,
             session::opencode::opencode_connect,
-            session::opencode::opencode_session_children,
             notifications::get_notification_preferences,
             notifications::save_notification_preferences,
             notifications::test_native_notification,

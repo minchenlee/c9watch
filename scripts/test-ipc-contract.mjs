@@ -31,10 +31,6 @@ const webServer = readFileSync(join(root, 'src-tauri/src/web_server.rs'), 'utf8'
 const matches = (text, re) => new Set([...text.matchAll(re)].map((m) => m[1]));
 const sorted = (set) => [...set].sort();
 
-// Registered but kept without a frontend caller until the owner decides
-// (OpenCode hierarchy scaffolding from PR #127).
-const COMMANDS_WITHOUT_CALLER = new Set(['opencode_session_children']);
-
 test('every Tauri event is both emitted and listened to', () => {
   const listened = matches(frontend, /\blisten(?:<.*?>)?\(\s*'([a-z][a-z0-9-]*)'/g);
   const emitted = matches(backend, /\.emit\(\s*"([a-z][a-z0-9-]*)"/g);
@@ -52,10 +48,7 @@ test('every registered Tauri command is invoked, and every invoke is registered'
   );
   const invoked = matches(frontend, /\binvoke(?:<.*?>)?\(\s*'([a-z_0-9]+)'/g);
   for (const name of invoked) assert.ok(registered.has(name), `invoked but not registered: ${name}`);
-  for (const name of registered) {
-    if (COMMANDS_WITHOUT_CALLER.has(name)) continue;
-    assert.ok(invoked.has(name), `registered but never invoked: ${name}`);
-  }
+  for (const name of registered) assert.ok(invoked.has(name), `registered but never invoked: ${name}`);
 });
 
 test('every WebSocket client request is sent by the frontend, and vice versa', () => {

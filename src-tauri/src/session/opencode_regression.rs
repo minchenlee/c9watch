@@ -158,13 +158,8 @@ fn identical_remote_ids_in_two_directories_survive_enrichment_and_reads_are_scop
 }
 
 #[test]
-fn detail_children_deleted_archived_and_wrong_directory_are_validated() {
+fn detail_deleted_archived_and_wrong_directory_are_validated() {
     let fixture = Fixture::new(|path| {
-        if path == "/session/root/children?directory=%2Fa" {
-            let mut child = remote("child", "/a");
-            child["parentID"] = json!("root");
-            return Reply::json(json!([child]));
-        }
         if path.contains("missing") {
             let mut reply = Reply::body("private body".into());
             reply.code = 404;
@@ -183,14 +178,6 @@ fn detail_children_deleted_archived_and_wrong_directory_are_validated() {
         }
         Reply::json(detail)
     });
-    let children = read_children(
-        &fixture.connection,
-        &client().unwrap(),
-        &scoped_id("root", "/a"),
-    )
-    .unwrap();
-    assert_eq!(children[0].parent_thread_id, scoped_id("root", "/a"));
-    assert_eq!(children[0].session_id, scoped_id("child", "/a"));
     let mut reader = ConversationReader::default();
     for (id, expected) in [
         ("missing", "404"),
