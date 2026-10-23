@@ -142,6 +142,7 @@ async fn get_conversation(
                     ConversationProgress {
                         session_id: emit_id.clone(),
                         provider,
+                        request_id: None,
                         bytes_read,
                         bytes_total,
                     },
