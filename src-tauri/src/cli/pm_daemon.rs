@@ -84,6 +84,26 @@ fn worker_crashed_json(full_id: &str, callback_inbox: &str) -> serde_json::Value
     })
 }
 
+// ── Peer check ────────────────────────────────────────────────────────────────
+
+/// Only a process running as the daemon's own uid may talk to it.
+pub(crate) fn peer_allowed(peer_uid: u32, me: u32) -> bool {
+    peer_uid == me
+}
+
+/// Check the uid of the process on the other end of an accepted connection.
+/// A peer whose credentials cannot be read is rejected too. `Err(None)`
+/// means the peer already hung up (the `ensure_daemon` readiness probe does
+/// this), which is rejected without a log line.
+fn check_peer(stream: &UnixStream, me: u32) -> Result<(), Option<String>> {
+    match stream.peer_cred() {
+        Ok(cred) if peer_allowed(cred.uid(), me) => Ok(()),
+        Ok(cred) => Err(Some(format!("peer uid mismatch uid={}", cred.uid()))),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => Err(None),
+        Err(e) => Err(Some(format!("peer uid mismatch uid=unknown ({})", e))),
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// How long a new daemon waits for a pre-lock daemon to exit after asking it
@@ -111,6 +131,7 @@ fn retire_legacy_daemon(sock_path: &Path, pid_path: &Path) -> Result<(), String>
     }
     match crate::cli::pm_rpc::rpc_call(sock_path, &RpcRequest::Shutdown, Duration::from_secs(5)) {
         Err(e) if e.starts_with(crate::cli::pm_rpc::DAEMON_UNREACHABLE) => return Ok(()),
+        Err(e) if e.starts_with(crate::cli::pm_rpc::DAEMON_UNTRUSTED) => return Err(e),
         // The old daemon exits without answering Shutdown, so any other
         // result means it got the request.
         _ => {}
@@ -211,12 +232,23 @@ pub async fn run_daemon() -> Result<(), String> {
     }));
 
     // 7. Accept loop — interruptible by ctrl_c / SIGTERM so the daemon can
-    //    kill workers and clean up their worker dirs before exiting.
+    //    kill workers and clean up their worker dirs before exiting. Every
+    //    peer must run as our uid; the 0700 dir and 0600 socket are the
+    //    first fence, this check is the second.
+    let me = unsafe { libc::geteuid() };
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| format!("Failed to install SIGTERM handler: {}", e))?;
     loop {
         tokio::select! {
             accept = listener.accept() => {
                 match accept {
                     Ok((stream, _addr)) => {
+                        if let Err(reason) = check_peer(&stream, me) {
+                            if let Some(reason) = reason {
+                                eprintln!("[pm_daemon] {}", reason);
+                            }
+                            continue;
+                        }
                         let state_clone = Arc::clone(&state);
                         tokio::spawn(async move {
                             handle_connection(stream, state_clone, max_workers).await;
@@ -229,6 +261,10 @@ pub async fn run_daemon() -> Result<(), String> {
             }
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("[pm_daemon] Received ctrl_c / SIGINT, shutting down...");
+                shutdown_daemon(state).await;
+            }
+            _ = sigterm.recv() => {
+                eprintln!("[pm_daemon] Received SIGTERM, shutting down...");
                 shutdown_daemon(state).await;
             }
         }
@@ -1335,6 +1371,32 @@ mod tests {
         );
         assert!(pm_fs::daemon_ready_marked(&dir.join(pm_fs::DAEMON_LOCK_NAME)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── C0h-07: peer uid check ───────────────────────────────────────────────
+
+    #[test]
+    fn peer_allowed_only_for_our_uid() {
+        let me = unsafe { libc::geteuid() };
+        assert!(peer_allowed(me, me));
+        assert!(!peer_allowed(me + 1, me));
+        assert!(!peer_allowed(0, me + 1));
+    }
+
+    #[test]
+    fn peer_cred_same_uid_allowed() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (a, _b) = UnixStream::pair().unwrap();
+            let me = unsafe { libc::geteuid() };
+            assert!(check_peer(&a, me).is_ok());
+            // The same connection seen by a daemon running as another uid.
+            let err = check_peer(&a, me + 1).unwrap_err();
+            assert_eq!(err, Some(format!("peer uid mismatch uid={}", me)));
+        });
     }
 
     // ── C0h-06: lifetime lock ────────────────────────────────────────────────
