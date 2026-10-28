@@ -33,6 +33,15 @@ export function providerLabel(provider: SessionProvider): string {
 	return 'CLAUDE CODE';
 }
 
+/** Short tag for dense rows; the full name goes in the tooltip. */
+export function providerShortLabel(provider: SessionProvider): string {
+	if (provider === 'codex') return 'CDX';
+	if (provider === 'cursor') return 'CUR';
+	if (provider === 'pi') return 'PI';
+	if (provider === 'opencode') return 'OC';
+	return 'CC';
+}
+
 export function surfaceLabel(surface?: SessionSurface): string | null {
 	if (!surface || surface === 'unknown' || surface === 'claudeCode' || surface === 'cursor') {
 		return null;

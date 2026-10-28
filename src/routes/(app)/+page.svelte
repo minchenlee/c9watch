@@ -20,6 +20,7 @@
 	import { isTauri } from '$lib/ws';
 	import StatusBar from '$lib/components/StatusBar.svelte';
 	import SessionCard from '$lib/components/SessionCard.svelte';
+	import DenseBoard from '$lib/components/DenseBoard.svelte';
 	import ExpandedCardOverlay from '$lib/components/ExpandedCardOverlay.svelte';
 	import ToastNotifications from '$lib/components/ToastNotifications.svelte';
 	import QRCodeModal from '$lib/components/QRCodeModal.svelte';
@@ -64,10 +65,20 @@
 	let expandedId = $derived($expandedSessionId);
 	let conversation = $derived($currentConversation);
 
-	let viewMode = $state<'project' | 'all'>('project');
+	let viewMode = $state<'project' | 'all' | 'dense'>('project');
+	let isDense = $derived(viewMode === 'dense');
 	let sessionFilter = $state<'humans' | 'workers'>('humans');
 
 	let isCompact = $state(false);
+
+	// Dense view text size, stepped by the A−/A+ buttons.
+	const DENSE_FONT_SCALES = [0.9, 1, 1.1, 1.2, 1.35, 1.5];
+	let denseFontScale = $state(1);
+	let denseFontStep = $derived(DENSE_FONT_SCALES.indexOf(denseFontScale));
+	function stepDenseFont(delta: number) {
+		const next = DENSE_FONT_SCALES[denseFontStep + delta];
+		if (next !== undefined) denseFontScale = next;
+	}
 
 	let activeTab = $state<'monitor' | 'history' | 'cost' | 'memory' | 'settings'>('monitor');
 	let fdaLikelyNeeded = $state(false);
@@ -87,12 +98,16 @@
 	onMount(() => {
 		if (browser) {
 			const saved = localStorage.getItem('sessionViewMode');
-			if (saved === 'project' || saved === 'all') {
+			if (saved === 'project' || saved === 'all' || saved === 'dense') {
 				viewMode = saved;
 			}
 			const savedCompact = localStorage.getItem('sessionViewCompact');
 			if (savedCompact === 'true') {
 				isCompact = true;
+			}
+			const savedFontScale = Number(localStorage.getItem('denseFontScale'));
+			if (DENSE_FONT_SCALES.includes(savedFontScale)) {
+				denseFontScale = savedFontScale;
 			}
 			const savedFilter = localStorage.getItem('sessionFilter');
 			if (
@@ -164,6 +179,12 @@
 	$effect(() => {
 		if (browser) {
 			localStorage.setItem('sessionViewCompact', String(isCompact));
+		}
+	});
+
+	$effect(() => {
+		if (browser) {
+			localStorage.setItem('denseFontScale', String(denseFontScale));
 		}
 	});
 
@@ -569,7 +590,7 @@
 		<SettingsTab />
 	</main>
 	{:else}
-	<main class="grid-container" in:fadeIn>
+	<main class="grid-container" class:dense={isDense} in:fadeIn>
 		<div class="sections-container">
 			<section class="system-section" in:flyIn|global={{ index: 0 }}>
 				<div class="project-header">
@@ -581,7 +602,7 @@
 						onclick={jumpToAttention}
 						disabled={attentionItems.length === 0}
 					>
-						{attentionItems.length} attention item{attentionItems.length === 1 ? '' : 's'}
+						{attentionItems.length}{' '}<span class="attention-label">attention item{attentionItems.length === 1 ? '' : 's'}</span><span class="attention-label-short">attn</span>
 					</button>
 					<span class="project-count">{filteredSessions.length}</span>
 					<button
@@ -647,7 +668,7 @@
 							class="toggle-btn"
 							class:active={isCompact}
 							onclick={() => isCompact = !isCompact}
-							title="Compact View"
+							title={isDense ? 'One line per session' : 'Compact View'}
 						>
 							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 								<polyline points="4 14 10 14 10 20" />
@@ -657,6 +678,26 @@
 							</svg>
 						</button>
 					</div>
+					{#if isDense}
+						<div class="view-toggle" role="group" aria-label="Text size">
+							<button
+								type="button"
+								class="toggle-btn font-btn smaller"
+								onclick={() => stepDenseFont(-1)}
+								disabled={denseFontStep <= 0}
+								title={`Smaller text (${Math.round(denseFontScale * 100)}%)`}
+								aria-label="Smaller text"
+							>A−</button>
+							<button
+								type="button"
+								class="toggle-btn font-btn larger"
+								onclick={() => stepDenseFont(1)}
+								disabled={denseFontStep >= DENSE_FONT_SCALES.length - 1}
+								title={`Larger text (${Math.round(denseFontScale * 100)}%)`}
+								aria-label="Larger text"
+							>A+</button>
+						</div>
+					{/if}
 					<div class="view-toggle">
 						<button 
 							class="toggle-btn" 
@@ -686,12 +727,25 @@
 								<rect x="3" y="14" width="7" height="7" rx="1" />
 							</svg>
 						</button>
+						<button
+							class="toggle-btn"
+							class:active={viewMode === 'dense'}
+							onclick={() => viewMode = 'dense'}
+							title="Dense: project tiles, one row per session"
+						>
+							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+								<rect x="3" y="3" width="18" height="18" rx="1" />
+								<line x1="7" y1="8" x2="17" y2="8" />
+								<line x1="7" y1="12" x2="17" y2="12" />
+								<line x1="7" y1="16" x2="17" y2="16" />
+							</svg>
+						</button>
 					</div>
 				</div>
 				
 				{#if filteredSessions.length > 0}
 					<div class="system-status-container">
-						<StatusBar total={filteredSessions.length} summary={filteredSummary} />
+						<StatusBar total={filteredSessions.length} summary={filteredSummary} dense={isDense} />
 					</div>
 				{/if}
 				<HiddenSessionsNotice hidden={hiddenClaudeSessions} />
@@ -739,7 +793,16 @@
 				</div>
 			{:else}
 
-				{#if viewMode === 'project'}
+				{#if viewMode === 'dense'}
+					<DenseBoard
+						groups={projectGroups}
+						compact={isCompact}
+						fontScale={denseFontScale}
+						onexpand={handleExpand}
+						onstop={(session) => handleStop(session.pid)}
+						onopen={(session) => handleOpen(session.pid, session.projectPath)}
+					/>
+				{:else if viewMode === 'project'}
 					{#each projectGroups as group, gi (group.path)}
 						{@const baseIdx = projectOffsets[gi] ?? 0}
 						<section class="project-section" in:flyIn|global={{ index: baseIdx }} animate:flip={{ duration: 400 }}>
@@ -1401,6 +1464,51 @@
 		flex: 1;
 	}
 
+	/* ── Dense view: every pixel goes to sessions ─────────────── */
+	.grid-container.dense {
+		padding: var(--space-sm) var(--space-md) var(--space-md);
+	}
+
+	.dense .sections-container {
+		gap: 6px;
+	}
+
+	.dense .system-section {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+
+	.dense .system-section .project-header {
+		gap: var(--space-sm);
+		padding-bottom: 6px;
+		margin-bottom: 0;
+		border-bottom-color: var(--border-default);
+	}
+
+	.dense .view-toggle .toggle-btn {
+		width: 24px;
+		height: 24px;
+	}
+
+	.attention-label-short { display: none; }
+
+	.font-btn {
+		font-family: var(--font-mono);
+		font-weight: 700;
+		line-height: 1;
+		letter-spacing: -0.02em;
+	}
+
+	.font-btn.smaller { font-size: 10px; }
+	.font-btn.larger { font-size: 13px; }
+
+	.font-btn:disabled {
+		opacity: 0.35;
+		cursor: default;
+		background: transparent;
+	}
+
 	/* ── Fullscreen: align tab padding with content padding ────── */
 	/* In macOS native fullscreen the traffic lights are gone. Replace the
 	   80px clearance with var(--space-xl) to match the grid-container padding. */
@@ -1451,13 +1559,14 @@
 			max-width: 100%;
 		}
 
-		/* Single column grid */
+		/* Single column grid. minmax(0, …) lets the column shrink below the
+		   cards' unwrapped text width instead of pushing them off screen. */
 		.all-sessions-grid {
-			grid-template-columns: 1fr;
+			grid-template-columns: minmax(0, 1fr);
 		}
 
 		.all-sessions-grid.compact {
-			grid-template-columns: 1fr;
+			grid-template-columns: minmax(0, 1fr);
 		}
 
 		.view-toggle {
@@ -1471,6 +1580,30 @@
 
 		.demo-toggle {
 			padding: 0 var(--space-xs);
+		}
+
+		/* Dense: header controls on one line, tiles nearly edge to edge. */
+		.grid-container.dense {
+			padding: 6px;
+		}
+
+		.dense .attention-label { display: none; }
+		.dense .attention-label-short { display: inline; }
+
+		/* Tighter gaps keep all controls on one line down to 360px. */
+		.dense .system-section .project-header { gap: 4px; }
+		.dense .view-toggle { gap: 0; }
+
+		.dense .system-section .project-name,
+		.dense .system-section .project-count,
+		.dense .demo-label,
+		.dense .mobile-label {
+			display: none;
+		}
+
+		.dense .view-toggle .toggle-btn {
+			width: 30px;
+			height: 30px;
 		}
 	}
 

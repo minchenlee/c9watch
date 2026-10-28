@@ -8,9 +8,11 @@
 			input: number;
 		};
 		total: number;
+		/** One slim row: bar and legend side by side. */
+		dense?: boolean;
 	}
 
-	let { summary, total }: Props = $props();
+	let { summary, total, dense = false }: Props = $props();
 
 	let trackWidth = $state(0);
 	let isSweeping = $state(false);
@@ -41,7 +43,12 @@
 	// Block width = 8px
 	// Gap = 2px
 	// Stride = 10px
-	let columns = $derived(Math.max(1, Math.floor((trackWidth - 6) / 10)));
+	// Dense: 12px track, 6px blocks, stride 8, 2px padding each side.
+	let columns = $derived(
+		dense
+			? Math.max(1, Math.floor((trackWidth - 4) / 8))
+			: Math.max(1, Math.floor((trackWidth - 6) / 10))
+	);
 	let totalBlocks = $derived(columns);
 
 	let blocks = $derived.by(() => {
@@ -87,7 +94,7 @@
 	});
 </script>
 
-<div class="system-status-bar">
+<div class="system-status-bar" class:dense>
 
 	<div class="progress-track" class:empty={total === 0} bind:clientWidth={trackWidth}>
 		<div class="grid-container" class:sweeping={isSweeping} style="grid-template-columns: repeat({columns}, 1fr);">
@@ -98,17 +105,17 @@
 	</div>
 
 	<div class="legend">
-		<div class="legend-item" class:inactive={summary.working === 0}>
+		<div class="legend-item" class:inactive={summary.working === 0} title="Working">
 			<span class="dot working"></span>
 			<span class="label">WORKING</span>
 			<span class="count">{summary.working}</span>
 		</div>
-		<div class="legend-item" class:inactive={summary.permission === 0}>
+		<div class="legend-item" class:inactive={summary.permission === 0} title="Approval">
 			<span class="dot permission"></span>
 			<span class="label">APPROVAL</span>
 			<span class="count">{summary.permission}</span>
 		</div>
-		<div class="legend-item" class:inactive={summary.input === 0}>
+		<div class="legend-item" class:inactive={summary.input === 0} title="Waiting">
 			<span class="dot input"></span>
 			<span class="label">WAITING</span>
 			<span class="count">{summary.input}</span>
@@ -285,6 +292,29 @@
 		background-size: 4px 4px;
 	}
 
+	/* ── Dense ─────────────────────────────────────────────────── */
+	.system-status-bar.dense {
+		flex-direction: row;
+		align-items: center;
+		gap: var(--space-md);
+		padding: 5px 8px;
+	}
+
+	.dense .progress-track {
+		flex: 1;
+		min-width: 0;
+		height: 12px;
+		padding: 2px;
+	}
+
+	.dense .legend { gap: var(--space-md); flex-shrink: 0; }
+	.dense .legend-item { gap: 5px; }
+	.dense .legend-item .dot { width: 6px; height: 6px; }
+	.dense .legend-item .label { font-size: 10px; }
+	.dense .legend-item .count { font-size: 12px; }
+	.dense .legend-item.inactive .count { color: var(--text-muted); }
+	.dense .deco-mesh { display: none; }
+
 	/* ── Mobile Responsive ─────────────────────────────────────── */
 	@media (max-width: 768px) {
 		.system-status-bar {
@@ -302,6 +332,10 @@
 		.legend-item .count {
 			font-size: 13px;
 		}
+
+		/* Dot and count only, so the legend fits beside the bar. */
+		.dense .legend-item .label { display: none; }
+		.dense .legend { gap: var(--space-sm); }
 	}
 
 </style>
