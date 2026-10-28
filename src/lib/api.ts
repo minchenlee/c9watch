@@ -79,7 +79,7 @@ export async function stopSession(session: Session): Promise<void> {
 	if (get(isDemoMode)) return;
 
 	if (useWebSocket()) {
-		await wsClient.request('stopSession', { pid: session.pid });
+		await wsClient.request('session.stop', { addr: sessionKeyOf(session), pid: session.pid });
 		return;
 	}
 	await invoke<void>('stop_session', { sessionKey: sessionKeyOf(session), pid: session.pid });

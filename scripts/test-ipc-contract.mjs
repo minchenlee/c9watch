@@ -51,11 +51,21 @@ test('every registered Tauri command is invoked, and every invoke is registered'
   for (const name of registered) assert.ok(invoked.has(name), `registered but never invoked: ${name}`);
 });
 
+// Requests the server still parses only to answer "removed"; the frontend
+// must not send them.
+const REMOVED_WS_REQUESTS = new Set(['stopSession']);
+
 test('every WebSocket client request is sent by the frontend, and vice versa', () => {
   const clientEnum = webServer.match(/enum ClientMsg \{([\s\S]*?)\n\}/);
   assert.ok(clientEnum, 'ClientMsg not found in web_server.rs');
-  const handled = matches(clientEnum[1], /#\[serde\(rename = "([A-Za-z]+)"\)\]\s*[A-Z]/g);
-  const requested = matches(frontend, /wsClient\.request(?:<.*?>)?\(\s*'([A-Za-z]+)'/g);
+  const handled = matches(clientEnum[1], /#\[serde\(rename = "([A-Za-z.]+)"\)\]\s*[A-Z]/g);
+  const requested = matches(frontend, /wsClient\.request(?:<.*?>)?\(\s*'([A-Za-z.]+)'/g);
+  for (const name of REMOVED_WS_REQUESTS) {
+    assert.ok(handled.has(name), `removed request no longer parsed: ${name}`);
+    handled.delete(name);
+    assert.ok(!frontend.includes(`'${name}'`), `frontend still sends removed request: ${name}`);
+  }
+  assert.ok(handled.has('session.stop') && requested.has('session.stop'));
   assert.deepEqual(sorted(requested), sorted(handled));
 });
 

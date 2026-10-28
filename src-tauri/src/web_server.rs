@@ -53,8 +53,23 @@ enum ClientMsg {
         include_tools: bool,
     },
 
+    /// Stop the session at `addr` (its session key, e.g. `claudeCode:<id>`).
+    /// The server resolves the process itself; `pid`, when given, only has
+    /// to agree with what it resolves.
+    #[serde(rename = "session.stop")]
+    SessionStop {
+        addr: String,
+        #[serde(default)]
+        pid: Option<u32>,
+    },
+
+    /// Removed: it named a raw pid. Still parsed so an old client gets a
+    /// clear error instead of "unknown message"; never stops anything.
     #[serde(rename = "stopSession")]
-    StopSession { pid: u32 },
+    StopSession {
+        #[allow(dead_code)]
+        pid: u32,
+    },
 
     #[serde(rename = "openSession")]
     OpenSession {
@@ -395,22 +410,31 @@ fn sessions_response<S: Serialize, D>(scan: Result<(Vec<S>, D), String>) -> Serv
     }
 }
 
+const STOP_SESSION_REMOVED: &str =
+    "stopSession removed; update the mobile client (use session.stop{addr})";
+
 async fn handle_message(
     msg: ClientMsg,
     detector: Arc<Mutex<crate::session::DetectorState>>,
 ) -> ServerMsg {
-    handle_message_with_owners(
-        msg,
-        crate::session::global_provider_source_owners(),
-        detector,
-    )
-    .await
+    let stop = move |addr: String, pid: Option<u32>| {
+        crate::actions::stop_session_by_key(
+            &addr,
+            pid,
+            || crate::detect_sessions(&detector),
+            crate::actions::process_start_secs,
+        )
+        .map(|_| ())
+    };
+    handle_message_with_owners(msg, crate::session::global_provider_source_owners(), stop).await
 }
 
+/// `stop` stops the session at an address and runs on the blocking pool;
+/// tests inject it the way they inject `owners`.
 async fn handle_message_with_owners(
     msg: ClientMsg,
     owners: crate::session::ProviderSourceOwners,
-    detector: Arc<Mutex<crate::session::DetectorState>>,
+    stop: impl FnOnce(String, Option<u32>) -> Result<(), String> + Send + 'static,
 ) -> ServerMsg {
     match msg {
         ClientMsg::GetSubscriptionUsage => ServerMsg::SubscriptionUsage {
@@ -430,20 +454,18 @@ async fn handle_message_with_owners(
             message: "getConversation is handled by the socket loop".into(),
         },
 
-        ClientMsg::StopSession { pid } => match tokio::task::spawn_blocking(move || {
-            crate::actions::stop_session_by_pid(
-                pid,
-                || crate::detect_sessions(&detector),
-                crate::actions::process_start_secs,
-            )
-        })
-        .await
-        {
-            Ok(Ok(())) => ServerMsg::Ok,
-            Ok(Err(e)) => ServerMsg::Error { message: e },
-            Err(e) => ServerMsg::Error {
-                message: format!("Stop failed: {e}"),
-            },
+        ClientMsg::SessionStop { addr, pid } => {
+            match tokio::task::spawn_blocking(move || stop(addr, pid)).await {
+                Ok(Ok(())) => ServerMsg::Ok,
+                Ok(Err(e)) => ServerMsg::Error { message: e },
+                Err(e) => ServerMsg::Error {
+                    message: format!("Stop failed: {e}"),
+                },
+            }
+        }
+
+        ClientMsg::StopSession { .. } => ServerMsg::Error {
+            message: STOP_SESSION_REMOVED.into(),
         },
 
         ClientMsg::OpenSession { pid, project_path } => {
@@ -488,28 +510,8 @@ mod tests {
 
     const SESSION_ID: &str = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
 
-    /// A detector that finds no sessions.
-    fn test_detector() -> Arc<Mutex<crate::session::DetectorState>> {
-        use crate::session::source::{
-            DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource,
-        };
-        use crate::session::{BackendMode, DetectorState};
-        struct NoSessions;
-        impl SessionSource for NoSessions {
-            fn detect(
-                &mut self,
-            ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError>
-            {
-                Ok((Vec::new(), DetectionDiagnostics::default()))
-            }
-            fn backend_name(&self) -> &'static str {
-                "cli"
-            }
-        }
-        Arc::new(Mutex::new(DetectorState::for_test(
-            Box::new(NoSessions),
-            BackendMode::Auto,
-        )))
+    fn no_stop(_: String, _: Option<u32>) -> Result<(), String> {
+        panic!("stop must not run");
     }
 
     #[test]
@@ -566,7 +568,7 @@ mod tests {
                     provider: None,
                 },
                 owners,
-                test_detector(),
+                no_stop,
             )
             .await;
 
@@ -634,6 +636,65 @@ mod protocol_tests {
         let without_id = serde_json::to_value(progress(None)).unwrap();
         assert!(without_id.get("requestId").is_none());
         assert!(without_id.get("provider").unwrap().is_null());
+    }
+
+    #[test]
+    fn session_stop_request_carries_an_address_and_optional_pid() {
+        let request: ClientMsg = serde_json::from_str(
+            r#"{"type":"session.stop","addr":"claudeCode:x","pid":1,"requestId":3}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            request,
+            ClientMsg::SessionStop { ref addr, pid: Some(1) } if addr == "claudeCode:x"
+        ));
+        let request: ClientMsg =
+            serde_json::from_str(r#"{"type":"session.stop","addr":"claudeCode:x"}"#).unwrap();
+        assert!(matches!(request, ClientMsg::SessionStop { pid: None, .. }));
+    }
+
+    /// Records each stop the handler asks for, and answers `Ok`.
+    fn recording_stop() -> (
+        Arc<Mutex<Vec<(String, Option<u32>)>>>,
+        impl FnOnce(String, Option<u32>) -> Result<(), String> + Send + 'static,
+    ) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&calls);
+        let stop = move |addr, pid| {
+            sink.lock().unwrap().push((addr, pid));
+            Ok(())
+        };
+        (calls, stop)
+    }
+
+    fn no_owners() -> crate::session::ProviderSourceOwners {
+        crate::session::ProviderSourceOwners::from_test_sources(None, None, None)
+    }
+
+    #[tokio::test]
+    async fn session_stop_passes_the_address_to_stop() {
+        let (calls, stop) = recording_stop();
+        let request =
+            serde_json::from_str(r#"{"type":"session.stop","addr":"claudeCode:x","pid":7}"#)
+                .unwrap();
+        let response = handle_message_with_owners(request, no_owners(), stop).await;
+        assert!(matches!(response, ServerMsg::Ok));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [("claudeCode:x".to_string(), Some(7))]
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_stop_session_by_pid_errors_without_stopping() {
+        let (calls, stop) = recording_stop();
+        let request = serde_json::from_str(r#"{"type":"stopSession","pid":4242}"#).unwrap();
+        let response = handle_message_with_owners(request, no_owners(), stop).await;
+        match response {
+            ServerMsg::Error { message } => assert!(message.contains("removed")),
+            other => panic!("expected the removed error, got {other:?}"),
+        }
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     /// The mobile client reads `data` as a session array; a `[sessions,
