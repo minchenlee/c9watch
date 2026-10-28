@@ -703,11 +703,8 @@ pub fn run() {
             let port = web_server::WS_PORT;
 
             let ws_url = format!("ws://{}:{}/ws?token={}", local_ip, port, token);
-            let http_url = format!("http://{}:{}/?token={}", local_ip, port, token);
 
-            debug_log::log_info(&format!("Mobile connection ready — URL: {}", http_url));
-            qr2term::print_qr(&http_url).ok();
-            eprintln!();
+            debug_log::log_info(&format!("WS server on port {}", port));
 
             let (sessions_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
             let (notifications_tx, _nrx) = tokio::sync::broadcast::channel::<String>(16);

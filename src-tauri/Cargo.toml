@@ -28,7 +28,6 @@ gui = [
     "dep:axum",
     "dep:tokio",
     "dep:rand",
-    "dep:qr2term",
     "dep:rust-embed",
     "dep:mime_guess",
     "dep:base64",
@@ -67,7 +66,6 @@ tauri-plugin-sharekit = { version = "0.3", optional = true }
 axum = { version = "0.7", features = ["ws"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "process", "signal", "fs", "time", "macros"], optional = true }
 rand = { version = "0.8", optional = true }
-qr2term = { version = "0.3", optional = true }
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 base64 = { version = "0.22", optional = true }
