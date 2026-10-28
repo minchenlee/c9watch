@@ -133,7 +133,9 @@ impl CliSessionSource {
             },
             entrypoint: meta.entrypoint,
             started_at_ms: Some(a.started_at),
-            official_name: a.name,
+            // A derived name says nothing about the work, so the card falls
+            // back to the AI title or first prompt instead.
+            official_name: a.name.filter(|_| !meta.name_derived),
             cli_activity: cli_activity(a.status.as_deref()),
             cli_reports_prompts: meta.version.is_some_and(reports_prompts_as_waiting),
             cwd: a.cwd,
@@ -545,6 +547,9 @@ struct PidMeta {
     version: Option<(u32, u32, u32)>,
     /// `procStart` / `startedAt` of the process that wrote the file.
     start: RecordedStart,
+    /// `nameSource` is `"derived"`: Claude Code made the session name up
+    /// (`<cwd>-<hex>`) rather than the user choosing it.
+    name_derived: bool,
 }
 
 fn pid_meta_under(home: &Path, pid: u32) -> PidMeta {
@@ -560,6 +565,7 @@ fn pid_meta_under(home: &Path, pid: u32) -> PidMeta {
         entrypoint: field("entrypoint").map(str::to_string),
         version: field("version").and_then(super::parse_semver),
         start: RecordedStart::from_record(&value),
+        name_derived: field("nameSource") == Some("derived"),
     }
 }
 
@@ -768,6 +774,7 @@ mod tests {
                 entrypoint: Some("sdk-cli".to_string()),
                 version: Some((2, 1, 280)),
                 start: RecordedStart::default(),
+                name_derived: false,
             },
         );
 
@@ -806,8 +813,54 @@ mod tests {
                 entrypoint: Some("cli".to_string()),
                 version: Some((2, 1, 280)),
                 start: RecordedStart::default(),
+                name_derived: false,
             }
         );
+    }
+
+    #[test]
+    fn map_agent_to_session_drops_derived_name_and_keeps_user_name() {
+        let mut source = CliSessionSource::new();
+        let mut map = |name_derived| {
+            source
+                .map_agent_to_session(
+                    CliAgent {
+                        pid: std::process::id(),
+                        cwd: PathBuf::from("/tmp/name-fixture"),
+                        kind: "interactive".to_string(),
+                        started_at: 1,
+                        session_id: "name-session".to_string(),
+                        name: Some("name-fixture-b5".to_string()),
+                        status: None,
+                    },
+                    PidMeta {
+                        name_derived,
+                        ..PidMeta::default()
+                    },
+                )
+                .official_name
+        };
+        assert_eq!(map(true), None);
+        assert_eq!(map(false).as_deref(), Some("name-fixture-b5"));
+    }
+
+    #[test]
+    fn pid_meta_reads_derived_name_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("7.json"),
+            r#"{"pid":7,"name":"proj-b5","nameSource":"derived"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("8.json"),
+            r#"{"pid":8,"name":"Chosen","nameSource":"user"}"#,
+        )
+        .unwrap();
+        assert!(pid_meta_under(tmp.path(), 7).name_derived);
+        assert!(!pid_meta_under(tmp.path(), 8).name_derived);
     }
 
     #[test]

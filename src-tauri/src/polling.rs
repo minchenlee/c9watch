@@ -240,7 +240,8 @@ pub fn start_polling(
                                                             .custom_title
                                                             .as_deref()
                                                             .or(session.codex_title.as_deref())
-                                                            .or(session.cursor_title.as_deref()),
+                                                            .or(session.cursor_title.as_deref())
+                                                            .or(session.ai_title.as_deref()),
                                                         session_name: &session.session_name,
                                                         status: &session.status,
                                                         pending_tool_name: session

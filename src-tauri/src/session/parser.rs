@@ -62,6 +62,13 @@ pub enum SessionEntry {
         #[serde(rename = "sessionId")]
         session_id: String,
     },
+    #[serde(rename = "ai-title")]
+    AiTitle {
+        #[serde(rename = "aiTitle")]
+        ai_title: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -654,44 +661,53 @@ pub fn get_native_custom_title(entries: &[SessionEntry]) -> Option<String> {
     None
 }
 
+/// Titles Claude Code writes into a session JSONL: the user's `/rename`
+/// (`custom-title`) and its own auto-generated one (`ai-title`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeTitles {
+    pub custom: Option<String>,
+    pub ai: Option<String>,
+}
+
 /// Extract the native custom title from a JSONL file.
 ///
 /// Scans the file for lines containing `"custom-title"` and parses only those.
 /// Returns the last (most recent) custom title found.
 pub fn get_native_custom_title_from_file(path: &std::path::Path) -> Option<String> {
-    scan_native_custom_title(File::open(path).ok()?).0
+    scan_native_titles(File::open(path).ok()?).0.custom
 }
 
-pub(crate) fn try_get_native_custom_title_from_file(
-    path: &Path,
-) -> std::io::Result<Option<String>> {
-    let (title, result) = scan_native_custom_title(File::open(path)?);
+pub(crate) fn try_get_native_titles_from_file(path: &Path) -> std::io::Result<NativeTitles> {
+    let (titles, result) = scan_native_titles(File::open(path)?);
     result?;
-    Ok(title)
+    Ok(titles)
 }
 
 /// Retain one line at a time, and keep I/O failure separate from no title.
 /// A line that isn't valid UTF-8 ends the scan with the titles found so far,
 /// as a complete result: rescanning an unchanged file gives the same answer.
-fn scan_native_custom_title(reader: impl Read) -> (Option<String>, std::io::Result<()>) {
+/// The last entry of each kind wins.
+fn scan_native_titles(reader: impl Read) -> (NativeTitles, std::io::Result<()>) {
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    let mut last_title = None;
+    let mut titles = NativeTitles::default();
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) => return (last_title, Ok(())),
+            Ok(0) => return (titles, Ok(())),
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                return (last_title, Ok(()))
+                return (titles, Ok(()))
             }
-            Err(error) => return (last_title, Err(error)),
+            Err(error) => return (titles, Err(error)),
         }
-        if line.contains("\"custom-title\"") {
-            if let Ok(SessionEntry::CustomTitle { custom_title, .. }) =
-                serde_json::from_str::<SessionEntry>(&line)
-            {
-                last_title = Some(custom_title);
+        if line.contains("\"custom-title\"") || line.contains("\"ai-title\"") {
+            match serde_json::from_str::<SessionEntry>(&line) {
+                Ok(SessionEntry::CustomTitle { custom_title, .. }) => {
+                    titles.custom = Some(custom_title)
+                }
+                Ok(SessionEntry::AiTitle { ai_title, .. }) => titles.ai = Some(ai_title),
+                _ => {}
             }
         }
     }
@@ -1342,8 +1358,8 @@ mod tests {
                 Err(std::io::Error::other("injected read failure"))
             }
         }
-        let (title, result) = scan_native_custom_title(FailingReader);
-        assert!(title.is_none());
+        let (titles, result) = scan_native_titles(FailingReader);
+        assert_eq!(titles, NativeTitles::default());
         assert!(result.is_err());
     }
 
@@ -1353,9 +1369,9 @@ mod tests {
         bytes.extend_from_slice(b"\n\xff\n");
         bytes
             .extend_from_slice(br#"{"type":"custom-title","customTitle":"after","sessionId":"s"}"#);
-        let (title, result) = scan_native_custom_title(std::io::Cursor::new(bytes));
+        let (titles, result) = scan_native_titles(std::io::Cursor::new(bytes));
         result.unwrap();
-        assert_eq!(title, Some("kept".to_string()));
+        assert_eq!(titles.custom, Some("kept".to_string()));
     }
 
     #[test]
@@ -1369,9 +1385,9 @@ mod tests {
         }
         let mut bytes = b"{}\n".repeat(100_000);
         bytes.extend_from_slice(br#"{"type":"custom-title","customTitle":"kept","sessionId":"s"}"#);
-        let (title, result) = scan_native_custom_title(BoundedReads(std::io::Cursor::new(bytes)));
+        let (titles, result) = scan_native_titles(BoundedReads(std::io::Cursor::new(bytes)));
         result.unwrap();
-        assert_eq!(title, Some("kept".to_string()));
+        assert_eq!(titles.custom, Some("kept".to_string()));
     }
 
     #[test]
@@ -1410,6 +1426,56 @@ mod tests {
         assert_eq!(
             get_native_custom_title_from_file(&path),
             Some("kept".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_ai_title_entry() {
+        let json = r#"{"type":"ai-title","aiTitle":"Fix login bug","sessionId":"abc-123"}"#;
+        match serde_json::from_str::<SessionEntry>(json) {
+            Ok(SessionEntry::AiTitle {
+                ai_title,
+                session_id,
+            }) => {
+                assert_eq!(ai_title, "Fix login bug");
+                assert_eq!(session_id, "abc-123");
+            }
+            other => panic!("Expected AiTitle entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn native_titles_scan_reads_ai_title_alone() {
+        let bytes = br#"{"type":"ai-title","aiTitle":"generated","sessionId":"s"}"#.to_vec();
+        let (titles, result) = scan_native_titles(std::io::Cursor::new(bytes));
+        result.unwrap();
+        assert_eq!(
+            titles,
+            NativeTitles {
+                custom: None,
+                ai: Some("generated".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn native_titles_scan_keeps_the_last_of_each_kind() {
+        let bytes = concat!(
+            r#"{"type":"ai-title","aiTitle":"first ai","sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":"renamed","sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"second ai","sessionId":"s"}"#,
+            "\n",
+        );
+        let (titles, result) = scan_native_titles(std::io::Cursor::new(bytes));
+        result.unwrap();
+        assert_eq!(
+            titles,
+            NativeTitles {
+                custom: Some("renamed".to_string()),
+                ai: Some("second ai".to_string()),
+            }
         );
     }
 
