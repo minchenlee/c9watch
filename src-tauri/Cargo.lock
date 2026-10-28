@@ -468,6 +468,8 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "sysinfo",
  "tauri",
  "tauri-build",

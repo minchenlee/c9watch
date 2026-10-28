@@ -23,6 +23,8 @@ pub mod polling;
 pub mod subscription_usage;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod web_server;
+#[cfg(all(not(mobile), feature = "gui"))]
+pub mod ws_auth;
 
 // ── CLI module ──────────────────────────────────────────────────────
 #[cfg(feature = "cli")]

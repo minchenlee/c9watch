@@ -31,6 +31,8 @@ gui = [
     "dep:rust-embed",
     "dep:mime_guess",
     "dep:base64",
+    "dep:sha2",
+    "dep:subtle",
     "dep:tauri-nspanel",
 ]
 cli = ["dep:clap", "dep:regex", "dep:tokio"]
@@ -69,6 +71,8 @@ rand = { version = "0.8", optional = true }
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 base64 = { version = "0.22", optional = true }
+sha2 = { version = "0.10", optional = true }
+subtle = { version = "2.6", optional = true }
 
 # ── CLI-only dependencies ────────────────────────────────────────────
 clap = { version = "4", features = ["derive"], optional = true }
