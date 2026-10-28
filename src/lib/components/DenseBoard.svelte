@@ -60,7 +60,6 @@
 			{#each column as tile (tile.path)}
 				<section
 					class="tile"
-					class:attention={tile.tier === 0}
 					in:flyIn|global={{ index: order.get(tile.path) ?? 0, y: 4, stride: 30 }}
 				>
 					<header class="tile-head" title={tile.path}>
@@ -113,11 +112,6 @@
 		background: var(--bg-card);
 		border: 1px solid var(--border-default);
 		min-width: 0;
-	}
-
-	.tile.attention {
-		border-color: color-mix(in srgb, var(--status-permission) 60%, var(--border-default));
-		box-shadow: 0 0 16px -4px var(--status-permission-glow);
 	}
 
 	.tile-head {
