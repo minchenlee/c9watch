@@ -15,6 +15,7 @@ fn fixture() -> Session {
         custom_title: None,
         codex_title: Some("Codex thread title".to_string()),
         cursor_title: None,
+        ai_title: None,
         project_path: "/tmp/project".to_string(),
         git_branch: None,
         first_prompt: "investigate".to_string(),

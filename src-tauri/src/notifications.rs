@@ -200,6 +200,7 @@ fn content(s: &Session, event: Event, detail: Detail) -> (String, String) {
         .as_deref()
         .or(s.codex_title.as_deref())
         .or(s.cursor_title.as_deref())
+        .or(s.ai_title.as_deref())
         .filter(|v| !v.trim().is_empty())
         .unwrap_or(&s.first_prompt);
     let title = compact(
@@ -352,6 +353,7 @@ mod tests {
             custom_title: None,
             codex_title: Some("Codex thread title".to_string()),
             cursor_title: None,
+            ai_title: None,
             project_path: "/tmp/project".to_string(),
             git_branch: None,
             first_prompt: "investigate".to_string(),

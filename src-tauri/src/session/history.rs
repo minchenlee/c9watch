@@ -32,6 +32,9 @@ pub struct HistoryEntry {
     /// Cursor's current UI composer name from state.vscdb.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_title: Option<String>,
+    /// Claude Code's auto-generated title (`ai-title` in the session JSONL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_title: Option<String>,
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,6 +107,7 @@ pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
                 custom_title: None,
                 codex_title: None,
                 cursor_title: None,
+                ai_title: None,
                 provider: default_provider(),
                 surface: None,
                 agent_kind: None,
@@ -156,6 +160,7 @@ fn codex_history_entries(home_dir: &std::path::Path) -> Vec<HistoryEntry> {
                 custom_title: None,
                 codex_title,
                 cursor_title: None,
+                ai_title: None,
                 provider: "codex".to_string(),
                 surface: Some(snapshot.surface),
                 agent_kind: Some(snapshot.agent_kind),
@@ -166,8 +171,8 @@ fn codex_history_entries(home_dir: &std::path::Path) -> Vec<HistoryEntry> {
 
 /// Drop entries whose session JSONL has been removed (via `/clear`, Claude Code
 /// cleanup, or manual deletion) so the HISTORY tab never surfaces rows that
-/// would open an empty overlay. Optionally resolves native custom titles via
-/// the mtime-cached title reader.
+/// would open an empty overlay. Optionally resolves the native custom and AI
+/// titles via the mtime-cached title reader.
 ///
 /// Exposed so tests can exercise the filter without touching `~/.claude`.
 pub(crate) fn filter_and_enrich(
@@ -190,9 +195,11 @@ pub(crate) fn filter_and_enrich(
                 return None;
             }
             if enrich_titles {
-                if let Some(title) = super::enrichment::get_cached_native_title(&session_file) {
-                    entry.custom_title = Some(title);
+                let titles = super::enrichment::get_cached_native_titles(&session_file);
+                if titles.custom.is_some() {
+                    entry.custom_title = titles.custom;
                 }
+                entry.ai_title = titles.ai;
             }
             Some(entry)
         })
@@ -686,6 +693,7 @@ mod tests {
                 custom_title: None,
                 codex_title: None,
                 cursor_title: None,
+                ai_title: None,
                 provider: default_provider(),
                 surface: None,
                 agent_kind: None,
@@ -699,6 +707,7 @@ mod tests {
                 custom_title: None,
                 codex_title: None,
                 cursor_title: None,
+                ai_title: None,
                 provider: default_provider(),
                 surface: None,
                 agent_kind: None,
@@ -708,6 +717,49 @@ mod tests {
         let out = filter_and_enrich(entries, projects_dir, false);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].session_id, "keep-sid");
+    }
+
+    #[test]
+    fn test_filter_and_enrich_reads_native_custom_and_ai_titles() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = "/p/titled";
+        let encoded = super::super::detector::encode_path_for_matching(project);
+        let project_dir = tmp.path().join(&encoded);
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("ai-only.jsonl"),
+            r#"{"type":"ai-title","aiTitle":"generated","sessionId":"ai-only"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("both.jsonl"),
+            concat!(
+                r#"{"type":"ai-title","aiTitle":"generated too","sessionId":"both"}"#,
+                "\n",
+                r#"{"type":"custom-title","customTitle":"renamed","sessionId":"both"}"#,
+            ),
+        )
+        .unwrap();
+        let entry = |session_id: &str| HistoryEntry {
+            session_id: session_id.into(),
+            display: "prompt".into(),
+            timestamp: 1,
+            project: project.into(),
+            project_name: "titled".into(),
+            custom_title: None,
+            codex_title: None,
+            cursor_title: None,
+            ai_title: None,
+            provider: default_provider(),
+            surface: None,
+            agent_kind: None,
+        };
+
+        let out = filter_and_enrich(vec![entry("ai-only"), entry("both")], tmp.path(), true);
+        assert_eq!(out[0].custom_title, None);
+        assert_eq!(out[0].ai_title.as_deref(), Some("generated"));
+        assert_eq!(out[1].custom_title.as_deref(), Some("renamed"));
+        assert_eq!(out[1].ai_title.as_deref(), Some("generated too"));
     }
 
     #[test]
@@ -722,6 +774,7 @@ mod tests {
             custom_title: None,
             codex_title: None,
             cursor_title: None,
+            ai_title: None,
             provider: default_provider(),
             surface: None,
             agent_kind: None,
