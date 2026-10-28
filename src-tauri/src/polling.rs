@@ -308,7 +308,8 @@ fn fire_notification(
         .custom_title
         .as_deref()
         .or(session.codex_title.as_deref())
-        .or(session.cursor_title.as_deref());
+        .or(session.cursor_title.as_deref())
+        .or(session.ai_title.as_deref());
     let session_name = &session.session_name;
     let pending_tool_name = session.pending_tool_name.as_deref();
     let title = truncate_string(custom_title.unwrap_or(&session.first_prompt), 60);

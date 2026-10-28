@@ -5,6 +5,7 @@ use crate::session::cache::{
 use crate::session::codex::CodexLifecycle;
 use crate::session::cursor::CursorLifecycle;
 use crate::session::owners::global_provider_source_owners;
+use crate::session::parser::NativeTitles;
 use crate::session::permissions::PermissionChecker;
 use crate::session::pi::PiLifecycle;
 use crate::session::source::{
@@ -40,6 +41,9 @@ pub struct Session {
     /// Cursor's current UI composer name from state.vscdb.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor_title: Option<String>,
+    /// Claude Code's auto-generated title (`ai-title` in the session JSONL).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_title: Option<String>,
     pub project_path: String,
     pub git_branch: Option<String>,
     pub first_prompt: String,
@@ -110,7 +114,7 @@ pub struct Session {
     pub can_rename: bool,
 }
 
-/// Cache for native custom titles, keyed by file path.
+/// Cache for native titles, keyed by file path.
 /// The stamp includes size and, on Unix, change time and inode.  Mtime alone
 /// can be coarse or unchanged for an in-place rewrite, which would otherwise
 /// let a stale title survive in the history view.
@@ -119,7 +123,7 @@ type NativeTitleStamp = FileVersion;
 /// Stores the file stamp and cached title to avoid re-scanning JSONL files
 /// every poll cycle while still falling back safely on weak metadata systems.
 static NATIVE_TITLE_CACHE: LazyLock<
-    Mutex<HashMap<std::path::PathBuf, (NativeTitleStamp, Option<String>)>>,
+    Mutex<HashMap<std::path::PathBuf, (NativeTitleStamp, NativeTitles)>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn native_title_stamp(path: &Path) -> Option<NativeTitleStamp> {
@@ -146,45 +150,45 @@ fn claude_custom_title(
         .flatten()
 }
 
-/// Look up the native custom title for a session JSONL, using a strong file
-/// stamp when the platform provides one and a safe re-scan otherwise.
-pub(crate) fn get_cached_native_title(path: &Path) -> Option<String> {
-    get_cached_native_title_with(
+/// Look up the native custom and AI titles for a session JSONL, using a strong
+/// file stamp when the platform provides one and a safe re-scan otherwise.
+pub(crate) fn get_cached_native_titles(path: &Path) -> NativeTitles {
+    get_cached_native_titles_with(
         path,
-        crate::session::parser::try_get_native_custom_title_from_file,
+        crate::session::parser::try_get_native_titles_from_file,
     )
 }
 
-fn get_cached_native_title_with(
+fn get_cached_native_titles_with(
     path: &Path,
-    read_title: impl FnOnce(&Path) -> std::io::Result<Option<String>>,
-) -> Option<String> {
+    read_titles: impl FnOnce(&Path) -> std::io::Result<NativeTitles>,
+) -> NativeTitles {
     let Some(stamp) = native_title_stamp(path) else {
         if let Ok(mut cache) = NATIVE_TITLE_CACHE.lock() {
             cache.remove(path);
         }
-        return None;
+        return NativeTitles::default();
     };
 
     if let Ok(mut cache) = NATIVE_TITLE_CACHE.lock() {
-        if let Some((cached_stamp, cached_title)) = cache.get(path) {
+        if let Some((cached_stamp, cached_titles)) = cache.get(path) {
             if *cached_stamp == stamp && stamp.supports_unchanged_fast_path() {
-                return cached_title.clone();
+                return cached_titles.clone();
             }
         }
         // Cache miss or stale — re-scan
-        let title = match read_title(path) {
-            Ok(title) => title,
+        let titles = match read_titles(path) {
+            Ok(titles) => titles,
             Err(_) => {
                 cache.remove(path);
-                return None;
+                return NativeTitles::default();
             }
         };
-        cache.insert(path.to_path_buf(), (stamp, title.clone()));
-        title
+        cache.insert(path.to_path_buf(), (stamp, titles.clone()));
+        titles
     } else {
         // Mutex poisoned — fallback to direct read
-        read_title(path).ok().flatten()
+        read_titles(path).unwrap_or_default()
     }
 }
 
@@ -575,8 +579,9 @@ pub fn enrich_detected_sessions(
 
         // Get custom title: Claude Code native /rename takes priority over c9watch's own.
         // Uses a static cache keyed by path plus a strong file stamp when available.
-        let native_title = get_cached_native_title(&session_file_path);
-        let custom_title = native_title
+        let native_titles = get_cached_native_titles(&session_file_path);
+        let custom_title = native_titles
+            .custom
             .or_else(|| claude_custom_title(detected.provider, &custom_titles, &session_id));
 
         sessions.push(Session {
@@ -587,6 +592,7 @@ pub fn enrich_detected_sessions(
             custom_title,
             codex_title: None,
             cursor_title: None,
+            ai_title: native_titles.ai,
             project_path: detected.cwd.to_string_lossy().to_string(),
             git_branch,
             first_prompt,
@@ -642,6 +648,7 @@ fn base_session(detected: &DetectedSession, session_id: &str) -> Session {
         custom_title: None,
         codex_title: None,
         cursor_title: None,
+        ai_title: None,
         project_path: detected.cwd.to_string_lossy().to_string(),
         git_branch: None,
         first_prompt: String::new(),
@@ -1677,12 +1684,15 @@ mod placeholder_tests {
         )
         .unwrap();
         assert_eq!(
-            get_cached_native_title_with(&path, |_| {
+            get_cached_native_titles_with(&path, |_| {
                 Err(std::io::Error::other("injected read failure"))
             }),
-            None
+            NativeTitles::default()
         );
-        assert_eq!(get_cached_native_title(&path).as_deref(), Some("recovered"));
+        assert_eq!(
+            get_cached_native_titles(&path).custom.as_deref(),
+            Some("recovered")
+        );
     }
 
     #[test]
@@ -1697,8 +1707,14 @@ mod placeholder_tests {
         .unwrap();
         drop(file);
 
-        assert_eq!(get_cached_native_title(&path).as_deref(), Some("first"));
-        assert_eq!(get_cached_native_title(&path).as_deref(), Some("first"));
+        assert_eq!(
+            get_cached_native_titles(&path).custom.as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            get_cached_native_titles(&path).custom.as_deref(),
+            Some("first")
+        );
 
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -1711,9 +1727,12 @@ mod placeholder_tests {
         .unwrap();
         drop(file);
 
-        assert_eq!(get_cached_native_title(&path).as_deref(), Some("second"));
+        assert_eq!(
+            get_cached_native_titles(&path).custom.as_deref(),
+            Some("second")
+        );
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(get_cached_native_title(&path), None);
+        assert_eq!(get_cached_native_titles(&path), NativeTitles::default());
     }
 
     #[test]

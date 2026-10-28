@@ -128,7 +128,7 @@
 	}
 
 	function entryTitle(entry: HistoryEntry): string {
-		return entry.customTitle || entry.codexTitle || entry.cursorTitle || '';
+		return entry.customTitle || entry.codexTitle || entry.cursorTitle || entry.aiTitle || '';
 	}
 
 	// ── Filtering & sorting ──────────────────────────────────────────

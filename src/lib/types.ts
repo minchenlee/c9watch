@@ -61,6 +61,9 @@ export interface Session {
   /** Custom title override for the session - if set, shown instead of summary/firstPrompt */
   customTitle: string | null;
 
+  /** Claude Code's auto-generated title (`ai-title` in the session JSONL). */
+  aiTitle?: string | null;
+
   /** Current Codex UI thread name from ~/.codex/session_index.jsonl. */
   codexTitle?: string | null;
 
@@ -228,6 +231,8 @@ export interface HistoryEntry {
   codexTitle?: string | null;
   /** Current Cursor UI composer name from state.vscdb. */
   cursorTitle?: string | null;
+  /** Claude Code's auto-generated title (`ai-title` in the session JSONL). */
+  aiTitle?: string | null;
   provider?: SessionProvider;
   surface?: SessionSurface;
 }

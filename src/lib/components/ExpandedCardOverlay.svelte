@@ -321,7 +321,7 @@
 			sessionId: child.id,
 			provider: providerOf(child),
 			agentType: child.agentRole || child.agentNickname || 'subagent',
-				description: child.agentNickname || child.codexTitle || child.cursorTitle || child.summary || child.firstPrompt || child.agentRole || `${providerFilterLabel(providerOf(child))} subagent`,
+				description: child.agentNickname || child.codexTitle || child.cursorTitle || child.aiTitle || child.summary || child.firstPrompt || child.agentRole || `${providerFilterLabel(providerOf(child))} subagent`,
 			startedAt: child.startedAtMs ? new Date(child.startedAtMs).toISOString() : child.modified,
 			completedAt: child.status === SessionStatus.Working ? null : child.modified,
 			parentSessionId: session.id,
@@ -782,7 +782,7 @@
 									class:active={sessionKeyOf(w) === sessionKeyOf(session)}
 									onclick={() => openWorker(w)}
 								>
-								<span class="worker-name">{w.customTitle || w.codexTitle || w.cursorTitle || w.summary || w.sessionName}</span>
+								<span class="worker-name">{w.customTitle || w.codexTitle || w.cursorTitle || w.aiTitle || w.summary || w.sessionName}</span>
 									<span class="worker-status" style="color: {getWorkerStatusColor(w.status)}">
 										{getWorkerStatusLabel(w.status)}
 									</span>

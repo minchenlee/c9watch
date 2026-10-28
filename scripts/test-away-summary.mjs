@@ -42,6 +42,18 @@ test('away summary lists only non-zero counts with singular forms', () => {
   );
 });
 
+test('short away summary for dense rows', () => {
+  assert.equal(utils.awayActivityShortLabel(undefined), null);
+  assert.equal(utils.awayActivityShortLabel(activity()), null);
+  assert.equal(
+    utils.awayActivityShortLabel(activity({ toolCalls: 12, filesEdited: 4, commandsRun: 6, subagentsCompleted: 2 })),
+    '4 files · 6 cmds · 2 agents'
+  );
+  assert.equal(utils.awayActivityShortLabel(activity({ filesEdited: 1, commandsRun: 1 })), '1 file · 1 cmd');
+  assert.equal(utils.awayActivityShortLabel(activity({ toolCalls: 3 })), '3 tool calls');
+  assert.equal(utils.awayActivityShortLabel(activity({ commandsRun: 3, partial: true })), '≥ 3 cmds');
+});
+
 test('away start: last look, else window blur, else session start', () => {
   const session = { id: 's1', provider: 'claudeCode', startedAtMs: 100 };
   assert.equal(utils.awaySinceMs(session, 'claudeCode:s1', { 'claudeCode:s1': 300 }, 200), 300);
@@ -50,10 +62,10 @@ test('away start: last look, else window blur, else session start', () => {
   assert.equal(utils.awaySinceMs({ id: 's2' }, 'claudeCode:s2', {}, null), 0);
 });
 
-test('session display title follows the six-field precedence', () => {
+test('session display title follows the seven-field precedence', () => {
   const all = {
     customTitle: 'custom', officialName: 'official', codexTitle: 'codex',
-    cursorTitle: 'cursor', summary: 'summary', firstPrompt: 'prompt'
+    cursorTitle: 'cursor', aiTitle: 'ai', summary: 'summary', firstPrompt: 'prompt'
   };
   assert.equal(utils.sessionDisplayTitle(all), 'custom');
   assert.equal(utils.sessionDisplayTitle({ ...all, customTitle: null }), 'official');
@@ -61,6 +73,10 @@ test('session display title follows the six-field precedence', () => {
   assert.equal(utils.sessionDisplayTitle({ ...all, customTitle: null, officialName: null, codexTitle: null }), 'cursor');
   assert.equal(
     utils.sessionDisplayTitle({ ...all, customTitle: null, officialName: null, codexTitle: null, cursorTitle: null }),
+    'ai'
+  );
+  assert.equal(
+    utils.sessionDisplayTitle({ ...all, customTitle: null, officialName: null, codexTitle: null, cursorTitle: null, aiTitle: null }),
     'summary'
   );
   assert.equal(
@@ -72,7 +88,7 @@ test('session display title follows the six-field precedence', () => {
 test('session display title skips empty strings and returns the raw last value', () => {
   assert.equal(
     utils.sessionDisplayTitle({
-      customTitle: '', officialName: '', codexTitle: '', cursorTitle: '', summary: '', firstPrompt: 'prompt'
+      customTitle: '', officialName: '', codexTitle: '', cursorTitle: '', aiTitle: '', summary: '', firstPrompt: 'prompt'
     }),
     'prompt'
   );

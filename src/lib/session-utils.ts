@@ -7,7 +7,7 @@ import type { AwayActivity, HiddenClaudeSession, Session, WaitingFor } from './t
 
 type SessionTitleFields = Pick<
 	Session,
-	'customTitle' | 'officialName' | 'codexTitle' | 'cursorTitle' | 'summary' | 'firstPrompt'
+	'customTitle' | 'officialName' | 'codexTitle' | 'cursorTitle' | 'aiTitle' | 'summary' | 'firstPrompt'
 >;
 
 /**
@@ -15,7 +15,7 @@ type SessionTitleFields = Pick<
  * fall through to the next field; the raw `||` result is returned.
  */
 export function sessionDisplayTitle(s: SessionTitleFields) {
-	return s.customTitle || s.officialName || s.codexTitle || s.cursorTitle || s.summary || s.firstPrompt;
+	return s.customTitle || s.officialName || s.codexTitle || s.cursorTitle || s.aiTitle || s.summary || s.firstPrompt;
 }
 
 /** "Approval: Bash", "Question"... Tool arguments are never shown. */
@@ -50,6 +50,19 @@ export function awayActivityLabel(activity: AwayActivity | null | undefined): st
 		count(activity.toolCalls, 'tool call', 'tool calls', p)
 	].filter((part): part is string => part !== null);
 	return parts.length > 0 ? parts.join(' · ') : 'No activity';
+}
+
+/** Terse form for one-line rows: "4 files · 6 cmds · 2 agents"; null when there is nothing to say. */
+export function awayActivityShortLabel(activity: AwayActivity | null | undefined): string | null {
+	if (!activity) return null;
+	const p = activity.partial;
+	const parts = [
+		count(activity.filesEdited, 'file', 'files', p),
+		count(activity.commandsRun, 'cmd', 'cmds', p),
+		count(activity.subagentsCompleted, 'agent', 'agents', p)
+	].filter((part): part is string => part !== null);
+	if (parts.length > 0) return parts.join(' · ');
+	return count(activity.toolCalls, 'tool call', 'tool calls', p);
 }
 
 /**
