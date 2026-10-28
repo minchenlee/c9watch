@@ -29,14 +29,25 @@ pub fn c9watch_dir() -> Result<PathBuf, String> {
     Ok(home.join(".claude").join("c9watch"))
 }
 
+pub const DAEMON_SOCK_NAME: &str = "daemon.sock";
+pub const DAEMON_PID_NAME: &str = "daemon.pid";
+pub const DAEMON_LOCK_NAME: &str = "daemon.lock";
+
 /// Returns `~/.claude/c9watch/daemon.sock`
 pub fn daemon_sock_path() -> Result<PathBuf, String> {
-    Ok(c9watch_dir()?.join("daemon.sock"))
+    Ok(c9watch_dir()?.join(DAEMON_SOCK_NAME))
 }
 
 /// Returns `~/.claude/c9watch/daemon.pid`
 pub fn daemon_pid_path() -> Result<PathBuf, String> {
-    Ok(c9watch_dir()?.join("daemon.pid"))
+    Ok(c9watch_dir()?.join(DAEMON_PID_NAME))
+}
+
+/// Returns `~/.claude/c9watch/daemon.lock`. The running daemon holds an
+/// exclusive flock on it for its whole lifetime. It is separate from
+/// `daemon.pid`, which clients lock to serialize spawning.
+pub fn daemon_lock_path() -> Result<PathBuf, String> {
+    Ok(c9watch_dir()?.join(DAEMON_LOCK_NAME))
 }
 
 /// Returns `~/.claude/c9watch/daemon.log`
@@ -218,6 +229,131 @@ pub fn open_private_file(path: &Path, opts: &mut OpenOptions) -> Result<File, St
             .map_err(|e| format!("Failed to chmod 0600 {:?}: {}", path, e))?;
     }
     Ok(file)
+}
+
+/// macOS `sun_path` is 104 bytes including the trailing NUL.
+const SUN_PATH_MAX: usize = 104;
+
+/// Name of the temp socket `bind_private` binds before renaming onto `path`.
+pub fn bind_tmp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(DAEMON_SOCK_NAME);
+    path.with_file_name(format!(".{}.tmp-{}", name, std::process::id()))
+}
+
+/// Bind a Unix socket under a temp name, chmod it 0600 (any error fails the
+/// bind), then rename it onto `path`. A client can never connect to the
+/// final path while the socket still has the umask permissions.
+pub fn bind_private(path: &Path) -> Result<std::os::unix::net::UnixListener, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = bind_tmp_path(path);
+    if tmp.as_os_str().as_bytes().len() >= SUN_PATH_MAX {
+        return Err(format!(
+            "Socket path {:?} is too long ({} bytes, limit {})",
+            tmp,
+            tmp.as_os_str().len(),
+            SUN_PATH_MAX - 1
+        ));
+    }
+    let _ = std::fs::remove_file(&tmp);
+    let listener = std::os::unix::net::UnixListener::bind(&tmp)
+        .map_err(|e| format!("Failed to bind Unix socket {:?}: {}", tmp, e))?;
+    let res = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("Failed to chmod 0600 {:?}: {}", tmp, e))
+        .and_then(|_| {
+            let mode = std::fs::symlink_metadata(&tmp)
+                .map_err(|e| format!("Failed to stat {:?}: {}", tmp, e))?
+                .mode()
+                & 0o777;
+            if mode == 0o600 {
+                Ok(())
+            } else {
+                Err(format!("Socket {:?} is {:o} after chmod 0600", tmp, mode))
+            }
+        })
+        .and_then(|_| {
+            std::fs::rename(&tmp, path)
+                .map_err(|e| format!("Failed to rename {:?} -> {:?}: {}", tmp, path, e))
+        });
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(listener)
+}
+
+/// Error code returned when another daemon already holds `daemon.lock`.
+pub const DAEMON_ALREADY_RUNNING: &str = "DAEMON_ALREADY_RUNNING";
+
+/// How long `acquire_daemon_lock` retries a busy lock. Clients probe the lock
+/// with a brief `LOCK_SH`, so a fresh daemon must not give up on the first
+/// `EWOULDBLOCK`; a live daemon holds it forever, so this only delays the
+/// second daemon's error.
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Open `path` (0600) and take an exclusive flock on it, then empty it: the
+/// file only carries the ready mark (see `mark_daemon_ready`) of the daemon
+/// that holds it. Keep the returned `File` alive for as long as the lock
+/// must be held.
+pub fn acquire_daemon_lock(path: &Path) -> Result<File, String> {
+    use std::os::unix::io::AsRawFd;
+    let file = open_private_file(path, OpenOptions::new().create(true).read(true).write(true))?;
+    let deadline = std::time::Instant::now() + LOCK_RETRY;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            file.set_len(0)
+                .map_err(|e| format!("Failed to truncate {:?}: {}", path, e))?;
+            return Ok(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(format!("Failed to lock {:?}: {}", path, err));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(DAEMON_ALREADY_RUNNING.to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Write our pid into the held lock file once the socket is listening.
+/// Clients wait for this mark, not just for a connectable socket: while a
+/// new daemon retires a pre-lock daemon, the old daemon's socket still
+/// accepts connections.
+pub fn mark_daemon_ready(lock: &File) -> Result<(), String> {
+    use std::io::{Seek, Write};
+    let mut f = lock;
+    f.seek(std::io::SeekFrom::Start(0))
+        .and_then(|_| f.write_all(std::process::id().to_string().as_bytes()))
+        .map_err(|e| format!("Failed to write daemon ready mark: {}", e))
+}
+
+/// True once the daemon holding `path` has called `mark_daemon_ready`.
+pub fn daemon_ready_marked(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|c| !c.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// True when some process holds an exclusive flock on `path` (the daemon is
+/// alive). The probe takes `LOCK_SH|LOCK_NB` and releases it before
+/// returning, so a daemon spawned right after can take its `LOCK_EX`.
+pub fn daemon_lock_held(path: &Path) -> Result<bool, String> {
+    use std::os::unix::io::AsRawFd;
+    let file = open_private_file(path, OpenOptions::new().create(true).read(true).write(true))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        // Dropping `file` closes the fd, which releases the shared lock.
+        drop(file);
+        return Ok(false);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(true)
+    } else {
+        Err(format!("Failed to probe lock {:?}: {}", path, err))
+    }
 }
 
 // ── I/O functions ─────────────────────────────────────────────────────
@@ -459,6 +595,60 @@ mod private_fs_tests {
         assert!(err.contains("symlink"), "got: {}", err);
         // The link target must not have been chmodded.
         assert_eq!(mode_of(&target), 0o755);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn bind_private_renames_a_0600_socket_and_it_still_accepts() {
+        use std::io::{BufRead, BufReader, Write};
+        let d = tmpdir("bind");
+        ensure_private_dir(&d).unwrap();
+        let p = d.join("e.sock");
+        let l = bind_private(&p).unwrap();
+        assert_eq!(mode_of(&p), 0o600);
+        // No temp name left behind.
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 1);
+        let h = std::thread::spawn(move || {
+            let (c, _) = l.accept().unwrap();
+            let mut s = String::new();
+            BufReader::new(&c).read_line(&mut s).unwrap();
+            s
+        });
+        let mut c = std::os::unix::net::UnixStream::connect(&p).unwrap();
+        writeln!(c, "hi").unwrap();
+        assert_eq!(h.join().unwrap(), "hi\n");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn bind_private_fails_cleanly_in_a_missing_dir() {
+        let d = tmpdir("missing");
+        assert!(bind_private(&d.join("e.sock")).is_err());
+        assert!(!d.exists());
+    }
+
+    #[test]
+    fn second_lock_fails_while_first_held() {
+        let d = tmpdir("lock");
+        ensure_private_dir(&d).unwrap();
+        let p = d.join(DAEMON_LOCK_NAME);
+        assert!(!daemon_lock_held(&p).unwrap());
+
+        let first = acquire_daemon_lock(&p).unwrap();
+        assert_eq!(mode_of(&p), 0o600);
+        assert!(daemon_lock_held(&p).unwrap());
+        assert_eq!(acquire_daemon_lock(&p).unwrap_err(), DAEMON_ALREADY_RUNNING);
+
+        assert!(!daemon_ready_marked(&p));
+        mark_daemon_ready(&first).unwrap();
+        assert!(daemon_ready_marked(&p));
+
+        drop(first);
+        assert!(!daemon_lock_held(&p).unwrap());
+        // The probe released its shared lock, so the next daemon can lock.
+        let _second = acquire_daemon_lock(&p).unwrap();
+        // A new holder clears the previous holder's ready mark.
+        assert!(!daemon_ready_marked(&p));
         fs::remove_dir_all(&d).unwrap();
     }
 

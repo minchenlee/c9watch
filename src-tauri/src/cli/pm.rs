@@ -6,59 +6,90 @@ use std::time::Duration;
 
 // ── Daemon lifecycle ──────────────────────────────────────────────────
 
+/// How long a client waits for the daemon to become ready.
+/// Generous because a new daemon may first wait for a pre-lock daemon to
+/// shut down (see `pm_daemon::start_listener`).
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Wait until the lock-holding daemon has marked itself ready and its socket
+/// accepts a connection. A socket file alone is not proof of a listener (a
+/// crashed daemon leaves one behind), and a connectable socket alone may
+/// still be a pre-lock daemon that the new one is shutting down. With
+/// `child`, stop early when the daemon we spawned has already exited.
+fn wait_until_ready(
+    lock_path: &std::path::Path,
+    sock_path: &std::path::Path,
+    mut child: Option<&mut std::process::Child>,
+    what: &str,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + DAEMON_READY_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if pm_fs::daemon_ready_marked(lock_path)
+            && std::os::unix::net::UnixStream::connect(sock_path).is_ok()
+        {
+            return Ok(());
+        }
+        if let Some(Ok(Some(status))) = child.as_mut().map(|c| c.try_wait()) {
+            return Err(format!(
+                "Daemon exited during startup ({}); see {:?}",
+                status,
+                pm_fs::daemon_log_path().unwrap_or_default()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!(
+        "Daemon did not accept connections on {:?} within {} seconds ({})",
+        sock_path,
+        DAEMON_READY_TIMEOUT.as_secs(),
+        what
+    ))
+}
+
 /// Ensure the PM daemon is running. Starts it if not already alive.
 ///
-/// An exclusive advisory flock on `daemon.pid` serializes concurrent callers
-/// so that only one process ever forks the daemon.
+/// Liveness is the daemon's lifetime flock on `daemon.lock`. A separate
+/// exclusive flock on `daemon.pid` serializes concurrent callers so that
+/// only one process ever forks the daemon. Clients never delete the socket:
+/// only a daemon that holds `daemon.lock` may replace it.
 pub fn ensure_daemon() -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
 
-    // Ensure directories exist before opening the pid file
+    // Ensure directories exist (base dir 0700) before opening any file
     pm_fs::ensure_dirs()?;
 
     let pid_path = pm_fs::daemon_pid_path()?;
     let sock_path = pm_fs::daemon_sock_path()?;
+    let lock_path = pm_fs::daemon_lock_path()?;
+
+    // Fast path: a daemon holds the lifetime lock. It may still be binding.
+    if pm_fs::daemon_lock_held(&lock_path)? {
+        return wait_until_ready(&lock_path, &sock_path, None, "daemon is running");
+    }
 
     // Open (or create) the pid file and take an exclusive advisory lock.
     // This serializes concurrent `c9watch spawn` calls so only one ever forks.
-    let lock_file = pm_fs::open_private_file(
+    let spawn_lock = pm_fs::open_private_file(
         &pid_path,
         std::fs::OpenOptions::new().create(true).write(true).read(true),
     )
     .map_err(|e| format!("Failed to open daemon.pid for locking: {}", e))?;
 
-    let fd = lock_file.as_raw_fd();
+    let fd = spawn_lock.as_raw_fd();
     let lock_result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
 
     if lock_result != 0 {
-        // Another process holds the lock — it is starting the daemon.
-        // Wait up to 3 s for the socket to appear, then return.
-        drop(lock_file);
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while std::time::Instant::now() < deadline {
-            if sock_path.exists() {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        return Err(
-            "Daemon failed to start within 3 seconds (waited for another process)".to_string(),
-        );
+        // Another process holds the spawn lock — it is starting the daemon.
+        drop(spawn_lock);
+        return wait_until_ready(&lock_path, &sock_path, None, "waited for another process");
     }
 
-    // We hold the exclusive lock. Check if a healthy daemon is already running.
-    if pid_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&pid_path) {
-            if let Ok(pid) = content.trim().parse::<libc::pid_t>() {
-                let alive = unsafe { libc::kill(pid, 0) } == 0;
-                if alive && sock_path.exists() {
-                    // Daemon is running — release lock and return
-                    return Ok(());
-                }
-            }
-        }
-        // Stale PID file — clean up
-        let _ = std::fs::remove_file(&sock_path);
+    // Re-check under the spawn lock: another caller may have started the
+    // daemon between our probe and taking the spawn lock. The probe has
+    // already released its shared lock, so the daemon we spawn below can
+    // take its exclusive one.
+    if pm_fs::daemon_lock_held(&lock_path)? {
+        return wait_until_ready(&lock_path, &sock_path, None, "daemon is running");
     }
 
     // Get current executable path
@@ -75,7 +106,7 @@ pub fn ensure_daemon() -> Result<(), String> {
         .map_err(|e| format!("Failed to clone log file handle: {}", e))?;
 
     // Spawn the daemon process
-    Command::new(&exe)
+    let mut child = Command::new(&exe)
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file_out))
@@ -83,23 +114,10 @@ pub fn ensure_daemon() -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("Failed to spawn daemon process: {}", e))?;
 
-    // Wait up to 3 seconds for the socket to appear.
-    // The flock is released when `lock_file` drops at the end of this scope,
-    // which happens after we return — that's fine because by then the daemon
-    // has written its own PID and the socket exists, so other callers will
-    // take the fast path above.
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while std::time::Instant::now() < deadline {
-        if sock_path.exists() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    Err(format!(
-        "Daemon did not start within 3 seconds (socket {:?} never appeared)",
-        sock_path
-    ))
+    // The spawn lock is released when `spawn_lock` drops after we return; by
+    // then the daemon holds `daemon.lock`, so other callers take the fast
+    // path above.
+    wait_until_ready(&lock_path, &sock_path, Some(&mut child), "spawned a new daemon")
 }
 
 // ── RPC helper ────────────────────────────────────────────────────────
