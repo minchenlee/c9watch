@@ -21,12 +21,11 @@ pub fn ensure_daemon() -> Result<(), String> {
 
     // Open (or create) the pid file and take an exclusive advisory lock.
     // This serializes concurrent `c9watch spawn` calls so only one ever forks.
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .read(true)
-        .open(&pid_path)
-        .map_err(|e| format!("Failed to open daemon.pid for locking: {}", e))?;
+    let lock_file = pm_fs::open_private_file(
+        &pid_path,
+        std::fs::OpenOptions::new().create(true).write(true).read(true),
+    )
+    .map_err(|e| format!("Failed to open daemon.pid for locking: {}", e))?;
 
     let fd = lock_file.as_raw_fd();
     let lock_result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
@@ -68,11 +67,8 @@ pub fn ensure_daemon() -> Result<(), String> {
 
     // Open log file for append
     let log_path = pm_fs::daemon_log_path()?;
-    let log_file_out = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| format!("Failed to open daemon log {:?}: {}", log_path, e))?;
+    let log_file_out =
+        pm_fs::open_private_file(&log_path, std::fs::OpenOptions::new().create(true).append(true))?;
 
     let log_file_err = log_file_out
         .try_clone()

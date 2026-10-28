@@ -107,8 +107,15 @@ pub async fn run_daemon() -> Result<(), String> {
     // 4. Write PID file now that the socket is listening.
     let pid = std::process::id();
     let pid_path = pm_fs::daemon_pid_path()?;
-    std::fs::write(&pid_path, pid.to_string())
+    {
+        use std::io::Write;
+        pm_fs::open_private_file(
+            &pid_path,
+            std::fs::OpenOptions::new().create(true).write(true).truncate(true),
+        )?
+        .write_all(pid.to_string().as_bytes())
         .map_err(|e| format!("Failed to write PID file {:?}: {}", pid_path, e))?;
+    }
 
     // 5. Read max_workers from env
     let max_workers: usize = std::env::var("C9WATCH_MAX_WORKERS")

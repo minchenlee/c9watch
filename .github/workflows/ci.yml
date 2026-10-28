@@ -62,3 +62,8 @@ jobs:
         run: |
           cargo test --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features cli
+
+      - name: PM orchestration tests
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features pm-orchestration

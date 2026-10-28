@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 // ── Path helpers ──────────────────────────────────────────────────────
 
@@ -134,13 +136,96 @@ pub struct WorkerMeta {
     pub stopped_at: Option<String>,
 }
 
+// ── Private dir and file helpers ──────────────────────────────────────
+
+/// Create `dir` if needed and make it a 0700 directory owned by us.
+///
+/// The dir is opened with `O_NOFOLLOW` and every check and the chmod run on
+/// that fd, so a symlink is rejected before anything is changed and the
+/// chmod can never land on the target of a swapped-in link. A dir owned by
+/// another uid is rejected, not chmodded.
+pub fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create dir {:?}: {}", parent, e))?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("Failed to create dir {:?}: {}", dir, e)),
+    }
+
+    let symlink_err = || format!("{:?} is a symlink, refusing to use it", dir);
+    if std::fs::symlink_metadata(dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(symlink_err());
+    }
+    // O_NOFOLLOW closes the race with a link swapped in after the check above.
+    let handle = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) => symlink_err(),
+            Some(libc::ENOTDIR) => format!("{:?} is not a directory", dir),
+            _ => format!("Failed to open dir {:?}: {}", dir, e),
+        })?;
+    let md = handle
+        .metadata()
+        .map_err(|e| format!("Failed to stat dir {:?}: {}", dir, e))?;
+    if !md.is_dir() {
+        return Err(format!("{:?} is not a directory", dir));
+    }
+    let me = unsafe { libc::geteuid() };
+    if md.uid() != me {
+        return Err(format!(
+            "{:?} is owned by uid {}, not by us (uid {})",
+            dir,
+            md.uid(),
+            me
+        ));
+    }
+    if md.mode() & 0o777 != 0o700 {
+        handle
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed to chmod 0700 {:?}: {}", dir, e))?;
+        let mode = handle
+            .metadata()
+            .map_err(|e| format!("Failed to stat dir {:?}: {}", dir, e))?
+            .mode();
+        if mode & 0o777 != 0o700 {
+            return Err(format!("{:?} is {:o} after chmod 0700", dir, mode & 0o777));
+        }
+    }
+    Ok(())
+}
+
+/// Open `path` with `opts`, creating it as 0600. `mode()` only applies when
+/// the file is created, so an existing file is chmodded to 0600 on the fd.
+pub fn open_private_file(path: &Path, opts: &mut OpenOptions) -> Result<File, String> {
+    let file = opts
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
+    let mode = file
+        .metadata()
+        .map_err(|e| format!("Failed to stat {:?}: {}", path, e))?
+        .mode();
+    if mode & 0o777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Failed to chmod 0600 {:?}: {}", path, e))?;
+    }
+    Ok(file)
+}
+
 // ── I/O functions ─────────────────────────────────────────────────────
 
-/// Ensure the base c9watch dir and workers dir exist.
+/// Ensure the base c9watch dir (private, 0700) and its subdirs exist.
 pub fn ensure_dirs() -> Result<(), String> {
     let base = c9watch_dir()?;
-    std::fs::create_dir_all(&base)
-        .map_err(|e| format!("Failed to create c9watch dir {:?}: {}", base, e))?;
+    ensure_private_dir(&base)?;
     let workers = base.join("workers");
     std::fs::create_dir_all(&workers)
         .map_err(|e| format!("Failed to create workers dir {:?}: {}", workers, e))?;
@@ -325,6 +410,77 @@ mod tests {
                 assert!(!id.is_empty());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod private_fs_tests {
+    use super::*;
+    use std::fs;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("c9w-pmfs-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        d
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn private_dir_is_0700_even_if_it_existed_wider() {
+        let d = tmpdir("wide");
+        fs::create_dir_all(&d).unwrap();
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&d).unwrap();
+        assert_eq!(mode_of(&d), 0o700);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn private_dir_is_created_0700() {
+        let d = tmpdir("new");
+        ensure_private_dir(&d.join("c9watch")).unwrap();
+        assert_eq!(mode_of(&d.join("c9watch")), 0o700);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn private_dir_rejects_symlink() {
+        let d = tmpdir("link");
+        let target = d.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = d.join("c9watch");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = ensure_private_dir(&link).unwrap_err();
+        assert!(err.contains("symlink"), "got: {}", err);
+        // The link target must not have been chmodded.
+        assert_eq!(mode_of(&target), 0o755);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn pid_and_log_files_are_0600() {
+        let d = tmpdir("files");
+        ensure_private_dir(&d).unwrap();
+
+        // New file: created 0600.
+        let pid = d.join("daemon.pid");
+        open_private_file(&pid, OpenOptions::new().create(true).write(true)).unwrap();
+        assert_eq!(mode_of(&pid), 0o600);
+
+        // Existing wider file: narrowed to 0600.
+        let log = d.join("daemon.log");
+        fs::write(&log, b"old").unwrap();
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+        open_private_file(&log, OpenOptions::new().create(true).append(true)).unwrap();
+        assert_eq!(mode_of(&log), 0o600);
+        assert_eq!(fs::read(&log).unwrap(), b"old");
+
+        fs::remove_dir_all(&d).unwrap();
     }
 }
 
