@@ -1486,14 +1486,6 @@
 		border-bottom-color: var(--border-default);
 	}
 
-	.dense .system-section .project-name {
-		font-size: 14px;
-	}
-
-	.dense .system-section .project-count {
-		font-size: 13px;
-	}
-
 	.dense .view-toggle .toggle-btn {
 		width: 24px;
 		height: 24px;
