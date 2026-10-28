@@ -44,6 +44,7 @@
 		|| session.officialName
 		|| session.codexTitle
 		|| session.cursorTitle
+		|| session.aiTitle
 		|| session.summary
 		|| session.firstPrompt
 		|| session.sessionName
