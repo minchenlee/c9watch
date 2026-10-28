@@ -417,9 +417,9 @@
 		expandedSessionId.set(null);
 	}
 
-	async function handleStop(pid: number) {
+	async function handleStop(session: Session) {
 		try {
-			await stopSession(pid);
+			await stopSession(session);
 		} catch (error) {
 			console.error('Failed to stop session:', error);
 		}
@@ -779,7 +779,7 @@
 						compact={isCompact}
 						fontScale={denseFontScale}
 						onexpand={handleExpand}
-						onstop={(session) => handleStop(session.pid)}
+						onstop={handleStop}
 						onopen={(session) => handleOpen(session.pid, session.projectPath)}
 					/>
 				{:else if viewMode === 'project'}
@@ -815,7 +815,7 @@
 													compact={isCompact}
 													workersView={sessionFilter === 'workers'}
 													onexpand={() => handleExpand(session)}
-													onstop={() => handleStop(session.pid)}
+													onstop={() => handleStop(session)}
 													onopen={() => handleOpen(session.pid, session.projectPath)}
 													onrename={() => showRenameHint = true}
 												/>
@@ -849,7 +849,7 @@
 											compact={isCompact}
 											workersView={sessionFilter === 'workers'}
 											onexpand={() => handleExpand(session)}
-											onstop={() => handleStop(session.pid)}
+											onstop={() => handleStop(session)}
 											onopen={() => handleOpen(session.pid, session.projectPath)}
 											onrename={() => showRenameHint = true}
 										/>
@@ -871,7 +871,7 @@
 			loadError={conversationError}
 			onretry={retryConversation}
 			onclose={handleClose}
-			onstop={() => handleStop(expandedSession.pid)}
+			onstop={() => handleStop(expandedSession)}
 			onopen={() => handleOpen(expandedSession.pid, expandedSession.projectPath)}
 		/>
 	{/if}

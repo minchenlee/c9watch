@@ -58,3 +58,11 @@ test('every WebSocket client request is sent by the frontend, and vice versa', (
   const requested = matches(frontend, /wsClient\.request(?:<.*?>)?\(\s*'([A-Za-z]+)'/g);
   assert.deepEqual(sorted(requested), sorted(handled));
 });
+
+test('stop_session is invoked with a session key, not a bare pid', () => {
+  const call = frontend.match(/\binvoke(?:<.*?>)?\(\s*'stop_session',\s*\{([^}]*)\}/);
+  assert.ok(call, "invoke('stop_session', {...}) not found");
+  const keys = call[1].split(',').map((entry) => entry.split(':')[0].trim());
+  assert.ok(keys.includes('sessionKey'), `stop_session args: ${keys.join(', ')}`);
+  assert.match(libRs, /async fn stop_session\([^)]*session_key: String/);
+});

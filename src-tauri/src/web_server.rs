@@ -10,7 +10,7 @@ use axum::{
 };
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 /// Embed the SvelteKit build output into the binary
@@ -26,6 +26,9 @@ pub struct WsState {
     pub auth_token: String,
     pub sessions_tx: broadcast::Sender<String>,
     pub notifications_tx: broadcast::Sender<String>,
+    /// The desktop app's detector, shared so stop resolves its target from
+    /// the same detection the app shows.
+    pub detector: Arc<Mutex<crate::session::DetectorState>>,
 }
 
 // ── Protocol types ──────────────────────────────────────────────────
@@ -250,7 +253,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
                                 }));
                             }
                             Ok(client_msg) => {
-                                let response = handle_message(client_msg).await;
+                                let response =
+                                    handle_message(client_msg, Arc::clone(&state.detector)).await;
                                 let json = response_json(&response, request_id);
                                 if socket.send(Message::Text(json)).await.is_err() {
                                     break;
@@ -391,13 +395,22 @@ fn sessions_response<S: Serialize, D>(scan: Result<(Vec<S>, D), String>) -> Serv
     }
 }
 
-async fn handle_message(msg: ClientMsg) -> ServerMsg {
-    handle_message_with_owners(msg, crate::session::global_provider_source_owners()).await
+async fn handle_message(
+    msg: ClientMsg,
+    detector: Arc<Mutex<crate::session::DetectorState>>,
+) -> ServerMsg {
+    handle_message_with_owners(
+        msg,
+        crate::session::global_provider_source_owners(),
+        detector,
+    )
+    .await
 }
 
 async fn handle_message_with_owners(
     msg: ClientMsg,
     owners: crate::session::ProviderSourceOwners,
+    detector: Arc<Mutex<crate::session::DetectorState>>,
 ) -> ServerMsg {
     match msg {
         ClientMsg::GetSubscriptionUsage => ServerMsg::SubscriptionUsage {
@@ -417,9 +430,20 @@ async fn handle_message_with_owners(
             message: "getConversation is handled by the socket loop".into(),
         },
 
-        ClientMsg::StopSession { pid } => match crate::actions::stop_session(pid) {
-            Ok(()) => ServerMsg::Ok,
-            Err(e) => ServerMsg::Error { message: e },
+        ClientMsg::StopSession { pid } => match tokio::task::spawn_blocking(move || {
+            crate::actions::stop_session_by_pid(
+                pid,
+                || crate::detect_sessions(&detector),
+                crate::actions::process_start_secs,
+            )
+        })
+        .await
+        {
+            Ok(Ok(())) => ServerMsg::Ok,
+            Ok(Err(e)) => ServerMsg::Error { message: e },
+            Err(e) => ServerMsg::Error {
+                message: format!("Stop failed: {e}"),
+            },
         },
 
         ClientMsg::OpenSession { pid, project_path } => {
@@ -463,6 +487,30 @@ mod tests {
     use crate::rename_test_fixtures::{synthetic_codex_owner, synthetic_cursor_owner};
 
     const SESSION_ID: &str = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+
+    /// A detector that finds no sessions.
+    fn test_detector() -> Arc<Mutex<crate::session::DetectorState>> {
+        use crate::session::source::{
+            DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource,
+        };
+        use crate::session::{BackendMode, DetectorState};
+        struct NoSessions;
+        impl SessionSource for NoSessions {
+            fn detect(
+                &mut self,
+            ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError>
+            {
+                Ok((Vec::new(), DetectionDiagnostics::default()))
+            }
+            fn backend_name(&self) -> &'static str {
+                "cli"
+            }
+        }
+        Arc::new(Mutex::new(DetectorState::for_test(
+            Box::new(NoSessions),
+            BackendMode::Auto,
+        )))
+    }
 
     #[test]
     fn rename_message_keeps_provider_namespace_for_validation() {
@@ -518,6 +566,7 @@ mod tests {
                     provider: None,
                 },
                 owners,
+                test_detector(),
             )
             .await;
 

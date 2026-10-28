@@ -9,6 +9,7 @@ import type { Session, Conversation, AwayActivity, AwayRequest, HistoryEntry, De
 import { isDemoMode } from './demo/mode';
 import { getDemoSessions, getDemoHistoryEntries, getDemoCostData, demoConversations, getDemoAwayActivity, getDemoDiagnostics } from './demo/data';
 import { wsClient, useWebSocket } from './ws';
+import { sessionKeyOf } from './provider';
 
 /**
  * Get all active Claude Code sessions
@@ -71,16 +72,17 @@ export async function getAwayActivity(requests: AwayRequest[]): Promise<Record<s
 }
 
 /**
- * Stop a running session by sending SIGTERM
+ * Stop a running session by sending SIGTERM. The backend resolves the
+ * process from its own detection by session key; `pid` only has to agree.
  */
-export async function stopSession(pid: number): Promise<void> {
+export async function stopSession(session: Session): Promise<void> {
 	if (get(isDemoMode)) return;
 
 	if (useWebSocket()) {
-		await wsClient.request('stopSession', { pid });
+		await wsClient.request('stopSession', { pid: session.pid });
 		return;
 	}
-	await invoke<void>('stop_session', { pid });
+	await invoke<void>('stop_session', { sessionKey: sessionKeyOf(session), pid: session.pid });
 }
 
 /**

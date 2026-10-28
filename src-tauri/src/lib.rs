@@ -29,7 +29,7 @@ pub mod web_server;
 pub mod cli;
 
 #[cfg(feature = "gui")]
-use actions::{open_session as open_session_action, stop_session as stop_session_action};
+use actions::open_session as open_session_action;
 #[cfg(feature = "gui")]
 use polling::{start_polling, Session};
 #[cfg(feature = "gui")]
@@ -98,6 +98,22 @@ fn detect_snapshot(
             session::enrichment::enrich_detected_sessions(detected, diag)
                 .map(|(sessions, _)| sessions)
         }))
+}
+
+/// Detect the current sessions with the shared detector, without the
+/// enrichment pass. Stop resolves its target from this, so it waits for the
+/// lock instead of failing when a poll's scan is running.
+#[cfg(all(not(mobile), feature = "gui"))]
+pub(crate) fn detect_sessions(
+    detector: &Mutex<session::DetectorState>,
+) -> Result<Vec<session::DetectedSession>, String> {
+    let mut state = detector
+        .lock()
+        .map_err(|e| format!("Detector lock poisoned: {}", e))?;
+    state
+        .detect()
+        .map(|(detected, _)| detected)
+        .map_err(|e| format!("Detect failed: {}", e))
 }
 
 /// Emit a fresh `sessions-updated` snapshot after a session action.
@@ -302,10 +318,21 @@ async fn reveal_in_file_manager(path: String) -> Result<(), String> {
 async fn stop_session(
     app: AppHandle,
     detector: tauri::State<'_, Arc<Mutex<session::DetectorState>>>,
-    pid: u32,
+    session_key: String,
+    pid: Option<u32>,
 ) -> Result<(), String> {
-    stop_session_action(pid)?;
-    std::thread::sleep(Duration::from_millis(300));
+    let shared = Arc::clone(detector.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        actions::stop_session_by_key(
+            &session_key,
+            pid,
+            || detect_sessions(&shared),
+            actions::process_start_secs,
+        )
+    })
+    .await
+    .map_err(|e| format!("Stop failed: {}", e))??;
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     emit_sessions_snapshot(&app, detector.inner())
 }
@@ -717,17 +744,18 @@ pub fn run() {
             };
             app.manage(server_info);
 
-            let ws_state = Arc::new(web_server::WsState {
-                auth_token: token,
-                sessions_tx: sessions_tx.clone(),
-                notifications_tx: notifications_tx.clone(),
-            });
-            tauri::async_runtime::spawn(web_server::start_server(ws_state));
-
             // ── Shared detector state ───────────────────────────
             let detector_state: Arc<Mutex<session::DetectorState>> =
                 Arc::new(Mutex::new(session::DetectorState::new()));
             app.manage(detector_state.clone());
+
+            let ws_state = Arc::new(web_server::WsState {
+                auth_token: token,
+                sessions_tx: sessions_tx.clone(),
+                notifications_tx: notifications_tx.clone(),
+                detector: detector_state.clone(),
+            });
+            tauri::async_runtime::spawn(web_server::start_server(ws_state));
             app.manage(polling::LatestDiagnostics::default());
 
             // ── Polling loop ────────────────────────────────────

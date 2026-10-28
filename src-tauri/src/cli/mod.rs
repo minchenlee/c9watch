@@ -759,8 +759,19 @@ fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
     }
 
     // If target parses as u32, treat as PID (regular Claude session stop).
+    // Only a pid detection reports for a stoppable Claude Code session is
+    // signalled, and only while it is still the process detection saw.
     if let Ok(pid) = target.parse::<u32>() {
-        crate::actions::stop_session(pid)?;
+        crate::actions::stop_session_by_pid(
+            pid,
+            || {
+                session::create_session_source()
+                    .detect()
+                    .map(|(detected, _)| detected)
+                    .map_err(|e| format!("Failed to detect sessions: {e}"))
+            },
+            crate::actions::process_start_secs,
+        )?;
         let output = serde_json::json!({
             "stopped": true,
             "pid": pid,
