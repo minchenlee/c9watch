@@ -114,7 +114,12 @@ impl CliSessionSource {
         lookup_with_cache(&home, &mut self.path_cache, cwd, session_id)
     }
 
-    fn map_agent_to_session(&mut self, a: CliAgent, meta: PidMeta) -> DetectedSession {
+    fn map_agent_to_session(
+        &mut self,
+        a: CliAgent,
+        meta: PidMeta,
+        process_start_secs: Option<u64>,
+    ) -> DetectedSession {
         let project_path = self.project_path_for_session(&a.cwd, &a.session_id);
         DetectedSession {
             pid: a.pid,
@@ -155,6 +160,7 @@ impl CliSessionSource {
             cursor_summary: None,
             pi_summary: None,
             opencode_summary: None,
+            process_start_secs,
         }
     }
 
@@ -327,11 +333,12 @@ impl SessionSource for CliSessionSource {
                     started_at_ms: meta.start.started_at_ms.or(Some(a.started_at)),
                     ..meta.start
                 };
-                if pid_was_reused(&recorded, start_times.get(&a.pid).copied()) {
+                let process_start = start_times.get(&a.pid).copied();
+                if pid_was_reused(&recorded, process_start) {
                     return None;
                 }
                 is_monitored_entrypoint(meta.entrypoint.as_deref())
-                    .then(|| self.map_agent_to_session(a, meta))
+                    .then(|| self.map_agent_to_session(a, meta, process_start))
             })
             .collect();
 
@@ -776,10 +783,12 @@ mod tests {
                 start: RecordedStart::default(),
                 name_derived: false,
             },
+            Some(7),
         );
 
         assert_eq!(session.entrypoint.as_deref(), Some("sdk-cli"));
         assert!(session.cli_reports_prompts);
+        assert_eq!(session.process_start_secs, Some(7));
     }
 
     #[test]
@@ -837,6 +846,7 @@ mod tests {
                         name_derived,
                         ..PidMeta::default()
                     },
+                    None,
                 )
                 .official_name
         };
@@ -1234,6 +1244,18 @@ mod tests {
         assert_eq!(detected_ids(&mut source), ["sid-reuse"]);
     }
 
+    /// Each detected session carries its pid's start time from the process
+    /// table, so stop can tell the process apart from a later one with the
+    /// same pid.
+    #[cfg(unix)]
+    #[test]
+    fn detect_records_the_process_start_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = reuse_fixture(tmp.path(), REGISTRY_WITH_PROC_START, PROC_START);
+        let (sessions, _) = source.detect().unwrap();
+        assert_eq!(sessions[0].process_start_secs, Some(PROC_START));
+    }
+
     /// Older Claude Code writes no `procStart`; the CLI row's `startedAt`
     /// still bounds the start, and a matching process is kept.
     #[cfg(unix)]
@@ -1255,7 +1277,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut source = reuse_fixture(tmp.path(), REGISTRY_WITH_PROC_START, 0);
         source.start_times = Box::new(|_| HashMap::new());
-        assert_eq!(detected_ids(&mut source), ["sid-reuse"]);
+        let (sessions, _) = source.detect().unwrap();
+        assert_eq!(sessions[0].session_id.as_deref(), Some("sid-reuse"));
+        assert_eq!(sessions[0].process_start_secs, None);
     }
 
     #[test]

@@ -1326,6 +1326,7 @@ mod placeholder_tests {
             cursor_summary: None,
             pi_summary: None,
             opencode_summary: None,
+            process_start_secs: None,
         };
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
@@ -1396,6 +1397,7 @@ mod placeholder_tests {
             cursor_summary: None,
             pi_summary: None,
             opencode_summary: None,
+            process_start_secs: None,
         };
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();

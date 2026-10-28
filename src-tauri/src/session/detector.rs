@@ -203,13 +203,16 @@ impl LegacySessionSource {
                     .find(|file| file.session_id == session_id)
                 {
                     used_session_ids.insert(session_id.clone());
-                    sessions.push(DetectedSession::with_legacy_defaults(
-                        proc.pid,
-                        proc_cwd.clone(),
-                        file.project_dir.clone(),
-                        Some(session_id),
-                        file.project_name.clone(),
-                    ));
+                    sessions.push(DetectedSession {
+                        process_start_secs: Some(proc.start_time),
+                        ..DetectedSession::with_legacy_defaults(
+                            proc.pid,
+                            proc_cwd.clone(),
+                            file.project_dir.clone(),
+                            Some(session_id),
+                            file.project_name.clone(),
+                        )
+                    });
                     claimed_named = true;
                     break;
                 }
@@ -281,13 +284,16 @@ impl LegacySessionSource {
             if let Some(file) = matching_session {
                 used_session_ids.insert(file.session_id.clone());
 
-                sessions.push(DetectedSession::with_legacy_defaults(
-                    proc.pid,
-                    proc_cwd.clone(),
-                    file.project_dir.clone(),
-                    Some(file.session_id.clone()),
-                    file.project_name.clone(),
-                ));
+                sessions.push(DetectedSession {
+                    process_start_secs: Some(proc.start_time),
+                    ..DetectedSession::with_legacy_defaults(
+                        proc.pid,
+                        proc_cwd.clone(),
+                        file.project_dir.clone(),
+                        Some(file.session_id.clone()),
+                        file.project_name.clone(),
+                    )
+                });
             } else {
                 crate::debug_log::log_warn(&format!(
                     "PID={}: no matching session found for cwd={}",
@@ -849,11 +855,13 @@ mod tests {
         let (tmp, source, dirs) = legacy_fixture(cwd, &[KILLED]);
         write_registry_row(tmp.path(), 5000, KILLED);
         let owner = process(5000, cwd, 7200);
+        let owner_start = owner.start_time;
         let newer_without_row = process(6000, cwd, 3600);
 
         let sessions = source.find_active_sessions(&[owner, newer_without_row], &dirs);
 
         assert_eq!(claimed(&sessions), vec![(5000, KILLED.to_string())]);
+        assert_eq!(sessions[0].process_start_secs, Some(owner_start));
     }
 
     /// Older Claude Code builds write no registry row; the cwd fallback still
@@ -864,10 +872,12 @@ mod tests {
         let (tmp, source, dirs) = legacy_fixture(cwd, &[KILLED, UNOWNED]);
         write_registry_row(tmp.path(), 999_999, KILLED);
         let live_without_row = process(4242, cwd, 3600);
+        let live_start = live_without_row.start_time;
 
         let sessions = source.find_active_sessions(&[live_without_row], &dirs);
 
         assert_eq!(claimed(&sessions), vec![(4242, UNOWNED.to_string())]);
+        assert_eq!(sessions[0].process_start_secs, Some(live_start));
     }
 
     /// A process started as `claude --resume <id>` with no registry row
