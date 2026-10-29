@@ -17,7 +17,11 @@ use std::path::{Component, Path};
 /// - A symlink at any level is rejected. The one exception is a root-owned
 ///   link in a root-owned directory above the leaf, such as `/var` and
 ///   `/tmp` on macOS: only root can plant or change those.
-/// - Missing parents are created 0700. Existing parents keep their mode.
+/// - Missing parents are created 0700. Existing parents keep their mode,
+///   but each one must be owned by our euid or root, and must not be group-
+///   or world-writable unless it is sticky (like `/tmp`). Otherwise another
+///   user could swap the leaf for a link after this check, and every later
+///   open by path would follow it.
 /// - The leaf must be owned by our euid. Its chmod runs on the open fd, so
 ///   it can never land on the target of a link.
 pub fn ensure_private_dir(dir: &Path) -> Result<(), String> {
@@ -44,8 +48,11 @@ pub fn open_private_dir(dir: &Path) -> Result<OwnedFd, String> {
     let mut fd =
         openat(None, &root, libc::O_NOFOLLOW).map_err(|e| format!("Failed to open /: {}", e))?;
     let mut at = std::path::PathBuf::from("/");
+    let me = unsafe { libc::geteuid() };
     for (i, name) in names.iter().enumerate() {
         let leaf = i + 1 == names.len();
+        // `fd` is the parent of `name`: a directory only we or root control.
+        check_trusted_parent(&fd, &at, me)?;
         at.push(name);
         let cname =
             CString::new(name.as_bytes()).map_err(|_| format!("{:?} contains a NUL byte", dir))?;
@@ -86,7 +93,6 @@ pub fn open_private_dir(dir: &Path) -> Result<OwnedFd, String> {
     }
 
     let md = fstat(&fd).map_err(|e| format!("Failed to stat dir {:?}: {}", dir, e))?;
-    let me = unsafe { libc::geteuid() };
     if md.st_uid != me {
         return Err(format!(
             "{:?} is owned by uid {}, not by us (uid {})",
@@ -110,6 +116,27 @@ pub fn open_private_dir(dir: &Path) -> Result<OwnedFd, String> {
         }
     }
     Ok(fd)
+}
+
+/// Fail unless the open directory `fd` (at path `at`) is owned by `me` or
+/// root, and is not group- or world-writable without the sticky bit.
+fn check_trusted_parent(fd: &OwnedFd, at: &Path, me: libc::uid_t) -> Result<(), String> {
+    let st = fstat(fd).map_err(|e| format!("Failed to stat dir {:?}: {}", at, e))?;
+    if st.st_uid != me && st.st_uid != 0 {
+        return Err(format!(
+            "{:?} is owned by uid {}, not by us (uid {}) or root",
+            at, st.st_uid, me
+        ));
+    }
+    let mode = st.st_mode as u32;
+    if mode & 0o022 != 0 && mode & libc::S_ISVTX as u32 == 0 {
+        return Err(format!(
+            "{:?} is writable by others ({:o}) and not sticky",
+            at,
+            mode & 0o7777
+        ));
+    }
+    Ok(())
 }
 
 /// `openat(parent, name, O_RDONLY|O_DIRECTORY|O_CLOEXEC|extra)`. `None`
@@ -239,6 +266,26 @@ mod tests {
         assert!(ensure_private_dir(&file.join("engine"))
             .unwrap_err()
             .contains("not a directory"));
+    }
+
+    #[test]
+    fn parent_writable_by_others_is_rejected_unless_sticky() {
+        let t = tmp();
+        let shared = t.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = ensure_private_dir(&shared.join("engine")).unwrap_err();
+        assert!(err.contains("writable by others"), "{}", err);
+        assert!(!shared.join("engine").exists());
+
+        // Group-writable is no better.
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(ensure_private_dir(&shared.join("engine")).is_err());
+
+        // Sticky, like /tmp: others cannot rename our entries.
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+        ensure_private_dir(&shared.join("engine")).unwrap();
+        assert_eq!(mode_of(&shared.join("engine")), 0o700);
     }
 
     #[test]
