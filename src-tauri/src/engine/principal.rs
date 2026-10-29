@@ -4,8 +4,10 @@
 //! C1a has two principals:
 //! 1. `agent:<id>`: the peer's ancestry (at most `MAX_ANCESTRY` levels)
 //!    reaches the PTY child of a live agent, with the same pid **and** start
-//!    time. Only agents the engine spawned or took over (`control=pty`) are
-//!    in the live set, so an observed session is never an agent (A:186).
+//!    time. The principal carries that agent's generation, as the engine
+//!    recorded it at spawn (C1a-33). The live set is the engine's table in
+//!    `engine::agents`, filled only from PTY children the engine spawned, so
+//!    an observed session is never an agent (A:186).
 //! 2. `local-unverified`: everything else (A:187).
 //!
 //! C1a never stamps `human` (that waits for the C1.5 code-signature check)
@@ -18,14 +20,19 @@ use serde::{Serialize, Serializer};
 /// Who a connection is, as the engine stamped it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {
-    Agent(String),
+    /// A live agent and the generation whose PTY child the peer descends
+    /// from.
+    Agent {
+        id: String,
+        gen: i64,
+    },
     LocalUnverified,
 }
 
 impl std::fmt::Display for Principal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Principal::Agent(id) => write!(f, "agent:{}", id),
+            Principal::Agent { id, .. } => write!(f, "agent:{}", id),
             Principal::LocalUnverified => f.write_str("local-unverified"),
         }
     }
@@ -37,16 +44,18 @@ impl Serialize for Principal {
     }
 }
 
-/// The PTY child of a live agent.
+/// The PTY child of a live agent's current generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveAgent {
     pub id: String,
+    pub gen: i64,
     pub pty_child_pid: libc::pid_t,
     pub pty_child_start: u64,
 }
 
-/// Lookup of live agents by the pid of their PTY child. C1a-33 backs it with
-/// the engine's agent table; until then `NoLiveAgents` is used.
+/// Lookup of live agents by the pid of their PTY child. The engine backs it
+/// with its live table (`engine::agents::LiveTable`); `NoLiveAgents` serves
+/// tests of the connection layer.
 pub trait LiveAgents: Send + Sync {
     /// The live agent whose PTY child has `pid`, if any. The caller checks
     /// the start time.
@@ -69,7 +78,10 @@ pub fn stamp(chain: &[ProcInfo], agents: &dyn LiveAgents) -> Principal {
     for p in chain.iter().take(MAX_ANCESTRY) {
         if let Some(agent) = agents.by_pty_child(p.pid) {
             if agent.pty_child_start == p.start {
-                return Principal::Agent(agent.id);
+                return Principal::Agent {
+                    id: agent.id,
+                    gen: agent.gen,
+                };
             }
         }
     }
@@ -103,6 +115,7 @@ pub(crate) mod tests {
                 pid,
                 LiveAgent {
                     id: id.into(),
+                    gen: 1,
                     pty_child_pid: pid,
                     pty_child_start: start,
                 },
@@ -113,6 +126,13 @@ pub(crate) mod tests {
     impl LiveAgents for FakeAgents {
         fn by_pty_child(&self, pid: libc::pid_t) -> Option<LiveAgent> {
             self.0.get(&pid).cloned()
+        }
+    }
+
+    fn agent(id: &str) -> Principal {
+        Principal::Agent {
+            id: id.into(),
+            gen: 1,
         }
     }
 
@@ -133,10 +153,7 @@ pub(crate) mod tests {
     #[test]
     fn agent_bash_subprocess_is_the_agent() {
         let agents = FakeAgents::one("a1", 10, 100);
-        assert_eq!(
-            stamp(&bash_tool_chain(100), &agents),
-            Principal::Agent("a1".into())
-        );
+        assert_eq!(stamp(&bash_tool_chain(100), &agents), agent("a1"));
         assert_eq!(
             stamp(&bash_tool_chain(100), &agents).to_string(),
             "agent:a1"
@@ -172,10 +189,7 @@ pub(crate) mod tests {
             stamp(&chain, &FakeAgents::one("a1", 110, 7)),
             Principal::LocalUnverified
         );
-        assert_eq!(
-            stamp(&chain, &FakeAgents::one("a1", 109, 7)),
-            Principal::Agent("a1".into())
-        );
+        assert_eq!(stamp(&chain, &FakeAgents::one("a1", 109, 7)), agent("a1"));
     }
 
     #[test]
@@ -185,7 +199,7 @@ pub(crate) mod tests {
         let pstart = peer::proc_info(parent).unwrap().start;
         let now = peer::start_token_now();
         let agents = FakeAgents::one("p", parent, pstart);
-        assert_eq!(stamp_peer(me, now, &agents), Principal::Agent("p".into()));
+        assert_eq!(stamp_peer(me, now, &agents), agent("p"));
         assert_eq!(
             stamp_peer(me, now, &FakeAgents::one("p", parent, pstart + 1)),
             Principal::LocalUnverified
@@ -207,10 +221,7 @@ pub(crate) mod tests {
             Principal::LocalUnverified
         );
         assert_eq!(stamp_peer(me, None, &agents), Principal::LocalUnverified);
-        assert_eq!(
-            stamp_peer(me, Some(mine.start), &agents),
-            Principal::Agent("p".into())
-        );
+        assert_eq!(stamp_peer(me, Some(mine.start), &agents), agent("p"));
     }
 
     #[test]
@@ -219,9 +230,6 @@ pub(crate) mod tests {
             serde_json::to_value(Principal::LocalUnverified).unwrap(),
             "local-unverified"
         );
-        assert_eq!(
-            serde_json::to_value(Principal::Agent("x".into())).unwrap(),
-            "agent:x"
-        );
+        assert_eq!(serde_json::to_value(agent("x")).unwrap(), "agent:x");
     }
 }

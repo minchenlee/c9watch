@@ -12,6 +12,7 @@
 //! is written before clients ask. The engine never talks to the legacy
 //! `c9watch daemon` and never writes its files.
 
+use super::agents::LiveTable;
 use super::api::{serve, ServerCtx};
 use super::db;
 use super::detect;
@@ -46,7 +47,13 @@ pub async fn run(home: &Path) -> Result<(), String> {
     let listener = UnixListener::from_std(std_listener)
         .map_err(|e| format!("Failed to register Unix socket: {}", e))?;
 
-    let ctx = Arc::new(ServerCtx::new(key.id().to_string()).with_db(db.clone()));
+    // The engine's live agents: empty until an agent is spawned (M5).
+    let agents = Arc::new(LiveTable::new());
+    let ctx = Arc::new(
+        ServerCtx::new(key.id().to_string())
+            .with_agents(agents)
+            .with_db(db.clone()),
+    );
     let pruner = tokio::spawn(prune_loop(db.clone()));
     let detection = detect::spawn(db.clone())?;
     spawn_import(db.clone(), home.to_path_buf());

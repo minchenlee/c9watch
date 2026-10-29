@@ -25,6 +25,9 @@ pub mod api;
 pub mod principal;
 
 #[cfg(unix)]
+pub mod agents;
+
+#[cfg(unix)]
 pub mod db;
 
 #[cfg(unix)]

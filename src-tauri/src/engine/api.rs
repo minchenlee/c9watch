@@ -64,11 +64,17 @@ impl ServerCtx {
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
             machine_id,
             hello_timeout: HELLO_TIMEOUT,
-            // C1a-33 replaces this with the engine's agent table.
+            // `run` sets the engine's live table (`with_agents`).
             agents: Arc::new(NoLiveAgents),
             engine_uid: peer::engine_uid(),
             db: None,
         }
+    }
+
+    /// Stamp `agent:<id>` from the engine's live-agent table (C1a-33).
+    pub fn with_agents(mut self, agents: Arc<dyn LiveAgents>) -> Self {
+        self.agents = agents;
+        self
     }
 
     pub fn with_db(mut self, db: Arc<Db>) -> Self {
@@ -1298,6 +1304,43 @@ mod tests {
         assert_eq!(c.call("2", "events.subscribe", json!({})).await["ok"], true);
         assert_eq!(c.call("3", "session.list", json!({})).await["ok"], true);
         assert_eq!(c.call("4", "agent.list", json!({})).await["ok"], true);
+    }
+
+    /// A detected session's row never makes its processes an agent: only
+    /// the engine's live table does (C1a-33, A:186).
+    #[tokio::test]
+    async fn an_observed_row_is_never_the_agent() {
+        use crate::engine::agents::LiveTable;
+        use crate::engine::driver::ChildId;
+        let me = std::process::id() as libc::pid_t;
+        let parent = peer::proc_info(me).unwrap();
+        let parent = peer::proc_info(parent.ppid).unwrap();
+        let table = Arc::new(LiveTable::new());
+        let (_t, ctx, db) = ctx_db(table.clone());
+        db.write(move |tx| {
+            tx.execute(
+                "INSERT INTO agents (id, role, provider, source, control, pid, started_at) \
+                 VALUES ('obs', 'observed', 'claude', 'detected', 'none', ?1, 1)",
+                [parent.pid],
+            )
+        })
+        .await
+        .unwrap();
+        let (_c, hello) = Client::new(ctx.clone()).await;
+        assert_eq!(hello["principal"], "local-unverified");
+        // The same parent as the PTY child of a live engine agent.
+        table
+            .register(
+                "a7",
+                2,
+                ChildId {
+                    pid: parent.pid,
+                    start: parent.start,
+                },
+            )
+            .unwrap();
+        let (_c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["principal"], "agent:a7");
     }
 
     // ── Detection-backed lists (C1a-15) ────────────────────────────────
