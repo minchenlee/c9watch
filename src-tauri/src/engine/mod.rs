@@ -28,4 +28,7 @@ pub mod principal;
 pub mod db;
 
 #[cfg(unix)]
+pub mod machine;
+
+#[cfg(unix)]
 pub mod run;

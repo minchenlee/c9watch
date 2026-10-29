@@ -3,14 +3,16 @@
 //! Order matters: the signal handlers go in before the bind, so a SIGTERM
 //! or SIGINT from then on always reaches the cleanup; the lifetime lock goes
 //! in before the bind, so only the lock holder can replace a leftover
-//! socket, and before the db opens, since opening may move a corrupt db
-//! aside. The engine never talks to the legacy `c9watch daemon`.
+//! socket, and before the machine key and the db, since creating the key
+//! and opening the db (which may move a corrupt db aside) are both
+//! lock-holder work. The engine never talks to the legacy `c9watch daemon`.
 
 use super::api::{serve, ServerCtx};
 use super::db;
 use super::fsutil::ensure_private_dir;
 use super::home::{lock_path, sock_path};
 use super::lock::acquire_engine_lock;
+use super::machine;
 use super::sock::{bind_private, ShutdownSignals};
 use std::path::Path;
 use std::sync::Arc;
@@ -24,7 +26,8 @@ pub async fn run(home: &Path) -> Result<(), String> {
     let mut signals = ShutdownSignals::install()
         .map_err(|e| format!("Failed to install signal handlers: {}", e))?;
     let lock = acquire_engine_lock(&lock_path(home))?;
-    let db = db::open(home)?;
+    let key = machine::load_or_create(home)?;
+    let db = db::open(home, key.id())?;
     let (std_listener, socket) = bind_private(&sock_path(home), &lock)?;
     std_listener
         .set_nonblocking(true)
@@ -32,12 +35,12 @@ pub async fn run(home: &Path) -> Result<(), String> {
     let listener = UnixListener::from_std(std_listener)
         .map_err(|e| format!("Failed to register Unix socket: {}", e))?;
 
-    // The machine id comes from the store (M2). Until then it is empty.
-    let ctx = Arc::new(ServerCtx::new(String::new()));
+    let ctx = Arc::new(ServerCtx::new(key.id().to_string()));
     eprintln!(
-        "[engine] Listening on {:?}, pid={}, epoch={}",
+        "[engine] Listening on {:?}, pid={}, machine={}, epoch={}",
         socket.path(),
         std::process::id(),
+        key.id(),
         db.epoch()
     );
 

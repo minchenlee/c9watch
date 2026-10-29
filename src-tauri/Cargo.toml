@@ -41,7 +41,7 @@ cli = ["dep:clap", "dep:regex", "dep:tokio"]
 # from `default`. Build with `--features pm-orchestration` to expose it.
 pm-orchestration = ["cli"]
 # Agent engine (C1a): `c9watch engine`, `api` and `task`, unix only.
-engine = ["cli"]
+engine = ["cli", "dep:ed25519-dalek", "dep:rand"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
@@ -80,6 +80,9 @@ subtle = { version = "2.6", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 regex = { version = "1", optional = true }
 wait-timeout = "0.2"
+
+# ── Engine-only dependencies ─────────────────────────────────────────
+ed25519-dalek = { version = "2", optional = true }
 
 # ── macOS GUI-only ───────────────────────────────────────────────────
 # tauri-nspanel provides NSPanel support for the popover (above fullscreen apps).

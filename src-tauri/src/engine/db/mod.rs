@@ -8,16 +8,20 @@
 //! 2. A db newer than this engine is refused with `db_newer_than_engine`
 //!    and left as it is.
 //! 3. Migrations, each after a `VACUUM INTO` backup (see `migrate`).
-//! 4. The writable connection moves to the writer thread (see `writer`).
+//! 4. This machine's row in `machines` (`is_self`), keyed by the machine
+//!    key id. A new self row is audited.
+//! 5. The writable connection moves to the writer thread (see `writer`).
 //!
 //! Call `open` only while holding the engine lock: it may move the db.
 
+pub mod audit;
 pub mod migrate;
 pub mod writer;
 
 use super::fsutil::ensure_private_dir;
+use audit::AuditEntry;
 use migrate::{migrate, MIGRATIONS};
-use rusqlite::{Connection, ErrorCode, OpenFlags};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use writer::Writer;
@@ -43,12 +47,18 @@ pub fn backups_dir(home: &Path) -> PathBuf {
 /// An open store.
 pub struct Db {
     path: PathBuf,
+    machine_id: String,
     epoch: String,
     moved_aside: Option<PathBuf>,
     writer: Writer,
 }
 
 impl Db {
+    /// The machine key id this db was opened for.
+    pub fn machine_id(&self) -> &str {
+        &self.machine_id
+    }
+
     /// Changes only when the db is recreated. Part of every cursor
     /// (`machine:epoch:seq`).
     pub fn epoch(&self) -> &str {
@@ -77,8 +87,9 @@ impl Db {
     }
 }
 
-/// Open (or create) the store in `home`.
-pub fn open(home: &Path) -> Result<Db, String> {
+/// Open (or create) the store in `home` for the machine `machine_id` (the
+/// machine key id, see `engine::machine`).
+pub fn open(home: &Path, machine_id: &str) -> Result<Db, String> {
     ensure_private_dir(home)?;
     let backups = backups_dir(home);
     ensure_private_dir(&backups)?;
@@ -102,8 +113,10 @@ pub fn open(home: &Path) -> Result<Db, String> {
     configure(&conn)?;
     migrate(&mut conn, MIGRATIONS, &backups)?;
     let epoch = ensure_epoch(&conn)?;
+    register_self(&mut conn, machine_id)?;
     Ok(Db {
         path,
+        machine_id: machine_id.to_string(),
         epoch,
         moved_aside,
         writer: Writer::spawn(conn)?,
@@ -191,10 +204,52 @@ fn ensure_epoch(conn: &Connection) -> Result<String, String> {
     .map_err(|e| format!("Failed to read the epoch: {}", e))
 }
 
-fn now_ms() -> u128 {
+/// Make `machine_id` the only `is_self` row. A machine key that is new to
+/// this db (first boot, or the key file was replaced) gets an audit row.
+fn register_self(conn: &mut Connection, machine_id: &str) -> Result<(), String> {
+    let fail = |e: rusqlite::Error| format!("Failed to register machine {}: {}", machine_id, e);
+    let tx = conn.transaction().map_err(fail)?;
+    tx.execute(
+        "UPDATE machines SET is_self = 0 WHERE is_self = 1 AND id != ?1",
+        [machine_id],
+    )
+    .map_err(fail)?;
+    let added = tx
+        .execute(
+            "INSERT INTO machines (id, is_self) VALUES (?1, 1) \
+             ON CONFLICT (id) DO NOTHING",
+            [machine_id],
+        )
+        .map_err(fail)?;
+    if added == 0 {
+        tx.execute(
+            "UPDATE machines SET is_self = 1 WHERE id = ?1",
+            params![machine_id],
+        )
+        .map_err(fail)?;
+    } else {
+        audit::append(
+            &tx,
+            now_ms(),
+            &AuditEntry {
+                principal: audit::SYSTEM,
+                method: "machine.register",
+                target: Some(machine_id),
+                decision: "allow",
+                reason: Some("new machine key"),
+                ..Default::default()
+            },
+        )
+        .map_err(fail)?;
+    }
+    tx.commit().map_err(fail)
+}
+
+/// Unix time in ms.
+pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis())
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 #[cfg(test)]
@@ -203,6 +258,9 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A machine id for tests; real ones come from `engine::machine`.
+    const M: &str = "m0";
 
     fn home() -> (tempfile::TempDir, PathBuf) {
         let t = tempfile::tempdir().unwrap();
@@ -242,7 +300,7 @@ mod tests {
     #[test]
     fn golden_schema_dump() {
         let (_t, h) = home();
-        let db = open(&h).unwrap();
+        let db = open(&h, M).unwrap();
         let dump = schema_dump(&db.reader().unwrap());
         let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join(GOLDEN);
         if std::env::var_os("C9_UPDATE_GOLDEN").is_some() {
@@ -255,7 +313,7 @@ mod tests {
     #[test]
     fn schema_has_the_c1a_tables_and_no_token_hash() {
         let (_t, h) = home();
-        let db = open(&h).unwrap();
+        let db = open(&h, M).unwrap();
         let r = db.reader().unwrap();
         let tables: Vec<String> = r
             .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
@@ -307,7 +365,7 @@ mod tests {
     #[test]
     fn open_creates_a_private_wal_db_and_keeps_its_epoch() {
         let (_t, h) = home();
-        let db = open(&h).unwrap();
+        let db = open(&h, M).unwrap();
         let epoch = db.epoch().to_string();
         assert_eq!(epoch.len(), 16);
         assert!(db.moved_aside().is_none());
@@ -322,14 +380,14 @@ mod tests {
         assert_eq!(perm(&backups_dir(&h)), 0o700);
         drop(db);
 
-        let db = open(&h).unwrap();
+        let db = open(&h, M).unwrap();
         assert_eq!(db.epoch(), epoch);
     }
 
     #[test]
     fn writes_go_through_the_writer_and_readers_see_them() {
         let (_t, h) = home();
-        let db = open(&h).unwrap();
+        let db = open(&h, M).unwrap();
         db.writer()
             .call_blocking(|c| {
                 c.execute(
@@ -368,13 +426,13 @@ mod tests {
     #[test]
     fn downgrade_is_refused_and_the_db_is_kept() {
         let (_t, h) = home();
-        drop(open(&h).unwrap());
+        drop(open(&h, M).unwrap());
         {
             let conn = Connection::open(db_path(&h)).unwrap();
             conn.pragma_update(None, "user_version", latest_version() + 1)
                 .unwrap();
         }
-        let err = open(&h).map(drop).unwrap_err();
+        let err = open(&h, M).map(drop).unwrap_err();
         assert!(err.starts_with(DB_NEWER_THAN_ENGINE), "{}", err);
         // Not moved aside, not migrated.
         let conn = Connection::open(db_path(&h)).unwrap();
@@ -396,7 +454,7 @@ mod tests {
     }
 
     fn assert_new_epoch_after(h: &Path, old_epoch: &str) {
-        let db = open(h).unwrap();
+        let db = open(h, M).unwrap();
         assert_ne!(db.epoch(), old_epoch);
         let moved = db.moved_aside().expect("db moved aside").to_path_buf();
         assert!(moved.starts_with(backups_dir(h)), "{:?}", moved);
@@ -413,7 +471,7 @@ mod tests {
     #[test]
     fn quick_check_failure_gives_a_new_epoch() {
         let (_t, h) = home();
-        let db = open(&h).unwrap();
+        let db = open(&h, M).unwrap();
         let old = db.epoch().to_string();
         let ep = old.clone();
         db.writer()
@@ -438,8 +496,62 @@ mod tests {
     #[test]
     fn not_a_db_gives_a_new_epoch() {
         let (_t, h) = home();
-        let old = open(&h).unwrap().epoch().to_string();
+        let old = open(&h, M).unwrap().epoch().to_string();
         fs::write(db_path(&h), vec![0x5Au8; 8192]).unwrap();
         assert_new_epoch_after(&h, &old);
+    }
+
+    fn self_rows(db: &Db) -> Vec<(String, i64)> {
+        db.reader()
+            .unwrap()
+            .prepare("SELECT id, is_self FROM machines ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn audit_rows(db: &Db) -> Vec<(String, String, String)> {
+        db.reader()
+            .unwrap()
+            .prepare("SELECT principal, method, target FROM audit ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn the_machine_key_id_is_the_self_row_and_new_keys_are_audited() {
+        let (_t, h) = home();
+        let db = open(&h, M).unwrap();
+        assert_eq!(db.machine_id(), M);
+        assert_eq!(self_rows(&db), [(M.to_string(), 1)]);
+        let reg = |id: &str| {
+            (
+                "system".to_string(),
+                "machine.register".to_string(),
+                id.to_string(),
+            )
+        };
+        assert_eq!(audit_rows(&db), [reg(M)]);
+        drop(db);
+
+        // Same key again: nothing new.
+        let db = open(&h, M).unwrap();
+        assert_eq!(audit_rows(&db), [reg(M)]);
+        drop(db);
+
+        // A replaced key file: a new self row, the old one stays as a peer.
+        let db = open(&h, "m1").unwrap();
+        assert_eq!(self_rows(&db), [(M.to_string(), 0), ("m1".to_string(), 1)]);
+        assert_eq!(audit_rows(&db), [reg(M), reg("m1")]);
+        drop(db);
+
+        let db = open(&h, M).unwrap();
+        assert_eq!(self_rows(&db), [(M.to_string(), 1), ("m1".to_string(), 0)]);
+        assert_eq!(audit_rows(&db).len(), 2);
     }
 }

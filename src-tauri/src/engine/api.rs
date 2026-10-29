@@ -30,7 +30,7 @@ const WRITE_QUEUE: usize = 64;
 /// Engine-wide facts every connection needs.
 pub struct ServerCtx {
     pub engine_version: String,
-    /// The machine key id. Set from the store once it exists (M2).
+    /// The machine key id (`engine::machine`).
     pub machine_id: String,
     pub hello_timeout: Duration,
     /// Live agents, for `agent:<id>` stamping.
