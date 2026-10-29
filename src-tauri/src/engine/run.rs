@@ -5,15 +5,18 @@
 //! in before the bind, so only the lock holder can replace a leftover
 //! socket, and before the machine key and the db, since creating the key
 //! and opening the db (which may move a corrupt db aside) are both
-//! lock-holder work. Detection starts once the db is open, so its first tick
-//! (or the rebuild after a new epoch) is written before clients ask. The
-//! engine never talks to the legacy `c9watch daemon`.
+//! lock-holder work. The legacy files are imported from a snapshot copy
+//! once the db is open, and a failed import only logs. Detection starts
+//! once the db is open, so its first tick (or the rebuild after a new epoch)
+//! is written before clients ask. The engine never talks to the legacy
+//! `c9watch daemon` and never writes its files.
 
 use super::api::{serve, ServerCtx};
 use super::db;
 use super::detect;
 use super::fsutil::ensure_private_dir;
 use super::home::{lock_path, sock_path};
+use super::import;
 use super::lock::acquire_engine_lock;
 use super::machine;
 use super::sock::{bind_private, ShutdownSignals};
@@ -35,6 +38,7 @@ pub async fn run(home: &Path) -> Result<(), String> {
     let lock = acquire_engine_lock(&lock_path(home))?;
     let key = machine::load_or_create(home)?;
     let db = Arc::new(db::open(home, key.id())?);
+    import_legacy(&db, home);
     let (std_listener, socket) = bind_private(&sock_path(home), &lock)?;
     std_listener
         .set_nonblocking(true)
@@ -70,6 +74,28 @@ pub async fn run(home: &Path) -> Result<(), String> {
     db.close();
     drop(lock);
     Ok(())
+}
+
+/// Import `~/.claude/c9watch` (see `engine::import`). Blocking, at boot.
+fn import_legacy(db: &db::Db, home: &Path) {
+    let Some(source) = import::legacy_root() else {
+        return;
+    };
+    match import::import(db, home, &source) {
+        Ok(r) if !r.is_empty() => eprintln!(
+            "[engine] Imported legacy files: {} copied, {} new rows, {} changed, {} events, \
+             {} symlinks and {} other files skipped, {} unreadable",
+            r.copied,
+            r.created.len(),
+            r.updated.len(),
+            r.events,
+            r.symlinks,
+            r.skipped,
+            r.bad
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("[engine] Legacy import failed: {}", e),
+    }
 }
 
 async fn prune_loop(db: Arc<db::Db>) {

@@ -29,6 +29,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         sql: include_str!("migrations/0002_detection.sql"),
     },
+    Migration {
+        version: 3,
+        sql: include_str!("migrations/0003_legacy_import.sql"),
+    },
 ];
 
 /// The schema version this engine writes.
@@ -186,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_1_db_moves_to_2_and_keeps_its_rows() {
+    fn a_version_1_db_moves_to_the_latest_and_keeps_its_rows() {
         let t = tempfile::tempdir().unwrap();
         let mut conn = Connection::open(t.path().join("e.db")).unwrap();
         migrate(&mut conn, &MIGRATIONS[..1], t.path()).unwrap();
@@ -196,8 +200,10 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), vec![2]);
+        let later: Vec<u32> = (2..=latest_version()).collect();
+        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), later);
         assert!(t.path().join("pre-2.db").exists());
+        assert!(t.path().join("pre-3.db").exists());
         let (id, key): (String, Option<String>) = conn
             .query_row("SELECT id, session_key FROM agents", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))

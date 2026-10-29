@@ -307,6 +307,9 @@ pub struct AgentRow {
     pub created_at: Option<i64>,
     /// Unix ms of the last detection tick that saw the agent.
     pub last_seen: Option<i64>,
+    /// The agent that owns this one; for an imported legacy worker, the PM
+    /// that adopted it.
+    pub parent_id: Option<String>,
 }
 
 /// `session.list` params. There are none yet; the engine ignores any it

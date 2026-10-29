@@ -34,4 +34,7 @@ pub mod machine;
 pub mod detect;
 
 #[cfg(unix)]
+pub mod import;
+
+#[cfg(unix)]
 pub mod run;

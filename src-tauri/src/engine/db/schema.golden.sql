@@ -1,6 +1,9 @@
--- user_version 2
+-- user_version 3
 -- index agents_detected_key
 CREATE UNIQUE INDEX agents_detected_key ON agents (session_key) WHERE source = 'detected';
+-- index agents_legacy_sid
+CREATE UNIQUE INDEX agents_legacy_sid ON agents (provider, provider_sid)
+    WHERE source = 'legacy_import';
 -- index agents_provider_sid
 CREATE INDEX agents_provider_sid ON agents (provider, provider_sid);
 -- index events_ts
@@ -33,7 +36,7 @@ CREATE TABLE agents (
 , session_key TEXT, machine_id TEXT, state TEXT CHECK (state IN (
     'creating', 'starting', 'ready', 'working', 'blocked', 'paused', 'refreshing',
     'interrupted', 'retiring', 'retired', 'failed', 'orphaned')), status TEXT CHECK (status IN (
-    'working', 'needs_attention', 'waiting_for_input', 'connecting')), cwd TEXT, name TEXT, pid INTEGER, started_at INTEGER, created_at INTEGER, last_seen INTEGER) STRICT;
+    'working', 'needs_attention', 'waiting_for_input', 'connecting')), cwd TEXT, name TEXT, pid INTEGER, started_at INTEGER, created_at INTEGER, last_seen INTEGER, parent_id TEXT REFERENCES agents (id)) STRICT;
 -- table audit
 CREATE TABLE audit (
     seq          INTEGER PRIMARY KEY,
@@ -63,6 +66,11 @@ CREATE TABLE events (
     payload TEXT,                                        -- JSON
     ts      INTEGER NOT NULL
 ) STRICT;
+-- table legacy_events
+CREATE TABLE legacy_events (
+    event_id    TEXT PRIMARY KEY,
+    imported_at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
 -- table machines
 CREATE TABLE machines (
     id      TEXT PRIMARY KEY,

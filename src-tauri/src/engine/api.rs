@@ -1143,7 +1143,8 @@ mod tests {
                 "pid": null,
                 "startedAt": null,
                 "createdAt": null,
-                "lastSeen": null
+                "lastSeen": null,
+                "parentId": null
             }])
         );
     }

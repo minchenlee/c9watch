@@ -103,6 +103,13 @@
             "null"
           ]
         },
+        "parentId": {
+          "description": "The agent that owns this one; for an imported legacy worker, the PM\nthat adopted it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "pid": {
           "format": "int64",
           "type": [
@@ -185,7 +192,8 @@
         "pid",
         "startedAt",
         "createdAt",
-        "lastSeen"
+        "lastSeen",
+        "parentId"
       ],
       "type": "object"
     },

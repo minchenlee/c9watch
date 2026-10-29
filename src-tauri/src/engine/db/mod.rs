@@ -324,7 +324,7 @@ impl AgentFilter {
 /// contract.
 pub const AGENT_COLUMNS: &str = "id, generation, mode, role, control, provider, provider_sid, \
      source, created_by, gone_at, resume_count, interrupted_note_pending, session_key, \
-     machine_id, state, status, cwd, name, pid, started_at, created_at, last_seen";
+     machine_id, state, status, cwd, name, pid, started_at, created_at, last_seen, parent_id";
 
 /// Read one row selected with `AGENT_COLUMNS`.
 pub fn agent_row(r: &rusqlite::Row) -> rusqlite::Result<AgentRow> {
@@ -351,6 +351,7 @@ pub fn agent_row(r: &rusqlite::Row) -> rusqlite::Result<AgentRow> {
         started_at: r.get(19)?,
         created_at: r.get(20)?,
         last_seen: r.get(21)?,
+        parent_id: r.get(22)?,
     })
 }
 
@@ -590,6 +591,7 @@ mod tests {
                 "audit",
                 "dedupe",
                 "events",
+                "legacy_events",
                 "machines",
                 "meta",
                 "ops",
@@ -627,7 +629,8 @@ mod tests {
                 "pid",
                 "started_at",
                 "created_at",
-                "last_seen"
+                "last_seen",
+                "parent_id"
             ]
         );
     }
@@ -956,6 +959,7 @@ mod tests {
                 started_at: None,
                 created_at: None,
                 last_seen: None,
+                parent_id: None,
             }
         );
         assert_eq!(db.check_cursor(&cur), Ok(1));

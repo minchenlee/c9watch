@@ -42,6 +42,11 @@ export interface C9pAgentRow {
   /** `managed` or `free`; `null` for an observed agent. */
   mode: string | null;
   name: string | null;
+  /**
+   * The agent that owns this one; for an imported legacy worker, the PM
+   * that adopted it.
+   */
+  parentId: string | null;
   pid: number | null;
   /** The adapter kind: `claude`, `codex`, ... */
   provider: string;
