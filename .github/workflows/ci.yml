@@ -113,13 +113,17 @@ jobs:
 
       - name: Prod channel has no shadow diff
         # C1a-17: the dev-only shadow diff and `engine shadow-report` are
-        # not compiled into a prod channel build.
+        # not compiled into a prod channel build. Exact names, and both must
+        # run: a renamed or cfg'd-out test fails the step, not skips it.
         env:
           C9WATCH_CHANNEL: prod
         run: |
-          cargo test --manifest-path src-tauri/Cargo.toml \
-            --no-default-features --features engine --lib \
-            -- prod_channel_build_has_no_shadow_diff shadow_report_only_in_dev_builds
+          out=$(cargo test --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features engine --lib -- --exact \
+            engine_proto::channel_tests::prod_channel_build_has_no_shadow_diff \
+            cli::dispatch_tests::shadow_report_only_in_dev_builds)
+          echo "$out"
+          echo "$out" | grep -q "test result: ok. 2 passed"
 
       - name: CLI-only tests
         run: |
