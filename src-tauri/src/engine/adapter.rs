@@ -136,7 +136,8 @@ pub const CC_HOOKS: &[(&str, &str)] = &[
 ];
 
 /// CC's own hook timeout, in seconds. The client gives up after 0.5 s
-/// (A:1054); this only bounds a stuck process.
+/// (A:1054), 4 s for `session-start` (`cli::task::hook_timeout`); this
+/// only bounds a stuck process.
 pub const CC_HOOK_TIMEOUT_S: u64 = 5;
 
 /// Single-quote `s` for the `sh -c` CC runs a hook command in. The engine
@@ -230,6 +231,13 @@ mod tests {
             let h = &hooks[*cc_event][0]["hooks"][0];
             assert_eq!(h["type"], "command");
             assert_eq!(h["timeout"], CC_HOOK_TIMEOUT_S);
+            // The client gives up before CC does.
+            assert!(
+                crate::cli::task::hook_timeout(event)
+                    < std::time::Duration::from_secs(CC_HOOK_TIMEOUT_S),
+                "{}",
+                event
+            );
             assert_eq!(
                 h["command"],
                 format!(

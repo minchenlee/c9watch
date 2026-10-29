@@ -81,7 +81,7 @@ fn main() {
                 &kind,
                 std::io::stdin(),
                 |k| std::env::var(k).ok(),
-                task::HOOK_TIMEOUT,
+                task::hook_timeout(&event),
             ) {
                 println!("{}", out);
             }

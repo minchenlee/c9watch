@@ -28,6 +28,12 @@ pub const ENV_AGENT_ID: &str = "C9_AGENT_ID";
 
 /// How long a hook waits for the engine, all in (A:1054).
 pub const HOOK_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long `hook session-start` waits instead. Its answer carries the
+/// standing orders and, once after an interrupt, a note the engine hands
+/// out only once (C1a-25); CC does not run the hook again, so a reply lost
+/// to a busy engine would lose the note. It runs once per generation, and
+/// stays under CC's own hook timeout (`engine::adapter::CC_HOOK_TIMEOUT_S`).
+pub const SESSION_START_TIMEOUT: Duration = Duration::from_secs(4);
 /// How long `task done` and `handoff` wait for each read and write.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// The largest hook stdin a hook forwards. A larger one goes as `null`
@@ -170,6 +176,15 @@ pub fn hook_method(event: &str) -> Option<&'static str> {
         .iter()
         .find(|(e, _)| *e == event)
         .map(|(_, m)| *m)
+}
+
+/// How long `hook <event>` waits for the engine, all in.
+pub fn hook_timeout(event: &str) -> Duration {
+    if event == "session-start" {
+        SESSION_START_TIMEOUT
+    } else {
+        HOOK_TIMEOUT
+    }
 }
 
 /// The `hook.*` params for the hook's stdin. Input that is not JSON, or is
@@ -459,6 +474,16 @@ mod tests {
             hook_stdout("hook.session_start", &HookResult::default()),
             None
         );
+    }
+
+    #[test]
+    fn only_session_start_waits_longer() {
+        assert_eq!(hook_timeout("session-start"), SESSION_START_TIMEOUT);
+        for (event, _) in HOOK_EVENTS {
+            if *event != "session-start" {
+                assert_eq!(hook_timeout(event), HOOK_TIMEOUT, "{}", event);
+            }
+        }
     }
 
     #[test]

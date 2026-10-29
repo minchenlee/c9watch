@@ -17,6 +17,10 @@
 //!   (A:551). Only a `startup` or `resume` takes it: a new generation
 //!   always starts with one of those, so a `compact` of the interrupted
 //!   generation itself, or one after the resume, never repeats or eats it.
+//!   The flag clears when the engine takes the event, and CC never runs
+//!   the hook again, so `hook session-start` waits
+//!   `cli::task::SESSION_START_TIMEOUT` (4 s), not 0.5 s, for the reply: a
+//!   busy writer must not cost the note (reviews).
 //! - The file is read outside the transaction (I/O never holds the single
 //!   writer) and with `O_NOFOLLOW`. It is capped at `MAX_ORDERS` bytes.
 

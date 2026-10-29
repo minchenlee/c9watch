@@ -281,9 +281,9 @@ fn session_start_prints_the_standing_orders() {
     };
     warm_up_agent();
     let bin = q(&engine.copy());
-    // The hook gives up after 0.5 s, and a slow runner can miss that: run
-    // it until it prints. Each run is a new event (a new seq). Returns the
-    // output, the context and how many runs it took.
+    // The hook gives up after 4 s, and a slow runner could still miss
+    // that: run it until it prints. Each run is a new event (a new seq).
+    // Returns the output, the context and how many runs it took.
     let context = |source: &str| -> (String, Value, usize) {
         let cmd = format!(
             "echo '{{\"session_id\":\"s1\",\"source\":\"{}\"}}' | {} hook session-start",
@@ -309,14 +309,13 @@ fn session_start_prints_the_standing_orders() {
     assert_eq!(pending(), 1);
     let (out, ctx, runs) = context("resume");
     assert_eq!(pending(), 0, "{}", out);
-    // An earlier run that timed out took the note without printing it.
-    if runs == 1 {
-        assert_eq!(
-            ctx, "Orders for agt_t.\n\nYou were interrupted; check `git status` first.\n",
-            "{}",
-            out
-        );
-    }
+    // Always on the first run that prints: an earlier run that timed out
+    // would have taken the note without printing it.
+    assert_eq!(
+        ctx, "Orders for agt_t.\n\nYou were interrupted; check `git status` first.\n",
+        "{} run(s): {}",
+        runs, out
+    );
     let (out, ctx, _) = context("startup");
     assert_eq!(ctx, "Orders for agt_t.\n", "{}", out);
     let (out, ctx, _) = context("compact");
