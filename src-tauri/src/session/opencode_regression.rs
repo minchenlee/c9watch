@@ -337,19 +337,18 @@ fn deadline_and_disconnect_bound_http_work_and_discard_late_data() {
         r.delay = Duration::from_millis(150);
         r
     });
+    // Build the client before the clock starts: on Linux, loading the
+    // OpenSSL roots can take longer than the 40 ms budget, and then no
+    // request is sent at all.
+    let http = client().unwrap();
     let start = Instant::now();
     let mut budget = Budget {
         deadline: Instant::now() + Duration::from_millis(40),
         remaining: MAX_RESPONSE,
     };
-    assert!(read_conversation_bounded(
-        &fixture.connection,
-        &client().unwrap(),
-        "root",
-        false,
-        &mut budget
-    )
-    .is_err());
+    assert!(
+        read_conversation_bounded(&fixture.connection, &http, "root", false, &mut budget).is_err()
+    );
     assert!(start.elapsed() < Duration::from_millis(500));
     let connection = fixture.connection.clone();
     let job =
