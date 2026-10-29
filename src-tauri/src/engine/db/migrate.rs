@@ -126,7 +126,10 @@ fn backup(conn: &Connection, dest: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("Backup path {:?} is not UTF-8", dest))?;
     conn.execute("VACUUM INTO ?1", [dest_str])
         .map_err(|e| format!("Failed to back up the db to {:?}: {}", dest, e))?;
-    Ok(())
+    // VACUUM INTO creates the file with the umask's mode; a backup holds
+    // the same data as the db, so it is owner-only too.
+    std::fs::set_permissions(dest, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|e| format!("Failed to chmod 0600 {:?}: {}", dest, e))
 }
 
 #[cfg(test)]
@@ -180,6 +183,12 @@ mod tests {
         assert_eq!(migrate(&mut conn, &two_step(), t.path()).unwrap(), vec![2]);
         assert_eq!(user_version(&conn).unwrap(), 2);
 
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(t.path().join("pre-2.db"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
         let backup = Connection::open(t.path().join("pre-2.db")).unwrap();
         assert_eq!(user_version(&backup).unwrap(), 1);
         let id: String = backup
