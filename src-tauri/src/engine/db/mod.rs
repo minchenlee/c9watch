@@ -1,12 +1,13 @@
 //! The engine store: `<home>/engine.db`, SQLite in WAL mode (A:340).
 //!
 //! Boot order in `open`:
-//! 1. `PRAGMA quick_check`. A db that fails it (or is not a db at all) is
+//! 1. A db newer than this engine is refused with `db_newer_than_engine`
+//!    and left as it is. The file header is checked before the db is
+//!    opened, and the open db again before anything writes to it.
+//! 2. `PRAGMA quick_check`. A db that fails it (or is not a db at all) is
 //!    moved to `<home>/backups/corrupt-<ms>.db` and a new one is created,
 //!    which starts a new epoch (A:497). Observed agents are rebuilt from
 //!    provider data by detection (M3).
-//! 2. A db newer than this engine is refused with `db_newer_than_engine`
-//!    and left as it is.
 //! 3. Migrations, each after a `VACUUM INTO` backup (see `migrate`).
 //! 4. This machine's row in `machines` (`is_self`), keyed by the machine
 //!    key id. A new self row is audited.
@@ -26,7 +27,7 @@ pub mod writer;
 
 use super::fsutil::ensure_private_dir;
 use audit::AuditEntry;
-use migrate::{migrate, MIGRATIONS};
+use migrate::{check_not_newer, latest_version, migrate, MIGRATIONS};
 use outbox::{Cursor, NewEvent, ReadError, Subscription};
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, Transaction};
 use serde_json::Value;
@@ -215,6 +216,14 @@ pub fn open(home: &Path, machine_id: &str) -> Result<Db, String> {
     let backups = backups_dir(home);
     ensure_private_dir(&backups)?;
     let path = db_path(home);
+    // Before anything opens the file. A newer engine's schema may not parse
+    // in this SQLite, and `quick_check` would then call the db corrupt and
+    // move it aside.
+    if let Some(have) = migrate::header_user_version(&path)? {
+        if have > latest_version() {
+            return Err(migrate::newer_than_engine(have, latest_version()));
+        }
+    }
 
     let mut moved_aside = None;
     let mut conn = match open_checked(&path)? {
@@ -231,6 +240,9 @@ pub fn open(home: &Path, machine_id: &str) -> Result<Db, String> {
         }
     };
 
+    // Again on the open db, which also sees a version that is still in the
+    // WAL, and before `configure` writes to it.
+    check_not_newer(&conn, MIGRATIONS)?;
     configure(&conn)?;
     migrate(&mut conn, MIGRATIONS, &backups)?;
     let epoch = ensure_epoch(&conn)?;
@@ -435,7 +447,7 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::migrate::{latest_version, user_version, DB_NEWER_THAN_ENGINE};
+    use super::migrate::{user_version, DB_NEWER_THAN_ENGINE};
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -619,11 +631,37 @@ mod tests {
             conn.pragma_update(None, "user_version", latest_version() + 1)
                 .unwrap();
         }
+        let before = fs::read(db_path(&h)).unwrap();
         let err = open(&h, M).map(drop).unwrap_err();
         assert!(err.starts_with(DB_NEWER_THAN_ENGINE), "{}", err);
-        // Not moved aside, not migrated.
+        // Not moved aside, not migrated, not written at all.
+        assert_eq!(fs::read(db_path(&h)).unwrap(), before);
         let conn = Connection::open(db_path(&h)).unwrap();
         assert_eq!(user_version(&conn).unwrap(), latest_version() + 1);
+        assert_eq!(fs::read_dir(backups_dir(&h)).unwrap().count(), 0);
+    }
+
+    /// A newer engine's schema that this SQLite cannot parse makes
+    /// `quick_check` fail as corrupt; the version check must come first.
+    #[test]
+    fn a_newer_db_this_sqlite_cannot_parse_is_refused_not_moved_aside() {
+        let (_t, h) = home();
+        drop(open(&h, M).unwrap());
+        {
+            let conn = Connection::open(db_path(&h)).unwrap();
+            conn.pragma_update(None, "user_version", latest_version() + 1)
+                .unwrap();
+            conn.execute_batch(
+                "PRAGMA writable_schema = ON; \
+                 INSERT INTO sqlite_schema (type, name, tbl_name, rootpage, sql) \
+                 VALUES ('table', 'future', 'future', 0, 'CREATE TABLE future (x FUTURE(((');",
+            )
+            .unwrap();
+        }
+        let before = fs::read(db_path(&h)).unwrap();
+        let err = open(&h, M).map(drop).unwrap_err();
+        assert!(err.starts_with(DB_NEWER_THAN_ENGINE), "{}", err);
+        assert_eq!(fs::read(db_path(&h)).unwrap(), before);
         assert_eq!(fs::read_dir(backups_dir(&h)).unwrap().count(), 0);
     }
 

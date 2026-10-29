@@ -4,7 +4,8 @@
 //! crash leaves the db at N-1 or N, never in between. Before each one runs
 //! on a db that already has a schema, the db is copied with `VACUUM INTO
 //! <backups>/pre-<N>.db` (A:497). A db newer than this engine is refused
-//! with `db_newer_than_engine` and left untouched.
+//! with `db_newer_than_engine` and left untouched; `db::open` checks the
+//! file header first, before anything opens the db.
 
 use rusqlite::Connection;
 use std::path::Path;
@@ -39,12 +40,40 @@ pub fn check_not_newer(conn: &Connection, migrations: &[Migration]) -> Result<u3
     let have = user_version(conn)?;
     let known = migrations.last().map_or(0, |m| m.version);
     if have > known {
-        return Err(format!(
-            "{}: db is at schema version {}, this engine knows up to {}",
-            DB_NEWER_THAN_ENGINE, have, known
-        ));
+        return Err(newer_than_engine(have, known));
     }
     Ok(have)
+}
+
+/// The `db_newer_than_engine` error for a db at `have`.
+pub fn newer_than_engine(have: u32, known: u32) -> String {
+    format!(
+        "{}: db is at schema version {}, this engine knows up to {}",
+        DB_NEWER_THAN_ENGINE, have, known
+    )
+}
+
+/// `user_version` read from the file header (bytes 60..64, big-endian),
+/// without opening the db. `None` when the file is missing, short or not
+/// a SQLite db. A version committed only to the WAL is not seen here.
+pub fn header_user_version(path: &Path) -> Result<Option<u32>, String> {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("Failed to open db {:?}: {}", path, e)),
+    };
+    let mut head = Vec::with_capacity(64);
+    f.by_ref()
+        .take(64)
+        .read_to_end(&mut head)
+        .map_err(|e| format!("Failed to read db header {:?}: {}", path, e))?;
+    if head.len() < 64 || !head.starts_with(b"SQLite format 3\0") {
+        return Ok(None);
+    }
+    Ok(Some(u32::from_be_bytes([
+        head[60], head[61], head[62], head[63],
+    ])))
 }
 
 /// Bring the db up to the last of `migrations`. Returns the versions that
