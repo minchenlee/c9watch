@@ -13,6 +13,7 @@
 use crate::engine::fsutil::ensure_private_dir;
 use crate::engine::home::{engine_home, lock_path, sock_path};
 use crate::engine::lock::{engine_lock_held, engine_pid};
+use crate::engine::peer::{self, PeerCred};
 use crate::engine::proto::{ClientInfo, HelloParams, HelloResult, Request, Response, API_MAJOR};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -65,19 +66,23 @@ pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
     "C9WATCH_EXPERIMENTAL_CREATE",
 ];
 
-/// Fail with `agent_caller_refused` when `C9_AGENT_ID` is set.
-pub fn refuse_agent_caller(get: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+/// Fail with `agent_caller_refused` when `C9_AGENT_ID` is set to anything
+/// but the empty string, including a value that is not UTF-8.
+pub fn refuse_agent_caller(get: &dyn Fn(&str) -> Option<OsString>) -> Result<(), String> {
     match get(ENV_AGENT_ID).filter(|v| !v.is_empty()) {
         Some(id) => Err(format!(
             "{}: {} is set ({}); agents may not run or auto-start the engine",
-            AGENT_CALLER_REFUSED, ENV_AGENT_ID, id
+            AGENT_CALLER_REFUSED,
+            ENV_AGENT_ID,
+            id.to_string_lossy()
         )),
         None => Ok(()),
     }
 }
 
-fn refuse_agent_caller_env() -> Result<(), String> {
-    refuse_agent_caller(|k| std::env::var(k).ok())
+/// The process environment, as `refuse_agent_caller` reads it.
+fn process_env(k: &str) -> Option<OsString> {
+    std::env::var_os(k)
 }
 
 /// Keep only the allowlisted variables of `vars`.
@@ -97,6 +102,18 @@ pub struct EngineConn {
     writer: UnixStream,
     next_id: u64,
     pub hello: HelloResult,
+}
+
+/// Connect to `sock` and check that the server runs under our euid. A
+/// socket served by another uid is refused before anything is sent.
+fn connect_checked(sock: &Path) -> Result<(UnixStream, PeerCred), ConnectError> {
+    let stream = UnixStream::connect(sock).map_err(|e| {
+        ConnectError::Unreachable(format!("cannot reach the engine at {:?}: {}", sock, e))
+    })?;
+    let server = peer::peer_cred(stream.as_raw_fd())
+        .and_then(|c| peer::check_peer_uid(&c, peer::engine_uid()).map(|_| c))
+        .map_err(|e| ConnectError::Refused(format!("engine socket {:?}: {}", sock, e)))?;
+    Ok((stream, server))
 }
 
 /// Why `EngineConn::connect` failed.
@@ -119,9 +136,7 @@ impl ConnectError {
 impl EngineConn {
     /// Connect to `sock` and send `hello`.
     pub fn connect(sock: &Path) -> Result<Self, ConnectError> {
-        let stream = UnixStream::connect(sock).map_err(|e| {
-            ConnectError::Unreachable(format!("cannot reach the engine at {:?}: {}", sock, e))
-        })?;
+        let (stream, _) = connect_checked(sock)?;
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
         let writer = stream
@@ -270,7 +285,16 @@ fn wait_until_ready(
 /// Make sure an engine serves `home`, spawning `exe engine` if none does.
 /// Returns the engine's `hello` result.
 pub fn ensure_engine(home: &Path, exe: &Path) -> Result<HelloResult, String> {
-    refuse_agent_caller_env()?;
+    ensure_engine_with(home, exe, &process_env)
+}
+
+/// `ensure_engine` with the caller's environment read through `env`.
+fn ensure_engine_with(
+    home: &Path,
+    exe: &Path,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<HelloResult, String> {
+    refuse_agent_caller(env)?;
     ensure_private_dir(home)?;
 
     // Fast path: an engine answers.
@@ -358,6 +382,40 @@ pub fn check_no_live_agents(live: usize) -> Result<(), String> {
     ))
 }
 
+/// The pid of the engine that serves `home`, taken from a connection to its
+/// socket (the kernel's peer pid), not from the lock file alone: the file
+/// can still hold a dead engine's pid while a new engine starts. The socket
+/// peer must run under our uid and must be the pid the lock holder wrote.
+/// Waits up to `timeout` for an engine that holds the lock but has not
+/// bound yet.
+fn serving_engine_pid(home: &Path, timeout: Duration) -> Result<libc::pid_t, String> {
+    let deadline = Instant::now() + timeout;
+    let server = loop {
+        match connect_checked(&sock_path(home)) {
+            Ok((_, server)) => break server,
+            Err(ConnectError::Refused(e)) => return Err(e),
+            Err(ConnectError::Unreachable(e)) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "{}: the engine holds {:?} but does not serve its socket ({})",
+                        ENGINE_NOT_READY,
+                        lock_path(home),
+                        e
+                    ));
+                }
+            }
+        }
+        std::thread::sleep(POLL);
+    };
+    match engine_pid(&lock_path(home))? {
+        Some(pid) if pid == server.pid => Ok(pid),
+        other => Err(format!(
+            "The engine socket is served by pid {}, but the lock holder is {:?}; not signalling anything",
+            server.pid, other
+        )),
+    }
+}
+
 /// SIGTERM the engine of `home`, wait for it to exit, start a new one with
 /// `exe`, and return the new engine's `hello`. Starts an engine when none
 /// runs. `live_agents` runs before anything is signalled.
@@ -366,11 +424,21 @@ pub fn restart_engine(
     exe: &Path,
     live_agents: impl FnOnce() -> Result<usize, String>,
 ) -> Result<HelloResult, String> {
-    refuse_agent_caller_env()?;
+    restart_engine_with(home, exe, live_agents, &process_env)
+}
+
+fn restart_engine_with(
+    home: &Path,
+    exe: &Path,
+    live_agents: impl FnOnce() -> Result<usize, String>,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<HelloResult, String> {
+    refuse_agent_caller(env)?;
     check_no_live_agents(live_agents()?)?;
     ensure_private_dir(home)?;
     let lock = lock_path(home);
-    if let Some(pid) = engine_pid(&lock)? {
+    if engine_lock_held(&lock)? {
+        let pid = serving_engine_pid(home, READY_TIMEOUT)?;
         if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::ESRCH) {
@@ -390,7 +458,7 @@ pub fn restart_engine(
             std::thread::sleep(POLL);
         }
     }
-    ensure_engine(home, exe)
+    ensure_engine_with(home, exe, env)
 }
 
 // ── Commands ──────────────────────────────────────────────────────────
@@ -401,7 +469,7 @@ fn current_exe() -> Result<PathBuf, String> {
 
 /// `c9watch engine`: run the engine in the foreground until SIGTERM/SIGINT.
 pub fn cmd_engine_run() -> Result<(), String> {
-    refuse_agent_caller_env()?;
+    refuse_agent_caller(&process_env)?;
     let home = engine_home()?;
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
@@ -418,7 +486,7 @@ pub fn cmd_engine_restart(pretty: bool) -> Result<(), String> {
 /// `c9watch api <method> '<json>'`: auto-start the engine, send one raw
 /// request, print the response frame. An `ok:false` response exits 1.
 pub fn cmd_api(method: &str, params: &str, pretty: bool) -> Result<(), String> {
-    refuse_agent_caller_env()?;
+    refuse_agent_caller(&process_env)?;
     let params: serde_json::Value =
         serde_json::from_str(params).map_err(|e| format!("api: params is not JSON: {}", e))?;
     let home = engine_home()?;
@@ -440,20 +508,31 @@ mod tests {
     use crate::engine::lock::acquire_engine_lock;
     use std::collections::HashMap;
 
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let m: HashMap<String, String> = pairs
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let m: HashMap<String, OsString> = pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (k.to_string(), OsString::from(v)))
             .collect();
         move |k| m.get(k).cloned()
     }
 
+    /// No `C9_AGENT_ID`, whatever the shell running the tests has set.
+    fn no_env(_: &str) -> Option<OsString> {
+        None
+    }
+
     #[test]
     fn agent_callers_are_refused() {
-        let err = refuse_agent_caller(env_of(&[("C9_AGENT_ID", "a1")])).unwrap_err();
+        let err = refuse_agent_caller(&env_of(&[("C9_AGENT_ID", "a1")])).unwrap_err();
         assert!(err.starts_with(AGENT_CALLER_REFUSED), "{err}");
-        assert!(refuse_agent_caller(env_of(&[("C9_AGENT_ID", "")])).is_ok());
-        assert!(refuse_agent_caller(env_of(&[])).is_ok());
+        assert!(refuse_agent_caller(&env_of(&[("C9_AGENT_ID", "")])).is_ok());
+        assert!(refuse_agent_caller(&env_of(&[])).is_ok());
+
+        // A value that is not UTF-8 is still set.
+        use std::os::unix::ffi::OsStringExt;
+        let bad = |_: &str| Some(OsString::from_vec(vec![0xff, b'a']));
+        let err = refuse_agent_caller(&bad).unwrap_err();
+        assert!(err.starts_with(AGENT_CALLER_REFUSED), "{err}");
     }
 
     #[test]
@@ -492,7 +571,8 @@ mod tests {
         // This test process holds the lock, so `engine_pid` names us: a
         // SIGTERM would kill the test run.
         let lock = acquire_engine_lock(&lock_path(t.path())).unwrap();
-        let err = restart_engine(t.path(), Path::new("/nonexistent"), || Ok(2)).unwrap_err();
+        let err = restart_engine_with(t.path(), Path::new("/nonexistent"), || Ok(2), &no_env)
+            .unwrap_err();
         assert!(err.starts_with(LIVE_AGENTS_NO_DRAIN), "{err}");
         assert!(err.contains("2 live agent"), "{err}");
         assert!(engine_lock_held(&lock_path(t.path())).unwrap());
@@ -506,7 +586,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let home = t.path().join("e");
         // `false engine` exits 1 without binding anything.
-        let err = ensure_engine(&home, Path::new("/usr/bin/false")).unwrap_err();
+        let err = ensure_engine_with(&home, Path::new("/usr/bin/false"), &no_env).unwrap_err();
         assert!(err.contains("exited"), "{err}");
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(log_path(&home))
@@ -515,6 +595,41 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600);
         assert!(!sock_path(&home).exists());
+    }
+
+    #[test]
+    fn restart_signals_only_the_pid_that_serves_the_socket() {
+        use std::os::unix::net::UnixListener;
+        let t = tempfile::tempdir().unwrap();
+        // The lock is held, but the file names another pid than the socket's
+        // server (this test process): a stale pid. Nothing is signalled.
+        let lock = acquire_engine_lock(&lock_path(t.path())).unwrap();
+        std::fs::write(lock_path(t.path()), b"999999").unwrap();
+        let _listener = UnixListener::bind(sock_path(t.path())).unwrap();
+        let err = restart_engine_with(t.path(), Path::new("/nonexistent"), || Ok(0), &no_env)
+            .unwrap_err();
+        assert!(err.contains("not signalling anything"), "{err}");
+
+        // Held lock, empty pid file: also an error, not a silent no-op.
+        std::fs::write(lock_path(t.path()), b"").unwrap();
+        let err = serving_engine_pid(t.path(), Duration::ZERO).unwrap_err();
+        assert!(err.contains("None"), "{err}");
+
+        // When both facts agree, that pid is the target.
+        std::fs::write(lock_path(t.path()), std::process::id().to_string()).unwrap();
+        assert_eq!(
+            serving_engine_pid(t.path(), Duration::ZERO).unwrap(),
+            std::process::id() as libc::pid_t
+        );
+        drop(lock);
+    }
+
+    #[test]
+    fn a_held_lock_without_a_socket_is_not_ready() {
+        let t = tempfile::tempdir().unwrap();
+        let _lock = acquire_engine_lock(&lock_path(t.path())).unwrap();
+        let err = serving_engine_pid(t.path(), Duration::from_millis(100)).unwrap_err();
+        assert!(err.starts_with(ENGINE_NOT_READY), "{err}");
     }
 
     #[test]
