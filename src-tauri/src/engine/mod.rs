@@ -5,3 +5,9 @@ pub mod home;
 
 #[cfg(unix)]
 pub mod fsutil;
+
+#[cfg(unix)]
+pub mod lock;
+
+#[cfg(unix)]
+pub mod sock;
