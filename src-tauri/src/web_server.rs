@@ -44,6 +44,9 @@ pub struct WsState {
     /// Bumped on every policy change. Each open socket closes when it
     /// changes; the client reconnects under the new policy.
     pub epoch: watch::Sender<u64>,
+    /// Sockets upgraded but not yet through `authenticate` (see
+    /// `MAX_UNAUTHENTICATED`).
+    unauthenticated: std::sync::atomic::AtomicUsize,
 }
 
 impl WsState {
@@ -60,7 +63,20 @@ impl WsState {
             detector,
             remote: RwLock::new(RemoteAccess::default()),
             epoch: watch::channel(0).0,
+            unauthenticated: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Take one of the `MAX_UNAUTHENTICATED` slots, or `None` when all are
+    /// in use. The slot frees when the returned guard drops.
+    fn reserve_unauthenticated(self: &Arc<Self>) -> Option<UnauthenticatedSlot> {
+        use std::sync::atomic::Ordering;
+        self.unauthenticated
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_UNAUTHENTICATED).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| UnauthenticatedSlot(Arc::clone(self)))
     }
 
     /// The policy now. A poisoned lock fails closed: the defaults are
@@ -882,6 +898,30 @@ fn serve_embedded_file(path: &str) -> impl IntoResponse {
 
 // ── WebSocket handler ───────────────────────────────────────────────
 
+/// At most this many sockets may be waiting to authenticate at once. Each
+/// can hold a buffered frame for up to `AUTH_TIMEOUT`.
+const MAX_UNAUTHENTICATED: usize = 16;
+/// Largest first frame read as an auth frame. A token or code frame is
+/// well under 200 bytes.
+const MAX_AUTH_FRAME_BYTES: usize = 4 * 1024;
+/// Largest message (and frame) a client may send. Requests are small JSON;
+/// `getAwayActivity` with a few hundred sessions is the biggest. axum sets
+/// this for the whole socket at upgrade, so it is also the bound on what an
+/// unauthenticated client can make the server buffer (axum's default is
+/// 64 MiB).
+const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// One reserved unauthenticated-socket slot; released on drop.
+struct UnauthenticatedSlot(Arc<WsState>);
+
+impl Drop for UnauthenticatedSlot {
+    fn drop(&mut self) {
+        self.0
+            .unauthenticated
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<WsState>>,
@@ -902,7 +942,12 @@ async fn ws_handler(
     ) {
         return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
     }
-    ws.on_upgrade(move |socket| handle_socket(socket, state, peer.ip()))
+    let Some(slot) = state.reserve_unauthenticated() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Too many pending connections").into_response();
+    };
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state, peer.ip(), slot))
         .into_response()
 }
 
@@ -955,6 +1000,9 @@ enum AuthReply {
 /// Checks a first frame against the registry and the pairing code. Returns
 /// the reply to send, or the close code to send instead.
 fn check_auth_frame(text: &str, state: &WsState) -> Result<AuthReply, u16> {
+    if text.len() > MAX_AUTH_FRAME_BYTES {
+        return Err(CLOSE_BAD_HANDSHAKE);
+    }
     let frame: AuthFrame = serde_json::from_str(text).map_err(|_| CLOSE_BAD_HANDSHAKE)?;
     match frame {
         AuthFrame::Auth { token } => {
@@ -1028,7 +1076,12 @@ fn close_with(code: u16, reason: &'static str) -> Message {
 /// restart"); the client reconnects.
 const CLOSE_POLICY_CHANGED: u16 = 1012;
 
-async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>, peer: IpAddr) {
+async fn handle_socket(
+    mut socket: WebSocket,
+    state: Arc<WsState>,
+    peer: IpAddr,
+    slot: UnauthenticatedSlot,
+) {
     // Subscribe before re-checking the policy: a change that lands between
     // the HTTP check and here either fires `changed()` or is already visible
     // to the re-check.
@@ -1060,6 +1113,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>, peer: IpAddr)
         }
         Err(None) => return,
     }
+    drop(slot);
     crate::debug_log::log_info("[ws-server] Client connected");
     let mut sessions_rx = state.sessions_tx.subscribe();
     let mut notifications_rx = state.notifications_tx.subscribe();
@@ -2199,6 +2253,58 @@ mod server_tests {
             Event::Close(Some(CLOSE_BAD_HANDSHAKE))
         ));
         assert!(started.elapsed() >= AUTH_TIMEOUT - Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_first_frame_closes_with_4400() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        let token = issue_token(&server);
+        let mut client = open(addr).await;
+        // A valid token padded past the pre-auth limit is still refused.
+        let padding = "x".repeat(MAX_AUTH_FRAME_BYTES);
+        send_json(
+            &mut client,
+            serde_json::json!({"type": "auth", "token": token, "pad": padding}),
+        )
+        .await;
+        assert!(matches!(
+            next_event(&mut client).await,
+            Event::Close(Some(CLOSE_BAD_HANDSHAKE))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_frame_past_the_message_limit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        let (mut client, _) = signed_in(&server, addr).await;
+        let huge = "x".repeat(MAX_WS_MESSAGE_BYTES + 1);
+        send_json(&mut client, serde_json::json!({"type": "getSessions", "pad": huge})).await;
+        // The server drops the connection instead of buffering the frame.
+        assert!(matches!(next_event(&mut client).await, Event::Close(_)));
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_connections_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        let mut waiting = Vec::new();
+        for _ in 0..MAX_UNAUTHENTICATED {
+            waiting.push(open(addr).await);
+        }
+        let refused = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await;
+        match refused {
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE)
+            }
+            other => panic!("expected 503, got {:?}", other.map(|_| ())),
+        }
+        // One of them signs in: its slot frees up for a new connection.
+        let token = issue_token(&server);
+        send_json(&mut waiting[0], serde_json::json!({"type": "auth", "token": token})).await;
+        assert!(matches!(next_event(&mut waiting[0]).await, Event::Text(v) if v["type"] == "authOk"));
+        let _next = open(addr).await;
     }
 
     #[tokio::test]
