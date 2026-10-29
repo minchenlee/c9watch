@@ -16,6 +16,7 @@ use c9watch_lib::engine::driver::{Driver, SpawnSpec};
 use c9watch_lib::engine::home::{sock_path, ENGINE_HOME_ENV};
 use c9watch_lib::engine::pty::NativePty;
 use c9watch_lib::engine::run::{run_until, EngineConfig};
+use c9watch_lib::engine::standing::header;
 use c9watch_lib::engine_proto::client::Conn;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -304,22 +305,29 @@ fn session_start_prints_the_standing_orders() {
         panic!("no context in 10 runs; last {:?}", last);
     };
     // A compaction does not take the note; the next start does, once.
+    // Every block names generation 1 and replaces earlier ones (D24).
+    let want = format!("{}\n\nOrders for agt_t.\n", header(1));
     let (out, ctx, _) = context("compact");
-    assert_eq!(ctx, "Orders for agt_t.\n", "{}", out);
+    assert_eq!(ctx, want, "{}", out);
     assert_eq!(pending(), 1);
     let (out, ctx, runs) = context("resume");
     assert_eq!(pending(), 0, "{}", out);
     // Always on the first run that prints: an earlier run that timed out
     // would have taken the note without printing it.
     assert_eq!(
-        ctx, "Orders for agt_t.\n\nYou were interrupted; check `git status` first.\n",
+        ctx,
+        format!(
+            "{}\nYou were interrupted; check `git status` first.\n",
+            want
+        ),
         "{} run(s): {}",
-        runs, out
+        runs,
+        out
     );
     let (out, ctx, _) = context("startup");
-    assert_eq!(ctx, "Orders for agt_t.\n", "{}", out);
+    assert_eq!(ctx, want, "{}", out);
     let (out, ctx, _) = context("compact");
-    assert_eq!(ctx, "Orders for agt_t.\n", "{}", out);
+    assert_eq!(ctx, want, "{}", out);
     assert!(engine.denials().is_empty(), "{:?}", engine.denials());
 }
 

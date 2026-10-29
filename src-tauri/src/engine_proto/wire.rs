@@ -141,6 +141,9 @@ pub enum ErrorCode {
     SpawnFailed,
     /// No engine agent has this id.
     UnknownAgent,
+    /// The engine is draining after a SIGTERM: no spawn and no injection
+    /// until the next engine is up. Retry against the new engine.
+    Draining,
     /// An engine-side failure.
     Internal,
 }
@@ -167,13 +170,17 @@ impl ErrorCode {
             ErrorCode::CwdCollision => "cwd_collision",
             ErrorCode::SpawnFailed => "spawn_failed",
             ErrorCode::UnknownAgent => "unknown_agent",
+            ErrorCode::Draining => "draining",
             ErrorCode::Internal => "internal",
         }
     }
 
     /// Whether the same request can succeed when it is sent again unchanged.
     pub fn retryable(self) -> bool {
-        matches!(self, ErrorCode::HelloTimeout | ErrorCode::Internal)
+        matches!(
+            self,
+            ErrorCode::HelloTimeout | ErrorCode::Draining | ErrorCode::Internal
+        )
     }
 
     /// What the caller should do next.
@@ -224,6 +231,9 @@ impl ErrorCode {
                 "read the vendor text in `msg` (usage limit, login), fix it, then create again"
             }
             ErrorCode::UnknownAgent => "see `agent.list` with `all` for the agent ids",
+            ErrorCode::Draining => {
+                "the engine is stopping; reconnect once the next engine is up and send it again"
+            }
             ErrorCode::Internal => "retry; if it persists, check the engine log",
         }
     }
@@ -375,6 +385,9 @@ pub struct AgentRow {
     /// The agent that owns this one; for an imported legacy worker, the PM
     /// that adopted it.
     pub parent_id: Option<String>,
+    /// Why the agent is in its `state`: `drain` for a `paused` or
+    /// `interrupted` agent that an engine drain stopped.
+    pub state_reason: Option<String>,
 }
 
 /// `session.list` params. There are none yet; the engine ignores any it

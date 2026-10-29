@@ -22,7 +22,8 @@
 //! binary's `c9watch api` can therefore never send one. An authorized
 //! `hook.*` event then goes through `engine::hooks::intake` (kind,
 //! generation, dedupe, state merge; C1a-22). `hook.session_start` also
-//! answers with the standing orders (`engine::standing`, C1a-25).
+//! answers with the standing orders (`engine::standing`, C1a-25), except
+//! while the engine drains (C1a-27, `engine::drain`).
 //!
 //! `agent.create` and `agent.retire` take only a local client
 //! (`local-unverified`); an agent gets `not_allowed`, which is audited. The
@@ -33,6 +34,7 @@ use super::create::Spawner;
 use super::db::audit::{self, AuditEntry};
 use super::db::outbox::{Cursor, Event, ReadError, Subscription, READ_BATCH};
 use super::db::{now_ms, AgentFilter, Db};
+use super::drain::DrainSwitch;
 use super::hooks::{self, HookEvent, Outcome};
 use super::merge::MergeTable;
 use super::peer::{self, PeerCred};
@@ -93,6 +95,9 @@ pub struct ServerCtx {
     /// Free-agent create and retire (C1a-26). `None` answers
     /// `experimental_disabled` to `agent.create`.
     pub spawner: Option<Arc<Spawner>>,
+    /// On while the engine drains (C1a-27): `hook.session_start` then
+    /// injects nothing.
+    pub drain: Arc<DrainSwitch>,
 }
 
 impl ServerCtx {
@@ -109,6 +114,7 @@ impl ServerCtx {
             merge: Arc::new(MergeTable::new()),
             standing_orders: None,
             spawner: None,
+            drain: Arc::new(DrainSwitch::new()),
         }
     }
 
@@ -135,6 +141,11 @@ impl ServerCtx {
 
     pub fn with_spawner(mut self, spawner: Arc<Spawner>) -> Self {
         self.spawner = Some(spawner);
+        self
+    }
+
+    pub fn with_drain(mut self, drain: Arc<DrainSwitch>) -> Self {
+        self.drain = drain;
         self
     }
 
@@ -733,6 +744,7 @@ async fn hook_intake(
     let live_gen = ctx.agents.current_gen(&params.agent_id);
     let agent_id = params.agent_id.clone();
     let is_start = method == "hook.session_start";
+    let draining = ctx.drain.on();
     let (method, principal) = (method.to_string(), principal.to_string());
     let (answer, _) = db
         .write(move |tx| {
@@ -744,7 +756,15 @@ async fn hook_intake(
                 params: &params,
             };
             if method == "hook.session_start" {
-                standing::session_start(tx, &machine, &merge, &ev, orders.as_deref(), now_ms())
+                standing::session_start(
+                    tx,
+                    &machine,
+                    &merge,
+                    &ev,
+                    orders.as_deref(),
+                    draining,
+                    now_ms(),
+                )
             } else {
                 hooks::intake(tx, &machine, &merge, &ev, now_ms()).map(|o| (o, None))
             }
@@ -1112,6 +1132,7 @@ mod tests {
             merge: Arc::new(MergeTable::new()),
             standing_orders: None,
             spawner: None,
+            drain: Arc::new(DrainSwitch::new()),
         })
     }
 
@@ -1453,6 +1474,7 @@ mod tests {
             merge: Arc::new(MergeTable::new()),
             standing_orders: None,
             spawner: None,
+            drain: Arc::new(DrainSwitch::new()),
         });
         (t, ctx, db)
     }
@@ -1575,7 +1597,8 @@ mod tests {
                 "startedAt": null,
                 "createdAt": null,
                 "lastSeen": null,
-                "parentId": null
+                "parentId": null,
+                "stateReason": null
             }])
         );
     }

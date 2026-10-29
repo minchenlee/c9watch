@@ -79,4 +79,7 @@ pub mod ops;
 pub mod create;
 
 #[cfg(unix)]
+pub mod drain;
+
+#[cfg(unix)]
 pub mod run;

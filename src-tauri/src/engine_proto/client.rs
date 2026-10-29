@@ -223,6 +223,7 @@ pub(crate) mod tests {
             created_at: None,
             last_seen: None,
             parent_id: None,
+            state_reason: None,
         }
     }
 

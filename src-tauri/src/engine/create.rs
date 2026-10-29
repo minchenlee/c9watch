@@ -35,6 +35,12 @@
 //!
 //! The supervisor owns the `Driver`. On engine shutdown it kills the PTY
 //! and leaves the row as it is; the next boot reconciles it (`ops`).
+//!
+//! **Drain (C1a-27, `engine::drain`).** Once the engine's drain switch is
+//! on, `agent.create` answers `draining`, a create that has its row but no
+//! PTY spawns nothing (its op is left to boot reconcile), and a PTY write
+//! is not sent but audited. A drained supervisor kills its agent and then
+//! writes `paused(drain)` or `interrupted` (`drain::settle`).
 
 use super::adapter::cc::profile::{
     resolve_cwd, settings_path_of, spawn_spec, write_settings, Profile,
@@ -45,6 +51,7 @@ use super::agents::LiveTable;
 use super::cc_screen::{vendor_refusal, CcScreen, ScreenEvent, ScreenFailure, READY_TIMEOUT};
 use super::db::audit::{self, AuditEntry};
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
+use super::drain::{self, DrainSwitch, InjectionPath};
 use super::driver::{Driver, SpawnSpec};
 use super::generation::{begin_generation, emit_upsert, GenReason};
 use super::merge::MergeTable;
@@ -128,6 +135,8 @@ enum Cmd {
     Retire { principal: String, reply: Reply },
     /// The engine stops: kill the agent, leave the row to boot reconcile.
     Shutdown,
+    /// The engine drains: kill the agent, then `drain::settle` its row.
+    Drain,
 }
 
 struct Handle {
@@ -152,6 +161,8 @@ enum Up {
     Failed(ApiError),
     Retired,
     Shutdown,
+    /// The engine drains: nothing was spawned.
+    Draining,
 }
 
 /// Creates, supervises and retires the engine's free agents.
@@ -169,6 +180,8 @@ pub struct Spawner {
     /// The supervisor of every agent that runs in this engine.
     live: Mutex<HashMap<String, Handle>>,
     stopping: AtomicBool,
+    /// The engine's drain switch (C1a-27).
+    drain: Arc<DrainSwitch>,
 }
 
 impl Spawner {
@@ -190,7 +203,42 @@ impl Spawner {
             starts: Mutex::new(HashSet::new()),
             live: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
+            drain: Arc::new(DrainSwitch::new()),
         }
+    }
+
+    /// Share the engine's drain switch.
+    pub fn with_drain(mut self, drain: Arc<DrainSwitch>) -> Spawner {
+        self.drain = drain;
+        self
+    }
+
+    /// The drain switch this spawner obeys.
+    pub fn drain_switch(&self) -> &Arc<DrainSwitch> {
+        &self.drain
+    }
+
+    /// The supervisors' clock (`with_clock`).
+    pub(super) fn now(&self) -> Instant {
+        (self.clock)()
+    }
+
+    pub(super) fn db(&self) -> &Db {
+        &self.db
+    }
+
+    /// The agents whose supervisor runs, sorted.
+    pub(super) fn supervised(&self) -> Vec<String> {
+        let mut ids: Vec<String> = lock(&self.live).keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Tell the supervisor of `id` to stop its agent for the drain.
+    /// Returns whether it took the command.
+    pub(super) fn drain_agent(&self, id: &str) -> bool {
+        let cmds = lock(&self.live).get(id).map(|h| h.cmds.clone());
+        cmds.is_some_and(|c| c.send(Cmd::Drain).is_ok())
     }
 
     pub fn with_launcher(mut self, launcher: Arc<dyn Launcher>) -> Spawner {
@@ -234,6 +282,9 @@ impl Spawner {
                     EXPERIMENTAL_CREATE_ENV
                 ),
             ));
+        }
+        if self.drain.on() {
+            return Err(draining());
         }
         let p: AgentCreateParams = parse(params, "agent.create")?;
         let desc = check_kind_and_mode(&p)?;
@@ -361,6 +412,10 @@ impl Spawner {
     fn supervise(self: &Arc<Self>, s: Start, reply: Reply) -> Result<(), ApiError> {
         let (cmds, rx) = mpsc::channel();
         let mut live = lock(&self.live);
+        if self.drain.on() {
+            // The row and its op stay for boot reconcile.
+            return Err(draining());
+        }
         if self.stopping.load(Ordering::SeqCst) {
             drop(live);
             self.fail_create(&s, "the engine stopped before the spawn");
@@ -407,6 +462,9 @@ impl Spawner {
             }
             Up::Shutdown => {
                 let _ = reply.send(Err(stopping()));
+            }
+            Up::Draining => {
+                let _ = reply.send(Err(draining()));
             }
         }
         self.agents.unregister(&s.id, s.gen);
@@ -455,6 +513,11 @@ impl Spawner {
             }
             Err(e) => return fail(e),
         }
+        // No spawn once the engine drains: the op stays open for boot
+        // reconcile, which also removes the settings file.
+        if self.drain.on() {
+            return Up::Draining;
+        }
         // The one spawn of this create; nothing below spawns again.
         let mut driver = match self.launcher.spawn(&spec) {
             Ok(d) => d,
@@ -481,7 +544,8 @@ impl Spawner {
                     let _ = reply.send(self.retire_row(&s.id, s.gen, &principal));
                     return Up::Retired;
                 }
-                Ok(Cmd::Shutdown) | Err(TryRecvError::Disconnected) => {
+                // A drain leaves an open create to boot reconcile.
+                Ok(Cmd::Shutdown | Cmd::Drain) | Err(TryRecvError::Disconnected) => {
                     let _ = driver.kill();
                     return Up::Shutdown;
                 }
@@ -499,9 +563,7 @@ impl Spawner {
             let mut ready = false;
             for ev in screen.step(&snap.title, &snap.text, snap.quiet, (self.clock)()) {
                 match ev {
-                    ScreenEvent::Write(keys) => {
-                        let _ = driver.write(keys);
-                    }
+                    ScreenEvent::Write(keys) => self.pty_write(&s.id, driver.as_mut(), keys),
                     ScreenEvent::Ready { first: true } => ready = true,
                     ScreenEvent::Failed(why) => {
                         let _ = driver.kill();
@@ -551,6 +613,20 @@ impl Spawner {
                     let _ = driver.kill();
                     return;
                 }
+                Ok(Cmd::Drain) => {
+                    // SIGTERM first (`Driver::kill`); the write then reads
+                    // whether the turn had ended.
+                    let _ = driver.kill();
+                    let (machine, id) = (self.db.machine_id().to_string(), s.id.clone());
+                    let wrote = self
+                        .db
+                        .write_blocking(move |tx| drain::settle(tx, &machine, &id));
+                    if let Err(e) = wrote {
+                        eprintln!("[engine] Failed to record the drain of {}: {}", s.id, e);
+                    }
+                    remove_settings(&self.config.home, &s.id, s.gen);
+                    return;
+                }
                 Err(RecvTimeoutError::Timeout) => {}
             }
             // Nobody reads the bytes yet; the screen keeps up regardless.
@@ -569,6 +645,25 @@ impl Spawner {
                 remove_settings(&self.config.home, &s.id, s.gen);
                 return;
             }
+        }
+    }
+
+    /// Send `keys` to the agent's terminal, unless the engine drains: then
+    /// nothing is sent, and the block is audited with path `pty`.
+    fn pty_write(&self, id: &str, driver: &mut dyn Driver, keys: &[u8]) {
+        if !self.drain.on() {
+            let _ = driver.write(keys);
+            return;
+        }
+        let id2 = id.to_string();
+        let wrote = self.db.write_blocking(move |tx| {
+            drain::audit_blocked(tx, audit::SYSTEM, &id2, InjectionPath::Pty, now_ms())
+        });
+        if let Err(e) = wrote {
+            eprintln!(
+                "[engine] Failed to audit a blocked PTY write to {}: {}",
+                id, e
+            );
         }
     }
 
@@ -1023,6 +1118,13 @@ fn stopping() -> ApiError {
     ApiError::new(ErrorCode::Internal, "the engine is stopping")
 }
 
+fn draining() -> ApiError {
+    ApiError::new(
+        ErrorCode::Draining,
+        "the engine is draining: no spawn and no injection until the next engine is up",
+    )
+}
+
 fn unknown_agent(id: &str) -> ApiError {
     ApiError::new(ErrorCode::UnknownAgent, format!("no engine agent {:?}", id))
 }
@@ -1063,6 +1165,9 @@ mod tests {
         Exit,
         /// Nothing at all, forever.
         Hang,
+        /// The workspace trust dialog, forever. The engine starts to drain
+        /// right after the spawn, as if a SIGTERM came then.
+        Trust,
     }
 
     struct FakeDriver {
@@ -1072,6 +1177,10 @@ mod tests {
         kills: Arc<AtomicUsize>,
         /// Set by a test: the process exits by itself.
         exit_now: Arc<AtomicBool>,
+        /// Bytes sent to the terminal, in writes.
+        writes: Arc<AtomicUsize>,
+        /// Set by a test: `kill` does not return until it is cleared.
+        stuck: Arc<AtomicBool>,
     }
 
     impl Driver for FakeDriver {
@@ -1082,6 +1191,7 @@ mod tests {
             self.child
         }
         fn write(&mut self, _: &[u8]) -> io::Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn output(&mut self, _: Duration) -> Output {
@@ -1099,6 +1209,10 @@ mod tests {
                 ),
                 Script::Exit => ("", "Error: the session could not start\n"),
                 Script::Hang => ("", ""),
+                Script::Trust => (
+                    "",
+                    " Do you trust this folder?\n   1. Yes, I trust this folder\n   2. No, exit\n",
+                ),
             };
             ScreenSnapshot {
                 text: text.into(),
@@ -1122,6 +1236,9 @@ mod tests {
             Ok(self.exited.then(|| ExitStatus::from_raw(1 << 8)))
         }
         fn kill(&mut self) -> io::Result<KillReport> {
+            while self.stuck.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             if !self.exited {
                 self.kills.fetch_add(1, Ordering::SeqCst);
             }
@@ -1139,6 +1256,8 @@ mod tests {
         next_pid: AtomicI32,
         kills: Arc<AtomicUsize>,
         exit_now: Arc<AtomicBool>,
+        writes: Arc<AtomicUsize>,
+        stuck: Arc<AtomicBool>,
         env: Mutex<Vec<(OsString, OsString)>>,
         spawner: OnceLock<Weak<Spawner>>,
     }
@@ -1162,6 +1281,11 @@ mod tests {
                     sp.session_started(&id, gen);
                 }
             }
+            if self.script == Script::Trust {
+                if let Some(sp) = self.spawner.get().and_then(Weak::upgrade) {
+                    sp.drain_switch().start();
+                }
+            }
             Ok(Box::new(FakeDriver {
                 script: self.script,
                 child: ChildId {
@@ -1171,6 +1295,8 @@ mod tests {
                 exited: matches!(self.script, Script::Refuse | Script::Exit),
                 kills: self.kills.clone(),
                 exit_now: self.exit_now.clone(),
+                writes: self.writes.clone(),
+                stuck: self.stuck.clone(),
             }))
         }
     }
@@ -1201,6 +1327,8 @@ mod tests {
             next_pid: AtomicI32::new(2_000_000_000),
             kills: Arc::new(AtomicUsize::new(0)),
             exit_now: Arc::new(AtomicBool::new(false)),
+            writes: Arc::new(AtomicUsize::new(0)),
+            stuck: Arc::new(AtomicBool::new(false)),
             env: Mutex::new(Vec::new()),
             spawner: OnceLock::new(),
         });
@@ -1821,5 +1949,228 @@ mod tests {
         assert_eq!(detail(&long).chars().count(), MAX_DETAIL);
         let many: String = (0..50).map(|i| format!("l{}\n", i)).collect();
         assert!(detail(&many).starts_with("l30\n"));
+    }
+
+    /// A clock the test moves by hand, in whole seconds.
+    fn hand_clock() -> (Clock, Arc<AtomicU64>) {
+        let base = Instant::now();
+        let secs = Arc::new(AtomicU64::new(0));
+        let s = secs.clone();
+        let clock: Clock = Arc::new(move || base + Duration::from_secs(s.load(Ordering::SeqCst)));
+        (clock, secs)
+    }
+
+    fn set_state(db: &Db, id: &str, state: &str) {
+        let (id, state) = (id.to_string(), state.to_string());
+        db.write_blocking(move |tx| {
+            tx.execute(
+                "UPDATE agents SET state = ?2 WHERE id = ?1",
+                params![id, state],
+            )
+        })
+        .unwrap();
+    }
+
+    fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !f() {
+            assert!(Instant::now() < deadline, "timed out waiting for {}", what);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// (state, state_reason, resume_argv) of `id`.
+    fn drained(db: &Db, id: &str) -> (Option<String>, Option<String>, Option<String>) {
+        db.reader()
+            .unwrap()
+            .query_row(
+                "SELECT state, state_reason, resume_argv FROM agents WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    /// What a drain leaves for `r`: `state`, reason `drain`, and the argv
+    /// that resumes its session.
+    fn drain_facts(r: &AgentRow, state: &str) -> (Option<String>, Option<String>, Option<String>) {
+        let sid = r.provider_sid.clone().unwrap();
+        let argv = serde_json::to_string(&["claude", "--resume", sid.as_str()]).unwrap();
+        (
+            Some(state.to_string()),
+            Some(drain::REASON_DRAIN.to_string()),
+            Some(argv),
+        )
+    }
+
+    fn blocked_pty_writes(db: &Db) -> i64 {
+        db.reader()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM audit WHERE method = ?1 AND reason = 'path=pty'",
+                [drain::BLOCKED_INJECTION],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn fast_drain() -> drain::Timing {
+        drain::Timing {
+            tick: Duration::from_millis(5),
+            ..Default::default()
+        }
+    }
+
+    /// C1a-27, the state table on live supervisors: `ready` is paused at
+    /// once, a turn that ends within 60 s is paused, a turn still running
+    /// at 60 s is interrupted; rows without a supervisor are not touched;
+    /// nothing is created meanwhile.
+    #[tokio::test]
+    async fn drain_pauses_ready_agents_and_interrupts_a_turn_at_60_s() {
+        let (clock, secs) = hand_clock();
+        let e = setup(Script::Ready, true, Some(clock));
+        let l = Principal::LocalUnverified;
+        let mut rows = Vec::new();
+        for _ in 0..3 {
+            rows.push(e.sp.create(&l, create_params(&e.cwd)).await.unwrap());
+        }
+        let (idle, ends, long) = (&rows[0], &rows[1], &rows[2]);
+        set_state(&e.db, &ends.id, "working");
+        set_state(&e.db, &long.id, "blocked");
+        let others = ["paused", "interrupted", "failed", "retired", "orphaned"];
+        e.db.write_blocking(move |tx| {
+            for st in others {
+                tx.execute(
+                    "INSERT INTO agents (id, mode, role, control, provider, provider_sid, \
+                     source, state) VALUES (?1, 'free', 'worker', 'pty', 'claudeCode', 's', \
+                     'engine', ?1)",
+                    [st],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(e.sp.drain_switch().start());
+        let err = e.sp.create(&l, create_params(&e.cwd)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Draining);
+        let sp = e.sp.clone();
+        let start = sp.now();
+        let drainer = std::thread::spawn(move || drain::run(&sp, fast_drain(), start));
+        wait_for("the ready agent paused", || {
+            drained(&e.db, &idle.id).0.as_deref() == Some("paused")
+        });
+        assert_eq!(drained(&e.db, &idle.id), drain_facts(idle, "paused"));
+        // A turn that ends within the wait.
+        secs.store(30, Ordering::SeqCst);
+        set_state(&e.db, &ends.id, "ready");
+        wait_for("the ended turn paused", || {
+            drained(&e.db, &ends.id).0.as_deref() == Some("paused")
+        });
+        // At 59 s the long turn still runs.
+        secs.store(59, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(row(&e.db, &long.id).state.as_deref(), Some("blocked"));
+        assert_eq!(e.launcher.kills.load(Ordering::SeqCst), 2);
+        assert!(!drainer.is_finished());
+        secs.store(60, Ordering::SeqCst);
+        let report = drainer.join().unwrap();
+
+        let mut paused = vec![idle.id.clone(), ends.id.clone()];
+        paused.sort();
+        let mut got = report.paused.clone();
+        got.sort();
+        assert_eq!(got, paused);
+        assert_eq!(report.interrupted, vec![long.id.clone()]);
+        assert!(report.left.is_empty() && report.unsettled.is_empty());
+        assert!(!report.timed_out);
+        assert_eq!(drained(&e.db, &long.id), drain_facts(long, "interrupted"));
+        assert!(row(&e.db, &long.id).interrupted_note_pending);
+        assert!(!row(&e.db, &idle.id).interrupted_note_pending);
+        assert_eq!(e.launcher.kills.load(Ordering::SeqCst), 3);
+        no_supervisors(&e.sp);
+        assert!(e.agents.is_empty());
+        assert_eq!(agent_state_rows(&e.db), 0);
+        for st in others {
+            assert_eq!(drained(&e.db, st), (Some(st.to_string()), None, None));
+        }
+        // Nothing was spawned during the drain, and nothing is failed.
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 3);
+        assert!(events(&e.db, "agent.failed").is_empty());
+        // Boot reconcile leaves the drained rows for the resume.
+        let done = ops::reconcile(&e.db, &e.home).unwrap();
+        assert!(done.is_empty(), "{:?}", done);
+    }
+
+    /// The drain stops waiting at the hard deadline (90 s less the room
+    /// for the final kills), even with a kill that hangs.
+    #[tokio::test]
+    async fn the_drain_gives_up_at_the_hard_deadline() {
+        let (clock, secs) = hand_clock();
+        let e = setup(Script::Ready, true, Some(clock));
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        set_state(&e.db, &r.id, "working");
+        e.launcher.stuck.store(true, Ordering::SeqCst);
+        e.sp.drain_switch().start();
+        let sp = e.sp.clone();
+        let start = sp.now();
+        let drainer = std::thread::spawn(move || drain::run(&sp, fast_drain(), start));
+        secs.store(60, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        let last = (drain::HARD_DEADLINE - drain::SHUTDOWN_RESERVE).as_secs();
+        secs.store(last - 1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!drainer.is_finished());
+        secs.store(last, Ordering::SeqCst);
+        let report = drainer.join().unwrap();
+        assert!(report.timed_out);
+        assert_eq!(report.unsettled, vec![r.id.clone()]);
+        assert!(report.paused.is_empty() && report.interrupted.is_empty());
+        // The kill ends; the supervisor still settles the row.
+        e.launcher.stuck.store(false, Ordering::SeqCst);
+        no_supervisors(&e.sp);
+        assert_eq!(drained(&e.db, &r.id), drain_facts(&r, "interrupted"));
+        e.sp.shutdown();
+    }
+
+    /// C1a-27: zero sends on the PTY path while draining. The drain starts
+    /// right after the spawn; the trust dialog's Down is not written but
+    /// audited. The open create is left to boot reconcile, and no other
+    /// create gets a row or a spawn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn while_draining_no_pty_write_and_no_spawn() {
+        let (clock, _secs) = hand_clock();
+        let e = setup(Script::Trust, true, Some(clock));
+        let (sp, cwd) = (e.sp.clone(), e.cwd.clone());
+        let create = tokio::spawn(async move {
+            sp.create(&Principal::LocalUnverified, create_params(&cwd))
+                .await
+        });
+        wait_for("a blocked PTY write", || blocked_pty_writes(&e.db) >= 1);
+        assert_eq!(e.launcher.writes.load(Ordering::SeqCst), 0);
+        let id = only_row(&e.db).id;
+        let err =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Draining);
+        assert!(err.code.retryable());
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(only_row(&e.db).id, id);
+
+        let report = drain::run(&e.sp, fast_drain(), e.sp.now());
+        assert_eq!(report.left, vec![id.clone()]);
+        assert!(report.paused.is_empty() && report.interrupted.is_empty());
+        assert!(!report.timed_out);
+        e.sp.shutdown();
+        assert_eq!(create.await.unwrap().unwrap_err().code, ErrorCode::Internal);
+        assert_eq!(e.launcher.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(row(&e.db, &id).state.as_deref(), Some("starting"));
+        assert_eq!(ops_of(&e.db), [("pty".to_string(), false, None)]);
+        let done = ops::reconcile(&e.db, &e.home).unwrap();
+        assert_eq!(done.failed, vec![id.clone()]);
     }
 }
