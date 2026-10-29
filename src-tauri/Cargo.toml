@@ -45,6 +45,9 @@ pm-orchestration = ["cli"]
 # Agent engine (C1a): `c9watch engine` and `api`, plus the `c9watch-agent`
 # binary, unix only.
 engine = ["cli", "dep:ed25519-dalek", "dep:rand", "dep:schemars", "dep:sha2"]
+# Test-only PTY input and screen files for tests/live/cc_sandbox.sh (C1a-32).
+# Never in release, default or CI builds.
+live-test = ["engine"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }

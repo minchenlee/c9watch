@@ -27,6 +27,10 @@
 //!   free agent cannot change the repo's own `.claude/`, skills and
 //!   commands included. The first two layers also cover the engine's
 //!   `bin/` and `spawn/` and its `standing-orders.md` (C1a-25).
+//! - The first two layers also cover the `.claude/` of every other live
+//!   engine agent at spawn time (C1a-32, `Profile::with_peers`): in live
+//!   run X14 one agent rewrote another agent's `settings.json` with a Bash
+//!   redirect.
 //! - The env carries only `C9_AGENT_ID`, `C9_AGENT_GEN` and
 //!   `C9_ENGINE_SOCK`, none of them a secret. There is no `C9_AGENT_TOKEN`
 //!   (D28 Q6=B) and no `C9_STANDING_ORDERS` (spike `c0-engine.rs:407`):
@@ -103,6 +107,9 @@ pub struct Profile {
     pub session_id: String,
     /// Resume `session_id` (`--resume`) instead of starting it.
     pub resume: bool,
+    /// Realpath cwds of the other live engine agents at spawn time. Their
+    /// `.claude/` gets the same deny rules as this agent's own (C1a-32).
+    pub peers: Vec<PathBuf>,
 }
 
 impl Profile {
@@ -131,7 +138,29 @@ impl Profile {
             generation,
             session_id: session_id.into(),
             resume: false,
+            peers: Vec::new(),
         })
+    }
+
+    /// Also deny writes to the `.claude/` of these cwds: the other live
+    /// engine agents (C1a-32, plan §6 item 6). Live run X14 row 8: agent B
+    /// overwrote agent A's `.claude/settings.json` with a Bash redirect;
+    /// B's rules named only B's cwd, the sandbox allowed the path and the
+    /// classifier let it through. Peers equal to this cwd, relative paths
+    /// and paths a rule would read as a pattern are left out.
+    pub fn with_peers(mut self, peers: impl IntoIterator<Item = PathBuf>) -> Profile {
+        let mut v: Vec<PathBuf> = peers
+            .into_iter()
+            .filter(|p| p.is_absolute() && *p != self.cwd && p.parent().is_some())
+            .filter(|p| {
+                p.to_str()
+                    .is_some_and(|s| !s.chars().any(|c| BAD_CWD_CHARS.contains(&c)))
+            })
+            .collect();
+        v.sort();
+        v.dedup();
+        self.peers = v;
+        self
     }
 
     /// The same spawn, resuming `session_id` (C1a-28).
@@ -240,10 +269,12 @@ pub fn engine_files(p: &Profile) -> Vec<PathBuf> {
 ///    Live run setC: `cp`, `python3` and `mv .claude` writes there were
 ///    stopped only by the classifier, which is a judgement, not a rule.
 ///
+/// 4. The same for every peer cwd (`Profile::peers`, C1a-32): one agent
+///    must not rewrite another agent's settings, which CC hot-reloads.
+///
 /// Layer 2 is `sandbox.filesystem.denyWrite` (`deny_write`) and layer 3
 /// `allowUnsandboxedCommands:false` (`settings`). No layer is enough alone.
 pub fn deny_rules(p: &Profile) -> Vec<String> {
-    let cwd = p.cwd.display().to_string();
     let mut v: Vec<String> = engine_dirs(p)
         .iter()
         .map(|d| format!("Edit(/{}/**)", d.display()))
@@ -253,12 +284,15 @@ pub fn deny_rules(p: &Profile) -> Vec<String> {
             .iter()
             .map(|f| format!("Edit(/{})", f.display())),
     );
-    v.extend(
-        SETTINGS_FILES
-            .iter()
-            .map(|f| format!("Edit(/{}/{})", cwd, f)),
-    );
-    v.push(format!("Edit(/{}/.claude/**)", cwd));
+    for dir in std::iter::once(&p.cwd).chain(&p.peers) {
+        let cwd = dir.display().to_string();
+        v.extend(
+            SETTINGS_FILES
+                .iter()
+                .map(|f| format!("Edit(/{}/{})", cwd, f)),
+        );
+        v.push(format!("Edit(/{}/.claude/**)", cwd));
+    }
     v
 }
 
@@ -271,12 +305,14 @@ pub fn claude_dir(p: &Profile) -> PathBuf {
 /// directories and files, and the `.claude` directory itself, not only its
 /// files. A
 /// sandbox path is a subtree, so this covers both settings files and also
-/// refuses `mv .claude` and a `.claude` symlink in its place.
+/// refuses `mv .claude` and a `.claude` symlink in its place. The peers'
+/// `.claude` directories too (C1a-32).
 pub fn deny_write(p: &Profile) -> Vec<String> {
     engine_dirs(p)
         .into_iter()
         .chain(engine_files(p))
         .chain([claude_dir(p)])
+        .chain(p.peers.iter().map(|d| d.join(".claude")))
         .map(|d| d.display().to_string())
         .collect()
 }
@@ -724,6 +760,53 @@ mod tests {
                 ])
             );
         });
+    }
+
+    #[test]
+    fn peer_cwds_get_the_same_claude_rules() {
+        // Live run X14 row 8 (C1a-32): agent B wrote agent A's settings.
+        let t = tempfile::tempdir().unwrap();
+        let (own, peer) = (t.path().join("b"), t.path().join("a"));
+        std::fs::create_dir(&own).unwrap();
+        std::fs::create_dir(&peer).unwrap();
+        let peer = peer.canonicalize().unwrap();
+        let p = p_in(&own).with_peers([
+            peer.clone(),
+            peer.clone(),
+            own.canonicalize().unwrap(),
+            PathBuf::from("rel/x"),
+            PathBuf::from("/x/proj[v2]"),
+            PathBuf::from("/"),
+        ]);
+        assert_eq!(p.peers, vec![peer.clone()]);
+        let s = settings(&p);
+        let deny: Vec<String> = serde_json::from_value(s["permissions"]["deny"].clone()).unwrap();
+        let pd = peer.display();
+        for want in [
+            format!("Edit(/{}/.claude/settings.json)", pd),
+            format!("Edit(/{}/.claude/settings.local.json)", pd),
+            format!("Edit(/{}/.claude/**)", pd),
+        ] {
+            assert!(deny.contains(&want), "{} not in {:?}", want, deny);
+        }
+        let dw: Vec<String> =
+            serde_json::from_value(s["sandbox"]["filesystem"]["denyWrite"].clone()).unwrap();
+        assert!(
+            dw.contains(&peer.join(".claude").display().to_string()),
+            "{:?}",
+            dw
+        );
+        assert!(
+            dw.contains(&claude_dir(&p).display().to_string()),
+            "{:?}",
+            dw
+        );
+        // No peers: the rules are the agent's own only.
+        let alone = p_in(&own);
+        assert!(alone.peers.is_empty());
+        assert!(!deny_rules(&alone)
+            .iter()
+            .any(|r| r.contains(&pd.to_string())));
     }
 
     #[test]

@@ -574,6 +574,14 @@ impl Spawner {
                 format!("{}: {}", s.id, why),
             ))
         };
+        // The other live agents' cwds: their `.claude/` is denied too
+        // (C1a-32). A failed read spawns nothing rather than spawn without.
+        let peers = match self.db.reader().map_err(|e| e.to_string()).and_then(|c| {
+            peer_cwds(&c, &s.id).map_err(|e| format!("Failed to read the peer cwds: {}", e))
+        }) {
+            Ok(p) => p,
+            Err(e) => return fail(e),
+        };
         let profile = match Profile::new(
             self.agent_bin.path(),
             &self.config.sock,
@@ -582,8 +590,8 @@ impl Spawner {
             s.gen,
             &s.sid,
         ) {
-            Ok(p) if s.kind == Kind::Resume => p.resuming(),
-            Ok(p) => p,
+            Ok(p) if s.kind == Kind::Resume => p.resuming().with_peers(peers),
+            Ok(p) => p.with_peers(peers),
             Err(e) => return fail(e),
         };
         // The realpath again: a path part swapped for a symlink since the
@@ -732,6 +740,8 @@ impl Spawner {
         mut screen: CcScreen,
         cmds: &Receiver<Cmd>,
     ) {
+        #[cfg(feature = "live-test")]
+        let mut last_screen = String::new();
         loop {
             match cmds.recv_timeout(RUN_TICK) {
                 Ok(Cmd::Retire { principal, reply }) => {
@@ -752,6 +762,14 @@ impl Spawner {
             // Nobody reads the bytes yet; the screen keeps up regardless.
             let _ = driver.output(Duration::ZERO);
             let snap = driver.screen();
+            #[cfg(feature = "live-test")]
+            {
+                use super::live_test;
+                live_test::dump_screen(&self.config.home, &s.id, &snap.text, &mut last_screen);
+                if let Some(keys) = live_test::take_input(&self.config.home, &s.id) {
+                    self.pty_write(&s.id, driver.as_mut(), &keys);
+                }
+            }
             for ev in screen.step(&snap.title, &snap.text, snap.quiet, (self.clock)()) {
                 if let ScreenEvent::State(st) = ev {
                     self.screen_claim(s, st);
@@ -1380,6 +1398,18 @@ fn engine_row(conn: &Connection, id: &str) -> rusqlite::Result<Option<AgentRow>>
         agent_row,
     )
     .optional()
+}
+
+/// The cwds of the live engine agents other than `id`: the peers whose
+/// `.claude/` the profile of `id` denies (C1a-32). Only agents that exist
+/// at this spawn: one created later is not in this agent's rules.
+fn peer_cwds(conn: &Connection, id: &str) -> rusqlite::Result<Vec<PathBuf>> {
+    let mut st = conn.prepare(
+        "SELECT cwd FROM agents WHERE source = 'engine' AND gone_at IS NULL \
+         AND cwd IS NOT NULL AND id != ?1",
+    )?;
+    let rows = st.query_map([id], |r| r.get::<_, String>(0))?;
+    rows.map(|r| r.map(PathBuf::from)).collect()
 }
 
 /// A live engine agent whose cwd is strictly above or below `cwd`, as
@@ -2084,6 +2114,42 @@ mod tests {
         assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 1);
         assert_eq!(e.launcher.kills.load(Ordering::SeqCst), 1);
         assert_eq!(only_row(&e.db).state.as_deref(), Some("failed"));
+    }
+
+    #[tokio::test]
+    async fn a_second_agent_denies_the_first_agents_claude_dir() {
+        // Live run X14 row 8 (C1a-32): B overwrote A's settings.json.
+        let e = setup(Script::Ready, true, None);
+        let l = Principal::LocalUnverified;
+        let a = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let other = e.t.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let b = e.sp.create(&l, create_params(&other)).await.unwrap();
+        let read = |id: &str| -> serde_json::Value {
+            let f = settings_path_of(&e.home, id, 1);
+            serde_json::from_slice(&std::fs::read(f).unwrap()).unwrap()
+        };
+        let a_claude = e.cwd.canonicalize().unwrap().join(".claude");
+        let b_set = read(&b.id);
+        let dw = b_set["sandbox"]["filesystem"]["denyWrite"].to_string();
+        let deny = b_set["permissions"]["deny"].to_string();
+        let a_s = a_claude.display().to_string();
+        assert!(dw.contains(&a_s), "{}", dw);
+        assert!(deny.contains(&format!("Edit(/{}/**)", a_s)), "{}", deny);
+        // A came first: B was not live at its spawn.
+        let b_claude = other.canonicalize().unwrap().join(".claude");
+        let a_set = read(&a.id).to_string();
+        assert!(!a_set.contains(&b_claude.display().to_string()));
+        // A retired agent is no peer.
+        e.sp.retire(&l, serde_json::json!({ "id": b.id }))
+            .await
+            .unwrap();
+        let conn = e.db.reader().unwrap();
+        assert!(peer_cwds(&conn, &a.id).unwrap().is_empty());
+        assert_eq!(
+            peer_cwds(&conn, &b.id).unwrap(),
+            vec![e.cwd.canonicalize().unwrap()]
+        );
     }
 
     #[tokio::test]
