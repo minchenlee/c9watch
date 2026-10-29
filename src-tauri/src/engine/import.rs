@@ -15,6 +15,11 @@
 //! - `WorkerMeta` (`cli/pm_fs.rs`): one `role=worker`, `control=none`,
 //!   `source=legacy_import` row per worker session, with a `session_alias`
 //!   row. A re-import updates that row; a change emits `agent.upsert`.
+//! - Legacy rows are history, never live: `gone_at` is the worker's
+//!   `stoppedAt`, or the import time when it has none (the daemon never
+//!   writes one). A legacy worker that still runs is listed by detection
+//!   as its `source=detected` row, so the default `agent.list` shows it
+//!   once.
 //! - `AdoptionRecord` (`cli/adoption.rs`): the worker's `parent_id`. The
 //!   adopting PM gets a `role=orch` legacy row if it has none. A record that
 //!   names a worker with no row (a dangling adoption) is skipped.
@@ -594,7 +599,8 @@ fn insert_legacy(
             w.and_then(|w| w.pid),
             started,
             now,
-            w.and_then(|w| iso_ms(w.stopped_at.as_deref())),
+            w.and_then(|w| iso_ms(w.stopped_at.as_deref()))
+                .unwrap_or(now),
         ],
     )?;
     tx.execute(
@@ -618,10 +624,11 @@ fn apply(tx: &mut Tx, machine: &str, legacy: &Legacy, now: i64) -> rusqlite::Res
                 applied.created.push(id);
             }
             Some(before) => {
-                // A stop time, once known, stays.
+                // A known stop time replaces the import time; the row
+                // stays gone either way.
                 tx.execute(
                     "UPDATE agents SET cwd = ?2, name = ?3, pid = ?4, started_at = ?5, \
-                     gone_at = COALESCE(gone_at, ?6) WHERE id = ?1",
+                     gone_at = COALESCE(?6, gone_at, ?7) WHERE id = ?1",
                     params![
                         before.id,
                         w.cwd,
@@ -629,6 +636,7 @@ fn apply(tx: &mut Tx, machine: &str, legacy: &Legacy, now: i64) -> rusqlite::Res
                         w.pid,
                         iso_ms(w.spawned_at.as_deref()),
                         iso_ms(w.stopped_at.as_deref()),
+                        now,
                     ],
                 )?;
                 let after = read_row(tx, &before.id)?;
@@ -870,10 +878,14 @@ mod tests {
         assert_eq!(w1.pid, Some(4242));
         assert_eq!(w1.machine_id.as_deref(), Some(M));
         assert_eq!(w1.started_at, iso_ms(Some("2026-10-01T10:00:00Z")));
-        assert_eq!(w1.gone_at, None);
+        // No stoppedAt (the daemon never writes one): gone at import.
+        assert!(w1.gone_at.is_some_and(|t| t >= w1.created_at.unwrap()));
         assert_eq!(w1.session_key, None);
         assert_eq!(w2.gone_at, iso_ms(Some("2026-10-01T12:00:00Z")));
         assert_eq!(pm.role, "orch");
+        assert!(pm.gone_at.is_some());
+        // History only: the default agent.list has none of them.
+        assert!(db.agents(AgentFilter::Live).unwrap().is_empty());
         assert_eq!(w1.parent_id.as_deref(), Some(pm.id.as_str()));
         assert_eq!(w2.parent_id, None);
         // Not in session.list: no detected session.
@@ -910,6 +922,29 @@ mod tests {
         let payload: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(payload["legacy"], true);
         assert_eq!(payload["event"]["status"], "done");
+    }
+
+    #[test]
+    fn a_running_legacy_worker_is_listed_once_by_its_detected_row() {
+        let f = fixture();
+        let db = db::open(&f.home, M).unwrap();
+        import(&db, &f.home, &f.src).unwrap();
+        let seen = vec![crate::engine::detect::Observed {
+            key: format!("claudeCode:{}", W1),
+            provider: PROVIDER.into(),
+            sid: W1.into(),
+            status: "working",
+            cwd: "/repo".into(),
+            name: "one".into(),
+            pid: 4242,
+            started_at: None,
+        }];
+        db.write_blocking(move |tx| crate::engine::detect::apply(tx, M, &seen, now_ms()))
+            .unwrap();
+        let live = db.agents(AgentFilter::Live).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].source, "detected");
+        assert_eq!(live[0].provider_sid.as_deref(), Some(W1));
     }
 
     #[test]
