@@ -1,0 +1,506 @@
+{
+  "$defs": {
+    "AgentRow": {
+      "description": "One row of the `agents` table (A:340), as `snapshot.get` sends it.",
+      "properties": {
+        "control": {
+          "description": "`pty` or `none`.",
+          "type": "string"
+        },
+        "createdBy": {
+          "description": "The principal that created the agent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generation": {
+          "description": "+1 on spawn, resume, refresh and takeover.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "goneAt": {
+          "description": "Unix ms; `null` while the agent is alive.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "`agt_<ulid>`.",
+          "type": "string"
+        },
+        "interruptedNotePending": {
+          "type": "boolean"
+        },
+        "mode": {
+          "description": "`managed` or `free`; `null` for an observed agent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "description": "The adapter kind: `claude`, `codex`, ...",
+          "type": "string"
+        },
+        "providerSid": {
+          "description": "The provider session id of the current generation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resumeCount": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "role": {
+          "description": "`human`, `orch`, `worker` or `observed`.",
+          "type": "string"
+        },
+        "source": {
+          "description": "`detected`, `engine` or `legacy_import`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "generation",
+        "mode",
+        "role",
+        "control",
+        "provider",
+        "providerSid",
+        "source",
+        "createdBy",
+        "goneAt",
+        "resumeCount",
+        "interruptedNotePending"
+      ],
+      "type": "object"
+    },
+    "ClientInfo": {
+      "description": "What a client says about itself in `hello`. Unverified.",
+      "properties": {
+        "kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ErrorBody": {
+      "description": "The `error` object of a failed response.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "msg": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "msg",
+        "retryable",
+        "hint"
+      ],
+      "type": "object"
+    },
+    "ErrorCode": {
+      "description": "Typed error codes. New codes are additive; a client that does not know a\ncode still has `msg`, `retryable` and `hint`.",
+      "oneOf": [
+        {
+          "const": "upgrade_required",
+          "description": "The client speaks another major version.",
+          "type": "string"
+        },
+        {
+          "const": "hello_required",
+          "description": "The first frame was not `hello`.",
+          "type": "string"
+        },
+        {
+          "const": "hello_timeout",
+          "description": "No `hello` arrived in time.",
+          "type": "string"
+        },
+        {
+          "const": "frame_too_large",
+          "description": "A frame is larger than `MAX_FRAME`.",
+          "type": "string"
+        },
+        {
+          "const": "bad_request",
+          "description": "The frame is not valid JSON or misses a required field.",
+          "type": "string"
+        },
+        {
+          "const": "unknown_method",
+          "description": "The engine has no such method.",
+          "type": "string"
+        },
+        {
+          "const": "peer_uid_mismatch",
+          "description": "The peer runs under another uid.",
+          "type": "string"
+        },
+        {
+          "const": "cursor_expired",
+          "description": "The cursor's events are gone: pruned, another epoch or machine, or\nahead of the log.",
+          "type": "string"
+        },
+        {
+          "const": "rate_limited",
+          "description": "The caller is over a limit, such as the event streams per\nconnection.",
+          "type": "string"
+        },
+        {
+          "const": "internal",
+          "description": "An engine-side failure.",
+          "type": "string"
+        }
+      ]
+    },
+    "EventFrame": {
+      "description": "One event on the wire (A:203). `sub` is the `id` of the subscribe\nrequest, so a connection can carry several subscriptions.",
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "data": true,
+        "origin": true,
+        "sub": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subject": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "topic": {
+          "type": "string"
+        },
+        "ts": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "type": {
+          "$ref": "#/$defs/EventType"
+        },
+        "v": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "cursor",
+        "topic",
+        "ts",
+        "data"
+      ],
+      "type": "object"
+    },
+    "EventType": {
+      "description": "The `type` of an event frame. A response frame has no `type`, so a\nclient tells the two apart by `type === \"event\"`.",
+      "enum": [
+        "event"
+      ],
+      "type": "string"
+    },
+    "HelloParams": {
+      "description": "`hello` params. `client` is the caller's own claim. The engine only logs\nit as unverified; it never decides the principal (N1).",
+      "properties": {
+        "apiMajor": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "client": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "want": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "HelloResult": {
+      "description": "`hello` result.",
+      "properties": {
+        "apiMajor": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "apiMinor": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cursor": {
+          "description": "Cursor of the newest committed event. `null` only without a store.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "engineVersion": {
+          "type": "string"
+        },
+        "machineId": {
+          "type": "string"
+        },
+        "principal": {
+          "description": "Stamped by the engine from connection facts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "apiMajor",
+        "apiMinor",
+        "engineVersion",
+        "machineId",
+        "principal",
+        "capabilities",
+        "cursor"
+      ],
+      "type": "object"
+    },
+    "Request": {
+      "description": "A request frame. Every field is optional on the wire, so that a frame\nwith a missing field still gets an error that echoes its `id`.",
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idem": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "method": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": true,
+        "v": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Response": {
+      "description": "A response frame: `ok:true` with `result`, or `ok:false` with `error`.",
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorBody"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "result": true,
+        "seq": {
+          "description": "Cursor of the event this write produced (from M2).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "v": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "v",
+        "ok"
+      ],
+      "type": "object"
+    },
+    "SnapshotParams": {
+      "description": "`snapshot.get` params. There are none yet; the engine ignores any it\ngets.",
+      "type": "object"
+    },
+    "SnapshotResult": {
+      "description": "`snapshot.get` result: the state and the cursor it is consistent with.\nSubscribing with `since` = `cursor` continues with no gap.",
+      "properties": {
+        "agents": {
+          "items": {
+            "$ref": "#/$defs/AgentRow"
+          },
+          "type": "array"
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "machineId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "cursor",
+        "machineId",
+        "agents"
+      ],
+      "type": "object"
+    },
+    "SubscribeParams": {
+      "description": "`events.subscribe` params (A:218). Empty filters match everything.",
+      "properties": {
+        "since": {
+          "description": "The last cursor the client has seen. Without it, the stream starts at\nthe current head.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subjects": {
+          "description": "Exact subjects.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "topics": {
+          "description": "Exact topics, or a prefix ending in `.*` (`agent.*`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "SubscribeResult": {
+      "description": "`events.subscribe` result. Event frames follow it on the same\nconnection until the connection closes, or until an error frame with\nthe subscribe request's `id` (`cursor_expired` when the subscriber fell\nbehind retention).",
+      "properties": {
+        "cursor": {
+          "description": "Where the stream starts: events after this cursor follow.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "cursor"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "apiMajor": 1,
+  "apiMinor": 0,
+  "description": "The c9watch engine protocol: one JSON object per line over the engine socket. Within a major version every change is additive.",
+  "frames": {
+    "event": {
+      "$ref": "#/$defs/EventFrame"
+    },
+    "request": {
+      "$ref": "#/$defs/Request"
+    },
+    "response": {
+      "$ref": "#/$defs/Response"
+    }
+  },
+  "methods": {
+    "events.subscribe": {
+      "events": {
+        "$ref": "#/$defs/EventFrame"
+      },
+      "params": {
+        "$ref": "#/$defs/SubscribeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SubscribeResult"
+      }
+    },
+    "hello": {
+      "params": {
+        "$ref": "#/$defs/HelloParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HelloResult"
+      }
+    },
+    "snapshot.get": {
+      "params": {
+        "$ref": "#/$defs/SnapshotParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SnapshotResult"
+      }
+    }
+  },
+  "title": "c9p/1"
+}

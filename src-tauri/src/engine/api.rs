@@ -7,12 +7,21 @@
 //! `hello`, an oversized frame and a peer under another uid. After `hello`, a
 //! frame that is not valid JSON or lacks `v` gets `bad_request`, and the
 //! connection stays open, because the line framing is still intact.
+//!
+//! `events.subscribe` starts a stream task on the connection. It reads the
+//! event log from SQLite at its own pace and writes event frames to the
+//! same write queue as responses, so a slow client only slows its own
+//! stream, never the db writer. A connection holds at most `MAX_STREAMS`
+//! live streams; one more gets `rate_limited`.
 
+use super::db::outbox::{Cursor, Event, ReadError, Subscription, READ_BATCH};
+use super::db::Db;
 use super::peer::{self, PeerCred};
 use super::principal::{self, LiveAgents, NoLiveAgents, Principal};
 use super::proto::{
-    encode, read_frame, ApiError, ErrorCode, FrameError, HelloParams, HelloResult, Request,
-    Response, API_MAJOR, API_MINOR, MAX_FRAME,
+    encode, encode_event, read_frame, ApiError, ErrorCode, EventFrame, EventType, FrameError,
+    HelloParams, HelloResult, Request, Response, SnapshotParams, SnapshotResult, SubscribeParams,
+    SubscribeResult, API_MAJOR, API_MINOR, MAX_FRAME,
 };
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
@@ -20,23 +29,32 @@ use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 /// How long a new connection has to send `hello`.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Responses queued for one connection's writer task.
+/// Encoded frames (responses and events) queued for one connection's
+/// writer task.
 const WRITE_QUEUE: usize = 64;
+
+/// Live `events.subscribe` streams one connection may hold. Each holds a
+/// SQLite reader (and its file descriptors) until the connection closes, so
+/// without a cap one client could exhaust the engine's descriptors.
+pub const MAX_STREAMS: usize = 16;
 
 /// Engine-wide facts every connection needs.
 pub struct ServerCtx {
     pub engine_version: String,
-    /// The machine key id. Set from the store once it exists (M2).
+    /// The machine key id (`engine::machine`).
     pub machine_id: String,
     pub hello_timeout: Duration,
     /// Live agents, for `agent:<id>` stamping.
     pub agents: Arc<dyn LiveAgents>,
     /// The only uid a peer may have: the engine's own euid.
     pub engine_uid: libc::uid_t,
+    /// The store. `None` only in tests of the connection layer.
+    pub db: Option<Arc<Db>>,
 }
 
 impl ServerCtx {
@@ -48,7 +66,19 @@ impl ServerCtx {
             // C1a-33 replaces this with the engine's agent table.
             agents: Arc::new(NoLiveAgents),
             engine_uid: peer::engine_uid(),
+            db: None,
         }
+    }
+
+    pub fn with_db(mut self, db: Arc<Db>) -> Self {
+        self.db = Some(db);
+        self
+    }
+
+    fn db(&self) -> Result<&Arc<Db>, ApiError> {
+        self.db
+            .as_ref()
+            .ok_or_else(|| ApiError::new(ErrorCode::Internal, "the engine has no store"))
     }
 }
 
@@ -89,10 +119,10 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
     let accepted = peer::start_token_now();
     let cred = peer::peer_cred(stream.as_raw_fd());
     let (read, mut write) = stream.into_split();
-    let (tx, mut rx) = mpsc::channel::<Response>(WRITE_QUEUE);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(WRITE_QUEUE);
     let writer = tokio::spawn(async move {
-        while let Some(resp) = rx.recv().await {
-            if write.write_all(&encode(&resp)).await.is_err() {
+        while let Some(line) = rx.recv().await {
+            if write.write_all(&line).await.is_err() {
                 break;
             }
         }
@@ -104,10 +134,10 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
         Err(e) => {
             eprintln!("[engine] Rejected connection: {}", e);
             let _ = tx
-                .send(Response::err(
+                .send(encode(&Response::err(
                     None,
                     ApiError::new(ErrorCode::PeerUidMismatch, e),
-                ))
+                )))
                 .await;
             drop(tx);
             let _ = writer.await;
@@ -121,6 +151,7 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
 
     let mut reader = BufReader::new(read);
     let mut conn: Option<Conn> = None;
+    let mut streams: Vec<JoinHandle<()>> = Vec::new();
     loop {
         let frame = if conn.is_none() {
             match tokio::time::timeout_at(hello_deadline, read_frame(&mut reader, MAX_FRAME)).await
@@ -128,10 +159,10 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
                 Ok(f) => f,
                 Err(_) => {
                     let _ = tx
-                        .send(Response::err(
+                        .send(encode(&Response::err(
                             None,
                             ApiError::new(ErrorCode::HelloTimeout, "no hello within the timeout"),
-                        ))
+                        )))
                         .await;
                     break;
                 }
@@ -144,13 +175,13 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
             Ok(None) => break,
             Err(FrameError::TooLarge) => {
                 let _ = tx
-                    .send(Response::err(
+                    .send(encode(&Response::err(
                         None,
                         ApiError::new(
                             ErrorCode::FrameTooLarge,
                             format!("frame exceeds {} bytes", MAX_FRAME),
                         ),
-                    ))
+                    )))
                     .await;
                 break;
             }
@@ -159,26 +190,67 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
         if frame.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let (resp, next) = handle_frame(&frame, &ctx, cred, &principal, &mut conn);
-        if tx.send(resp).await.is_err() {
+        // A stream that ended (expired, or the store closed) frees its slot.
+        streams.retain(|h| !h.is_finished());
+        let (resp, next, stream) =
+            handle_frame(&frame, &ctx, cred, &principal, &mut conn, streams.len()).await;
+        if tx.send(encode(&resp)).await.is_err() {
             break;
+        }
+        // Start the stream only after its subscribe response is queued, so
+        // that response comes first.
+        if let Some(s) = stream {
+            streams.push(tokio::spawn(s.run(tx.clone())));
         }
         if let Next::Close = next {
             break;
         }
     }
+    for s in &streams {
+        s.abort();
+    }
     drop(tx);
     let _ = writer.await;
 }
 
-/// Handle one frame and say whether the connection stays open.
-fn handle_frame(
+/// Handle one frame and say whether the connection stays open, and which
+/// event stream to start after the response.
+async fn handle_frame(
     frame: &[u8],
     ctx: &ServerCtx,
     cred: PeerCred,
     principal: &Principal,
     conn: &mut Option<Conn>,
-) -> (Response, Next) {
+    streams: usize,
+) -> (Response, Next, Option<EventStream>) {
+    match check_frame(frame, ctx, cred, principal, conn) {
+        Checked::Done(resp, next) => (resp, next, None),
+        Checked::Call(req, method) => {
+            let id = req.id.clone();
+            match dispatch(&method, req, ctx, streams).await {
+                Ok((result, stream)) => (Response::ok(id, result), Next::Continue, stream),
+                Err(e) => (Response::err(id, e), Next::Continue, None),
+            }
+        }
+    }
+}
+
+/// A frame after the envelope checks.
+enum Checked {
+    /// Answered already (an error or `hello`).
+    Done(Response, Next),
+    /// A method call after `hello`.
+    Call(Request, String),
+}
+
+/// Envelope checks and `hello`. Never touches the store.
+fn check_frame(
+    frame: &[u8],
+    ctx: &ServerCtx,
+    cred: PeerCred,
+    principal: &Principal,
+    conn: &mut Option<Conn>,
+) -> Checked {
     // A bad frame before `hello` closes; after it the connection stays.
     let soft = if conn.is_some() {
         Next::Continue
@@ -188,7 +260,7 @@ fn handle_frame(
     let req: Request = match serde_json::from_slice(frame) {
         Ok(r) => r,
         Err(e) => {
-            return (
+            return Checked::Done(
                 Response::err(
                     None,
                     ApiError::new(ErrorCode::BadRequest, format!("invalid JSON: {}", e)),
@@ -199,13 +271,13 @@ fn handle_frame(
     };
     let id = req.id.clone();
     let Some(v) = req.v else {
-        return (
+        return Checked::Done(
             Response::err(id, ApiError::new(ErrorCode::BadRequest, "missing v")),
             soft,
         );
     };
     if v != API_MAJOR {
-        return (
+        return Checked::Done(
             Response::err(
                 id,
                 ApiError::new(
@@ -216,17 +288,18 @@ fn handle_frame(
             Next::Close,
         );
     }
-    let Some(method) = req.method.as_deref() else {
-        return (
+    let Some(method) = req.method.clone() else {
+        return Checked::Done(
             Response::err(id, ApiError::new(ErrorCode::BadRequest, "missing method")),
             soft,
         );
     };
     if method == "hello" {
-        return hello(req, ctx, cred, principal, conn);
+        let (resp, next) = hello(req, ctx, cred, principal, conn);
+        return Checked::Done(resp, next);
     }
     if conn.is_none() {
-        return (
+        return Checked::Done(
             Response::err(
                 id,
                 ApiError::new(
@@ -237,19 +310,242 @@ fn handle_frame(
             Next::Close,
         );
     }
-    let resp = match dispatch(method, &req) {
-        Ok(result) => Response::ok(id, result),
-        Err(e) => Response::err(id, e),
-    };
-    (resp, Next::Continue)
+    Checked::Call(req, method)
 }
 
-/// Methods after `hello`. The method table grows from M2 on.
-fn dispatch(method: &str, _req: &Request) -> Result<serde_json::Value, ApiError> {
-    Err(ApiError::new(
-        ErrorCode::UnknownMethod,
-        format!("unknown method {:?}", method),
+/// Every c9p/1 method, as in `docs/api/c9p-1.json`. `hello` is handled
+/// before dispatch; `dispatch` serves the rest.
+pub const METHODS: &[&str] = &["hello", "snapshot.get", "events.subscribe"];
+
+/// The c9p/1 JSON Schema (A:245): the frame types, a `methods` table with
+/// each method's params and result, and every wire type under `$defs`.
+/// `docs/api/c9p-1.json` is this value, and `src/lib/c9p-1.ts` is generated
+/// from that file by `scripts/gen-c9p-types.mjs`.
+pub fn schema() -> serde_json::Value {
+    use schemars::generate::SchemaSettings;
+    // Params and the request frame are what the engine reads; results and
+    // the other frames are what it writes. Each side gets its own contract,
+    // so an `Option` param may be left out while an `Option` result field
+    // is always sent.
+    let mut de = SchemaSettings::draft2020_12()
+        .for_deserialize()
+        .into_generator();
+    let mut ser = SchemaSettings::draft2020_12()
+        .for_serialize()
+        .into_generator();
+    let frames = serde_json::json!({
+        "request": de.subschema_for::<Request>(),
+        "response": ser.subschema_for::<Response>(),
+        "event": ser.subschema_for::<EventFrame>(),
+    });
+    let methods = serde_json::json!({
+        "hello": {
+            "params": de.subschema_for::<HelloParams>(),
+            "result": ser.subschema_for::<HelloResult>(),
+        },
+        "snapshot.get": {
+            "params": de.subschema_for::<SnapshotParams>(),
+            "result": ser.subschema_for::<SnapshotResult>(),
+        },
+        "events.subscribe": {
+            "params": de.subschema_for::<SubscribeParams>(),
+            "result": ser.subschema_for::<SubscribeResult>(),
+            "events": ser.subschema_for::<EventFrame>(),
+        },
+    });
+    let mut defs = de.take_definitions(true);
+    for (name, def) in ser.take_definitions(true) {
+        match defs.get(&name) {
+            // A type on both sides (ErrorCode) must read the same way.
+            Some(other) => assert_eq!(other, &def, "{} differs between contracts", name),
+            None => {
+                defs.insert(name, def);
+            }
+        }
+    }
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "c9p/1",
+        "description": "The c9watch engine protocol: one JSON object per line over \
+            the engine socket. Within a major version every change is additive.",
+        "apiMajor": API_MAJOR,
+        "apiMinor": API_MINOR,
+        "frames": frames,
+        "methods": methods,
+        "$defs": defs,
+    })
+}
+
+/// Methods after `hello`. Both C1a principals, L and A, may call every
+/// method here (§1.1); later methods check the principal. `streams` is how
+/// many event streams the connection holds.
+async fn dispatch(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    streams: usize,
+) -> Result<(serde_json::Value, Option<EventStream>), ApiError> {
+    match method {
+        "snapshot.get" => Ok((snapshot_get(ctx).await?, None)),
+        "events.subscribe" => {
+            if streams >= MAX_STREAMS {
+                return Err(ApiError::new(
+                    ErrorCode::RateLimited,
+                    format!("this connection already holds {} event streams", streams),
+                ));
+            }
+            let (result, stream) = events_subscribe(req, ctx).await?;
+            Ok((result, Some(stream)))
+        }
+        _ => Err(ApiError::new(
+            ErrorCode::UnknownMethod,
+            format!("unknown method {:?}", method),
+        )),
+    }
+}
+
+fn internal(e: impl std::fmt::Display) -> ApiError {
+    ApiError::new(ErrorCode::Internal, e.to_string())
+}
+
+fn read_error(e: ReadError) -> ApiError {
+    match e {
+        ReadError::Expired(m) => ApiError::new(ErrorCode::CursorExpired, m),
+        ReadError::Db(m) => internal(m),
+    }
+}
+
+/// Run blocking store work off the async workers.
+async fn blocking<R, F>(f: F) -> Result<R, ApiError>
+where
+    F: FnOnce() -> Result<R, ApiError> + Send + 'static,
+    R: Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.map_err(internal)?
+}
+
+async fn snapshot_get(ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
+    let db = ctx.db()?.clone();
+    let (cursor, agents) = blocking(move || db.snapshot().map_err(internal)).await?;
+    let result = SnapshotResult {
+        cursor: cursor.to_string(),
+        machine_id: ctx.machine_id.clone(),
+        agents,
+    };
+    Ok(serde_json::to_value(result).expect("SnapshotResult serializes"))
+}
+
+async fn events_subscribe(
+    req: Request,
+    ctx: &ServerCtx,
+) -> Result<(serde_json::Value, EventStream), ApiError> {
+    let params: SubscribeParams = if req.params.is_null() {
+        SubscribeParams::default()
+    } else {
+        serde_json::from_value(req.params).map_err(|e| {
+            ApiError::new(
+                ErrorCode::BadRequest,
+                format!("bad events.subscribe params: {}", e),
+            )
+        })?
+    };
+    let db = ctx.db()?.clone();
+    let since = match &params.since {
+        Some(s) => Some(Cursor::parse(s).map_err(|e| ApiError::new(ErrorCode::BadRequest, e))?),
+        None => None,
+    };
+    let (start, sub) = blocking(move || {
+        let after = match since {
+            Some(c) => db.check_cursor(&c).map_err(read_error)?,
+            None => db.head_cursor().seq,
+        };
+        let sub = db.subscribe(after, READ_BATCH).map_err(internal)?;
+        Ok((db.cursor_at(after), sub))
+    })
+    .await?;
+    let result = SubscribeResult {
+        cursor: start.to_string(),
+    };
+    let stream = EventStream {
+        sub,
+        id: req.id,
+        machine: start.machine,
+        epoch: start.epoch,
+        topics: params.topics,
+        subjects: params.subjects,
+    };
+    Ok((
+        serde_json::to_value(result).expect("SubscribeResult serializes"),
+        stream,
     ))
+}
+
+/// One `events.subscribe` on a connection.
+struct EventStream {
+    sub: Subscription,
+    /// The subscribe request's `id`, set on every frame of the stream.
+    id: Option<String>,
+    machine: String,
+    epoch: String,
+    topics: Vec<String>,
+    subjects: Vec<String>,
+}
+
+impl EventStream {
+    fn wants(&self, e: &Event) -> bool {
+        let topic_ok = self.topics.is_empty()
+            || self.topics.iter().any(|t| match t.strip_suffix(".*") {
+                Some(prefix) => e
+                    .topic
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('.')),
+                None => *t == e.topic,
+            });
+        let subject_ok = self.subjects.is_empty()
+            || e.subject
+                .as_ref()
+                .is_some_and(|s| self.subjects.contains(s));
+        topic_ok && subject_ok
+    }
+
+    fn frame(&self, e: Event) -> EventFrame {
+        EventFrame {
+            v: API_MAJOR,
+            kind: EventType::Event,
+            sub: self.id.clone(),
+            cursor: format!("{}:{}:{}", self.machine, self.epoch, e.seq),
+            topic: e.topic,
+            subject: e.subject,
+            ts: e.ts,
+            origin: e.origin,
+            data: e.data,
+        }
+    }
+
+    /// Send events until the connection closes or the subscription fails.
+    /// A full write queue only parks this task.
+    async fn run(mut self, tx: mpsc::Sender<Vec<u8>>) {
+        loop {
+            let batch = match self.sub.next().await {
+                Ok(Some(batch)) => batch,
+                Ok(None) => return,
+                Err(e) => {
+                    let _ = tx
+                        .send(encode(&Response::err(self.id.clone(), read_error(e))))
+                        .await;
+                    return;
+                }
+            };
+            for e in batch {
+                if !self.wants(&e) {
+                    continue;
+                }
+                if tx.send(encode_event(&self.frame(e))).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Capabilities this engine offers. Empty until the first optional feature.
@@ -329,7 +625,7 @@ fn hello(
         machine_id: ctx.machine_id.clone(),
         principal: principal.to_string(),
         capabilities,
-        cursor: None,
+        cursor: ctx.db.as_ref().map(|db| db.head_cursor().to_string()),
     };
     let result = serde_json::to_value(result).expect("HelloResult serializes");
     (Response::ok(id, result), Next::Continue)
@@ -352,6 +648,7 @@ mod tests {
             hello_timeout,
             agents,
             engine_uid: peer::engine_uid(),
+            db: None,
         })
     }
 
@@ -602,5 +899,371 @@ mod tests {
         let agents = principal::tests::FakeAgents::one("a7", parent, start + 1);
         let r = principal_for(Arc::new(agents), json!({})).await;
         assert_eq!(r["result"]["principal"], "local-unverified");
+    }
+
+    // ── Store-backed methods (C1a-13) ──────────────────────────────────
+
+    use crate::engine::db::outbox::{self, NewEvent};
+    use tokio::io::Lines;
+    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+
+    const MACHINE: &str = "m-test";
+
+    /// `docs/api/c9p-1.json` must equal `schema()`. With
+    /// `C9P_SCHEMA_WRITE=1` the test rewrites the file instead.
+    #[test]
+    fn schema_file_is_current() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/api/c9p-1.json");
+        let want = serde_json::to_string_pretty(&schema()).unwrap() + "\n";
+        if std::env::var_os("C9P_SCHEMA_WRITE").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, want).unwrap();
+            return;
+        }
+        let have = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            have == want,
+            "docs/api/c9p-1.json is stale. Run `C9P_SCHEMA_WRITE=1 cargo test --no-default-features \
+             --features engine schema_file_is_current`, then `node scripts/gen-c9p-types.mjs`."
+        );
+    }
+
+    #[test]
+    fn schema_lists_every_method_and_resolves_every_ref() {
+        let s = schema();
+        let methods: Vec<&str> = s["methods"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut want = METHODS.to_vec();
+        want.sort();
+        assert_eq!(methods, want);
+        let text = s.to_string();
+        let defs = s["$defs"].as_object().unwrap();
+        for r in text.split("\"$ref\":\"#/$defs/").skip(1) {
+            let name = &r[..r.find('"').unwrap()];
+            assert!(defs.contains_key(name), "dangling $ref {}", name);
+        }
+        let codes = serde_json::to_string(&s["$defs"]["ErrorCode"]).unwrap();
+        for code in ["upgrade_required", "cursor_expired", "internal"] {
+            assert!(codes.contains(code), "ErrorCode lacks {}", code);
+        }
+    }
+
+    /// Every method in the schema is served: none answers `unknown_method`.
+    #[tokio::test]
+    async fn every_schema_method_is_served() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        for (i, m) in METHODS.iter().enumerate() {
+            let r = c.call(&i.to_string(), m, json!({})).await;
+            assert_eq!(r["ok"], true, "{}: {}", m, r);
+        }
+        let r = c.call("x", "no.such", json!({})).await;
+        assert_eq!(r["error"]["code"], "unknown_method");
+    }
+
+    /// A server context with a fresh store, and the store.
+    fn ctx_db(agents: Arc<dyn LiveAgents>) -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Db>) {
+        let t = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::engine::db::open(&t.path().join("engine"), MACHINE).unwrap());
+        let ctx = Arc::new(ServerCtx {
+            engine_version: "9.9.9".into(),
+            machine_id: MACHINE.into(),
+            hello_timeout: HELLO_TIMEOUT,
+            agents,
+            engine_uid: peer::engine_uid(),
+            db: Some(db.clone()),
+        });
+        (t, ctx, db)
+    }
+
+    struct Client {
+        lines: Lines<BufReader<OwnedReadHalf>>,
+        write: OwnedWriteHalf,
+    }
+
+    impl Client {
+        /// Connect and say `hello`; returns the hello result too.
+        async fn new(ctx: Arc<ServerCtx>) -> (Client, Value) {
+            let (read, write) = connect(ctx).into_split();
+            let mut c = Client {
+                lines: BufReader::new(read).lines(),
+                write,
+            };
+            let r = c.call("h", "hello", json!({})).await;
+            assert_eq!(r["ok"], true, "{}", r);
+            (c, r["result"].clone())
+        }
+
+        async fn send(&mut self, id: &str, method: &str, params: Value) {
+            let mut line =
+                serde_json::to_vec(&json!({"v": 1, "id": id, "method": method, "params": params}))
+                    .unwrap();
+            line.push(b'\n');
+            self.write.write_all(&line).await.unwrap();
+        }
+
+        async fn next(&mut self) -> Value {
+            let line = tokio::time::timeout(Duration::from_secs(10), self.lines.next_line())
+                .await
+                .expect("a frame within 10 s")
+                .unwrap()
+                .expect("connection open");
+            serde_json::from_str(&line).unwrap()
+        }
+
+        async fn call(&mut self, id: &str, method: &str, params: Value) -> Value {
+            self.send(id, method, params).await;
+            self.next().await
+        }
+    }
+
+    fn event(topic: &str, subject: &str, n: usize, pad: usize) -> NewEvent {
+        NewEvent {
+            topic: topic.into(),
+            subject: Some(subject.into()),
+            origin: Some(json!({"kind": "system"})),
+            data: json!({"n": n, "pad": "x".repeat(pad)}),
+        }
+    }
+
+    /// Emit `n` events, one write transaction each.
+    async fn emit(db: &Db, n: usize, pad: usize) {
+        for i in 0..n {
+            let e = event("agent.upsert", "m-test/a1", i, pad);
+            db.write(move |tx| tx.emit(&e)).await.unwrap();
+        }
+    }
+
+    fn seq_of(frame: &Value) -> i64 {
+        Cursor::parse(frame["cursor"].as_str().unwrap())
+            .unwrap()
+            .seq
+    }
+
+    #[tokio::test]
+    async fn hello_and_snapshot_return_the_head_cursor() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        emit(&db, 3, 0).await;
+        let head = format!("{}:{}:3", MACHINE, db.epoch());
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["cursor"], head);
+        let r = c.call("1", "snapshot.get", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        assert_eq!(r["result"]["cursor"], head);
+        assert_eq!(r["result"]["machineId"], MACHINE);
+        assert_eq!(r["result"]["agents"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn snapshot_agents_are_typed_camel_case_rows() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        db.write(|tx| {
+            tx.execute(
+                "INSERT INTO agents (id, role, provider, provider_sid, source, \
+                 interrupted_note_pending) \
+                 VALUES ('a1', 'observed', 'claude', 'sid-1', 'detected', 1)",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c.call("1", "snapshot.get", json!({})).await;
+        assert_eq!(
+            r["result"]["agents"],
+            json!([{
+                "id": "a1",
+                "generation": 0,
+                "mode": null,
+                "role": "observed",
+                "control": "none",
+                "provider": "claude",
+                "providerSid": "sid-1",
+                "source": "detected",
+                "createdBy": null,
+                "goneAt": null,
+                "resumeCount": 0,
+                "interruptedNotePending": true
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_does_not_block_the_writer_and_catches_up_without_gaps() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c.call("s", "events.subscribe", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        assert_eq!(seq_of(&r["result"]), 0);
+
+        // The client reads nothing while ~6 MB of events are written: far
+        // more than the socket buffer and the write queue hold.
+        const N: usize = 3000;
+        tokio::time::timeout(Duration::from_secs(30), emit(&db, N, 2000))
+            .await
+            .expect("the writer is not blocked by the slow subscriber");
+
+        let mut seqs = Vec::with_capacity(N);
+        while seqs.len() < N {
+            let f = c.next().await;
+            assert_eq!(f["type"], "event", "{}", f);
+            assert_eq!(f["sub"], "s");
+            assert_eq!(f["data"]["n"], seqs.len());
+            seqs.push(seq_of(&f));
+        }
+        assert_eq!(seqs, (1..=N as i64).collect::<Vec<_>>());
+
+        // Caught up, the stream is live again.
+        emit(&db, 1, 0).await;
+        assert_eq!(seq_of(&c.next().await), N as i64 + 1);
+    }
+
+    #[tokio::test]
+    async fn expired_cursor_errors_and_the_snapshot_cursor_resumes() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        emit(&db, 5, 0).await;
+        db.writer()
+            .call(|c| outbox::prune_with(c, 0, 2))
+            .await
+            .unwrap()
+            .unwrap();
+        let (mut c, _) = Client::new(ctx).await;
+        let epoch = db.epoch().to_string();
+
+        // Events 2 and 3 are gone.
+        let r = c
+            .call(
+                "1",
+                "events.subscribe",
+                json!({"since": format!("{}:{}:1", MACHINE, epoch)}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "cursor_expired", "{}", r);
+        assert!(r["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("snapshot.get"));
+        // An old epoch.
+        let r = c
+            .call(
+                "2",
+                "events.subscribe",
+                json!({"since": format!("{}:old:5", MACHINE)}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "cursor_expired", "{}", r);
+        // Not a cursor.
+        let r = c
+            .call("3", "events.subscribe", json!({"since": "nope"}))
+            .await;
+        assert_eq!(r["error"]["code"], "bad_request", "{}", r);
+
+        let snap = c.call("4", "snapshot.get", json!({})).await;
+        let cursor = snap["result"]["cursor"].as_str().unwrap().to_string();
+        let r = c
+            .call("5", "events.subscribe", json!({"since": cursor}))
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        assert_eq!(r["result"]["cursor"], cursor);
+        emit(&db, 1, 0).await;
+        let f = c.next().await;
+        assert_eq!(f["sub"], "5");
+        assert_eq!(f["cursor"], format!("{}:{}:6", MACHINE, epoch));
+        assert_eq!(f["topic"], "agent.upsert");
+        assert_eq!(f["subject"], "m-test/a1");
+        assert_eq!(f["origin"]["kind"], "system");
+    }
+
+    #[tokio::test]
+    async fn subscribe_replays_from_since_and_filters() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        for (topic, subject) in [
+            ("agent.upsert", "m/a1"),
+            ("session.seen", "m/a1"),
+            ("agent.gone", "m/a2"),
+            ("agentx.y", "m/a2"),
+        ] {
+            let e = event(topic, subject, 0, 0);
+            db.write(move |tx| tx.emit(&e)).await.unwrap();
+        }
+        let since = format!("{}:{}:0", MACHINE, db.epoch());
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c
+            .call(
+                "t",
+                "events.subscribe",
+                json!({"since": since, "topics": ["agent.*"]}),
+            )
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        // Events of "t" may arrive before the response to "s".
+        c.send(
+            "s",
+            "events.subscribe",
+            json!({"since": since, "subjects": ["m/a2"]}),
+        )
+        .await;
+        let mut got = Vec::new();
+        while got.len() < 4 {
+            let f = c.next().await;
+            if f["type"] == "event" {
+                got.push((f["sub"].as_str().unwrap().to_string(), seq_of(&f)));
+            } else {
+                assert_eq!((&f["id"], &f["ok"]), (&json!("s"), &json!(true)), "{}", f);
+            }
+        }
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("s".to_string(), 3),
+                ("s".to_string(), 4),
+                ("t".to_string(), 1),
+                ("t".to_string(), 3)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_principal_may_read_the_store() {
+        let me = std::process::id() as libc::pid_t;
+        let parent = peer::proc_info(me).unwrap().ppid;
+        let start = peer::proc_info(parent).unwrap().start;
+        let agents = principal::tests::FakeAgents::one("a7", parent, start);
+        let (_t, ctx, _db) = ctx_db(Arc::new(agents));
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["principal"], "agent:a7");
+        assert_eq!(c.call("1", "snapshot.get", json!({})).await["ok"], true);
+        assert_eq!(c.call("2", "events.subscribe", json!({})).await["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn a_connection_holds_at_most_max_streams() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        for i in 0..MAX_STREAMS {
+            let r = c.call(&i.to_string(), "events.subscribe", json!({})).await;
+            assert_eq!(r["ok"], true, "{}", r);
+        }
+        let r = c.call("over", "events.subscribe", json!({})).await;
+        assert_eq!(r["error"]["code"], "rate_limited", "{}", r);
+        // The connection and its streams keep working.
+        assert_eq!(c.call("snap", "snapshot.get", json!({})).await["ok"], true);
+        emit(&db, 1, 0).await;
+        let f = c.next().await;
+        assert_eq!(f["type"], "event", "{}", f);
+    }
+
+    #[tokio::test]
+    async fn store_methods_need_hello_first() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let mut c = connect(ctx);
+        send(&mut c, json!({"v": 1, "id": "1", "method": "snapshot.get"})).await;
+        let got = read_all(c).await;
+        assert_eq!(got[0]["error"]["code"], "hello_required");
     }
 }

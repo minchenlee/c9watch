@@ -5,6 +5,7 @@
 //! error codes with a hint, and the `hello` handshake. Within major 1 every
 //! change is additive, so unknown fields are ignored on input.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
@@ -17,7 +18,7 @@ pub const MAX_FRAME: usize = 1 << 20;
 
 /// A request frame. Every field is optional on the wire, so that a frame
 /// with a missing field still gets an error that echoes its `id`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Request {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v: Option<u32>,
@@ -32,7 +33,7 @@ pub struct Request {
 }
 
 /// A response frame: `ok:true` with `result`, or `ok:false` with `error`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Response {
     pub v: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,7 +73,7 @@ impl Response {
 }
 
 /// The `error` object of a failed response.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorBody {
     pub code: ErrorCode,
     pub msg: String,
@@ -82,7 +83,7 @@ pub struct ErrorBody {
 
 /// Typed error codes. New codes are additive; a client that does not know a
 /// code still has `msg`, `retryable` and `hint`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     /// The client speaks another major version.
@@ -99,6 +100,12 @@ pub enum ErrorCode {
     UnknownMethod,
     /// The peer runs under another uid.
     PeerUidMismatch,
+    /// The cursor's events are gone: pruned, another epoch or machine, or
+    /// ahead of the log.
+    CursorExpired,
+    /// The caller is over a limit, such as the event streams per
+    /// connection.
+    RateLimited,
     /// An engine-side failure.
     Internal,
 }
@@ -113,6 +120,8 @@ impl ErrorCode {
             ErrorCode::BadRequest => "bad_request",
             ErrorCode::UnknownMethod => "unknown_method",
             ErrorCode::PeerUidMismatch => "peer_uid_mismatch",
+            ErrorCode::CursorExpired => "cursor_expired",
+            ErrorCode::RateLimited => "rate_limited",
             ErrorCode::Internal => "internal",
         }
     }
@@ -138,6 +147,13 @@ impl ErrorCode {
             }
             ErrorCode::UnknownMethod => "see `capabilities` in the hello result",
             ErrorCode::PeerUidMismatch => "connect as the user that runs the engine",
+            ErrorCode::CursorExpired => {
+                "call `snapshot.get`, then `events.subscribe` with the snapshot's cursor"
+            }
+            ErrorCode::RateLimited => {
+                "use fewer event streams per connection: one subscription with \
+                 topic and subject filters, or another connection"
+            }
             ErrorCode::Internal => "retry; if it persists, check the engine log",
         }
     }
@@ -178,7 +194,7 @@ impl From<ApiError> for ErrorBody {
 
 /// `hello` params. `client` is the caller's own claim. The engine only logs
 /// it as unverified; it never decides the principal (N1).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HelloParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,7 +206,7 @@ pub struct HelloParams {
 }
 
 /// What a client says about itself in `hello`. Unverified.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ClientInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
@@ -201,7 +217,7 @@ pub struct ClientInfo {
 }
 
 /// `hello` result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HelloResult {
     pub api_major: u32,
@@ -211,8 +227,105 @@ pub struct HelloResult {
     /// Stamped by the engine from connection facts.
     pub principal: String,
     pub capabilities: Vec<String>,
-    /// Current event cursor. `null` until the event store lands (M2).
+    /// Cursor of the newest committed event. `null` only without a store.
     pub cursor: Option<String>,
+}
+
+/// `snapshot.get` params. There are none yet; the engine ignores any it
+/// gets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotParams {}
+
+/// `snapshot.get` result: the state and the cursor it is consistent with.
+/// Subscribing with `since` = `cursor` continues with no gap.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotResult {
+    pub cursor: String,
+    pub machine_id: String,
+    pub agents: Vec<AgentRow>,
+}
+
+/// One row of the `agents` table (A:340), as `snapshot.get` sends it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRow {
+    /// `agt_<ulid>`.
+    pub id: String,
+    /// +1 on spawn, resume, refresh and takeover.
+    pub generation: i64,
+    /// `managed` or `free`; `null` for an observed agent.
+    pub mode: Option<String>,
+    /// `human`, `orch`, `worker` or `observed`.
+    pub role: String,
+    /// `pty` or `none`.
+    pub control: String,
+    /// The adapter kind: `claude`, `codex`, ...
+    pub provider: String,
+    /// The provider session id of the current generation.
+    pub provider_sid: Option<String>,
+    /// `detected`, `engine` or `legacy_import`.
+    pub source: String,
+    /// The principal that created the agent.
+    pub created_by: Option<String>,
+    /// Unix ms; `null` while the agent is alive.
+    pub gone_at: Option<i64>,
+    pub resume_count: i64,
+    pub interrupted_note_pending: bool,
+}
+
+/// `events.subscribe` params (A:218). Empty filters match everything.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscribeParams {
+    /// The last cursor the client has seen. Without it, the stream starts at
+    /// the current head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// Exact topics, or a prefix ending in `.*` (`agent.*`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<String>,
+    /// Exact subjects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+}
+
+/// `events.subscribe` result. Event frames follow it on the same
+/// connection until the connection closes, or until an error frame with
+/// the subscribe request's `id` (`cursor_expired` when the subscriber fell
+/// behind retention).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscribeResult {
+    /// Where the stream starts: events after this cursor follow.
+    pub cursor: String,
+}
+
+/// One event on the wire (A:203). `sub` is the `id` of the subscribe
+/// request, so a connection can carry several subscriptions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EventFrame {
+    pub v: u32,
+    #[serde(rename = "type")]
+    pub kind: EventType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
+    pub cursor: String,
+    pub topic: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub ts: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<serde_json::Value>,
+    pub data: serde_json::Value,
+}
+
+/// The `type` of an event frame. A response frame has no `type`, so a
+/// client tells the two apart by `type === "event"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum EventType {
+    #[serde(rename = "event")]
+    Event,
 }
 
 /// Why `read_frame` could not return a frame.
@@ -258,9 +371,18 @@ pub async fn read_frame<R: AsyncBufRead + Unpin>(
 
 /// Serialize `resp` as one NDJSON line.
 pub fn encode(resp: &Response) -> Vec<u8> {
-    // A `Response` holds only strings, numbers and JSON values, so
-    // serialization cannot fail.
-    let mut line = serde_json::to_vec(resp).expect("Response serializes");
+    encode_line(resp)
+}
+
+/// Serialize an event frame as one NDJSON line.
+pub fn encode_event(ev: &EventFrame) -> Vec<u8> {
+    encode_line(ev)
+}
+
+fn encode_line<T: Serialize>(v: &T) -> Vec<u8> {
+    // Frames hold only strings, numbers and JSON values, so serialization
+    // cannot fail.
+    let mut line = serde_json::to_vec(v).expect("frame serializes");
     line.push(b'\n');
     line
 }
@@ -347,6 +469,7 @@ mod tests {
             ErrorCode::BadRequest,
             ErrorCode::UnknownMethod,
             ErrorCode::PeerUidMismatch,
+            ErrorCode::CursorExpired,
             ErrorCode::Internal,
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), code.as_str());
