@@ -110,6 +110,14 @@ fn check_peer(stream: &UnixStream, me: u32) -> Result<(), Option<String>> {
 /// to shut down. Its shutdown kills every worker first.
 const LEGACY_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the Shutdown RPC to a pre-lock daemon may take.
+const LEGACY_SHUTDOWN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The longest a new daemon may spend retiring a pre-lock daemon before it
+/// binds. Clients wait longer than this (see `pm::DAEMON_READY_TIMEOUT`).
+pub(crate) const LEGACY_RETIRE_BUDGET: Duration =
+    Duration::from_secs(LEGACY_SHUTDOWN_RPC_TIMEOUT.as_secs() + LEGACY_EXIT_TIMEOUT.as_secs());
+
 /// Ask a daemon from before the lifetime lock (it never takes `daemon.lock`)
 /// to shut down, and wait for its pid to exit. Must run while holding the
 /// lock and before binding: the old daemon's shutdown deletes `daemon.sock`
@@ -129,7 +137,7 @@ fn retire_legacy_daemon(sock_path: &Path, pid_path: &Path) -> Result<(), String>
     if !alive(pid) {
         return Ok(());
     }
-    match crate::cli::pm_rpc::rpc_call(sock_path, &RpcRequest::Shutdown, Duration::from_secs(5)) {
+    match crate::cli::pm_rpc::rpc_call(sock_path, &RpcRequest::Shutdown, LEGACY_SHUTDOWN_RPC_TIMEOUT) {
         Err(e) if e.starts_with(crate::cli::pm_rpc::DAEMON_UNREACHABLE) => return Ok(()),
         Err(e) if e.starts_with(crate::cli::pm_rpc::DAEMON_UNTRUSTED) => return Err(e),
         // The old daemon exits without answering Shutdown, so any other

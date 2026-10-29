@@ -6,10 +6,12 @@ use std::time::Duration;
 
 // ── Daemon lifecycle ──────────────────────────────────────────────────
 
-/// How long a client waits for the daemon to become ready.
-/// Generous because a new daemon may first wait for a pre-lock daemon to
-/// shut down (see `pm_daemon::start_listener`).
-const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a client waits for the daemon to become ready. A new daemon may
+/// first spend up to `LEGACY_RETIRE_BUDGET` shutting down a pre-lock daemon
+/// (see `pm_daemon::start_listener`), so the client waits that long plus
+/// time to bind.
+const DAEMON_READY_TIMEOUT: Duration =
+    Duration::from_secs(super::pm_daemon::LEGACY_RETIRE_BUDGET.as_secs() + 5);
 
 /// Wait until the lock-holding daemon has marked itself ready and its socket
 /// accepts a connection. A socket file alone is not proof of a listener (a

@@ -331,10 +331,17 @@ pub fn mark_daemon_ready(lock: &File) -> Result<(), String> {
 }
 
 /// True once the daemon holding `path` has called `mark_daemon_ready`.
+///
+/// The mark is a pid, and it only counts while that pid is alive. A daemon
+/// that exited cleanly leaves its pid behind; until the next daemon takes
+/// the lock and truncates the file, that stale mark must not make a client
+/// talk to whatever answers the socket (for example a pre-lock daemon that
+/// the new one is about to retire).
 pub fn daemon_ready_marked(path: &Path) -> bool {
     std::fs::read_to_string(path)
-        .map(|c| !c.trim().is_empty())
-        .unwrap_or(false)
+        .ok()
+        .and_then(|c| c.trim().parse::<libc::pid_t>().ok())
+        .is_some_and(|pid| pid > 1 && unsafe { libc::kill(pid, 0) } == 0)
 }
 
 /// True when some process holds an exclusive flock on `path` (the daemon is
@@ -625,6 +632,24 @@ mod private_fs_tests {
         let d = tmpdir("missing");
         assert!(bind_private(&d.join("e.sock")).is_err());
         assert!(!d.exists());
+    }
+
+    #[test]
+    fn a_ready_mark_from_an_exited_daemon_is_not_ready() {
+        let d = tmpdir("stale-mark");
+        ensure_private_dir(&d).unwrap();
+        let p = d.join(DAEMON_LOCK_NAME);
+        // A daemon that exited cleanly leaves its pid in the lock file.
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let gone_pid = gone.id();
+        gone.wait().unwrap();
+        fs::write(&p, gone_pid.to_string()).unwrap();
+        assert!(!daemon_ready_marked(&p), "stale mark of pid {gone_pid}");
+        fs::write(&p, "not a pid").unwrap();
+        assert!(!daemon_ready_marked(&p));
+        fs::write(&p, std::process::id().to_string()).unwrap();
+        assert!(daemon_ready_marked(&p));
+        fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
