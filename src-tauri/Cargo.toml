@@ -40,6 +40,8 @@ cli = ["dep:clap", "dep:regex", "dep:tokio"]
 # Claude Code and Codex now provide native agent spawning, so this is excluded
 # from `default`. Build with `--features pm-orchestration` to expose it.
 pm-orchestration = ["cli"]
+# Agent engine (C1a). Empty for now; the engine code lands behind this flag.
+engine = ["cli"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
@@ -91,6 +93,11 @@ futures-util = { version = "0.3", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 notify-rust = { version = "4", optional = true }
+
+# Smaller dev and test builds: keep line tables for backtraces, drop full
+# debug info.
+[profile.dev]
+debug = "line-tables-only"
 
 [[example]]
 name = "notification_smoke"

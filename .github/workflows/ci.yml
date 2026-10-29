@@ -63,6 +63,11 @@ jobs:
           cargo test --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features cli
 
+      - name: Engine feature tests
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features engine
+
       - name: PM orchestration tests
         run: |
           cargo test --manifest-path src-tauri/Cargo.toml \
@@ -98,3 +103,8 @@ jobs:
         run: |
           cargo test --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features cli
+
+      - name: Engine feature tests
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features engine

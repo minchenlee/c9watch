@@ -109,6 +109,8 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Release channel: build.rs leaves cfg c9_channel_dev off.
+          C9WATCH_CHANNEL: prod
         run: npx tauri build --target ${{ matrix.target }}
 
       - name: Validate signed and notarized native bundle
@@ -231,6 +233,9 @@ jobs:
           workspaces: src-tauri -> target
 
       - name: Build CLI-only binary
+        env:
+          # Release channel: build.rs leaves cfg c9_channel_dev off.
+          C9WATCH_CHANNEL: prod
         run: |
           cargo build --release --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features cli \

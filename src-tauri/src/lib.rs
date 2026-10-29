@@ -32,6 +32,10 @@ pub mod ws_auth;
 #[cfg(feature = "cli")]
 pub mod cli;
 
+// ── Engine module (opt-in) ──────────────────────────────────────────
+#[cfg(feature = "engine")]
+pub mod engine;
+
 #[cfg(feature = "gui")]
 use actions::open_session as open_session_action;
 #[cfg(feature = "gui")]
