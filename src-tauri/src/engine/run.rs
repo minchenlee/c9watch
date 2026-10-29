@@ -211,12 +211,27 @@ pub async fn run_until(
     let deadline = tokio::time::Instant::now() + drain::HARD_DEADLINE;
     if sig == Some(ShutdownSignal::Term) {
         // Keep serving while the drain runs: hooks still come in, and get
-        // no context. A SIGINT or `stop` ends the drain early.
-        tokio::select! {
-            _ = &mut serving => eprintln!("[engine] The listener failed during the drain"),
-            _ = run_drain(&spawner) => {}
-            sig = signals.recv() => eprintln!("[engine] {:?} during the drain", sig),
-            _ = &mut stop => {}
+        // no context. A SIGINT or `stop` ends the drain early; another
+        // SIGTERM (a second `engine restart`) does not (reviews M3).
+        let drain = run_drain(&spawner);
+        tokio::pin!(drain);
+        loop {
+            tokio::select! {
+                _ = &mut serving => {
+                    eprintln!("[engine] The listener failed during the drain");
+                    break;
+                }
+                _ = &mut drain => break,
+                sig = signals.recv() => {
+                    if sig == ShutdownSignal::Term {
+                        eprintln!("[engine] SIGTERM again: still draining");
+                        continue;
+                    }
+                    eprintln!("[engine] {:?} during the drain", sig);
+                    break;
+                }
+                _ = &mut stop => break,
+            }
         }
     }
     eprintln!("[engine] Shutting down ({:?})", sig);

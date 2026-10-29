@@ -474,7 +474,11 @@ pub fn cmd_engine_run() -> Result<(), String> {
     let config = crate::engine::run::EngineConfig::new(engine_home()?)?;
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
-    rt.block_on(crate::engine::run::run(&config))
+    let done = rt.block_on(crate::engine::run::run(&config));
+    // The drain's hard deadline bounds the exit too: dropping the runtime
+    // would wait for a supervisor stuck in a kill (reviews L4).
+    rt.shutdown_timeout(Duration::from_secs(1));
+    done
 }
 
 /// `c9watch engine restart`
