@@ -21,9 +21,15 @@
 //! `peer_not_authorized`, and the refusal goes to the audit log. The main
 //! binary's `c9watch api` can therefore never send one. An authorized
 //! `hook.*` event then goes through `engine::hooks::intake` (kind,
-//! generation, dedupe, state merge; C1a-22).
+//! generation, dedupe, state merge; C1a-22). `hook.session_start` also
+//! answers with the standing orders (`engine::standing`, C1a-25).
+//!
+//! `agent.create` and `agent.retire` take only a local client
+//! (`local-unverified`); an agent gets `not_allowed`, which is audited. The
+//! work is in `engine::create` (C1a-26).
 
 use super::agent_bin::AgentBin;
+use super::create::Spawner;
 use super::db::audit::{self, AuditEntry};
 use super::db::outbox::{Cursor, Event, ReadError, Subscription, READ_BATCH};
 use super::db::{now_ms, AgentFilter, Db};
@@ -32,13 +38,16 @@ use super::merge::MergeTable;
 use super::peer::{self, PeerCred};
 use super::principal::{self, LiveAgents, NoLiveAgents, Principal};
 use super::proto::{
-    encode, encode_event, is_hook_class, read_frame, AgentListParams, AgentListResult, ApiError,
-    ErrorCode, EventFrame, EventType, FrameError, HandoffParams, HandoffResult, HelloParams,
-    HelloResult, HookParams, HookResult, Request, Response, SessionListParams, SessionListResult,
+    encode, encode_event, is_hook_class, read_frame, AgentCreateParams, AgentCreateResult,
+    AgentListParams, AgentListResult, AgentRetireParams, AgentRetireResult, ApiError, ErrorCode,
+    EventFrame, EventType, FrameError, HandoffParams, HandoffResult, HelloParams, HelloResult,
+    HookParams, HookResult, Request, Response, SessionListParams, SessionListResult,
     SnapshotParams, SnapshotResult, SubscribeParams, SubscribeResult, TaskDoneParams,
     TaskDoneResult, API_MAJOR, API_MINOR, HOOK_METHODS, MAX_FRAME,
 };
+use super::standing;
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -78,6 +87,12 @@ pub struct ServerCtx {
     pub db: Option<Arc<Db>>,
     /// The state merge of every live agent (C1a-22).
     pub merge: Arc<MergeTable>,
+    /// `<home>/standing-orders.md`, sent on `hook.session_start`. `None`
+    /// sends no orders.
+    pub standing_orders: Option<PathBuf>,
+    /// Free-agent create and retire (C1a-26). `None` answers
+    /// `experimental_disabled` to `agent.create`.
+    pub spawner: Option<Arc<Spawner>>,
 }
 
 impl ServerCtx {
@@ -92,6 +107,8 @@ impl ServerCtx {
             agent_bin: None,
             db: None,
             merge: Arc::new(MergeTable::new()),
+            standing_orders: None,
+            spawner: None,
         }
     }
 
@@ -108,6 +125,16 @@ impl ServerCtx {
 
     pub fn with_db(mut self, db: Arc<Db>) -> Self {
         self.db = Some(db);
+        self
+    }
+
+    pub fn with_standing_orders(mut self, path: PathBuf) -> Self {
+        self.standing_orders = Some(path);
+        self
+    }
+
+    pub fn with_spawner(mut self, spawner: Arc<Spawner>) -> Self {
+        self.spawner = Some(spawner);
         self
     }
 
@@ -281,7 +308,7 @@ async fn handle_frame(
         }
         Checked::Call(req, method) => {
             let id = req.id.clone();
-            match dispatch(&method, req, ctx, streams).await {
+            match dispatch(&method, req, ctx, peer, principal, streams).await {
                 Ok((result, stream)) => (Response::ok(id, result), Next::Continue, stream),
                 Err(e) => (Response::err(id, e), Next::Continue, None),
             }
@@ -375,6 +402,8 @@ pub const METHODS: &[&str] = &[
     "events.subscribe",
     "session.list",
     "agent.list",
+    "agent.create",
+    "agent.retire",
     "hook.session_start",
     "hook.stop",
     "hook.permission_request",
@@ -427,6 +456,14 @@ pub fn schema() -> serde_json::Value {
             "params": de.subschema_for::<AgentListParams>(),
             "result": ser.subschema_for::<AgentListResult>(),
         },
+        "agent.create": {
+            "params": de.subschema_for::<AgentCreateParams>(),
+            "result": ser.subschema_for::<AgentCreateResult>(),
+        },
+        "agent.retire": {
+            "params": de.subschema_for::<AgentRetireParams>(),
+            "result": ser.subschema_for::<AgentRetireResult>(),
+        },
         "task.done": {
             "params": de.subschema_for::<TaskDoneParams>(),
             "result": ser.subschema_for::<TaskDoneResult>(),
@@ -467,15 +504,26 @@ pub fn schema() -> serde_json::Value {
 }
 
 /// Methods after `hello`, except the hook-class ones. Both C1a principals,
-/// L and A, may call every method here (§1.1). `streams` is how many event
+/// L and A, may call every method here except `agent.create` and
+/// `agent.retire`, which take L only (§1.1). `streams` is how many event
 /// streams the connection holds.
 async fn dispatch(
     method: &str,
     req: Request,
     ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
     streams: usize,
 ) -> Result<(serde_json::Value, Option<EventStream>), ApiError> {
     match method {
+        "agent.create" => Ok((
+            agent_lifecycle(method, req, ctx, peer, principal).await?,
+            None,
+        )),
+        "agent.retire" => Ok((
+            agent_lifecycle(method, req, ctx, peer, principal).await?,
+            None,
+        )),
         "snapshot.get" => Ok((snapshot_get(ctx).await?, None)),
         "session.list" => Ok((session_list(ctx).await?, None)),
         "agent.list" => Ok((agent_list(req, ctx).await?, None)),
@@ -493,6 +541,91 @@ async fn dispatch(
             ErrorCode::UnknownMethod,
             format!("unknown method {:?}", method),
         )),
+    }
+}
+
+/// `agent.create` and `agent.retire` (C1a-26, `engine::create`). An agent
+/// principal's call is refused and audited. So is a `local-unverified`
+/// peer that fails `principal::check_mutating_peer`: an ancestry that does
+/// not reach init, a live agent's PTY child at any depth, or a sandbox.
+async fn agent_lifecycle(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+) -> Result<serde_json::Value, ApiError> {
+    let r = match check_local_peer(method, ctx, peer, principal).await {
+        Ok(()) => spawn_or_retire(method, req, ctx, principal).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = &r {
+        if e.code == ErrorCode::NotAllowed {
+            audit_refusal(ctx, principal, method, "", e).await;
+        }
+    }
+    r
+}
+
+/// Who may call `agent.create` or `agent.retire`: never an agent, also
+/// with the experimental switch off, so its attempt is audited; and a
+/// `local-unverified` peer only after the mutation check.
+async fn check_local_peer(
+    method: &str,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+) -> Result<(), ApiError> {
+    if *principal != Principal::LocalUnverified {
+        return Err(ApiError::new(
+            ErrorCode::NotAllowed,
+            format!("{} may not call {} in C1a", principal, method),
+        ));
+    }
+    let agents = ctx.agents.clone();
+    let checked = blocking(move || {
+        Ok(principal::check_mutating_peer(
+            peer.cred.pid,
+            peer.start,
+            agents.as_ref(),
+        ))
+    })
+    .await?;
+    checked.map_err(|why| {
+        ApiError::new(
+            ErrorCode::NotAllowed,
+            format!("{} refused for this peer: {}", method, why),
+        )
+    })
+}
+
+async fn spawn_or_retire(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    principal: &Principal,
+) -> Result<serde_json::Value, ApiError> {
+    let Some(spawner) = &ctx.spawner else {
+        return Err(match method {
+            "agent.create" => ApiError::new(
+                ErrorCode::ExperimentalDisabled,
+                "this engine cannot create agents",
+            ),
+            _ => ApiError::new(ErrorCode::Internal, "this engine runs no agents"),
+        });
+    };
+    if method == "agent.create" {
+        let agent = spawner.create(principal, req.params).await?;
+        Ok(
+            serde_json::to_value(AgentCreateResult { agent })
+                .expect("AgentCreateResult serializes"),
+        )
+    } else {
+        let agent = spawner.retire(principal, req.params).await?;
+        Ok(
+            serde_json::to_value(AgentRetireResult { agent })
+                .expect("AgentRetireResult serializes"),
+        )
     }
 }
 
@@ -564,35 +697,44 @@ async fn hook_class(
                     format!("{} is not an agent", principal),
                 ));
             };
-            let accepted = hook_intake(ctx, method, principal, *gen, params).await?;
-            // Standing orders for `hook.session_start` come with the spawn
-            // profile (M5).
+            let (outcome, additional_context) =
+                hook_intake(ctx, method, principal, *gen, params).await?;
             let result = HookResult {
-                accepted,
-                additional_context: None,
+                accepted: outcome == Outcome::Accepted,
+                additional_context,
             };
             Ok(serde_json::to_value(result).expect("HookResult serializes"))
         }
     }
 }
 
-/// Run an authorized `hook.*` event through the intake. Returns whether
-/// the engine took it; a dropped event is not an error (the hook must not
-/// fail).
+/// Run an authorized `hook.*` event through the intake. Returns the
+/// outcome, and for `hook.session_start` the context to send; a dropped
+/// event is not an error (the hook must not fail).
 async fn hook_intake(
     ctx: &ServerCtx,
     method: &str,
     principal: &Principal,
     gen: i64,
     params: HookParams,
-) -> Result<bool, ApiError> {
+) -> Result<(Outcome, Option<String>), ApiError> {
     let db = ctx.db()?.clone();
     let machine = ctx.machine_id.clone();
     let merge = ctx.merge.clone();
+    // The file is read before the write: no I/O inside the transaction.
+    let orders = match (&ctx.standing_orders, method) {
+        (Some(path), "hook.session_start") => {
+            let path = path.clone();
+            blocking(move || Ok(standing::read(&path))).await?
+        }
+        _ => None,
+    };
     // Read now, not at accept: a resume since then makes the event stale.
     let live_gen = ctx.agents.current_gen(&params.agent_id);
+    let agent_id = params.agent_id.clone();
+    let is_start = method == "hook.session_start";
     let (method, principal) = (method.to_string(), principal.to_string());
-    let (outcome, _) = db
+    let (answer, _) = db
         .write(move |tx| {
             let ev = HookEvent {
                 method: &method,
@@ -601,11 +743,23 @@ async fn hook_intake(
                 live_gen,
                 params: &params,
             };
-            hooks::intake(tx, &machine, &merge, &ev, now_ms())
+            if method == "hook.session_start" {
+                standing::session_start(tx, &machine, &merge, &ev, orders.as_deref(), now_ms())
+            } else {
+                hooks::intake(tx, &machine, &merge, &ev, now_ms()).map(|o| (o, None))
+            }
         })
         .await
         .map_err(internal)?;
-    Ok(outcome == Outcome::Accepted)
+    // A duplicate is the hook's retry: the start still happened.
+    let started = matches!(
+        answer.0,
+        Outcome::Accepted | Outcome::Dropped(hooks::DropReason::Duplicate)
+    );
+    if let (true, true, Some(spawner)) = (is_start, started, &ctx.spawner) {
+        spawner.session_started(&agent_id, gen);
+    }
+    Ok(answer)
 }
 
 /// The two facts a hook-class call needs: the principal is the agent the
@@ -956,6 +1110,8 @@ mod tests {
             agent_bin: None,
             db: None,
             merge: Arc::new(MergeTable::new()),
+            standing_orders: None,
+            spawner: None,
         })
     }
 
@@ -1269,6 +1425,11 @@ mod tests {
             if is_hook_class(m) {
                 // Served, but only to an agent (C1a-21).
                 assert_eq!(r["error"]["code"], "peer_not_authorized", "{}: {}", m, r);
+            } else if *m == "agent.create" {
+                // Off without the experimental switch (C1a-26).
+                assert_eq!(r["error"]["code"], "experimental_disabled", "{}: {}", m, r);
+            } else if *m == "agent.retire" {
+                assert_eq!(r["error"]["code"], "internal", "{}: {}", m, r);
             } else {
                 assert_eq!(r["ok"], true, "{}: {}", m, r);
             }
@@ -1290,6 +1451,8 @@ mod tests {
             agent_bin: None,
             db: Some(db.clone()),
             merge: Arc::new(MergeTable::new()),
+            standing_orders: None,
+            spawner: None,
         });
         (t, ctx, db)
     }
@@ -1705,6 +1868,29 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("no c9watch-agent"));
+    }
+
+    /// Reviews: an agent's create or retire is `not_allowed` and audited,
+    /// also on an engine that cannot create.
+    #[tokio::test]
+    async fn an_agent_may_not_create_or_retire_even_with_the_switch_off() {
+        let (_t, ctx, db) = ctx_db(as_agent("a7"));
+        let (mut c, _) = Client::new(ctx).await;
+        for (i, m) in ["agent.create", "agent.retire"].iter().enumerate() {
+            let r = c.call(&i.to_string(), m, json!({})).await;
+            assert_eq!(r["error"]["code"], "not_allowed", "{}: {}", m, r);
+        }
+        let rows: Vec<(String, String)> = audit_rows(&db)
+            .into_iter()
+            .map(|(p, m, _, _)| (p, m))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("agent:a7".to_string(), "agent.create".to_string()),
+                ("agent:a7".to_string(), "agent.retire".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]

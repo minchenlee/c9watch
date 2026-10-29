@@ -2,7 +2,30 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 2;
+export const C9P_API_MINOR = 3;
+
+/**
+ * `agent.create` params. C1a creates only free agents (A:794): no brief,
+ * no worktree, the given cwd.
+ */
+export interface C9pAgentCreateParams {
+  /** An absolute directory. The engine uses its realpath. */
+  cwd: string;
+  /** The adapter kind. Only `claude` in C1a. */
+  kind?: string;
+  /** `free`. `managed` comes in C1b and answers `unsupported_in_c1a`. */
+  mode: string;
+  /**
+   * A display name: letters, digits, `.`, `_` and `-`, unique among
+   * the live engine agents.
+   */
+  name?: string | null;
+}
+
+/** `agent.create` result: the agent once it is `ready`. */
+export interface C9pAgentCreateResult {
+  agent: C9pAgentRow;
+}
 
 /** `agent.list` params. */
 export interface C9pAgentListParams {
@@ -13,6 +36,20 @@ export interface C9pAgentListParams {
 /** `agent.list` result, in creation order. */
 export interface C9pAgentListResult {
   agents: C9pAgentRow[];
+}
+
+/** `agent.retire` params. */
+export interface C9pAgentRetireParams {
+  /** The agent id (`agt_<ulid>`). */
+  id: string;
+}
+
+/**
+ * `agent.retire` result: the tombstone row (A:828). Retiring a retired or
+ * failed agent changes nothing and returns its row.
+ */
+export interface C9pAgentRetireResult {
+  agent: C9pAgentRow;
 }
 
 /**
@@ -147,6 +184,28 @@ export type C9pErrorCode =
    * when the engine installed it.
    */
   | 'agent_bin_mismatch'
+  /**
+   * `agent.create` while the engine runs without
+   * `C9WATCH_EXPERIMENTAL_CREATE=1` (C1a).
+   */
+  | 'experimental_disabled'
+  /**
+   * The principal may not call this method (`agent.create` and
+   * `agent.retire` take only a local client in C1a).
+   */
+  | 'not_allowed'
+  /**
+   * The canonical cwd of a free agent is inside the engine home or a
+   * managed worktree home.
+   */
+  | 'cwd_collision'
+  /**
+   * The agent process exited, showed a vendor refusal (usage limit,
+   * login) or was not ready in time. The engine does not retry.
+   */
+  | 'spawn_failed'
+  /** No engine agent has this id. */
+  | 'unknown_agent'
   /** An engine-side failure. */
   | 'internal';
 
@@ -353,6 +412,10 @@ export interface C9pFrames {
 
 /** Each method's params and result (and event frames, for a subscription). */
 export interface C9pMethods {
+  'agent.create': {
+    params: C9pAgentCreateParams;
+    result: C9pAgentCreateResult;
+  };
   'agent.handoff': {
     params: C9pHandoffParams;
     result: C9pHandoffResult;
@@ -360,6 +423,10 @@ export interface C9pMethods {
   'agent.list': {
     params: C9pAgentListParams;
     result: C9pAgentListResult;
+  };
+  'agent.retire': {
+    params: C9pAgentRetireParams;
+    result: C9pAgentRetireResult;
   };
   'events.subscribe': {
     events: C9pEventFrame;

@@ -70,4 +70,13 @@ pub mod generation;
 pub mod hooks;
 
 #[cfg(unix)]
+pub mod standing;
+
+#[cfg(unix)]
+pub mod ops;
+
+#[cfg(unix)]
+pub mod create;
+
+#[cfg(unix)]
 pub mod run;

@@ -17,6 +17,7 @@ use c9watch_lib::engine::home::{sock_path, ENGINE_HOME_ENV};
 use c9watch_lib::engine::pty::NativePty;
 use c9watch_lib::engine::run::{run_until, EngineConfig};
 use c9watch_lib::engine_proto::client::Conn;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -47,6 +48,8 @@ impl Engine {
             agent_source: PathBuf::from(AGENT),
             agents: agents.clone(),
             detection: false,
+            experimental_create: false,
+            claude: None,
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let thread = std::thread::spawn(move || {
@@ -249,6 +252,77 @@ fn an_accepted_hook_moves_the_agent_row() {
     assert!(engine.denials().is_empty(), "{:?}", engine.denials());
 }
 
+/// C1a-25: `hook session-start` prints the standing orders from
+/// `<home>/standing-orders.md` as CC's `additionalContext`, and after an
+/// interrupt the note goes out once.
+#[test]
+fn session_start_prints_the_standing_orders() {
+    let engine = Engine::start();
+    let orders = engine.home.join("standing-orders.md");
+    let default = std::fs::read_to_string(&orders).unwrap();
+    assert!(default.contains("{{agent_id}}"), "{}", default);
+    std::fs::write(&orders, "Orders for {{agent_id}}.\n").unwrap();
+    let db = rusqlite::Connection::open(db_path(&engine.home)).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    db.execute(
+        "INSERT INTO agents (id, generation, mode, role, control, provider, provider_sid, \
+         source, state, interrupted_note_pending) VALUES (?1, 1, 'free', 'worker', 'pty', \
+         'claudeCode', 's1', 'engine', 'ready', 1)",
+        [AGENT_ID],
+    )
+    .unwrap();
+    let pending = || -> i64 {
+        db.query_row(
+            "SELECT interrupted_note_pending FROM agents WHERE id = ?1",
+            [AGENT_ID],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    warm_up_agent();
+    let bin = q(&engine.copy());
+    // The hook gives up after 4 s, and a slow runner could still miss
+    // that: run it until it prints. Each run is a new event (a new seq).
+    // Returns the output, the context and how many runs it took.
+    let context = |source: &str| -> (String, Value, usize) {
+        let cmd = format!(
+            "echo '{{\"session_id\":\"s1\",\"source\":\"{}\"}}' | {} hook session-start",
+            source, bin
+        );
+        let mut last = String::new();
+        for run in 1..=10 {
+            let (out, rc) = as_agent(&engine, &cmd, true);
+            assert_eq!(rc, 0, "{}", out);
+            if let Some(line) = out.lines().find(|l| l.contains("hookSpecificOutput")) {
+                let v: Value = serde_json::from_str(line.trim()).unwrap();
+                let ctx = v["hookSpecificOutput"]["additionalContext"].clone();
+                assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+                return (out, ctx, run);
+            }
+            last = out;
+        }
+        panic!("no context in 10 runs; last {:?}", last);
+    };
+    // A compaction does not take the note; the next start does, once.
+    let (out, ctx, _) = context("compact");
+    assert_eq!(ctx, "Orders for agt_t.\n", "{}", out);
+    assert_eq!(pending(), 1);
+    let (out, ctx, runs) = context("resume");
+    assert_eq!(pending(), 0, "{}", out);
+    // Always on the first run that prints: an earlier run that timed out
+    // would have taken the note without printing it.
+    assert_eq!(
+        ctx, "Orders for agt_t.\n\nYou were interrupted; check `git status` first.\n",
+        "{} run(s): {}",
+        runs, out
+    );
+    let (out, ctx, _) = context("startup");
+    assert_eq!(ctx, "Orders for agt_t.\n", "{}", out);
+    let (out, ctx, _) = context("compact");
+    assert_eq!(ctx, "Orders for agt_t.\n", "{}", out);
+    assert!(engine.denials().is_empty(), "{:?}", engine.denials());
+}
+
 #[test]
 fn the_copy_outside_a_live_agent_is_refused() {
     let engine = Engine::start();
@@ -311,6 +385,63 @@ fn an_agent_running_another_binary_is_refused() {
             (agent, "hook.stop".to_string()),
         ]
     );
+}
+
+/// Security review H1: `local-unverified` may retire (and create), but not
+/// from deeper than the stamp looks under a live agent, nor from a sandbox.
+#[test]
+fn a_nested_or_sandboxed_local_peer_may_not_retire() {
+    let engine = Engine::start();
+    let api = format!(
+        "env -u C9_AGENT_ID {}={} {} api agent.retire '{{\"id\":\"agt_none\"}}'",
+        ENGINE_HOME_ENV,
+        q(&engine.home),
+        q(Path::new(MAIN))
+    );
+    // Outside any agent: the call goes through to the unknown id.
+    let (out, rc) = as_agent(&engine, &api, false);
+    assert_eq!(rc, 1, "{}", out);
+    assert!(out.contains("unknown_agent"), "{}", out);
+    // 14 shells under the live agent's PTY child: the stamp walks only 10
+    // levels and says local-unverified, the mutation check walks them all.
+    let nest = engine.dir.path().join("nest.sh");
+    std::fs::write(
+        &nest,
+        format!(
+            "if [ \"$1\" -gt 0 ]; then /bin/sh \"$0\" $(($1 - 1)); rc=$?; exit $rc; fi\n{}\n",
+            api
+        ),
+    )
+    .unwrap();
+    let (out, rc) = as_agent(&engine, &format!("/bin/sh {} 14", q(&nest)), true);
+    assert_eq!(rc, 1, "{}", out);
+    assert!(out.contains("not_allowed"), "{}", out);
+    assert!(out.contains("agent:agt_t"), "{}", out);
+    let mut want = 1;
+    // A sandboxed peer, as an agent's Bash or anything it left behind.
+    if cfg!(target_os = "macos") {
+        let (out, rc) = as_agent(
+            &engine,
+            &format!(
+                "/usr/bin/sandbox-exec -p '(version 1)(allow default)' /bin/sh -c {}",
+                q(Path::new(&api))
+            ),
+            false,
+        );
+        assert_eq!(rc, 1, "{}", out);
+        if out.contains("not_allowed") {
+            assert!(out.contains("sandbox"), "{}", out);
+            want += 1;
+        } else {
+            // sandbox-exec cannot nest inside a sandboxed test run.
+            eprintln!("skip: sandbox-exec did not run: {}", out);
+        }
+    }
+    let denials = engine.denials();
+    assert_eq!(denials.len(), want, "{:?}", denials);
+    assert!(denials
+        .iter()
+        .all(|(p, m)| p == "local-unverified" && m == "agent.retire"));
 }
 
 #[test]

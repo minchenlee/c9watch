@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
 /// Protocol minor version. Raised for additive changes.
-pub const API_MINOR: u32 = 2;
+pub const API_MINOR: u32 = 3;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -127,6 +127,20 @@ pub enum ErrorCode {
     /// The engine's `c9watch-agent` copy no longer has the sha256 it had
     /// when the engine installed it.
     AgentBinMismatch,
+    /// `agent.create` while the engine runs without
+    /// `C9WATCH_EXPERIMENTAL_CREATE=1` (C1a).
+    ExperimentalDisabled,
+    /// The principal may not call this method (`agent.create` and
+    /// `agent.retire` take only a local client in C1a).
+    NotAllowed,
+    /// The canonical cwd of a free agent is inside the engine home or a
+    /// managed worktree home.
+    CwdCollision,
+    /// The agent process exited, showed a vendor refusal (usage limit,
+    /// login) or was not ready in time. The engine does not retry.
+    SpawnFailed,
+    /// No engine agent has this id.
+    UnknownAgent,
     /// An engine-side failure.
     Internal,
 }
@@ -148,6 +162,11 @@ impl ErrorCode {
             ErrorCode::UnsupportedInC1a => "unsupported_in_c1a",
             ErrorCode::AgentBinMissing => "agent_bin_missing",
             ErrorCode::AgentBinMismatch => "agent_bin_mismatch",
+            ErrorCode::ExperimentalDisabled => "experimental_disabled",
+            ErrorCode::NotAllowed => "not_allowed",
+            ErrorCode::CwdCollision => "cwd_collision",
+            ErrorCode::SpawnFailed => "spawn_failed",
+            ErrorCode::UnknownAgent => "unknown_agent",
             ErrorCode::Internal => "internal",
         }
     }
@@ -194,6 +213,17 @@ impl ErrorCode {
                 "`c9watch engine restart` copies c9watch-agent again; check what changed \
                  the engine's copy"
             }
+            ErrorCode::ExperimentalDisabled => {
+                "restart the engine with C9WATCH_EXPERIMENTAL_CREATE=1 to try agent creation"
+            }
+            ErrorCode::NotAllowed => "call this from the CLI or the GUI, not from an agent",
+            ErrorCode::CwdCollision => {
+                "pick a cwd outside the engine home and outside `.c9watch/worktrees`"
+            }
+            ErrorCode::SpawnFailed => {
+                "read the vendor text in `msg` (usage limit, login), fix it, then create again"
+            }
+            ErrorCode::UnknownAgent => "see `agent.list` with `all` for the agent ids",
             ErrorCode::Internal => "retry; if it persists, check the engine log",
         }
     }
@@ -375,6 +405,52 @@ pub struct AgentListParams {
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AgentListResult {
     pub agents: Vec<AgentRow>,
+}
+
+/// `agent.create` params. C1a creates only free agents (A:794): no brief,
+/// no worktree, the given cwd.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCreateParams {
+    /// The adapter kind. Only `claude` in C1a.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// `free`. `managed` comes in C1b and answers `unsupported_in_c1a`.
+    pub mode: String,
+    /// An absolute directory. The engine uses its realpath.
+    pub cwd: String,
+    /// A display name: letters, digits, `.`, `_` and `-`, unique among
+    /// the live engine agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+fn default_kind() -> String {
+    "claude".into()
+}
+
+/// `agent.create` result: the agent once it is `ready`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct AgentCreateResult {
+    pub agent: AgentRow,
+}
+
+/// `agent.retire` params.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct AgentRetireParams {
+    /// The agent id (`agt_<ulid>`).
+    pub id: String,
+}
+
+/// `agent.retire` result: the tombstone row (A:828). Retiring a retired or
+/// failed agent changes nothing and returns its row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct AgentRetireResult {
+    pub agent: AgentRow,
 }
 
 /// `events.subscribe` params (A:218). Empty filters match everything.

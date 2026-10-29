@@ -153,6 +153,11 @@ mod tests {
             ErrorCode::UnsupportedInC1a,
             ErrorCode::AgentBinMissing,
             ErrorCode::AgentBinMismatch,
+            ErrorCode::ExperimentalDisabled,
+            ErrorCode::NotAllowed,
+            ErrorCode::CwdCollision,
+            ErrorCode::SpawnFailed,
+            ErrorCode::UnknownAgent,
             ErrorCode::Internal,
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), code.as_str());

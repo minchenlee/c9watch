@@ -1,5 +1,47 @@
 {
   "$defs": {
+    "AgentCreateParams": {
+      "description": "`agent.create` params. C1a creates only free agents (A:794): no brief,\nno worktree, the given cwd.",
+      "properties": {
+        "cwd": {
+          "description": "An absolute directory. The engine uses its realpath.",
+          "type": "string"
+        },
+        "kind": {
+          "default": "claude",
+          "description": "The adapter kind. Only `claude` in C1a.",
+          "type": "string"
+        },
+        "mode": {
+          "description": "`free`. `managed` comes in C1b and answers `unsupported_in_c1a`.",
+          "type": "string"
+        },
+        "name": {
+          "description": "A display name: letters, digits, `.`, `_` and `-`, unique among\nthe live engine agents.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "mode",
+        "cwd"
+      ],
+      "type": "object"
+    },
+    "AgentCreateResult": {
+      "description": "`agent.create` result: the agent once it is `ready`.",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/AgentRow"
+        }
+      },
+      "required": [
+        "agent"
+      ],
+      "type": "object"
+    },
     "AgentListParams": {
       "description": "`agent.list` params.",
       "properties": {
@@ -23,6 +65,31 @@
       },
       "required": [
         "agents"
+      ],
+      "type": "object"
+    },
+    "AgentRetireParams": {
+      "description": "`agent.retire` params.",
+      "properties": {
+        "id": {
+          "description": "The agent id (`agt_<ulid>`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "AgentRetireResult": {
+      "description": "`agent.retire` result: the tombstone row (A:828). Retiring a retired or\nfailed agent changes nothing and returns its row.",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/AgentRow"
+        }
+      },
+      "required": [
+        "agent"
       ],
       "type": "object"
     },
@@ -316,6 +383,31 @@
         {
           "const": "agent_bin_mismatch",
           "description": "The engine's `c9watch-agent` copy no longer has the sha256 it had\nwhen the engine installed it.",
+          "type": "string"
+        },
+        {
+          "const": "experimental_disabled",
+          "description": "`agent.create` while the engine runs without\n`C9WATCH_EXPERIMENTAL_CREATE=1` (C1a).",
+          "type": "string"
+        },
+        {
+          "const": "not_allowed",
+          "description": "The principal may not call this method (`agent.create` and\n`agent.retire` take only a local client in C1a).",
+          "type": "string"
+        },
+        {
+          "const": "cwd_collision",
+          "description": "The canonical cwd of a free agent is inside the engine home or a\nmanaged worktree home.",
+          "type": "string"
+        },
+        {
+          "const": "spawn_failed",
+          "description": "The agent process exited, showed a vendor refusal (usage limit,\nlogin) or was not ready in time. The engine does not retry.",
+          "type": "string"
+        },
+        {
+          "const": "unknown_agent",
+          "description": "No engine agent has this id.",
           "type": "string"
         },
         {
@@ -740,7 +832,7 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
-  "apiMinor": 2,
+  "apiMinor": 3,
   "description": "The c9watch engine protocol: one JSON object per line over the engine socket. Within a major version every change is additive.",
   "frames": {
     "event": {
@@ -754,6 +846,14 @@
     }
   },
   "methods": {
+    "agent.create": {
+      "params": {
+        "$ref": "#/$defs/AgentCreateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AgentCreateResult"
+      }
+    },
     "agent.handoff": {
       "params": {
         "$ref": "#/$defs/HandoffParams"
@@ -768,6 +868,14 @@
       },
       "result": {
         "$ref": "#/$defs/AgentListResult"
+      }
+    },
+    "agent.retire": {
+      "params": {
+        "$ref": "#/$defs/AgentRetireParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AgentRetireResult"
       }
     },
     "events.subscribe": {

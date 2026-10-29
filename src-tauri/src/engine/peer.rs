@@ -253,6 +253,67 @@ pub fn ancestry(pid: libc::pid_t, max: usize) -> Vec<ProcInfo> {
     out
 }
 
+/// How many levels `full_ancestry` walks at most: a bound against a loop,
+/// not a policy.
+const MAX_FULL_ANCESTRY: usize = 1024;
+
+/// The whole chain from `pid` up to a child of init, `pid` first, or `None`
+/// when the walk stopped before it got there (an unreadable parent, a
+/// reused pid, the bound). A mutating call needs the whole chain: a peer
+/// that nests itself deeper than `MAX_ANCESTRY` must not look unrelated
+/// to the agent it runs under.
+pub fn full_ancestry(pid: libc::pid_t) -> Option<Vec<ProcInfo>> {
+    let chain = ancestry(pid, MAX_FULL_ANCESTRY);
+    match chain.last() {
+        Some(last) if last.ppid <= 1 => Some(chain),
+        _ => None,
+    }
+}
+
+/// Whether `pid` runs confined in a way the engine does not: a CC agent's
+/// Bash runs under the vendor sandbox, and so does everything it starts,
+/// even a process that `setsid`/`nohup` moved under init. `None` when it
+/// cannot be told.
+///
+/// macOS: `sandbox_check(pid, NULL, SANDBOX_FILTER_NONE)` (Seatbelt; a
+/// gone pid reads as sandboxed). An engine that itself runs sandboxed
+/// treats a sandboxed peer as its equal.
+#[cfg(target_os = "macos")]
+pub fn confined(pid: libc::pid_t) -> Option<bool> {
+    extern "C" {
+        fn sandbox_check(
+            pid: libc::pid_t,
+            operation: *const libc::c_char,
+            filter_type: libc::c_int,
+            ...
+        ) -> libc::c_int;
+    }
+    // SANDBOX_FILTER_NONE
+    let check = |p: libc::pid_t| unsafe { sandbox_check(p, std::ptr::null(), 0) } != 0;
+    if pid <= 0 {
+        return None;
+    }
+    Some(check(pid) && !check(std::process::id() as libc::pid_t))
+}
+
+/// Whether `pid` runs confined in a way the engine does not. Linux: the
+/// vendor sandbox (bubblewrap) gives it its own mount namespace, so a peer
+/// in another mount namespace than the engine is confined. `None` when it
+/// cannot be told.
+#[cfg(target_os = "linux")]
+pub fn confined(pid: libc::pid_t) -> Option<bool> {
+    if pid <= 0 {
+        return None;
+    }
+    let ns = |p: &str| std::fs::read_link(format!("/proc/{}/ns/mnt", p)).ok();
+    Some(ns(&pid.to_string())? != ns("self")?)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn confined(_pid: libc::pid_t) -> Option<bool> {
+    None
+}
+
 /// The executable `pid` runs. C1a-21 checks it against
 /// `<home>/bin/c9watch-agent`. On Linux a replaced or deleted file reads as
 /// `<path> (deleted)`, which never equals the expected path.
@@ -331,6 +392,52 @@ mod tests {
         assert!(chain.iter().all(|p| p.start > 0));
         // The same process read twice has the same start time.
         assert_eq!(proc_info(me).unwrap().start, chain[0].start);
+    }
+
+    #[test]
+    fn full_ancestry_of_the_test_process_reaches_init() {
+        let chain = full_ancestry(my_pid()).expect("a complete chain");
+        assert_eq!(chain[0].pid, my_pid());
+        assert!(chain.last().unwrap().ppid <= 1, "{:?}", chain);
+        assert!(full_ancestry(-1).is_none());
+    }
+
+    #[test]
+    fn the_test_process_is_not_confined() {
+        assert_eq!(confined(my_pid()), Some(false));
+        assert_eq!(confined(0), None);
+    }
+
+    /// A process under a Seatbelt profile is confined, also after it was
+    /// moved under init; the engine is not.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sandboxed_process_is_confined() {
+        let mut child = match std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/bin/sleep", "30"])
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skip: no sandbox-exec: {}", e);
+                return;
+            }
+        };
+        let pid = child.id() as libc::pid_t;
+        // sandbox-exec applies the profile and then execs sleep.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut got = confined(pid);
+        while got != Some(true) && std::time::Instant::now() < deadline {
+            if let Ok(Some(st)) = child.try_wait() {
+                eprintln!("skip: sandbox-exec exited ({}); nested sandbox?", st);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            got = confined(pid);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(got, Some(true));
     }
 
     #[test]
