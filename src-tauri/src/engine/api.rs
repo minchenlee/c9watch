@@ -188,12 +188,10 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
 
     // Stamp at accept, not at `hello`: the peer pid is then as fresh as it
     // gets, and a late `hello` cannot wait for the pid to be reused.
-    let principal = principal::stamp_peer(cred.pid, accepted, ctx.agents.as_ref());
-    // The peer's start time, so a later exe check reads the same process.
-    let peer = Peer {
-        cred,
-        start: peer::proc_info(cred.pid).map(|p| p.start),
-    };
+    // The peer's start time comes from the same read as the principal, so
+    // a later exe check reads the process the principal came from.
+    let (principal, start) = principal::stamp_peer(cred.pid, accepted, ctx.agents.as_ref());
+    let peer = Peer { cred, start };
 
     let mut reader = BufReader::new(read);
     let mut conn: Option<Conn> = None;

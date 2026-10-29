@@ -43,7 +43,10 @@ impl LiveTable {
     /// Make `gen` with PTY child `child` the current generation of
     /// `agent_id`. It replaces an older generation, whose processes stop
     /// being the agent at once. Fails when `gen` is not newer than the
-    /// current one, or when another live agent has the same PTY child.
+    /// current one, or when another live agent has the same PTY child (pid
+    /// and start time). Another agent's row with the same pid and an older
+    /// start time is stale: that child is gone and its pid was reused, so
+    /// the row goes.
     pub fn register(&self, agent_id: &str, gen: i64, child: ChildId) -> Result<(), String> {
         let mut map = self.by_agent.write().unwrap_or_else(|e| e.into_inner());
         if let Some(cur) = map.get(agent_id) {
@@ -56,13 +59,14 @@ impl LiveTable {
         }
         if let Some((other, _)) = map
             .iter()
-            .find(|(id, g)| id.as_str() != agent_id && g.pty_child.pid == child.pid)
+            .find(|(id, g)| id.as_str() != agent_id && g.pty_child == child)
         {
             return Err(format!(
                 "pid {} is already the PTY child of {}",
                 child.pid, other
             ));
         }
+        map.retain(|id, g| id == agent_id || g.pty_child.pid != child.pid);
         map.insert(
             agent_id.to_string(),
             Generation {
@@ -105,10 +109,10 @@ impl LiveTable {
 }
 
 impl LiveAgents for LiveTable {
-    fn by_pty_child(&self, pid: libc::pid_t) -> Option<LiveAgent> {
+    fn by_pty_child(&self, pid: libc::pid_t, start: u64) -> Option<LiveAgent> {
         let map = self.by_agent.read().unwrap_or_else(|e| e.into_inner());
         map.iter()
-            .find(|(_, g)| g.pty_child.pid == pid)
+            .find(|(_, g)| g.pty_child.pid == pid && g.pty_child.start == start)
             .map(|(id, g)| LiveAgent {
                 id: id.clone(),
                 gen: g.gen,
@@ -170,7 +174,7 @@ mod tests {
     }
 
     fn stamp(pid: libc::pid_t, table: &LiveTable) -> Principal {
-        stamp_peer(pid, peer::start_token_now(), table)
+        stamp_peer(pid, peer::start_token_now(), table).0
     }
 
     #[test]
@@ -254,9 +258,16 @@ mod tests {
             })
         );
         // The old PTY child of a1 is free again.
-        assert!(table.by_pty_child(10).is_none());
-        assert_eq!(table.by_pty_child(11).unwrap().gen, 3);
+        assert!(table.by_pty_child(10, 100).is_none());
+        assert_eq!(table.by_pty_child(11, 110).unwrap().gen, 3);
+        assert!(table.by_pty_child(11, 111).is_none());
         assert_eq!(table.len(), 2);
+        // a2's child 12 died and its pid went to a3's new child: the stale
+        // row goes, and a3 gets the pid.
+        table.register("a3", 1, child(12, 125)).unwrap();
+        assert!(table.current("a2").is_none());
+        assert_eq!(table.by_pty_child(12, 125).unwrap().id, "a3");
+        table.register("a2", 1, child(13, 130)).unwrap();
         assert!(table.unregister("a2", 1));
         assert!(!table.unregister("a2", 1));
         assert!(table.current("a2").is_none());

@@ -57,9 +57,10 @@ pub struct LiveAgent {
 /// with its live table (`engine::agents::LiveTable`); `NoLiveAgents` serves
 /// tests of the connection layer.
 pub trait LiveAgents: Send + Sync {
-    /// The live agent whose PTY child has `pid`, if any. The caller checks
-    /// the start time.
-    fn by_pty_child(&self, pid: libc::pid_t) -> Option<LiveAgent>;
+    /// The live agent whose PTY child has `pid` and started at `start`, if
+    /// any. A row with the same pid and another start time is a reused pid
+    /// and does not match.
+    fn by_pty_child(&self, pid: libc::pid_t, start: u64) -> Option<LiveAgent>;
 
     /// The current generation of `agent_id`, if it is live. A hook event
     /// stamped with another generation is stale (C1a-22).
@@ -70,7 +71,7 @@ pub trait LiveAgents: Send + Sync {
 pub struct NoLiveAgents;
 
 impl LiveAgents for NoLiveAgents {
-    fn by_pty_child(&self, _pid: libc::pid_t) -> Option<LiveAgent> {
+    fn by_pty_child(&self, _pid: libc::pid_t, _start: u64) -> Option<LiveAgent> {
         None
     }
 
@@ -84,13 +85,11 @@ impl LiveAgents for NoLiveAgents {
 /// whose start time differs was reused and does not count.
 pub fn stamp(chain: &[ProcInfo], agents: &dyn LiveAgents) -> Principal {
     for p in chain.iter().take(MAX_ANCESTRY) {
-        if let Some(agent) = agents.by_pty_child(p.pid) {
-            if agent.pty_child_start == p.start {
-                return Principal::Agent {
-                    id: agent.id,
-                    gen: agent.gen,
-                };
-            }
+        if let Some(agent) = agents.by_pty_child(p.pid, p.start) {
+            return Principal::Agent {
+                id: agent.id,
+                gen: agent.gen,
+            };
         }
     }
     Principal::LocalUnverified
@@ -101,11 +100,19 @@ pub fn stamp(chain: &[ProcInfo], agents: &dyn LiveAgents) -> Principal {
 /// it holds a reused pid, not the process that connected, and is
 /// `local-unverified`; so is every peer when the clock could not be read.
 /// This does not catch a reuse between connect and accept.
-pub fn stamp_peer(pid: libc::pid_t, accepted: Option<u64>, agents: &dyn LiveAgents) -> Principal {
+///
+/// Also returns the peer's start time from the same read, so a later check
+/// of the peer (its exe) is tied to the process the principal came from.
+pub fn stamp_peer(
+    pid: libc::pid_t,
+    accepted: Option<u64>,
+    agents: &dyn LiveAgents,
+) -> (Principal, Option<u64>) {
     let chain = peer::ancestry(pid, MAX_ANCESTRY);
-    match (chain.first(), accepted) {
-        (Some(first), Some(at)) if first.start <= at => stamp(&chain, agents),
-        _ => Principal::LocalUnverified,
+    let start = chain.first().map(|p| p.start);
+    match (start, accepted) {
+        (Some(first), Some(at)) if first <= at => (stamp(&chain, agents), start),
+        _ => (Principal::LocalUnverified, start),
     }
 }
 
@@ -132,8 +139,11 @@ pub(crate) mod tests {
     }
 
     impl LiveAgents for FakeAgents {
-        fn by_pty_child(&self, pid: libc::pid_t) -> Option<LiveAgent> {
-            self.0.get(&pid).cloned()
+        fn by_pty_child(&self, pid: libc::pid_t, start: u64) -> Option<LiveAgent> {
+            self.0
+                .get(&pid)
+                .filter(|a| a.pty_child_start == start)
+                .cloned()
         }
 
         fn current_gen(&self, agent_id: &str) -> Option<i64> {
@@ -211,13 +221,13 @@ pub(crate) mod tests {
         let pstart = peer::proc_info(parent).unwrap().start;
         let now = peer::start_token_now();
         let agents = FakeAgents::one("p", parent, pstart);
-        assert_eq!(stamp_peer(me, now, &agents), agent("p"));
+        assert_eq!(stamp_peer(me, now, &agents).0, agent("p"));
         assert_eq!(
-            stamp_peer(me, now, &FakeAgents::one("p", parent, pstart + 1)),
+            stamp_peer(me, now, &FakeAgents::one("p", parent, pstart + 1)).0,
             Principal::LocalUnverified
         );
         assert_eq!(
-            stamp_peer(me, now, &NoLiveAgents),
+            stamp_peer(me, now, &NoLiveAgents).0,
             Principal::LocalUnverified
         );
     }
@@ -229,11 +239,14 @@ pub(crate) mod tests {
         let agents = FakeAgents::one("p", mine.ppid, peer::proc_info(mine.ppid).unwrap().start);
         // Accepted just before we started: our pid would be a reused one.
         assert_eq!(
-            stamp_peer(me, Some(mine.start - 1), &agents),
+            stamp_peer(me, Some(mine.start - 1), &agents).0,
             Principal::LocalUnverified
         );
-        assert_eq!(stamp_peer(me, None, &agents), Principal::LocalUnverified);
-        assert_eq!(stamp_peer(me, Some(mine.start), &agents), agent("p"));
+        assert_eq!(stamp_peer(me, None, &agents).0, Principal::LocalUnverified);
+        assert_eq!(stamp_peer(me, Some(mine.start), &agents).0, agent("p"));
+        // The start time comes back from the same read, even when refused.
+        assert_eq!(stamp_peer(me, None, &agents).1, Some(mine.start));
+        assert_eq!(stamp_peer(-1, None, &agents).1, None);
     }
 
     #[test]
