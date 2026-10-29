@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { browser } from '$app/environment';
-	import { deepSearchSessions, getConversation } from '$lib/api';
-	import { toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
+	import { deepSearchSessions } from '$lib/api';
+	import { acceptsConversation, loadPreviewConversation } from '$lib/stores/conversation-loader';
 	import type { HistoryEntry, Conversation, DeepSearchHit } from '$lib/types';
 	import HistoryCardOverlay from './HistoryCardOverlay.svelte';
 	import { flyIn } from '$lib/transitions';
@@ -221,19 +221,9 @@
 		const requestId = ++conversationRequestId;
 		selectedEntry = entry;
 		conversation = null;
-		toolsLoadedFor.set(null);
-		try {
-			const requestedKey = entryKey(entry);
-			const conv = await withConversationLoader(entry.sessionId, entry.provider, 'conversation', () =>
-				getConversation(entry.sessionId, entry.provider, false)
-			);
-			if (requestId !== conversationRequestId) return;
-			if ($toolsLoadedFor === requestedKey) return;
-			if (providerSessionKey(conv.provider ?? entry.provider, conv.sessionId) !== requestedKey) return;
+		await loadPreviewConversation(entry, () => requestId === conversationRequestId, (conv) => {
 			conversation = conv;
-		} catch (e) {
-			if (requestId === conversationRequestId) console.error('Failed to load conversation:', e);
-		}
+		});
 	}
 
 	function handleCloseConversation() {
@@ -451,11 +441,7 @@
 		searchQuery={query.trim() && deepSearchResults?.has(entryKey(selectedEntry)) ? query.trim() : undefined}
 		onclose={handleCloseConversation}
 		onconversation={(conv) => {
-			if (
-				selectedEntry &&
-				providerSessionKey(selectedEntry.provider, selectedEntry.sessionId) ===
-					providerSessionKey(conv.provider, conv.sessionId)
-			) conversation = conv;
+			if (acceptsConversation(selectedEntry, conv)) conversation = conv;
 		}}
 	/>
 {/if}

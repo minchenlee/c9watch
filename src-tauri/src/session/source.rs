@@ -51,6 +51,48 @@ pub enum SessionProvider {
     Opencode,
 }
 
+impl SessionProvider {
+    /// Every provider, in declaration order.
+    pub(crate) const ALL: [SessionProvider; 5] = [
+        Self::ClaudeCode,
+        Self::Codex,
+        Self::Cursor,
+        Self::Pi,
+        Self::Opencode,
+    ];
+
+    /// Wire key, identical to the serde encoding (`claudeCode`, `codex`, ...).
+    pub(crate) fn as_key(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claudeCode",
+            Self::Codex => "codex",
+            Self::Cursor => "cursor",
+            Self::Pi => "pi",
+            Self::Opencode => "opencode",
+        }
+    }
+
+    /// Inverse of [`SessionProvider::as_key`]. Unknown keys return `None`.
+    pub(crate) fn from_key(key: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|provider| provider.as_key() == key)
+    }
+
+    /// Human-readable product name for user-facing text.
+    // Only notifications.rs (GUI build) calls this.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Cursor => "Cursor",
+            Self::Pi => "Pi",
+            Self::Opencode => "OpenCode",
+        }
+    }
+}
+
 /// Health of the source observation used to produce a session card.
 ///
 /// This is deliberately separate from `SessionStatus`: a session can be
@@ -111,6 +153,32 @@ pub enum AgentKind {
     Internal,
 }
 
+impl SessionSurface {
+    /// Wire name, identical to the serde encoding.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claudeCode",
+            Self::App => "app",
+            Self::Cli => "cli",
+            Self::Exec => "exec",
+            Self::Integration => "integration",
+            Self::Cursor => "cursor",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl AgentKind {
+    /// Wire name, identical to the serde encoding.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::Subagent => "subagent",
+            Self::Internal => "internal",
+        }
+    }
+}
+
 /// Stable identity for a detected session.
 ///
 /// A provider owns the namespace of its session IDs. Keeping the provider in
@@ -134,17 +202,7 @@ impl SessionIdentity {
     /// Opaque UI/storage key. The provider prefix is explicit so callers do
     /// not have to infer a namespace from a raw session ID.
     pub fn key(&self) -> String {
-        format!("{}:{}", provider_key(self.provider), self.session_id)
-    }
-}
-
-fn provider_key(provider: SessionProvider) -> &'static str {
-    match provider {
-        SessionProvider::ClaudeCode => "claudeCode",
-        SessionProvider::Codex => "codex",
-        SessionProvider::Cursor => "cursor",
-        SessionProvider::Pi => "pi",
-        SessionProvider::Opencode => "opencode",
+        format!("{}:{}", self.provider.as_key(), self.session_id)
     }
 }
 
@@ -268,6 +326,26 @@ impl DetectedSession {
             opencode_summary: None,
         }
     }
+
+    /// Session found from files or an HTTP snapshot rather than a process c9watch
+    /// controls: pid 0, `project_path` equal to `cwd`, and no open, stop or
+    /// rename. Callers set provider-specific fields with struct-update syntax.
+    pub fn read_only(
+        provider: SessionProvider,
+        surface: SessionSurface,
+        cwd: PathBuf,
+        session_id: String,
+        project_name: String,
+    ) -> Self {
+        Self {
+            provider,
+            surface,
+            can_open: false,
+            can_stop: false,
+            can_rename: false,
+            ..Self::with_legacy_defaults(0, cwd.clone(), cwd, Some(session_id), project_name)
+        }
+    }
 }
 
 pub trait SessionSource: Send {
@@ -280,6 +358,80 @@ pub trait SessionSource: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surface_and_agent_kind_as_str_match_serde() {
+        for surface in [
+            SessionSurface::ClaudeCode,
+            SessionSurface::App,
+            SessionSurface::Cli,
+            SessionSurface::Exec,
+            SessionSurface::Integration,
+            SessionSurface::Cursor,
+            SessionSurface::Unknown,
+        ] {
+            assert_eq!(
+                serde_json::to_value(surface).unwrap(),
+                serde_json::Value::from(surface.as_str())
+            );
+        }
+        for kind in [AgentKind::Root, AgentKind::Subagent, AgentKind::Internal] {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::Value::from(kind.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn provider_keys_match_serde_and_round_trip() {
+        for provider in SessionProvider::ALL {
+            assert_eq!(
+                serde_json::to_value(provider).unwrap(),
+                serde_json::Value::from(provider.as_key())
+            );
+            assert_eq!(SessionProvider::from_key(provider.as_key()), Some(provider));
+        }
+        assert_eq!(SessionProvider::from_key("bogus"), None);
+        assert_eq!(SessionProvider::from_key(""), None);
+        assert_eq!(SessionProvider::from_key("ClaudeCode"), None);
+    }
+
+    /// `ALL` is written by hand. serde's derived error lists every variant
+    /// in declaration order, so a variant missing from `ALL` fails here.
+    #[test]
+    fn provider_all_lists_every_serde_variant() {
+        let err = serde_json::from_str::<SessionProvider>("\"__not_a_provider__\"")
+            .unwrap_err()
+            .to_string();
+        let expected = SessionProvider::ALL
+            .iter()
+            .map(|p| format!("`{}`", p.as_key()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            err.contains(&format!("expected one of {expected} ")),
+            "SessionProvider::ALL is out of sync with the enum: {err}"
+        );
+    }
+
+    #[test]
+    fn provider_labels_are_product_names() {
+        let labels: Vec<_> = SessionProvider::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(labels, ["Claude Code", "Codex", "Cursor", "Pi", "OpenCode"]);
+    }
+
+    #[test]
+    fn identity_key_uses_provider_key_prefix() {
+        assert_eq!(
+            SessionIdentity::new(SessionProvider::ClaudeCode, "abc").key(),
+            "claudeCode:abc"
+        );
+        assert_eq!(
+            SessionIdentity::new(SessionProvider::Opencode, "ses_1").key(),
+            "opencode:ses_1"
+        );
+    }
 
     #[test]
     fn session_kind_serializes_as_lowercase() {
@@ -366,6 +518,35 @@ mod tests {
         assert_eq!(d.surface, SessionSurface::ClaudeCode);
         assert_eq!(d.agent_kind, AgentKind::Root);
         assert!(d.can_open && d.can_stop && d.can_rename);
+    }
+
+    #[test]
+    fn read_only_session_has_pid_zero_cwd_as_project_and_no_actions() {
+        let d = DetectedSession::read_only(
+            SessionProvider::Pi,
+            SessionSurface::Cli,
+            PathBuf::from("/tmp/proj"),
+            "uuid".to_string(),
+            "proj".to_string(),
+        );
+        let mut expected = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/proj"),
+            PathBuf::from("/tmp/proj"),
+            Some("uuid".to_string()),
+            "proj".to_string(),
+        );
+        expected.provider = SessionProvider::Pi;
+        expected.surface = SessionSurface::Cli;
+        expected.can_open = false;
+        expected.can_stop = false;
+        expected.can_rename = false;
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert!(d.codex_summary.is_none() && d.cursor_summary.is_none());
+        assert!(d.pi_summary.is_none() && d.opencode_summary.is_none());
     }
 
     #[test]

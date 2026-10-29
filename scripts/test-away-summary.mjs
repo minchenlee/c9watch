@@ -61,3 +61,37 @@ test('away start: last look, else window blur, else session start', () => {
   assert.equal(utils.awaySinceMs(session, 'claudeCode:s1', {}, null), 100);
   assert.equal(utils.awaySinceMs({ id: 's2' }, 'claudeCode:s2', {}, null), 0);
 });
+
+test('session display title follows the seven-field precedence', () => {
+  const all = {
+    customTitle: 'custom', officialName: 'official', codexTitle: 'codex',
+    cursorTitle: 'cursor', aiTitle: 'ai', summary: 'summary', firstPrompt: 'prompt'
+  };
+  assert.equal(utils.sessionDisplayTitle(all), 'custom');
+  assert.equal(utils.sessionDisplayTitle({ ...all, customTitle: null }), 'official');
+  assert.equal(utils.sessionDisplayTitle({ ...all, customTitle: null, officialName: undefined }), 'codex');
+  assert.equal(utils.sessionDisplayTitle({ ...all, customTitle: null, officialName: null, codexTitle: null }), 'cursor');
+  assert.equal(
+    utils.sessionDisplayTitle({ ...all, customTitle: null, officialName: null, codexTitle: null, cursorTitle: null }),
+    'ai'
+  );
+  assert.equal(
+    utils.sessionDisplayTitle({ ...all, customTitle: null, officialName: null, codexTitle: null, cursorTitle: null, aiTitle: null }),
+    'summary'
+  );
+  assert.equal(
+    utils.sessionDisplayTitle({ customTitle: null, summary: null, firstPrompt: 'prompt' }),
+    'prompt'
+  );
+});
+
+test('session display title skips empty strings and returns the raw last value', () => {
+  assert.equal(
+    utils.sessionDisplayTitle({
+      customTitle: '', officialName: '', codexTitle: '', cursorTitle: '', aiTitle: '', summary: '', firstPrompt: 'prompt'
+    }),
+    'prompt'
+  );
+  assert.equal(utils.sessionDisplayTitle({ customTitle: '', summary: null, firstPrompt: '' }), '');
+  assert.equal(utils.sessionDisplayTitle({ customTitle: null, summary: null }), undefined);
+});

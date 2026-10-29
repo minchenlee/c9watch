@@ -1,5 +1,6 @@
 // src-tauri/src/session/cost.rs
 
+use super::project_name_from_path;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -408,15 +409,6 @@ fn model_display_name(model: &str) -> String {
     }
 }
 
-/// Derive project name from a cwd path (last segment).
-fn project_name_from_path(path: &str) -> String {
-    PathBuf::from(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string()
-}
-
 /// Extract the date portion "YYYY-MM-DD" from an ISO 8601 timestamp.
 fn date_from_timestamp(ts: &str) -> String {
     ts.get(..10).unwrap_or("unknown").to_string()
@@ -583,8 +575,8 @@ fn codex_cost_records(home_dir: &std::path::Path) -> Vec<SessionCostRecord> {
                     project_name: project_name.clone(),
                     model: day.model,
                     provider: "codex".to_string(),
-                    surface: Some(snapshot.surface.clone()),
-                    agent_kind: Some(snapshot.agent_kind.clone()),
+                    surface: Some(snapshot.surface.as_str().to_string()),
+                    agent_kind: Some(snapshot.agent_kind.as_str().to_string()),
                     cost: estimated_cost.unwrap_or_default(),
                     cost_available: estimated_cost.is_some(),
                     input_tokens: day.usage.input_tokens,

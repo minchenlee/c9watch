@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { providerFilter } from '$lib/stores/provider-filter';
-	import type { ProviderFilter as ProviderFilterValue } from '$lib/provider';
+	import { ALL_PROVIDERS_LABEL, PROVIDERS, type ProviderFilter as ProviderFilterValue } from '$lib/provider';
 
 	interface Props {
 		compact?: boolean;
@@ -9,12 +9,8 @@
 	}
 	let { compact = false, variant = 'segmented' }: Props = $props();
 	const options: Array<{ value: ProviderFilterValue; label: string; short: string }> = [
-		{ value: 'all', label: 'All providers', short: 'ALL' },
-		{ value: 'claudeCode', label: 'Claude Code', short: 'CLAUDE CODE' },
-		{ value: 'codex', label: 'Codex', short: 'CODEX' },
-		{ value: 'cursor', label: 'Cursor', short: 'CURSOR' },
-		{ value: 'pi', label: 'Pi', short: 'PI' },
-		{ value: 'opencode', label: 'OpenCode', short: 'OPENCODE' }
+		{ value: 'all', label: ALL_PROVIDERS_LABEL, short: 'ALL' },
+		...PROVIDERS.map((p) => ({ value: p.id, label: p.filterLabel, short: p.label }))
 	];
 	let dropdownOpen = $state(false);
 	let activeIndex = $state(0);

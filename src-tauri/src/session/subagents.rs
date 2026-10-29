@@ -10,9 +10,7 @@
 //! without requiring users to install a hook.
 
 use crate::session::cache::{
-    can_incrementally_read, extend_prefix_snapshot, hash_file_prefix, next_full_verify_offset,
-    read_lines_from_offset, validate_cached_prefix, FileVersion, PrefixSnapshot,
-    PrefixValidationKind,
+    read_lines_from_offset, refresh_incremental_entry, FileVersion, IncrementalEntry,
 };
 use crate::session::parser::{parse_jsonl_entries, MessageContent, SessionEntry};
 use chrono::{DateTime, Utc};
@@ -292,19 +290,9 @@ pub fn active_subagents_for_path<P: AsRef<Path>>(
 }
 
 /// Cached subagent state for one file: the version stamp and byte offset the
-/// cache is current as of, plus the accumulated subagent list as of that
-/// offset.
-struct SubagentCacheEntry {
-    stamp: FileVersion,
-    offset: u64,
-    subagents: Vec<SubagentInfo>,
-    prefix: Option<PrefixSnapshot>,
-    next_full_verify_offset: u64,
-    last_full_validation_at: Instant,
-    #[cfg(test)]
-    last_prefix_validation_bytes: u64,
-    last_access: Instant,
-}
+/// cache is current as of, plus the accumulated subagent list (`value`) as of
+/// that offset.
+type SubagentCacheEntry = IncrementalEntry<Vec<SubagentInfo>>;
 
 /// Caches `active_subagents_for_path` results per file, so neither an
 /// unchanged transcript nor the already-scanned prefix of a growing one gets
@@ -364,136 +352,24 @@ fn cached_active_subagents_for_path_at(
         Err(_) => return active_subagents_for_path(session_id, path),
     };
 
-    if let Some((
-        previous_stamp,
-        previous_offset,
-        previous_subagents,
-        previous_prefix,
-        previous_next_full_verify_offset,
-        previous_last_full_validation_at,
-    )) = cache.get(path).map(|existing| {
-        (
-            existing.stamp,
-            existing.offset,
-            existing.subagents.clone(),
-            existing.prefix,
-            existing.next_full_verify_offset,
-            existing.last_full_validation_at,
-        )
-    }) {
-        if let Some(previous_prefix) = previous_prefix {
-            if previous_stamp == stamp && stamp.supports_unchanged_fast_path() {
-                if now.saturating_duration_since(previous_last_full_validation_at)
-                    < crate::session::cache::PREFIX_FULL_REVALIDATION_INTERVAL
-                {
-                    if let Some(existing) = cache.get_mut(path) {
-                        existing.last_access = now;
-                    }
-                    return previous_subagents;
-                }
-
-                if let Some(validation) = validate_cached_prefix(
-                    path,
-                    previous_prefix,
-                    previous_next_full_verify_offset,
-                    previous_last_full_validation_at,
-                    now,
-                ) {
-                    if let Some(existing) = cache.get_mut(path) {
-                        existing.prefix = Some(validation.snapshot);
-                        if validation.kind == PrefixValidationKind::Full {
-                            existing.last_full_validation_at = now;
-                            existing.next_full_verify_offset =
-                                next_full_verify_offset(existing.offset);
-                        }
-                        #[cfg(test)]
-                        {
-                            existing.last_prefix_validation_bytes = validation.bytes_read;
-                        }
-                        existing.last_access = now;
-                    }
-                    return previous_subagents;
-                }
+    let Some(entry) = refresh_incremental_entry(
+        cache.remove(path),
+        path,
+        stamp,
+        now,
+        |lines| build_subagents_from_lines(session_id, lines),
+        |mut subagents, new_lines| {
+            if !new_lines.is_empty() {
+                let new_entries = parse_jsonl_entries(new_lines.to_vec());
+                merge_new_subagents(&mut subagents, &new_entries, new_lines, session_id);
             }
-
-            if can_incrementally_read(previous_stamp, stamp) {
-                if let Some(validation) = validate_cached_prefix(
-                    path,
-                    previous_prefix,
-                    previous_next_full_verify_offset,
-                    previous_last_full_validation_at,
-                    now,
-                ) {
-                    if let Ok((new_lines, new_offset)) =
-                        read_lines_from_offset(path, previous_offset)
-                    {
-                        if let Ok(prefix) = extend_prefix_snapshot(
-                            path,
-                            previous_offset,
-                            new_offset,
-                            validation.snapshot,
-                        ) {
-                            let mut subagents = previous_subagents;
-                            if !new_lines.is_empty() {
-                                let new_entries = parse_jsonl_entries(new_lines.clone());
-                                merge_new_subagents(
-                                    &mut subagents,
-                                    &new_entries,
-                                    &new_lines,
-                                    session_id,
-                                );
-                            }
-                            let full_validation = validation.kind == PrefixValidationKind::Full;
-                            cache.insert(
-                                path.to_path_buf(),
-                                SubagentCacheEntry {
-                                    stamp,
-                                    offset: new_offset,
-                                    subagents: subagents.clone(),
-                                    prefix: Some(prefix),
-                                    next_full_verify_offset: if full_validation {
-                                        next_full_verify_offset(new_offset)
-                                    } else {
-                                        previous_next_full_verify_offset
-                                    },
-                                    last_full_validation_at: if full_validation {
-                                        now
-                                    } else {
-                                        previous_last_full_validation_at
-                                    },
-                                    #[cfg(test)]
-                                    last_prefix_validation_bytes: validation.bytes_read,
-                                    last_access: now,
-                                },
-                            );
-                            evict_oldest_subagent_cache_entries(&mut cache);
-                            return subagents;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let Ok((lines, offset)) = read_lines_from_offset(path, 0) else {
-        cache.remove(path);
+            subagents
+        },
+    ) else {
         return Vec::new();
     };
-    let subagents = build_subagents_from_lines(session_id, &lines);
-    cache.insert(
-        path.to_path_buf(),
-        SubagentCacheEntry {
-            stamp,
-            offset,
-            subagents: subagents.clone(),
-            prefix: hash_file_prefix(path, offset).ok(),
-            next_full_verify_offset: next_full_verify_offset(offset),
-            last_full_validation_at: now,
-            #[cfg(test)]
-            last_prefix_validation_bytes: 0,
-            last_access: now,
-        },
-    );
+    let subagents = entry.value.clone();
+    cache.insert(path.to_path_buf(), entry);
     evict_oldest_subagent_cache_entries(&mut cache);
     subagents
 }
@@ -993,7 +869,7 @@ fn cache_has_relevant_entry(path: &Path, now: DateTime<Utc>, parent_is_live: boo
         return false;
     };
     cache.get(path).is_some_and(|entry| {
-        entry.subagents.iter().any(|sa| {
+        entry.value.iter().any(|sa| {
             is_relevant(sa, now) && (parent_is_live || sa.status == SubagentStatus::Completed)
         })
     })
@@ -1020,7 +896,7 @@ fn prune_subagent_cache(
             .is_some_and(|stem| live_session_ids.contains(stem));
         parent_is_live
             || entry
-                .subagents
+                .value
                 .iter()
                 .any(|sa| sa.status == SubagentStatus::Completed && is_relevant(sa, now))
     });
@@ -1551,7 +1427,7 @@ mod tests {
                     identity: 1,
                 },
                 offset: 1,
-                subagents: vec![subagent_info(SubagentStatus::Running, None)],
+                value: vec![subagent_info(SubagentStatus::Running, None)],
                 prefix: None,
                 next_full_verify_offset: 0,
                 last_full_validation_at: Instant::now(),
@@ -1569,7 +1445,7 @@ mod tests {
                     identity: 2,
                 },
                 offset: 2,
-                subagents: vec![subagent_info(
+                value: vec![subagent_info(
                     SubagentStatus::Completed,
                     Some(&completed_at),
                 )],
@@ -1601,7 +1477,7 @@ mod tests {
                         identity: i as u64 + 1,
                     },
                     offset: i as u64,
-                    subagents: Vec::new(),
+                    value: Vec::new(),
                     prefix: None,
                     next_full_verify_offset: 0,
                     last_full_validation_at: Instant::now(),

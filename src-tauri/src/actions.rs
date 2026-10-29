@@ -120,17 +120,23 @@ pub fn open_session(pid: u32, project_path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Get the controlling tty of a process via `ps -o tty=`
-#[cfg(target_os = "macos")]
-fn get_process_tty(pid: u32) -> Option<String> {
+/// Read one `ps -o <field>=` column for a process, trimmed.
+/// Errors only when `ps` cannot be spawned; an unknown pid yields "".
+fn ps_field(pid: u32, field: &str) -> Result<String, String> {
     let output = Command::new("ps")
         .arg("-o")
-        .arg("tty=")
+        .arg(format!("{}=", field))
         .arg("-p")
         .arg(pid.to_string())
         .output()
-        .ok()?;
-    let tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        .map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Get the controlling tty of a process via `ps -o tty=`
+#[cfg(target_os = "macos")]
+fn get_process_tty(pid: u32) -> Option<String> {
+    let tty = ps_field(pid, "tty").ok()?;
     if tty.is_empty() || tty == "??" {
         None
     } else {
@@ -146,17 +152,7 @@ fn get_session_tty(pid: u32) -> Option<String> {
         if let Some(tty) = get_process_tty(current_pid) {
             return Some(tty);
         }
-        let ppid_output = Command::new("ps")
-            .arg("-o")
-            .arg("ppid=")
-            .arg("-p")
-            .arg(current_pid.to_string())
-            .output()
-            .ok()?;
-        let ppid: u32 = String::from_utf8_lossy(&ppid_output.stdout)
-            .trim()
-            .parse()
-            .ok()?;
+        let ppid: u32 = ps_field(current_pid, "ppid").ok()?.parse().ok()?;
         if ppid <= 1 {
             break;
         }
@@ -433,46 +429,6 @@ fn focus_jetbrains_window(app_name: &str, project_path: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// Get the iTerm2 session title for a process by matching its tty
-#[cfg(target_os = "macos")]
-pub fn get_iterm2_session_title(pid: u32) -> Option<String> {
-    let tty = get_session_tty(pid)?;
-
-    let script = format!(
-        r#"
-        tell application "System Events"
-            if not (exists process "iTerm2") then return ""
-        end tell
-        tell application "iTerm2"
-            repeat with w in windows
-                repeat with t in tabs of w
-                    repeat with s in sessions of t
-                        if tty of s ends with "{tty}" then
-                            return name of s
-                        end if
-                    end repeat
-                end repeat
-            end repeat
-            return ""
-        end tell
-        "#,
-        tty = tty
-    );
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .ok()?;
-
-    let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if title.is_empty() {
-        None
-    } else {
-        Some(title)
-    }
-}
-
 /// Platform-specific fallback to activate/focus an application
 #[cfg(target_os = "macos")]
 fn activate_app_fallback(app_name: &str) -> Result<(), String> {
@@ -640,6 +596,15 @@ fn jetbrains_url_scheme(app_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Map a JetBrains IDE app name to its macOS `.app` bundle name.
+/// Community Edition variants ("IntelliJ IDEA CE", "PyCharm CE") share the
+/// bundle name of the base IDE. The CLI binary name equals the URL scheme
+/// from `jetbrains_url_scheme`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn jetbrains_app_dir_name(app_name: &str) -> &str {
+    app_name.strip_suffix(" CE").unwrap_or(app_name)
+}
+
 /// Get the JetBrains Toolbox scripts directory
 #[cfg(target_os = "macos")]
 fn get_jetbrains_toolbox_scripts_dir() -> Option<String> {
@@ -690,22 +655,8 @@ fn get_app_cli(app_name: &str) -> Option<String> {
     }
 
     // JetBrains IDEs: check Toolbox scripts dir, then ~/Applications, then /Applications
-    let jetbrains_cli: Option<(&str, &str)> = match app_name {
-        "PhpStorm" => Some(("phpstorm", "PhpStorm")),
-        "IntelliJ IDEA" | "IntelliJ IDEA CE" => Some(("idea", "IntelliJ IDEA")),
-        "WebStorm" => Some(("webstorm", "WebStorm")),
-        "PyCharm" | "PyCharm CE" => Some(("pycharm", "PyCharm")),
-        "GoLand" => Some(("goland", "GoLand")),
-        "CLion" => Some(("clion", "CLion")),
-        "Rider" => Some(("rider", "Rider")),
-        "RubyMine" => Some(("rubymine", "RubyMine")),
-        "DataGrip" => Some(("datagrip", "DataGrip")),
-        "Android Studio" => Some(("studio", "Android Studio")),
-        "Aqua" => Some(("aqua", "Aqua")),
-        "Fleet" => Some(("fleet", "Fleet")),
-        "RustRover" => Some(("rustrover", "RustRover")),
-        _ => None,
-    };
+    let jetbrains_cli = jetbrains_url_scheme(app_name)
+        .map(|bin_name| (bin_name, jetbrains_app_dir_name(app_name)));
 
     if let Some((bin_name, app_dir_name)) = jetbrains_cli {
         // 1. JetBrains Toolbox scripts directory
@@ -784,22 +735,7 @@ fn get_app_cli(app_name: &str) -> Option<String> {
     }
 
     // JetBrains IDEs: check Toolbox scripts dir, then standard paths
-    let jetbrains_bin = match app_name {
-        "PhpStorm" => Some("phpstorm"),
-        "IntelliJ IDEA" | "IntelliJ IDEA CE" => Some("idea"),
-        "WebStorm" => Some("webstorm"),
-        "PyCharm" | "PyCharm CE" => Some("pycharm"),
-        "GoLand" => Some("goland"),
-        "CLion" => Some("clion"),
-        "Rider" => Some("rider"),
-        "RubyMine" => Some("rubymine"),
-        "DataGrip" => Some("datagrip"),
-        "Android Studio" => Some("studio"),
-        "Aqua" => Some("aqua"),
-        "Fleet" => Some("fleet"),
-        "RustRover" => Some("rustrover"),
-        _ => None,
-    };
+    let jetbrains_bin = jetbrains_url_scheme(app_name);
 
     if let Some(bin_name) = jetbrains_bin {
         // 1. JetBrains Toolbox scripts directory
@@ -870,17 +806,8 @@ fn find_parent_app(pid: u32) -> Result<String, String> {
     // Walk up the process tree to find a GUI application
     for i in 0..20 {
         // Get the command/path for current process
-        let comm_output = Command::new("ps")
-            .arg("-o")
-            .arg("comm=")
-            .arg("-p")
-            .arg(current_pid.to_string())
-            .output()
+        let comm = ps_field(current_pid, "comm")
             .map_err(|e| format!("Failed to execute ps: {}", e))?;
-
-        let comm = String::from_utf8_lossy(&comm_output.stdout)
-            .trim()
-            .to_string();
         crate::debug_log::log_info(&format!(
             "[open_session] Step {}: PID {} -> comm: {}",
             i, current_pid, comm
@@ -893,33 +820,16 @@ fn find_parent_app(pid: u32) -> Result<String, String> {
         }
 
         // Get parent PID
-        let ppid_output = Command::new("ps")
-            .arg("-o")
-            .arg("ppid=")
-            .arg("-p")
-            .arg(current_pid.to_string())
-            .output()
-            .map_err(|e| format!("Failed to execute ps: {}", e))?;
-
-        let ppid_str = String::from_utf8_lossy(&ppid_output.stdout)
-            .trim()
-            .to_string();
-        let ppid: u32 = ppid_str.parse().unwrap_or(1);
+        let ppid: u32 = ps_field(current_pid, "ppid")
+            .map_err(|e| format!("Failed to execute ps: {}", e))?
+            .parse()
+            .unwrap_or(1);
         crate::debug_log::log_info(&format!("[open_session] Parent PID: {}", ppid));
 
         // Move to parent
         if ppid <= 1 {
-            crate::debug_log::log_info(
-                "[open_session] Reached root, checking current comm one more time",
-            );
-            // Check current process one more time before giving up
-            if let Some(app_name) = get_app_name(&comm) {
-                crate::debug_log::log_info(&format!(
-                    "[open_session] Found app at root: {}",
-                    app_name
-                ));
-                return Ok(app_name.to_string());
-            }
+            // get_app_name(&comm) already returned None above, so stop here.
+            crate::debug_log::log_info("[open_session] Reached root");
             break;
         }
         current_pid = ppid;
@@ -1137,6 +1047,21 @@ pub fn stop_session(pid: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ps_field_reads_own_comm() {
+        let comm = ps_field(std::process::id(), "comm").expect("ps should run");
+        assert!(!comm.is_empty());
+    }
+
+    #[test]
+    fn ps_field_reads_own_ppid() {
+        let ppid: u32 = ps_field(std::process::id(), "ppid")
+            .expect("ps should run")
+            .parse()
+            .expect("ppid should parse as u32");
+        assert!(ppid > 0);
+    }
 
     #[test]
     fn native_return_guarantee_matches_the_surface() {
@@ -1363,6 +1288,35 @@ mod tests {
             get_app_name("/Applications/PyCharm.app/Contents/MacOS/pycharm"),
             Some("PyCharm")
         );
+    }
+
+    #[test]
+    fn test_jetbrains_cli_bin_and_app_dir() {
+        // (app name, CLI binary, macOS .app bundle name) as previously
+        // hard-coded in get_app_cli on macOS and Linux.
+        let cases = [
+            ("PhpStorm", "phpstorm", "PhpStorm"),
+            ("IntelliJ IDEA", "idea", "IntelliJ IDEA"),
+            ("IntelliJ IDEA CE", "idea", "IntelliJ IDEA"),
+            ("WebStorm", "webstorm", "WebStorm"),
+            ("PyCharm", "pycharm", "PyCharm"),
+            ("PyCharm CE", "pycharm", "PyCharm"),
+            ("GoLand", "goland", "GoLand"),
+            ("CLion", "clion", "CLion"),
+            ("Rider", "rider", "Rider"),
+            ("RubyMine", "rubymine", "RubyMine"),
+            ("DataGrip", "datagrip", "DataGrip"),
+            ("Android Studio", "studio", "Android Studio"),
+            ("Aqua", "aqua", "Aqua"),
+            ("Fleet", "fleet", "Fleet"),
+            ("RustRover", "rustrover", "RustRover"),
+        ];
+        for (app, bin, dir) in cases {
+            assert_eq!(jetbrains_url_scheme(app), Some(bin), "bin for {app}");
+            assert_eq!(jetbrains_app_dir_name(app), dir, "app dir for {app}");
+        }
+        assert_eq!(jetbrains_url_scheme("Zed"), None);
+        assert_eq!(jetbrains_url_scheme("Visual Studio Code"), None);
     }
 
     #[test]

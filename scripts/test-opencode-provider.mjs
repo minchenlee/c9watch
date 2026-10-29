@@ -44,3 +44,37 @@ test('directory-qualified OpenCode roots and children cannot collide', () => {
   assert.deepEqual(hierarchy.subagentsByParent.get('opencode:same?directory=%2Fa'), [sessions[1]]);
   assert.deepEqual(hierarchy.subagentsByParent.get('opencode:same?directory=%2Fb'), [sessions[3]]);
 });
+
+test('provider registry keeps labels, order and known-provider checks stable', () => {
+  assert.deepEqual(provider.PROVIDERS.map(p => p.id), ['claudeCode', 'codex', 'cursor', 'pi', 'opencode']);
+  const badge = { claudeCode: 'CLAUDE CODE', codex: 'CODEX', cursor: 'CURSOR', pi: 'PI', opencode: 'OPENCODE' };
+  const filter = { claudeCode: 'Claude Code', codex: 'Codex', cursor: 'Cursor', pi: 'Pi', opencode: 'OpenCode' };
+  for (const id of Object.keys(badge)) {
+    assert.equal(provider.providerLabel(id), badge[id]);
+    assert.equal(provider.providerFilterLabel(id), filter[id]);
+    assert.equal(provider.isKnownProvider(id), true);
+  }
+  assert.equal(provider.providerFilterLabel('all'), 'All providers');
+  assert.equal(provider.providerLabel('foo'), 'CLAUDE CODE');
+  for (const value of ['foo', null, undefined, 'all', '']) assert.equal(provider.isKnownProvider(value), false);
+  assert.equal(provider.providerOf({ provider: 'foo' }), 'claudeCode');
+  assert.equal(provider.providerSessionKey(undefined, 'x'), 'claudeCode:x');
+});
+
+test('canSessionAction uses direct booleans, then provider defaults', () => {
+  const claude = { id: 'c', provider: 'claudeCode' };
+  for (const action of ['open', 'stop', 'rename', 'conversation']) assert.equal(provider.canSessionAction(claude, action), true);
+  const locked = { ...claude, canOpen: false, canStop: false, canRename: false };
+  for (const action of ['open', 'stop', 'rename']) assert.equal(provider.canSessionAction(locked, action), false);
+  assert.equal(provider.canSessionAction(locked, 'conversation'), true);
+  const codex = { id: 'x', provider: 'codex', canOpen: true };
+  assert.equal(provider.canSessionAction(codex, 'open'), true);
+  assert.equal(provider.canSessionAction(codex, 'stop'), false);
+  assert.equal(provider.canSessionAction(codex, 'conversation'), true);
+});
+
+test('demo Codex and Cursor cards hide open, stop and rename', () => {
+  const demo = readFileSync(new URL('../src/lib/demo/data.ts', import.meta.url), 'utf8');
+  assert.equal(demo.includes('actionCapabilities'), false);
+  assert.equal(demo.match(/canOpen: false, canStop: false, canRename: false/g)?.length, 4);
+});

@@ -2,8 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import { slide } from '$lib/transitions';
 	import { cubicOut } from 'svelte/easing';
-	import { marked } from 'marked';
-	import DOMPurify from 'dompurify';
+	import { renderMarkdown } from '$lib/markdown';
 	import { getMemoryFiles, revealInFileManager } from '$lib/api';
 	import type { ProjectMemory } from '$lib/types';
 	import { providerFilter } from '$lib/stores/provider-filter';
@@ -67,30 +66,6 @@
 		navigator.clipboard.writeText(cmd);
 		copied = true;
 		setTimeout(() => (copied = false), 2000);
-	}
-
-	function renderMarkdown(content: string): string {
-		const renderer = new marked.Renderer();
-
-		renderer.code = function ({ text, lang }) {
-			const language = lang || 'code';
-			return `
-				<div class="code-block-wrapper">
-					<div class="code-header">
-						<span class="code-lang">${language}</span>
-					</div>
-					<pre><code class="language-${language}">${text}</code></pre>
-				</div>
-			`;
-		};
-
-		const rawHtml = marked.parse(content, {
-			async: false,
-			breaks: true,
-			gfm: true,
-			renderer
-		});
-		return DOMPurify.sanitize(rawHtml as string);
 	}
 
 	async function handleReveal() {

@@ -2,6 +2,11 @@ import { SessionStatus } from '$lib/types';
 import type { WaitingFor } from '$lib/types';
 import type { SubagentInfo } from '$lib/stores/subagents';
 
+/** True for the pending-tool names that mean Claude is asking the user a question. */
+export function isQuestionTool(name: string | null | undefined): boolean {
+	return name === 'Question' || name === 'AskUserQuestion';
+}
+
 export function getSessionStatusColor(status: SessionStatus): string {
 	switch (status) {
 		case SessionStatus.Working:
@@ -22,7 +27,7 @@ export function getSessionStatusLabel(status: SessionStatus, pendingToolName?: s
 		case SessionStatus.Working:
 			return 'Working';
 		case SessionStatus.NeedsAttention:
-			if (pendingToolName === 'Question' || pendingToolName === 'AskUserQuestion') {
+			if (isQuestionTool(pendingToolName)) {
 				return 'Waiting for Response';
 			}
 			return 'Approval Required';
@@ -85,4 +90,52 @@ export function getWorkerStatusLabel(status: SessionStatus): string {
 		case SessionStatus.Connecting: return 'Connecting';
 		default: return 'Unknown';
 	}
+}
+
+/** The three dashboard groups a session status falls into. */
+export type StatusBucket = 'attention' | 'idle' | 'working';
+
+/** Bucket order and labels, as the monitor grid shows them. */
+export const STATUS_BUCKETS: ReadonlyArray<{ id: StatusBucket; label: string }> = [
+	{ id: 'attention', label: 'Needs Attention' },
+	{ id: 'idle', label: 'Idle' },
+	{ id: 'working', label: 'Working' }
+];
+
+/** Bucket for a session status. Unknown statuses return null and are not shown. */
+export function statusBucket(status: SessionStatus): StatusBucket | null {
+	switch (status) {
+		case SessionStatus.NeedsAttention:
+			return 'attention';
+		case SessionStatus.WaitingForInput:
+			return 'idle';
+		case SessionStatus.Working:
+		case SessionStatus.Connecting:
+			return 'working';
+		default:
+			return null;
+	}
+}
+
+/** Per-bucket counts in the shape StatusBar and the popover read. */
+export function countStatusBuckets(sessions: ReadonlyArray<{ status: SessionStatus }>): {
+	working: number;
+	permission: number;
+	input: number;
+} {
+	const counts = { working: 0, permission: 0, input: 0 };
+	for (const session of sessions) {
+		switch (statusBucket(session.status)) {
+			case 'working':
+				counts.working++;
+				break;
+			case 'attention':
+				counts.permission++;
+				break;
+			case 'idle':
+				counts.input++;
+				break;
+		}
+	}
+	return counts;
 }

@@ -1,6 +1,8 @@
 use super::cache::FileVersion;
+use super::source::{AgentKind, SessionSurface};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -129,8 +131,8 @@ struct ArchivedTokenEvent {
 pub(crate) struct CodexRolloutSnapshot {
     pub thread_id: String,
     pub cwd: String,
-    pub surface: String,
-    pub agent_kind: String,
+    pub surface: SessionSurface,
+    pub agent_kind: AgentKind,
     pub parent_thread_id: Option<String>,
     pub display: String,
     pub created_at_ms: u64,
@@ -149,7 +151,7 @@ pub(crate) struct CodexRolloutSnapshot {
 
 impl CodexRolloutSnapshot {
     pub(crate) fn is_internal(&self) -> bool {
-        self.agent_kind == "internal"
+        self.agent_kind == AgentKind::Internal
     }
 }
 
@@ -220,12 +222,17 @@ fn fingerprint(path: &Path) -> Option<FileFingerprint> {
     })
 }
 
+/// File name of the archive cache, next to the sessions root in `~/.codex`.
+/// `default_cache_path` and `cached_thread_paths` must agree on it, or the
+/// warm-cache fast path silently misses.
+const ARCHIVE_CACHE_FILENAME: &str = "c9watch-archive-cache.json";
+
 pub(crate) fn default_sessions_root(home: &Path) -> PathBuf {
     home.join(".codex").join("sessions")
 }
 
 pub(crate) fn default_cache_path(home: &Path) -> PathBuf {
-    home.join(".codex").join("c9watch-archive-cache.json")
+    home.join(".codex").join(ARCHIVE_CACHE_FILENAME)
 }
 
 fn collect_rollouts(root: &Path) -> Vec<PathBuf> {
@@ -277,17 +284,11 @@ fn message_text(value: &Value) -> Option<(String, String)> {
     let payload = value.get("payload")?;
     match value.get("type").and_then(Value::as_str) {
         Some("event_msg") => {
-            let kind = payload.get("type").and_then(Value::as_str)?;
-            let role = match kind {
-                "user_message" => "user",
-                "agent_message" => "assistant",
-                _ => return None,
-            };
-            let text = payload.get("message").and_then(Value::as_str)?.to_string();
+            let (role, text) = super::codex::event_message_text(payload)?;
             if text.trim().is_empty() {
                 return None;
             }
-            Some((role.to_string(), text))
+            Some((role.to_string(), text.to_string()))
         }
         Some("response_item") => super::codex::response_item_message_text(payload)
             .map(|(role, content, _)| (role, content)),
@@ -295,45 +296,50 @@ fn message_text(value: &Value) -> Option<(String, String)> {
     }
 }
 
-fn classify_session(source: &Value, originator: &str) -> (String, String, Option<String>) {
+fn classify_session(
+    source: &Value,
+    originator: &str,
+) -> (SessionSurface, AgentKind, Option<String>) {
     if matches!(originator, "Claude Code" | "Claude Cowork") {
-        return classify_agent(source, "integration".to_string());
+        return classify_agent(source, SessionSurface::Integration);
     }
     let originator_lower = originator.to_ascii_lowercase();
     let surface = if originator_lower.contains("desktop") {
-        "app"
+        SessionSurface::App
     } else if originator_lower.contains("tui") {
-        "cli"
+        SessionSurface::Cli
     } else if originator_lower.contains("exec") {
-        "exec"
+        SessionSurface::Exec
     } else {
         match source.as_str().unwrap_or_default() {
-            "vscode" => "app",
-            "cli" => "cli",
-            "exec" => "exec",
-            "appServer" | "app_server" => "integration",
-            _ => "unknown",
+            "vscode" => SessionSurface::App,
+            "cli" => SessionSurface::Cli,
+            "exec" => SessionSurface::Exec,
+            "appServer" | "app_server" => SessionSurface::Integration,
+            _ => SessionSurface::Unknown,
         }
-    }
-    .to_string();
+    };
 
     classify_agent(source, surface)
 }
 
-fn classify_agent(source: &Value, surface: String) -> (String, String, Option<String>) {
+fn classify_agent(
+    source: &Value,
+    surface: SessionSurface,
+) -> (SessionSurface, AgentKind, Option<String>) {
     let Some(subagent) = source.get("subagent") else {
-        return (surface, "root".to_string(), None);
+        return (surface, AgentKind::Root, None);
     };
     if let Some(spawn) = subagent.get("thread_spawn") {
         let parent = spawn
             .get("parent_thread_id")
             .and_then(Value::as_str)
             .map(str::to_string);
-        return (surface, "subagent".to_string(), parent);
+        return (surface, AgentKind::Subagent, parent);
     }
     // User-spawned agents carry thread_spawn metadata. Every other subagent
     // source shape is a Codex-owned helper, including kinds added in the future.
-    (surface, "internal".to_string(), None)
+    (surface, AgentKind::Internal, None)
 }
 
 #[derive(Default)]
@@ -348,8 +354,8 @@ fn empty_cached(path: &Path, fingerprint: FileFingerprint) -> CachedRollout {
         snapshot: CodexRolloutSnapshot {
             thread_id: String::new(),
             cwd: String::new(),
-            surface: "unknown".to_string(),
-            agent_kind: "root".to_string(),
+            surface: SessionSurface::Unknown,
+            agent_kind: AgentKind::Root,
             parent_thread_id: None,
             display: String::new(),
             created_at_ms: 0,
@@ -804,8 +810,8 @@ fn listing_snapshot(snapshot: &CodexRolloutSnapshot) -> CodexRolloutSnapshot {
     CodexRolloutSnapshot {
         thread_id: snapshot.thread_id.clone(),
         cwd: snapshot.cwd.clone(),
-        surface: snapshot.surface.clone(),
-        agent_kind: snapshot.agent_kind.clone(),
+        surface: snapshot.surface,
+        agent_kind: snapshot.agent_kind,
         parent_thread_id: snapshot.parent_thread_id.clone(),
         display: snapshot.display.clone(),
         created_at_ms: snapshot.created_at_ms,
@@ -909,7 +915,7 @@ pub(crate) fn load_listing_snapshots(root: &Path, cache_path: &Path) -> Vec<Code
 
 /// Fast path for conversation loading when History/Cost already warmed the archive.
 pub(crate) fn cached_thread_paths(sessions_root: &Path, thread_id: &str) -> Option<Vec<PathBuf>> {
-    let cache_path = sessions_root.parent()?.join("c9watch-archive-cache.json");
+    let cache_path = sessions_root.parent()?.join(ARCHIVE_CACHE_FILENAME);
     let key = (sessions_root.to_path_buf(), cache_path);
     let state = archive_state()
         .lock()
@@ -1012,19 +1018,21 @@ pub(crate) fn search_rollout<F>(
 where
     F: Fn(&str, &str, bool) -> bool,
 {
+    let matches = |text: &str| {
+        let normalized = if case_sensitive {
+            Cow::Borrowed(text)
+        } else {
+            Cow::Owned(text.to_lowercase())
+        };
+        phrase_match(&normalized, query, whole_word)
+    };
+
     if snapshot.messages_complete {
-        for message in &snapshot.messages {
-            let text = &message.text;
-            let normalized = if case_sensitive {
-                text.clone()
-            } else {
-                text.to_lowercase()
-            };
-            if phrase_match(&normalized, query, whole_word) {
-                return Some(text.clone());
-            }
-        }
-        return None;
+        return snapshot
+            .messages
+            .iter()
+            .find(|message| matches(&message.text))
+            .map(|message| message.text.clone());
     }
 
     // The persisted message cache is intentionally bounded. For an incomplete
@@ -1047,12 +1055,7 @@ where
             let Some((_, text)) = message_text(&value) else {
                 continue;
             };
-            let normalized = if case_sensitive {
-                text.clone()
-            } else {
-                text.to_lowercase()
-            };
-            if phrase_match(&normalized, query, whole_word) {
+            if matches(&text) {
                 return Some(text);
             }
         }
@@ -1063,18 +1066,11 @@ where
 
     // If a rollout disappeared after caching, retain the previous best-effort
     // behavior for its cached excerpts rather than dropping all searchability.
-    for message in &snapshot.messages {
-        let text = &message.text;
-        let normalized = if case_sensitive {
-            text.clone()
-        } else {
-            text.to_lowercase()
-        };
-        if phrase_match(&normalized, query, whole_word) {
-            return Some(text.clone());
-        }
-    }
-    None
+    snapshot
+        .messages
+        .iter()
+        .find(|message| matches(&message.text))
+        .map(|message| message.text.clone())
 }
 
 #[cfg(test)]
@@ -1083,6 +1079,44 @@ mod tests {
 
     fn write_rollout(path: &Path, lines: &[&str]) {
         std::fs::write(path, lines.join("\n")).unwrap();
+    }
+
+    #[test]
+    fn v6_cache_json_round_trips_byte_identically() {
+        // A cache written before surface/agentKind became enums must parse and
+        // re-serialize unchanged, so CACHE_VERSION does not need a bump.
+        let json = concat!(
+            r#"{"version":6,"files":{"/tmp/a.jsonl":{"#,
+            r#""fingerprint":{"size":10,"modifiedNs":20,"changedNs":30,"identity":40},"#,
+            r#""snapshot":{"threadId":"t-1","cwd":"/tmp/app","surface":"app","#,
+            r#""agentKind":"subagent","parentThreadId":"p-1","display":"hi","#,
+            r#""createdAtMs":1,"updatedAtMs":2,"tokenDays":[],"path":"/tmp/a.jsonl","#,
+            r#""paths":["/tmp/a.jsonl"],"messagesComplete":true,"messages":[],"tokenEvents":[]},"#,
+            r#""offset":10,"currentModel":"gpt-5","indexedMessageBytes":0,"anchor":[1,2],"#,
+            r#""prefixHash":99}}}"#
+        );
+        let cache: ArchiveCache = serde_json::from_str(json).unwrap();
+        assert_eq!(cache.version, CACHE_VERSION);
+        let entry = &cache.files["/tmp/a.jsonl"];
+        assert_eq!(entry.snapshot.surface, SessionSurface::App);
+        assert_eq!(entry.snapshot.agent_kind, AgentKind::Subagent);
+        assert_eq!(serde_json::to_string(&cache).unwrap(), json);
+
+        for (surface, kind) in [
+            ("cli", "root"),
+            ("exec", "internal"),
+            ("integration", "root"),
+            ("unknown", "root"),
+        ] {
+            let json = json
+                .replace(r#""surface":"app""#, &format!(r#""surface":"{surface}""#))
+                .replace(
+                    r#""agentKind":"subagent""#,
+                    &format!(r#""agentKind":"{kind}""#),
+                );
+            let cache: ArchiveCache = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&cache).unwrap(), json);
+        }
     }
 
     #[test]
@@ -1131,14 +1165,17 @@ mod tests {
             ],
         );
 
-        assert_eq!(scan_rollout(&app).unwrap().surface, "app");
-        assert_eq!(scan_rollout(&cli).unwrap().surface, "cli");
+        assert_eq!(scan_rollout(&app).unwrap().surface, SessionSurface::App);
+        assert_eq!(scan_rollout(&cli).unwrap().surface, SessionSurface::Cli);
         let child = scan_rollout(&child).unwrap();
-        assert_eq!(child.agent_kind, "subagent");
+        assert_eq!(child.agent_kind, AgentKind::Subagent);
         assert_eq!(child.parent_thread_id.as_deref(), Some("app-1"));
         assert!(scan_rollout(&guardian).unwrap().is_internal());
         assert!(scan_rollout(&future_internal).unwrap().is_internal());
-        assert_eq!(scan_rollout(&integration).unwrap().surface, "integration");
+        assert_eq!(
+            scan_rollout(&integration).unwrap().surface,
+            SessionSurface::Integration
+        );
     }
 
     #[test]
@@ -1308,6 +1345,104 @@ mod tests {
             },
         );
         assert!(hit.is_none());
+    }
+
+    fn mixed_case_rollout(directory: &Path) -> (PathBuf, CodexRolloutSnapshot) {
+        let path = directory.join("case-search.jsonl");
+        write_rollout(
+            &path,
+            &[
+                r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"case-1","cwd":"/tmp/p","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{"type":"agent_message","message":"Mixed NEEDLE Text"}}"#,
+            ],
+        );
+        let snapshot = scan_rollout(&path).unwrap();
+        (path, snapshot)
+    }
+
+    /// Records each haystack the matcher sees and matches on substring.
+    fn recording_matcher(
+        seen: &std::cell::RefCell<Vec<String>>,
+    ) -> impl Fn(&str, &str, bool) -> bool + '_ {
+        move |text, query, _| {
+            seen.borrow_mut().push(text.to_string());
+            text.contains(query)
+        }
+    }
+
+    #[test]
+    fn deep_search_normalizes_case_but_returns_original_text_on_every_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, complete) = mixed_case_rollout(directory.path());
+        assert!(complete.messages_complete);
+        let mut incomplete = complete.clone();
+        incomplete.messages_complete = false;
+
+        // Complete cache path and disk-stream path.
+        for snapshot in [&complete, &incomplete] {
+            let seen = std::cell::RefCell::new(Vec::new());
+            let hit = search_rollout(snapshot, "needle", false, false, recording_matcher(&seen));
+            assert_eq!(hit.as_deref(), Some("Mixed NEEDLE Text"));
+            assert_eq!(seen.borrow().as_slice(), ["mixed needle text"]);
+
+            let seen = std::cell::RefCell::new(Vec::new());
+            let hit = search_rollout(snapshot, "needle", true, false, recording_matcher(&seen));
+            assert!(hit.is_none());
+            assert_eq!(seen.borrow().as_slice(), ["Mixed NEEDLE Text"]);
+        }
+
+        // Fallback path: the rollout disappeared, so cached excerpts are used.
+        std::fs::remove_file(&path).unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let hit = search_rollout(
+            &incomplete,
+            "needle",
+            false,
+            false,
+            recording_matcher(&seen),
+        );
+        assert_eq!(hit.as_deref(), Some("Mixed NEEDLE Text"));
+        assert_eq!(seen.borrow().as_slice(), ["mixed needle text"]);
+        let hit = search_rollout(&incomplete, "NEEDLE", true, false, |text, query, _| {
+            text.contains(query)
+        });
+        assert_eq!(hit.as_deref(), Some("Mixed NEEDLE Text"));
+    }
+
+    #[test]
+    fn deep_search_passes_whole_word_flag_to_the_matcher() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_path, snapshot) = mixed_case_rollout(directory.path());
+        for whole_word in [false, true] {
+            let hit = search_rollout(
+                &snapshot,
+                "needle",
+                false,
+                whole_word,
+                |text, query, flag| flag == whole_word && text.contains(query),
+            );
+            assert_eq!(hit.as_deref(), Some("Mixed NEEDLE Text"));
+        }
+    }
+
+    #[test]
+    fn cached_thread_paths_hits_the_cache_written_at_default_cache_path() {
+        let home = tempfile::tempdir().unwrap();
+        let root = default_sessions_root(home.path());
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-2026-07-13T01-00-00-warm.jsonl");
+        write_rollout(
+            &path,
+            &[
+                r#"{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{"id":"warm","cwd":"/tmp/warm","source":"cli","originator":"codex-tui"}}"#,
+                r#"{"timestamp":"2026-07-13T01:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"warm prompt"}}"#,
+            ],
+        );
+
+        load_snapshots(&root, &default_cache_path(home.path()));
+
+        assert_eq!(cached_thread_paths(&root, "warm"), Some(vec![path]));
+        assert_eq!(cached_thread_paths(&root, "missing"), None);
     }
 
     #[test]

@@ -15,8 +15,8 @@ use super::agent_liveness::{
 };
 use super::parser::MessageType;
 use super::source::{
-    AgentKind, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionKind,
-    SessionProvider, SessionSource, SessionSurface,
+    AgentKind, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionProvider,
+    SessionSource, SessionSurface,
 };
 
 /// Rollouts do not expose a supported process-liveness API. Keep recently idle
@@ -305,7 +305,7 @@ pub struct CodexSessionSource {
 impl CodexSessionSource {
     pub fn new() -> Result<Self, SessionDetectorError> {
         let home = dirs::home_dir().ok_or(SessionDetectorError::HomeDirectoryNotFound)?;
-        Ok(Self::at_root(home.join(".codex").join("sessions"))
+        Ok(Self::at_root(super::codex_archive::default_sessions_root(&home))
             .with_process_probe(Box::new(SysinfoCodexOpenFileProbe::new())))
     }
 
@@ -377,7 +377,7 @@ impl CodexSessionSource {
                 let is_rollout = path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"));
+                    .is_some_and(is_rollout_file_name);
                 if path.is_file()
                     && is_rollout
                     && rollout_age_secs(&path, wall_now) <= DISCOVERY_RECENT_SECS
@@ -394,12 +394,13 @@ impl CodexSessionSource {
         if discovery_due {
             let mut next_index = HashMap::new();
             for path in collect_rollout_paths(&self.sessions_root) {
-                if rollout_age_secs(&path, wall_now) <= LINKED_PARENT_CEILING_SECS {
+                let age = rollout_age_secs(&path, wall_now);
+                if age <= LINKED_PARENT_CEILING_SECS {
                     if let Some(thread_id) = thread_id_from_rollout_filename(&path) {
                         index_rollout_path(&mut next_index, thread_id, path.clone());
                     }
                 }
-                if rollout_age_secs(&path, wall_now) <= DISCOVERY_RECENT_SECS {
+                if age <= DISCOVERY_RECENT_SECS {
                     paths.insert(path);
                 }
             }
@@ -699,20 +700,16 @@ impl CodexSessionSource {
                 .and_then(|name| name.to_str())
                 .unwrap_or("Codex")
                 .to_string();
-            sessions.push(DetectedSession {
-                pid: 0,
-                cwd: cwd.clone(),
-                project_path: cwd,
-                session_id: Some(summary.thread_id.clone()),
+            let base = DetectedSession::read_only(
+                SessionProvider::Codex,
+                summary.surface,
+                cwd,
+                summary.thread_id.clone(),
                 project_name,
-                kind: SessionKind::Interactive,
-                entrypoint: None,
+            );
+            sessions.push(DetectedSession {
                 started_at_ms: summary.started_at_ms,
                 official_name: summary.agent_nickname.clone(),
-                cli_activity: None,
-                cli_reports_prompts: false,
-                provider: SessionProvider::Codex,
-                surface: summary.surface,
                 agent_kind: summary.agent_kind,
                 parent_thread_id: summary.parent_thread_id.clone(),
                 root_session_id: summary.root_session_id.clone(),
@@ -720,13 +717,8 @@ impl CodexSessionSource {
                 agent_nickname: summary.agent_nickname.clone(),
                 agent_role: summary.agent_role.clone(),
                 internal_kind: summary.internal_kind.clone(),
-                can_open: false,
-                can_stop: false,
-                can_rename: false,
                 codex_summary: Some(summary),
-                cursor_summary: None,
-                pi_summary: None,
-                opencode_summary: None,
+                ..base
             });
         }
         Ok((sessions, DetectionDiagnostics::default()))
@@ -1202,6 +1194,21 @@ fn push_codex_message(
     });
 }
 
+/// Sort messages into display order, then drop adjacent duplicates.
+///
+/// `dedup_codex_messages` only removes adjacent duplicates, so every caller
+/// must use this exact sort first.
+fn sort_and_dedup_messages(messages: &mut Vec<CodexMessage>) {
+    messages.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.role.cmp(&right.role))
+            .then_with(|| left.content.cmp(&right.content))
+            .then_with(|| left.content_identity.cmp(&right.content_identity))
+    });
+    dedup_codex_messages(messages);
+}
+
 fn dedup_codex_messages(messages: &mut Vec<CodexMessage>) {
     let mut deduplicated: Vec<CodexMessage> = Vec::with_capacity(messages.len());
     for message in messages.drain(..) {
@@ -1259,14 +1266,7 @@ fn merge_live_rollout_summary(existing: &mut LiveRolloutSummary, mut incoming: L
     };
     let mut messages = std::mem::take(&mut existing.1.messages);
     messages.append(&mut incoming.1.messages);
-    messages.sort_by(|left, right| {
-        left.timestamp
-            .cmp(&right.timestamp)
-            .then_with(|| left.role.cmp(&right.role))
-            .then_with(|| left.content.cmp(&right.content))
-            .then_with(|| left.content_identity.cmp(&right.content_identity))
-    });
-    dedup_codex_messages(&mut messages);
+    sort_and_dedup_messages(&mut messages);
 
     if incoming_is_newer {
         *existing = incoming;
@@ -1523,13 +1523,18 @@ fn collect_rollout_paths(root: &Path) -> Vec<PathBuf> {
             } else if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+                .is_some_and(is_rollout_file_name)
             {
                 paths.push(path);
             }
         }
     }
     paths
+}
+
+/// Whether a file name is a Codex rollout: `rollout-<timestamp>-<thread-id>.jsonl`.
+pub(crate) fn is_rollout_file_name(name: &str) -> bool {
+    name.starts_with("rollout-") && name.ends_with(".jsonl")
 }
 
 fn thread_rollout_suffix(thread_id: &str) -> String {
@@ -1589,17 +1594,6 @@ fn thread_id_from_rollout_filename(path: &Path) -> Option<String> {
 
 fn file_stamp(path: &Path) -> io::Result<FileStamp> {
     FileVersion::read(path)
-}
-
-#[cfg(unix)]
-fn file_identity(metadata: &fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.ino()
-}
-
-#[cfg(not(unix))]
-fn file_identity(_metadata: &fs::Metadata) -> u64 {
-    0
 }
 
 impl SessionSource for CodexSessionSource {
@@ -1750,31 +1744,25 @@ fn apply_event_message(
     payload: &Value,
     compact_for_monitor: bool,
 ) {
-    match payload.get("type").and_then(Value::as_str) {
-        Some("user_message") | Some("agent_message") => {
-            let role = if payload.get("type").and_then(Value::as_str) == Some("user_message") {
-                "user"
+    if let Some((role, content)) = event_message_text(payload) {
+        push_codex_message(
+            summary,
+            timestamp,
+            role,
+            if role == "user" {
+                MessageType::User
             } else {
-                "assistant"
-            };
-            if let Some(content) = payload.get("message").and_then(Value::as_str) {
-                push_codex_message(
-                    summary,
-                    timestamp,
-                    role,
-                    if role == "user" {
-                        MessageType::User
-                    } else {
-                        MessageType::Assistant
-                    },
-                    content.to_string(),
-                    compact_for_monitor,
-                    role == "user"
-                        && !crate::session::parser::is_system_content(content)
-                        && !is_codex_context_message(content),
-                );
-            }
-        }
+                MessageType::Assistant
+            },
+            content.to_string(),
+            compact_for_monitor,
+            role == "user"
+                && !crate::session::parser::is_system_content(content)
+                && !is_codex_context_message(content),
+        );
+        return;
+    }
+    match payload.get("type").and_then(Value::as_str) {
         Some("task_started") => summary.lifecycle = CodexLifecycle::Working,
         Some("task_complete") | Some("turn_aborted") => summary.lifecycle = CodexLifecycle::Idle,
         Some("thread_rolled_back") => {
@@ -1883,6 +1871,19 @@ fn response_item_title_candidate(payload: &Value, role: &str, content: &str) -> 
                 .any(|kind| kind == "user.text")
         })
         .unwrap_or(!is_codex_context_message(content))
+}
+
+/// Role and text of an `event_msg` `user_message` / `agent_message` payload.
+///
+/// Does not filter empty text; callers decide what to do with it.
+pub(crate) fn event_message_text(payload: &Value) -> Option<(&'static str, &str)> {
+    let role = match payload.get("type").and_then(Value::as_str)? {
+        "user_message" => "user",
+        "agent_message" => "assistant",
+        _ => return None,
+    };
+    let content = payload.get("message").and_then(Value::as_str)?;
+    Some((role, content))
 }
 
 pub(crate) fn response_item_message_text(payload: &Value) -> Option<(String, String, bool)> {
@@ -2029,23 +2030,10 @@ pub fn find_codex_conversation_with_progress(
 ) -> Result<Vec<CodexMessage>, String> {
     let home = dirs::home_dir().ok_or("Failed to get home directory")?;
     find_codex_conversation_under_with_progress(
-        &home.join(".codex").join("sessions"),
+        &super::codex_archive::default_sessions_root(&home),
         thread_id,
         include_tools,
         on_progress,
-    )
-}
-
-fn find_codex_conversation_under(
-    sessions_root: &Path,
-    thread_id: &str,
-    include_tools: bool,
-) -> Result<Vec<CodexMessage>, String> {
-    find_codex_conversation_under_with_progress(
-        sessions_root,
-        thread_id,
-        include_tools,
-        &mut |_, _| {},
     )
 }
 
@@ -2091,14 +2079,7 @@ fn find_codex_conversation_under_with_progress(
     if !parsed_any {
         return Err(last_error.unwrap_or_else(|| format!("Codex session {thread_id} not found")));
     }
-    messages.sort_by(|left, right| {
-        left.timestamp
-            .cmp(&right.timestamp)
-            .then_with(|| left.role.cmp(&right.role))
-            .then_with(|| left.content.cmp(&right.content))
-            .then_with(|| left.content_identity.cmp(&right.content_identity))
-    });
-    dedup_codex_messages(&mut messages);
+    sort_and_dedup_messages(&mut messages);
     Ok(messages)
 }
 
@@ -2109,6 +2090,122 @@ mod tests {
     use std::io::Write;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    type Classified<'a> = (SessionSurface, AgentKind, Option<&'a str>);
+
+    #[cfg(unix)]
+    fn file_identity(metadata: &fs::Metadata) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        metadata.ino()
+    }
+
+    #[cfg(not(unix))]
+    fn file_identity(_metadata: &fs::Metadata) -> u64 {
+        0
+    }
+
+    fn find_codex_conversation_under(
+        sessions_root: &Path,
+        thread_id: &str,
+        include_tools: bool,
+    ) -> Result<Vec<CodexMessage>, String> {
+        find_codex_conversation_under_with_progress(
+            sessions_root,
+            thread_id,
+            include_tools,
+            &mut |_, _| {},
+        )
+    }
+
+    #[test]
+    fn live_and_archive_session_meta_classifiers_pin_known_divergences() {
+        // Pins today's MONITOR (apply_session_meta) vs HISTORY/COST
+        // (codex_archive) split. Unifying the two classifiers needs an owner
+        // decision; until then a change to either output must update this table.
+        let rows: &[(&str, Classified, Classified)] = &[
+            (
+                r#"{"id":"a","source":"vscode","originator":"Codex Desktop"}"#,
+                (SessionSurface::App, AgentKind::Root, Some("a")),
+                (SessionSurface::App, AgentKind::Root, Some("a")),
+            ),
+            (
+                r#"{"id":"a","source":"cli","originator":"codex-tui"}"#,
+                (SessionSurface::Cli, AgentKind::Root, Some("a")),
+                (SessionSurface::Cli, AgentKind::Root, Some("a")),
+            ),
+            (
+                r#"{"id":"a","source":"vscode","originator":"Claude Code"}"#,
+                (SessionSurface::Integration, AgentKind::Root, Some("a")),
+                (SessionSurface::Integration, AgentKind::Root, Some("a")),
+            ),
+            (
+                r#"{"id":"a","originator":"Codex Desktop","source":{"subagent":{"thread_spawn":{"parent_thread_id":"p"}}}}"#,
+                (SessionSurface::App, AgentKind::Subagent, Some("a")),
+                (SessionSurface::App, AgentKind::Subagent, Some("a")),
+            ),
+            (
+                r#"{"id":"a","originator":"Codex Desktop","source":{"subagent":{"other":"guardian"}}}"#,
+                (SessionSurface::App, AgentKind::Internal, Some("a")),
+                (SessionSurface::App, AgentKind::Internal, Some("a")),
+            ),
+            // Divergence 1: live checks source before originator; the archive
+            // checks a case-insensitive originator substring first.
+            (
+                r#"{"id":"a","source":"cli","originator":"Codex Desktop"}"#,
+                (SessionSurface::Cli, AgentKind::Root, Some("a")),
+                (SessionSurface::App, AgentKind::Root, Some("a")),
+            ),
+            // Divergence 2: appServer maps to integration only in the archive.
+            (
+                r#"{"id":"a","source":"appServer","originator":"other"}"#,
+                (SessionSurface::Unknown, AgentKind::Root, Some("a")),
+                (SessionSurface::Integration, AgentKind::Root, Some("a")),
+            ),
+            // Divergence 3: an unknown subagent shape is internal only in the
+            // archive; live keeps it as root.
+            (
+                r#"{"id":"a","originator":"Codex Desktop","source":{"subagent":{"future_shape":{}}}}"#,
+                (SessionSurface::App, AgentKind::Root, Some("a")),
+                (SessionSurface::App, AgentKind::Internal, Some("a")),
+            ),
+            // Divergence 4: without `id`, only the archive falls back to
+            // `session_id` for the thread id.
+            (
+                r#"{"session_id":"s","source":"cli","originator":"codex-tui"}"#,
+                (SessionSurface::Cli, AgentKind::Root, None),
+                (SessionSurface::Cli, AgentKind::Root, Some("s")),
+            ),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        for (index, (payload_json, expected_live, expected_archive)) in rows.iter().enumerate() {
+            let payload: Value = serde_json::from_str(payload_json).unwrap();
+            let mut summary = CodexRolloutSummary::default();
+            apply_session_meta(&mut summary, "2026-07-13T01:00:00Z", &payload);
+            let live_id = (!summary.thread_id.is_empty()).then_some(summary.thread_id.as_str());
+            assert_eq!(
+                (summary.surface, summary.agent_kind, live_id),
+                *expected_live,
+                "live classifier: {payload_json}"
+            );
+
+            let path = directory.path().join(format!("rollout-{index}.jsonl"));
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"timestamp":"2026-07-13T01:00:00Z","type":"session_meta","payload":{payload_json}}}"#
+                ),
+            )
+            .unwrap();
+            let snapshot = super::super::codex_archive::scan_rollout(&path).unwrap();
+            let archive_id =
+                (!snapshot.thread_id.is_empty()).then_some(snapshot.thread_id.as_str());
+            assert_eq!(
+                (snapshot.surface, snapshot.agent_kind, archive_id),
+                *expected_archive,
+                "archive classifier: {payload_json}"
+            );
+        }
+    }
 
     fn event(timestamp: &str, event_type: &str, payload: Value) -> String {
         ordered_event(timestamp, event_type, payload)
@@ -3769,6 +3866,63 @@ mod tests {
         let summary = source.summary_for(&path).unwrap();
         assert!(!summary.needs_attention_at(at(3600)));
         assert_eq!(summary.latest_message(), Some("after"));
+    }
+
+    #[test]
+    fn sort_and_dedup_messages_removes_non_adjacent_duplicates() {
+        fn message(
+            timestamp: &str,
+            role: &str,
+            content: &str,
+            title_candidate: bool,
+        ) -> CodexMessage {
+            CodexMessage {
+                timestamp: timestamp.to_string(),
+                role: role.to_string(),
+                message_type: if role == "user" {
+                    MessageType::User
+                } else {
+                    MessageType::Assistant
+                },
+                content: content.to_string(),
+                content_identity: message_identity(content),
+                title_candidate,
+            }
+        }
+        let mut messages = vec![
+            message("2026-07-13T00:00:02Z", "assistant", "answer", false),
+            message("2026-07-13T00:00:01Z", "user", "prompt", false),
+            message("2026-07-13T00:00:02Z", "assistant", "answer", false),
+            message("2026-07-13T00:00:01Z", "user", "prompt", true),
+        ];
+        sort_and_dedup_messages(&mut messages);
+        let contents: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["prompt", "answer"]);
+        assert!(messages[0].title_candidate);
+        assert!(!messages[1].title_candidate);
+    }
+
+    #[test]
+    fn event_message_text_maps_roles_and_keeps_empty_text() {
+        let text = |payload: Value| event_message_text(&payload).map(|(r, c)| (r, c.to_string()));
+        assert_eq!(
+            text(serde_json::json!({"type":"user_message","message":"hi"})),
+            Some(("user", "hi".to_string()))
+        );
+        assert_eq!(
+            text(serde_json::json!({"type":"agent_message","message":"yo"})),
+            Some(("assistant", "yo".to_string()))
+        );
+        assert_eq!(
+            text(serde_json::json!({"type":"agent_message","message":"  "})),
+            Some(("assistant", "  ".to_string()))
+        );
+        assert_eq!(text(serde_json::json!({"type":"user_message"})), None);
+        assert_eq!(
+            text(serde_json::json!({"type":"task_started","message":"x"})),
+            None
+        );
+        assert_eq!(text(serde_json::json!({"message":"x"})), None);
     }
 
     // ── Open-file evidence (agent_liveness) ───────────────────────────

@@ -4,6 +4,8 @@
 	import { sortedSessions, sessions as sessionsStore, initializeSessionListeners, visibleTopLevelSessionIds } from '$lib/stores/sessions';
 	import { openSession, getSessions } from '$lib/api';
 	import { SessionStatus } from '$lib/types';
+	import { countStatusBuckets } from '$lib/status-utils';
+	import { sessionDisplayTitle } from '$lib/session-utils';
 	import type { Session } from '$lib/types';
 	import { invoke } from '@tauri-apps/api/core';
 	import { listen } from '@tauri-apps/api/event';
@@ -14,11 +16,7 @@
 	import ProviderBadge from '$lib/components/ProviderBadge.svelte';
 
 	let sessions = $derived($sortedSessions.filter((session) => $visibleTopLevelSessionIds.has(sessionKeyOf(session))).filter((session) => matchesProvider(session, $providerFilter)));
-	let summary = $derived({
-		working: sessions.filter((s) => s.status === SessionStatus.Working || s.status === SessionStatus.Connecting).length,
-		permission: sessions.filter((s) => s.status === SessionStatus.NeedsAttention).length,
-		input: sessions.filter((s) => s.status === SessionStatus.WaitingForInput).length
-	});
+	let summary = $derived(countStatusBuckets(sessions));
 	let totalSessions = $derived(sessions.length);
 
 	// Pixel grid state
@@ -183,7 +181,7 @@
 							</svg>
 							{/if}
 						</div>
-						<div class="card-title">{session.customTitle || session.officialName || session.codexTitle || session.cursorTitle || session.aiTitle || session.summary || session.firstPrompt}</div>
+						<div class="card-title">{sessionDisplayTitle(session)}</div>
 						{#if session.latestMessage}
 							<div class="card-latest">{session.latestMessage}</div>
 						{/if}

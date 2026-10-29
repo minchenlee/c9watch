@@ -10,9 +10,9 @@ use std::path::Path;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Keep small transcripts exact while avoiding a full-history read on every
-/// poll of a large live transcript. These values intentionally match the
-/// bounded prefix policy used by the Cursor transcript reader, but the
-/// Claude-specific caches own their validation state independently.
+/// poll of a large live transcript. The Claude-specific caches and the Cursor
+/// transcript reader share these values, but each cache owns its validation
+/// state independently.
 pub(crate) const EXACT_PREFIX_VERIFY_LIMIT: u64 = 4 * 1024 * 1024;
 pub(crate) const PREFIX_GUARD_BYTES: u64 = 64 * 1024;
 pub(crate) const MIN_FULL_VERIFY_GROWTH_BYTES: u64 = 1024 * 1024;
@@ -287,6 +287,142 @@ pub(crate) fn validate_cached_prefix(
     })
 }
 
+/// One cached, incrementally maintained summary of an append-only JSONL file.
+///
+/// `value` is whatever the caller folds the file's lines into (a subagent
+/// list, a message count). The other fields are the version stamp and byte
+/// offset `value` is current as of, plus the prefix-validation state that
+/// [`refresh_incremental_entry`] uses to decide whether the cached prefix can
+/// still be trusted.
+pub(crate) struct IncrementalEntry<T> {
+    pub(crate) stamp: FileVersion,
+    pub(crate) offset: u64,
+    pub(crate) value: T,
+    pub(crate) prefix: Option<PrefixSnapshot>,
+    pub(crate) next_full_verify_offset: u64,
+    pub(crate) last_full_validation_at: Instant,
+    #[cfg(test)]
+    pub(crate) last_prefix_validation_bytes: u64,
+    pub(crate) last_access: Instant,
+}
+
+/// Bring one cache entry up to date with the file at `path`.
+///
+/// `previous` is the entry the caller took out of its cache (if any) and
+/// `stamp` the file version the caller read before taking its lock. The steps
+/// run in this order:
+///
+/// 1. Unchanged strong stamp inside the full-revalidation interval: return the
+///    entry as is, with only `last_access` bumped.
+/// 2. Unchanged strong stamp past the deadline: validate the cached prefix and
+///    keep the value. A guard-only validation keeps the previous
+///    `next_full_verify_offset` and `last_full_validation_at`.
+/// 3. Same-file growth: validate the prefix, read the newly complete lines
+///    from the cached offset, extend the prefix hash, and `fold` the new lines
+///    into the cached value.
+/// 4. Otherwise (or when any step above fails): read the whole file and
+///    `build` the value from scratch.
+///
+/// Returns `None` when the full read fails; the caller then drops its entry.
+/// The function holds no lock and touches no cache, so each caller keeps its
+/// own storage, lock, poison fallback and eviction policy.
+pub(crate) fn refresh_incremental_entry<T>(
+    previous: Option<IncrementalEntry<T>>,
+    path: &Path,
+    stamp: FileVersion,
+    now: Instant,
+    build: impl FnOnce(&[String]) -> T,
+    fold: impl FnOnce(T, &[String]) -> T,
+) -> Option<IncrementalEntry<T>> {
+    if let Some(mut existing) = previous {
+        if let Some(previous_prefix) = existing.prefix {
+            if existing.stamp == stamp && stamp.supports_unchanged_fast_path() {
+                if now.saturating_duration_since(existing.last_full_validation_at)
+                    < PREFIX_FULL_REVALIDATION_INTERVAL
+                {
+                    existing.last_access = now;
+                    return Some(existing);
+                }
+
+                if let Some(validation) = validate_cached_prefix(
+                    path,
+                    previous_prefix,
+                    existing.next_full_verify_offset,
+                    existing.last_full_validation_at,
+                    now,
+                ) {
+                    existing.prefix = Some(validation.snapshot);
+                    if validation.kind == PrefixValidationKind::Full {
+                        existing.last_full_validation_at = now;
+                        existing.next_full_verify_offset = next_full_verify_offset(existing.offset);
+                    }
+                    #[cfg(test)]
+                    {
+                        existing.last_prefix_validation_bytes = validation.bytes_read;
+                    }
+                    existing.last_access = now;
+                    return Some(existing);
+                }
+            }
+
+            if can_incrementally_read(existing.stamp, stamp) {
+                if let Some(validation) = validate_cached_prefix(
+                    path,
+                    previous_prefix,
+                    existing.next_full_verify_offset,
+                    existing.last_full_validation_at,
+                    now,
+                ) {
+                    if let Ok((new_lines, new_offset)) =
+                        read_lines_from_offset(path, existing.offset)
+                    {
+                        if let Ok(prefix) = extend_prefix_snapshot(
+                            path,
+                            existing.offset,
+                            new_offset,
+                            validation.snapshot,
+                        ) {
+                            let full_validation = validation.kind == PrefixValidationKind::Full;
+                            return Some(IncrementalEntry {
+                                stamp,
+                                offset: new_offset,
+                                value: fold(existing.value, &new_lines),
+                                prefix: Some(prefix),
+                                next_full_verify_offset: if full_validation {
+                                    next_full_verify_offset(new_offset)
+                                } else {
+                                    existing.next_full_verify_offset
+                                },
+                                last_full_validation_at: if full_validation {
+                                    now
+                                } else {
+                                    existing.last_full_validation_at
+                                },
+                                #[cfg(test)]
+                                last_prefix_validation_bytes: validation.bytes_read,
+                                last_access: now,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let (lines, offset) = read_lines_from_offset(path, 0).ok()?;
+    Some(IncrementalEntry {
+        stamp,
+        offset,
+        value: build(&lines),
+        prefix: hash_file_prefix(path, offset).ok(),
+        next_full_verify_offset: next_full_verify_offset(offset),
+        last_full_validation_at: now,
+        #[cfg(test)]
+        last_prefix_validation_bytes: 0,
+        last_access: now,
+    })
+}
+
 /// Provider-neutral metadata version used by file-backed caches.
 ///
 /// The parsers keep their own cache entries and parsing semantics, but they
@@ -491,5 +627,81 @@ mod tests {
         assert_eq!(validation.kind, super::PrefixValidationKind::Guard);
         assert!(validation.bytes_read <= super::PREFIX_GUARD_BYTES * 2);
         assert!(validation.bytes_read < len);
+    }
+
+    fn refresh_line_count(
+        previous: Option<super::IncrementalEntry<usize>>,
+        path: &std::path::Path,
+        now: Instant,
+    ) -> Option<super::IncrementalEntry<usize>> {
+        let stamp = FileVersion::read(path).ok()?;
+        super::refresh_incremental_entry(
+            previous,
+            path,
+            stamp,
+            now,
+            |lines| lines.len(),
+            |count, lines| count + lines.len(),
+        )
+    }
+
+    #[test]
+    fn incremental_entry_builds_reuses_folds_and_reparses() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("lines.jsonl");
+        std::fs::write(&path, b"a\nb\npartial").unwrap();
+        let t0 = Instant::now();
+
+        // Full build ignores the incomplete trailing line.
+        let entry = refresh_line_count(None, &path, t0).unwrap();
+        assert_eq!(entry.value, 2);
+        assert_eq!(entry.offset, 4);
+        assert_eq!(entry.last_access, t0);
+        assert_eq!(entry.last_full_validation_at, t0);
+
+        // Unchanged file inside the interval: same value, only last_access moves.
+        let t1 = t0 + Duration::from_secs(1);
+        let entry = refresh_line_count(Some(entry), &path, t1).unwrap();
+        assert_eq!(entry.value, 2);
+        assert_eq!(entry.last_access, t1);
+        if entry.stamp.supports_unchanged_fast_path() {
+            assert_eq!(entry.last_full_validation_at, t0);
+        }
+
+        // Append completes the partial line and adds one more: fold only the delta.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"\nc\n").unwrap();
+        drop(file);
+        let t2 = t0 + Duration::from_secs(2);
+        let entry = refresh_line_count(Some(entry), &path, t2).unwrap();
+        assert_eq!(entry.value, 4);
+        assert_eq!(entry.offset, std::fs::metadata(&path).unwrap().len());
+
+        // Shrinking rewrite falls back to a full rebuild.
+        std::fs::write(&path, b"x\n").unwrap();
+        let entry = refresh_line_count(Some(entry), &path, t2).unwrap();
+        assert_eq!(entry.value, 1);
+        assert_eq!(entry.offset, 2);
+
+        // A missing file yields no entry.
+        let missing = temp.path().join("missing.jsonl");
+        assert!(super::refresh_incremental_entry(
+            Some(entry),
+            &missing,
+            FileVersion {
+                len: 0,
+                modified_nanos: 0,
+                changed_nanos: 0,
+                identity: 0,
+            },
+            t2,
+            |lines| lines.len(),
+            |count, lines| count + lines.len(),
+        )
+        .is_none());
     }
 }

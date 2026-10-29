@@ -1,7 +1,6 @@
 <script lang="ts">
 	import type { Message } from '$lib/types';
-	import { marked } from 'marked';
-	import DOMPurify from 'dompurify';
+	import { renderMarkdown } from '$lib/markdown';
 
 	interface Props {
 		message: Message;
@@ -62,37 +61,9 @@
 		}
 	});
 
-	let renderedContent = $derived.by(() => {
-		if (!message.content) return '';
-
-		const renderer = new marked.Renderer();
-
-		// Custom code block renderer for Vercel Noir style
-		renderer.code = function ({ text, lang }) {
-			const language = lang || 'code';
-			return `
-				<div class="code-block-wrapper">
-					<div class="code-header">
-						<span class="code-lang">${language}</span>
-						<div class="code-actions">
-							<span class="code-dot"></span>
-							<span class="code-dot"></span>
-						</div>
-					</div>
-					<pre><code class="language-${language}">${text}</code></pre>
-				</div>
-			`;
-		};
-
-		// Configure marked for safe rendering
-		const rawHtml = marked.parse(message.content, {
-			async: false,
-			breaks: true,
-			gfm: true,
-			renderer
-		});
-		return DOMPurify.sanitize(rawHtml as string);
-	});
+	let renderedContent = $derived(
+		message.content ? renderMarkdown(message.content, { codeDots: true }) : ''
+	);
 </script>
 
 <div
