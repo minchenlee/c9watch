@@ -20,3 +20,6 @@ pub mod proto;
 
 #[cfg(unix)]
 pub mod api;
+
+#[cfg(unix)]
+pub mod principal;

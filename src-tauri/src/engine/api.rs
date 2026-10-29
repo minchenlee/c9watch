@@ -8,6 +8,7 @@
 //! connection stays open, because the line framing is still intact.
 
 use super::peer::{self, PeerCred};
+use super::principal::{self, LiveAgents, NoLiveAgents, Principal};
 use super::proto::{
     encode, read_frame, ApiError, ErrorCode, FrameError, HelloParams, HelloResult, Request,
     Response, API_MAJOR, API_MINOR, MAX_FRAME,
@@ -31,6 +32,8 @@ pub struct ServerCtx {
     /// The machine key id. Set from the store once it exists (M2).
     pub machine_id: String,
     pub hello_timeout: Duration,
+    /// Live agents, for `agent:<id>` stamping.
+    pub agents: Arc<dyn LiveAgents>,
 }
 
 impl ServerCtx {
@@ -39,6 +42,8 @@ impl ServerCtx {
             engine_version: env!("CARGO_PKG_VERSION").to_string(),
             machine_id,
             hello_timeout: HELLO_TIMEOUT,
+            // C1a-33 replaces this with the engine's agent table.
+            agents: Arc::new(NoLiveAgents),
         }
     }
 }
@@ -63,7 +68,7 @@ pub async fn serve(listener: UnixListener, ctx: Arc<ServerCtx>) {
 
 /// The connection's state after `hello`.
 struct Conn {
-    principal: String,
+    principal: Principal,
 }
 
 /// What the reader does after handling a frame.
@@ -284,7 +289,7 @@ fn hello(
     let principal = match conn {
         Some(c) => c.principal.clone(),
         None => {
-            let principal = stamp_principal(&cred);
+            let principal = principal::stamp_peer(cred.pid, ctx.agents.as_ref());
             *conn = Some(Conn {
                 principal: principal.clone(),
             });
@@ -310,17 +315,12 @@ fn hello(
         api_minor: API_MINOR,
         engine_version: ctx.engine_version.clone(),
         machine_id: ctx.machine_id.clone(),
-        principal,
+        principal: principal.to_string(),
         capabilities,
         cursor: None,
     };
     let result = serde_json::to_value(result).expect("HelloResult serializes");
     (Response::ok(id, result), Next::Continue)
-}
-
-/// The principal of a connection. Only `local-unverified` until C1a-09.
-fn stamp_principal(_cred: &PeerCred) -> String {
-    "local-unverified".to_string()
 }
 
 #[cfg(test)]
@@ -330,10 +330,15 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
     fn ctx(hello_timeout: Duration) -> Arc<ServerCtx> {
+        ctx_with(hello_timeout, Arc::new(NoLiveAgents))
+    }
+
+    fn ctx_with(hello_timeout: Duration, agents: Arc<dyn LiveAgents>) -> Arc<ServerCtx> {
         Arc::new(ServerCtx {
             engine_version: "9.9.9".into(),
             machine_id: "m-test".into(),
             hello_timeout,
+            agents,
         })
     }
 
@@ -488,5 +493,53 @@ mod tests {
         send(&mut c, hello_req("1", json!({"apiMajor": 1}))).await;
         assert_eq!(read_one(&mut c).await["result"]["apiMajor"], 1);
         server.abort();
+    }
+
+    /// Hello with `params` from the test process, and the stamped principal.
+    async fn principal_for(agents: Arc<dyn LiveAgents>, params: Value) -> Value {
+        let mut c = connect(ctx_with(HELLO_TIMEOUT, agents));
+        send(&mut c, hello_req("1", params)).await;
+        let r = read_one(&mut c).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        r
+    }
+
+    #[tokio::test]
+    async fn cli_and_gui_connections_are_local_unverified() {
+        for kind in ["cli", "gui"] {
+            let r = principal_for(
+                Arc::new(NoLiveAgents),
+                json!({"client": {"kind": kind, "name": "c9watch"}}),
+            )
+            .await;
+            assert_eq!(r["result"]["principal"], "local-unverified", "{}", kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_claim_is_local_unverified() {
+        let r = principal_for(
+            Arc::new(NoLiveAgents),
+            json!({"client": {"kind": "gateway", "name": "x"}, "clientId": "x"}),
+        )
+        .await;
+        assert_eq!(r["result"]["principal"], "local-unverified");
+        assert!(!r.to_string().contains("client:"), "{}", r);
+    }
+
+    #[tokio::test]
+    async fn descendant_of_a_live_pty_child_is_the_agent() {
+        // The peer is this test process; pretend its parent is the PTY child.
+        let me = std::process::id() as libc::pid_t;
+        let parent = peer::proc_info(me).unwrap().ppid;
+        let start = peer::proc_info(parent).unwrap().start;
+        let agents = principal::tests::FakeAgents::one("a7", parent, start);
+        let r = principal_for(Arc::new(agents), json!({"client": {"kind": "cli"}})).await;
+        assert_eq!(r["result"]["principal"], "agent:a7");
+
+        // Same pid, other start time: a reused pid is not the agent.
+        let agents = principal::tests::FakeAgents::one("a7", parent, start + 1);
+        let r = principal_for(Arc::new(agents), json!({})).await;
+        assert_eq!(r["result"]["principal"], "local-unverified");
     }
 }
