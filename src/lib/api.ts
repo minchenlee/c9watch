@@ -9,6 +9,13 @@ import type { Session, Conversation, AwayActivity, AwayRequest, HistoryEntry, De
 import { isDemoMode } from './demo/mode';
 import { getDemoSessions, getDemoHistoryEntries, getDemoCostData, demoConversations, getDemoAwayActivity, getDemoDiagnostics } from './demo/data';
 import { wsClient, useWebSocket } from './ws';
+
+/**
+ * Thrown by `getConversation` and `openSession` over WebSocket when the
+ * desktop has that capability off for remote devices (the default). The
+ * request is not sent; the server refuses it too.
+ */
+export { CapabilityDisabledError } from './ws';
 import { sessionKeyOf } from './provider';
 
 /**
@@ -86,16 +93,18 @@ export async function stopSession(session: Session): Promise<void> {
 }
 
 /**
- * Open the terminal or IDE window for a session
+ * Open the terminal or IDE window for a session. Over WebSocket the backend
+ * resolves the process and project path from its own detection by session
+ * key; `pid` only has to agree.
  */
-export async function openSession(pid: number, projectPath: string): Promise<void> {
+export async function openSession(session: Session): Promise<void> {
 	if (get(isDemoMode)) return;
 
 	if (useWebSocket()) {
-		await wsClient.request('openSession', { pid, projectPath });
+		await wsClient.request('openSession', { addr: sessionKeyOf(session), pid: session.pid });
 		return;
 	}
-	await invoke<void>('open_session', { pid, projectPath });
+	await invoke<void>('open_session', { pid: session.pid, projectPath: session.projectPath });
 }
 
 /**

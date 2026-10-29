@@ -69,9 +69,107 @@ impl WsState {
         self.remote.read().map(|r| r.clone()).unwrap_or_default()
     }
 
+    /// What remote clients may do now. A poisoned lock fails closed.
+    fn policy_now(&self) -> WsPolicy {
+        self.remote
+            .read()
+            .map(|r| WsPolicy::from(&*r))
+            .unwrap_or_default()
+    }
+
     fn lan_enabled(&self) -> bool {
         // A poisoned lock fails closed: loopback only.
         self.remote.read().map(|r| r.lan_enabled).unwrap_or(false)
+    }
+}
+
+// ── Remote capabilities ─────────────────────────────────────────────
+
+/// What a remote (WS) client may do beyond watching session cards. Both are
+/// off by default. This is the real gate: the frontend only hides what the
+/// server refuses anyway. It is sent to the client as `capabilities` in
+/// `authOk` and `paired`; a change closes every socket, so a client always
+/// learns the new value when it reconnects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct WsPolicy {
+    /// Full transcripts (`getConversation`) and conversation text in pushes.
+    #[serde(rename = "conversation")]
+    pub allow_conversation: bool,
+    /// `openSession`: focus a terminal or editor window on this Mac.
+    #[serde(rename = "open")]
+    pub allow_open: bool,
+}
+
+impl From<&RemoteAccess> for WsPolicy {
+    fn from(remote: &RemoteAccess) -> Self {
+        Self {
+            allow_conversation: remote.allow_conversation,
+            allow_open: remote.allow_open,
+        }
+    }
+}
+
+/// `code` of an error frame for a request the policy turned off.
+const CAPABILITY_DISABLED: &str = "capabilityDisabled";
+
+fn capability_disabled(capability: &'static str) -> ServerMsg {
+    let message = match capability {
+        "conversation" => "getConversation disabled over remote",
+        _ => "openSession disabled over remote",
+    };
+    ServerMsg::CapabilityDisabled {
+        message: message.into(),
+        code: CAPABILITY_DISABLED,
+        capability,
+    }
+}
+
+/// Session fields that carry conversation text. With conversations off they
+/// are blanked (string fields the client expects) or dropped (optional ones).
+const BLANKED_SESSION_FIELDS: &[&str] = &["firstPrompt", "latestMessage"];
+const DROPPED_SESSION_FIELDS: &[&str] = &["lastAssistantMessage", "pendingToolInput"];
+
+/// Removes what the policy keeps from remote clients out of a session array
+/// (`sessions`, `sessionsUpdated`). Names, titles, status and the pending
+/// tool's name stay, so a card still says what it is and what it waits for.
+fn redact_sessions(data: &mut serde_json::Value, policy: &WsPolicy) {
+    let Some(sessions) = data.as_array_mut() else {
+        return;
+    };
+    for session in sessions.iter_mut().filter_map(|s| s.as_object_mut()) {
+        if !policy.allow_conversation {
+            for field in BLANKED_SESSION_FIELDS {
+                if session.contains_key(*field) {
+                    session.insert((*field).into(), "".into());
+                }
+            }
+            for field in DROPPED_SESSION_FIELDS {
+                session.remove(*field);
+            }
+            if session.contains_key("summary") {
+                session.insert("summary".into(), serde_json::Value::Null);
+            }
+        }
+        if !policy.allow_open {
+            session.insert("canOpen".into(), false.into());
+            session.remove("openTarget");
+        }
+    }
+}
+
+/// A notification's `title` can be the session's first prompt. With
+/// conversations off it becomes `redactedTitle` (the session's own title or
+/// name). `redactedTitle` itself never goes out.
+fn redact_notification(data: &mut serde_json::Value, policy: &WsPolicy) {
+    let Some(notification) = data.as_object_mut() else {
+        return;
+    };
+    let redacted = notification.remove("redactedTitle");
+    if !policy.allow_conversation {
+        notification.insert(
+            "title".into(),
+            redacted.unwrap_or_else(|| "c9watch".into()),
+        );
     }
 }
 
@@ -115,11 +213,14 @@ enum ClientMsg {
         pid: u32,
     },
 
+    /// Focus the window of the session at `addr`. Like `session.stop`, the
+    /// server resolves the pid and project path itself; `pid`, when given,
+    /// only has to agree. An old client's `projectPath` is ignored.
     #[serde(rename = "openSession")]
     OpenSession {
-        pid: u32,
-        #[serde(rename = "projectPath")]
-        project_path: String,
+        addr: String,
+        #[serde(default)]
+        pid: Option<u32>,
     },
 
     #[serde(rename = "renameSession")]
@@ -155,6 +256,15 @@ enum ServerMsg {
 
     #[serde(rename = "error")]
     Error { message: String },
+
+    /// An `error` the client can tell apart: the remote-access policy
+    /// turned `capability` off.
+    #[serde(rename = "error")]
+    CapabilityDisabled {
+        message: String,
+        code: &'static str,
+        capability: &'static str,
+    },
 
     #[serde(rename = "ok")]
     Ok,
@@ -826,6 +936,7 @@ enum AuthReply {
     AuthOk {
         #[serde(rename = "clientId")]
         client_id: String,
+        capabilities: WsPolicy,
     },
     /// Sent once, after a code is redeemed. `token` is the client's
     /// credential from now on; the server keeps only its hash.
@@ -834,6 +945,7 @@ enum AuthReply {
         #[serde(rename = "clientId")]
         client_id: String,
         token: String,
+        capabilities: WsPolicy,
     },
 }
 
@@ -846,7 +958,10 @@ fn check_auth_frame(text: &str, state: &WsState) -> Result<AuthReply, u16> {
             let clients = state.clients.lock().map_err(|_| CLOSE_UNAUTHORIZED)?;
             clients
                 .verify(&token)
-                .map(|client_id| AuthReply::AuthOk { client_id })
+                .map(|client_id| AuthReply::AuthOk {
+                    client_id,
+                    capabilities: state.policy_now(),
+                })
                 .ok_or(CLOSE_UNAUTHORIZED)
         }
         AuthFrame::Pair { code } => {
@@ -861,7 +976,11 @@ fn check_auth_frame(text: &str, state: &WsState) -> Result<AuthReply, u16> {
                 .lock()
                 .map_err(|_| CLOSE_UNAUTHORIZED)?
                 .issue();
-            Ok(AuthReply::Paired { client_id, token })
+            Ok(AuthReply::Paired {
+                client_id,
+                token,
+                capabilities: state.policy_now(),
+            })
         }
     }
 }
@@ -958,6 +1077,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>, peer: IpAddr)
                         let request_id = serde_json::from_str::<serde_json::Value>(text_str)
                             .ok().and_then(|value| value.get("requestId").and_then(|id| id.as_u64()));
                         match serde_json::from_str::<ClientMsg>(text_str) {
+                            Ok(ClientMsg::GetConversation { .. })
+                                if !state.policy_now().allow_conversation =>
+                            {
+                                let refused = response_json(&capability_disabled("conversation"), request_id);
+                                if socket.send(Message::Text(refused)).await.is_err() { break; }
+                            }
                             Ok(ClientMsg::GetConversation {
                                 session_id,
                                 provider,
@@ -984,8 +1109,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>, peer: IpAddr)
                                 }));
                             }
                             Ok(client_msg) => {
-                                let response =
-                                    handle_message(client_msg, Arc::clone(&state.detector)).await;
+                                let response = handle_message(
+                                    client_msg,
+                                    &state.policy_now(),
+                                    Arc::clone(&state.detector),
+                                )
+                                .await;
                                 let json = response_json(&response, request_id);
                                 if socket.send(Message::Text(json)).await.is_err() {
                                     break;
@@ -1032,9 +1161,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>, peer: IpAddr)
             }
             // Push session updates from polling loop
             Ok(sessions_json) = sessions_rx.recv() => {
-                let msg = ServerMsg::SessionsUpdated {
-                    data: serde_json::from_str(&sessions_json).unwrap_or_default(),
-                };
+                let mut data = serde_json::from_str(&sessions_json).unwrap_or_default();
+                redact_sessions(&mut data, &state.policy_now());
+                let msg = ServerMsg::SessionsUpdated { data };
                 let json = serde_json::to_string(&msg).unwrap_or_default();
                 if socket.send(Message::Text(json)).await.is_err() {
                     break;
@@ -1042,9 +1171,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>, peer: IpAddr)
             }
             // Push notifications to WS clients
             Ok(notif_json) = notifications_rx.recv() => {
-                let msg = ServerMsg::Notification {
-                    data: serde_json::from_str(&notif_json).unwrap_or_default(),
-                };
+                let mut data = serde_json::from_str(&notif_json).unwrap_or_default();
+                redact_notification(&mut data, &state.policy_now());
+                let msg = ServerMsg::Notification { data };
                 let json = serde_json::to_string(&msg).unwrap_or_default();
                 if socket.send(Message::Text(json)).await.is_err() {
                     break;
@@ -1121,11 +1250,16 @@ async fn load_conversation_response(
 
 /// `getSessions` reply. `data` is the session array, the same shape as
 /// `sessionsUpdated`; the detection diagnostics stay on the server.
-fn sessions_response<S: Serialize, D>(scan: Result<(Vec<S>, D), String>) -> ServerMsg {
+fn sessions_response<S: Serialize, D>(
+    scan: Result<(Vec<S>, D), String>,
+    policy: &WsPolicy,
+) -> ServerMsg {
     match scan {
-        Ok((sessions, _diagnostics)) => ServerMsg::Sessions {
-            data: serde_json::to_value(&sessions).unwrap_or_default(),
-        },
+        Ok((sessions, _diagnostics)) => {
+            let mut data = serde_json::to_value(&sessions).unwrap_or_default();
+            redact_sessions(&mut data, policy);
+            ServerMsg::Sessions { data }
+        }
         Err(message) => ServerMsg::Error { message },
     }
 }
@@ -1135,8 +1269,10 @@ const STOP_SESSION_REMOVED: &str =
 
 async fn handle_message(
     msg: ClientMsg,
+    policy: &WsPolicy,
     detector: Arc<Mutex<crate::session::DetectorState>>,
 ) -> ServerMsg {
+    let open_detector = Arc::clone(&detector);
     let stop = move |addr: String, pid: Option<u32>| {
         crate::actions::stop_session_by_key(
             &addr,
@@ -1146,15 +1282,30 @@ async fn handle_message(
         )
         .map(|_| ())
     };
-    handle_message_with_owners(msg, crate::session::global_provider_source_owners(), stop).await
+    let open = move |addr: String, pid: Option<u32>| {
+        crate::actions::open_session_by_key(&addr, pid, || {
+            crate::detect_sessions(&open_detector)
+        })
+    };
+    handle_message_with_policy(
+        msg,
+        policy,
+        crate::session::global_provider_source_owners(),
+        stop,
+        open,
+    )
+    .await
 }
 
-/// `stop` stops the session at an address and runs on the blocking pool;
-/// tests inject it the way they inject `owners`.
-async fn handle_message_with_owners(
+/// `stop` and `open` act on the session at an address and run on the
+/// blocking pool; tests inject them the way they inject `owners`. `policy`
+/// gates `openSession`; `getConversation` is gated in the socket loop.
+async fn handle_message_with_policy(
     msg: ClientMsg,
+    policy: &WsPolicy,
     owners: crate::session::ProviderSourceOwners,
     stop: impl FnOnce(String, Option<u32>) -> Result<(), String> + Send + 'static,
+    open: impl FnOnce(String, Option<u32>) -> Result<(), String> + Send + 'static,
 ) -> ServerMsg {
     match msg {
         ClientMsg::GetSubscriptionUsage => ServerMsg::SubscriptionUsage {
@@ -1167,6 +1318,7 @@ async fn handle_message_with_owners(
                 crate::polling::detect_and_enrich_sessions,
             )
             .await,
+            policy,
         ),
 
         // handle_socket owns getConversation (cancellation + progress).
@@ -1188,10 +1340,14 @@ async fn handle_message_with_owners(
             message: STOP_SESSION_REMOVED.into(),
         },
 
-        ClientMsg::OpenSession { pid, project_path } => {
-            match crate::actions::open_session(pid, project_path) {
-                Ok(()) => ServerMsg::Ok,
-                Err(e) => ServerMsg::Error { message: e },
+        ClientMsg::OpenSession { .. } if !policy.allow_open => capability_disabled("open"),
+        ClientMsg::OpenSession { addr, pid } => {
+            match tokio::task::spawn_blocking(move || open(addr, pid)).await {
+                Ok(Ok(())) => ServerMsg::Ok,
+                Ok(Err(e)) => ServerMsg::Error { message: e },
+                Err(e) => ServerMsg::Error {
+                    message: format!("Open failed: {e}"),
+                },
             }
         }
 
@@ -1281,13 +1437,15 @@ mod tests {
         ];
 
         for owners in owners {
-            let response = handle_message_with_owners(
+            let response = handle_message_with_policy(
                 ClientMsg::RenameSession {
                     session_id: SESSION_ID.to_string(),
                     new_name: "synthetic collision".to_string(),
                     provider: None,
                 },
+                &WsPolicy::default(),
                 owners,
+                no_stop,
                 no_stop,
             )
             .await;
@@ -1397,7 +1555,9 @@ mod protocol_tests {
         let request =
             serde_json::from_str(r#"{"type":"session.stop","addr":"claudeCode:x","pid":7}"#)
                 .unwrap();
-        let response = handle_message_with_owners(request, no_owners(), stop).await;
+        let response =
+            handle_message_with_policy(request, &WsPolicy::default(), no_owners(), stop, no_open)
+                .await;
         assert!(matches!(response, ServerMsg::Ok));
         assert_eq!(
             *calls.lock().unwrap(),
@@ -1409,12 +1569,145 @@ mod protocol_tests {
     async fn removed_stop_session_by_pid_errors_without_stopping() {
         let (calls, stop) = recording_stop();
         let request = serde_json::from_str(r#"{"type":"stopSession","pid":4242}"#).unwrap();
-        let response = handle_message_with_owners(request, no_owners(), stop).await;
+        let response =
+            handle_message_with_policy(request, &WsPolicy::default(), no_owners(), stop, no_open)
+                .await;
         match response {
             ServerMsg::Error { message } => assert!(message.contains("removed")),
             other => panic!("expected the removed error, got {other:?}"),
         }
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    fn no_open(_: String, _: Option<u32>) -> Result<(), String> {
+        panic!("open must not run")
+    }
+
+    fn no_stop(_: String, _: Option<u32>) -> Result<(), String> {
+        panic!("stop must not run")
+    }
+
+    const OPEN_ON: WsPolicy = WsPolicy {
+        allow_conversation: false,
+        allow_open: true,
+    };
+
+    #[test]
+    fn open_session_request_carries_an_address_and_optional_pid() {
+        let request: ClientMsg = serde_json::from_str(
+            r#"{"type":"openSession","addr":"claudeCode:x","pid":9,"projectPath":"--x"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            request,
+            ClientMsg::OpenSession { ref addr, pid: Some(9) } if addr == "claudeCode:x"
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_session_is_refused_when_remote_open_is_off() {
+        let (calls, open) = recording_stop();
+        let request =
+            serde_json::from_str(r#"{"type":"openSession","addr":"claudeCode:x","pid":7}"#)
+                .unwrap();
+        let response =
+            handle_message_with_policy(request, &WsPolicy::default(), no_owners(), no_stop, open)
+                .await;
+        let value: serde_json::Value =
+            serde_json::from_str(&response_json(&response, Some(2))).unwrap();
+        assert_eq!(value["type"], "error", "{value}");
+        assert_eq!(value["code"], "capabilityDisabled");
+        assert_eq!(value["capability"], "open");
+        assert_eq!(value["requestId"], 2);
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_session_passes_the_address_when_remote_open_is_on() {
+        let (calls, open) = recording_stop();
+        let request =
+            serde_json::from_str(r#"{"type":"openSession","addr":"claudeCode:x","pid":7}"#)
+                .unwrap();
+        let response = handle_message_with_policy(request, &OPEN_ON, no_owners(), no_stop, open).await;
+        assert!(matches!(response, ServerMsg::Ok), "{response:?}");
+        assert_eq!(*calls.lock().unwrap(), [("claudeCode:x".to_string(), Some(7))]);
+    }
+
+    fn content_session() -> serde_json::Value {
+        serde_json::json!({
+            "id": "s1",
+            "sessionName": "proj",
+            "customTitle": "My title",
+            "firstPrompt": "secret prompt",
+            "latestMessage": "secret latest",
+            "lastAssistantMessage": "secret reply",
+            "summary": "secret summary",
+            "pendingToolName": "Bash",
+            "pendingToolInput": { "command": "cat ~/.ssh/id_rsa" },
+            "openTarget": "terminal",
+            "canOpen": true,
+            "canStop": true,
+        })
+    }
+
+    #[test]
+    fn sessions_lose_conversation_content_and_open_when_both_are_off() {
+        let mut data = serde_json::json!([content_session()]);
+        redact_sessions(&mut data, &WsPolicy::default());
+        let s = &data[0];
+        assert_eq!(s["firstPrompt"], "");
+        assert_eq!(s["latestMessage"], "");
+        assert!(s["summary"].is_null());
+        assert!(s.get("lastAssistantMessage").is_none());
+        assert!(s.get("pendingToolInput").is_none());
+        assert!(!data.to_string().contains("secret"), "{data}");
+        assert!(!data.to_string().contains("id_rsa"), "{data}");
+        // Names and status stay: the card still shows what it is.
+        assert_eq!(s["sessionName"], "proj");
+        assert_eq!(s["customTitle"], "My title");
+        assert_eq!(s["pendingToolName"], "Bash");
+        assert_eq!(s["canOpen"], false);
+        assert!(s.get("openTarget").is_none());
+        assert_eq!(s["canStop"], true);
+    }
+
+    #[test]
+    fn sessions_keep_everything_when_both_are_on() {
+        let mut data = serde_json::json!([content_session()]);
+        let all = WsPolicy {
+            allow_conversation: true,
+            allow_open: true,
+        };
+        redact_sessions(&mut data, &all);
+        assert_eq!(data, serde_json::json!([content_session()]));
+    }
+
+    #[test]
+    fn notifications_fall_back_to_the_name_when_conversations_are_off() {
+        let push = || {
+            serde_json::json!({
+                "title": "secret prompt",
+                "redactedTitle": "proj",
+                "body": "proj: Finished working",
+                "sessionId": "s1",
+            })
+        };
+        let mut off = push();
+        redact_notification(&mut off, &WsPolicy::default());
+        assert_eq!(off["title"], "proj");
+        assert!(off.get("redactedTitle").is_none());
+        assert!(!off.to_string().contains("secret"));
+
+        let mut on = push();
+        redact_notification(
+            &mut on,
+            &WsPolicy {
+                allow_conversation: true,
+                allow_open: false,
+            },
+        );
+        assert_eq!(on["title"], "secret prompt");
+        assert!(on.get("redactedTitle").is_none());
     }
 
     /// The mobile client reads `data` as a session array; a `[sessions,
@@ -1423,7 +1716,11 @@ mod protocol_tests {
     fn get_sessions_reply_is_the_session_array() {
         let session = serde_json::json!({ "id": "s1", "projectPath": "/tmp/p" });
         let diagnostics = serde_json::json!({ "claudeProcessesFound": 1 });
-        let reply = sessions_response(Ok((vec![session.clone()], diagnostics)));
+        let all = WsPolicy {
+            allow_conversation: true,
+            allow_open: true,
+        };
+        let reply = sessions_response(Ok((vec![session.clone()], diagnostics)), &all);
         let value: serde_json::Value =
             serde_json::from_str(&response_json(&reply, Some(1))).unwrap();
         assert_eq!(value["type"], "sessions");
@@ -2027,6 +2324,116 @@ mod server_tests {
             next_event(&mut again).await,
             Event::Close(Some(CLOSE_UNAUTHORIZED))
         ));
+    }
+
+    /// Opens an authenticated socket and returns it with the `authOk` frame.
+    async fn signed_in(server: &WsServer, addr: SocketAddr) -> (Client, serde_json::Value) {
+        let token = issue_token(server);
+        let mut client = open(addr).await;
+        send_json(&mut client, serde_json::json!({"type": "auth", "token": token})).await;
+        match next_event(&mut client).await {
+            Event::Text(v) if v["type"] == "authOk" => (client, v),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    async fn wait_for_subscriber(state: &WsState) {
+        for _ in 0..50 {
+            if state.sessions_tx.receiver_count() == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("socket never subscribed");
+    }
+
+    #[tokio::test]
+    async fn auth_ok_carries_the_capabilities_and_they_default_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        let (_client, ok) = signed_in(&server, addr).await;
+        assert_eq!(ok["capabilities"], serde_json::json!({"conversation": false, "open": false}));
+
+        server
+            .apply(RemoteAccess {
+                allow_conversation: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let addr = server.bound().await[0];
+        let (_client, ok) = signed_in(&server, addr).await;
+        assert_eq!(ok["capabilities"], serde_json::json!({"conversation": true, "open": false}));
+    }
+
+    #[tokio::test]
+    async fn get_conversation_is_refused_without_progress_when_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        let (mut client, _) = signed_in(&server, addr).await;
+        send_json(
+            &mut client,
+            serde_json::json!({"type": "getConversation", "sessionId": SESSION, "requestId": 5}),
+        )
+        .await;
+        match next_event(&mut client).await {
+            Event::Text(v) => {
+                assert_eq!(v["type"], "error", "{v}");
+                assert_eq!(v["code"], "capabilityDisabled");
+                assert_eq!(v["capability"], "conversation");
+                assert_eq!(v["requestId"], 5);
+            }
+            other => panic!("{other:?}"),
+        }
+        // The next frame is this push, not a conversationProgress.
+        let state = Arc::clone(server.state());
+        wait_for_subscriber(&state).await;
+        state.sessions_tx.send("[]".into()).unwrap();
+        assert!(matches!(
+            next_event(&mut client).await,
+            Event::Text(v) if v["type"] == "sessionsUpdated"
+        ));
+    }
+
+    const SESSION: &str = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+
+    #[tokio::test]
+    async fn pushes_carry_no_conversation_content_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        let (mut client, _) = signed_in(&server, addr).await;
+        let state = Arc::clone(server.state());
+        wait_for_subscriber(&state).await;
+        let sessions = serde_json::json!([{
+            "id": "s1",
+            "firstPrompt": "secret prompt",
+            "latestMessage": "secret latest",
+            "lastAssistantMessage": "secret reply",
+            "canOpen": true,
+        }]);
+        state.sessions_tx.send(sessions.to_string()).unwrap();
+        match next_event(&mut client).await {
+            Event::Text(v) => {
+                assert_eq!(v["type"], "sessionsUpdated");
+                assert!(!v.to_string().contains("secret"), "{v}");
+                assert_eq!(v["data"][0]["canOpen"], false);
+            }
+            other => panic!("{other:?}"),
+        }
+        let notification = serde_json::json!({
+            "title": "secret prompt",
+            "redactedTitle": "proj",
+            "body": "proj: Finished working",
+        });
+        state.notifications_tx.send(notification.to_string()).unwrap();
+        match next_event(&mut client).await {
+            Event::Text(v) => {
+                assert_eq!(v["type"], "notification");
+                assert_eq!(v["data"]["title"], "proj");
+                assert!(!v.to_string().contains("secret"), "{v}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

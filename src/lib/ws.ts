@@ -14,6 +14,29 @@ export const CLOSE_UNAUTHORIZED = 4401;
 
 const CONNECT_TIMEOUT_MS = 5000;
 
+/** What the desktop lets a remote client do beyond watching cards. Both default off. */
+export interface RemoteCapabilities {
+	conversation: boolean;
+	open: boolean;
+}
+export type RemoteCapability = keyof RemoteCapabilities;
+
+/** The request needs a capability the desktop has turned off for remote devices. */
+export class CapabilityDisabledError extends Error {
+	readonly capability: RemoteCapability;
+	constructor(capability: RemoteCapability, message?: string) {
+		super(message ?? `${capability} is off for remote devices`);
+		this.name = 'CapabilityDisabledError';
+		this.capability = capability;
+	}
+}
+
+/** Requests the server refuses unless the matching capability is on. */
+const REQUIRED_CAPABILITY: Record<string, RemoteCapability> = {
+	getConversation: 'conversation',
+	openSession: 'open',
+};
+
 class WsClient {
 	private ws: WebSocket | null = null;
 	private host = '';
@@ -23,9 +46,19 @@ class WsClient {
 	private pending = new Map<number, { resolve: (value: any) => void; reject: (reason: any) => void }>();
 	private listeners = new Map<string, Set<EventCallback>>();
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	private capabilities: RemoteCapabilities | null = null;
 
 	get isConnected() {
 		return this._connected;
+	}
+
+	/**
+	 * Whether the desktop allows `capability` for this client, from the last
+	 * `authOk`/`paired`. Before an ack (or from a server that sends none) this
+	 * is true: the server is the real gate and refuses anyway.
+	 */
+	allows(capability: RemoteCapability): boolean {
+		return this.capabilities?.[capability] !== false;
 	}
 
 	/**
@@ -104,9 +137,11 @@ class WsClient {
 				} else if (msg.type !== 'authOk') {
 					return;
 				}
+				this.capabilities = msg.capabilities ?? null;
 				this._connected = true;
 				console.log('[ws] Connected');
 				settle();
+				this.emit('capabilities', this.capabilities);
 			};
 		});
 	}
@@ -124,6 +159,10 @@ class WsClient {
 	async request<T = any>(type: string, data?: Record<string, any>): Promise<T> {
 		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
 			throw new Error('WebSocket not connected');
+		}
+		const capability = REQUIRED_CAPABILITY[type];
+		if (capability && !this.allows(capability)) {
+			throw new CapabilityDisabledError(capability);
 		}
 		return new Promise((resolve, reject) => {
 			const requestId = ++this.nextRequestId;
@@ -172,7 +211,9 @@ class WsClient {
 			const pending = this.pending.get(msg.requestId);
 			if (!pending) return;
 			this.pending.delete(msg.requestId);
-			if (msg.type === 'error') pending.reject(new Error(msg.message));
+			if (msg.type === 'error' && msg.code === 'capabilityDisabled') {
+				pending.reject(new CapabilityDisabledError(msg.capability, msg.message));
+			} else if (msg.type === 'error') pending.reject(new Error(msg.message));
 			else pending.resolve(msg.data ?? msg);
 		} catch (e) {
 			console.error('[ws] Failed to parse message:', e);

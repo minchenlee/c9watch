@@ -40,6 +40,7 @@ pub fn open_session(pid: u32, project_path: String) -> Result<(), String> {
     if pid == 0 {
         return Err("This session does not expose a focusable terminal process".to_string());
     }
+    check_open_path(&project_path)?;
     // Find the parent application by walking up the process tree
     let app_name = find_parent_app(pid)?;
 
@@ -119,6 +120,51 @@ pub fn open_session(pid: u32, project_path: String) -> Result<(), String> {
     activate_app_fallback(&app_name)?;
 
     Ok(())
+}
+
+/// Editor CLIs (`code`, `cursor`, `zed`, ...) get the project path as an
+/// argument. One that starts with `-` would be read as an option, such as
+/// `--install-extension=...`, so it is refused.
+pub fn check_open_path(project_path: &str) -> Result<(), String> {
+    if project_path.starts_with('-') {
+        return Err(format!("{project_path:?} is not a project path"));
+    }
+    Ok(())
+}
+
+/// Open the session whose key is `key`. Like stop, the pid and project path
+/// come from `resolve` (c9watch's own detection), never from the caller;
+/// `expect_pid`, when given, only has to agree with the detected pid.
+pub fn open_session_by_key(
+    key: &str,
+    expect_pid: Option<u32>,
+    resolve: impl FnOnce() -> Result<Vec<DetectedSession>, String>,
+) -> Result<(), String> {
+    open_session_by_key_with(key, expect_pid, resolve, open_session)
+}
+
+fn open_session_by_key_with(
+    key: &str,
+    expect_pid: Option<u32>,
+    resolve: impl FnOnce() -> Result<Vec<DetectedSession>, String>,
+    open: impl FnOnce(u32, String) -> Result<(), String>,
+) -> Result<(), String> {
+    let sessions = resolve()?;
+    let session = sessions
+        .iter()
+        .find(|s| s.identity_key().as_deref() == Some(key))
+        .ok_or_else(|| format!("No running session matches {key}"))?;
+    if !session.can_open || session.pid == 0 {
+        return Err("This session cannot be opened through c9watch".to_string());
+    }
+    if expect_pid.is_some_and(|pid| pid != session.pid) {
+        return Err(format!(
+            "Session {key} is no longer running as that process; not opening it"
+        ));
+    }
+    let project_path = session.project_path.to_string_lossy().into_owned();
+    check_open_path(&project_path)?;
+    open(session.pid, project_path)
 }
 
 /// Read one `ps -o <field>=` column for a process, trimmed.
@@ -1280,6 +1326,63 @@ mod tests {
             assert_eq!(result.is_ok(), pid == 4242, "pid {pid}");
         }
         assert_eq!(signalled, [4242]);
+    }
+
+    /// Runs a by-key open of `KEY` against `sessions` with a recording opener.
+    fn open_key(
+        sessions: Vec<DetectedSession>,
+        expect_pid: Option<u32>,
+    ) -> (Result<(), String>, Vec<(u32, String)>) {
+        let mut opened = Vec::new();
+        let result = open_session_by_key_with(
+            KEY,
+            expect_pid,
+            || Ok(sessions),
+            |pid, path| {
+                opened.push((pid, path));
+                Ok(())
+            },
+        );
+        (result, opened)
+    }
+
+    #[test]
+    fn open_by_key_uses_the_detected_pid_and_project_path() {
+        let (result, opened) = open_key(vec![stoppable(4242, 1_000)], Some(4242));
+        assert_eq!(result, Ok(()));
+        assert_eq!(opened, [(4242, "/tmp/proj".to_string())]);
+    }
+
+    #[test]
+    fn open_by_key_refuses_without_opening() {
+        let mut no_open = stoppable(4242, 1_000);
+        no_open.can_open = false;
+        let mut dash = stoppable(4242, 1_000);
+        dash.project_path = "--install-extension=evil".into();
+        let cases = [
+            (vec![], None),                          // key not detected
+            (vec![no_open], None),                   // can_open = false
+            (vec![stoppable(0, 1_000)], None),       // no focusable process
+            (vec![stoppable(4242, 1_000)], Some(7)), // caller's pid disagrees
+            (vec![dash], None),                      // path reads as an option
+        ];
+        for (sessions, expect_pid) in cases {
+            let (result, opened) = open_key(sessions, expect_pid);
+            assert!(result.is_err());
+            assert!(opened.is_empty());
+        }
+    }
+
+    #[test]
+    fn open_paths_that_start_with_a_dash_are_rejected() {
+        assert!(check_open_path("-r").is_err());
+        assert!(check_open_path("--install-extension=x").is_err());
+        assert!(check_open_path("").is_ok(), "a terminal focus needs no path");
+        assert!(check_open_path("/Users/me/project").is_ok());
+        assert!(check_open_path("relative/dir").is_ok());
+        assert!(open_session(4242, "--goto=x".into())
+            .unwrap_err()
+            .contains("not a project path"));
     }
 
     #[cfg(unix)]

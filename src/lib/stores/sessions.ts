@@ -8,7 +8,6 @@ import { isPermissionGranted, requestPermission } from '@tauri-apps/plugin-notif
 import type { Session, Conversation } from '../types';
 import { SessionStatus } from '../types';
 import { isDemoMode } from '../demo/mode';
-import { openSession } from '../api';
 import { wsClient, useWebSocket, getStoredConnection, isTauri } from '../ws';
 import { providerOf, providerSessionKey, resolveCodexHierarchy, sessionReturnKind, sessionKeyOf } from '../provider';
 import { initConversationProgressListener } from './conversation-loader';

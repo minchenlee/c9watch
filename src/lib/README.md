@@ -50,7 +50,7 @@ const conv = await getConversation(sessionId);
 await stopSession(session);
 
 // Open terminal/IDE window
-await openSession(pid, projectPath);
+await openSession(session);
 ```
 
 ## Event Listeners

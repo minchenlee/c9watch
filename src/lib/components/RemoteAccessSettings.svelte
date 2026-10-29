@@ -113,6 +113,26 @@
 				{/if}
 			</div>
 		{/if}
+		<div class="setting-row">
+			<span>Conversations over remote<small>Off: remote devices see session cards only. No transcripts, prompts, replies or pending tool input leave this Mac.</small></span>
+			<button
+				class:active={remote.allowConversation}
+				aria-label="Conversations over remote"
+				aria-pressed={remote.allowConversation}
+				disabled={busy}
+				onclick={() => save({ allowConversation: !remote!.allowConversation })}
+			>{busy ? '…' : remote.allowConversation ? 'On' : 'Off'}</button>
+		</div>
+		<div class="setting-row">
+			<span>Open terminal from remote<small>On: a remote device can bring a session's terminal or editor window to the front on this Mac.</small></span>
+			<button
+				class:active={remote.allowOpen}
+				aria-label="Open terminal from remote"
+				aria-pressed={remote.allowOpen}
+				disabled={busy}
+				onclick={() => save({ allowOpen: !remote!.allowOpen })}
+			>{busy ? '…' : remote.allowOpen ? 'On' : 'Off'}</button>
+		</div>
 		<div class="hosts-group">
 			<label for="remote-extra-hosts">Extra allowed hosts<small>Other host names this server answers to, one per line, as host or host:port. Leave empty unless you reach c9watch through a proxy you run.</small></label>
 			<textarea

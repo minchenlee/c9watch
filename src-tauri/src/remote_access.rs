@@ -19,9 +19,9 @@ pub const FILE_NAME: &str = "remote-access.json";
 pub struct RemoteAccess {
     /// Bind every interface instead of loopback only.
     pub lan_enabled: bool,
-    /// Serve full conversations over WS (enforced from C0h-15).
+    /// Serve full conversations and conversation text in pushes over WS.
     pub allow_conversation: bool,
-    /// Allow `openSession` over WS (enforced from C0h-15).
+    /// Allow `openSession` over WS.
     pub allow_open: bool,
     /// Extra `Host` values to accept (enforced from C0h-10).
     pub extra_allowed_hosts: Vec<String>,

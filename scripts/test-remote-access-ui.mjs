@@ -79,3 +79,28 @@ test('the connection screen pairs with a code and reads it from the fragment', (
   assert.doesNotMatch(connection, /params\.get\('(token|wsUrl)'\)/);
   assert.match(connection, /Pair again/);
 });
+
+test('conversation and open capabilities are separate toggles that save through set_remote_access', () => {
+  assert.match(remote, /aria-label="Conversations over remote"/);
+  assert.match(remote, /aria-pressed=\{remote\.allowConversation\}/);
+  assert.match(remote, /save\(\{ allowConversation: !remote!\.allowConversation \}\)/);
+  assert.match(remote, /aria-label="Open terminal from remote"/);
+  assert.match(remote, /aria-pressed=\{remote\.allowOpen\}/);
+  assert.match(remote, /save\(\{ allowOpen: !remote!\.allowOpen \}\)/);
+});
+
+const overlay = read('src/lib/components/ExpandedCardOverlay.svelte');
+const page = read('src/routes/(app)/+page.svelte');
+
+test('the overlay shows a calm off state when conversations are off', () => {
+  const off = overlay.slice(overlay.indexOf('{:else if !conversation && conversationsOff}'));
+  assert.ok(off.indexOf('Conversations are off for remote devices.') > 0);
+  assert.ok(off.indexOf('Turn on in desktop Settings → Remote access.') > 0);
+  assert.ok(off.indexOf('Conversations are off') < off.indexOf('Could not load conversation'),
+    'the off state comes before the error state');
+});
+
+test('a refused stop shows its reason in a toast', () => {
+  const stop = page.slice(page.indexOf('async function handleStop'), page.indexOf('async function handleOpen'));
+  assert.match(stop, /showInAppNotification\('Could not stop session', errorText\(error\)\)/);
+});

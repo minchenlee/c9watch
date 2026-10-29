@@ -68,13 +68,15 @@
 		session: Session;
 		conversation: Conversation | null;
 		loadError?: string | null;
+		/** The desktop does not serve conversations to remote devices. */
+		conversationsOff?: boolean;
 		onretry?: () => void;
 		onclose?: () => void;
 		onstop?: () => void;
 		onopen?: () => void;
 	}
 
-	let { session, conversation, loadError = null, onretry, onclose, onstop, onopen }: Props = $props();
+	let { session, conversation, loadError = null, conversationsOff = false, onretry, onclose, onstop, onopen }: Props = $props();
 
 	let messagesContainer = $state<HTMLDivElement>(undefined!);
 	let isInitialLoad = $state(true);
@@ -658,6 +660,16 @@
 								{/if}
 							</div>
 						{/if}
+					</div>
+				{:else if !conversation && conversationsOff}
+					<div class="empty-state">
+						<div class="empty-icon">
+							<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+								<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+							</svg>
+						</div>
+						<p>Conversations are off for remote devices.</p>
+						<p class="empty-hint">Turn on in desktop Settings → Remote access.</p>
 					</div>
 				{:else if !conversation && loadError}
 					<div class="loading-state" role="alert">

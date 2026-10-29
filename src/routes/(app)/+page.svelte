@@ -9,9 +9,10 @@
 		attentionInbox,
 		expandedSessionId,
 		currentConversation,
-		visibleTopLevelSessionIds
+		visibleTopLevelSessionIds,
+		showInAppNotification
 	} from '$lib/stores/sessions';
-	import { getConversation, stopSession, openSession, getDetectionDiagnostics } from '$lib/api';
+	import { getConversation, stopSession, openSession, getDetectionDiagnostics, CapabilityDisabledError } from '$lib/api';
 	import { toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
 	import { get } from 'svelte/store';
 	import { isDemoMode, toggleDemoMode } from '$lib/demo';
@@ -375,12 +376,15 @@
 	let conversationTarget = $derived(expandedSession ? sessionKeyOf(expandedSession) : null);
 	let conversationRequestId = 0;
 	let conversationError = $state<string | null>(null);
+	/** The desktop does not serve conversations to this remote device. */
+	let conversationsOff = $state(false);
 	let conversationRetry = $state(0);
 	function retryConversation() { conversationRetry += 1; }
 	$effect(() => {
 		const sessionId = conversationTarget;
 		conversationRetry;
 		conversationError = null;
+		conversationsOff = false;
 		const requestId = ++conversationRequestId;
 		currentConversation.set(null);
 		const selected = untrack(() => expandedSession);
@@ -402,6 +406,10 @@
 					conversationError = null;
 					currentConversation.set(conv);
 				} catch (error) {
+					if (error instanceof CapabilityDisabledError) {
+						if (!cancelled && requestId === conversationRequestId) conversationsOff = true;
+						return;
+					}
 					if (!cancelled && requestId === conversationRequestId) conversationError = String(error);
 					console.error('Failed to fetch conversation:', error);
 					// Keep the last successful preview during transient refresh failures.
@@ -425,19 +433,29 @@
 		expandedSessionId.set(null);
 	}
 
+	function errorText(error: unknown): string {
+		return error instanceof Error ? error.message : String(error);
+	}
+
 	async function handleStop(session: Session) {
 		try {
 			await stopSession(session);
 		} catch (error) {
 			console.error('Failed to stop session:', error);
+			// The backend refuses a stop it cannot verify; say why.
+			showInAppNotification('Could not stop session', errorText(error));
 		}
 	}
 
-	async function handleOpen(pid: number, projectPath: string) {
-		markPidSeen(pid);
+	async function handleOpen(session: Session) {
+		markPidSeen(session.pid);
 		try {
-			await openSession(pid, projectPath);
+			await openSession(session);
 		} catch (error) {
+			if (error instanceof CapabilityDisabledError) {
+				showInAppNotification('Open is off', 'Opening a terminal from remote devices is off. Turn it on in desktop Settings → Remote access.');
+				return;
+			}
 			console.error('Failed to open session:', error);
 		}
 	}
@@ -451,11 +469,11 @@
 		const item = attentionItems[0];
 		if (!item) return;
 		if (item.returnKind === 'native') {
-			await handleOpen(item.session.pid, item.session.projectPath);
+			await handleOpen(item.session);
 		} else {
 			expandedSessionId.set(item.key);
 			if (item.returnKind === 'project' || item.returnKind === 'application') {
-				await handleOpen(item.session.pid, item.session.projectPath);
+				await handleOpen(item.session);
 			}
 		}
 	}
@@ -788,7 +806,7 @@
 						fontScale={denseFontScale}
 						onexpand={handleExpand}
 						onstop={handleStop}
-						onopen={(session) => handleOpen(session.pid, session.projectPath)}
+						onopen={(session) => handleOpen(session)}
 					/>
 				{:else if viewMode === 'project'}
 					{#each projectGroups as group, gi (group.path)}
@@ -824,7 +842,7 @@
 													workersView={sessionFilter === 'workers'}
 													onexpand={() => handleExpand(session)}
 													onstop={() => handleStop(session)}
-													onopen={() => handleOpen(session.pid, session.projectPath)}
+													onopen={() => handleOpen(session)}
 													onrename={() => showRenameHint = true}
 												/>
 											</div>
@@ -858,7 +876,7 @@
 											workersView={sessionFilter === 'workers'}
 											onexpand={() => handleExpand(session)}
 											onstop={() => handleStop(session)}
-											onopen={() => handleOpen(session.pid, session.projectPath)}
+											onopen={() => handleOpen(session)}
 											onrename={() => showRenameHint = true}
 										/>
 									</div>
@@ -877,10 +895,11 @@
 			session={expandedSession}
 			{conversation}
 			loadError={conversationError}
+			{conversationsOff}
 			onretry={retryConversation}
 			onclose={handleClose}
 			onstop={() => handleStop(expandedSession)}
-			onopen={() => handleOpen(expandedSession.pid, expandedSession.projectPath)}
+			onopen={() => handleOpen(expandedSession)}
 		/>
 	{/if}
 

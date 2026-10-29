@@ -1,6 +1,6 @@
 import { get, writable, type Writable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
-import { getConversation } from '$lib/api';
+import { getConversation, CapabilityDisabledError } from '$lib/api';
 import { isTauri, useWebSocket, wsClient } from '$lib/ws';
 import { providerSessionKey } from '$lib/provider';
 import type { Conversation, SessionProvider } from '$lib/types';
@@ -161,6 +161,8 @@ export async function loadPreviewConversation(
 		if (providerSessionKey(conv.provider ?? entry.provider, conv.sessionId) !== requestedKey) return;
 		apply(conv);
 	} catch (e) {
+		// Conversations off for this remote device: nothing to show, not a fault.
+		if (e instanceof CapabilityDisabledError) return;
 		if (isCurrent()) console.error('Failed to load conversation:', e);
 	}
 }
@@ -190,7 +192,7 @@ export async function loadToolsConversation(
 		deps.toolsLoadedFor.set(requestedKey);
 		return true;
 	} catch (error) {
-		console.error('Failed to load tools:', error);
+		if (!(error instanceof CapabilityDisabledError)) console.error('Failed to load tools:', error);
 		return false;
 	}
 }

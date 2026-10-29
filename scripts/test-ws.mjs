@@ -209,3 +209,64 @@ test('stored connection reads host and token; useWebSocket follows it', () => {
   assert.deepEqual({ ...ws.getStoredConnection() }, { host: 'h:9210', token: 'abc' });
   assert.equal(ws.useWebSocket(), true);
 });
+
+// ── Remote capabilities (C0h-15) ─────────────────────────────────────
+
+async function signedIn(capabilities) {
+  const h = harness();
+  const done = h.client.connect('h:9210', { token: 'abc' });
+  h.sockets[0].open();
+  h.sockets[0].reply({ type: 'authOk', clientId: 'c1', capabilities });
+  await done;
+  return h;
+}
+
+test('a turned-off capability throws before anything is sent', async () => {
+  const { ws, client, sockets } = await signedIn({ conversation: false, open: false });
+  sockets[0].readyState = 1;
+  for (const type of ['getConversation', 'openSession']) {
+    const error = await client.request(type, { sessionId: 's' }).then(() => null, (e) => e);
+    assert.ok(error instanceof ws.CapabilityDisabledError, type);
+    assert.equal(error.capability, type === 'getConversation' ? 'conversation' : 'open');
+  }
+  assert.deepEqual(sockets[0].sent.map((f) => f.type), ['auth'], 'only the auth frame went out');
+  assert.equal(client.allows('conversation'), false);
+  assert.equal(client.allows('open'), false);
+  // Watching cards stays allowed.
+  void client.request('getSessions');
+  assert.equal(sockets[0].sent.at(-1).type, 'getSessions');
+});
+
+test('capabilities that are on let the request through', async () => {
+  const { client, sockets } = await signedIn({ conversation: true, open: true });
+  sockets[0].readyState = 1;
+  void client.request('getConversation', { sessionId: 's' });
+  void client.request('openSession', { addr: 'claudeCode:s' });
+  assert.deepEqual(sockets[0].sent.map((f) => f.type), ['auth', 'getConversation', 'openSession']);
+});
+
+test('a capabilityDisabled error from the server rejects with CapabilityDisabledError', async () => {
+  const { ws, client, sockets } = await signedIn({ conversation: true, open: true });
+  sockets[0].readyState = 1;
+  const request = client.request('getConversation', { sessionId: 's' });
+  const id = sockets[0].sent.at(-1).requestId;
+  sockets[0].reply({ type: 'error', requestId: id, code: 'capabilityDisabled', capability: 'conversation', message: 'off' });
+  const error = await request.then(() => null, (e) => e);
+  assert.ok(error instanceof ws.CapabilityDisabledError);
+  assert.equal(error.capability, 'conversation');
+});
+
+test('the capabilities from each ack are emitted, so a reconnect can change them', async () => {
+  const { client, sockets, runTimers } = await signedIn({ conversation: false, open: false });
+  const seen = [];
+  client.on('capabilities', (caps) => seen.push(caps));
+  sockets[0].drop(1012);
+  runTimers(3000);
+  sockets[1].open();
+  sockets[1].reply({ type: 'authOk', clientId: 'c1', capabilities: { conversation: true, open: false } });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].conversation, true);
+  assert.equal(client.allows('conversation'), true);
+  assert.equal(client.allows('open'), false);
+});
