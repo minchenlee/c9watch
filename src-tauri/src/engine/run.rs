@@ -3,9 +3,11 @@
 //! Order matters: the signal handlers go in before the bind, so a SIGTERM
 //! or SIGINT from then on always reaches the cleanup; the lifetime lock goes
 //! in before the bind, so only the lock holder can replace a leftover
-//! socket. The engine never talks to the legacy `c9watch daemon`.
+//! socket, and before the db opens, since opening may move a corrupt db
+//! aside. The engine never talks to the legacy `c9watch daemon`.
 
 use super::api::{serve, ServerCtx};
+use super::db;
 use super::fsutil::ensure_private_dir;
 use super::home::{lock_path, sock_path};
 use super::lock::acquire_engine_lock;
@@ -22,6 +24,7 @@ pub async fn run(home: &Path) -> Result<(), String> {
     let mut signals = ShutdownSignals::install()
         .map_err(|e| format!("Failed to install signal handlers: {}", e))?;
     let lock = acquire_engine_lock(&lock_path(home))?;
+    let db = db::open(home)?;
     let (std_listener, socket) = bind_private(&sock_path(home), &lock)?;
     std_listener
         .set_nonblocking(true)
@@ -32,9 +35,10 @@ pub async fn run(home: &Path) -> Result<(), String> {
     // The machine id comes from the store (M2). Until then it is empty.
     let ctx = Arc::new(ServerCtx::new(String::new()));
     eprintln!(
-        "[engine] Listening on {:?}, pid={}",
+        "[engine] Listening on {:?}, pid={}, epoch={}",
         socket.path(),
-        std::process::id()
+        std::process::id(),
+        db.epoch()
     );
 
     let sig = tokio::select! {
@@ -42,9 +46,11 @@ pub async fn run(home: &Path) -> Result<(), String> {
         sig = signals.recv() => Some(sig),
     };
     eprintln!("[engine] Shutting down ({:?})", sig);
-    // Unlink our socket first, then release the lock, so a new engine that
-    // takes the lock never sees our socket as live.
+    // Unlink our socket first, then close the db, then release the lock, so
+    // a new engine that takes the lock never sees our socket as live or our
+    // db as open.
     drop(socket);
+    drop(db);
     drop(lock);
     Ok(())
 }
