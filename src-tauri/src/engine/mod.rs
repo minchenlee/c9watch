@@ -14,3 +14,9 @@ pub mod sock;
 
 #[cfg(unix)]
 pub mod peer;
+
+#[cfg(unix)]
+pub mod proto;
+
+#[cfg(unix)]
+pub mod api;
