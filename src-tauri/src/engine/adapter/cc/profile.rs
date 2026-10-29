@@ -16,7 +16,10 @@
 //!   --no-chrome` and `remoteControlAtStartup:false`.
 //! - Identity: `--session-id <uuid>` on every spawn (D:244), and the hooks
 //!   run `<home>/bin/c9watch-agent hook <event>` (D:243,
-//!   `adapter::claude_hook_settings`).
+//!   `adapter::claude_hook_settings`). A boot resume (C1a-28) passes
+//!   `--resume <uuid>` instead, with the same rest of the profile and a new
+//!   settings file for the new generation: CC keeps the session id and the
+//!   transcript (D24, M6 precheck).
 //! - The cwd is a realpath before anything is built from it (S:69).
 //! - Three layers block writes to the cwd's `.claude/` (C1a-31, see
 //!   `deny_rules`): `permissions.deny`, `sandbox.filesystem.denyWrite` and
@@ -96,8 +99,10 @@ pub struct Profile {
     pub cwd: PathBuf,
     pub agent_id: String,
     pub generation: i64,
-    /// The `--session-id` of this spawn.
+    /// The `--session-id` of this spawn, or the session it resumes.
     pub session_id: String,
+    /// Resume `session_id` (`--resume`) instead of starting it.
+    pub resume: bool,
 }
 
 impl Profile {
@@ -125,7 +130,14 @@ impl Profile {
             agent_id: agent_id.into(),
             generation,
             session_id: session_id.into(),
+            resume: false,
         })
+    }
+
+    /// The same spawn, resuming `session_id` (C1a-28).
+    pub fn resuming(mut self) -> Profile {
+        self.resume = true;
+        self
     }
 }
 
@@ -344,11 +356,13 @@ pub fn write_settings(home: &Path, p: &Profile) -> Result<PathBuf, String> {
 }
 
 /// argv: `claude --session-id <uuid> --settings <file> --permission-mode
-/// auto` plus `ISOLATE_ARGS`. No model: the user's default applies.
+/// auto` plus `ISOLATE_ARGS`; `--resume <uuid>` for a resume. No model: the
+/// user's default applies.
 pub fn argv(p: &Profile, claude: &Path, settings_file: &Path) -> Vec<OsString> {
+    let session_flag = if p.resume { "--resume" } else { "--session-id" };
     let mut v: Vec<OsString> = vec![
         claude.into(),
-        "--session-id".into(),
+        session_flag.into(),
         p.session_id.clone().into(),
         "--settings".into(),
         settings_file.into(),
@@ -612,6 +626,25 @@ mod tests {
             std::os::unix::fs::symlink(&d, &ln).unwrap();
             assert!(resolve_cwd(&ln).is_err(), "{}", name);
         }
+    }
+
+    /// C1a-28: a resume is `--resume <uuid>` plus the same profile, with
+    /// the settings file of the new generation.
+    #[test]
+    fn a_resume_keeps_the_profile_and_swaps_the_session_flag() {
+        with_cwd(|_, p| {
+            let strs = |v: Vec<OsString>| -> Vec<String> {
+                v.into_iter().map(|s| s.into_string().unwrap()).collect()
+            };
+            let fresh = strs(argv(&p, Path::new("/x/claude"), Path::new("/h/s.json")));
+            let r = p.clone().resuming();
+            let resumed = strs(argv(&r, Path::new("/x/claude"), Path::new("/h/s.json")));
+            assert_eq!(&resumed[..3], ["/x/claude", "--resume", SID]);
+            assert_eq!(resumed[3..], fresh[3..]);
+            assert!(!resumed.iter().any(|a| a == "--session-id"));
+            // The settings do not depend on the flag.
+            assert_eq!(settings(&r), settings(&p));
+        });
     }
 
     #[test]

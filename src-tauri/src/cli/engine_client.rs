@@ -30,9 +30,6 @@ use std::time::{Duration, Instant};
 /// run or auto-start the engine. This guards against mistakes, not attacks:
 /// `C9_AGENT_ID` is not a secret.
 pub const AGENT_CALLER_REFUSED: &str = "agent_caller_refused";
-/// Error code: `engine restart` refused because agents are live and the
-/// engine cannot drain them yet (until C1a-28).
-pub const LIVE_AGENTS_NO_DRAIN: &str = "live_agents_no_drain";
 /// Error code: the engine did not answer `hello` in time.
 pub const ENGINE_NOT_READY: &str = "engine_not_ready";
 
@@ -40,8 +37,11 @@ const ENV_AGENT_ID: &str = "C9_AGENT_ID";
 
 /// How long a client waits for a new engine to answer `hello`.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long `engine restart` waits for the old engine to release its lock.
-const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `engine restart` waits for the old engine to release its lock:
+/// its drain may take up to the 90 s hard deadline (C1a-27), plus room to
+/// close.
+const EXIT_TIMEOUT: Duration =
+    Duration::from_secs(crate::engine::drain::HARD_DEADLINE.as_secs() + 5);
 /// Read and write timeout of one engine connection.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(50);
@@ -388,24 +388,6 @@ fn spawn_engine(home: &Path, exe: &Path) -> Result<Child, String> {
 
 // ── Restart ───────────────────────────────────────────────────────────
 
-/// Number of live engine agents. The engine has no agent table in M1, so
-/// this reports zero; C1a-33 asks the engine instead.
-pub fn live_agent_count(_home: &Path) -> Result<usize, String> {
-    Ok(0)
-}
-
-/// Fail with `live_agents_no_drain` while any agent is live. Removed once
-/// the engine can drain and resume agents (C1a-28).
-pub fn check_no_live_agents(live: usize) -> Result<(), String> {
-    if live == 0 {
-        return Ok(());
-    }
-    Err(format!(
-        "{}: {} live agent(s); the engine cannot drain them yet, so a restart would kill them",
-        LIVE_AGENTS_NO_DRAIN, live
-    ))
-}
-
 /// The pid of the engine that serves `home`, taken from a connection to its
 /// socket (the kernel's peer pid), not from the lock file alone: the file
 /// can still hold a dead engine's pid while a new engine starts. The socket
@@ -442,23 +424,18 @@ fn serving_engine_pid(home: &Path, timeout: Duration) -> Result<libc::pid_t, Str
 
 /// SIGTERM the engine of `home`, wait for it to exit, start a new one with
 /// `exe`, and return the new engine's `hello`. Starts an engine when none
-/// runs. `live_agents` runs before anything is signalled.
-pub fn restart_engine(
-    home: &Path,
-    exe: &Path,
-    live_agents: impl FnOnce() -> Result<usize, String>,
-) -> Result<HelloResult, String> {
-    restart_engine_with(home, exe, live_agents, &process_env)
+/// runs. Live agents are fine: the SIGTERM drains them and the new engine
+/// resumes them (C1a-27, C1a-28).
+pub fn restart_engine(home: &Path, exe: &Path) -> Result<HelloResult, String> {
+    restart_engine_with(home, exe, &process_env)
 }
 
 fn restart_engine_with(
     home: &Path,
     exe: &Path,
-    live_agents: impl FnOnce() -> Result<usize, String>,
     env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<HelloResult, String> {
     refuse_agent_caller(env)?;
-    check_no_live_agents(live_agents()?)?;
     ensure_private_dir(home)?;
     let lock = lock_path(home);
     if engine_lock_held(&lock)? {
@@ -503,7 +480,7 @@ pub fn cmd_engine_run() -> Result<(), String> {
 /// `c9watch engine restart`
 pub fn cmd_engine_restart(pretty: bool) -> Result<(), String> {
     let home = engine_home()?;
-    let hello = restart_engine(&home, &current_exe()?, || live_agent_count(&home))?;
+    let hello = restart_engine(&home, &current_exe()?)?;
     super::print_json(&hello, pretty)
 }
 
@@ -648,22 +625,6 @@ mod tests {
     }
 
     #[test]
-    fn restart_refuses_with_live_agents_and_signals_nothing() {
-        let t = tempfile::tempdir().unwrap();
-        // This test process holds the lock, so `engine_pid` names us: a
-        // SIGTERM would kill the test run.
-        let lock = acquire_engine_lock(&lock_path(t.path())).unwrap();
-        let err = restart_engine_with(t.path(), Path::new("/nonexistent"), || Ok(2), &no_env)
-            .unwrap_err();
-        assert!(err.starts_with(LIVE_AGENTS_NO_DRAIN), "{err}");
-        assert!(err.contains("2 live agent"), "{err}");
-        assert!(engine_lock_held(&lock_path(t.path())).unwrap());
-        drop(lock);
-        assert!(check_no_live_agents(0).is_ok());
-        assert_eq!(live_agent_count(t.path()).unwrap(), 0);
-    }
-
-    #[test]
     fn an_engine_that_exits_early_fails_the_auto_start() {
         let t = tempfile::tempdir().unwrap();
         let home = t.path().join("e");
@@ -688,8 +649,7 @@ mod tests {
         let lock = acquire_engine_lock(&lock_path(t.path())).unwrap();
         std::fs::write(lock_path(t.path()), b"999999").unwrap();
         let _listener = UnixListener::bind(sock_path(t.path())).unwrap();
-        let err = restart_engine_with(t.path(), Path::new("/nonexistent"), || Ok(0), &no_env)
-            .unwrap_err();
+        let err = restart_engine_with(t.path(), Path::new("/nonexistent"), &no_env).unwrap_err();
         assert!(err.contains("not signalling anything"), "{err}");
 
         // Held lock, empty pid file: also an error, not a silent no-op.

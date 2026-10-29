@@ -29,6 +29,14 @@
 //! so hooks still arrive, while ready agents are paused and mid-turn agents
 //! get up to 60 s; the engine exits by the 90 s hard deadline. SIGINT and
 //! `run_until`'s `stop` skip the drain.
+//!
+//! Boot resume (C1a-28, `Spawner::resume_on_boot`) runs after boot
+//! reconcile and after the bind, so the resumed agents' SessionStart hooks
+//! find the socket: every `paused(drain)` and `interrupted` agent gets a
+//! new generation and comes up on `claude --resume` on its supervisor's
+//! thread. It needs `C9WATCH_EXPERIMENTAL_CREATE=1` like a create; without
+//! it the rows stay as they are. A failed read or write logs and the
+//! engine runs on.
 
 use super::agent_bin::{self, AgentBin};
 use super::agents::LiveTable;
@@ -157,6 +165,24 @@ pub async fn run_until(
         );
     }
     let ctx = Arc::new(ctx.with_spawner(spawner.clone()));
+    match spawner.resume_on_boot() {
+        Ok(r) if r == Default::default() => {}
+        Ok(r) => eprintln!(
+            "[engine] Boot resume: started {:?}, failed {:?}, left {:?}{}",
+            r.started,
+            r.failed,
+            r.left,
+            if r.left.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({}=1 is not set, or the engine drains)",
+                    EXPERIMENTAL_CREATE_ENV
+                )
+            }
+        ),
+        Err(e) => eprintln!("[engine] Boot resume: {}", e),
+    }
     let pruner = tokio::spawn(prune_loop(db.clone()));
     let detection = if config.detection {
         let d = detect::spawn(db.clone())?;

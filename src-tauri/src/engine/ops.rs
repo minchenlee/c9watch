@@ -9,15 +9,23 @@
 //!   `agent_state`; the row moves to `starting`.
 //! - `bound`: the agent is `ready`; the op is done.
 //!
+//! A boot resume (C1a-28, `engine::create`) is an op of kind
+//! `agent.resume` with the same payload and phases. Its `row` phase is the
+//! new generation; the row keeps its `paused` or `interrupted` state until
+//! phase `pty`.
+//!
 //! On boot, before the socket is bound and so before any mutation, `reconcile`
 //! undoes what a stopped engine left (A:231):
 //! - An open create op: its PTY child, if one was recorded, is killed by pid
 //!   **and** start time (`pty::kill_orphan`; a reused pid is never
 //!   signalled), and the agent ends `failed` with `create_interrupted`.
+//!   An open resume op ends the same way, with `resume_failed`: the engine
+//!   never tries a resume twice.
 //! - An engine agent that was live (`starting`, `ready`, `working`,
 //!   `blocked`, `refreshing`): its PTY child is killed the same way, since
 //!   no engine can reach its terminal any more, and it is marked
-//!   `interrupted` with the note pending (C1a-25). Resuming it is M6.
+//!   `interrupted` with the note pending (C1a-25). The boot resume
+//!   (C1a-28) runs after this and picks it up.
 //! - An agent left `retiring` ends `retired`; one left `creating` without an
 //!   open op ends `failed`.
 //!
@@ -38,8 +46,16 @@ use std::path::Path;
 /// `ops.kind` of a free create.
 pub const KIND_CREATE: &str = "agent.create";
 
+/// `ops.kind` of a boot resume (C1a-28).
+pub const KIND_RESUME: &str = "agent.resume";
+
 /// Why boot failed an agent whose create op was still open.
 pub const CREATE_INTERRUPTED: &str = "create_interrupted";
+
+/// Why a resume failed (A:1011): the agent exited before `ready`, the
+/// vendor refused, it was not `ready` in time, or the engine stopped while
+/// it came up. Never retried.
+pub const RESUME_FAILED: &str = "resume_failed";
 
 /// The phases of a free create.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,9 +114,18 @@ fn to_json(p: &CreatePayload) -> String {
 
 /// Open a create op in phase `row`.
 pub fn open_create(tx: &Tx, op_id: &str, p: &CreatePayload, now: i64) -> rusqlite::Result<()> {
+    open(tx, op_id, KIND_CREATE, p, now)
+}
+
+/// Open a resume op in phase `row`.
+pub fn open_resume(tx: &Tx, op_id: &str, p: &CreatePayload, now: i64) -> rusqlite::Result<()> {
+    open(tx, op_id, KIND_RESUME, p, now)
+}
+
+fn open(tx: &Tx, op_id: &str, kind: &str, p: &CreatePayload, now: i64) -> rusqlite::Result<()> {
     tx.execute(
         "INSERT INTO ops (id, kind, phase, payload, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![op_id, KIND_CREATE, Phase::Row.as_str(), to_json(p), now],
+        params![op_id, kind, Phase::Row.as_str(), to_json(p), now],
     )?;
     Ok(())
 }
@@ -140,11 +165,12 @@ pub fn finish(tx: &Tx, op_id: &str, outcome: &str, now: i64) -> rusqlite::Result
 /// The audit method of an agent that exited by itself after `ready`.
 pub const METHOD_EXIT: &str = "agent.exit";
 
-/// Mark engine agent `agent_id` `failed` and gone, forget its PTY child,
-/// and emit `agent.upsert` and `agent.failed` with `reason` and `detail`.
-/// The audit row names `method`: `KIND_CREATE` for a create that failed,
-/// `METHOD_EXIT` for a ready agent that exited. Does not touch a row that
-/// is already retired or failed.
+/// Mark engine agent `agent_id` `failed` and gone with `state_reason`
+/// `reason`, forget its PTY child, and emit `agent.upsert` and
+/// `agent.failed` with `reason` and `detail`. The audit row names
+/// `method`: `KIND_CREATE` for a create that failed, `KIND_RESUME` for a
+/// resume, `METHOD_EXIT` for a ready agent that exited. Does not touch a
+/// row that is already retired or failed.
 pub fn fail_agent(
     tx: &mut Tx,
     machine: &str,
@@ -155,9 +181,9 @@ pub fn fail_agent(
     now: i64,
 ) -> rusqlite::Result<bool> {
     let n = tx.execute(
-        "UPDATE agents SET state = 'failed', gone_at = ?2 WHERE id = ?1 \
+        "UPDATE agents SET state = 'failed', gone_at = ?2, state_reason = ?3 WHERE id = ?1 \
          AND source = 'engine' AND state NOT IN ('retired', 'failed')",
-        params![agent_id, now],
+        params![agent_id, now, reason],
     )?;
     tx.execute("DELETE FROM agent_state WHERE agent_id = ?1", [agent_id])?;
     if n == 0 {
@@ -189,7 +215,7 @@ pub fn fail_agent(
 /// What `reconcile` did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Reconciled {
-    /// Agents of open create ops, now `failed`.
+    /// Agents of open create or resume ops, now `failed`.
     pub failed: Vec<String>,
     /// Live agents of the old engine, now `interrupted`.
     pub interrupted: Vec<String>,
@@ -212,8 +238,12 @@ impl Reconciled {
 /// What one row of the old engine becomes.
 #[derive(Debug, Clone)]
 enum Fix {
-    /// An open create op and its agent.
-    Create { op_id: String, p: CreatePayload },
+    /// An open create or resume op and its agent.
+    Create {
+        op_id: String,
+        kind: String,
+        p: CreatePayload,
+    },
     /// A live agent without an open op.
     Live {
         agent_id: String,
@@ -232,22 +262,26 @@ fn plan(db: &Db) -> Result<Vec<Fix>, String> {
     {
         let mut st = conn
             .prepare(
-                "SELECT id, payload FROM ops WHERE done_at IS NULL AND kind = ?1 \
-                 ORDER BY created_at, id",
+                "SELECT id, kind, payload FROM ops WHERE done_at IS NULL \
+                 AND kind IN (?1, ?2) ORDER BY created_at, id",
             )
             .map_err(fail)?;
         let rows = st
-            .query_map([KIND_CREATE], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            .query_map([KIND_CREATE, KIND_RESUME], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
             })
             .map_err(fail)?;
         for row in rows {
-            let (op_id, payload) = row.map_err(fail)?;
+            let (op_id, kind, payload) = row.map_err(fail)?;
             let p: CreatePayload = payload
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default();
             open.push(p.agent_id.clone());
-            fixes.push(Fix::Create { op_id, p });
+            fixes.push(Fix::Create { op_id, kind, p });
         }
     }
     let mut st = conn
@@ -318,8 +352,13 @@ pub fn reconcile(db: &Db, home: &Path) -> Result<Reconciled, String> {
     let machine = db.machine_id().to_string();
     for fix in plan(db)? {
         match fix {
-            Fix::Create { op_id, p } => {
+            Fix::Create { op_id, kind, p } => {
                 let killed = kill(p.child(), &mut done);
+                let (method, reason) = if kind == KIND_RESUME {
+                    (KIND_RESUME, RESUME_FAILED)
+                } else {
+                    (KIND_CREATE, CREATE_INTERRUPTED)
+                };
                 let phase = if p.child().is_some() { "pty" } else { "row" };
                 let detail = match killed {
                     None => format!("the engine stopped in phase {}", phase),
@@ -328,8 +367,8 @@ pub fn reconcile(db: &Db, home: &Path) -> Result<Reconciled, String> {
                 let (m, id) = (machine.clone(), p.agent_id.clone());
                 db.write_blocking(move |tx| {
                     let now = now_ms();
-                    finish(tx, &op_id, CREATE_INTERRUPTED, now)?;
-                    fail_agent(tx, &m, &id, KIND_CREATE, CREATE_INTERRUPTED, &detail, now)
+                    finish(tx, &op_id, reason, now)?;
+                    fail_agent(tx, &m, &id, method, reason, &detail, now)
                 })?;
                 let _ = std::fs::remove_file(settings_path_of(home, &p.agent_id, p.generation));
                 done.failed.push(p.agent_id);

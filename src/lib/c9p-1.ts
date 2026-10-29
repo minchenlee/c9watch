@@ -112,7 +112,9 @@ export interface C9pAgentRow {
   state: string | null;
   /**
    * Why the agent is in its `state`: `drain` for a `paused` or
-   * `interrupted` agent that an engine drain stopped.
+   * `interrupted` agent that an engine drain stopped; for a `failed`
+   * agent the failure reason, such as `spawn_failed`, `resume_failed`,
+   * `exited` or `create_interrupted`.
    */
   stateReason: string | null;
   /**

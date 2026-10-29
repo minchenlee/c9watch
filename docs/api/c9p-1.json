@@ -230,7 +230,7 @@
           ]
         },
         "stateReason": {
-          "description": "Why the agent is in its `state`: `drain` for a `paused` or\n`interrupted` agent that an engine drain stopped.",
+          "description": "Why the agent is in its `state`: `drain` for a `paused` or\n`interrupted` agent that an engine drain stopped; for a `failed`\nagent the failure reason, such as `spawn_failed`, `resume_failed`,\n`exited` or `create_interrupted`.",
           "type": [
             "string",
             "null"

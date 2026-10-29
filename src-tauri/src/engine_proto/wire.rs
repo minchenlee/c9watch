@@ -386,7 +386,9 @@ pub struct AgentRow {
     /// that adopted it.
     pub parent_id: Option<String>,
     /// Why the agent is in its `state`: `drain` for a `paused` or
-    /// `interrupted` agent that an engine drain stopped.
+    /// `interrupted` agent that an engine drain stopped; for a `failed`
+    /// agent the failure reason, such as `spawn_failed`, `resume_failed`,
+    /// `exited` or `create_interrupted`.
     pub state_reason: Option<String>,
 }
 

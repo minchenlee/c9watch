@@ -24,9 +24,9 @@
 //!      ends meanwhile is `ready` and goes the same way. After that the
 //!      supervisor kills it and the row becomes `interrupted` with reason
 //!      `drain`, its `resume_argv` and `interrupted_note_pending`.
-//!    - An agent whose create op is still open (`creating`, `starting`
-//!      before `bound`): left as it is. The engine kills its PTY when it
-//!      stops, and boot reconcile fails it (A:231).
+//!    - An agent whose create or resume op is still open (`creating`,
+//!      `starting` before `bound`): left as it is. The engine kills its PTY
+//!      when it stops, and boot reconcile fails it (A:231).
 //!    - `paused`, `interrupted`, `failed`, `retired` and `orphaned` rows
 //!      have no supervisor here and are not touched.
 //! 3. `HARD_DEADLINE` after the start the engine exits, whatever is left;
@@ -147,7 +147,7 @@ pub enum Action {
 }
 
 /// The state table (see the module doc). `create_open`: the agent's create
-/// op is still open.
+/// or resume op is still open.
 pub fn action(state: Option<&str>, create_open: bool) -> Action {
     if create_open {
         return Action::Leave;
@@ -252,7 +252,8 @@ pub struct Report {
     pub timed_out: bool,
 }
 
-/// The state and whether the create op is still open, for `agent_id`.
+/// The state and whether a create or resume op of `agent_id` is still
+/// open.
 fn look(db: &Db, agent_id: &str) -> Result<(Option<String>, bool), String> {
     let conn = db.reader()?;
     let fail = |e: rusqlite::Error| format!("Failed to read agent {}: {}", agent_id, e);
@@ -267,9 +268,9 @@ fn look(db: &Db, agent_id: &str) -> Result<(Option<String>, bool), String> {
         .flatten();
     let open = conn
         .query_row(
-            "SELECT 1 FROM ops WHERE kind = ?1 AND done_at IS NULL \
-             AND json_extract(payload, '$.agentId') = ?2",
-            params![ops::KIND_CREATE, agent_id],
+            "SELECT 1 FROM ops WHERE kind IN (?1, ?2) AND done_at IS NULL \
+             AND json_extract(payload, '$.agentId') = ?3",
+            params![ops::KIND_CREATE, ops::KIND_RESUME, agent_id],
             |_| Ok(()),
         )
         .optional()
