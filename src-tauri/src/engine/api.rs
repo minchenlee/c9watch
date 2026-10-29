@@ -744,10 +744,14 @@ async fn hook_intake(
     let live_gen = ctx.agents.current_gen(&params.agent_id);
     let agent_id = params.agent_id.clone();
     let is_start = method == "hook.session_start";
-    let draining = ctx.drain.on();
+    let drain = ctx.drain.clone();
     let (method, principal) = (method.to_string(), principal.to_string());
     let (answer, _) = db
         .write(move |tx| {
+            // Read in the transaction: the writer is serial, so a start
+            // that commits after the drain began gets no context (reviews
+            // L1).
+            let draining = drain.on();
             let ev = HookEvent {
                 method: &method,
                 principal: &principal,
@@ -2038,5 +2042,93 @@ mod tests {
         send(&mut c, json!({"v": 1, "id": "1", "method": "snapshot.get"})).await;
         let got = read_all(c).await;
         assert_eq!(got[0]["error"]["code"], "hello_required");
+    }
+
+    /// Reviews L4: the drain switch reaches `hook.session_start` through
+    /// `hook_intake`. The start is taken, gets no context, keeps the
+    /// interrupted note and is audited as a blocked hook injection; once
+    /// the engine no longer drains, the same intake answers with context.
+    #[tokio::test]
+    async fn hook_intake_obeys_the_drain_switch() {
+        use crate::engine::agents::LiveTable;
+        use crate::engine::driver::ChildId;
+        use crate::engine::generation::tests::{db_with_agent, MACHINE};
+        use crate::engine::generation::{begin_generation, GenReason};
+        let (t, db) = db_with_agent("a1");
+        db.write_blocking(|tx| {
+            begin_generation(tx, MACHINE, "a1", GenReason::Spawn, "s1", None, 1)?;
+            tx.execute(
+                "UPDATE agents SET state = 'ready', interrupted_note_pending = 1 \
+                 WHERE id = 'a1'",
+                [],
+            )
+        })
+        .unwrap();
+        let db = Arc::new(db);
+        let agents = Arc::new(LiveTable::new());
+        agents
+            .register("a1", 1, ChildId { pid: 1, start: 1 })
+            .unwrap();
+        let orders = t.path().join("standing-orders.md");
+        std::fs::write(&orders, "Be {{agent_id}}.\n").unwrap();
+        let drain = Arc::new(DrainSwitch::new());
+        let ctx = ServerCtx::new(MACHINE.into())
+            .with_agents(agents)
+            .with_db(db.clone())
+            .with_standing_orders(orders)
+            .with_drain(drain.clone());
+        let principal = Principal::Agent {
+            id: "a1".into(),
+            gen: 1,
+        };
+        let start = |seq: &str| HookParams {
+            agent_id: "a1".into(),
+            kind: "claude".into(),
+            seq: seq.into(),
+            input: json!({"session_id": "s1", "source": "resume"}),
+            truncated: false,
+        };
+        let note = || -> i64 {
+            db.reader()
+                .unwrap()
+                .query_row(
+                    "SELECT interrupted_note_pending FROM agents WHERE id = 'a1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        drain.start();
+        let (out, context) = hook_intake(&ctx, "hook.session_start", &principal, 1, start("1"))
+            .await
+            .unwrap();
+        assert_eq!(out, Outcome::Accepted);
+        assert_eq!(context, None);
+        assert_eq!(note(), 1);
+        let blocked: Vec<(String, String)> = {
+            let conn = db.reader().unwrap();
+            let mut st = conn
+                .prepare("SELECT principal, reason FROM audit WHERE method = ?1")
+                .unwrap();
+            let rows = st
+                .query_map([crate::engine::drain::BLOCKED_INJECTION], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert_eq!(blocked, [("agent:a1".to_string(), "path=hook".to_string())]);
+
+        // The same intake without the drain: context, and the note taken.
+        let ctx = ServerCtx {
+            drain: Arc::new(DrainSwitch::new()),
+            ..ctx
+        };
+        let (_, context) = hook_intake(&ctx, "hook.session_start", &principal, 1, start("2"))
+            .await
+            .unwrap();
+        let context = context.unwrap();
+        assert!(context.starts_with(&standing::header(1)), "{}", context);
+        assert_eq!(note(), 0);
     }
 }

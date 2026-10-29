@@ -19,23 +19,29 @@
 //!    (`action`) says:
 //!    - `ready`: its supervisor kills it (SIGTERM first) and the row becomes
 //!      `paused` with reason `drain` and its `resume_argv`.
-//!    - Mid-turn (`starting`, `working`, `blocked`, `refreshing`,
-//!      `retiring`): wait up to `TURN_WAIT` for the turn end; a turn that
-//!      ends meanwhile is `ready` and goes the same way. After that the
-//!      supervisor kills it and the row becomes `interrupted` with reason
-//!      `drain`, its `resume_argv` and `interrupted_note_pending`.
+//!    - Mid-turn (`starting`, `working`, `blocked`, `refreshing`): wait up
+//!      to `TURN_WAIT` for the turn end; a turn that ends meanwhile is
+//!      `ready` and goes the same way. After that the supervisor kills it
+//!      and the row becomes `interrupted` with reason `drain`, its
+//!      `resume_argv` and `interrupted_note_pending`. A ready agent's
+//!      supervisor reports a turn from its screen (`hooks::screen_claim`).
 //!    - An agent whose create or resume op is still open (`creating`,
 //!      `starting` before `bound`): left as it is. The engine kills its PTY
-//!      when it stops, and boot reconcile fails it (A:231).
+//!      when it stops; boot reconcile fails a create (A:231), and a resume
+//!      goes back to its row for the next boot (`create::undo_resume`).
+//!    - `retiring` is left too: it is on its way out, and boot reconcile
+//!      makes it `retired` (reviews L2). Nothing writes it in C1a yet.
 //!    - `paused`, `interrupted`, `failed`, `retired` and `orphaned` rows
 //!      have no supervisor here and are not touched.
 //! 3. `HARD_DEADLINE` after the start the engine exits, whatever is left;
 //!    boot reconcile handles it. `run` keeps `SHUTDOWN_RESERVE` of it for
 //!    the final kills.
 //!
-//! The kill runs before the write, outside any transaction, and the write
-//! decides from the state it reads: a turn that ended just before the kill
-//! is `paused`, not `interrupted`.
+//! The supervisor reads the state, kills, then writes, the kill outside any
+//! transaction. The row is `interrupted` when it was mid-turn before the
+//! kill or is after it, so a Stop hook that CC sends on its way out does
+//! not hide a cut turn. A kill that fails writes nothing but an audit row:
+//! the row and its `agent_state` stay for boot reconcile.
 
 use super::adapter;
 use super::create::Spawner;
@@ -154,7 +160,7 @@ pub fn action(state: Option<&str>, create_open: bool) -> Action {
     }
     match state {
         Some("ready") => Action::Pause,
-        Some("starting" | "working" | "blocked" | "refreshing" | "retiring") => Action::Wait,
+        Some("starting" | "working" | "blocked" | "refreshing") => Action::Wait,
         _ => Action::Leave,
     }
 }
@@ -169,9 +175,15 @@ pub fn resume_argv(provider: &str, session_id: &str) -> Option<Vec<String>> {
 
 /// The write after the supervisor killed a drained agent: `ready` becomes
 /// `paused`, a live mid-turn state `interrupted` with the note pending;
-/// both get reason `drain` and their `resume_argv`. Any other row is left
-/// alone. Returns the new state.
-pub fn settle(tx: &mut Tx, machine: &str, agent_id: &str) -> rusqlite::Result<Option<String>> {
+/// both get reason `drain` and their `resume_argv`. `before` is the state
+/// read before the kill: mid-turn then or now is `interrupted`. Any other
+/// row is left alone. Returns the new state.
+pub fn settle(
+    tx: &mut Tx,
+    machine: &str,
+    agent_id: &str,
+    before: Option<&str>,
+) -> rusqlite::Result<Option<String>> {
     let row: Option<(Option<String>, String, Option<String>)> = tx
         .query_row(
             "SELECT state, provider, provider_sid FROM agents \
@@ -183,10 +195,10 @@ pub fn settle(tx: &mut Tx, machine: &str, agent_id: &str) -> rusqlite::Result<Op
     let Some((state, provider, sid)) = row else {
         return Ok(None);
     };
-    let new = match action(state.as_deref(), false) {
-        Action::Pause => "paused",
-        Action::Wait => "interrupted",
-        Action::Leave => return Ok(None),
+    let new = match (action(before, false), action(state.as_deref(), false)) {
+        (_, Action::Leave) => return Ok(None),
+        (Action::Wait, _) | (_, Action::Wait) => "interrupted",
+        _ => "paused",
     };
     let argv = sid
         .as_deref()
@@ -214,6 +226,24 @@ pub fn settle(tx: &mut Tx, machine: &str, agent_id: &str) -> rusqlite::Result<Op
     )?;
     emit_upsert(tx, machine, agent_id)?;
     Ok(Some(new.to_string()))
+}
+
+/// A drained agent's kill failed: an audit row, nothing else.
+pub fn audit_kill_failed(tx: &mut Tx, agent_id: &str, why: &str) -> rusqlite::Result<()> {
+    let reason = format!("kill failed, left to boot reconcile: {}", why);
+    audit::append(
+        tx,
+        now_ms(),
+        &AuditEntry {
+            principal: audit::SYSTEM,
+            method: METHOD_DRAIN,
+            target: Some(agent_id),
+            decision: "error",
+            reason: Some(&reason),
+            ..Default::default()
+        },
+    )?;
+    Ok(())
 }
 
 /// The drain's waits. `Default` is the engine's.
@@ -252,20 +282,25 @@ pub struct Report {
     pub timed_out: bool,
 }
 
+/// The state of `agent_id`, if it is not gone.
+pub fn state_of(db: &Db, agent_id: &str) -> Result<Option<String>, String> {
+    let conn = db.reader()?;
+    conn.query_row(
+        "SELECT state FROM agents WHERE id = ?1 AND gone_at IS NULL",
+        [agent_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map(Option::flatten)
+    .map_err(|e| format!("Failed to read agent {}: {}", agent_id, e))
+}
+
 /// The state and whether a create or resume op of `agent_id` is still
 /// open.
 fn look(db: &Db, agent_id: &str) -> Result<(Option<String>, bool), String> {
+    let state = state_of(db, agent_id)?;
     let conn = db.reader()?;
     let fail = |e: rusqlite::Error| format!("Failed to read agent {}: {}", agent_id, e);
-    let state: Option<String> = conn
-        .query_row(
-            "SELECT state FROM agents WHERE id = ?1 AND gone_at IS NULL",
-            [agent_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(fail)?
-        .flatten();
     let open = conn
         .query_row(
             "SELECT 1 FROM ops WHERE kind IN (?1, ?2) AND done_at IS NULL \
@@ -351,9 +386,10 @@ mod tests {
     use super::*;
     use crate::engine::generation::tests::{db_with_agent, MACHINE};
 
-    const LIVE: &[&str] = &["starting", "working", "blocked", "refreshing", "retiring"];
+    const LIVE: &[&str] = &["starting", "working", "blocked", "refreshing"];
     const UNTOUCHED: &[&str] = &[
         "creating",
+        "retiring",
         "paused",
         "interrupted",
         "failed",
@@ -396,8 +432,19 @@ mod tests {
         Option<String>,
         (Option<String>, Option<String>, Option<String>, i64),
     ) {
+        settle_after(state, state)
+    }
+
+    /// `settle` of a row that was `before` at the kill and is `state` now.
+    fn settle_after(
+        before: &str,
+        state: &str,
+    ) -> (
+        Option<String>,
+        (Option<String>, Option<String>, Option<String>, i64),
+    ) {
         let (_t, db) = db_with_agent("a1");
-        let st = state.to_string();
+        let (st, before) = (state.to_string(), before.to_string());
         let (new, _) = db
             .write_blocking(move |tx| {
                 tx.execute(
@@ -410,7 +457,7 @@ mod tests {
                      VALUES ('a1', 1, 10, 100)",
                     [],
                 )?;
-                settle(tx, MACHINE, "a1")
+                settle(tx, MACHINE, "a1", Some(&before))
             })
             .unwrap();
         (new, facts(&db))
@@ -446,6 +493,26 @@ mod tests {
                 s
             );
         }
+    }
+
+    /// Reviews L1: a turn cut by the kill stays `interrupted` when CC's
+    /// Stop hook made the row `ready` on its way out, and a ready agent
+    /// whose row is now mid-turn is not `paused`.
+    #[test]
+    fn settle_keeps_a_turn_cut_by_the_kill() {
+        let argv = Some(r#"["claude","--resume","s-1"]"#.to_string());
+        let drain = Some(REASON_DRAIN.to_string());
+        let interrupted = (
+            Some("interrupted".into()),
+            (Some("interrupted".into()), drain.clone(), argv.clone(), 1),
+        );
+        assert_eq!(settle_after("working", "ready"), interrupted);
+        assert_eq!(settle_after("ready", "working"), interrupted);
+        // A row that is no longer live is left alone.
+        assert_eq!(
+            settle_after("working", "retired"),
+            (None, (Some("retired".into()), None, None, 0))
+        );
     }
 
     #[test]
