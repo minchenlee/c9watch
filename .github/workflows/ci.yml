@@ -94,10 +94,16 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
-      - name: CLI-only build check
+      - name: Rust format check
+        run: cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Prod channel build check
+        # CI builds are dev channel by default. Check the prod cfg path too.
+        env:
+          C9WATCH_CHANNEL: prod
         run: |
           cargo check --manifest-path src-tauri/Cargo.toml \
-            --no-default-features --features cli
+            --no-default-features --features engine
 
       - name: CLI-only tests
         run: |

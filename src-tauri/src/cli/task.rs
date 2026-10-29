@@ -207,4 +207,37 @@ mod tests {
         assert_eq!(reply["ok"], true);
         assert_eq!(h.join().unwrap()["method"], "task.done");
     }
+
+    #[test]
+    fn empty_report_is_rejected_before_connecting() {
+        let env = EngineEnv {
+            sock: "/nonexistent/e.sock".into(),
+            agent_id: "a".into(),
+            token: "t".into(),
+        };
+        let e = report_done(&env, "  \n").unwrap_err();
+        assert!(e.contains("empty"), "{e}");
+    }
+
+    #[test]
+    fn reply_without_ok_true_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let h = std::thread::spawn(move || {
+            let (c, _) = l.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&c).read_line(&mut line).unwrap();
+            let mut w = &c;
+            writeln!(w, "{}", json!({"ok": false})).unwrap();
+        });
+        let env = EngineEnv {
+            sock: path.display().to_string(),
+            agent_id: "a".into(),
+            token: "t".into(),
+        };
+        let e = report_done(&env, "r").unwrap_err();
+        assert!(e.contains("refused"), "{e}");
+        h.join().unwrap();
+    }
 }
