@@ -4,7 +4,8 @@
 //!
 //! - Peer pid and uid: `LOCAL_PEERPID` and `getpeereid` on macOS,
 //!   `SO_PEERCRED` on Linux.
-//! - Process info (ppid and start time): `proc_pidinfo(PROC_PIDTBSDINFO)` on
+//! - Process info (ppid, group and start time; the process list):
+//!   `proc_listallpids` and `proc_pidinfo(PROC_PIDTBSDINFO)` on
 //!   macOS, `/proc/<pid>/stat` on Linux. Never `ps`.
 //! - Executable: `proc_pidpath` on macOS, `/proc/<pid>/exe` on Linux.
 //!
@@ -34,9 +35,19 @@ pub struct ProcInfo {
     pub start: u64,
 }
 
-/// Ppid and start time of `pid`, or `None` when it is gone or unreadable.
+/// One process as `processes` lists it: its info, its process group, and
+/// whether it is a zombie (exited, not yet reaped; it runs nothing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcEntry {
+    pub info: ProcInfo,
+    pub pgid: libc::pid_t,
+    pub zombie: bool,
+}
+
+/// Ppid, group, start time and state of `pid`, or `None` when it is gone
+/// or unreadable.
 #[cfg(target_os = "macos")]
-pub fn proc_info(pid: libc::pid_t) -> Option<ProcInfo> {
+pub fn proc_entry(pid: libc::pid_t) -> Option<ProcEntry> {
     if pid <= 0 {
         return None;
     }
@@ -54,27 +65,102 @@ pub fn proc_info(pid: libc::pid_t) -> Option<ProcInfo> {
     if n != size {
         return None;
     }
-    Some(ProcInfo {
-        pid: info.pbi_pid as libc::pid_t,
-        ppid: info.pbi_ppid as libc::pid_t,
-        start: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+    Some(ProcEntry {
+        info: ProcInfo {
+            pid: info.pbi_pid as libc::pid_t,
+            ppid: info.pbi_ppid as libc::pid_t,
+            start: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+        },
+        pgid: info.pbi_pgid as libc::pid_t,
+        zombie: info.pbi_status == libc::SZOMB,
     })
 }
 
-/// Ppid and start time of `pid`, or `None` when it is gone or unreadable.
+/// Ppid, group, start time and state of `pid`, or `None` when it is gone
+/// or unreadable.
 #[cfg(target_os = "linux")]
-pub fn proc_info(pid: libc::pid_t) -> Option<ProcInfo> {
+pub fn proc_entry(pid: libc::pid_t) -> Option<ProcEntry> {
     if pid <= 0 {
         return None;
     }
     let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    let (ppid, start) = parse_proc_stat(&stat)?;
-    Some(ProcInfo { pid, ppid, start })
+    let f = parse_proc_stat(&stat)?;
+    Some(ProcEntry {
+        info: ProcInfo {
+            pid,
+            ppid: f.ppid,
+            start: f.start,
+        },
+        pgid: f.pgid,
+        zombie: f.zombie,
+    })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn proc_info(_pid: libc::pid_t) -> Option<ProcInfo> {
+pub fn proc_entry(_pid: libc::pid_t) -> Option<ProcEntry> {
     None
+}
+
+/// Ppid and start time of `pid`, or `None` when it is gone or unreadable.
+pub fn proc_info(pid: libc::pid_t) -> Option<ProcInfo> {
+    proc_entry(pid).map(|e| e.info)
+}
+
+/// Every process this module can read, zombies included.
+#[cfg(target_os = "macos")]
+pub fn processes() -> Vec<ProcEntry> {
+    let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    // Room for processes started since the count.
+    let mut pids = vec![0 as libc::pid_t; n as usize + 64];
+    let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr() as *mut libc::c_void, bytes) };
+    pids.truncate(n.max(0) as usize);
+    pids.into_iter().filter_map(proc_entry).collect()
+}
+
+/// Every process this module can read, zombies included.
+#[cfg(target_os = "linux")]
+pub fn processes() -> Vec<ProcEntry> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .filter_map(proc_entry)
+        .collect()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn processes() -> Vec<ProcEntry> {
+    Vec::new()
+}
+
+/// The descendants of `roots` (pid and start time) in the list `all`, at
+/// any depth, roots left out. A root counts only when `all` holds it with
+/// the same start time, and a child only when it did not start before its
+/// parent, so a reused pid adds nothing. A process whose parent exited has
+/// been moved to init and is not found from its old ancestors.
+pub fn descendants(all: &[ProcEntry], roots: &[(libc::pid_t, u64)]) -> Vec<ProcEntry> {
+    let mut frontier: Vec<&ProcInfo> = all
+        .iter()
+        .map(|e| &e.info)
+        .filter(|p| roots.contains(&(p.pid, p.start)))
+        .collect();
+    let mut seen: Vec<libc::pid_t> = frontier.iter().map(|p| p.pid).collect();
+    let mut out = Vec::new();
+    while let Some(parent) = frontier.pop() {
+        for e in all {
+            let p = &e.info;
+            if p.ppid == parent.pid && p.start >= parent.start && !seen.contains(&p.pid) {
+                seen.push(p.pid);
+                out.push(e.clone());
+                frontier.push(p);
+            }
+        }
+    }
+    out
 }
 
 /// The current time as a start-time token (see `ProcInfo::start`), or
@@ -111,17 +197,30 @@ pub fn start_token_now() -> Option<u64> {
     None
 }
 
-/// Ppid (field 4) and starttime (field 22) from a `/proc/<pid>/stat` line.
-/// The comm field (2) is in parentheses and may itself hold spaces and
-/// parentheses, so the fields are counted from the last `)`.
+/// The fields of a `/proc/<pid>/stat` line the engine reads.
+#[derive(Debug, PartialEq, Eq)]
+struct StatFields {
+    ppid: libc::pid_t,
+    pgid: libc::pid_t,
+    start: u64,
+    zombie: bool,
+}
+
+/// State (field 3), ppid (4), pgrp (5) and starttime (22) from a
+/// `/proc/<pid>/stat` line. The comm field (2) is in parentheses and may
+/// itself hold spaces and parentheses, so the fields are counted from the
+/// last `)`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn parse_proc_stat(stat: &str) -> Option<(libc::pid_t, u64)> {
+fn parse_proc_stat(stat: &str) -> Option<StatFields> {
     let rest = &stat[stat.rfind(')')? + 1..];
     let fields: Vec<&str> = rest.split_whitespace().collect();
     // fields[0] is field 3 (state), so field N is fields[N - 3].
-    let ppid = fields.get(1)?.parse().ok()?;
-    let start = fields.get(19)?.parse().ok()?;
-    Some((ppid, start))
+    Some(StatFields {
+        ppid: fields.get(1)?.parse().ok()?,
+        pgid: fields.get(2)?.parse().ok()?,
+        start: fields.get(19)?.parse().ok()?,
+        zombie: *fields.first()? == "Z",
+    })
 }
 
 /// The chain of processes from `pid` up, `pid` first, at most `max` levels.
@@ -280,6 +379,54 @@ mod tests {
     }
 
     #[test]
+    fn processes_hold_the_test_process_and_its_children() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let all = processes();
+        let _ = child.kill();
+        let _ = child.wait();
+        let me = proc_info(my_pid()).unwrap();
+        let mine = all.iter().find(|e| e.info.pid == me.pid).unwrap();
+        assert_eq!(mine.info, me);
+        assert_eq!(mine.pgid, unsafe { libc::getpgrp() });
+        assert!(!mine.zombie);
+        let found = descendants(&all, &[(me.pid, me.start)]);
+        assert!(found.iter().any(|e| e.info.pid == pid), "{:?}", found);
+        // A root with another start time is a reused pid: nothing below it.
+        assert!(descendants(&all, &[(me.pid, me.start + 1)]).is_empty());
+    }
+
+    #[test]
+    fn descendants_walk_every_level_and_skip_later_parents() {
+        let e = |pid, ppid, start| ProcEntry {
+            info: ProcInfo { pid, ppid, start },
+            pgid: pid,
+            zombie: false,
+        };
+        // 10 -> 11 -> 12, 10 -> 13; 14 claims parent 11 but started first.
+        let all = [
+            e(10, 1, 100),
+            e(11, 10, 110),
+            e(12, 11, 120),
+            e(13, 10, 130),
+            e(14, 11, 105),
+            e(15, 1, 150),
+        ];
+        let mut pids: Vec<_> = descendants(&all, &[(10, 100)])
+            .iter()
+            .map(|e| e.info.pid)
+            .collect();
+        pids.sort();
+        assert_eq!(pids, vec![11, 12, 13]);
+        // An orphan kept as a root still yields its own children.
+        let all = [e(11, 1, 110), e(12, 11, 120)];
+        assert_eq!(descendants(&all, &[(10, 100), (11, 110)]).len(), 1);
+    }
+
+    #[test]
     fn proc_stat_is_parsed_after_the_last_paren() {
         // comm "a) (b" holds spaces and parentheses.
         let mut stat = String::from("123 (a) (b) S 77");
@@ -287,7 +434,17 @@ mod tests {
             stat.push_str(&format!(" {}", n));
         }
         stat.push_str(" 987654 rest of the line");
-        assert_eq!(parse_proc_stat(&stat), Some((77, 987654)));
+        assert_eq!(
+            parse_proc_stat(&stat),
+            Some(StatFields {
+                ppid: 77,
+                pgid: 5,
+                start: 987654,
+                zombie: false
+            })
+        );
+        let stat = stat.replace(" S 77", " Z 77");
+        assert!(parse_proc_stat(&stat).unwrap().zombie);
         assert_eq!(parse_proc_stat("123 (x) S"), None);
         assert_eq!(parse_proc_stat("no paren"), None);
     }

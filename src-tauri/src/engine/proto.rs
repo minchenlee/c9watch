@@ -147,6 +147,12 @@ mod tests {
             ErrorCode::UnknownMethod,
             ErrorCode::PeerUidMismatch,
             ErrorCode::CursorExpired,
+            ErrorCode::RateLimited,
+            ErrorCode::PeerNotAuthorized,
+            ErrorCode::NoTask,
+            ErrorCode::UnsupportedInC1a,
+            ErrorCode::AgentBinMissing,
+            ErrorCode::AgentBinMismatch,
             ErrorCode::Internal,
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), code.as_str());

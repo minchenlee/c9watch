@@ -25,6 +25,12 @@ pub mod api;
 pub mod principal;
 
 #[cfg(unix)]
+pub mod agents;
+
+#[cfg(unix)]
+pub mod agent_bin;
+
+#[cfg(unix)]
 pub mod db;
 
 #[cfg(unix)]
@@ -35,6 +41,33 @@ pub mod detect;
 
 #[cfg(unix)]
 pub mod import;
+
+#[cfg(unix)]
+pub mod driver;
+
+#[cfg(unix)]
+pub mod pty;
+
+#[cfg(unix)]
+pub mod vt;
+
+#[cfg(unix)]
+pub mod cc_screen;
+
+#[cfg(unix)]
+pub mod adapter;
+
+#[cfg(unix)]
+pub mod transcript;
+
+#[cfg(unix)]
+pub mod merge;
+
+#[cfg(unix)]
+pub mod generation;
+
+#[cfg(unix)]
+pub mod hooks;
 
 #[cfg(unix)]
 pub mod run;

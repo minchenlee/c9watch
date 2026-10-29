@@ -20,8 +20,9 @@ pub enum CostSortDir {
 mod cost;
 mod session_json;
 mod session_ref;
-// Engine commands (`engine`, `api`, `task`) talk to the engine over a unix
-// socket. They exist only in engine builds, so a release CLI is unchanged.
+// Engine commands (`engine`, `api`) talk to the engine over a unix socket.
+// They exist only in engine builds, so a release CLI is unchanged. `task`
+// holds the calls of the separate `c9watch-agent` binary (C1a-21).
 #[cfg(all(unix, feature = "engine"))]
 pub mod engine_client;
 #[cfg(all(unix, feature = "engine"))]
@@ -79,11 +80,11 @@ pub const CLI_COMMANDS: &[&str] = &[
     "wait",
     "tasks",
     #[cfg(all(unix, feature = "engine"))]
-    "task",
-    #[cfg(all(unix, feature = "engine"))]
     "engine",
     #[cfg(all(unix, feature = "engine"))]
     "api",
+    #[cfg(all(unix, feature = "engine"))]
+    "integration",
     "spawn",
     "send",
     "workers",
@@ -96,10 +97,11 @@ pub const CLI_COMMANDS: &[&str] = &[
     "help",
 ];
 
-/// Engine command names in builds without the engine. They stay out of
-/// `CLI_COMMANDS`, but `is_cli_invocation` still routes them to Clap, so the
-/// user gets an unknown-command error instead of the GUI.
-pub const RESERVED_ENGINE_COMMANDS: &[&str] = &["task", "engine", "api"];
+/// Engine command names in builds without the engine, and `task`, which
+/// moved to `c9watch-agent` (C1a-21). They stay out of `CLI_COMMANDS`, but
+/// `is_cli_invocation` still routes them to Clap, so the user gets an
+/// unknown-command error instead of the GUI.
+pub const RESERVED_ENGINE_COMMANDS: &[&str] = &["task", "engine", "api", "integration"];
 
 /// Whether `first` (the first argument) selects the CLI.
 pub fn is_cli_invocation(first: &str) -> bool {
@@ -349,13 +351,6 @@ pub enum Commands {
         force: bool,
     },
 
-    /// Report to the c9 engine that this managed worker finished its task
-    #[cfg(all(unix, feature = "engine"))]
-    Task {
-        #[command(subcommand)]
-        action: TaskAction,
-    },
-
     /// Run the c9 engine in the foreground, or control it
     #[cfg(all(unix, feature = "engine"))]
     Engine {
@@ -371,6 +366,13 @@ pub enum Commands {
         /// Params as one JSON value
         #[arg(default_value = "{}")]
         params: String,
+    },
+
+    /// Show the engine's agent adapters and their integration files
+    #[cfg(all(unix, feature = "engine"))]
+    Integration {
+        #[command(subcommand)]
+        action: IntegrationAction,
     },
 
     /// Query session cost data
@@ -420,12 +422,14 @@ pub enum EngineAction {
 
 #[cfg(all(unix, feature = "engine"))]
 #[derive(Subcommand)]
-pub enum TaskAction {
-    /// Send the final report to the engine (needs C9_ENGINE_SOCK, C9_AGENT_ID, C9_AGENT_TOKEN)
-    Done {
-        /// Report text, or `-` to read it from stdin
-        #[arg(long)]
-        report: String,
+pub enum IntegrationAction {
+    /// Each adapter's descriptor and integration status
+    Status,
+    /// Print an adapter's integration file (for claude: the hooks block of
+    /// the per-spawn --settings file)
+    Show {
+        /// Adapter kind, e.g. `claude`
+        kind: String,
     },
 }
 
@@ -483,10 +487,6 @@ pub fn run(cli: Cli) {
         },
         Commands::Tasks { session_id } => cmd_tasks(&session_id, cli.pretty),
         #[cfg(all(unix, feature = "engine"))]
-        Commands::Task {
-            action: TaskAction::Done { report },
-        } => task::cmd_task_done(&report),
-        #[cfg(all(unix, feature = "engine"))]
         Commands::Engine { action } => match action {
             None => engine_client::cmd_engine_run(),
             Some(EngineAction::Restart) => engine_client::cmd_engine_restart(cli.pretty),
@@ -495,6 +495,8 @@ pub fn run(cli: Cli) {
         },
         #[cfg(all(unix, feature = "engine"))]
         Commands::Api { method, params } => engine_client::cmd_api(&method, &params, cli.pretty),
+        #[cfg(all(unix, feature = "engine"))]
+        Commands::Integration { action } => engine_client::cmd_integration(&action, cli.pretty),
         #[cfg(feature = "pm-orchestration")]
         Commands::Spawn {
             cwd,
@@ -1194,7 +1196,7 @@ mod dispatch_tests {
     #[cfg(not(feature = "engine"))]
     #[test]
     fn cli_build_has_no_engine_commands() {
-        for name in ["engine", "api", "task"] {
+        for name in ["engine", "api", "task", "integration"] {
             assert!(
                 !CLI_COMMANDS.contains(&name),
                 "{name} in a non-engine build"
@@ -1208,7 +1210,7 @@ mod dispatch_tests {
     #[cfg(all(unix, feature = "engine"))]
     #[test]
     fn engine_and_api_parse_and_route() {
-        for name in ["engine", "api", "task"] {
+        for name in ["engine", "api"] {
             assert!(is_cli_invocation(name));
         }
         let cli = Cli::try_parse_from(["c9watch", "engine"]).unwrap();
@@ -1247,17 +1249,36 @@ mod dispatch_tests {
 
     #[cfg(all(unix, feature = "engine"))]
     #[test]
-    fn task_done_parses_and_routes() {
+    fn integration_parses_and_routes() {
+        assert!(is_cli_invocation("integration"));
+        let cli = Cli::try_parse_from(["c9watch", "integration", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Integration {
+                action: IntegrationAction::Status
+            }
+        ));
+        let cli = Cli::try_parse_from(["c9watch", "integration", "show", "claude"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Integration {
+                action: IntegrationAction::Show { kind }
+            } if kind == "claude"
+        ));
+        assert!(Cli::try_parse_from(["c9watch", "integration"]).is_err());
+        // No global install in C1a: managed CC gets its hooks per spawn.
+        assert!(Cli::try_parse_from(["c9watch", "integration", "install"]).is_err());
+    }
+
+    /// `task done` lives only in `c9watch-agent` (C1a-21): the main binary
+    /// has no `task`, so done has one path. Clap reports it; the GUI does
+    /// not launch.
+    #[cfg(all(unix, feature = "engine"))]
+    #[test]
+    fn the_main_binary_has_no_task_command() {
+        assert!(!CLI_COMMANDS.contains(&"task"));
         assert!(is_cli_invocation("task"));
-        let cli = Cli::try_parse_from(["c9watch", "task", "done", "--report", "ok"]).unwrap();
-        let Commands::Task {
-            action: TaskAction::Done { report },
-        } = cli.command
-        else {
-            panic!("not task done");
-        };
-        assert_eq!(report, "ok");
-        assert!(Cli::try_parse_from(["c9watch", "task", "done"]).is_err());
+        assert!(Cli::try_parse_from(["c9watch", "task", "done", "--report", "ok"]).is_err());
     }
 }
 

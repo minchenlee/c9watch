@@ -6,13 +6,15 @@ usage() {
 Usage: scripts/dogfood-build.sh [--link] [--dry-run]
 
 Build the c9 engine dogfood binary (plan C1a-17, D28 Q8=A): dev channel,
-release profile, no bundle, `engine` feature. The one binary has the GUI
-(with the dev-only shadow diff), the CLI and the engine.
+release profile, no bundle, `engine` feature. The main binary has the GUI
+(with the dev-only shadow diff), the CLI and the engine; c9watch-agent sits
+next to it, where the engine copies it from (C1a-21).
 
 Steps:
   1. Main binary:  npm run tauri build -- --no-bundle --features engine
                    -> <target>/release/c9watch
-  2. Agent binary: c9watch-agent. A no-op until M4 adds that binary.
+  2. Agent binary: cargo build --release --features engine --bin c9watch-agent
+                   -> <target>/release/c9watch-agent
   3. Symlink:      ~/.local/bin/c9watch -> <target>/release/c9watch,
                    only with --link. Without it, the script prints what it
                    would change.
@@ -39,10 +41,14 @@ EOF
 # VERIFIED 2026-10-30: `npm run tauri build -- --no-bundle --features engine`
 # passes `--no-bundle` and `--features` through tauri v2, needs no signing
 # key, and builds <target>/release/c9watch with the engine and the dev-only
-# shadow diff (`c9watch engine --help` lists `shadow-report`). It does not
-# build c9watch-agent: that binary does not exist before M4, so whether the
-# second [[bin]] breaks `tauri build`, or gets built by it, is checked again
-# in M4. AGENT_BUILD is not verified yet.
+# shadow diff (`c9watch engine --help` lists `shadow-report`).
+# C1a-21 (M4) added the second [[bin]], c9watch-agent (required-features =
+# ["engine"], default-run = "c9watch"). `cargo check --features engine` of
+# the GUI passes with it; the release `tauri build` with both binaries is
+# not re-run yet. Step 2 builds the agent explicitly, so the script does not
+# depend on whether `tauri build` also builds it: when it did, step 2 is a
+# no-op. The engine copies `c9watch-agent` from the directory of
+# realpath(~/.local/bin/c9watch), so both must land in <target>/release.
 MAIN_BUILD=(npm run tauri build -- --no-bundle --features engine)
 AGENT_BUILD=(cargo build --release --manifest-path src-tauri/Cargo.toml
   --features engine --bin c9watch-agent)
@@ -107,11 +113,12 @@ if ! $dry_run; then
 fi
 
 echo "== 2/3 c9watch-agent"
-if grep -q '^name = "c9watch-agent"' src-tauri/Cargo.toml; then
-  run "${AGENT_BUILD[@]}"
-else
-  echo "skipped: c9watch-agent does not exist yet; it arrives in M4 (C1a-19..)."
-  echo "         Then this step runs: ${AGENT_BUILD[*]}"
+run "${AGENT_BUILD[@]}"
+if ! $dry_run; then
+  test -x "$agent_bin" || {
+    echo "Expected $agent_bin after the build." >&2
+    exit 1
+  }
 fi
 
 echo "== 3/3 ~/.local/bin/c9watch"
@@ -135,6 +142,4 @@ fi
 
 echo
 echo "Done. Run the binary directly: $main_bin"
-if [[ -x "$agent_bin" ]]; then
-  echo "Agent binary: $agent_bin"
-fi
+echo "Agent binary: $agent_bin (the engine copies it at start)"

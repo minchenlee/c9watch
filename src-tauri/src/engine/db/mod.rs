@@ -138,10 +138,15 @@ impl Db {
         Ok((r, seq.map(|s| self.cursor_at(s))))
     }
 
-    /// Run event retention (24 h / 50k) on the writer thread.
+    /// Run event retention (24 h / 50k) and the dedupe window on the
+    /// writer thread. Returns how many events went.
     pub async fn prune(&self) -> Result<usize, String> {
         self.writer
-            .call(|c| outbox::prune(c, now_ms()))
+            .call(|c| {
+                let now = now_ms();
+                prune_dedupe(c, now)?;
+                outbox::prune(c, now)
+            })
             .await?
             .map_err(|e| format!("Failed to prune events: {}", e))
     }
@@ -254,6 +259,7 @@ pub fn open(home: &Path, machine_id: &str) -> Result<Db, String> {
     let epoch = ensure_epoch(&conn)?;
     register_self(&mut conn, machine_id)?;
     outbox::prune(&conn, now_ms()).map_err(|e| format!("Failed to prune events: {}", e))?;
+    prune_dedupe(&conn, now_ms()).map_err(|e| format!("Failed to prune dedupe: {}", e))?;
     let head = outbox::head(&conn).map_err(|e| format!("Failed to read the event head: {}", e))?;
     Ok(Db {
         path,
@@ -511,6 +517,16 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// How long a `dedupe` row is kept. A sender never retries after its
+/// own deadline (0.5 s for a hook), so an hour is plenty.
+pub const DEDUPE_WINDOW_MS: i64 = 60 * 60 * 1000;
+
+/// Delete `dedupe` rows older than `DEDUPE_WINDOW_MS`. Returns how many
+/// went.
+pub fn prune_dedupe(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
+    conn.execute("DELETE FROM dedupe WHERE ts < ?1", [now - DEDUPE_WINDOW_MS])
 }
 
 #[cfg(test)]
