@@ -6,6 +6,11 @@
 //! portable-pty: the spike used one call of it, and the whole crate is a
 //! dozen new dependencies.
 //!
+//! The reader thread feeds a VT model (`engine::vt`), so `screen` is the
+//! rendered terminal, and answers the terminal queries the child sends
+//! (cursor position, device attributes, colours) at once: CC waits for
+//! those replies at startup.
+//!
 //! Process-group rules:
 //! - The child calls `setsid`, so its pid is also its process group id.
 //!   Every process it starts stays in that group unless it calls `setsid`
@@ -14,9 +19,11 @@
 //!   signalling the group is safe until the group is empty. Once it is
 //!   empty, `kill` and `signal` stop sending.
 
-use super::driver::{ChildId, Driver, KillReport, Output, SpawnSpec, KILL_GRACE, KILL_VERIFY};
+use super::driver::{
+    ChildId, Driver, KillReport, Output, ScreenSnapshot, SpawnSpec, KILL_GRACE, KILL_VERIFY,
+};
 use super::peer;
-use std::collections::VecDeque;
+use super::vt::{self, Screen};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -28,22 +35,18 @@ use std::time::{Duration, Instant};
 /// Unread output kept at most. Older bytes are dropped and counted.
 const PENDING_MAX: usize = 1 << 20;
 
-/// Raw output tail kept for `screen`.
-const TAIL_MAX: usize = 64 * 1024;
-
 /// How often `kill` polls the group.
 const POLL: Duration = Duration::from_millis(20);
 
 /// Output shared between the reader thread and the driver.
-#[derive(Default)]
 struct Buf {
     pending: Vec<u8>,
     dropped: u64,
-    tail: VecDeque<u8>,
+    screen: Screen,
+    last_output: Instant,
     eof: bool,
 }
 
-#[derive(Default)]
 struct Shared {
     buf: Mutex<Buf>,
     ready: Condvar,
@@ -123,7 +126,10 @@ fn group_alive(pgid: libc::pid_t) -> bool {
 
 /// Reads the master until EOF. On Linux a master whose slave side is fully
 /// closed reads EIO, which also counts as EOF.
-fn read_loop(mut master: File, shared: Arc<Shared>) {
+///
+/// Query replies go out through `replies` after the lock is released. A
+/// child that sent a query reads its input, so the write does not block.
+fn read_loop(mut master: File, mut replies: File, shared: Arc<Shared>) {
     let mut chunk = [0u8; 65536];
     loop {
         let n = match master.read(&mut chunk) {
@@ -144,12 +150,18 @@ fn read_loop(mut master: File, shared: Arc<Shared>) {
             buf.pending.drain(..over);
             buf.dropped += over as u64;
         }
-        buf.tail.extend(data.iter().copied());
-        if buf.tail.len() > TAIL_MAX {
-            let over = buf.tail.len() - TAIL_MAX;
-            buf.tail.drain(..over);
-        }
+        buf.last_output = Instant::now();
+        buf.screen.feed_bytes(data);
+        let cursor = (buf.screen.y, buf.screen.x);
+        let answers: Vec<String> = std::mem::take(&mut buf.screen.queries)
+            .iter()
+            .filter_map(|q| vt::query_reply(q, cursor))
+            .collect();
         shared.ready.notify_all();
+        drop(buf);
+        for a in answers {
+            let _ = replies.write_all(a.as_bytes());
+        }
     }
 }
 
@@ -212,7 +224,16 @@ impl Driver for NativePty {
         drop(slave);
         let pid = child.id() as libc::pid_t;
         let master = File::from(master);
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared {
+            buf: Mutex::new(Buf {
+                pending: Vec::new(),
+                dropped: 0,
+                screen: Screen::new(spec.cols as usize, spec.rows as usize),
+                last_output: Instant::now(),
+                eof: false,
+            }),
+            ready: Condvar::new(),
+        });
         let mut pty = NativePty {
             child,
             id: ChildId { pid, start: 0 },
@@ -230,10 +251,11 @@ impl Driver for NativePty {
         };
         pty.id.start = info.start;
         let reader = pty.master.try_clone()?;
+        let replies = pty.master.try_clone()?;
         let shared = pty.shared.clone();
         std::thread::Builder::new()
             .name(format!("pty-read-{}", pid))
-            .spawn(move || read_loop(reader, shared))?;
+            .spawn(move || read_loop(reader, replies, shared))?;
         Ok(pty)
     }
 
@@ -268,13 +290,17 @@ impl Driver for NativePty {
         }
     }
 
-    fn screen(&self) -> String {
+    fn screen(&self) -> ScreenSnapshot {
         let buf = self.shared.buf.lock().unwrap_or_else(|e| e.into_inner());
-        let (a, b) = buf.tail.as_slices();
-        let mut raw = Vec::with_capacity(a.len() + b.len());
-        raw.extend_from_slice(a);
-        raw.extend_from_slice(b);
-        String::from_utf8_lossy(&raw).into_owned()
+        let s = &buf.screen;
+        ScreenSnapshot {
+            text: s.text(),
+            title: s.title.clone(),
+            title_seq: s.title_seq,
+            cursor: (s.y, s.x),
+            alt_screen: s.in_alt,
+            quiet: buf.last_output.elapsed(),
+        }
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
@@ -289,6 +315,8 @@ impl Driver for NativePty {
         {
             return Err(io::Error::last_os_error());
         }
+        let mut buf = self.shared.buf.lock().unwrap_or_else(|e| e.into_inner());
+        buf.screen.resize(cols as usize, rows as usize);
         Ok(())
     }
 
@@ -438,7 +466,7 @@ mod tests {
         read_until(&mut pty, "ready");
         pty.write(b"hello\n").unwrap();
         read_until(&mut pty, "got:hello");
-        assert!(pty.screen().contains("got:hello"));
+        assert!(pty.screen().text.contains("got:hello"));
     }
 
     #[test]
@@ -561,5 +589,47 @@ mod tests {
         let terms: Vec<_> = spec.env.iter().filter(|(k, _)| k == "TERM").collect();
         assert_eq!(terms.len(), 1);
         assert_eq!(terms[0].1, "dumb");
+    }
+
+    /// Wait up to 10 s for `f` to hold on the screen.
+    fn screen_until(pty: &mut NativePty, f: impl Fn(&ScreenSnapshot) -> bool) -> ScreenSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            pty.output(Duration::from_millis(50));
+            let snap = pty.screen();
+            if f(&snap) {
+                return snap;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "screen never matched: {:?}",
+                snap
+            );
+        }
+    }
+
+    #[test]
+    fn screen_is_the_rendered_terminal_with_its_title() {
+        let mut pty = NativePty::spawn(&sh(
+            "printf 'gone\\r\\033[Kkept\\033]0;\\342\\234\\263 idle\\007'; sleep 30",
+        ))
+        .unwrap();
+        let snap = screen_until(&mut pty, |s| s.title_seq == 1);
+        assert_eq!(snap.title, "\u{2733} idle");
+        assert_eq!(snap.text.lines().next(), Some("kept"));
+        assert_eq!(snap.cursor, (0, 4));
+        // No output since: the quiet time grows.
+        let snap = screen_until(&mut pty, |s| s.quiet >= Duration::from_millis(300));
+        assert!(!snap.text.contains("gone"));
+    }
+
+    #[test]
+    fn terminal_queries_are_answered() {
+        // Device status report: the reply is ESC [ 0 n, read raw.
+        let mut pty = NativePty::spawn(&sh("stty -icanon -echo; printf '\\033[5n'; \
+             dd bs=1 count=4 2>/dev/null | od -An -c; stty sane; echo end"))
+        .unwrap();
+        let text = read_until(&mut pty, "end");
+        assert!(text.contains("[   0   n"), "{:?}", text);
     }
 }

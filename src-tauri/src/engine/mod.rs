@@ -43,4 +43,10 @@ pub mod driver;
 pub mod pty;
 
 #[cfg(unix)]
+pub mod vt;
+
+#[cfg(unix)]
+pub mod cc_screen;
+
+#[cfg(unix)]
 pub mod run;

@@ -93,6 +93,22 @@ pub struct Output {
     pub eof: bool,
 }
 
+/// The rendered terminal at one moment (`engine::vt`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenSnapshot {
+    /// The visible rows, trailing spaces trimmed.
+    pub text: String,
+    /// The last OSC 0/2 window title.
+    pub title: String,
+    /// Bumped on every title change, also to the same title.
+    pub title_seq: u64,
+    /// (row, col), zero-based.
+    pub cursor: (usize, usize),
+    pub alt_screen: bool,
+    /// Time since the last output byte, or since the spawn when none came.
+    pub quiet: Duration,
+}
+
 /// How a `kill` ended. `kill` returns an error, not a report, when the
 /// group is still alive after SIGKILL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,9 +136,8 @@ pub trait Driver: Send {
     /// none are there yet; returns at once on EOF.
     fn output(&mut self, wait: Duration) -> Output;
 
-    /// The terminal as text. C1a-19 gives the tail of the raw output; the VT
-    /// model of C1a-20 replaces it with the rendered screen.
-    fn screen(&self) -> String;
+    /// The terminal as the VT model renders it, with its title.
+    fn screen(&self) -> ScreenSnapshot;
 
     /// Change the terminal size. The child gets SIGWINCH.
     fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()>;
