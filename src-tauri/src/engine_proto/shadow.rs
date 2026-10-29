@@ -163,6 +163,8 @@ pub struct ShadowDiff {
     reported: HashSet<Diff>,
     last_flush: Option<Instant>,
     last_error: Option<String>,
+    /// Per socket operation; `ENGINE_TIMEOUT` outside tests.
+    timeout: Duration,
 }
 
 impl ShadowDiff {
@@ -185,6 +187,7 @@ impl ShadowDiff {
             reported: HashSet::new(),
             last_flush: None,
             last_error: None,
+            timeout: ENGINE_TIMEOUT,
         }
     }
 
@@ -192,7 +195,7 @@ impl ShadowDiff {
     /// when it is due.
     pub fn tick(&mut self, sessions: &[Session]) {
         let gui: Vec<Side> = sessions.iter().map(Side::from_session).collect();
-        let engine = client::session_list(&sock_path(&self.home), "gui-shadow", ENGINE_TIMEOUT)
+        let engine = client::session_list(&sock_path(&self.home), "gui-shadow", self.timeout)
             .map(|rows| rows.iter().filter_map(Side::from_row).collect::<Vec<_>>());
         self.note_error(engine.as_ref().err());
         let now = chrono::Local::now();
@@ -551,6 +554,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (_sock, server) = fake_engine(dir.path(), vec![row("claudeCode:a", "working")], 1);
         let mut sd = ShadowDiff::new(dir.path().to_path_buf());
+        // A loaded CI runner can be slower than the GUI's budget.
+        sd.timeout = Duration::from_secs(2);
         sd.tick(&[]);
         server.join().unwrap();
         sd.flush();
