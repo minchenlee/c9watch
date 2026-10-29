@@ -1,4 +1,4 @@
--- user_version 3
+-- user_version 4
 -- index agents_detected_key
 CREATE UNIQUE INDEX agents_detected_key ON agents (session_key) WHERE source = 'detected';
 -- index agents_legacy_sid
@@ -36,7 +36,7 @@ CREATE TABLE agents (
 , session_key TEXT, machine_id TEXT, state TEXT CHECK (state IN (
     'creating', 'starting', 'ready', 'working', 'blocked', 'paused', 'refreshing',
     'interrupted', 'retiring', 'retired', 'failed', 'orphaned')), status TEXT CHECK (status IN (
-    'working', 'needs_attention', 'waiting_for_input', 'connecting')), cwd TEXT, name TEXT, pid INTEGER, started_at INTEGER, created_at INTEGER, last_seen INTEGER, parent_id TEXT REFERENCES agents (id)) STRICT;
+    'working', 'needs_attention', 'waiting_for_input', 'connecting')), cwd TEXT, name TEXT, pid INTEGER, started_at INTEGER, created_at INTEGER, last_seen INTEGER, parent_id TEXT REFERENCES agents (id), state_reason TEXT, resume_argv TEXT) STRICT;
 -- table audit
 CREATE TABLE audit (
     seq          INTEGER PRIMARY KEY,

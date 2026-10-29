@@ -111,6 +111,13 @@ export interface C9pAgentRow {
    */
   state: string | null;
   /**
+   * Why the agent is in its `state`: `drain` for a `paused` or
+   * `interrupted` agent that an engine drain stopped; for a `failed`
+   * agent the failure reason, such as `spawn_failed`, `resume_failed`,
+   * `exited` or `create_interrupted`.
+   */
+  stateReason: string | null;
+  /**
    * The detected session status: `working`, `needs_attention`,
    * `waiting_for_input` or `connecting`.
    */
@@ -206,6 +213,11 @@ export type C9pErrorCode =
   | 'spawn_failed'
   /** No engine agent has this id. */
   | 'unknown_agent'
+  /**
+   * The engine is draining after a SIGTERM: no spawn and no injection
+   * until the next engine is up. Retry against the new engine.
+   */
+  | 'draining'
   /** An engine-side failure. */
   | 'internal';
 

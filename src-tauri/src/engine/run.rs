@@ -24,6 +24,19 @@
 //! `C9WATCH_EXPERIMENTAL_CREATE=1` in the engine's env (C1a-26). On
 //! shutdown every agent the engine runs is killed before the db closes; the
 //! next boot reconciles their rows.
+//!
+//! SIGTERM drains first (C1a-27, `engine::drain`): the socket keeps serving,
+//! so hooks still arrive, while ready agents are paused and mid-turn agents
+//! get up to 60 s; the engine exits by the 90 s hard deadline. SIGINT and
+//! `run_until`'s `stop` skip the drain.
+//!
+//! Boot resume (C1a-28, `Spawner::resume_on_boot`) runs after boot
+//! reconcile and after the bind, so the resumed agents' SessionStart hooks
+//! find the socket: every `paused(drain)` and `interrupted` agent gets a
+//! new generation and comes up on `claude --resume` on its supervisor's
+//! thread. It needs `C9WATCH_EXPERIMENTAL_CREATE=1` like a create; without
+//! it the rows stay as they are. A failed read or write logs and the
+//! engine runs on.
 
 use super::agent_bin::{self, AgentBin};
 use super::agents::LiveTable;
@@ -31,13 +44,14 @@ use super::api::{serve, ServerCtx};
 use super::create::{Spawner, SpawnerConfig, EXPERIMENTAL_CREATE_ENV};
 use super::db;
 use super::detect;
+use super::drain::{self, DrainSwitch};
 use super::fsutil::ensure_private_dir;
 use super::home::{lock_path, sock_path};
 use super::import;
 use super::lock::acquire_engine_lock;
 use super::machine;
 use super::ops;
-use super::sock::{bind_private, ShutdownSignals};
+use super::sock::{bind_private, ShutdownSignal, ShutdownSignals};
 use super::standing;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -122,23 +136,28 @@ pub async fn run_until(
     let listener = UnixListener::from_std(std_listener)
         .map_err(|e| format!("Failed to register Unix socket: {}", e))?;
 
+    let drain_switch = Arc::new(DrainSwitch::new());
     let ctx = ServerCtx::new(key.id().to_string())
         .with_agents(config.agents.clone())
         .with_agent_bin(agent_bin.clone())
         .with_db(db.clone())
-        .with_standing_orders(standing::path(home));
-    let spawner = Arc::new(Spawner::new(
-        SpawnerConfig {
-            home: home.to_path_buf(),
-            sock: socket.path().to_path_buf(),
-            claude: config.claude.clone(),
-            enabled: config.experimental_create,
-        },
-        db.clone(),
-        config.agents.clone(),
-        ctx.merge.clone(),
-        agent_bin,
-    ));
+        .with_standing_orders(standing::path(home))
+        .with_drain(drain_switch.clone());
+    let spawner = Arc::new(
+        Spawner::new(
+            SpawnerConfig {
+                home: home.to_path_buf(),
+                sock: socket.path().to_path_buf(),
+                claude: config.claude.clone(),
+                enabled: config.experimental_create,
+            },
+            db.clone(),
+            config.agents.clone(),
+            ctx.merge.clone(),
+            agent_bin,
+        )
+        .with_drain(drain_switch),
+    );
     if spawner.enabled() {
         eprintln!(
             "[engine] {}=1: agent.create is on (experimental)",
@@ -146,6 +165,24 @@ pub async fn run_until(
         );
     }
     let ctx = Arc::new(ctx.with_spawner(spawner.clone()));
+    match spawner.resume_on_boot() {
+        Ok(r) if r == Default::default() => {}
+        Ok(r) => eprintln!(
+            "[engine] Boot resume: started {:?}, failed {:?}, left {:?}{}",
+            r.started,
+            r.failed,
+            r.left,
+            if r.left.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({}=1 is not set, or the engine drains)",
+                    EXPERIMENTAL_CREATE_ENV
+                )
+            }
+        ),
+        Err(e) => eprintln!("[engine] Boot resume: {}", e),
+    }
     let pruner = tokio::spawn(prune_loop(db.clone()));
     let detection = if config.detection {
         let d = detect::spawn(db.clone())?;
@@ -162,16 +199,58 @@ pub async fn run_until(
         db.epoch()
     );
 
+    let serving = serve(listener, ctx);
+    tokio::pin!(serving);
+    tokio::pin!(stop);
     let sig = tokio::select! {
-        _ = serve(listener, ctx) => None,
+        _ = &mut serving => None,
         sig = signals.recv() => Some(sig),
-        _ = stop => None,
+        _ = &mut stop => None,
     };
+    // The hard deadline counts from the SIGTERM.
+    let deadline = tokio::time::Instant::now() + drain::HARD_DEADLINE;
+    if sig == Some(ShutdownSignal::Term) {
+        // Keep serving while the drain runs: hooks still come in, and get
+        // no context. A SIGINT or `stop` ends the drain early; another
+        // SIGTERM (a second `engine restart`) does not (reviews M3).
+        let drain = run_drain(&spawner);
+        tokio::pin!(drain);
+        loop {
+            tokio::select! {
+                _ = &mut serving => {
+                    eprintln!("[engine] The listener failed during the drain");
+                    break;
+                }
+                _ = &mut drain => break,
+                sig = signals.recv() => {
+                    if sig == ShutdownSignal::Term {
+                        eprintln!("[engine] SIGTERM again: still draining");
+                        continue;
+                    }
+                    eprintln!("[engine] {:?} during the drain", sig);
+                    break;
+                }
+                _ = &mut stop => break,
+            }
+        }
+    }
     eprintln!("[engine] Shutting down ({:?})", sig);
     pruner.abort();
     // The agents go before the db closes, so their supervisors can still
-    // write; what they leave is reconciled at the next boot.
-    let _ = tokio::task::spawn_blocking(move || spawner.shutdown()).await;
+    // write; what they leave is reconciled at the next boot. After a drain
+    // only what it left is still running, and the hard deadline holds:
+    // a supervisor stuck past it is not waited for.
+    let shut = tokio::task::spawn_blocking(move || spawner.shutdown());
+    if sig == Some(ShutdownSignal::Term) {
+        if tokio::time::timeout_at(deadline, shut).await.is_err() {
+            eprintln!(
+                "[engine] Hard deadline of {} s: exiting with agents still stopping",
+                drain::HARD_DEADLINE.as_secs()
+            );
+        }
+    } else {
+        let _ = shut.await;
+    }
     // Stops the detection thread after its current tick. A tick that is
     // still writing when the db closes fails, and nothing waits for it.
     drop(detection);
@@ -183,6 +262,36 @@ pub async fn run_until(
     db.close();
     drop(lock);
     Ok(())
+}
+
+/// Turn the drain switch on and drain the agents (`engine::drain`).
+async fn run_drain(spawner: &Arc<Spawner>) {
+    spawner.drain_switch().start();
+    let start = spawner.now();
+    eprintln!(
+        "[engine] SIGTERM: draining {} agent(s), up to {} s",
+        spawner.live_count(),
+        drain::HARD_DEADLINE.as_secs()
+    );
+    let sp = spawner.clone();
+    match tokio::task::spawn_blocking(move || drain::run(&sp, drain::Timing::default(), start))
+        .await
+    {
+        Ok(r) => eprintln!(
+            "[engine] Drained: paused {:?}, interrupted {:?}, left to boot reconcile {:?}, \
+             unsettled {:?}{}",
+            r.paused,
+            r.interrupted,
+            r.left,
+            r.unsettled,
+            if r.timed_out {
+                ", deadline reached"
+            } else {
+                ""
+            }
+        ),
+        Err(e) => eprintln!("[engine] The drain failed: {}", e),
+    }
 }
 
 /// Import the legacy files on their own thread. A thread, not a blocking

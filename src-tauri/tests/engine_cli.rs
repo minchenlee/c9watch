@@ -299,3 +299,122 @@ fn a_db_from_a_newer_engine_fails_the_auto_start_with_its_code() {
     // Refused, not moved aside or changed.
     assert_eq!(std::fs::read(&db).unwrap(), before);
 }
+
+/// A stand-in for `claude` (never the real one). Detection's `--version`
+/// gets a version; any other call without `--settings` fails at once. An
+/// agent spawn logs its argv, sends the SessionStart hook through the
+/// engine's `c9watch-agent` copy as CC would (source `resume` with
+/// `--resume`), shows CC's idle title and a prompt, and waits to be killed.
+const FAKE_CLAUDE: &str = r#"#!/bin/sh
+case "$1" in --version) echo "2.1.312 (Claude Code)"; exit 0 ;; esac
+dir=$(dirname "$0")
+args="$*"
+sid=""; source="startup"; settings=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --session-id) sid="$2"; shift 2 ;;
+    --resume) sid="$2"; source="resume"; shift 2 ;;
+    --settings) settings="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$settings" ] || exit 1
+echo "$args" >> "$dir/argv.log"
+home=$(dirname "$(dirname "$settings")")
+printf '{"session_id":"%s","source":"%s","hook_event_name":"SessionStart"}' "$sid" "$source" \
+  | "$home/bin/c9watch-agent" hook session-start --kind claude > "$dir/ctx-$C9_AGENT_GEN.out"
+printf '\033]0;\342\234\263 Claude Code\007\342\235\257 \r\n'
+while :; do sleep 1; done
+"#;
+
+/// C1a-28 end to end: `engine restart` with a live agent drains it and the
+/// next engine resumes it on the same session, as generation 2, with
+/// `--resume`; the restart does not count as a resume.
+#[test]
+fn engine_restart_with_a_live_agent_drains_then_resumes_it() {
+    let sb = Sandbox::new();
+    let root = sb.home.parent().unwrap().to_path_buf();
+    let bin = root.join("fakebin");
+    std::fs::create_dir(&bin).unwrap();
+    let claude = bin.join("claude");
+    std::fs::write(&claude, FAKE_CLAUDE).unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cwd = root.join("work");
+    std::fs::create_dir(&cwd).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |args: &[&str]| -> Output {
+        sb.cmd(args)
+            .env("PATH", &path)
+            .env("C9WATCH_EXPERIMENTAL_CREATE", "1")
+            .output()
+            .unwrap()
+    };
+    let list = || -> Vec<Value> {
+        let out = run(&["api", "agent.list", r#"{"all":true}"#]);
+        assert!(out.status.success(), "{:?}", out);
+        stdout_json(&out)["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+
+    let params = serde_json::json!({ "mode": "free", "cwd": cwd }).to_string();
+    let out = run(&["api", "agent.create", &params]);
+    assert!(out.status.success(), "{:?} / log {}", out, sb.log());
+    let created = stdout_json(&out)["result"]["agent"].clone();
+    assert_eq!(created["state"], "ready", "{}", created);
+    assert_eq!(created["generation"], 1);
+    let id = created["id"].as_str().unwrap().to_string();
+    let sid = created["providerSid"].as_str().unwrap().to_string();
+    let old = sb.pid().unwrap();
+
+    let out = run(&["engine", "restart"]);
+    assert!(out.status.success(), "{:?} / log {}", out, sb.log());
+    assert_ne!(sb.pid(), Some(old));
+    let mut last = Value::Null;
+    let resumed = wait_for(Duration::from_secs(30), || {
+        last = list()
+            .into_iter()
+            .find(|a| a["id"] == id.as_str())
+            .unwrap_or_default();
+        last["state"] == "ready" && last["generation"] == 2
+    });
+    assert!(resumed, "{} / log {}", last, sb.log());
+    assert_eq!(last["providerSid"], sid.as_str());
+    assert_eq!(last["resumeCount"], 0);
+    assert!(last["stateReason"].is_null(), "{}", last);
+    let argv = std::fs::read_to_string(bin.join("argv.log")).unwrap();
+    let lines: Vec<&str> = argv.lines().collect();
+    assert_eq!(lines.len(), 2, "{}", argv);
+    assert!(lines[0].starts_with(&format!("--session-id {} --settings ", sid)));
+    assert!(lines[1].starts_with(&format!("--resume {} --settings ", sid)));
+    assert!(lines[1].contains(&format!("{}-2.json", id)), "{}", lines[1]);
+    assert!(lines[1].contains("--permission-mode auto"), "{}", lines[1]);
+    // D24: each generation's SessionStart context names its generation
+    // and replaces the earlier blocks (reviews L4).
+    for gen in [1, 2] {
+        let ctx = std::fs::read_to_string(bin.join(format!("ctx-{}.out", gen))).unwrap();
+        let header = format!(
+            "c9watch context, generation {} (replaces any earlier c9watch context)",
+            gen
+        );
+        assert!(ctx.contains(&header), "ctx-{}.out: {}", gen, ctx);
+    }
+
+    let out = run(&["api", "agent.retire", &format!(r#"{{"id":"{}"}}"#, id)]);
+    assert!(out.status.success(), "{:?}", out);
+    // Nothing of the fake agent is left running.
+    let claude_s = claude.display().to_string();
+    let gone = wait_for(Duration::from_secs(10), || {
+        let out = Command::new("pgrep")
+            .args(["-f", &claude_s])
+            .output()
+            .unwrap();
+        out.stdout.is_empty()
+    });
+    assert!(gone, "a fake claude still runs");
+}

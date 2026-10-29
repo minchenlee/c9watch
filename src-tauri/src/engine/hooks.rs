@@ -26,7 +26,7 @@ use super::db::audit::{self, AuditEntry};
 use super::db::outbox::NewEvent;
 use super::db::Tx;
 use super::generation;
-use super::merge::{Activity, Claim, MergeTable, Source};
+use super::merge::{Activity, Change, Claim, MergeTable, Source};
 use super::proto::HookParams;
 use rusqlite::{params, OptionalExtension};
 
@@ -161,6 +161,32 @@ fn apply(
         }
         (change, m.row_state(now_ms), attention)
     });
+    write_change(tx, machine, id, ev.gen, state, &change, row_state)?;
+    if let Some(reason) = attention {
+        tx.emit(&NewEvent {
+            topic: "agent.attention".into(),
+            subject: Some(format!("{}/{}", machine, id)),
+            origin: None,
+            data: serde_json::json!({
+                "id": id, "generation": ev.gen, "reason": reason,
+                "toolUseId": p.input["tool_use_id"],
+            }),
+        })?;
+    }
+    Ok(())
+}
+
+/// What a merge claim changed, into the row: the new `state` and the turn
+/// end event.
+fn write_change(
+    tx: &mut Tx,
+    machine: &str,
+    id: &str,
+    gen: i64,
+    state: Option<&str>,
+    change: &Change,
+    row_state: Option<&'static str>,
+) -> rusqlite::Result<()> {
     // Lifecycle states (starting, paused, retiring, ...) belong to the
     // spawn, drain and retire paths; the merge moves only these.
     let mergeable = matches!(state, Some("ready" | "working" | "blocked"));
@@ -171,29 +197,58 @@ fn apply(
         )?;
         generation::emit_upsert(tx, machine, id)?;
     }
-    let subject = Some(format!("{}/{}", machine, id));
     if let Some(end) = change.turn_end {
         tx.emit(&NewEvent {
             topic: "agent.turn_end".into(),
-            subject: subject.clone(),
+            subject: Some(format!("{}/{}", machine, id)),
             origin: None,
             data: serde_json::json!({
-                "id": id, "generation": ev.gen, "by": end.by.as_str(), "at": end.at_ms,
-            }),
-        })?;
-    }
-    if let Some(reason) = attention {
-        tx.emit(&NewEvent {
-            topic: "agent.attention".into(),
-            subject,
-            origin: None,
-            data: serde_json::json!({
-                "id": id, "generation": ev.gen, "reason": reason,
-                "toolUseId": p.input["tool_use_id"],
+                "id": id, "generation": gen, "by": end.by.as_str(), "at": end.at_ms,
             }),
         })?;
     }
     Ok(())
+}
+
+/// A claim of the agent's own screen, from its supervisor after `ready`:
+/// into the merge, then the row state and turn end that follow. CC has no
+/// turn-start hook in the profile, so this is how a ready engine agent
+/// becomes `working`, which the drain waits for (reviews H1). Ignored
+/// unless `gen` is the row's generation. Returns whether it was taken.
+pub fn screen_claim(
+    tx: &mut Tx,
+    machine: &str,
+    merge: &MergeTable,
+    id: &str,
+    gen: i64,
+    activity: Activity,
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    let row: Option<(i64, Option<String>)> = tx
+        .query_row(
+            "SELECT generation, state FROM agents WHERE id = ?1 \
+             AND source = 'engine' AND control = 'pty' AND gone_at IS NULL",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((row_gen, state)) = row.filter(|(g, _)| *g == gen) else {
+        return Ok(false);
+    };
+    let (change, row_state) = merge.with(id, gen, |m| {
+        let change = m.claim(Claim::new(Source::Screen, activity, now_ms));
+        (change, m.row_state(now_ms))
+    });
+    write_change(
+        tx,
+        machine,
+        id,
+        row_gen,
+        state.as_deref(),
+        &change,
+        row_state,
+    )?;
+    Ok(true)
 }
 
 /// Audit a dropped event (not a duplicate) and say so.

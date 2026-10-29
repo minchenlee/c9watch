@@ -33,8 +33,48 @@
 //! row kept (A:828). An agent that exits by itself after `ready` ends
 //! `failed` with `exited`.
 //!
-//! The supervisor owns the `Driver`. On engine shutdown it kills the PTY
-//! and leaves the row as it is; the next boot reconciles it (`ops`).
+//! The supervisor owns the `Driver`. After `ready` it keeps following the
+//! screen and feeds its state into the merge as a screen claim
+//! (`hooks::screen_claim`): CC has no turn-start hook in the profile, so
+//! this is what makes a ready agent `working` (reviews H1). On engine
+//! shutdown it kills the PTY and leaves the row as it is; the next boot
+//! reconciles it (`ops`).
+//!
+//! **Drain (C1a-27, `engine::drain`).** Once the engine's drain switch is
+//! on, `agent.create` answers `draining`, a create that has its row but no
+//! PTY spawns nothing (its op is left to boot reconcile), and a PTY write
+//! is not sent but audited. A drained supervisor kills its agent and then
+//! writes `paused(drain)` or `interrupted` (`drain::settle`); a kill that
+//! fails writes nothing, so boot reconcile still finds and kills the
+//! process by its `agent_state` (reviews M1).
+//!
+//! **Boot resume (C1a-28, A:236, A:1038).** After boot reconcile, the
+//! engine resumes every `paused(drain)` and `interrupted` agent
+//! (`resume_on_boot`), only with the create switch on:
+//! - The session is the one in the row's `resume_argv` (`claude --resume
+//!   <id>`), or `provider_sid` for an agent that boot reconcile marked
+//!   `interrupted` without a drain. The spawn is the same profile with
+//!   `--resume` for `--session-id` and a new settings file for the new
+//!   generation.
+//! - One transaction starts the next generation (`agents.generation` + 1
+//!   and a `session_alias` row on the same session and transcript) and
+//!   opens an op of kind `agent.resume` (`engine::ops`). A resume after a
+//!   drain has reason `engine_restart` and does not count in
+//!   `resume_count`; one after a crash does.
+//! - The supervisor then brings the agent up exactly as for a create. No
+//!   quota is checked first (D28 Q7). An exit before `ready`, a vendor
+//!   refusal or no `ready` within 30 s ends the row `failed` with
+//!   `resume_failed` and the vendor's text in the detail; it is never
+//!   tried again. `ready` clears `state_reason` and `resume_argv`; the
+//!   resume SessionStart takes the interrupted note (`engine::standing`).
+//! - A drain or stop of this engine while the resume comes up is not a
+//!   resume failure: the supervisor kills the agent and puts the row back
+//!   to `paused` or `interrupted` with reason `drain` and its
+//!   `resume_argv`, so the next boot resumes it again (reviews M2). Only a
+//!   kill that fails, or an engine that dies, leaves it to boot reconcile,
+//!   which fails it.
+//! - Events of the old generation are dropped as `stale_generation` and
+//!   audited (`engine::hooks`).
 
 use super::adapter::cc::profile::{
     resolve_cwd, settings_path_of, spawn_spec, write_settings, Profile,
@@ -42,12 +82,17 @@ use super::adapter::cc::profile::{
 use super::adapter::{self, Descriptor};
 use super::agent_bin::{AgentBin, Rehash};
 use super::agents::LiveTable;
-use super::cc_screen::{vendor_refusal, CcScreen, ScreenEvent, ScreenFailure, READY_TIMEOUT};
+use super::cc_screen::{
+    vendor_refusal, CcScreen, ScreenEvent, ScreenFailure, ScreenState, READY_TIMEOUT,
+};
 use super::db::audit::{self, AuditEntry};
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
+use super::drain::{self, DrainSwitch, InjectionPath};
 use super::driver::{Driver, SpawnSpec};
+use super::generation;
 use super::generation::{begin_generation, emit_upsert, GenReason};
-use super::merge::MergeTable;
+use super::hooks;
+use super::merge::{Activity, MergeTable};
 use super::ops::{self, CreatePayload, Phase};
 use super::principal::Principal;
 use super::proto::{AgentCreateParams, AgentRetireParams, AgentRow, ApiError, ErrorCode};
@@ -128,6 +173,8 @@ enum Cmd {
     Retire { principal: String, reply: Reply },
     /// The engine stops: kill the agent, leave the row to boot reconcile.
     Shutdown,
+    /// The engine drains: kill the agent, then `drain::settle` its row.
+    Drain,
 }
 
 struct Handle {
@@ -135,7 +182,24 @@ struct Handle {
     thread: JoinHandle<()>,
 }
 
-/// One create, as the supervisor gets it.
+/// Whether a supervisor starts a new session or resumes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Create,
+    Resume,
+}
+
+impl Kind {
+    /// The op kind (and audit method), and the reason of a failure.
+    fn failure(self) -> (&'static str, &'static str) {
+        match self {
+            Kind::Create => (ops::KIND_CREATE, SPAWN_FAILED),
+            Kind::Resume => (ops::KIND_RESUME, ops::RESUME_FAILED),
+        }
+    }
+}
+
+/// One create or resume, as the supervisor gets it.
 #[derive(Debug, Clone)]
 struct Start {
     id: String,
@@ -144,14 +208,43 @@ struct Start {
     op_id: String,
     cwd: PathBuf,
     claude: PathBuf,
+    kind: Kind,
+    /// A resume: the row's state before it (`paused` or `interrupted`).
+    from: Option<String>,
+}
+
+/// What `resume_on_boot` did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Resumed {
+    /// A new generation and a supervisor each; `ready` comes later.
+    pub started: Vec<String>,
+    /// Failed before the spawn, now `failed` with `resume_failed`.
+    pub failed: Vec<String>,
+    /// Not resumed: `agent.create` is off, the engine drains, or a write
+    /// failed.
+    pub left: Vec<String>,
+}
+
+/// A row the boot resume picks up.
+#[derive(Debug, Clone)]
+struct Resumable {
+    id: String,
+    state: String,
+    reason: Option<String>,
+    provider: String,
+    sid: Option<String>,
+    cwd: Option<String>,
+    argv: Option<String>,
 }
 
 /// How bringing an agent up ended.
 enum Up {
-    Ready(Box<dyn Driver>, Box<AgentRow>),
+    Ready(Box<dyn Driver>, Box<AgentRow>, Box<CcScreen>),
     Failed(ApiError),
     Retired,
     Shutdown,
+    /// The engine drains: nothing was spawned.
+    Draining,
 }
 
 /// Creates, supervises and retires the engine's free agents.
@@ -169,6 +262,8 @@ pub struct Spawner {
     /// The supervisor of every agent that runs in this engine.
     live: Mutex<HashMap<String, Handle>>,
     stopping: AtomicBool,
+    /// The engine's drain switch (C1a-27).
+    drain: Arc<DrainSwitch>,
 }
 
 impl Spawner {
@@ -190,7 +285,42 @@ impl Spawner {
             starts: Mutex::new(HashSet::new()),
             live: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
+            drain: Arc::new(DrainSwitch::new()),
         }
+    }
+
+    /// Share the engine's drain switch.
+    pub fn with_drain(mut self, drain: Arc<DrainSwitch>) -> Spawner {
+        self.drain = drain;
+        self
+    }
+
+    /// The drain switch this spawner obeys.
+    pub fn drain_switch(&self) -> &Arc<DrainSwitch> {
+        &self.drain
+    }
+
+    /// The supervisors' clock (`with_clock`).
+    pub(super) fn now(&self) -> Instant {
+        (self.clock)()
+    }
+
+    pub(super) fn db(&self) -> &Db {
+        &self.db
+    }
+
+    /// The agents whose supervisor runs, sorted.
+    pub(super) fn supervised(&self) -> Vec<String> {
+        let mut ids: Vec<String> = lock(&self.live).keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Tell the supervisor of `id` to stop its agent for the drain.
+    /// Returns whether it took the command.
+    pub(super) fn drain_agent(&self, id: &str) -> bool {
+        let cmds = lock(&self.live).get(id).map(|h| h.cmds.clone());
+        cmds.is_some_and(|c| c.send(Cmd::Drain).is_ok())
     }
 
     pub fn with_launcher(mut self, launcher: Arc<dyn Launcher>) -> Spawner {
@@ -235,6 +365,9 @@ impl Spawner {
                 ),
             ));
         }
+        if self.drain.on() {
+            return Err(draining());
+        }
         let p: AgentCreateParams = parse(params, "agent.create")?;
         let desc = check_kind_and_mode(&p)?;
         if let Some(name) = &p.name {
@@ -255,6 +388,8 @@ impl Spawner {
             op_id: ops::new_op_id(),
             cwd,
             claude,
+            kind: Kind::Create,
+            from: None,
         };
         let gen = self
             .write_row(&start, desc, principal, p.name.clone())
@@ -361,6 +496,15 @@ impl Spawner {
     fn supervise(self: &Arc<Self>, s: Start, reply: Reply) -> Result<(), ApiError> {
         let (cmds, rx) = mpsc::channel();
         let mut live = lock(&self.live);
+        if self.drain.on() {
+            // A create's row and op stay for boot reconcile; a resume
+            // leaves its row for the next boot.
+            drop(live);
+            if s.kind == Kind::Resume {
+                self.drop_resume(&s);
+            }
+            return Err(draining());
+        }
         if self.stopping.load(Ordering::SeqCst) {
             drop(live);
             self.fail_create(&s, "the engine stopped before the spawn");
@@ -392,11 +536,14 @@ impl Spawner {
     /// run it until it is retired, exits or the engine stops.
     fn supervisor(self: Arc<Self>, s: Start, reply: Reply, cmds: Receiver<Cmd>) {
         match self.bring_up(&s, &cmds) {
-            Up::Ready(driver, row) => {
+            Up::Ready(driver, row, screen) => {
                 let _ = reply.send(Ok(*row));
-                self.run(&s, driver, &cmds);
+                self.run(&s, driver, *screen, &cmds);
             }
             Up::Failed(e) => {
+                if s.kind == Kind::Resume {
+                    eprintln!("[engine] The resume of {} failed: {}", s.id, e.msg);
+                }
                 let _ = reply.send(Err(e));
             }
             Up::Retired => {
@@ -407,6 +554,9 @@ impl Spawner {
             }
             Up::Shutdown => {
                 let _ = reply.send(Err(stopping()));
+            }
+            Up::Draining => {
+                let _ = reply.send(Err(draining()));
             }
         }
         self.agents.unregister(&s.id, s.gen);
@@ -432,6 +582,7 @@ impl Spawner {
             s.gen,
             &s.sid,
         ) {
+            Ok(p) if s.kind == Kind::Resume => p.resuming(),
             Ok(p) => p,
             Err(e) => return fail(e),
         };
@@ -455,7 +606,17 @@ impl Spawner {
             }
             Err(e) => return fail(e),
         }
-        // The one spawn of this create; nothing below spawns again.
+        // No spawn once the engine drains: a create's op stays open for
+        // boot reconcile, which also removes the settings file; a resume
+        // leaves its row for the next boot.
+        if self.drain.on() {
+            if s.kind == Kind::Resume {
+                self.drop_resume(s);
+            }
+            return Up::Draining;
+        }
+        // The one spawn of this create or resume; nothing below spawns
+        // again.
         let mut driver = match self.launcher.spawn(&spec) {
             Ok(d) => d,
             Err(e) => return fail(format!("could not start {:?}: {}", s.claude, e)),
@@ -473,6 +634,12 @@ impl Spawner {
                 return fail(e);
             }
         }
+        // A drain that started during the spawn: the agent goes at once
+        // (reviews L2). The PTY child is in `agent_state` by now, so a
+        // kill that fails is still boot reconcile's.
+        if self.drain.on() {
+            return self.cut(s, driver);
+        }
         let mut screen = CcScreen::new((self.clock)());
         loop {
             match cmds.try_recv() {
@@ -481,9 +648,8 @@ impl Spawner {
                     let _ = reply.send(self.retire_row(&s.id, s.gen, &principal));
                     return Up::Retired;
                 }
-                Ok(Cmd::Shutdown) | Err(TryRecvError::Disconnected) => {
-                    let _ = driver.kill();
-                    return Up::Shutdown;
+                Ok(Cmd::Shutdown | Cmd::Drain) | Err(TryRecvError::Disconnected) => {
+                    return self.cut(s, driver);
                 }
                 Err(TryRecvError::Empty) => {}
             }
@@ -499,9 +665,7 @@ impl Spawner {
             let mut ready = false;
             for ev in screen.step(&snap.title, &snap.text, snap.quiet, (self.clock)()) {
                 match ev {
-                    ScreenEvent::Write(keys) => {
-                        let _ = driver.write(keys);
-                    }
+                    ScreenEvent::Write(keys) => self.pty_write(&s.id, driver.as_mut(), keys),
                     ScreenEvent::Ready { first: true } => ready = true,
                     ScreenEvent::Failed(why) => {
                         let _ = driver.kill();
@@ -512,7 +676,7 @@ impl Spawner {
             }
             if ready {
                 return match self.write_bound(s) {
-                    Ok(Some(row)) => Up::Ready(driver, Box::new(row)),
+                    Ok(Some(row)) => Up::Ready(driver, Box::new(row), Box::new(screen)),
                     Ok(None) => retired_meanwhile(driver),
                     Err(e) => {
                         let _ = driver.kill();
@@ -538,8 +702,36 @@ impl Spawner {
         }
     }
 
-    /// A ready agent: wait for a command or its exit.
-    fn run(&self, s: &Start, mut driver: Box<dyn Driver>, cmds: &Receiver<Cmd>) {
+    /// The engine stops or drains while `s` comes up: kill the agent. A
+    /// create's op stays open for boot reconcile, which fails it. A resume
+    /// whose kill worked goes back to the row it came from
+    /// (`drop_resume`): the session did not fail (reviews M2).
+    fn cut(&self, s: &Start, mut driver: Box<dyn Driver>) -> Up {
+        let killed = driver.kill();
+        match killed {
+            Ok(_) if s.kind == Kind::Resume => self.drop_resume(s),
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "[engine] Failed to kill {} while it came up; left to boot reconcile: {}",
+                s.id, e
+            ),
+        }
+        if self.drain.on() {
+            Up::Draining
+        } else {
+            Up::Shutdown
+        }
+    }
+
+    /// A ready agent: follow its screen, and wait for a command or its
+    /// exit.
+    fn run(
+        &self,
+        s: &Start,
+        mut driver: Box<dyn Driver>,
+        mut screen: CcScreen,
+        cmds: &Receiver<Cmd>,
+    ) {
         loop {
             match cmds.recv_timeout(RUN_TICK) {
                 Ok(Cmd::Retire { principal, reply }) => {
@@ -551,10 +743,20 @@ impl Spawner {
                     let _ = driver.kill();
                     return;
                 }
+                Ok(Cmd::Drain) => {
+                    self.drain_now(s, driver);
+                    return;
+                }
                 Err(RecvTimeoutError::Timeout) => {}
             }
             // Nobody reads the bytes yet; the screen keeps up regardless.
             let _ = driver.output(Duration::ZERO);
+            let snap = driver.screen();
+            for ev in screen.step(&snap.title, &snap.text, snap.quiet, (self.clock)()) {
+                if let ScreenEvent::State(st) = ev {
+                    self.screen_claim(s, st);
+                }
+            }
             if let Ok(Some(status)) = driver.try_wait() {
                 let text = driver.screen().text;
                 let _ = driver.kill();
@@ -569,6 +771,87 @@ impl Spawner {
                 remove_settings(&self.config.home, &s.id, s.gen);
                 return;
             }
+        }
+    }
+
+    /// `Cmd::Drain`: SIGTERM first (`Driver::kill`), then `drain::settle`
+    /// with the state read before the kill, so a Stop hook that CC sends
+    /// on its way out does not turn a cut turn into `paused` (reviews L1).
+    /// A kill that fails settles nothing: the row and its `agent_state`
+    /// stay for boot reconcile, which kills the process by pid and start
+    /// time before anything resumes it (reviews M1).
+    fn drain_now(&self, s: &Start, mut driver: Box<dyn Driver>) {
+        let before = drain::state_of(&self.db, &s.id).unwrap_or_else(|e| {
+            eprintln!("[engine] Drain: {}", e);
+            None
+        });
+        let (machine, id) = (self.db.machine_id().to_string(), s.id.clone());
+        if let Err(e) = driver.kill() {
+            let why = e.to_string();
+            eprintln!(
+                "[engine] Drain: failed to kill {}; left to boot reconcile: {}",
+                s.id, why
+            );
+            let wrote = self
+                .db
+                .write_blocking(move |tx| drain::audit_kill_failed(tx, &id, &why));
+            if let Err(e) = wrote {
+                eprintln!(
+                    "[engine] Failed to audit the failed kill of {}: {}",
+                    s.id, e
+                );
+            }
+            return;
+        }
+        let wrote = self
+            .db
+            .write_blocking(move |tx| drain::settle(tx, &machine, &id, before.as_deref()));
+        if let Err(e) = wrote {
+            eprintln!("[engine] Failed to record the drain of {}: {}", s.id, e);
+        }
+        remove_settings(&self.config.home, &s.id, s.gen);
+    }
+
+    /// A screen state change of a ready agent, into the merge as a screen
+    /// claim. Trust, other dialogs and no title claim nothing: the last
+    /// claim stands.
+    fn screen_claim(&self, s: &Start, st: ScreenState) {
+        let activity = match st {
+            ScreenState::Working => Activity::Working,
+            ScreenState::Idle => Activity::Ready,
+            ScreenState::Blocked => Activity::Blocked,
+            ScreenState::Trust | ScreenState::Dialog | ScreenState::Unknown => return,
+        };
+        let (machine, id, gen, merge) = (
+            self.db.machine_id().to_string(),
+            s.id.clone(),
+            s.gen,
+            self.merge.clone(),
+        );
+        let wrote = self.db.write_blocking(move |tx| {
+            hooks::screen_claim(tx, &machine, &merge, &id, gen, activity, now_ms())
+        });
+        if let Err(e) = wrote {
+            eprintln!("[engine] Failed to record the screen of {}: {}", s.id, e);
+        }
+    }
+
+    /// Send `keys` to the agent's terminal, unless the engine drains: then
+    /// nothing is sent, and the block is audited with path `pty`.
+    fn pty_write(&self, id: &str, driver: &mut dyn Driver, keys: &[u8]) {
+        if !self.drain.on() {
+            let _ = driver.write(keys);
+            return;
+        }
+        let id2 = id.to_string();
+        let wrote = self.db.write_blocking(move |tx| {
+            drain::audit_blocked(tx, audit::SYSTEM, &id2, InjectionPath::Pty, now_ms())
+        });
+        if let Err(e) = wrote {
+            eprintln!(
+                "[engine] Failed to audit a blocked PTY write to {}: {}",
+                id, e
+            );
         }
     }
 
@@ -603,22 +886,16 @@ impl Spawner {
             .map(|(row, _)| row)
     }
 
-    /// The create failed: close the op, fail the row. A failed write only
-    /// logs; boot reconcile finishes it.
+    /// The create or resume failed: close the op, fail the row with
+    /// `spawn_failed` or `resume_failed`. A failed write only logs; boot
+    /// reconcile finishes it.
     fn fail_create(&self, s: &Start, why: &str) {
         let (machine, s2, why2) = (self.db.machine_id().to_string(), s.clone(), why.to_string());
+        let (method, reason) = s.kind.failure();
         let wrote = self.db.write_blocking(move |tx| {
             let now = now_ms();
-            ops::finish(tx, &s2.op_id, SPAWN_FAILED, now)?;
-            ops::fail_agent(
-                tx,
-                &machine,
-                &s2.id,
-                ops::KIND_CREATE,
-                SPAWN_FAILED,
-                &why2,
-                now,
-            )
+            ops::finish(tx, &s2.op_id, reason, now)?;
+            ops::fail_agent(tx, &machine, &s2.id, method, reason, &why2, now)
         });
         if let Err(e) = wrote {
             eprintln!(
@@ -627,6 +904,167 @@ impl Spawner {
             );
         }
         remove_settings(&self.config.home, &s.id, s.gen);
+    }
+
+    /// A resume that the engine's drain or stop cut before `ready`, with
+    /// no spawn or a killed one: close its op and put the row back
+    /// (`undo_resume`), so the next boot resumes it.
+    fn drop_resume(&self, s: &Start) {
+        let (machine, s2) = (self.db.machine_id().to_string(), s.clone());
+        let outcome = if self.drain.on() {
+            "draining"
+        } else {
+            "stopped"
+        };
+        let wrote = self
+            .db
+            .write_blocking(move |tx| undo_resume(tx, &machine, &s2, outcome));
+        if let Err(e) = wrote {
+            eprintln!("[engine] Failed to close the resume op of {}: {}", s.id, e);
+        }
+        remove_settings(&self.config.home, &s.id, s.gen);
+    }
+
+    /// Resume every `paused(drain)` and `interrupted` engine agent (see
+    /// the module doc). Run once at boot, after boot reconcile and the
+    /// bind. Blocking: the supervisors bring the agents up on their own
+    /// threads.
+    pub fn resume_on_boot(self: &Arc<Self>) -> Result<Resumed, String> {
+        let mut done = Resumed::default();
+        for r in self.resumables()? {
+            if !self.config.enabled || self.drain.on() {
+                done.left.push(r.id);
+                continue;
+            }
+            let start = match self.resume_plan(&r) {
+                Ok(s) => s,
+                Err(why) => {
+                    let (machine, id) = (self.db.machine_id().to_string(), r.id.clone());
+                    let wrote = self.db.write_blocking(move |tx| {
+                        ops::fail_agent(
+                            tx,
+                            &machine,
+                            &id,
+                            ops::KIND_RESUME,
+                            ops::RESUME_FAILED,
+                            &why,
+                            now_ms(),
+                        )
+                    });
+                    // One failed write does not stop the other resumes
+                    // (reviews L3).
+                    match wrote {
+                        Ok(_) => done.failed.push(r.id),
+                        Err(e) => {
+                            eprintln!("[engine] Failed to fail the resume of {}: {}", r.id, e);
+                            done.left.push(r.id);
+                        }
+                    }
+                    continue;
+                }
+            };
+            let reason = if r.reason.as_deref() == Some(drain::REASON_DRAIN) {
+                GenReason::EngineRestart
+            } else {
+                GenReason::Resume
+            };
+            let (machine, s2, state) = (
+                self.db.machine_id().to_string(),
+                start.clone(),
+                r.state.clone(),
+            );
+            let (gen, _) = self
+                .db
+                .write_blocking(move |tx| write_resume(tx, &machine, &s2, &state, reason))?;
+            let Some(gen) = gen else {
+                continue;
+            };
+            // The old generation's settings file: a crash left it, and
+            // nothing else removes it (reviews L3).
+            remove_settings(&self.config.home, &r.id, gen - 1);
+            // Nobody waits for a resume's answer.
+            let (reply, _) = oneshot::channel();
+            match self.supervise(Start { gen, ..start }, reply) {
+                Ok(()) => done.started.push(r.id),
+                Err(e) if e.code == ErrorCode::Draining => done.left.push(r.id),
+                Err(_) => done.failed.push(r.id),
+            }
+        }
+        Ok(done)
+    }
+
+    /// The engine agents a boot resume picks up, by id.
+    fn resumables(&self) -> Result<Vec<Resumable>, String> {
+        let conn = self.db.reader()?;
+        let fail = |e: rusqlite::Error| format!("Failed to read the agents to resume: {}", e);
+        let mut st = conn
+            .prepare(
+                "SELECT id, state, state_reason, provider, provider_sid, cwd, resume_argv \
+                 FROM agents WHERE source = 'engine' AND control = 'pty' AND gone_at IS NULL \
+                 AND ((state = 'paused' AND state_reason = ?1) OR state = 'interrupted') \
+                 ORDER BY id",
+            )
+            .map_err(fail)?;
+        let rows = st
+            .query_map([drain::REASON_DRAIN], |r| {
+                Ok(Resumable {
+                    id: r.get(0)?,
+                    state: r.get(1)?,
+                    reason: r.get(2)?,
+                    provider: r.get(3)?,
+                    sid: r.get(4)?,
+                    cwd: r.get(5)?,
+                    argv: r.get(6)?,
+                })
+            })
+            .map_err(fail)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(fail)
+    }
+
+    /// The session, cwd and `claude` of a resume, or why there is none.
+    /// Blocking.
+    fn resume_plan(&self, r: &Resumable) -> Result<Start, String> {
+        let argv: Vec<String> = match (&r.argv, &r.sid) {
+            (Some(a), _) => serde_json::from_str(a)
+                .map_err(|e| format!("resume_argv {:?} is not an argv: {}", a, e))?,
+            (None, Some(sid)) => drain::resume_argv(&r.provider, sid)
+                .ok_or_else(|| format!("no resume for a {} agent", r.provider))?,
+            (None, None) => return Err("no session to resume".into()),
+        };
+        // Only the adapter's own form: `claude --resume <id>`.
+        let sid = match argv.get(2) {
+            Some(sid) if drain::resume_argv(&r.provider, sid).as_ref() == Some(&argv) => {
+                sid.clone()
+            }
+            _ => {
+                return Err(format!(
+                    "resume_argv {:?} is not a resume of a {} agent",
+                    argv, r.provider
+                ))
+            }
+        };
+        let cwd = PathBuf::from(r.cwd.as_deref().ok_or("the agent has no cwd")?);
+        let real = resolve_cwd(&cwd)?;
+        if real != cwd {
+            return Err(format!("cwd {:?} now resolves to {:?}", cwd, real));
+        }
+        check_collision(&self.config.home, &cwd).map_err(|e| e.msg)?;
+        self.agent_bin.check(Rehash::Always).map_err(|e| e.msg)?;
+        let claude = match &self.config.claude {
+            Some(c) => c.clone(),
+            None => find_on_path("claude")
+                .ok_or("claude is not on the engine's PATH; nothing was spawned")?,
+        };
+        Ok(Start {
+            id: r.id.clone(),
+            gen: 0,
+            sid,
+            op_id: ops::new_op_id(),
+            cwd,
+            claude,
+            kind: Kind::Resume,
+            from: Some(r.state.clone()),
+        })
     }
 
     /// The retire transaction. Blocking.
@@ -753,8 +1191,11 @@ fn write_pty(
          VALUES (?1, ?2, ?3, ?4)",
         params![s.id, s.gen, child.pid as i64, child.start as i64],
     )?;
+    // A create comes from `creating`, a resume from `paused` or
+    // `interrupted`.
     tx.execute(
-        "UPDATE agents SET state = 'starting', pid = ?2 WHERE id = ?1 AND state = 'creating'",
+        "UPDATE agents SET state = 'starting', pid = ?2 WHERE id = ?1 \
+         AND state IN ('creating', 'paused', 'interrupted')",
         params![s.id, child.pid as i64],
     )?;
     emit_upsert(tx, machine, &s.id)?;
@@ -777,8 +1218,10 @@ fn write_bound(tx: &mut Tx, machine: &str, s: &Start) -> rusqlite::Result<Option
         return Ok(None);
     }
     ops::finish(tx, &s.op_id, Phase::Bound.as_str(), now_ms())?;
+    // A resume's drain reason and argv are spent.
     tx.execute(
-        "UPDATE agents SET state = 'ready' WHERE id = ?1 AND state = 'starting'",
+        "UPDATE agents SET state = 'ready', state_reason = NULL, resume_argv = NULL \
+         WHERE id = ?1 AND state = 'starting'",
         [&s.id],
     )?;
     emit_upsert(tx, machine, &s.id)?;
@@ -790,8 +1233,98 @@ fn write_bound(tx: &mut Tx, machine: &str, s: &Start) -> rusqlite::Result<Option
     .map(Some)
 }
 
+/// Phase `row` of a resume: the next generation on the same session and
+/// transcript, the resume op, the audit row. `None` when the row is no
+/// longer `state` (a retire came first).
+fn write_resume(
+    tx: &mut Tx,
+    machine: &str,
+    s: &Start,
+    state: &str,
+    reason: GenReason,
+) -> rusqlite::Result<Option<i64>> {
+    let now = now_ms();
+    let old: Option<i64> = tx
+        .query_row(
+            "SELECT generation FROM agents WHERE id = ?1 AND source = 'engine' \
+             AND gone_at IS NULL AND state = ?2",
+            params![s.id, state],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(old) = old else {
+        return Ok(None);
+    };
+    let transcript = generation::transcript_path(tx, &s.id, old)?;
+    let gen = begin_generation(
+        tx,
+        machine,
+        &s.id,
+        reason,
+        &s.sid,
+        transcript.as_deref(),
+        now,
+    )?;
+    let cwd = s.cwd.display().to_string();
+    let payload = CreatePayload {
+        agent_id: s.id.clone(),
+        generation: gen,
+        session_id: s.sid.clone(),
+        cwd,
+        ..Default::default()
+    };
+    ops::open_resume(tx, &s.op_id, &payload, now)?;
+    let why = format!(
+        "{} from {}, generation {}",
+        match reason {
+            GenReason::EngineRestart => "engine_restart",
+            _ => "resume",
+        },
+        state,
+        gen
+    );
+    audit::append(
+        tx,
+        now,
+        &AuditEntry {
+            principal: audit::SYSTEM,
+            method: ops::KIND_RESUME,
+            target: Some(&s.id),
+            decision: "allow",
+            reason: Some(&why),
+            ..Default::default()
+        },
+    )?;
+    Ok(Some(gen))
+}
+
+/// Undo a resume cut before `ready` (see `Spawner::drop_resume`): the op
+/// closes as `outcome`, the row goes back to the state it came from with
+/// reason `drain`, so the next resume is an `engine_restart` that does not
+/// count, its `resume_argv` kept and, from `interrupted`, the note pending
+/// again; no PTY child is left in `agent_state`. A row that left
+/// `starting` meanwhile (a retire) is not touched.
+fn undo_resume(tx: &mut Tx, machine: &str, s: &Start, outcome: &str) -> rusqlite::Result<()> {
+    ops::finish(tx, &s.op_id, outcome, now_ms())?;
+    let Some(from) = s.from.as_deref() else {
+        return Ok(());
+    };
+    let n = tx.execute(
+        "UPDATE agents SET state = ?2, state_reason = ?3, \
+         interrupted_note_pending = CASE WHEN ?2 = 'interrupted' THEN 1 \
+         ELSE interrupted_note_pending END \
+         WHERE id = ?1 AND gone_at IS NULL AND state IN ('starting', ?2)",
+        params![s.id, from, drain::REASON_DRAIN],
+    )?;
+    if n == 0 {
+        return Ok(());
+    }
+    tx.execute("DELETE FROM agent_state WHERE agent_id = ?1", [&s.id])?;
+    emit_upsert(tx, machine, &s.id)
+}
+
 /// The retire transaction: the tombstone (`retired`, `gone_at`), no PTY
-/// child, a create op still open closed as `retired`, the audit row and
+/// child, a create or resume op still open closed as `retired`, the audit row and
 /// the event. `None` when there is no such engine agent.
 fn retire_tx(
     tx: &mut Tx,
@@ -809,10 +1342,12 @@ fn retire_tx(
         tx.execute("DELETE FROM agent_state WHERE agent_id = ?1", [id])?;
         let open: Vec<String> = {
             let mut st = tx.prepare(
-                "SELECT id FROM ops WHERE kind = ?1 AND done_at IS NULL \
-                 AND json_extract(payload, '$.agentId') = ?2",
+                "SELECT id FROM ops WHERE kind IN (?1, ?2) AND done_at IS NULL \
+                 AND json_extract(payload, '$.agentId') = ?3",
             )?;
-            let rows = st.query_map(params![ops::KIND_CREATE, id], |r| r.get(0))?;
+            let rows = st.query_map(params![ops::KIND_CREATE, ops::KIND_RESUME, id], |r| {
+                r.get(0)
+            })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
         for op in open {
@@ -1023,6 +1558,13 @@ fn stopping() -> ApiError {
     ApiError::new(ErrorCode::Internal, "the engine is stopping")
 }
 
+fn draining() -> ApiError {
+    ApiError::new(
+        ErrorCode::Draining,
+        "the engine is draining: no spawn and no injection until the next engine is up",
+    )
+}
+
 fn unknown_agent(id: &str) -> ApiError {
     ApiError::new(ErrorCode::UnknownAgent, format!("no engine agent {:?}", id))
 }
@@ -1063,6 +1605,10 @@ mod tests {
         Exit,
         /// Nothing at all, forever.
         Hang,
+        /// The workspace trust dialog, forever. The engine starts to drain
+        /// right after the spawn, as if a SIGTERM came then, or at the
+        /// first look at the screen with `drain_on_screen`.
+        Trust,
     }
 
     struct FakeDriver {
@@ -1072,6 +1618,19 @@ mod tests {
         kills: Arc<AtomicUsize>,
         /// Set by a test: the process exits by itself.
         exit_now: Arc<AtomicBool>,
+        /// Bytes sent to the terminal, in writes.
+        writes: Arc<AtomicUsize>,
+        /// Set by a test: `kill` does not return until it is cleared.
+        stuck: Arc<AtomicBool>,
+        /// The agent id, from the spawn's env.
+        id: String,
+        /// Set by a test: the agents whose screen shows a turn (CC's busy
+        /// title).
+        busy: Arc<Mutex<HashSet<String>>>,
+        /// Set by a test: `kill` fails, as when a process survives SIGKILL.
+        kill_fails: Arc<AtomicBool>,
+        /// Starts the drain at the first look at the screen.
+        drain_on_screen: Option<Arc<DrainSwitch>>,
     }
 
     impl Driver for FakeDriver {
@@ -1082,6 +1641,7 @@ mod tests {
             self.child
         }
         fn write(&mut self, _: &[u8]) -> io::Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn output(&mut self, _: Duration) -> Output {
@@ -1091,7 +1651,12 @@ mod tests {
             }
         }
         fn screen(&self) -> ScreenSnapshot {
+            if let Some(d) = &self.drain_on_screen {
+                d.start();
+            }
+            let busy = lock(&self.busy).contains(&self.id);
             let (title, text) = match self.script {
+                Script::Ready if busy => ("\u{25d0} Claude Code", "\u{276f} \n  auto mode on"),
                 Script::Ready => ("\u{2733} Claude Code", "\u{276f} \n  auto mode on"),
                 Script::Refuse => (
                     "",
@@ -1099,6 +1664,10 @@ mod tests {
                 ),
                 Script::Exit => ("", "Error: the session could not start\n"),
                 Script::Hang => ("", ""),
+                Script::Trust => (
+                    "",
+                    " Do you trust this folder?\n   1. Yes, I trust this folder\n   2. No, exit\n",
+                ),
             };
             ScreenSnapshot {
                 text: text.into(),
@@ -1122,6 +1691,12 @@ mod tests {
             Ok(self.exited.then(|| ExitStatus::from_raw(1 << 8)))
         }
         fn kill(&mut self) -> io::Result<KillReport> {
+            while self.stuck.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if self.kill_fails.load(Ordering::SeqCst) {
+                return Err(io::Error::other("still alive after SIGKILL"));
+            }
             if !self.exited {
                 self.kills.fetch_add(1, Ordering::SeqCst);
             }
@@ -1139,7 +1714,14 @@ mod tests {
         next_pid: AtomicI32,
         kills: Arc<AtomicUsize>,
         exit_now: Arc<AtomicBool>,
+        writes: Arc<AtomicUsize>,
+        stuck: Arc<AtomicBool>,
+        busy: Arc<Mutex<HashSet<String>>>,
+        kill_fails: Arc<AtomicBool>,
+        drain_on_screen: AtomicBool,
         env: Mutex<Vec<(OsString, OsString)>>,
+        /// The argv of the last spawn.
+        argv: Mutex<Vec<OsString>>,
         spawner: OnceLock<Weak<Spawner>>,
     }
 
@@ -1154,12 +1736,23 @@ mod tests {
         fn spawn(&self, spec: &SpawnSpec) -> io::Result<Box<dyn Driver>> {
             self.spawns.fetch_add(1, Ordering::SeqCst);
             *lock(&self.env) = spec.env.clone();
+            *lock(&self.argv) = spec.argv.clone();
             if self.script == Script::Ready {
                 // The SessionStart hook, as `c9watch-agent` would send it.
                 let id = env_of(spec, "C9_AGENT_ID").unwrap();
                 let gen = env_of(spec, "C9_AGENT_GEN").unwrap().parse().unwrap();
                 if let Some(sp) = self.spawner.get().and_then(Weak::upgrade) {
                     sp.session_started(&id, gen);
+                }
+            }
+            let mut drain_on_screen = None;
+            if self.script == Script::Trust {
+                if let Some(sp) = self.spawner.get().and_then(Weak::upgrade) {
+                    if self.drain_on_screen.load(Ordering::SeqCst) {
+                        drain_on_screen = Some(sp.drain_switch().clone());
+                    } else {
+                        sp.drain_switch().start();
+                    }
                 }
             }
             Ok(Box::new(FakeDriver {
@@ -1171,6 +1764,12 @@ mod tests {
                 exited: matches!(self.script, Script::Refuse | Script::Exit),
                 kills: self.kills.clone(),
                 exit_now: self.exit_now.clone(),
+                writes: self.writes.clone(),
+                stuck: self.stuck.clone(),
+                id: env_of(spec, "C9_AGENT_ID").unwrap_or_default(),
+                busy: self.busy.clone(),
+                kill_fails: self.kill_fails.clone(),
+                drain_on_screen,
             }))
         }
     }
@@ -1189,11 +1788,40 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let home = t.path().join("engine home");
         let db = Arc::new(db::open(&home, MACHINE).unwrap());
-        let src = t.path().join("agent-src");
-        std::fs::write(&src, b"#!/bin/sh\nexit 0\n").unwrap();
-        let bin = Arc::new(AgentBin::install(&home, &src));
+        std::fs::write(t.path().join("agent-src"), b"#!/bin/sh\nexit 0\n").unwrap();
         let cwd = t.path().join("work");
         std::fs::create_dir(&cwd).unwrap();
+        let (agents, launcher, sp) = engine_on(t.path(), &home, &db, script, enabled, clock);
+        Env {
+            t,
+            home,
+            cwd,
+            db,
+            agents,
+            launcher,
+            sp,
+        }
+    }
+
+    /// The next engine on the same home and store: a new live table, a
+    /// new launcher and a new spawner, as after a restart.
+    fn next_engine(
+        e: &Env,
+        script: Script,
+        clock: Option<Clock>,
+    ) -> (Arc<LiveTable>, Arc<FakeLauncher>, Arc<Spawner>) {
+        engine_on(e.t.path(), &e.home, &e.db, script, true, clock)
+    }
+
+    fn engine_on(
+        dir: &Path,
+        home: &Path,
+        db: &Arc<Db>,
+        script: Script,
+        enabled: bool,
+        clock: Option<Clock>,
+    ) -> (Arc<LiveTable>, Arc<FakeLauncher>, Arc<Spawner>) {
+        let bin = Arc::new(AgentBin::install(home, &dir.join("agent-src")));
         let agents = Arc::new(LiveTable::new());
         let launcher = Arc::new(FakeLauncher {
             script,
@@ -1201,13 +1829,19 @@ mod tests {
             next_pid: AtomicI32::new(2_000_000_000),
             kills: Arc::new(AtomicUsize::new(0)),
             exit_now: Arc::new(AtomicBool::new(false)),
+            writes: Arc::new(AtomicUsize::new(0)),
+            stuck: Arc::new(AtomicBool::new(false)),
+            busy: Arc::new(Mutex::new(HashSet::new())),
+            kill_fails: Arc::new(AtomicBool::new(false)),
+            drain_on_screen: AtomicBool::new(false),
             env: Mutex::new(Vec::new()),
+            argv: Mutex::new(Vec::new()),
             spawner: OnceLock::new(),
         });
         let mut sp = Spawner::new(
             SpawnerConfig {
-                home: home.clone(),
-                sock: sock_path(&home),
+                home: home.to_path_buf(),
+                sock: sock_path(home),
                 claude: Some(PathBuf::from("/bin/false")),
                 enabled,
             },
@@ -1222,15 +1856,7 @@ mod tests {
         }
         let sp = Arc::new(sp);
         let _ = launcher.spawner.set(Arc::downgrade(&sp));
-        Env {
-            t,
-            home,
-            cwd,
-            db,
-            agents,
-            launcher,
-            sp,
-        }
+        (agents, launcher, sp)
     }
 
     fn create_params(cwd: &Path) -> serde_json::Value {
@@ -1629,6 +2255,8 @@ mod tests {
             op_id: ops::new_op_id(),
             cwd: e.cwd.canonicalize().unwrap(),
             claude: PathBuf::from("/bin/false"),
+            kind: Kind::Create,
+            from: None,
         };
         let gen =
             e.sp.write_row(&s, &CLAUDE, &Principal::LocalUnverified, None)
@@ -1704,6 +2332,8 @@ mod tests {
             op_id: ops::new_op_id(),
             cwd: e.cwd.canonicalize().unwrap(),
             claude: PathBuf::from("/bin/false"),
+            kind: Kind::Create,
+            from: None,
         };
         let gen =
             e.sp.write_row(&s, &CLAUDE, &Principal::LocalUnverified, None)
@@ -1821,5 +2451,797 @@ mod tests {
         assert_eq!(detail(&long).chars().count(), MAX_DETAIL);
         let many: String = (0..50).map(|i| format!("l{}\n", i)).collect();
         assert!(detail(&many).starts_with("l30\n"));
+    }
+
+    /// A clock the test moves by hand, in whole seconds.
+    fn hand_clock() -> (Clock, Arc<AtomicU64>) {
+        let base = Instant::now();
+        let secs = Arc::new(AtomicU64::new(0));
+        let s = secs.clone();
+        let clock: Clock = Arc::new(move || base + Duration::from_secs(s.load(Ordering::SeqCst)));
+        (clock, secs)
+    }
+
+    fn set_state(db: &Db, id: &str, state: &str) {
+        let (id, state) = (id.to_string(), state.to_string());
+        db.write_blocking(move |tx| {
+            tx.execute(
+                "UPDATE agents SET state = ?2 WHERE id = ?1",
+                params![id, state],
+            )
+        })
+        .unwrap();
+    }
+
+    fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !f() {
+            assert!(Instant::now() < deadline, "timed out waiting for {}", what);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// (state, state_reason, resume_argv) of `id`.
+    fn drained(db: &Db, id: &str) -> (Option<String>, Option<String>, Option<String>) {
+        db.reader()
+            .unwrap()
+            .query_row(
+                "SELECT state, state_reason, resume_argv FROM agents WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    /// What a drain leaves for `r`: `state`, reason `drain`, and the argv
+    /// that resumes its session.
+    fn drain_facts(r: &AgentRow, state: &str) -> (Option<String>, Option<String>, Option<String>) {
+        let sid = r.provider_sid.clone().unwrap();
+        let argv = serde_json::to_string(&["claude", "--resume", sid.as_str()]).unwrap();
+        (
+            Some(state.to_string()),
+            Some(drain::REASON_DRAIN.to_string()),
+            Some(argv),
+        )
+    }
+
+    fn blocked_pty_writes(db: &Db) -> i64 {
+        db.reader()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM audit WHERE method = ?1 AND reason = 'path=pty'",
+                [drain::BLOCKED_INJECTION],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn fast_drain() -> drain::Timing {
+        drain::Timing {
+            tick: Duration::from_millis(5),
+            ..Default::default()
+        }
+    }
+
+    /// C1a-27, the state table on live supervisors: `ready` is paused at
+    /// once, a turn that ends within 60 s is paused, a turn still running
+    /// at 60 s is interrupted; rows without a supervisor are not touched;
+    /// nothing is created meanwhile.
+    #[tokio::test]
+    async fn drain_pauses_ready_agents_and_interrupts_a_turn_at_60_s() {
+        let (clock, secs) = hand_clock();
+        let e = setup(Script::Ready, true, Some(clock));
+        let l = Principal::LocalUnverified;
+        let mut rows = Vec::new();
+        for _ in 0..3 {
+            rows.push(e.sp.create(&l, create_params(&e.cwd)).await.unwrap());
+        }
+        let (idle, ends, long) = (&rows[0], &rows[1], &rows[2]);
+        set_state(&e.db, &ends.id, "working");
+        set_state(&e.db, &long.id, "blocked");
+        let others = ["paused", "interrupted", "failed", "retired", "orphaned"];
+        e.db.write_blocking(move |tx| {
+            for st in others {
+                tx.execute(
+                    "INSERT INTO agents (id, mode, role, control, provider, provider_sid, \
+                     source, state) VALUES (?1, 'free', 'worker', 'pty', 'claudeCode', 's', \
+                     'engine', ?1)",
+                    [st],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(e.sp.drain_switch().start());
+        let err = e.sp.create(&l, create_params(&e.cwd)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Draining);
+        let sp = e.sp.clone();
+        let start = sp.now();
+        let drainer = std::thread::spawn(move || drain::run(&sp, fast_drain(), start));
+        wait_for("the ready agent paused", || {
+            drained(&e.db, &idle.id).0.as_deref() == Some("paused")
+        });
+        assert_eq!(drained(&e.db, &idle.id), drain_facts(idle, "paused"));
+        // A turn that ends within the wait.
+        secs.store(30, Ordering::SeqCst);
+        set_state(&e.db, &ends.id, "ready");
+        wait_for("the ended turn paused", || {
+            drained(&e.db, &ends.id).0.as_deref() == Some("paused")
+        });
+        // At 59 s the long turn still runs.
+        secs.store(59, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(row(&e.db, &long.id).state.as_deref(), Some("blocked"));
+        assert_eq!(e.launcher.kills.load(Ordering::SeqCst), 2);
+        assert!(!drainer.is_finished());
+        secs.store(60, Ordering::SeqCst);
+        let report = drainer.join().unwrap();
+
+        let mut paused = vec![idle.id.clone(), ends.id.clone()];
+        paused.sort();
+        let mut got = report.paused.clone();
+        got.sort();
+        assert_eq!(got, paused);
+        assert_eq!(report.interrupted, vec![long.id.clone()]);
+        assert!(report.left.is_empty() && report.unsettled.is_empty());
+        assert!(!report.timed_out);
+        assert_eq!(drained(&e.db, &long.id), drain_facts(long, "interrupted"));
+        assert!(row(&e.db, &long.id).interrupted_note_pending);
+        assert!(!row(&e.db, &idle.id).interrupted_note_pending);
+        assert_eq!(e.launcher.kills.load(Ordering::SeqCst), 3);
+        no_supervisors(&e.sp);
+        assert!(e.agents.is_empty());
+        assert_eq!(agent_state_rows(&e.db), 0);
+        for st in others {
+            assert_eq!(drained(&e.db, st), (Some(st.to_string()), None, None));
+        }
+        // Nothing was spawned during the drain, and nothing is failed.
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 3);
+        assert!(events(&e.db, "agent.failed").is_empty());
+        // Boot reconcile leaves the drained rows for the resume.
+        let done = ops::reconcile(&e.db, &e.home).unwrap();
+        assert!(done.is_empty(), "{:?}", done);
+    }
+
+    /// The drain stops waiting at the hard deadline (90 s less the room
+    /// for the final kills), even with a kill that hangs.
+    #[tokio::test]
+    async fn the_drain_gives_up_at_the_hard_deadline() {
+        let (clock, secs) = hand_clock();
+        let e = setup(Script::Ready, true, Some(clock));
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        set_state(&e.db, &r.id, "working");
+        e.launcher.stuck.store(true, Ordering::SeqCst);
+        e.sp.drain_switch().start();
+        let sp = e.sp.clone();
+        let start = sp.now();
+        let drainer = std::thread::spawn(move || drain::run(&sp, fast_drain(), start));
+        secs.store(60, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        let last = (drain::HARD_DEADLINE - drain::SHUTDOWN_RESERVE).as_secs();
+        secs.store(last - 1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!drainer.is_finished());
+        secs.store(last, Ordering::SeqCst);
+        let report = drainer.join().unwrap();
+        assert!(report.timed_out);
+        assert_eq!(report.unsettled, vec![r.id.clone()]);
+        assert!(report.paused.is_empty() && report.interrupted.is_empty());
+        // The kill ends; the supervisor still settles the row.
+        e.launcher.stuck.store(false, Ordering::SeqCst);
+        no_supervisors(&e.sp);
+        assert_eq!(drained(&e.db, &r.id), drain_facts(&r, "interrupted"));
+        e.sp.shutdown();
+    }
+
+    /// C1a-27: zero sends on the PTY path while draining. The drain starts
+    /// at the first look at the screen; the trust dialog's Down is not
+    /// written but audited. The open create is left to boot reconcile, and
+    /// no other create gets a row or a spawn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn while_draining_no_pty_write_and_no_spawn() {
+        let (clock, _secs) = hand_clock();
+        let e = setup(Script::Trust, true, Some(clock));
+        e.launcher.drain_on_screen.store(true, Ordering::SeqCst);
+        let (sp, cwd) = (e.sp.clone(), e.cwd.clone());
+        let create = tokio::spawn(async move {
+            sp.create(&Principal::LocalUnverified, create_params(&cwd))
+                .await
+        });
+        wait_for("a blocked PTY write", || blocked_pty_writes(&e.db) >= 1);
+        assert_eq!(e.launcher.writes.load(Ordering::SeqCst), 0);
+        let id = only_row(&e.db).id;
+        let err =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Draining);
+        assert!(err.code.retryable());
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(only_row(&e.db).id, id);
+
+        let report = drain::run(&e.sp, fast_drain(), e.sp.now());
+        assert_eq!(report.left, vec![id.clone()]);
+        assert!(report.paused.is_empty() && report.interrupted.is_empty());
+        assert!(!report.timed_out);
+        e.sp.shutdown();
+        assert_eq!(create.await.unwrap().unwrap_err().code, ErrorCode::Draining);
+        assert_eq!(e.launcher.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(row(&e.db, &id).state.as_deref(), Some("starting"));
+        assert_eq!(ops_of(&e.db), [("pty".to_string(), false, None)]);
+        let done = ops::reconcile(&e.db, &e.home).unwrap();
+        assert_eq!(done.failed, vec![id.clone()]);
+    }
+
+    /// (generation, resume_count, provider_sid) of `id`.
+    fn gens(db: &Db, id: &str) -> (i64, i64, Option<String>) {
+        db.reader()
+            .unwrap()
+            .query_row(
+                "SELECT generation, resume_count, provider_sid FROM agents WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    /// (generation, provider_sid) of every alias row of `id`.
+    fn aliases_of(db: &Db, id: &str) -> Vec<(i64, String)> {
+        let conn = db.reader().unwrap();
+        let mut st = conn
+            .prepare(
+                "SELECT generation, provider_sid FROM session_alias WHERE agent_id = ?1 \
+                 ORDER BY rowid",
+            )
+            .unwrap();
+        let rows = st.query_map([id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// (kind, phase, done, outcome) of every op of `id`.
+    fn ops_for(db: &Db, id: &str) -> Vec<(String, String, bool, Option<String>)> {
+        let conn = db.reader().unwrap();
+        let mut st = conn
+            .prepare(
+                "SELECT kind, phase, done_at IS NOT NULL, payload FROM ops \
+                 WHERE json_extract(payload, '$.agentId') = ?1 ORDER BY created_at, rowid",
+            )
+            .unwrap();
+        let rows = st
+            .query_map([id], |r| {
+                let p: String = r.get(3)?;
+                let p: CreatePayload = serde_json::from_str(&p).unwrap();
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, p.outcome))
+            })
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    fn strings(v: Vec<OsString>) -> Vec<String> {
+        v.into_iter().map(|s| s.into_string().unwrap()).collect()
+    }
+
+    /// Create one agent and drain it: `paused(drain)`, its supervisor gone.
+    async fn drained_agent(e: &Env) -> AgentRow {
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        e.sp.drain_switch().start();
+        let report = drain::run(&e.sp, fast_drain(), e.sp.now());
+        assert_eq!(report.paused, std::slice::from_ref(&r.id));
+        no_supervisors(&e.sp);
+        r
+    }
+
+    /// C1a-28, with a live agent at the restart: the drain pauses the
+    /// ready agent and interrupts the long turn at 60 s; the next engine
+    /// reconciles (nothing to do) and resumes both with `claude --resume`
+    /// on the same session, the same profile, a new settings file and
+    /// generation 2. An engine-restart resume does not count, and `ready`
+    /// clears the drain reason and argv. The interrupted note waits for
+    /// the resume's SessionStart.
+    #[tokio::test]
+    async fn a_restart_drains_then_resumes_with_the_same_session() {
+        let (clock, secs) = hand_clock();
+        let e = setup(Script::Ready, true, Some(clock));
+        let l = Principal::LocalUnverified;
+        let idle = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let busy = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        set_state(&e.db, &busy.id, "working");
+        e.sp.drain_switch().start();
+        let sp = e.sp.clone();
+        let start = sp.now();
+        let drainer = std::thread::spawn(move || drain::run(&sp, fast_drain(), start));
+        wait_for("the ready agent paused", || {
+            drained(&e.db, &idle.id).0.as_deref() == Some("paused")
+        });
+        secs.store(60, Ordering::SeqCst);
+        let report = drainer.join().unwrap();
+        assert_eq!(report.interrupted, std::slice::from_ref(&busy.id));
+        no_supervisors(&e.sp);
+
+        // The next engine: reconcile first, then the resume.
+        assert!(ops::reconcile(&e.db, &e.home).unwrap().is_empty());
+        let (agents, l2, sp2) = next_engine(&e, Script::Ready, None);
+        let resumed = sp2.resume_on_boot().unwrap();
+        let mut want = vec![idle.id.clone(), busy.id.clone()];
+        want.sort();
+        assert_eq!(resumed.started, want);
+        assert!(resumed.failed.is_empty() && resumed.left.is_empty());
+        for r in [&idle, &busy] {
+            wait_for("the resumed agent ready", || {
+                row(&e.db, &r.id).state.as_deref() == Some("ready")
+            });
+            let sid = r.provider_sid.clone().unwrap();
+            assert_eq!(gens(&e.db, &r.id), (2, 0, Some(sid.clone())));
+            assert_eq!(drained(&e.db, &r.id), (Some("ready".into()), None, None));
+            assert_eq!(aliases_of(&e.db, &r.id), [(1, sid.clone()), (2, sid)]);
+            assert_eq!(
+                ops_for(&e.db, &r.id),
+                [
+                    (
+                        ops::KIND_CREATE.to_string(),
+                        "bound".to_string(),
+                        true,
+                        Some("bound".to_string())
+                    ),
+                    (
+                        ops::KIND_RESUME.to_string(),
+                        "bound".to_string(),
+                        true,
+                        Some("bound".to_string())
+                    ),
+                ]
+            );
+            assert_eq!(agents.current(&r.id).unwrap().gen, 2);
+            assert!(!settings_path_of(&e.home, &r.id, 1).exists());
+            assert!(settings_path_of(&e.home, &r.id, 2).exists());
+        }
+        assert!(row(&e.db, &busy.id).interrupted_note_pending);
+        assert!(!row(&e.db, &idle.id).interrupted_note_pending);
+        // One spawn each, and nothing failed.
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 2);
+        assert!(events(&e.db, "agent.failed").is_empty());
+
+        // The argv of the last spawn (ids sort, so it is `want[1]`).
+        let last = &want[1];
+        let sid = row(&e.db, last).provider_sid.unwrap();
+        let settings = settings_path_of(&e.home, last, 2).display().to_string();
+        let mut argv = vec![
+            "/bin/false".to_string(),
+            "--resume".into(),
+            sid,
+            "--settings".into(),
+            settings,
+        ];
+        argv.extend(CLAUDE.permission_flags.auto.iter().map(|s| s.to_string()));
+        argv.extend(
+            crate::engine::adapter::cc::profile::ISOLATE_ARGS
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        assert_eq!(strings(lock(&l2.argv).clone()), argv);
+        let env = lock(&l2.env).clone();
+        let gen_env = env.iter().find(|(k, _)| k == "C9_AGENT_GEN").unwrap();
+        assert_eq!(gen_env.1, "2");
+        sp2.shutdown();
+    }
+
+    /// After a resume, an event of the old generation is dropped as
+    /// `stale_generation` and audited; the new generation's is taken.
+    #[tokio::test]
+    async fn old_generation_hooks_after_a_resume_are_dropped_and_audited() {
+        let e = setup(Script::Ready, true, None);
+        let r = drained_agent(&e).await;
+        let (agents, _l2, sp2) = next_engine(&e, Script::Ready, None);
+        sp2.resume_on_boot().unwrap();
+        wait_for("ready", || {
+            row(&e.db, &r.id).state.as_deref() == Some("ready")
+        });
+        let merge = Arc::new(MergeTable::new());
+        let live = agents.current(&r.id).map(|g| g.gen);
+        assert_eq!(live, Some(2));
+        let send = |gen: i64, seq: &str| {
+            let (id, seq, merge) = (r.id.clone(), seq.to_string(), merge.clone());
+            e.db.write_blocking(move |tx| {
+                let params = crate::engine::proto::HookParams {
+                    agent_id: id.clone(),
+                    kind: "claude".into(),
+                    seq,
+                    input: serde_json::json!({}),
+                    truncated: false,
+                };
+                let principal = format!("agent:{}", id);
+                let ev = crate::engine::hooks::HookEvent {
+                    method: "hook.stop",
+                    principal: &principal,
+                    gen,
+                    live_gen: live,
+                    params: &params,
+                };
+                crate::engine::hooks::intake(tx, MACHINE, &merge, &ev, now_ms())
+            })
+            .unwrap()
+            .0
+        };
+        use crate::engine::hooks::{DropReason, Outcome};
+        assert_eq!(send(1, "1"), Outcome::Dropped(DropReason::StaleGeneration));
+        assert_eq!(send(2, "2"), Outcome::Accepted);
+        let audited: Vec<(String, String)> = {
+            let conn = e.db.reader().unwrap();
+            let mut st = conn
+                .prepare("SELECT method, reason FROM audit WHERE decision = 'drop' AND target = ?1")
+                .unwrap();
+            let rows = st
+                .query_map([&r.id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert_eq!(audited.len(), 1, "{:?}", audited);
+        assert_eq!(audited[0].0, "hook.stop");
+        assert!(
+            audited[0]
+                .1
+                .starts_with("stale_generation: event of generation 1"),
+            "{}",
+            audited[0].1
+        );
+        sp2.shutdown();
+    }
+
+    /// D28 Q7 on resume: a usage-limit screen before ready ends the row
+    /// `failed` with `resume_failed` and the vendor's text, after exactly
+    /// one attempt. No later boot tries it again.
+    #[tokio::test]
+    async fn a_vendor_refusal_on_resume_is_resume_failed_with_one_attempt() {
+        let e = setup(Script::Ready, true, None);
+        let r = drained_agent(&e).await;
+        let (_, l2, sp2) = next_engine(&e, Script::Refuse, None);
+        assert_eq!(sp2.resume_on_boot().unwrap().started, [r.id.clone()]);
+        wait_for("failed", || {
+            row(&e.db, &r.id).state.as_deref() == Some("failed")
+        });
+        no_supervisors(&sp2);
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 1);
+        let got = row(&e.db, &r.id);
+        assert_eq!(got.state_reason.as_deref(), Some(ops::RESUME_FAILED));
+        assert!(got.gone_at.is_some());
+        assert_eq!(gens(&e.db, &r.id).1, 0);
+        let failed = events(&e.db, "agent.failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["reason"], ops::RESUME_FAILED);
+        assert!(failed[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Claude usage limit reached"));
+        assert_eq!(
+            ops_for(&e.db, &r.id)[1],
+            (
+                ops::KIND_RESUME.to_string(),
+                "pty".to_string(),
+                true,
+                Some(ops::RESUME_FAILED.to_string())
+            )
+        );
+        assert_eq!(agent_state_rows(&e.db), 0);
+        assert!(!settings_path_of(&e.home, &r.id, 2).exists());
+        // Never retried: not by reconcile, not by the next boot.
+        assert!(ops::reconcile(&e.db, &e.home).unwrap().is_empty());
+        let (_, l3, sp3) = next_engine(&e, Script::Ready, None);
+        assert_eq!(sp3.resume_on_boot().unwrap(), Resumed::default());
+        assert_eq!(l3.spawns.load(Ordering::SeqCst), 0);
+    }
+
+    /// An exit before ready, and no ready within 30 s, are `resume_failed`
+    /// with one spawn each.
+    #[tokio::test]
+    async fn an_exit_or_no_ready_on_resume_is_resume_failed() {
+        // A clock that moves 1 s per look.
+        let base = Instant::now();
+        let n = Arc::new(AtomicU64::new(0));
+        let fast: Clock =
+            Arc::new(move || base + Duration::from_secs(n.fetch_add(1, Ordering::SeqCst)));
+        for (script, clock, text) in [
+            (Script::Exit, None, "exited before ready"),
+            (Script::Hang, Some(fast), "not ready within 30 s"),
+        ] {
+            let e = setup(Script::Ready, true, None);
+            let r = drained_agent(&e).await;
+            let (_, l2, sp2) = next_engine(&e, script, clock);
+            sp2.resume_on_boot().unwrap();
+            no_supervisors(&sp2);
+            assert_eq!(l2.spawns.load(Ordering::SeqCst), 1, "{:?}", script);
+            let got = row(&e.db, &r.id);
+            assert_eq!(got.state.as_deref(), Some("failed"), "{:?}", script);
+            assert_eq!(got.state_reason.as_deref(), Some(ops::RESUME_FAILED));
+            let failed = events(&e.db, "agent.failed");
+            assert!(
+                failed[0]["detail"].as_str().unwrap().contains(text),
+                "{:?}",
+                failed
+            );
+        }
+    }
+
+    /// An agent that boot reconcile marked `interrupted` after a crash
+    /// (no drain) resumes on its `provider_sid`, and that resume counts.
+    #[tokio::test]
+    async fn a_crash_interrupted_agent_resumes_and_counts() {
+        let e = setup(Script::Ready, true, None);
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        e.sp.shutdown();
+        let done = ops::reconcile(&e.db, &e.home).unwrap();
+        assert_eq!(done.interrupted, std::slice::from_ref(&r.id));
+        assert_eq!(
+            drained(&e.db, &r.id),
+            (Some("interrupted".into()), None, None)
+        );
+        let (_, l2, sp2) = next_engine(&e, Script::Ready, None);
+        assert_eq!(sp2.resume_on_boot().unwrap().started, [r.id.clone()]);
+        wait_for("ready", || {
+            row(&e.db, &r.id).state.as_deref() == Some("ready")
+        });
+        assert_eq!(gens(&e.db, &r.id), (2, 1, r.provider_sid.clone()));
+        // Reviews L3: the crashed generation's settings file goes.
+        assert!(!settings_path_of(&e.home, &r.id, 1).exists());
+        assert!(settings_path_of(&e.home, &r.id, 2).exists());
+        let argv = strings(lock(&l2.argv).clone());
+        assert_eq!(
+            argv[1..3],
+            ["--resume".to_string(), r.provider_sid.unwrap()]
+        );
+        sp2.shutdown();
+    }
+
+    /// Reviews M2: the engine stops (SIGINT) or drains (a second restart)
+    /// while a resume comes up. The supervisor kills it and puts the row
+    /// back to `paused(drain)` with its argv; the resume op closes; boot
+    /// reconcile has nothing to do, and the next boot resumes it.
+    #[tokio::test]
+    async fn a_resume_cut_by_a_stop_or_drain_is_resumed_again() {
+        for drains in [false, true] {
+            let e = setup(Script::Ready, true, None);
+            let r = drained_agent(&e).await;
+            let before = drained(&e.db, &r.id);
+            let (_, l2, sp2) = next_engine(&e, Script::Hang, None);
+            sp2.resume_on_boot().unwrap();
+            wait_for("the resume spawned", || {
+                row(&e.db, &r.id).state.as_deref() == Some("starting")
+            });
+            if drains {
+                sp2.drain_switch().start();
+                let report = drain::run(&sp2, fast_drain(), sp2.now());
+                assert_eq!(report.left, std::slice::from_ref(&r.id));
+            }
+            sp2.shutdown();
+            assert_eq!(l2.kills.load(Ordering::SeqCst), 1);
+            assert_eq!(drained(&e.db, &r.id), before, "drains {}", drains);
+            let outcome = if drains { "draining" } else { "stopped" };
+            assert_eq!(
+                ops_for(&e.db, &r.id)[1],
+                (
+                    ops::KIND_RESUME.to_string(),
+                    "pty".to_string(),
+                    true,
+                    Some(outcome.to_string())
+                )
+            );
+            assert_eq!(agent_state_rows(&e.db), 0);
+            assert!(!settings_path_of(&e.home, &r.id, 2).exists());
+            assert!(ops::reconcile(&e.db, &e.home).unwrap().is_empty());
+            let (_, l3, sp3) = next_engine(&e, Script::Ready, None);
+            assert_eq!(sp3.resume_on_boot().unwrap().started, [r.id.clone()]);
+            wait_for("ready", || {
+                row(&e.db, &r.id).state.as_deref() == Some("ready")
+            });
+            assert_eq!(l3.spawns.load(Ordering::SeqCst), 1);
+            // Neither cut resume counts.
+            assert_eq!(gens(&e.db, &r.id).0, 3);
+            assert_eq!(gens(&e.db, &r.id).1, 0);
+            sp3.shutdown();
+        }
+    }
+
+    /// A resume cut while the engine dies (no supervisor to undo it) is
+    /// failed by boot reconcile, and the next boot does not try again.
+    #[tokio::test]
+    async fn a_resume_cut_by_a_crash_is_failed_by_reconcile() {
+        let e = setup(Script::Ready, true, None);
+        let r = drained_agent(&e).await;
+        let (_, l2, sp2) = next_engine(&e, Script::Hang, None);
+        sp2.resume_on_boot().unwrap();
+        wait_for("the resume spawned", || {
+            row(&e.db, &r.id).state.as_deref() == Some("starting")
+        });
+        // The kill fails, as it would for a process the supervisor cannot
+        // stop: the op stays open, as after a crash.
+        l2.kill_fails.store(true, Ordering::SeqCst);
+        sp2.shutdown();
+        let done = ops::reconcile(&e.db, &e.home).unwrap();
+        assert_eq!(done.failed, std::slice::from_ref(&r.id));
+        let got = row(&e.db, &r.id);
+        assert_eq!(got.state.as_deref(), Some("failed"));
+        assert_eq!(got.state_reason.as_deref(), Some(ops::RESUME_FAILED));
+        let (_, l3, sp3) = next_engine(&e, Script::Ready, None);
+        assert_eq!(sp3.resume_on_boot().unwrap(), Resumed::default());
+        assert_eq!(l3.spawns.load(Ordering::SeqCst), 0);
+    }
+
+    /// A retire while a resume comes up kills it and closes the resume op;
+    /// boot reconcile then has nothing to do.
+    #[tokio::test]
+    async fn a_retire_during_a_resume_closes_its_op() {
+        let e = setup(Script::Ready, true, None);
+        let r = drained_agent(&e).await;
+        let (_, l2, sp2) = next_engine(&e, Script::Hang, None);
+        sp2.resume_on_boot().unwrap();
+        wait_for("the resume spawned", || {
+            row(&e.db, &r.id).state.as_deref() == Some("starting")
+        });
+        let got = sp2
+            .retire(
+                &Principal::LocalUnverified,
+                serde_json::json!({ "id": r.id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        no_supervisors(&sp2);
+        assert_eq!(l2.kills.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ops_for(&e.db, &r.id)[1],
+            (
+                ops::KIND_RESUME.to_string(),
+                "pty".to_string(),
+                true,
+                Some("retired".to_string())
+            )
+        );
+        assert!(ops::reconcile(&e.db, &e.home).unwrap().is_empty());
+    }
+
+    /// No resume with `agent.create` off or while draining: the rows stay.
+    /// A row with no session to resume fails at once, with no spawn.
+    #[tokio::test]
+    async fn rows_that_cannot_resume_spawn_nothing() {
+        let e = setup(Script::Ready, true, None);
+        let r = drained_agent(&e).await;
+        let before = drained(&e.db, &r.id);
+        let (_, l_off, off) = engine_on(e.t.path(), &e.home, &e.db, Script::Ready, false, None);
+        assert_eq!(off.resume_on_boot().unwrap().left, [r.id.clone()]);
+        let (_, l_dr, dr) = next_engine(&e, Script::Ready, None);
+        dr.drain_switch().start();
+        assert_eq!(dr.resume_on_boot().unwrap().left, [r.id.clone()]);
+        assert_eq!(drained(&e.db, &r.id), before);
+        assert_eq!(gens(&e.db, &r.id).0, 1);
+        assert_eq!(l_off.spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(l_dr.spawns.load(Ordering::SeqCst), 0);
+
+        // An interrupted row with neither argv nor session.
+        let cwd = e.cwd.canonicalize().unwrap().display().to_string();
+        e.db.write_blocking(move |tx| {
+            tx.execute(
+                "INSERT INTO agents (id, mode, role, control, provider, source, state, cwd) \
+                 VALUES ('agt_nosid', 'free', 'worker', 'pty', 'claudeCode', 'engine', \
+                 'interrupted', ?1)",
+                [cwd],
+            )
+        })
+        .unwrap();
+        let (_, l2, sp2) = next_engine(&e, Script::Ready, None);
+        let resumed = sp2.resume_on_boot().unwrap();
+        assert_eq!(resumed.failed, ["agt_nosid".to_string()]);
+        assert_eq!(resumed.started, [r.id.clone()]);
+        let got = row(&e.db, "agt_nosid");
+        assert_eq!(got.state.as_deref(), Some("failed"));
+        assert_eq!(got.state_reason.as_deref(), Some(ops::RESUME_FAILED));
+        wait_for("ready", || {
+            row(&e.db, &r.id).state.as_deref() == Some("ready")
+        });
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 1);
+        sp2.shutdown();
+    }
+
+    /// Reviews H1, through the screen and not `set_state`: a ready agent
+    /// whose screen shows a turn is `working`, so the drain waits for it.
+    /// One turn ends at 30 s and is paused; the other still runs at 60 s
+    /// and is interrupted with the note.
+    #[tokio::test]
+    async fn the_drain_waits_for_a_turn_seen_on_the_screen() {
+        let (clock, secs) = hand_clock();
+        let e = setup(Script::Ready, true, Some(clock));
+        let l = Principal::LocalUnverified;
+        let ends = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let long = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        for r in [&ends, &long] {
+            lock(&e.launcher.busy).insert(r.id.clone());
+            wait_for("working from the screen", || {
+                row(&e.db, &r.id).state.as_deref() == Some("working")
+            });
+        }
+        e.sp.drain_switch().start();
+        let sp = e.sp.clone();
+        let start = sp.now();
+        let drainer = std::thread::spawn(move || drain::run(&sp, fast_drain(), start));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(e.launcher.kills.load(Ordering::SeqCst), 0);
+        secs.store(30, Ordering::SeqCst);
+        lock(&e.launcher.busy).remove(&ends.id);
+        wait_for("the ended turn paused", || {
+            drained(&e.db, &ends.id).0.as_deref() == Some("paused")
+        });
+        assert!(events(&e.db, "agent.turn_end")
+            .iter()
+            .any(|ev| ev["id"] == ends.id.as_str() && ev["by"] == "screen"));
+        secs.store(60, Ordering::SeqCst);
+        let report = drainer.join().unwrap();
+        assert_eq!(report.paused, std::slice::from_ref(&ends.id));
+        assert_eq!(report.interrupted, std::slice::from_ref(&long.id));
+        assert_eq!(drained(&e.db, &long.id), drain_facts(&long, "interrupted"));
+        assert!(row(&e.db, &long.id).interrupted_note_pending);
+        assert!(!row(&e.db, &ends.id).interrupted_note_pending);
+        no_supervisors(&e.sp);
+    }
+
+    /// Reviews M1: a drained agent whose kill fails is not settled. The
+    /// row and its `agent_state` stay, so boot reconcile kills the process
+    /// by pid and start time before anything resumes it.
+    #[tokio::test]
+    async fn a_failed_drain_kill_leaves_the_row_to_boot_reconcile() {
+        let e = setup(Script::Ready, true, None);
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        e.launcher.kill_fails.store(true, Ordering::SeqCst);
+        e.sp.drain_switch().start();
+        let report = drain::run(&e.sp, fast_drain(), e.sp.now());
+        assert_eq!(report.unsettled, std::slice::from_ref(&r.id));
+        no_supervisors(&e.sp);
+        assert_eq!(drained(&e.db, &r.id), (Some("ready".into()), None, None));
+        assert_eq!(agent_state_rows(&e.db), 1);
+        let audited: i64 =
+            e.db.reader()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM audit WHERE method = ?1 AND decision = 'error'",
+                    [drain::METHOD_DRAIN],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(audited, 1);
+        // Boot reconcile finds the process (gone here: a fake pid) and
+        // marks the row; only then is it resumable.
+        let done = ops::reconcile(&e.db, &e.home).unwrap();
+        assert_eq!(done.interrupted, std::slice::from_ref(&r.id));
+        assert_eq!(agent_state_rows(&e.db), 0);
+    }
+
+    /// Reviews L2: a drain that starts during the spawn cuts the new agent
+    /// before it is used. Nothing is written to it; the create answers
+    /// `draining`, and its open op is boot reconcile's.
+    #[tokio::test]
+    async fn a_drain_during_the_spawn_cuts_the_agent() {
+        let e = setup(Script::Trust, true, None);
+        let err =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Draining);
+        no_supervisors(&e.sp);
+        assert_eq!(e.launcher.kills.load(Ordering::SeqCst), 1);
+        assert_eq!(e.launcher.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(blocked_pty_writes(&e.db), 0);
+        assert_eq!(ops_of(&e.db), [("pty".to_string(), false, None)]);
+        let id = only_row(&e.db).id;
+        assert_eq!(ops::reconcile(&e.db, &e.home).unwrap().failed, [id]);
     }
 }

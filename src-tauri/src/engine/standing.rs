@@ -23,8 +23,16 @@
 //!   busy writer must not cost the note (reviews).
 //! - The file is read outside the transaction (I/O never holds the single
 //!   writer) and with `O_NOFOLLOW`. It is capped at `MAX_ORDERS` bytes.
+//! - Every block starts with `header(gen)`: the agent's generation, and that
+//!   it replaces any earlier c9watch context. A resume keeps the old
+//!   history, earlier blocks included, and the model may follow an old one
+//!   when asked vaguely (D24, M6 precheck).
+//! - While the engine drains (C1a-27) the reply carries no context, the
+//!   note stays pending, and the block is audited as
+//!   `drain.blocked_injection` with path `hook` (`engine::drain`).
 
 use super::db::Tx;
+use super::drain::{self, InjectionPath};
 use super::hooks::{self, DropReason, HookEvent, Outcome};
 use super::merge::MergeTable;
 use rusqlite::params;
@@ -44,6 +52,14 @@ pub const MAX_ORDERS: usize = 8 * 1024;
 
 /// The one-time line after an interrupted generation (A:551).
 pub const INTERRUPTED_NOTE: &str = "You were interrupted; check `git status` first.";
+
+/// The first line of every block the engine injects for generation `gen`.
+pub fn header(gen: i64) -> String {
+    format!(
+        "c9watch context, generation {} (replaces any earlier c9watch context)",
+        gen
+    )
+}
 
 /// What the engine writes on the first start: the agent's name, the
 /// `c9watch` read commands and the engine socket (D28 Q5=A), nothing else.
@@ -146,9 +162,10 @@ pub fn take_interrupted_note(
     Ok(n > 0)
 }
 
-/// The `additionalContext` text: the orders for `agent_id`, then the
-/// interrupted note. `None` when there is neither.
-pub fn context(orders: Option<&str>, agent_id: &str, note: bool) -> Option<String> {
+/// The `additionalContext` text for generation `gen`: `header(gen)`, the
+/// orders for `agent_id`, then the interrupted note. `None` when there are
+/// neither orders nor a note.
+pub fn context(orders: Option<&str>, agent_id: &str, gen: i64, note: bool) -> Option<String> {
     let mut out = orders
         .map(|o| o.replace(AGENT_PLACEHOLDER, agent_id))
         .filter(|o| !o.trim().is_empty())
@@ -163,31 +180,37 @@ pub fn context(orders: Option<&str>, agent_id: &str, note: bool) -> Option<Strin
         out.push_str(INTERRUPTED_NOTE);
         out.push('\n');
     }
-    (!out.is_empty()).then_some(out)
+    (!out.is_empty()).then(|| format!("{}\n\n{}", header(gen), out))
 }
 
 /// `hook.session_start`: the intake (`engine::hooks`), and in the same
 /// transaction the interrupted note. Returns the outcome and the context
 /// to send. An accepted event gets the orders; a duplicate (the hook's
 /// retry of an answer it may have lost) gets them again, without the note;
-/// any other drop gets nothing.
+/// any other drop gets nothing. With `draining` an accepted or duplicate
+/// event gets nothing either, keeps the note pending and is audited.
 pub fn session_start(
     tx: &mut Tx,
     machine: &str,
     merge: &MergeTable,
     ev: &HookEvent,
     orders: Option<&str>,
+    draining: bool,
     now_ms: i64,
 ) -> rusqlite::Result<(Outcome, Option<String>)> {
     let out = hooks::intake(tx, machine, merge, ev, now_ms)?;
     let id = ev.params.agent_id.as_str();
     let ctx = match out {
+        Outcome::Accepted | Outcome::Dropped(DropReason::Duplicate) if draining => {
+            drain::audit_blocked(tx, ev.principal, id, InjectionPath::Hook, now_ms)?;
+            None
+        }
         Outcome::Accepted => {
             let source = ev.params.input["source"].as_str();
             let note = take_interrupted_note(tx, id, source)?;
-            context(orders, id, note)
+            context(orders, id, ev.gen, note)
         }
-        Outcome::Dropped(DropReason::Duplicate) => context(orders, id, false),
+        Outcome::Dropped(DropReason::Duplicate) => context(orders, id, ev.gen, false),
         Outcome::Dropped(_) => None,
     };
     Ok((out, ctx))
@@ -205,6 +228,11 @@ mod tests {
     use std::sync::Arc;
 
     const ORDERS: &str = "Be agent {{agent_id}}.\n";
+
+    /// The block generation `gen` gets for `body`.
+    fn block(gen: i64, body: &str) -> String {
+        format!("{}\n\n{}", header(gen), body)
+    }
 
     /// A store with agent a1 at generation 1, state `ready`.
     fn setup() -> (tempfile::TempDir, Db, Arc<MergeTable>) {
@@ -226,6 +254,18 @@ mod tests {
         source: &str,
         seq: &str,
     ) -> (Outcome, Option<String>) {
+        start_as(db, merge, gen, source, seq, false)
+    }
+
+    /// `start`, while the engine drains or not.
+    fn start_as(
+        db: &Db,
+        merge: &Arc<MergeTable>,
+        gen: i64,
+        source: &str,
+        seq: &str,
+        draining: bool,
+    ) -> (Outcome, Option<String>) {
         let merge = merge.clone();
         let p = HookParams {
             agent_id: "a1".into(),
@@ -242,7 +282,7 @@ mod tests {
                 live_gen: Some(gen),
                 params: &p,
             };
-            session_start(tx, MACHINE, &merge, &ev, Some(ORDERS), 10)
+            session_start(tx, MACHINE, &merge, &ev, Some(ORDERS), draining, 10)
         })
         .unwrap()
         .0
@@ -329,7 +369,7 @@ mod tests {
         {
             let (out, ctx) = start(&db, &merge, 1, source, &i.to_string());
             assert_eq!(out, Outcome::Accepted, "{}", source);
-            assert_eq!(ctx.as_deref(), Some("Be agent a1.\n"), "{}", source);
+            assert_eq!(ctx, Some(block(1, "Be agent a1.\n")), "{}", source);
         }
     }
 
@@ -341,16 +381,16 @@ mod tests {
         resume(&db, 2);
         let (_, ctx) = start(&db, &merge, 2, "resume", "1");
         assert_eq!(
-            ctx.as_deref(),
-            Some(format!("Be agent a1.\n\n{}\n", INTERRUPTED_NOTE).as_str())
+            ctx,
+            Some(block(2, &format!("Be agent a1.\n\n{}\n", INTERRUPTED_NOTE)))
         );
         assert!(!pending(&db), "cleared with the reply");
         // The compaction after the resume gets the orders only.
         let (_, ctx) = start(&db, &merge, 2, "compact", "2");
-        assert_eq!(ctx.as_deref(), Some("Be agent a1.\n"));
+        assert_eq!(ctx, Some(block(2, "Be agent a1.\n")));
         // So does a second start event of the same generation.
         let (_, ctx) = start(&db, &merge, 2, "resume", "3");
-        assert_eq!(ctx.as_deref(), Some("Be agent a1.\n"));
+        assert_eq!(ctx, Some(block(2, "Be agent a1.\n")));
     }
 
     #[test]
@@ -359,7 +399,7 @@ mod tests {
         // The flag is set while generation 1 still runs and compacts.
         set_pending(&db);
         let (_, ctx) = start(&db, &merge, 1, "compact", "1");
-        assert_eq!(ctx.as_deref(), Some("Be agent a1.\n"));
+        assert_eq!(ctx, Some(block(1, "Be agent a1.\n")));
         assert!(pending(&db));
         // The next generation's first start takes it.
         resume(&db, 2);
@@ -391,7 +431,7 @@ mod tests {
                     live_gen: Some(2),
                     params: &p,
                 };
-                session_start(tx, MACHINE, &merge2, &ev, Some(ORDERS), 10)
+                session_start(tx, MACHINE, &merge2, &ev, Some(ORDERS), false, 10)
             })
             .unwrap()
             .0;
@@ -404,20 +444,83 @@ mod tests {
         assert!(ctx.unwrap().contains(INTERRUPTED_NOTE));
         let (out, ctx) = start(&db, &merge, 2, "resume", "2");
         assert_eq!(out, Outcome::Dropped(DropReason::Duplicate));
-        assert_eq!(ctx.as_deref(), Some("Be agent a1.\n"));
+        assert_eq!(ctx, Some(block(2, "Be agent a1.\n")));
     }
 
     #[test]
     fn context_without_orders() {
-        assert_eq!(context(None, "a1", false), None);
-        assert_eq!(context(Some("  \n"), "a1", false), None);
+        assert_eq!(context(None, "a1", 1, false), None);
+        assert_eq!(context(Some("  \n"), "a1", 1, false), None);
         assert_eq!(
-            context(None, "a1", true).as_deref(),
-            Some(format!("{}\n", INTERRUPTED_NOTE).as_str())
+            context(None, "a1", 1, true),
+            Some(block(1, &format!("{}\n", INTERRUPTED_NOTE)))
         );
         assert_eq!(
-            context(Some("x"), "a1", true).as_deref(),
-            Some(format!("x\n\n{}\n", INTERRUPTED_NOTE).as_str())
+            context(Some("x"), "a1", 1, true),
+            Some(block(1, &format!("x\n\n{}\n", INTERRUPTED_NOTE)))
         );
+    }
+
+    /// D24 (M6 precheck): a resume keeps the earlier blocks in the history,
+    /// so each block names its generation and replaces the earlier ones.
+    #[test]
+    fn every_block_starts_with_its_generation_header() {
+        assert_eq!(
+            header(3),
+            "c9watch context, generation 3 (replaces any earlier c9watch context)"
+        );
+        let (_t, db, merge) = setup();
+        let (_, first) = start(&db, &merge, 1, "startup", "1");
+        set_pending(&db);
+        resume(&db, 2);
+        let (_, second) = start(&db, &merge, 2, "resume", "2");
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(
+            first.starts_with(&format!("{}\n\n", header(1))),
+            "{}",
+            first
+        );
+        assert!(
+            second.starts_with(&format!("{}\n\n", header(2))),
+            "{}",
+            second
+        );
+        // The note is inside the generation's block, not before it.
+        assert_eq!(second.lines().next(), Some(header(2).as_str()));
+        assert!(second.contains(INTERRUPTED_NOTE));
+    }
+
+    /// C1a-27: while the engine drains, a SessionStart is still taken but
+    /// gets no context; the note stays for the resumed generation, and the
+    /// block is audited with path `hook`.
+    #[test]
+    fn a_start_while_draining_gets_nothing_and_keeps_the_note() {
+        let (_t, db, merge) = setup();
+        set_pending(&db);
+        resume(&db, 2);
+        let (out, ctx) = start_as(&db, &merge, 2, "resume", "1", true);
+        assert_eq!(out, Outcome::Accepted);
+        assert_eq!(ctx, None);
+        // Its retry is blocked too.
+        let (out, ctx) = start_as(&db, &merge, 2, "resume", "1", true);
+        assert_eq!(out, Outcome::Dropped(DropReason::Duplicate));
+        assert_eq!(ctx, None);
+        assert!(pending(&db));
+        let conn = db.reader().unwrap();
+        let blocked: Vec<(String, String, String)> = conn
+            .prepare("SELECT principal, target, reason FROM audit WHERE method = ?1 ORDER BY seq")
+            .unwrap()
+            .query_map([drain::BLOCKED_INJECTION], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let one = (
+            "agent:a1".to_string(),
+            "a1".to_string(),
+            "path=hook".to_string(),
+        );
+        assert_eq!(blocked, vec![one.clone(), one]);
     }
 }

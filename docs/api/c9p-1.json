@@ -229,6 +229,13 @@
             "null"
           ]
         },
+        "stateReason": {
+          "description": "Why the agent is in its `state`: `drain` for a `paused` or\n`interrupted` agent that an engine drain stopped; for a `failed`\nagent the failure reason, such as `spawn_failed`, `resume_failed`,\n`exited` or `create_interrupted`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "status": {
           "description": "The detected session status: `working`, `needs_attention`,\n`waiting_for_input` or `connecting`.",
           "type": [
@@ -260,7 +267,8 @@
         "startedAt",
         "createdAt",
         "lastSeen",
-        "parentId"
+        "parentId",
+        "stateReason"
       ],
       "type": "object"
     },
@@ -408,6 +416,11 @@
         {
           "const": "unknown_agent",
           "description": "No engine agent has this id.",
+          "type": "string"
+        },
+        {
+          "const": "draining",
+          "description": "The engine is draining after a SIGTERM: no spawn and no injection\nuntil the next engine is up. Retry against the new engine.",
           "type": "string"
         },
         {
