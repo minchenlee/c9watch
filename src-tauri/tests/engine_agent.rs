@@ -269,22 +269,37 @@ fn an_agent_running_another_binary_is_refused() {
     );
     assert_eq!(rc, 1, "{}", out);
     assert!(out.contains("peer_not_authorized"), "{}", out);
-    // The main binary's raw `api` escape hatch, from inside the agent.
-    let cmd = format!(
-        "env -u C9_AGENT_ID {}={} {} api task.done '{{\"agentId\":\"{}\",\"report\":\"r\",\"seq\":\"1\"}}'",
-        ENGINE_HOME_ENV,
-        q(&engine.home),
-        q(Path::new(MAIN)),
-        AGENT_ID
-    );
-    let (out, rc) = as_agent(&engine, &cmd, true);
-    assert_eq!(rc, 1, "{}", out);
-    assert!(out.contains("peer_not_authorized"), "{}", out);
+    // The main binary's raw `api` escape hatch, from inside the agent, for
+    // `task.done` and for a hook.
+    for (method, params) in [
+        ("task.done", r#"{"agentId":"agt_t","report":"r","seq":"1"}"#),
+        (
+            "hook.stop",
+            r#"{"agentId":"agt_t","kind":"claude","seq":"2","input":{}}"#,
+        ),
+    ] {
+        let cmd = format!(
+            "env -u C9_AGENT_ID {}={} {} api {} '{}'",
+            ENGINE_HOME_ENV,
+            q(&engine.home),
+            q(Path::new(MAIN)),
+            method,
+            params
+        );
+        let (out, rc) = as_agent(&engine, &cmd, true);
+        assert_eq!(rc, 1, "{}: {}", method, out);
+        assert!(out.contains("peer_not_authorized"), "{}: {}", method, out);
+    }
     let denials = engine.denials();
-    assert_eq!(denials.len(), 2, "{:?}", denials);
-    assert!(denials
-        .iter()
-        .all(|(p, m)| p == &format!("agent:{}", AGENT_ID) && m == "task.done"));
+    let agent = format!("agent:{}", AGENT_ID);
+    assert_eq!(
+        denials,
+        vec![
+            (agent.clone(), "task.done".to_string()),
+            (agent.clone(), "task.done".to_string()),
+            (agent, "hook.stop".to_string()),
+        ]
+    );
 }
 
 #[test]
@@ -303,8 +318,16 @@ fn a_changed_copy_is_refused() {
     assert!(out.contains("agent_bin_mismatch"), "{}", out);
 }
 
+/// Run the agent binary once, untimed: the first exec of a freshly linked
+/// binary can wait on the OS's malware scan, which is not the hook's cost.
+fn warm_up_agent() {
+    let out = Command::new(AGENT).arg("--version").output().unwrap();
+    assert!(out.status.success(), "{:?}", out);
+}
+
 #[test]
 fn a_hook_exits_0_without_an_engine_or_with_bad_args() {
+    warm_up_agent();
     let dir = tempfile::tempdir().unwrap();
     let hook = |args: &[&str]| {
         let t = Instant::now();
@@ -327,7 +350,7 @@ fn a_hook_exits_0_without_an_engine_or_with_bad_args() {
         let (out, took) = hook(args);
         assert_eq!(out.status.code(), Some(0), "{:?}: {:?}", args, out);
         assert!(out.stdout.is_empty(), "{:?}: {:?}", args, out);
-        assert!(took < Duration::from_secs(2), "{:?} took {:?}", args, took);
+        assert!(took < Duration::from_secs(3), "{:?} took {:?}", args, took);
     }
     // `task done` is not a hook: it fails loudly.
     let (out, _) = hook(&["task", "done", "--report", "r"]);
@@ -342,6 +365,7 @@ fn a_hook_exits_0_without_an_engine_or_with_bad_args() {
 /// after its 0.5 s budget and still exits 0.
 #[test]
 fn a_hook_against_a_silent_engine_exits_0_in_time() {
+    warm_up_agent();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("e.sock");
     let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -361,12 +385,14 @@ fn a_hook_against_a_silent_engine_exits_0_in_time() {
     let took = t.elapsed();
     assert_eq!(out.status.code(), Some(0), "{:?}", out);
     assert!(out.stdout.is_empty());
-    assert!(took < Duration::from_millis(1500), "took {:?}", took);
+    // Well under the 3 s the engine holds the connection.
+    assert!(took < Duration::from_millis(2500), "took {:?}", took);
     held.join().unwrap();
 }
 
 /// `cargo run` picks the main binary (`default-run`), and the agent binary
-/// exists only with the engine (`required-features`).
+/// exists only with the engine (`required-features`). The Linux CI job also
+/// runs `cargo run ... -- --version` and builds `c9watch-agent` by name.
 #[test]
 fn the_manifest_keeps_c9watch_the_default_binary() {
     let manifest = include_str!("../Cargo.toml");

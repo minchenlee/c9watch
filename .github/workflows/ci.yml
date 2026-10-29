@@ -134,3 +134,14 @@ jobs:
         run: |
           cargo test --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features engine
+
+      - name: Agent binary and default run target
+        # C1a-21: Linux builds c9watch-agent by name, and `cargo run` with
+        # two binaries still picks c9watch (`default-run`).
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features engine --bin c9watch-agent
+          out=$(cargo run --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features engine -- --version)
+          echo "$out"
+          echo "$out" | grep -q '^c9watch '
