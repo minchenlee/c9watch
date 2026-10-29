@@ -525,6 +525,22 @@ pub fn cmd_api(method: &str, params: &str, pretty: bool) -> Result<(), String> {
     }
 }
 
+/// `c9watch engine shadow-report`: the dev GUI's daily shadow diff
+/// coverage from `<home>/shadow-coverage.ndjson`, oldest day first, plus
+/// where the unexplained diffs are. Reads files only; never starts the
+/// engine.
+#[cfg(c9_channel_dev)]
+pub fn cmd_shadow_report(pretty: bool) -> Result<(), String> {
+    use crate::engine_proto::shadow::{read_coverage, DIFF_FILE};
+    let home = engine_home()?;
+    let days = read_coverage(&home)?;
+    let report = serde_json::json!({
+        "days": days,
+        "diffs": home.join(DIFF_FILE),
+    });
+    super::print_json(&report, pretty)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

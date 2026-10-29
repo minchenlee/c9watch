@@ -3,7 +3,8 @@
  *
  * Lifecycle:
  *   1. App launch calls `runStartupCheck()` once. If an update is available,
- *      `updateAvailable` is set and the banner renders.
+ *      `updateAvailable` is set and the banner renders. Dev channel builds
+ *      skip this check.
  *   2. User lands on the Settings tab → `fetchReleaseNotes()` is called.
  *      The notes are cached by version so re-entering the tab doesn't re-fetch.
  *   3. User clicks "Download and install" → store drives download/install and
@@ -11,6 +12,7 @@
  */
 
 import { writable, derived, get } from 'svelte/store';
+import { invoke } from '@tauri-apps/api/core';
 import { checkOnly, downloadOnly, installAndRelaunch, type UpdateHandle } from '../updater';
 import { isTauri } from '../ws';
 
@@ -40,6 +42,13 @@ export async function runStartupCheck() {
 		currentVersion.set(await getVersion());
 	} catch (err) {
 		console.error('[updater-store] Failed to read app version:', err);
+	}
+	// A dev channel build (dogfood) skips the launch check, so a release
+	// never replaces it. "Check for updates" in Settings still works.
+	try {
+		if ((await invoke<string>('get_build_channel')) === 'dev') return;
+	} catch (err) {
+		console.error('[updater-store] Failed to read build channel:', err);
 	}
 	const update = await checkOnly();
 	updateAvailable.set(update);

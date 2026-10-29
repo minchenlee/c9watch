@@ -111,6 +111,16 @@ jobs:
           cargo check --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features engine
 
+      - name: Prod channel has no shadow diff
+        # C1a-17: the dev-only shadow diff and `engine shadow-report` are
+        # not compiled into a prod channel build.
+        env:
+          C9WATCH_CHANNEL: prod
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features engine --lib \
+            -- prod_channel_build_has_no_shadow_diff shadow_report_only_in_dev_builds
+
       - name: CLI-only tests
         run: |
           cargo test --manifest-path src-tauri/Cargo.toml \

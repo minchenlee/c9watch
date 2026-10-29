@@ -155,6 +155,10 @@ pub fn start_polling(
         let mut prev_diagnostics: Option<crate::session::DetectionDiagnostics> = None;
         let mut prev_sessions_hash: Option<u64> = None;
 
+        // Dev channel only: compare each poll with the engine (C1a-17).
+        #[cfg(all(unix, c9_channel_dev))]
+        let mut shadow = crate::engine_proto::shadow::ShadowDiff::for_gui();
+
         loop {
             // Lock the shared DetectorState only for the detection step itself,
             // then drop the guard BEFORE the slow enrichment pass so other call
@@ -174,6 +178,13 @@ pub fn start_polling(
 
             match enriched {
                 Ok((mut sessions, diagnostics)) => {
+                    // Before the workers overlay, so both sides compare
+                    // plain detection. Never starts the engine.
+                    #[cfg(all(unix, c9_channel_dev))]
+                    if let Some(shadow) = shadow.as_mut() {
+                        shadow.tick(&sessions);
+                    }
+
                     // Overlay worker_of from ~/.claude/c9watch/workers/*/meta.json
                     let overlay = load_workers_overlay();
                     for s in sessions.iter_mut() {

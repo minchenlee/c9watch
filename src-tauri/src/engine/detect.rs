@@ -122,12 +122,7 @@ impl Observed {
 
 /// The `agents.status` value of a detected status.
 pub fn status_name(s: &SessionStatus) -> &'static str {
-    match s {
-        SessionStatus::Working => "working",
-        SessionStatus::NeedsAttention => "needs_attention",
-        SessionStatus::WaitingForInput => "waiting_for_input",
-        SessionStatus::Connecting => "connecting",
-    }
+    s.wire_name()
 }
 
 /// What one tick changed: agent ids.
