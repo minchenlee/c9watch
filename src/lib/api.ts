@@ -11,6 +11,14 @@ import { getDemoSessions, getDemoHistoryEntries, getDemoCostData, demoConversati
 import { wsClient, useWebSocket } from './ws';
 
 /**
+ * Thrown by `getConversation` and `openSession` over WebSocket when the
+ * desktop has that capability off for remote devices (the default). The
+ * request is not sent; the server refuses it too.
+ */
+export { CapabilityDisabledError } from './ws';
+import { sessionKeyOf } from './provider';
+
+/**
  * Get all active Claude Code sessions
  */
 export async function getSessions(): Promise<Session[]> {
@@ -71,29 +79,32 @@ export async function getAwayActivity(requests: AwayRequest[]): Promise<Record<s
 }
 
 /**
- * Stop a running session by sending SIGTERM
+ * Stop a running session by sending SIGTERM. The backend resolves the
+ * process from its own detection by session key; `pid` only has to agree.
  */
-export async function stopSession(pid: number): Promise<void> {
+export async function stopSession(session: Session): Promise<void> {
 	if (get(isDemoMode)) return;
 
 	if (useWebSocket()) {
-		await wsClient.request('stopSession', { pid });
+		await wsClient.request('session.stop', { addr: sessionKeyOf(session), pid: session.pid });
 		return;
 	}
-	await invoke<void>('stop_session', { pid });
+	await invoke<void>('stop_session', { sessionKey: sessionKeyOf(session), pid: session.pid });
 }
 
 /**
- * Open the terminal or IDE window for a session
+ * Open the terminal or IDE window for a session. Over WebSocket the backend
+ * resolves the process and project path from its own detection by session
+ * key; `pid` only has to agree.
  */
-export async function openSession(pid: number, projectPath: string): Promise<void> {
+export async function openSession(session: Session): Promise<void> {
 	if (get(isDemoMode)) return;
 
 	if (useWebSocket()) {
-		await wsClient.request('openSession', { pid, projectPath });
+		await wsClient.request('openSession', { addr: sessionKeyOf(session), pid: session.pid });
 		return;
 	}
-	await invoke<void>('open_session', { pid, projectPath });
+	await invoke<void>('open_session', { pid: session.pid, projectPath: session.projectPath });
 }
 
 /**
@@ -117,14 +128,53 @@ export async function renameSession(
  * Server connection info (desktop/Tauri only)
  */
 export interface ServerInfo {
-	token: string;
 	port: number;
 	localIp: string;
-	wsUrl: string;
+	/** False: port 9210 accepts connections from this Mac only. */
+	lanEnabled: boolean;
+	bind: 'loopback' | 'lan';
+	/** This Mac's interface IPs; empty unless LAN is on. */
+	lanAddresses: string[];
 }
 
 export async function getServerInfo(): Promise<ServerInfo> {
 	return await invoke<ServerInfo>('get_server_info');
+}
+
+/** A one-time pairing code; `expiresAt` is Unix milliseconds. */
+export interface PairingCode {
+	code: string;
+	expiresAt: number;
+}
+
+/** Start a new pairing code (desktop only). The previous code stops working. */
+export async function createPairingCode(): Promise<PairingCode> {
+	return await invoke<PairingCode>('create_pairing_code');
+}
+
+/** Forget every paired device (desktop only). Their sockets close and they must pair again. */
+export async function forgetPairedClients(): Promise<void> {
+	await invoke<void>('forget_paired_clients');
+}
+
+/**
+ * Remote-access settings (desktop/Tauri only), stored in remote-access.json.
+ */
+export interface RemoteAccess {
+	/** Bind every interface instead of loopback only. */
+	lanEnabled: boolean;
+	allowConversation: boolean;
+	allowOpen: boolean;
+	extraAllowedHosts: string[];
+}
+
+export async function getRemoteAccess(): Promise<RemoteAccess> {
+	return await invoke<RemoteAccess>('get_remote_access');
+}
+
+/** Saves the settings and rebinds the server; open WS clients reconnect. */
+export async function setRemoteAccess(remote: RemoteAccess): Promise<RemoteAccess> {
+	return await invoke<RemoteAccess>('set_remote_access', { remote });
 }
 
 /**

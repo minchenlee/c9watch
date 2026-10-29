@@ -29,11 +29,12 @@ export function harness(initialProvider = 'codex') {
  const requests = [];
  const getConversation = (id,provider) => new Promise((resolve,reject) => requests.push({id,provider,resolve,reject}));
  const withConversationLoader = (_id,_provider,_kind,task) => task();
+ class CapabilityDisabledError extends Error {}
  ${loader.slice(0, loader.indexOf("\t$effect(() => {"))}
  const dispose = $effect.root(() => {
  ${loader.slice(loader.indexOf("\t$effect(() => {"))}
  });
- return {requests,dispose,error:()=>conversationError,retry:()=>retryConversation(),refresh(){const work=[...timers.values()];timers.clear();work.forEach(fn=>fn());},value:()=>value,poll:()=>{sessions=sessions.map(s=>({...s}));},select(provider){sessions=[{id:'same',provider}];expandedId=provider+':same';},close(){expandedId=null;}};
+ return {requests,dispose,CapabilityDisabledError,error:()=>conversationError,off:()=>conversationsOff,retry:()=>retryConversation(),refresh(){const work=[...timers.values()];timers.clear();work.forEach(fn=>fn());},value:()=>value,poll:()=>{sessions=sessions.map(s=>({...s}));},select(provider){sessions=[{id:'same',provider}];expandedId=provider+':same';},close(){expandedId=null;}};
 }`;
 let code = compileModule(ts.transpileModule(source, {compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ES2022}}).outputText, { filename: 'conversation-selection.svelte.js', generate: 'client' }).js.code;
 code = code.replace(/from '([^']+)'/g, (_, spec) => `from '${import.meta.resolve(spec)}'`);
@@ -50,6 +51,15 @@ test('initial failure is visible, retry succeeds, and stale errors are ignored',
   h.requests[1].resolve(response); await settle(); assert.equal(h.value(),response);
   h.refresh(); h.select('codex'); flushSync();
   h.requests[2].reject(new Error('stale error')); await settle(); assert.equal(h.error(),null);
+ } finally {h.dispose();}
+});
+
+test('conversations turned off for remote show the off state, not an error', async () => {
+ const h=harness();
+ try {
+  flushSync(); h.requests[0].reject(new h.CapabilityDisabledError('off')); await settle();
+  assert.equal(h.off(),true); assert.equal(h.error(),null); assert.equal(h.value(),null);
+  h.select('cursor'); flushSync(); assert.equal(h.off(),false);
  } finally {h.dispose();}
 });
 

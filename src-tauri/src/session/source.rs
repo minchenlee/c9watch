@@ -271,6 +271,12 @@ pub struct DetectedSession {
     pub pi_summary: Option<PiTranscriptSummary>,
     #[serde(skip)]
     pub opencode_summary: Option<super::opencode::OpenCodeSummary>,
+    /// Start time (seconds since the epoch) of `pid` when it was detected.
+    /// Stop re-reads it before signalling, so a pid the OS has since handed
+    /// to another process is never killed. `None` when the backend has no
+    /// process behind the session.
+    #[serde(skip)]
+    pub process_start_secs: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -324,6 +330,7 @@ impl DetectedSession {
             cursor_summary: None,
             pi_summary: None,
             opencode_summary: None,
+            process_start_secs: None,
         }
     }
 
@@ -518,6 +525,21 @@ mod tests {
         assert_eq!(d.surface, SessionSurface::ClaudeCode);
         assert_eq!(d.agent_kind, AgentKind::Root);
         assert!(d.can_open && d.can_stop && d.can_rename);
+        assert_eq!(d.process_start_secs, None);
+    }
+
+    #[test]
+    fn process_start_secs_is_not_serialized() {
+        let mut d = DetectedSession::with_legacy_defaults(
+            42,
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/proj"),
+            Some("uuid".to_string()),
+            "tmp".to_string(),
+        );
+        let before = serde_json::to_value(&d).unwrap();
+        d.process_start_secs = Some(1_791_984_957);
+        assert_eq!(serde_json::to_value(&d).unwrap(), before);
     }
 
     #[test]
@@ -547,6 +569,7 @@ mod tests {
         );
         assert!(d.codex_summary.is_none() && d.cursor_summary.is_none());
         assert!(d.pi_summary.is_none() && d.opencode_summary.is_none());
+        assert_eq!(d.process_start_secs, None);
     }
 
     #[test]

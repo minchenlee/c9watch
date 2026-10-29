@@ -13,7 +13,7 @@ const dataUrl = code => 'data:text/javascript;base64,' + Buffer.from(code).toStr
 const stubs = {
   'svelte/store': import.meta.resolve('svelte/store'),
   '@tauri-apps/api/event': dataUrl('export const listen = async () => () => {};'),
-  '$lib/api': dataUrl('export const getConversation = () => { throw new Error("not injected"); };'),
+  '$lib/api': dataUrl('export const getConversation = () => { throw new Error("not injected"); }; export class CapabilityDisabledError extends Error {}'),
   '$lib/ws': dataUrl('export const isTauri = () => false; export const useWebSocket = () => false; export const wsClient = { on() {} };'),
   '$lib/provider': dataUrl(transpile(read('../src/lib/provider.ts')))
 };

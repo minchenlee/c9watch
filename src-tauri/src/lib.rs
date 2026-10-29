@@ -20,16 +20,20 @@ pub mod notifications;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod polling;
 #[cfg(all(not(mobile), feature = "gui"))]
+pub mod remote_access;
+#[cfg(all(not(mobile), feature = "gui"))]
 pub mod subscription_usage;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod web_server;
+#[cfg(all(not(mobile), feature = "gui"))]
+pub mod ws_auth;
 
 // ── CLI module ──────────────────────────────────────────────────────
 #[cfg(feature = "cli")]
 pub mod cli;
 
 #[cfg(feature = "gui")]
-use actions::{open_session as open_session_action, stop_session as stop_session_action};
+use actions::open_session as open_session_action;
 #[cfg(feature = "gui")]
 use polling::{start_polling, Session};
 #[cfg(feature = "gui")]
@@ -98,6 +102,22 @@ fn detect_snapshot(
             session::enrichment::enrich_detected_sessions(detected, diag)
                 .map(|(sessions, _)| sessions)
         }))
+}
+
+/// Detect the current sessions with the shared detector, without the
+/// enrichment pass. Stop resolves its target from this, so it waits for the
+/// lock instead of failing when a poll's scan is running.
+#[cfg(all(not(mobile), feature = "gui"))]
+pub(crate) fn detect_sessions(
+    detector: &Mutex<session::DetectorState>,
+) -> Result<Vec<session::DetectedSession>, String> {
+    let mut state = detector
+        .lock()
+        .map_err(|e| format!("Detector lock poisoned: {}", e))?;
+    state
+        .detect()
+        .map(|(detected, _)| detected)
+        .map_err(|e| format!("Detect failed: {}", e))
 }
 
 /// Emit a fresh `sessions-updated` snapshot after a session action.
@@ -302,10 +322,21 @@ async fn reveal_in_file_manager(path: String) -> Result<(), String> {
 async fn stop_session(
     app: AppHandle,
     detector: tauri::State<'_, Arc<Mutex<session::DetectorState>>>,
-    pid: u32,
+    session_key: String,
+    pid: Option<u32>,
 ) -> Result<(), String> {
-    stop_session_action(pid)?;
-    std::thread::sleep(Duration::from_millis(300));
+    let shared = Arc::clone(detector.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        actions::stop_session_by_key(
+            &session_key,
+            pid,
+            || detect_sessions(&shared),
+            actions::process_start_secs,
+        )
+    })
+    .await
+    .map_err(|e| format!("Stop failed: {}", e))??;
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     emit_sessions_snapshot(&app, detector.inner())
 }
@@ -631,26 +662,89 @@ async fn show_main_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Server connection info for the mobile client
+/// Server connection info for the MOBILE modal and Settings. It carries no
+/// credential: a phone gets its token by redeeming a pairing code.
 #[cfg(all(not(mobile), feature = "gui"))]
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerInfo {
-    pub token: String,
     pub port: u16,
+    /// The address a phone uses: the default-route IP in LAN mode,
+    /// `127.0.0.1` otherwise.
     pub local_ip: String,
-    pub ws_url: String,
+    pub lan_enabled: bool,
+    /// `"loopback"` or `"lan"`.
+    pub bind: &'static str,
+    /// This Mac's interface IPs, read now. Empty unless LAN is on.
+    pub lan_addresses: Vec<String>,
+}
+
+#[cfg(all(not(mobile), feature = "gui"))]
+fn server_info(server: &web_server::WsServer) -> ServerInfo {
+    let lan_enabled = server.remote().lan_enabled;
+    let (local_ip, lan_addresses) = if lan_enabled {
+        let ips = remote_access::local_interface_ips()
+            .into_iter()
+            .map(|ip| ip.to_string())
+            .collect();
+        (auth::get_local_ip(), ips)
+    } else {
+        ("127.0.0.1".to_string(), Vec::new())
+    };
+    let port = server.port();
+    ServerInfo {
+        port,
+        local_ip,
+        lan_enabled,
+        bind: if lan_enabled { "lan" } else { "loopback" },
+        lan_addresses,
+    }
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
-async fn get_server_info(info: tauri::State<'_, ServerInfo>) -> Result<ServerInfo, String> {
-    Ok(ServerInfo {
-        token: info.token.clone(),
-        port: info.port,
-        local_ip: info.local_ip.clone(),
-        ws_url: info.ws_url.clone(),
-    })
+async fn get_server_info(
+    server: tauri::State<'_, Arc<web_server::WsServer>>,
+) -> Result<ServerInfo, String> {
+    Ok(server_info(&server))
+}
+
+/// A new one-time pairing code for the MOBILE modal. The previous code
+/// stops working.
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn create_pairing_code(
+    server: tauri::State<'_, Arc<web_server::WsServer>>,
+) -> Result<web_server::PairingCode, String> {
+    server.create_pairing_code()
+}
+
+/// Forget every paired device and close their sockets.
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn forget_paired_clients(
+    server: tauri::State<'_, Arc<web_server::WsServer>>,
+) -> Result<(), String> {
+    server.forget_paired_clients()
+}
+
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn get_remote_access(
+    server: tauri::State<'_, Arc<web_server::WsServer>>,
+) -> Result<remote_access::RemoteAccess, String> {
+    Ok(server.remote())
+}
+
+/// Save the remote-access settings and rebind the WS server. Open sockets
+/// close; turning LAN off drops LAN clients.
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn set_remote_access(
+    server: tauri::State<'_, Arc<web_server::WsServer>>,
+    remote: remote_access::RemoteAccess,
+) -> Result<remote_access::RemoteAccess, String> {
+    server.update(remote).await
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -698,39 +792,34 @@ pub fn run() {
         .setup(|app| {
             notifications::initialize(app.handle()).map_err(std::io::Error::other)?;
             // ── WebSocket server ────────────────────────────────
-            let token = auth::generate_token();
-            let local_ip = auth::get_local_ip();
             let port = web_server::WS_PORT;
-
-            let ws_url = format!("ws://{}:{}/ws?token={}", local_ip, port, token);
-            let http_url = format!("http://{}:{}/?token={}", local_ip, port, token);
-
-            debug_log::log_info(&format!("Mobile connection ready — URL: {}", http_url));
-            qr2term::print_qr(&http_url).ok();
-            eprintln!();
 
             let (sessions_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
             let (notifications_tx, _nrx) = tokio::sync::broadcast::channel::<String>(16);
-
-            let server_info = ServerInfo {
-                token: token.clone(),
-                port,
-                local_ip: local_ip.clone(),
-                ws_url,
-            };
-            app.manage(server_info);
-
-            let ws_state = Arc::new(web_server::WsState {
-                auth_token: token,
-                sessions_tx: sessions_tx.clone(),
-                notifications_tx: notifications_tx.clone(),
-            });
-            tauri::async_runtime::spawn(web_server::start_server(ws_state));
 
             // ── Shared detector state ───────────────────────────
             let detector_state: Arc<Mutex<session::DetectorState>> =
                 Arc::new(Mutex::new(session::DetectorState::new()));
             app.manage(detector_state.clone());
+
+            let ws_state = Arc::new(web_server::WsState::new(
+                sessions_tx.clone(),
+                notifications_tx.clone(),
+                detector_state.clone(),
+            ));
+            let remote_path = app
+                .path()
+                .app_config_dir()
+                .map_err(std::io::Error::other)?
+                .join(remote_access::FILE_NAME);
+            let remote = remote_access::load(&remote_path);
+            let ws_server = Arc::new(web_server::WsServer::new(ws_state, port, remote_path));
+            app.manage(ws_server.clone());
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = ws_server.apply(remote).await {
+                    debug_log::log_error(&format!("[ws-server] {}", e));
+                }
+            });
             app.manage(polling::LatestDiagnostics::default());
 
             // ── Polling loop ────────────────────────────────────
@@ -922,6 +1011,10 @@ pub fn run() {
             rename_session,
             show_main_window,
             get_server_info,
+            create_pairing_code,
+            forget_paired_clients,
+            get_remote_access,
+            set_remote_access,
             get_debug_logs
         ]);
 

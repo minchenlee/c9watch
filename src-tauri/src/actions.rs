@@ -1,3 +1,4 @@
+use crate::session::{DetectedSession, SessionProvider};
 use std::process::Command;
 
 /// The strongest native target supported by the existing focus mechanism.
@@ -39,6 +40,7 @@ pub fn open_session(pid: u32, project_path: String) -> Result<(), String> {
     if pid == 0 {
         return Err("This session does not expose a focusable terminal process".to_string());
     }
+    check_open_path(&project_path)?;
     // Find the parent application by walking up the process tree
     let app_name = find_parent_app(pid)?;
 
@@ -118,6 +120,51 @@ pub fn open_session(pid: u32, project_path: String) -> Result<(), String> {
     activate_app_fallback(&app_name)?;
 
     Ok(())
+}
+
+/// Editor CLIs (`code`, `cursor`, `zed`, ...) get the project path as an
+/// argument. One that starts with `-` would be read as an option, such as
+/// `--install-extension=...`, so it is refused.
+pub fn check_open_path(project_path: &str) -> Result<(), String> {
+    if project_path.starts_with('-') {
+        return Err(format!("{project_path:?} is not a project path"));
+    }
+    Ok(())
+}
+
+/// Open the session whose key is `key`. Like stop, the pid and project path
+/// come from `resolve` (c9watch's own detection), never from the caller;
+/// `expect_pid`, when given, only has to agree with the detected pid.
+pub fn open_session_by_key(
+    key: &str,
+    expect_pid: Option<u32>,
+    resolve: impl FnOnce() -> Result<Vec<DetectedSession>, String>,
+) -> Result<(), String> {
+    open_session_by_key_with(key, expect_pid, resolve, open_session)
+}
+
+fn open_session_by_key_with(
+    key: &str,
+    expect_pid: Option<u32>,
+    resolve: impl FnOnce() -> Result<Vec<DetectedSession>, String>,
+    open: impl FnOnce(u32, String) -> Result<(), String>,
+) -> Result<(), String> {
+    let sessions = resolve()?;
+    let session = sessions
+        .iter()
+        .find(|s| s.identity_key().as_deref() == Some(key))
+        .ok_or_else(|| format!("No running session matches {key}"))?;
+    if !session.can_open || session.pid == 0 {
+        return Err("This session cannot be opened through c9watch".to_string());
+    }
+    if expect_pid.is_some_and(|pid| pid != session.pid) {
+        return Err(format!(
+            "Session {key} is no longer running as that process; not opening it"
+        ));
+    }
+    let project_path = session.project_path.to_string_lossy().into_owned();
+    check_open_path(&project_path)?;
+    open(session.pid, project_path)
 }
 
 /// Read one `ps -o <field>=` column for a process, trimmed.
@@ -1015,33 +1062,139 @@ fn is_jetbrains_ide(app_name: &str) -> bool {
     jetbrains_url_scheme(app_name).is_some()
 }
 
-/// Stop a session by sending SIGTERM to the process
-///
-/// This gracefully terminates the Claude process by sending a SIGTERM signal.
-/// SIGTERM is preferred over SIGINT as Claude Code may trap SIGINT for its own use.
-pub fn stop_session(pid: u32) -> Result<(), String> {
-    if pid == 0 {
+/// How far the start time re-read before a stop may drift from the one
+/// recorded at detection. Both come from the same process table, so only
+/// rounding separates them; a reused pid starts much later.
+const STOP_START_TOLERANCE_SECS: u64 = 1;
+
+/// Confirms the process holding a pid is the one detection saw. Either start
+/// time missing is a refusal: without it a reused pid can't be ruled out.
+pub fn verify_stop_target(recorded: Option<u64>, actual: Option<u64>) -> Result<(), String> {
+    match (recorded, actual) {
+        (Some(recorded), Some(actual))
+            if recorded.abs_diff(actual) <= STOP_START_TOLERANCE_SECS =>
+        {
+            Ok(())
+        }
+        (Some(_), Some(_)) => {
+            Err("The process has changed since it was detected; not stopping it".to_string())
+        }
+        _ => Err("Cannot confirm the process start time; not stopping it".to_string()),
+    }
+}
+
+/// Start time (seconds since the epoch) of a running pid, as detection
+/// records it in `DetectedSession::process_start_secs`.
+pub fn process_start_secs(pid: u32) -> Option<u64> {
+    crate::session::detector_cli::process_start_times(&[pid])
+        .get(&pid)
+        .copied()
+}
+
+/// Stop the Claude Code session whose key (`claudeCode:<sessionId>`) is
+/// `key`. The pid comes from `resolve` (c9watch's own detection), never from
+/// the caller; `expect_pid`, when given, only has to agree with it.
+/// Returns the pid that was signalled.
+pub fn stop_session_by_key(
+    key: &str,
+    expect_pid: Option<u32>,
+    resolve: impl FnOnce() -> Result<Vec<DetectedSession>, String>,
+    start_time_of: impl Fn(u32) -> Option<u64>,
+) -> Result<u32, String> {
+    stop_session_by_key_with(key, expect_pid, resolve, start_time_of, send_sigterm)
+}
+
+fn stop_session_by_key_with(
+    key: &str,
+    expect_pid: Option<u32>,
+    resolve: impl FnOnce() -> Result<Vec<DetectedSession>, String>,
+    start_time_of: impl Fn(u32) -> Option<u64>,
+    signal: impl FnOnce(u32) -> Result<(), String>,
+) -> Result<u32, String> {
+    let sessions = resolve()?;
+    let session = sessions
+        .iter()
+        .find(|s| s.identity_key().as_deref() == Some(key))
+        .ok_or_else(|| format!("No running session matches {key}"))?;
+    if !is_stoppable(session) {
         return Err("This session cannot be stopped through c9watch".to_string());
     }
-    crate::debug_log::log_info(&format!("[stop_session] Stopping PID: {}", pid));
-
-    // First try SIGTERM (signal 15) - graceful termination
-    let output = Command::new("kill")
-        .arg("-15") // SIGTERM
-        .arg(pid.to_string())
-        .output()
-        .map_err(|e| format!("Failed to execute kill command: {}", e))?;
-
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        crate::debug_log::log_error(&format!("[stop_session] SIGTERM failed: {}", error));
-
-        // If SIGTERM fails, the process might not exist or we don't have permission
-        return Err(format!("Failed to stop process {}: {}", pid, error));
+    if expect_pid.is_some_and(|pid| pid != session.pid) {
+        return Err(format!(
+            "Session {key} is no longer running as that process; not stopping it"
+        ));
     }
+    stop_detected(session, start_time_of, signal)
+}
 
+/// Stop the Claude Code session running as `pid`. Only a pid that detection
+/// reports for a stoppable session is accepted. Kept for `c9watch stop <pid>`.
+pub fn stop_session_by_pid(
+    pid: u32,
+    resolve: impl FnOnce() -> Result<Vec<DetectedSession>, String>,
+    start_time_of: impl Fn(u32) -> Option<u64>,
+) -> Result<(), String> {
+    stop_session_by_pid_with(pid, resolve, start_time_of, send_sigterm)
+}
+
+fn stop_session_by_pid_with(
+    pid: u32,
+    resolve: impl FnOnce() -> Result<Vec<DetectedSession>, String>,
+    start_time_of: impl Fn(u32) -> Option<u64>,
+    signal: impl FnOnce(u32) -> Result<(), String>,
+) -> Result<(), String> {
+    let sessions = resolve()?;
+    let session = sessions
+        .iter()
+        .find(|s| s.pid == pid && is_stoppable(s))
+        .ok_or_else(|| format!("PID {pid} is not a Claude Code session c9watch can stop"))?;
+    stop_detected(session, start_time_of, signal).map(|_| ())
+}
+
+fn is_stoppable(session: &DetectedSession) -> bool {
+    session.provider == SessionProvider::ClaudeCode && session.can_stop && session.pid != 0
+}
+
+fn stop_detected(
+    session: &DetectedSession,
+    start_time_of: impl Fn(u32) -> Option<u64>,
+    signal: impl FnOnce(u32) -> Result<(), String>,
+) -> Result<u32, String> {
+    let pid = session.pid;
+    verify_stop_target(session.process_start_secs, start_time_of(pid))?;
+    crate::debug_log::log_info(&format!("[stop_session] Stopping PID: {}", pid));
+    signal(pid)?;
     crate::debug_log::log_info("[stop_session] SIGTERM sent successfully");
-    Ok(())
+    Ok(pid)
+}
+
+/// Gracefully terminate `pid` with SIGTERM. SIGTERM is preferred over SIGINT
+/// as Claude Code may trap SIGINT for its own use.
+#[cfg(unix)]
+fn send_sigterm(pid: u32) -> Result<(), String> {
+    // pid 0 and negative pids signal process groups (-1: every process this
+    // user owns), and pid 1 is init; a u32 above i32::MAX wraps negative.
+    let target = libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|&p| p > 1)
+        .ok_or_else(|| format!("Refusing to signal PID {pid}"))?;
+    if unsafe { libc::kill(target, libc::SIGTERM) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    crate::debug_log::log_error(&format!("[stop_session] SIGTERM failed: {}", error));
+    Err(match error.raw_os_error() {
+        Some(libc::ESRCH) => format!("Process {pid} is no longer running"),
+        Some(libc::EPERM) => format!("Not permitted to stop process {pid}"),
+        _ => format!("Failed to stop process {pid}: {error}"),
+    })
+}
+
+#[cfg(not(unix))]
+fn send_sigterm(pid: u32) -> Result<(), String> {
+    Err(format!(
+        "Stopping process {pid} is not supported on this platform"
+    ))
 }
 
 #[cfg(test)]
@@ -1084,10 +1237,180 @@ mod tests {
     }
 
     #[test]
-    fn test_stop_session_invalid_pid() {
-        // Try to stop a non-existent process
-        let result = stop_session(999999);
+    fn verify_stop_target_accepts_only_a_matching_start_time() {
+        assert!(verify_stop_target(Some(1_000), Some(1_000)).is_ok());
+        assert!(verify_stop_target(Some(1_000), Some(1_001)).is_ok());
+        assert!(verify_stop_target(Some(1_000), Some(1_100)).is_err());
+        assert!(verify_stop_target(None, Some(1_000)).is_err());
+        assert!(verify_stop_target(Some(1_000), None).is_err());
+    }
+
+    const KEY: &str = "claudeCode:stop-fixture";
+
+    fn stoppable(pid: u32, start: u64) -> DetectedSession {
+        DetectedSession {
+            process_start_secs: Some(start),
+            ..DetectedSession::with_legacy_defaults(
+                pid,
+                "/tmp".into(),
+                "/tmp/proj".into(),
+                Some("stop-fixture".to_string()),
+                "proj".to_string(),
+            )
+        }
+    }
+
+    /// Runs a by-key stop of `KEY` against `sessions` with a recording
+    /// signal; the process table reports every pid as started at 1000.
+    fn stop_key(
+        sessions: Vec<DetectedSession>,
+        expect_pid: Option<u32>,
+    ) -> (Result<u32, String>, Vec<u32>) {
+        let mut signalled = Vec::new();
+        let result = stop_session_by_key_with(
+            KEY,
+            expect_pid,
+            || Ok(sessions),
+            |_| Some(1_000),
+            |pid| {
+                signalled.push(pid);
+                Ok(())
+            },
+        );
+        (result, signalled)
+    }
+
+    #[test]
+    fn stop_by_key_signals_the_detected_pid() {
+        let (result, signalled) = stop_key(vec![stoppable(4242, 1_000)], Some(4242));
+        assert_eq!(result, Ok(4242));
+        assert_eq!(signalled, [4242]);
+    }
+
+    #[test]
+    fn stop_by_key_refuses_without_signalling() {
+        let mut no_stop = stoppable(4242, 1_000);
+        no_stop.can_stop = false;
+        let mut codex = stoppable(4242, 1_000);
+        codex.provider = SessionProvider::Codex;
+        let cases = [
+            (vec![], None),                          // key not detected
+            (vec![no_stop], None),                   // can_stop = false
+            (vec![codex], None),                     // not Claude Code
+            (vec![stoppable(4242, 1_000)], Some(7)), // caller's pid disagrees
+            (vec![stoppable(4242, 1_500)], None),    // pid now another process
+        ];
+        for (sessions, expect_pid) in cases {
+            let (result, signalled) = stop_key(sessions, expect_pid);
+            assert!(result.is_err());
+            assert!(signalled.is_empty());
+        }
+    }
+
+    #[test]
+    fn stop_by_pid_accepts_only_a_detected_stoppable_pid() {
+        let mut codex = stoppable(5555, 1_000);
+        codex.provider = SessionProvider::Codex;
+        let detected = vec![stoppable(4242, 1_000), codex];
+        let mut signalled = Vec::new();
+        for pid in [9999, 5555, 4242] {
+            let result = stop_session_by_pid_with(
+                pid,
+                || Ok(detected.clone()),
+                |_| Some(1_000),
+                |pid| {
+                    signalled.push(pid);
+                    Ok(())
+                },
+            );
+            assert_eq!(result.is_ok(), pid == 4242, "pid {pid}");
+        }
+        assert_eq!(signalled, [4242]);
+    }
+
+    /// Runs a by-key open of `KEY` against `sessions` with a recording opener.
+    fn open_key(
+        sessions: Vec<DetectedSession>,
+        expect_pid: Option<u32>,
+    ) -> (Result<(), String>, Vec<(u32, String)>) {
+        let mut opened = Vec::new();
+        let result = open_session_by_key_with(
+            KEY,
+            expect_pid,
+            || Ok(sessions),
+            |pid, path| {
+                opened.push((pid, path));
+                Ok(())
+            },
+        );
+        (result, opened)
+    }
+
+    #[test]
+    fn open_by_key_uses_the_detected_pid_and_project_path() {
+        let (result, opened) = open_key(vec![stoppable(4242, 1_000)], Some(4242));
+        assert_eq!(result, Ok(()));
+        assert_eq!(opened, [(4242, "/tmp/proj".to_string())]);
+    }
+
+    #[test]
+    fn open_by_key_refuses_without_opening() {
+        let mut no_open = stoppable(4242, 1_000);
+        no_open.can_open = false;
+        let mut dash = stoppable(4242, 1_000);
+        dash.project_path = "--install-extension=evil".into();
+        let cases = [
+            (vec![], None),                          // key not detected
+            (vec![no_open], None),                   // can_open = false
+            (vec![stoppable(0, 1_000)], None),       // no focusable process
+            (vec![stoppable(4242, 1_000)], Some(7)), // caller's pid disagrees
+            (vec![dash], None),                      // path reads as an option
+        ];
+        for (sessions, expect_pid) in cases {
+            let (result, opened) = open_key(sessions, expect_pid);
+            assert!(result.is_err());
+            assert!(opened.is_empty());
+        }
+    }
+
+    #[test]
+    fn open_paths_that_start_with_a_dash_are_rejected() {
+        assert!(check_open_path("-r").is_err());
+        assert!(check_open_path("--install-extension=x").is_err());
+        assert!(check_open_path("").is_ok(), "a terminal focus needs no path");
+        assert!(check_open_path("/Users/me/project").is_ok());
+        assert!(check_open_path("relative/dir").is_ok());
+        assert!(open_session(4242, "--goto=x".into())
+            .unwrap_err()
+            .contains("not a project path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn send_sigterm_refuses_group_and_init_pids() {
+        for pid in [0, 1, u32::MAX, i32::MAX as u32 + 1] {
+            assert!(send_sigterm(pid).unwrap_err().starts_with("Refusing"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_checks_a_real_process_start_time_before_signalling() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let actual = process_start_secs(pid).expect("child start time");
+
+        let wrong = vec![stoppable(pid, actual + 100)];
+        let result = stop_session_by_key(KEY, Some(pid), || Ok(wrong), process_start_secs);
         assert!(result.is_err());
+        assert!(child.try_wait().unwrap().is_none(), "child must survive");
+
+        let right = vec![stoppable(pid, actual)];
+        let result = stop_session_by_key(KEY, Some(pid), || Ok(right), process_start_secs);
+        assert_eq!(result, Ok(pid));
+        let status = child.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
     }
 
     #[test]

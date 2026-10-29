@@ -124,7 +124,7 @@
 
 	async function handleOpen(session: Session) {
 		try {
-			await openSession(session.pid, session.projectPath);
+			await openSession(session);
 		} catch (error) {
 			console.error('Failed to open:', error);
 		}

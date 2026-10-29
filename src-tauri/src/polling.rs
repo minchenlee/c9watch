@@ -313,6 +313,9 @@ fn fire_notification(
     let session_name = &session.session_name;
     let pending_tool_name = session.pending_tool_name.as_deref();
     let title = truncate_string(custom_title.unwrap_or(&session.first_prompt), 60);
+    // The WS server sends this instead of `title` when remote clients may not
+    // see conversation text (`title` can be the first prompt).
+    let redacted_title = truncate_string(custom_title.unwrap_or(session_name), 60);
 
     // Build the body based on the status
     let body = match session.status {
@@ -346,6 +349,7 @@ fn fire_notification(
     // Broadcast to WebSocket clients for web notifications
     let ws_notification = serde_json::json!({
         "title": title,
+        "redactedTitle": redacted_title,
         "body": body,
         "sessionId": session.id,
         "sessionKey": session.session_key,

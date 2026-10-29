@@ -46,11 +46,11 @@ const allSessions = await getSessions();
 // Get conversation for a session
 const conv = await getConversation(sessionId);
 
-// Stop a session
-await stopSession(pid);
+// Stop a session (resolved by session key on the backend)
+await stopSession(session);
 
 // Open terminal/IDE window
-await openSession(pid, projectPath);
+await openSession(session);
 ```
 
 ## Event Listeners

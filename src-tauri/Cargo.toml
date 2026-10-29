@@ -28,10 +28,11 @@ gui = [
     "dep:axum",
     "dep:tokio",
     "dep:rand",
-    "dep:qr2term",
     "dep:rust-embed",
     "dep:mime_guess",
     "dep:base64",
+    "dep:sha2",
+    "dep:subtle",
     "dep:tauri-nspanel",
 ]
 cli = ["dep:clap", "dep:regex", "dep:tokio"]
@@ -67,10 +68,11 @@ tauri-plugin-sharekit = { version = "0.3", optional = true }
 axum = { version = "0.7", features = ["ws"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "process", "signal", "fs", "time", "macros"], optional = true }
 rand = { version = "0.8", optional = true }
-qr2term = { version = "0.3", optional = true }
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 base64 = { version = "0.22", optional = true }
+sha2 = { version = "0.10", optional = true }
+subtle = { version = "2.6", optional = true }
 
 # ── CLI-only dependencies ────────────────────────────────────────────
 clap = { version = "4", features = ["derive"], optional = true }
@@ -84,6 +86,8 @@ tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", rev = "da9c9a
 
 [dev-dependencies]
 tempfile = "3"
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 notify-rust = { version = "4", optional = true }

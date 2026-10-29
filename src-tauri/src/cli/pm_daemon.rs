@@ -5,6 +5,7 @@ use crate::cli::pm_worker::{
 };
 use crate::cli::worker_backend::{select_backend, validate_initial_prompt, BackendKind};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -83,32 +84,156 @@ fn worker_crashed_json(full_id: &str, callback_inbox: &str) -> serde_json::Value
     })
 }
 
+// ── Peer check ────────────────────────────────────────────────────────────────
+
+/// Only a process running as the daemon's own uid may talk to it.
+pub(crate) fn peer_allowed(peer_uid: u32, me: u32) -> bool {
+    peer_uid == me
+}
+
+/// Check the uid of the process on the other end of an accepted connection.
+/// A peer whose credentials cannot be read is rejected too. `Err(None)`
+/// means the peer already hung up (the `ensure_daemon` readiness probe does
+/// this), which is rejected without a log line.
+fn check_peer(stream: &UnixStream, me: u32) -> Result<(), Option<String>> {
+    match stream.peer_cred() {
+        Ok(cred) if peer_allowed(cred.uid(), me) => Ok(()),
+        Ok(cred) => Err(Some(format!("peer uid mismatch uid={}", cred.uid()))),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => Err(None),
+        Err(e) => Err(Some(format!("peer uid mismatch uid=unknown ({})", e))),
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
+
+/// How long a new daemon waits for a pre-lock daemon to exit after asking it
+/// to shut down. Its shutdown kills every worker first.
+const LEGACY_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the Shutdown RPC to a pre-lock daemon may take.
+const LEGACY_SHUTDOWN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The longest a new daemon may spend retiring a pre-lock daemon before it
+/// binds. Clients wait longer than this (see `pm::DAEMON_READY_TIMEOUT`).
+pub(crate) const LEGACY_RETIRE_BUDGET: Duration =
+    Duration::from_secs(LEGACY_SHUTDOWN_RPC_TIMEOUT.as_secs() + LEGACY_EXIT_TIMEOUT.as_secs());
+
+/// Ask a daemon from before the lifetime lock (it never takes `daemon.lock`)
+/// to shut down, and wait for its pid to exit. Must run while holding the
+/// lock and before binding: the old daemon's shutdown deletes `daemon.sock`
+/// unconditionally, so binding first would lose the new socket.
+///
+/// Only a daemon that answers on our socket is asked; a live pid with
+/// nothing listening is a stale pid file pointing at a reused pid.
+fn retire_legacy_daemon(sock_path: &Path, pid_path: &Path) -> Result<(), String> {
+    let pid = match std::fs::read_to_string(pid_path)
+        .ok()
+        .and_then(|c| c.trim().parse::<libc::pid_t>().ok())
+    {
+        Some(pid) if pid > 1 && pid as u32 != std::process::id() => pid,
+        _ => return Ok(()),
+    };
+    let alive = |pid: libc::pid_t| unsafe { libc::kill(pid, 0) } == 0;
+    if !alive(pid) {
+        return Ok(());
+    }
+    match crate::cli::pm_rpc::rpc_call(
+        sock_path,
+        &RpcRequest::Shutdown,
+        LEGACY_SHUTDOWN_RPC_TIMEOUT,
+    ) {
+        Err(e) if e.starts_with(crate::cli::pm_rpc::DAEMON_UNREACHABLE) => return Ok(()),
+        Err(e) if e.starts_with(crate::cli::pm_rpc::DAEMON_UNTRUSTED) => return Err(e),
+        // The old daemon exits without answering Shutdown, so any other
+        // result means it got the request.
+        _ => {}
+    }
+    eprintln!("[pm_daemon] Asked old daemon pid={} to shut down", pid);
+    let deadline = std::time::Instant::now() + LEGACY_EXIT_TIMEOUT;
+    while alive(pid) {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "DAEMON_LEGACY_RUNNING: old daemon pid {} did not exit after shutdown",
+                pid
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+/// Take the lifetime lock and bind the daemon socket in `dir`.
+///
+/// Order: lock, retire a pre-lock daemon, clear the stale socket and temp
+/// sockets, bind 0600 under a temp name and rename, write the pid file, then
+/// write the ready mark into the lock file.
+/// A second daemon fails at the lock with `DAEMON_ALREADY_RUNNING` and never
+/// touches the socket or the pid file. The returned `DaemonLock` holds the lock and
+/// must live as long as the listener.
+pub(crate) fn start_listener(
+    dir: &Path,
+) -> Result<(pm_fs::DaemonLock, std::os::unix::net::UnixListener), String> {
+    let lock = pm_fs::acquire_daemon_lock(&dir.join(pm_fs::DAEMON_LOCK_NAME))?;
+
+    let sock_path = dir.join(pm_fs::DAEMON_SOCK_NAME);
+    let pid_path = dir.join(pm_fs::DAEMON_PID_NAME);
+    retire_legacy_daemon(&sock_path, &pid_path)?;
+
+    // We hold the lock, so nothing live is serving these paths.
+    match std::fs::remove_file(&sock_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "Failed to remove stale socket {:?}: {}",
+                sock_path, e
+            ))
+        }
+    }
+    let tmp_prefix = format!(".{}.tmp-", pm_fs::DAEMON_SOCK_NAME);
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&tmp_prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    // Bind BEFORE writing the pid file, so the socket is listening by the
+    // time anyone reads the pid (fix C3).
+    let listener = pm_fs::bind_private(&sock_path)?;
+
+    use std::io::Write;
+    pm_fs::open_private_file(
+        &pid_path,
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true),
+    )?
+    .write_all(std::process::id().to_string().as_bytes())
+    .map_err(|e| format!("Failed to write PID file {:?}: {}", pid_path, e))?;
+
+    pm_fs::mark_daemon_ready(&lock)?;
+    Ok((lock, listener))
+}
 
 /// Called by the CLI's `Daemon` subcommand. Starts the RPC server loop.
 pub async fn run_daemon() -> Result<(), String> {
-    // 1. Ensure directories exist
+    // 1. Ensure directories exist (the base dir private, 0700)
     pm_fs::ensure_dirs()?;
 
-    // 2. Get socket path and remove stale socket if it exists
-    let sock_path = pm_fs::daemon_sock_path()?;
-    if sock_path.exists() {
-        std::fs::remove_file(&sock_path)
-            .map_err(|e| format!("Failed to remove stale socket {:?}: {}", sock_path, e))?;
-    }
-
-    // 3. Bind the Unix socket BEFORE writing the pid file. `ensure_daemon`
-    //    treats a live pid file as proof that the daemon is accepting RPCs, so
-    //    the socket must be listening first — otherwise a waiter can see the
-    //    pid, dial the socket, and hit ECONNREFUSED (fix C3).
-    let listener = UnixListener::bind(&sock_path)
-        .map_err(|e| format!("Failed to bind Unix socket {:?}: {}", sock_path, e))?;
-
-    // 4. Write PID file now that the socket is listening.
+    // 2-4. Lock, bind and write the pid file. `_lock` holds the lifetime
+    //      flock until the process exits.
+    let dir = pm_fs::c9watch_dir()?;
+    let sock_path = dir.join(pm_fs::DAEMON_SOCK_NAME);
+    let (_lock, std_listener) = start_listener(&dir)?;
+    std_listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("Failed to set socket non-blocking: {}", e))?;
+    let listener = UnixListener::from_std(std_listener)
+        .map_err(|e| format!("Failed to register Unix socket: {}", e))?;
     let pid = std::process::id();
-    let pid_path = pm_fs::daemon_pid_path()?;
-    std::fs::write(&pid_path, pid.to_string())
-        .map_err(|e| format!("Failed to write PID file {:?}: {}", pid_path, e))?;
 
     // 5. Read max_workers from env
     let max_workers: usize = std::env::var("C9WATCH_MAX_WORKERS")
@@ -127,12 +252,23 @@ pub async fn run_daemon() -> Result<(), String> {
     }));
 
     // 7. Accept loop — interruptible by ctrl_c / SIGTERM so the daemon can
-    //    kill workers and clean up their worker dirs before exiting.
+    //    kill workers and clean up their worker dirs before exiting. Every
+    //    peer must run as our uid; the 0700 dir and 0600 socket are the
+    //    first fence, this check is the second.
+    let me = unsafe { libc::geteuid() };
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| format!("Failed to install SIGTERM handler: {}", e))?;
     loop {
         tokio::select! {
             accept = listener.accept() => {
                 match accept {
                     Ok((stream, _addr)) => {
+                        if let Err(reason) = check_peer(&stream, me) {
+                            if let Some(reason) = reason {
+                                eprintln!("[pm_daemon] {}", reason);
+                            }
+                            continue;
+                        }
                         let state_clone = Arc::clone(&state);
                         tokio::spawn(async move {
                             handle_connection(stream, state_clone, max_workers).await;
@@ -145,6 +281,10 @@ pub async fn run_daemon() -> Result<(), String> {
             }
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("[pm_daemon] Received ctrl_c / SIGINT, shutting down...");
+                shutdown_daemon(state).await;
+            }
+            _ = sigterm.recv() => {
+                eprintln!("[pm_daemon] Received SIGTERM, shutting down...");
                 shutdown_daemon(state).await;
             }
         }
@@ -160,10 +300,9 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>, m
 
     // Read one JSON line
     match reader.read_line(&mut line).await {
-        Ok(0) => {
-            eprintln!("[pm_daemon] Client disconnected without sending a request");
-            return;
-        }
+        // `ensure_daemon` probes readiness by connecting and closing, so a
+        // connection with no request is normal and not logged.
+        Ok(0) => return,
         Err(e) => {
             eprintln!("[pm_daemon] Failed to read request line: {}", e);
             return;
@@ -1217,48 +1356,117 @@ mod tests {
 
     // ── C3: bind-before-pid invariant ────────────────────────────────────────
 
-    /// Verify the C3 invariant by binding a Unix socket and writing a pid file
-    /// in the correct order: socket must be bound before pid file exists.
-    ///
-    /// This mimics what `run_daemon` does. `ensure_daemon` polls `sock_path.exists()`
-    /// as the readiness signal (not the pid file), but the pid-file ordering
-    /// ensures that any caller which _reads_ the pid file will find the socket
-    /// already listening — no ECONNREFUSED window.
+    fn private_tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("c9w-d-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        pm_fs::ensure_private_dir(&d).expect("private temp dir");
+        d
+    }
+
+    fn mode_of(p: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// `start_listener` binds the socket (0600) before the pid file exists,
+    /// so anyone who reads the pid finds the socket already listening.
     #[test]
     fn c3_socket_bound_before_pid_file_written() {
-        use std::fs;
-        use tokio::net::UnixListener;
+        let dir = private_tmpdir("c3");
+        let sock_path = dir.join(pm_fs::DAEMON_SOCK_NAME);
+        let pid_path = dir.join(pm_fs::DAEMON_PID_NAME);
 
-        // Use a temp directory so the test is isolated and self-cleaning.
-        let dir = std::env::temp_dir().join(format!("c3_test_{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("create temp dir");
+        let _listener = pm_fs::bind_private(&sock_path).expect("bind");
+        assert!(sock_path.exists(), "socket must exist after bind");
+        assert_eq!(mode_of(&sock_path), 0o600);
+        assert!(!pid_path.exists(), "pid file must not exist before write");
+        drop(_listener);
 
-        let sock_path = dir.join("daemon.sock");
-        let pid_path = dir.join("daemon.pid");
+        let (_lock, _l) = start_listener(&dir).expect("start_listener");
+        assert_eq!(mode_of(&sock_path), 0o600);
+        assert_eq!(mode_of(&pid_path), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&pid_path).unwrap(),
+            std::process::id().to_string()
+        );
+        assert!(pm_fs::daemon_ready_marked(
+            &dir.join(pm_fs::DAEMON_LOCK_NAME)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        // Run on a single-threaded tokio runtime to keep the test synchronous.
+    // ── C0h-07: peer uid check ───────────────────────────────────────────────
+
+    #[test]
+    fn peer_allowed_only_for_our_uid() {
+        let me = unsafe { libc::geteuid() };
+        assert!(peer_allowed(me, me));
+        assert!(!peer_allowed(me + 1, me));
+        assert!(!peer_allowed(0, me + 1));
+    }
+
+    #[test]
+    fn peer_cred_same_uid_allowed() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .build()
-            .expect("build tokio rt");
-
+            .unwrap();
         rt.block_on(async {
-            // Step 1: bind socket
-            let _listener = UnixListener::bind(&sock_path).expect("bind Unix socket");
-
-            // Assert: socket exists, pid file does NOT yet
-            assert!(sock_path.exists(), "socket must exist after bind");
-            assert!(!pid_path.exists(), "pid file must not exist before write");
-
-            // Step 2: write pid file
-            fs::write(&pid_path, std::process::id().to_string()).expect("write pid file");
-
-            // Assert: both now exist in the correct causal order
-            assert!(sock_path.exists(), "socket still exists after pid write");
-            assert!(pid_path.exists(), "pid file exists after write");
+            let (a, _b) = UnixStream::pair().unwrap();
+            let me = unsafe { libc::geteuid() };
+            assert!(check_peer(&a, me).is_ok());
+            // The same connection seen by a daemon running as another uid.
+            let err = check_peer(&a, me + 1).unwrap_err();
+            assert_eq!(err, Some(format!("peer uid mismatch uid={}", me)));
         });
+    }
 
-        // Clean up
-        let _ = fs::remove_dir_all(&dir);
+    // ── C0h-06: lifetime lock ────────────────────────────────────────────────
+
+    #[test]
+    fn second_daemon_cannot_steal_socket() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::fs::MetadataExt;
+        let dir = private_tmpdir("steal");
+        let sock_path = dir.join(pm_fs::DAEMON_SOCK_NAME);
+
+        let (_lock, listener) = start_listener(&dir).expect("first daemon");
+        let ino = std::fs::metadata(&sock_path).unwrap().ino();
+
+        let err = start_listener(&dir).unwrap_err();
+        assert_eq!(err, pm_fs::DAEMON_ALREADY_RUNNING);
+        assert_eq!(std::fs::metadata(&sock_path).unwrap().ino(), ino);
+
+        // The first listener still serves the path.
+        let h = std::thread::spawn(move || {
+            let (c, _) = listener.accept().unwrap();
+            let mut s = String::new();
+            BufReader::new(&c).read_line(&mut s).unwrap();
+            s
+        });
+        let mut c = std::os::unix::net::UnixStream::connect(&sock_path).unwrap();
+        writeln!(c, "ping").unwrap();
+        assert_eq!(h.join().unwrap(), "ping\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_socket_is_replaced_when_unlocked() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = private_tmpdir("stale");
+        let sock_path = dir.join(pm_fs::DAEMON_SOCK_NAME);
+
+        // A crashed daemon leaves its socket file and a temp socket behind.
+        drop(std::os::unix::net::UnixListener::bind(&sock_path).unwrap());
+        let stale_tmp = dir.join(format!(".{}.tmp-999999", pm_fs::DAEMON_SOCK_NAME));
+        std::fs::write(&stale_tmp, b"").unwrap();
+        let old_ino = std::fs::metadata(&sock_path).unwrap().ino();
+        assert!(std::os::unix::net::UnixStream::connect(&sock_path).is_err());
+
+        let (_lock, _listener) = start_listener(&dir).expect("start over stale socket");
+        assert_ne!(std::fs::metadata(&sock_path).unwrap().ino(), old_ino);
+        assert!(!stale_tmp.exists());
+        assert!(std::os::unix::net::UnixStream::connect(&sock_path).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

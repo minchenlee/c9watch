@@ -754,13 +754,24 @@ fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
     // daemon for a worker match first; only fall back to PID if no worker
     // matches AND the target parses as u32.
     #[cfg(feature = "pm-orchestration")]
-    if let Some(worker_id) = try_resolve_worker(target) {
+    if let Some(worker_id) = try_resolve_worker(target)? {
         return pm::cmd_stop(worker_id, pretty);
     }
 
     // If target parses as u32, treat as PID (regular Claude session stop).
+    // Only a pid detection reports for a stoppable Claude Code session is
+    // signalled, and only while it is still the process detection saw.
     if let Ok(pid) = target.parse::<u32>() {
-        crate::actions::stop_session(pid)?;
+        crate::actions::stop_session_by_pid(
+            pid,
+            || {
+                session::create_session_source()
+                    .detect()
+                    .map(|(detected, _)| detected)
+                    .map_err(|e| format!("Failed to detect sessions: {e}"))
+            },
+            crate::actions::process_start_secs,
+        )?;
         let output = serde_json::json!({
             "stopped": true,
             "pid": pid,
@@ -783,22 +794,39 @@ fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
 
 /// If the PM daemon is already running and has exactly one worker whose
 /// session id matches `target` (exact or unique prefix), return that full
-/// session id. Returns `None` if the daemon is unreachable, if there's no
-/// match, or if the match is ambiguous — leaving the caller free to fall
+/// session id. Returns `Ok(None)` if the daemon is unreachable, if there's
+/// no match, or if the match is ambiguous — leaving the caller free to fall
 /// back to PID-based stop.
+///
+/// Returns `Err` when the daemon socket fails the trust checks
+/// (`DAEMON_UNTRUSTED`): then the caller must stop, not fall back to PID.
 ///
 /// This function never starts the daemon: if the daemon isn't running there
 /// can't be any workers to match against, so PID-based stop is safe.
 #[cfg(feature = "pm-orchestration")]
-fn try_resolve_worker(target: &str) -> Option<String> {
+fn try_resolve_worker(target: &str) -> Result<Option<String>, String> {
     use std::time::Duration;
-    let sock_path = pm_fs::daemon_sock_path().ok()?;
-    if !sock_path.exists() {
-        return None;
+    let sock_path = match pm_fs::daemon_sock_path() {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    if std::fs::symlink_metadata(&sock_path).is_err() {
+        return Ok(None);
     }
+    // An install from before the 0700 dir still has a 0755 dir. Narrow it
+    // first, as `ensure_daemon` does, so the trust check below accepts it.
+    pm_fs::ensure_private_dir(&pm_fs::c9watch_dir()?)
+        .map_err(|e| format!("{}: {}", pm_rpc::DAEMON_UNTRUSTED, e))?;
     let request = pm_rpc::RpcRequest::List;
-    let response = pm_rpc::rpc_call(&sock_path, &request, Duration::from_secs(2)).ok()?;
-    let workers = response.get("workers").and_then(|w| w.as_array())?;
+    let response = match pm_rpc::rpc_call(&sock_path, &request, Duration::from_secs(2)) {
+        Ok(r) => r,
+        Err(e) if e.starts_with(pm_rpc::DAEMON_UNTRUSTED) => return Err(e),
+        Err(_) => return Ok(None),
+    };
+    let workers = match response.get("workers").and_then(|w| w.as_array()) {
+        Some(w) => w,
+        None => return Ok(None),
+    };
     let ids: Vec<String> = workers
         .iter()
         .filter_map(|w| {
@@ -812,7 +840,7 @@ fn try_resolve_worker(target: &str) -> Option<String> {
     // ambiguous rules stay in one place. An ambiguous prefix silently falls
     // through to None: the caller will next try PID parsing, which fails for
     // a uuid-shaped prefix, landing in the WORKER_NOT_FOUND path from PM.
-    pm_daemon::resolve_worker_id_from_keys(ids.iter().map(|s| s.as_str()), target).ok()
+    Ok(pm_daemon::resolve_worker_id_from_keys(ids.iter().map(|s| s.as_str()), target).ok())
 }
 
 /// One poll of live sessions as `watch`/`wait` snapshots, keyed by the

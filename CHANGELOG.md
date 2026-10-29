@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+These changes break old mobile clients, QR codes and bookmarks on purpose. See [docs/mobile-migration-c0h.md](docs/mobile-migration-c0h.md) before you upgrade.
+
+- **Port 9210 listens on this Mac only.** LAN access is a new opt-in in **Settings → Remote access**. With it on, traffic is plain `ws://`, and the settings page says so.
+- **Pairing codes replace tokens in URLs.** Connect Mobile shows a one-time 8-character code (5 minutes, single use) and a QR code that carries it in the URL fragment. A device sends its token in the first WebSocket frame, never in the URL. Old `?token=` URLs stop working; devices must pair again. **Forget paired devices** disconnects them all.
+- **Remote devices see cards only by default.** Conversations (including the first prompt, latest messages and pending tool input in session pushes) and opening a terminal are separate opt-in settings.
+- **The server checks `Host` on every route and `Origin` on the WebSocket upgrade**, and sends a strict content security policy. The desktop webview has a strict CSP too. Remote images in Markdown no longer load.
+- **Stop resolves the session itself.** `session.stop{addr}` replaces `stopSession{pid}`; c9watch signals only a detected Claude Code session whose process start time still matches. A refused stop shows its reason. `openSession` also takes `{addr}` and uses the detected project path.
+- **The access URL is no longer logged** or printed as a terminal QR code.
+- **The PM daemon state directory is private** (`0700`, files `0600`), it refuses clients of another user, and a second daemon can no longer take over the socket. Run `pkill -f 'c9watch daemon'` once after upgrading.
+
 ## [0.11.1] - 2026-10-15
 
 ### Added
