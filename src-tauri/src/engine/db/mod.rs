@@ -10,20 +10,30 @@
 //! 3. Migrations, each after a `VACUUM INTO` backup (see `migrate`).
 //! 4. This machine's row in `machines` (`is_self`), keyed by the machine
 //!    key id. A new self row is audited.
-//! 5. The writable connection moves to the writer thread (see `writer`).
+//! 5. Event retention runs once (see `outbox`).
+//! 6. The writable connection moves to the writer thread (see `writer`).
+//!
+//! State changes go through `Db::write`, which runs on the writer thread in
+//! one transaction and can emit events into the outbox in that same
+//! transaction.
 //!
 //! Call `open` only while holding the engine lock: it may move the db.
 
 pub mod audit;
 pub mod migrate;
+pub mod outbox;
 pub mod writer;
 
 use super::fsutil::ensure_private_dir;
 use audit::AuditEntry;
 use migrate::{migrate, MIGRATIONS};
-use rusqlite::{params, Connection, ErrorCode, OpenFlags};
+use outbox::{Cursor, NewEvent, ReadError, Subscription};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags, Transaction};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use writer::Writer;
 
 /// The db file inside the engine home.
@@ -51,6 +61,35 @@ pub struct Db {
     epoch: String,
     moved_aside: Option<PathBuf>,
     writer: Writer,
+    /// The newest committed event `seq`, sent after each commit that emitted
+    /// events. Subscribers wake on it and read the rows from SQLite.
+    head: Arc<watch::Sender<i64>>,
+}
+
+/// A write transaction on the writer thread. Derefs to the connection, so
+/// state changes run on it directly; `emit` adds an event to the same
+/// transaction.
+pub struct Tx<'a> {
+    tx: Transaction<'a>,
+    epoch: String,
+    last: Option<i64>,
+}
+
+impl Tx<'_> {
+    /// Insert `e` into the outbox. It becomes visible, and is broadcast,
+    /// only when the transaction commits.
+    pub fn emit(&mut self, e: &NewEvent) -> rusqlite::Result<i64> {
+        let seq = outbox::append(&self.tx, &self.epoch, now_ms(), e)?;
+        self.last = Some(seq);
+        Ok(seq)
+    }
+}
+
+impl std::ops::Deref for Tx<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.tx
+    }
 }
 
 impl Db {
@@ -72,6 +111,88 @@ impl Db {
 
     pub fn writer(&self) -> &Writer {
         &self.writer
+    }
+
+    /// Run `f` in one write transaction on the writer thread. It commits
+    /// when `f` returns `Ok` and rolls back otherwise. Returns `f`'s value
+    /// and the cursor of the last event it emitted.
+    pub async fn write<R, F>(&self, f: F) -> Result<(R, Option<Cursor>), String>
+    where
+        F: FnOnce(&mut Tx) -> rusqlite::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let job = tx_job(self.epoch.clone(), self.head.clone(), f);
+        let (r, seq) = self.writer.call(job).await??;
+        Ok((r, seq.map(|s| self.cursor_at(s))))
+    }
+
+    /// `write` for code outside the async runtime (boot, tests).
+    pub fn write_blocking<R, F>(&self, f: F) -> Result<(R, Option<Cursor>), String>
+    where
+        F: FnOnce(&mut Tx) -> rusqlite::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let job = tx_job(self.epoch.clone(), self.head.clone(), f);
+        let (r, seq) = self.writer.call_blocking(job)??;
+        Ok((r, seq.map(|s| self.cursor_at(s))))
+    }
+
+    /// Run event retention (24 h / 50k) on the writer thread.
+    pub async fn prune(&self) -> Result<usize, String> {
+        self.writer
+            .call(|c| outbox::prune(c, now_ms()))
+            .await?
+            .map_err(|e| format!("Failed to prune events: {}", e))
+    }
+
+    /// Finish the queued writes and close the writable connection; see
+    /// `Writer::close`. Readers and subscribers may still hold the `Db`.
+    pub fn close(&self) {
+        self.writer.close();
+    }
+
+    /// The cursor for `seq` in this db.
+    pub fn cursor_at(&self, seq: i64) -> Cursor {
+        Cursor {
+            machine: self.machine_id.clone(),
+            epoch: self.epoch.clone(),
+            seq,
+        }
+    }
+
+    /// The cursor of the newest committed event.
+    pub fn head_cursor(&self) -> Cursor {
+        self.cursor_at(*self.head.borrow())
+    }
+
+    /// Check that `since` belongs to this db and can be read on from
+    /// without a gap. Returns its `seq`. Blocking (one short read).
+    pub fn check_cursor(&self, since: &Cursor) -> Result<i64, ReadError> {
+        let conn = self.reader().map_err(ReadError::Db)?;
+        outbox::check_cursor(&conn, since, &self.machine_id, &self.epoch)
+    }
+
+    /// Follow the log from `after`, reading `batch` rows at a time.
+    pub fn subscribe(&self, after: i64, batch: usize) -> Result<Subscription, String> {
+        // Take the receiver before the reader's first read (A:218).
+        let rx = self.head.subscribe();
+        Ok(Subscription::new(self.reader()?, rx, after, batch))
+    }
+
+    /// The state for `snapshot.get` and the cursor it is consistent with,
+    /// read in one read transaction. Blocking.
+    pub fn snapshot(&self) -> Result<(Cursor, Vec<Value>), String> {
+        let conn = self.reader()?;
+        let fail = |e: rusqlite::Error| format!("Failed to read the snapshot: {}", e);
+        conn.execute_batch("BEGIN").map_err(fail)?;
+        let read = (|| {
+            let seq = outbox::head(&conn)?;
+            let agents = rows_as_json(&conn, "SELECT * FROM agents ORDER BY id")?;
+            Ok((seq, agents))
+        })();
+        conn.execute_batch("COMMIT").map_err(fail)?;
+        let (seq, agents) = read.map_err(fail)?;
+        Ok((self.cursor_at(seq), agents))
     }
 
     /// A new read-only connection. WAL lets readers run beside the writer.
@@ -114,13 +235,70 @@ pub fn open(home: &Path, machine_id: &str) -> Result<Db, String> {
     migrate(&mut conn, MIGRATIONS, &backups)?;
     let epoch = ensure_epoch(&conn)?;
     register_self(&mut conn, machine_id)?;
+    outbox::prune(&conn, now_ms()).map_err(|e| format!("Failed to prune events: {}", e))?;
+    let head = outbox::head(&conn).map_err(|e| format!("Failed to read the event head: {}", e))?;
     Ok(Db {
         path,
         machine_id: machine_id.to_string(),
         epoch,
         moved_aside,
         writer: Writer::spawn(conn)?,
+        head: Arc::new(watch::channel(head).0),
     })
+}
+
+type TxResult<R> = Result<(R, Option<i64>), String>;
+
+/// The writer job behind `Db::write`: run `f` in a transaction, commit, and
+/// only then broadcast the new head.
+fn tx_job<R, F>(
+    epoch: String,
+    head: Arc<watch::Sender<i64>>,
+    f: F,
+) -> impl FnOnce(&mut Connection) -> TxResult<R> + Send + 'static
+where
+    F: FnOnce(&mut Tx) -> rusqlite::Result<R> + Send + 'static,
+    R: Send + 'static,
+{
+    move |c| {
+        let fail = |e: rusqlite::Error| format!("Write failed: {}", e);
+        let mut tx = Tx {
+            tx: c.transaction().map_err(fail)?,
+            epoch,
+            last: None,
+        };
+        // On error `tx` drops here, which rolls back.
+        let r = f(&mut tx).map_err(fail)?;
+        let last = tx.last;
+        tx.tx.commit().map_err(fail)?;
+        if let Some(seq) = last {
+            head.send_replace(seq);
+        }
+        Ok((r, last))
+    }
+}
+
+/// Every row of `sql` as a JSON object keyed by column name.
+fn rows_as_json(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<Value>> {
+    let mut st = conn.prepare(sql)?;
+    let names: Vec<String> = st.column_names().iter().map(|n| n.to_string()).collect();
+    let rows = st.query_map([], |r| {
+        let mut obj = serde_json::Map::new();
+        for (i, name) in names.iter().enumerate() {
+            let v = match r.get_ref(i)? {
+                rusqlite::types::ValueRef::Null => Value::Null,
+                rusqlite::types::ValueRef::Integer(n) => Value::from(n),
+                rusqlite::types::ValueRef::Real(f) => Value::from(f),
+                rusqlite::types::ValueRef::Text(t) => {
+                    Value::from(String::from_utf8_lossy(t).into_owned())
+                }
+                rusqlite::types::ValueRef::Blob(_) => Value::Null,
+            };
+            obj.insert(name.clone(), v);
+        }
+        Ok(Value::Object(obj))
+    })?;
+    rows.collect()
 }
 
 /// Open `path` and run `quick_check`. `Ok(None)` means the file is corrupt
@@ -553,5 +731,92 @@ mod tests {
         let db = open(&h, M).unwrap();
         assert_eq!(self_rows(&db), [(M.to_string(), 1), ("m1".to_string(), 0)]);
         assert_eq!(audit_rows(&db).len(), 2);
+    }
+
+    fn agent_event(id: &str) -> NewEvent {
+        NewEvent {
+            topic: "agent.upsert".into(),
+            subject: Some(format!("{}/{}", M, id)),
+            origin: None,
+            data: serde_json::json!({ "id": id }),
+        }
+    }
+
+    fn insert_agent(tx: &Tx, id: &str) -> rusqlite::Result<usize> {
+        tx.execute(
+            "INSERT INTO agents (id, role, provider, source) \
+             VALUES (?1, 'observed', 'claude', 'detected')",
+            [id],
+        )
+    }
+
+    #[test]
+    fn an_event_commits_or_rolls_back_with_its_state_change() {
+        let (_t, h) = home();
+        let db = open(&h, M).unwrap();
+        let mut head = db.head.subscribe();
+        assert_eq!(
+            db.head_cursor().to_string(),
+            format!("{}:{}:0", M, db.epoch())
+        );
+
+        let (_, cur) = db
+            .write_blocking(|tx| {
+                insert_agent(tx, "a1")?;
+                tx.emit(&agent_event("a1"))
+            })
+            .unwrap();
+        assert_eq!(cur, Some(db.cursor_at(1)));
+        assert!(head.has_changed().unwrap());
+        assert_eq!(*head.borrow_and_update(), 1);
+
+        // The state change fails after the emit: neither row stays, and no
+        // head is broadcast.
+        let err = db
+            .write_blocking(|tx| {
+                tx.emit(&agent_event("a1"))?;
+                insert_agent(tx, "a1")
+            })
+            .unwrap_err();
+        assert!(err.contains("UNIQUE"), "{}", err);
+        assert!(!head.has_changed().unwrap());
+        let r = db.reader().unwrap();
+        let count = |sql: &str| -> i64 { r.query_row(sql, [], |row| row.get(0)).unwrap() };
+        assert_eq!(count("SELECT count(*) FROM agents"), 1);
+        assert_eq!(count("SELECT count(*) FROM events"), 1);
+
+        // A write without events moves no cursor.
+        let (_, cur) = db.write_blocking(|tx| insert_agent(tx, "a2")).unwrap();
+        assert_eq!(cur, None);
+        assert!(!head.has_changed().unwrap());
+
+        // The next event is seq 2: the rolled-back one took no seq.
+        let (_, cur) = db.write_blocking(|tx| tx.emit(&agent_event("a2"))).unwrap();
+        assert_eq!(cur.unwrap().seq, 2);
+    }
+
+    #[test]
+    fn the_snapshot_cursor_matches_its_state_and_survives_a_reopen() {
+        let (_t, h) = home();
+        let db = open(&h, M).unwrap();
+        db.write_blocking(|tx| {
+            insert_agent(tx, "a1")?;
+            tx.emit(&agent_event("a1"))
+        })
+        .unwrap();
+        let (cur, agents) = db.snapshot().unwrap();
+        assert_eq!(cur, db.cursor_at(1));
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["id"], "a1");
+        assert_eq!(agents[0]["source"], "detected");
+        assert_eq!(agents[0]["gone_at"], Value::Null);
+        assert_eq!(db.check_cursor(&cur), Ok(1));
+        db.close();
+        assert!(db.write_blocking(|tx| insert_agent(tx, "a2")).is_err());
+        drop(db);
+
+        let db = open(&h, M).unwrap();
+        assert_eq!(db.head_cursor(), cur);
+        assert_eq!(db.check_cursor(&cur), Ok(1));
     }
 }

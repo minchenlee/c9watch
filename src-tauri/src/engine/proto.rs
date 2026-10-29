@@ -99,6 +99,9 @@ pub enum ErrorCode {
     UnknownMethod,
     /// The peer runs under another uid.
     PeerUidMismatch,
+    /// The cursor's events are gone: pruned, another epoch or machine, or
+    /// ahead of the log.
+    CursorExpired,
     /// An engine-side failure.
     Internal,
 }
@@ -113,6 +116,7 @@ impl ErrorCode {
             ErrorCode::BadRequest => "bad_request",
             ErrorCode::UnknownMethod => "unknown_method",
             ErrorCode::PeerUidMismatch => "peer_uid_mismatch",
+            ErrorCode::CursorExpired => "cursor_expired",
             ErrorCode::Internal => "internal",
         }
     }
@@ -138,6 +142,9 @@ impl ErrorCode {
             }
             ErrorCode::UnknownMethod => "see `capabilities` in the hello result",
             ErrorCode::PeerUidMismatch => "connect as the user that runs the engine",
+            ErrorCode::CursorExpired => {
+                "call `snapshot.get`, then `events.subscribe` with the snapshot's cursor"
+            }
             ErrorCode::Internal => "retry; if it persists, check the engine log",
         }
     }
@@ -211,8 +218,69 @@ pub struct HelloResult {
     /// Stamped by the engine from connection facts.
     pub principal: String,
     pub capabilities: Vec<String>,
-    /// Current event cursor. `null` until the event store lands (M2).
+    /// Cursor of the newest committed event. `null` only without a store.
     pub cursor: Option<String>,
+}
+
+/// `snapshot.get` result: the state and the cursor it is consistent with.
+/// Subscribing with `since` = `cursor` continues with no gap.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotResult {
+    pub cursor: String,
+    pub machine_id: String,
+    /// Rows of the `agents` table, keyed by column name.
+    pub agents: Vec<serde_json::Value>,
+}
+
+/// `events.subscribe` params (A:218). Empty filters match everything.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscribeParams {
+    /// The last cursor the client has seen. Without it, the stream starts at
+    /// the current head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// Exact topics, or a prefix ending in `.*` (`agent.*`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<String>,
+    /// Exact subjects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+}
+
+/// `events.subscribe` result. Event frames follow it on the same
+/// connection until the connection closes, or until an error frame with
+/// the subscribe request's `id` (`cursor_expired` when the subscriber fell
+/// behind retention).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscribeResult {
+    /// Where the stream starts: events after this cursor follow.
+    pub cursor: String,
+}
+
+/// One event on the wire (A:203). `sub` is the `id` of the subscribe
+/// request, so a connection can carry several subscriptions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventFrame {
+    pub v: u32,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
+    pub cursor: String,
+    pub topic: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub ts: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<serde_json::Value>,
+    pub data: serde_json::Value,
+}
+
+impl EventFrame {
+    pub const KIND: &'static str = "event";
 }
 
 /// Why `read_frame` could not return a frame.
@@ -258,9 +326,18 @@ pub async fn read_frame<R: AsyncBufRead + Unpin>(
 
 /// Serialize `resp` as one NDJSON line.
 pub fn encode(resp: &Response) -> Vec<u8> {
-    // A `Response` holds only strings, numbers and JSON values, so
-    // serialization cannot fail.
-    let mut line = serde_json::to_vec(resp).expect("Response serializes");
+    encode_line(resp)
+}
+
+/// Serialize an event frame as one NDJSON line.
+pub fn encode_event(ev: &EventFrame) -> Vec<u8> {
+    encode_line(ev)
+}
+
+fn encode_line<T: Serialize>(v: &T) -> Vec<u8> {
+    // Frames hold only strings, numbers and JSON values, so serialization
+    // cannot fail.
+    let mut line = serde_json::to_vec(v).expect("frame serializes");
     line.push(b'\n');
     line
 }
@@ -347,6 +424,7 @@ mod tests {
             ErrorCode::BadRequest,
             ErrorCode::UnknownMethod,
             ErrorCode::PeerUidMismatch,
+            ErrorCode::CursorExpired,
             ErrorCode::Internal,
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), code.as_str());

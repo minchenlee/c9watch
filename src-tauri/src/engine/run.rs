@@ -16,7 +16,11 @@ use super::machine;
 use super::sock::{bind_private, ShutdownSignals};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UnixListener;
+
+/// How often event retention runs (it also runs at boot).
+const PRUNE_EVERY: Duration = Duration::from_secs(60);
 
 /// Run the engine in `home` until SIGTERM or SIGINT. Must run inside a tokio
 /// runtime. Fails with `engine_already_running` when another engine holds
@@ -27,7 +31,7 @@ pub async fn run(home: &Path) -> Result<(), String> {
         .map_err(|e| format!("Failed to install signal handlers: {}", e))?;
     let lock = acquire_engine_lock(&lock_path(home))?;
     let key = machine::load_or_create(home)?;
-    let db = db::open(home, key.id())?;
+    let db = Arc::new(db::open(home, key.id())?);
     let (std_listener, socket) = bind_private(&sock_path(home), &lock)?;
     std_listener
         .set_nonblocking(true)
@@ -35,7 +39,8 @@ pub async fn run(home: &Path) -> Result<(), String> {
     let listener = UnixListener::from_std(std_listener)
         .map_err(|e| format!("Failed to register Unix socket: {}", e))?;
 
-    let ctx = Arc::new(ServerCtx::new(key.id().to_string()));
+    let ctx = Arc::new(ServerCtx::new(key.id().to_string()).with_db(db.clone()));
+    let pruner = tokio::spawn(prune_loop(db.clone()));
     eprintln!(
         "[engine] Listening on {:?}, pid={}, machine={}, epoch={}",
         socket.path(),
@@ -49,11 +54,25 @@ pub async fn run(home: &Path) -> Result<(), String> {
         sig = signals.recv() => Some(sig),
     };
     eprintln!("[engine] Shutting down ({:?})", sig);
+    pruner.abort();
     // Unlink our socket first, then close the db, then release the lock, so
     // a new engine that takes the lock never sees our socket as live or our
-    // db as open.
+    // db as open. Connection tasks may still hold the `Db`; `close` shuts
+    // its writer anyway.
     drop(socket);
-    drop(db);
+    db.close();
     drop(lock);
     Ok(())
+}
+
+async fn prune_loop(db: Arc<db::Db>) {
+    let mut every = tokio::time::interval(PRUNE_EVERY);
+    // The first tick is immediate; boot already pruned.
+    every.tick().await;
+    loop {
+        every.tick().await;
+        if let Err(e) = db.prune().await {
+            eprintln!("[engine] {}", e);
+        }
+    }
 }

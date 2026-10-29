@@ -6,7 +6,7 @@
 //! change and its event row in one transaction (A:216-217).
 
 use rusqlite::Connection;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::thread::JoinHandle;
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -15,8 +15,8 @@ type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 const WRITER_STOPPED: &str = "db writer stopped";
 
 pub struct Writer {
-    tx: Option<mpsc::Sender<Job>>,
-    thread: Option<JoinHandle<()>>,
+    tx: Mutex<Option<mpsc::Sender<Job>>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Writer {
@@ -37,16 +37,30 @@ impl Writer {
             })
             .map_err(|e| format!("Failed to start the db writer thread: {}", e))?;
         Ok(Writer {
-            tx: Some(tx),
-            thread: Some(thread),
+            tx: Mutex::new(Some(tx)),
+            thread: Mutex::new(Some(thread)),
         })
     }
 
     fn send(&self, job: Job) -> Result<(), String> {
         self.tx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .and_then(|tx| tx.send(job).ok())
             .ok_or_else(|| WRITER_STOPPED.to_string())
+    }
+
+    /// Finish the queued jobs, then close the connection (which checkpoints
+    /// the WAL) before returning, so the caller can release the engine lock
+    /// knowing the db is closed. Later calls fail with `db writer stopped`.
+    /// Idempotent; `Drop` calls it too.
+    pub fn close(&self) {
+        drop(self.tx.lock().unwrap_or_else(|p| p.into_inner()).take());
+        let thread = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(t) = thread {
+            let _ = t.join();
+        }
     }
 
     /// Run `f` on the writer thread and wait for it without blocking the
@@ -78,14 +92,8 @@ impl Writer {
 }
 
 impl Drop for Writer {
-    /// Finish the queued jobs, then close the connection (which checkpoints
-    /// the WAL) before returning, so the caller can release the engine lock
-    /// knowing the db is closed.
     fn drop(&mut self) {
-        drop(self.tx.take());
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        self.close();
     }
 }
 
@@ -153,5 +161,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn close_finishes_queued_jobs_then_refuses_new_ones() {
+        let w = writer();
+        w.call_blocking(|c| c.execute("INSERT INTO t (x) VALUES (1)", []).unwrap())
+            .unwrap();
+        w.close();
+        w.close();
+        let err = w.call_blocking(|_| ()).unwrap_err();
+        assert_eq!(err, WRITER_STOPPED);
     }
 }
