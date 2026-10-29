@@ -11,7 +11,12 @@
 //! once the db is open, so its first tick (or the rebuild after a new epoch)
 //! is written before clients ask. The engine never talks to the legacy
 //! `c9watch daemon` and never writes its files.
+//!
+//! `c9watch-agent` is copied into `<home>/bin` before the socket is bound,
+//! so the first hook-class call already finds it (`engine::agent_bin`). A
+//! missing source only logs: the engine runs without agents.
 
+use super::agent_bin::{self, AgentBin};
 use super::agents::LiveTable;
 use super::api::{serve, ServerCtx};
 use super::db;
@@ -30,16 +35,58 @@ use tokio::net::UnixListener;
 /// How often event retention runs (it also runs at boot).
 const PRUNE_EVERY: Duration = Duration::from_secs(60);
 
-/// Run the engine in `home` until SIGTERM or SIGINT. Must run inside a tokio
-/// runtime. Fails with `engine_already_running` when another engine holds
-/// the lock.
-pub async fn run(home: &Path) -> Result<(), String> {
+/// What one engine runs with.
+pub struct EngineConfig {
+    /// The engine home (`engine::home`).
+    pub home: PathBuf,
+    /// Where the engine copies `c9watch-agent` from. `new` sets it next to
+    /// `realpath(current_exe())`; there is no env override. Integration
+    /// tests set `env!("CARGO_BIN_EXE_c9watch-agent")` here.
+    pub agent_source: PathBuf,
+    /// The live agents. Spawns register here (M5).
+    pub agents: Arc<LiveTable>,
+    /// Run session detection and the legacy import. Off only in tests of
+    /// the agent path, which must not scan the machine.
+    pub detection: bool,
+}
+
+impl EngineConfig {
+    pub fn new(home: PathBuf) -> Result<Self, String> {
+        Ok(EngineConfig {
+            home,
+            agent_source: agent_bin::default_source()?,
+            agents: Arc::new(LiveTable::new()),
+            detection: true,
+        })
+    }
+}
+
+/// Run the engine until SIGTERM or SIGINT. Must run inside a tokio runtime.
+/// Fails with `engine_already_running` when another engine holds the lock.
+pub async fn run(config: &EngineConfig) -> Result<(), String> {
+    run_until(config, std::future::pending()).await
+}
+
+/// `run`, which also stops when `stop` completes.
+pub async fn run_until(
+    config: &EngineConfig,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<(), String> {
+    let home = config.home.as_path();
     ensure_private_dir(home)?;
     let mut signals = ShutdownSignals::install()
         .map_err(|e| format!("Failed to install signal handlers: {}", e))?;
     let lock = acquire_engine_lock(&lock_path(home))?;
     let key = machine::load_or_create(home)?;
     let db = Arc::new(db::open(home, key.id())?);
+    let agent_bin = Arc::new(AgentBin::install(home, &config.agent_source));
+    match (agent_bin.sha256_hex(), agent_bin.missing_reason()) {
+        (Some(sha), _) => eprintln!("[engine] Installed {:?} (sha256 {})", agent_bin.path(), sha),
+        (None, why) => eprintln!(
+            "[engine] No agent binary, agents cannot start: {}",
+            why.unwrap_or_default()
+        ),
+    }
     let (std_listener, socket) = bind_private(&sock_path(home), &lock)?;
     std_listener
         .set_nonblocking(true)
@@ -47,16 +94,20 @@ pub async fn run(home: &Path) -> Result<(), String> {
     let listener = UnixListener::from_std(std_listener)
         .map_err(|e| format!("Failed to register Unix socket: {}", e))?;
 
-    // The engine's live agents: empty until an agent is spawned (M5).
-    let agents = Arc::new(LiveTable::new());
     let ctx = Arc::new(
         ServerCtx::new(key.id().to_string())
-            .with_agents(agents)
+            .with_agents(config.agents.clone())
+            .with_agent_bin(agent_bin)
             .with_db(db.clone()),
     );
     let pruner = tokio::spawn(prune_loop(db.clone()));
-    let detection = detect::spawn(db.clone())?;
-    spawn_import(db.clone(), home.to_path_buf());
+    let detection = if config.detection {
+        let d = detect::spawn(db.clone())?;
+        spawn_import(db.clone(), home.to_path_buf());
+        Some(d)
+    } else {
+        None
+    };
     eprintln!(
         "[engine] Listening on {:?}, pid={}, machine={}, epoch={}",
         socket.path(),
@@ -68,6 +119,7 @@ pub async fn run(home: &Path) -> Result<(), String> {
     let sig = tokio::select! {
         _ = serve(listener, ctx) => None,
         sig = signals.recv() => Some(sig),
+        _ = stop => None,
     };
     eprintln!("[engine] Shutting down ({:?})", sig);
     pruner.abort();

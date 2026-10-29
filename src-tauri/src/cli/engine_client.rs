@@ -494,10 +494,10 @@ fn current_exe() -> Result<PathBuf, String> {
 /// `c9watch engine`: run the engine in the foreground until SIGTERM/SIGINT.
 pub fn cmd_engine_run() -> Result<(), String> {
     refuse_agent_caller(&process_env)?;
-    let home = engine_home()?;
+    let config = crate::engine::run::EngineConfig::new(engine_home()?)?;
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
-    rt.block_on(crate::engine::run::run(&home))
+    rt.block_on(crate::engine::run::run(&config))
 }
 
 /// `c9watch engine restart`

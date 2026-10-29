@@ -28,6 +28,9 @@ pub mod principal;
 pub mod agents;
 
 #[cfg(unix)]
+pub mod agent_bin;
+
+#[cfg(unix)]
 pub mod db;
 
 #[cfg(unix)]

@@ -13,16 +13,26 @@
 //! same write queue as responses, so a slow client only slows its own
 //! stream, never the db writer. A connection holds at most `MAX_STREAMS`
 //! live streams; one more gets `rate_limited`.
+//!
+//! Hook-class methods (`hook.*`, `task.done`, `agent.handoff`) need two
+//! facts (C1a-21): the principal is `agent:<id>` for the agent the params
+//! name, and the peer's exe realpath is the engine's `c9watch-agent` copy
+//! with the sha256 the engine recorded. Anything else is
+//! `peer_not_authorized`, and the refusal goes to the audit log. The main
+//! binary's `c9watch api` can therefore never send one.
 
+use super::agent_bin::AgentBin;
+use super::db::audit::{self, AuditEntry};
 use super::db::outbox::{Cursor, Event, ReadError, Subscription, READ_BATCH};
-use super::db::{AgentFilter, Db};
+use super::db::{now_ms, AgentFilter, Db};
 use super::peer::{self, PeerCred};
 use super::principal::{self, LiveAgents, NoLiveAgents, Principal};
 use super::proto::{
-    encode, encode_event, read_frame, AgentListParams, AgentListResult, ApiError, ErrorCode,
-    EventFrame, EventType, FrameError, HelloParams, HelloResult, Request, Response,
-    SessionListParams, SessionListResult, SnapshotParams, SnapshotResult, SubscribeParams,
-    SubscribeResult, API_MAJOR, API_MINOR, MAX_FRAME,
+    encode, encode_event, is_hook_class, read_frame, AgentListParams, AgentListResult, ApiError,
+    ErrorCode, EventFrame, EventType, FrameError, HandoffParams, HandoffResult, HelloParams,
+    HelloResult, HookParams, HookResult, Request, Response, SessionListParams, SessionListResult,
+    SnapshotParams, SnapshotResult, SubscribeParams, SubscribeResult, TaskDoneParams,
+    TaskDoneResult, API_MAJOR, API_MINOR, HOOK_METHODS, MAX_FRAME,
 };
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
@@ -54,6 +64,9 @@ pub struct ServerCtx {
     pub agents: Arc<dyn LiveAgents>,
     /// The only uid a peer may have: the engine's own euid.
     pub engine_uid: libc::uid_t,
+    /// The engine's `c9watch-agent` copy. Without one, every hook-class
+    /// call is `peer_not_authorized`.
+    pub agent_bin: Option<Arc<AgentBin>>,
     /// The store. `None` only in tests of the connection layer.
     pub db: Option<Arc<Db>>,
 }
@@ -67,6 +80,7 @@ impl ServerCtx {
             // `run` sets the engine's live table (`with_agents`).
             agents: Arc::new(NoLiveAgents),
             engine_uid: peer::engine_uid(),
+            agent_bin: None,
             db: None,
         }
     }
@@ -74,6 +88,11 @@ impl ServerCtx {
     /// Stamp `agent:<id>` from the engine's live-agent table (C1a-33).
     pub fn with_agents(mut self, agents: Arc<dyn LiveAgents>) -> Self {
         self.agents = agents;
+        self
+    }
+
+    pub fn with_agent_bin(mut self, bin: Arc<AgentBin>) -> Self {
+        self.agent_bin = Some(bin);
         self
     }
 
@@ -105,6 +124,14 @@ pub async fn serve(listener: UnixListener, ctx: Arc<ServerCtx>) {
             }
         }
     }
+}
+
+/// The process on the other end, as read at accept.
+#[derive(Debug, Clone, Copy)]
+struct Peer {
+    cred: PeerCred,
+    /// Start time of `cred.pid`; `None` when it could not be read.
+    start: Option<u64>,
 }
 
 /// The connection's state after `hello`.
@@ -155,6 +182,11 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
     // Stamp at accept, not at `hello`: the peer pid is then as fresh as it
     // gets, and a late `hello` cannot wait for the pid to be reused.
     let principal = principal::stamp_peer(cred.pid, accepted, ctx.agents.as_ref());
+    // The peer's start time, so a later exe check reads the same process.
+    let peer = Peer {
+        cred,
+        start: peer::proc_info(cred.pid).map(|p| p.start),
+    };
 
     let mut reader = BufReader::new(read);
     let mut conn: Option<Conn> = None;
@@ -200,7 +232,7 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
         // A stream that ended (expired, or the store closed) frees its slot.
         streams.retain(|h| !h.is_finished());
         let (resp, next, stream) =
-            handle_frame(&frame, &ctx, cred, &principal, &mut conn, streams.len()).await;
+            handle_frame(&frame, &ctx, peer, &principal, &mut conn, streams.len()).await;
         if tx.send(encode(&resp)).await.is_err() {
             break;
         }
@@ -225,13 +257,20 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
 async fn handle_frame(
     frame: &[u8],
     ctx: &ServerCtx,
-    cred: PeerCred,
+    peer: Peer,
     principal: &Principal,
     conn: &mut Option<Conn>,
     streams: usize,
 ) -> (Response, Next, Option<EventStream>) {
-    match check_frame(frame, ctx, cred, principal, conn) {
+    match check_frame(frame, ctx, peer.cred, principal, conn) {
         Checked::Done(resp, next) => (resp, next, None),
+        Checked::Call(req, method) if is_hook_class(&method) => {
+            let id = req.id.clone();
+            match hook_class(&method, req, ctx, peer, principal).await {
+                Ok(result) => (Response::ok(id, result), Next::Continue, None),
+                Err(e) => (Response::err(id, e), Next::Continue, None),
+            }
+        }
         Checked::Call(req, method) => {
             let id = req.id.clone();
             match dispatch(&method, req, ctx, streams).await {
@@ -328,6 +367,13 @@ pub const METHODS: &[&str] = &[
     "events.subscribe",
     "session.list",
     "agent.list",
+    "hook.session_start",
+    "hook.stop",
+    "hook.permission_request",
+    "hook.permission_denied",
+    "hook.notification",
+    "task.done",
+    "agent.handoff",
 ];
 
 /// The c9p/1 JSON Schema (A:245): the frame types, a `methods` table with
@@ -373,7 +419,22 @@ pub fn schema() -> serde_json::Value {
             "params": de.subschema_for::<AgentListParams>(),
             "result": ser.subschema_for::<AgentListResult>(),
         },
+        "task.done": {
+            "params": de.subschema_for::<TaskDoneParams>(),
+            "result": ser.subschema_for::<TaskDoneResult>(),
+        },
+        "agent.handoff": {
+            "params": de.subschema_for::<HandoffParams>(),
+            "result": ser.subschema_for::<HandoffResult>(),
+        },
     });
+    let mut methods = methods;
+    for m in HOOK_METHODS {
+        methods[*m] = serde_json::json!({
+            "params": de.subschema_for::<HookParams>(),
+            "result": ser.subschema_for::<HookResult>(),
+        });
+    }
     let mut defs = de.take_definitions(true);
     for (name, def) in ser.take_definitions(true) {
         match defs.get(&name) {
@@ -397,9 +458,9 @@ pub fn schema() -> serde_json::Value {
     })
 }
 
-/// Methods after `hello`. Both C1a principals, L and A, may call every
-/// method here (§1.1); later methods check the principal. `streams` is how
-/// many event streams the connection holds.
+/// Methods after `hello`, except the hook-class ones. Both C1a principals,
+/// L and A, may call every method here (§1.1). `streams` is how many event
+/// streams the connection holds.
 async fn dispatch(
     method: &str,
     req: Request,
@@ -424,6 +485,143 @@ async fn dispatch(
             ErrorCode::UnknownMethod,
             format!("unknown method {:?}", method),
         )),
+    }
+}
+
+/// Hook-class methods (§1.1): `hook.*`, `task.done` and `agent.handoff`.
+async fn hook_class(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+) -> Result<serde_json::Value, ApiError> {
+    if method.starts_with("hook.") && !HOOK_METHODS.contains(&method) {
+        return Err(ApiError::new(
+            ErrorCode::UnknownMethod,
+            format!("unknown method {:?}", method),
+        ));
+    }
+    let claimed = req
+        .params
+        .get("agentId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let checked = {
+        let bin = ctx.agent_bin.clone();
+        let principal = principal.clone();
+        let claimed = claimed.clone();
+        blocking(move || Ok(authorize(bin.as_deref(), peer, &principal, &claimed))).await?
+    };
+    if let Err(e) = checked {
+        audit_refusal(ctx, principal, method, &claimed, &e).await;
+        return Err(e);
+    }
+    let bad = |e: serde_json::Error| {
+        ApiError::new(
+            ErrorCode::BadRequest,
+            format!("bad {} params: {}", method, e),
+        )
+    };
+    match method {
+        "task.done" => {
+            serde_json::from_value::<TaskDoneParams>(req.params).map_err(bad)?;
+            // Every C1a agent is free, and free agents have no task.
+            Err(ApiError::new(
+                ErrorCode::NoTask,
+                format!("{} is a free agent and has no task", claimed),
+            ))
+        }
+        "agent.handoff" => {
+            serde_json::from_value::<HandoffParams>(req.params).map_err(bad)?;
+            Err(ApiError::new(
+                ErrorCode::UnsupportedInC1a,
+                "agent.handoff comes with refresh in C1b",
+            ))
+        }
+        _ => {
+            serde_json::from_value::<HookParams>(req.params).map_err(bad)?;
+            // The state merge (C1a-22) consumes the event; standing orders
+            // for `hook.session_start` come with the spawn profile (M5).
+            let result = HookResult {
+                accepted: true,
+                additional_context: None,
+            };
+            Ok(serde_json::to_value(result).expect("HookResult serializes"))
+        }
+    }
+}
+
+/// The two facts a hook-class call needs: the principal is the agent the
+/// params name, and the peer runs the engine's `c9watch-agent` copy. The
+/// exe check reads the peer pid again, so it must still be the process that
+/// was stamped at accept. Blocking.
+fn authorize(
+    bin: Option<&AgentBin>,
+    peer: Peer,
+    principal: &Principal,
+    claimed: &str,
+) -> Result<(), ApiError> {
+    let denied = |m: String| ApiError::new(ErrorCode::PeerNotAuthorized, m);
+    let Principal::Agent { id, .. } = principal else {
+        return Err(denied(format!("{} is not an agent", principal)));
+    };
+    if claimed != id {
+        return Err(denied(format!(
+            "the call names agent {:?}, the caller is {}",
+            claimed, principal
+        )));
+    }
+    let Some(bin) = bin else {
+        return Err(denied("the engine has no c9watch-agent copy".into()));
+    };
+    let exe = peer::peer_exe_path(peer.cred.pid).map_err(denied)?;
+    let start = peer::proc_info(peer.cred.pid).map(|p| p.start);
+    if start.is_none() || start != peer.start {
+        return Err(denied(format!(
+            "pid {} is no longer the process that connected",
+            peer.cred.pid
+        )));
+    }
+    bin.check_peer_exe(&exe)
+}
+
+/// Record a refused hook-class call. A failed write only logs.
+async fn audit_refusal(
+    ctx: &ServerCtx,
+    principal: &Principal,
+    method: &str,
+    claimed: &str,
+    e: &ApiError,
+) {
+    let Some(db) = ctx.db.clone() else {
+        return;
+    };
+    let (principal, method, claimed) = (
+        principal.to_string(),
+        method.to_string(),
+        claimed.to_string(),
+    );
+    let reason = format!("{}: {}", e.code, e.msg);
+    let wrote = db
+        .write(move |tx| {
+            audit::append(
+                tx,
+                now_ms(),
+                &AuditEntry {
+                    principal: &principal,
+                    method: &method,
+                    target: (!claimed.is_empty()).then_some(claimed.as_str()),
+                    decision: "deny",
+                    reason: Some(&reason),
+                    ..Default::default()
+                },
+            )
+        })
+        .await;
+    if let Err(e) = wrote {
+        eprintln!("[engine] Failed to audit a refused hook-class call: {}", e);
     }
 }
 
@@ -700,6 +898,7 @@ mod tests {
             hello_timeout,
             agents,
             engine_uid: peer::engine_uid(),
+            agent_bin: None,
             db: None,
         })
     }
@@ -1011,7 +1210,12 @@ mod tests {
         let (mut c, _) = Client::new(ctx).await;
         for (i, m) in METHODS.iter().enumerate() {
             let r = c.call(&i.to_string(), m, json!({})).await;
-            assert_eq!(r["ok"], true, "{}: {}", m, r);
+            if is_hook_class(m) {
+                // Served, but only to an agent (C1a-21).
+                assert_eq!(r["error"]["code"], "peer_not_authorized", "{}: {}", m, r);
+            } else {
+                assert_eq!(r["ok"], true, "{}: {}", m, r);
+            }
         }
         let r = c.call("x", "no.such", json!({})).await;
         assert_eq!(r["error"]["code"], "unknown_method");
@@ -1027,6 +1231,7 @@ mod tests {
             hello_timeout: HELLO_TIMEOUT,
             agents,
             engine_uid: peer::engine_uid(),
+            agent_bin: None,
             db: Some(db.clone()),
         });
         (t, ctx, db)
@@ -1341,6 +1546,129 @@ mod tests {
             .unwrap();
         let (_c, hello) = Client::new(ctx).await;
         assert_eq!(hello["principal"], "agent:a7");
+    }
+
+    // ── Hook-class methods (C1a-21) ────────────────────────────────────
+
+    const HOOK_CLASS: &[&str] = &[
+        "hook.session_start",
+        "hook.stop",
+        "hook.permission_request",
+        "hook.permission_denied",
+        "hook.notification",
+        "task.done",
+        "agent.handoff",
+    ];
+
+    fn hook_params(agent: &str) -> Value {
+        json!({"agentId": agent, "kind": "claude", "seq": "1", "report": "r", "note": "n",
+               "input": {}})
+    }
+
+    fn audit_rows(db: &Db) -> Vec<(String, String, String, String)> {
+        let conn = db.reader().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT principal, method, decision, reason FROM audit \
+                 WHERE decision = 'deny' ORDER BY seq",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// The test process as the descendant of a live agent's PTY child.
+    fn as_agent(id: &str) -> Arc<dyn LiveAgents> {
+        let me = std::process::id() as libc::pid_t;
+        let parent = peer::proc_info(me).unwrap().ppid;
+        let start = peer::proc_info(parent).unwrap().start;
+        Arc::new(principal::tests::FakeAgents::one(id, parent, start))
+    }
+
+    /// A store-backed context whose agent copy is a fake file: no test
+    /// process runs it.
+    fn ctx_with_bin(agents: Arc<dyn LiveAgents>) -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Db>) {
+        let (t, ctx, db) = ctx_db(agents);
+        let source = t.path().join("c9watch-agent");
+        std::fs::write(&source, b"fake agent").unwrap();
+        let bin = Arc::new(AgentBin::install(&t.path().join("engine"), &source));
+        let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+        ctx.agent_bin = Some(bin);
+        (t, Arc::new(ctx), db)
+    }
+
+    #[tokio::test]
+    async fn hook_class_calls_from_a_local_peer_are_refused_and_audited() {
+        let (_t, ctx, db) = ctx_with_bin(Arc::new(NoLiveAgents));
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["principal"], "local-unverified");
+        for (i, m) in HOOK_CLASS.iter().enumerate() {
+            let r = c.call(&i.to_string(), m, hook_params("a7")).await;
+            assert_eq!(r["error"]["code"], "peer_not_authorized", "{}: {}", m, r);
+        }
+        let rows = audit_rows(&db);
+        assert_eq!(rows.len(), HOOK_CLASS.len());
+        for (row, m) in rows.iter().zip(HOOK_CLASS) {
+            assert_eq!(row.0, "local-unverified");
+            assert_eq!(row.1, *m);
+            assert_eq!(row.2, "deny");
+            assert!(row.3.starts_with("peer_not_authorized"), "{:?}", row);
+        }
+    }
+
+    /// An agent's process that is not the engine's `c9watch-agent` copy
+    /// (here the test binary; in life, the main binary's `c9watch api`)
+    /// is refused.
+    #[tokio::test]
+    async fn an_agent_running_another_binary_is_refused() {
+        let (_t, ctx, db) = ctx_with_bin(as_agent("a7"));
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["principal"], "agent:a7");
+        for (i, m) in HOOK_CLASS.iter().enumerate() {
+            let r = c.call(&i.to_string(), m, hook_params("a7")).await;
+            assert_eq!(r["error"]["code"], "peer_not_authorized", "{}: {}", m, r);
+            assert!(
+                r["error"]["msg"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not the engine's"),
+                "{}",
+                r
+            );
+        }
+        assert_eq!(audit_rows(&db)[0].0, "agent:a7");
+        // Without any copy, the refusal says so.
+        let (_t, ctx, _db) = ctx_db(as_agent("a7"));
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c.call("1", "hook.stop", hook_params("a7")).await;
+        assert_eq!(r["error"]["code"], "peer_not_authorized");
+        assert!(r["error"]["msg"]
+            .as_str()
+            .unwrap()
+            .contains("no c9watch-agent"));
+    }
+
+    #[tokio::test]
+    async fn an_agent_naming_another_agent_is_refused() {
+        let (_t, ctx, db) = ctx_with_bin(as_agent("a7"));
+        let (mut c, _) = Client::new(ctx).await;
+        for params in [hook_params("a8"), json!({})] {
+            let r = c.call("1", "task.done", params).await;
+            assert_eq!(r["error"]["code"], "peer_not_authorized", "{}", r);
+            assert!(r["error"]["msg"].as_str().unwrap().contains("names agent"));
+        }
+        assert_eq!(audit_rows(&db).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_hook_method_is_unknown() {
+        let (_t, ctx, db) = ctx_with_bin(as_agent("a7"));
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c.call("1", "hook.pre_tool_use", hook_params("a7")).await;
+        assert_eq!(r["error"]["code"], "unknown_method");
+        assert!(audit_rows(&db).is_empty());
     }
 
     // ── Detection-backed lists (C1a-15) ────────────────────────────────

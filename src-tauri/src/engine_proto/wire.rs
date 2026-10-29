@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
 /// Protocol minor version. Raised for additive changes.
-pub const API_MINOR: u32 = 1;
+pub const API_MINOR: u32 = 2;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -112,6 +112,21 @@ pub enum ErrorCode {
     /// The caller is over a limit, such as the event streams per
     /// connection.
     RateLimited,
+    /// A hook-class method (`hook.*`, `task.done`, `agent.handoff`) from a
+    /// caller that is not a live agent running the engine's own
+    /// `c9watch-agent` copy, or that names another agent.
+    PeerNotAuthorized,
+    /// `task.done` from an agent without a task (every free agent).
+    NoTask,
+    /// The method is part of the wire format but does nothing before C1b
+    /// (`agent.handoff`).
+    UnsupportedInC1a,
+    /// The engine has no `c9watch-agent` copy: none was next to the engine
+    /// binary when it started, or the copy is gone.
+    AgentBinMissing,
+    /// The engine's `c9watch-agent` copy no longer has the sha256 it had
+    /// when the engine installed it.
+    AgentBinMismatch,
     /// An engine-side failure.
     Internal,
 }
@@ -128,6 +143,11 @@ impl ErrorCode {
             ErrorCode::PeerUidMismatch => "peer_uid_mismatch",
             ErrorCode::CursorExpired => "cursor_expired",
             ErrorCode::RateLimited => "rate_limited",
+            ErrorCode::PeerNotAuthorized => "peer_not_authorized",
+            ErrorCode::NoTask => "no_task",
+            ErrorCode::UnsupportedInC1a => "unsupported_in_c1a",
+            ErrorCode::AgentBinMissing => "agent_bin_missing",
+            ErrorCode::AgentBinMismatch => "agent_bin_mismatch",
             ErrorCode::Internal => "internal",
         }
     }
@@ -159,6 +179,20 @@ impl ErrorCode {
             ErrorCode::RateLimited => {
                 "use fewer event streams per connection: one subscription with \
                  topic and subject filters, or another connection"
+            }
+            ErrorCode::PeerNotAuthorized => {
+                "only an engine agent may call this, through `c9watch-agent` from the \
+                 engine's own copy"
+            }
+            ErrorCode::NoTask => "free agents have no task; just end the turn",
+            ErrorCode::UnsupportedInC1a => "this engine does not support it yet",
+            ErrorCode::AgentBinMissing => {
+                "install c9watch-agent next to the c9watch binary, then \
+                 `c9watch engine restart`"
+            }
+            ErrorCode::AgentBinMismatch => {
+                "`c9watch engine restart` copies c9watch-agent again; check what changed \
+                 the engine's copy"
             }
             ErrorCode::Internal => "retry; if it persists, check the engine log",
         }
@@ -399,4 +433,99 @@ pub struct EventFrame {
 pub enum EventType {
     #[serde(rename = "event")]
     Event,
+}
+
+/// The hook-class methods (§1.1). Only a live agent may call them, and only
+/// through the engine's own copy of `c9watch-agent` (C1a-21).
+pub const HOOK_METHODS: &[&str] = &[
+    "hook.session_start",
+    "hook.stop",
+    "hook.permission_request",
+    "hook.permission_denied",
+    "hook.notification",
+];
+
+/// Whether `method` is hook-class: a `hook.*` method, `task.done` or
+/// `agent.handoff`.
+pub fn is_hook_class(method: &str) -> bool {
+    method.starts_with("hook.") || method == "task.done" || method == "agent.handoff"
+}
+
+/// `hook.*` params: one Claude Code hook event, sent by `c9watch-agent
+/// hook <event>`. The engine alone writes the log (A:1167).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct HookParams {
+    /// `C9_AGENT_ID` of the sender. It must be the agent the engine stamped.
+    pub agent_id: String,
+    /// The adapter kind of the hook (`claude`). The engine compares it with
+    /// the agent row (A:1056).
+    pub kind: String,
+    /// The sender's clock in ns, as a string. With `agentId` it dedupes.
+    pub seq: String,
+    /// The hook's stdin JSON as the vendor sent it; `null` when it was not
+    /// JSON or too large.
+    #[serde(default)]
+    pub input: serde_json::Value,
+    /// The stdin JSON was larger than the hook forwards.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+/// `hook.*` result.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct HookResult {
+    /// The engine took the event. A dropped event (an old generation, a
+    /// duplicate) still gets `ok:true`, with `accepted:false`.
+    pub accepted: bool,
+    /// For `hook.session_start`: context the hook prints as
+    /// `hookSpecificOutput.additionalContext`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_context: Option<String>,
+}
+
+/// `task.done` params (`c9watch-agent task done --report`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDoneParams {
+    /// `C9_AGENT_ID` of the sender.
+    pub agent_id: String,
+    pub report: String,
+    /// The sender's clock in ns, as a string.
+    pub seq: String,
+}
+
+/// `task.done` result. In C1a every agent is free, so the call fails with
+/// `no_task` instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDoneResult {
+    pub task_id: String,
+}
+
+/// `agent.handoff` params (`c9watch-agent handoff --note -`). The wire
+/// format is fixed now; the engine answers `unsupported_in_c1a` until C1b.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffParams {
+    /// `C9_AGENT_ID` of the sender.
+    pub agent_id: String,
+    /// What the next generation should know.
+    pub note: String,
+    /// The sender's clock in ns, as a string.
+    pub seq: String,
+}
+
+/// `agent.handoff` result (C1b).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffResult {
+    pub accepted: bool,
 }

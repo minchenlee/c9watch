@@ -294,6 +294,31 @@
           "type": "string"
         },
         {
+          "const": "peer_not_authorized",
+          "description": "A hook-class method (`hook.*`, `task.done`, `agent.handoff`) from a\ncaller that is not a live agent running the engine's own\n`c9watch-agent` copy, or that names another agent.",
+          "type": "string"
+        },
+        {
+          "const": "no_task",
+          "description": "`task.done` from an agent without a task (every free agent).",
+          "type": "string"
+        },
+        {
+          "const": "unsupported_in_c1a",
+          "description": "The method is part of the wire format but does nothing before C1b\n(`agent.handoff`).",
+          "type": "string"
+        },
+        {
+          "const": "agent_bin_missing",
+          "description": "The engine has no `c9watch-agent` copy: none was next to the engine\nbinary when it started, or the copy is gone.",
+          "type": "string"
+        },
+        {
+          "const": "agent_bin_mismatch",
+          "description": "The engine's `c9watch-agent` copy no longer has the sha256 it had\nwhen the engine installed it.",
+          "type": "string"
+        },
+        {
           "const": "internal",
           "description": "An engine-side failure.",
           "type": "string"
@@ -352,6 +377,41 @@
         "event"
       ],
       "type": "string"
+    },
+    "HandoffParams": {
+      "description": "`agent.handoff` params (`c9watch-agent handoff --note -`). The wire\nformat is fixed now; the engine answers `unsupported_in_c1a` until C1b.",
+      "properties": {
+        "agentId": {
+          "description": "`C9_AGENT_ID` of the sender.",
+          "type": "string"
+        },
+        "note": {
+          "description": "What the next generation should know.",
+          "type": "string"
+        },
+        "seq": {
+          "description": "The sender's clock in ns, as a string.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "agentId",
+        "note",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "HandoffResult": {
+      "description": "`agent.handoff` result (C1b).",
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "type": "object"
     },
     "HelloParams": {
       "description": "`hello` params. `client` is the caller's own claim. The engine only logs\nit as unverified; it never decides the principal (N1).",
@@ -428,6 +488,57 @@
         "principal",
         "capabilities",
         "cursor"
+      ],
+      "type": "object"
+    },
+    "HookParams": {
+      "description": "`hook.*` params: one Claude Code hook event, sent by `c9watch-agent\nhook <event>`. The engine alone writes the log (A:1167).",
+      "properties": {
+        "agentId": {
+          "description": "`C9_AGENT_ID` of the sender. It must be the agent the engine stamped.",
+          "type": "string"
+        },
+        "input": {
+          "default": null,
+          "description": "The hook's stdin JSON as the vendor sent it; `null` when it was not\nJSON or too large."
+        },
+        "kind": {
+          "description": "The adapter kind of the hook (`claude`). The engine compares it with\nthe agent row (A:1056).",
+          "type": "string"
+        },
+        "seq": {
+          "description": "The sender's clock in ns, as a string. With `agentId` it dedupes.",
+          "type": "string"
+        },
+        "truncated": {
+          "description": "The stdin JSON was larger than the hook forwards.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "agentId",
+        "kind",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "HookResult": {
+      "description": "`hook.*` result.",
+      "properties": {
+        "accepted": {
+          "description": "The engine took the event. A dropped event (an old generation, a\nduplicate) still gets `ok:true`, with `accepted:false`.",
+          "type": "boolean"
+        },
+        "additionalContext": {
+          "description": "For `hook.session_start`: context the hook prints as\n`hookSpecificOutput.additionalContext`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "accepted"
       ],
       "type": "object"
     },
@@ -591,11 +702,45 @@
         "cursor"
       ],
       "type": "object"
+    },
+    "TaskDoneParams": {
+      "description": "`task.done` params (`c9watch-agent task done --report`).",
+      "properties": {
+        "agentId": {
+          "description": "`C9_AGENT_ID` of the sender.",
+          "type": "string"
+        },
+        "report": {
+          "type": "string"
+        },
+        "seq": {
+          "description": "The sender's clock in ns, as a string.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "agentId",
+        "report",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "TaskDoneResult": {
+      "description": "`task.done` result. In C1a every agent is free, so the call fails with\n`no_task` instead.",
+      "properties": {
+        "taskId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "taskId"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
-  "apiMinor": 1,
+  "apiMinor": 2,
   "description": "The c9watch engine protocol: one JSON object per line over the engine socket. Within a major version every change is additive.",
   "frames": {
     "event": {
@@ -609,6 +754,14 @@
     }
   },
   "methods": {
+    "agent.handoff": {
+      "params": {
+        "$ref": "#/$defs/HandoffParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HandoffResult"
+      }
+    },
     "agent.list": {
       "params": {
         "$ref": "#/$defs/AgentListParams"
@@ -636,6 +789,46 @@
         "$ref": "#/$defs/HelloResult"
       }
     },
+    "hook.notification": {
+      "params": {
+        "$ref": "#/$defs/HookParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HookResult"
+      }
+    },
+    "hook.permission_denied": {
+      "params": {
+        "$ref": "#/$defs/HookParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HookResult"
+      }
+    },
+    "hook.permission_request": {
+      "params": {
+        "$ref": "#/$defs/HookParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HookResult"
+      }
+    },
+    "hook.session_start": {
+      "params": {
+        "$ref": "#/$defs/HookParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HookResult"
+      }
+    },
+    "hook.stop": {
+      "params": {
+        "$ref": "#/$defs/HookParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HookResult"
+      }
+    },
     "session.list": {
       "params": {
         "$ref": "#/$defs/SessionListParams"
@@ -650,6 +843,14 @@
       },
       "result": {
         "$ref": "#/$defs/SnapshotResult"
+      }
+    },
+    "task.done": {
+      "params": {
+        "$ref": "#/$defs/TaskDoneParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TaskDoneResult"
       }
     }
   },

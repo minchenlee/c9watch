@@ -2,7 +2,7 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 1;
+export const C9P_API_MINOR = 2;
 
 /** `agent.list` params. */
 export interface C9pAgentListParams {
@@ -124,6 +124,29 @@ export type C9pErrorCode =
    * connection.
    */
   | 'rate_limited'
+  /**
+   * A hook-class method (`hook.*`, `task.done`, `agent.handoff`) from a
+   * caller that is not a live agent running the engine's own
+   * `c9watch-agent` copy, or that names another agent.
+   */
+  | 'peer_not_authorized'
+  /** `task.done` from an agent without a task (every free agent). */
+  | 'no_task'
+  /**
+   * The method is part of the wire format but does nothing before C1b
+   * (`agent.handoff`).
+   */
+  | 'unsupported_in_c1a'
+  /**
+   * The engine has no `c9watch-agent` copy: none was next to the engine
+   * binary when it started, or the copy is gone.
+   */
+  | 'agent_bin_missing'
+  /**
+   * The engine's `c9watch-agent` copy no longer has the sha256 it had
+   * when the engine installed it.
+   */
+  | 'agent_bin_mismatch'
   /** An engine-side failure. */
   | 'internal';
 
@@ -150,6 +173,24 @@ export interface C9pEventFrame {
 export type C9pEventType = 'event';
 
 /**
+ * `agent.handoff` params (`c9watch-agent handoff --note -`). The wire
+ * format is fixed now; the engine answers `unsupported_in_c1a` until C1b.
+ */
+export interface C9pHandoffParams {
+  /** `C9_AGENT_ID` of the sender. */
+  agentId: string;
+  /** What the next generation should know. */
+  note: string;
+  /** The sender's clock in ns, as a string. */
+  seq: string;
+}
+
+/** `agent.handoff` result (C1b). */
+export interface C9pHandoffResult {
+  accepted: boolean;
+}
+
+/**
  * `hello` params. `client` is the caller's own claim. The engine only logs
  * it as unverified; it never decides the principal (N1).
  */
@@ -170,6 +211,43 @@ export interface C9pHelloResult {
   machineId: string;
   /** Stamped by the engine from connection facts. */
   principal: string;
+}
+
+/**
+ * `hook.*` params: one Claude Code hook event, sent by `c9watch-agent
+ * hook <event>`. The engine alone writes the log (A:1167).
+ */
+export interface C9pHookParams {
+  /** `C9_AGENT_ID` of the sender. It must be the agent the engine stamped. */
+  agentId: string;
+  /**
+   * The hook's stdin JSON as the vendor sent it; `null` when it was not
+   * JSON or too large.
+   */
+  input?: unknown;
+  /**
+   * The adapter kind of the hook (`claude`). The engine compares it with
+   * the agent row (A:1056).
+   */
+  kind: string;
+  /** The sender's clock in ns, as a string. With `agentId` it dedupes. */
+  seq: string;
+  /** The stdin JSON was larger than the hook forwards. */
+  truncated?: boolean;
+}
+
+/** `hook.*` result. */
+export interface C9pHookResult {
+  /**
+   * The engine took the event. A dropped event (an old generation, a
+   * duplicate) still gets `ok:true`, with `accepted:false`.
+   */
+  accepted: boolean;
+  /**
+   * For `hook.session_start`: context the hook prints as
+   * `hookSpecificOutput.additionalContext`.
+   */
+  additionalContext?: string | null;
 }
 
 /**
@@ -249,6 +327,23 @@ export interface C9pSubscribeResult {
   cursor: string;
 }
 
+/** `task.done` params (`c9watch-agent task done --report`). */
+export interface C9pTaskDoneParams {
+  /** `C9_AGENT_ID` of the sender. */
+  agentId: string;
+  report: string;
+  /** The sender's clock in ns, as a string. */
+  seq: string;
+}
+
+/**
+ * `task.done` result. In C1a every agent is free, so the call fails with
+ * `no_task` instead.
+ */
+export interface C9pTaskDoneResult {
+  taskId: string;
+}
+
 /** The frame types on the engine socket. */
 export interface C9pFrames {
   event: C9pEventFrame;
@@ -258,6 +353,10 @@ export interface C9pFrames {
 
 /** Each method's params and result (and event frames, for a subscription). */
 export interface C9pMethods {
+  'agent.handoff': {
+    params: C9pHandoffParams;
+    result: C9pHandoffResult;
+  };
   'agent.list': {
     params: C9pAgentListParams;
     result: C9pAgentListResult;
@@ -271,6 +370,26 @@ export interface C9pMethods {
     params: C9pHelloParams;
     result: C9pHelloResult;
   };
+  'hook.notification': {
+    params: C9pHookParams;
+    result: C9pHookResult;
+  };
+  'hook.permission_denied': {
+    params: C9pHookParams;
+    result: C9pHookResult;
+  };
+  'hook.permission_request': {
+    params: C9pHookParams;
+    result: C9pHookResult;
+  };
+  'hook.session_start': {
+    params: C9pHookParams;
+    result: C9pHookResult;
+  };
+  'hook.stop': {
+    params: C9pHookParams;
+    result: C9pHookResult;
+  };
   'session.list': {
     params: C9pSessionListParams;
     result: C9pSessionListResult;
@@ -278,6 +397,10 @@ export interface C9pMethods {
   'snapshot.get': {
     params: C9pSnapshotParams;
     result: C9pSnapshotResult;
+  };
+  'task.done': {
+    params: C9pTaskDoneParams;
+    result: C9pTaskDoneResult;
   };
 }
 

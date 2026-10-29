@@ -4,6 +4,8 @@ version = "0.11.1"
 description = "Monitor and control Claude Code sessions, with Codex and Cursor Agent visibility"
 authors = ["minchenlee"]
 edition = "2021"
+# Two binaries in engine builds: `cargo run` and `tauri dev` pick this one.
+default-run = "c9watch"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -40,8 +42,9 @@ cli = ["dep:clap", "dep:regex", "dep:tokio"]
 # Claude Code and Codex now provide native agent spawning, so this is excluded
 # from `default`. Build with `--features pm-orchestration` to expose it.
 pm-orchestration = ["cli"]
-# Agent engine (C1a): `c9watch engine`, `api` and `task`, unix only.
-engine = ["cli", "dep:ed25519-dalek", "dep:rand", "dep:schemars"]
+# Agent engine (C1a): `c9watch engine` and `api`, plus the `c9watch-agent`
+# binary, unix only.
+engine = ["cli", "dep:ed25519-dalek", "dep:rand", "dep:schemars", "dep:sha2"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
@@ -103,6 +106,13 @@ notify-rust = { version = "4", optional = true }
 # debug info.
 [profile.dev]
 debug = "line-tables-only"
+
+# The agent side of the engine (C1a-21): `hook`, `task done`, `handoff`.
+# Built only with the engine, so GUI and release CLI builds do not change.
+[[bin]]
+name = "c9watch-agent"
+path = "src/bin/c9watch-agent.rs"
+required-features = ["engine"]
 
 [[example]]
 name = "notification_smoke"

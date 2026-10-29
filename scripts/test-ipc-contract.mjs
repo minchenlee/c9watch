@@ -84,6 +84,7 @@ test('stop_session is invoked with a session key, not a bare pid', () => {
 // comes from that file.
 const c9pSchema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf8'));
 const engineApi = readFileSync(join(root, 'src-tauri/src/engine/api.rs'), 'utf8');
+const wire = readFileSync(join(root, 'src-tauri/src/engine_proto/wire.rs'), 'utf8');
 
 test('c9p/1 TS types are generated from the current schema', () => {
   assert.equal(
@@ -96,12 +97,20 @@ test('c9p/1 TS types are generated from the current schema', () => {
 test('c9p/1 schema lists exactly the methods the engine serves', () => {
   const list = engineApi.match(/pub const METHODS: &\[&str\] = &\[([^\]]*)\]/);
   assert.ok(list, 'METHODS not found in engine/api.rs');
-  const methods = matches(list[1], /"([a-z.]+)"/g);
+  const methods = matches(list[1], /"([a-z._]+)"/g);
   assert.deepEqual(sorted(Object.keys(c9pSchema.methods)), sorted(methods));
   const dispatch = engineApi.match(/async fn dispatch\([\s\S]*?\n\}/);
   assert.ok(dispatch, 'dispatch not found in engine/api.rs');
-  const served = matches(dispatch[0], /^\s*"([a-z.]+)" =>/gm);
+  const served = matches(dispatch[0], /^\s*"([a-z._]+)" =>/gm);
   served.add('hello'); // handled before dispatch
+  // Hook-class methods (C1a-21): `task.done` and `agent.handoff` by name,
+  // every `hook.*` in HOOK_METHODS.
+  const hookClass = engineApi.match(/async fn hook_class\([\s\S]*?\n\}/);
+  assert.ok(hookClass, 'hook_class not found in engine/api.rs');
+  for (const m of matches(hookClass[0], /^\s*"([a-z._]+)" =>/gm)) served.add(m);
+  const hooks = wire.match(/pub const HOOK_METHODS: &\[&str\] = &\[([^\]]*)\]/);
+  assert.ok(hooks, 'HOOK_METHODS not found in engine_proto/wire.rs');
+  for (const m of matches(hooks[1], /"([a-z._]+)"/g)) served.add(m);
   assert.deepEqual(sorted(served), sorted(methods));
 });
 

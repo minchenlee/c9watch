@@ -1,0 +1,326 @@
+//! `c9watch-agent` against a real engine (C1a-21): the engine's own copy,
+//! the exe and ancestry checks, and the hook's exit-0 promise.
+//!
+//! The engine runs in this process, in a temp engine home whose path holds
+//! a space (like `Application Support`), with detection off. The agent
+//! source comes in through `EngineConfig`, never through the env. Agents
+//! are `/bin/sh` PTY children that the test registers in the engine's live
+//! table; no real Claude Code runs.
+
+#![cfg(all(unix, feature = "engine"))]
+
+use c9watch_lib::engine::agent_bin::installed_path;
+use c9watch_lib::engine::agents::LiveTable;
+use c9watch_lib::engine::db::db_path;
+use c9watch_lib::engine::driver::{Driver, SpawnSpec};
+use c9watch_lib::engine::home::{sock_path, ENGINE_HOME_ENV};
+use c9watch_lib::engine::pty::NativePty;
+use c9watch_lib::engine::run::{run_until, EngineConfig};
+use c9watch_lib::engine_proto::client::Conn;
+use sha2::{Digest, Sha256};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const AGENT: &str = env!("CARGO_BIN_EXE_c9watch-agent");
+const MAIN: &str = env!("CARGO_BIN_EXE_c9watch");
+const AGENT_ID: &str = "agt_t";
+
+/// An engine running on its own thread. Dropping it stops the engine.
+struct Engine {
+    dir: tempfile::TempDir,
+    home: PathBuf,
+    agents: Arc<LiveTable>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<Result<(), String>>>,
+}
+
+impl Engine {
+    fn start() -> Engine {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("engine home");
+        let agents = Arc::new(LiveTable::new());
+        let config = EngineConfig {
+            home: home.clone(),
+            agent_source: PathBuf::from(AGENT),
+            agents: agents.clone(),
+            detection: false,
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(run_until(&config, async {
+                let _ = stopped.await;
+            }))
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Conn::connect(&sock_path(&home), "test", Duration::from_secs(1)).is_err() {
+            assert!(Instant::now() < deadline, "the engine did not come up");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Engine {
+            dir,
+            home,
+            agents,
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
+
+    fn sock(&self) -> PathBuf {
+        sock_path(&self.home)
+    }
+
+    fn copy(&self) -> PathBuf {
+        installed_path(&self.home)
+    }
+
+    /// Audit rows the engine wrote for refused hook-class calls.
+    fn denials(&self) -> Vec<(String, String)> {
+        let conn = rusqlite::Connection::open(db_path(&self.home)).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT principal, method FROM audit WHERE decision = 'deny' ORDER BY seq")
+            .unwrap();
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(t) = self.thread.take() {
+            t.join().unwrap().unwrap();
+        }
+    }
+}
+
+/// Single-quote `p` for `/bin/sh`.
+fn q(p: &Path) -> String {
+    format!("'{}'", p.display().to_string().replace('\'', r"'\''"))
+}
+
+/// Run `cmd` in `/bin/sh` behind a PTY with the agent env, as an engine
+/// agent would. With `register`, the PTY child is the live generation 1 of
+/// `AGENT_ID` before the command starts. Returns the output and the exit
+/// code.
+fn as_agent(engine: &Engine, cmd: &str, register: bool) -> (String, i32) {
+    let script = format!("read go; {}; echo \"rc=$?.\"", cmd);
+    let mut spec = SpawnSpec::new(
+        vec!["/bin/sh".into(), "-c".into(), script.into()],
+        engine.dir.path().to_path_buf(),
+    );
+    spec.env("HOME", engine.dir.path());
+    spec.env("C9_ENGINE_SOCK", engine.sock());
+    spec.env("C9_AGENT_ID", AGENT_ID);
+    let mut pty = NativePty::spawn(&spec).unwrap();
+    if register {
+        engine.agents.register(AGENT_ID, 1, pty.child()).unwrap();
+    }
+    pty.write(b"go\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut seen = String::new();
+    let rc = loop {
+        let out = pty.output(Duration::from_millis(100));
+        seen.push_str(&String::from_utf8_lossy(&out.bytes));
+        if let Some(i) = seen.rfind("rc=") {
+            if let Some(end) = seen[i..].find('.') {
+                break seen[i + 3..i + end].parse().unwrap();
+            }
+        }
+        assert!(!out.eof, "EOF; got {:?}", seen);
+        assert!(Instant::now() < deadline, "no rc; got {:?}", seen);
+    };
+    pty.kill().unwrap();
+    if register {
+        engine.agents.unregister(AGENT_ID, 1);
+    }
+    (seen, rc)
+}
+
+#[test]
+fn the_engine_installs_its_own_copy_0555_with_the_source_sha() {
+    let engine = Engine::start();
+    let copy = engine.copy();
+    let meta = std::fs::metadata(&copy).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o555);
+    assert_eq!(
+        Sha256::digest(std::fs::read(&copy).unwrap()),
+        Sha256::digest(std::fs::read(AGENT).unwrap())
+    );
+    assert_ne!(
+        meta.ino(),
+        std::fs::metadata(AGENT).unwrap().ino(),
+        "a copy, not a link"
+    );
+}
+
+#[test]
+fn an_agent_running_the_copy_is_authorized() {
+    let engine = Engine::start();
+    let bin = q(&engine.copy());
+    // Authorized, and every C1a agent is free: no task.
+    let (out, rc) = as_agent(&engine, &format!("{} task done --report r", bin), true);
+    assert_eq!(rc, 1, "{}", out);
+    assert!(out.contains("no_task"), "{}", out);
+    let (out, rc) = as_agent(&engine, &format!("echo n | {} handoff --note -", bin), true);
+    assert_eq!(rc, 1, "{}", out);
+    assert!(out.contains("unsupported_in_c1a"), "{}", out);
+    // The hook goes through quietly.
+    let (out, rc) = as_agent(
+        &engine,
+        &format!("echo '{{\"session_id\":\"s\"}}' | {} hook stop", bin),
+        true,
+    );
+    assert_eq!(rc, 0, "{}", out);
+    // Nothing on stdout but the terminal's echo of our input.
+    let lines: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && *l != "go")
+        .collect();
+    assert_eq!(lines, ["rc=0."], "{:?}", out);
+    assert!(engine.denials().is_empty(), "{:?}", engine.denials());
+}
+
+#[test]
+fn the_copy_outside_a_live_agent_is_refused() {
+    let engine = Engine::start();
+    let bin = q(&engine.copy());
+    let (out, rc) = as_agent(&engine, &format!("{} task done --report r", bin), false);
+    assert_eq!(rc, 1, "{}", out);
+    assert!(out.contains("peer_not_authorized"), "{}", out);
+    // The hook still exits 0; the engine logs the refusal.
+    let (_, rc) = as_agent(&engine, &format!("{} hook stop </dev/null", bin), false);
+    assert_eq!(rc, 0);
+    let denials = engine.denials();
+    assert_eq!(
+        denials,
+        vec![
+            ("local-unverified".to_string(), "task.done".to_string()),
+            ("local-unverified".to_string(), "hook.stop".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn an_agent_running_another_binary_is_refused() {
+    let engine = Engine::start();
+    // The source next to the main binary: same bytes, not the engine's copy.
+    let (out, rc) = as_agent(
+        &engine,
+        &format!("{} task done --report r", q(Path::new(AGENT))),
+        true,
+    );
+    assert_eq!(rc, 1, "{}", out);
+    assert!(out.contains("peer_not_authorized"), "{}", out);
+    // The main binary's raw `api` escape hatch, from inside the agent.
+    let cmd = format!(
+        "env -u C9_AGENT_ID {}={} {} api task.done '{{\"agentId\":\"{}\",\"report\":\"r\",\"seq\":\"1\"}}'",
+        ENGINE_HOME_ENV,
+        q(&engine.home),
+        q(Path::new(MAIN)),
+        AGENT_ID
+    );
+    let (out, rc) = as_agent(&engine, &cmd, true);
+    assert_eq!(rc, 1, "{}", out);
+    assert!(out.contains("peer_not_authorized"), "{}", out);
+    let denials = engine.denials();
+    assert_eq!(denials.len(), 2, "{:?}", denials);
+    assert!(denials
+        .iter()
+        .all(|(p, m)| p == &format!("agent:{}", AGENT_ID) && m == "task.done"));
+}
+
+#[test]
+fn a_changed_copy_is_refused() {
+    let engine = Engine::start();
+    let copy = engine.copy();
+    // Same inode, other bytes: the agent binary with a trailing byte, which
+    // still runs.
+    let mut bytes = std::fs::read(&copy).unwrap();
+    bytes.push(0);
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(&copy, &bytes).unwrap();
+    let (out, rc) = as_agent(&engine, &format!("{} task done --report r", q(&copy)), true);
+    assert_eq!(rc, 1, "{}", out);
+    assert!(out.contains("peer_not_authorized"), "{}", out);
+    assert!(out.contains("agent_bin_mismatch"), "{}", out);
+}
+
+#[test]
+fn a_hook_exits_0_without_an_engine_or_with_bad_args() {
+    let dir = tempfile::tempdir().unwrap();
+    let hook = |args: &[&str]| {
+        let t = Instant::now();
+        let out = Command::new(AGENT)
+            .args(args)
+            .env("C9_ENGINE_SOCK", dir.path().join("none.sock"))
+            .env("C9_AGENT_ID", AGENT_ID)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (out, t.elapsed())
+    };
+    for args in [
+        &["hook", "stop"][..],
+        &["hook", "session-start"],
+        &["hook", "no-such-event"],
+        &["hook"],
+        &["hook", "stop", "--bogus"],
+    ] {
+        let (out, took) = hook(args);
+        assert_eq!(out.status.code(), Some(0), "{:?}: {:?}", args, out);
+        assert!(out.stdout.is_empty(), "{:?}: {:?}", args, out);
+        assert!(took < Duration::from_secs(2), "{:?} took {:?}", args, took);
+    }
+    // `task done` is not a hook: it fails loudly.
+    let (out, _) = hook(&["task", "done", "--report", "r"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot reach the engine"));
+    // No `api`.
+    let (out, _) = hook(&["api", "hello"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// The engine accepts the connection but never answers: the hook gives up
+/// after its 0.5 s budget and still exits 0.
+#[test]
+fn a_hook_against_a_silent_engine_exits_0_in_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("e.sock");
+    let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let held = std::thread::spawn(move || {
+        let c = l.accept().unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        drop(c);
+    });
+    let t = Instant::now();
+    let out = Command::new(AGENT)
+        .args(["hook", "stop"])
+        .env("C9_ENGINE_SOCK", &path)
+        .env("C9_AGENT_ID", AGENT_ID)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let took = t.elapsed();
+    assert_eq!(out.status.code(), Some(0), "{:?}", out);
+    assert!(out.stdout.is_empty());
+    assert!(took < Duration::from_millis(1500), "took {:?}", took);
+    held.join().unwrap();
+}
+
+/// `cargo run` picks the main binary (`default-run`), and the agent binary
+/// exists only with the engine (`required-features`).
+#[test]
+fn the_manifest_keeps_c9watch_the_default_binary() {
+    let manifest = include_str!("../Cargo.toml");
+    assert!(manifest.contains("\ndefault-run = \"c9watch\"\n"));
+    let bin = manifest.split("[[bin]]").nth(1).unwrap();
+    assert!(bin.contains("name = \"c9watch-agent\""));
+    assert!(bin.contains("required-features = [\"engine\"]"));
+}

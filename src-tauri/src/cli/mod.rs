@@ -20,8 +20,9 @@ pub enum CostSortDir {
 mod cost;
 mod session_json;
 mod session_ref;
-// Engine commands (`engine`, `api`, `task`) talk to the engine over a unix
-// socket. They exist only in engine builds, so a release CLI is unchanged.
+// Engine commands (`engine`, `api`) talk to the engine over a unix socket.
+// They exist only in engine builds, so a release CLI is unchanged. `task`
+// holds the calls of the separate `c9watch-agent` binary (C1a-21).
 #[cfg(all(unix, feature = "engine"))]
 pub mod engine_client;
 #[cfg(all(unix, feature = "engine"))]
@@ -79,8 +80,6 @@ pub const CLI_COMMANDS: &[&str] = &[
     "wait",
     "tasks",
     #[cfg(all(unix, feature = "engine"))]
-    "task",
-    #[cfg(all(unix, feature = "engine"))]
     "engine",
     #[cfg(all(unix, feature = "engine"))]
     "api",
@@ -96,9 +95,10 @@ pub const CLI_COMMANDS: &[&str] = &[
     "help",
 ];
 
-/// Engine command names in builds without the engine. They stay out of
-/// `CLI_COMMANDS`, but `is_cli_invocation` still routes them to Clap, so the
-/// user gets an unknown-command error instead of the GUI.
+/// Engine command names in builds without the engine, and `task`, which
+/// moved to `c9watch-agent` (C1a-21). They stay out of `CLI_COMMANDS`, but
+/// `is_cli_invocation` still routes them to Clap, so the user gets an
+/// unknown-command error instead of the GUI.
 pub const RESERVED_ENGINE_COMMANDS: &[&str] = &["task", "engine", "api"];
 
 /// Whether `first` (the first argument) selects the CLI.
@@ -349,13 +349,6 @@ pub enum Commands {
         force: bool,
     },
 
-    /// Report to the c9 engine that this managed worker finished its task
-    #[cfg(all(unix, feature = "engine"))]
-    Task {
-        #[command(subcommand)]
-        action: TaskAction,
-    },
-
     /// Run the c9 engine in the foreground, or control it
     #[cfg(all(unix, feature = "engine"))]
     Engine {
@@ -418,17 +411,6 @@ pub enum EngineAction {
     ShadowReport,
 }
 
-#[cfg(all(unix, feature = "engine"))]
-#[derive(Subcommand)]
-pub enum TaskAction {
-    /// Send the final report to the engine (needs C9_ENGINE_SOCK, C9_AGENT_ID, C9_AGENT_TOKEN)
-    Done {
-        /// Report text, or `-` to read it from stdin
-        #[arg(long)]
-        report: String,
-    },
-}
-
 /// Run the CLI and return the exit code.
 pub fn run(cli: Cli) {
     // Suppress debug log stderr noise — agents shouldn't see warnings
@@ -482,10 +464,6 @@ pub fn run(cli: Cli) {
             Err(e) => Err(e),
         },
         Commands::Tasks { session_id } => cmd_tasks(&session_id, cli.pretty),
-        #[cfg(all(unix, feature = "engine"))]
-        Commands::Task {
-            action: TaskAction::Done { report },
-        } => task::cmd_task_done(&report),
         #[cfg(all(unix, feature = "engine"))]
         Commands::Engine { action } => match action {
             None => engine_client::cmd_engine_run(),
@@ -1208,7 +1186,7 @@ mod dispatch_tests {
     #[cfg(all(unix, feature = "engine"))]
     #[test]
     fn engine_and_api_parse_and_route() {
-        for name in ["engine", "api", "task"] {
+        for name in ["engine", "api"] {
             assert!(is_cli_invocation(name));
         }
         let cli = Cli::try_parse_from(["c9watch", "engine"]).unwrap();
@@ -1245,19 +1223,15 @@ mod dispatch_tests {
         assert!(parsed.is_err());
     }
 
+    /// `task done` lives only in `c9watch-agent` (C1a-21): the main binary
+    /// has no `task`, so done has one path. Clap reports it; the GUI does
+    /// not launch.
     #[cfg(all(unix, feature = "engine"))]
     #[test]
-    fn task_done_parses_and_routes() {
+    fn the_main_binary_has_no_task_command() {
+        assert!(!CLI_COMMANDS.contains(&"task"));
         assert!(is_cli_invocation("task"));
-        let cli = Cli::try_parse_from(["c9watch", "task", "done", "--report", "ok"]).unwrap();
-        let Commands::Task {
-            action: TaskAction::Done { report },
-        } = cli.command
-        else {
-            panic!("not task done");
-        };
-        assert_eq!(report, "ok");
-        assert!(Cli::try_parse_from(["c9watch", "task", "done"]).is_err());
+        assert!(Cli::try_parse_from(["c9watch", "task", "done", "--report", "ok"]).is_err());
     }
 }
 
