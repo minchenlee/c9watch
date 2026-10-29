@@ -22,7 +22,8 @@
 //!   `deny_rules`): `permissions.deny`, `sandbox.filesystem.denyWrite` and
 //!   `allowUnsandboxedCommands:false`. The price, accepted in D28 Q2=A: a
 //!   free agent cannot change the repo's own `.claude/`, skills and
-//!   commands included.
+//!   commands included. The first two layers also cover the engine's
+//!   `bin/` and `spawn/` and its `standing-orders.md` (C1a-25).
 //! - The env carries only `C9_AGENT_ID`, `C9_AGENT_GEN` and
 //!   `C9_ENGINE_SOCK`, none of them a secret. There is no `C9_AGENT_TOKEN`
 //!   (D28 Q6=B) and no `C9_STANDING_ORDERS` (spike `c0-engine.rs:407`):
@@ -37,6 +38,7 @@ use crate::cli::task::{ENV_AGENT_ID, ENV_SOCK};
 use crate::engine::adapter::{claude_hook_settings, CLAUDE};
 use crate::engine::driver::SpawnSpec;
 use crate::engine::fsutil::ensure_private_dir;
+use crate::engine::standing::STANDING_ORDERS_NAME;
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::io::Write;
@@ -183,15 +185,24 @@ pub fn engine_dirs(p: &Profile) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Engine-owned files the agent must not write: `<home>/standing-orders.md`,
+/// which the engine sends to every agent (A:545, C1a-25).
+pub fn engine_files(p: &Profile) -> Vec<PathBuf> {
+    let home = p.agent_bin.parent().and_then(Path::parent);
+    home.map(|h| h.join(STANDING_ORDERS_NAME))
+        .into_iter()
+        .collect()
+}
+
 /// Layer 1, deny rules for CC's own file tools. `Edit` covers every file
 /// tool; CC 2.1.312 warns that a `Write(path)` rule is not matched by file
 /// permission checks. Paths use the `//abs` form: CC roots `//x` at `/`,
 /// but roots a single-slash `/x` at the settings source's own root, so
 /// `Edit(/abs/...)` would not name the absolute path.
 ///
-/// 1. The engine directories. Not a boundary on their own (the engine
-///    checks the agent binary's sha anyway), but they stop the obvious
-///    Edit/Write path.
+/// 1. The engine directories and the standing orders. Not a boundary on
+///    their own (the engine checks the agent binary's sha anyway), but
+///    they stop the obvious Edit/Write path.
 /// 2. The cwd's settings files. Live run sett1 (auto + sandbox): the
 ///    auto-mode classifier allowed a Write of `.claude/settings.local.json`
 ///    and CC hot-reloaded it. The sandbox's built-in write-deny of settings
@@ -211,6 +222,11 @@ pub fn deny_rules(p: &Profile) -> Vec<String> {
         .map(|d| format!("Edit(/{}/**)", d.display()))
         .collect();
     v.extend(
+        engine_files(p)
+            .iter()
+            .map(|f| format!("Edit(/{})", f.display())),
+    );
+    v.extend(
         SETTINGS_FILES
             .iter()
             .map(|f| format!("Edit(/{}/{})", cwd, f)),
@@ -225,12 +241,14 @@ pub fn claude_dir(p: &Profile) -> PathBuf {
 }
 
 /// Layer 2, `sandbox.filesystem.denyWrite` for sandboxed Bash: the engine
-/// directories and the `.claude` directory itself, not only its files. A
+/// directories and files, and the `.claude` directory itself, not only its
+/// files. A
 /// sandbox path is a subtree, so this covers both settings files and also
 /// refuses `mv .claude` and a `.claude` symlink in its place.
 pub fn deny_write(p: &Profile) -> Vec<String> {
     engine_dirs(p)
         .into_iter()
+        .chain(engine_files(p))
         .chain([claude_dir(p)])
         .map(|d| d.display().to_string())
         .collect()
@@ -426,7 +444,11 @@ mod tests {
         with_cwd(|cwd, p| {
             let spec = spawn_spec(&p, Path::new("/x/claude"), Path::new("/h/spawn/a.json"));
             assert!(spec.env.iter().all(|(k, _)| k != "C9_STANDING_ORDERS"));
-            let s = serde_json::to_string(&settings(&p)).unwrap();
+            // The settings name the orders file only to deny writes to it.
+            let mut s = settings(&p);
+            s["permissions"]["deny"] = json!(null);
+            s["sandbox"]["filesystem"]["denyWrite"] = json!(null);
+            let s = serde_json::to_string(&s).unwrap();
             assert!(!s.contains("standing"), "{}", s);
             assert_eq!(spec.cwd, cwd.canonicalize().unwrap());
         });
@@ -632,6 +654,7 @@ mod tests {
                 json!([
                     "/b/Application Support/c9/bin",
                     "/b/Application Support/c9/spawn",
+                    "/b/Application Support/c9/standing-orders.md",
                     format!("{}/.claude", cwd)
                 ])
             );
@@ -656,6 +679,7 @@ mod tests {
             json!([
                 "Edit(//b/Application Support/c9/bin/**)",
                 "Edit(//b/Application Support/c9/spawn/**)",
+                "Edit(//b/Application Support/c9/standing-orders.md)",
                 format!("Edit(/{}/.claude/settings.json)", cwd),
                 format!("Edit(/{}/.claude/settings.local.json)", cwd),
                 format!("Edit(/{}/.claude/**)", cwd),

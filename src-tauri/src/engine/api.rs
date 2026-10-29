@@ -21,7 +21,8 @@
 //! `peer_not_authorized`, and the refusal goes to the audit log. The main
 //! binary's `c9watch api` can therefore never send one. An authorized
 //! `hook.*` event then goes through `engine::hooks::intake` (kind,
-//! generation, dedupe, state merge; C1a-22).
+//! generation, dedupe, state merge; C1a-22). `hook.session_start` also
+//! answers with the standing orders (`engine::standing`, C1a-25).
 
 use super::agent_bin::AgentBin;
 use super::db::audit::{self, AuditEntry};
@@ -38,7 +39,9 @@ use super::proto::{
     SnapshotParams, SnapshotResult, SubscribeParams, SubscribeResult, TaskDoneParams,
     TaskDoneResult, API_MAJOR, API_MINOR, HOOK_METHODS, MAX_FRAME,
 };
+use super::standing;
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -78,6 +81,9 @@ pub struct ServerCtx {
     pub db: Option<Arc<Db>>,
     /// The state merge of every live agent (C1a-22).
     pub merge: Arc<MergeTable>,
+    /// `<home>/standing-orders.md`, sent on `hook.session_start`. `None`
+    /// sends no orders.
+    pub standing_orders: Option<PathBuf>,
 }
 
 impl ServerCtx {
@@ -92,6 +98,7 @@ impl ServerCtx {
             agent_bin: None,
             db: None,
             merge: Arc::new(MergeTable::new()),
+            standing_orders: None,
         }
     }
 
@@ -108,6 +115,11 @@ impl ServerCtx {
 
     pub fn with_db(mut self, db: Arc<Db>) -> Self {
         self.db = Some(db);
+        self
+    }
+
+    pub fn with_standing_orders(mut self, path: PathBuf) -> Self {
+        self.standing_orders = Some(path);
         self
     }
 
@@ -564,35 +576,42 @@ async fn hook_class(
                     format!("{} is not an agent", principal),
                 ));
             };
-            let accepted = hook_intake(ctx, method, principal, *gen, params).await?;
-            // Standing orders for `hook.session_start` come with the spawn
-            // profile (M5).
+            let (outcome, additional_context) =
+                hook_intake(ctx, method, principal, *gen, params).await?;
             let result = HookResult {
-                accepted,
-                additional_context: None,
+                accepted: outcome == Outcome::Accepted,
+                additional_context,
             };
             Ok(serde_json::to_value(result).expect("HookResult serializes"))
         }
     }
 }
 
-/// Run an authorized `hook.*` event through the intake. Returns whether
-/// the engine took it; a dropped event is not an error (the hook must not
-/// fail).
+/// Run an authorized `hook.*` event through the intake. Returns the
+/// outcome, and for `hook.session_start` the context to send; a dropped
+/// event is not an error (the hook must not fail).
 async fn hook_intake(
     ctx: &ServerCtx,
     method: &str,
     principal: &Principal,
     gen: i64,
     params: HookParams,
-) -> Result<bool, ApiError> {
+) -> Result<(Outcome, Option<String>), ApiError> {
     let db = ctx.db()?.clone();
     let machine = ctx.machine_id.clone();
     let merge = ctx.merge.clone();
+    // The file is read before the write: no I/O inside the transaction.
+    let orders = match (&ctx.standing_orders, method) {
+        (Some(path), "hook.session_start") => {
+            let path = path.clone();
+            blocking(move || Ok(standing::read(&path))).await?
+        }
+        _ => None,
+    };
     // Read now, not at accept: a resume since then makes the event stale.
     let live_gen = ctx.agents.current_gen(&params.agent_id);
     let (method, principal) = (method.to_string(), principal.to_string());
-    let (outcome, _) = db
+    let (answer, _) = db
         .write(move |tx| {
             let ev = HookEvent {
                 method: &method,
@@ -601,11 +620,15 @@ async fn hook_intake(
                 live_gen,
                 params: &params,
             };
-            hooks::intake(tx, &machine, &merge, &ev, now_ms())
+            if method == "hook.session_start" {
+                standing::session_start(tx, &machine, &merge, &ev, orders.as_deref(), now_ms())
+            } else {
+                hooks::intake(tx, &machine, &merge, &ev, now_ms()).map(|o| (o, None))
+            }
         })
         .await
         .map_err(internal)?;
-    Ok(outcome == Outcome::Accepted)
+    Ok(answer)
 }
 
 /// The two facts a hook-class call needs: the principal is the agent the
@@ -956,6 +979,7 @@ mod tests {
             agent_bin: None,
             db: None,
             merge: Arc::new(MergeTable::new()),
+            standing_orders: None,
         })
     }
 
@@ -1290,6 +1314,7 @@ mod tests {
             agent_bin: None,
             db: Some(db.clone()),
             merge: Arc::new(MergeTable::new()),
+            standing_orders: None,
         });
         (t, ctx, db)
     }

@@ -14,7 +14,9 @@
 //!
 //! `c9watch-agent` is copied into `<home>/bin` before the socket is bound,
 //! so the first hook-class call already finds it (`engine::agent_bin`). A
-//! missing source only logs: the engine runs without agents.
+//! missing source only logs: the engine runs without agents. The default
+//! `<home>/standing-orders.md` is written on the first start
+//! (`engine::standing`); a failure only logs.
 
 use super::agent_bin::{self, AgentBin};
 use super::agents::LiveTable;
@@ -27,6 +29,7 @@ use super::import;
 use super::lock::acquire_engine_lock;
 use super::machine;
 use super::sock::{bind_private, ShutdownSignals};
+use super::standing;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,6 +90,11 @@ pub async fn run_until(
             why.unwrap_or_default()
         ),
     }
+    match standing::ensure(home) {
+        Ok(true) => eprintln!("[engine] Wrote the default {:?}", standing::path(home)),
+        Ok(false) => {}
+        Err(e) => eprintln!("[engine] {}", e),
+    }
     let (std_listener, socket) = bind_private(&sock_path(home), &lock)?;
     std_listener
         .set_nonblocking(true)
@@ -98,7 +106,8 @@ pub async fn run_until(
         ServerCtx::new(key.id().to_string())
             .with_agents(config.agents.clone())
             .with_agent_bin(agent_bin)
-            .with_db(db.clone()),
+            .with_db(db.clone())
+            .with_standing_orders(standing::path(home)),
     );
     let pruner = tokio::spawn(prune_loop(db.clone()));
     let detection = if config.detection {
