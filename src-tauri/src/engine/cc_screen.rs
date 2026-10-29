@@ -166,6 +166,37 @@ pub fn auto_deny_notice(screen: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// Screen text, lower case, of a vendor that refuses to start a session:
+/// a usage limit or a missing login (D28 Q7). The wording is CC's and may
+/// change; when nothing matches, the ready timeout still fails the spawn,
+/// only with a less clear message (plan §6.4).
+pub const VENDOR_REFUSALS: &[&str] = &[
+    "usage limit",
+    "hit your limit",
+    "limit reached",
+    "credit balance is too low",
+    "please run /login",
+    "not logged in",
+    "invalid api key",
+    "oauth token has expired",
+    "select login method",
+];
+
+/// The lines of `screen` that show a vendor refusal, joined, or `None`.
+/// Only for the screen before the first ready: after it, the agent's own
+/// output may contain the words.
+pub fn vendor_refusal(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            let l = l.to_lowercase();
+            VENDOR_REFUSALS.iter().any(|m| l.contains(m))
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// Why a screen needs a human. The engine never answers a prompt (O1 = A).
 /// The trust dialog is a spawn step (D24.3) and needs attention only when
 /// it shows after the first ready.
@@ -648,5 +679,23 @@ mod tests {
         // Chat above the rule does not change the hash.
         let scrolled = screen.replace("chat line", "other chat");
         assert_eq!(prompt_hash(&screen), prompt_hash(&scrolled));
+    }
+
+    #[test]
+    fn vendor_refusals_are_found_with_their_lines() {
+        let limit =
+            "  \u{23bf}  Claude usage limit reached. Your limit will reset at 5pm\n\n\u{276f} ";
+        assert_eq!(
+            vendor_refusal(limit).as_deref(),
+            Some("\u{23bf}  Claude usage limit reached. Your limit will reset at 5pm")
+        );
+        let login = "Invalid API key \u{b7} Please run /login\nother";
+        assert_eq!(
+            vendor_refusal(login).as_deref(),
+            Some("Invalid API key \u{b7} Please run /login")
+        );
+        assert!(vendor_refusal(PROMPT).is_none());
+        assert!(vendor_refusal(TRUST).is_none());
+        assert!(vendor_refusal(PERM).is_none());
     }
 }

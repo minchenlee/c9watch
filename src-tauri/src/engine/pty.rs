@@ -535,6 +535,75 @@ impl Drop for NativePty {
     }
 }
 
+/// What `kill_orphan` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Orphan {
+    /// No process runs with that pid (a zombie runs nothing).
+    Gone,
+    /// The pid runs, with another start time: it was reused. Not touched.
+    PidReused,
+    /// The PTY child and its group were killed.
+    Killed,
+}
+
+/// Kill the PTY child `id` of an engine that is gone (boot reconcile,
+/// C1a-26), with its group and descendants, as `NativePty::kill` does. The
+/// engine holds no handle to it, so it is checked by pid **and** start time
+/// first: a process that got the pid since is never signalled. Blocking:
+/// up to `KILL_GRACE` + `KILL_VERIFY`.
+pub fn kill_orphan(id: ChildId) -> io::Result<Orphan> {
+    match peer::proc_entry(id.pid) {
+        None => return Ok(Orphan::Gone),
+        Some(e) if e.info.start != id.start => return Ok(Orphan::PidReused),
+        Some(e) if e.zombie => return Ok(Orphan::Gone),
+        Some(_) => {}
+    }
+    let leader = peer::ProcEntry {
+        info: peer::ProcInfo {
+            pid: id.pid,
+            ppid: 0,
+            start: id.start,
+        },
+        pgid: id.pid,
+        zombie: false,
+    };
+    // Walk the descendants before the first signal, as `kill` does.
+    let mut seen = Descendants::default();
+    seen.sweep(id);
+    // While the leader runs, its pid is also its group id (it called
+    // `setsid`), so the group signal reaches the right processes.
+    let signal = |seen: &Descendants, sig| {
+        if runs(&leader) {
+            let _ = signal_group(id.pid, sig);
+        }
+        Descendants::signal(&seen.0, id.pid, sig);
+    };
+    let gone = |seen: &mut Descendants, limit: Duration, sig| {
+        let deadline = Instant::now() + limit;
+        loop {
+            Descendants::signal(&seen.sweep(id), id.pid, sig);
+            if !runs(&leader) && !seen.any_runs() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL);
+        }
+    };
+    signal(&seen, libc::SIGTERM);
+    if !gone(&mut seen, KILL_GRACE, libc::SIGTERM) {
+        signal(&seen, libc::SIGKILL);
+        if !gone(&mut seen, KILL_VERIFY, libc::SIGKILL) {
+            return Err(io::Error::other(format!(
+                "orphan PTY child {} or a descendant is still alive after SIGKILL",
+                id.pid
+            )));
+        }
+    }
+    Ok(Orphan::Killed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,5 +962,41 @@ mod tests {
         .unwrap();
         let text = read_until(&mut pty, "end");
         assert!(text.contains("[   0   n"), "{:?}", text);
+    }
+
+    /// Whether `pid` runs something (a zombie does not).
+    fn runs_pid(pid: libc::pid_t) -> bool {
+        peer::proc_entry(pid).is_some_and(|e| !e.zombie)
+    }
+
+    #[test]
+    fn an_orphan_is_killed_with_its_descendants() {
+        // The engine that spawned it is "gone": nothing calls `kill` on the
+        // handle, only `kill_orphan` with the recorded pid and start time.
+        let mut pty =
+            NativePty::spawn(&sh("sleep 30 & echo \"$!:child\"; trap '' TERM; wait")).unwrap();
+        let child = read_pid(&mut pty, ":child");
+        let id = pty.child();
+        assert_eq!(kill_orphan(id).unwrap(), Orphan::Killed);
+        assert!(!runs_pid(id.pid));
+        assert!(gone_soon(child));
+        // Gone now: a second call finds nothing to do.
+        assert_eq!(kill_orphan(id).unwrap(), Orphan::Gone);
+    }
+
+    #[test]
+    fn a_reused_pid_is_never_killed() {
+        let mut pty = NativePty::spawn(&sh("echo up; sleep 30")).unwrap();
+        read_until(&mut pty, "up");
+        let id = pty.child();
+        // The journal holds the same pid with another start time.
+        let stale = ChildId {
+            pid: id.pid,
+            start: id.start + 1,
+        };
+        assert_eq!(kill_orphan(stale).unwrap(), Orphan::PidReused);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(runs_pid(id.pid));
+        pty.kill().unwrap();
     }
 }

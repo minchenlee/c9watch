@@ -23,8 +23,13 @@
 //! `hook.*` event then goes through `engine::hooks::intake` (kind,
 //! generation, dedupe, state merge; C1a-22). `hook.session_start` also
 //! answers with the standing orders (`engine::standing`, C1a-25).
+//!
+//! `agent.create` and `agent.retire` take only a local client
+//! (`local-unverified`); an agent gets `not_allowed`, which is audited. The
+//! work is in `engine::create` (C1a-26).
 
 use super::agent_bin::AgentBin;
+use super::create::Spawner;
 use super::db::audit::{self, AuditEntry};
 use super::db::outbox::{Cursor, Event, ReadError, Subscription, READ_BATCH};
 use super::db::{now_ms, AgentFilter, Db};
@@ -33,9 +38,10 @@ use super::merge::MergeTable;
 use super::peer::{self, PeerCred};
 use super::principal::{self, LiveAgents, NoLiveAgents, Principal};
 use super::proto::{
-    encode, encode_event, is_hook_class, read_frame, AgentListParams, AgentListResult, ApiError,
-    ErrorCode, EventFrame, EventType, FrameError, HandoffParams, HandoffResult, HelloParams,
-    HelloResult, HookParams, HookResult, Request, Response, SessionListParams, SessionListResult,
+    encode, encode_event, is_hook_class, read_frame, AgentCreateParams, AgentCreateResult,
+    AgentListParams, AgentListResult, AgentRetireParams, AgentRetireResult, ApiError, ErrorCode,
+    EventFrame, EventType, FrameError, HandoffParams, HandoffResult, HelloParams, HelloResult,
+    HookParams, HookResult, Request, Response, SessionListParams, SessionListResult,
     SnapshotParams, SnapshotResult, SubscribeParams, SubscribeResult, TaskDoneParams,
     TaskDoneResult, API_MAJOR, API_MINOR, HOOK_METHODS, MAX_FRAME,
 };
@@ -84,6 +90,9 @@ pub struct ServerCtx {
     /// `<home>/standing-orders.md`, sent on `hook.session_start`. `None`
     /// sends no orders.
     pub standing_orders: Option<PathBuf>,
+    /// Free-agent create and retire (C1a-26). `None` answers
+    /// `experimental_disabled` to `agent.create`.
+    pub spawner: Option<Arc<Spawner>>,
 }
 
 impl ServerCtx {
@@ -99,6 +108,7 @@ impl ServerCtx {
             db: None,
             merge: Arc::new(MergeTable::new()),
             standing_orders: None,
+            spawner: None,
         }
     }
 
@@ -120,6 +130,11 @@ impl ServerCtx {
 
     pub fn with_standing_orders(mut self, path: PathBuf) -> Self {
         self.standing_orders = Some(path);
+        self
+    }
+
+    pub fn with_spawner(mut self, spawner: Arc<Spawner>) -> Self {
+        self.spawner = Some(spawner);
         self
     }
 
@@ -293,7 +308,7 @@ async fn handle_frame(
         }
         Checked::Call(req, method) => {
             let id = req.id.clone();
-            match dispatch(&method, req, ctx, streams).await {
+            match dispatch(&method, req, ctx, principal, streams).await {
                 Ok((result, stream)) => (Response::ok(id, result), Next::Continue, stream),
                 Err(e) => (Response::err(id, e), Next::Continue, None),
             }
@@ -387,6 +402,8 @@ pub const METHODS: &[&str] = &[
     "events.subscribe",
     "session.list",
     "agent.list",
+    "agent.create",
+    "agent.retire",
     "hook.session_start",
     "hook.stop",
     "hook.permission_request",
@@ -439,6 +456,14 @@ pub fn schema() -> serde_json::Value {
             "params": de.subschema_for::<AgentListParams>(),
             "result": ser.subschema_for::<AgentListResult>(),
         },
+        "agent.create": {
+            "params": de.subschema_for::<AgentCreateParams>(),
+            "result": ser.subschema_for::<AgentCreateResult>(),
+        },
+        "agent.retire": {
+            "params": de.subschema_for::<AgentRetireParams>(),
+            "result": ser.subschema_for::<AgentRetireResult>(),
+        },
         "task.done": {
             "params": de.subschema_for::<TaskDoneParams>(),
             "result": ser.subschema_for::<TaskDoneResult>(),
@@ -479,15 +504,19 @@ pub fn schema() -> serde_json::Value {
 }
 
 /// Methods after `hello`, except the hook-class ones. Both C1a principals,
-/// L and A, may call every method here (§1.1). `streams` is how many event
+/// L and A, may call every method here except `agent.create` and
+/// `agent.retire`, which take L only (§1.1). `streams` is how many event
 /// streams the connection holds.
 async fn dispatch(
     method: &str,
     req: Request,
     ctx: &ServerCtx,
+    principal: &Principal,
     streams: usize,
 ) -> Result<(serde_json::Value, Option<EventStream>), ApiError> {
     match method {
+        "agent.create" => Ok((agent_lifecycle(method, req, ctx, principal).await?, None)),
+        "agent.retire" => Ok((agent_lifecycle(method, req, ctx, principal).await?, None)),
         "snapshot.get" => Ok((snapshot_get(ctx).await?, None)),
         "session.list" => Ok((session_list(ctx).await?, None)),
         "agent.list" => Ok((agent_list(req, ctx).await?, None)),
@@ -505,6 +534,53 @@ async fn dispatch(
             ErrorCode::UnknownMethod,
             format!("unknown method {:?}", method),
         )),
+    }
+}
+
+/// `agent.create` and `agent.retire` (C1a-26, `engine::create`). An agent
+/// principal's call is refused and audited.
+async fn agent_lifecycle(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    principal: &Principal,
+) -> Result<serde_json::Value, ApiError> {
+    let r = spawn_or_retire(method, req, ctx, principal).await;
+    if let Err(e) = &r {
+        if e.code == ErrorCode::NotAllowed {
+            audit_refusal(ctx, principal, method, "", e).await;
+        }
+    }
+    r
+}
+
+async fn spawn_or_retire(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    principal: &Principal,
+) -> Result<serde_json::Value, ApiError> {
+    let Some(spawner) = &ctx.spawner else {
+        return Err(match method {
+            "agent.create" => ApiError::new(
+                ErrorCode::ExperimentalDisabled,
+                "this engine cannot create agents",
+            ),
+            _ => ApiError::new(ErrorCode::Internal, "this engine runs no agents"),
+        });
+    };
+    if method == "agent.create" {
+        let agent = spawner.create(principal, req.params).await?;
+        Ok(
+            serde_json::to_value(AgentCreateResult { agent })
+                .expect("AgentCreateResult serializes"),
+        )
+    } else {
+        let agent = spawner.retire(principal, req.params).await?;
+        Ok(
+            serde_json::to_value(AgentRetireResult { agent })
+                .expect("AgentRetireResult serializes"),
+        )
     }
 }
 
@@ -610,6 +686,8 @@ async fn hook_intake(
     };
     // Read now, not at accept: a resume since then makes the event stale.
     let live_gen = ctx.agents.current_gen(&params.agent_id);
+    let agent_id = params.agent_id.clone();
+    let is_start = method == "hook.session_start";
     let (method, principal) = (method.to_string(), principal.to_string());
     let (answer, _) = db
         .write(move |tx| {
@@ -628,6 +706,14 @@ async fn hook_intake(
         })
         .await
         .map_err(internal)?;
+    // A duplicate is the hook's retry: the start still happened.
+    let started = matches!(
+        answer.0,
+        Outcome::Accepted | Outcome::Dropped(hooks::DropReason::Duplicate)
+    );
+    if let (true, true, Some(spawner)) = (is_start, started, &ctx.spawner) {
+        spawner.session_started(&agent_id, gen);
+    }
     Ok(answer)
 }
 
@@ -980,6 +1066,7 @@ mod tests {
             db: None,
             merge: Arc::new(MergeTable::new()),
             standing_orders: None,
+            spawner: None,
         })
     }
 
@@ -1293,6 +1380,11 @@ mod tests {
             if is_hook_class(m) {
                 // Served, but only to an agent (C1a-21).
                 assert_eq!(r["error"]["code"], "peer_not_authorized", "{}: {}", m, r);
+            } else if *m == "agent.create" {
+                // Off without the experimental switch (C1a-26).
+                assert_eq!(r["error"]["code"], "experimental_disabled", "{}: {}", m, r);
+            } else if *m == "agent.retire" {
+                assert_eq!(r["error"]["code"], "internal", "{}: {}", m, r);
             } else {
                 assert_eq!(r["ok"], true, "{}: {}", m, r);
             }
@@ -1315,6 +1407,7 @@ mod tests {
             db: Some(db.clone()),
             merge: Arc::new(MergeTable::new()),
             standing_orders: None,
+            spawner: None,
         });
         (t, ctx, db)
     }

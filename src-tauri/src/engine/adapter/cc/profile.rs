@@ -295,8 +295,14 @@ pub fn settings(p: &Profile) -> Value {
 
 /// `<home>/spawn/<agent_id>-<generation>.json`
 pub fn settings_path(home: &Path, p: &Profile) -> PathBuf {
+    settings_path_of(home, &p.agent_id, p.generation)
+}
+
+/// `settings_path` by agent id and generation, for removing the file of a
+/// retired or failed agent.
+pub fn settings_path_of(home: &Path, agent_id: &str, generation: i64) -> PathBuf {
     home.join(SPAWN_DIR)
-        .join(format!("{}-{}.json", p.agent_id, p.generation))
+        .join(format!("{}-{}.json", agent_id, generation))
 }
 
 /// Write `settings(p)` to `settings_path`, mode 0600 in a 0700 directory,

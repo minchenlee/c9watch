@@ -17,10 +17,18 @@
 //! missing source only logs: the engine runs without agents. The default
 //! `<home>/standing-orders.md` is written on the first start
 //! (`engine::standing`); a failure only logs.
+//!
+//! Boot reconcile (`engine::ops`) runs after the db opens and before the
+//! bind, so no mutation can arrive before it is done; a failed reconcile
+//! stops the boot. `agent.create` is on only with
+//! `C9WATCH_EXPERIMENTAL_CREATE=1` in the engine's env (C1a-26). On
+//! shutdown every agent the engine runs is killed before the db closes; the
+//! next boot reconciles their rows.
 
 use super::agent_bin::{self, AgentBin};
 use super::agents::LiveTable;
 use super::api::{serve, ServerCtx};
+use super::create::{Spawner, SpawnerConfig, EXPERIMENTAL_CREATE_ENV};
 use super::db;
 use super::detect;
 use super::fsutil::ensure_private_dir;
@@ -28,6 +36,7 @@ use super::home::{lock_path, sock_path};
 use super::import;
 use super::lock::acquire_engine_lock;
 use super::machine;
+use super::ops;
 use super::sock::{bind_private, ShutdownSignals};
 use super::standing;
 use std::path::{Path, PathBuf};
@@ -51,6 +60,11 @@ pub struct EngineConfig {
     /// Run session detection and the legacy import. Off only in tests of
     /// the agent path, which must not scan the machine.
     pub detection: bool,
+    /// `agent.create` is on (`C9WATCH_EXPERIMENTAL_CREATE=1`).
+    pub experimental_create: bool,
+    /// The `claude` binary for free agents. `None` looks it up on `PATH`
+    /// at each create; tests set a script here.
+    pub claude: Option<PathBuf>,
 }
 
 impl EngineConfig {
@@ -60,6 +74,8 @@ impl EngineConfig {
             agent_source: agent_bin::default_source()?,
             agents: Arc::new(LiveTable::new()),
             detection: true,
+            experimental_create: std::env::var(EXPERIMENTAL_CREATE_ENV).is_ok_and(|v| v == "1"),
+            claude: None,
         })
     }
 }
@@ -95,6 +111,10 @@ pub async fn run_until(
         Ok(false) => {}
         Err(e) => eprintln!("[engine] {}", e),
     }
+    let reconciled = ops::reconcile(&db, home)?;
+    if !reconciled.is_empty() {
+        eprintln!("[engine] Boot reconcile: {:?}", reconciled);
+    }
     let (std_listener, socket) = bind_private(&sock_path(home), &lock)?;
     std_listener
         .set_nonblocking(true)
@@ -102,13 +122,30 @@ pub async fn run_until(
     let listener = UnixListener::from_std(std_listener)
         .map_err(|e| format!("Failed to register Unix socket: {}", e))?;
 
-    let ctx = Arc::new(
-        ServerCtx::new(key.id().to_string())
-            .with_agents(config.agents.clone())
-            .with_agent_bin(agent_bin)
-            .with_db(db.clone())
-            .with_standing_orders(standing::path(home)),
-    );
+    let ctx = ServerCtx::new(key.id().to_string())
+        .with_agents(config.agents.clone())
+        .with_agent_bin(agent_bin.clone())
+        .with_db(db.clone())
+        .with_standing_orders(standing::path(home));
+    let spawner = Arc::new(Spawner::new(
+        SpawnerConfig {
+            home: home.to_path_buf(),
+            sock: socket.path().to_path_buf(),
+            claude: config.claude.clone(),
+            enabled: config.experimental_create,
+        },
+        db.clone(),
+        config.agents.clone(),
+        ctx.merge.clone(),
+        agent_bin,
+    ));
+    if spawner.enabled() {
+        eprintln!(
+            "[engine] {}=1: agent.create is on (experimental)",
+            EXPERIMENTAL_CREATE_ENV
+        );
+    }
+    let ctx = Arc::new(ctx.with_spawner(spawner.clone()));
     let pruner = tokio::spawn(prune_loop(db.clone()));
     let detection = if config.detection {
         let d = detect::spawn(db.clone())?;
@@ -132,6 +169,9 @@ pub async fn run_until(
     };
     eprintln!("[engine] Shutting down ({:?})", sig);
     pruner.abort();
+    // The agents go before the db closes, so their supervisors can still
+    // write; what they leave is reconciled at the next boot.
+    let _ = tokio::task::spawn_blocking(move || spawner.shutdown()).await;
     // Stops the detection thread after its current tick. A tick that is
     // still writing when the db closes fails, and nothing waits for it.
     drop(detection);
