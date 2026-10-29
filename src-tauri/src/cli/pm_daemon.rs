@@ -164,11 +164,11 @@ fn retire_legacy_daemon(sock_path: &Path, pid_path: &Path) -> Result<(), String>
 /// sockets, bind 0600 under a temp name and rename, write the pid file, then
 /// write the ready mark into the lock file.
 /// A second daemon fails at the lock with `DAEMON_ALREADY_RUNNING` and never
-/// touches the socket or the pid file. The returned `File` holds the lock and
+/// touches the socket or the pid file. The returned `DaemonLock` holds the lock and
 /// must live as long as the listener.
 pub(crate) fn start_listener(
     dir: &Path,
-) -> Result<(std::fs::File, std::os::unix::net::UnixListener), String> {
+) -> Result<(pm_fs::DaemonLock, std::os::unix::net::UnixListener), String> {
     let lock = pm_fs::acquire_daemon_lock(&dir.join(pm_fs::DAEMON_LOCK_NAME))?;
 
     let sock_path = dir.join(pm_fs::DAEMON_SOCK_NAME);

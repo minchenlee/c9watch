@@ -287,6 +287,35 @@ pub fn bind_private(path: &Path) -> Result<std::os::unix::net::UnixListener, Str
 /// Error code returned when another daemon already holds `daemon.lock`.
 pub const DAEMON_ALREADY_RUNNING: &str = "DAEMON_ALREADY_RUNNING";
 
+/// Release a flock explicitly, then close the fd. Closing alone is not
+/// enough: a flock belongs to the open file description, and a child forked
+/// by another thread shares that description until it execs or exits, so a
+/// plain close would leave the lock held. `LOCK_UN` releases it for every
+/// copy.
+fn unlock_and_close(file: File) {
+    use std::os::unix::io::AsRawFd;
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    drop(file);
+}
+
+/// The daemon's exclusive lock. Dropping it releases the lock (see
+/// `unlock_and_close`).
+#[derive(Debug)]
+pub struct DaemonLock(File);
+
+impl std::os::unix::io::AsRawFd for DaemonLock {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+impl Drop for DaemonLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// How long `acquire_daemon_lock` retries a busy lock. Clients probe the lock
 /// with a brief `LOCK_SH`, so a fresh daemon must not give up on the first
 /// `EWOULDBLOCK`; a live daemon holds it forever, so this only delays the
@@ -295,9 +324,9 @@ const LOCK_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Open `path` (0600) and take an exclusive flock on it, then empty it: the
 /// file only carries the ready mark (see `mark_daemon_ready`) of the daemon
-/// that holds it. Keep the returned `File` alive for as long as the lock
-/// must be held.
-pub fn acquire_daemon_lock(path: &Path) -> Result<File, String> {
+/// that holds it. Keep the returned `DaemonLock` alive for as long as the
+/// lock must be held.
+pub fn acquire_daemon_lock(path: &Path) -> Result<DaemonLock, String> {
     use std::os::unix::io::AsRawFd;
     let file = open_private_file(path, OpenOptions::new().create(true).read(true).write(true))?;
     let deadline = std::time::Instant::now() + LOCK_RETRY;
@@ -305,7 +334,7 @@ pub fn acquire_daemon_lock(path: &Path) -> Result<File, String> {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             file.set_len(0)
                 .map_err(|e| format!("Failed to truncate {:?}: {}", path, e))?;
-            return Ok(file);
+            return Ok(DaemonLock(file));
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
@@ -322,9 +351,9 @@ pub fn acquire_daemon_lock(path: &Path) -> Result<File, String> {
 /// Clients wait for this mark, not just for a connectable socket: while a
 /// new daemon retires a pre-lock daemon, the old daemon's socket still
 /// accepts connections.
-pub fn mark_daemon_ready(lock: &File) -> Result<(), String> {
+pub fn mark_daemon_ready(lock: &DaemonLock) -> Result<(), String> {
     use std::io::{Seek, Write};
-    let mut f = lock;
+    let mut f = &lock.0;
     f.seek(std::io::SeekFrom::Start(0))
         .and_then(|_| f.write_all(std::process::id().to_string().as_bytes()))
         .map_err(|e| format!("Failed to write daemon ready mark: {}", e))
@@ -351,8 +380,7 @@ pub fn daemon_lock_held(path: &Path) -> Result<bool, String> {
     use std::os::unix::io::AsRawFd;
     let file = open_private_file(path, OpenOptions::new().create(true).read(true).write(true))?;
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
-        // Dropping `file` closes the fd, which releases the shared lock.
-        drop(file);
+        unlock_and_close(file);
         return Ok(false);
     }
     let err = std::io::Error::last_os_error();
@@ -674,6 +702,34 @@ mod private_fs_tests {
         let _second = acquire_daemon_lock(&p).unwrap();
         // A new holder clears the previous holder's ready mark.
         assert!(!daemon_ready_marked(&p));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Another test in this binary forks a child that parks before exec, so
+    /// it shares every open file description we hold at that moment. A `dup`
+    /// gives the same shared description deterministically: dropping our
+    /// lock (or the probe) must still release the flock.
+    #[test]
+    fn lock_and_probe_release_even_if_the_fd_was_inherited() {
+        use std::os::unix::io::AsRawFd;
+        let d = tmpdir("inherited");
+        ensure_private_dir(&d).unwrap();
+        let p = d.join(DAEMON_LOCK_NAME);
+
+        let first = acquire_daemon_lock(&p).unwrap();
+        let copy = unsafe { libc::dup(first.as_raw_fd()) };
+        assert!(copy >= 0);
+        drop(first);
+        assert!(!daemon_lock_held(&p).unwrap(), "lock outlived its guard");
+        unsafe { libc::close(copy) };
+
+        // The probe's shared lock must not linger in a copy either.
+        let probe = OpenOptions::new().read(true).open(&p).unwrap();
+        assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) }, 0);
+        let probe_copy = unsafe { libc::dup(probe.as_raw_fd()) };
+        unlock_and_close(probe);
+        let _second = acquire_daemon_lock(&p).unwrap();
+        unsafe { libc::close(probe_copy) };
         fs::remove_dir_all(&d).unwrap();
     }
 
