@@ -68,6 +68,19 @@ class WsClient {
 	 * resolve only when the server accepts it. The token never goes in the URL.
 	 */
 	async connect(host: string, auth: WsAuth): Promise<void> {
+		// One socket at a time: a pending reconnect with an older auth must
+		// not replace this one, and the socket being replaced must not stay open.
+		if (this.reconnectTimer) {
+			clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = null;
+		}
+		if (this.ws) {
+			const previous = this.ws;
+			this.ws = null;
+			this._connected = false;
+			this.rejectPending('Connection closed');
+			previous.close();
+		}
 		this.host = host;
 		this.auth = auth;
 		return new Promise((resolve, reject) => {

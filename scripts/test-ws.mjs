@@ -222,6 +222,30 @@ test('a 4401 for an old token does not clear a newer stored token', async () => 
   assert.equal(store['c9watch-client-token'], 'new');
 });
 
+test('connect cancels a pending reconnect and closes the previous socket', async () => {
+  const { client, sockets, runTimers, store } = harness();
+  const first = client.connect('h:9210', { token: 'old' });
+  sockets[0].open();
+  sockets[0].reply({ type: 'authOk', clientId: 'c1' });
+  await first;
+  sockets[0].drop(1006); // schedules a reconnect with the old token
+  const paired = client.connect('h:9210', { code: 'ABCD2345' });
+  sockets[1].open();
+  sockets[1].reply({ type: 'paired', clientId: 'c2', token: 'new' });
+  await paired;
+  runTimers(3000);
+  assert.equal(sockets.length, 2, 'the old reconnect must not fire');
+  assert.equal(store['c9watch-client-token'], 'new');
+
+  // A third connect closes the live socket it replaces.
+  const again = client.connect('h:9210', { token: 'new' });
+  assert.equal(sockets[1].readyState, 3, 'previous socket closed');
+  sockets[2].open();
+  sockets[2].reply({ type: 'authOk', clientId: 'c2' });
+  await again;
+  assert.equal(client.isConnected, true);
+});
+
 test('a legacy token URL is removed and flagged for re-pairing', () => {
   const { ws, store } = harness({ storage: { 'c9watch-ws-url': 'ws://h:9210/ws?token=abc' } });
   assert.equal(ws.migrateLegacyWsUrl(), true);
