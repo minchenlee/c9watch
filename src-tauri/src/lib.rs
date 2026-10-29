@@ -662,17 +662,16 @@ async fn show_main_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Server connection info for the mobile client
+/// Server connection info for the MOBILE modal and Settings. It carries no
+/// credential: a phone gets its token by redeeming a pairing code.
 #[cfg(all(not(mobile), feature = "gui"))]
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerInfo {
-    pub token: String,
     pub port: u16,
     /// The address a phone uses: the default-route IP in LAN mode,
     /// `127.0.0.1` otherwise.
     pub local_ip: String,
-    pub ws_url: String,
     pub lan_enabled: bool,
     /// `"loopback"` or `"lan"`.
     pub bind: &'static str,
@@ -692,11 +691,8 @@ fn server_info(server: &web_server::WsServer) -> ServerInfo {
     } else {
         ("127.0.0.1".to_string(), Vec::new())
     };
-    let token = server.state().auth_token.clone();
     let port = server.port();
     ServerInfo {
-        ws_url: format!("ws://{}:{}/ws?token={}", local_ip, port, token),
-        token,
         port,
         local_ip,
         lan_enabled,
@@ -711,6 +707,25 @@ async fn get_server_info(
     server: tauri::State<'_, Arc<web_server::WsServer>>,
 ) -> Result<ServerInfo, String> {
     Ok(server_info(&server))
+}
+
+/// A new one-time pairing code for the MOBILE modal. The previous code
+/// stops working.
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn create_pairing_code(
+    server: tauri::State<'_, Arc<web_server::WsServer>>,
+) -> Result<web_server::PairingCode, String> {
+    server.create_pairing_code()
+}
+
+/// Forget every paired device and close their sockets.
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn forget_paired_clients(
+    server: tauri::State<'_, Arc<web_server::WsServer>>,
+) -> Result<(), String> {
+    server.forget_paired_clients()
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -777,7 +792,6 @@ pub fn run() {
         .setup(|app| {
             notifications::initialize(app.handle()).map_err(std::io::Error::other)?;
             // ── WebSocket server ────────────────────────────────
-            let token = auth::generate_token();
             let port = web_server::WS_PORT;
 
             let (sessions_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
@@ -789,7 +803,6 @@ pub fn run() {
             app.manage(detector_state.clone());
 
             let ws_state = Arc::new(web_server::WsState::new(
-                token,
                 sessions_tx.clone(),
                 notifications_tx.clone(),
                 detector_state.clone(),
@@ -998,6 +1011,8 @@ pub fn run() {
             rename_session,
             show_main_window,
             get_server_info,
+            create_pairing_code,
+            forget_paired_clients,
             get_remote_access,
             set_remote_access,
             get_debug_logs

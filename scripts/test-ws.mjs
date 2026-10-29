@@ -52,3 +52,160 @@ test('push events do not settle requests and disconnect rejects all pending requ
   await Promise.all([one, two]);
   assert.equal(c.pending.size, 0);
 });
+
+// ── Handshake: token in the first frame, pairing, reconnect ──────────
+
+function harness({ storage = {} } = {}) {
+  const exports = {};
+  const code = ts.transpileModule(readFileSync(new URL('../src/lib/ws.ts', import.meta.url), 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
+  }).outputText;
+  const sockets = [];
+  class FakeSocket {
+    static OPEN = 1;
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      this.sent = [];
+      sockets.push(this);
+    }
+    send(text) { this.sent.push(JSON.parse(text)); }
+    close() { this.readyState = 3; }
+    open() { this.readyState = 1; this.onopen?.(); }
+    reply(msg) { this.onmessage?.({ data: JSON.stringify(msg) }); }
+    drop(code = 1006) { this.readyState = 3; this.onclose?.({ code }); }
+  }
+  const store = { ...storage };
+  const localStorage = {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem: (k, v) => { store[k] = String(v); },
+    removeItem: (k) => { delete store[k]; },
+  };
+  const timers = [];
+  const fakeSetTimeout = (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); return t; };
+  const fakeClearTimeout = (t) => { if (t) t.cleared = true; };
+  const runTimers = (ms) => {
+    for (const t of timers.splice(0)) if (!t.cleared && t.ms === ms) t.fn(); else if (!t.cleared) timers.push(t);
+  };
+  vm.runInNewContext(code, {
+    exports, console: { log() {}, error() {}, warn() {} },
+    setTimeout: fakeSetTimeout, clearTimeout: fakeClearTimeout,
+    WebSocket: FakeSocket, localStorage,
+  });
+  return { ws: exports, client: exports.wsClient, sockets, store, timers, runTimers };
+}
+
+test('the first frame after open is auth, and the URL carries no token', async () => {
+  const { client, sockets } = harness();
+  const done = client.connect('10.0.0.2:9210', { token: 'abc' });
+  assert.equal(sockets.length, 1);
+  assert.equal(sockets[0].url, 'ws://10.0.0.2:9210/ws');
+  assert.doesNotMatch(sockets[0].url, /token/);
+  sockets[0].open();
+  assert.deepEqual(sockets[0].sent, [{ type: 'auth', token: 'abc' }]);
+  sockets[0].reply({ type: 'authOk', clientId: 'c1' });
+  await done;
+  assert.equal(client.isConnected, true);
+});
+
+test('connect does not resolve before the ack', async () => {
+  const { client, sockets } = harness();
+  let settled = false;
+  const done = client.connect('h:9210', { token: 'abc' }).then(() => (settled = true));
+  sockets[0].open();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(settled, false);
+  assert.equal(client.isConnected, false);
+  sockets[0].reply({ type: 'authOk', clientId: 'c1' });
+  await done;
+  assert.equal(settled, true);
+});
+
+test('the connect timeout covers the ack', async () => {
+  const { client, sockets, runTimers } = harness();
+  const done = assert.rejects(client.connect('h:9210', { token: 'abc' }), /timeout/i);
+  sockets[0].open();
+  runTimers(5000);
+  await done;
+  assert.equal(client.isConnected, false);
+});
+
+test('4401 stops reconnecting, clears the token and emits authRequired', async () => {
+  const { client, sockets, store, timers } = harness({
+    storage: { 'c9watch-ws-host': 'h:9210', 'c9watch-client-token': 'abc' },
+  });
+  let required = 0;
+  client.on('authRequired', () => required++);
+  const done = client.connect('h:9210', { token: 'abc' });
+  sockets[0].open();
+  sockets[0].reply({ type: 'authOk', clientId: 'c1' });
+  await done;
+  sockets[0].drop(4401);
+  assert.equal(required, 1);
+  assert.equal(timers.filter((t) => !t.cleared && t.ms === 3000).length, 0, 'no reconnect scheduled');
+  assert.equal(store['c9watch-client-token'], undefined);
+});
+
+test('4401 during connect rejects it and emits authRequired', async () => {
+  const { client, sockets } = harness();
+  let required = 0;
+  client.on('authRequired', () => required++);
+  const done = assert.rejects(client.connect('h:9210', { token: 'bad' }));
+  sockets[0].open();
+  sockets[0].drop(4401);
+  await done;
+  assert.equal(required, 1);
+});
+
+test('a normal drop reconnects and sends auth again', async () => {
+  const { client, sockets, runTimers } = harness();
+  const done = client.connect('h:9210', { token: 'abc' });
+  sockets[0].open();
+  sockets[0].reply({ type: 'authOk', clientId: 'c1' });
+  await done;
+  sockets[0].drop(1012);
+  assert.equal(client.isConnected, false);
+  runTimers(3000);
+  assert.equal(sockets.length, 2);
+  sockets[1].open();
+  assert.deepEqual(sockets[1].sent, [{ type: 'auth', token: 'abc' }]);
+});
+
+test('pairing stores the token, not the code, and reconnects with the token', async () => {
+  const { client, sockets, store, runTimers } = harness();
+  const done = client.connect('h:9210', { code: 'ABCD2345' });
+  sockets[0].open();
+  assert.deepEqual(sockets[0].sent, [{ type: 'pair', code: 'ABCD2345' }]);
+  sockets[0].reply({ type: 'paired', clientId: 'c1', token: 'tok' });
+  await done;
+  assert.equal(store['c9watch-ws-host'], 'h:9210');
+  assert.equal(store['c9watch-client-token'], 'tok');
+  assert.ok(!Object.values(store).includes('ABCD2345'));
+  sockets[0].drop(1006);
+  runTimers(3000);
+  sockets[1].open();
+  assert.deepEqual(sockets[1].sent, [{ type: 'auth', token: 'tok' }]);
+});
+
+test('a failed pairing does not retry the code', async () => {
+  const { client, sockets, timers } = harness();
+  const done = assert.rejects(client.connect('h:9210', { code: 'ABCD2345' }));
+  sockets[0].open();
+  sockets[0].drop(1006);
+  await done;
+  assert.equal(timers.filter((t) => !t.cleared && t.ms === 3000).length, 0);
+});
+
+test('a legacy token URL is removed and flagged for re-pairing', () => {
+  const { ws, store } = harness({ storage: { 'c9watch-ws-url': 'ws://h:9210/ws?token=abc' } });
+  assert.equal(ws.migrateLegacyWsUrl(), true);
+  assert.equal(store['c9watch-ws-url'], undefined);
+  assert.equal(ws.migrateLegacyWsUrl(), false);
+  assert.equal(ws.getStoredConnection(), null);
+});
+
+test('stored connection reads host and token; useWebSocket follows it', () => {
+  const { ws } = harness({ storage: { 'c9watch-ws-host': 'h:9210', 'c9watch-client-token': 'abc' } });
+  assert.deepEqual({ ...ws.getStoredConnection() }, { host: 'h:9210', token: 'abc' });
+  assert.equal(ws.useWebSocket(), true);
+});

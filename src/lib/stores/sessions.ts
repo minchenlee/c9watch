@@ -9,7 +9,7 @@ import type { Session, Conversation } from '../types';
 import { SessionStatus } from '../types';
 import { isDemoMode } from '../demo/mode';
 import { openSession } from '../api';
-import { wsClient, useWebSocket, getStoredWsUrl, isTauri } from '../ws';
+import { wsClient, useWebSocket, getStoredConnection, isTauri } from '../ws';
 import { providerOf, providerSessionKey, resolveCodexHierarchy, sessionReturnKind, sessionKeyOf } from '../provider';
 import { initConversationProgressListener } from './conversation-loader';
 
@@ -216,17 +216,20 @@ export async function initializeSessionListeners() {
 // ── WebSocket mode ──────────────────────────────────────────────────
 
 async function initWebSocketListeners() {
-	const wsUrl = getStoredWsUrl();
-	if (!wsUrl) {
-		console.warn('[ws] No server URL configured');
-		return;
-	}
-
-	try {
-		await wsClient.connect(wsUrl);
-	} catch (e) {
-		console.error('[ws] Failed to connect:', e);
-		return;
+	// ConnectionScreen may have connected already (pairing); otherwise use
+	// the stored host and token.
+	if (!wsClient.isConnected) {
+		const stored = getStoredConnection();
+		if (!stored) {
+			console.warn('[ws] Not paired with a desktop');
+			return;
+		}
+		try {
+			await wsClient.connect(stored.host, { token: stored.token });
+		} catch (e) {
+			console.error('[ws] Failed to connect:', e);
+			return;
+		}
 	}
 
 	wsClient.on('sessionsUpdated', (data: Session[]) => {

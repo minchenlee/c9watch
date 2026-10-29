@@ -53,3 +53,29 @@ test('LAN on shows the plain-ws warning in amber', () => {
 test('remote access settings do not promise tailscale works', () => {
   assert.doesNotMatch(remote, /tailscale|ts\.net/i);
 });
+
+test('MOBILE modal shows a pairing code and its QR carries it in the fragment', () => {
+  assert.match(modal, /createPairingCode\(\)/);
+  assert.match(modal, /pageUrl = `http:\/\/\$\{info\.localIp\}:\$\{info\.port\}\/#pair=\$\{code\}`/);
+  assert.match(modal, /class="pair-code"/);
+  assert.match(modal, /onclick=\{newCode\}[^>]*>New code</);
+  assert.match(modal, /Expires in/);
+  assert.doesNotMatch(modal, /info\.token|copyToken/);
+});
+
+test('Settings can forget every paired device', () => {
+  assert.match(remote, /aria-label="Forget paired devices"/);
+  assert.match(remote, /await forgetPairedClients\(\)/);
+  assert.match(api, /invoke<void>\('forget_paired_clients'\)/);
+});
+
+const connection = read('src/lib/components/ConnectionScreen.svelte');
+
+test('the connection screen pairs with a code and reads it from the fragment', () => {
+  assert.match(connection, /Enter pairing code/);
+  assert.match(connection, /hash\.get\('pair'\)/);
+  assert.match(connection, /history\.replaceState/);
+  assert.match(connection, /Could not connect\. Check that remote access is on and the code has not expired\./);
+  assert.doesNotMatch(connection, /params\.get\('(token|wsUrl)'\)/);
+  assert.match(connection, /Pair again/);
+});

@@ -1,97 +1,128 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { setStoredWsUrl, getStoredWsUrl, clearStoredWsUrl, wsClient } from '$lib/ws';
+	import {
+		wsClient,
+		getStoredConnection,
+		getStoredHost,
+		migrateLegacyWsUrl,
+		type WsAuth
+	} from '$lib/ws';
 	import { initializeSessionListeners, sessions } from '$lib/stores/sessions';
 	import { getSessions } from '$lib/api';
 
 	let { onconnected }: { onconnected: () => void } = $props();
 
-	let mode = $state<'choose' | 'token' | 'url'>('choose');
+	let mode = $state<'choose' | 'code' | 'advanced'>('choose');
 	let connecting = $state(false);
-	let tokenInput = $state('');
-	let urlInput = $state('');
+	let codeInput = $state('');
+	let hostInput = $state('');
 	let inputError = $state('');
+	/** Shown when an old token link was dropped or the desktop forgot this device. */
+	let pairAgain = $state(false);
 
 	const WS_PORT = 9210;
+	const CONNECT_ERROR =
+		'Could not connect. Check that remote access is on and the code has not expired.';
 
-	async function doConnect(wsUrl: string) {
+	/** This page's own server, as "host:port". The socket goes to the server that served the page. */
+	function pageHost(): string {
+		const { hostname, port } = window.location;
+		// 127.0.0.1 instead of localhost avoids IPv6 resolution issues.
+		const name = hostname === 'localhost' ? '127.0.0.1' : hostname;
+		const host = name.includes(':') && !name.startsWith('[') ? `[${name}]` : name;
+		return `${host}:${port || WS_PORT}`;
+	}
+
+	/**
+	 * Crockford base32: case-insensitive, hyphens and spaces ignored, I/L read
+	 * as 1 and O as 0. Returns the 8-character code or null.
+	 */
+	function normalizeCode(raw: string): string | null {
+		const code = raw
+			.replace(/[\s-]/g, '')
+			.toUpperCase()
+			.replace(/[IL]/g, '1')
+			.replace(/O/g, '0');
+		return /^[0-9A-HJKMNP-TV-Z]{8}$/.test(code) ? code : null;
+	}
+
+	/** "host" or "host:port"; no scheme, path or query. */
+	function normalizeHost(raw: string): string | null {
+		const value = raw.trim();
+		if (/^[a-z0-9.-]+$/i.test(value) || /^\[[0-9a-f:]+\]$/i.test(value)) return `${value}:${WS_PORT}`;
+		if (/^([a-z0-9.-]+|\[[0-9a-f:]+\]):\d{1,5}$/i.test(value)) return value;
+		return null;
+	}
+
+	async function doConnect(host: string, auth: WsAuth) {
 		connecting = true;
 		inputError = '';
-		setStoredWsUrl(wsUrl);
 		try {
+			await wsClient.connect(host, auth);
 			await initializeSessionListeners();
-			if (!wsClient.isConnected) {
-				clearStoredWsUrl();
-				throw new Error('Could not connect — check that the desktop app is running and the token is correct');
-			}
 			const initial = await getSessions();
 			sessions.set(initial);
 			onconnected();
-		} catch (e) {
-			inputError = e instanceof Error ? e.message : 'Connection failed';
-			connecting = false;
-		}
-	}
-
-	function connectWithWsUrl(url: string) {
-		const trimmed = url.trim();
-		try {
-			const parsed = new URL(trimmed);
-			if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
-				inputError = 'URL must start with ws:// or wss://';
-				return;
-			}
 		} catch {
-			inputError = 'Invalid URL format';
-			return;
+			inputError = CONNECT_ERROR;
+			pairAgain = !getStoredConnection() && !!getStoredHost();
 		}
-		doConnect(trimmed);
 	}
 
-	function connectWithToken() {
-		const token = tokenInput.trim();
-		if (!token) return;
-		if (!/^[a-f0-9]+$/i.test(token)) {
-			inputError = 'Invalid token format';
+	function connectWithCode() {
+		const code = normalizeCode(codeInput);
+		if (!code) {
+			inputError = 'A pairing code is 8 letters and digits, as shown on the desktop.';
 			return;
 		}
-		// Use 127.0.0.1 instead of localhost to avoid IPv6 resolution issues
-		let host = window.location.hostname;
-		if (host === 'localhost') host = '127.0.0.1';
-		const wsUrl = `ws://${host}:${WS_PORT}/ws?token=${token}`;
-		doConnect(wsUrl);
+		doConnect(pageHost(), { code });
 	}
 
-	function goBack() {
-		mode = 'choose';
+	function connectAdvanced() {
+		if (/[?&]token=/i.test(hostInput)) {
+			inputError = 'Old token links no longer work. Enter the host and a pairing code.';
+			return;
+		}
+		const host = normalizeHost(hostInput);
+		if (!host) {
+			inputError = 'Enter a host or host:port, without ws:// or a path.';
+			return;
+		}
+		const code = normalizeCode(codeInput);
+		if (!code) {
+			inputError = 'A pairing code is 8 letters and digits, as shown on the desktop.';
+			return;
+		}
+		doConnect(host, { code });
+	}
+
+	function show(next: 'choose' | 'code' | 'advanced') {
+		mode = next;
 		inputError = '';
 	}
 
 	onMount(() => {
-		// Auto-connect if URL already stored (e.g. from previous session)
-		const existing = getStoredWsUrl();
-		if (existing) {
-			doConnect(existing);
+		const hadLegacyToken = migrateLegacyWsUrl();
+
+		// QR scan opens this page with #pair=CODE. The fragment never reaches the
+		// server or a log; drop it from the address bar right away.
+		const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+		const pairParam = hash.get('pair');
+		if (pairParam !== null) {
+			window.history.replaceState({}, '', window.location.pathname + window.location.search);
+			const code = normalizeCode(pairParam);
+			if (code) {
+				doConnect(pageHost(), { code });
+				return;
+			}
+		}
+
+		const stored = getStoredConnection();
+		if (stored) {
+			doConnect(stored.host, { token: stored.token });
 			return;
 		}
-
-		const params = new URLSearchParams(window.location.search);
-
-		// Auto-connect from QR code: ?token=hextoken
-		const tokenParam = params.get('token');
-		if (tokenParam) {
-			window.history.replaceState({}, '', window.location.pathname);
-			const host = window.location.hostname;
-			doConnect(`ws://${host}:${WS_PORT}/ws?token=${tokenParam}`);
-			return;
-		}
-
-		// Legacy: ?wsUrl=ws://...
-		const wsUrlParam = params.get('wsUrl');
-		if (wsUrlParam) {
-			window.history.replaceState({}, '', window.location.pathname);
-			doConnect(wsUrlParam);
-		}
+		pairAgain = hadLegacyToken || !!getStoredHost();
 	});
 </script>
 
@@ -107,69 +138,91 @@
 
 		{#if connecting}
 			<div class="connecting">
-				<div class="spinner"></div>
-				<span class="connecting-text">Connecting...</span>
 				{#if inputError}
-					<div class="error">{inputError}</div>
-					<button class="back-btn" onclick={() => { connecting = false; inputError = ''; }}>Retry</button>
+					<div class="error" role="alert">{inputError}</div>
+					{#if pairAgain}<div class="pair-again">Pair again: open MOBILE on the desktop for a new code.</div>{/if}
+					<button class="back-btn" onclick={() => { connecting = false; inputError = ''; mode = 'choose'; }}>Back</button>
+				{:else}
+					<div class="spinner"></div>
+					<span class="connecting-text">Connecting...</span>
 				{/if}
 			</div>
 		{:else if mode === 'choose'}
+			{#if pairAgain}
+				<div class="pair-again" role="status">Pair again: this device is no longer paired. Open MOBILE on the desktop for a new code.</div>
+			{/if}
 			<div class="options">
-				<button class="option-btn" onclick={() => (mode = 'token')}>
+				<button class="option-btn" onclick={() => show('code')}>
 					<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
 						<rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
 						<path d="M7 11V7a5 5 0 0 1 10 0v4" />
 					</svg>
-					<span class="option-label">Enter Token</span>
-					<span class="option-desc">Type the token shown on desktop</span>
+					<span class="option-label">Enter pairing code</span>
+					<span class="option-desc">Type the code shown on desktop</span>
 				</button>
 
-				<button class="option-btn secondary" onclick={() => (mode = 'url')}>
-					<span class="option-label">Advanced: Paste Full URL</span>
+				<button class="option-btn secondary" onclick={() => show('advanced')}>
+					<span class="option-label">Advanced: Other host</span>
 				</button>
 			</div>
-		{:else if mode === 'token'}
+		{:else if mode === 'code'}
 			<div class="paste-view">
-				<label class="input-label" for="token-input">Token</label>
+				<label class="input-label" for="code-input">Enter pairing code</label>
 				<input
-					id="token-input"
+					id="code-input"
 					type="text"
-					class="url-input"
-					bind:value={tokenInput}
-					placeholder="e.g. a1b2c3d4e5f6..."
+					class="url-input code-input"
+					bind:value={codeInput}
+					placeholder="XXXX-XXXX"
+					maxlength="11"
 					autocomplete="off"
-					autocapitalize="off"
-					onkeydown={(e) => e.key === 'Enter' && connectWithToken()}
+					autocapitalize="characters"
+					spellcheck="false"
+					onkeydown={(e) => e.key === 'Enter' && connectWithCode()}
 				/>
 				{#if inputError}
-					<div class="error">{inputError}</div>
+					<div class="error" role="alert">{inputError}</div>
 				{/if}
-				<div class="hint">Connects to <code>ws://{typeof window !== 'undefined' ? window.location.hostname : 'host'}:{WS_PORT}</code></div>
+				<div class="hint">Connects to <code>{typeof window !== 'undefined' ? pageHost() : 'host'}</code></div>
 				<div class="paste-actions">
-					<button class="back-btn" onclick={goBack}>Back</button>
-					<button class="connect-btn" onclick={connectWithToken} disabled={!tokenInput.trim()}>
+					<button class="back-btn" onclick={() => show('choose')}>Back</button>
+					<button class="connect-btn" onclick={connectWithCode} disabled={!codeInput.trim()}>
 						Connect
 					</button>
 				</div>
 			</div>
-		{:else if mode === 'url'}
+		{:else if mode === 'advanced'}
 			<div class="paste-view">
-				<label class="input-label" for="ws-url-input">WebSocket URL</label>
+				<label class="input-label" for="host-input">Host</label>
 				<input
-					id="ws-url-input"
-					type="url"
+					id="host-input"
+					type="text"
 					class="url-input"
-					bind:value={urlInput}
-					placeholder="ws://192.168.x.x:9210/ws?token=..."
-					onkeydown={(e) => e.key === 'Enter' && connectWithWsUrl(urlInput)}
+					bind:value={hostInput}
+					placeholder="192.168.x.x:9210"
+					autocomplete="off"
+					autocapitalize="off"
+					spellcheck="false"
+				/>
+				<label class="input-label" for="adv-code-input">Pairing code</label>
+				<input
+					id="adv-code-input"
+					type="text"
+					class="url-input code-input"
+					bind:value={codeInput}
+					placeholder="XXXX-XXXX"
+					maxlength="11"
+					autocomplete="off"
+					autocapitalize="characters"
+					spellcheck="false"
+					onkeydown={(e) => e.key === 'Enter' && connectAdvanced()}
 				/>
 				{#if inputError}
-					<div class="error">{inputError}</div>
+					<div class="error" role="alert">{inputError}</div>
 				{/if}
 				<div class="paste-actions">
-					<button class="back-btn" onclick={goBack}>Back</button>
-					<button class="connect-btn" onclick={() => connectWithWsUrl(urlInput)} disabled={!urlInput.trim()}>
+					<button class="back-btn" onclick={() => show('choose')}>Back</button>
+					<button class="connect-btn" onclick={connectAdvanced} disabled={!hostInput.trim() || !codeInput.trim()}>
 						Connect
 					</button>
 				</div>
@@ -414,6 +467,22 @@
 		color: var(--text-muted);
 		text-transform: uppercase;
 		letter-spacing: 0.1em;
+	}
+
+	.code-input {
+		font-size: 18px;
+		letter-spacing: 0.15em;
+		text-transform: uppercase;
+	}
+
+	.pair-again {
+		width: 100%;
+		padding: var(--space-md);
+		border: 1px solid var(--border-default);
+		font-family: var(--font-mono);
+		font-size: 12px;
+		color: var(--text-muted);
+		text-align: center;
 	}
 
 	.error {

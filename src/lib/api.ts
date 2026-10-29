@@ -119,10 +119,8 @@ export async function renameSession(
  * Server connection info (desktop/Tauri only)
  */
 export interface ServerInfo {
-	token: string;
 	port: number;
 	localIp: string;
-	wsUrl: string;
 	/** False: port 9210 accepts connections from this Mac only. */
 	lanEnabled: boolean;
 	bind: 'loopback' | 'lan';
@@ -132,6 +130,22 @@ export interface ServerInfo {
 
 export async function getServerInfo(): Promise<ServerInfo> {
 	return await invoke<ServerInfo>('get_server_info');
+}
+
+/** A one-time pairing code; `expiresAt` is Unix milliseconds. */
+export interface PairingCode {
+	code: string;
+	expiresAt: number;
+}
+
+/** Start a new pairing code (desktop only). The previous code stops working. */
+export async function createPairingCode(): Promise<PairingCode> {
+	return await invoke<PairingCode>('create_pairing_code');
+}
+
+/** Forget every paired device (desktop only). Their sockets close and they must pair again. */
+export async function forgetPairedClients(): Promise<void> {
+	await invoke<void>('forget_paired_clients');
 }
 
 /**

@@ -4,9 +4,20 @@
 
 type EventCallback = (data: any) => void;
 
+/** How a client proves itself in the first frame: a stored token, or a one-time pairing code. */
+export type WsAuth = { token: string } | { code: string };
+
+/** Close code: the first frame was missing, late, or malformed. */
+export const CLOSE_BAD_HANDSHAKE = 4400;
+/** Close code: token or code rejected. Pair again; do not retry. */
+export const CLOSE_UNAUTHORIZED = 4401;
+
+const CONNECT_TIMEOUT_MS = 5000;
+
 class WsClient {
 	private ws: WebSocket | null = null;
-	private url: string = '';
+	private host = '';
+	private auth: WsAuth | null = null;
 	private _connected = false;
 	private nextRequestId = 0;
 	private pending = new Map<number, { resolve: (value: any) => void; reject: (reason: any) => void }>();
@@ -17,40 +28,86 @@ class WsClient {
 		return this._connected;
 	}
 
-	async connect(url: string): Promise<void> {
-		this.url = url;
+	/**
+	 * Open the socket to `host` ("host:port"), send the auth frame first, and
+	 * resolve only when the server accepts it. The token never goes in the URL.
+	 */
+	async connect(host: string, auth: WsAuth): Promise<void> {
+		this.host = host;
+		this.auth = auth;
 		return new Promise((resolve, reject) => {
+			let settled = false;
+			const settle = (error?: Error) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timeout);
+				if (error) reject(error);
+				else resolve();
+			};
+			let socket: WebSocket;
 			try {
-				this.ws = new WebSocket(url);
+				socket = new WebSocket(wsUrlFor(host));
 			} catch (e) {
 				reject(e);
 				return;
 			}
+			this.ws = socket;
 
+			// Covers the open and the server's ack.
 			const timeout = setTimeout(() => {
-				reject(new Error('Connection timeout'));
-				this.ws?.close();
-			}, 5000);
+				settle(new Error('Connection timeout'));
+				socket.close();
+			}, CONNECT_TIMEOUT_MS);
 
-			this.ws.onopen = () => {
-				clearTimeout(timeout);
-				this._connected = true;
-				console.log('[ws] Connected');
-				resolve();
+			socket.onopen = () => {
+				const frame = 'token' in auth
+					? { type: 'auth', token: auth.token }
+					: { type: 'pair', code: auth.code };
+				socket.send(JSON.stringify(frame));
 			};
 
-			this.ws.onerror = () => {
-				clearTimeout(timeout);
-				if (!this._connected) reject(new Error('Connection failed'));
+			socket.onerror = () => {
+				if (!this._connected) settle(new Error('Connection failed'));
 			};
 
-			this.ws.onclose = () => {
+			socket.onclose = (event: CloseEvent) => {
+				const unauthorized = event?.code === CLOSE_UNAUTHORIZED;
+				settle(new Error(unauthorized ? 'Not paired' : 'Connection closed'));
+				if (this.ws !== socket) return; // replaced or disconnected
 				this._connected = false;
 				this.rejectPending('Connection closed');
+				if (unauthorized) {
+					this.auth = null;
+					clearStoredToken();
+					this.emit('authRequired', null);
+					return;
+				}
+				// Reconnects only with a token: a pairing code is single-use
+				// and every failed try counts against it.
 				this.scheduleReconnect();
 			};
 
-			this.ws.onmessage = (event) => this.handleMessage(event);
+			socket.onmessage = (event) => {
+				if (this._connected) {
+					this.handleMessage(event);
+					return;
+				}
+				let msg: any;
+				try {
+					msg = JSON.parse(event.data);
+				} catch {
+					return;
+				}
+				if (msg.type === 'paired' && typeof msg.token === 'string') {
+					this.auth = { token: msg.token };
+					setStoredConnection(host, msg.token);
+				} else if (msg.type !== 'authOk') {
+					return;
+				}
+				this._connected = true;
+				console.log('[ws] Connected');
+				settle();
+			};
 		});
 	}
 
@@ -138,11 +195,12 @@ class WsClient {
 	}
 
 	private scheduleReconnect() {
-		if (this.reconnectTimer || !this.url) return;
+		const auth = this.auth;
+		if (this.reconnectTimer || !this.host || !auth || !('token' in auth)) return;
 		console.log('[ws] Reconnecting in 3s...');
 		this.reconnectTimer = setTimeout(() => {
 			this.reconnectTimer = null;
-			this.connect(this.url).catch(() => {
+			this.connect(this.host, auth).catch(() => {
 				// onclose will trigger another scheduleReconnect
 			});
 		}, 3000);
@@ -159,26 +217,79 @@ export function isTauri(): boolean {
 		typeof (window as any).__TAURI_INTERNALS__?.invoke === 'function';
 }
 
-/** Get stored WS URL (set by QR code scan on mobile) */
-export function getStoredWsUrl(): string | null {
+const HOST_KEY = 'c9watch-ws-host';
+const TOKEN_KEY = 'c9watch-client-token';
+/** Pre-C0h key: a full ws:// URL that carried the token. */
+const LEGACY_URL_KEY = 'c9watch-ws-url';
+
+/** The URL for a "host:port". The page's own scheme picks ws or wss. */
+export function wsUrlFor(host: string): string {
+	const secure = typeof location !== 'undefined' && location.protocol === 'https:';
+	return `${secure ? 'wss' : 'ws'}://${host}/ws`;
+}
+
+/** The last desktop this device paired with, even when its token was dropped. */
+export function getStoredHost(): string | null {
 	try {
-		return localStorage.getItem('c9watch-ws-url');
+		return localStorage.getItem(HOST_KEY);
 	} catch {
 		return null;
 	}
 }
 
-/** Store WS URL from QR code scan */
-export function setStoredWsUrl(url: string) {
-	localStorage.setItem('c9watch-ws-url', url);
+/** The paired desktop and this device's token, if any. */
+export function getStoredConnection(): { host: string; token: string } | null {
+	try {
+		const host = localStorage.getItem(HOST_KEY);
+		const token = localStorage.getItem(TOKEN_KEY);
+		return host && token ? { host, token } : null;
+	} catch {
+		return null;
+	}
 }
 
-/** Clear stored WS URL */
-export function clearStoredWsUrl() {
-	localStorage.removeItem('c9watch-ws-url');
+export function setStoredConnection(host: string, token: string) {
+	try {
+		localStorage.setItem(HOST_KEY, host);
+		localStorage.setItem(TOKEN_KEY, token);
+	} catch {
+		// Private mode: the connection works, it is just not remembered.
+	}
+}
+
+function clearStoredToken() {
+	try {
+		localStorage.removeItem(TOKEN_KEY);
+	} catch {
+		// Nothing stored.
+	}
+}
+
+export function clearStoredConnection() {
+	clearStoredToken();
+	try {
+		localStorage.removeItem(HOST_KEY);
+	} catch {
+		// Nothing stored.
+	}
+}
+
+/**
+ * Drop the pre-C0h stored URL. Returns true when it carried a token, so the
+ * UI can say "Pair again".
+ */
+export function migrateLegacyWsUrl(): boolean {
+	try {
+		const old = localStorage.getItem(LEGACY_URL_KEY);
+		if (old === null) return false;
+		localStorage.removeItem(LEGACY_URL_KEY);
+		return /[?&]token=/.test(old);
+	} catch {
+		return false;
+	}
 }
 
 /** Should we use WebSocket transport? (vs Tauri IPC) */
 export function useWebSocket(): boolean {
-	return !!getStoredWsUrl() || !isTauri();
+	return !!getStoredConnection() || !isTauri();
 }

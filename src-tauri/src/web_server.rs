@@ -1,8 +1,9 @@
 use crate::remote_access::{self, RemoteAccess, Transport};
+use crate::ws_auth::{ClientRegistry, Pairing};
 use axum::{
     extract::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
-        ConnectInfo, Query, Request, State,
+        ConnectInfo, Request, State,
     },
     http::{header, HeaderMap, StatusCode},
     middleware::Next,
@@ -28,7 +29,11 @@ pub const WS_PORT: u16 = 9210;
 
 /// Shared state for the WebSocket server
 pub struct WsState {
-    pub auth_token: String,
+    /// Paired clients (token hashes only). In memory: a restart of the
+    /// desktop app means pairing again.
+    pub clients: Mutex<ClientRegistry>,
+    /// The one live pairing code, if any.
+    pub pairing: Mutex<Pairing>,
     pub sessions_tx: broadcast::Sender<String>,
     pub notifications_tx: broadcast::Sender<String>,
     /// The desktop app's detector, shared so stop resolves its target from
@@ -43,13 +48,13 @@ pub struct WsState {
 
 impl WsState {
     pub fn new(
-        auth_token: String,
         sessions_tx: broadcast::Sender<String>,
         notifications_tx: broadcast::Sender<String>,
         detector: Arc<Mutex<crate::session::DetectorState>>,
     ) -> Self {
         Self {
-            auth_token,
+            clients: Mutex::new(ClientRegistry::new()),
+            pairing: Mutex::new(Pairing::new()),
             sessions_tx,
             notifications_tx,
             detector,
@@ -536,6 +541,14 @@ struct Listening {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// A pairing code for the MOBILE modal. `expires_at` is Unix milliseconds.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingCode {
+    pub code: String,
+    pub expires_at: u64,
+}
+
 /// Owns the WS listeners and swaps them when the remote-access policy
 /// changes.
 pub struct WsServer {
@@ -565,6 +578,39 @@ impl WsServer {
 
     pub fn config_path(&self) -> &std::path::Path {
         &self.config_path
+    }
+
+    /// Start a new pairing code; the previous one stops working. Returns
+    /// the code and its expiry as Unix milliseconds.
+    pub fn create_pairing_code(&self) -> Result<PairingCode, String> {
+        let now = std::time::Instant::now();
+        let (code, expires_at) = self
+            .state
+            .pairing
+            .lock()
+            .map_err(|_| "pairing state unavailable".to_string())?
+            .create(now);
+        let expires_at = std::time::SystemTime::now() + expires_at.saturating_duration_since(now);
+        let expires_at_ms = expires_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Ok(PairingCode {
+            code,
+            expires_at: expires_at_ms,
+        })
+    }
+
+    /// Forget every paired client and close every open socket. Clients
+    /// reconnect, their tokens fail, and they must pair again.
+    pub fn forget_paired_clients(&self) -> Result<(), String> {
+        self.state
+            .clients
+            .lock()
+            .map_err(|_| "client registry unavailable".to_string())?
+            .forget_all();
+        self.state.epoch.send_modify(|e| *e = e.wrapping_add(1));
+        Ok(())
     }
 
     /// The current policy.
@@ -726,20 +772,15 @@ fn serve_embedded_file(path: &str) -> impl IntoResponse {
 
 // ── WebSocket handler ───────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct WsQuery {
-    token: Option<String>,
-}
-
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    Query(params): Query<WsQuery>,
     State(state): State<Arc<WsState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Extension(ListenPort(port)): Extension<ListenPort>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    // Origin first, before the token: a foreign page learns nothing.
+    // Origin first: a foreign page cannot even open the socket. The token
+    // is not in the URL; it comes in the first frame (see `authenticate`).
     let origin = headers
         .get(header::ORIGIN)
         .map(|v| v.to_str().unwrap_or(""));
@@ -751,16 +792,114 @@ async fn ws_handler(
     ) {
         return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
     }
-    match &params.token {
-        Some(token) if token == &state.auth_token => ws
-            .on_upgrade(move |socket| handle_socket(socket, state, peer.ip()))
-            .into_response(),
-        _ => (
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Invalid or missing token",
-        )
-            .into_response(),
+    ws.on_upgrade(move |socket| handle_socket(socket, state, peer.ip()))
+        .into_response()
+}
+
+// ── Handshake ───────────────────────────────────────────────────────
+
+/// How long a client has to send its first frame and get it accepted.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Close code: the first frame was missing, late, or not an auth frame.
+const CLOSE_BAD_HANDSHAKE: u16 = 4400;
+/// Close code: the token or pairing code was not accepted. The client
+/// must pair again; it should not retry on its own.
+const CLOSE_UNAUTHORIZED: u16 = 4401;
+
+/// The first frame a client sends. Nothing else is read before it.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum AuthFrame {
+    /// A client paired before presents its token.
+    #[serde(rename = "auth")]
+    Auth { token: String },
+    /// A new client redeems a one-time pairing code.
+    #[serde(rename = "pair")]
+    Pair { code: String },
+}
+
+/// The reply that admits a client.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum AuthReply {
+    #[serde(rename = "authOk")]
+    AuthOk {
+        #[serde(rename = "clientId")]
+        client_id: String,
+    },
+    /// Sent once, after a code is redeemed. `token` is the client's
+    /// credential from now on; the server keeps only its hash.
+    #[serde(rename = "paired")]
+    Paired {
+        #[serde(rename = "clientId")]
+        client_id: String,
+        token: String,
+    },
+}
+
+/// Checks a first frame against the registry and the pairing code. Returns
+/// the reply to send, or the close code to send instead.
+fn check_auth_frame(text: &str, state: &WsState) -> Result<AuthReply, u16> {
+    let frame: AuthFrame = serde_json::from_str(text).map_err(|_| CLOSE_BAD_HANDSHAKE)?;
+    match frame {
+        AuthFrame::Auth { token } => {
+            let clients = state.clients.lock().map_err(|_| CLOSE_UNAUTHORIZED)?;
+            clients
+                .verify(&token)
+                .map(|client_id| AuthReply::AuthOk { client_id })
+                .ok_or(CLOSE_UNAUTHORIZED)
+        }
+        AuthFrame::Pair { code } => {
+            state
+                .pairing
+                .lock()
+                .map_err(|_| CLOSE_UNAUTHORIZED)?
+                .redeem(&code, std::time::Instant::now())
+                .map_err(|_| CLOSE_UNAUTHORIZED)?;
+            let (client_id, token) = state
+                .clients
+                .lock()
+                .map_err(|_| CLOSE_UNAUTHORIZED)?
+                .issue();
+            Ok(AuthReply::Paired { client_id, token })
+        }
     }
+}
+
+/// Waits for the first frame and checks it. On success the reply is
+/// already sent. On failure the socket gets a close frame with the reason
+/// code. `Err(None)` means the client went away first.
+async fn authenticate(socket: &mut WebSocket, state: &WsState) -> Result<(), Option<u16>> {
+    let first = tokio::time::timeout(AUTH_TIMEOUT, async {
+        loop {
+            match socket.recv().await {
+                Some(Ok(Message::Text(text))) => return Some(text),
+                // Control frames may come first; they are not the handshake.
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                Some(Ok(Message::Binary(_))) => return Some(String::new()),
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return None,
+            }
+        }
+    })
+    .await;
+    let text = match first {
+        Ok(Some(text)) => text,
+        Ok(None) => return Err(None),
+        Err(_) => return Err(Some(CLOSE_BAD_HANDSHAKE)),
+    };
+    let reply = check_auth_frame(&text, state).map_err(Some)?;
+    let json = serde_json::to_string(&reply).unwrap_or_default();
+    socket
+        .send(Message::Text(json))
+        .await
+        .map_err(|_| None)
+}
+
+fn close_with(code: u16, reason: &'static str) -> Message {
+    Message::Close(Some(CloseFrame {
+        code,
+        reason: reason.into(),
+    }))
 }
 
 /// Close code sent when the remote-access policy changes (1012, "service
@@ -775,6 +914,27 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>, peer: IpAddr)
     if !peer_allowed(state.lan_enabled(), peer) {
         let _ = socket.send(policy_changed_close()).await;
         return;
+    }
+    // Nothing is subscribed and nothing is sent until the client is in.
+    let admitted = tokio::select! {
+        _ = epoch_rx.changed() => {
+            let _ = socket.send(policy_changed_close()).await;
+            return;
+        }
+        result = authenticate(&mut socket, &state) => result,
+    };
+    match admitted {
+        Ok(()) => {}
+        Err(Some(code)) => {
+            let reason = if code == CLOSE_UNAUTHORIZED {
+                "unauthorized"
+            } else {
+                "expected auth frame"
+            };
+            let _ = socket.send(close_with(code, reason)).await;
+            return;
+        }
+        Err(None) => return,
     }
     crate::debug_log::log_info("[ws-server] Client connected");
     let mut sessions_rx = state.sessions_tx.subscribe();
@@ -909,10 +1069,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>, peer: IpAddr)
 }
 
 fn policy_changed_close() -> Message {
-    Message::Close(Some(CloseFrame {
-        code: CLOSE_POLICY_CHANGED,
-        reason: "remote access changed".into(),
-    }))
+    close_with(CLOSE_POLICY_CHANGED, "remote access changed")
 }
 
 // ── Message dispatch ────────────────────────────────────────────────
@@ -1302,7 +1459,6 @@ mod server_tests {
             BackendMode::ForceCli,
         )));
         let state = Arc::new(WsState::new(
-            "test-token".into(),
             broadcast::channel(4).0,
             broadcast::channel(4).0,
             detector,
@@ -1328,7 +1484,7 @@ mod server_tests {
     /// upgrade reply (101 when it upgraded).
     async fn upgrade_status(addr: SocketAddr, origin: Option<&str>) -> u16 {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        let mut request = format!("ws://{addr}/ws?token=test-token")
+        let mut request = format!("ws://{addr}/ws")
             .into_client_request()
             .unwrap();
         if let Some(origin) = origin {
@@ -1423,7 +1579,7 @@ mod server_tests {
         let server = test_server(dir.path());
         let addr = server.apply(RemoteAccess::default()).await.unwrap()[0];
         let port = addr.port();
-        for path in ["/health", "/info", "/", "/ws?token=test-token"] {
+        for path in ["/health", "/info", "/", "/ws"] {
             let reply = get_with_host(addr, path, &format!("evil.example:{port}"))
                 .await
                 .unwrap();
@@ -1608,8 +1764,10 @@ mod server_tests {
         let dir = tempfile::tempdir().unwrap();
         let server = test_server(dir.path());
         let bound = server.apply(RemoteAccess::default()).await.unwrap();
-        let url = format!("ws://{}/ws?token=test-token", bound[0]);
-        let (mut client, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let mut client = open(bound[0]).await;
+        let token = issue_token(&server);
+        send_json(&mut client, serde_json::json!({"type": "auth", "token": token})).await;
+        assert!(matches!(next_event(&mut client).await, Event::Text(v) if v["type"] == "authOk"));
 
         server.update(RemoteAccess::default()).await.unwrap();
 
@@ -1666,5 +1824,223 @@ mod server_tests {
             assert!(health(*old).await.is_err(), "{old} still accepts");
         }
         assert!(health(second[0]).await.is_ok());
+    }
+
+    // ── First-frame handshake (end to end) ──────────────────────────
+
+    type Client = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    #[derive(Debug)]
+    enum Event {
+        Text(serde_json::Value),
+        Close(Option<u16>),
+    }
+
+    async fn open(addr: SocketAddr) -> Client {
+        tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("upgrade")
+            .0
+    }
+
+    async fn send_json(client: &mut Client, value: serde_json::Value) {
+        use futures_util::SinkExt;
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(value.to_string()))
+            .await
+            .unwrap();
+    }
+
+    /// The next text frame or close, skipping control frames.
+    async fn next_event(client: &mut Client) -> Event {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as T;
+        let wait = AUTH_TIMEOUT + Duration::from_secs(3);
+        tokio::time::timeout(wait, async {
+            loop {
+                match client.next().await {
+                    Some(Ok(T::Text(text))) => {
+                        return Event::Text(serde_json::from_str(&text).unwrap())
+                    }
+                    Some(Ok(T::Close(frame))) => {
+                        return Event::Close(frame.map(|f| u16::from(f.code)))
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) | None => return Event::Close(None),
+                }
+            }
+        })
+        .await
+        .expect("no frame from the server")
+    }
+
+    fn issue_token(server: &WsServer) -> String {
+        server.state().clients.lock().unwrap().issue().1
+    }
+
+    async fn loopback_server(dir: &std::path::Path) -> (WsServer, SocketAddr) {
+        let server = test_server(dir);
+        let addr = server.apply(RemoteAccess::default()).await.unwrap()[0];
+        (server, addr)
+    }
+
+    #[tokio::test]
+    async fn no_first_frame_closes_with_4400() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_server, addr) = loopback_server(dir.path()).await;
+        let mut client = open(addr).await;
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            next_event(&mut client).await,
+            Event::Close(Some(CLOSE_BAD_HANDSHAKE))
+        ));
+        assert!(started.elapsed() >= AUTH_TIMEOUT - Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn a_first_frame_that_is_not_auth_closes_with_4400() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        issue_token(&server);
+        let mut client = open(addr).await;
+        send_json(&mut client, serde_json::json!({"type": "getSessions"})).await;
+        assert!(matches!(
+            next_event(&mut client).await,
+            Event::Close(Some(CLOSE_BAD_HANDSHAKE))
+        ));
+    }
+
+    #[tokio::test]
+    async fn wrong_token_closes_with_4401() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        let token = issue_token(&server);
+        let mut client = open(addr).await;
+        let wrong = format!("{}0", &token[..63]);
+        let wrong = if wrong == token { format!("{}1", &token[..63]) } else { wrong };
+        send_json(&mut client, serde_json::json!({"type": "auth", "token": wrong})).await;
+        assert!(matches!(
+            next_event(&mut client).await,
+            Event::Close(Some(CLOSE_UNAUTHORIZED))
+        ));
+    }
+
+    #[tokio::test]
+    async fn nothing_is_pushed_before_auth_and_a_valid_token_gets_auth_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        let token = issue_token(&server);
+        let state = Arc::clone(server.state());
+        let mut client = open(addr).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Not subscribed yet, so a push now cannot reach the socket.
+        assert_eq!(state.sessions_tx.receiver_count(), 0);
+        assert_eq!(state.notifications_tx.receiver_count(), 0);
+        let _ = state.sessions_tx.send("[]".into());
+
+        send_json(&mut client, serde_json::json!({"type": "auth", "token": token})).await;
+        match next_event(&mut client).await {
+            Event::Text(v) => {
+                assert_eq!(v["type"], "authOk", "{v}");
+                assert!(v["clientId"].as_str().is_some_and(|id| !id.is_empty()));
+                assert!(v.get("token").is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        for _ in 0..50 {
+            if state.sessions_tx.receiver_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        state.sessions_tx.send("[]".into()).unwrap();
+        assert!(matches!(
+            next_event(&mut client).await,
+            Event::Text(v) if v["type"] == "sessionsUpdated"
+        ));
+    }
+
+    #[tokio::test]
+    async fn pairing_returns_a_token_that_works_on_the_next_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        let code = server.create_pairing_code().unwrap().code;
+
+        let mut client = open(addr).await;
+        send_json(&mut client, serde_json::json!({"type": "pair", "code": code})).await;
+        let (client_id, token) = match next_event(&mut client).await {
+            Event::Text(v) if v["type"] == "paired" => (
+                v["clientId"].as_str().unwrap().to_string(),
+                v["token"].as_str().unwrap().to_string(),
+            ),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(token.len(), 64);
+        drop(client);
+
+        let mut next = open(addr).await;
+        send_json(&mut next, serde_json::json!({"type": "auth", "token": token})).await;
+        assert!(matches!(
+            next_event(&mut next).await,
+            Event::Text(v) if v["type"] == "authOk" && v["clientId"] == client_id.as_str()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_pairing_code_works_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        let code = server.create_pairing_code().unwrap().code;
+
+        let mut first = open(addr).await;
+        send_json(&mut first, serde_json::json!({"type": "pair", "code": code})).await;
+        assert!(matches!(next_event(&mut first).await, Event::Text(v) if v["type"] == "paired"));
+
+        let mut second = open(addr).await;
+        send_json(&mut second, serde_json::json!({"type": "pair", "code": code})).await;
+        assert!(matches!(
+            next_event(&mut second).await,
+            Event::Close(Some(CLOSE_UNAUTHORIZED))
+        ));
+    }
+
+    #[tokio::test]
+    async fn forgetting_clients_closes_sockets_and_revokes_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        let token = issue_token(&server);
+        let mut client = open(addr).await;
+        send_json(&mut client, serde_json::json!({"type": "auth", "token": token})).await;
+        assert!(matches!(next_event(&mut client).await, Event::Text(v) if v["type"] == "authOk"));
+
+        server.forget_paired_clients().unwrap();
+        assert!(matches!(
+            next_event(&mut client).await,
+            Event::Close(Some(CLOSE_POLICY_CHANGED))
+        ));
+
+        let mut again = open(addr).await;
+        send_json(&mut again, serde_json::json!({"type": "auth", "token": token})).await;
+        assert!(matches!(
+            next_event(&mut again).await,
+            Event::Close(Some(CLOSE_UNAUTHORIZED))
+        ));
+    }
+
+    #[test]
+    fn pairing_code_expiry_is_five_minutes_ahead_in_unix_ms() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = test_server(dir.path());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let code = server.create_pairing_code().unwrap();
+        let ttl = crate::ws_auth::PAIRING_TTL.as_millis() as u64;
+        assert!(code.expires_at >= now_ms + ttl - 1000, "{code:?}");
+        assert!(code.expires_at <= now_ms + ttl + 1000, "{code:?}");
+        assert_eq!(code.code.len(), crate::ws_auth::PAIRING_CODE_LEN);
     }
 }

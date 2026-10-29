@@ -1,56 +1,68 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import QRCode from 'qrcode';
-	import { getServerInfo, type ServerInfo } from '$lib/api';
+	import { getServerInfo, createPairingCode, type ServerInfo, type PairingCode } from '$lib/api';
 
 	let { onclose }: { onclose: () => void } = $props();
 
 	let info = $state<ServerInfo | null>(null);
+	let pairing = $state<PairingCode | null>(null);
 	let qrDataUrl = $state<string>('');
 	let pageUrl = $state('');
 	let error = $state<string>('');
 	let copied = $state(false);
-	let copiedToken = $state(false);
+	let creating = $state(false);
+	let now = $state(Date.now());
+	const tick = setInterval(() => (now = Date.now()), 1000);
+	onDestroy(() => clearInterval(tick));
+
+	let secondsLeft = $derived(pairing ? Math.max(0, Math.ceil((pairing.expiresAt - now) / 1000)) : 0);
+	let expired = $derived(pairing !== null && secondsLeft === 0);
+	let countdown = $derived(`${Math.floor(secondsLeft / 60)}:${String(secondsLeft % 60).padStart(2, '0')}`);
+	/** XXXX-XXXX reads easier; the server ignores the hyphen. */
+	let displayCode = $derived(pairing ? `${pairing.code.slice(0, 4)}-${pairing.code.slice(4)}` : '');
+
+	async function renderQr(info: ServerInfo, code: string) {
+		qrDataUrl = '';
+		pageUrl = '';
+		if (!info.lanEnabled) return;
+		// QR encodes an HTTP URL so the phone camera opens the browser directly.
+		// The code rides in the fragment, which never reaches the server or a log.
+		pageUrl = `http://${info.localIp}:${info.port}/#pair=${code}`;
+		qrDataUrl = await QRCode.toDataURL(pageUrl, {
+			width: 256,
+			margin: 2,
+			color: { dark: '#ffffff', light: '#000000' }
+		});
+	}
+
+	async function newCode() {
+		if (!info || creating) return;
+		creating = true;
+		try {
+			pairing = await createPairingCode();
+			now = Date.now();
+			await renderQr(info, pairing.code);
+		} catch (e) {
+			error = e instanceof Error ? e.message : 'Failed to create a pairing code';
+		} finally {
+			creating = false;
+		}
+	}
 
 	onMount(async () => {
 		try {
 			info = await getServerInfo();
-			if (!info.lanEnabled) return;
-			// QR encodes an HTTP URL so phone camera opens the browser directly
-			// In production, the axum server on port 9210 serves the frontend files
-			pageUrl = `http://${info.localIp}:${info.port}/?token=${info.token}`;
-			qrDataUrl = await QRCode.toDataURL(pageUrl, {
-				width: 256,
-				margin: 2,
-				color: { dark: '#ffffff', light: '#000000' }
-			});
+			await newCode();
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Failed to load server info';
 		}
 	});
 
-	async function copyToken() {
-		if (!info) return;
-		try {
-			await navigator.clipboard.writeText(info.token);
-		} catch {
-			const el = document.createElement('textarea');
-			el.value = info.token;
-			document.body.appendChild(el);
-			el.select();
-			document.execCommand('copy');
-			document.body.removeChild(el);
-		}
-		copiedToken = true;
-		setTimeout(() => (copiedToken = false), 2000);
-	}
-
 	async function copyUrl() {
 		if (!pageUrl) return;
 		try {
 			await navigator.clipboard.writeText(pageUrl);
-			copied = true;
-			setTimeout(() => (copied = false), 2000);
 		} catch {
 			const el = document.createElement('textarea');
 			el.value = pageUrl;
@@ -58,9 +70,9 @@
 			el.select();
 			document.execCommand('copy');
 			document.body.removeChild(el);
-			copied = true;
-			setTimeout(() => (copied = false), 2000);
 		}
+		copied = true;
+		setTimeout(() => (copied = false), 2000);
 	}
 
 	function handleBackdrop(e: MouseEvent) {
@@ -73,6 +85,19 @@
 </script>
 
 <svelte:window on:keydown={handleKeydown} />
+
+{#snippet pairingCode()}
+	<div class="info-section">
+		<span class="info-label">Pairing code</span>
+		<div class="code-box" class:expired>
+			<code class="pair-code" aria-live="polite">{displayCode || '…'}</code>
+			<span class="code-meta">
+				<span class="countdown">{expired ? 'Expired' : `Expires in ${countdown}`}</span>
+				<button class="new-code-btn" onclick={newCode} disabled={creating}>New code</button>
+			</span>
+		</div>
+	</div>
+{/snippet}
 
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <div class="backdrop" onclick={handleBackdrop} role="dialog" aria-modal="true" aria-label="Connect Mobile" tabindex="-1">
@@ -95,23 +120,18 @@
 			<div class="instructions remote-off">
 				<p class="remote-off-title">Remote access is off. This Mac only accepts connections from itself.</p>
 				<p>To connect a phone on this network, turn on LAN access in Settings → Remote access.</p>
-				<p>To use c9watch from another computer, forward the port over SSH: <code>ssh -L 9210:127.0.0.1:9210 &lt;this-mac&gt;</code>, then open <code>localhost:9210</code> in a browser there.</p>
+				<p>To use c9watch from another computer, forward the port over SSH: <code>ssh -L 9210:127.0.0.1:9210 &lt;this-mac&gt;</code>, then open <code>localhost:9210</code> in a browser there and enter this code.</p>
 			</div>
+			{@render pairingCode()}
 		{:else}
-			<div class="qr-container">
-				<img src={qrDataUrl} alt="QR Code" class="qr-image" />
+			<div class="qr-container" class:expired>
+				{#if qrDataUrl}<img src={qrDataUrl} alt="QR code with the pairing link" class="qr-image" />{/if}
 			</div>
 
-			<div class="info-section">
-				<span class="info-label">Token</span>
-				<button class="url-box token-box" onclick={copyToken} title="Click to copy token">
-					<code class="token-text">{info.token}</code>
-					<span class="copy-hint">{copiedToken ? 'COPIED' : 'COPY'}</span>
-				</button>
-			</div>
+			{@render pairingCode()}
 
 			<div class="info-section">
-				<span class="info-label">Full URL</span>
+				<span class="info-label">Pairing link</span>
 				<button class="url-box" onclick={copyUrl} title="Click to copy">
 					<code class="url-text">{pageUrl}</code>
 					<span class="copy-hint">{copied ? 'COPIED' : 'COPY'}</span>
@@ -119,7 +139,7 @@
 			</div>
 
 			<div class="instructions">
-				<p>Scan QR with phone camera to open in browser, or enter the token manually on the mobile connection screen.</p>
+				<p>Scan the QR with the phone camera, or open this Mac's address on port {info.port} and enter the code. Each code works once, for 5 minutes.</p>
 			</div>
 		{/if}
 	</div>
@@ -183,7 +203,9 @@
 
 	.qr-container {
 		display: flex;
+		align-items: center;
 		justify-content: center;
+		min-height: 280px;
 		padding: var(--space-md);
 		border: 1px solid var(--border-muted);
 		background: #000;
@@ -227,16 +249,67 @@
 		border-color: var(--text-muted);
 	}
 
-	.token-box {
-		background: rgba(255, 255, 255, 0.05);
+	.qr-container.expired .qr-image,
+	.code-box.expired .pair-code {
+		opacity: 0.3;
 	}
 
-	.token-text {
+	.code-box {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--space-md);
+		padding: var(--space-md);
+		border: 1px solid var(--border-default);
+		background: var(--bg-base);
+	}
+
+	.pair-code {
 		font-family: var(--font-mono);
-		font-size: 14px;
+		font-size: 28px;
+		font-weight: 600;
 		color: var(--text-primary);
+		letter-spacing: 0.12em;
+	}
+
+	.code-meta {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-end;
+		gap: var(--space-sm);
+		flex-shrink: 0;
+	}
+
+	.countdown {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		text-transform: uppercase;
 		letter-spacing: 0.05em;
-		word-break: break-all;
+	}
+
+	.new-code-btn {
+		padding: 4px var(--space-sm);
+		border: 1px solid var(--border-default);
+		background: transparent;
+		color: var(--text-secondary);
+		font-family: var(--font-mono);
+		font-size: 11px;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		cursor: pointer;
+		min-height: 0;
+		min-width: 0;
+	}
+
+	.new-code-btn:hover:not(:disabled) {
+		border-color: var(--text-muted);
+		color: var(--text-primary);
+	}
+
+	.new-code-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 
 	.url-text {

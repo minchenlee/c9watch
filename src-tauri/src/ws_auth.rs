@@ -5,7 +5,7 @@
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
-use subtle::ConstantTimeEq;
+use subtle::{ConditionallySelectable, ConstantTimeEq};
 
 /// How long a pairing code stays valid after it is created.
 pub const PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
@@ -43,17 +43,22 @@ impl ClientRegistry {
         (client_id, token)
     }
 
-    /// Return the client that owns `token`. Every stored hash is compared in
-    /// constant time, so timing reveals neither the match nor its position.
+    /// Return the client that owns `token`. Every stored hash is compared,
+    /// and the matching index is picked with a branchless constant-time
+    /// select, so the loop does the same work whether and where it matches.
+    /// The one clone happens after the loop. Only SHA-256 hashes are
+    /// compared, so timing cannot reveal the token itself.
     pub fn verify(&self, token: &str) -> Option<ClientId> {
         let candidate = hash_token(token);
-        let mut found = None;
-        for (id, hash) in &self.clients {
-            if bool::from(hash.ct_eq(&candidate)) && found.is_none() {
-                found = Some(id.clone());
-            }
+        let mut found = u64::MAX;
+        for (i, (_, hash)) in self.clients.iter().enumerate() {
+            let hit = hash.ct_eq(&candidate) & found.ct_eq(&u64::MAX);
+            found = u64::conditional_select(&found, &(i as u64), hit);
         }
-        found
+        usize::try_from(found)
+            .ok()
+            .and_then(|i| self.clients.get(i))
+            .map(|(id, _)| id.clone())
     }
 
     pub fn forget_all(&mut self) {

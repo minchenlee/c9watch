@@ -16,7 +16,7 @@
 	import { get } from 'svelte/store';
 	import { isDemoMode, toggleDemoMode } from '$lib/demo';
 	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
-	import { isTauri } from '$lib/ws';
+	import { isTauri, wsClient } from '$lib/ws';
 	import StatusBar from '$lib/components/StatusBar.svelte';
 	import SessionCard from '$lib/components/SessionCard.svelte';
 	import DenseBoard from '$lib/components/DenseBoard.svelte';
@@ -48,6 +48,14 @@
 	let showQRModal = $state(false);
 
 	let needsConnection = $state(!isTauri());
+
+	// The desktop forgot this device (or restarted): back to pairing.
+	onMount(() => {
+		if (isTauri()) return;
+		const onAuthRequired = () => (needsConnection = true);
+		wsClient.on('authRequired', onAuthRequired);
+		return () => wsClient.off('authRequired', onAuthRequired);
+	});
 
 	let sessions = $derived($sortedSessions);
 	let activeSessionIds = $derived(new Set(sessions.map((s) => sessionKeyOf(s))));

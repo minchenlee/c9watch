@@ -4,6 +4,7 @@
 		getRemoteAccess,
 		setRemoteAccess,
 		getServerInfo,
+		forgetPairedClients,
 		type RemoteAccess
 	} from '$lib/api';
 
@@ -14,6 +15,8 @@
 	let busy = $state(false);
 	let error = $state<string | null>(null);
 	let savedHosts = $state(false);
+	let forgetting = $state(false);
+	let forgotten = $state(false);
 
 	let hostsDirty = $derived(
 		remote !== null && hostsText.trim() !== remote.extraAllowedHosts.join('\n')
@@ -56,6 +59,21 @@
 		}
 	}
 
+	async function forgetDevices() {
+		if (forgetting) return;
+		forgetting = true;
+		error = null;
+		try {
+			await forgetPairedClients();
+			forgotten = true;
+			setTimeout(() => (forgotten = false), 2000);
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		} finally {
+			forgetting = false;
+		}
+	}
+
 	async function saveHosts() {
 		const ok = await save({ extraAllowedHosts: hostsText.split('\n') });
 		if (!ok) return;
@@ -73,7 +91,7 @@
 		{#if !error}<p class="state-msg">Loading…</p>{/if}
 	{:else}
 		<div class="setting-row">
-			<span>LAN access<small>Off: only this Mac can connect. On: devices on your network can connect with the token from Connect Mobile.</small></span>
+			<span>LAN access<small>Off: only this Mac can connect. On: devices on your network can connect after pairing with a code from Connect Mobile.</small></span>
 			<button
 				class:active={remote.lanEnabled}
 				aria-label="LAN access"
@@ -84,7 +102,7 @@
 		</div>
 		{#if remote.lanEnabled}
 			<div class="warning">
-				<strong>Not encrypted.</strong> LAN access uses plain <code>ws://</code>. Anyone on this network can read the traffic between a device and this Mac, including the access token and session content. Turn it on only on a network you trust, and turn it off when you are done.
+				<strong>Not encrypted.</strong> LAN access uses plain <code>ws://</code>. Anyone on this network can read the traffic between a device and this Mac, including the pairing code, the device token and session content. Turn it on only on a network you trust, and turn it off when you are done.
 			</div>
 			<div class="addresses">
 				<span class="label">This Mac's addresses</span>
@@ -110,6 +128,13 @@
 				{#if savedHosts}<span class="saved">Saved</span>{/if}
 				<button onclick={saveHosts} disabled={busy || !hostsDirty}>Save hosts</button>
 			</div>
+		</div>
+		<div class="setting-row">
+			<span>Paired devices<small>Disconnect every paired phone or browser now. Each one must pair again with a new code. Restarting c9watch also forgets them.</small></span>
+			<span class="row-actions">
+				{#if forgotten}<span class="saved">Forgotten</span>{/if}
+				<button aria-label="Forget paired devices" disabled={forgetting} onclick={forgetDevices}>{forgetting ? '…' : 'Forget'}</button>
+			</span>
 		</div>
 		<p class="save-note">Changing a setting restarts the server. Connected devices reconnect.</p>
 	{/if}
@@ -140,6 +165,7 @@
 	.hosts-group { display: flex; flex-direction: column; gap: var(--space-sm); padding: var(--space-lg) 0; border-bottom: 1px solid var(--border-default); }
 	textarea { width: 100%; box-sizing: border-box; resize: vertical; padding: var(--space-sm) var(--space-md); border: 1px solid var(--border-default); border-radius: 0; background: var(--bg-base); color: var(--text-primary); font: 12px/1.6 var(--font-mono); }
 	textarea::placeholder { color: var(--text-muted); }
+	.row-actions { display: flex; align-items: center; gap: var(--space-md); flex-shrink: 0; }
 	.hosts-actions { display: flex; align-items: center; justify-content: flex-end; gap: var(--space-md); }
 	.saved { font: 11px var(--font-mono); color: var(--accent-green); text-transform: uppercase; letter-spacing: .1em; }
 	.save-note { padding-top: var(--space-lg); }
