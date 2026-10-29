@@ -2,3 +2,6 @@
 
 #[cfg(unix)]
 pub mod home;
+
+#[cfg(unix)]
+pub mod fsutil;
