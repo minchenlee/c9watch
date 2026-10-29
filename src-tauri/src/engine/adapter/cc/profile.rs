@@ -30,7 +30,11 @@
 //! - The first two layers also cover the `.claude/` of every other live
 //!   engine agent at spawn time (C1a-32, `Profile::with_peers`): in live
 //!   run X14 one agent rewrote another agent's `settings.json` with a Bash
-//!   redirect.
+//!   redirect. Rules built at spawn cannot name a later agent, so
+//!   `agent.create` takes one cwd at a time (M7 reviews H1).
+//! - Layer 1 also denies, for every agent, `~/.claude`, `~/.claude.json`
+//!   and every `.claude/` (`STATIC_DENY`), and the store and machine key
+//!   in both layers (M7 reviews M3, M4).
 //! - The env carries only `C9_AGENT_ID`, `C9_AGENT_GEN` and
 //!   `C9_ENGINE_SOCK`, none of them a secret. There is no `C9_AGENT_TOKEN`
 //!   (D28 Q6=B) and no `C9_STANDING_ORDERS` (spike `c0-engine.rs:407`):
@@ -232,23 +236,60 @@ pub fn allow_rules(p: &Profile) -> Vec<String> {
 
 /// Engine-owned directories the agent must not write: `<home>/bin` (the
 /// agent binary) and `<home>/spawn` (its own settings file). `home` is the
-/// parent of `bin`, as `agent_bin::installed_path` lays it out.
+/// parent of `bin`, as `agent_bin::installed_path` lays it out. A
+/// `live-test` build adds `<home>/live-test`: the engine types the bytes of
+/// a file there into an agent's PTY, so a write there is a `!` command
+/// outside the sandbox, into any agent's terminal (M7 reviews M3).
 pub fn engine_dirs(p: &Profile) -> Vec<PathBuf> {
     let bin = p.agent_bin.parent();
-    bin.into_iter()
+    let home = bin.and_then(Path::parent);
+    let mut v: Vec<PathBuf> = bin
+        .into_iter()
         .map(Path::to_path_buf)
-        .chain(bin.and_then(Path::parent).map(|h| h.join(SPAWN_DIR)))
-        .collect()
+        .chain(home.map(|h| h.join(SPAWN_DIR)))
+        .collect();
+    #[cfg(feature = "live-test")]
+    v.extend(home.map(|h| h.join(crate::engine::live_test::DIR)));
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Engine-owned files the agent must not write: `<home>/standing-orders.md`,
-/// which the engine sends to every agent (A:545, C1a-25).
+/// which the engine sends to every agent (A:545, C1a-25), and the store
+/// (`engine.db` with its WAL files, the audit rows among them) and
+/// `machine.key` (M7 reviews M3). The socket is not here: the agent must
+/// connect to it.
 pub fn engine_files(p: &Profile) -> Vec<PathBuf> {
     let home = p.agent_bin.parent().and_then(Path::parent);
-    home.map(|h| h.join(STANDING_ORDERS_NAME))
-        .into_iter()
+    let db = crate::engine::db::DB_NAME;
+    home.into_iter()
+        .flat_map(|h| {
+            [
+                h.join(STANDING_ORDERS_NAME),
+                h.join(db),
+                h.join(format!("{}-wal", db)),
+                h.join(format!("{}-shm", db)),
+                h.join(crate::engine::machine::KEY_NAME),
+            ]
+        })
         .collect()
 }
+
+/// Layer-1 rules that do not depend on which agents are live (M7 reviews
+/// H1, M4). CC does not sandbox its file tools, so without them a Write
+/// outside the cwd meets only the auto-mode classifier:
+/// - `~/.claude/**` and `~/.claude.json`: the user source and MCP config of
+///   the owner's next CC session, whose hooks run unsandboxed.
+/// - `//**/.claude/**`: every other `.claude/` (a peer agent's, another
+///   repo's), whenever it was created. The `**` glob in an absolute rule is
+///   not live-verified (plan §6 item 6), so the create gate
+///   (`create::other_live_cwd`) does not rely on it.
+pub const STATIC_DENY: &[&str] = &[
+    "Edit(~/.claude/**)",
+    "Edit(~/.claude.json)",
+    "Edit(//**/.claude/**)",
+];
 
 /// Layer 1, deny rules for CC's own file tools. `Edit` covers every file
 /// tool; CC 2.1.312 warns that a `Write(path)` rule is not matched by file
@@ -271,6 +312,9 @@ pub fn engine_files(p: &Profile) -> Vec<PathBuf> {
 ///
 /// 4. The same for every peer cwd (`Profile::peers`, C1a-32): one agent
 ///    must not rewrite another agent's settings, which CC hot-reloads.
+///    Only the agents live at this spawn; `create` therefore refuses a
+///    second cwd while an agent is live (M7 reviews H1).
+/// 5. `STATIC_DENY`: the user's `~/.claude` and every other `.claude/`.
 ///
 /// Layer 2 is `sandbox.filesystem.denyWrite` (`deny_write`) and layer 3
 /// `allowUnsandboxedCommands:false` (`settings`). No layer is enough alone.
@@ -293,6 +337,7 @@ pub fn deny_rules(p: &Profile) -> Vec<String> {
         );
         v.push(format!("Edit(/{}/.claude/**)", cwd));
     }
+    v.extend(STATIC_DENY.iter().map(|r| r.to_string()));
     v
 }
 
@@ -426,6 +471,18 @@ mod tests {
 
     const SID: &str = "6f1c2b8e-3d4a-4b5c-9e7f-0a1b2c3d4e5f";
     const BIN: &str = "/b/Application Support/c9/bin/c9watch-agent";
+    const HOME: &str = "/b/Application Support/c9";
+    #[cfg(not(feature = "live-test"))]
+    const ENGINE_DIRS: &[&str] = &["/bin", "/spawn"];
+    #[cfg(feature = "live-test")]
+    const ENGINE_DIRS: &[&str] = &["/bin", "/live-test", "/spawn"];
+    const ENGINE_FILES: &[&str] = &[
+        "/standing-orders.md",
+        "/engine.db",
+        "/engine.db-wal",
+        "/engine.db-shm",
+        "/machine.key",
+    ];
 
     fn p_in(cwd: &Path) -> Profile {
         Profile::new(Path::new(BIN), Path::new("/s/e.sock"), cwd, "agt_1", 3, SID).unwrap()
@@ -720,9 +777,15 @@ mod tests {
             }
             // No unsandboxed retry around the write-deny.
             assert_eq!(s["sandbox"]["allowUnsandboxedCommands"], false);
-            // Every rule is rooted at `/`, never at the settings source.
+            // Every rule is rooted at `/` or `~`, never at the settings
+            // source.
             for r in deny {
-                assert!(r.as_str().unwrap().starts_with("Edit(//"), "{}", r);
+                let r = r.as_str().unwrap();
+                assert!(
+                    r.starts_with("Edit(//") || r.starts_with("Edit(~/"),
+                    "{}",
+                    r
+                );
             }
         });
         // A relative cwd or `/` never reaches a rule.
@@ -750,15 +813,13 @@ mod tests {
             assert!(deny.contains(&json!(format!("Edit(/{}/.claude/**)", cwd))));
             // Sandboxed Bash: the directory itself, so a rename or a symlink
             // in its place is refused too, not only writes to the files.
-            assert_eq!(
-                s["sandbox"]["filesystem"]["denyWrite"],
-                json!([
-                    "/b/Application Support/c9/bin",
-                    "/b/Application Support/c9/spawn",
-                    "/b/Application Support/c9/standing-orders.md",
-                    format!("{}/.claude", cwd)
-                ])
-            );
+            let mut want: Vec<String> = ENGINE_DIRS
+                .iter()
+                .map(|d| format!("{}{}", HOME, d))
+                .collect();
+            want.extend(ENGINE_FILES.iter().map(|f| format!("{}{}", HOME, f)));
+            want.push(format!("{}/.claude", cwd));
+            assert_eq!(s["sandbox"]["filesystem"]["denyWrite"], json!(want));
         });
     }
 
@@ -822,17 +883,20 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&settings(&p)).unwrap()).unwrap();
 
         // Layer 1: permissions.deny.
-        assert_eq!(
-            s["permissions"]["deny"],
-            json!([
-                "Edit(//b/Application Support/c9/bin/**)",
-                "Edit(//b/Application Support/c9/spawn/**)",
-                "Edit(//b/Application Support/c9/standing-orders.md)",
-                format!("Edit(/{}/.claude/settings.json)", cwd),
-                format!("Edit(/{}/.claude/settings.local.json)", cwd),
-                format!("Edit(/{}/.claude/**)", cwd),
-            ])
-        );
+        let mut want: Vec<String> = ENGINE_DIRS
+            .iter()
+            .map(|d| format!("Edit(/{}{}/**)", HOME, d))
+            .collect();
+        want.extend(ENGINE_FILES.iter().map(|f| format!("Edit(/{}{})", HOME, f)));
+        want.extend([
+            format!("Edit(/{}/.claude/settings.json)", cwd),
+            format!("Edit(/{}/.claude/settings.local.json)", cwd),
+            format!("Edit(/{}/.claude/**)", cwd),
+            "Edit(~/.claude/**)".into(),
+            "Edit(~/.claude.json)".into(),
+            "Edit(//**/.claude/**)".into(),
+        ]);
+        assert_eq!(s["permissions"]["deny"], json!(want));
         // Layer 2: sandbox.filesystem.denyWrite, the same places.
         let dw = s["sandbox"]["filesystem"]["denyWrite"].as_array().unwrap();
         assert!(dw.contains(&json!(format!("{}/.claude", cwd))));
@@ -853,5 +917,37 @@ mod tests {
             s["permissions"]["allow"],
             json!([format!("Bash({}:*)", BIN)])
         );
+    }
+    #[test]
+    fn engine_store_and_owner_claude_are_denied() {
+        // M7 reviews M3, M4: the store, the machine key and the owner's
+        // ~/.claude are outside the cwd, where the file tools meet only the
+        // classifier.
+        let t = tempfile::tempdir().unwrap();
+        let p = p_in(t.path());
+        let deny = deny_rules(&p);
+        let dw = deny_write(&p);
+        for f in ["engine.db", "engine.db-wal", "engine.db-shm", "machine.key"] {
+            let path = format!("{}/{}", HOME, f);
+            assert!(deny.contains(&format!("Edit(/{})", path)), "{:?}", deny);
+            assert!(dw.contains(&path), "{:?}", dw);
+        }
+        assert!(!dw.iter().any(|d| d.ends_with(".sock")));
+        for r in STATIC_DENY {
+            assert!(deny.contains(&r.to_string()), "{}", r);
+        }
+        // The static rules hold for an agent with no peers too.
+        assert!(p.peers.is_empty());
+    }
+
+    #[cfg(feature = "live-test")]
+    #[test]
+    fn live_test_input_dir_is_denied_in_both_layers() {
+        // M7 reviews M3: bytes written there reach a PTY as typed keys.
+        let t = tempfile::tempdir().unwrap();
+        let p = p_in(t.path());
+        let dir = format!("{}/{}", HOME, crate::engine::live_test::DIR);
+        assert!(deny_write(&p).contains(&dir));
+        assert!(deny_rules(&p).contains(&format!("Edit(/{}/**)", dir)));
     }
 }

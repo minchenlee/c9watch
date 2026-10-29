@@ -12,7 +12,8 @@
 //!    (`.c9watch/worktrees`) with `cwd_collision` (D22.9), and a cwd that
 //!    holds the engine home.
 //! 2. One transaction: `cwd_collision` when a live engine agent's cwd is
-//!    above or below this one, then the `agents` row (`creating`, `created_by` = the
+//!    above or below this one, or any other cwd at all (one cwd at a time,
+//!    M7 reviews H1), then the `agents` row (`creating`, `created_by` = the
 //!    caller's principal), its first generation with the `--session-id`,
 //!    and the create op in phase `row` (`engine::ops`).
 //! 3. A supervisor thread writes the per-spawn settings, spawns the agent
@@ -452,6 +453,18 @@ impl Spawner {
                         format!(
                             "cwd {:?} and the cwd {:?} of live agent {} are nested",
                             s.cwd, other.1, other.0
+                        ),
+                    )));
+                }
+                if let Some(other) = other_live_cwd(tx, &s.cwd)? {
+                    return Ok(Err(ApiError::new(
+                        ErrorCode::CwdCollision,
+                        format!(
+                            "live agent {} runs in another cwd {:?}: its deny rules do not \
+                             name {:?}, so one agent could rewrite the other's .claude/ \
+                             (one cwd at a time until a rule for every live agent is \
+                             verified live)",
+                            other.0, other.1, s.cwd
                         ),
                     )));
                 }
@@ -1436,6 +1449,28 @@ fn nested_cwd(conn: &Connection, cwd: &Path) -> rusqlite::Result<Option<(String,
     Ok(None)
 }
 
+/// A live engine agent whose cwd differs from `cwd`, as `(id, cwd)` (M7
+/// reviews H1). An agent's rules deny the `.claude/` of only the agents
+/// live at its spawn (`peer_cwds`), so an agent created earlier could
+/// still write a later agent's settings, which CC hot-reloads. Until a
+/// rule that names every live agent is verified live, `agent.create`
+/// takes one cwd at a time. The same cwd is fine: both deny it. A boot
+/// resume reads every live row, so resumed agents deny each other. In the
+/// create transaction, so two creates cannot race past it.
+fn other_live_cwd(conn: &Connection, cwd: &Path) -> rusqlite::Result<Option<(String, PathBuf)>> {
+    let mut st = conn.prepare(
+        "SELECT id, cwd FROM agents WHERE source = 'engine' AND gone_at IS NULL \
+         AND cwd IS NOT NULL AND cwd != ?1 ORDER BY created_at, id LIMIT 1",
+    )?;
+    st.query_row([cwd.display().to_string()], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            PathBuf::from(r.get::<_, String>(1)?),
+        ))
+    })
+    .optional()
+}
+
 fn name_taken(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
     Ok(conn
         .query_row(
@@ -2117,38 +2152,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_agent_denies_the_first_agents_claude_dir() {
-        // Live run X14 row 8 (C1a-32): B overwrote A's settings.json.
+    async fn a_second_cwd_is_refused_while_an_agent_is_live() {
+        // M7 reviews H1: A's rules, built at A's spawn, do not name B's
+        // .claude/, so A could rewrite B's settings (live X14 row 8, the
+        // other way round). One cwd at a time.
         let e = setup(Script::Ready, true, None);
         let l = Principal::LocalUnverified;
         let a = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
         let other = e.t.path().join("other");
         std::fs::create_dir(&other).unwrap();
-        let b = e.sp.create(&l, create_params(&other)).await.unwrap();
-        let read = |id: &str| -> serde_json::Value {
-            let f = settings_path_of(&e.home, id, 1);
-            serde_json::from_slice(&std::fs::read(f).unwrap()).unwrap()
-        };
-        let a_claude = e.cwd.canonicalize().unwrap().join(".claude");
-        let b_set = read(&b.id);
-        let dw = b_set["sandbox"]["filesystem"]["denyWrite"].to_string();
-        let deny = b_set["permissions"]["deny"].to_string();
-        let a_s = a_claude.display().to_string();
-        assert!(dw.contains(&a_s), "{}", dw);
-        assert!(deny.contains(&format!("Edit(/{}/**)", a_s)), "{}", deny);
-        // A came first: B was not live at its spawn.
-        let b_claude = other.canonicalize().unwrap().join(".claude");
-        let a_set = read(&a.id).to_string();
-        assert!(!a_set.contains(&b_claude.display().to_string()));
-        // A retired agent is no peer.
-        e.sp.retire(&l, serde_json::json!({ "id": b.id }))
-            .await
-            .unwrap();
+        let err = e.sp.create(&l, create_params(&other)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::CwdCollision);
+        assert!(err.msg.contains(&a.id), "{}", err.msg);
+        // The same cwd is fine: both agents deny its .claude/.
+        let a2 = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
         let conn = e.db.reader().unwrap();
-        assert!(peer_cwds(&conn, &a.id).unwrap().is_empty());
+        assert!(peer_cwds(&conn, &a2.id)
+            .unwrap()
+            .iter()
+            .all(|p| *p == e.cwd.canonicalize().unwrap()));
+        drop(conn);
+        // With no agent live, the other cwd is taken.
+        for id in [&a.id, &a2.id] {
+            e.sp.retire(&l, serde_json::json!({ "id": id }))
+                .await
+                .unwrap();
+        }
+        let b = e.sp.create(&l, create_params(&other)).await.unwrap();
+        let conn = e.db.reader().unwrap();
+        assert!(peer_cwds(&conn, &b.id).unwrap().is_empty());
+        assert!(other_live_cwd(&conn, &other.canonicalize().unwrap())
+            .unwrap()
+            .is_none());
         assert_eq!(
-            peer_cwds(&conn, &b.id).unwrap(),
-            vec![e.cwd.canonicalize().unwrap()]
+            other_live_cwd(&conn, &e.cwd.canonicalize().unwrap())
+                .unwrap()
+                .map(|(id, _)| id),
+            Some(b.id.clone())
         );
     }
 
