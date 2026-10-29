@@ -4,11 +4,11 @@ use axum::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
         ConnectInfo, Query, Request, State,
     },
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     middleware::Next,
     response::IntoResponse,
     routing::get,
-    Json, Router,
+    Extension, Json, Router,
 };
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,12 @@ impl WsState {
             remote: RwLock::new(RemoteAccess::default()),
             epoch: watch::channel(0).0,
         }
+    }
+
+    /// The policy now. A poisoned lock fails closed: the defaults are
+    /// loopback only.
+    fn remote_now(&self) -> RemoteAccess {
+        self.remote.read().map(|r| r.clone()).unwrap_or_default()
     }
 
     fn lan_enabled(&self) -> bool {
@@ -160,7 +166,11 @@ enum ServerMsg {
 
 // ── Server entrypoint ───────────────────────────────────────────────
 
-fn router(state: Arc<WsState>) -> Router {
+/// The port a listener serves on. `Host` and `Origin` must name it.
+#[derive(Debug, Clone, Copy)]
+struct ListenPort(u16);
+
+fn router(state: Arc<WsState>, port: u16) -> Router {
     Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health))
@@ -170,6 +180,11 @@ fn router(state: Arc<WsState>) -> Router {
             Arc::clone(&state),
             peer_guard,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            host_guard,
+        ))
+        .layer(Extension(ListenPort(port)))
         .with_state(state)
 }
 
@@ -180,7 +195,14 @@ pub async fn serve(
     state: Arc<WsState>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
-    let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+    let port = match listener.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(e) => {
+            crate::debug_log::log_error(&format!("[ws-server] Error: {}", e));
+            return;
+        }
+    };
+    let app = router(state, port).into_make_service_with_connect_info::<SocketAddr>();
     if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await
@@ -207,6 +229,168 @@ async fn peer_guard(
         next.run(request).await
     } else {
         (StatusCode::FORBIDDEN, "Remote access is off").into_response()
+    }
+}
+
+// ── Host and Origin checks ──────────────────────────────────────────
+
+/// Loopback names a page or client may use for this server. Each one must
+/// carry the listener's port.
+const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
+
+/// Splits a `Host` value (or an allowed-host entry) into a lowercase host and
+/// an optional port. IPv6 literals keep their brackets. Returns `None` for a
+/// value that is not a bare `host` or `host:port`.
+fn split_host(value: &str) -> Option<(String, Option<u16>)> {
+    let value = value.trim().to_ascii_lowercase();
+    let (host, port) = if value.starts_with('[') {
+        let end = value.find(']')?;
+        let (host, rest) = value.split_at(end + 1);
+        match rest {
+            "" => (host.to_string(), None),
+            _ => (host.to_string(), Some(rest.strip_prefix(':')?)),
+        }
+    } else {
+        match value.split_once(':') {
+            Some((host, port)) => (host.to_string(), Some(port)),
+            None => (value.clone(), None),
+        }
+    };
+    let ok_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']');
+    if host.is_empty() || !host.chars().all(ok_char) {
+        return None;
+    }
+    let port = match port {
+        Some(p) => Some(p.parse::<u16>().ok()?),
+        None => None,
+    };
+    Some((host, port))
+}
+
+/// The IP address a `Host` names, when it is an IP literal.
+fn host_ip(host: &str) -> Option<IpAddr> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse().ok()
+}
+
+/// True when this server answers to `host` (a `Host` header value). This
+/// blocks DNS rebinding: a page on `evil.example` that resolves to
+/// 127.0.0.1 still sends `Host: evil.example`.
+///
+/// - A loopback name with the listener's port.
+/// - An `extraAllowedHosts` entry. An entry with a port must match exactly.
+///   An entry without a port matches the host with no port (a proxy on its
+///   default port, such as `tailscale serve` on 443) or with the
+///   listener's port.
+/// - In LAN mode, an IP address of a local interface with the listener's
+///   port. `local_ips` is called only then, so the addresses are read fresh
+///   per request and never cached.
+fn host_allowed(
+    host: &str,
+    remote: &RemoteAccess,
+    port: u16,
+    local_ips: impl FnOnce() -> Vec<IpAddr>,
+) -> bool {
+    let Some((name, given_port)) = split_host(host) else {
+        return false;
+    };
+    if LOOPBACK_HOSTS.contains(&name.as_str()) && given_port == Some(port) {
+        return true;
+    }
+    let extra = remote
+        .extra_allowed_hosts
+        .iter()
+        .any(|entry| match split_host(entry) {
+            Some((entry_name, Some(entry_port))) => {
+                entry_name == name && given_port == Some(entry_port)
+            }
+            Some((entry_name, None)) => {
+                entry_name == name && (given_port.is_none() || given_port == Some(port))
+            }
+            None => false,
+        });
+    if extra {
+        return true;
+    }
+    if remote.lan_enabled && given_port == Some(port) {
+        if let Some(ip) = host_ip(&name) {
+            return local_ips().contains(&ip);
+        }
+    }
+    false
+}
+
+/// The `Host` of a request. HTTP/2 carries it in the URI authority instead.
+fn request_host(request: &Request) -> Option<String> {
+    request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| request.uri().authority().map(|a| a.as_str().to_string()))
+}
+
+/// Origins allowed in debug builds only: the Vite dev server.
+#[cfg(debug_assertions)]
+const DEV_ORIGINS: &[&str] = &["http://localhost:1420"];
+#[cfg(not(debug_assertions))]
+const DEV_ORIGINS: &[&str] = &[];
+
+/// True when a WS upgrade with this `Origin` may proceed.
+///
+/// No `Origin` is allowed on purpose. Browsers always send `Origin` on a
+/// WebSocket upgrade, so a missing one means a client that is not a
+/// browser (a script, the CLI, a native app). Such a client cannot be
+/// driven by a hostile web page, which is what this check stops, and it
+/// still has to present a valid token.
+///
+/// A present `Origin` must be `http://` or `https://` plus a host that
+/// [`host_allowed`] accepts. `null` and every other scheme are rejected.
+fn origin_allowed(
+    origin: Option<&str>,
+    remote: &RemoteAccess,
+    port: u16,
+    local_ips: impl FnOnce() -> Vec<IpAddr>,
+) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    let origin = origin.trim().to_ascii_lowercase();
+    if DEV_ORIGINS.contains(&origin.as_str()) {
+        return true;
+    }
+    let Some(host) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    !host.contains('/') && host_allowed(host, remote, port, local_ips)
+}
+
+/// Rejects a request whose `Host` this server does not answer to. Runs on
+/// every route: `/ws`, `/health`, `/info` and the static files.
+async fn host_guard(
+    State(state): State<Arc<WsState>>,
+    Extension(ListenPort(port)): Extension<ListenPort>,
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    let allowed = request_host(&request).is_some_and(|host| {
+        host_allowed(
+            &host,
+            &state.remote_now(),
+            port,
+            remote_access::local_interface_ips,
+        )
+    });
+    if allowed {
+        next.run(request).await
+    } else {
+        (StatusCode::FORBIDDEN, "Host not allowed").into_response()
     }
 }
 
@@ -253,11 +437,7 @@ impl WsServer {
 
     /// The current policy.
     pub fn remote(&self) -> RemoteAccess {
-        self.state
-            .remote
-            .read()
-            .map(|r| r.clone())
-            .unwrap_or_default()
+        self.state.remote_now()
     }
 
     /// The addresses bound now.
@@ -424,7 +604,21 @@ async fn ws_handler(
     Query(params): Query<WsQuery>,
     State(state): State<Arc<WsState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(ListenPort(port)): Extension<ListenPort>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
+    // Origin first, before the token: a foreign page learns nothing.
+    let origin = headers
+        .get(header::ORIGIN)
+        .map(|v| v.to_str().unwrap_or(""));
+    if !origin_allowed(
+        origin,
+        &state.remote_now(),
+        port,
+        remote_access::local_interface_ips,
+    ) {
+        return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
+    }
     match &params.token {
         Some(token) if token == &state.auth_token => ws
             .on_upgrade(move |socket| handle_socket(socket, state, peer.ip()))
@@ -986,13 +1180,176 @@ mod server_tests {
     }
 
     async fn health(addr: SocketAddr) -> std::io::Result<String> {
+        get_with_host(addr, "/health", &format!("127.0.0.1:{}", addr.port())).await
+    }
+
+    async fn get_with_host(addr: SocketAddr, path: &str, host: &str) -> std::io::Result<String> {
         let mut stream = tokio::net::TcpStream::connect(addr).await?;
-        stream
-            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await?;
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await?;
         let mut reply = String::new();
         stream.read_to_string(&mut reply).await?;
         Ok(reply)
+    }
+
+    /// Opens `/ws` with the given `Origin`; returns the HTTP status of the
+    /// upgrade reply (101 when it upgraded).
+    async fn upgrade_status(addr: SocketAddr, origin: Option<&str>) -> u16 {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://{addr}/ws?token=test-token")
+            .into_client_request()
+            .unwrap();
+        if let Some(origin) = origin {
+            request
+                .headers_mut()
+                .insert("origin", origin.parse().unwrap());
+        }
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((_, response)) => response.status().as_u16(),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                response.status().as_u16()
+            }
+            Err(e) => panic!("upgrade failed: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_from_a_foreign_origin_is_forbidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = test_server(dir.path());
+        let addr = server.apply(RemoteAccess::default()).await.unwrap()[0];
+        assert_eq!(upgrade_status(addr, Some("http://evil.example")).await, 403);
+        let same_origin = format!("http://127.0.0.1:{}", addr.port());
+        assert_eq!(upgrade_status(addr, Some(&same_origin)).await, 101);
+        assert_eq!(upgrade_status(addr, None).await, 101, "non-browser client");
+    }
+
+    #[tokio::test]
+    async fn every_route_rejects_a_foreign_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = test_server(dir.path());
+        let addr = server.apply(RemoteAccess::default()).await.unwrap()[0];
+        let port = addr.port();
+        for path in ["/health", "/info", "/", "/ws?token=test-token"] {
+            let reply = get_with_host(addr, path, &format!("evil.example:{port}"))
+                .await
+                .unwrap();
+            assert!(reply.starts_with("HTTP/1.1 403"), "{path}: {reply}");
+        }
+        let reply = get_with_host(addr, "/info", &format!("localhost:{port}"))
+            .await
+            .unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    }
+
+    const PORT: u16 = 9210;
+    const LAN_IP: &str = "192.168.1.20";
+
+    fn lan_ips() -> Vec<IpAddr> {
+        vec![LAN_IP.parse().unwrap(), "fd00::20".parse().unwrap()]
+    }
+
+    fn policy(lan_enabled: bool, extra: &[&str]) -> RemoteAccess {
+        RemoteAccess {
+            lan_enabled,
+            extra_allowed_hosts: extra.iter().map(|h| h.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn host_check_table() {
+        let off = policy(false, &[]);
+        let lan = policy(true, &[]);
+        let extra = policy(false, &["mac.tail1234.ts.net", "box.lan:8000"]);
+        let cases: &[(&str, &RemoteAccess, bool)] = &[
+            ("127.0.0.1:9210", &off, true),
+            ("localhost:9210", &off, true),
+            ("LOCALHOST:9210", &off, true),
+            ("[::1]:9210", &off, true),
+            ("evil.example:9210", &off, false),
+            ("evil.example", &off, false),
+            ("localhost", &off, false),
+            ("127.0.0.1:8000", &off, false),
+            ("localhost:9211", &off, false),
+            ("localhost:x", &off, false),
+            ("localhost.:9210", &off, false),
+            ("", &off, false),
+            ("192.168.1.20:9210", &off, false),
+            ("192.168.1.20:9210", &lan, true),
+            ("[fd00::20]:9210", &lan, true),
+            ("192.168.1.20:8000", &lan, false),
+            ("192.168.1.99:9210", &lan, false),
+            ("evil.example:9210", &lan, false),
+            ("mac.tail1234.ts.net", &extra, true),
+            ("mac.tail1234.ts.net:9210", &extra, true),
+            ("mac.tail1234.ts.net:443", &extra, false),
+            ("box.lan:8000", &extra, true),
+            ("box.lan", &extra, false),
+            ("box.lan:9210", &extra, false),
+            ("other.ts.net", &extra, false),
+        ];
+        for (host, remote, want) in cases {
+            assert_eq!(
+                host_allowed(host, remote, PORT, lan_ips),
+                *want,
+                "Host {host:?} lan={}",
+                remote.lan_enabled
+            );
+        }
+    }
+
+    #[test]
+    fn interface_ips_are_read_only_for_lan_ip_hosts() {
+        let never = || -> Vec<IpAddr> { panic!("interfaces read") };
+        assert!(host_allowed(
+            "localhost:9210",
+            &policy(true, &[]),
+            PORT,
+            never
+        ));
+        assert!(!host_allowed(
+            "192.168.1.20:9210",
+            &policy(false, &[]),
+            PORT,
+            never
+        ));
+    }
+
+    #[test]
+    fn origin_check_table() {
+        let off = policy(false, &[]);
+        let lan = policy(true, &[]);
+        let extra = policy(false, &["mac.tail1234.ts.net"]);
+        let cases: &[(Option<&str>, &RemoteAccess, bool)] = &[
+            (None, &off, true),
+            (Some("http://127.0.0.1:9210"), &off, true),
+            (Some("http://localhost:9210"), &off, true),
+            (Some("http://[::1]:9210"), &off, true),
+            (Some("https://mac.tail1234.ts.net"), &extra, true),
+            (Some("http://192.168.1.20:9210"), &lan, true),
+            (Some("http://192.168.1.20:9210"), &off, false),
+            (Some("http://evil.example"), &off, false),
+            (Some("http://evil.localhost:8000"), &off, false),
+            (Some("http://localhost:8000"), &off, false),
+            (Some("null"), &off, false),
+            (Some(""), &off, false),
+            (Some("tauri://localhost"), &off, false),
+            (Some("ws://localhost:9210"), &off, false),
+            (Some("http://localhost:9210/x"), &off, false),
+        ];
+        for (origin, remote, want) in cases {
+            assert_eq!(
+                origin_allowed(*origin, remote, PORT, lan_ips),
+                *want,
+                "Origin {origin:?}"
+            );
+        }
+        assert_eq!(
+            origin_allowed(Some("http://localhost:1420"), &off, PORT, lan_ips),
+            cfg!(debug_assertions),
+            "the Vite dev origin is a debug-build exception"
+        );
     }
 
     #[test]
