@@ -184,6 +184,7 @@ fn router(state: Arc<WsState>, port: u16) -> Router {
             Arc::clone(&state),
             host_guard,
         ))
+        .layer(axum::middleware::from_fn(security_headers))
         .layer(Extension(ListenPort(port)))
         .with_state(state)
 }
@@ -379,19 +380,150 @@ async fn host_guard(
     request: Request,
     next: Next,
 ) -> axum::response::Response {
-    let allowed = request_host(&request).is_some_and(|host| {
-        host_allowed(
-            &host,
-            &state.remote_now(),
-            port,
-            remote_access::local_interface_ips,
-        )
-    });
-    if allowed {
-        next.run(request).await
-    } else {
-        (StatusCode::FORBIDDEN, "Host not allowed").into_response()
+    let checked = request_host(&request)
+        .filter(|host| {
+            host_allowed(
+                host,
+                &state.remote_now(),
+                port,
+                remote_access::local_interface_ips,
+            )
+        })
+        .and_then(|host| split_host(&host))
+        .map(|(name, port)| match port {
+            Some(port) => CheckedHost(format!("{name}:{port}")),
+            None => CheckedHost(name),
+        });
+    match checked {
+        Some(host) => {
+            let mut response = next.run(request).await;
+            response.extensions_mut().insert(host);
+            response
+        }
+        None => (StatusCode::FORBIDDEN, "Host not allowed").into_response(),
     }
+}
+
+// ── Security headers ────────────────────────────────────────────────
+
+/// A `Host` that passed [`host_guard`], normalized. Only a checked host is
+/// ever written into the CSP.
+#[derive(Debug, Clone)]
+struct CheckedHost(String);
+
+/// One `'sha256-…'` source per inline `<script>` (a script without `src`)
+/// in `html`. The hash covers the exact text between the tags, as the
+/// browser computes it.
+fn inline_script_hashes(html: &str) -> Vec<String> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    // ASCII lowercasing keeps byte offsets, so slices of `lower` index `html`.
+    let lower = html.to_ascii_lowercase();
+    let mut hashes = Vec::new();
+    let mut at = 0;
+    while let Some(found) = lower[at..].find("<script") {
+        let start = at + found;
+        let name_end = start + "<script".len();
+        let Some(open_len) = lower[name_end..].find('>') else {
+            break;
+        };
+        let open_end = name_end + open_len;
+        let Some(close_len) = lower[open_end..].find("</script") else {
+            break;
+        };
+        let close = open_end + close_len;
+        at = close;
+        let attrs = &lower[name_end..open_end];
+        if !attrs.is_empty() && !attrs.starts_with(|c: char| c.is_ascii_whitespace()) {
+            continue; // e.g. `<scripts>`, not a script tag
+        }
+        let has_src = attrs
+            .split(|c: char| c.is_ascii_whitespace())
+            .any(|attr| attr == "src" || attr.starts_with("src="));
+        if has_src {
+            continue;
+        }
+        let digest = Sha256::digest(&html.as_bytes()[open_end + 1..close]);
+        let hash = base64::engine::general_purpose::STANDARD.encode(digest);
+        let source = format!("'sha256-{hash}'");
+        if !hashes.contains(&source) {
+            hashes.push(source);
+        }
+    }
+    hashes
+}
+
+/// The hashes of the inline scripts in the embedded `index.html` (the
+/// SvelteKit bootstrap), computed once.
+fn embedded_script_hashes() -> &'static str {
+    static HASHES: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASHES.get_or_init(|| {
+        Assets::get("index.html")
+            .map(|file| inline_script_hashes(&String::from_utf8_lossy(&file.data)).join(" "))
+            .unwrap_or_default()
+    })
+}
+
+/// The CSP for every response. `connect-src` lists each loopback alias,
+/// because the page may connect its socket to a different alias than the
+/// one it was loaded from (`localhost` is rewritten to `127.0.0.1`), plus
+/// the checked `Host` for LAN and proxy pages.
+fn content_security_policy(script_hashes: &str, port: u16, host: Option<&str>) -> String {
+    let mut connect = vec!["'self'".to_string()];
+    let mut add = |source: String| {
+        if !connect.contains(&source) {
+            connect.push(source);
+        }
+    };
+    for alias in LOOPBACK_HOSTS {
+        add(format!("ws://{alias}:{port}"));
+    }
+    if let Some(host) = host {
+        add(format!("ws://{host}"));
+        add(format!("wss://{host}"));
+    }
+    let script = match script_hashes {
+        "" => "'self'".to_string(),
+        hashes => format!("'self' {hashes}"),
+    };
+    format!(
+        "default-src 'self'; script-src {script}; style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; font-src 'self'; connect-src {}; object-src 'none'; \
+         base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+        connect.join(" ")
+    )
+}
+
+/// Adds the security headers to every response, rejections included.
+async fn security_headers(
+    Extension(ListenPort(port)): Extension<ListenPort>,
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    let host = response.extensions().get::<CheckedHost>().cloned();
+    let csp = content_security_policy(
+        embedded_script_hashes(),
+        port,
+        host.as_ref().map(|h| h.0.as_str()),
+    );
+    let headers = response.headers_mut();
+    if let Ok(value) = header::HeaderValue::from_str(&csp) {
+        headers.insert(header::CONTENT_SECURITY_POLICY, value);
+    }
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        header::HeaderValue::from_static("DENY"),
+    );
+    response
 }
 
 /// How long a stopping listener may take to finish its connections before
@@ -1224,6 +1356,67 @@ mod server_tests {
         assert_eq!(upgrade_status(addr, None).await, 101, "non-browser client");
     }
 
+    fn header_value<'a>(reply: &'a str, name: &str) -> Option<&'a str> {
+        let head = reply.split("\r\n\r\n").next()?;
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    #[tokio::test]
+    async fn responses_carry_security_headers_and_a_strict_csp() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = test_server(dir.path());
+        let addr = server.apply(RemoteAccess::default()).await.unwrap()[0];
+        let port = addr.port();
+        let host = format!("localhost:{port}");
+        // The static routes answer 404 when the frontend is not built (as in
+        // CI); the headers must be there either way.
+        for path in ["/", "/health", "/no-such-page"] {
+            let reply = get_with_host(addr, path, &host).await.unwrap();
+            assert_eq!(
+                header_value(&reply, "x-content-type-options"),
+                Some("nosniff")
+            );
+            assert_eq!(header_value(&reply, "referrer-policy"), Some("no-referrer"));
+            assert_eq!(header_value(&reply, "x-frame-options"), Some("DENY"));
+            let csp = header_value(&reply, "content-security-policy").expect("CSP");
+            let script_src = csp
+                .split(';')
+                .map(str::trim)
+                .find(|d| d.starts_with("script-src "))
+                .expect("script-src");
+            assert!(!script_src.contains("'unsafe-inline'"), "{csp}");
+            assert!(!script_src.contains("'unsafe-eval'"), "{csp}");
+            for directive in [
+                "default-src 'self'",
+                "object-src 'none'",
+                "base-uri 'none'",
+                "frame-ancestors 'none'",
+                "form-action 'none'",
+            ] {
+                assert!(csp.contains(directive), "{directive} missing: {csp}");
+            }
+            // The page rewrites localhost to 127.0.0.1 for its socket, so
+            // every loopback alias must be allowed, not only this Host.
+            for ws in [
+                format!("ws://127.0.0.1:{port}"),
+                format!("ws://localhost:{port}"),
+                format!("ws://[::1]:{port}"),
+            ] {
+                assert!(csp.contains(&ws), "{ws} missing: {csp}");
+            }
+        }
+        let rejected = get_with_host(addr, "/", "evil.example").await.unwrap();
+        assert!(rejected.starts_with("HTTP/1.1 403"), "{rejected}");
+        let csp = header_value(&rejected, "content-security-policy").expect("CSP on 403");
+        assert!(
+            !csp.contains("evil.example"),
+            "an unchecked Host is never echoed: {csp}"
+        );
+    }
+
     #[tokio::test]
     async fn every_route_rejects_a_foreign_host() {
         let dir = tempfile::tempdir().unwrap();
@@ -1297,6 +1490,43 @@ mod server_tests {
                 remote.lan_enabled
             );
         }
+    }
+
+    #[test]
+    fn inline_script_hashes_skip_external_scripts() {
+        let html = "<head><script src=\"/a.js\"></script>\
+                    <SCRIPT type=\"module\" src=/b.js></SCRIPT></head>\
+                    <body><script>alert(1)</script><scripts></scripts>\
+                    <script type=\"text/javascript\">\n  run();\n</script>\
+                    <script>alert(1)</script></body>";
+        assert_eq!(
+            inline_script_hashes(html),
+            [
+                "'sha256-bhHHL3z2vDgxUt0W3dWQOrprscmda2Y5pLsLg4GF+pI='",
+                "'sha256-2P5SgcCngN/gHHrSMQVmAm2SPYlTnahjTR7WEmfSs8Y='",
+            ]
+        );
+        assert!(inline_script_hashes("<p>no scripts</p>").is_empty());
+    }
+
+    #[test]
+    fn csp_adds_the_checked_host_and_the_script_hashes() {
+        let csp = content_security_policy("'sha256-abc='", PORT, Some("192.168.1.20:9210"));
+        assert!(csp.contains("script-src 'self' 'sha256-abc=';"), "{csp}");
+        assert!(
+            csp.contains(
+                "connect-src 'self' ws://127.0.0.1:9210 ws://localhost:9210 \
+                 ws://[::1]:9210 ws://192.168.1.20:9210 wss://192.168.1.20:9210;"
+            ),
+            "{csp}"
+        );
+        let loopback = content_security_policy("", PORT, Some("localhost:9210"));
+        assert!(loopback.contains("script-src 'self';"), "{loopback}");
+        assert_eq!(
+            loopback.matches("ws://localhost:9210").count(),
+            1,
+            "{loopback}"
+        );
     }
 
     #[test]
