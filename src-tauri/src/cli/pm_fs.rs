@@ -725,7 +725,10 @@ mod private_fs_tests {
 
         // The probe's shared lock must not linger in a copy either.
         let probe = OpenOptions::new().read(true).open(&p).unwrap();
-        assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) }, 0);
+        assert_eq!(
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+            0
+        );
         let probe_copy = unsafe { libc::dup(probe.as_raw_fd()) };
         unlock_and_close(probe);
         let _second = acquire_daemon_lock(&p).unwrap();

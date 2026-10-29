@@ -137,7 +137,11 @@ fn retire_legacy_daemon(sock_path: &Path, pid_path: &Path) -> Result<(), String>
     if !alive(pid) {
         return Ok(());
     }
-    match crate::cli::pm_rpc::rpc_call(sock_path, &RpcRequest::Shutdown, LEGACY_SHUTDOWN_RPC_TIMEOUT) {
+    match crate::cli::pm_rpc::rpc_call(
+        sock_path,
+        &RpcRequest::Shutdown,
+        LEGACY_SHUTDOWN_RPC_TIMEOUT,
+    ) {
         Err(e) if e.starts_with(crate::cli::pm_rpc::DAEMON_UNREACHABLE) => return Ok(()),
         Err(e) if e.starts_with(crate::cli::pm_rpc::DAEMON_UNTRUSTED) => return Err(e),
         // The old daemon exits without answering Shutdown, so any other
@@ -179,7 +183,12 @@ pub(crate) fn start_listener(
     match std::fs::remove_file(&sock_path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("Failed to remove stale socket {:?}: {}", sock_path, e)),
+        Err(e) => {
+            return Err(format!(
+                "Failed to remove stale socket {:?}: {}",
+                sock_path, e
+            ))
+        }
     }
     let tmp_prefix = format!(".{}.tmp-", pm_fs::DAEMON_SOCK_NAME);
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -197,7 +206,10 @@ pub(crate) fn start_listener(
     use std::io::Write;
     pm_fs::open_private_file(
         &pid_path,
-        std::fs::OpenOptions::new().create(true).write(true).truncate(true),
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true),
     )?
     .write_all(std::process::id().to_string().as_bytes())
     .map_err(|e| format!("Failed to write PID file {:?}: {}", pid_path, e))?;
@@ -1377,7 +1389,9 @@ mod tests {
             std::fs::read_to_string(&pid_path).unwrap(),
             std::process::id().to_string()
         );
-        assert!(pm_fs::daemon_ready_marked(&dir.join(pm_fs::DAEMON_LOCK_NAME)));
+        assert!(pm_fs::daemon_ready_marked(
+            &dir.join(pm_fs::DAEMON_LOCK_NAME)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

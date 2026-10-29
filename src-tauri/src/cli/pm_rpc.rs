@@ -102,7 +102,11 @@ fn verify_socket_path(sock_path: &Path, me: u32) -> Result<(), String> {
         return Err(untrusted(format!("{:?} is not a directory", dir)));
     }
     if dir_md.uid() != me {
-        return Err(untrusted(format!("{:?} is owned by uid {}", dir, dir_md.uid())));
+        return Err(untrusted(format!(
+            "{:?} is owned by uid {}",
+            dir,
+            dir_md.uid()
+        )));
     }
     if dir_md.mode() & 0o777 != 0o700 {
         return Err(untrusted(format!(
@@ -381,8 +385,12 @@ mod tests {
     #[test]
     fn client_reports_missing_socket_as_unreachable() {
         let d = private_tmpdir("missing", 0o700);
-        let err = rpc_call(&d.join("daemon.sock"), &RpcRequest::List, Duration::from_secs(2))
-            .unwrap_err();
+        let err = rpc_call(
+            &d.join("daemon.sock"),
+            &RpcRequest::List,
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
         assert_eq!(err, DAEMON_UNREACHABLE);
         let _ = std::fs::remove_dir_all(&d);
     }

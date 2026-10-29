@@ -73,7 +73,10 @@ pub fn ensure_daemon() -> Result<(), String> {
     // This serializes concurrent `c9watch spawn` calls so only one ever forks.
     let spawn_lock = pm_fs::open_private_file(
         &pid_path,
-        std::fs::OpenOptions::new().create(true).write(true).read(true),
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true),
     )
     .map_err(|e| format!("Failed to open daemon.pid for locking: {}", e))?;
 
@@ -100,8 +103,10 @@ pub fn ensure_daemon() -> Result<(), String> {
 
     // Open log file for append
     let log_path = pm_fs::daemon_log_path()?;
-    let log_file_out =
-        pm_fs::open_private_file(&log_path, std::fs::OpenOptions::new().create(true).append(true))?;
+    let log_file_out = pm_fs::open_private_file(
+        &log_path,
+        std::fs::OpenOptions::new().create(true).append(true),
+    )?;
 
     let log_file_err = log_file_out
         .try_clone()
@@ -119,7 +124,12 @@ pub fn ensure_daemon() -> Result<(), String> {
     // The spawn lock is released when `spawn_lock` drops after we return; by
     // then the daemon holds `daemon.lock`, so other callers take the fast
     // path above.
-    wait_until_ready(&lock_path, &sock_path, Some(&mut child), "spawned a new daemon")
+    wait_until_ready(
+        &lock_path,
+        &sock_path,
+        Some(&mut child),
+        "spawned a new daemon",
+    )
 }
 
 // ── RPC helper ────────────────────────────────────────────────────────

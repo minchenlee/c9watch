@@ -191,10 +191,7 @@ fn redact_notification(data: &mut serde_json::Value, policy: &WsPolicy) {
     };
     let redacted = notification.remove("redactedTitle");
     if !policy.allow_conversation {
-        notification.insert(
-            "title".into(),
-            redacted.unwrap_or_else(|| "c9watch".into()),
-        );
+        notification.insert("title".into(), redacted.unwrap_or_else(|| "c9watch".into()));
     }
 }
 
@@ -962,7 +959,11 @@ async fn ws_handler(
         return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
     }
     let Some(slot) = state.reserve_unauthenticated() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "Too many pending connections").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many pending connections",
+        )
+            .into_response();
     };
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
@@ -1080,10 +1081,7 @@ async fn authenticate(socket: &mut WebSocket, state: &WsState) -> Result<(), Opt
     };
     let reply = check_auth_frame(&text, state).map_err(Some)?;
     let json = serde_json::to_string(&reply).unwrap_or_default();
-    socket
-        .send(Message::Text(json))
-        .await
-        .map_err(|_| None)
+    socket.send(Message::Text(json)).await.map_err(|_| None)
 }
 
 fn close_with(code: u16, reason: &'static str) -> Message {
@@ -1363,9 +1361,7 @@ async fn handle_message(
         .map(|_| ())
     };
     let open = move |addr: String, pid: Option<u32>| {
-        crate::actions::open_session_by_key(&addr, pid, || {
-            crate::detect_sessions(&open_detector)
-        })
+        crate::actions::open_session_by_key(&addr, pid, || crate::detect_sessions(&open_detector))
     };
     handle_message_with_policy(
         msg,
@@ -1708,9 +1704,13 @@ mod protocol_tests {
         let request =
             serde_json::from_str(r#"{"type":"openSession","addr":"claudeCode:x","pid":7}"#)
                 .unwrap();
-        let response = handle_message_with_policy(request, &OPEN_ON, no_owners(), no_stop, open).await;
+        let response =
+            handle_message_with_policy(request, &OPEN_ON, no_owners(), no_stop, open).await;
         assert!(matches!(response, ServerMsg::Ok), "{response:?}");
-        assert_eq!(*calls.lock().unwrap(), [("claudeCode:x".to_string(), Some(7))]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [("claudeCode:x".to_string(), Some(7))]
+        );
     }
 
     fn content_session() -> serde_json::Value {
@@ -1868,9 +1868,7 @@ mod server_tests {
     /// upgrade reply (101 when it upgraded).
     async fn upgrade_status(addr: SocketAddr, origin: Option<&str>) -> u16 {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        let mut request = format!("ws://{addr}/ws")
-            .into_client_request()
-            .unwrap();
+        let mut request = format!("ws://{addr}/ws").into_client_request().unwrap();
         if let Some(origin) = origin {
             request
                 .headers_mut()
@@ -2150,7 +2148,11 @@ mod server_tests {
         let bound = server.apply(RemoteAccess::default()).await.unwrap();
         let mut client = open(bound[0]).await;
         let token = issue_token(&server);
-        send_json(&mut client, serde_json::json!({"type": "auth", "token": token})).await;
+        send_json(
+            &mut client,
+            serde_json::json!({"type": "auth", "token": token}),
+        )
+        .await;
         assert!(matches!(next_event(&mut client).await, Event::Text(v) if v["type"] == "authOk"));
 
         server.update(RemoteAccess::default()).await.unwrap();
@@ -2232,7 +2234,9 @@ mod server_tests {
     async fn send_json(client: &mut Client, value: serde_json::Value) {
         use futures_util::SinkExt;
         client
-            .send(tokio_tungstenite::tungstenite::Message::Text(value.to_string()))
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                value.to_string(),
+            ))
             .await
             .unwrap();
     }
@@ -2308,7 +2312,11 @@ mod server_tests {
         let (server, addr) = loopback_server(dir.path()).await;
         let (mut client, _) = signed_in(&server, addr).await;
         let huge = "x".repeat(MAX_WS_MESSAGE_BYTES + 1);
-        send_json(&mut client, serde_json::json!({"type": "getSessions", "pad": huge})).await;
+        send_json(
+            &mut client,
+            serde_json::json!({"type": "getSessions", "pad": huge}),
+        )
+        .await;
         // The server drops the connection instead of buffering the frame.
         assert!(matches!(next_event(&mut client).await, Event::Close(_)));
     }
@@ -2330,8 +2338,14 @@ mod server_tests {
         }
         // One of them signs in: its slot frees up for a new connection.
         let token = issue_token(&server);
-        send_json(&mut waiting[0], serde_json::json!({"type": "auth", "token": token})).await;
-        assert!(matches!(next_event(&mut waiting[0]).await, Event::Text(v) if v["type"] == "authOk"));
+        send_json(
+            &mut waiting[0],
+            serde_json::json!({"type": "auth", "token": token}),
+        )
+        .await;
+        assert!(
+            matches!(next_event(&mut waiting[0]).await, Event::Text(v) if v["type"] == "authOk")
+        );
         let _next = open(addr).await;
     }
 
@@ -2355,8 +2369,16 @@ mod server_tests {
         let token = issue_token(&server);
         let mut client = open(addr).await;
         let wrong = format!("{}0", &token[..63]);
-        let wrong = if wrong == token { format!("{}1", &token[..63]) } else { wrong };
-        send_json(&mut client, serde_json::json!({"type": "auth", "token": wrong})).await;
+        let wrong = if wrong == token {
+            format!("{}1", &token[..63])
+        } else {
+            wrong
+        };
+        send_json(
+            &mut client,
+            serde_json::json!({"type": "auth", "token": wrong}),
+        )
+        .await;
         assert!(matches!(
             next_event(&mut client).await,
             Event::Close(Some(CLOSE_UNAUTHORIZED))
@@ -2376,7 +2398,11 @@ mod server_tests {
         assert_eq!(state.notifications_tx.receiver_count(), 0);
         let _ = state.sessions_tx.send("[]".into());
 
-        send_json(&mut client, serde_json::json!({"type": "auth", "token": token})).await;
+        send_json(
+            &mut client,
+            serde_json::json!({"type": "auth", "token": token}),
+        )
+        .await;
         match next_event(&mut client).await {
             Event::Text(v) => {
                 assert_eq!(v["type"], "authOk", "{v}");
@@ -2405,7 +2431,11 @@ mod server_tests {
         let code = server.create_pairing_code().unwrap().code;
 
         let mut client = open(addr).await;
-        send_json(&mut client, serde_json::json!({"type": "pair", "code": code})).await;
+        send_json(
+            &mut client,
+            serde_json::json!({"type": "pair", "code": code}),
+        )
+        .await;
         let (client_id, token) = match next_event(&mut client).await {
             Event::Text(v) if v["type"] == "paired" => (
                 v["clientId"].as_str().unwrap().to_string(),
@@ -2417,7 +2447,11 @@ mod server_tests {
         drop(client);
 
         let mut next = open(addr).await;
-        send_json(&mut next, serde_json::json!({"type": "auth", "token": token})).await;
+        send_json(
+            &mut next,
+            serde_json::json!({"type": "auth", "token": token}),
+        )
+        .await;
         assert!(matches!(
             next_event(&mut next).await,
             Event::Text(v) if v["type"] == "authOk" && v["clientId"] == client_id.as_str()
@@ -2431,13 +2465,21 @@ mod server_tests {
         let code = server.create_pairing_code().unwrap().code;
 
         let mut first = open(addr).await;
-        send_json(&mut first, serde_json::json!({"type": "pair", "code": code})).await;
+        send_json(
+            &mut first,
+            serde_json::json!({"type": "pair", "code": code}),
+        )
+        .await;
         assert!(matches!(next_event(&mut first).await, Event::Text(v) if v["type"] == "paired"));
 
         // A refused code gets its own close code, so a client that also
         // holds a valid token knows the token is not the problem.
         let mut second = open(addr).await;
-        send_json(&mut second, serde_json::json!({"type": "pair", "code": code})).await;
+        send_json(
+            &mut second,
+            serde_json::json!({"type": "pair", "code": code}),
+        )
+        .await;
         assert!(matches!(
             next_event(&mut second).await,
             Event::Close(Some(CLOSE_PAIR_REJECTED))
@@ -2450,7 +2492,11 @@ mod server_tests {
         let (server, addr) = loopback_server(dir.path()).await;
         let token = issue_token(&server);
         let mut client = open(addr).await;
-        send_json(&mut client, serde_json::json!({"type": "auth", "token": token})).await;
+        send_json(
+            &mut client,
+            serde_json::json!({"type": "auth", "token": token}),
+        )
+        .await;
         assert!(matches!(next_event(&mut client).await, Event::Text(v) if v["type"] == "authOk"));
 
         server.forget_paired_clients().unwrap();
@@ -2460,7 +2506,11 @@ mod server_tests {
         ));
 
         let mut again = open(addr).await;
-        send_json(&mut again, serde_json::json!({"type": "auth", "token": token})).await;
+        send_json(
+            &mut again,
+            serde_json::json!({"type": "auth", "token": token}),
+        )
+        .await;
         assert!(matches!(
             next_event(&mut again).await,
             Event::Close(Some(CLOSE_UNAUTHORIZED))
@@ -2475,7 +2525,11 @@ mod server_tests {
         server.forget_paired_clients().unwrap();
 
         let mut client = open(addr).await;
-        send_json(&mut client, serde_json::json!({"type": "pair", "code": code})).await;
+        send_json(
+            &mut client,
+            serde_json::json!({"type": "pair", "code": code}),
+        )
+        .await;
         assert!(matches!(
             next_event(&mut client).await,
             Event::Close(Some(CLOSE_PAIR_REJECTED))
@@ -2486,7 +2540,11 @@ mod server_tests {
     async fn signed_in(server: &WsServer, addr: SocketAddr) -> (Client, serde_json::Value) {
         let token = issue_token(server);
         let mut client = open(addr).await;
-        send_json(&mut client, serde_json::json!({"type": "auth", "token": token})).await;
+        send_json(
+            &mut client,
+            serde_json::json!({"type": "auth", "token": token}),
+        )
+        .await;
         match next_event(&mut client).await {
             Event::Text(v) if v["type"] == "authOk" => (client, v),
             other => panic!("{other:?}"),
@@ -2508,7 +2566,10 @@ mod server_tests {
         let dir = tempfile::tempdir().unwrap();
         let (server, addr) = loopback_server(dir.path()).await;
         let (_client, ok) = signed_in(&server, addr).await;
-        assert_eq!(ok["capabilities"], serde_json::json!({"conversation": false, "open": false}));
+        assert_eq!(
+            ok["capabilities"],
+            serde_json::json!({"conversation": false, "open": false})
+        );
 
         server
             .apply(RemoteAccess {
@@ -2519,7 +2580,10 @@ mod server_tests {
             .unwrap();
         let addr = server.bound().await[0];
         let (_client, ok) = signed_in(&server, addr).await;
-        assert_eq!(ok["capabilities"], serde_json::json!({"conversation": true, "open": false}));
+        assert_eq!(
+            ok["capabilities"],
+            serde_json::json!({"conversation": true, "open": false})
+        );
     }
 
     #[tokio::test]
@@ -2581,7 +2645,10 @@ mod server_tests {
             "redactedTitle": "proj",
             "body": "proj: Finished working",
         });
-        state.notifications_tx.send(notification.to_string()).unwrap();
+        state
+            .notifications_tx
+            .send(notification.to_string())
+            .unwrap();
         match next_event(&mut client).await {
             Event::Text(v) => {
                 assert_eq!(v["type"], "notification");
