@@ -103,8 +103,8 @@ impl Report {
 }
 
 /// Copy `source` into a new snapshot in `home`, import the copy, and drop
-/// old snapshots. A missing `source` imports nothing and creates nothing.
-/// Blocking.
+/// old snapshots. A missing `source` imports nothing and creates nothing,
+/// and a failed import removes its snapshot. Blocking.
 pub fn import(db: &Db, home: &Path, source: &Path) -> Result<Report, String> {
     let mut report = Report::default();
     let root = match open_nofollow(None, &cstr(source.as_os_str())?, DIR_FLAGS) {
@@ -124,19 +124,28 @@ pub fn import(db: &Db, home: &Path, source: &Path) -> Result<Report, String> {
     let base = import_dir(home);
     ensure_private_dir(&base)?;
     let snap = new_snapshot_dir(&base)?;
+    if let Err(e) = copy_and_apply(db, &root, &snap, &mut report) {
+        // Each failed boot would otherwise leave one more copy behind.
+        if let Err(rm) = std::fs::remove_dir_all(&snap) {
+            eprintln!("[engine] Failed to remove import {:?}: {}", snap, rm);
+        }
+        return Err(e);
+    }
     report.snapshot = Some(snap.clone());
-    copy_legacy(&root, &snap, &mut report)?;
+    prune_snapshots(&base, &snap);
+    Ok(report)
+}
 
-    let legacy = parse(&snap, &mut report);
+fn copy_and_apply(db: &Db, root: &OwnedFd, snap: &Path, report: &mut Report) -> Result<(), String> {
+    copy_legacy(root, snap, report)?;
+    let legacy = parse(snap, report);
     let machine = db.machine_id().to_string();
     let (applied, _) = db.write_blocking(move |tx| apply(tx, &machine, &legacy, now_ms()))?;
     report.created = applied.created;
     report.updated = applied.updated;
     report.dangling = applied.dangling;
     report.events = applied.events;
-
-    prune_snapshots(&base, &snap);
-    Ok(report)
+    Ok(())
 }
 
 // ── Copy ──────────────────────────────────────────────────────────────
@@ -1069,6 +1078,17 @@ mod tests {
         let r = import(&db2, &home2, &linked_root).unwrap();
         assert_eq!((r.symlinks, r.copied, r.snapshot), (1, 0, None));
         assert!(legacy_rows(&db2).is_empty());
+    }
+
+    #[test]
+    fn a_failed_import_removes_its_snapshot() {
+        let f = fixture();
+        let db = db::open(&f.home, M).unwrap();
+        import(&db, &f.home, &f.src).unwrap();
+        db.close();
+        assert!(import(&db, &f.home, &f.src).is_err());
+        assert!(import(&db, &f.home, &f.src).is_err());
+        assert_eq!(fs::read_dir(import_dir(&f.home)).unwrap().count(), 1);
     }
 
     #[test]

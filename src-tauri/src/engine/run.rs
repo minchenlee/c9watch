@@ -5,8 +5,9 @@
 //! in before the bind, so only the lock holder can replace a leftover
 //! socket, and before the machine key and the db, since creating the key
 //! and opening the db (which may move a corrupt db aside) are both
-//! lock-holder work. The legacy files are imported from a snapshot copy
-//! once the db is open, and a failed import only logs. Detection starts
+//! lock-holder work. The legacy files are imported from a snapshot copy on
+//! a thread of their own once the socket is bound, so a large legacy tree
+//! never holds up readiness; a failed import only logs. Detection starts
 //! once the db is open, so its first tick (or the rebuild after a new epoch)
 //! is written before clients ask. The engine never talks to the legacy
 //! `c9watch daemon` and never writes its files.
@@ -20,7 +21,7 @@ use super::import;
 use super::lock::acquire_engine_lock;
 use super::machine;
 use super::sock::{bind_private, ShutdownSignals};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixListener;
@@ -38,7 +39,6 @@ pub async fn run(home: &Path) -> Result<(), String> {
     let lock = acquire_engine_lock(&lock_path(home))?;
     let key = machine::load_or_create(home)?;
     let db = Arc::new(db::open(home, key.id())?);
-    import_legacy(&db, home);
     let (std_listener, socket) = bind_private(&sock_path(home), &lock)?;
     std_listener
         .set_nonblocking(true)
@@ -49,6 +49,7 @@ pub async fn run(home: &Path) -> Result<(), String> {
     let ctx = Arc::new(ServerCtx::new(key.id().to_string()).with_db(db.clone()));
     let pruner = tokio::spawn(prune_loop(db.clone()));
     let detection = detect::spawn(db.clone())?;
+    spawn_import(db.clone(), home.to_path_buf());
     eprintln!(
         "[engine] Listening on {:?}, pid={}, machine={}, epoch={}",
         socket.path(),
@@ -76,7 +77,19 @@ pub async fn run(home: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Import `~/.claude/c9watch` (see `engine::import`). Blocking, at boot.
+/// Import the legacy files on their own thread. A thread, not a blocking
+/// task, so an import in flight never holds up the runtime's shutdown; one
+/// still writing when the db closes fails and logs.
+fn spawn_import(db: Arc<db::Db>, home: PathBuf) {
+    let spawned = std::thread::Builder::new()
+        .name("engine-import".into())
+        .spawn(move || import_legacy(&db, &home));
+    if let Err(e) = spawned {
+        eprintln!("[engine] Failed to start the legacy import: {}", e);
+    }
+}
+
+/// Import `~/.claude/c9watch` (see `engine::import`). Blocking.
 fn import_legacy(db: &db::Db, home: &Path) {
     let Some(source) = import::legacy_root() else {
         return;
