@@ -169,9 +169,12 @@ pub fn auto_deny_notice(screen: &str) -> Option<String> {
 /// Screen text, lower case, of a vendor that refuses to start a session:
 /// a usage limit or a missing login (D28 Q7). The wording is CC's and may
 /// change; when nothing matches, the ready timeout still fails the spawn,
-/// only with a less clear message (plan §6.4).
+/// only with a less clear message (plan §6.4). Only refusals: a warning
+/// such as "Approaching usage limit" leaves a usable session, and a match
+/// on it would kill an agent that could start (reviews), so a bare "usage
+/// limit" is not here and a line with `NOT_REFUSALS` never matches.
 pub const VENDOR_REFUSALS: &[&str] = &[
-    "usage limit",
+    "usage limit reached",
     "hit your limit",
     "limit reached",
     "credit balance is too low",
@@ -181,6 +184,9 @@ pub const VENDOR_REFUSALS: &[&str] = &[
     "oauth token has expired",
     "select login method",
 ];
+
+/// Lower-case words of a line that warns but does not refuse.
+pub const NOT_REFUSALS: &[&str] = &["approaching"];
 
 /// The lines of `screen` that show a vendor refusal, joined, or `None`.
 /// Only for the screen before the first ready: after it, the agent's own
@@ -192,6 +198,7 @@ pub fn vendor_refusal(screen: &str) -> Option<String> {
         .filter(|l| {
             let l = l.to_lowercase();
             VENDOR_REFUSALS.iter().any(|m| l.contains(m))
+                && !NOT_REFUSALS.iter().any(|m| l.contains(m))
         })
         .collect();
     (!lines.is_empty()).then(|| lines.join("\n"))
@@ -697,5 +704,14 @@ mod tests {
         assert!(vendor_refusal(PROMPT).is_none());
         assert!(vendor_refusal(TRUST).is_none());
         assert!(vendor_refusal(PERM).is_none());
+        // Warnings leave a usable session.
+        for warn in [
+            "Approaching usage limit \u{b7} resets at 10pm",
+            "Approaching Opus usage limit",
+            "You've used 90% of your weekly usage limit",
+        ] {
+            assert!(vendor_refusal(warn).is_none(), "{}", warn);
+        }
+        assert!(vendor_refusal("5-hour limit reached \u{2219} resets 5pm").is_some());
     }
 }
