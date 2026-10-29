@@ -391,7 +391,7 @@ mod tests {
     fn allow_list_is_only_the_absolute_agent_bin() {
         with_cwd(|_, p| {
             let rule = format!("Bash({}:*)", BIN);
-            assert_eq!(allow_rules(&p), [rule.clone()]);
+            assert_eq!(allow_rules(&p), std::slice::from_ref(&rule));
             assert!(!allow_rules(&p)
                 .iter()
                 .any(|r| r.starts_with("Bash(c9watch")));

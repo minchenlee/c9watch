@@ -148,7 +148,7 @@ struct Start {
 
 /// How bringing an agent up ended.
 enum Up {
-    Ready(Box<dyn Driver>, AgentRow),
+    Ready(Box<dyn Driver>, Box<AgentRow>),
     Failed(ApiError),
     Retired,
     Shutdown,
@@ -225,6 +225,7 @@ impl Spawner {
         principal: &Principal,
         params: serde_json::Value,
     ) -> Result<AgentRow, ApiError> {
+        local_only(principal, "agent.create")?;
         if !self.config.enabled {
             return Err(ApiError::new(
                 ErrorCode::ExperimentalDisabled,
@@ -234,7 +235,6 @@ impl Spawner {
                 ),
             ));
         }
-        local_only(principal, "agent.create")?;
         let p: AgentCreateParams = parse(params, "agent.create")?;
         let desc = check_kind_and_mode(&p)?;
         if let Some(name) = &p.name {
@@ -393,7 +393,7 @@ impl Spawner {
     fn supervisor(self: Arc<Self>, s: Start, reply: Reply, cmds: Receiver<Cmd>) {
         match self.bring_up(&s, &cmds) {
             Up::Ready(driver, row) => {
-                let _ = reply.send(Ok(row));
+                let _ = reply.send(Ok(*row));
                 self.run(&s, driver, &cmds);
             }
             Up::Failed(e) => {
@@ -512,7 +512,7 @@ impl Spawner {
             }
             if ready {
                 return match self.write_bound(s) {
-                    Ok(Some(row)) => Up::Ready(driver, row),
+                    Ok(Some(row)) => Up::Ready(driver, Box::new(row)),
                     Ok(None) => retired_meanwhile(driver),
                     Err(e) => {
                         let _ = driver.kill();
@@ -561,7 +561,7 @@ impl Spawner {
                 let why = format!("exited ({}): {}", status, detail(&text));
                 let (machine, id) = (self.db.machine_id().to_string(), s.id.clone());
                 let wrote = self.db.write_blocking(move |tx| {
-                    ops::fail_agent(tx, &machine, &id, EXITED, &why, now_ms())
+                    ops::fail_agent(tx, &machine, &id, ops::METHOD_EXIT, EXITED, &why, now_ms())
                 });
                 if let Err(e) = wrote {
                     eprintln!("[engine] Failed to record the exit of {}: {}", s.id, e);
@@ -610,7 +610,15 @@ impl Spawner {
         let wrote = self.db.write_blocking(move |tx| {
             let now = now_ms();
             ops::finish(tx, &s2.op_id, SPAWN_FAILED, now)?;
-            ops::fail_agent(tx, &machine, &s2.id, SPAWN_FAILED, &why2, now)
+            ops::fail_agent(
+                tx,
+                &machine,
+                &s2.id,
+                ops::KIND_CREATE,
+                SPAWN_FAILED,
+                &why2,
+                now,
+            )
         });
         if let Err(e) = wrote {
             eprintln!(
@@ -1062,6 +1070,8 @@ mod tests {
         child: ChildId,
         exited: bool,
         kills: Arc<AtomicUsize>,
+        /// Set by a test: the process exits by itself.
+        exit_now: Arc<AtomicBool>,
     }
 
     impl Driver for FakeDriver {
@@ -1106,6 +1116,9 @@ mod tests {
             Ok(())
         }
         fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            if self.exit_now.load(Ordering::SeqCst) {
+                self.exited = true;
+            }
             Ok(self.exited.then(|| ExitStatus::from_raw(1 << 8)))
         }
         fn kill(&mut self) -> io::Result<KillReport> {
@@ -1125,6 +1138,7 @@ mod tests {
         spawns: AtomicUsize,
         next_pid: AtomicI32,
         kills: Arc<AtomicUsize>,
+        exit_now: Arc<AtomicBool>,
         env: Mutex<Vec<(OsString, OsString)>>,
         spawner: OnceLock<Weak<Spawner>>,
     }
@@ -1156,6 +1170,7 @@ mod tests {
                 },
                 exited: matches!(self.script, Script::Refuse | Script::Exit),
                 kills: self.kills.clone(),
+                exit_now: self.exit_now.clone(),
             }))
         }
     }
@@ -1185,6 +1200,7 @@ mod tests {
             spawns: AtomicUsize::new(0),
             next_pid: AtomicI32::new(2_000_000_000),
             kills: Arc::new(AtomicUsize::new(0)),
+            exit_now: Arc::new(AtomicBool::new(false)),
             env: Mutex::new(Vec::new()),
             spawner: OnceLock::new(),
         });
@@ -1295,6 +1311,14 @@ mod tests {
             gen: 1,
         };
         let err = e.sp.create(&a, create_params(&e.cwd)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotAllowed);
+        // Also with the switch off: not_allowed, not experimental_disabled.
+        let off = setup(Script::Ready, false, None);
+        let err = off
+            .sp
+            .create(&a, create_params(&off.cwd))
+            .await
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotAllowed);
         let err =
             e.sp.retire(&a, serde_json::json!({"id": "agt_x"}))
@@ -1517,7 +1541,7 @@ mod tests {
         // The row stays as it was until the next boot.
         assert_eq!(row(&e.db, &r.id).state.as_deref(), Some("ready"));
         let done = ops::reconcile(&e.db, &e.home).unwrap();
-        assert_eq!(done.interrupted, [r.id.clone()]);
+        assert_eq!(done.interrupted, std::slice::from_ref(&r.id));
         let r = row(&e.db, &r.id);
         assert_eq!(r.state.as_deref(), Some("interrupted"));
         assert!(r.interrupted_note_pending);
@@ -1568,6 +1592,31 @@ mod tests {
         }
         e.sp.create(&l, create_params(&b)).await.unwrap();
         e.sp.shutdown();
+    }
+
+    /// A ready agent that exits by itself ends `failed` with `exited`, and
+    /// the audit names `agent.exit`, not `agent.create` (reviews).
+    #[tokio::test]
+    async fn a_ready_agent_that_exits_is_failed_as_an_exit() {
+        let e = setup(Script::Ready, true, None);
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        e.launcher.exit_now.store(true, Ordering::SeqCst);
+        no_supervisors(&e.sp);
+        assert_eq!(row(&e.db, &r.id).state.as_deref(), Some("failed"));
+        let failed: Vec<(String, String)> = {
+            let conn = e.db.reader().unwrap();
+            let mut st = conn
+                .prepare("SELECT method, reason FROM audit WHERE decision = 'failed'")
+                .unwrap();
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert_eq!(failed.len(), 1, "{:?}", failed);
+        assert_eq!(failed[0].0, ops::METHOD_EXIT);
+        assert!(failed[0].1.starts_with(EXITED), "{:?}", failed);
     }
 
     /// A new create's row, written as `create` writes it, with no
@@ -1692,7 +1741,7 @@ mod tests {
     #[tokio::test]
     async fn a_crash_after_phase_row_fails_the_agent() {
         let (e, done, r, _) = crash_after(Phase::Row, |c| c).await;
-        assert_eq!(done.failed, [r.id.clone()]);
+        assert_eq!(done.failed, std::slice::from_ref(&r.id));
         assert_eq!(done.killed, 0);
         assert_eq!(r.state.as_deref(), Some("failed"));
         assert!(r.gone_at.is_some());
@@ -1712,7 +1761,7 @@ mod tests {
     async fn a_crash_after_phase_pty_kills_the_orphan_and_fails_the_agent() {
         let (e, done, r, pty) = crash_after(Phase::Pty, |c| c).await;
         let pid = pty.as_ref().unwrap().child().pid;
-        assert_eq!(done.failed, [r.id.clone()]);
+        assert_eq!(done.failed, std::slice::from_ref(&r.id));
         assert_eq!(done.killed, 1);
         assert!(!runs(pid));
         assert_eq!(r.state.as_deref(), Some("failed"));
@@ -1730,7 +1779,7 @@ mod tests {
     async fn a_crash_after_phase_bound_kills_the_orphan_and_interrupts_the_agent() {
         let (e, done, r, pty) = crash_after(Phase::Bound, |c| c).await;
         let pid = pty.as_ref().unwrap().child().pid;
-        assert_eq!(done.interrupted, [r.id.clone()]);
+        assert_eq!(done.interrupted, std::slice::from_ref(&r.id));
         assert_eq!(done.killed, 1);
         assert!(!runs(pid));
         assert_eq!(r.state.as_deref(), Some("interrupted"));

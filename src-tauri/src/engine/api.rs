@@ -563,8 +563,9 @@ async fn agent_lifecycle(
     r
 }
 
-/// The mutation check of a `local-unverified` peer. An agent principal is
-/// refused later, by `engine::create`.
+/// Who may call `agent.create` or `agent.retire`: never an agent, also
+/// with the experimental switch off, so its attempt is audited; and a
+/// `local-unverified` peer only after the mutation check.
 async fn check_local_peer(
     method: &str,
     ctx: &ServerCtx,
@@ -572,7 +573,10 @@ async fn check_local_peer(
     principal: &Principal,
 ) -> Result<(), ApiError> {
     if *principal != Principal::LocalUnverified {
-        return Ok(());
+        return Err(ApiError::new(
+            ErrorCode::NotAllowed,
+            format!("{} may not call {} in C1a", principal, method),
+        ));
     }
     let agents = ctx.agents.clone();
     let checked = blocking(move || {
@@ -1860,6 +1864,29 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("no c9watch-agent"));
+    }
+
+    /// Reviews: an agent's create or retire is `not_allowed` and audited,
+    /// also on an engine that cannot create.
+    #[tokio::test]
+    async fn an_agent_may_not_create_or_retire_even_with_the_switch_off() {
+        let (_t, ctx, db) = ctx_db(as_agent("a7"));
+        let (mut c, _) = Client::new(ctx).await;
+        for (i, m) in ["agent.create", "agent.retire"].iter().enumerate() {
+            let r = c.call(&i.to_string(), m, json!({})).await;
+            assert_eq!(r["error"]["code"], "not_allowed", "{}: {}", m, r);
+        }
+        let rows: Vec<(String, String)> = audit_rows(&db)
+            .into_iter()
+            .map(|(p, m, _, _)| (p, m))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("agent:a7".to_string(), "agent.create".to_string()),
+                ("agent:a7".to_string(), "agent.retire".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]

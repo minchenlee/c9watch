@@ -137,13 +137,19 @@ pub fn finish(tx: &Tx, op_id: &str, outcome: &str, now: i64) -> rusqlite::Result
     Ok(true)
 }
 
+/// The audit method of an agent that exited by itself after `ready`.
+pub const METHOD_EXIT: &str = "agent.exit";
+
 /// Mark engine agent `agent_id` `failed` and gone, forget its PTY child,
 /// and emit `agent.upsert` and `agent.failed` with `reason` and `detail`.
-/// Does not touch a row that is already retired or failed.
+/// The audit row names `method`: `KIND_CREATE` for a create that failed,
+/// `METHOD_EXIT` for a ready agent that exited. Does not touch a row that
+/// is already retired or failed.
 pub fn fail_agent(
     tx: &mut Tx,
     machine: &str,
     agent_id: &str,
+    method: &str,
     reason: &str,
     detail: &str,
     now: i64,
@@ -163,7 +169,7 @@ pub fn fail_agent(
         now,
         &AuditEntry {
             principal: audit::SYSTEM,
-            method: KIND_CREATE,
+            method,
             target: Some(agent_id),
             decision: "failed",
             reason: Some(&why),
@@ -323,7 +329,7 @@ pub fn reconcile(db: &Db, home: &Path) -> Result<Reconciled, String> {
                 db.write_blocking(move |tx| {
                     let now = now_ms();
                     finish(tx, &op_id, CREATE_INTERRUPTED, now)?;
-                    fail_agent(tx, &m, &id, CREATE_INTERRUPTED, &detail, now)
+                    fail_agent(tx, &m, &id, KIND_CREATE, CREATE_INTERRUPTED, &detail, now)
                 })?;
                 let _ = std::fs::remove_file(settings_path_of(home, &p.agent_id, p.generation));
                 done.failed.push(p.agent_id);
@@ -367,7 +373,15 @@ fn live_fix(
     let now = now_ms();
     if state == "creating" {
         let detail = "no open create op";
-        fail_agent(tx, machine, agent_id, CREATE_INTERRUPTED, detail, now)?;
+        fail_agent(
+            tx,
+            machine,
+            agent_id,
+            KIND_CREATE,
+            CREATE_INTERRUPTED,
+            detail,
+            now,
+        )?;
         return Ok(());
     }
     let (new_state, reason) = if state == "retiring" {
