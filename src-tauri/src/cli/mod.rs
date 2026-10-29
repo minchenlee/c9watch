@@ -20,6 +20,9 @@ pub enum CostSortDir {
 mod cost;
 mod session_json;
 mod session_ref;
+// `task done` talks to the engine over a unix socket.
+#[cfg(unix)]
+pub mod task;
 
 use cost::cmd_cost;
 use session_json::{
@@ -71,6 +74,9 @@ pub const CLI_COMMANDS: &[&str] = &[
     "watch",
     "wait",
     "tasks",
+    // `task done` uses a unix socket; the subcommand exists only on unix.
+    #[cfg(unix)]
+    "task",
     "spawn",
     "send",
     "workers",
@@ -329,6 +335,13 @@ pub enum Commands {
         force: bool,
     },
 
+    /// Report to the c9 engine that this managed worker finished its task
+    #[cfg(unix)]
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
+
     /// Query session cost data
     #[command(name = "cost", about = "Query session cost data")]
     Cost {
@@ -362,6 +375,17 @@ pub enum Commands {
     #[cfg(feature = "pm-orchestration")]
     #[command(hide = true)]
     Daemon,
+}
+
+#[cfg(unix)]
+#[derive(Subcommand)]
+pub enum TaskAction {
+    /// Send the final report to the engine (needs C9_ENGINE_SOCK, C9_AGENT_ID, C9_AGENT_TOKEN)
+    Done {
+        /// Report text, or `-` to read it from stdin
+        #[arg(long)]
+        report: String,
+    },
 }
 
 /// Run the CLI and return the exit code.
@@ -417,6 +441,10 @@ pub fn run(cli: Cli) {
             Err(e) => Err(e),
         },
         Commands::Tasks { session_id } => cmd_tasks(&session_id, cli.pretty),
+        #[cfg(unix)]
+        Commands::Task {
+            action: TaskAction::Done { report },
+        } => task::cmd_task_done(&report),
         #[cfg(feature = "pm-orchestration")]
         Commands::Spawn {
             cwd,
@@ -1110,6 +1138,21 @@ mod dispatch_tests {
         assert_eq!(interval, 2);
         assert!(Cli::try_parse_from(["c9watch", "wait", "abc"]).is_err());
         assert!(Cli::try_parse_from(["c9watch", "watch", "--json"]).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_done_parses_and_routes() {
+        assert!(is_cli_invocation("task"));
+        let cli = Cli::try_parse_from(["c9watch", "task", "done", "--report", "ok"]).unwrap();
+        let Commands::Task {
+            action: TaskAction::Done { report },
+        } = cli.command
+        else {
+            panic!("not task done");
+        };
+        assert_eq!(report, "ok");
+        assert!(Cli::try_parse_from(["c9watch", "task", "done"]).is_err());
     }
 }
 
