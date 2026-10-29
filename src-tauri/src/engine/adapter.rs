@@ -18,6 +18,11 @@
 
 use std::path::Path;
 
+/// Claude Code runtime pieces: the spawn profile (`adapter/cc/profile.rs`).
+pub mod cc {
+    pub mod profile;
+}
+
 /// `full` | `basic` | `later` (A:1022).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
