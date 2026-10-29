@@ -115,6 +115,11 @@ impl Pairing {
         (code, expires_at)
     }
 
+    /// Void the active code, if any.
+    pub fn revoke(&mut self) {
+        self.active = None;
+    }
+
     /// Consume the active code. Succeeds at most once per code.
     pub fn redeem(&mut self, code: &str, now: Instant) -> Result<(), RedeemError> {
         let active = self.active.as_mut().ok_or(RedeemError::NoActiveCode)?;

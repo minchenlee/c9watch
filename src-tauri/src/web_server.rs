@@ -727,9 +727,15 @@ impl WsServer {
         })
     }
 
-    /// Forget every paired client and close every open socket. Clients
-    /// reconnect, their tokens fail, and they must pair again.
+    /// Forget every paired client, void the live pairing code, and close
+    /// every open socket. Clients reconnect, their tokens fail, and they
+    /// must pair again with a new code.
     pub fn forget_paired_clients(&self) -> Result<(), String> {
+        self.state
+            .pairing
+            .lock()
+            .map_err(|_| "pairing state unavailable".to_string())?
+            .revoke();
         self.state
             .clients
             .lock()
@@ -2436,6 +2442,21 @@ mod server_tests {
         assert!(matches!(
             next_event(&mut again).await,
             Event::Close(Some(CLOSE_UNAUTHORIZED))
+        ));
+    }
+
+    #[tokio::test]
+    async fn forgetting_clients_also_voids_the_live_pairing_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        let code = server.create_pairing_code().unwrap().code;
+        server.forget_paired_clients().unwrap();
+
+        let mut client = open(addr).await;
+        send_json(&mut client, serde_json::json!({"type": "pair", "code": code})).await;
+        assert!(matches!(
+            next_event(&mut client).await,
+            Event::Close(Some(CLOSE_PAIR_REJECTED))
         ));
     }
 

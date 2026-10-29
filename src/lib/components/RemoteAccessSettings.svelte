@@ -150,7 +150,7 @@
 			</div>
 		</div>
 		<div class="setting-row">
-			<span>Paired devices<small>Disconnect every paired phone or browser now. Each one must pair again with a new code. Restarting c9watch also forgets them.</small></span>
+			<span>Paired devices<small>Disconnect every paired phone or browser now. Each one must pair again with a new code; a code shown now stops working. Restarting c9watch also forgets them.</small></span>
 			<span class="row-actions">
 				{#if forgotten}<span class="saved">Forgotten</span>{/if}
 				<button aria-label="Forget paired devices" disabled={forgetting} onclick={forgetDevices}>{forgetting ? '…' : 'Forget'}</button>
