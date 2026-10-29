@@ -740,16 +740,20 @@ impl WsServer {
     /// every open socket. Clients reconnect, their tokens fail, and they
     /// must pair again with a new code.
     pub fn forget_paired_clients(&self) -> Result<(), String> {
-        self.state
+        // Lock order matches the pairing path in `check_auth_frame`:
+        // pairing, then clients, held together.
+        let mut pairing = self
+            .state
             .pairing
             .lock()
-            .map_err(|_| "pairing state unavailable".to_string())?
-            .revoke();
+            .map_err(|_| "pairing state unavailable".to_string())?;
+        pairing.revoke();
         self.state
             .clients
             .lock()
             .map_err(|_| "client registry unavailable".to_string())?
             .forget_all();
+        drop(pairing);
         self.state.epoch.send_modify(|e| *e = e.wrapping_add(1));
         Ok(())
     }
@@ -1031,10 +1035,11 @@ fn check_auth_frame(text: &str, state: &WsState) -> Result<AuthReply, u16> {
                 .ok_or(CLOSE_UNAUTHORIZED)
         }
         AuthFrame::Pair { code } => {
-            state
-                .pairing
-                .lock()
-                .map_err(|_| CLOSE_PAIR_REJECTED)?
+            // Hold the pairing lock until the token is issued. Forget takes
+            // the same locks in the same order, so it either runs first (the
+            // code is void) or after (it forgets the new token).
+            let mut pairing = state.pairing.lock().map_err(|_| CLOSE_PAIR_REJECTED)?;
+            pairing
                 .redeem(&code, std::time::Instant::now())
                 .map_err(|_| CLOSE_PAIR_REJECTED)?;
             let (client_id, token) = state
@@ -1042,6 +1047,7 @@ fn check_auth_frame(text: &str, state: &WsState) -> Result<AuthReply, u16> {
                 .lock()
                 .map_err(|_| CLOSE_PAIR_REJECTED)?
                 .issue();
+            drop(pairing);
             Ok(AuthReply::Paired {
                 client_id,
                 token,
