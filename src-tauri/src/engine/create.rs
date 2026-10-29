@@ -429,6 +429,16 @@ impl Spawner {
             Err(e) => return fail(e),
         };
         let spec = spawn_spec(&profile, &s.claude, &settings);
+        // A retire that found no supervisor yet (between the row and
+        // `supervise`) closed the op: spawn nothing.
+        match self.op_open(s) {
+            Ok(true) => {}
+            Ok(false) => {
+                remove_settings(&self.config.home, &s.id, s.gen);
+                return Up::Retired;
+            }
+            Err(e) => return fail(e),
+        }
         // The one spawn of this create; nothing below spawns again.
         let mut driver = match self.launcher.spawn(&spec) {
             Ok(d) => d,
@@ -439,9 +449,13 @@ impl Spawner {
             let _ = driver.kill();
             return fail(e);
         }
-        if let Err(e) = self.write_pty(s, child) {
-            let _ = driver.kill();
-            return fail(e);
+        match self.write_pty(s, child) {
+            Ok(true) => {}
+            Ok(false) => return retired_meanwhile(driver),
+            Err(e) => {
+                let _ = driver.kill();
+                return fail(e);
+            }
         }
         let mut screen = CcScreen::new((self.clock)());
         loop {
@@ -482,7 +496,8 @@ impl Spawner {
             }
             if ready {
                 return match self.write_bound(s) {
-                    Ok(row) => Up::Ready(driver, row),
+                    Ok(Some(row)) => Up::Ready(driver, row),
+                    Ok(None) => retired_meanwhile(driver),
                     Err(e) => {
                         let _ = driver.kill();
                         fail(e)
@@ -541,17 +556,31 @@ impl Spawner {
         }
     }
 
+    /// Whether the create op of `s` is still open: a retire closes it.
+    fn op_open(&self, s: &Start) -> Result<bool, String> {
+        let conn = self.db.reader()?;
+        conn.query_row(
+            "SELECT 1 FROM ops WHERE id = ?1 AND done_at IS NULL",
+            [&s.op_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|r| r.is_some())
+        .map_err(|e| format!("Failed to read the create op: {}", e))
+    }
+
     /// Phase `pty`: the PTY child in the op and in `agent_state`, and the
-    /// row `starting`.
-    fn write_pty(&self, s: &Start, child: super::driver::ChildId) -> Result<(), String> {
+    /// row `starting`. `false` when a retire closed the op first.
+    fn write_pty(&self, s: &Start, child: super::driver::ChildId) -> Result<bool, String> {
         let (s, machine) = (s.clone(), self.db.machine_id().to_string());
         self.db
             .write_blocking(move |tx| write_pty(tx, &machine, &s, child))
-            .map(|_| ())
+            .map(|(open, _)| open)
     }
 
-    /// Phase `bound`: the op is done and the row `ready`.
-    fn write_bound(&self, s: &Start) -> Result<AgentRow, String> {
+    /// Phase `bound`: the op is done and the row `ready`. `None` when a
+    /// retire closed the op first.
+    fn write_bound(&self, s: &Start) -> Result<Option<AgentRow>, String> {
         let (s, machine) = (s.clone(), self.db.machine_id().to_string());
         self.db
             .write_blocking(move |tx| write_bound(tx, &machine, &s))
@@ -613,23 +642,37 @@ impl Spawner {
         if matches!(row.state.as_deref(), Some("retired" | "failed")) {
             return Ok(row);
         }
-        let cmds = lock(&self.live).get(&p.id).map(|h| h.cmds.clone());
-        if let Some(cmds) = cmds {
-            let (reply, answer) = oneshot::channel();
-            let sent = cmds.send(Cmd::Retire {
-                principal: principal.to_string(),
-                reply,
-            });
-            if sent.is_ok() {
-                if let Ok(r) = answer.await {
-                    return r;
-                }
-            }
-            // The supervisor ended meanwhile: retire the row below.
+        if let Some(r) = self.retire_live(&p.id, principal).await {
+            return r;
         }
+        // No supervisor: the agent runs nowhere, or its create is between
+        // the row and `supervise`. The tombstone closes the create op, so
+        // that supervisor spawns nothing or kills what it spawned; one
+        // that registered meanwhile is told to kill it here.
         let sp = self.clone();
-        let principal = principal.to_string();
-        blocking(move || sp.retire_row(&p.id, row.generation, &principal)).await
+        let (id, principal_s) = (p.id.clone(), principal.to_string());
+        let r = blocking(move || sp.retire_row(&id, row.generation, &principal_s)).await;
+        if r.is_ok() {
+            self.retire_live(&p.id, principal).await;
+        }
+        r
+    }
+
+    /// Hand the retire of `id` to its supervisor, if it runs here. `None`
+    /// when there is no supervisor, or it ended before it answered.
+    async fn retire_live(
+        &self,
+        id: &str,
+        principal: &Principal,
+    ) -> Option<Result<AgentRow, ApiError>> {
+        let cmds = lock(&self.live).get(id).map(|h| h.cmds.clone())?;
+        let (reply, answer) = oneshot::channel();
+        cmds.send(Cmd::Retire {
+            principal: principal.to_string(),
+            reply,
+        })
+        .ok()?;
+        answer.await.ok()
     }
 
     /// Kill every agent this engine runs and wait for the supervisors. The
@@ -655,13 +698,20 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Phase `pty` (see `Spawner::write_pty`).
+/// A retire made the row a tombstone while the agent came up: the PTY goes.
+fn retired_meanwhile(mut driver: Box<dyn Driver>) -> Up {
+    let _ = driver.kill();
+    Up::Retired
+}
+
+/// Phase `pty` (see `Spawner::write_pty`). Writes nothing and returns
+/// `false` when the op is closed.
 fn write_pty(
     tx: &mut Tx,
     machine: &str,
     s: &Start,
     child: super::driver::ChildId,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<bool> {
     let payload = CreatePayload {
         agent_id: s.id.clone(),
         generation: s.gen,
@@ -671,7 +721,9 @@ fn write_pty(
         start: Some(child.start),
         outcome: None,
     };
-    ops::set_phase(tx, &s.op_id, Phase::Pty, &payload)?;
+    if !ops::set_phase(tx, &s.op_id, Phase::Pty, &payload)? {
+        return Ok(false);
+    }
     tx.execute(
         "INSERT OR REPLACE INTO agent_state (agent_id, gen, pty_child_pid, pty_child_start) \
          VALUES (?1, ?2, ?3, ?4)",
@@ -681,11 +733,13 @@ fn write_pty(
         "UPDATE agents SET state = 'starting', pid = ?2 WHERE id = ?1 AND state = 'creating'",
         params![s.id, child.pid as i64],
     )?;
-    emit_upsert(tx, machine, &s.id)
+    emit_upsert(tx, machine, &s.id)?;
+    Ok(true)
 }
 
-/// Phase `bound` (see `Spawner::write_bound`).
-fn write_bound(tx: &mut Tx, machine: &str, s: &Start) -> rusqlite::Result<AgentRow> {
+/// Phase `bound` (see `Spawner::write_bound`). Writes nothing and returns
+/// `None` when the op is closed.
+fn write_bound(tx: &mut Tx, machine: &str, s: &Start) -> rusqlite::Result<Option<AgentRow>> {
     let payload: Option<String> = tx
         .query_row("SELECT payload FROM ops WHERE id = ?1", [&s.op_id], |r| {
             r.get(0)
@@ -695,7 +749,9 @@ fn write_bound(tx: &mut Tx, machine: &str, s: &Start) -> rusqlite::Result<AgentR
     let payload: CreatePayload = payload
         .and_then(|p| serde_json::from_str(&p).ok())
         .unwrap_or_default();
-    ops::set_phase(tx, &s.op_id, Phase::Bound, &payload)?;
+    if !ops::set_phase(tx, &s.op_id, Phase::Bound, &payload)? {
+        return Ok(None);
+    }
     ops::finish(tx, &s.op_id, Phase::Bound.as_str(), now_ms())?;
     tx.execute(
         "UPDATE agents SET state = 'ready' WHERE id = ?1 AND state = 'starting'",
@@ -707,6 +763,7 @@ fn write_bound(tx: &mut Tx, machine: &str, s: &Start) -> rusqlite::Result<AgentR
         [&s.id],
         agent_row,
     )
+    .map(Some)
 }
 
 /// The retire transaction: the tombstone (`retired`, `gone_at`), no PTY
@@ -1430,6 +1487,76 @@ mod tests {
 
     fn runs(pid: libc::pid_t) -> bool {
         peer::proc_entry(pid).is_some_and(|e| !e.zombie)
+    }
+
+    /// A new create's row, written as `create` writes it, with no
+    /// supervisor yet.
+    async fn row_only(e: &Env) -> Start {
+        let s = Start {
+            id: new_agent_id(),
+            gen: 0,
+            sid: uuid::Uuid::new_v4().to_string(),
+            op_id: ops::new_op_id(),
+            cwd: e.cwd.canonicalize().unwrap(),
+            claude: PathBuf::from("/bin/false"),
+        };
+        let gen =
+            e.sp.write_row(&s, &CLAUDE, &Principal::LocalUnverified, None)
+                .await
+                .unwrap();
+        Start { gen, ..s }
+    }
+
+    /// Reviews M1: a retire between the row and `supervise` finds no
+    /// supervisor. The tombstone closes the op, and the supervisor that
+    /// starts after it spawns nothing.
+    #[tokio::test]
+    async fn a_retire_before_the_supervisor_spawns_nothing() {
+        let e = setup(Script::Ready, true, None);
+        let l = Principal::LocalUnverified;
+        let s = row_only(&e).await;
+        let r =
+            e.sp.retire(&l, serde_json::json!({ "id": s.id }))
+                .await
+                .unwrap();
+        assert_eq!(r.state.as_deref(), Some("retired"));
+        let (reply, answer) = oneshot::channel();
+        e.sp.supervise(s.clone(), reply).unwrap();
+        let err = answer.await.unwrap().unwrap_err();
+        assert_eq!(err.code, ErrorCode::SpawnFailed);
+        assert!(
+            err.msg.contains("retired before it was ready"),
+            "{}",
+            err.msg
+        );
+        no_supervisors(&e.sp);
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(row(&e.db, &s.id).state.as_deref(), Some("retired"));
+        assert_eq!(agent_state_rows(&e.db), 0);
+        assert!(!settings_path_of(&e.home, &s.id, s.gen).exists());
+    }
+
+    /// Reviews M1: a retire that lands after the spawn but before phase
+    /// `pty` or `bound` makes those writes no-ops, so the supervisor kills
+    /// the PTY instead of answering with a retired row.
+    #[tokio::test]
+    async fn phase_writes_after_a_retire_write_nothing() {
+        let e = setup(Script::Ready, true, None);
+        let s = row_only(&e).await;
+        e.sp.retire_row(&s.id, s.gen, "local-unverified").unwrap();
+        let child = ChildId { pid: 7, start: 1 };
+        assert_eq!(e.sp.write_pty(&s, child), Ok(false));
+        assert_eq!(agent_state_rows(&e.db), 0);
+        let s2 = row_only(&e).await;
+        assert_eq!(e.sp.write_pty(&s2, child), Ok(true));
+        e.sp.retire_row(&s2.id, s2.gen, "local-unverified").unwrap();
+        assert_eq!(e.sp.write_bound(&s2), Ok(None));
+        for id in [&s.id, &s2.id] {
+            assert_eq!(row(&e.db, id).state.as_deref(), Some("retired"));
+        }
+        assert!(ops_of(&e.db)
+            .iter()
+            .all(|(_, done, out)| *done && out.as_deref() == Some("retired")));
     }
 
     /// The engine "crashes" after `phase`: nothing cleans up, the db is
