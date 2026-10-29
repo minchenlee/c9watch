@@ -11,3 +11,6 @@ pub mod lock;
 
 #[cfg(unix)]
 pub mod sock;
+
+#[cfg(unix)]
+pub mod peer;
