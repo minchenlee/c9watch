@@ -305,8 +305,10 @@ pub struct CodexSessionSource {
 impl CodexSessionSource {
     pub fn new() -> Result<Self, SessionDetectorError> {
         let home = dirs::home_dir().ok_or(SessionDetectorError::HomeDirectoryNotFound)?;
-        Ok(Self::at_root(super::codex_archive::default_sessions_root(&home))
-            .with_process_probe(Box::new(SysinfoCodexOpenFileProbe::new())))
+        Ok(
+            Self::at_root(super::codex_archive::default_sessions_root(&home))
+                .with_process_probe(Box::new(SysinfoCodexOpenFileProbe::new())),
+        )
     }
 
     pub(crate) fn with_process_probe(mut self, probe: Box<dyn OpenFileProbe>) -> Self {

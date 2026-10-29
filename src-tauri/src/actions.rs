@@ -702,8 +702,8 @@ fn get_app_cli(app_name: &str) -> Option<String> {
     }
 
     // JetBrains IDEs: check Toolbox scripts dir, then ~/Applications, then /Applications
-    let jetbrains_cli = jetbrains_url_scheme(app_name)
-        .map(|bin_name| (bin_name, jetbrains_app_dir_name(app_name)));
+    let jetbrains_cli =
+        jetbrains_url_scheme(app_name).map(|bin_name| (bin_name, jetbrains_app_dir_name(app_name)));
 
     if let Some((bin_name, app_dir_name)) = jetbrains_cli {
         // 1. JetBrains Toolbox scripts directory
@@ -853,8 +853,8 @@ fn find_parent_app(pid: u32) -> Result<String, String> {
     // Walk up the process tree to find a GUI application
     for i in 0..20 {
         // Get the command/path for current process
-        let comm = ps_field(current_pid, "comm")
-            .map_err(|e| format!("Failed to execute ps: {}", e))?;
+        let comm =
+            ps_field(current_pid, "comm").map_err(|e| format!("Failed to execute ps: {}", e))?;
         crate::debug_log::log_info(&format!(
             "[open_session] Step {}: PID {} -> comm: {}",
             i, current_pid, comm
@@ -1377,7 +1377,10 @@ mod tests {
     fn open_paths_that_start_with_a_dash_are_rejected() {
         assert!(check_open_path("-r").is_err());
         assert!(check_open_path("--install-extension=x").is_err());
-        assert!(check_open_path("").is_ok(), "a terminal focus needs no path");
+        assert!(
+            check_open_path("").is_ok(),
+            "a terminal focus needs no path"
+        );
         assert!(check_open_path("/Users/me/project").is_ok());
         assert!(check_open_path("relative/dir").is_ok());
         assert!(open_session(4242, "--goto=x".into())

@@ -63,7 +63,54 @@ jobs:
           cargo test --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features cli
 
+      - name: Engine feature tests
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features engine
+
       - name: PM orchestration tests
         run: |
           cargo test --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features pm-orchestration
+
+  linux-cli:
+    # The CLI-only build must stay portable. The GUI needs macOS (Tauri,
+    # NSPanel), so this job builds and tests without the `gui` feature.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system packages
+        # reqwest uses native-tls, which links OpenSSL on Linux.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Rust format check
+        run: cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Prod channel build check
+        # CI builds are dev channel by default. Check the prod cfg path too.
+        env:
+          C9WATCH_CHANNEL: prod
+        run: |
+          cargo check --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features engine
+
+      - name: CLI-only tests
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features cli
+
+      - name: Engine feature tests
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features engine
