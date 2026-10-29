@@ -138,12 +138,18 @@ pub fn prune(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
     prune_with(conn, now - RETENTION_MS, RETENTION_EVENTS)
 }
 
-/// `prune` with explicit limits. The newest row always stays, so `seq` is
-/// never reused. Touches nothing but `events` (audit is never pruned).
+/// `prune` with explicit limits. Deletes only a prefix of the log, up to
+/// the newest event older than `cutoff_ts` or the `keep` limit: `ts` is
+/// wall-clock time and can go back, and a hole in the middle would let a
+/// subscriber below it skip events without `cursor_expired`. The newest row
+/// always stays, so `seq` is never reused. Touches nothing but `events`
+/// (audit is never pruned).
 pub fn prune_with(conn: &Connection, cutoff_ts: i64, keep: i64) -> rusqlite::Result<usize> {
     conn.execute(
         "DELETE FROM events WHERE seq < (SELECT max(seq) FROM events) \
-         AND (ts < ?1 OR seq <= (SELECT max(seq) FROM events) - ?2)",
+         AND seq <= max( \
+             (SELECT coalesce(max(seq), 0) FROM events WHERE ts < ?1), \
+             (SELECT max(seq) FROM events) - ?2)",
         params![cutoff_ts, keep],
     )
 }
@@ -378,6 +384,30 @@ mod tests {
         append(&c, "e", now, &ev(13)).unwrap();
         prune(&c, now).unwrap();
         assert_eq!(seqs(&c), [13]);
+    }
+
+    #[test]
+    fn retention_by_age_deletes_only_a_prefix_when_the_clock_goes_back() {
+        let c = mem();
+        // The clock stepped back between seq 2 and 3.
+        for (i, ts) in [100, 500, 110, 120, 600].into_iter().enumerate() {
+            append(&c, "e", ts, &ev(i as i64 + 1)).unwrap();
+        }
+        // Seq 4 is older than the cutoff, so everything up to it goes,
+        // seq 2 included; nothing after a kept row is deleted.
+        assert_eq!(prune_with(&c, 200, 50).unwrap(), 4);
+        assert_eq!(seqs(&c), [5]);
+
+        let c = mem();
+        for (i, ts) in [100, 500, 110, 900].into_iter().enumerate() {
+            append(&c, "e", ts, &ev(i as i64 + 1)).unwrap();
+        }
+        // Only seq 1 and 3 are old; 3 drags 2 with it. A subscriber at 2
+        // must not pass the gap check and then miss 3.
+        prune_with(&c, 200, 50).unwrap();
+        assert_eq!(seqs(&c), [4]);
+        assert!(expired(read_after(&c, 2, 10)).contains("pruned"));
+        assert_eq!(read_after(&c, 3, 10).unwrap()[0].seq, 4);
     }
 
     #[test]
