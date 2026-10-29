@@ -19,8 +19,8 @@ use super::peer::{self, PeerCred};
 use super::principal::{self, LiveAgents, NoLiveAgents, Principal};
 use super::proto::{
     encode, encode_event, read_frame, ApiError, ErrorCode, EventFrame, FrameError, HelloParams,
-    HelloResult, Request, Response, SnapshotResult, SubscribeParams, SubscribeResult, API_MAJOR,
-    API_MINOR, MAX_FRAME,
+    HelloResult, Request, Response, SnapshotParams, SnapshotResult, SubscribeParams,
+    SubscribeResult, API_MAJOR, API_MINOR, MAX_FRAME,
 };
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
@@ -301,6 +301,69 @@ fn check_frame(
         );
     }
     Checked::Call(req, method)
+}
+
+/// Every c9p/1 method, as in `docs/api/c9p-1.json`. `hello` is handled
+/// before dispatch; `dispatch` serves the rest.
+pub const METHODS: &[&str] = &["hello", "snapshot.get", "events.subscribe"];
+
+/// The c9p/1 JSON Schema (A:245): the frame types, a `methods` table with
+/// each method's params and result, and every wire type under `$defs`.
+/// `docs/api/c9p-1.json` is this value, and `src/lib/c9p-1.ts` is generated
+/// from that file by `scripts/gen-c9p-types.mjs`.
+pub fn schema() -> serde_json::Value {
+    use schemars::generate::SchemaSettings;
+    // Params and the request frame are what the engine reads; results and
+    // the other frames are what it writes. Each side gets its own contract,
+    // so an `Option` param may be left out while an `Option` result field
+    // is always sent.
+    let mut de = SchemaSettings::draft2020_12()
+        .for_deserialize()
+        .into_generator();
+    let mut ser = SchemaSettings::draft2020_12()
+        .for_serialize()
+        .into_generator();
+    let frames = serde_json::json!({
+        "request": de.subschema_for::<Request>(),
+        "response": ser.subschema_for::<Response>(),
+        "event": ser.subschema_for::<EventFrame>(),
+    });
+    let methods = serde_json::json!({
+        "hello": {
+            "params": de.subschema_for::<HelloParams>(),
+            "result": ser.subschema_for::<HelloResult>(),
+        },
+        "snapshot.get": {
+            "params": de.subschema_for::<SnapshotParams>(),
+            "result": ser.subschema_for::<SnapshotResult>(),
+        },
+        "events.subscribe": {
+            "params": de.subschema_for::<SubscribeParams>(),
+            "result": ser.subschema_for::<SubscribeResult>(),
+            "events": ser.subschema_for::<EventFrame>(),
+        },
+    });
+    let mut defs = de.take_definitions(true);
+    for (name, def) in ser.take_definitions(true) {
+        match defs.get(&name) {
+            // A type on both sides (ErrorCode) must read the same way.
+            Some(other) => assert_eq!(other, &def, "{} differs between contracts", name),
+            None => {
+                defs.insert(name, def);
+            }
+        }
+    }
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "c9p/1",
+        "description": "The c9watch engine protocol: one JSON object per line over \
+            the engine socket. Within a major version every change is additive.",
+        "apiMajor": API_MAJOR,
+        "apiMinor": API_MINOR,
+        "frames": frames,
+        "methods": methods,
+        "$defs": defs,
+    })
 }
 
 /// Methods after `hello`. Both C1a principals, L and A, may call every
@@ -827,6 +890,62 @@ mod tests {
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
     const MACHINE: &str = "m-test";
+
+    /// `docs/api/c9p-1.json` must equal `schema()`. With
+    /// `C9P_SCHEMA_WRITE=1` the test rewrites the file instead.
+    #[test]
+    fn schema_file_is_current() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/api/c9p-1.json");
+        let want = serde_json::to_string_pretty(&schema()).unwrap() + "\n";
+        if std::env::var_os("C9P_SCHEMA_WRITE").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, want).unwrap();
+            return;
+        }
+        let have = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            have == want,
+            "docs/api/c9p-1.json is stale. Run `C9P_SCHEMA_WRITE=1 cargo test --no-default-features \
+             --features engine schema_file_is_current`, then `node scripts/gen-c9p-types.mjs`."
+        );
+    }
+
+    #[test]
+    fn schema_lists_every_method_and_resolves_every_ref() {
+        let s = schema();
+        let methods: Vec<&str> = s["methods"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut want = METHODS.to_vec();
+        want.sort();
+        assert_eq!(methods, want);
+        let text = s.to_string();
+        let defs = s["$defs"].as_object().unwrap();
+        for r in text.split("\"$ref\":\"#/$defs/").skip(1) {
+            let name = &r[..r.find('"').unwrap()];
+            assert!(defs.contains_key(name), "dangling $ref {}", name);
+        }
+        let codes = serde_json::to_string(&s["$defs"]["ErrorCode"]).unwrap();
+        for code in ["upgrade_required", "cursor_expired", "internal"] {
+            assert!(codes.contains(code), "ErrorCode lacks {}", code);
+        }
+    }
+
+    /// Every method in the schema is served: none answers `unknown_method`.
+    #[tokio::test]
+    async fn every_schema_method_is_served() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        for (i, m) in METHODS.iter().enumerate() {
+            let r = c.call(&i.to_string(), m, json!({})).await;
+            assert_eq!(r["ok"], true, "{}: {}", m, r);
+        }
+        let r = c.call("x", "no.such", json!({})).await;
+        assert_eq!(r["error"]["code"], "unknown_method");
+    }
 
     /// A server context with a fresh store, and the store.
     fn ctx_db(agents: Arc<dyn LiveAgents>) -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Db>) {

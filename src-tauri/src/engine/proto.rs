@@ -5,6 +5,7 @@
 //! error codes with a hint, and the `hello` handshake. Within major 1 every
 //! change is additive, so unknown fields are ignored on input.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
@@ -17,7 +18,7 @@ pub const MAX_FRAME: usize = 1 << 20;
 
 /// A request frame. Every field is optional on the wire, so that a frame
 /// with a missing field still gets an error that echoes its `id`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Request {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v: Option<u32>,
@@ -32,7 +33,7 @@ pub struct Request {
 }
 
 /// A response frame: `ok:true` with `result`, or `ok:false` with `error`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Response {
     pub v: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,7 +73,7 @@ impl Response {
 }
 
 /// The `error` object of a failed response.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorBody {
     pub code: ErrorCode,
     pub msg: String,
@@ -82,7 +83,7 @@ pub struct ErrorBody {
 
 /// Typed error codes. New codes are additive; a client that does not know a
 /// code still has `msg`, `retryable` and `hint`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     /// The client speaks another major version.
@@ -185,7 +186,7 @@ impl From<ApiError> for ErrorBody {
 
 /// `hello` params. `client` is the caller's own claim. The engine only logs
 /// it as unverified; it never decides the principal (N1).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HelloParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,7 +198,7 @@ pub struct HelloParams {
 }
 
 /// What a client says about itself in `hello`. Unverified.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ClientInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
@@ -208,7 +209,7 @@ pub struct ClientInfo {
 }
 
 /// `hello` result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HelloResult {
     pub api_major: u32,
@@ -222,9 +223,14 @@ pub struct HelloResult {
     pub cursor: Option<String>,
 }
 
+/// `snapshot.get` params. There are none yet; the engine ignores any it
+/// gets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotParams {}
+
 /// `snapshot.get` result: the state and the cursor it is consistent with.
 /// Subscribing with `since` = `cursor` continues with no gap.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotResult {
     pub cursor: String,
@@ -234,7 +240,7 @@ pub struct SnapshotResult {
 }
 
 /// `events.subscribe` params (A:218). Empty filters match everything.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscribeParams {
     /// The last cursor the client has seen. Without it, the stream starts at
@@ -253,7 +259,7 @@ pub struct SubscribeParams {
 /// connection until the connection closes, or until an error frame with
 /// the subscribe request's `id` (`cursor_expired` when the subscriber fell
 /// behind retention).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscribeResult {
     /// Where the stream starts: events after this cursor follow.
@@ -262,7 +268,7 @@ pub struct SubscribeResult {
 
 /// One event on the wire (A:203). `sub` is the `id` of the subscribe
 /// request, so a connection can carry several subscriptions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct EventFrame {
     pub v: u32,
     #[serde(rename = "type")]
