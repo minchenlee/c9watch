@@ -245,11 +245,30 @@ fn open_private(path: &Path, opts: &mut OpenOptions) -> Result<File, String> {
         })
 }
 
+/// The last non-empty line the engine wrote to `engine.log` after byte
+/// `from`, cut to 500 bytes. An engine that fails at boot (for example with
+/// `db_newer_than_engine`) prints its error there before it exits.
+fn log_tail(home: &Path, from: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = File::open(log_path(home)).ok()?;
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut buf = Vec::new();
+    f.take(64 * 1024).read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let line = text.lines().rev().map(str::trim).find(|l| !l.is_empty())?;
+    let mut end = line.len().min(500);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(line[..end].to_string())
+}
+
 /// Poll `hello` on `sock` until it succeeds. Fails early when the engine
-/// refuses us or when `child` (the engine we spawned) exits.
+/// refuses us or when `child` (the engine we spawned, and the `engine.log`
+/// offset it started writing at) exits.
 fn wait_until_ready(
     home: &Path,
-    mut child: Option<&mut Child>,
+    mut child: Option<(&mut Child, u64)>,
     timeout: Duration,
 ) -> Result<HelloResult, String> {
     let sock = sock_path(home);
@@ -260,11 +279,15 @@ fn wait_until_ready(
             Err(ConnectError::Refused(e)) => return Err(e),
             Err(ConnectError::Unreachable(e)) => e,
         };
-        if let Some(c) = child.as_deref_mut() {
+        if let Some((c, log_from)) = child.as_mut() {
             if let Ok(Some(status)) = c.try_wait() {
+                let said = log_tail(home, *log_from)
+                    .map(|l| format!(": {}", l))
+                    .unwrap_or_default();
                 return Err(format!(
-                    "The engine exited ({}) before it answered hello; see {:?}",
+                    "The engine exited ({}) before it answered hello{}; see {:?}",
                     status,
+                    said,
                     log_path(home)
                 ));
             }
@@ -323,10 +346,11 @@ fn ensure_engine_with(
         return wait_until_ready(home, None, READY_TIMEOUT);
     }
 
+    let log_from = std::fs::metadata(log_path(home)).map_or(0, |m| m.len());
     let mut child = spawn_engine(home, exe)?;
     // `spawn_lock` is released when we return; by then the engine holds
     // `engine.lock`, so other callers take the fast path.
-    wait_until_ready(home, Some(&mut child), READY_TIMEOUT)
+    wait_until_ready(home, Some((&mut child, log_from)), READY_TIMEOUT)
 }
 
 /// Spawn `exe engine` in a new session, with the allowlisted environment

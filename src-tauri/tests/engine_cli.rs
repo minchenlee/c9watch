@@ -278,3 +278,24 @@ fn the_engine_leaves_the_legacy_daemon_alone() {
     let _ = sleeper.kill();
     let _ = sleeper.wait();
 }
+
+#[test]
+fn a_db_from_a_newer_engine_fails_the_auto_start_with_its_code() {
+    let sb = Sandbox::new();
+    std::fs::create_dir(&sb.engine).unwrap();
+    std::fs::set_permissions(&sb.engine, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let db = sb.engine.join("engine.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE t (x INTEGER); PRAGMA user_version = 9999;")
+            .unwrap();
+    }
+    let before = std::fs::read(&db).unwrap();
+    let out = sb.run(&["api", "hello"]);
+    assert!(!out.status.success(), "{:?}", out);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("db_newer_than_engine"), "stderr: {err}");
+    assert!(sb.pid().is_none());
+    // Refused, not moved aside or changed.
+    assert_eq!(std::fs::read(&db).unwrap(), before);
+}
