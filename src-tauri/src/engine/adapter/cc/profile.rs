@@ -79,6 +79,12 @@ const BAD_PATH_CHARS: &[char] = &[
     '!', '~', '#', '"', '\'',
 ];
 
+/// Characters that may not appear in the cwd's realpath. CC permission
+/// rules are gitignore-style patterns and sandbox paths take globs, so
+/// `/x/proj[v2]` would make the `.claude` rules name `/x/projv` instead
+/// (reviews M3); `(` and `)` would bend an `Edit(...)` rule.
+const BAD_CWD_CHARS: &[char] = &['*', '?', '[', ']', '{', '}', '(', ')', '\\', '\n', '\r'];
+
 /// One spawn of one free agent.
 #[derive(Debug, Clone)]
 pub struct Profile {
@@ -125,11 +131,20 @@ impl Profile {
 
 /// Realpath of a spawn cwd (S:69). Every path rule is built from it, so a
 /// symlinked cwd cannot point the rules at another directory. It must be a
-/// directory and not `/`.
+/// directory, not `/`, UTF-8 and free of `BAD_CWD_CHARS`.
 pub fn resolve_cwd(cwd: &Path) -> Result<PathBuf, String> {
     let real = cwd
         .canonicalize()
         .map_err(|e| format!("cwd {:?}: {}", cwd, e))?;
+    let s = real
+        .to_str()
+        .ok_or_else(|| format!("cwd {:?} is not UTF-8", real))?;
+    if let Some(c) = s.chars().find(|c| BAD_CWD_CHARS.contains(c)) {
+        return Err(format!(
+            "cwd {:?} has {:?}, which a permission rule reads as a pattern",
+            s, c
+        ));
+    }
     if !real.is_dir() {
         return Err(format!("cwd {:?} is not a directory", real));
     }
@@ -586,6 +601,17 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         assert!(resolve_cwd(&file).is_err());
         assert!(resolve_cwd(Path::new("/")).is_err());
+        // Glob and rule characters, also when only the realpath has them.
+        for name in ["proj[v2]", "a*b", "a?b", "a{b,c}", "a(b)", "a\\b"] {
+            let d = t.path().join(name);
+            std::fs::create_dir(&d).unwrap();
+            let e = resolve_cwd(&d).unwrap_err();
+            assert!(e.contains("pattern"), "{}: {}", name, e);
+            let ln = t.path().join(format!("ok-{}", name.len()));
+            let _ = std::fs::remove_file(&ln);
+            std::os::unix::fs::symlink(&d, &ln).unwrap();
+            assert!(resolve_cwd(&ln).is_err(), "{}", name);
+        }
     }
 
     #[test]

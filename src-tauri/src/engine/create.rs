@@ -9,8 +9,10 @@
 //! A create:
 //! 1. Checks the engine's `c9watch-agent` copy, realpaths the cwd, and
 //!    refuses a cwd inside the engine home or a managed worktree home
-//!    (`.c9watch/worktrees`) with `cwd_collision` (D22.9).
-//! 2. One transaction: the `agents` row (`creating`, `created_by` = the
+//!    (`.c9watch/worktrees`) with `cwd_collision` (D22.9), and a cwd that
+//!    holds the engine home.
+//! 2. One transaction: `cwd_collision` when a live engine agent's cwd is
+//!    above or below this one, then the `agents` row (`creating`, `created_by` = the
 //!    caller's principal), its first generation with the `--session-id`,
 //!    and the create op in phase `row` (`engine::ops`).
 //! 3. A supervisor thread writes the per-spawn settings, spawns the agent
@@ -309,6 +311,15 @@ impl Spawner {
                         return Ok(Err(bad(format!("name {:?} is in use by a live agent", n))));
                     }
                 }
+                if let Some(other) = nested_cwd(tx, &s.cwd)? {
+                    return Ok(Err(ApiError::new(
+                        ErrorCode::CwdCollision,
+                        format!(
+                            "cwd {:?} and the cwd {:?} of live agent {} are nested",
+                            s.cwd, other.1, other.0
+                        ),
+                    )));
+                }
                 let cwd = s.cwd.display().to_string();
                 tx.execute(
                     "INSERT INTO agents (id, mode, role, control, provider, source, created_by, \
@@ -424,6 +435,11 @@ impl Spawner {
             Ok(p) => p,
             Err(e) => return fail(e),
         };
+        // The realpath again: a path part swapped for a symlink since the
+        // collision check must not move the agent (reviews L1).
+        if profile.cwd != s.cwd {
+            return fail(format!("cwd {:?} now resolves to {:?}", s.cwd, profile.cwd));
+        }
         let settings = match write_settings(&self.config.home, &profile) {
             Ok(f) => f,
             Err(e) => return fail(e),
@@ -823,6 +839,30 @@ fn engine_row(conn: &Connection, id: &str) -> rusqlite::Result<Option<AgentRow>>
     .optional()
 }
 
+/// A live engine agent whose cwd is strictly above or below `cwd`, as
+/// `(id, cwd)` (reviews M4). The outer agent's sandbox may write the inner
+/// one's `.claude/`, which CC hot-reloads. The same cwd is fine: both deny
+/// it. In the create transaction, so two creates cannot race past it.
+fn nested_cwd(conn: &Connection, cwd: &Path) -> rusqlite::Result<Option<(String, PathBuf)>> {
+    let mut st = conn.prepare(
+        "SELECT id, cwd FROM agents WHERE source = 'engine' AND gone_at IS NULL \
+         AND cwd IS NOT NULL",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            PathBuf::from(r.get::<_, String>(1)?),
+        ))
+    })?;
+    for row in rows {
+        let (id, other) = row?;
+        if other != cwd && (other.starts_with(cwd) || cwd.starts_with(&other)) {
+            return Ok(Some((id, other)));
+        }
+    }
+    Ok(None)
+}
+
 fn name_taken(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
     Ok(conn
         .query_row(
@@ -889,13 +929,21 @@ fn check_name(name: &str) -> Result<(), ApiError> {
 }
 
 /// `cwd_collision` (D22.9): `cwd` (a realpath) is inside the engine home,
-/// or inside a managed worktree home `<repo>/.c9watch/worktrees`.
+/// or inside a managed worktree home `<repo>/.c9watch/worktrees`. Also
+/// when the engine home is inside `cwd` (`$HOME`, `~/Library`): the
+/// agent's sandbox could then write `engine.db` (reviews M2).
 pub fn check_collision(home: &Path, cwd: &Path) -> Result<(), ApiError> {
     let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
     if cwd.starts_with(&home) {
         return Err(ApiError::new(
             ErrorCode::CwdCollision,
             format!("cwd {:?} is inside the engine home {:?}", cwd, home),
+        ));
+    }
+    if home.starts_with(cwd) {
+        return Err(ApiError::new(
+            ErrorCode::CwdCollision,
+            format!("the engine home {:?} is inside cwd {:?}", home, cwd),
         ));
     }
     let parts: Vec<_> = cwd.components().collect();
@@ -1268,8 +1316,15 @@ mod tests {
         // A symlink to the engine home resolves into it.
         let link = e.t.path().join("link");
         std::os::unix::fs::symlink(&e.home, &link).unwrap();
+        // The engine home is inside it.
+        let above = e.t.path().to_path_buf();
+        // A glob character in the cwd.
+        let glob = e.t.path().join("proj[v2]");
+        std::fs::create_dir(&glob).unwrap();
         for (params, want) in [
             (create_params(&inside), ErrorCode::CwdCollision),
+            (create_params(&above), ErrorCode::CwdCollision),
+            (create_params(&glob), ErrorCode::BadRequest),
             (create_params(&wt), ErrorCode::CwdCollision),
             (create_params(&link), ErrorCode::CwdCollision),
             (
@@ -1487,6 +1542,32 @@ mod tests {
 
     fn runs(pid: libc::pid_t) -> bool {
         peer::proc_entry(pid).is_some_and(|e| !e.zombie)
+    }
+
+    /// Reviews M4: a live agent's cwd may not hold, or sit inside, a new
+    /// agent's cwd. The same cwd is fine, and a retired agent's no longer
+    /// counts.
+    #[tokio::test]
+    async fn nested_cwds_of_live_agents_collide() {
+        let e = setup(Script::Ready, true, None);
+        let l = Principal::LocalUnverified;
+        let (a, b) = (e.cwd.join("a"), e.cwd.join("a").join("b"));
+        std::fs::create_dir_all(&b).unwrap();
+        let first = e.sp.create(&l, create_params(&a)).await.unwrap();
+        for dir in [&b, &e.cwd] {
+            let err = e.sp.create(&l, create_params(dir)).await.unwrap_err();
+            assert_eq!(err.code, ErrorCode::CwdCollision, "{:?}", dir);
+            assert!(err.msg.contains(&first.id), "{}", err.msg);
+        }
+        let second = e.sp.create(&l, create_params(&a)).await.unwrap();
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 2);
+        for r in [&first, &second] {
+            e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+                .await
+                .unwrap();
+        }
+        e.sp.create(&l, create_params(&b)).await.unwrap();
+        e.sp.shutdown();
     }
 
     /// A new create's row, written as `create` writes it, with no
