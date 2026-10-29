@@ -394,6 +394,16 @@ fn engine_restart_with_a_live_agent_drains_then_resumes_it() {
     assert!(lines[1].starts_with(&format!("--resume {} --settings ", sid)));
     assert!(lines[1].contains(&format!("{}-2.json", id)), "{}", lines[1]);
     assert!(lines[1].contains("--permission-mode auto"), "{}", lines[1]);
+    // D24: each generation's SessionStart context names its generation
+    // and replaces the earlier blocks (reviews L4).
+    for gen in [1, 2] {
+        let ctx = std::fs::read_to_string(bin.join(format!("ctx-{}.out", gen))).unwrap();
+        let header = format!(
+            "c9watch context, generation {} (replaces any earlier c9watch context)",
+            gen
+        );
+        assert!(ctx.contains(&header), "ctx-{}.out: {}", gen, ctx);
+    }
 
     let out = run(&["api", "agent.retire", &format!(r#"{{"id":"{}"}}"#, id)]);
     assert!(out.status.success(), "{:?}", out);
