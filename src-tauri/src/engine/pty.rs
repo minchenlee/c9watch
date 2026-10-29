@@ -635,12 +635,29 @@ mod tests {
 
     /// The first line of output that parses as a pid.
     fn read_pid(pty: &mut NativePty, marker: &str) -> libc::pid_t {
-        let text = read_until(pty, &format!("{}\r\n", marker));
-        let line = text
-            .lines()
-            .find_map(|l| l.trim().strip_suffix(marker).map(str::to_string))
-            .unwrap();
-        line.trim().parse().unwrap()
+        read_pids(pty, &[marker])[0]
+    }
+
+    /// The pid printed before each marker. One read for all of them: lines
+    /// that arrive in the same chunk are not lost between calls.
+    fn read_pids(pty: &mut NativePty, markers: &[&str]) -> Vec<libc::pid_t> {
+        let mut text = String::new();
+        for marker in markers {
+            let want = format!("{}\r\n", marker);
+            if !text.contains(&want) {
+                text.push_str(&read_until(pty, &want));
+            }
+        }
+        markers
+            .iter()
+            .map(|marker| {
+                let line = text
+                    .lines()
+                    .find_map(|l| l.trim().strip_suffix(marker).map(str::to_string))
+                    .unwrap();
+                line.trim().parse().unwrap()
+            })
+            .collect()
     }
 
     fn alive(pid: libc::pid_t) -> bool {
@@ -803,8 +820,8 @@ mod tests {
     fn kill_takes_detached_descendants_too() {
         let script = format!("{}; {}; wait", detached_sleep("d1"), detached_sleep("d2"));
         let mut pty = NativePty::spawn(&sh(&script)).unwrap();
-        let d1 = read_pid(&mut pty, " d1");
-        let d2 = read_pid(&mut pty, " d2");
+        let pids = read_pids(&mut pty, &[" d1", " d2"]);
+        let (d1, d2) = (pids[0], pids[1]);
         wait_detached(d1);
         wait_detached(d2);
         assert_ne!(unsafe { libc::getpgid(d1) }, pty.child().pid);
