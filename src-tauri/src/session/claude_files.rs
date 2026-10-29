@@ -60,13 +60,19 @@ mod tests {
         let project = home.path().join(".claude").join("projects").join("-p");
         std::fs::create_dir_all(&project).unwrap();
 
-        assert_eq!(find_claude_session_file_under(home.path(), SESSION_ID), None);
+        assert_eq!(
+            find_claude_session_file_under(home.path(), SESSION_ID),
+            None
+        );
     }
 
     #[test]
     fn missing_projects_dir_returns_none() {
         let home = tempfile::tempdir().unwrap();
-        assert_eq!(find_claude_session_file_under(home.path(), SESSION_ID), None);
+        assert_eq!(
+            find_claude_session_file_under(home.path(), SESSION_ID),
+            None
+        );
     }
 
     #[test]
@@ -76,6 +82,9 @@ mod tests {
         std::fs::create_dir_all(&projects).unwrap();
         std::fs::write(projects.join(format!("{SESSION_ID}.jsonl")), "").unwrap();
 
-        assert_eq!(find_claude_session_file_under(home.path(), SESSION_ID), None);
+        assert_eq!(
+            find_claude_session_file_under(home.path(), SESSION_ID),
+            None
+        );
     }
 }
