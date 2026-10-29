@@ -18,6 +18,11 @@
 //!   run `<home>/bin/c9watch-agent hook <event>` (D:243,
 //!   `adapter::claude_hook_settings`).
 //! - The cwd is a realpath before anything is built from it (S:69).
+//! - Three layers block writes to the cwd's `.claude/` (C1a-31, see
+//!   `deny_rules`): `permissions.deny`, `sandbox.filesystem.denyWrite` and
+//!   `allowUnsandboxedCommands:false`. The price, accepted in D28 Q2=A: a
+//!   free agent cannot change the repo's own `.claude/`, skills and
+//!   commands included.
 //! - The env carries only `C9_AGENT_ID`, `C9_AGENT_GEN` and
 //!   `C9_ENGINE_SOCK`, none of them a secret. There is no `C9_AGENT_TOKEN`
 //!   (D28 Q6=B) and no `C9_STANDING_ORDERS` (spike `c0-engine.rs:407`):
@@ -58,6 +63,10 @@ pub const ISOLATE_ARGS: [&str; 4] = [
 
 /// `<home>/spawn`: the per-spawn settings files.
 pub const SPAWN_DIR: &str = "spawn";
+
+/// The cwd settings files CC reads and hot-reloads while a session runs
+/// (`.claude/settings.json` = project source, `.local` = local source).
+pub const SETTINGS_FILES: [&str; 2] = [".claude/settings.json", ".claude/settings.local.json"];
 
 /// Characters that may not appear in the agent binary's path. The allow
 /// rule is a prefix match, so a wildcard would widen it and a shell
@@ -163,6 +172,70 @@ pub fn allow_rules(p: &Profile) -> Vec<String> {
     vec![format!("Bash({}:*)", p.agent_bin.display())]
 }
 
+/// Engine-owned directories the agent must not write: `<home>/bin` (the
+/// agent binary) and `<home>/spawn` (its own settings file). `home` is the
+/// parent of `bin`, as `agent_bin::installed_path` lays it out.
+pub fn engine_dirs(p: &Profile) -> Vec<PathBuf> {
+    let bin = p.agent_bin.parent();
+    bin.into_iter()
+        .map(Path::to_path_buf)
+        .chain(bin.and_then(Path::parent).map(|h| h.join(SPAWN_DIR)))
+        .collect()
+}
+
+/// Layer 1, deny rules for CC's own file tools. `Edit` covers every file
+/// tool; CC 2.1.312 warns that a `Write(path)` rule is not matched by file
+/// permission checks. Paths use the `//abs` form: CC roots `//x` at `/`,
+/// but roots a single-slash `/x` at the settings source's own root, so
+/// `Edit(/abs/...)` would not name the absolute path.
+///
+/// 1. The engine directories. Not a boundary on their own (the engine
+///    checks the agent binary's sha anyway), but they stop the obvious
+///    Edit/Write path.
+/// 2. The cwd's settings files. Live run sett1 (auto + sandbox): the
+///    auto-mode classifier allowed a Write of `.claude/settings.local.json`
+///    and CC hot-reloaded it. The sandbox's built-in write-deny of settings
+///    files covers only Bash (spike `profile.rs:85`).
+/// 3. Everything else under the cwd's `.claude/`. Live run setB: CC
+///    hot-reloads a `.claude/settings.json` written from outside, and the
+///    project source also loads `.claude/skills`, `agents` and `rules`.
+///    Live run setC: `cp`, `python3` and `mv .claude` writes there were
+///    stopped only by the classifier, which is a judgement, not a rule.
+///
+/// Layer 2 is `sandbox.filesystem.denyWrite` (`deny_write`) and layer 3
+/// `allowUnsandboxedCommands:false` (`settings`). No layer is enough alone.
+pub fn deny_rules(p: &Profile) -> Vec<String> {
+    let cwd = p.cwd.display().to_string();
+    let mut v: Vec<String> = engine_dirs(p)
+        .iter()
+        .map(|d| format!("Edit(/{}/**)", d.display()))
+        .collect();
+    v.extend(
+        SETTINGS_FILES
+            .iter()
+            .map(|f| format!("Edit(/{}/{})", cwd, f)),
+    );
+    v.push(format!("Edit(/{}/.claude/**)", cwd));
+    v
+}
+
+/// The cwd's `.claude` directory.
+pub fn claude_dir(p: &Profile) -> PathBuf {
+    p.cwd.join(".claude")
+}
+
+/// Layer 2, `sandbox.filesystem.denyWrite` for sandboxed Bash: the engine
+/// directories and the `.claude` directory itself, not only its files. A
+/// sandbox path is a subtree, so this covers both settings files and also
+/// refuses `mv .claude` and a `.claude` symlink in its place.
+pub fn deny_write(p: &Profile) -> Vec<String> {
+    engine_dirs(p)
+        .into_iter()
+        .chain([claude_dir(p)])
+        .map(|d| d.display().to_string())
+        .collect()
+}
+
 /// `sandbox.network.allowUnixSockets`: the socket as bound and, when it
 /// differs, as a realpath. A home below `/tmp` is `/private/tmp` on macOS
 /// (D24 補充); the agent connects through `C9_ENGINE_SOCK`, and the
@@ -187,14 +260,16 @@ pub fn settings(p: &Profile) -> Value {
     let mut s = claude_hook_settings(&p.agent_bin);
     // Pinned so the screen detector sees the layout it knows (D24.9).
     s["tui"] = json!("fullscreen");
-    s["permissions"] = json!({ "allow": allow_rules(p) });
-    // allowUnsandboxedCommands false: no `dangerouslyDisableSandbox` retry
-    // around the sandbox (honored from a `--settings` file, CC 2.1.312).
+    s["permissions"] = json!({ "allow": allow_rules(p), "deny": deny_rules(p) });
+    // Layer 3, allowUnsandboxedCommands false: no `dangerouslyDisableSandbox`
+    // retry, so Bash cannot step around the write-deny (honored from a
+    // `--settings` file, CC 2.1.312).
     s["sandbox"] = json!({
         "enabled": true,
         "autoAllowBashIfSandboxed": true,
         "allowUnsandboxedCommands": false,
         "network": { "allowUnixSockets": unix_sockets(p) },
+        "filesystem": { "denyWrite": deny_write(p) },
     });
     s["remoteControlAtStartup"] = json!(false);
     s
@@ -499,5 +574,112 @@ mod tests {
         assert_eq!(back, settings(&p));
         // A second write of the same generation replaces the file.
         assert_eq!(write_settings(&home, &p).unwrap(), path);
+    }
+
+    #[test]
+    fn agent_cannot_widen_its_own_settings() {
+        with_cwd(|_, p| {
+            // The local source (hot-reloaded, also read from the main
+            // checkout) does not load; project stays on for CLAUDE.md.
+            let a = argv(&p, Path::new("/x/claude"), Path::new("/h/s.json"));
+            let i = a.iter().position(|x| x == "--setting-sources").unwrap();
+            assert_eq!(a[i + 1], "project");
+            // The file tools may not write the cwd's settings files.
+            let cwd = p.cwd.display().to_string();
+            let s = settings(&p);
+            let deny = s["permissions"]["deny"].as_array().unwrap();
+            for f in SETTINGS_FILES {
+                assert!(
+                    deny.contains(&json!(format!("Edit(/{}/{})", cwd, f))),
+                    "{}",
+                    f
+                );
+            }
+            // No unsandboxed retry around the write-deny.
+            assert_eq!(s["sandbox"]["allowUnsandboxedCommands"], false);
+            // Every rule is rooted at `/`, never at the settings source.
+            for r in deny {
+                assert!(r.as_str().unwrap().starts_with("Edit(//"), "{}", r);
+            }
+        });
+        // A relative cwd or `/` never reaches a rule.
+        let err = Profile::new(
+            Path::new(BIN),
+            Path::new("/s/e.sock"),
+            Path::new("/"),
+            "agt_1",
+            1,
+            SID,
+        )
+        .unwrap_err();
+        assert!(err.contains("must not be /"), "{}", err);
+        assert!(resolve_cwd(Path::new(".")).unwrap().is_absolute());
+    }
+
+    #[test]
+    fn agent_cannot_write_anything_under_its_claude_dir() {
+        with_cwd(|_, p| {
+            let cwd = p.cwd.display().to_string();
+            // File tools: every path under .claude (skills, agents, rules
+            // and the settings files).
+            let s = settings(&p);
+            let deny = s["permissions"]["deny"].as_array().unwrap();
+            assert!(deny.contains(&json!(format!("Edit(/{}/.claude/**)", cwd))));
+            // Sandboxed Bash: the directory itself, so a rename or a symlink
+            // in its place is refused too, not only writes to the files.
+            assert_eq!(
+                s["sandbox"]["filesystem"]["denyWrite"],
+                json!([
+                    "/b/Application Support/c9/bin",
+                    "/b/Application Support/c9/spawn",
+                    format!("{}/.claude", cwd)
+                ])
+            );
+        });
+    }
+
+    #[test]
+    fn settings_writes_are_blocked_in_three_layers() {
+        // A cwd with a space, below a symlink: every rule names the realpath.
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().join("my repo");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, t.path().join("ln")).unwrap();
+        let p = p_in(&t.path().join("ln"));
+        let cwd = real.canonicalize().unwrap().display().to_string();
+        let s: Value =
+            serde_json::from_str(&serde_json::to_string(&settings(&p)).unwrap()).unwrap();
+
+        // Layer 1: permissions.deny.
+        assert_eq!(
+            s["permissions"]["deny"],
+            json!([
+                "Edit(//b/Application Support/c9/bin/**)",
+                "Edit(//b/Application Support/c9/spawn/**)",
+                format!("Edit(/{}/.claude/settings.json)", cwd),
+                format!("Edit(/{}/.claude/settings.local.json)", cwd),
+                format!("Edit(/{}/.claude/**)", cwd),
+            ])
+        );
+        // Layer 2: sandbox.filesystem.denyWrite, the same places.
+        let dw = s["sandbox"]["filesystem"]["denyWrite"].as_array().unwrap();
+        assert!(dw.contains(&json!(format!("{}/.claude", cwd))));
+        for f in SETTINGS_FILES {
+            let file = format!("{}/{}", cwd, f);
+            assert!(
+                dw.iter()
+                    .any(|d| file.starts_with(&format!("{}/", d.as_str().unwrap()))),
+                "{}",
+                f
+            );
+        }
+        // Layer 3: no unsandboxed retry, with the sandbox on.
+        assert_eq!(s["sandbox"]["enabled"], true);
+        assert_eq!(s["sandbox"]["allowUnsandboxedCommands"], false);
+        // The allow list does not reopen any of it.
+        assert_eq!(
+            s["permissions"]["allow"],
+            json!([format!("Bash({}:*)", BIN)])
+        );
     }
 }
