@@ -361,7 +361,10 @@ fn configure(conn: &Connection) -> Result<(), String> {
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(format!("Failed to enable WAL: journal_mode is {}", mode));
     }
-    conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")
+    // FULL, not NORMAL: in WAL mode NORMAL skips the fsync on commit, so a
+    // power loss could drop events that were already broadcast, and the
+    // next boot would hand their seqs to new events in the same epoch.
+    conn.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;")
         .map_err(|e| format!("Failed to set db pragmas: {}", e))?;
     conn.busy_timeout(BUSY_TIMEOUT)
         .map_err(|e| format!("Failed to set busy_timeout: {}", e))
@@ -553,6 +556,12 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
+        let sync: i64 = db
+            .writer()
+            .call_blocking(|c| c.query_row("PRAGMA synchronous", [], |r| r.get(0)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(sync, 2, "the writer syncs every commit (FULL)");
         let perm = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(perm(&db_path(&h)), 0o600);
         assert_eq!(perm(&backups_dir(&h)), 0o700);
