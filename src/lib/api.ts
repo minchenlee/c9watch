@@ -123,6 +123,11 @@ export interface ServerInfo {
 	port: number;
 	localIp: string;
 	wsUrl: string;
+	/** False: port 9210 accepts connections from this Mac only. */
+	lanEnabled: boolean;
+	bind: 'loopback' | 'lan';
+	/** This Mac's interface IPs; empty unless LAN is on. */
+	lanAddresses: string[];
 }
 
 export async function getServerInfo(): Promise<ServerInfo> {

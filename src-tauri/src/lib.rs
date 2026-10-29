@@ -20,6 +20,8 @@ pub mod notifications;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod polling;
 #[cfg(all(not(mobile), feature = "gui"))]
+pub mod remote_access;
+#[cfg(all(not(mobile), feature = "gui"))]
 pub mod subscription_usage;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod web_server;
@@ -667,19 +669,48 @@ async fn show_main_window(app: AppHandle) -> Result<(), String> {
 pub struct ServerInfo {
     pub token: String,
     pub port: u16,
+    /// The address a phone uses: the default-route IP in LAN mode,
+    /// `127.0.0.1` otherwise.
     pub local_ip: String,
     pub ws_url: String,
+    pub lan_enabled: bool,
+    /// `"loopback"` or `"lan"`.
+    pub bind: &'static str,
+    /// This Mac's interface IPs, read now. Empty unless LAN is on.
+    pub lan_addresses: Vec<String>,
+}
+
+#[cfg(all(not(mobile), feature = "gui"))]
+fn server_info(server: &web_server::WsServer) -> ServerInfo {
+    let lan_enabled = server.remote().lan_enabled;
+    let (local_ip, lan_addresses) = if lan_enabled {
+        let ips = remote_access::local_interface_ips()
+            .into_iter()
+            .map(|ip| ip.to_string())
+            .collect();
+        (auth::get_local_ip(), ips)
+    } else {
+        ("127.0.0.1".to_string(), Vec::new())
+    };
+    let token = server.state().auth_token.clone();
+    let port = server.port();
+    ServerInfo {
+        ws_url: format!("ws://{}:{}/ws?token={}", local_ip, port, token),
+        token,
+        port,
+        local_ip,
+        lan_enabled,
+        bind: if lan_enabled { "lan" } else { "loopback" },
+        lan_addresses,
+    }
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
-async fn get_server_info(info: tauri::State<'_, ServerInfo>) -> Result<ServerInfo, String> {
-    Ok(ServerInfo {
-        token: info.token.clone(),
-        port: info.port,
-        local_ip: info.local_ip.clone(),
-        ws_url: info.ws_url.clone(),
-    })
+async fn get_server_info(
+    server: tauri::State<'_, Arc<web_server::WsServer>>,
+) -> Result<ServerInfo, String> {
+    Ok(server_info(&server))
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -728,36 +759,35 @@ pub fn run() {
             notifications::initialize(app.handle()).map_err(std::io::Error::other)?;
             // ── WebSocket server ────────────────────────────────
             let token = auth::generate_token();
-            let local_ip = auth::get_local_ip();
             let port = web_server::WS_PORT;
-
-            let ws_url = format!("ws://{}:{}/ws?token={}", local_ip, port, token);
-
-            debug_log::log_info(&format!("WS server on port {}", port));
 
             let (sessions_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
             let (notifications_tx, _nrx) = tokio::sync::broadcast::channel::<String>(16);
-
-            let server_info = ServerInfo {
-                token: token.clone(),
-                port,
-                local_ip: local_ip.clone(),
-                ws_url,
-            };
-            app.manage(server_info);
 
             // ── Shared detector state ───────────────────────────
             let detector_state: Arc<Mutex<session::DetectorState>> =
                 Arc::new(Mutex::new(session::DetectorState::new()));
             app.manage(detector_state.clone());
 
-            let ws_state = Arc::new(web_server::WsState {
-                auth_token: token,
-                sessions_tx: sessions_tx.clone(),
-                notifications_tx: notifications_tx.clone(),
-                detector: detector_state.clone(),
+            let ws_state = Arc::new(web_server::WsState::new(
+                token,
+                sessions_tx.clone(),
+                notifications_tx.clone(),
+                detector_state.clone(),
+            ));
+            let remote_path = app
+                .path()
+                .app_config_dir()
+                .map_err(std::io::Error::other)?
+                .join(remote_access::FILE_NAME);
+            let remote = remote_access::load(&remote_path);
+            let ws_server = Arc::new(web_server::WsServer::new(ws_state, port, remote_path));
+            app.manage(ws_server.clone());
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = ws_server.apply(remote).await {
+                    debug_log::log_error(&format!("[ws-server] {}", e));
+                }
             });
-            tauri::async_runtime::spawn(web_server::start_server(ws_state));
             app.manage(polling::LatestDiagnostics::default());
 
             // ── Polling loop ────────────────────────────────────

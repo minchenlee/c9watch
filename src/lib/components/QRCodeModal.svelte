@@ -15,6 +15,7 @@
 	onMount(async () => {
 		try {
 			info = await getServerInfo();
+			if (!info.lanEnabled) return;
 			// QR encodes an HTTP URL so phone camera opens the browser directly
 			// In production, the axum server on port 9210 serves the frontend files
 			pageUrl = `http://${info.localIp}:${info.port}/?token=${info.token}`;
@@ -90,6 +91,11 @@
 			<div class="error">{error}</div>
 		{:else if !info}
 			<div class="loading">Loading server info...</div>
+		{:else if !info.lanEnabled}
+			<div class="instructions remote-off">
+				<p class="remote-off-title">Remote access is off. This Mac only accepts connections from itself.</p>
+				<p>To use c9watch from another computer, forward the port over SSH: <code>ssh -L 9210:127.0.0.1:9210 &lt;this-mac&gt;</code>, then open <code>localhost:9210</code> in a browser there.</p>
+			</div>
 		{:else}
 			<div class="qr-container">
 				<img src={qrDataUrl} alt="QR Code" class="qr-image" />
@@ -258,6 +264,20 @@
 		font-size: 12px;
 		color: var(--text-muted);
 		line-height: 1.6;
+	}
+
+	.remote-off {
+		gap: var(--space-md);
+	}
+
+	.remote-off .remote-off-title {
+		color: var(--text-primary);
+	}
+
+	.remote-off code {
+		font-family: var(--font-mono);
+		color: var(--text-primary);
+		word-break: break-all;
 	}
 
 	.loading, .error {

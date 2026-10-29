@@ -1,17 +1,22 @@
+use crate::remote_access::{self, RemoteAccess, Transport};
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
+        ConnectInfo, Query, Request, State,
     },
     http::{header, StatusCode},
+    middleware::Next,
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
-use tokio::sync::broadcast;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+use tokio::sync::{broadcast, oneshot, watch};
 
 /// Embed the SvelteKit build output into the binary
 #[derive(Embed)]
@@ -29,6 +34,34 @@ pub struct WsState {
     /// The desktop app's detector, shared so stop resolves its target from
     /// the same detection the app shows.
     pub detector: Arc<Mutex<crate::session::DetectorState>>,
+    /// The remote-access policy the listeners run under now.
+    pub remote: RwLock<RemoteAccess>,
+    /// Bumped on every policy change. Each open socket closes when it
+    /// changes; the client reconnects under the new policy.
+    pub epoch: watch::Sender<u64>,
+}
+
+impl WsState {
+    pub fn new(
+        auth_token: String,
+        sessions_tx: broadcast::Sender<String>,
+        notifications_tx: broadcast::Sender<String>,
+        detector: Arc<Mutex<crate::session::DetectorState>>,
+    ) -> Self {
+        Self {
+            auth_token,
+            sessions_tx,
+            notifications_tx,
+            detector,
+            remote: RwLock::new(RemoteAccess::default()),
+            epoch: watch::channel(0).0,
+        }
+    }
+
+    fn lan_enabled(&self) -> bool {
+        // A poisoned lock fails closed: loopback only.
+        self.remote.read().map(|r| r.lan_enabled).unwrap_or(false)
+    }
 }
 
 // ── Protocol types ──────────────────────────────────────────────────
@@ -127,27 +160,185 @@ enum ServerMsg {
 
 // ── Server entrypoint ───────────────────────────────────────────────
 
-/// Start the axum WebSocket server (call from tauri::async_runtime::spawn)
-pub async fn start_server(state: Arc<WsState>) {
-    let app = Router::new()
+fn router(state: Arc<WsState>) -> Router {
+    Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health))
         .route("/info", get(info))
         .fallback(get(serve_static_fallback))
-        .with_state(state);
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            peer_guard,
+        ))
+        .with_state(state)
+}
 
-    // [::] accepts both IPv4 and IPv6 (localhost can resolve to ::1)
-    let addr = format!("[::]:{}", WS_PORT);
-    crate::debug_log::log_info(&format!("[ws-server] Listening on {}", addr));
+/// Serve one bound listener until `shutdown` resolves. Taking a bound
+/// listener (not an address) lets tests bind port 0.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    state: Arc<WsState>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+    {
+        crate::debug_log::log_error(&format!("[ws-server] Error: {}", e));
+    }
+}
 
-    match tokio::net::TcpListener::bind(&addr).await {
-        Ok(listener) => {
-            if let Err(e) = axum::serve(listener, app).await {
-                crate::debug_log::log_error(&format!("[ws-server] Error: {}", e));
+/// A peer may connect when it is loopback, or when LAN access is on.
+fn peer_allowed(lan_enabled: bool, peer: IpAddr) -> bool {
+    lan_enabled || remote_access::is_loopback_peer(peer)
+}
+
+/// Rejects non-loopback peers while LAN access is off. The listeners are
+/// loopback-only then anyway; this also covers a keep-alive connection that
+/// a LAN listener accepted before LAN was turned off.
+async fn peer_guard(
+    State(state): State<Arc<WsState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    if peer_allowed(state.lan_enabled(), peer.ip()) {
+        next.run(request).await
+    } else {
+        (StatusCode::FORBIDDEN, "Remote access is off").into_response()
+    }
+}
+
+/// How long a stopping listener may take to finish its connections before
+/// its task is aborted.
+const STOP_GRACE: Duration = Duration::from_secs(2);
+
+struct Listening {
+    addr: SocketAddr,
+    shutdown: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Owns the WS listeners and swaps them when the remote-access policy
+/// changes.
+pub struct WsServer {
+    state: Arc<WsState>,
+    port: u16,
+    config_path: PathBuf,
+    listening: tokio::sync::Mutex<Vec<Listening>>,
+}
+
+impl WsServer {
+    pub fn new(state: Arc<WsState>, port: u16, config_path: PathBuf) -> Self {
+        Self {
+            state,
+            port,
+            config_path,
+            listening: tokio::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn state(&self) -> &Arc<WsState> {
+        &self.state
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.config_path
+    }
+
+    /// The current policy.
+    pub fn remote(&self) -> RemoteAccess {
+        self.state
+            .remote
+            .read()
+            .map(|r| r.clone())
+            .unwrap_or_default()
+    }
+
+    /// The addresses bound now.
+    pub async fn bound(&self) -> Vec<SocketAddr> {
+        self.listening.lock().await.iter().map(|l| l.addr).collect()
+    }
+
+    /// Run under `remote`: publish the policy, close every open socket, stop
+    /// the old listeners, then bind the new ones. Returns the bound
+    /// addresses. Fails when the first address of the plan cannot be bound;
+    /// nothing is listening then.
+    pub async fn apply(&self, remote: RemoteAccess) -> Result<Vec<SocketAddr>, String> {
+        let mut listening = self.listening.lock().await;
+        let plan = remote_access::bind_plan(&remote, self.port);
+        // Policy first, so the peer check rejects stale LAN connections from
+        // here on; then the epoch, so open sockets close.
+        if let Ok(mut current) = self.state.remote.write() {
+            *current = remote;
+        }
+        self.state.epoch.send_modify(|e| *e = e.wrapping_add(1));
+        for old in listening.drain(..) {
+            stop_listener(old).await;
+        }
+        for (i, addr) in plan.addrs.iter().enumerate() {
+            match bind_with_retry(*addr).await {
+                Ok(listener) => {
+                    let addr = listener.local_addr().unwrap_or(*addr);
+                    let (shutdown, rx) = oneshot::channel();
+                    let stopped = async {
+                        let _ = rx.await;
+                    };
+                    // A TLS transport would wrap the listener here.
+                    let task = match plan.transport {
+                        Transport::PlainWs => {
+                            tokio::spawn(serve(listener, Arc::clone(&self.state), stopped))
+                        }
+                    };
+                    crate::debug_log::log_info(&format!("[ws-server] Listening on {}", addr));
+                    listening.push(Listening {
+                        addr,
+                        shutdown,
+                        task,
+                    });
+                }
+                Err(e) if i == 0 => {
+                    return Err(format!("Failed to bind {}: {}", addr, e));
+                }
+                Err(e) => {
+                    crate::debug_log::log_info(&format!(
+                        "[ws-server] Optional listener {} not bound: {}",
+                        addr, e
+                    ));
+                }
             }
         }
-        Err(e) => {
-            crate::debug_log::log_error(&format!("[ws-server] Failed to bind {}: {}", addr, e));
+        Ok(listening.iter().map(|l| l.addr).collect())
+    }
+}
+
+async fn stop_listener(old: Listening) {
+    let Listening {
+        shutdown, mut task, ..
+    } = old;
+    let _ = shutdown.send(());
+    if tokio::time::timeout(STOP_GRACE, &mut task).await.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+/// A listener that was just stopped may hold the port for a moment, so an
+/// `EADDRINUSE` is retried briefly.
+async fn bind_with_retry(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let mut attempts = 0;
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempts < 10 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            result => return result,
         }
     }
 }
@@ -210,10 +401,11 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(params): Query<WsQuery>,
     State(state): State<Arc<WsState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> axum::response::Response {
     match &params.token {
         Some(token) if token == &state.auth_token => ws
-            .on_upgrade(move |socket| handle_socket(socket, state))
+            .on_upgrade(move |socket| handle_socket(socket, state, peer.ip()))
             .into_response(),
         _ => (
             axum::http::StatusCode::UNAUTHORIZED,
@@ -223,7 +415,19 @@ async fn ws_handler(
     }
 }
 
-async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
+/// Close code sent when the remote-access policy changes (1012, "service
+/// restart"); the client reconnects.
+const CLOSE_POLICY_CHANGED: u16 = 1012;
+
+async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>, peer: IpAddr) {
+    // Subscribe before re-checking the policy: a change that lands between
+    // the HTTP check and here either fires `changed()` or is already visible
+    // to the re-check.
+    let mut epoch_rx = state.epoch.subscribe();
+    if !peer_allowed(state.lan_enabled(), peer) {
+        let _ = socket.send(policy_changed_close()).await;
+        return;
+    }
     crate::debug_log::log_info("[ws-server] Client connected");
     let mut sessions_rx = state.sessions_tx.subscribe();
     let mut notifications_rx = state.notifications_tx.subscribe();
@@ -234,6 +438,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
 
     loop {
         tokio::select! {
+            _ = epoch_rx.changed() => {
+                let _ = socket.send(policy_changed_close()).await;
+                break;
+            }
             // Incoming client message
             msg = socket.recv() => {
                 match msg {
@@ -350,6 +558,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
         handle.abort();
     }
     crate::debug_log::log_info("[ws-server] Client disconnected");
+}
+
+fn policy_changed_close() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: CLOSE_POLICY_CHANGED,
+        reason: "remote access changed".into(),
+    }))
 }
 
 // ── Message dispatch ────────────────────────────────────────────────
@@ -708,5 +923,88 @@ mod protocol_tests {
             serde_json::from_str(&response_json(&reply, Some(1))).unwrap();
         assert_eq!(value["type"], "sessions");
         assert_eq!(value["data"], serde_json::json!([session]));
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+    use crate::session::source::{
+        DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource,
+    };
+    use crate::session::{BackendMode, DetectorState};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct EmptySource;
+
+    impl SessionSource for EmptySource {
+        fn detect(
+            &mut self,
+        ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
+            Ok((Vec::new(), DetectionDiagnostics::default()))
+        }
+        fn backend_name(&self) -> &'static str {
+            "empty"
+        }
+    }
+
+    pub(super) fn test_server(dir: &std::path::Path) -> WsServer {
+        let detector = Arc::new(Mutex::new(DetectorState::for_test(
+            Box::new(EmptySource),
+            BackendMode::ForceCli,
+        )));
+        let state = Arc::new(WsState::new(
+            "test-token".into(),
+            broadcast::channel(4).0,
+            broadcast::channel(4).0,
+            detector,
+        ));
+        // Port 0: each listener gets a free port.
+        WsServer::new(state, 0, dir.join(remote_access::FILE_NAME))
+    }
+
+    async fn health(addr: SocketAddr) -> std::io::Result<String> {
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).await?;
+        Ok(reply)
+    }
+
+    #[test]
+    fn non_loopback_peers_need_lan() {
+        let lan_peer: IpAddr = "192.168.1.20".parse().unwrap();
+        assert!(!peer_allowed(false, lan_peer));
+        assert!(peer_allowed(true, lan_peer));
+        assert!(peer_allowed(false, "::ffff:127.0.0.1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn default_policy_serves_on_loopback_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = test_server(dir.path());
+        let bound = server.apply(RemoteAccess::default()).await.unwrap();
+        assert!(!bound.is_empty());
+        assert!(bound.iter().all(|a| a.ip().is_loopback()), "{bound:?}");
+        let reply = health(bound[0]).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        assert!(reply.ends_with("ok"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn apply_replaces_the_old_listeners() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = test_server(dir.path());
+        let first = server.apply(RemoteAccess::default()).await.unwrap();
+        let epoch = *server.state().epoch.borrow();
+        let second = server.apply(RemoteAccess::default()).await.unwrap();
+        assert_eq!(*server.state().epoch.borrow(), epoch + 1);
+        assert_eq!(server.bound().await, second);
+        for old in first.iter().filter(|a| !second.contains(a)) {
+            assert!(health(*old).await.is_err(), "{old} still accepts");
+        }
+        assert!(health(second[0]).await.is_ok());
     }
 }
