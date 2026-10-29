@@ -27,6 +27,37 @@ pub struct RemoteAccess {
     pub extra_allowed_hosts: Vec<String>,
 }
 
+/// Most extra hosts a user can add.
+pub const MAX_EXTRA_HOSTS: usize = 16;
+
+/// Cleans the extra allowed hosts: trims and lowercases each entry, drops
+/// empty lines and duplicates. Rejects anything that is not a bare
+/// `host` or `host:port` (no scheme, path, user info or spaces).
+pub fn normalize_hosts(hosts: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in hosts {
+        let host = raw.trim().to_ascii_lowercase();
+        if host.is_empty() || out.contains(&host) {
+            continue;
+        }
+        let bad = host.len() > 260
+            || host
+                .chars()
+                .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')));
+        if bad {
+            return Err(format!(
+                "Not a host name: {:?}. Use a bare host or host:port, one per line.",
+                raw.trim()
+            ));
+        }
+        out.push(host);
+    }
+    if out.len() > MAX_EXTRA_HOSTS {
+        return Err(format!("At most {MAX_EXTRA_HOSTS} extra hosts"));
+    }
+    Ok(out)
+}
+
 /// How a listener carries the WebSocket protocol.
 ///
 /// Only plain `ws` exists today. LAN mode sends traffic in clear text, which
@@ -254,6 +285,37 @@ mod tests {
         assert_eq!(load(&path), RemoteAccess::default());
         std::fs::write(&path, br#"{"lanEnabled":true}"#).unwrap();
         assert!(load(&path).lan_enabled, "missing fields take defaults");
+    }
+
+    #[test]
+    fn hosts_are_trimmed_lowercased_and_deduplicated() {
+        let hosts = [
+            " Mac.Example.NET ",
+            "",
+            "mac.example.net",
+            "box.lan:8000",
+            "[::1]:9210",
+        ]
+        .map(String::from);
+        assert_eq!(
+            normalize_hosts(&hosts).unwrap(),
+            ["mac.example.net", "box.lan:8000", "[::1]:9210"]
+        );
+    }
+
+    #[test]
+    fn hosts_with_a_scheme_path_or_space_are_rejected() {
+        for bad in [
+            "http://mac.lan",
+            "mac.lan/x",
+            "user@mac.lan",
+            "mac lan",
+            "*.lan",
+        ] {
+            assert!(normalize_hosts(&[bad.to_string()]).is_err(), "{bad}");
+        }
+        let many: Vec<String> = (0..=MAX_EXTRA_HOSTS).map(|i| format!("h{i}.lan")).collect();
+        assert!(normalize_hosts(&many).is_err());
     }
 
     #[test]

@@ -317,6 +317,28 @@ impl WsServer {
     }
 }
 
+impl WsServer {
+    /// Change the policy at runtime: clean it, write `remote-access.json`,
+    /// then rebind. When the new policy cannot be bound, the old file and
+    /// listeners come back and the error is returned.
+    pub async fn update(&self, remote: RemoteAccess) -> Result<RemoteAccess, String> {
+        let remote = RemoteAccess {
+            extra_allowed_hosts: remote_access::normalize_hosts(&remote.extra_allowed_hosts)?,
+            ..remote
+        };
+        let previous = self.remote();
+        remote_access::save(&self.config_path, &remote)?;
+        if let Err(e) = self.apply(remote.clone()).await {
+            let _ = remote_access::save(&self.config_path, &previous);
+            if let Err(restore) = self.apply(previous).await {
+                crate::debug_log::log_error(&format!("[ws-server] {}", restore));
+            }
+            return Err(e);
+        }
+        Ok(remote)
+    }
+}
+
 async fn stop_listener(old: Listening) {
     let Listening {
         shutdown, mut task, ..
@@ -991,6 +1013,57 @@ mod server_tests {
         let reply = health(bound[0]).await.unwrap();
         assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
         assert!(reply.ends_with("ok"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn policy_change_closes_open_sockets() {
+        use futures_util::StreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let server = test_server(dir.path());
+        let bound = server.apply(RemoteAccess::default()).await.unwrap();
+        let url = format!("ws://{}/ws?token=test-token", bound[0]);
+        let (mut client, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+        server.update(RemoteAccess::default()).await.unwrap();
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(msg) = client.next().await {
+                if let Ok(tokio_tungstenite::tungstenite::Message::Close(frame)) = msg {
+                    return frame;
+                }
+            }
+            None
+        })
+        .await
+        .expect("socket was not closed");
+        let frame = frame.expect("close frame");
+        assert_eq!(u16::from(frame.code), CLOSE_POLICY_CHANGED);
+    }
+
+    #[tokio::test]
+    async fn update_writes_the_file_and_rejects_bad_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = test_server(dir.path());
+        server.apply(RemoteAccess::default()).await.unwrap();
+        let saved = server
+            .update(RemoteAccess {
+                extra_allowed_hosts: vec![" Box.LAN ".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved.extra_allowed_hosts, ["box.lan"]);
+        assert_eq!(remote_access::load(server.config_path()), saved);
+        assert_eq!(server.remote(), saved);
+
+        let epoch = *server.state().epoch.borrow();
+        let bad = RemoteAccess {
+            extra_allowed_hosts: vec!["http://evil".into()],
+            ..Default::default()
+        };
+        assert!(server.update(bad).await.is_err());
+        assert_eq!(*server.state().epoch.borrow(), epoch, "nothing rebinds");
+        assert_eq!(remote_access::load(server.config_path()), saved);
     }
 
     #[tokio::test]

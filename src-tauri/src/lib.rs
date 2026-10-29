@@ -715,6 +715,25 @@ async fn get_server_info(
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
+async fn get_remote_access(
+    server: tauri::State<'_, Arc<web_server::WsServer>>,
+) -> Result<remote_access::RemoteAccess, String> {
+    Ok(server.remote())
+}
+
+/// Save the remote-access settings and rebind the WS server. Open sockets
+/// close; turning LAN off drops LAN clients.
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+async fn set_remote_access(
+    server: tauri::State<'_, Arc<web_server::WsServer>>,
+    remote: remote_access::RemoteAccess,
+) -> Result<remote_access::RemoteAccess, String> {
+    server.update(remote).await
+}
+
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
 async fn get_debug_logs() -> Result<Vec<debug_log::LogEntry>, String> {
     Ok(debug_log::get_logs())
 }
@@ -979,6 +998,8 @@ pub fn run() {
             rename_session,
             show_main_window,
             get_server_info,
+            get_remote_access,
+            set_remote_access,
             get_debug_logs
         ]);
 

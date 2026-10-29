@@ -135,6 +135,26 @@ export async function getServerInfo(): Promise<ServerInfo> {
 }
 
 /**
+ * Remote-access settings (desktop/Tauri only), stored in remote-access.json.
+ */
+export interface RemoteAccess {
+	/** Bind every interface instead of loopback only. */
+	lanEnabled: boolean;
+	allowConversation: boolean;
+	allowOpen: boolean;
+	extraAllowedHosts: string[];
+}
+
+export async function getRemoteAccess(): Promise<RemoteAccess> {
+	return await invoke<RemoteAccess>('get_remote_access');
+}
+
+/** Saves the settings and rebinds the server; open WS clients reconnect. */
+export async function setRemoteAccess(remote: RemoteAccess): Promise<RemoteAccess> {
+	return await invoke<RemoteAccess>('set_remote_access', { remote });
+}
+
+/**
  * Get all inactive session history from ~/.claude/history.jsonl
  * (Desktop/Tauri only — returns empty array on mobile/browser)
  */

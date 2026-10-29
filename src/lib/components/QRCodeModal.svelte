@@ -94,6 +94,7 @@
 		{:else if !info.lanEnabled}
 			<div class="instructions remote-off">
 				<p class="remote-off-title">Remote access is off. This Mac only accepts connections from itself.</p>
+				<p>To connect a phone on this network, turn on LAN access in Settings → Remote access.</p>
 				<p>To use c9watch from another computer, forward the port over SSH: <code>ssh -L 9210:127.0.0.1:9210 &lt;this-mac&gt;</code>, then open <code>localhost:9210</code> in a browser there.</p>
 			</div>
 		{:else}
