@@ -14,13 +14,42 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
-/// Name of the temp socket `bind_private` binds before renaming onto `path`.
-fn bind_tmp_path(path: &Path) -> PathBuf {
+/// Prefix of the temp sockets `bind_private` binds before renaming.
+fn bind_tmp_prefix(path: &Path) -> String {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(super::home::ENGINE_SOCK_NAME);
-    path.with_file_name(format!(".{}.tmp-{}", name, std::process::id()))
+    format!(".{}.tmp-", name)
+}
+
+/// Name of the temp socket `bind_private` binds before renaming onto `path`.
+fn bind_tmp_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!("{}{}", bind_tmp_prefix(path), std::process::id()))
+}
+
+/// Remove temp sockets that engines which died between bind and rename left
+/// next to `path`. Only the lock holder binds, so under the lock every one of
+/// them is a leftover. Only sockets owned by our euid are touched.
+fn remove_stale_tmp_sockets(path: &Path) {
+    let (Some(dir), prefix) = (path.parent(), bind_tmp_prefix(path)) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let me = super::peer::engine_uid();
+    for e in entries.flatten() {
+        if !e.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let p = e.path();
+        if std::fs::symlink_metadata(&p)
+            .is_ok_and(|md| md.file_type().is_socket() && md.uid() == me)
+        {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 /// The socket this engine bound. Dropping it unlinks the socket, but only
@@ -45,6 +74,11 @@ impl OwnedSocket {
     }
 
     /// Unlink the socket if it is still ours. Returns whether it unlinked.
+    ///
+    /// The check and the unlink are two path operations, so a socket swapped
+    /// in between them would be unlinked. The home is 0700 and its parents
+    /// are trusted (`fsutil`), so only our own uid can do that, and the
+    /// engine lock keeps our own engines from racing here. We accept that.
     pub fn remove(&self) -> bool {
         self.is_ours() && std::fs::remove_file(&self.path).is_ok()
     }
@@ -72,6 +106,7 @@ pub fn bind_private(
     check_sun_path(&tmp)?;
     // The temp name carries our pid, so a socket there is our own leftover.
     let _ = std::fs::remove_file(&tmp);
+    remove_stale_tmp_sockets(path);
     let listener = UnixListener::bind(&tmp)
         .map_err(|e| format!("Failed to bind Unix socket {:?}: {}", tmp, e))?;
     let res = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
@@ -203,6 +238,24 @@ mod tests {
         let (_l, owned) = bind_private(&path, &lock).unwrap();
         assert!(owned.is_ours());
         std::os::unix::net::UnixStream::connect(&path).unwrap();
+    }
+
+    #[test]
+    fn stale_temp_sockets_of_dead_engines_are_removed() {
+        let t = tempfile::tempdir().unwrap();
+        let path = sock_path(t.path());
+        let stale = t
+            .path()
+            .join(format!("{}{}", bind_tmp_prefix(&path), 999_999));
+        drop(UnixListener::bind(&stale).unwrap());
+        // A regular file with the prefix is not a socket and stays.
+        let file = t.path().join(format!("{}x", bind_tmp_prefix(&path)));
+        std::fs::write(&file, b"").unwrap();
+
+        let lock = acquire_engine_lock(&lock_path(t.path())).unwrap();
+        let (_l, _owned) = bind_private(&path, &lock).unwrap();
+        assert!(!stale.exists());
+        assert!(file.exists());
     }
 
     #[test]
