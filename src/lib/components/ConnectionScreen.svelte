@@ -24,6 +24,14 @@
 	const CONNECT_ERROR =
 		'Could not connect. Check that remote access is on and the code has not expired.';
 	const LOAD_ERROR = 'Connected, but the session list did not load. Try again.';
+	/**
+	 * A page served by c9watch can only open a socket to the desktop that
+	 * served it: its CSP allows no other host, and the other desktop refuses
+	 * this page's Origin. The mode still works from the dev server.
+	 */
+	function otherHostError(host: string): string {
+		return `Could not connect to ${host}. This page can only connect to the desktop that served it; the browser blocks other hosts. Open http://${host}/ on this device instead.`;
+	}
 
 	/** This page's own server, as "host:port". The socket goes to the server that served the page. */
 	function pageHost(): string {
@@ -78,7 +86,7 @@
 	 * scanned twice, a code typed again after a failed load) must not cost a
 	 * working pairing. A rejected code never clears the token (close 4403).
 	 */
-	async function doConnect(host: string, auth: WsAuth) {
+	async function doConnect(host: string, auth: WsAuth, connectError = CONNECT_ERROR) {
 		connecting = true;
 		inputError = '';
 		const stored = getStoredConnection();
@@ -88,7 +96,7 @@
 		}
 		if (result === 'auth') result = await attempt(host, auth);
 		if (result === 'ok') return;
-		inputError = result === 'load' ? LOAD_ERROR : CONNECT_ERROR;
+		inputError = result === 'load' ? LOAD_ERROR : connectError;
 		pairAgain = !getStoredConnection() && !!getStoredHost();
 	}
 
@@ -116,7 +124,7 @@
 			inputError = 'A pairing code is 8 letters and digits, as shown on the desktop.';
 			return;
 		}
-		doConnect(host, { code });
+		doConnect(host, { code }, host === pageHost() ? CONNECT_ERROR : otherHostError(host));
 	}
 
 	function show(next: 'choose' | 'code' | 'advanced') {
@@ -227,6 +235,7 @@
 					autocapitalize="off"
 					spellcheck="false"
 				/>
+				<div class="hint">To use another desktop, open its page (<code>http://host:9210/</code>) on this device.</div>
 				<label class="input-label" for="adv-code-input">Pairing code</label>
 				<input
 					id="adv-code-input"

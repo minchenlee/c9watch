@@ -86,7 +86,14 @@ test('a pairing code never costs a stored token for the same host', () => {
   assert.match(connect, /'code' in auth && stored\?\.host === host/);
   assert.ok(connect.indexOf('{ token: stored.token }') < connect.indexOf('attempt(host, auth)'));
   // A failed first session list is not reported as a pairing failure.
-  assert.match(connection, /result === 'load' \? LOAD_ERROR : CONNECT_ERROR/);
+  assert.match(connection, /result === 'load' \? LOAD_ERROR : connectError/);
+});
+
+test('connecting to another host explains why it cannot work from this page', () => {
+  const advanced = connection.slice(connection.indexOf('function connectAdvanced'), connection.indexOf('function show('));
+  assert.match(advanced, /host === pageHost\(\) \? CONNECT_ERROR : otherHostError\(host\)/);
+  assert.match(connection, /can only connect to the desktop that served it/);
+  assert.match(connection, /Open http:\/\/\$\{host\}\/ on this device instead\./);
 });
 
 test('conversation and open capabilities are separate toggles that save through set_remote_access', () => {
