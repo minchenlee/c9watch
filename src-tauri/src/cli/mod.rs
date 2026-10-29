@@ -413,6 +413,9 @@ pub enum Commands {
 pub enum EngineAction {
     /// Stop the engine with SIGTERM and wait for a new one to answer hello
     Restart,
+    /// Print the dev GUI's daily shadow diff coverage (dev builds only)
+    #[cfg(c9_channel_dev)]
+    ShadowReport,
 }
 
 #[cfg(all(unix, feature = "engine"))]
@@ -487,6 +490,8 @@ pub fn run(cli: Cli) {
         Commands::Engine { action } => match action {
             None => engine_client::cmd_engine_run(),
             Some(EngineAction::Restart) => engine_client::cmd_engine_restart(cli.pretty),
+            #[cfg(c9_channel_dev)]
+            Some(EngineAction::ShadowReport) => engine_client::cmd_shadow_report(cli.pretty),
         },
         #[cfg(all(unix, feature = "engine"))]
         Commands::Api { method, params } => engine_client::cmd_api(&method, &params, cli.pretty),
@@ -1222,6 +1227,22 @@ mod dispatch_tests {
         assert_eq!((method.as_str(), params.as_str()), ("hello", "{}"));
         let cli = Cli::try_parse_from(["c9watch", "api", "x", r#"{"a":1}"#]).unwrap();
         assert!(matches!(cli.command, Commands::Api { params, .. } if params == r#"{"a":1}"#));
+    }
+
+    /// `engine shadow-report` exists only in dev channel builds (C1a-17).
+    #[cfg(all(unix, feature = "engine"))]
+    #[test]
+    fn shadow_report_only_in_dev_builds() {
+        let parsed = Cli::try_parse_from(["c9watch", "engine", "shadow-report"]);
+        #[cfg(c9_channel_dev)]
+        assert!(matches!(
+            parsed.unwrap().command,
+            Commands::Engine {
+                action: Some(EngineAction::ShadowReport)
+            }
+        ));
+        #[cfg(not(c9_channel_dev))]
+        assert!(parsed.is_err());
     }
 
     #[cfg(all(unix, feature = "engine"))]

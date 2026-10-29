@@ -6,8 +6,8 @@
 //!    opened, and the open db again before anything writes to it.
 //! 2. `PRAGMA quick_check`. A db that fails it (or is not a db at all) is
 //!    moved to `<home>/backups/corrupt-<ms>.db` and a new one is created,
-//!    which starts a new epoch (A:497). Observed agents are rebuilt from
-//!    provider data by detection (M3).
+//!    which starts a new epoch (A:497). Detection rebuilds the observed
+//!    agents from provider data on its next tick (`engine::detect`).
 //! 3. Migrations, each after a `VACUUM INTO` backup (see `migrate`).
 //! 4. This machine's row in `machines` (`is_self`), keyed by the machine
 //!    key id. A new self row is audited.
@@ -188,12 +188,18 @@ impl Db {
         conn.execute_batch("BEGIN").map_err(fail)?;
         let read = (|| {
             let seq = outbox::head(&conn)?;
-            let agents = agent_rows(&conn)?;
+            let agents = agent_rows(&conn, AgentFilter::All)?;
             Ok((seq, agents))
         })();
         conn.execute_batch("COMMIT").map_err(fail)?;
         let (seq, agents) = read.map_err(fail)?;
         Ok((self.cursor_at(seq), agents))
+    }
+
+    /// The `agents` rows that pass `filter`. Blocking (one short read).
+    pub fn agents(&self, filter: AgentFilter) -> Result<Vec<AgentRow>, String> {
+        let conn = self.reader()?;
+        agent_rows(&conn, filter).map_err(|e| format!("Failed to read agents: {}", e))
     }
 
     /// A new read-only connection. WAL lets readers run beside the writer.
@@ -290,30 +296,73 @@ where
     }
 }
 
-/// Every `agents` row. The columns are named, not `*`, so a schema change
-/// has to change `AgentRow`, and with it the c9p/1 contract.
-fn agent_rows(conn: &Connection) -> rusqlite::Result<Vec<AgentRow>> {
-    let mut st = conn.prepare(
-        "SELECT id, generation, mode, role, control, provider, provider_sid, source, \
-         created_by, gone_at, resume_count, interrupted_note_pending \
-         FROM agents ORDER BY id",
-    )?;
-    let rows = st.query_map([], |r| {
-        Ok(AgentRow {
-            id: r.get(0)?,
-            generation: r.get(1)?,
-            mode: r.get(2)?,
-            role: r.get(3)?,
-            control: r.get(4)?,
-            provider: r.get(5)?,
-            provider_sid: r.get(6)?,
-            source: r.get(7)?,
-            created_by: r.get(8)?,
-            gone_at: r.get(9)?,
-            resume_count: r.get(10)?,
-            interrupted_note_pending: r.get::<_, i64>(11)? != 0,
-        })
-    })?;
+/// Which `agents` rows a read returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentFilter {
+    /// Every row: gone, retired, failed and tombstones too.
+    All,
+    /// Not gone, and not retired or failed.
+    Live,
+    /// Rows whose session detection sees now (`session.list`).
+    Sessions,
+}
+
+impl AgentFilter {
+    fn sql(self) -> &'static str {
+        match self {
+            AgentFilter::All => "1",
+            AgentFilter::Live => {
+                "gone_at IS NULL AND (state IS NULL OR state NOT IN ('retired', 'failed'))"
+            }
+            AgentFilter::Sessions => "gone_at IS NULL AND session_key IS NOT NULL",
+        }
+    }
+}
+
+/// The `agents` columns of an `AgentRow`, in its field order. Named, not
+/// `*`, so a schema change has to change `AgentRow`, and with it the c9p/1
+/// contract.
+pub const AGENT_COLUMNS: &str = "id, generation, mode, role, control, provider, provider_sid, \
+     source, created_by, gone_at, resume_count, interrupted_note_pending, session_key, \
+     machine_id, state, status, cwd, name, pid, started_at, created_at, last_seen, parent_id";
+
+/// Read one row selected with `AGENT_COLUMNS`.
+pub fn agent_row(r: &rusqlite::Row) -> rusqlite::Result<AgentRow> {
+    Ok(AgentRow {
+        id: r.get(0)?,
+        generation: r.get(1)?,
+        mode: r.get(2)?,
+        role: r.get(3)?,
+        control: r.get(4)?,
+        provider: r.get(5)?,
+        provider_sid: r.get(6)?,
+        source: r.get(7)?,
+        created_by: r.get(8)?,
+        gone_at: r.get(9)?,
+        resume_count: r.get(10)?,
+        interrupted_note_pending: r.get::<_, i64>(11)? != 0,
+        session_key: r.get(12)?,
+        machine_id: r.get(13)?,
+        state: r.get(14)?,
+        status: r.get(15)?,
+        cwd: r.get(16)?,
+        name: r.get(17)?,
+        pid: r.get(18)?,
+        started_at: r.get(19)?,
+        created_at: r.get(20)?,
+        last_seen: r.get(21)?,
+        parent_id: r.get(22)?,
+    })
+}
+
+/// The `agents` rows that pass `filter`, in id (creation) order.
+pub fn agent_rows(conn: &Connection, filter: AgentFilter) -> rusqlite::Result<Vec<AgentRow>> {
+    let mut st = conn.prepare(&format!(
+        "SELECT {} FROM agents WHERE {} ORDER BY id",
+        AGENT_COLUMNS,
+        filter.sql()
+    ))?;
+    let rows = st.query_map([], agent_row)?;
     rows.collect()
 }
 
@@ -442,6 +491,21 @@ fn register_self(conn: &mut Connection, machine_id: &str) -> Result<(), String> 
     tx.commit().map_err(fail)
 }
 
+/// A new agent id, `agt_<ulid>`: 48 bits of unix ms, then 80 random bits,
+/// in Crockford base32. Ids sort by the ms they were made in.
+pub fn new_agent_id() -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let random: u128 = rand::random::<u128>() & ((1u128 << 80) - 1);
+    let v = ((now_ms().max(0) as u128 & ((1u128 << 48) - 1)) << 80) | random;
+    let mut id = String::with_capacity(30);
+    id.push_str("agt_");
+    // 26 digits of 5 bits cover 130 bits; the top two are always 0.
+    for i in 0..26 {
+        id.push(ALPHABET[((v >> (125 - 5 * i)) & 31) as usize] as char);
+    }
+    id
+}
+
 /// Unix time in ms.
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -527,6 +591,7 @@ mod tests {
                 "audit",
                 "dedupe",
                 "events",
+                "legacy_events",
                 "machines",
                 "meta",
                 "ops",
@@ -554,7 +619,18 @@ mod tests {
                 "created_by",
                 "gone_at",
                 "resume_count",
-                "interrupted_note_pending"
+                "interrupted_note_pending",
+                "session_key",
+                "machine_id",
+                "state",
+                "status",
+                "cwd",
+                "name",
+                "pid",
+                "started_at",
+                "created_at",
+                "last_seen",
+                "parent_id"
             ]
         );
     }
@@ -873,6 +949,17 @@ mod tests {
                 gone_at: None,
                 resume_count: 0,
                 interrupted_note_pending: false,
+                session_key: None,
+                machine_id: None,
+                state: None,
+                status: None,
+                cwd: None,
+                name: None,
+                pid: None,
+                started_at: None,
+                created_at: None,
+                last_seen: None,
+                parent_id: None,
             }
         );
         assert_eq!(db.check_cursor(&cur), Ok(1));

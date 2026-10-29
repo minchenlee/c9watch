@@ -36,6 +36,11 @@ pub mod cli;
 #[cfg(feature = "engine")]
 pub mod engine;
 
+// c9p/1 client side (wire types, engine home, blocking client). Not behind
+// the `engine` feature: the dev channel GUI reads the engine through it.
+#[cfg(all(unix, any(feature = "gui", feature = "engine")))]
+pub mod engine_proto;
+
 #[cfg(feature = "gui")]
 use actions::open_session as open_session_action;
 #[cfg(feature = "gui")]
@@ -757,6 +762,18 @@ async fn get_debug_logs() -> Result<Vec<debug_log::LogEntry>, String> {
     Ok(debug_log::get_logs())
 }
 
+/// `"dev"` or `"prod"`. A dev channel GUI skips the update check on launch,
+/// so a release never replaces a dogfood build (C1a-17).
+#[cfg(all(not(mobile), feature = "gui"))]
+#[tauri::command]
+fn get_build_channel() -> &'static str {
+    if cfg!(c9_channel_dev) {
+        "dev"
+    } else {
+        "prod"
+    }
+}
+
 // ── NSPanel definition for macOS popover ────────────────────────────
 #[cfg(all(target_os = "macos", feature = "gui"))]
 tauri_panel! {
@@ -1019,7 +1036,8 @@ pub fn run() {
             forget_paired_clients,
             get_remote_access,
             set_remote_access,
-            get_debug_logs
+            get_debug_logs,
+            get_build_channel
         ]);
 
     // Mobile: minimal shell (all communication via WebSocket from the frontend)

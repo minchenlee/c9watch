@@ -1,6 +1,8 @@
 // src-tauri/src/session/state.rs
 use super::owners::{global_provider_source_owners, ProviderSourceOwners};
-use super::source::{DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionSource};
+use super::source::{
+    DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionProvider, SessionSource,
+};
 use super::{create_session_source, mode_from_env, BackendMode};
 use crate::session::detector::LegacySessionSource;
 use crate::session::detector_cli::CliSessionSource;
@@ -95,6 +97,8 @@ pub struct DetectorState {
     now: Clock,
     probe_cli: CliProbe,
     make_source: SourceFactory,
+    /// Providers that did not answer the last `detect`.
+    failed: Vec<SessionProvider>,
 }
 
 impl DetectorState {
@@ -109,6 +113,7 @@ impl DetectorState {
             now: Box::new(Instant::now),
             probe_cli: Box::new(super::probe_claude_supports_agents_json),
             make_source: Box::new(backend_source),
+            failed: Vec::new(),
         }
     }
 
@@ -123,6 +128,17 @@ impl DetectorState {
         let cursor_result = self.provider_sources.detect_cursor();
         let pi_result = self.provider_sources.detect_pi();
         let opencode_sessions = self.provider_sources.detect_opencode();
+        self.failed.clear();
+        for (provider, answered) in [
+            (SessionProvider::ClaudeCode, claude_result.is_ok()),
+            (SessionProvider::Codex, codex_result.is_some()),
+            (SessionProvider::Cursor, cursor_result.is_some()),
+            (SessionProvider::Pi, pi_result.is_some()),
+        ] {
+            if !answered {
+                self.failed.push(provider);
+            }
+        }
         match &claude_result {
             Ok(_) => self.consecutive_failures = 0,
             Err(_) => {
@@ -139,6 +155,13 @@ impl DetectorState {
             pi_result,
             opencode_sessions,
         )
+    }
+
+    /// Providers that did not answer the last `detect`: an error, or a
+    /// source that is missing or could not start. OpenCode always answers.
+    /// A merged result without their sessions says nothing about them.
+    pub fn failed_providers(&self) -> &[SessionProvider] {
+        &self.failed
     }
 
     /// Auto mode on the legacy backend retries the CLI backend every
@@ -200,6 +223,7 @@ impl DetectorState {
             last_backend_check: Instant::now(),
             now: Box::new(Instant::now),
             probe_cli: Box::new(|| false),
+            failed: Vec::new(),
             make_source: Box::new(|cli| {
                 Box::new(TestSource {
                     name: if cli { "cli" } else { "legacy" },

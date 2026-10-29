@@ -27,6 +27,19 @@ pub enum SessionStatus {
     Connecting,
 }
 
+impl SessionStatus {
+    /// The snake_case name the engine stores in `agents.status` and sends on
+    /// c9p/1.
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            SessionStatus::Working => "working",
+            SessionStatus::NeedsAttention => "needs_attention",
+            SessionStatus::WaitingForInput => "waiting_for_input",
+            SessionStatus::Connecting => "connecting",
+        }
+    }
+}
+
 /// Analyzes session entries to determine the current status
 ///
 /// # Arguments

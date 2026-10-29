@@ -20,10 +20,20 @@ pub struct Migration {
 }
 
 /// Every migration, in order. Versions start at 1 and have no gaps.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("migrations/0001_init.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("migrations/0001_init.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("migrations/0002_detection.sql"),
+    },
+    Migration {
+        version: 3,
+        sql: include_str!("migrations/0003_legacy_import.sql"),
+    },
+];
 
 /// The schema version this engine writes.
 pub fn latest_version() -> u32 {
@@ -93,8 +103,9 @@ pub fn migrate(
                 have, m.version
             ));
         }
-        // Version 0 is an empty file: there is nothing to keep.
-        if have > 0 {
+        // A db that started at version 0 was an empty file: there is
+        // nothing to keep.
+        if start > 0 {
             backup(conn, &backups.join(format!("pre-{}.db", m.version)))?;
         }
         let tx = conn
@@ -136,19 +147,26 @@ fn backup(conn: &Connection, dest: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    const V2: Migration = Migration {
-        version: 2,
-        sql: "CREATE TABLE extra (x INTEGER) STRICT;",
-    };
+    /// A migration one past the newest, as a newer engine would ship it.
+    const NEXT_SQL: &str = "CREATE TABLE extra (x INTEGER) STRICT;";
 
-    fn two_step() -> Vec<Migration> {
-        vec![
-            Migration {
-                version: 1,
-                sql: MIGRATIONS[0].sql,
-            },
-            V2,
-        ]
+    /// `MIGRATIONS` plus one more step with `sql`.
+    fn plus_next(sql: &'static str) -> Vec<Migration> {
+        MIGRATIONS
+            .iter()
+            .map(|m| Migration {
+                version: m.version,
+                sql: m.sql,
+            })
+            .chain(std::iter::once(Migration {
+                version: latest_version() + 1,
+                sql,
+            }))
+            .collect()
+    }
+
+    fn next() -> u32 {
+        latest_version() + 1
     }
 
     #[test]
@@ -162,35 +180,61 @@ mod tests {
     fn fresh_db_migrates_without_backup() {
         let t = tempfile::tempdir().unwrap();
         let mut conn = Connection::open(t.path().join("e.db")).unwrap();
-        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), vec![1]);
+        let all: Vec<u32> = (1..=latest_version()).collect();
+        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), all);
         assert_eq!(user_version(&conn).unwrap(), latest_version());
-        assert!(!t.path().join("pre-1.db").exists());
+        // Not even between the steps of one run.
+        assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 1);
         // Idempotent.
         assert!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_version_1_db_moves_to_the_latest_and_keeps_its_rows() {
+        let t = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open(t.path().join("e.db")).unwrap();
+        migrate(&mut conn, &MIGRATIONS[..1], t.path()).unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, role, provider, source) \
+             VALUES ('agt_1', 'observed', 'claudeCode', 'detected')",
+            [],
+        )
+        .unwrap();
+        let later: Vec<u32> = (2..=latest_version()).collect();
+        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), later);
+        assert!(t.path().join("pre-2.db").exists());
+        assert!(t.path().join("pre-3.db").exists());
+        let (id, key): (String, Option<String>) = conn
+            .query_row("SELECT id, session_key FROM agents", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((id.as_str(), key), ("agt_1", None));
     }
 
     #[test]
     fn each_later_migration_backs_up_the_previous_version() {
         let t = tempfile::tempdir().unwrap();
         let mut conn = Connection::open(t.path().join("e.db")).unwrap();
-        migrate(&mut conn, &two_step()[..1], t.path()).unwrap();
+        migrate(&mut conn, MIGRATIONS, t.path()).unwrap();
         conn.execute(
             "INSERT INTO machines (id, label, is_self) VALUES ('k', 'me', 1)",
             [],
         )
         .unwrap();
 
-        assert_eq!(migrate(&mut conn, &two_step(), t.path()).unwrap(), vec![2]);
-        assert_eq!(user_version(&conn).unwrap(), 2);
+        let pre = t.path().join(format!("pre-{}.db", next()));
+        assert_eq!(
+            migrate(&mut conn, &plus_next(NEXT_SQL), t.path()).unwrap(),
+            vec![next()]
+        );
+        assert_eq!(user_version(&conn).unwrap(), next());
 
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(t.path().join("pre-2.db"))
-            .unwrap()
-            .permissions()
-            .mode();
+        let mode = std::fs::metadata(&pre).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        let backup = Connection::open(t.path().join("pre-2.db")).unwrap();
-        assert_eq!(user_version(&backup).unwrap(), 1);
+        let backup = Connection::open(&pre).unwrap();
+        assert_eq!(user_version(&backup).unwrap(), latest_version());
         let id: String = backup
             .query_row("SELECT id FROM machines", [], |r| r.get(0))
             .unwrap();
@@ -209,30 +253,22 @@ mod tests {
     fn stale_backup_file_is_replaced() {
         let t = tempfile::tempdir().unwrap();
         let mut conn = Connection::open(t.path().join("e.db")).unwrap();
-        migrate(&mut conn, &two_step()[..1], t.path()).unwrap();
-        std::fs::write(t.path().join("pre-2.db"), b"stale").unwrap();
-        migrate(&mut conn, &two_step(), t.path()).unwrap();
-        let backup = Connection::open(t.path().join("pre-2.db")).unwrap();
-        assert_eq!(user_version(&backup).unwrap(), 1);
+        migrate(&mut conn, MIGRATIONS, t.path()).unwrap();
+        let pre = t.path().join(format!("pre-{}.db", next()));
+        std::fs::write(&pre, b"stale").unwrap();
+        migrate(&mut conn, &plus_next(NEXT_SQL), t.path()).unwrap();
+        let backup = Connection::open(&pre).unwrap();
+        assert_eq!(user_version(&backup).unwrap(), latest_version());
     }
 
     #[test]
     fn failed_migration_rolls_back() {
         let t = tempfile::tempdir().unwrap();
         let mut conn = Connection::open(t.path().join("e.db")).unwrap();
-        let bad = [
-            Migration {
-                version: 1,
-                sql: MIGRATIONS[0].sql,
-            },
-            Migration {
-                version: 2,
-                sql: "CREATE TABLE half (x INTEGER); NOT SQL;",
-            },
-        ];
-        migrate(&mut conn, &bad[..1], t.path()).unwrap();
+        migrate(&mut conn, MIGRATIONS, t.path()).unwrap();
+        let bad = plus_next("CREATE TABLE half (x INTEGER); NOT SQL;");
         assert!(migrate(&mut conn, &bad, t.path()).is_err());
-        assert_eq!(user_version(&conn).unwrap(), 1);
+        assert_eq!(user_version(&conn).unwrap(), latest_version());
         let half: i64 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE name = 'half'",
@@ -247,9 +283,9 @@ mod tests {
     fn newer_db_is_refused_and_untouched() {
         let t = tempfile::tempdir().unwrap();
         let mut conn = Connection::open(t.path().join("e.db")).unwrap();
-        migrate(&mut conn, &two_step(), t.path()).unwrap();
+        migrate(&mut conn, &plus_next(NEXT_SQL), t.path()).unwrap();
         let err = migrate(&mut conn, MIGRATIONS, t.path()).unwrap_err();
         assert!(err.starts_with(DB_NEWER_THAN_ENGINE), "{}", err);
-        assert_eq!(user_version(&conn).unwrap(), 2);
+        assert_eq!(user_version(&conn).unwrap(), next());
     }
 }

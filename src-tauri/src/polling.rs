@@ -1,5 +1,6 @@
 use crate::session::enrichment::enrich_detected_sessions;
 pub use crate::session::enrichment::{detect_and_enrich_sessions, truncate_string, Session};
+use crate::session::transitions::notification_transitions;
 
 /// Keep the per-transcript away-activity index current and drop indexes for
 /// sessions that ended. Lives in the GUI poll (not enrichment) so one-shot CLI
@@ -154,6 +155,10 @@ pub fn start_polling(
         let mut prev_diagnostics: Option<crate::session::DetectionDiagnostics> = None;
         let mut prev_sessions_hash: Option<u64> = None;
 
+        // Dev channel only: compare each poll with the engine (C1a-17).
+        #[cfg(all(unix, c9_channel_dev))]
+        let mut shadow = crate::engine_proto::shadow::ShadowDiff::for_gui();
+
         loop {
             // Lock the shared DetectorState only for the detection step itself,
             // then drop the guard BEFORE the slow enrichment pass so other call
@@ -173,6 +178,13 @@ pub fn start_polling(
 
             match enriched {
                 Ok((mut sessions, diagnostics)) => {
+                    // Before the workers overlay, so both sides compare
+                    // plain detection. Never starts the engine.
+                    #[cfg(all(unix, c9_channel_dev))]
+                    if let Some(shadow) = shadow.as_mut() {
+                        shadow.tick(&sessions);
+                    }
+
                     // Overlay worker_of from ~/.claude/c9watch/workers/*/meta.json
                     let overlay = load_workers_overlay();
                     for s in sessions.iter_mut() {
@@ -264,37 +276,6 @@ pub fn start_polling(
             thread::sleep(poll_interval);
         }
     });
-}
-
-/// Update `prev` with this cycle's statuses and return the sessions that
-/// moved from `Working` to `NeedsAttention` or `WaitingForInput`.
-///
-/// On the first cycle the map is only seeded and nothing is returned.
-/// Keys of sessions that are no longer present are pruned.
-fn notification_transitions<'a>(
-    prev: &mut HashMap<String, SessionStatus>,
-    first_cycle: bool,
-    sessions: &'a [Session],
-) -> Vec<&'a Session> {
-    let mut transitioned = Vec::new();
-    for session in sessions {
-        if !first_cycle {
-            let should_notify = matches!(
-                (prev.get(&session.session_key), &session.status),
-                (
-                    Some(SessionStatus::Working),
-                    SessionStatus::NeedsAttention | SessionStatus::WaitingForInput,
-                )
-            );
-            if should_notify {
-                transitioned.push(session);
-            }
-        }
-        prev.insert(session.session_key.clone(), session.status.clone());
-    }
-    let current: HashSet<&str> = sessions.iter().map(|s| s.session_key.as_str()).collect();
-    prev.retain(|id, _| current.contains(id.as_str()));
-    transitioned
 }
 
 /// Fire a notification for a status transition
@@ -420,74 +401,6 @@ mod tests {
             crate::session::SessionProvider::Cursor
         );
         assert_eq!(sessions[0].first_prompt, "synthetic Cursor fixture");
-    }
-
-    fn session(key: &str, status: SessionStatus) -> Session {
-        let mut s = crate::notifications::tests::fixture();
-        s.session_key = key.to_string();
-        s.status = status;
-        s
-    }
-
-    fn keys(sessions: Vec<&Session>) -> Vec<&str> {
-        sessions.iter().map(|s| s.session_key.as_str()).collect()
-    }
-
-    #[test]
-    fn transitions_first_cycle_seeds_without_notifying() {
-        let mut prev = HashMap::new();
-        prev.insert("gone".to_string(), SessionStatus::Working);
-        let sessions = vec![session("a", SessionStatus::WaitingForInput)];
-
-        assert!(notification_transitions(&mut prev, true, &sessions).is_empty());
-        assert_eq!(prev.len(), 1);
-        assert_eq!(prev.get("a"), Some(&SessionStatus::WaitingForInput));
-    }
-
-    #[test]
-    fn transitions_working_to_waiting_or_attention_notifies() {
-        let mut prev = HashMap::new();
-        prev.insert("a".to_string(), SessionStatus::Working);
-        prev.insert("b".to_string(), SessionStatus::Working);
-        prev.insert("c".to_string(), SessionStatus::Working);
-        let sessions = vec![
-            session("a", SessionStatus::WaitingForInput),
-            session("b", SessionStatus::NeedsAttention),
-            session("c", SessionStatus::Working),
-        ];
-
-        let fired = notification_transitions(&mut prev, false, &sessions);
-        assert_eq!(keys(fired), vec!["a", "b"]);
-        assert_eq!(prev.get("a"), Some(&SessionStatus::WaitingForInput));
-        assert_eq!(prev.get("b"), Some(&SessionStatus::NeedsAttention));
-        assert_eq!(prev.get("c"), Some(&SessionStatus::Working));
-    }
-
-    #[test]
-    fn transitions_from_non_working_or_unknown_do_not_notify() {
-        let mut prev = HashMap::new();
-        prev.insert("a".to_string(), SessionStatus::WaitingForInput);
-        prev.insert("b".to_string(), SessionStatus::NeedsAttention);
-        let sessions = vec![
-            session("a", SessionStatus::NeedsAttention),
-            session("b", SessionStatus::WaitingForInput),
-            session("new", SessionStatus::WaitingForInput),
-        ];
-
-        assert!(notification_transitions(&mut prev, false, &sessions).is_empty());
-        assert_eq!(prev.get("new"), Some(&SessionStatus::WaitingForInput));
-    }
-
-    #[test]
-    fn transitions_prune_disappeared_sessions() {
-        let mut prev = HashMap::new();
-        prev.insert("a".to_string(), SessionStatus::Working);
-        prev.insert("gone".to_string(), SessionStatus::Working);
-        let sessions = vec![session("a", SessionStatus::Working)];
-
-        assert!(notification_transitions(&mut prev, false, &sessions).is_empty());
-        assert!(!prev.contains_key("gone"));
-        assert_eq!(prev.len(), 1);
     }
 
     #[test]
