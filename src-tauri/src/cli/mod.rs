@@ -96,9 +96,16 @@ pub const CLI_COMMANDS: &[&str] = &[
     "help",
 ];
 
+/// Engine command names in builds without the engine. They stay out of
+/// `CLI_COMMANDS`, but `is_cli_invocation` still routes them to Clap, so the
+/// user gets an unknown-command error instead of the GUI.
+pub const RESERVED_ENGINE_COMMANDS: &[&str] = &["task", "engine", "api"];
+
 /// Whether `first` (the first argument) selects the CLI.
 pub fn is_cli_invocation(first: &str) -> bool {
-    CLI_COMMANDS.contains(&first) || matches!(first, "--help" | "-h" | "--version" | "-V")
+    CLI_COMMANDS.contains(&first)
+        || RESERVED_ENGINE_COMMANDS.contains(&first)
+        || matches!(first, "--help" | "-h" | "--version" | "-V")
 }
 
 #[derive(Parser)]
@@ -1188,6 +1195,8 @@ mod dispatch_tests {
                 "{name} in a non-engine build"
             );
             assert!(Cli::try_parse_from(["c9watch", name]).is_err());
+            // Clap reports the unknown command; the GUI does not launch.
+            assert!(is_cli_invocation(name), "{name} would launch the GUI");
         }
     }
 
