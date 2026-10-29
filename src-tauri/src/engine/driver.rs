@@ -142,13 +142,15 @@ pub trait Driver: Send {
     /// Change the terminal size. The child gets SIGWINCH.
     fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()>;
 
-    /// Send `sig` to the child's whole process group.
+    /// Send `sig` to the child's whole process group. Fails once the child
+    /// has exited and its group is empty.
     fn signal(&mut self, sig: libc::c_int) -> io::Result<()>;
 
     /// The PTY child's exit status once it has exited (reaps it).
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>>;
 
-    /// SIGTERM to the group, SIGKILL after `KILL_GRACE`, then check that no
-    /// process of the group is left.
+    /// SIGTERM to the group and to the groups of the child's descendants
+    /// that left it, SIGKILL after `KILL_GRACE`, then check that no process
+    /// of the group and no descendant seen is left.
     fn kill(&mut self) -> io::Result<KillReport>;
 }

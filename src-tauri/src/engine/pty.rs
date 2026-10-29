@@ -21,7 +21,12 @@
 //! Process-group rules:
 //! - The child calls `setsid`, so its pid is also its process group id.
 //!   Every process it starts stays in that group unless it calls `setsid`
-//!   or `setpgid` itself; such a process escapes `kill`.
+//!   or `setpgid` itself.
+//! - CC does call `setsid` for its Bash tool and its hooks (Node's
+//!   `detached`). `kill` therefore also walks the PTY child's descendants
+//!   by ppid and signals each of their groups, and waits until every
+//!   descendant it saw is gone. A process whose parent had already exited
+//!   before `kill` (moved to init) cannot be found this way.
 //! - The kernel does not reuse a pid while a group with that id exists, so
 //!   signalling the group is safe until the group is empty. Once it is
 //!   empty, `kill` and `signal` stop sending.
@@ -59,6 +64,52 @@ enum Job {
     Reply(Vec<u8>),
     /// Input from `write`, which waits for the result.
     Input(Vec<u8>, SyncSender<io::Result<()>>),
+}
+
+/// The PTY child's descendants that `kill` has seen, by pid and start
+/// time. A descendant stays a root for later walks after its own parent
+/// exits, so its children are still found.
+#[derive(Default)]
+struct Descendants(Vec<peer::ProcEntry>);
+
+impl Descendants {
+    /// Walk the process list again from `root` and every descendant seen
+    /// so far. Returns the newly seen ones.
+    fn sweep(&mut self, root: ChildId) -> Vec<peer::ProcEntry> {
+        let mut roots = vec![(root.pid, root.start)];
+        roots.extend(self.0.iter().map(|e| (e.info.pid, e.info.start)));
+        let found = peer::descendants(&peer::processes(), &roots);
+        let new: Vec<_> = found
+            .into_iter()
+            .filter(|e| !roots.contains(&(e.info.pid, e.info.start)))
+            .collect();
+        self.0.extend(new.iter().cloned());
+        new
+    }
+
+    /// Send `sig` to the groups of `procs` other than `pgid` and the
+    /// engine's own, each group once, and only while a member seen in it
+    /// still runs: then the group id is not free.
+    fn signal(procs: &[peer::ProcEntry], pgid: libc::pid_t, sig: libc::c_int) {
+        let mut sent = vec![pgid, unsafe { libc::getpgrp() }];
+        for e in procs {
+            if !sent.contains(&e.pgid) && runs(e) {
+                sent.push(e.pgid);
+                let _ = signal_group(e.pgid, sig);
+            }
+        }
+    }
+
+    /// Whether any descendant seen still runs.
+    fn any_runs(&self) -> bool {
+        self.0.iter().any(runs)
+    }
+}
+
+/// Whether the process `e` names (same pid and start time) still runs. A
+/// zombie runs nothing.
+fn runs(e: &peer::ProcEntry) -> bool {
+    peer::proc_entry(e.info.pid).is_some_and(|p| p.info.start == e.info.start && !p.zombie)
 }
 
 /// Output shared between the reader thread and the driver.
@@ -250,12 +301,15 @@ impl NativePty {
         Ok(self.exit)
     }
 
-    /// Wait up to `limit` for the child to be reaped and its group empty.
-    fn wait_gone(&mut self, limit: Duration) -> bool {
+    /// Wait up to `limit` for the child to be reaped, its group empty and
+    /// every descendant in `seen` gone. A descendant first seen meanwhile
+    /// gets `sig` too.
+    fn wait_gone(&mut self, limit: Duration, seen: &mut Descendants, sig: libc::c_int) -> bool {
         let deadline = Instant::now() + limit;
         loop {
             let _ = self.reap();
-            if self.exit.is_some() && !group_alive(self.id.pid) {
+            Descendants::signal(&seen.sweep(self.id), self.id.pid, sig);
+            if self.exit.is_some() && !group_alive(self.id.pid) && !seen.any_runs() {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -424,7 +478,10 @@ impl Driver for NativePty {
     }
 
     fn signal(&mut self, sig: libc::c_int) -> io::Result<()> {
-        if self.killed {
+        let _ = self.reap();
+        // An empty group's id may already belong to another group.
+        if self.killed || (self.exit.is_some() && !group_alive(self.id.pid)) {
+            self.killed = true;
             return Err(io::Error::from_raw_os_error(libc::ESRCH));
         }
         signal_group(self.id.pid, sig)
@@ -445,13 +502,19 @@ impl Driver for NativePty {
                 exit: self.exit,
             });
         }
+        // Walk the descendants before the first signal: once a parent
+        // dies, its children move to init and the walk loses them.
+        let mut seen = Descendants::default();
+        seen.sweep(self.id);
         let _ = signal_group(pgid, libc::SIGTERM);
-        let term_was_enough = self.wait_gone(KILL_GRACE);
+        Descendants::signal(&seen.0, pgid, libc::SIGTERM);
+        let term_was_enough = self.wait_gone(KILL_GRACE, &mut seen, libc::SIGTERM);
         if !term_was_enough {
             let _ = signal_group(pgid, libc::SIGKILL);
-            if !self.wait_gone(KILL_VERIFY) {
+            Descendants::signal(&seen.0, pgid, libc::SIGKILL);
+            if !self.wait_gone(KILL_VERIFY, &mut seen, libc::SIGKILL) {
                 return Err(io::Error::other(format!(
-                    "process group {} is still alive after SIGKILL",
+                    "process group {} or a descendant is still alive after SIGKILL",
                     pgid
                 )));
             }
@@ -647,6 +710,65 @@ mod tests {
         let report = pty.kill().unwrap();
         assert!(report.term_was_enough);
         assert!(gone_soon(bg), "orphan {} survived", bg);
+    }
+
+    /// A shell command that runs `sleep 300` in a new session, as CC runs
+    /// its Bash tool and hooks, and prints its pid with `marker`.
+    fn detached_sleep(marker: &str) -> String {
+        format!(
+            "perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' sleep 300 & echo \"$! {}\"",
+            marker
+        )
+    }
+
+    /// Wait up to 10 s for `pid` to lead its own session.
+    fn wait_detached(pid: libc::pid_t) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while unsafe { libc::getpgid(pid) } != pid {
+            assert!(Instant::now() < deadline, "{} never called setsid", pid);
+            std::thread::sleep(POLL);
+        }
+    }
+
+    #[test]
+    fn kill_takes_detached_descendants_too() {
+        let script = format!("{}; {}; wait", detached_sleep("d1"), detached_sleep("d2"));
+        let mut pty = NativePty::spawn(&sh(&script)).unwrap();
+        let d1 = read_pid(&mut pty, " d1");
+        let d2 = read_pid(&mut pty, " d2");
+        wait_detached(d1);
+        wait_detached(d2);
+        assert_ne!(unsafe { libc::getpgid(d1) }, pty.child().pid);
+        let report = pty.kill().unwrap();
+        assert!(report.term_was_enough);
+        assert!(gone_soon(d1), "detached {} survived", d1);
+        assert!(gone_soon(d2), "detached {} survived", d2);
+    }
+
+    #[test]
+    fn kill_escalates_for_a_detached_descendant_that_ignores_sigterm() {
+        let mut pty = NativePty::spawn(&sh(
+            "perl -e 'use POSIX; POSIX::setsid(); $SIG{TERM} = q(IGNORE); \
+             print \"$$ d\\n\"; sleep 300' & wait",
+        ))
+        .unwrap();
+        let d = read_pid(&mut pty, " d");
+        wait_detached(d);
+        let report = pty.kill().unwrap();
+        assert!(!report.term_was_enough);
+        assert!(gone_soon(d), "detached {} survived", d);
+    }
+
+    #[test]
+    fn signal_after_the_group_is_gone_is_refused() {
+        let mut pty = NativePty::spawn(&sh("exit 0")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pty.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "leader did not exit");
+            std::thread::sleep(POLL);
+        }
+        let err = pty.signal(libc::SIGINT).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ESRCH));
     }
 
     #[test]
