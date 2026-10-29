@@ -26,11 +26,11 @@ pub mod outbox;
 pub mod writer;
 
 use super::fsutil::ensure_private_dir;
+use super::proto::AgentRow;
 use audit::AuditEntry;
 use migrate::{check_not_newer, latest_version, migrate, MIGRATIONS};
 use outbox::{Cursor, NewEvent, ReadError, Subscription};
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, Transaction};
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -182,13 +182,13 @@ impl Db {
 
     /// The state for `snapshot.get` and the cursor it is consistent with,
     /// read in one read transaction. Blocking.
-    pub fn snapshot(&self) -> Result<(Cursor, Vec<Value>), String> {
+    pub fn snapshot(&self) -> Result<(Cursor, Vec<AgentRow>), String> {
         let conn = self.reader()?;
         let fail = |e: rusqlite::Error| format!("Failed to read the snapshot: {}", e);
         conn.execute_batch("BEGIN").map_err(fail)?;
         let read = (|| {
             let seq = outbox::head(&conn)?;
-            let agents = rows_as_json(&conn, "SELECT * FROM agents ORDER BY id")?;
+            let agents = agent_rows(&conn)?;
             Ok((seq, agents))
         })();
         conn.execute_batch("COMMIT").map_err(fail)?;
@@ -290,25 +290,29 @@ where
     }
 }
 
-/// Every row of `sql` as a JSON object keyed by column name.
-fn rows_as_json(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<Value>> {
-    let mut st = conn.prepare(sql)?;
-    let names: Vec<String> = st.column_names().iter().map(|n| n.to_string()).collect();
+/// Every `agents` row. The columns are named, not `*`, so a schema change
+/// has to change `AgentRow`, and with it the c9p/1 contract.
+fn agent_rows(conn: &Connection) -> rusqlite::Result<Vec<AgentRow>> {
+    let mut st = conn.prepare(
+        "SELECT id, generation, mode, role, control, provider, provider_sid, source, \
+         created_by, gone_at, resume_count, interrupted_note_pending \
+         FROM agents ORDER BY id",
+    )?;
     let rows = st.query_map([], |r| {
-        let mut obj = serde_json::Map::new();
-        for (i, name) in names.iter().enumerate() {
-            let v = match r.get_ref(i)? {
-                rusqlite::types::ValueRef::Null => Value::Null,
-                rusqlite::types::ValueRef::Integer(n) => Value::from(n),
-                rusqlite::types::ValueRef::Real(f) => Value::from(f),
-                rusqlite::types::ValueRef::Text(t) => {
-                    Value::from(String::from_utf8_lossy(t).into_owned())
-                }
-                rusqlite::types::ValueRef::Blob(_) => Value::Null,
-            };
-            obj.insert(name.clone(), v);
-        }
-        Ok(Value::Object(obj))
+        Ok(AgentRow {
+            id: r.get(0)?,
+            generation: r.get(1)?,
+            mode: r.get(2)?,
+            role: r.get(3)?,
+            control: r.get(4)?,
+            provider: r.get(5)?,
+            provider_sid: r.get(6)?,
+            source: r.get(7)?,
+            created_by: r.get(8)?,
+            gone_at: r.get(9)?,
+            resume_count: r.get(10)?,
+            interrupted_note_pending: r.get::<_, i64>(11)? != 0,
+        })
     })?;
     rows.collect()
 }
@@ -854,9 +858,23 @@ mod tests {
         let (cur, agents) = db.snapshot().unwrap();
         assert_eq!(cur, db.cursor_at(1));
         assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0]["id"], "a1");
-        assert_eq!(agents[0]["source"], "detected");
-        assert_eq!(agents[0]["gone_at"], Value::Null);
+        assert_eq!(
+            agents[0],
+            AgentRow {
+                id: "a1".into(),
+                generation: 0,
+                mode: None,
+                role: "observed".into(),
+                control: "none".into(),
+                provider: "claude".into(),
+                provider_sid: None,
+                source: "detected".into(),
+                created_by: None,
+                gone_at: None,
+                resume_count: 0,
+                interrupted_note_pending: false,
+            }
+        );
         assert_eq!(db.check_cursor(&cur), Ok(1));
         db.close();
         assert!(db.write_blocking(|tx| insert_agent(tx, "a2")).is_err());

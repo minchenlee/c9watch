@@ -4,6 +4,32 @@
 export const C9P_API_MAJOR = 1;
 export const C9P_API_MINOR = 0;
 
+/** One row of the `agents` table (A:340), as `snapshot.get` sends it. */
+export interface C9pAgentRow {
+  /** `pty` or `none`. */
+  control: string;
+  /** The principal that created the agent. */
+  createdBy: string | null;
+  /** +1 on spawn, resume, refresh and takeover. */
+  generation: number;
+  /** Unix ms; `null` while the agent is alive. */
+  goneAt: number | null;
+  /** `agt_<ulid>`. */
+  id: string;
+  interruptedNotePending: boolean;
+  /** `managed` or `free`; `null` for an observed agent. */
+  mode: string | null;
+  /** The adapter kind: `claude`, `codex`, ... */
+  provider: string;
+  /** The provider session id of the current generation. */
+  providerSid: string | null;
+  resumeCount: number;
+  /** `human`, `orch`, `worker` or `observed`. */
+  role: string;
+  /** `detected`, `engine` or `legacy_import`. */
+  source: string;
+}
+
 /** What a client says about itself in `hello`. Unverified. */
 export interface C9pClientInfo {
   kind?: string | null;
@@ -63,9 +89,15 @@ export interface C9pEventFrame {
   subject?: string | null;
   topic: string;
   ts: number;
-  type: string;
+  type: C9pEventType;
   v: number;
 }
+
+/**
+ * The `type` of an event frame. A response frame has no `type`, so a
+ * client tells the two apart by `type === "event"`.
+ */
+export type C9pEventType = 'event';
 
 /**
  * `hello` params. `client` is the caller's own claim. The engine only logs
@@ -124,8 +156,7 @@ export type C9pSnapshotParams = Record<string, unknown>;
  * Subscribing with `since` = `cursor` continues with no gap.
  */
 export interface C9pSnapshotResult {
-  /** Rows of the `agents` table, keyed by column name. */
-  agents: unknown[];
+  agents: C9pAgentRow[];
   cursor: string;
   machineId: string;
 }

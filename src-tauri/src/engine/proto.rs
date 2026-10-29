@@ -243,8 +243,35 @@ pub struct SnapshotParams {}
 pub struct SnapshotResult {
     pub cursor: String,
     pub machine_id: String,
-    /// Rows of the `agents` table, keyed by column name.
-    pub agents: Vec<serde_json::Value>,
+    pub agents: Vec<AgentRow>,
+}
+
+/// One row of the `agents` table (A:340), as `snapshot.get` sends it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRow {
+    /// `agt_<ulid>`.
+    pub id: String,
+    /// +1 on spawn, resume, refresh and takeover.
+    pub generation: i64,
+    /// `managed` or `free`; `null` for an observed agent.
+    pub mode: Option<String>,
+    /// `human`, `orch`, `worker` or `observed`.
+    pub role: String,
+    /// `pty` or `none`.
+    pub control: String,
+    /// The adapter kind: `claude`, `codex`, ...
+    pub provider: String,
+    /// The provider session id of the current generation.
+    pub provider_sid: Option<String>,
+    /// `detected`, `engine` or `legacy_import`.
+    pub source: String,
+    /// The principal that created the agent.
+    pub created_by: Option<String>,
+    /// Unix ms; `null` while the agent is alive.
+    pub gone_at: Option<i64>,
+    pub resume_count: i64,
+    pub interrupted_note_pending: bool,
 }
 
 /// `events.subscribe` params (A:218). Empty filters match everything.
@@ -280,7 +307,7 @@ pub struct SubscribeResult {
 pub struct EventFrame {
     pub v: u32,
     #[serde(rename = "type")]
-    pub kind: String,
+    pub kind: EventType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub: Option<String>,
     pub cursor: String,
@@ -293,8 +320,12 @@ pub struct EventFrame {
     pub data: serde_json::Value,
 }
 
-impl EventFrame {
-    pub const KIND: &'static str = "event";
+/// The `type` of an event frame. A response frame has no `type`, so a
+/// client tells the two apart by `type === "event"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum EventType {
+    #[serde(rename = "event")]
+    Event,
 }
 
 /// Why `read_frame` could not return a frame.

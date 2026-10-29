@@ -19,8 +19,8 @@ use super::db::Db;
 use super::peer::{self, PeerCred};
 use super::principal::{self, LiveAgents, NoLiveAgents, Principal};
 use super::proto::{
-    encode, encode_event, read_frame, ApiError, ErrorCode, EventFrame, FrameError, HelloParams,
-    HelloResult, Request, Response, SnapshotParams, SnapshotResult, SubscribeParams,
+    encode, encode_event, read_frame, ApiError, ErrorCode, EventFrame, EventType, FrameError,
+    HelloParams, HelloResult, Request, Response, SnapshotParams, SnapshotResult, SubscribeParams,
     SubscribeResult, API_MAJOR, API_MINOR, MAX_FRAME,
 };
 use std::os::unix::io::AsRawFd;
@@ -511,7 +511,7 @@ impl EventStream {
     fn frame(&self, e: Event) -> EventFrame {
         EventFrame {
             v: API_MAJOR,
-            kind: EventFrame::KIND.into(),
+            kind: EventType::Event,
             sub: self.id.clone(),
             cursor: format!("{}:{}:{}", self.machine, self.epoch, e.seq),
             topic: e.topic,
@@ -1056,6 +1056,40 @@ mod tests {
         assert_eq!(r["result"]["cursor"], head);
         assert_eq!(r["result"]["machineId"], MACHINE);
         assert_eq!(r["result"]["agents"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn snapshot_agents_are_typed_camel_case_rows() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        db.write(|tx| {
+            tx.execute(
+                "INSERT INTO agents (id, role, provider, provider_sid, source, \
+                 interrupted_note_pending) \
+                 VALUES ('a1', 'observed', 'claude', 'sid-1', 'detected', 1)",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c.call("1", "snapshot.get", json!({})).await;
+        assert_eq!(
+            r["result"]["agents"],
+            json!([{
+                "id": "a1",
+                "generation": 0,
+                "mode": null,
+                "role": "observed",
+                "control": "none",
+                "provider": "claude",
+                "providerSid": "sid-1",
+                "source": "detected",
+                "createdBy": null,
+                "goneAt": null,
+                "resumeCount": 0,
+                "interruptedNotePending": true
+            }])
+        );
     }
 
     #[tokio::test]

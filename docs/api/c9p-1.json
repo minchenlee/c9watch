@@ -1,5 +1,86 @@
 {
   "$defs": {
+    "AgentRow": {
+      "description": "One row of the `agents` table (A:340), as `snapshot.get` sends it.",
+      "properties": {
+        "control": {
+          "description": "`pty` or `none`.",
+          "type": "string"
+        },
+        "createdBy": {
+          "description": "The principal that created the agent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generation": {
+          "description": "+1 on spawn, resume, refresh and takeover.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "goneAt": {
+          "description": "Unix ms; `null` while the agent is alive.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "`agt_<ulid>`.",
+          "type": "string"
+        },
+        "interruptedNotePending": {
+          "type": "boolean"
+        },
+        "mode": {
+          "description": "`managed` or `free`; `null` for an observed agent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "description": "The adapter kind: `claude`, `codex`, ...",
+          "type": "string"
+        },
+        "providerSid": {
+          "description": "The provider session id of the current generation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resumeCount": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "role": {
+          "description": "`human`, `orch`, `worker` or `observed`.",
+          "type": "string"
+        },
+        "source": {
+          "description": "`detected`, `engine` or `legacy_import`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "generation",
+        "mode",
+        "role",
+        "control",
+        "provider",
+        "providerSid",
+        "source",
+        "createdBy",
+        "goneAt",
+        "resumeCount",
+        "interruptedNotePending"
+      ],
+      "type": "object"
+    },
     "ClientInfo": {
       "description": "What a client says about itself in `hello`. Unverified.",
       "properties": {
@@ -131,7 +212,7 @@
           "type": "integer"
         },
         "type": {
-          "type": "string"
+          "$ref": "#/$defs/EventType"
         },
         "v": {
           "format": "uint32",
@@ -148,6 +229,13 @@
         "data"
       ],
       "type": "object"
+    },
+    "EventType": {
+      "description": "The `type` of an event frame. A response frame has no `type`, so a\nclient tells the two apart by `type === \"event\"`.",
+      "enum": [
+        "event"
+      ],
+      "type": "string"
     },
     "HelloParams": {
       "description": "`hello` params. `client` is the caller's own claim. The engine only logs\nit as unverified; it never decides the principal (N1).",
@@ -310,8 +398,9 @@
       "description": "`snapshot.get` result: the state and the cursor it is consistent with.\nSubscribing with `since` = `cursor` continues with no gap.",
       "properties": {
         "agents": {
-          "description": "Rows of the `agents` table, keyed by column name.",
-          "items": true,
+          "items": {
+            "$ref": "#/$defs/AgentRow"
+          },
           "type": "array"
         },
         "cursor": {
