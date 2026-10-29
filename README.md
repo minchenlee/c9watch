@@ -212,7 +212,7 @@ See [SKILLS.md](SKILLS.md) for more install options.
 - **Multi-project view** -- Sessions grouped by project with git branch info
 - **Tray popover** -- Click the menu bar icon for a quick-glance overlay with session status indicators and latest messages
 - **Status notifications** -- Get a native macOS notification when a session needs your attention
-- **Mobile/Web client** -- Connect from any browser or mobile device via WebSocket; scan the QR code to monitor sessions remotely
+- **Mobile/Web client** -- Watch sessions from a phone or another browser over WebSocket. Remote access is off by default: turn on LAN access in Settings → Remote access, then pair the device with a one-time code or QR code from Connect Mobile. Conversations and opening a terminal from the device are separate opt-in settings. LAN traffic is plain `ws://`, so use it only on a network you trust. See [docs/mobile-migration-c0h.md](docs/mobile-migration-c0h.md)
 - **Session history** -- Browse and search all past sessions with instant metadata filter and deep content search; click a result to scroll to and highlight the matching message
 - **Memory viewer** -- Browse and inspect Claude Code and Codex memory files with a two-panel layout and quick Claude command access
 - **Cost tracker** -- Track Claude Code spending, plus Codex and Pi cost data, with daily, per-project, and per-model breakdowns; click any session to preview the conversation; sort by date or cost
