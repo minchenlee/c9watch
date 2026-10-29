@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
 /// Protocol minor version. Raised for additive changes.
-pub const API_MINOR: u32 = 0;
+pub const API_MINOR: u32 = 1;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -246,7 +246,8 @@ pub struct SnapshotResult {
     pub agents: Vec<AgentRow>,
 }
 
-/// One row of the `agents` table (A:340), as `snapshot.get` sends it.
+/// One row of the `agents` table (A:340), as `snapshot.get`,
+/// `session.list` and `agent.list` send it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRow {
@@ -272,6 +273,54 @@ pub struct AgentRow {
     pub gone_at: Option<i64>,
     pub resume_count: i64,
     pub interrupted_note_pending: bool,
+    /// `SessionIdentity::key()` (`<provider>:<session id>`) of the session
+    /// detection matched to this agent.
+    pub session_key: Option<String>,
+    /// The machine the agent runs on.
+    pub machine_id: Option<String>,
+    /// Engine lifecycle state (`creating`, `starting`, `ready`, `working`,
+    /// `blocked`, `paused`, `refreshing`, `interrupted`, `retiring`,
+    /// `retired`, `failed`, `orphaned`); `null` for an observed agent.
+    pub state: Option<String>,
+    /// The detected session status: `working`, `needs_attention`,
+    /// `waiting_for_input` or `connecting`.
+    pub status: Option<String>,
+    /// The working directory; for an observed agent, the project path.
+    pub cwd: Option<String>,
+    pub name: Option<String>,
+    pub pid: Option<i64>,
+    /// Unix ms, as the provider reports it.
+    pub started_at: Option<i64>,
+    /// Unix ms.
+    pub created_at: Option<i64>,
+    /// Unix ms of the last detection tick that saw the agent.
+    pub last_seen: Option<i64>,
+}
+
+/// `session.list` params. There are none yet; the engine ignores any it
+/// gets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SessionListParams {}
+
+/// `session.list` result: the agents whose session detection sees now
+/// (`goneAt` is `null`), in creation order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionListResult {
+    pub sessions: Vec<AgentRow>,
+}
+
+/// `agent.list` params.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AgentListParams {
+    /// Also return gone, retired and failed agents (tombstones included).
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// `agent.list` result, in creation order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentListResult {
+    pub agents: Vec<AgentRow>,
 }
 
 /// `events.subscribe` params (A:218). Empty filters match everything.

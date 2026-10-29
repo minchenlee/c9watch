@@ -15,12 +15,13 @@
 //! live streams; one more gets `rate_limited`.
 
 use super::db::outbox::{Cursor, Event, ReadError, Subscription, READ_BATCH};
-use super::db::Db;
+use super::db::{AgentFilter, Db};
 use super::peer::{self, PeerCred};
 use super::principal::{self, LiveAgents, NoLiveAgents, Principal};
 use super::proto::{
-    encode, encode_event, read_frame, ApiError, ErrorCode, EventFrame, EventType, FrameError,
-    HelloParams, HelloResult, Request, Response, SnapshotParams, SnapshotResult, SubscribeParams,
+    encode, encode_event, read_frame, AgentListParams, AgentListResult, ApiError, ErrorCode,
+    EventFrame, EventType, FrameError, HelloParams, HelloResult, Request, Response,
+    SessionListParams, SessionListResult, SnapshotParams, SnapshotResult, SubscribeParams,
     SubscribeResult, API_MAJOR, API_MINOR, MAX_FRAME,
 };
 use std::os::unix::io::AsRawFd;
@@ -315,7 +316,13 @@ fn check_frame(
 
 /// Every c9p/1 method, as in `docs/api/c9p-1.json`. `hello` is handled
 /// before dispatch; `dispatch` serves the rest.
-pub const METHODS: &[&str] = &["hello", "snapshot.get", "events.subscribe"];
+pub const METHODS: &[&str] = &[
+    "hello",
+    "snapshot.get",
+    "events.subscribe",
+    "session.list",
+    "agent.list",
+];
 
 /// The c9p/1 JSON Schema (A:245): the frame types, a `methods` table with
 /// each method's params and result, and every wire type under `$defs`.
@@ -352,6 +359,14 @@ pub fn schema() -> serde_json::Value {
             "result": ser.subschema_for::<SubscribeResult>(),
             "events": ser.subschema_for::<EventFrame>(),
         },
+        "session.list": {
+            "params": de.subschema_for::<SessionListParams>(),
+            "result": ser.subschema_for::<SessionListResult>(),
+        },
+        "agent.list": {
+            "params": de.subschema_for::<AgentListParams>(),
+            "result": ser.subschema_for::<AgentListResult>(),
+        },
     });
     let mut defs = de.take_definitions(true);
     for (name, def) in ser.take_definitions(true) {
@@ -387,6 +402,8 @@ async fn dispatch(
 ) -> Result<(serde_json::Value, Option<EventStream>), ApiError> {
     match method {
         "snapshot.get" => Ok((snapshot_get(ctx).await?, None)),
+        "session.list" => Ok((session_list(ctx).await?, None)),
+        "agent.list" => Ok((agent_list(req, ctx).await?, None)),
         "events.subscribe" => {
             if streams >= MAX_STREAMS {
                 return Err(ApiError::new(
@@ -433,6 +450,35 @@ async fn snapshot_get(ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
         agents,
     };
     Ok(serde_json::to_value(result).expect("SnapshotResult serializes"))
+}
+
+/// The agents whose session detection sees now (C1a-15).
+async fn session_list(ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
+    let db = ctx.db()?.clone();
+    let sessions = blocking(move || db.agents(AgentFilter::Sessions).map_err(internal)).await?;
+    Ok(serde_json::to_value(SessionListResult { sessions }).expect("SessionListResult serializes"))
+}
+
+/// Live agents, or with `all` every row (N4).
+async fn agent_list(req: Request, ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
+    let params: AgentListParams = if req.params.is_null() {
+        AgentListParams::default()
+    } else {
+        serde_json::from_value(req.params).map_err(|e| {
+            ApiError::new(
+                ErrorCode::BadRequest,
+                format!("bad agent.list params: {}", e),
+            )
+        })?
+    };
+    let filter = if params.all {
+        AgentFilter::All
+    } else {
+        AgentFilter::Live
+    };
+    let db = ctx.db()?.clone();
+    let agents = blocking(move || db.agents(filter).map_err(internal)).await?;
+    Ok(serde_json::to_value(AgentListResult { agents }).expect("AgentListResult serializes"))
 }
 
 async fn events_subscribe(
@@ -1087,7 +1133,17 @@ mod tests {
                 "createdBy": null,
                 "goneAt": null,
                 "resumeCount": 0,
-                "interruptedNotePending": true
+                "interruptedNotePending": true,
+                "sessionKey": null,
+                "machineId": null,
+                "state": null,
+                "status": null,
+                "cwd": null,
+                "name": null,
+                "pid": null,
+                "startedAt": null,
+                "createdAt": null,
+                "lastSeen": null
             }])
         );
     }
@@ -1239,6 +1295,85 @@ mod tests {
         assert_eq!(hello["principal"], "agent:a7");
         assert_eq!(c.call("1", "snapshot.get", json!({})).await["ok"], true);
         assert_eq!(c.call("2", "events.subscribe", json!({})).await["ok"], true);
+        assert_eq!(c.call("3", "session.list", json!({})).await["ok"], true);
+        assert_eq!(c.call("4", "agent.list", json!({})).await["ok"], true);
+    }
+
+    // ── Detection-backed lists (C1a-15) ────────────────────────────────
+
+    fn ids(rows: &Value) -> Vec<String> {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn session_list_and_agent_list_read_the_agents_table() {
+        use crate::engine::detect::{apply, Observed};
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let seen = |sid: &str| Observed {
+            key: format!("claudeCode:{}", sid),
+            provider: "claudeCode".into(),
+            sid: sid.into(),
+            status: "working",
+            cwd: "/p".into(),
+            name: sid.into(),
+            pid: 1,
+            started_at: None,
+        };
+        let (a, b) = (seen("a"), seen("b"));
+        let both = vec![a.clone(), b];
+        db.write(move |tx| apply(tx, MACHINE, &both, 1))
+            .await
+            .unwrap();
+        db.write(move |tx| {
+            apply(tx, MACHINE, &[a], 2)?;
+            tx.execute(
+                "INSERT INTO agents (id, role, provider, source, state) \
+                 VALUES ('agt_zretired', 'worker', 'claudeCode', 'engine', 'retired')",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+        let rows = db.agents(AgentFilter::All).unwrap();
+        let id_of = |sid: &str| {
+            rows.iter()
+                .find(|r| r.provider_sid.as_deref() == Some(sid))
+                .unwrap()
+                .id
+                .clone()
+        };
+
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c.call("1", "session.list", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let sessions = &r["result"]["sessions"];
+        assert_eq!(ids(sessions), [id_of("a")]);
+        assert_eq!(sessions[0]["sessionKey"], "claudeCode:a");
+        assert_eq!(sessions[0]["status"], "working");
+        assert_eq!(sessions[0]["machineId"], MACHINE);
+
+        let r = c.call("2", "agent.list", Value::Null).await;
+        assert_eq!(ids(&r["result"]["agents"]), [id_of("a")]);
+        let r = c.call("3", "agent.list", json!({"all": false})).await;
+        assert_eq!(ids(&r["result"]["agents"]), [id_of("a")]);
+        let r = c.call("4", "agent.list", json!({"all": true})).await;
+        let mut want = vec![id_of("a"), id_of("b"), "agt_zretired".to_string()];
+        want.sort();
+        assert_eq!(ids(&r["result"]["agents"]), want);
+        let gone = &r["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id_of("b"))
+            .unwrap()["goneAt"];
+        assert_eq!(gone, 2);
+
+        let r = c.call("5", "agent.list", json!({"all": "yes"})).await;
+        assert_eq!(r["error"]["code"], "bad_request", "{}", r);
     }
 
     #[tokio::test]

@@ -1,14 +1,55 @@
 {
   "$defs": {
+    "AgentListParams": {
+      "description": "`agent.list` params.",
+      "properties": {
+        "all": {
+          "default": false,
+          "description": "Also return gone, retired and failed agents (tombstones included).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "AgentListResult": {
+      "description": "`agent.list` result, in creation order.",
+      "properties": {
+        "agents": {
+          "items": {
+            "$ref": "#/$defs/AgentRow"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "agents"
+      ],
+      "type": "object"
+    },
     "AgentRow": {
-      "description": "One row of the `agents` table (A:340), as `snapshot.get` sends it.",
+      "description": "One row of the `agents` table (A:340), as `snapshot.get`,\n`session.list` and `agent.list` send it.",
       "properties": {
         "control": {
           "description": "`pty` or `none`.",
           "type": "string"
         },
+        "createdAt": {
+          "description": "Unix ms.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "createdBy": {
           "description": "The principal that created the agent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "description": "The working directory; for an observed agent, the project path.",
           "type": [
             "string",
             "null"
@@ -34,10 +75,38 @@
         "interruptedNotePending": {
           "type": "boolean"
         },
+        "lastSeen": {
+          "description": "Unix ms of the last detection tick that saw the agent.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "machineId": {
+          "description": "The machine the agent runs on.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "description": "`managed` or `free`; `null` for an observed agent.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pid": {
+          "format": "int64",
+          "type": [
+            "integer",
             "null"
           ]
         },
@@ -60,9 +129,38 @@
           "description": "`human`, `orch`, `worker` or `observed`.",
           "type": "string"
         },
+        "sessionKey": {
+          "description": "`SessionIdentity::key()` (`<provider>:<session id>`) of the session\ndetection matched to this agent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "source": {
           "description": "`detected`, `engine` or `legacy_import`.",
           "type": "string"
+        },
+        "startedAt": {
+          "description": "Unix ms, as the provider reports it.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "state": {
+          "description": "Engine lifecycle state (`creating`, `starting`, `ready`, `working`,\n`blocked`, `paused`, `refreshing`, `interrupted`, `retiring`,\n`retired`, `failed`, `orphaned`); `null` for an observed agent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "The detected session status: `working`, `needs_attention`,\n`waiting_for_input` or `connecting`.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -77,7 +175,17 @@
         "createdBy",
         "goneAt",
         "resumeCount",
-        "interruptedNotePending"
+        "interruptedNotePending",
+        "sessionKey",
+        "machineId",
+        "state",
+        "status",
+        "cwd",
+        "name",
+        "pid",
+        "startedAt",
+        "createdAt",
+        "lastSeen"
       ],
       "type": "object"
     },
@@ -390,6 +498,25 @@
       ],
       "type": "object"
     },
+    "SessionListParams": {
+      "description": "`session.list` params. There are none yet; the engine ignores any it\ngets.",
+      "type": "object"
+    },
+    "SessionListResult": {
+      "description": "`session.list` result: the agents whose session detection sees now\n(`goneAt` is `null`), in creation order.",
+      "properties": {
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/AgentRow"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "sessions"
+      ],
+      "type": "object"
+    },
     "SnapshotParams": {
       "description": "`snapshot.get` params. There are none yet; the engine ignores any it\ngets.",
       "type": "object"
@@ -460,7 +587,7 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
-  "apiMinor": 0,
+  "apiMinor": 1,
   "description": "The c9watch engine protocol: one JSON object per line over the engine socket. Within a major version every change is additive.",
   "frames": {
     "event": {
@@ -474,6 +601,14 @@
     }
   },
   "methods": {
+    "agent.list": {
+      "params": {
+        "$ref": "#/$defs/AgentListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AgentListResult"
+      }
+    },
     "events.subscribe": {
       "events": {
         "$ref": "#/$defs/EventFrame"
@@ -491,6 +626,14 @@
       },
       "result": {
         "$ref": "#/$defs/HelloResult"
+      }
+    },
+    "session.list": {
+      "params": {
+        "$ref": "#/$defs/SessionListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionListResult"
       }
     },
     "snapshot.get": {

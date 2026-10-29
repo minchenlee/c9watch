@@ -2,14 +2,32 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 0;
+export const C9P_API_MINOR = 1;
 
-/** One row of the `agents` table (A:340), as `snapshot.get` sends it. */
+/** `agent.list` params. */
+export interface C9pAgentListParams {
+  /** Also return gone, retired and failed agents (tombstones included). */
+  all?: boolean;
+}
+
+/** `agent.list` result, in creation order. */
+export interface C9pAgentListResult {
+  agents: C9pAgentRow[];
+}
+
+/**
+ * One row of the `agents` table (A:340), as `snapshot.get`,
+ * `session.list` and `agent.list` send it.
+ */
 export interface C9pAgentRow {
   /** `pty` or `none`. */
   control: string;
+  /** Unix ms. */
+  createdAt: number | null;
   /** The principal that created the agent. */
   createdBy: string | null;
+  /** The working directory; for an observed agent, the project path. */
+  cwd: string | null;
   /** +1 on spawn, resume, refresh and takeover. */
   generation: number;
   /** Unix ms; `null` while the agent is alive. */
@@ -17,8 +35,14 @@ export interface C9pAgentRow {
   /** `agt_<ulid>`. */
   id: string;
   interruptedNotePending: boolean;
+  /** Unix ms of the last detection tick that saw the agent. */
+  lastSeen: number | null;
+  /** The machine the agent runs on. */
+  machineId: string | null;
   /** `managed` or `free`; `null` for an observed agent. */
   mode: string | null;
+  name: string | null;
+  pid: number | null;
   /** The adapter kind: `claude`, `codex`, ... */
   provider: string;
   /** The provider session id of the current generation. */
@@ -26,8 +50,26 @@ export interface C9pAgentRow {
   resumeCount: number;
   /** `human`, `orch`, `worker` or `observed`. */
   role: string;
+  /**
+   * `SessionIdentity::key()` (`<provider>:<session id>`) of the session
+   * detection matched to this agent.
+   */
+  sessionKey: string | null;
   /** `detected`, `engine` or `legacy_import`. */
   source: string;
+  /** Unix ms, as the provider reports it. */
+  startedAt: number | null;
+  /**
+   * Engine lifecycle state (`creating`, `starting`, `ready`, `working`,
+   * `blocked`, `paused`, `refreshing`, `interrupted`, `retiring`,
+   * `retired`, `failed`, `orphaned`); `null` for an observed agent.
+   */
+  state: string | null;
+  /**
+   * The detected session status: `working`, `needs_attention`,
+   * `waiting_for_input` or `connecting`.
+   */
+  status: string | null;
 }
 
 /** What a client says about itself in `hello`. Unverified. */
@@ -146,6 +188,20 @@ export interface C9pResponse {
 }
 
 /**
+ * `session.list` params. There are none yet; the engine ignores any it
+ * gets.
+ */
+export type C9pSessionListParams = Record<string, unknown>;
+
+/**
+ * `session.list` result: the agents whose session detection sees now
+ * (`goneAt` is `null`), in creation order.
+ */
+export interface C9pSessionListResult {
+  sessions: C9pAgentRow[];
+}
+
+/**
  * `snapshot.get` params. There are none yet; the engine ignores any it
  * gets.
  */
@@ -194,6 +250,10 @@ export interface C9pFrames {
 
 /** Each method's params and result (and event frames, for a subscription). */
 export interface C9pMethods {
+  'agent.list': {
+    params: C9pAgentListParams;
+    result: C9pAgentListResult;
+  };
   'events.subscribe': {
     events: C9pEventFrame;
     params: C9pSubscribeParams;
@@ -202,6 +262,10 @@ export interface C9pMethods {
   hello: {
     params: C9pHelloParams;
     result: C9pHelloResult;
+  };
+  'session.list': {
+    params: C9pSessionListParams;
+    result: C9pSessionListResult;
   };
   'snapshot.get': {
     params: C9pSnapshotParams;

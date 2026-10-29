@@ -5,10 +5,13 @@
 //! in before the bind, so only the lock holder can replace a leftover
 //! socket, and before the machine key and the db, since creating the key
 //! and opening the db (which may move a corrupt db aside) are both
-//! lock-holder work. The engine never talks to the legacy `c9watch daemon`.
+//! lock-holder work. Detection starts once the db is open, so its first tick
+//! (or the rebuild after a new epoch) is written before clients ask. The
+//! engine never talks to the legacy `c9watch daemon`.
 
 use super::api::{serve, ServerCtx};
 use super::db;
+use super::detect;
 use super::fsutil::ensure_private_dir;
 use super::home::{lock_path, sock_path};
 use super::lock::acquire_engine_lock;
@@ -41,6 +44,7 @@ pub async fn run(home: &Path) -> Result<(), String> {
 
     let ctx = Arc::new(ServerCtx::new(key.id().to_string()).with_db(db.clone()));
     let pruner = tokio::spawn(prune_loop(db.clone()));
+    let detection = detect::spawn(db.clone())?;
     eprintln!(
         "[engine] Listening on {:?}, pid={}, machine={}, epoch={}",
         socket.path(),
@@ -55,6 +59,9 @@ pub async fn run(home: &Path) -> Result<(), String> {
     };
     eprintln!("[engine] Shutting down ({:?})", sig);
     pruner.abort();
+    // Stops the detection thread after its current tick. A tick that is
+    // still writing when the db closes fails, and nothing waits for it.
+    drop(detection);
     // Unlink our socket first, then close the db, then release the lock, so
     // a new engine that takes the lock never sees our socket as live or our
     // db as open. Connection tasks may still hold the `Db`; `close` shuts

@@ -1,4 +1,8 @@
--- user_version 1
+-- user_version 2
+-- index agents_detected_key
+CREATE UNIQUE INDEX agents_detected_key ON agents (session_key) WHERE source = 'detected';
+-- index agents_provider_sid
+CREATE INDEX agents_provider_sid ON agents (provider, provider_sid);
 -- index events_ts
 CREATE INDEX events_ts ON events (ts);
 -- index ops_open
@@ -26,7 +30,10 @@ CREATE TABLE agents (
     gone_at                  INTEGER,                    -- unix ms; null while alive
     resume_count             INTEGER NOT NULL DEFAULT 0, -- engine_restart resumes not counted
     interrupted_note_pending INTEGER NOT NULL DEFAULT 0
-) STRICT;
+, session_key TEXT, machine_id TEXT, state TEXT CHECK (state IN (
+    'creating', 'starting', 'ready', 'working', 'blocked', 'paused', 'refreshing',
+    'interrupted', 'retiring', 'retired', 'failed', 'orphaned')), status TEXT CHECK (status IN (
+    'working', 'needs_attention', 'waiting_for_input', 'connecting')), cwd TEXT, name TEXT, pid INTEGER, started_at INTEGER, created_at INTEGER, last_seen INTEGER) STRICT;
 -- table audit
 CREATE TABLE audit (
     seq          INTEGER PRIMARY KEY,

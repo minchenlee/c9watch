@@ -1056,6 +1056,57 @@ fn count_messages_in_jsonl_at(path: &Path, now: Instant) -> u32 {
 }
 
 #[cfg(test)]
+impl Session {
+    /// A Claude Code session `id` with `status`, for tests that need an
+    /// enriched session without reading any provider files.
+    pub(crate) fn fixture(id: &str, status: SessionStatus) -> Session {
+        Session {
+            id: id.to_string(),
+            session_key: SessionIdentity::new(SessionProvider::ClaudeCode, id).key(),
+            pid: 4242,
+            session_name: format!("name-{}", id),
+            custom_title: None,
+            codex_title: None,
+            cursor_title: None,
+            ai_title: None,
+            project_path: "/tmp/project".to_string(),
+            git_branch: None,
+            first_prompt: "investigate".to_string(),
+            summary: None,
+            message_count: 3,
+            modified: "2026-07-13T00:00:00Z".to_string(),
+            status,
+            source_health: None,
+            notification_preview: None,
+            latest_message: String::new(),
+            pending_tool_name: None,
+            pending_tool_input: None,
+            waiting_for: None,
+            last_assistant_message: None,
+            transcript_path: None,
+            worker_of: None,
+            official_name: None,
+            started_at_ms: Some(1_752_364_800_000),
+            provider: SessionProvider::ClaudeCode,
+            surface: SessionSurface::Cli,
+            kind: SessionKind::Interactive,
+            entrypoint: None,
+            agent_kind: AgentKind::Root,
+            parent_thread_id: None,
+            root_session_id: None,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+            internal_kind: None,
+            open_target: None,
+            can_open: false,
+            can_stop: false,
+            can_rename: false,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
