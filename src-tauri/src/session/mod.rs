@@ -27,6 +27,7 @@ pub use hidden_sessions::HiddenClaudeSession;
 pub mod detector_cli;
 pub use detector_cli::CliSessionSource;
 pub mod state;
+pub mod transitions;
 pub use parser::{
     extract_messages, parse_all_entries, parse_last_n_entries, parse_sessions_index, ImageBlock,
     MessageContent, MessageType, SessionEntry, SessionIndexEntry, SessionsIndex,

@@ -1,4 +1,5 @@
-//! Session detection in the engine (plan C1a-15).
+//! Session detection and notification triggers in the engine (plan C1a-15,
+//! C1a-16).
 //!
 //! A `DetectorState` with enrichment runs on its own thread every `TICK`,
 //! like the GUI poll. The engine has no window, so the backend recheck that
@@ -16,6 +17,13 @@
 //! - Detected rows whose session is gone get `gone_at` and emit
 //!   `agent.gone`. A session that comes back gets its row back.
 //!
+//! - A session that moved from working to needs-attention or
+//!   waiting-for-input emits `notification.needs_attention` or
+//!   `notification.waiting_for_input`, by the rule the GUI uses
+//!   (`session::transitions`) and with its 30 s cooldown per session. The
+//!   GUI keeps firing its own notifications; these events are for engine
+//!   clients.
+//!
 //! A failed detection writes nothing, so one bad pass does not mark every
 //! session gone. A tick keeps nothing between ticks: it reads the rows it
 //! compares against from the db. After `quick_check` starts a new epoch,
@@ -25,17 +33,22 @@ use super::db::outbox::NewEvent;
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
 use super::proto::AgentRow;
 use crate::session::enrichment::enrich_detected_sessions;
+use crate::session::transitions::notification_transitions;
 use crate::session::{
     DetectedSession, DetectionDiagnostics, DetectorState, Session, SessionStatus,
 };
 use rusqlite::{params, OptionalExtension};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Time between ticks; the GUI polls at the same rate.
 pub const TICK: Duration = Duration::from_millis(3500);
+
+/// One session notifies at most once per this long, as in the GUI poll, so
+/// a flickering status does not repeat a notification.
+pub const NOTIFY_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Where a tick's sessions come from.
 pub trait Observe: Send {
@@ -124,12 +137,67 @@ pub struct Applied {
     pub upserted: Vec<String>,
     /// Rows that got `gone_at`.
     pub gone: Vec<String>,
+    /// `(topic, agent id)` of each notification event.
+    pub notified: Vec<(String, String)>,
+}
+
+/// A notification a tick emits. It carries no conversation text: the
+/// session name and the pending tool name only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Notification {
+    pub topic: &'static str,
+    pub key: String,
+    pub status: &'static str,
+    pub name: String,
+    pub pending_tool: Option<String>,
+}
+
+/// Which sessions notify, tick to tick.
+#[derive(Default)]
+pub struct Notifier {
+    prev: HashMap<String, SessionStatus>,
+    started: bool,
+    last: HashMap<String, Instant>,
+}
+
+impl Notifier {
+    /// This tick's notifications. The first tick only seeds the statuses.
+    pub fn step(&mut self, sessions: &[Session], now: Instant) -> Vec<Notification> {
+        let first = !self.started;
+        self.started = true;
+        let mut out = Vec::new();
+        for s in notification_transitions(&mut self.prev, first, sessions) {
+            let cooling = self
+                .last
+                .get(&s.session_key)
+                .is_some_and(|t| now.saturating_duration_since(*t) < NOTIFY_COOLDOWN);
+            if cooling {
+                continue;
+            }
+            self.last.insert(s.session_key.clone(), now);
+            let topic = match s.status {
+                SessionStatus::NeedsAttention => "notification.needs_attention",
+                _ => "notification.waiting_for_input",
+            };
+            out.push(Notification {
+                topic,
+                key: s.session_key.clone(),
+                status: status_name(&s.status),
+                name: s.session_name.clone(),
+                pending_tool: s.pending_tool_name.clone(),
+            });
+        }
+        let live: HashSet<&str> = sessions.iter().map(|s| s.session_key.as_str()).collect();
+        self.last.retain(|k, _| live.contains(k.as_str()));
+        out
+    }
 }
 
 /// Detection for one engine.
 pub struct Detector {
     observe: Box<dyn Observe>,
     machine_id: String,
+    notifier: Notifier,
 }
 
 impl Detector {
@@ -137,17 +205,59 @@ impl Detector {
         Self {
             observe,
             machine_id,
+            notifier: Notifier::default(),
         }
     }
 
     /// Detect once and write the result. Blocking.
     pub fn tick(&mut self, db: &Db) -> Result<Applied, String> {
         let sessions = self.observe.observe()?;
+        let notes = self.notifier.step(&sessions, Instant::now());
         let seen: Vec<Observed> = sessions.iter().map(Observed::from_session).collect();
         let machine = self.machine_id.clone();
-        let (applied, _) = db.write_blocking(move |tx| apply(tx, &machine, &seen, now_ms()))?;
+        let (applied, _) = db.write_blocking(move |tx| {
+            let mut applied = apply(tx, &machine, &seen, now_ms())?;
+            applied.notified = emit_notifications(tx, &machine, &notes)?;
+            Ok(applied)
+        })?;
         Ok(applied)
     }
+}
+
+/// Emit `notes` for the rows `apply` just wrote. Returns `(topic, id)`.
+pub fn emit_notifications(
+    tx: &mut Tx,
+    machine: &str,
+    notes: &[Notification],
+) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut sent = Vec::new();
+    for n in notes {
+        // The engine-controlled row first: it holds the session over a
+        // detected one.
+        let id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM agents WHERE session_key = ?1 AND gone_at IS NULL \
+                 ORDER BY control = 'pty' DESC, id LIMIT 1",
+                [&n.key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else { continue };
+        tx.emit(&NewEvent {
+            topic: n.topic.into(),
+            subject: Some(subject(machine, &id)),
+            origin: None,
+            data: serde_json::json!({
+                "id": id,
+                "sessionKey": n.key,
+                "status": n.status,
+                "name": n.name,
+                "pendingTool": n.pending_tool,
+            }),
+        })?;
+        sent.push((n.topic.to_string(), id));
+    }
+    Ok(sent)
 }
 
 /// Run detection on its own thread every `TICK` until the returned sender
@@ -465,9 +575,14 @@ mod tests {
         let changed = d.tick(&db).unwrap();
         assert_eq!(changed.upserted, vec![a.id.clone()]);
         let t = topics(&db);
+        let subject = format!("{}/{}", M, a.id);
         assert_eq!(
-            t.last().unwrap(),
-            &("agent.upsert".to_string(), format!("{}/{}", M, a.id))
+            t[t.len() - 2..],
+            [
+                ("agent.upsert".to_string(), subject.clone()),
+                // Working to needs-attention also notifies (C1a-16).
+                ("notification.needs_attention".to_string(), subject)
+            ]
         );
     }
 
@@ -628,6 +743,135 @@ mod tests {
         );
         // None of these has a session detection matched.
         assert!(ids(AgentFilter::Sessions).is_empty());
+    }
+
+    // ── Notification triggers (C1a-16) ─────────────────────────────────
+
+    fn topics_of(notes: &[Notification]) -> Vec<(&str, &str)> {
+        notes.iter().map(|n| (n.topic, n.key.as_str())).collect()
+    }
+
+    #[test]
+    fn the_notifier_uses_the_gui_transitions_and_cooldown() {
+        let mut n = Notifier::default();
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let working = vec![
+            s("a", SessionStatus::Working),
+            s("b", SessionStatus::Working),
+        ];
+        // The first tick only seeds, even for a session that is waiting.
+        assert!(n
+            .step(&[s("a", SessionStatus::WaitingForInput)], at(0))
+            .is_empty());
+        assert!(n.step(&working, at(1)).is_empty());
+
+        let mut asking = s("b", SessionStatus::NeedsAttention);
+        asking.pending_tool_name = Some("Bash".into());
+        let notes = n.step(
+            &[s("a", SessionStatus::WaitingForInput), asking.clone()],
+            at(2),
+        );
+        assert_eq!(
+            topics_of(&notes),
+            [
+                ("notification.waiting_for_input", "claudeCode:a"),
+                ("notification.needs_attention", "claudeCode:b")
+            ]
+        );
+        assert_eq!(notes[1].status, "needs_attention");
+        assert_eq!(notes[1].name, "name-b");
+        assert_eq!(notes[1].pending_tool.as_deref(), Some("Bash"));
+
+        // Flicker inside the cooldown: no repeat.
+        assert!(n.step(&working, at(3)).is_empty());
+        assert!(n
+            .step(&[s("a", SessionStatus::WaitingForInput), asking], at(4))
+            .is_empty());
+        // After the cooldown the same transition notifies again.
+        assert!(n.step(&working, at(40)).is_empty());
+        let notes = n.step(
+            &[
+                s("a", SessionStatus::WaitingForInput),
+                s("b", SessionStatus::Working),
+            ],
+            at(41),
+        );
+        assert_eq!(
+            topics_of(&notes),
+            [("notification.waiting_for_input", "claudeCode:a")]
+        );
+    }
+
+    #[test]
+    fn a_gone_session_starts_a_fresh_cooldown() {
+        let mut n = Notifier::default();
+        let t0 = Instant::now();
+        n.step(&[s("a", SessionStatus::Working)], t0);
+        assert_eq!(
+            n.step(&[s("a", SessionStatus::WaitingForInput)], t0).len(),
+            1
+        );
+        n.step(&[], t0);
+        n.step(&[s("a", SessionStatus::Working)], t0);
+        assert_eq!(
+            n.step(&[s("a", SessionStatus::WaitingForInput)], t0).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_tick_emits_notifications_with_its_rows() {
+        let (_t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let script = Script::default();
+        let mut d = detector(&script);
+        script.set(vec![
+            s("a", SessionStatus::Working),
+            s("p", SessionStatus::Working),
+        ]);
+        d.tick(&db).unwrap();
+        db.write_blocking(|tx| {
+            tx.execute(
+                "INSERT INTO agents (id, generation, mode, role, control, provider, \
+                 provider_sid, source) \
+                 VALUES ('agt_pty', 1, 'free', 'worker', 'pty', 'claudeCode', 'p', 'engine')",
+                [],
+            )
+        })
+        .unwrap();
+        let a_id = rows(&db, AgentFilter::All)
+            .into_iter()
+            .find(|r| r.provider_sid.as_deref() == Some("a"))
+            .unwrap()
+            .id;
+
+        script.set(vec![
+            s("a", SessionStatus::WaitingForInput),
+            s("p", SessionStatus::NeedsAttention),
+        ]);
+        let tick = d.tick(&db).unwrap();
+        assert_eq!(
+            tick.notified,
+            [
+                ("notification.waiting_for_input".to_string(), a_id.clone()),
+                // The engine-controlled row holds session p now.
+                ("notification.needs_attention".to_string(), "agt_pty".into())
+            ]
+        );
+        let r = db.reader().unwrap();
+        let (subject, data): (String, String) = r
+            .query_row(
+                "SELECT subject, payload FROM events WHERE topic = 'notification.needs_attention'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(subject, format!("{}/agt_pty", M));
+        let data: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data["sessionKey"], "claudeCode:p");
+        assert_eq!(data["status"], "needs_attention");
+        assert!(data.get("firstPrompt").is_none());
     }
 
     /// A backend that always succeeds with no sessions.
