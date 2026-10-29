@@ -388,6 +388,63 @@ fn an_agent_running_another_binary_is_refused() {
     );
 }
 
+/// Security review H1: `local-unverified` may retire (and create), but not
+/// from deeper than the stamp looks under a live agent, nor from a sandbox.
+#[test]
+fn a_nested_or_sandboxed_local_peer_may_not_retire() {
+    let engine = Engine::start();
+    let api = format!(
+        "env -u C9_AGENT_ID {}={} {} api agent.retire '{{\"id\":\"agt_none\"}}'",
+        ENGINE_HOME_ENV,
+        q(&engine.home),
+        q(Path::new(MAIN))
+    );
+    // Outside any agent: the call goes through to the unknown id.
+    let (out, rc) = as_agent(&engine, &api, false);
+    assert_eq!(rc, 1, "{}", out);
+    assert!(out.contains("unknown_agent"), "{}", out);
+    // 14 shells under the live agent's PTY child: the stamp walks only 10
+    // levels and says local-unverified, the mutation check walks them all.
+    let nest = engine.dir.path().join("nest.sh");
+    std::fs::write(
+        &nest,
+        format!(
+            "if [ \"$1\" -gt 0 ]; then /bin/sh \"$0\" $(($1 - 1)); rc=$?; exit $rc; fi\n{}\n",
+            api
+        ),
+    )
+    .unwrap();
+    let (out, rc) = as_agent(&engine, &format!("/bin/sh {} 14", q(&nest)), true);
+    assert_eq!(rc, 1, "{}", out);
+    assert!(out.contains("not_allowed"), "{}", out);
+    assert!(out.contains("agent:agt_t"), "{}", out);
+    let mut want = 1;
+    // A sandboxed peer, as an agent's Bash or anything it left behind.
+    if cfg!(target_os = "macos") {
+        let (out, rc) = as_agent(
+            &engine,
+            &format!(
+                "/usr/bin/sandbox-exec -p '(version 1)(allow default)' /bin/sh -c {}",
+                q(Path::new(&api))
+            ),
+            false,
+        );
+        assert_eq!(rc, 1, "{}", out);
+        if out.contains("not_allowed") {
+            assert!(out.contains("sandbox"), "{}", out);
+            want += 1;
+        } else {
+            // sandbox-exec cannot nest inside a sandboxed test run.
+            eprintln!("skip: sandbox-exec did not run: {}", out);
+        }
+    }
+    let denials = engine.denials();
+    assert_eq!(denials.len(), want, "{:?}", denials);
+    assert!(denials
+        .iter()
+        .all(|(p, m)| p == "local-unverified" && m == "agent.retire"));
+}
+
 #[test]
 fn a_changed_copy_is_refused() {
     let engine = Engine::start();

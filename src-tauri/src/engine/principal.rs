@@ -116,6 +116,50 @@ pub fn stamp_peer(
     }
 }
 
+/// The extra check before a `local-unverified` peer may call a mutating
+/// method (`agent.create`, `agent.retire`). The stamp walks at most
+/// `MAX_ANCESTRY` levels and calls the rest `local-unverified`, which is
+/// fine for reads; a mutation fails closed instead (security review H1):
+/// - `chain` is the peer's whole ancestry up to init (`None`: the walk
+///   stopped early, so an agent may be above the cut);
+/// - its first entry is the process stamped at accept (`peer_start`);
+/// - no process in it is a live agent's PTY child, at any depth;
+/// - the peer is not `confined`: an agent's Bash runs in the vendor
+///   sandbox, and a process it moved under init stays there.
+pub fn check_mutation(
+    chain: Option<&[ProcInfo]>,
+    peer_start: Option<u64>,
+    confined: Option<bool>,
+    agents: &dyn LiveAgents,
+) -> Result<(), String> {
+    let chain = chain.ok_or("the peer's ancestry could not be read up to init")?;
+    match (chain.first(), peer_start) {
+        (Some(first), Some(start)) if first.start == start => {}
+        _ => return Err("the peer is not the process that connected".into()),
+    }
+    if let Some(agent) = chain
+        .iter()
+        .find_map(|p| agents.by_pty_child(p.pid, p.start))
+    {
+        return Err(format!("the peer runs under agent:{}", agent.id));
+    }
+    match confined {
+        Some(false) => Ok(()),
+        Some(true) => Err("the peer runs in a sandbox".into()),
+        None => Err("whether the peer runs in a sandbox could not be told".into()),
+    }
+}
+
+/// `check_mutation` for the peer with `pid`, as read now. Blocking.
+pub fn check_mutating_peer(
+    pid: libc::pid_t,
+    peer_start: Option<u64>,
+    agents: &dyn LiveAgents,
+) -> Result<(), String> {
+    let chain = peer::full_ancestry(pid);
+    check_mutation(chain.as_deref(), peer_start, peer::confined(pid), agents)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -247,6 +291,46 @@ pub(crate) mod tests {
         // The start time comes back from the same read, even when refused.
         assert_eq!(stamp_peer(me, None, &agents).1, Some(mine.start));
         assert_eq!(stamp_peer(-1, None, &agents).1, None);
+    }
+
+    /// H1: a mutation fails closed where the stamp says
+    /// `local-unverified`.
+    #[test]
+    fn a_mutation_needs_the_whole_chain_and_no_sandbox() {
+        let chain = bash_tool_chain(100);
+        let ok = |c: Option<&[ProcInfo]>, start, confined, agents: &dyn LiveAgents| {
+            check_mutation(c, start, confined, agents)
+        };
+        assert_eq!(
+            ok(Some(&chain), Some(300), Some(false), &NoLiveAgents),
+            Ok(())
+        );
+        // The walk stopped before init.
+        let e = ok(None, Some(300), Some(false), &NoLiveAgents).unwrap_err();
+        assert!(e.contains("up to init"), "{}", e);
+        // Another process than the one stamped at accept.
+        assert!(ok(Some(&chain), Some(301), Some(false), &NoLiveAgents).is_err());
+        assert!(ok(Some(&chain), None, Some(false), &NoLiveAgents).is_err());
+        // Sandboxed, or not known.
+        let e = ok(Some(&chain), Some(300), Some(true), &NoLiveAgents).unwrap_err();
+        assert!(e.contains("sandbox"), "{}", e);
+        assert!(ok(Some(&chain), Some(300), None, &NoLiveAgents).is_err());
+        // A live agent's PTY child far past `MAX_ANCESTRY`.
+        let deep: Vec<ProcInfo> = (0..40).map(|i| pi(100 + i, 101 + i, 7)).collect();
+        let agents = FakeAgents::one("a1", 135, 7);
+        assert_eq!(stamp(&deep, &agents), Principal::LocalUnverified);
+        let e = ok(Some(&deep), Some(7), Some(false), &agents).unwrap_err();
+        assert!(e.contains("agent:a1"), "{}", e);
+    }
+
+    #[test]
+    fn the_test_process_may_mutate() {
+        let me = std::process::id() as libc::pid_t;
+        let start = peer::proc_info(me).map(|p| p.start);
+        assert_eq!(check_mutating_peer(me, start, &NoLiveAgents), Ok(()));
+        let parent = peer::proc_info(me).unwrap().ppid;
+        let pstart = peer::proc_info(parent).unwrap().start;
+        assert!(check_mutating_peer(me, start, &FakeAgents::one("p", parent, pstart)).is_err());
     }
 
     #[test]

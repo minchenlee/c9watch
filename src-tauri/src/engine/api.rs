@@ -308,7 +308,7 @@ async fn handle_frame(
         }
         Checked::Call(req, method) => {
             let id = req.id.clone();
-            match dispatch(&method, req, ctx, principal, streams).await {
+            match dispatch(&method, req, ctx, peer, principal, streams).await {
                 Ok((result, stream)) => (Response::ok(id, result), Next::Continue, stream),
                 Err(e) => (Response::err(id, e), Next::Continue, None),
             }
@@ -511,12 +511,15 @@ async fn dispatch(
     method: &str,
     req: Request,
     ctx: &ServerCtx,
+    peer: Peer,
     principal: &Principal,
     streams: usize,
 ) -> Result<(serde_json::Value, Option<EventStream>), ApiError> {
     match method {
-        "agent.create" => Ok((agent_lifecycle(method, req, ctx, principal).await?, None)),
-        "agent.retire" => Ok((agent_lifecycle(method, req, ctx, principal).await?, None)),
+        "agent.create" | "agent.retire" => Ok((
+            agent_lifecycle(method, req, ctx, peer, principal).await?,
+            None,
+        )),
         "snapshot.get" => Ok((snapshot_get(ctx).await?, None)),
         "session.list" => Ok((session_list(ctx).await?, None)),
         "agent.list" => Ok((agent_list(req, ctx).await?, None)),
@@ -538,20 +541,54 @@ async fn dispatch(
 }
 
 /// `agent.create` and `agent.retire` (C1a-26, `engine::create`). An agent
-/// principal's call is refused and audited.
+/// principal's call is refused and audited. So is a `local-unverified`
+/// peer that fails `principal::check_mutating_peer`: an ancestry that does
+/// not reach init, a live agent's PTY child at any depth, or a sandbox.
 async fn agent_lifecycle(
     method: &str,
     req: Request,
     ctx: &ServerCtx,
+    peer: Peer,
     principal: &Principal,
 ) -> Result<serde_json::Value, ApiError> {
-    let r = spawn_or_retire(method, req, ctx, principal).await;
+    let r = match check_local_peer(method, ctx, peer, principal).await {
+        Ok(()) => spawn_or_retire(method, req, ctx, principal).await,
+        Err(e) => Err(e),
+    };
     if let Err(e) = &r {
         if e.code == ErrorCode::NotAllowed {
             audit_refusal(ctx, principal, method, "", e).await;
         }
     }
     r
+}
+
+/// The mutation check of a `local-unverified` peer. An agent principal is
+/// refused later, by `engine::create`.
+async fn check_local_peer(
+    method: &str,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+) -> Result<(), ApiError> {
+    if *principal != Principal::LocalUnverified {
+        return Ok(());
+    }
+    let agents = ctx.agents.clone();
+    let checked = blocking(move || {
+        Ok(principal::check_mutating_peer(
+            peer.cred.pid,
+            peer.start,
+            agents.as_ref(),
+        ))
+    })
+    .await?;
+    checked.map_err(|why| {
+        ApiError::new(
+            ErrorCode::NotAllowed,
+            format!("{} refused for this peer: {}", method, why),
+        )
+    })
 }
 
 async fn spawn_or_retire(
