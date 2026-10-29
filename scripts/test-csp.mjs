@@ -64,6 +64,8 @@ const allowedUrls = [
   { re: /^http:\/\/127\.0\.0\.1:4096$/ },
   // Mobile access URL shown as text and a data: QR code; never fetched.
   { re: /^http:\/\/\$\{info\.localIp\}:\$\{info\.port\}\// },
+  // Another desktop's page address in the "Other host" hint; text only, never fetched.
+  { re: /^http:\/\/(\$\{host\}|host:9210)\/(<\/code)?$/ },
   // Documentation links in comments.
   { re: /^https:\/\/(svelte\.dev|v2\.tauri\.app)\// },
 ];
