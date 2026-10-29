@@ -939,8 +939,10 @@ mod tests {
             pid: 4242,
             started_at: None,
         }];
-        db.write_blocking(move |tx| crate::engine::detect::apply(tx, M, &seen, now_ms()))
-            .unwrap();
+        db.write_blocking(move |tx| {
+            crate::engine::detect::apply(tx, M, &seen, now_ms(), &Default::default())
+        })
+        .unwrap();
         let live = db.agents(AgentFilter::Live).unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].source, "detected");

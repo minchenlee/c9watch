@@ -305,7 +305,8 @@ pub struct AgentRow {
     pub started_at: Option<i64>,
     /// Unix ms.
     pub created_at: Option<i64>,
-    /// Unix ms of the last detection tick that saw the agent.
+    /// Unix ms of a detection tick that saw the agent. While nothing else
+    /// in the row changes, it moves at most once a minute.
     pub last_seen: Option<i64>,
     /// The agent that owns this one; for an imported legacy worker, the PM
     /// that adopted it.

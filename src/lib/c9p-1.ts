@@ -35,7 +35,10 @@ export interface C9pAgentRow {
   /** `agt_<ulid>`. */
   id: string;
   interruptedNotePending: boolean;
-  /** Unix ms of the last detection tick that saw the agent. */
+  /**
+   * Unix ms of a detection tick that saw the agent. While nothing else
+   * in the row changes, it moves at most once a minute.
+   */
   lastSeen: number | null;
   /** The machine the agent runs on. */
   machineId: string | null;

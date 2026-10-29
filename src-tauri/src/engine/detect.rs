@@ -9,11 +9,14 @@
 //! Each tick writes one transaction, with its events:
 //! - One `role=observed`, `control=none`, `source=detected` row per
 //!   session, keyed by `SessionIdentity::key()` (A:472). A new or changed
-//!   row emits `agent.upsert`; an unchanged one only moves `last_seen`, so
-//!   an idle machine adds no events.
+//!   row emits `agent.upsert`. An unchanged one moves only `last_seen`, and
+//!   only once `LAST_SEEN_EVERY` has passed, so an idle machine writes
+//!   nothing most ticks and adds no events.
 //! - A live `control=pty` row whose `provider_sid` is the session's id
 //!   takes the session instead, so an engine-started agent is never listed
-//!   twice. A detected row of that session goes.
+//!   twice. A detected row of that session goes. A pty row that no longer
+//!   holds a detected session (it is gone, or a newer pty row of the same
+//!   id took it) gives back its `session_key` and `status`.
 //! - Detected rows whose session is gone get `gone_at` and emit
 //!   `agent.gone`. A session that comes back gets its row back.
 //!
@@ -25,9 +28,13 @@
 //!   clients.
 //!
 //! A failed detection writes nothing, so one bad pass does not mark every
-//! session gone. A tick keeps nothing between ticks: it reads the rows it
-//! compares against from the db. After `quick_check` starts a new epoch,
-//! the next tick rebuilds the observed rows from provider data (A:497).
+//! session gone. A pass where only some providers failed (say `claude
+//! agents --json` timed out, but Codex answered) keeps the rows of the
+//! failed providers as they are, for up to `HOLD_TICKS` failed passes in a
+//! row; after that their sessions count as gone. Between ticks a tick
+//! keeps only those counts and the notifier: it reads the rows it compares
+//! against from the db. After `quick_check` starts a new epoch, the next
+//! tick rebuilds the observed rows from provider data (A:497).
 
 use super::db::outbox::NewEvent;
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
@@ -50,9 +57,27 @@ pub const TICK: Duration = Duration::from_millis(3500);
 /// a flickering status does not repeat a notification.
 pub const NOTIFY_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// A provider that failed this many passes in a row stops holding its
+/// rows. It outlasts the switch to the legacy backend after repeated
+/// `claude` failures (`DOWNGRADE_THRESHOLD`, 5 passes).
+pub const HOLD_TICKS: u32 = 6;
+
+/// An unchanged row's `last_seen` is rewritten at most this often, so an
+/// idle tick commits nothing.
+pub const LAST_SEEN_EVERY: Duration = Duration::from_secs(60);
+
+/// One detection pass.
+#[derive(Debug, Clone, Default)]
+pub struct Observation {
+    pub sessions: Vec<Session>,
+    /// Providers (`SessionProvider::as_key`) that did not answer: the pass
+    /// says nothing about their sessions.
+    pub failed: Vec<&'static str>,
+}
+
 /// Where a tick's sessions come from.
 pub trait Observe: Send {
-    fn observe(&mut self) -> Result<Vec<Session>, String>;
+    fn observe(&mut self) -> Result<Observation, String>;
 }
 
 type Enrich = fn(Vec<DetectedSession>, DetectionDiagnostics) -> Result<Vec<Session>, String>;
@@ -82,12 +107,21 @@ impl Live {
 }
 
 impl Observe for Live {
-    fn observe(&mut self) -> Result<Vec<Session>, String> {
+    fn observe(&mut self) -> Result<Observation, String> {
         let (detected, diag) = self
             .state
             .detect()
             .map_err(|e| format!("Detect failed: {}", e))?;
-        (self.enrich)(detected, diag)
+        let failed = self
+            .state
+            .failed_providers()
+            .iter()
+            .map(|p| p.as_key())
+            .collect();
+        Ok(Observation {
+            sessions: (self.enrich)(detected, diag)?,
+            failed,
+        })
     }
 }
 
@@ -148,7 +182,7 @@ pub struct Notification {
 }
 
 /// Which sessions notify, tick to tick.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Notifier {
     prev: HashMap<String, SessionStatus>,
     started: bool,
@@ -157,9 +191,23 @@ pub struct Notifier {
 
 impl Notifier {
     /// This tick's notifications. The first tick only seeds the statuses.
-    pub fn step(&mut self, sessions: &[Session], now: Instant) -> Vec<Notification> {
+    /// Sessions of the `held` providers (which did not answer) keep their
+    /// previous status and cooldown.
+    pub fn step(
+        &mut self,
+        sessions: &[Session],
+        held: &HashSet<String>,
+        now: Instant,
+    ) -> Vec<Notification> {
         let first = !self.started;
         self.started = true;
+        let is_held = |key: &str| held.contains(provider_of(key));
+        let kept: Vec<(String, SessionStatus)> = self
+            .prev
+            .iter()
+            .filter(|(k, _)| is_held(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let mut out = Vec::new();
         for s in notification_transitions(&mut self.prev, first, sessions) {
             let cooling = self
@@ -182,10 +230,19 @@ impl Notifier {
                 pending_tool: s.pending_tool_name.clone(),
             });
         }
+        for (k, v) in kept {
+            self.prev.entry(k).or_insert(v);
+        }
         let live: HashSet<&str> = sessions.iter().map(|s| s.session_key.as_str()).collect();
-        self.last.retain(|k, _| live.contains(k.as_str()));
+        self.last
+            .retain(|k, _| live.contains(k.as_str()) || is_held(k));
         out
     }
+}
+
+/// The provider part of a `SessionIdentity::key()`.
+fn provider_of(key: &str) -> &str {
+    key.split_once(':').map_or(key, |(p, _)| p)
 }
 
 /// Detection for one engine.
@@ -193,6 +250,8 @@ pub struct Detector {
     observe: Box<dyn Observe>,
     machine_id: String,
     notifier: Notifier,
+    /// Failed passes in a row, per provider key.
+    misses: HashMap<&'static str, u32>,
 }
 
 impl Detector {
@@ -201,20 +260,35 @@ impl Detector {
             observe,
             machine_id,
             notifier: Notifier::default(),
+            misses: HashMap::new(),
         }
     }
 
     /// Detect once and write the result. Blocking.
     pub fn tick(&mut self, db: &Db) -> Result<Applied, String> {
-        let sessions = self.observe.observe()?;
-        let notes = self.notifier.step(&sessions, Instant::now());
-        let seen: Vec<Observed> = sessions.iter().map(Observed::from_session).collect();
+        let obs = self.observe.observe()?;
+        self.misses.retain(|p, _| obs.failed.contains(p));
+        for p in &obs.failed {
+            *self.misses.entry(p).or_insert(0) += 1;
+        }
+        let held: HashSet<String> = self
+            .misses
+            .iter()
+            .filter(|(_, n)| **n < HOLD_TICKS)
+            .map(|(p, _)| p.to_string())
+            .collect();
+        // Step a copy: a tick whose write fails must not use up its
+        // transitions, so the next tick finds them again.
+        let mut notifier = self.notifier.clone();
+        let notes = notifier.step(&obs.sessions, &held, Instant::now());
+        let seen: Vec<Observed> = obs.sessions.iter().map(Observed::from_session).collect();
         let machine = self.machine_id.clone();
         let (applied, _) = db.write_blocking(move |tx| {
-            let mut applied = apply(tx, &machine, &seen, now_ms())?;
+            let mut applied = apply(tx, &machine, &seen, now_ms(), &held)?;
             applied.notified = emit_notifications(tx, &machine, &notes)?;
             Ok(applied)
         })?;
+        self.notifier = notifier;
         Ok(applied)
     }
 }
@@ -342,12 +416,22 @@ fn mark_gone(
     Ok(())
 }
 
-/// Write one tick's sessions; see the module docs.
-pub fn apply(tx: &mut Tx, machine: &str, seen: &[Observed], now: i64) -> rusqlite::Result<Applied> {
+/// Write one tick's sessions; see the module docs. The rows of `held`
+/// providers (keys of providers that did not answer) stay as they are.
+pub fn apply(
+    tx: &mut Tx,
+    machine: &str,
+    seen: &[Observed],
+    now: i64,
+    held: &HashSet<String>,
+) -> rusqlite::Result<Applied> {
     let mut applied = Applied::default();
+    let stale = now - LAST_SEEN_EVERY.as_millis() as i64;
     let mut keys: HashSet<&str> = HashSet::new();
     // Keys whose detected row stays live.
     let mut detected: HashSet<&str> = HashSet::new();
+    // Key -> the pty row that holds it this tick.
+    let mut pty_of: HashMap<&str, String> = HashMap::new();
     for o in seen {
         // A provider listing the same session twice: the first one wins.
         if !keys.insert(o.key.as_str()) {
@@ -364,11 +448,17 @@ pub fn apply(tx: &mut Tx, machine: &str, seen: &[Observed], now: i64) -> rusqlit
         if let Some(id) = pty {
             // The engine owns the rest of a pty row.
             let before = read_row(tx, &id)?;
-            tx.execute(
-                "UPDATE agents SET session_key = ?2, status = ?3, last_seen = ?4 WHERE id = ?1",
-                params![id, o.key, o.status, now],
-            )?;
-            emit_if_changed(tx, machine, &id, Some(before), &mut applied)?;
+            let same = before.session_key.as_deref() == Some(o.key.as_str())
+                && before.status.as_deref() == Some(o.status);
+            if !same || before.last_seen.is_none_or(|t| t <= stale) {
+                tx.execute(
+                    "UPDATE agents SET session_key = ?2, status = ?3, last_seen = ?4 \
+                     WHERE id = ?1",
+                    params![id, o.key, o.status, now],
+                )?;
+                emit_if_changed(tx, machine, &id, Some(before), &mut applied)?;
+            }
+            pty_of.insert(o.key.as_str(), id);
             continue;
         }
         detected.insert(o.key.as_str());
@@ -383,6 +473,7 @@ pub fn apply(tx: &mut Tx, machine: &str, seen: &[Observed], now: i64) -> rusqlit
             )
             .optional()?;
         let id = match &before {
+            Some(row) if is_current(row, o, machine, stale) => continue,
             Some(row) => {
                 tx.execute(
                     "UPDATE agents SET gone_at = NULL, provider = ?2, provider_sid = ?3, \
@@ -431,20 +522,58 @@ pub fn apply(tx: &mut Tx, machine: &str, seen: &[Observed], now: i64) -> rusqlit
         emit_if_changed(tx, machine, &id, before, &mut applied)?;
     }
 
-    let live: Vec<(String, String)> = {
+    let live: Vec<(String, String, String)> = {
         let mut st = tx.prepare(
-            "SELECT id, session_key FROM agents \
+            "SELECT id, session_key, provider FROM agents \
              WHERE source = 'detected' AND gone_at IS NULL ORDER BY id",
         )?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    for (id, key) in live {
-        if !detected.contains(key.as_str()) {
+    for (id, key, provider) in live {
+        if !detected.contains(key.as_str()) && !held.contains(&provider) {
             mark_gone(tx, machine, &id, &key, now, &mut applied)?;
         }
     }
+
+    // A pty row that no longer holds its session gives the key back, so
+    // `session.list` neither keeps a stale session nor lists one twice.
+    let ptys: Vec<(String, String, String)> = {
+        let mut st = tx.prepare(
+            "SELECT id, session_key, provider FROM agents \
+             WHERE control = 'pty' AND gone_at IS NULL AND session_key IS NOT NULL ORDER BY id",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, key, provider) in ptys {
+        let holder = pty_of.get(key.as_str());
+        if holder == Some(&id) || (holder.is_none() && held.contains(&provider)) {
+            continue;
+        }
+        let before = read_row(tx, &id)?;
+        tx.execute(
+            "UPDATE agents SET session_key = NULL, status = NULL WHERE id = ?1",
+            [&id],
+        )?;
+        emit_if_changed(tx, machine, &id, Some(before), &mut applied)?;
+    }
     Ok(applied)
+}
+
+/// Whether the detected `row` already says what `o` does, with a recent
+/// enough `last_seen`: then the tick writes nothing for it.
+fn is_current(row: &AgentRow, o: &Observed, machine: &str, stale: i64) -> bool {
+    row.gone_at.is_none()
+        && row.provider == o.provider
+        && row.provider_sid.as_deref() == Some(o.sid.as_str())
+        && row.machine_id.as_deref() == Some(machine)
+        && row.status.as_deref() == Some(o.status)
+        && row.cwd.as_deref() == Some(o.cwd.as_str())
+        && row.name.as_deref() == Some(o.name.as_str())
+        && row.pid == Some(o.pid)
+        && row.started_at == o.started_at
+        && row.last_seen.is_some_and(|t| t > stale)
 }
 
 #[cfg(test)]
@@ -465,19 +594,26 @@ mod tests {
         (t, h)
     }
 
-    /// Sessions the next tick sees; an `Err` fails the tick.
+    /// What the next tick sees; an `Err` fails the tick.
     #[derive(Clone)]
-    struct Script(Arc<Mutex<Result<Vec<Session>, String>>>);
+    struct Script(Arc<Mutex<Result<Observation, String>>>);
 
     impl Default for Script {
         fn default() -> Self {
-            Script(Arc::new(Mutex::new(Ok(Vec::new()))))
+            Script(Arc::new(Mutex::new(Ok(Observation::default()))))
         }
     }
 
     impl Script {
         fn set(&self, sessions: Vec<Session>) {
-            *self.0.lock().unwrap() = Ok(sessions);
+            self.partial(sessions, &[]);
+        }
+        /// `sessions`, while the `failed` providers did not answer.
+        fn partial(&self, sessions: Vec<Session>, failed: &[&'static str]) {
+            *self.0.lock().unwrap() = Ok(Observation {
+                sessions,
+                failed: failed.to_vec(),
+            });
         }
         fn fail(&self) {
             *self.0.lock().unwrap() = Err("detect failed".into());
@@ -485,9 +621,13 @@ mod tests {
     }
 
     impl Observe for Script {
-        fn observe(&mut self) -> Result<Vec<Session>, String> {
+        fn observe(&mut self) -> Result<Observation, String> {
             self.0.lock().unwrap().clone()
         }
+    }
+
+    fn none() -> HashSet<String> {
+        HashSet::new()
     }
 
     fn detector(script: &Script) -> Detector {
@@ -550,16 +690,11 @@ mod tests {
         assert!(a.created_at.is_some() && a.last_seen.is_some());
         assert_eq!(topics(&db).len(), 2);
 
-        // The same sessions again: same rows, no event, `last_seen` moves.
+        // The same sessions again: same rows, no event, no write.
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(d.tick(&db).unwrap(), Applied::default());
         let again = rows(&db, AgentFilter::All);
-        assert_eq!(again.len(), 2);
-        assert_eq!(
-            again.iter().map(|r| &r.id).collect::<Vec<_>>(),
-            r.iter().map(|r| &r.id).collect::<Vec<_>>()
-        );
-        assert!(again[0].last_seen > r[0].last_seen);
+        assert_eq!(again, r);
         assert_eq!(topics(&db).len(), 2);
 
         // A status change is one upsert of that row.
@@ -638,6 +773,143 @@ mod tests {
         assert!(d.tick(&db).is_err());
         assert_eq!(rows(&db, AgentFilter::All), before);
         assert_eq!(rows(&db, AgentFilter::Sessions).len(), 1);
+    }
+
+    fn codex(id: &str, status: SessionStatus) -> Session {
+        let mut x = s(id, status);
+        x.provider = crate::session::SessionProvider::Codex;
+        x.session_key = format!("codex:{}", id);
+        x
+    }
+
+    #[test]
+    fn a_provider_that_did_not_answer_keeps_its_rows() {
+        let (_t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let script = Script::default();
+        let mut d = detector(&script);
+        script.set(vec![
+            s("a", SessionStatus::Working),
+            s("b", SessionStatus::Working),
+            codex("x", SessionStatus::Working),
+        ]);
+        d.tick(&db).unwrap();
+        let before = rows(&db, AgentFilter::All);
+        let events = topics(&db).len();
+
+        // `claude agents --json` timed out; Codex answered.
+        script.partial(vec![codex("x", SessionStatus::Working)], &["claudeCode"]);
+        for _ in 1..HOLD_TICKS {
+            assert_eq!(d.tick(&db).unwrap(), Applied::default());
+        }
+        assert_eq!(rows(&db, AgentFilter::All), before);
+        assert_eq!(rows(&db, AgentFilter::Sessions).len(), 3);
+        assert_eq!(topics(&db).len(), events);
+
+        // A transition across the blip still notifies.
+        script.set(vec![
+            s("a", SessionStatus::WaitingForInput),
+            s("b", SessionStatus::Working),
+            codex("x", SessionStatus::Working),
+        ]);
+        let tick = d.tick(&db).unwrap();
+        assert_eq!(tick.gone, Vec::<String>::new());
+        assert_eq!(tick.notified.len(), 1);
+        assert_eq!(tick.notified[0].0, "notification.waiting_for_input");
+
+        // A provider that keeps failing stops holding its rows.
+        script.partial(vec![codex("x", SessionStatus::Working)], &["claudeCode"]);
+        for _ in 1..HOLD_TICKS {
+            assert!(d.tick(&db).unwrap().gone.is_empty());
+        }
+        assert_eq!(d.tick(&db).unwrap().gone.len(), 2);
+        assert_eq!(rows(&db, AgentFilter::Sessions).len(), 1);
+    }
+
+    #[test]
+    fn a_failed_write_keeps_its_notifications_for_the_next_tick() {
+        let (_t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let script = Script::default();
+        let mut d = detector(&script);
+        script.set(vec![s("a", SessionStatus::Working)]);
+        d.tick(&db).unwrap();
+        script.set(vec![s("a", SessionStatus::WaitingForInput)]);
+        db.close();
+        assert!(d.tick(&db).is_err());
+        drop(db);
+
+        let db = db::open(&h, M).unwrap();
+        let tick = d.tick(&db).unwrap();
+        assert_eq!(tick.notified.len(), 1, "{:?}", tick);
+    }
+
+    #[test]
+    fn an_idle_tick_writes_nothing_until_last_seen_is_due() {
+        let (_t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let seen = vec![Observed::from_session(&s("a", SessionStatus::Working))];
+        let at = |ms: i64| {
+            let seen = seen.clone();
+            db.write_blocking(move |tx| apply(tx, M, &seen, ms, &none()))
+                .unwrap()
+                .0
+        };
+        assert_eq!(at(1_000).upserted.len(), 1);
+        let first = rows(&db, AgentFilter::All);
+        assert_eq!(at(5_000), Applied::default());
+        assert_eq!(rows(&db, AgentFilter::All), first);
+
+        let due = 1_000 + LAST_SEEN_EVERY.as_millis() as i64;
+        assert_eq!(at(due), Applied::default());
+        let after = rows(&db, AgentFilter::All);
+        assert_eq!(after[0].last_seen, Some(due));
+        assert_eq!(topics(&db).len(), 1, "a last_seen refresh emits nothing");
+    }
+
+    #[test]
+    fn a_pty_row_gives_back_its_session_when_it_goes_or_is_replaced() {
+        let (_t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let script = Script::default();
+        let mut d = detector(&script);
+        let pty = |id: &'static str| {
+            db.write_blocking(move |tx| {
+                tx.execute(
+                    "INSERT INTO agents (id, generation, mode, role, control, provider, \
+                     provider_sid, source) \
+                     VALUES (?1, 1, 'free', 'worker', 'pty', 'claudeCode', 'p', 'engine')",
+                    [id],
+                )
+            })
+            .unwrap();
+        };
+        pty("agt_pty1");
+        script.set(vec![s("p", SessionStatus::Working)]);
+        d.tick(&db).unwrap();
+        let key_of = |id: &str| {
+            rows(&db, AgentFilter::All)
+                .into_iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .session_key
+        };
+        assert_eq!(key_of("agt_pty1").as_deref(), Some("claudeCode:p"));
+
+        // A respawn of the same session: the newer row takes the key.
+        pty("agt_pty2");
+        let tick = d.tick(&db).unwrap();
+        assert_eq!(tick.upserted, vec!["agt_pty2", "agt_pty1"]);
+        assert_eq!(key_of("agt_pty1"), None);
+        let live = rows(&db, AgentFilter::Sessions);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, "agt_pty2");
+
+        // Its session is gone: no stale session stays listed.
+        script.set(vec![]);
+        assert_eq!(d.tick(&db).unwrap().upserted, vec!["agt_pty2"]);
+        assert!(rows(&db, AgentFilter::Sessions).is_empty());
+        assert_eq!(d.tick(&db).unwrap(), Applied::default());
     }
 
     #[test]
@@ -757,14 +1029,15 @@ mod tests {
         ];
         // The first tick only seeds, even for a session that is waiting.
         assert!(n
-            .step(&[s("a", SessionStatus::WaitingForInput)], at(0))
+            .step(&[s("a", SessionStatus::WaitingForInput)], &none(), at(0))
             .is_empty());
-        assert!(n.step(&working, at(1)).is_empty());
+        assert!(n.step(&working, &none(), at(1)).is_empty());
 
         let mut asking = s("b", SessionStatus::NeedsAttention);
         asking.pending_tool_name = Some("Bash".into());
         let notes = n.step(
             &[s("a", SessionStatus::WaitingForInput), asking.clone()],
+            &none(),
             at(2),
         );
         assert_eq!(
@@ -779,17 +1052,22 @@ mod tests {
         assert_eq!(notes[1].pending_tool.as_deref(), Some("Bash"));
 
         // Flicker inside the cooldown: no repeat.
-        assert!(n.step(&working, at(3)).is_empty());
+        assert!(n.step(&working, &none(), at(3)).is_empty());
         assert!(n
-            .step(&[s("a", SessionStatus::WaitingForInput), asking], at(4))
+            .step(
+                &[s("a", SessionStatus::WaitingForInput), asking],
+                &none(),
+                at(4)
+            )
             .is_empty());
         // After the cooldown the same transition notifies again.
-        assert!(n.step(&working, at(40)).is_empty());
+        assert!(n.step(&working, &none(), at(40)).is_empty());
         let notes = n.step(
             &[
                 s("a", SessionStatus::WaitingForInput),
                 s("b", SessionStatus::Working),
             ],
+            &none(),
             at(41),
         );
         assert_eq!(
@@ -802,15 +1080,17 @@ mod tests {
     fn a_gone_session_starts_a_fresh_cooldown() {
         let mut n = Notifier::default();
         let t0 = Instant::now();
-        n.step(&[s("a", SessionStatus::Working)], t0);
+        n.step(&[s("a", SessionStatus::Working)], &none(), t0);
         assert_eq!(
-            n.step(&[s("a", SessionStatus::WaitingForInput)], t0).len(),
+            n.step(&[s("a", SessionStatus::WaitingForInput)], &none(), t0)
+                .len(),
             1
         );
-        n.step(&[], t0);
-        n.step(&[s("a", SessionStatus::Working)], t0);
+        n.step(&[], &none(), t0);
+        n.step(&[s("a", SessionStatus::Working)], &none(), t0);
         assert_eq!(
-            n.step(&[s("a", SessionStatus::WaitingForInput)], t0).len(),
+            n.step(&[s("a", SessionStatus::WaitingForInput)], &none(), t0)
+                .len(),
             1
         );
     }

@@ -1326,11 +1326,11 @@ mod tests {
         };
         let (a, b) = (seen("a"), seen("b"));
         let both = vec![a.clone(), b];
-        db.write(move |tx| apply(tx, MACHINE, &both, 1))
+        db.write(move |tx| apply(tx, MACHINE, &both, 1, &Default::default()))
             .await
             .unwrap();
         db.write(move |tx| {
-            apply(tx, MACHINE, &[a], 2)?;
+            apply(tx, MACHINE, &[a], 2, &Default::default())?;
             tx.execute(
                 "INSERT INTO agents (id, role, provider, source, state) \
                  VALUES ('agt_zretired', 'worker', 'claudeCode', 'engine', 'retired')",

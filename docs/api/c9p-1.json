@@ -76,7 +76,7 @@
           "type": "boolean"
         },
         "lastSeen": {
-          "description": "Unix ms of the last detection tick that saw the agent.",
+          "description": "Unix ms of a detection tick that saw the agent. While nothing else\nin the row changes, it moves at most once a minute.",
           "format": "int64",
           "type": [
             "integer",
