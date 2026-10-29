@@ -142,12 +142,21 @@ fn capability_disabled(capability: &'static str) -> ServerMsg {
 
 /// Session fields that carry conversation text. With conversations off they
 /// are blanked (string fields the client expects) or dropped (optional ones).
+/// AI-generated titles (`aiTitle`, `codexTitle`, `cursorTitle`) summarise
+/// the conversation, so they go too.
 const BLANKED_SESSION_FIELDS: &[&str] = &["firstPrompt", "latestMessage"];
-const DROPPED_SESSION_FIELDS: &[&str] = &["lastAssistantMessage", "pendingToolInput"];
+const DROPPED_SESSION_FIELDS: &[&str] = &[
+    "lastAssistantMessage",
+    "pendingToolInput",
+    "aiTitle",
+    "codexTitle",
+    "cursorTitle",
+];
 
 /// Removes what the policy keeps from remote clients out of a session array
-/// (`sessions`, `sessionsUpdated`). Names, titles, status and the pending
-/// tool's name stay, so a card still says what it is and what it waits for.
+/// (`sessions`, `sessionsUpdated`). User-set names (`sessionName`,
+/// `customTitle`), status and the pending tool's name stay, so a card still
+/// says what it is and what it waits for.
 fn redact_sessions(data: &mut serde_json::Value, policy: &WsPolicy) {
     let Some(sessions) = data.as_array_mut() else {
         return;
@@ -1703,6 +1712,9 @@ mod protocol_tests {
             "id": "s1",
             "sessionName": "proj",
             "customTitle": "My title",
+            "aiTitle": "secret ai title",
+            "codexTitle": "secret codex title",
+            "cursorTitle": "secret cursor title",
             "firstPrompt": "secret prompt",
             "latestMessage": "secret latest",
             "lastAssistantMessage": "secret reply",
@@ -1725,9 +1737,13 @@ mod protocol_tests {
         assert!(s["summary"].is_null());
         assert!(s.get("lastAssistantMessage").is_none());
         assert!(s.get("pendingToolInput").is_none());
+        // AI-generated titles summarise the conversation.
+        assert!(s.get("aiTitle").is_none());
+        assert!(s.get("codexTitle").is_none());
+        assert!(s.get("cursorTitle").is_none());
         assert!(!data.to_string().contains("secret"), "{data}");
         assert!(!data.to_string().contains("id_rsa"), "{data}");
-        // Names and status stay: the card still shows what it is.
+        // User-set names and status stay: the card still shows what it is.
         assert_eq!(s["sessionName"], "proj");
         assert_eq!(s["customTitle"], "My title");
         assert_eq!(s["pendingToolName"], "Bash");

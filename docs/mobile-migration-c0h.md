@@ -43,9 +43,11 @@ script, or the PM orchestration CLI.
 6. **Remote devices get no conversation content by default.** With
    **Conversations over remote** off:
    - `getConversation` is refused.
-   - Session pushes have no first prompt, latest message, last reply, summary
-     or pending tool input. Names, titles, status and the pending tool's name
-     stay, so a card still says what it is and what it waits for.
+   - Session pushes have no first prompt, latest message, last reply, summary,
+     pending tool input or AI-generated title (`aiTitle`, `codexTitle`,
+     `cursorTitle`). The session name, a title you set, status and the
+     pending tool's name stay, so a card still says what it is and what it
+     waits for.
    - A notification's title is the session's title or name, never the first
      prompt.
 7. **Remote devices cannot open windows by default.** With **Open terminal
@@ -113,9 +115,9 @@ The protocol changes are:
   away-activity counts (files edited, commands run, subagents done; no
   content). Both are part of watching cards, so they stay available to every
   paired device on purpose.
-- **Titles can come from the conversation.** Claude Code's generated title
-  (`aiTitle`) stays in pushes when conversations are off, because the card
-  needs a name. It is a short summary, not the transcript.
+- **A title you set can describe the conversation.** With conversations off,
+  generated titles are removed, but `customTitle` and `sessionName` stay,
+  because the card needs a name.
 
 ## Out of scope
 
