@@ -11,6 +11,13 @@
 //! (cursor position, device attributes, colours) at once: CC waits for
 //! those replies at startup.
 //!
+//! A writer thread owns every write to the master. A child that stops
+//! reading its input fills the terminal's input queue, and a write then
+//! blocks; on that thread it blocks neither the reader (which must keep
+//! draining output) nor the engine (`write` gives up after
+//! `WRITE_TIMEOUT`). Query replies wait in a bounded queue and are dropped
+//! when it is full.
+//!
 //! Process-group rules:
 //! - The child calls `setsid`, so its pid is also its process group id.
 //!   Every process it starts stays in that group unless it calls `setsid`
@@ -24,11 +31,13 @@ use super::driver::{
 };
 use super::peer;
 use super::vt::{self, Screen};
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,6 +46,20 @@ const PENDING_MAX: usize = 1 << 20;
 
 /// How often `kill` polls the group.
 const POLL: Duration = Duration::from_millis(20);
+
+/// Writes queued for the writer thread at most.
+const WRITE_QUEUE: usize = 64;
+
+/// How long `write` waits for the child to take its bytes.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One write for the writer thread.
+enum Job {
+    /// A query reply from the reader thread. Nobody waits for it.
+    Reply(Vec<u8>),
+    /// Input from `write`, which waits for the result.
+    Input(Vec<u8>, SyncSender<io::Result<()>>),
+}
 
 /// Output shared between the reader thread and the driver.
 struct Buf {
@@ -57,6 +80,7 @@ pub struct NativePty {
     child: Child,
     id: ChildId,
     master: File,
+    writer: SyncSender<Job>,
     shared: Arc<Shared>,
     exit: Option<ExitStatus>,
     /// `kill` has run and found the group gone.
@@ -72,36 +96,65 @@ fn winsize(cols: u16, rows: u16) -> libc::winsize {
     }
 }
 
-fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
-    let raw = fd.as_raw_fd();
-    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
-    if flags == -1 || unsafe { libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// A new PTY pair `(master, slave)`, both close-on-exec. `openpty` cannot
-/// set the flag atomically; a child forked by another thread in between
-/// gets a copy until it execs.
-fn open_pty(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
-    let (mut master, mut slave) = (-1, -1);
-    let mut ws = winsize(cols, rows);
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut ws,
+/// `open(path, O_RDWR | O_NOCTTY | O_CLOEXEC)`.
+fn open_tty(path: &CStr) -> io::Result<OwnedFd> {
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
         )
     };
-    if rc != 0 {
+    if fd == -1 {
         return Err(io::Error::last_os_error());
     }
-    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-    set_cloexec(&master)?;
-    set_cloexec(&slave)?;
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The path of the slave side of `master`.
+#[cfg(target_os = "macos")]
+fn slave_name(master: &OwnedFd) -> io::Result<CString> {
+    // `ptsname` uses a static buffer; the ioctl does not.
+    let mut buf = [0 as libc::c_char; 128];
+    if unsafe {
+        libc::ioctl(
+            master.as_raw_fd(),
+            libc::TIOCPTYGNAME as _,
+            buf.as_mut_ptr(),
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { CStr::from_ptr(buf.as_ptr()) }.to_owned())
+}
+
+/// The path of the slave side of `master`.
+#[cfg(not(target_os = "macos"))]
+fn slave_name(master: &OwnedFd) -> io::Result<CString> {
+    let mut buf = [0 as libc::c_char; 128];
+    let rc = unsafe { libc::ptsname_r(master.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    Ok(unsafe { CStr::from_ptr(buf.as_ptr()) }.to_owned())
+}
+
+/// A new PTY pair `(master, slave)`, both opened close-on-exec. The flag
+/// must be there from the first moment: fd flags are copied at fork, so a
+/// child that another thread forks or spawns before a later `fcntl` keeps
+/// both ends past its exec, and could drive this terminal. `openpty`
+/// cannot do this, so the pair is opened by hand.
+fn open_pty(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
+    let master = open_tty(c"/dev/ptmx")?;
+    let raw = master.as_raw_fd();
+    if unsafe { libc::grantpt(raw) } != 0 || unsafe { libc::unlockpt(raw) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let slave = open_tty(&slave_name(&master)?)?;
+    let ws = winsize(cols, rows);
+    if unsafe { libc::ioctl(raw, libc::TIOCSWINSZ as _, &ws as *const libc::winsize) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
     Ok((master, slave))
 }
 
@@ -127,9 +180,10 @@ fn group_alive(pgid: libc::pid_t) -> bool {
 /// Reads the master until EOF. On Linux a master whose slave side is fully
 /// closed reads EIO, which also counts as EOF.
 ///
-/// Query replies go out through `replies` after the lock is released. A
-/// child that sent a query reads its input, so the write does not block.
-fn read_loop(mut master: File, mut replies: File, shared: Arc<Shared>) {
+/// Query replies go to the writer thread after the lock is released, one
+/// per distinct reply in a chunk. A full queue drops them: the reader never
+/// waits on the child's input.
+fn read_loop(mut master: File, replies: SyncSender<Job>, shared: Arc<Shared>) {
     let mut chunk = [0u8; 65536];
     loop {
         let n = match master.read(&mut chunk) {
@@ -153,14 +207,36 @@ fn read_loop(mut master: File, mut replies: File, shared: Arc<Shared>) {
         buf.last_output = Instant::now();
         buf.screen.feed_bytes(data);
         let cursor = (buf.screen.y, buf.screen.x);
-        let answers: Vec<String> = std::mem::take(&mut buf.screen.queries)
-            .iter()
-            .filter_map(|q| vt::query_reply(q, cursor))
-            .collect();
+        let mut answers: Vec<String> = Vec::new();
+        for q in std::mem::take(&mut buf.screen.queries) {
+            if let Some(a) = vt::query_reply(&q, cursor) {
+                if !answers.contains(&a) {
+                    answers.push(a);
+                }
+            }
+        }
         shared.ready.notify_all();
         drop(buf);
         for a in answers {
-            let _ = replies.write_all(a.as_bytes());
+            if let Err(TrySendError::Full(_)) = replies.try_send(Job::Reply(a.into_bytes())) {
+                break;
+            }
+        }
+    }
+}
+
+/// Runs the queued writes in order until every sender is gone. A write to
+/// a master whose slave side is fully closed fails at once, so the thread
+/// does not outlive the child for long.
+fn write_loop(mut master: File, jobs: Receiver<Job>) {
+    for job in jobs {
+        match job {
+            Job::Reply(bytes) => {
+                let _ = master.write_all(&bytes);
+            }
+            Job::Input(bytes, done) => {
+                let _ = done.send(master.write_all(&bytes).and_then(|_| master.flush()));
+            }
         }
     }
 }
@@ -224,6 +300,7 @@ impl Driver for NativePty {
         drop(slave);
         let pid = child.id() as libc::pid_t;
         let master = File::from(master);
+        let (writer, jobs) = mpsc::sync_channel(WRITE_QUEUE);
         let shared = Arc::new(Shared {
             buf: Mutex::new(Buf {
                 pending: Vec::new(),
@@ -238,6 +315,7 @@ impl Driver for NativePty {
             child,
             id: ChildId { pid, start: 0 },
             master,
+            writer,
             shared,
             exit: None,
             killed: false,
@@ -251,8 +329,12 @@ impl Driver for NativePty {
         };
         pty.id.start = info.start;
         let reader = pty.master.try_clone()?;
-        let replies = pty.master.try_clone()?;
+        let output = pty.master.try_clone()?;
+        let replies = pty.writer.clone();
         let shared = pty.shared.clone();
+        std::thread::Builder::new()
+            .name(format!("pty-write-{}", pid))
+            .spawn(move || write_loop(output, jobs))?;
         std::thread::Builder::new()
             .name(format!("pty-read-{}", pid))
             .spawn(move || read_loop(reader, replies, shared))?;
@@ -263,9 +345,30 @@ impl Driver for NativePty {
         self.id
     }
 
+    /// Fails with `WouldBlock` when the write queue is full, and with
+    /// `TimedOut` when the child has not taken the bytes within
+    /// `WRITE_TIMEOUT`; they may still arrive later.
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.master.write_all(bytes)?;
-        self.master.flush()
+        let gone = || io::Error::new(io::ErrorKind::BrokenPipe, "the PTY writer has stopped");
+        let (done, result) = mpsc::sync_channel(1);
+        match self.writer.try_send(Job::Input(bytes.to_vec(), done)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "the PTY write queue is full",
+                ))
+            }
+            Err(TrySendError::Disconnected(_)) => return Err(gone()),
+        }
+        match result.recv_timeout(WRITE_TIMEOUT) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the child did not read its input in time",
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(gone()),
+        }
     }
 
     fn output(&mut self, wait: Duration) -> Output {
@@ -621,6 +724,43 @@ mod tests {
         // No output since: the quiet time grows.
         let snap = screen_until(&mut pty, |s| s.quiet >= Duration::from_millis(300));
         assert!(!snap.text.contains("gone"));
+    }
+
+    #[test]
+    fn the_pty_pair_is_close_on_exec_from_the_start() {
+        let (master, slave) = open_pty(80, 24).unwrap();
+        for fd in [&master, &slave] {
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+        let mut ws = winsize(0, 0);
+        assert_ne!(
+            unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCGWINSZ as _, &mut ws) },
+            -1
+        );
+        assert_eq!((ws.ws_col, ws.ws_row), (80, 24));
+    }
+
+    #[test]
+    fn a_child_that_never_reads_stalls_neither_output_nor_write() {
+        // A flood of queries while stdin goes unread: the replies fill the
+        // terminal's input queue, and output must still drain.
+        let mut pty = NativePty::spawn(&sh("stty -icanon -echo; i=0; while [ $i -lt 3000 ]; do \
+             printf '\\033[5n\\033[c\\033[6n'; i=$((i+1)); echo \"tick $i\"; done; sleep 30"))
+        .unwrap();
+        read_until(&mut pty, "tick 3000\r\n");
+        let started = Instant::now();
+        let err = pty.write(&[b'x'; 1 << 16]).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ),
+            "{:?}",
+            err
+        );
+        assert!(started.elapsed() < WRITE_TIMEOUT + Duration::from_secs(2));
+        pty.kill().unwrap();
     }
 
     #[test]
