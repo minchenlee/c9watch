@@ -9,8 +9,10 @@ export type WsAuth = { token: string } | { code: string };
 
 /** Close code: the first frame was missing, late, or malformed. */
 export const CLOSE_BAD_HANDSHAKE = 4400;
-/** Close code: token or code rejected. Pair again; do not retry. */
+/** Close code: token rejected. Pair again; do not retry. */
 export const CLOSE_UNAUTHORIZED = 4401;
+/** Close code: pairing code wrong, expired or used. A stored token is unaffected. */
+export const CLOSE_PAIR_REJECTED = 4403;
 
 const CONNECT_TIMEOUT_MS = 5000;
 
@@ -105,13 +107,24 @@ class WsClient {
 
 			socket.onclose = (event: CloseEvent) => {
 				const unauthorized = event?.code === CLOSE_UNAUTHORIZED;
-				settle(new Error(unauthorized ? 'Not paired' : 'Connection closed'));
+				const pairRejected = event?.code === CLOSE_PAIR_REJECTED;
+				settle(new Error(
+					unauthorized ? 'Not paired' : pairRejected ? 'Pairing code rejected' : 'Connection closed'
+				));
 				if (this.ws !== socket) return; // replaced or disconnected
 				this._connected = false;
 				this.rejectPending('Connection closed');
-				if (unauthorized) {
+				if (pairRejected) {
+					// Only the code failed; a stored token is still good.
 					this.auth = null;
-					clearStoredToken();
+					return;
+				}
+				if (unauthorized) {
+					// Only the token this socket sent is void. A newer one stored
+					// meanwhile (another tab, a fresh pairing) stays.
+					const rejected = this.auth && 'token' in this.auth ? this.auth.token : null;
+					this.auth = null;
+					if (rejected !== null) clearStoredToken(rejected);
 					this.emit('authRequired', null);
 					return;
 				}
@@ -298,8 +311,10 @@ export function setStoredConnection(host: string, token: string) {
 	}
 }
 
-function clearStoredToken() {
+/** Remove the stored token; with `only`, just when it is still that token. */
+function clearStoredToken(only?: string) {
 	try {
+		if (only !== undefined && localStorage.getItem(TOKEN_KEY) !== only) return;
 		localStorage.removeItem(TOKEN_KEY);
 	} catch {
 		// Nothing stored.

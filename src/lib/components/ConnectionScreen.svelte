@@ -23,6 +23,7 @@
 	const WS_PORT = 9210;
 	const CONNECT_ERROR =
 		'Could not connect. Check that remote access is on and the code has not expired.';
+	const LOAD_ERROR = 'Connected, but the session list did not load. Try again.';
 
 	/** This page's own server, as "host:port". The socket goes to the server that served the page. */
 	function pageHost(): string {
@@ -54,19 +55,41 @@
 		return null;
 	}
 
+	/** 'auth': the socket was not let in. 'load': it was, but the first session list failed. */
+	async function attempt(host: string, auth: WsAuth): Promise<'ok' | 'auth' | 'load'> {
+		try {
+			await wsClient.connect(host, auth);
+		} catch {
+			return 'auth';
+		}
+		try {
+			await initializeSessionListeners();
+			sessions.set(await getSessions());
+		} catch {
+			return 'load';
+		}
+		onconnected();
+		return 'ok';
+	}
+
+	/**
+	 * Connect to `host` with a pairing code. When this device already has a
+	 * token for that host, try the token first: an old or used code (a QR
+	 * scanned twice, a code typed again after a failed load) must not cost a
+	 * working pairing. A rejected code never clears the token (close 4403).
+	 */
 	async function doConnect(host: string, auth: WsAuth) {
 		connecting = true;
 		inputError = '';
-		try {
-			await wsClient.connect(host, auth);
-			await initializeSessionListeners();
-			const initial = await getSessions();
-			sessions.set(initial);
-			onconnected();
-		} catch {
-			inputError = CONNECT_ERROR;
-			pairAgain = !getStoredConnection() && !!getStoredHost();
+		const stored = getStoredConnection();
+		let result: 'ok' | 'auth' | 'load' = 'auth';
+		if ('code' in auth && stored?.host === host) {
+			result = await attempt(host, { token: stored.token });
 		}
+		if (result === 'auth') result = await attempt(host, auth);
+		if (result === 'ok') return;
+		inputError = result === 'load' ? LOAD_ERROR : CONNECT_ERROR;
+		pairAgain = !getStoredConnection() && !!getStoredHost();
 	}
 
 	function connectWithCode() {

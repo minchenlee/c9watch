@@ -83,7 +83,7 @@ The protocol changes are:
 |---|---|
 | `ws://host:9210/ws?token=T` | `ws://host:9210/ws`, then the first frame `{"type":"auth","token":"T"}` or `{"type":"pair","code":"CODE"}` within 5 s |
 | connection opens at once | wait for `{"type":"authOk","clientId","capabilities"}` or `{"type":"paired","clientId","token","capabilities"}` before you send requests |
-| — | close code `4400`: no, late or malformed first frame. `4401`: token or code refused; pair again, do not retry |
+| — | close code `4400`: no, late or malformed first frame. `4401`: token refused; pair again, do not retry. `4403`: pairing code wrong, expired or used; a stored token is still valid |
 | `{"type":"stopSession","pid":N}` | `{"type":"session.stop","addr":"claudeCode:<sessionId>","pid":N?}` |
 | `{"type":"openSession","pid":N,"projectPath":P}` | `{"type":"openSession","addr":"<provider>:<sessionId>","pid":N?}`. The server uses the pid and project path of the session it detects. |
 

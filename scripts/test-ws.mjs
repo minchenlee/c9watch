@@ -196,6 +196,32 @@ test('a failed pairing does not retry the code', async () => {
   assert.equal(timers.filter((t) => !t.cleared && t.ms === 3000).length, 0);
 });
 
+test('a rejected pairing code keeps a stored valid token', async () => {
+  const { client, ws, sockets, store } = harness({
+    storage: { 'c9watch-ws-host': 'h:9210', 'c9watch-client-token': 'tok' },
+  });
+  let required = 0;
+  client.on('authRequired', () => required++);
+  const done = assert.rejects(client.connect('h:9210', { code: 'ABCD2345' }), /pairing code/i);
+  sockets[0].open();
+  sockets[0].drop(ws.CLOSE_PAIR_REJECTED);
+  await done;
+  assert.equal(store['c9watch-client-token'], 'tok');
+  assert.equal(required, 0);
+});
+
+test('a 4401 for an old token does not clear a newer stored token', async () => {
+  const { client, sockets, store } = harness({
+    storage: { 'c9watch-ws-host': 'h:9210', 'c9watch-client-token': 'old' },
+  });
+  const done = assert.rejects(client.connect('h:9210', { token: 'old' }));
+  sockets[0].open();
+  store['c9watch-client-token'] = 'new'; // paired meanwhile
+  sockets[0].drop(4401);
+  await done;
+  assert.equal(store['c9watch-client-token'], 'new');
+});
+
 test('a legacy token URL is removed and flagged for re-pairing', () => {
   const { ws, store } = harness({ storage: { 'c9watch-ws-url': 'ws://h:9210/ws?token=abc' } });
   assert.equal(ws.migrateLegacyWsUrl(), true);

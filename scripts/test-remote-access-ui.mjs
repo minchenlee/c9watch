@@ -80,6 +80,15 @@ test('the connection screen pairs with a code and reads it from the fragment', (
   assert.match(connection, /Pair again/);
 });
 
+test('a pairing code never costs a stored token for the same host', () => {
+  const connect = connection.slice(connection.indexOf('async function doConnect'), connection.indexOf('function connectWithCode'));
+  // The stored token is tried before the code, and only for its own host.
+  assert.match(connect, /'code' in auth && stored\?\.host === host/);
+  assert.ok(connect.indexOf('{ token: stored.token }') < connect.indexOf('attempt(host, auth)'));
+  // A failed first session list is not reported as a pairing failure.
+  assert.match(connection, /result === 'load' \? LOAD_ERROR : CONNECT_ERROR/);
+});
+
 test('conversation and open capabilities are separate toggles that save through set_remote_access', () => {
   assert.match(remote, /aria-label="Conversations over remote"/);
   assert.match(remote, /aria-pressed=\{remote\.allowConversation\}/);

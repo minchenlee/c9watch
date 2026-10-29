@@ -915,6 +915,9 @@ const CLOSE_BAD_HANDSHAKE: u16 = 4400;
 /// Close code: the token or pairing code was not accepted. The client
 /// must pair again; it should not retry on its own.
 const CLOSE_UNAUTHORIZED: u16 = 4401;
+/// Close code: the pairing code was wrong, expired or already used. Unlike
+/// 4401 it says nothing about a token the client may already hold.
+const CLOSE_PAIR_REJECTED: u16 = 4403;
 
 /// The first frame a client sends. Nothing else is read before it.
 #[derive(Deserialize)]
@@ -968,13 +971,13 @@ fn check_auth_frame(text: &str, state: &WsState) -> Result<AuthReply, u16> {
             state
                 .pairing
                 .lock()
-                .map_err(|_| CLOSE_UNAUTHORIZED)?
+                .map_err(|_| CLOSE_PAIR_REJECTED)?
                 .redeem(&code, std::time::Instant::now())
-                .map_err(|_| CLOSE_UNAUTHORIZED)?;
+                .map_err(|_| CLOSE_PAIR_REJECTED)?;
             let (client_id, token) = state
                 .clients
                 .lock()
-                .map_err(|_| CLOSE_UNAUTHORIZED)?
+                .map_err(|_| CLOSE_PAIR_REJECTED)?
                 .issue();
             Ok(AuthReply::Paired {
                 client_id,
@@ -1047,6 +1050,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>, peer: IpAddr)
         Err(Some(code)) => {
             let reason = if code == CLOSE_UNAUTHORIZED {
                 "unauthorized"
+            } else if code == CLOSE_PAIR_REJECTED {
+                "pairing code rejected"
             } else {
                 "expected auth frame"
             };
@@ -2295,11 +2300,13 @@ mod server_tests {
         send_json(&mut first, serde_json::json!({"type": "pair", "code": code})).await;
         assert!(matches!(next_event(&mut first).await, Event::Text(v) if v["type"] == "paired"));
 
+        // A refused code gets its own close code, so a client that also
+        // holds a valid token knows the token is not the problem.
         let mut second = open(addr).await;
         send_json(&mut second, serde_json::json!({"type": "pair", "code": code})).await;
         assert!(matches!(
             next_event(&mut second).await,
-            Event::Close(Some(CLOSE_UNAUTHORIZED))
+            Event::Close(Some(CLOSE_PAIR_REJECTED))
         ));
     }
 
