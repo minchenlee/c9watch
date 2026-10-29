@@ -516,7 +516,11 @@ async fn dispatch(
     streams: usize,
 ) -> Result<(serde_json::Value, Option<EventStream>), ApiError> {
     match method {
-        "agent.create" | "agent.retire" => Ok((
+        "agent.create" => Ok((
+            agent_lifecycle(method, req, ctx, peer, principal).await?,
+            None,
+        )),
+        "agent.retire" => Ok((
             agent_lifecycle(method, req, ctx, peer, principal).await?,
             None,
         )),
