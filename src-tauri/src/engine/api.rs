@@ -1,10 +1,11 @@
 //! c9p/1 connection handling: one reader and one writer task per
 //! connection, the `hello` handshake, and method dispatch.
 //!
-//! The first frame must be `hello` and must arrive within 5 s. A major
-//! version mismatch gets `upgrade_required` and the connection closes. So do
-//! a missing or late `hello`, an oversized frame and a peer under another
-//! uid. A frame that is not valid JSON gets `bad_request`, and the
+//! The first frame must be `hello` and must arrive within 5 s of the accept;
+//! blank lines do not extend that deadline. A major version mismatch gets
+//! `upgrade_required` and the connection closes. So do a missing or late
+//! `hello`, an oversized frame and a peer under another uid. After `hello`, a
+//! frame that is not valid JSON or lacks `v` gets `bad_request`, and the
 //! connection stays open, because the line framing is still intact.
 
 use super::peer::{self, PeerCred};
@@ -34,6 +35,8 @@ pub struct ServerCtx {
     pub hello_timeout: Duration,
     /// Live agents, for `agent:<id>` stamping.
     pub agents: Arc<dyn LiveAgents>,
+    /// The only uid a peer may have: the engine's own euid.
+    pub engine_uid: libc::uid_t,
 }
 
 impl ServerCtx {
@@ -44,6 +47,7 @@ impl ServerCtx {
             hello_timeout: HELLO_TIMEOUT,
             // C1a-33 replaces this with the engine's agent table.
             agents: Arc::new(NoLiveAgents),
+            engine_uid: peer::engine_uid(),
         }
     }
 }
@@ -79,6 +83,10 @@ enum Next {
 
 /// Serve one connection until the peer closes it or a fatal error.
 pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
+    let hello_deadline = tokio::time::Instant::now() + ctx.hello_timeout;
+    // Read the clock before the peer facts: a peer that started after this
+    // reused the pid of the process that connected.
+    let accepted = peer::start_token_now();
     let cred = peer::peer_cred(stream.as_raw_fd());
     let (read, mut write) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<Response>(WRITE_QUEUE);
@@ -91,7 +99,7 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
         let _ = write.shutdown().await;
     });
 
-    let cred = match cred.and_then(|c| peer::check_peer_uid(&c, peer::engine_uid()).map(|_| c)) {
+    let cred = match cred.and_then(|c| peer::check_peer_uid(&c, ctx.engine_uid).map(|_| c)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[engine] Rejected connection: {}", e);
@@ -107,11 +115,15 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
         }
     };
 
+    // Stamp at accept, not at `hello`: the peer pid is then as fresh as it
+    // gets, and a late `hello` cannot wait for the pid to be reused.
+    let principal = principal::stamp_peer(cred.pid, accepted, ctx.agents.as_ref());
+
     let mut reader = BufReader::new(read);
     let mut conn: Option<Conn> = None;
     loop {
         let frame = if conn.is_none() {
-            match tokio::time::timeout(ctx.hello_timeout, read_frame(&mut reader, MAX_FRAME)).await
+            match tokio::time::timeout_at(hello_deadline, read_frame(&mut reader, MAX_FRAME)).await
             {
                 Ok(f) => f,
                 Err(_) => {
@@ -147,7 +159,7 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
         if frame.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let (resp, next) = handle_frame(&frame, &ctx, cred, &mut conn);
+        let (resp, next) = handle_frame(&frame, &ctx, cred, &principal, &mut conn);
         if tx.send(resp).await.is_err() {
             break;
         }
@@ -164,54 +176,54 @@ fn handle_frame(
     frame: &[u8],
     ctx: &ServerCtx,
     cred: PeerCred,
+    principal: &Principal,
     conn: &mut Option<Conn>,
 ) -> (Response, Next) {
+    // A bad frame before `hello` closes; after it the connection stays.
+    let soft = if conn.is_some() {
+        Next::Continue
+    } else {
+        Next::Close
+    };
     let req: Request = match serde_json::from_slice(frame) {
         Ok(r) => r,
         Err(e) => {
-            let next = if conn.is_some() {
-                Next::Continue
-            } else {
-                Next::Close
-            };
             return (
                 Response::err(
                     None,
                     ApiError::new(ErrorCode::BadRequest, format!("invalid JSON: {}", e)),
                 ),
-                next,
+                soft,
             );
         }
     };
     let id = req.id.clone();
-    if req.v != Some(API_MAJOR) {
+    let Some(v) = req.v else {
+        return (
+            Response::err(id, ApiError::new(ErrorCode::BadRequest, "missing v")),
+            soft,
+        );
+    };
+    if v != API_MAJOR {
         return (
             Response::err(
                 id,
                 ApiError::new(
                     ErrorCode::UpgradeRequired,
-                    format!(
-                        "envelope v={:?}, this engine speaks c9p/{}",
-                        req.v, API_MAJOR
-                    ),
+                    format!("envelope v={}, this engine speaks c9p/{}", v, API_MAJOR),
                 ),
             ),
             Next::Close,
         );
     }
     let Some(method) = req.method.as_deref() else {
-        let next = if conn.is_some() {
-            Next::Continue
-        } else {
-            Next::Close
-        };
         return (
             Response::err(id, ApiError::new(ErrorCode::BadRequest, "missing method")),
-            next,
+            soft,
         );
     };
     if method == "hello" {
-        return hello(req, ctx, cred, conn);
+        return hello(req, ctx, cred, principal, conn);
     }
     if conn.is_none() {
         return (
@@ -247,6 +259,7 @@ fn hello(
     req: Request,
     ctx: &ServerCtx,
     cred: PeerCred,
+    principal: &Principal,
     conn: &mut Option<Conn>,
 ) -> (Response, Next) {
     let id = req.id.clone();
@@ -289,11 +302,10 @@ fn hello(
     let principal = match conn {
         Some(c) => c.principal.clone(),
         None => {
-            let principal = principal::stamp_peer(cred.pid, ctx.agents.as_ref());
             *conn = Some(Conn {
                 principal: principal.clone(),
             });
-            principal
+            principal.clone()
         }
     };
     // The client's claim about itself is logged as unverified and nothing
@@ -339,6 +351,7 @@ mod tests {
             machine_id: "m-test".into(),
             hello_timeout,
             agents,
+            engine_uid: peer::engine_uid(),
         })
     }
 
@@ -437,6 +450,54 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0]["error"]["code"], "hello_timeout");
         assert_eq!(got[0]["error"]["retryable"], true);
+    }
+
+    #[tokio::test]
+    async fn blank_lines_do_not_extend_the_hello_deadline() {
+        let c = connect(ctx(Duration::from_millis(200)));
+        let (read, mut write) = c.into_split();
+        let ticker = tokio::spawn(async move {
+            // Ends once the engine closes and the write fails.
+            while write.write_all(b"\n").await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let mut lines = BufReader::new(read).lines();
+        let first = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("engine answers within the hello deadline")
+            .unwrap()
+            .expect("one error frame");
+        let v: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(v["error"]["code"], "hello_timeout");
+        ticker.abort();
+    }
+
+    #[tokio::test]
+    async fn a_peer_under_another_uid_is_rejected() {
+        let mut ctx = ServerCtx::new("m".into());
+        ctx.engine_uid = peer::engine_uid().wrapping_add(1);
+        // The engine answers before any frame, then closes.
+        let c = connect(Arc::new(ctx));
+        let got = read_all(c).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["error"]["code"], "peer_uid_mismatch");
+    }
+
+    #[tokio::test]
+    async fn missing_v_after_hello_is_a_bad_request() {
+        let mut c = connect(ctx(HELLO_TIMEOUT));
+        send(&mut c, hello_req("1", json!({}))).await;
+        assert_eq!(read_one(&mut c).await["ok"], true);
+        send(&mut c, json!({"id": "2", "method": "x"})).await;
+        let r = read_one(&mut c).await;
+        assert_eq!(r["id"], "2");
+        assert_eq!(r["error"]["code"], "bad_request");
+        // Still open; an explicit v2 then closes it.
+        send(&mut c, json!({"v": 2, "id": "3", "method": "x"})).await;
+        let got = read_all(c).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["error"]["code"], "upgrade_required");
     }
 
     #[tokio::test]

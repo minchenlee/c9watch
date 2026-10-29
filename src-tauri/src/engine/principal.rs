@@ -76,9 +76,17 @@ pub fn stamp(chain: &[ProcInfo], agents: &dyn LiveAgents) -> Principal {
     Principal::LocalUnverified
 }
 
-/// Stamp the principal of the peer with `pid`.
-pub fn stamp_peer(pid: libc::pid_t, agents: &dyn LiveAgents) -> Principal {
-    stamp(&peer::ancestry(pid, MAX_ANCESTRY), agents)
+/// Stamp the principal of the peer with `pid`. `accepted` is the start-time
+/// token taken when the connection was accepted. A peer that started after
+/// it holds a reused pid, not the process that connected, and is
+/// `local-unverified`; so is every peer when the clock could not be read.
+/// This does not catch a reuse between connect and accept.
+pub fn stamp_peer(pid: libc::pid_t, accepted: Option<u64>, agents: &dyn LiveAgents) -> Principal {
+    let chain = peer::ancestry(pid, MAX_ANCESTRY);
+    match (chain.first(), accepted) {
+        (Some(first), Some(at)) if first.start <= at => stamp(&chain, agents),
+        _ => Principal::LocalUnverified,
+    }
 }
 
 #[cfg(test)]
@@ -175,15 +183,34 @@ pub(crate) mod tests {
         let me = std::process::id() as libc::pid_t;
         let parent = peer::proc_info(me).unwrap().ppid;
         let pstart = peer::proc_info(parent).unwrap().start;
+        let now = peer::start_token_now();
+        let agents = FakeAgents::one("p", parent, pstart);
+        assert_eq!(stamp_peer(me, now, &agents), Principal::Agent("p".into()));
         assert_eq!(
-            stamp_peer(me, &FakeAgents::one("p", parent, pstart)),
-            Principal::Agent("p".into())
-        );
-        assert_eq!(
-            stamp_peer(me, &FakeAgents::one("p", parent, pstart + 1)),
+            stamp_peer(me, now, &FakeAgents::one("p", parent, pstart + 1)),
             Principal::LocalUnverified
         );
-        assert_eq!(stamp_peer(me, &NoLiveAgents), Principal::LocalUnverified);
+        assert_eq!(
+            stamp_peer(me, now, &NoLiveAgents),
+            Principal::LocalUnverified
+        );
+    }
+
+    #[test]
+    fn a_peer_that_started_after_the_accept_is_local_unverified() {
+        let me = std::process::id() as libc::pid_t;
+        let mine = peer::proc_info(me).unwrap();
+        let agents = FakeAgents::one("p", mine.ppid, peer::proc_info(mine.ppid).unwrap().start);
+        // Accepted just before we started: our pid would be a reused one.
+        assert_eq!(
+            stamp_peer(me, Some(mine.start - 1), &agents),
+            Principal::LocalUnverified
+        );
+        assert_eq!(stamp_peer(me, None, &agents), Principal::LocalUnverified);
+        assert_eq!(
+            stamp_peer(me, Some(mine.start), &agents),
+            Principal::Agent("p".into())
+        );
     }
 
     #[test]

@@ -161,6 +161,40 @@ pub fn proc_info(_pid: libc::pid_t) -> Option<ProcInfo> {
     None
 }
 
+/// The current time as a start-time token (see `ProcInfo::start`), or
+/// `None` when the clock cannot be read. A process that started after this
+/// token was taken has a larger `start`.
+#[cfg(target_os = "macos")]
+pub fn start_token_now() -> Option<u64> {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(d.as_secs() * 1_000_000 + u64::from(d.subsec_micros()))
+}
+
+/// The current time as a start-time token (see `ProcInfo::start`), or
+/// `None` when the clock cannot be read. `/proc/<pid>/stat` counts clock
+/// ticks on the boot-time clock, so this does too, rounded down like the
+/// kernel.
+#[cfg(target_os = "linux")]
+pub fn start_token_now() -> Option<u64> {
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return None;
+    }
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
+        return None;
+    }
+    let hz = hz as u64;
+    Some(ts.tv_sec as u64 * hz + ts.tv_nsec as u64 * hz / 1_000_000_000)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn start_token_now() -> Option<u64> {
+    None
+}
+
 /// Ppid (field 4) and starttime (field 22) from a `/proc/<pid>/stat` line.
 /// The comm field (2) is in parentheses and may itself hold spaces and
 /// parentheses, so the fields are counted from the last `)`.
@@ -309,6 +343,24 @@ mod tests {
         let want = std::env::current_exe().unwrap().canonicalize().unwrap();
         assert_eq!(exe.canonicalize().unwrap(), want);
         assert!(peer_exe_path(-1).is_err());
+    }
+
+    #[test]
+    fn processes_started_before_now_are_not_later_than_the_token() {
+        let before = start_token_now().unwrap();
+        assert!(proc_info(my_pid()).unwrap().start <= before);
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let start = proc_info(pid).map(|p| p.start);
+        let after = start_token_now().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let start = start.unwrap();
+        assert!(start >= before, "{} < {}", start, before);
+        assert!(start <= after, "{} > {}", start, after);
     }
 
     #[test]
