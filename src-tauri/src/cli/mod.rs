@@ -20,8 +20,11 @@ pub enum CostSortDir {
 mod cost;
 mod session_json;
 mod session_ref;
-// `task done` talks to the engine over a unix socket.
-#[cfg(unix)]
+// Engine commands (`engine`, `api`, `task`) talk to the engine over a unix
+// socket. They exist only in engine builds, so a release CLI is unchanged.
+#[cfg(all(unix, feature = "engine"))]
+pub mod engine_client;
+#[cfg(all(unix, feature = "engine"))]
 pub mod task;
 
 use cost::cmd_cost;
@@ -62,7 +65,8 @@ pub mod worker_backend;
 /// Every subcommand must be listed, or the desktop binary launches the GUI
 /// for it (v0.8.1 shipped that bug for `inbox`/`cost`/`adopt`). PM command
 /// names are listed even when the `pm-orchestration` feature is off, so Clap
-/// reports an unknown command instead of launching the GUI.
+/// reports an unknown command instead of launching the GUI. Engine command
+/// names are listed only in engine builds, so a release build is unchanged.
 pub const CLI_COMMANDS: &[&str] = &[
     "list",
     "status",
@@ -74,9 +78,12 @@ pub const CLI_COMMANDS: &[&str] = &[
     "watch",
     "wait",
     "tasks",
-    // `task done` uses a unix socket; the subcommand exists only on unix.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "engine"))]
     "task",
+    #[cfg(all(unix, feature = "engine"))]
+    "engine",
+    #[cfg(all(unix, feature = "engine"))]
+    "api",
     "spawn",
     "send",
     "workers",
@@ -89,9 +96,16 @@ pub const CLI_COMMANDS: &[&str] = &[
     "help",
 ];
 
+/// Engine command names in builds without the engine. They stay out of
+/// `CLI_COMMANDS`, but `is_cli_invocation` still routes them to Clap, so the
+/// user gets an unknown-command error instead of the GUI.
+pub const RESERVED_ENGINE_COMMANDS: &[&str] = &["task", "engine", "api"];
+
 /// Whether `first` (the first argument) selects the CLI.
 pub fn is_cli_invocation(first: &str) -> bool {
-    CLI_COMMANDS.contains(&first) || matches!(first, "--help" | "-h" | "--version" | "-V")
+    CLI_COMMANDS.contains(&first)
+        || RESERVED_ENGINE_COMMANDS.contains(&first)
+        || matches!(first, "--help" | "-h" | "--version" | "-V")
 }
 
 #[derive(Parser)]
@@ -336,10 +350,27 @@ pub enum Commands {
     },
 
     /// Report to the c9 engine that this managed worker finished its task
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "engine"))]
     Task {
         #[command(subcommand)]
         action: TaskAction,
+    },
+
+    /// Run the c9 engine in the foreground, or control it
+    #[cfg(all(unix, feature = "engine"))]
+    Engine {
+        #[command(subcommand)]
+        action: Option<EngineAction>,
+    },
+
+    /// Send one raw c9p/1 request to the engine and print the response
+    #[cfg(all(unix, feature = "engine"))]
+    Api {
+        /// Method name, e.g. `hello`
+        method: String,
+        /// Params as one JSON value
+        #[arg(default_value = "{}")]
+        params: String,
     },
 
     /// Query session cost data
@@ -377,7 +408,14 @@ pub enum Commands {
     Daemon,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "engine"))]
+#[derive(Subcommand)]
+pub enum EngineAction {
+    /// Stop the engine with SIGTERM and wait for a new one to answer hello
+    Restart,
+}
+
+#[cfg(all(unix, feature = "engine"))]
 #[derive(Subcommand)]
 pub enum TaskAction {
     /// Send the final report to the engine (needs C9_ENGINE_SOCK, C9_AGENT_ID, C9_AGENT_TOKEN)
@@ -441,10 +479,17 @@ pub fn run(cli: Cli) {
             Err(e) => Err(e),
         },
         Commands::Tasks { session_id } => cmd_tasks(&session_id, cli.pretty),
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "engine"))]
         Commands::Task {
             action: TaskAction::Done { report },
         } => task::cmd_task_done(&report),
+        #[cfg(all(unix, feature = "engine"))]
+        Commands::Engine { action } => match action {
+            None => engine_client::cmd_engine_run(),
+            Some(EngineAction::Restart) => engine_client::cmd_engine_restart(cli.pretty),
+        },
+        #[cfg(all(unix, feature = "engine"))]
+        Commands::Api { method, params } => engine_client::cmd_api(&method, &params, cli.pretty),
         #[cfg(feature = "pm-orchestration")]
         Commands::Spawn {
             cwd,
@@ -1140,7 +1185,46 @@ mod dispatch_tests {
         assert!(Cli::try_parse_from(["c9watch", "watch", "--json"]).is_ok());
     }
 
-    #[cfg(unix)]
+    /// A release CLI (`--features cli`) has no engine commands (v3.1 M-a).
+    #[cfg(not(feature = "engine"))]
+    #[test]
+    fn cli_build_has_no_engine_commands() {
+        for name in ["engine", "api", "task"] {
+            assert!(
+                !CLI_COMMANDS.contains(&name),
+                "{name} in a non-engine build"
+            );
+            assert!(Cli::try_parse_from(["c9watch", name]).is_err());
+            // Clap reports the unknown command; the GUI does not launch.
+            assert!(is_cli_invocation(name), "{name} would launch the GUI");
+        }
+    }
+
+    #[cfg(all(unix, feature = "engine"))]
+    #[test]
+    fn engine_and_api_parse_and_route() {
+        for name in ["engine", "api", "task"] {
+            assert!(is_cli_invocation(name));
+        }
+        let cli = Cli::try_parse_from(["c9watch", "engine"]).unwrap();
+        assert!(matches!(cli.command, Commands::Engine { action: None }));
+        let cli = Cli::try_parse_from(["c9watch", "engine", "restart"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Engine {
+                action: Some(EngineAction::Restart)
+            }
+        ));
+        let cli = Cli::try_parse_from(["c9watch", "api", "hello"]).unwrap();
+        let Commands::Api { method, params } = cli.command else {
+            panic!("not api");
+        };
+        assert_eq!((method.as_str(), params.as_str()), ("hello", "{}"));
+        let cli = Cli::try_parse_from(["c9watch", "api", "x", r#"{"a":1}"#]).unwrap();
+        assert!(matches!(cli.command, Commands::Api { params, .. } if params == r#"{"a":1}"#));
+    }
+
+    #[cfg(all(unix, feature = "engine"))]
     #[test]
     fn task_done_parses_and_routes() {
         assert!(is_cli_invocation("task"));

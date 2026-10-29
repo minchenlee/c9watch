@@ -1,0 +1,50 @@
+//! `c9watch engine`: the engine process itself.
+//!
+//! Order matters: the signal handlers go in before the bind, so a SIGTERM
+//! or SIGINT from then on always reaches the cleanup; the lifetime lock goes
+//! in before the bind, so only the lock holder can replace a leftover
+//! socket. The engine never talks to the legacy `c9watch daemon`.
+
+use super::api::{serve, ServerCtx};
+use super::fsutil::ensure_private_dir;
+use super::home::{lock_path, sock_path};
+use super::lock::acquire_engine_lock;
+use super::sock::{bind_private, ShutdownSignals};
+use std::path::Path;
+use std::sync::Arc;
+use tokio::net::UnixListener;
+
+/// Run the engine in `home` until SIGTERM or SIGINT. Must run inside a tokio
+/// runtime. Fails with `engine_already_running` when another engine holds
+/// the lock.
+pub async fn run(home: &Path) -> Result<(), String> {
+    ensure_private_dir(home)?;
+    let mut signals = ShutdownSignals::install()
+        .map_err(|e| format!("Failed to install signal handlers: {}", e))?;
+    let lock = acquire_engine_lock(&lock_path(home))?;
+    let (std_listener, socket) = bind_private(&sock_path(home), &lock)?;
+    std_listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("Failed to set socket non-blocking: {}", e))?;
+    let listener = UnixListener::from_std(std_listener)
+        .map_err(|e| format!("Failed to register Unix socket: {}", e))?;
+
+    // The machine id comes from the store (M2). Until then it is empty.
+    let ctx = Arc::new(ServerCtx::new(String::new()));
+    eprintln!(
+        "[engine] Listening on {:?}, pid={}",
+        socket.path(),
+        std::process::id()
+    );
+
+    let sig = tokio::select! {
+        _ = serve(listener, ctx) => None,
+        sig = signals.recv() => Some(sig),
+    };
+    eprintln!("[engine] Shutting down ({:?})", sig);
+    // Unlink our socket first, then release the lock, so a new engine that
+    // takes the lock never sees our socket as live.
+    drop(socket);
+    drop(lock);
+    Ok(())
+}

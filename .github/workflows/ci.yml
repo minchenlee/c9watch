@@ -73,6 +73,12 @@ jobs:
           cargo test --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features pm-orchestration
 
+      - name: Engine and legacy daemon coexistence test
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features engine,pm-orchestration \
+            --test engine_cli
+
   linux-cli:
     # The CLI-only build must stay portable. The GUI needs macOS (Tauri,
     # NSPanel), so this job builds and tests without the `gui` feature.
