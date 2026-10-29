@@ -260,7 +260,13 @@ mod tests {
         };
         let home = PathBuf::from(home);
         let go = home.join(RACE_GO);
+        // A parent that died before writing `go` must not leave us spinning.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !go.exists() {
+            assert!(
+                home.exists() && std::time::Instant::now() < deadline,
+                "no go signal from the parent"
+            );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let (key, won) = load_or_create_inner(&home).unwrap();
