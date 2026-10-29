@@ -19,12 +19,16 @@
 //! name, and the peer's exe realpath is the engine's `c9watch-agent` copy
 //! with the sha256 the engine recorded. Anything else is
 //! `peer_not_authorized`, and the refusal goes to the audit log. The main
-//! binary's `c9watch api` can therefore never send one.
+//! binary's `c9watch api` can therefore never send one. An authorized
+//! `hook.*` event then goes through `engine::hooks::intake` (kind,
+//! generation, dedupe, state merge; C1a-22).
 
 use super::agent_bin::AgentBin;
 use super::db::audit::{self, AuditEntry};
 use super::db::outbox::{Cursor, Event, ReadError, Subscription, READ_BATCH};
 use super::db::{now_ms, AgentFilter, Db};
+use super::hooks::{self, HookEvent, Outcome};
+use super::merge::MergeTable;
 use super::peer::{self, PeerCred};
 use super::principal::{self, LiveAgents, NoLiveAgents, Principal};
 use super::proto::{
@@ -69,6 +73,8 @@ pub struct ServerCtx {
     pub agent_bin: Option<Arc<AgentBin>>,
     /// The store. `None` only in tests of the connection layer.
     pub db: Option<Arc<Db>>,
+    /// The state merge of every live agent (C1a-22).
+    pub merge: Arc<MergeTable>,
 }
 
 impl ServerCtx {
@@ -82,6 +88,7 @@ impl ServerCtx {
             engine_uid: peer::engine_uid(),
             agent_bin: None,
             db: None,
+            merge: Arc::new(MergeTable::new()),
         }
     }
 
@@ -541,16 +548,56 @@ async fn hook_class(
             ))
         }
         _ => {
-            serde_json::from_value::<HookParams>(req.params).map_err(bad)?;
-            // The state merge (C1a-22) consumes the event; standing orders
-            // for `hook.session_start` come with the spawn profile (M5).
+            let params = serde_json::from_value::<HookParams>(req.params).map_err(bad)?;
+            let Principal::Agent { gen, .. } = principal else {
+                // `authorize` lets only an agent through.
+                return Err(ApiError::new(
+                    ErrorCode::PeerNotAuthorized,
+                    format!("{} is not an agent", principal),
+                ));
+            };
+            let accepted = hook_intake(ctx, method, principal, *gen, params).await?;
+            // Standing orders for `hook.session_start` come with the spawn
+            // profile (M5).
             let result = HookResult {
-                accepted: true,
+                accepted,
                 additional_context: None,
             };
             Ok(serde_json::to_value(result).expect("HookResult serializes"))
         }
     }
+}
+
+/// Run an authorized `hook.*` event through the intake. Returns whether
+/// the engine took it; a dropped event is not an error (the hook must not
+/// fail).
+async fn hook_intake(
+    ctx: &ServerCtx,
+    method: &str,
+    principal: &Principal,
+    gen: i64,
+    params: HookParams,
+) -> Result<bool, ApiError> {
+    let db = ctx.db()?.clone();
+    let machine = ctx.machine_id.clone();
+    let merge = ctx.merge.clone();
+    // Read now, not at accept: a resume since then makes the event stale.
+    let live_gen = ctx.agents.current_gen(&params.agent_id);
+    let (method, principal) = (method.to_string(), principal.to_string());
+    let (outcome, _) = db
+        .write(move |tx| {
+            let ev = HookEvent {
+                method: &method,
+                principal: &principal,
+                gen,
+                live_gen,
+                params: &params,
+            };
+            hooks::intake(tx, &machine, &merge, &ev, now_ms())
+        })
+        .await
+        .map_err(internal)?;
+    Ok(outcome == Outcome::Accepted)
 }
 
 /// The two facts a hook-class call needs: the principal is the agent the
@@ -900,6 +947,7 @@ mod tests {
             engine_uid: peer::engine_uid(),
             agent_bin: None,
             db: None,
+            merge: Arc::new(MergeTable::new()),
         })
     }
 
@@ -1233,6 +1281,7 @@ mod tests {
             engine_uid: peer::engine_uid(),
             agent_bin: None,
             db: Some(db.clone()),
+            merge: Arc::new(MergeTable::new()),
         });
         (t, ctx, db)
     }

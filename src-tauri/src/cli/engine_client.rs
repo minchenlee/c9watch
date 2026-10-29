@@ -525,6 +525,48 @@ pub fn cmd_api(method: &str, params: &str, pretty: bool) -> Result<(), String> {
     }
 }
 
+/// `c9watch integration status|show`: the adapters the engine knows and
+/// their integration files. Reads files only; never starts the engine and
+/// never writes a vendor config (managed CC gets its hooks per spawn
+/// through `--settings`, D24.1; observed sessions use `c9watch hooks`).
+pub fn cmd_integration(action: &super::IntegrationAction, pretty: bool) -> Result<(), String> {
+    let home = engine_home()?;
+    let report = integration_report(action, &home)?;
+    super::print_json(&report, pretty)
+}
+
+/// The JSON `cmd_integration` prints for `home`.
+pub fn integration_report(
+    action: &super::IntegrationAction,
+    home: &Path,
+) -> Result<serde_json::Value, String> {
+    use crate::engine::adapter::{
+        claude_hook_settings, claude_integration_status, descriptor, DESCRIPTORS,
+    };
+    use crate::engine::agent_bin::installed_path;
+    let bin = installed_path(home);
+    match action {
+        super::IntegrationAction::Status => {
+            let kinds: Vec<serde_json::Value> = DESCRIPTORS
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "descriptor": d,
+                        "status": claude_integration_status(&bin),
+                        "delivery": "per_spawn_settings",
+                        "agentBin": bin,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "adapters": kinds }))
+        }
+        super::IntegrationAction::Show { kind } => match descriptor(kind) {
+            Some(d) if d.kind == "claude" => Ok(claude_hook_settings(&bin)),
+            _ => Err(format!("integration: unknown adapter kind {:?}", kind)),
+        },
+    }
+}
+
 /// `c9watch engine shadow-report`: the dev GUI's daily shadow diff
 /// coverage from `<home>/shadow-coverage.ndjson`, oldest day first, plus
 /// where the unexplained diffs are. Reads files only; never starts the
@@ -697,5 +739,41 @@ mod tests {
         assert!(err.starts_with("upgrade_required"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(4));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn integration_reports_the_adapters_and_the_per_spawn_hooks() {
+        use super::super::IntegrationAction;
+        use crate::engine::agent_bin::installed_path;
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("engine home");
+        let status = integration_report(&IntegrationAction::Status, &home).unwrap();
+        let claude = &status["adapters"][0];
+        assert_eq!(claude["descriptor"]["kind"], "claude");
+        assert_eq!(claude["descriptor"]["provider"], "claudeCode");
+        assert_eq!(claude["status"], "missing");
+        // The engine installed its agent copy: CC's integration is current.
+        let bin = installed_path(&home);
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"x").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let status = integration_report(&IntegrationAction::Status, &home).unwrap();
+        assert_eq!(status["adapters"][0]["status"], "current");
+        let show = IntegrationAction::Show {
+            kind: "claude".into(),
+        };
+        let hooks = integration_report(&show, &home).unwrap();
+        let stop = hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            stop.contains("engine home/bin/c9watch-agent' hook stop"),
+            "{stop}"
+        );
+        let bad = IntegrationAction::Show {
+            kind: "grok".into(),
+        };
+        assert!(integration_report(&bad, &home).is_err());
     }
 }

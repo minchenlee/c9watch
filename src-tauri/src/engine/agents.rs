@@ -116,6 +116,10 @@ impl LiveAgents for LiveTable {
                 pty_child_start: g.pty_child.start,
             })
     }
+
+    fn current_gen(&self, agent_id: &str) -> Option<i64> {
+        self.current(agent_id).map(|g| g.gen)
+    }
 }
 
 #[cfg(test)]

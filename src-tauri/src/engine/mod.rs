@@ -55,4 +55,19 @@ pub mod vt;
 pub mod cc_screen;
 
 #[cfg(unix)]
+pub mod adapter;
+
+#[cfg(unix)]
+pub mod transcript;
+
+#[cfg(unix)]
+pub mod merge;
+
+#[cfg(unix)]
+pub mod generation;
+
+#[cfg(unix)]
+pub mod hooks;
+
+#[cfg(unix)]
 pub mod run;

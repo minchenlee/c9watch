@@ -187,6 +187,57 @@ fn an_agent_running_the_copy_is_authorized() {
     assert!(engine.denials().is_empty(), "{:?}", engine.denials());
 }
 
+/// X10: an authorized hook moves the agent row through the state merge
+/// (C1a-22); a hook of another kind is dropped and audited.
+#[test]
+fn an_accepted_hook_moves_the_agent_row() {
+    let engine = Engine::start();
+    let db = || {
+        let c = rusqlite::Connection::open(db_path(&engine.home)).unwrap();
+        c.busy_timeout(Duration::from_secs(5)).unwrap();
+        c
+    };
+    db().execute(
+        "INSERT INTO agents (id, generation, mode, role, control, provider, provider_sid, \
+         source, state) VALUES (?1, 1, 'free', 'worker', 'pty', 'claudeCode', 's1', \
+         'engine', 'working')",
+        [AGENT_ID],
+    )
+    .unwrap();
+    let state = || -> String {
+        db().query_row("SELECT state FROM agents WHERE id = ?1", [AGENT_ID], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    let bin = q(&engine.copy());
+    let (out, rc) = as_agent(
+        &engine,
+        &format!("{} hook permission-request </dev/null", bin),
+        true,
+    );
+    assert_eq!(rc, 0, "{}", out);
+    assert_eq!(state(), "blocked");
+    let (out, rc) = as_agent(
+        &engine,
+        &format!("{} hook stop --kind grok </dev/null", bin),
+        true,
+    );
+    assert_eq!(rc, 0, "{}", out);
+    assert_eq!(state(), "blocked");
+    let drops: Vec<String> = {
+        let c = db();
+        let mut st = c
+            .prepare("SELECT reason FROM audit WHERE decision = 'drop'")
+            .unwrap();
+        let rows = st.query_map([], |r| r.get(0)).unwrap();
+        rows.map(Result::unwrap).collect()
+    };
+    assert_eq!(drops.len(), 1, "{:?}", drops);
+    assert!(drops[0].starts_with("kind_mismatch"), "{:?}", drops);
+    assert!(engine.denials().is_empty(), "{:?}", engine.denials());
+}
+
 #[test]
 fn the_copy_outside_a_live_agent_is_refused() {
     let engine = Engine::start();

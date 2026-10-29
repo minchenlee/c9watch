@@ -1,0 +1,444 @@
+//! Hook event intake (plan C1a-22): what the engine does with a `hook.*`
+//! call after `api::authorize` let it in.
+//!
+//! In order, in one write transaction:
+//! 1. The agent row: a live engine row (`source=engine`, `control=pty`).
+//!    Anything else is dropped as `unknown_agent`.
+//! 2. **Kind before dedupe** (A:1056): the hook's `kind` must be one the
+//!    row's adapter accepts. A Grok agent running the claude hook script
+//!    sends `kind=claude` with Grok's agent id; it is dropped here, before
+//!    it can take a `seq` slot of the real agent.
+//! 3. **Generation** (A:474, A:1051): the event's generation is the one the
+//!    engine stamped on the connection from its live table (C1a-33), never
+//!    a value the agent sends. An event from a generation that is no longer
+//!    the live one, or no longer the row's, is dropped.
+//! 4. **Dedupe** by `agent_id + seq` in the `dedupe` table.
+//! 5. The event goes into the state merge (`engine::merge`), and the
+//!    session binding for SessionStart (`engine::generation`).
+//!
+//! Drops for 1-3 go to the audit log with decision `drop`; a duplicate does
+//! not (a retry is not a finding). Every drop still answers `ok:true` with
+//! `accepted:false`, so a hook never fails.
+
+use super::adapter;
+use super::db::audit::{self, AuditEntry};
+use super::db::outbox::NewEvent;
+use super::db::Tx;
+use super::generation;
+use super::merge::{Activity, Claim, MergeTable, Source};
+use super::proto::HookParams;
+use rusqlite::{params, OptionalExtension};
+
+/// Why an event was not taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    UnknownAgent,
+    KindMismatch,
+    StaleGeneration,
+    Duplicate,
+}
+
+impl DropReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DropReason::UnknownAgent => "unknown_agent",
+            DropReason::KindMismatch => "kind_mismatch",
+            DropReason::StaleGeneration => "stale_generation",
+            DropReason::Duplicate => "duplicate",
+        }
+    }
+}
+
+/// The outcome of one hook event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Accepted,
+    Dropped(DropReason),
+}
+
+/// One `hook.*` call, as the engine sees it.
+pub struct HookEvent<'a> {
+    /// `hook.stop`, ...
+    pub method: &'a str,
+    /// The principal, as stamped (`agent:<id>`).
+    pub principal: &'a str,
+    /// The generation stamped on the connection.
+    pub gen: i64,
+    /// The live table's current generation of the agent now, if it is live.
+    pub live_gen: Option<i64>,
+    pub params: &'a HookParams,
+}
+
+/// Take one hook event (see the module doc). `now_ms` is the engine clock;
+/// a hook claim is timed by its arrival.
+pub fn intake(
+    tx: &mut Tx,
+    machine: &str,
+    merge: &MergeTable,
+    ev: &HookEvent,
+    now_ms: i64,
+) -> rusqlite::Result<Outcome> {
+    let p = ev.params;
+    let id = p.agent_id.as_str();
+    let row: Option<(String, i64, Option<String>)> = tx
+        .query_row(
+            "SELECT provider, generation, state FROM agents WHERE id = ?1 \
+             AND source = 'engine' AND control = 'pty' AND gone_at IS NULL",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((provider, row_gen, state)) = row else {
+        let why = format!("no live engine agent {}", id);
+        return dropped(tx, ev, DropReason::UnknownAgent, &why, now_ms);
+    };
+    let kind_ok =
+        adapter::descriptor_for_provider(&provider).is_some_and(|d| d.accepts_hook_kind(&p.kind));
+    if !kind_ok {
+        let why = format!("hook kind {:?} for a {} agent", p.kind, provider);
+        return dropped(tx, ev, DropReason::KindMismatch, &why, now_ms);
+    }
+    if ev.live_gen != Some(ev.gen) || row_gen != ev.gen {
+        let why = format!(
+            "event of generation {}, live generation {}, row generation {}",
+            ev.gen,
+            ev.live_gen.map_or("none".to_string(), |g| g.to_string()),
+            row_gen
+        );
+        return dropped(tx, ev, DropReason::StaleGeneration, &why, now_ms);
+    }
+    let fresh = tx.execute(
+        "INSERT OR IGNORE INTO dedupe (peer, msg_id, ts) VALUES (?1, ?2, ?3)",
+        params![id, p.seq, now_ms],
+    )? > 0;
+    if !fresh {
+        return Ok(Outcome::Dropped(DropReason::Duplicate));
+    }
+    apply(tx, machine, merge, ev, state.as_deref(), now_ms)?;
+    Ok(Outcome::Accepted)
+}
+
+/// Feed an accepted event into the session binding and the merge, and
+/// write what changed.
+fn apply(
+    tx: &mut Tx,
+    machine: &str,
+    merge: &MergeTable,
+    ev: &HookEvent,
+    state: Option<&str>,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    let p = ev.params;
+    let id = p.agent_id.as_str();
+    let claim = |a: Activity| Some(Claim::new(Source::Hook, a, now_ms));
+    let (claim, attention) = match ev.method {
+        "hook.session_start" => {
+            if let Some(sid) = p.input["session_id"].as_str() {
+                let path = p.input["transcript_path"].as_str();
+                generation::bind_session(tx, machine, id, ev.gen, sid, path, now_ms)?;
+            }
+            (None, None)
+        }
+        // D24.6: the Stop hook is the first turn-end signal.
+        "hook.stop" => (claim(Activity::Ready), None),
+        // D24.5: confirms the screen's `blocked`.
+        "hook.permission_request" => (claim(Activity::Blocked), None),
+        // An auto-mode denial: a human should look (O1 = A).
+        "hook.permission_denied" => {
+            let reason = p.input["reason"]
+                .as_str()
+                .unwrap_or("auto mode classifier denied");
+            (None, Some(format!("auto_mode_denied: {}", reason)))
+        }
+        // Information only; the screen and transcript tell the state.
+        _ => (None, None),
+    };
+    let (change, row_state, attention) = merge.with(id, ev.gen, |m| {
+        let change = claim.map(|c| m.claim(c)).unwrap_or_default();
+        if let Some(a) = &attention {
+            m.attention(a, now_ms);
+        }
+        (change, m.row_state(now_ms), attention)
+    });
+    // Lifecycle states (starting, paused, retiring, ...) belong to the
+    // spawn, drain and retire paths; the merge moves only these.
+    let mergeable = matches!(state, Some("ready" | "working" | "blocked"));
+    if let Some(new) = row_state.filter(|s| mergeable && state != Some(*s)) {
+        tx.execute(
+            "UPDATE agents SET state = ?2 WHERE id = ?1",
+            params![id, new],
+        )?;
+        generation::emit_upsert(tx, machine, id)?;
+    }
+    let subject = Some(format!("{}/{}", machine, id));
+    if let Some(end) = change.turn_end {
+        tx.emit(&NewEvent {
+            topic: "agent.turn_end".into(),
+            subject: subject.clone(),
+            origin: None,
+            data: serde_json::json!({
+                "id": id, "generation": ev.gen, "by": end.by.as_str(), "at": end.at_ms,
+            }),
+        })?;
+    }
+    if let Some(reason) = attention {
+        tx.emit(&NewEvent {
+            topic: "agent.attention".into(),
+            subject,
+            origin: None,
+            data: serde_json::json!({
+                "id": id, "generation": ev.gen, "reason": reason,
+                "toolUseId": p.input["tool_use_id"],
+            }),
+        })?;
+    }
+    Ok(())
+}
+
+/// Audit a dropped event (not a duplicate) and say so.
+fn dropped(
+    tx: &mut Tx,
+    ev: &HookEvent,
+    why: DropReason,
+    detail: &str,
+    now_ms: i64,
+) -> rusqlite::Result<Outcome> {
+    let reason = format!("{}: {}", why.as_str(), detail);
+    audit::append(
+        tx,
+        now_ms,
+        &AuditEntry {
+            principal: ev.principal,
+            method: ev.method,
+            target: Some(&ev.params.agent_id),
+            decision: "drop",
+            reason: Some(&reason),
+            ..Default::default()
+        },
+    )?;
+    Ok(Outcome::Dropped(why))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::db::Db;
+    use crate::engine::generation::tests::{db_with_agent, MACHINE};
+    use crate::engine::generation::{begin_generation, GenReason};
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    fn params(kind: &str, seq: &str, input: Value) -> HookParams {
+        HookParams {
+            agent_id: "a1".into(),
+            kind: kind.into(),
+            seq: seq.into(),
+            input,
+            truncated: false,
+        }
+    }
+
+    /// A store with agent a1 at generation 1, state `ready`.
+    fn setup() -> (tempfile::TempDir, Db, Arc<MergeTable>) {
+        let (t, db) = db_with_agent("a1");
+        db.write_blocking(|tx| {
+            begin_generation(tx, MACHINE, "a1", GenReason::Spawn, "s1", None, 1)?;
+            tx.execute("UPDATE agents SET state = 'ready' WHERE id = 'a1'", [])
+        })
+        .unwrap();
+        (t, db, Arc::new(MergeTable::new()))
+    }
+
+    fn send(
+        db: &Db,
+        merge: &Arc<MergeTable>,
+        method: &'static str,
+        gen: i64,
+        live_gen: Option<i64>,
+        p: HookParams,
+        now: i64,
+    ) -> Outcome {
+        let merge = merge.clone();
+        db.write_blocking(move |tx| {
+            let ev = HookEvent {
+                method,
+                principal: "agent:a1",
+                gen,
+                live_gen,
+                params: &p,
+            };
+            intake(tx, MACHINE, &merge, &ev, now)
+        })
+        .unwrap()
+        .0
+    }
+
+    fn audit(db: &Db) -> Vec<(String, String, String)> {
+        let conn = db.reader().unwrap();
+        let mut st = conn
+            .prepare("SELECT method, decision, reason FROM audit ORDER BY seq")
+            .unwrap();
+        let rows = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        rows.map(Result::unwrap)
+            .filter(|(m, _, _): &(String, String, String)| m.starts_with("hook."))
+            .collect()
+    }
+
+    fn state(db: &Db) -> String {
+        let conn = db.reader().unwrap();
+        conn.query_row("SELECT state FROM agents", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn topics(db: &Db) -> Vec<String> {
+        let conn = db.reader().unwrap();
+        let mut st = conn
+            .prepare("SELECT topic FROM events ORDER BY seq")
+            .unwrap();
+        let rows = st.query_map([], |r| r.get(0)).unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    #[test]
+    fn stale_generation_events_are_dropped_and_audited() {
+        let (_t, db, merge) = setup();
+        // The connection was stamped with generation 1; the agent was
+        // resumed since, so the live table and the row are at 2.
+        db.write_blocking(|tx| {
+            begin_generation(tx, MACHINE, "a1", GenReason::Resume, "s1", None, 2)
+        })
+        .unwrap();
+        let p = params("claude", "1", json!({}));
+        let out = send(&db, &merge, "hook.stop", 1, Some(2), p, 10);
+        assert_eq!(out, Outcome::Dropped(DropReason::StaleGeneration));
+        // The agent is gone from the live table: also stale.
+        let p = params("claude", "2", json!({}));
+        let out = send(&db, &merge, "hook.stop", 2, None, p, 10);
+        assert_eq!(out, Outcome::Dropped(DropReason::StaleGeneration));
+        let rows = audit(&db);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "hook.stop");
+        assert_eq!(rows[0].1, "drop");
+        assert_eq!(
+            rows[0].2,
+            "stale_generation: event of generation 1, live generation 2, row generation 2"
+        );
+        assert!(rows[1].2.contains("live generation none"));
+        // A drop does not take the seq: the current generation's event
+        // with seq 1 still goes in.
+        let p = params("claude", "1", json!({}));
+        assert_eq!(
+            send(&db, &merge, "hook.stop", 2, Some(2), p, 10),
+            Outcome::Accepted
+        );
+    }
+
+    #[test]
+    fn kind_mismatch_is_dropped_before_dedupe() {
+        let (_t, db, merge) = setup();
+        // A hook of another kind under this agent's id (A:1056).
+        let p = params("grok", "7", json!({}));
+        assert_eq!(
+            send(&db, &merge, "hook.permission_request", 1, Some(1), p, 10),
+            Outcome::Dropped(DropReason::KindMismatch)
+        );
+        let rows = audit(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].2,
+            "kind_mismatch: hook kind \"grok\" for a claudeCode agent"
+        );
+        assert_eq!(state(&db), "ready");
+        // The mismatch did not use seq 7.
+        let p = params("claude", "7", json!({}));
+        assert_eq!(
+            send(&db, &merge, "hook.permission_request", 1, Some(1), p, 10),
+            Outcome::Accepted
+        );
+        assert_eq!(state(&db), "blocked");
+        // The same seq again is a duplicate, and not audited.
+        let p = params("claude", "7", json!({}));
+        assert_eq!(
+            send(&db, &merge, "hook.stop", 1, Some(1), p, 20),
+            Outcome::Dropped(DropReason::Duplicate)
+        );
+        assert_eq!(audit(&db).len(), 1);
+        assert_eq!(state(&db), "blocked");
+    }
+
+    #[test]
+    fn an_unknown_or_observed_agent_is_dropped() {
+        let (_t, db, merge) = setup();
+        db.write_blocking(|tx| {
+            tx.execute(
+                "UPDATE agents SET source = 'detected', control = 'none' WHERE id = 'a1'",
+                [],
+            )
+        })
+        .unwrap();
+        let p = params("claude", "1", json!({}));
+        assert_eq!(
+            send(&db, &merge, "hook.stop", 1, Some(1), p, 10),
+            Outcome::Dropped(DropReason::UnknownAgent)
+        );
+        assert_eq!(audit(&db)[0].1, "drop");
+    }
+
+    #[test]
+    fn accepted_events_drive_the_state_and_the_session_binding() {
+        let (_t, db, merge) = setup();
+        // SessionStart binds the transcript.
+        let p = params(
+            "claude",
+            "1",
+            json!({"session_id": "s1", "transcript_path": "/t/s1.jsonl", "source": "startup"}),
+        );
+        assert_eq!(
+            send(&db, &merge, "hook.session_start", 1, Some(1), p, 10),
+            Outcome::Accepted
+        );
+        let path = db
+            .write_blocking(|tx| generation::transcript_path(tx, "a1", 1))
+            .unwrap()
+            .0;
+        assert_eq!(path.as_deref(), Some("/t/s1.jsonl"));
+        // The screen saw a turn start; the Stop hook ends it.
+        merge.with("a1", 1, |m| {
+            m.claim(Claim::new(Source::Screen, Activity::Working, 100))
+        });
+        let p = params("claude", "2", json!({}));
+        assert_eq!(
+            send(&db, &merge, "hook.stop", 1, Some(1), p, 1_000),
+            Outcome::Accepted
+        );
+        assert_eq!(state(&db), "ready");
+        assert!(topics(&db).contains(&"agent.turn_end".to_string()));
+        // A denial raises attention and does not move the state.
+        let p = params(
+            "claude",
+            "3",
+            json!({"tool_use_id": "toolu_1", "reason": "[Code from External]"}),
+        );
+        send(&db, &merge, "hook.permission_denied", 1, Some(1), p, 1_100);
+        assert_eq!(state(&db), "ready");
+        let conn = db.reader().unwrap();
+        let data: String = conn
+            .query_row(
+                "SELECT payload FROM events WHERE topic = 'agent.attention'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let data: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data["reason"], "auto_mode_denied: [Code from External]");
+        assert_eq!(data["toolUseId"], "toolu_1");
+        // A lifecycle state is left alone.
+        db.write_blocking(|tx| tx.execute("UPDATE agents SET state = 'paused'", []))
+            .unwrap();
+        let p = params("claude", "4", json!({}));
+        send(&db, &merge, "hook.permission_request", 1, Some(1), p, 9_000);
+        assert_eq!(state(&db), "paused");
+    }
+}

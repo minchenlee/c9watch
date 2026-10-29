@@ -60,6 +60,10 @@ pub trait LiveAgents: Send + Sync {
     /// The live agent whose PTY child has `pid`, if any. The caller checks
     /// the start time.
     fn by_pty_child(&self, pid: libc::pid_t) -> Option<LiveAgent>;
+
+    /// The current generation of `agent_id`, if it is live. A hook event
+    /// stamped with another generation is stale (C1a-22).
+    fn current_gen(&self, agent_id: &str) -> Option<i64>;
 }
 
 /// No agent is live. Every connection is `local-unverified`.
@@ -67,6 +71,10 @@ pub struct NoLiveAgents;
 
 impl LiveAgents for NoLiveAgents {
     fn by_pty_child(&self, _pid: libc::pid_t) -> Option<LiveAgent> {
+        None
+    }
+
+    fn current_gen(&self, _agent_id: &str) -> Option<i64> {
         None
     }
 }
@@ -126,6 +134,10 @@ pub(crate) mod tests {
     impl LiveAgents for FakeAgents {
         fn by_pty_child(&self, pid: libc::pid_t) -> Option<LiveAgent> {
             self.0.get(&pid).cloned()
+        }
+
+        fn current_gen(&self, agent_id: &str) -> Option<i64> {
+            self.0.values().find(|a| a.id == agent_id).map(|a| a.gen)
         }
     }
 
