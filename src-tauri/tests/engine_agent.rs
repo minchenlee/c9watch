@@ -217,15 +217,20 @@ fn an_accepted_hook_moves_the_agent_row() {
         true,
     );
     assert_eq!(rc, 0, "{}", out);
-    assert_eq!(state(), "blocked");
+    // The hook waits for the engine's answer, but it gives up after 0.5 s
+    // and still exits 0: wait for the row, and show the hook's output.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while state() != "blocked" && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(state(), "blocked", "{}", out);
     let (out, rc) = as_agent(
         &engine,
         &format!("{} hook stop --kind grok </dev/null", bin),
         true,
     );
     assert_eq!(rc, 0, "{}", out);
-    assert_eq!(state(), "blocked");
-    let drops: Vec<String> = {
+    let drops = || -> Vec<String> {
         let c = db();
         let mut st = c
             .prepare("SELECT reason FROM audit WHERE decision = 'drop'")
@@ -233,7 +238,13 @@ fn an_accepted_hook_moves_the_agent_row() {
         let rows = st.query_map([], |r| r.get(0)).unwrap();
         rows.map(Result::unwrap).collect()
     };
-    assert_eq!(drops.len(), 1, "{:?}", drops);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while drops().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(state(), "blocked");
+    let drops = drops();
+    assert_eq!(drops.len(), 1, "{:?} {}", drops, out);
     assert!(drops[0].starts_with("kind_mismatch"), "{:?}", drops);
     assert!(engine.denials().is_empty(), "{:?}", engine.denials());
 }

@@ -125,13 +125,19 @@ impl AgentBin {
                 // `home` may sit below a symlink like /tmp; peers report
                 // the real path.
                 let path = path.canonicalize().unwrap_or(path);
+                // The copy was just hashed as it was written, so the first
+                // hook does not pay for a full rehash within its 0.5 s.
+                let verified = std::fs::symlink_metadata(&path)
+                    .ok()
+                    .filter(|m| m.dev() == dev && m.ino() == ino)
+                    .map(|m| Stamp::of(&m));
                 AgentBin {
                     path,
                     state: Mutex::new(State::Installed {
                         sha,
                         dev,
                         ino,
-                        verified: None,
+                        verified,
                     }),
                 }
             }
