@@ -1,0 +1,565 @@
+//! The native PTY driver: `openpty`, a child in its own session with the
+//! PTY as its controlling terminal, and a reader thread on the master.
+//!
+//! Ported from the C0 spike (`c0-engine.rs:421-456` spawn, `:487-490` write,
+//! `:749-766` kill and verify), on top of the libc crate instead of
+//! portable-pty: the spike used one call of it, and the whole crate is a
+//! dozen new dependencies.
+//!
+//! Process-group rules:
+//! - The child calls `setsid`, so its pid is also its process group id.
+//!   Every process it starts stays in that group unless it calls `setsid`
+//!   or `setpgid` itself; such a process escapes `kill`.
+//! - The kernel does not reuse a pid while a group with that id exists, so
+//!   signalling the group is safe until the group is empty. Once it is
+//!   empty, `kill` and `signal` stop sending.
+
+use super::driver::{ChildId, Driver, KillReport, Output, SpawnSpec, KILL_GRACE, KILL_VERIFY};
+use super::peer;
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+/// Unread output kept at most. Older bytes are dropped and counted.
+const PENDING_MAX: usize = 1 << 20;
+
+/// Raw output tail kept for `screen`.
+const TAIL_MAX: usize = 64 * 1024;
+
+/// How often `kill` polls the group.
+const POLL: Duration = Duration::from_millis(20);
+
+/// Output shared between the reader thread and the driver.
+#[derive(Default)]
+struct Buf {
+    pending: Vec<u8>,
+    dropped: u64,
+    tail: VecDeque<u8>,
+    eof: bool,
+}
+
+#[derive(Default)]
+struct Shared {
+    buf: Mutex<Buf>,
+    ready: Condvar,
+}
+
+/// One child on a native PTY. Dropping it kills the process group.
+pub struct NativePty {
+    child: Child,
+    id: ChildId,
+    master: File,
+    shared: Arc<Shared>,
+    exit: Option<ExitStatus>,
+    /// `kill` has run and found the group gone.
+    killed: bool,
+}
+
+fn winsize(cols: u16, rows: u16) -> libc::winsize {
+    libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    }
+}
+
+fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
+    let raw = fd.as_raw_fd();
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+    if flags == -1 || unsafe { libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A new PTY pair `(master, slave)`, both close-on-exec. `openpty` cannot
+/// set the flag atomically; a child forked by another thread in between
+/// gets a copy until it execs.
+fn open_pty(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
+    let (mut master, mut slave) = (-1, -1);
+    let mut ws = winsize(cols, rows);
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut ws,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    set_cloexec(&master)?;
+    set_cloexec(&slave)?;
+    Ok((master, slave))
+}
+
+/// `kill(-pgid, sig)`.
+fn signal_group(pgid: libc::pid_t, sig: libc::c_int) -> io::Result<()> {
+    if pgid <= 1 {
+        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    if unsafe { libc::kill(-pgid, sig) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Whether any process (zombies included) is still in group `pgid`.
+fn group_alive(pgid: libc::pid_t) -> bool {
+    match signal_group(pgid, 0) {
+        Ok(()) => true,
+        Err(e) => e.raw_os_error() == Some(libc::EPERM),
+    }
+}
+
+/// Reads the master until EOF. On Linux a master whose slave side is fully
+/// closed reads EIO, which also counts as EOF.
+fn read_loop(mut master: File, shared: Arc<Shared>) {
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = match master.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => 0,
+        };
+        let mut buf = shared.buf.lock().unwrap_or_else(|e| e.into_inner());
+        if n == 0 {
+            buf.eof = true;
+            shared.ready.notify_all();
+            return;
+        }
+        let data = &chunk[..n];
+        buf.pending.extend_from_slice(data);
+        if buf.pending.len() > PENDING_MAX {
+            let over = buf.pending.len() - PENDING_MAX;
+            buf.pending.drain(..over);
+            buf.dropped += over as u64;
+        }
+        buf.tail.extend(data.iter().copied());
+        if buf.tail.len() > TAIL_MAX {
+            let over = buf.tail.len() - TAIL_MAX;
+            buf.tail.drain(..over);
+        }
+        shared.ready.notify_all();
+    }
+}
+
+impl NativePty {
+    /// Reap the PTY child if it has exited.
+    fn reap(&mut self) -> io::Result<Option<ExitStatus>> {
+        if self.exit.is_none() {
+            self.exit = self.child.try_wait()?;
+        }
+        Ok(self.exit)
+    }
+
+    /// Wait up to `limit` for the child to be reaped and its group empty.
+    fn wait_gone(&mut self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            let _ = self.reap();
+            if self.exit.is_some() && !group_alive(self.id.pid) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+impl Driver for NativePty {
+    fn spawn(spec: &SpawnSpec) -> io::Result<NativePty> {
+        let Some(program) = spec.argv.first() else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
+        };
+        let (master, slave) = open_pty(spec.cols, spec.rows)?;
+        let mut cmd = Command::new(program);
+        cmd.args(&spec.argv[1..])
+            .current_dir(&spec.cwd)
+            .env_clear()
+            .envs(spec.env.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::from(slave.try_clone()?))
+            .stdout(Stdio::from(slave.try_clone()?))
+            .stderr(Stdio::from(slave.try_clone()?));
+        // Runs in the forked child before exec: only async-signal-safe calls.
+        // A new session makes the child a group leader without a terminal;
+        // TIOCSCTTY on its stdin (the slave) makes the PTY its terminal.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn()?;
+        // The slave copies must all close here, or the master never sees EOF.
+        drop(cmd);
+        drop(slave);
+        let pid = child.id() as libc::pid_t;
+        let master = File::from(master);
+        let shared = Arc::new(Shared::default());
+        let mut pty = NativePty {
+            child,
+            id: ChildId { pid, start: 0 },
+            master,
+            shared,
+            exit: None,
+            killed: false,
+        };
+        let Some(info) = peer::proc_info(pid) else {
+            let _ = pty.kill();
+            return Err(io::Error::other(format!(
+                "cannot read the start time of PTY child {}",
+                pid
+            )));
+        };
+        pty.id.start = info.start;
+        let reader = pty.master.try_clone()?;
+        let shared = pty.shared.clone();
+        std::thread::Builder::new()
+            .name(format!("pty-read-{}", pid))
+            .spawn(move || read_loop(reader, shared))?;
+        Ok(pty)
+    }
+
+    fn child(&self) -> ChildId {
+        self.id
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.master.write_all(bytes)?;
+        self.master.flush()
+    }
+
+    fn output(&mut self, wait: Duration) -> Output {
+        let deadline = Instant::now() + wait;
+        let mut buf = self.shared.buf.lock().unwrap_or_else(|e| e.into_inner());
+        while buf.pending.is_empty() && !buf.eof {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            buf = self
+                .shared
+                .ready
+                .wait_timeout(buf, deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        Output {
+            bytes: std::mem::take(&mut buf.pending),
+            dropped: std::mem::take(&mut buf.dropped),
+            eof: buf.eof,
+        }
+    }
+
+    fn screen(&self) -> String {
+        let buf = self.shared.buf.lock().unwrap_or_else(|e| e.into_inner());
+        let (a, b) = buf.tail.as_slices();
+        let mut raw = Vec::with_capacity(a.len() + b.len());
+        raw.extend_from_slice(a);
+        raw.extend_from_slice(b);
+        String::from_utf8_lossy(&raw).into_owned()
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+        let ws = winsize(cols, rows);
+        if unsafe {
+            libc::ioctl(
+                self.master.as_raw_fd(),
+                libc::TIOCSWINSZ as _,
+                &ws as *const libc::winsize,
+            )
+        } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn signal(&mut self, sig: libc::c_int) -> io::Result<()> {
+        if self.killed {
+            return Err(io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        signal_group(self.id.pid, sig)
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.reap()
+    }
+
+    fn kill(&mut self) -> io::Result<KillReport> {
+        let pgid = self.id.pid;
+        let _ = self.reap();
+        // Nothing left to signal: the group id may already be free.
+        if self.killed || (self.exit.is_some() && !group_alive(pgid)) {
+            self.killed = true;
+            return Ok(KillReport {
+                term_was_enough: true,
+                exit: self.exit,
+            });
+        }
+        let _ = signal_group(pgid, libc::SIGTERM);
+        let term_was_enough = self.wait_gone(KILL_GRACE);
+        if !term_was_enough {
+            let _ = signal_group(pgid, libc::SIGKILL);
+            if !self.wait_gone(KILL_VERIFY) {
+                return Err(io::Error::other(format!(
+                    "process group {} is still alive after SIGKILL",
+                    pgid
+                )));
+            }
+        }
+        self.killed = true;
+        Ok(KillReport {
+            term_was_enough,
+            exit: self.exit,
+        })
+    }
+}
+
+impl Drop for NativePty {
+    fn drop(&mut self) {
+        // The reader thread ends by itself at EOF, once the last slave copy
+        // is gone with the group.
+        let _ = self.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn sh(script: &str) -> SpawnSpec {
+        SpawnSpec::new(
+            vec!["/bin/sh".into(), "-c".into(), script.into()],
+            std::env::temp_dir(),
+        )
+    }
+
+    /// Read until `want` shows up in the output, or panic after 10 s.
+    fn read_until(pty: &mut NativePty, want: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = Vec::new();
+        loop {
+            let out = pty.output(Duration::from_millis(100));
+            seen.extend_from_slice(&out.bytes);
+            let text = String::from_utf8_lossy(&seen).into_owned();
+            if text.contains(want) {
+                return text;
+            }
+            assert!(!out.eof, "EOF before {:?}; got {:?}", want, text);
+            assert!(Instant::now() < deadline, "no {:?}; got {:?}", want, text);
+        }
+    }
+
+    /// The first line of output that parses as a pid.
+    fn read_pid(pty: &mut NativePty, marker: &str) -> libc::pid_t {
+        let text = read_until(pty, &format!("{}\r\n", marker));
+        let line = text
+            .lines()
+            .find_map(|l| l.trim().strip_suffix(marker).map(str::to_string))
+            .unwrap();
+        line.trim().parse().unwrap()
+    }
+
+    fn alive(pid: libc::pid_t) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Wait up to 2 s for `pid` to be gone (an orphan is reaped by init).
+    fn gone_soon(pid: libc::pid_t) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while alive(pid) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL);
+        }
+        true
+    }
+
+    #[test]
+    fn spawn_records_pid_and_start_in_a_new_session() {
+        let mut pty = NativePty::spawn(&sh("echo started; sleep 30")).unwrap();
+        read_until(&mut pty, "started");
+        let id = pty.child();
+        let info = peer::proc_info(id.pid).unwrap();
+        assert_eq!(info.start, id.start);
+        assert_eq!(info.ppid, std::process::id() as libc::pid_t);
+        assert_eq!(unsafe { libc::getpgid(id.pid) }, id.pid);
+        assert_eq!(unsafe { libc::getsid(id.pid) }, id.pid);
+        let report = pty.kill().unwrap();
+        assert!(report.term_was_enough);
+        assert!(!alive(id.pid));
+    }
+
+    #[test]
+    fn the_pty_is_the_controlling_terminal() {
+        let mut pty = NativePty::spawn(&sh("test -t 0 && tty && echo isatty > /dev/tty")).unwrap();
+        let text = read_until(&mut pty, "isatty");
+        assert!(text.contains("/dev/"), "{:?}", text);
+    }
+
+    #[test]
+    fn env_is_only_the_spec_env() {
+        let mut spec =
+            sh("echo \"T=$TERM X=${C9_PTY_TEST-unset} M=${CARGO_MANIFEST_DIR-unset} end\"");
+        spec.env("C9_PTY_TEST", "yes");
+        let mut pty = NativePty::spawn(&spec).unwrap();
+        let text = read_until(&mut pty, " end");
+        assert!(
+            text.contains("T=xterm-256color X=yes M=unset end"),
+            "{:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn write_reaches_the_child() {
+        let mut pty = NativePty::spawn(&sh("echo ready; read line; echo \"got:$line\"")).unwrap();
+        read_until(&mut pty, "ready");
+        pty.write(b"hello\n").unwrap();
+        read_until(&mut pty, "got:hello");
+        assert!(pty.screen().contains("got:hello"));
+    }
+
+    #[test]
+    fn resize_changes_the_terminal_size() {
+        let mut pty = NativePty::spawn(&sh("stty size; read x; stty size; echo done")).unwrap();
+        read_until(&mut pty, "40 120");
+        pty.resize(100, 50).unwrap();
+        pty.write(b"\n").unwrap();
+        read_until(&mut pty, "50 100");
+        read_until(&mut pty, "done");
+    }
+
+    #[test]
+    fn output_ends_with_eof_and_the_exit_status() {
+        let mut pty = NativePty::spawn(&sh("sleep 0.2; echo bye; exit 3")).unwrap();
+        read_until(&mut pty, "bye");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pty.output(Duration::from_millis(100)).eof {
+            assert!(Instant::now() < deadline, "no EOF");
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(s) = pty.try_wait().unwrap() {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "no exit");
+            std::thread::sleep(POLL);
+        };
+        assert_eq!(status.code(), Some(3));
+        // Kill after a clean exit sends nothing and reports the status.
+        let report = pty.kill().unwrap();
+        assert_eq!(report.exit.and_then(|s| s.code()), Some(3));
+    }
+
+    #[test]
+    fn kill_takes_the_whole_group_with_sigterm() {
+        let mut pty = NativePty::spawn(&sh("sleep 300 & echo \"$! bg\"; wait")).unwrap();
+        let bg = read_pid(&mut pty, " bg");
+        let leader = pty.child().pid;
+        assert_eq!(unsafe { libc::getpgid(bg) }, leader);
+        let report = pty.kill().unwrap();
+        assert!(report.term_was_enough);
+        assert!(!alive(leader));
+        assert!(gone_soon(bg), "background child {} survived", bg);
+    }
+
+    #[test]
+    fn kill_escalates_to_sigkill_when_sigterm_is_ignored() {
+        let mut pty =
+            NativePty::spawn(&sh("trap '' TERM; sleep 300 & echo \"$! bg\"; wait")).unwrap();
+        let bg = read_pid(&mut pty, " bg");
+        let started = Instant::now();
+        let report = pty.kill().unwrap();
+        assert!(!report.term_was_enough);
+        assert!(started.elapsed() >= KILL_GRACE);
+        assert!(gone_soon(bg), "background child {} survived", bg);
+        // Signals after kill are refused, not sent to a free group id.
+        assert!(pty.signal(libc::SIGTERM).is_err());
+    }
+
+    #[test]
+    fn kill_after_the_leader_exits_leaves_no_orphan() {
+        // The session leader's exit hangs up the terminal; the background
+        // child ignores SIGHUP, as a detached tool would.
+        let mut pty =
+            NativePty::spawn(&sh("trap '' HUP; sleep 300 & echo \"$! bg\"; exit 0")).unwrap();
+        let bg = read_pid(&mut pty, " bg");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pty.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "leader did not exit");
+            std::thread::sleep(POLL);
+        }
+        // The leader is gone but its background child keeps the group.
+        assert!(alive(bg));
+        let report = pty.kill().unwrap();
+        assert!(report.term_was_enough);
+        assert!(gone_soon(bg), "orphan {} survived", bg);
+    }
+
+    #[test]
+    fn signal_reaches_the_group() {
+        let mut pty = NativePty::spawn(&sh(
+            "trap 'echo got-usr1' USR1; echo ready; while :; do sleep 0.05; done",
+        ))
+        .unwrap();
+        read_until(&mut pty, "ready");
+        pty.signal(libc::SIGUSR1).unwrap();
+        read_until(&mut pty, "got-usr1");
+        pty.kill().unwrap();
+    }
+
+    #[test]
+    fn drop_kills_the_group() {
+        let mut pty = NativePty::spawn(&sh("sleep 300 & echo \"$! bg\"; wait")).unwrap();
+        let bg = read_pid(&mut pty, " bg");
+        let leader = pty.child().pid;
+        drop(pty);
+        assert!(gone_soon(leader));
+        assert!(gone_soon(bg), "background child {} survived", bg);
+    }
+
+    #[test]
+    fn spawn_failures_are_errors() {
+        let missing = SpawnSpec::new(
+            vec![OsString::from("/nonexistent/c9-no-such-binary")],
+            std::env::temp_dir(),
+        );
+        assert!(NativePty::spawn(&missing).is_err());
+        let mut bad_cwd = sh("true");
+        bad_cwd.cwd = PathBuf::from("/nonexistent/c9-no-such-dir");
+        assert!(NativePty::spawn(&bad_cwd).is_err());
+        let empty = SpawnSpec::new(vec![], std::env::temp_dir());
+        assert!(NativePty::spawn(&empty).is_err());
+    }
+
+    #[test]
+    fn spec_env_replaces_a_key() {
+        let mut spec = sh("true");
+        spec.env("TERM", "dumb");
+        let terms: Vec<_> = spec.env.iter().filter(|(k, _)| k == "TERM").collect();
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].1, "dumb");
+    }
+}

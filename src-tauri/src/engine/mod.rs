@@ -37,4 +37,10 @@ pub mod detect;
 pub mod import;
 
 #[cfg(unix)]
+pub mod driver;
+
+#[cfg(unix)]
+pub mod pty;
+
+#[cfg(unix)]
 pub mod run;
