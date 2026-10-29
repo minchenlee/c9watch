@@ -32,17 +32,29 @@ WORK=${2:?work dir}
 MAX_PROMPTS=${MAX_PROMPTS:-8}
 MODEL=claude-haiku-5-5
 
-case "$WORK" in
-/private/tmp/*) ;;
-*)
-    echo "WORK must be under /private/tmp" >&2
-    exit 2
-    ;;
-esac
+# Not under CC's own sandbox tmp (/private/tmp/claude-*): an agent's
+# sandboxed Bash may write there, and the engine home (live-test input,
+# engine.db with the audit rows) lives in WORK (M7 reviews M3).
+check_work() { # path
+    case "$1" in
+    *..* | /private/tmp/claude-* | /private/tmp/claude)
+        echo "WORK must not hold '..' or be under /private/tmp/claude-*: $1" >&2
+        exit 2
+        ;;
+    /private/tmp/?*) ;;
+    *)
+        echo "WORK must be under /private/tmp: $1" >&2
+        exit 2
+        ;;
+    esac
+}
+check_work "$WORK"
 if [ -e "$WORK/engine home" ]; then
     echo "$WORK already used; pick a fresh dir" >&2
     exit 2
 fi
+mkdir -p "$WORK" && WORK=$(cd "$WORK" && pwd -P) || exit 2
+check_work "$WORK"
 
 mkdir -p "$WORK"/{bin,evidence}
 H="$WORK/engine home"
@@ -192,7 +204,7 @@ kill -TERM "$EPID"
 for _ in $(seq 1 100); do kill -0 "$EPID" 2>/dev/null || break; sleep 1; done
 kill -0 "$EPID" 2>/dev/null && note "cleanup: engine $EPID still runs after SIGTERM"
 sqlite3 -header "$H/engine.db" 'SELECT seq, ts, principal, method, target, decision, reason FROM audit ORDER BY seq' >"$EV/audit.txt" 2>&1
-sqlite3 -header "$H/engine.db" 'SELECT id, state, state_reason, generation, provider_sid, cwd FROM agents WHERE source = "engine"' >"$EV/agents-db.txt" 2>&1
+sqlite3 -header "$H/engine.db" "SELECT id, state, state_reason, generation, provider_sid, cwd FROM agents WHERE source = 'engine'" >"$EV/agents-db.txt" 2>&1
 cp "$WORK"/engine.log "$EV/" 2>/dev/null
 
 # --- verdict from the transcript's Bash calls and results.
