@@ -16,6 +16,9 @@ use std::collections::BTreeSet;
 /// their content is never needed.
 const SEQ_MAX: usize = 4096;
 
+/// Private modes `modes` keeps at most; later ones set are not recorded.
+const MODES_MAX: usize = 64;
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum St {
     Ground,
@@ -47,6 +50,7 @@ pub struct Screen {
     pub title: String,
     /// Bumped on every title change, so callers can see a repeat of the same title.
     pub title_seq: u64,
+    /// Private modes set (`CSI ? N h`), at most `MODES_MAX`.
     pub modes: BTreeSet<u32>,
     utf8_pending: Vec<u8>,
 }
@@ -418,7 +422,10 @@ impl Screen {
                     }
                 }
                 if f == 'h' {
-                    self.modes.insert(m as u32);
+                    // Bounded: a flood of distinct modes must not grow it.
+                    if self.modes.len() < MODES_MAX {
+                        self.modes.insert(m as u32);
+                    }
                 } else {
                     self.modes.remove(&(m as u32));
                 }
@@ -686,5 +693,21 @@ mod tests {
         long.push('\x07');
         s.feed(&long);
         assert_eq!(s.title.len(), SEQ_MAX - 2);
+    }
+
+    #[test]
+    fn private_modes_are_bounded() {
+        let mut s = Screen::new(20, 5);
+        let mut flood = String::new();
+        for m in 2000..4000 {
+            flood.push_str(&format!("\x1b[?{}h", m));
+        }
+        s.feed_bytes(flood.as_bytes());
+        assert_eq!(s.modes.len(), MODES_MAX);
+        // The alt screen still works past the cap.
+        s.feed_bytes(b"\x1b[?1049h");
+        assert!(s.in_alt);
+        s.feed_bytes(b"\x1b[?2000l");
+        assert_eq!(s.modes.len(), MODES_MAX - 1);
     }
 }

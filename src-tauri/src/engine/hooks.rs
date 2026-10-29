@@ -12,7 +12,8 @@
 //!    engine stamped on the connection from its live table (C1a-33), never
 //!    a value the agent sends. An event from a generation that is no longer
 //!    the live one, or no longer the row's, is dropped.
-//! 4. **Dedupe** by `agent_id + seq` in the `dedupe` table.
+//! 4. **Dedupe** by `agent_id + seq` in the `dedupe` table, for
+//!    `db::DEDUPE_WINDOW_MS`.
 //! 5. The event goes into the state merge (`engine::merge`), and the
 //!    session binding for SessionStart (`engine::generation`).
 //!
@@ -222,7 +223,7 @@ fn dropped(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::db::Db;
+    use crate::engine::db::{Db, DEDUPE_WINDOW_MS};
     use crate::engine::generation::tests::{db_with_agent, MACHINE};
     use crate::engine::generation::{begin_generation, GenReason};
     use serde_json::{json, Value};
@@ -366,6 +367,17 @@ mod tests {
         );
         assert_eq!(audit(&db).len(), 1);
         assert_eq!(state(&db), "blocked");
+        // Past the dedupe window the row is pruned.
+        let pruned = db
+            .write_blocking(|tx| crate::engine::db::prune_dedupe(tx, 10 + DEDUPE_WINDOW_MS))
+            .unwrap()
+            .0;
+        assert_eq!(pruned, 0);
+        let pruned = db
+            .write_blocking(|tx| crate::engine::db::prune_dedupe(tx, 11 + DEDUPE_WINDOW_MS))
+            .unwrap()
+            .0;
+        assert_eq!(pruned, 1);
     }
 
     #[test]

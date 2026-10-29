@@ -58,6 +58,9 @@ const WRITE_QUEUE: usize = 64;
 /// without a cap one client could exhaust the engine's descriptors.
 pub const MAX_STREAMS: usize = 16;
 
+/// Longest `seq` a hook-class call may carry. A ns clock has 19 digits.
+const MAX_SEQ: usize = 32;
+
 /// Engine-wide facts every connection needs.
 pub struct ServerCtx {
     pub engine_version: String,
@@ -547,6 +550,13 @@ async fn hook_class(
         }
         _ => {
             let params = serde_json::from_value::<HookParams>(req.params).map_err(bad)?;
+            // A sender's `seq` is a clock in ns; a long one only fills dedupe.
+            if params.seq.len() > MAX_SEQ {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!("bad {} params: seq is longer than {}", method, MAX_SEQ),
+                ));
+            }
             let Principal::Agent { gen, .. } = principal else {
                 // `authorize` lets only an agent through.
                 return Err(ApiError::new(
