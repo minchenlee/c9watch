@@ -92,6 +92,11 @@
           "type": "string"
         },
         {
+          "const": "rate_limited",
+          "description": "The caller is over a limit, such as the event streams per\nconnection.",
+          "type": "string"
+        },
+        {
           "const": "internal",
           "description": "An engine-side failure.",
           "type": "string"

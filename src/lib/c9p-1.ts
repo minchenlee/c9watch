@@ -43,6 +43,11 @@ export type C9pErrorCode =
    * ahead of the log.
    */
   | 'cursor_expired'
+  /**
+   * The caller is over a limit, such as the event streams per
+   * connection.
+   */
+  | 'rate_limited'
   /** An engine-side failure. */
   | 'internal';
 

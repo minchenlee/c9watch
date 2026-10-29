@@ -103,6 +103,9 @@ pub enum ErrorCode {
     /// The cursor's events are gone: pruned, another epoch or machine, or
     /// ahead of the log.
     CursorExpired,
+    /// The caller is over a limit, such as the event streams per
+    /// connection.
+    RateLimited,
     /// An engine-side failure.
     Internal,
 }
@@ -118,6 +121,7 @@ impl ErrorCode {
             ErrorCode::UnknownMethod => "unknown_method",
             ErrorCode::PeerUidMismatch => "peer_uid_mismatch",
             ErrorCode::CursorExpired => "cursor_expired",
+            ErrorCode::RateLimited => "rate_limited",
             ErrorCode::Internal => "internal",
         }
     }
@@ -145,6 +149,10 @@ impl ErrorCode {
             ErrorCode::PeerUidMismatch => "connect as the user that runs the engine",
             ErrorCode::CursorExpired => {
                 "call `snapshot.get`, then `events.subscribe` with the snapshot's cursor"
+            }
+            ErrorCode::RateLimited => {
+                "use fewer event streams per connection: one subscription with \
+                 topic and subject filters, or another connection"
             }
             ErrorCode::Internal => "retry; if it persists, check the engine log",
         }

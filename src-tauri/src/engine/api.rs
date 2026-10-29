@@ -11,7 +11,8 @@
 //! `events.subscribe` starts a stream task on the connection. It reads the
 //! event log from SQLite at its own pace and writes event frames to the
 //! same write queue as responses, so a slow client only slows its own
-//! stream, never the db writer.
+//! stream, never the db writer. A connection holds at most `MAX_STREAMS`
+//! live streams; one more gets `rate_limited`.
 
 use super::db::outbox::{Cursor, Event, ReadError, Subscription, READ_BATCH};
 use super::db::Db;
@@ -36,6 +37,11 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Encoded frames (responses and events) queued for one connection's
 /// writer task.
 const WRITE_QUEUE: usize = 64;
+
+/// Live `events.subscribe` streams one connection may hold. Each holds a
+/// SQLite reader (and its file descriptors) until the connection closes, so
+/// without a cap one client could exhaust the engine's descriptors.
+pub const MAX_STREAMS: usize = 16;
 
 /// Engine-wide facts every connection needs.
 pub struct ServerCtx {
@@ -184,7 +190,10 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
         if frame.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let (resp, next, stream) = handle_frame(&frame, &ctx, cred, &principal, &mut conn).await;
+        // A stream that ended (expired, or the store closed) frees its slot.
+        streams.retain(|h| !h.is_finished());
+        let (resp, next, stream) =
+            handle_frame(&frame, &ctx, cred, &principal, &mut conn, streams.len()).await;
         if tx.send(encode(&resp)).await.is_err() {
             break;
         }
@@ -212,12 +221,13 @@ async fn handle_frame(
     cred: PeerCred,
     principal: &Principal,
     conn: &mut Option<Conn>,
+    streams: usize,
 ) -> (Response, Next, Option<EventStream>) {
     match check_frame(frame, ctx, cred, principal, conn) {
         Checked::Done(resp, next) => (resp, next, None),
         Checked::Call(req, method) => {
             let id = req.id.clone();
-            match dispatch(&method, req, ctx).await {
+            match dispatch(&method, req, ctx, streams).await {
                 Ok((result, stream)) => (Response::ok(id, result), Next::Continue, stream),
                 Err(e) => (Response::err(id, e), Next::Continue, None),
             }
@@ -367,15 +377,23 @@ pub fn schema() -> serde_json::Value {
 }
 
 /// Methods after `hello`. Both C1a principals, L and A, may call every
-/// method here (§1.1); later methods check the principal.
+/// method here (§1.1); later methods check the principal. `streams` is how
+/// many event streams the connection holds.
 async fn dispatch(
     method: &str,
     req: Request,
     ctx: &ServerCtx,
+    streams: usize,
 ) -> Result<(serde_json::Value, Option<EventStream>), ApiError> {
     match method {
         "snapshot.get" => Ok((snapshot_get(ctx).await?, None)),
         "events.subscribe" => {
+            if streams >= MAX_STREAMS {
+                return Err(ApiError::new(
+                    ErrorCode::RateLimited,
+                    format!("this connection already holds {} event streams", streams),
+                ));
+            }
             let (result, stream) = events_subscribe(req, ctx).await?;
             Ok((result, Some(stream)))
         }
@@ -1187,6 +1205,23 @@ mod tests {
         assert_eq!(hello["principal"], "agent:a7");
         assert_eq!(c.call("1", "snapshot.get", json!({})).await["ok"], true);
         assert_eq!(c.call("2", "events.subscribe", json!({})).await["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn a_connection_holds_at_most_max_streams() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        for i in 0..MAX_STREAMS {
+            let r = c.call(&i.to_string(), "events.subscribe", json!({})).await;
+            assert_eq!(r["ok"], true, "{}", r);
+        }
+        let r = c.call("over", "events.subscribe", json!({})).await;
+        assert_eq!(r["error"]["code"], "rate_limited", "{}", r);
+        // The connection and its streams keep working.
+        assert_eq!(c.call("snap", "snapshot.get", json!({})).await["ok"], true);
+        emit(&db, 1, 0).await;
+        let f = c.next().await;
+        assert_eq!(f["type"], "event", "{}", f);
     }
 
     #[tokio::test]
