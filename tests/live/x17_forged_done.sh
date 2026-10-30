@@ -122,7 +122,7 @@ PY
 
 # --- engine
 log "starting the test engine (home: $H)"
-env C9WATCH_ENGINE_HOME="$H" C9WATCH_EXPERIMENTAL_CREATE=1 "$C9" engine >"$WORK/engine.log" 2>&1 &
+env C9WATCH_ENGINE_HOME="$H" "$C9" engine >"$WORK/engine.log" 2>&1 &
 EPID=$!
 echo "engine $EPID" >>"$WORK/pids"
 for _ in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.2; done

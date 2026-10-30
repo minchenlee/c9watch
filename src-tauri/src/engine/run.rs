@@ -22,10 +22,9 @@
 //!
 //! Boot reconcile (`engine::ops`) runs after the db opens and before the
 //! bind, so no mutation can arrive before it is done; a failed reconcile
-//! stops the boot. `agent.create` is on only with
-//! `C9WATCH_EXPERIMENTAL_CREATE=1` in the engine's env (C1a-26). On
-//! shutdown every agent the engine runs is killed before the db closes; the
-//! next boot reconciles their rows.
+//! stops the boot. `agent.create` is always on (C1a-26; C1a-35 dropped the
+//! experimental switch). On shutdown every agent the engine runs is killed
+//! before the db closes; the next boot reconciles their rows.
 //!
 //! SIGTERM drains first (C1a-27, `engine::drain`): the socket keeps serving,
 //! so hooks still arrive, while ready agents are paused and mid-turn agents
@@ -36,14 +35,13 @@
 //! reconcile and after the bind, so the resumed agents' SessionStart hooks
 //! find the socket: every `paused(drain)` and `interrupted` agent gets a
 //! new generation and comes up on `claude --resume` on its supervisor's
-//! thread. It needs `C9WATCH_EXPERIMENTAL_CREATE=1` like a create; without
-//! it the rows stay as they are. A failed read or write logs and the
-//! engine runs on.
+//! thread. While the engine drains the rows stay as they are. A failed read
+//! or write logs and the engine runs on.
 
 use super::agent_bin::{self, AgentBin};
 use super::agents::LiveTable;
 use super::api::{serve, ServerCtx};
-use super::create::{Spawner, SpawnerConfig, EXPERIMENTAL_CREATE_ENV};
+use super::create::{Spawner, SpawnerConfig};
 use super::db;
 use super::detect;
 use super::drain::{self, DrainSwitch};
@@ -76,8 +74,6 @@ pub struct EngineConfig {
     /// Run session detection and the legacy import. Off only in tests of
     /// the agent path, which must not scan the machine.
     pub detection: bool,
-    /// `agent.create` is on (`C9WATCH_EXPERIMENTAL_CREATE=1`).
-    pub experimental_create: bool,
     /// The `claude` binary for free agents. `None` looks it up on `PATH`
     /// at each create; tests set a script here.
     pub claude: Option<PathBuf>,
@@ -90,7 +86,6 @@ impl EngineConfig {
             agent_source: agent_bin::default_source()?,
             agents: Arc::new(LiveTable::new()),
             detection: true,
-            experimental_create: std::env::var(EXPERIMENTAL_CREATE_ENV).is_ok_and(|v| v == "1"),
             claude: None,
         })
     }
@@ -157,7 +152,6 @@ pub async fn run_until(
                 home: home.to_path_buf(),
                 sock: socket.path().to_path_buf(),
                 claude: config.claude.clone(),
-                enabled: config.experimental_create,
             },
             db.clone(),
             config.agents.clone(),
@@ -166,12 +160,6 @@ pub async fn run_until(
         )
         .with_drain(drain_switch),
     );
-    if spawner.enabled() {
-        eprintln!(
-            "[engine] {}=1: agent.create is on (experimental)",
-            EXPERIMENTAL_CREATE_ENV
-        );
-    }
     let ctx = Arc::new(ctx.with_spawner(spawner.clone()));
     match spawner.resume_on_boot() {
         Ok(r) if r == Default::default() => {}
@@ -181,12 +169,9 @@ pub async fn run_until(
             r.failed,
             r.left,
             if r.left.is_empty() {
-                String::new()
+                ""
             } else {
-                format!(
-                    " ({}=1 is not set, or the engine drains)",
-                    EXPERIMENTAL_CREATE_ENV
-                )
+                " (the engine drains, or a write failed)"
             }
         ),
         Err(e) => eprintln!("[engine] Boot resume: {}", e),

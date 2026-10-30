@@ -352,13 +352,7 @@ fn engine_restart_with_a_live_agent_drains_then_resumes_it() {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let run = |args: &[&str]| -> Output {
-        sb.cmd(args)
-            .env("PATH", &path)
-            .env("C9WATCH_EXPERIMENTAL_CREATE", "1")
-            .output()
-            .unwrap()
-    };
+    let run = |args: &[&str]| -> Output { sb.cmd(args).env("PATH", &path).output().unwrap() };
     let list = || -> Vec<Value> {
         let out = run(&["api", "agent.list", r#"{"all":true}"#]);
         assert!(out.status.success(), "{:?}", out);
@@ -891,21 +885,16 @@ impl FreeAgents {
         }
     }
 
-    /// `c9watch <args>` in `<root>`, with the create switch on or off.
-    fn cmd(&self, sb: &Sandbox, args: &[&str], create: bool) -> Command {
+    /// `c9watch <args>` in `<root>`.
+    fn cmd(&self, sb: &Sandbox, args: &[&str]) -> Command {
         let mut c = sb.cmd(args);
         c.env("PATH", &self.path)
             .current_dir(self.cwd.parent().unwrap());
-        if create {
-            c.env("C9WATCH_EXPERIMENTAL_CREATE", "1");
-        } else {
-            c.env_remove("C9WATCH_EXPERIMENTAL_CREATE");
-        }
         c
     }
 
-    fn run(&self, sb: &Sandbox, args: &[&str], create: bool) -> Output {
-        self.cmd(sb, args, create).output().unwrap()
+    fn run(&self, sb: &Sandbox, args: &[&str]) -> Output {
+        self.cmd(sb, args).output().unwrap()
     }
 
     /// Wait until no fake agent runs.
@@ -938,7 +927,6 @@ fn spawn_free_creates_an_agent_that_lists_and_retires() {
     let out = fa.run(
         &sb,
         &["spawn", "--mode", "free", "--cwd", "work", "--name", "ann"],
-        true,
     );
     assert!(out.status.success(), "{:?} / log {}", out, sb.log());
     assert!(started.elapsed() >= Duration::from_secs(7));
@@ -960,7 +948,7 @@ fn spawn_free_creates_an_agent_that_lists_and_retires() {
 
     let list = |all: bool| -> Vec<Value> {
         let params = format!(r#"{{"all":{}}}"#, all);
-        let out = fa.run(&sb, &["api", "agent.list", &params], true);
+        let out = fa.run(&sb, &["api", "agent.list", &params]);
         assert!(out.status.success(), "{:?}", out);
         stdout_json(&out)["result"]["agents"]
             .as_array()
@@ -974,7 +962,6 @@ fn spawn_free_creates_an_agent_that_lists_and_retires() {
     let out = fa.run(
         &sb,
         &["api", "agent.retire", &format!(r#"{{"id":"{}"}}"#, id)],
-        true,
     );
     assert!(out.status.success(), "{:?}", out);
     assert_eq!(stdout_json(&out)["result"]["agent"]["state"], "retired");
@@ -983,22 +970,6 @@ fn spawn_free_creates_an_agent_that_lists_and_retires() {
     let tomb = all.iter().find(|a| a["id"] == id.as_str()).unwrap();
     assert_eq!(tomb["state"], "retired", "{}", tomb);
     assert!(fa.all_gone(), "a fake claude still runs");
-}
-
-/// Before C1a-35, an engine without `C9WATCH_EXPERIMENTAL_CREATE=1`
-/// answers `experimental_disabled`, and nothing is spawned.
-#[test]
-fn spawn_free_without_the_switch_is_experimental_disabled() {
-    let sb = Sandbox::new();
-    let fa = FreeAgents::new(&sb);
-    let out = fa.run(&sb, &["spawn", "--mode", "free", "--cwd", "work"], false);
-    assert_eq!(out.status.code(), Some(1), "{:?}", out);
-    let err = stderr_of(&out);
-    assert!(err.contains("experimental_disabled"), "{err}");
-    assert!(err.contains("C9WATCH_EXPERIMENTAL_CREATE=1"), "{err}");
-    assert!(out.stdout.is_empty(), "{:?}", out);
-    assert!(sb.pid().is_some(), "the engine was not auto-started");
-    assert!(!fa.bin.join("argv.log").exists());
 }
 
 /// An agent (`C9_AGENT_ID` set) gets `not_allowed` without reaching
@@ -1012,7 +983,6 @@ fn spawn_free_refuses_agents_and_managed_flags_locally() {
     let out = c
         .env("PATH", &fa.path)
         .env("C9_AGENT_ID", "agt_x")
-        .env("C9WATCH_EXPERIMENTAL_CREATE", "1")
         .current_dir(fa.cwd.parent().unwrap())
         .output()
         .unwrap();
@@ -1031,7 +1001,7 @@ fn spawn_free_refuses_agents_and_managed_flags_locally() {
         &["--append-system-prompt", "x"],
     ] {
         let args = [&["spawn", "--mode", "free"][..], flag].concat();
-        let out = fa.run(&sb, &args, true);
+        let out = fa.run(&sb, &args);
         assert_eq!(out.status.code(), Some(1), "{args:?}: {:?}", out);
         let err = stderr_of(&out);
         assert!(err.contains("bad_args"), "{args:?}: {err}");
@@ -1052,7 +1022,7 @@ fn spawn_managed_needs_the_pm_build() {
     let sb = Sandbox::new();
     let fa = FreeAgents::new(&sb);
     for args in [&["spawn"][..], &["spawn", "--mode", "managed"]] {
-        let out = fa.run(&sb, args, true);
+        let out = fa.run(&sb, args);
         assert_eq!(out.status.code(), Some(1), "{args:?}: {:?}", out);
         let err = stderr_of(&out);
         assert!(err.contains("pm-orchestration"), "{args:?}: {err}");
@@ -1083,7 +1053,7 @@ fn cursor_seq(cursor: &Value) -> i64 {
 fn a_stopped_subscriber_gets_every_event_after_it_continues() {
     let sb = Sandbox::new();
     let fa = FreeAgents::new(&sb);
-    assert!(fa.run(&sb, &["api", "hello"], true).status.success());
+    assert!(fa.run(&sb, &["api", "hello"]).status.success());
     let mut nc = Command::new("nc")
         .arg("-U")
         .arg(sock_path(&sb.engine))
@@ -1125,7 +1095,7 @@ fn a_stopped_subscriber_gets_every_event_after_it_continues() {
             .iter()
             .map(|a| {
                 let a: Vec<&str> = a.iter().map(String::as_str).collect();
-                fa.cmd(&sb, &a, true)
+                fa.cmd(&sb, &a)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()
@@ -1164,7 +1134,7 @@ fn a_stopped_subscriber_gets_every_event_after_it_continues() {
             assert!(out.status.success(), "{:?} / log {}", out, sb.log());
         }
     }
-    let out = fa.run(&sb, &["api", "snapshot.get"], true);
+    let out = fa.run(&sb, &["api", "snapshot.get"]);
     assert!(out.status.success(), "{:?}", out);
     let head = cursor_seq(&stdout_json(&out)["result"]["cursor"]);
     assert!(head - start >= 375, "only {} events", head - start);
@@ -1262,8 +1232,8 @@ fn a_stopped_engine_leaves_no_socket_once_its_clients_close() {
 /// `live-test` failpoint, `engine::live_test::crash_after`) is reconciled
 /// by the next boot: every op has `done_at`, and the agent it left running
 /// is killed. The fake agent ignores SIGHUP, so the engine's death (which
-/// closes the PTY) does not end it and only boot reconcile can. The next
-/// engine runs without the create switch, so it resumes nothing.
+/// closes the PTY) does not end it and only boot reconcile can. After
+/// phase `bound` the agent was `ready`, so the next engine resumes it.
 #[cfg(feature = "live-test")]
 #[test]
 fn an_engine_killed_after_each_create_phase_is_reconciled_on_boot() {
@@ -1277,7 +1247,7 @@ fn an_engine_killed_after_each_create_phase_is_reconciled_on_boot() {
         let hardy = FAKE_CLAUDE.replacen("#!/bin/sh\n", "#!/bin/sh\ntrap '' HUP\n", 1);
         std::fs::write(fa.bin.join("claude"), hardy).unwrap();
         let mut engine = fa
-            .cmd(&sb, &["engine"], true)
+            .cmd(&sb, &["engine"])
             .env(CRASH_AFTER_ENV, phase)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1290,7 +1260,7 @@ fn an_engine_killed_after_each_create_phase_is_reconciled_on_boot() {
             "{phase}: log {}",
             sb.log()
         );
-        let out = fa.run(&sb, &["spawn", "--mode", "free", "--cwd", "work"], true);
+        let out = fa.run(&sb, &["spawn", "--mode", "free", "--cwd", "work"]);
         assert!(!out.status.success(), "{phase}: {:?}", out);
         let status = engine
             .wait_timeout(Duration::from_secs(30))
@@ -1339,8 +1309,8 @@ fn an_engine_killed_after_each_create_phase_is_reconciled_on_boot() {
             assert!(alive(pid), "{phase}: the agent died with the engine");
         }
 
-        // The next engine, auto-started without the switch.
-        let out = fa.run(&sb, &["api", "hello"], false);
+        // The next engine, auto-started.
+        let out = fa.run(&sb, &["api", "hello"]);
         assert!(
             out.status.success(),
             "{phase}: {:?} / log {}",
@@ -1354,6 +1324,26 @@ fn an_engine_killed_after_each_create_phase_is_reconciled_on_boot() {
                 wait_for(Duration::from_secs(10), || !alive(pid)),
                 "{phase}: orphan {pid} still runs"
             );
+        }
+        // Only phase `bound` left a live (now `interrupted`) agent: it is
+        // resumed as generation 2, then retired here.
+        let out = fa.run(&sb, &["api", "agent.list", r#"{"all":false}"#]);
+        assert!(out.status.success(), "{phase}: {:?}", out);
+        let live = stdout_json(&out)["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            live.len(),
+            usize::from(phase == "bound"),
+            "{phase}: {live:?}"
+        );
+        for a in &live {
+            assert_eq!(a["state"], "ready", "{phase}: {a}");
+            assert_eq!(a["generation"], 2, "{phase}: {a}");
+            let params = format!(r#"{{"id":{}}}"#, a["id"]);
+            let out = fa.run(&sb, &["api", "agent.retire", &params]);
+            assert!(out.status.success(), "{phase}: {:?}", out);
         }
         assert!(fa.all_gone(), "{phase}: a fake claude still runs");
     }

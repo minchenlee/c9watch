@@ -133,7 +133,7 @@ for f in "$A" "$B" "$C"; do shasum -a 256 "$f/.claude/settings.json"; done >"$EV
 
 # --- engine
 log "starting the test engine (home: $H)"
-env C9WATCH_ENGINE_HOME="$H" C9WATCH_EXPERIMENTAL_CREATE=1 "$C9" engine >"$WORK/engine.log" 2>&1 &
+env C9WATCH_ENGINE_HOME="$H" "$C9" engine >"$WORK/engine.log" 2>&1 &
 EPID=$!
 echo "engine $EPID" >>"$WORK/pids"
 for _ in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.2; done
@@ -354,11 +354,10 @@ if [ -n "$CID" ]; then
 fi
 
 # --- cleanup through the test engine: retire A, then SIGTERM (drain).
-# The restart runs without C9WATCH_EXPERIMENTAL_CREATE, so it does not
-# boot-resume A. C1a-35 removes that switch: then this restart runs a real
-# `claude --resume` outside MAX_PROMPTS, and must change with C1a-35.
+# Since C1a-35 the restart boot-resumes A: a real `claude --resume` that
+# gets no prompt, so it is outside MAX_PROMPTS. The retire below kills it.
 if ! kill -0 "$EPID" 2>/dev/null; then
-    log "restarting the test engine without the create switch (no resume)"
+    log "restarting the test engine (it boot-resumes A; the retire kills it)"
     env C9WATCH_ENGINE_HOME="$H" "$C9" engine >"$WORK/engine2.log" 2>&1 &
     EPID2=$!
     echo "engine2 $EPID2" >>"$WORK/pids"

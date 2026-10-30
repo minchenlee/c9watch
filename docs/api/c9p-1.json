@@ -394,11 +394,6 @@
           "type": "string"
         },
         {
-          "const": "experimental_disabled",
-          "description": "`agent.create` while the engine runs without\n`C9WATCH_EXPERIMENTAL_CREATE=1` (C1a).",
-          "type": "string"
-        },
-        {
           "const": "not_allowed",
           "description": "The principal may not call this method (`agent.create` and\n`agent.retire` take only a local client in C1a).",
           "type": "string"

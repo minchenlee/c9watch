@@ -50,7 +50,6 @@ impl Engine {
             agent_source: PathBuf::from(AGENT),
             agents: agents.clone(),
             detection: false,
-            experimental_create: false,
             claude: None,
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();

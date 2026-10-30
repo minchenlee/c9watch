@@ -93,8 +93,8 @@ pub struct ServerCtx {
     /// `<home>/standing-orders.md`, sent on `hook.session_start`. `None`
     /// sends no orders.
     pub standing_orders: Option<PathBuf>,
-    /// Free-agent create and retire (C1a-26). `None` answers
-    /// `experimental_disabled` to `agent.create`.
+    /// Free-agent create and retire (C1a-26). `None` (only in tests)
+    /// answers `internal` to both.
     pub spawner: Option<Arc<Spawner>>,
     /// On while the engine drains (C1a-27): `hook.session_start` then
     /// injects nothing.
@@ -601,9 +601,9 @@ async fn agent_lifecycle(
     r
 }
 
-/// Who may call `agent.create` or `agent.retire`: never an agent, also
-/// with the experimental switch off, so its attempt is audited; and a
-/// `local-unverified` peer only after the mutation check.
+/// Who may call `agent.create` or `agent.retire`: never an agent, so its
+/// attempt is audited; and a `local-unverified` peer only after the
+/// mutation check.
 async fn check_local_peer(
     method: &str,
     ctx: &ServerCtx,
@@ -640,13 +640,10 @@ async fn spawn_or_retire(
     principal: &Principal,
 ) -> Result<serde_json::Value, ApiError> {
     let Some(spawner) = &ctx.spawner else {
-        return Err(match method {
-            "agent.create" => ApiError::new(
-                ErrorCode::ExperimentalDisabled,
-                "this engine cannot create agents",
-            ),
-            _ => ApiError::new(ErrorCode::Internal, "this engine runs no agents"),
-        });
+        return Err(ApiError::new(
+            ErrorCode::Internal,
+            "this engine runs no agents",
+        ));
     };
     if method == "agent.create" {
         let agent = spawner.create(principal, req.params).await?;
@@ -1476,10 +1473,8 @@ mod tests {
             if is_hook_class(m) {
                 // Served, but only to an agent (C1a-21).
                 assert_eq!(r["error"]["code"], "peer_not_authorized", "{}: {}", m, r);
-            } else if *m == "agent.create" {
-                // Off without the experimental switch (C1a-26).
-                assert_eq!(r["error"]["code"], "experimental_disabled", "{}: {}", m, r);
-            } else if *m == "agent.retire" {
+            } else if *m == "agent.create" || *m == "agent.retire" {
+                // This test engine has no spawner.
                 assert_eq!(r["error"]["code"], "internal", "{}: {}", m, r);
             } else {
                 assert_eq!(r["ok"], true, "{}: {}", m, r);

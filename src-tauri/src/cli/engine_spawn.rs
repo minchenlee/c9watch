@@ -6,10 +6,9 @@
 //! agent is `ready` or has failed, so the call waits up to the engine's
 //! ready timeout plus a margin, longer than the usual 5 s read timeout.
 //!
-//! Until C1a-35 the engine answers `experimental_disabled` unless it runs
-//! with `C9WATCH_EXPERIMENTAL_CREATE=1`. A caller inside an engine agent
-//! (`C9_AGENT_ID` set) gets `not_allowed` here, the engine's code for the same refusal,, without a connection:
-//! C1a has no orch, and only an orch may create agents (A:262, §1.1).
+//! A caller inside an engine agent (`C9_AGENT_ID` set) gets `not_allowed`
+//! here, the engine's code for the same refusal, without a connection: C1a
+//! has no orch, and only an orch may create agents (A:262, §1.1).
 
 use super::engine_client::{current_exe, ensure_engine, EngineConn, ENV_AGENT_ID};
 use crate::engine::home::{engine_home, sock_path};

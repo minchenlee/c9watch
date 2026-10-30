@@ -1,8 +1,7 @@
 //! Free-mode `agent.create` and `agent.retire` (plan C1a-26, A:794-828).
 //!
-//! `agent.create` is off unless the engine started with
-//! `C9WATCH_EXPERIMENTAL_CREATE=1` (`experimental_disabled`; C1a-35 drops
-//! the switch). Only `local-unverified` may call it, or `agent.retire`
+//! `agent.create` is always on (C1a-35 dropped the experimental switch).
+//! Only `local-unverified` may call it, or `agent.retire`
 //! (§1.1, v3.1: any L may retire). There is no cap on live agents: the
 //! legacy daemon's `DEFAULT_MAX_WORKERS=16` does not carry over.
 //!
@@ -53,7 +52,7 @@
 //!
 //! **Boot resume (C1a-28, A:236, A:1038).** After boot reconcile, the
 //! engine resumes every `paused(drain)` and `interrupted` agent
-//! (`resume_on_boot`), only with the create switch on:
+//! (`resume_on_boot`) unless it drains:
 //! - The session is the one in the row's `resume_argv` (`claude --resume
 //!   <id>`), or `provider_sid` for an agent that boot reconcile marked
 //!   `interrupted` without a drain. The spawn is the same profile with
@@ -111,9 +110,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-/// The engine's env switch for `agent.create` (until C1a-35).
-pub const EXPERIMENTAL_CREATE_ENV: &str = "C9WATCH_EXPERIMENTAL_CREATE";
-
 /// Why a create failed: the vendor refused, the agent exited or it was
 /// not ready in time.
 pub const SPAWN_FAILED: &str = "spawn_failed";
@@ -165,8 +161,6 @@ pub struct SpawnerConfig {
     /// The `claude` binary. `None` looks `claude` up on the engine's
     /// `PATH` at each create.
     pub claude: Option<PathBuf>,
-    /// `C9WATCH_EXPERIMENTAL_CREATE=1` at engine start.
-    pub enabled: bool,
 }
 
 type Reply = oneshot::Sender<Result<AgentRow, ApiError>>;
@@ -223,8 +217,7 @@ pub struct Resumed {
     pub started: Vec<String>,
     /// Failed before the spawn, now `failed` with `resume_failed`.
     pub failed: Vec<String>,
-    /// Not resumed: `agent.create` is off, the engine drains, or a write
-    /// failed.
+    /// Not resumed: the engine drains, or a write failed.
     pub left: Vec<String>,
 }
 
@@ -337,10 +330,6 @@ impl Spawner {
     }
 
     /// Whether `agent.create` is switched on.
-    pub fn enabled(&self) -> bool {
-        self.config.enabled
-    }
-
     /// The engine took a SessionStart hook of `agent_id`'s generation
     /// `gen`: one input of `ready` (D24.4).
     pub fn session_started(&self, agent_id: &str, gen: i64) {
@@ -359,15 +348,6 @@ impl Spawner {
         params: serde_json::Value,
     ) -> Result<AgentRow, ApiError> {
         local_only(principal, "agent.create")?;
-        if !self.config.enabled {
-            return Err(ApiError::new(
-                ErrorCode::ExperimentalDisabled,
-                format!(
-                    "agent.create is off: the engine started without {}=1",
-                    EXPERIMENTAL_CREATE_ENV
-                ),
-            ));
-        }
         if self.drain.on() {
             return Err(draining());
         }
@@ -1016,7 +996,7 @@ impl Spawner {
     pub fn resume_on_boot(self: &Arc<Self>) -> Result<Resumed, String> {
         let mut done = Resumed::default();
         for r in self.resumables()? {
-            if !self.config.enabled || self.drain.on() {
+            if self.drain.on() {
                 done.left.push(r.id);
                 continue;
             }
@@ -1902,14 +1882,14 @@ mod tests {
         sp: Arc<Spawner>,
     }
 
-    fn setup(script: Script, enabled: bool, clock: Option<Clock>) -> Env {
+    fn setup(script: Script, clock: Option<Clock>) -> Env {
         let t = tempfile::tempdir().unwrap();
         let home = t.path().join("engine home");
         let db = Arc::new(db::open(&home, MACHINE).unwrap());
         std::fs::write(t.path().join("agent-src"), b"#!/bin/sh\nexit 0\n").unwrap();
         let cwd = t.path().join("work");
         std::fs::create_dir(&cwd).unwrap();
-        let (agents, launcher, sp) = engine_on(t.path(), &home, &db, script, enabled, clock);
+        let (agents, launcher, sp) = engine_on(t.path(), &home, &db, script, clock);
         Env {
             t,
             home,
@@ -1928,7 +1908,7 @@ mod tests {
         script: Script,
         clock: Option<Clock>,
     ) -> (Arc<LiveTable>, Arc<FakeLauncher>, Arc<Spawner>) {
-        engine_on(e.t.path(), &e.home, &e.db, script, true, clock)
+        engine_on(e.t.path(), &e.home, &e.db, script, clock)
     }
 
     fn engine_on(
@@ -1936,7 +1916,6 @@ mod tests {
         home: &Path,
         db: &Arc<Db>,
         script: Script,
-        enabled: bool,
         clock: Option<Clock>,
     ) -> (Arc<LiveTable>, Arc<FakeLauncher>, Arc<Spawner>) {
         let bin = Arc::new(AgentBin::install(home, &dir.join("agent-src")));
@@ -1961,7 +1940,6 @@ mod tests {
                 home: home.to_path_buf(),
                 sock: sock_path(home),
                 claude: Some(PathBuf::from("/bin/false")),
-                enabled,
             },
             db.clone(),
             agents.clone(),
@@ -2035,34 +2013,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn switch_off_refuses_create() {
-        let e = setup(Script::Ready, false, None);
-        let err =
-            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
-                .await
-                .unwrap_err();
-        assert_eq!(err.code, ErrorCode::ExperimentalDisabled);
-        assert!(err.msg.contains(EXPERIMENTAL_CREATE_ENV), "{}", err.msg);
-        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 0);
-        assert!(e.db.agents(AgentFilter::All).unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn an_agent_may_not_create_or_retire() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let a = Principal::Agent {
             id: "agt_x".into(),
             gen: 1,
         };
         let err = e.sp.create(&a, create_params(&e.cwd)).await.unwrap_err();
-        assert_eq!(err.code, ErrorCode::NotAllowed);
-        // Also with the switch off: not_allowed, not experimental_disabled.
-        let off = setup(Script::Ready, false, None);
-        let err = off
-            .sp
-            .create(&a, create_params(&off.cwd))
-            .await
-            .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotAllowed);
         let err =
             e.sp.retire(&a, serde_json::json!({"id": "agt_x"}))
@@ -2074,7 +2031,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_params_mode_kind_and_cwd_collisions_spawn_nothing() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let l = Principal::LocalUnverified;
         let code = |r: Result<AgentRow, ApiError>| r.unwrap_err().code;
         let inside = e.home.join("sub");
@@ -2131,7 +2088,7 @@ mod tests {
     /// D28 Q7: a usage-limit screen before ready, then the process exits.
     #[tokio::test]
     async fn a_vendor_refusal_is_spawn_failed_with_one_spawn() {
-        let e = setup(Script::Refuse, true, None);
+        let e = setup(Script::Refuse, None);
         let err =
             e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
                 .await
@@ -2167,7 +2124,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_exit_before_ready_is_spawn_failed_with_the_screen() {
-        let e = setup(Script::Exit, true, None);
+        let e = setup(Script::Exit, None);
         let err =
             e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
                 .await
@@ -2191,7 +2148,7 @@ mod tests {
         let n = Arc::new(AtomicU64::new(0));
         let clock: Clock =
             Arc::new(move || base + Duration::from_secs(n.fetch_add(1, Ordering::SeqCst)));
-        let e = setup(Script::Hang, true, Some(clock));
+        let e = setup(Script::Hang, Some(clock));
         let err =
             e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
                 .await
@@ -2209,7 +2166,7 @@ mod tests {
         // M7 reviews H1: A's rules, built at A's spawn, do not name B's
         // .claude/, so A could rewrite B's settings (live X14 row 8, the
         // other way round). One cwd at a time.
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let l = Principal::LocalUnverified;
         let a = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
         let other = e.t.path().join("other");
@@ -2247,7 +2204,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_walks_the_phases_and_retire_keeps_a_tombstone() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let l = Principal::LocalUnverified;
         let mut params = create_params(&e.cwd);
         params["name"] = "w-1".into();
@@ -2310,7 +2267,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_kills_the_agents_and_boot_marks_them_interrupted() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let r =
             e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
                 .await
@@ -2358,7 +2315,7 @@ mod tests {
     /// counts.
     #[tokio::test]
     async fn nested_cwds_of_live_agents_collide() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let l = Principal::LocalUnverified;
         let (a, b) = (e.cwd.join("a"), e.cwd.join("a").join("b"));
         std::fs::create_dir_all(&b).unwrap();
@@ -2383,7 +2340,7 @@ mod tests {
     /// the audit names `agent.exit`, not `agent.create` (reviews).
     #[tokio::test]
     async fn a_ready_agent_that_exits_is_failed_as_an_exit() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let r =
             e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
                 .await
@@ -2429,7 +2386,7 @@ mod tests {
     /// starts after it spawns nothing.
     #[tokio::test]
     async fn a_retire_before_the_supervisor_spawns_nothing() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let l = Principal::LocalUnverified;
         let s = row_only(&e).await;
         let r =
@@ -2458,7 +2415,7 @@ mod tests {
     /// the PTY instead of answering with a retired row.
     #[tokio::test]
     async fn phase_writes_after_a_retire_write_nothing() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let s = row_only(&e).await;
         e.sp.retire_row(&s.id, s.gen, "local-unverified").unwrap();
         let child = ChildId { pid: 7, start: 1 };
@@ -2483,7 +2440,7 @@ mod tests {
         phase: Phase,
         child: impl Fn(ChildId) -> ChildId,
     ) -> (Env, ops::Reconciled, AgentRow, Option<NativePty>) {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let s = Start {
             id: new_agent_id(),
             gen: 0,
@@ -2689,7 +2646,7 @@ mod tests {
     #[tokio::test]
     async fn drain_pauses_ready_agents_and_interrupts_a_turn_at_60_s() {
         let (clock, secs) = hand_clock();
-        let e = setup(Script::Ready, true, Some(clock));
+        let e = setup(Script::Ready, Some(clock));
         let l = Principal::LocalUnverified;
         let mut rows = Vec::new();
         for _ in 0..3 {
@@ -2768,7 +2725,7 @@ mod tests {
     #[tokio::test]
     async fn the_drain_gives_up_at_the_hard_deadline() {
         let (clock, secs) = hand_clock();
-        let e = setup(Script::Ready, true, Some(clock));
+        let e = setup(Script::Ready, Some(clock));
         let r =
             e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
                 .await
@@ -2804,7 +2761,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn while_draining_no_pty_write_and_no_spawn() {
         let (clock, _secs) = hand_clock();
-        let e = setup(Script::Trust, true, Some(clock));
+        let e = setup(Script::Trust, Some(clock));
         e.launcher.drain_on_screen.store(true, Ordering::SeqCst);
         let (sp, cwd) = (e.sp.clone(), e.cwd.clone());
         let create = tokio::spawn(async move {
@@ -2907,7 +2864,7 @@ mod tests {
     #[tokio::test]
     async fn a_restart_drains_then_resumes_with_the_same_session() {
         let (clock, secs) = hand_clock();
-        let e = setup(Script::Ready, true, Some(clock));
+        let e = setup(Script::Ready, Some(clock));
         let l = Principal::LocalUnverified;
         let idle = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
         let busy = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
@@ -3000,7 +2957,7 @@ mod tests {
     /// `stale_generation` and audited; the new generation's is taken.
     #[tokio::test]
     async fn old_generation_hooks_after_a_resume_are_dropped_and_audited() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let r = drained_agent(&e).await;
         let (agents, _l2, sp2) = next_engine(&e, Script::Ready, None);
         sp2.resume_on_boot().unwrap();
@@ -3063,7 +3020,7 @@ mod tests {
     /// one attempt. No later boot tries it again.
     #[tokio::test]
     async fn a_vendor_refusal_on_resume_is_resume_failed_with_one_attempt() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let r = drained_agent(&e).await;
         let (_, l2, sp2) = next_engine(&e, Script::Refuse, None);
         assert_eq!(sp2.resume_on_boot().unwrap().started, [r.id.clone()]);
@@ -3114,7 +3071,7 @@ mod tests {
             (Script::Exit, None, "exited before ready"),
             (Script::Hang, Some(fast), "not ready within 30 s"),
         ] {
-            let e = setup(Script::Ready, true, None);
+            let e = setup(Script::Ready, None);
             let r = drained_agent(&e).await;
             let (_, l2, sp2) = next_engine(&e, script, clock);
             sp2.resume_on_boot().unwrap();
@@ -3136,7 +3093,7 @@ mod tests {
     /// (no drain) resumes on its `provider_sid`, and that resume counts.
     #[tokio::test]
     async fn a_crash_interrupted_agent_resumes_and_counts() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let r =
             e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
                 .await
@@ -3172,7 +3129,7 @@ mod tests {
     #[tokio::test]
     async fn a_resume_cut_by_a_stop_or_drain_is_resumed_again() {
         for drains in [false, true] {
-            let e = setup(Script::Ready, true, None);
+            let e = setup(Script::Ready, None);
             let r = drained_agent(&e).await;
             let before = drained(&e.db, &r.id);
             let (_, l2, sp2) = next_engine(&e, Script::Hang, None);
@@ -3218,7 +3175,7 @@ mod tests {
     /// failed by boot reconcile, and the next boot does not try again.
     #[tokio::test]
     async fn a_resume_cut_by_a_crash_is_failed_by_reconcile() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let r = drained_agent(&e).await;
         let (_, l2, sp2) = next_engine(&e, Script::Hang, None);
         sp2.resume_on_boot().unwrap();
@@ -3243,7 +3200,7 @@ mod tests {
     /// boot reconcile then has nothing to do.
     #[tokio::test]
     async fn a_retire_during_a_resume_closes_its_op() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let r = drained_agent(&e).await;
         let (_, l2, sp2) = next_engine(&e, Script::Hang, None);
         sp2.resume_on_boot().unwrap();
@@ -3272,21 +3229,18 @@ mod tests {
         assert!(ops::reconcile(&e.db, &e.home).unwrap().is_empty());
     }
 
-    /// No resume with `agent.create` off or while draining: the rows stay.
+    /// No resume while draining: the row stays.
     /// A row with no session to resume fails at once, with no spawn.
     #[tokio::test]
     async fn rows_that_cannot_resume_spawn_nothing() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let r = drained_agent(&e).await;
         let before = drained(&e.db, &r.id);
-        let (_, l_off, off) = engine_on(e.t.path(), &e.home, &e.db, Script::Ready, false, None);
-        assert_eq!(off.resume_on_boot().unwrap().left, [r.id.clone()]);
         let (_, l_dr, dr) = next_engine(&e, Script::Ready, None);
         dr.drain_switch().start();
         assert_eq!(dr.resume_on_boot().unwrap().left, [r.id.clone()]);
         assert_eq!(drained(&e.db, &r.id), before);
         assert_eq!(gens(&e.db, &r.id).0, 1);
-        assert_eq!(l_off.spawns.load(Ordering::SeqCst), 0);
         assert_eq!(l_dr.spawns.load(Ordering::SeqCst), 0);
 
         // An interrupted row with neither argv nor session.
@@ -3321,7 +3275,7 @@ mod tests {
     #[tokio::test]
     async fn the_drain_waits_for_a_turn_seen_on_the_screen() {
         let (clock, secs) = hand_clock();
-        let e = setup(Script::Ready, true, Some(clock));
+        let e = setup(Script::Ready, Some(clock));
         let l = Principal::LocalUnverified;
         let ends = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
         let long = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
@@ -3360,7 +3314,7 @@ mod tests {
     /// by pid and start time before anything resumes it.
     #[tokio::test]
     async fn a_failed_drain_kill_leaves_the_row_to_boot_reconcile() {
-        let e = setup(Script::Ready, true, None);
+        let e = setup(Script::Ready, None);
         let r =
             e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
                 .await
@@ -3394,7 +3348,7 @@ mod tests {
     /// `draining`, and its open op is boot reconcile's.
     #[tokio::test]
     async fn a_drain_during_the_spawn_cuts_the_agent() {
-        let e = setup(Script::Trust, true, None);
+        let e = setup(Script::Trust, None);
         let err =
             e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
                 .await
