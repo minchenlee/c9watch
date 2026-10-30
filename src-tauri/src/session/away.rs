@@ -8,8 +8,8 @@
 
 use crate::session::cache::{
     can_incrementally_read, extend_prefix_snapshot, hash_file_prefix, next_full_verify_offset,
-    read_lines_from_offset, validate_cached_prefix, FileVersion, PrefixSnapshot,
-    PrefixValidationKind, PREFIX_FULL_REVALIDATION_INTERVAL,
+    validate_cached_prefix, FileVersion, LineBatches, PrefixSnapshot, PrefixValidationKind,
+    PREFIX_FULL_REVALIDATION_INTERVAL,
 };
 use crate::session::status::{is_question_tool, SessionStatus};
 use serde::{Deserialize, Serialize};
@@ -376,11 +376,21 @@ fn updated_entry(previous: Option<IndexEntry>, path: &Path, now: Instant) -> Opt
                 entry.last_full_validation_at,
                 now,
             ) {
-                if let Ok((lines, new_offset)) = read_lines_from_offset(path, entry.offset) {
+                // A failed read or prefix check falls through to a full
+                // rebuild, which never looks at `entry` again.
+                let delta = LineBatches::open(path, entry.offset).and_then(|mut batches| {
+                    let index =
+                        batches.fold(std::mem::take(&mut entry.index), |mut index, lines| {
+                            index.ingest(lines);
+                            index
+                        })?;
+                    Ok((index, batches.consumed()))
+                });
+                if let Ok((index, new_offset)) = delta {
                     if let Ok(prefix) =
                         extend_prefix_snapshot(path, entry.offset, new_offset, validation.snapshot)
                     {
-                        entry.index.ingest(&lines);
+                        entry.index = index;
                         entry.stamp = stamp;
                         entry.offset = new_offset;
                         entry.prefix = prefix;
@@ -396,10 +406,15 @@ fn updated_entry(previous: Option<IndexEntry>, path: &Path, now: Instant) -> Opt
     }
 
     // First sight, replaced file, or failed validation: rebuild from byte 0.
-    let (lines, offset) = read_lines_from_offset(path, 0).ok()?;
+    let mut batches = LineBatches::open(path, 0).ok()?;
+    let index = batches
+        .fold(ActivityIndex::default(), |mut index, lines| {
+            index.ingest(lines);
+            index
+        })
+        .ok()?;
+    let offset = batches.consumed();
     let prefix = hash_file_prefix(path, offset).ok()?;
-    let mut index = ActivityIndex::default();
-    index.ingest(&lines);
     Some(IndexEntry {
         path: path.to_path_buf(),
         stamp,

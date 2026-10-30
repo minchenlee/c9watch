@@ -10,7 +10,7 @@
 //! without requiring users to install a hook.
 
 use crate::session::cache::{
-    read_lines_from_offset, refresh_incremental_entry, FileVersion, IncrementalEntry,
+    build_from_line_batches, refresh_incremental_entry, FileVersion, IncrementalEntry,
 };
 use crate::session::parser::{parse_jsonl_entries, MessageContent, SessionEntry};
 use chrono::{DateTime, Utc};
@@ -182,7 +182,7 @@ fn collect_user_tool_result_ids_from_lines(lines: &[String]) -> HashMap<String, 
 /// Builds subagent info from a full (or full-so-far) set of raw JSONL lines.
 fn build_subagents_from_lines(session_id: &str, lines: &[String]) -> Vec<SubagentInfo> {
     let user_results = collect_user_tool_result_ids_from_lines(lines);
-    let entries = parse_jsonl_entries(lines.to_vec());
+    let entries = parse_jsonl_entries(lines);
     let mut subagents = extract_subagents_from_entries(&entries, session_id);
 
     for sa in subagents.iter_mut() {
@@ -283,10 +283,26 @@ pub fn active_subagents_for_path<P: AsRef<Path>>(
     jsonl_path: P,
 ) -> Vec<SubagentInfo> {
     let path = jsonl_path.as_ref();
-    let Ok((lines, _offset)) = read_lines_from_offset(path, 0) else {
-        return Vec::new();
-    };
-    build_subagents_from_lines(session_id, &lines)
+    build_from_line_batches(
+        path,
+        |lines| build_subagents_from_lines(session_id, lines),
+        |subagents, new_lines| fold_new_subagents(subagents, new_lines, session_id),
+    )
+    .map(|(subagents, _offset)| subagents)
+    .unwrap_or_default()
+}
+
+/// `merge_new_subagents` over raw appended lines.
+fn fold_new_subagents(
+    mut subagents: Vec<SubagentInfo>,
+    new_lines: &[String],
+    session_id: &str,
+) -> Vec<SubagentInfo> {
+    if !new_lines.is_empty() {
+        let new_entries = parse_jsonl_entries(new_lines);
+        merge_new_subagents(&mut subagents, &new_entries, new_lines, session_id);
+    }
+    subagents
 }
 
 /// Cached subagent state for one file: the version stamp and byte offset the
@@ -358,13 +374,7 @@ fn cached_active_subagents_for_path_at(
         stamp,
         now,
         |lines| build_subagents_from_lines(session_id, lines),
-        |mut subagents, new_lines| {
-            if !new_lines.is_empty() {
-                let new_entries = parse_jsonl_entries(new_lines.to_vec());
-                merge_new_subagents(&mut subagents, &new_entries, new_lines, session_id);
-            }
-            subagents
-        },
+        |subagents, new_lines| fold_new_subagents(subagents, new_lines, session_id),
     ) else {
         return Vec::new();
     };
@@ -1025,6 +1035,29 @@ mod tests {
         let subs = active_subagents_for_path("s1", f.path());
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].agent_type, "Explore");
+    }
+
+    #[test]
+    fn completion_in_a_later_read_batch_still_counts() {
+        // Start and result sit more than one read batch apart, so the cold
+        // read sees them in different batches.
+        let start = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","sessionId":"s1","message":{"id":"m1","role":"assistant","model":"claude","content":[{"type":"tool_use","id":"toolu_far","name":"Agent","input":{"subagent_type":"Explore","description":"far"}}],"stop_reason":null,"stop_sequence":null}}"#;
+        let done = r#"{"type":"user","uuid":"u2","timestamp":"2026-01-01T00:09:00Z","sessionId":"s1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_far","content":"ok"}]}}"#;
+        let pad = format!(r#"{{"type":"system","pad":"{}"}}"#, "x".repeat(4096));
+        let pads = crate::session::cache::LINE_BATCH_BYTES / pad.len() + 1;
+        let mut lines = vec![start];
+        lines.extend(std::iter::repeat(pad.as_str()).take(pads));
+        lines.push(done);
+        let f = write_jsonl(&lines);
+
+        let subs = active_subagents_for_path("s1", f.path());
+
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].status, SubagentStatus::Completed);
+        assert_eq!(
+            subs[0].completed_at.as_deref(),
+            Some("2026-01-01T00:09:00Z")
+        );
     }
 
     #[test]

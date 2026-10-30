@@ -338,7 +338,7 @@ pub fn read_last_n_lines<P: AsRef<Path>>(path: P, n: usize) -> Result<Vec<String
 }
 
 /// Parse JSONL lines into SessionEntry structs
-pub fn parse_jsonl_entries(lines: Vec<String>) -> Vec<SessionEntry> {
+pub fn parse_jsonl_entries(lines: &[String]) -> Vec<SessionEntry> {
     lines
         .iter()
         .filter_map(|line| serde_json::from_str::<SessionEntry>(line).ok())
@@ -351,7 +351,7 @@ pub fn parse_last_n_entries<P: AsRef<Path>>(
     n: usize,
 ) -> Result<Vec<SessionEntry>, String> {
     let lines = read_last_n_lines(path, n)?;
-    Ok(parse_jsonl_entries(lines))
+    Ok(parse_jsonl_entries(&lines))
 }
 
 /// Parse all entries from a session JSONL file
@@ -388,7 +388,7 @@ pub fn parse_all_entries_with_progress<P: AsRef<Path>>(
         }
     }
     on_progress(total, total);
-    Ok(parse_jsonl_entries(lines))
+    Ok(parse_jsonl_entries(&lines))
 }
 
 /// Known XML tag prefixes that indicate system-generated (non-user) messages.

@@ -1,6 +1,6 @@
 use crate::claude_hooks::{HookSessionState, PendingPermission};
 use crate::session::cache::{
-    read_lines_from_offset, refresh_incremental_entry, FileVersion, IncrementalEntry,
+    build_from_line_batches, refresh_incremental_entry, FileVersion, IncrementalEntry,
 };
 use crate::session::codex::CodexLifecycle;
 use crate::session::cursor::CursorLifecycle;
@@ -1032,10 +1032,10 @@ fn count_messages_in_jsonl_at(path: &Path, now: Instant) -> u32 {
     let mut cache = match MESSAGE_COUNT_CACHE.lock() {
         Ok(cache) => cache,
         Err(_) => {
-            let Ok((lines, _)) = read_lines_from_offset(path, 0) else {
-                return 0;
-            };
-            return count_messages_in_lines(&lines);
+            return build_from_line_batches(path, count_messages_in_lines, |count, lines| {
+                count + count_messages_in_lines(lines)
+            })
+            .map_or(0, |(count, _)| count);
         }
     };
 
