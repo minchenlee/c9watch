@@ -186,6 +186,9 @@ enum Cmd {
     Shutdown,
     /// The engine drains: kill the agent, then `drain::settle` its row.
     Drain,
+    /// New mail for the agent (C1b-M1 §4.4). It carries nothing: the
+    /// supervisor reads its queue from the store.
+    Mail,
 }
 
 struct Handle {
@@ -346,6 +349,15 @@ impl Spawner {
     pub(super) fn drain_agent(&self, id: &str) -> bool {
         let cmds = lock(&self.live).get(id).map(|h| h.cmds.clone());
         cmds.is_some_and(|c| c.send(Cmd::Drain).is_ok())
+    }
+
+    /// Tell `id`'s supervisor that it has new mail. No-op when `id` has
+    /// none yet (still coming up): a supervisor reads its queue once it is
+    /// ready anyway.
+    pub fn nudge_mail(&self, id: &str) {
+        if let Some(c) = lock(&self.live).get(id).map(|h| h.cmds.clone()) {
+            let _ = c.send(Cmd::Mail);
+        }
     }
 
     pub fn with_launcher(mut self, launcher: Arc<dyn Launcher>) -> Spawner {
@@ -687,7 +699,8 @@ impl Spawner {
                 Ok(Cmd::Shutdown | Cmd::Drain) | Err(TryRecvError::Disconnected) => {
                     return self.cut(s, driver);
                 }
-                Err(TryRecvError::Empty) => {}
+                // `run` reads the queue once the agent is ready.
+                Ok(Cmd::Mail) | Err(TryRecvError::Empty) => {}
             }
             let out = driver.output(POLL);
             let snap = driver.screen();
@@ -795,7 +808,7 @@ impl Spawner {
                     self.drain_now(s, driver);
                     return;
                 }
-                Err(RecvTimeoutError::Timeout) => {}
+                Ok(Cmd::Mail) | Err(RecvTimeoutError::Timeout) => {}
             }
             // Nobody reads the bytes yet; the screen keeps up regardless.
             let _ = driver.output(Duration::ZERO);

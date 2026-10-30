@@ -665,6 +665,102 @@
       ],
       "type": "object"
     },
+    "MsgAddress": {
+      "description": "The agent a message went to.",
+      "properties": {
+        "addr": {
+          "description": "`<machine>/<id>`.",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "addr"
+      ],
+      "type": "object"
+    },
+    "MsgKind": {
+      "description": "What a message asks of its reader (A:418). A caller sends `request` or\n`info`; `result` and `system` are written by the engine.",
+      "enum": [
+        "request",
+        "info",
+        "result",
+        "system"
+      ],
+      "type": "string"
+    },
+    "MsgSendParams": {
+      "description": "`msg.send` params. The envelope's `idem` makes a resend safe: the same\nsender, key and request get the first message back.",
+      "properties": {
+        "body": {
+          "description": "UTF-8 text. No control characters other than `\\n` and `\\t`.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/MsgKind",
+          "default": "info",
+          "description": "`request` or `info`."
+        },
+        "replyTo": {
+          "description": "The id of the message this one answers. Stored, not checked.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "to": {
+          "description": "An agent id (`agt_<ulid>`), a name, or `<machine>/<id>` with this\nmachine's id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "to",
+        "body"
+      ],
+      "type": "object"
+    },
+    "MsgSendResult": {
+      "description": "`msg.send` result. The response's `seq` is the same cursor.",
+      "properties": {
+        "cursor": {
+          "description": "Cursor of the message's `msg.state` `queued` event. For a replay it\nis the first send's cursor, which may be past event retention.",
+          "type": "string"
+        },
+        "msgId": {
+          "description": "`msg_<ulid>`.",
+          "type": "string"
+        },
+        "replayed": {
+          "description": "The same sender sent the same request with this `idem` before; no\nnew message was written.",
+          "type": "boolean"
+        },
+        "state": {
+          "description": "The message's state now: `queued` for a new message.",
+          "type": "string"
+        },
+        "to": {
+          "$ref": "#/$defs/MsgAddress"
+        }
+      },
+      "required": [
+        "msgId",
+        "state",
+        "to",
+        "cursor",
+        "replayed"
+      ],
+      "type": "object"
+    },
     "Request": {
       "description": "A request frame. Every field is optional on the wire, so that a frame\nwith a missing field still gets an error that echoes its `id`.",
       "properties": {
@@ -982,6 +1078,14 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
+      }
+    },
+    "msg.send": {
+      "params": {
+        "$ref": "#/$defs/MsgSendParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MsgSendResult"
       }
     },
     "session.list": {

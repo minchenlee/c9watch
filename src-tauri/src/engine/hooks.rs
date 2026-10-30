@@ -15,7 +15,9 @@
 //! 4. **Dedupe** by `agent_id + seq` in the `dedupe` table, for
 //!    `db::DEDUPE_WINDOW_MS`.
 //! 5. The event goes into the state merge (`engine::merge`), and the
-//!    session binding for SessionStart (`engine::generation`).
+//!    session binding for SessionStart (`engine::generation`). A
+//!    UserPromptSubmit whose prompt carries a mail fence marks that mail
+//!    `delivered` (`engine::mail::confirm_from_prompt`).
 //!
 //! Drops for 1-3 go to the audit log with decision `drop`; a duplicate does
 //! not (a retry is not a finding). Every drop still answers `ok:true` with
@@ -26,6 +28,7 @@ use super::db::audit::{self, AuditEntry};
 use super::db::outbox::NewEvent;
 use super::db::Tx;
 use super::generation;
+use super::mail;
 use super::merge::{Activity, Change, Claim, MergeTable, Source};
 use super::proto::HookParams;
 use rusqlite::{params, OptionalExtension};
@@ -195,6 +198,14 @@ fn apply(
         (change, row_state, attention)
     });
     write_change(tx, machine, id, ev.gen, state, &change, row_state)?;
+    // C1b-M1 §4.5: a prompt that carries a mail fence is that mail,
+    // delivered. `c9watch-agent` sends only the fence header lines
+    // (`cli::task::mail_headers`), never the prompt.
+    if ev.method == "hook.user_prompt_submit" {
+        if let Some(headers) = p.input["mail"].as_str() {
+            mail::confirm_from_prompt(tx, machine, id, headers, now_ms)?;
+        }
+    }
     if let Some(reason) = attention {
         tx.emit(&NewEvent {
             topic: "agent.attention".into(),
@@ -672,6 +683,58 @@ mod tests {
             .filter(|t| *t == "agent.turn_end")
             .count();
         assert_eq!(ends, 1);
+    }
+
+    /// C1b-M1 §4.5: a UserPromptSubmit whose prompt carries the fence of
+    /// a message in delivery marks it `delivered` with detail
+    /// `prompt_hook`. A fence of a queued message, or none, moves nothing.
+    #[test]
+    fn a_prompt_with_a_mail_fence_confirms_the_delivery() {
+        use crate::engine::mail::{self, MsgState};
+        use crate::engine::principal::Principal;
+        use crate::engine::proto::MsgSendParams;
+        let (_t, db, merge) = setup();
+        let queue = |body: &'static str| {
+            db.write_blocking(move |tx| {
+                let sender = mail::sender(tx, &Principal::LocalUnverified)?;
+                let target = mail::resolve(tx, MACHINE, &format!("{}/a1", MACHINE))?.unwrap();
+                let params = MsgSendParams {
+                    to: "a1".into(),
+                    body: body.into(),
+                    ..Default::default()
+                };
+                let sent = mail::enqueue(tx, MACHINE, &sender, &target, &params, None, "me", 1)?;
+                Ok(sent.unwrap().msg_id)
+            })
+            .unwrap()
+            .0
+        };
+        let (first, second) = (queue("one"), queue("two"));
+        db.write_blocking(|tx| mail::take_next(tx, MACHINE, "a1", 2))
+            .unwrap();
+        let state_of = |id: &str| mail::state_of(&db.reader().unwrap(), id).unwrap();
+        let fence = |id: &str| format!("[c9watch mail {} \u{b7} tok ab]", id);
+        // No `mail` key: nothing moves.
+        let p = params("claude", "1", json!({}));
+        send(&db, &merge, "hook.user_prompt_submit", 1, Some(1), p, 1_000);
+        assert_eq!(state_of(&first), Some(MsgState::Delivering));
+        // The queued one is not in delivery: it stays.
+        let headers = format!("{}\n{}", fence(&first), fence(&second));
+        let p = params("claude", "2", json!({ "mail": headers }));
+        send(&db, &merge, "hook.user_prompt_submit", 1, Some(1), p, 2_000);
+        assert_eq!(state_of(&first), Some(MsgState::Delivered));
+        assert_eq!(state_of(&second), Some(MsgState::Queued));
+        let detail: Option<String> = db
+            .reader()
+            .unwrap()
+            .query_row(
+                "SELECT detail FROM message_status WHERE msg_id = ?1 AND state = 'delivered'",
+                [&first],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(detail.as_deref(), Some("prompt_hook"));
+        assert_eq!(state(&db), "working");
     }
 
     #[test]

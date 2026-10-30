@@ -463,7 +463,9 @@ pub fn fence(msg_id: &str, token: Option<&str>, provenance: &str, body: &str) ->
     out
 }
 
-fn sha256_hex(b: &[u8]) -> String {
+/// Lowercase hex sha256 of `b`: the body hash, also the audit
+/// `payload_hash` of a send.
+pub fn sha256_hex(b: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(b)
         .iter()

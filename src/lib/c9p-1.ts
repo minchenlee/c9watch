@@ -344,6 +344,57 @@ export interface C9pHookResult {
   additionalContext?: string | null;
 }
 
+/** The agent a message went to. */
+export interface C9pMsgAddress {
+  /** `<machine>/<id>`. */
+  addr: string;
+  id: string;
+  name: string | null;
+}
+
+/**
+ * What a message asks of its reader (A:418). A caller sends `request` or
+ * `info`; `result` and `system` are written by the engine.
+ */
+export type C9pMsgKind = 'request' | 'info' | 'result' | 'system';
+
+/**
+ * `msg.send` params. The envelope's `idem` makes a resend safe: the same
+ * sender, key and request get the first message back.
+ */
+export interface C9pMsgSendParams {
+  /** UTF-8 text. No control characters other than `\n` and `\t`. */
+  body: string;
+  /** `request` or `info`. */
+  kind?: C9pMsgKind;
+  /** The id of the message this one answers. Stored, not checked. */
+  replyTo?: string | null;
+  /**
+   * An agent id (`agt_<ulid>`), a name, or `<machine>/<id>` with this
+   * machine's id.
+   */
+  to: string;
+}
+
+/** `msg.send` result. The response's `seq` is the same cursor. */
+export interface C9pMsgSendResult {
+  /**
+   * Cursor of the message's `msg.state` `queued` event. For a replay it
+   * is the first send's cursor, which may be past event retention.
+   */
+  cursor: string;
+  /** `msg_<ulid>`. */
+  msgId: string;
+  /**
+   * The same sender sent the same request with this `idem` before; no
+   * new message was written.
+   */
+  replayed: boolean;
+  /** The message's state now: `queued` for a new message. */
+  state: string;
+  to: C9pMsgAddress;
+}
+
 /**
  * A request frame. Every field is optional on the wire, so that a frame
  * with a missing field still gets an error that echoes its `id`.
@@ -499,6 +550,10 @@ export interface C9pMethods {
   'hook.user_prompt_submit': {
     params: C9pHookParams;
     result: C9pHookResult;
+  };
+  'msg.send': {
+    params: C9pMsgSendParams;
+    result: C9pMsgSendResult;
   };
   'session.list': {
     params: C9pSessionListParams;
