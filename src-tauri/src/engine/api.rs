@@ -34,6 +34,7 @@ use super::create::Spawner;
 use super::db::audit::{self, AuditEntry};
 use super::db::outbox::{Cursor, Event, ReadError, Subscription, READ_BATCH};
 use super::db::{now_ms, AgentFilter, Db};
+use super::detect::{FirstTick, FIRST_TICK_WAIT};
 use super::drain::DrainSwitch;
 use super::hooks::{self, HookEvent, Outcome};
 use super::merge::MergeTable;
@@ -98,6 +99,9 @@ pub struct ServerCtx {
     /// On while the engine drains (C1a-27): `hook.session_start` then
     /// injects nothing.
     pub drain: Arc<DrainSwitch>,
+    /// Detection's first pass: `session.list` and `snapshot.get` wait for
+    /// it (`detect::FirstTick`).
+    pub first_tick: Arc<FirstTick>,
 }
 
 impl ServerCtx {
@@ -115,6 +119,7 @@ impl ServerCtx {
             standing_orders: None,
             spawner: None,
             drain: Arc::new(DrainSwitch::new()),
+            first_tick: Arc::new(FirstTick::open_now()),
         }
     }
 
@@ -147,6 +152,22 @@ impl ServerCtx {
     pub fn with_drain(mut self, drain: Arc<DrainSwitch>) -> Self {
         self.drain = drain;
         self
+    }
+
+    pub fn with_first_tick(mut self, first_tick: Arc<FirstTick>) -> Self {
+        self.first_tick = first_tick;
+        self
+    }
+
+    /// Wait for detection's first pass; past `FIRST_TICK_WAIT` answer with
+    /// what the table holds.
+    async fn detected(&self) {
+        if !self.first_tick.is_open() && !self.first_tick.wait(FIRST_TICK_WAIT).await {
+            eprintln!(
+                "[engine] detection's first pass took over {:?}; answering anyway",
+                FIRST_TICK_WAIT
+            );
+        }
     }
 
     fn db(&self) -> Result<&Arc<Db>, ApiError> {
@@ -879,6 +900,7 @@ where
 }
 
 async fn snapshot_get(ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
+    ctx.detected().await;
     let db = ctx.db()?.clone();
     let (cursor, agents) = blocking(move || db.snapshot().map_err(internal)).await?;
     let result = SnapshotResult {
@@ -891,6 +913,7 @@ async fn snapshot_get(ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
 
 /// The agents whose session detection sees now (C1a-15).
 async fn session_list(ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
+    ctx.detected().await;
     let db = ctx.db()?.clone();
     let sessions = blocking(move || db.agents(AgentFilter::Sessions).map_err(internal)).await?;
     Ok(serde_json::to_value(SessionListResult { sessions }).expect("SessionListResult serializes"))
@@ -1137,6 +1160,7 @@ mod tests {
             standing_orders: None,
             spawner: None,
             drain: Arc::new(DrainSwitch::new()),
+            first_tick: Arc::new(FirstTick::open_now()),
         })
     }
 
@@ -1479,6 +1503,7 @@ mod tests {
             standing_orders: None,
             spawner: None,
             drain: Arc::new(DrainSwitch::new()),
+            first_tick: Arc::new(FirstTick::open_now()),
         });
         (t, ctx, db)
     }
@@ -1949,6 +1974,33 @@ mod tests {
             .iter()
             .map(|r| r["id"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    /// Until detection's first pass is written, `session.list` and
+    /// `snapshot.get` wait (reviews H1).
+    #[tokio::test]
+    async fn session_list_and_snapshot_wait_for_the_first_detection_pass() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let gate = Arc::new(FirstTick::pending());
+        let ctx = ServerCtx {
+            first_tick: gate.clone(),
+            ..Arc::try_unwrap(ctx).ok().unwrap()
+        };
+        let short = Duration::from_millis(200);
+        assert!(tokio::time::timeout(short, session_list(&ctx))
+            .await
+            .is_err());
+        assert!(tokio::time::timeout(short, snapshot_get(&ctx))
+            .await
+            .is_err());
+        let waiting = tokio::time::timeout(Duration::from_secs(5), session_list(&ctx));
+        let open = async {
+            tokio::time::sleep(short).await;
+            gate.open();
+        };
+        let (listed, ()) = tokio::join!(waiting, open);
+        assert!(listed.unwrap().is_ok());
+        assert!(snapshot_get(&ctx).await.is_ok());
     }
 
     #[tokio::test]

@@ -1,0 +1,9 @@
+{
+  "exit": 2,
+  "stderr": [
+    {
+      "error": "No live session matches '9999'"
+    }
+  ],
+  "stdout": []
+}

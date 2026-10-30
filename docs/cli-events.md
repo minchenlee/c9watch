@@ -95,6 +95,60 @@ build is about ten times slower). `--timeout` is exact even while a poll is
 running. With a timeout shorter than one poll, `wait` exits `124` before it
 can check the session.
 
+## Engine builds (`--features engine`, not released)
+
+In an engine build, `list`, `status`, `self`, `watch` and `wait` are clients
+of the c9 engine. They auto-start it and read its sessions (`session.list`;
+`snapshot.get`, then `events.subscribe` from its cursor for `watch` and
+`wait`). The event lines keep the fields above. The differences:
+
+- `session` (and each `list` row) keeps the `--direct` names the engine
+  can fill: `id` (the provider's session id), `sessionKey`, `sessionName`,
+  `projectPath`, `status`, `pid` and `provider`. The engine's row (c9p/1
+  `AgentRow`, `docs/api/c9p-1.json`) is under `engine`. Fields the engine
+  does not know (`canStop`, `firstPrompt`, `modified`, ...) and
+  `pendingToolName` are left out; `list` has no `diagnostics`.
+- Lines follow the engine's events, so `--interval` does not apply.
+- After an `engine restart`, `watch` and `wait` reconnect and go on; a
+  session that did not change prints nothing. For 15 s after the stream
+  ends they only reconnect, so the restart starts the new engine; after
+  that they start one themselves.
+- An engine that just started answers once its first detection pass is
+  written, so the first `list` already shows the sessions.
+- `--direct` keeps in-process detection and the output above. A caller with
+  `C9_AGENT_ID` set (inside an engine agent) gets `--direct` without asking
+  and never starts the engine.
+- When no engine answers and none can start, the command exits `1` with
+  `engine_unreachable` and a hint to use `--direct`.
+
+### `wait --event turn_ended --agent <id|name>`
+
+An engine build also waits for the next turn end of one engine agent (an
+agent the engine runs in a PTY). A turn end means only that the agent is
+idle; it does not mean its work is done. The command reads `snapshot.get`
+and follows `agent.turn_end` events from its cursor, and after an `engine
+restart` it goes on from the last cursor it saw.
+
+Only turn ends after the snapshot count. If you send a prompt and then
+wait, a short turn can end before the wait starts; pass `--since <cursor>`
+to count events after a cursor you hold (for example the `cursor` of the
+last line `wait` printed). Without `--since` and without `--timeout` the
+wait can last until the next turn ends. `--timeout` covers the whole
+command, the engine auto-start included.
+
+```json
+{"schema":1,"event":"turn_ended","agentId":"agt_01J…","name":"w1","generation":1,"by":"hook","at":1767000000000,"cursor":"m:e:42","timestamp":"2026-10-30T10:00:00+00:00"}
+```
+
+`by` names the signal that saw the turn end (`hook`, `screen`, `transcript`
+or `process`), or `snapshot` when the engine had pruned the event and the
+agent, mid-turn before, was idle in a new snapshot (`at` is then null). Exit codes: `0` the turn ended, `2` no live engine agent
+matches, `3` the agent stopped first (the line has `"event":"agent_ended"`
+and a `reason`: its final state, `gone` or `failed`), `124` timeout. Inside
+an engine agent (`C9_AGENT_ID` set) the command connects only to
+`C9_ENGINE_SOCK`, never starts the engine, and exits `1` with
+`engine_unreachable` when no engine answers there.
+
 ## Shell example: notify me when a session needs me
 
 ```bash

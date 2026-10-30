@@ -1,0 +1,16 @@
+{
+  "exit": 0,
+  "stderr": [],
+  "stdout": [
+    {
+      "byProject": {
+        "proj": 1
+      },
+      "byStatus": {
+        "Connecting": 1
+      },
+      "needsPermission": [],
+      "total": 1
+    }
+  ]
+}
