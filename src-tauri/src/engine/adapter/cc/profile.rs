@@ -372,6 +372,11 @@ pub fn settings(p: &Profile) -> Value {
     let mut s = claude_hook_settings(&p.agent_bin);
     // Pinned so the screen detector sees the layout it knows (D24.9).
     s["tui"] = json!("fullscreen");
+    // Pinned so a mail paste is text, never vim NORMAL-mode commands. A
+    // `--settings` value beats the project's `editorMode` (live run, CC
+    // 2.1.314, C1b-M1-3), and vim NORMAL mode shows nothing on screen to
+    // detect it by.
+    s["editorMode"] = json!("normal");
     s["permissions"] = json!({ "allow": allow_rules(p), "deny": deny_rules(p) });
     // Layer 3, allowUnsandboxedCommands false: no `dangerouslyDisableSandbox`
     // retry, so Bash cannot step around the write-deny (honored from a
@@ -610,6 +615,7 @@ mod tests {
             let s = settings(&p);
             assert_eq!(s["remoteControlAtStartup"], false);
             assert_eq!(s["tui"], "fullscreen");
+            assert_eq!(s["editorMode"], "normal");
             let hooks = s["hooks"].as_object().unwrap();
             assert_eq!(hooks.len(), CC_HOOKS.len());
             for (cc_event, event) in CC_HOOKS {

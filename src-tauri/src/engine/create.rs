@@ -165,6 +165,19 @@ pub struct SpawnerConfig {
 
 type Reply = oneshot::Sender<Result<AgentRow, ApiError>>;
 
+/// Why `Spawner::pty_write` did not send its bytes, or may have sent only
+/// part of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PtyWriteError {
+    /// The engine drains: nothing was sent (audited with path `pty`).
+    Blocked,
+    /// The driver's write failed. For `NativePty`, only `WouldBlock` (the
+    /// write queue is full) means that nothing was sent; after `TimedOut`
+    /// the bytes may still arrive, and any other error may leave a part
+    /// sent.
+    Io(io::ErrorKind, String),
+}
+
 enum Cmd {
     /// Kill the agent and make its row a tombstone.
     Retire { principal: String, reply: Reply },
@@ -672,7 +685,9 @@ impl Spawner {
             let mut ready = false;
             for ev in screen.step(&snap.title, &snap.text, snap.quiet, (self.clock)()) {
                 match ev {
-                    ScreenEvent::Write(keys) => self.pty_write(&s.id, driver.as_mut(), keys),
+                    ScreenEvent::Write(keys) => {
+                        let _ = self.pty_write(&s.id, driver.as_mut(), keys);
+                    }
                     ScreenEvent::Ready { first: true } => ready = true,
                     ScreenEvent::Failed(why) => {
                         let _ = driver.kill();
@@ -774,7 +789,7 @@ impl Spawner {
                 use super::live_test;
                 live_test::dump_screen(&self.config.home, &s.id, &snap.text, &mut last_screen);
                 if let Some(keys) = live_test::take_input(&self.config.home, &s.id) {
-                    self.pty_write(&s.id, driver.as_mut(), &keys);
+                    let _ = self.pty_write(&s.id, driver.as_mut(), &keys);
                 }
             }
             for ev in screen.step(&snap.title, &snap.text, snap.quiet, (self.clock)()) {
@@ -900,11 +915,18 @@ impl Spawner {
     }
 
     /// Send `keys` to the agent's terminal, unless the engine drains: then
-    /// nothing is sent, and the block is audited with path `pty`.
-    fn pty_write(&self, id: &str, driver: &mut dyn Driver, keys: &[u8]) {
+    /// nothing is sent, the block is audited with path `pty`, and the
+    /// result is `Blocked`.
+    fn pty_write(
+        &self,
+        id: &str,
+        driver: &mut dyn Driver,
+        keys: &[u8],
+    ) -> Result<(), PtyWriteError> {
         if !self.drain.on() {
-            let _ = driver.write(keys);
-            return;
+            return driver
+                .write(keys)
+                .map_err(|e| PtyWriteError::Io(e.kind(), e.to_string()));
         }
         let id2 = id.to_string();
         let wrote = self.db.write_blocking(move |tx| {
@@ -916,6 +938,7 @@ impl Spawner {
                 id, e
             );
         }
+        Err(PtyWriteError::Blocked)
     }
 
     /// Whether the create op of `s` is still open: a retire closes it.
@@ -2751,6 +2774,24 @@ mod tests {
         no_supervisors(&e.sp);
         assert_eq!(drained(&e.db, &r.id), drain_facts(&r, "interrupted"));
         e.sp.shutdown();
+    }
+
+    /// C1b-M1-3: a write the drain stops is `Blocked`, sends nothing and
+    /// is audited; a driver error comes back with its kind.
+    #[test]
+    fn pty_write_reports_a_drain_block() {
+        let e = setup(Script::Hang, None);
+        let spec = SpawnSpec::new(vec!["claude".into()], e.cwd.clone());
+        let mut d = e.launcher.spawn(&spec).unwrap();
+        assert_eq!(e.sp.pty_write("agt_x", d.as_mut(), b"hi"), Ok(()));
+        assert_eq!(e.launcher.writes.load(Ordering::SeqCst), 1);
+        e.sp.drain_switch().start();
+        assert_eq!(
+            e.sp.pty_write("agt_x", d.as_mut(), b"hi"),
+            Err(PtyWriteError::Blocked)
+        );
+        assert_eq!(e.launcher.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(blocked_pty_writes(&e.db), 1);
     }
 
     /// C1a-27: zero sends on the PTY path while draining. The drain starts

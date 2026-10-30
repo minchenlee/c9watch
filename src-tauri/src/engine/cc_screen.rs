@@ -238,6 +238,73 @@ fn is_rule(line: &str) -> bool {
     t.chars().count() >= 10 && t.chars().all(|c| c == '\u{2500}')
 }
 
+/// What CC's input box holds: the lines between the last two full-width
+/// rules. `prompt_text` is not this: on a real screen, the lines below the
+/// last rule are the status line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputBox {
+    /// No box: fewer than two rules, nothing between them, or a first line
+    /// without the `❯` cursor (some other screen drawn between rules).
+    Missing,
+    /// Only the `❯` cursor.
+    Empty,
+    /// CC's suggestion on a fresh session, such as `Try "fix lint
+    /// errors"`. The VT model drops colours, so it is told from typed text
+    /// by its form alone: one line, `Try "…"`.
+    Placeholder,
+    /// Anything else, without the `❯` and trimmed; lines joined by `\n`.
+    Text(String),
+}
+
+/// Read CC's input box from the screen (C1b-M1-3). Real layouts:
+/// `tests/fixtures/cc_screens/cc2.1.314_input_*.txt`.
+pub fn input_box(screen: &str) -> InputBox {
+    let lines: Vec<&str> = screen.lines().collect();
+    let Some(bottom) = lines.iter().rposition(|l| is_rule(l)) else {
+        return InputBox::Missing;
+    };
+    let Some(top) = lines[..bottom].iter().rposition(|l| is_rule(l)) else {
+        return InputBox::Missing;
+    };
+    let inside = &lines[top + 1..bottom];
+    let Some(first) = inside.first().map(|l| l.trim_start()) else {
+        return InputBox::Missing;
+    };
+    let Some(first) = first.strip_prefix(SELECT_GLYPH) else {
+        return InputBox::Missing;
+    };
+    let text = std::iter::once(first)
+        .chain(inside[1..].iter().copied())
+        .map(|l| l.trim_matches(|c: char| c.is_whitespace()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = text.trim_matches(|c: char| c.is_whitespace());
+    if text.is_empty() {
+        InputBox::Empty
+    } else if !text.contains('\n') && text.starts_with("Try \"") && text.ends_with('"') {
+        InputBox::Placeholder
+    } else {
+        InputBox::Text(text.to_string())
+    }
+}
+
+/// A paste may go in: the box is empty or shows only the placeholder.
+pub fn box_is_free(b: &InputBox) -> bool {
+    matches!(b, InputBox::Empty | InputBox::Placeholder)
+}
+
+/// The box shows the paste of `msg_id`: its fence line, or CC's collapsed
+/// `[Pasted text #n +k lines]` (CC 2.1.314 collapses any paste of more
+/// than one line).
+pub fn box_has_paste(b: &InputBox, msg_id: &str) -> bool {
+    match b {
+        InputBox::Text(t) => {
+            t.contains(&format!("[c9watch mail {}", msg_id)) || t.contains("[Pasted text #")
+        }
+        _ => false,
+    }
+}
+
 /// The text of the open prompt: the lines below the last full-width rule
 /// that comes before the first dialog marker (the whole screen when there
 /// is no rule), with the selection cursor and blank lines taken out. Moving
@@ -349,6 +416,11 @@ impl CcScreen {
 
     pub fn ever_ready(&self) -> bool {
         self.ever_ready
+    }
+
+    /// The D24.4 ready rule held at the last `step`.
+    pub fn ready_now(&self) -> bool {
+        self.ready_now
     }
 
     pub fn state(&self) -> Option<ScreenState> {
@@ -582,6 +654,67 @@ mod tests {
         assert!(s.step("", TRUST_YES, ms(300), t0 + ms(5000)).is_empty());
     }
 
+    const RULE: &str = "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}";
+
+    /// A screen with chat above, the box between two rules, and a status
+    /// line below.
+    fn boxed(inside: &str) -> String {
+        format!(
+            "\u{23fa} earlier reply\n{}\n{}\n{}\n  \u{23f5}\u{23f5} auto mode on",
+            RULE, inside, RULE
+        )
+    }
+
+    #[test]
+    fn input_box_reads_between_the_last_two_rules() {
+        assert_eq!(input_box(&boxed("\u{276f} ")), InputBox::Empty);
+        assert_eq!(input_box(&boxed("\u{276f}\u{a0}")), InputBox::Empty);
+        assert_eq!(
+            input_box(&boxed("\u{276f}\u{a0}Try \"fix lint errors\"")),
+            InputBox::Placeholder
+        );
+        assert_eq!(
+            input_box(&boxed("\u{276f} please look")),
+            InputBox::Text("please look".into())
+        );
+        // A typed `Try "x` without its closing quote is text.
+        assert_eq!(
+            input_box(&boxed("\u{276f} Try \"x")),
+            InputBox::Text("Try \"x".into())
+        );
+        assert_eq!(
+            input_box(&boxed(
+                "\u{276f} [c9watch mail msg_1 \u{b7} tok ab]\n  second line"
+            )),
+            InputBox::Text("[c9watch mail msg_1 \u{b7} tok ab]\nsecond line".into())
+        );
+        // Not a box: one rule, no cursor, nothing between the rules.
+        assert_eq!(
+            input_box(&format!("{}\n\u{276f} hi", RULE)),
+            InputBox::Missing
+        );
+        assert_eq!(input_box(&boxed(" 1. Yes")), InputBox::Missing);
+        assert_eq!(input_box(&format!("{}\n{}", RULE, RULE)), InputBox::Missing);
+        assert_eq!(input_box(""), InputBox::Missing);
+        // The unit-test PROMPT has rules too short to count.
+        assert_eq!(input_box(PROMPT), InputBox::Missing);
+    }
+
+    #[test]
+    fn a_paste_goes_only_into_a_free_box_and_is_seen_by_id_or_collapse() {
+        assert!(box_is_free(&InputBox::Empty));
+        assert!(box_is_free(&InputBox::Placeholder));
+        assert!(!box_is_free(&InputBox::Missing));
+        assert!(!box_is_free(&InputBox::Text("x".into())));
+        let fence = InputBox::Text("[c9watch mail msg_1 \u{b7} tok ab]".into());
+        assert!(box_has_paste(&fence, "msg_1"));
+        assert!(!box_has_paste(&fence, "msg_2"));
+        let collapsed = InputBox::Text("[Pasted text #3 +12 lines]".into());
+        assert!(box_has_paste(&collapsed, "msg_2"));
+        assert!(!box_has_paste(&InputBox::Empty, "msg_1"));
+        assert!(!box_has_paste(&InputBox::Text("hello".into()), "msg_1"));
+    }
+
     #[test]
     fn ready_is_an_edge_and_times_out_after_30_s() {
         let t0 = Instant::now();
@@ -591,17 +724,22 @@ mod tests {
             .step(IDLE, PROMPT, ms(400), t0 + ms(500))
             .iter()
             .any(|e| matches!(e, ScreenEvent::Ready { .. })));
+        assert!(!s.ready_now());
         s.session_start();
         let ev = s.step(IDLE, PROMPT, ms(400), t0 + ms(600));
         assert!(ev.contains(&ScreenEvent::Ready { first: true }));
         assert!(s.ever_ready());
+        assert!(s.ready_now());
         // Still ready: no second event.
         assert!(!s
             .step(IDLE, PROMPT, ms(900), t0 + ms(900))
             .iter()
             .any(|e| matches!(e, ScreenEvent::Ready { .. })));
         s.step(BUSY, PROMPT, ms(0), t0 + ms(1000));
+        // Busy: not ready now, though it was ready once.
+        assert!(!s.ready_now() && s.ever_ready());
         let ev = s.step(IDLE, PROMPT, ms(400), t0 + ms(2000));
+        assert!(s.ready_now());
         assert!(ev.contains(&ScreenEvent::Ready { first: false }));
         // After the first ready there is no timeout.
         assert!(!s
