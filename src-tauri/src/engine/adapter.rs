@@ -133,6 +133,10 @@ pub const CC_HOOKS: &[(&str, &str)] = &[
     // CC 2.1.312: runs after the auto-mode classifier denies a call.
     ("PermissionDenied", "permission-denied"),
     ("Notification", "notification"),
+    // Turn start, and work again after a permission prompt (Orca's
+    // pattern): the screen read stays as the fallback.
+    ("UserPromptSubmit", "prompt-submit"),
+    ("PostToolUse", "post-tool-use"),
 ];
 
 /// CC's own hook timeout, in seconds. The client gives up after 0.5 s

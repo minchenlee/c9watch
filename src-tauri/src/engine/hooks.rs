@@ -144,6 +144,9 @@ fn apply(
         "hook.stop" => (claim(Activity::Ready), None),
         // D24.5: confirms the screen's `blocked`.
         "hook.permission_request" => (claim(Activity::Blocked), None),
+        // Turn start, and work again after a permission prompt: the hook
+        // tells `working` before the screen does (Orca's pattern).
+        "hook.user_prompt_submit" | "hook.post_tool_use" => (claim(Activity::Working), None),
         // An auto-mode denial: a human should look (O1 = A).
         "hook.permission_denied" => {
             let reason = p.input["reason"]
@@ -159,7 +162,9 @@ fn apply(
         if let Some(a) = &attention {
             m.attention(a, now_ms);
         }
-        (change, m.row_state(now_ms), attention)
+        let row_state = m.row_state(now_ms);
+        m.written(row_state);
+        (change, row_state, attention)
     });
     write_change(tx, machine, id, ev.gen, state, &change, row_state)?;
     if let Some(reason) = attention {
@@ -211,10 +216,11 @@ fn write_change(
 }
 
 /// A claim of the agent's own screen, from its supervisor after `ready`:
-/// into the merge, then the row state and turn end that follow. CC has no
-/// turn-start hook in the profile, so this is how a ready engine agent
-/// becomes `working`, which the drain waits for (reviews H1). Ignored
-/// unless `gen` is the row's generation. Returns whether it was taken.
+/// into the merge, then the row state and turn end that follow. The
+/// `UserPromptSubmit` and `PostToolUse` hooks claim `working` first; the
+/// screen is the fallback when a hook does not arrive, and the drain waits
+/// for `working` either way (reviews H1). Ignored unless `gen` is the
+/// row's generation. Returns whether it was taken.
 pub fn screen_claim(
     tx: &mut Tx,
     machine: &str,
@@ -237,7 +243,9 @@ pub fn screen_claim(
     };
     let (change, row_state) = merge.with(id, gen, |m| {
         let change = m.claim(Claim::new(Source::Screen, activity, now_ms));
-        (change, m.row_state(now_ms))
+        let row_state = m.row_state(now_ms);
+        m.written(row_state);
+        (change, row_state)
     });
     write_change(
         tx,
@@ -246,6 +254,47 @@ pub fn screen_claim(
         row_gen,
         state.as_deref(),
         &change,
+        row_state,
+    )?;
+    Ok(true)
+}
+
+/// Write the merge's row state when a hold ran out with no new claim
+/// (`AgentMerge::stale_row_state`): a hook `working` held a later screen
+/// `ready` for `SETTLE_MS`, and nothing else arrives after an Esc
+/// interrupt. No claim, so no turn starts or ends here. Ignored unless
+/// `gen` is the row's generation. Returns whether it wrote.
+pub fn expire_hold(
+    tx: &mut Tx,
+    machine: &str,
+    merge: &MergeTable,
+    id: &str,
+    gen: i64,
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    let row: Option<Option<String>> = tx
+        .query_row(
+            "SELECT state FROM agents WHERE id = ?1 AND generation = ?2 \
+             AND source = 'engine' AND control = 'pty' AND gone_at IS NULL",
+            params![id, gen],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(state) = row else {
+        return Ok(false);
+    };
+    let row_state = merge.with(id, gen, |m| {
+        let s = m.row_state(now_ms);
+        m.written(s);
+        s
+    });
+    write_change(
+        tx,
+        machine,
+        id,
+        gen,
+        state.as_deref(),
+        &Change::default(),
         row_state,
     )?;
     Ok(true)
@@ -507,5 +556,75 @@ mod tests {
         let p = params("claude", "4", json!({}));
         send(&db, &merge, "hook.permission_request", 1, Some(1), p, 9_000);
         assert_eq!(state(&db), "paused");
+    }
+
+    #[test]
+    fn prompt_submit_and_post_tool_use_claim_working() {
+        let (_t, db, merge) = setup();
+        // UserPromptSubmit starts the turn before the screen shows it.
+        let p = params("claude", "1", json!({"prompt": "hi"}));
+        assert_eq!(
+            send(&db, &merge, "hook.user_prompt_submit", 1, Some(1), p, 1_000),
+            Outcome::Accepted
+        );
+        assert_eq!(state(&db), "working");
+        // A permission prompt, then PostToolUse after the approval.
+        let p = params("claude", "2", json!({}));
+        send(&db, &merge, "hook.permission_request", 1, Some(1), p, 2_000);
+        assert_eq!(state(&db), "blocked");
+        let p = params("claude", "3", json!({"tool_name": "Bash"}));
+        send(&db, &merge, "hook.post_tool_use", 1, Some(1), p, 9_000);
+        assert_eq!(state(&db), "working");
+        // Stop ends the one turn.
+        let p = params("claude", "4", json!({}));
+        send(&db, &merge, "hook.stop", 1, Some(1), p, 10_000);
+        assert_eq!(state(&db), "ready");
+        let ends = topics(&db)
+            .iter()
+            .filter(|t| *t == "agent.turn_end")
+            .count();
+        assert_eq!(ends, 1);
+    }
+
+    #[test]
+    fn an_expired_hold_is_written_without_a_new_claim() {
+        let (_t, db, merge) = setup();
+        let p = params("claude", "1", json!({}));
+        send(&db, &merge, "hook.post_tool_use", 1, Some(1), p, 1_000);
+        assert_eq!(state(&db), "working");
+        // Esc: the screen goes idle within the hook's hold, and no Stop
+        // hook comes. The hold keeps the row `working` for now.
+        let m2 = merge.clone();
+        let held = db
+            .write_blocking(move |tx| {
+                screen_claim(tx, MACHINE, &m2, "a1", 1, Activity::Ready, 1_500)
+            })
+            .unwrap()
+            .0;
+        assert!(held);
+        assert_eq!(state(&db), "working");
+        assert_eq!(merge.with("a1", 1, |m| m.stale_row_state(2_000)), None);
+        // The hold runs out: the merge says `ready`, and expire_hold
+        // writes it, with no new claim.
+        let after = 1_000 + crate::engine::merge::SETTLE_MS;
+        assert_eq!(
+            merge.with("a1", 1, |m| m.stale_row_state(after)),
+            Some("ready")
+        );
+        let m2 = merge.clone();
+        let wrote = db
+            .write_blocking(move |tx| expire_hold(tx, MACHINE, &m2, "a1", 1, after))
+            .unwrap()
+            .0;
+        assert!(wrote);
+        assert_eq!(state(&db), "ready");
+        assert_eq!(merge.with("a1", 1, |m| m.stale_row_state(after + 1)), None);
+        // Another generation is ignored.
+        let m2 = merge.clone();
+        let other = db
+            .write_blocking(move |tx| expire_hold(tx, MACHINE, &m2, "a1", 2, after))
+            .unwrap()
+            .0;
+        assert!(!other);
     }
 }

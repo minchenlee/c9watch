@@ -25,8 +25,8 @@ struct Cli {
 enum Command {
     /// Send one hook event to the engine. Always exits 0.
     Hook {
-        /// session-start, stop, permission-request, permission-denied or
-        /// notification
+        /// session-start, stop, permission-request, permission-denied,
+        /// notification, prompt-submit or post-tool-use
         event: String,
         /// The adapter kind of the hook
         #[arg(long, default_value = c9watch_lib::cli::task::DEFAULT_HOOK_KIND)]

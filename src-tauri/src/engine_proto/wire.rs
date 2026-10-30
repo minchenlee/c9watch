@@ -534,6 +534,8 @@ pub const HOOK_METHODS: &[&str] = &[
     "hook.permission_request",
     "hook.permission_denied",
     "hook.notification",
+    "hook.user_prompt_submit",
+    "hook.post_tool_use",
 ];
 
 /// Whether `method` is hook-class: a `hook.*` method, `task.done` or

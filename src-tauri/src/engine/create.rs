@@ -36,8 +36,10 @@
 //!
 //! The supervisor owns the `Driver`. After `ready` it keeps following the
 //! screen and feeds its state into the merge as a screen claim
-//! (`hooks::screen_claim`): CC has no turn-start hook in the profile, so
-//! this is what makes a ready agent `working` (reviews H1). On engine
+//! (`hooks::screen_claim`), the fallback for the `UserPromptSubmit` and
+//! `PostToolUse` hooks that claim `working` first (reviews H1). When a
+//! hook's hold on the merge runs out with no new claim, it writes the
+//! merge's state (`hooks::expire_hold`). On engine
 //! shutdown it kills the PTY and leaves the row as it is; the next boot
 //! reconciles it (`ops`).
 //!
@@ -788,6 +790,7 @@ impl Spawner {
                     self.screen_claim(s, st);
                 }
             }
+            self.expire_hold(s);
             if let Ok(Some(status)) = driver.try_wait() {
                 let text = driver.screen().text;
                 let _ = driver.kill();
@@ -864,6 +867,31 @@ impl Spawner {
         });
         if let Err(e) = wrote {
             eprintln!("[engine] Failed to record the screen of {}: {}", s.id, e);
+        }
+    }
+
+    /// Write the merge's state when a hold ran out with no new claim. The
+    /// check is in memory; the write runs only when the state changes.
+    fn expire_hold(&self, s: &Start) {
+        let now = now_ms();
+        if self
+            .merge
+            .with(&s.id, s.gen, |m| m.stale_row_state(now))
+            .is_none()
+        {
+            return;
+        }
+        let (machine, id, gen, merge) = (
+            self.db.machine_id().to_string(),
+            s.id.clone(),
+            s.gen,
+            self.merge.clone(),
+        );
+        let wrote = self
+            .db
+            .write_blocking(move |tx| hooks::expire_hold(tx, &machine, &merge, &id, gen, now));
+        if let Err(e) = wrote {
+            eprintln!("[engine] Failed to settle the state of {}: {}", s.id, e);
         }
     }
 

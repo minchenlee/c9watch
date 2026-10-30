@@ -7,9 +7,10 @@
 //! claims made after it: a lagging or racing weaker source cannot undo a
 //! hook within that window (the screen still shows the spinner just after
 //! the Stop hook). After the window the newest evidence wins again, so a
-//! new turn the hook cannot report (CC has no turn-start hook in the
-//! profile) still shows as `working`. Process evidence only says the
-//! process lives, which is `Unknown`; with nothing else the merge is
+//! change the hooks miss (an Esc interrupt fires no Stop hook) still shows.
+//! The window can end with no new claim, so the supervisor asks
+//! `stale_row_state` and writes the result (`hooks::expire_hold`).
+//! Process evidence only says the process lives, which is `Unknown`; with nothing else the merge is
 //! `Unknown`, never idle (A:1037).
 //!
 //! Turn end (D24.6): Stop hook, then JSONL `turn_duration`, then the
@@ -151,6 +152,8 @@ pub struct AgentMerge {
     turn_open: bool,
     last_turn_end: Option<TurnEnd>,
     attention: Option<Attention>,
+    /// The `row_state` last written to the row.
+    written: Option<&'static str>,
 }
 
 impl AgentMerge {
@@ -221,6 +224,19 @@ impl AgentMerge {
     pub fn merged(&self, now_ms: i64) -> Merged {
         let claims: Vec<Claim> = self.claims.values().copied().collect();
         merge(&claims, now_ms)
+    }
+
+    /// Record that `state` was written to the row.
+    pub fn written(&mut self, state: Option<&'static str>) {
+        if state.is_some() {
+            self.written = state;
+        }
+    }
+
+    /// The `row_state` at `now_ms` when it differs from the one last
+    /// written: a hold ran out with no new claim.
+    pub fn stale_row_state(&self, now_ms: i64) -> Option<&'static str> {
+        self.row_state(now_ms).filter(|s| self.written != Some(*s))
     }
 
     /// The `agents.state` for the merge, or `None` while it is `Unknown`

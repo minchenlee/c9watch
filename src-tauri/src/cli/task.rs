@@ -168,6 +168,8 @@ pub const HOOK_EVENTS: &[(&str, &str)] = &[
     ("permission-request", "hook.permission_request"),
     ("permission-denied", "hook.permission_denied"),
     ("notification", "hook.notification"),
+    ("prompt-submit", "hook.user_prompt_submit"),
+    ("post-tool-use", "hook.post_tool_use"),
 ];
 
 /// The c9p/1 method of a hook event (`session-start` → `hook.session_start`).
