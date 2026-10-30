@@ -173,6 +173,13 @@ impl EngineConn {
         Ok(conn)
     }
 
+    /// Wait up to `d` for each response instead of the default 5 s, for a
+    /// method that answers late (`agent.create` answers once the agent is
+    /// ready).
+    pub fn set_read_timeout(&mut self, d: Duration) {
+        let _ = self.reader.get_ref().set_read_timeout(Some(d));
+    }
+
     /// Send one request and read its response.
     pub fn call(&mut self, method: &str, params: serde_json::Value) -> Result<Response, String> {
         let id = self.next_id.to_string();

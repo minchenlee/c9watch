@@ -28,6 +28,8 @@ pub mod engine_client;
 #[cfg(all(unix, feature = "engine"))]
 pub mod engine_sessions;
 #[cfg(all(unix, feature = "engine"))]
+pub mod engine_spawn;
+#[cfg(all(unix, feature = "engine"))]
 pub mod engine_wait;
 #[cfg(all(unix, feature = "engine"))]
 pub mod task;
@@ -147,6 +149,18 @@ impl DetectArgs {
     fn via_engine(&self) -> bool {
         engine_sessions::use_engine(self.direct, &|k| std::env::var_os(k))
     }
+}
+
+/// `spawn --mode` (C1a-38). An engine build adds the flag; in other builds
+/// this holds nothing, so the PM build's `spawn` is unchanged.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct SpawnModeArgs {
+    /// `managed` (default): a c9watch worker through the legacy daemon.
+    /// `free`: an engine agent in --cwd (agent.create), with only --cwd and
+    /// --name
+    #[cfg(all(unix, feature = "engine"))]
+    #[arg(long, value_enum, default_value_t = engine_spawn::SpawnMode::Managed)]
+    pub mode: engine_spawn::SpawnMode,
 }
 
 /// `wait --event turn_ended --agent X` (C1a-37). An engine build adds the
@@ -357,7 +371,7 @@ pub enum Commands {
     },
 
     /// Spawn a new worker session managed by c9watch
-    #[cfg(feature = "pm-orchestration")]
+    #[cfg(any(feature = "pm-orchestration", all(unix, feature = "engine")))]
     Spawn {
         #[arg(long)]
         cwd: Option<String>,
@@ -377,6 +391,9 @@ pub enum Commands {
         /// PrintBackend ignores this — prompts come via `c9watch send` after spawn.
         #[arg(long)]
         prompt: Option<String>,
+
+        #[command(flatten)]
+        mode: SpawnModeArgs,
     },
 
     /// Send a message to a spawned worker session
@@ -583,7 +600,7 @@ pub fn run(cli: Cli) {
         Commands::Api { method, params } => engine_client::cmd_api(&method, &params, cli.pretty),
         #[cfg(all(unix, feature = "engine"))]
         Commands::Integration { action } => engine_client::cmd_integration(&action, cli.pretty),
-        #[cfg(feature = "pm-orchestration")]
+        #[cfg(any(feature = "pm-orchestration", all(unix, feature = "engine")))]
         Commands::Spawn {
             cwd,
             name,
@@ -593,24 +610,21 @@ pub fn run(cli: Cli) {
             model,
             add_dir,
             prompt,
-        } => (|| -> Result<(), String> {
-            let resolved_cwd = match cwd {
-                Some(c) => c,
-                None => std::env::current_dir()
-                    .map_err(|e| format!("Failed to get current directory: {}", e))?
-                    .to_string_lossy()
-                    .to_string(),
-            };
-            let args = pm_worker::SpawnArgs {
-                cwd: resolved_cwd,
+            mode,
+        } => spawn_command(
+            SpawnFlags {
+                cwd,
                 name,
                 append_system_prompt,
+                append_system_prompt_file,
                 permission_mode,
                 model,
-                add_dirs: add_dir,
-            };
-            pm::cmd_spawn(args, append_system_prompt_file, prompt, cli.pretty)
-        })(),
+                add_dir,
+                prompt,
+            },
+            &mode,
+            cli.pretty,
+        ),
         #[cfg(feature = "pm-orchestration")]
         Commands::Send {
             session_id,
@@ -1105,6 +1119,70 @@ fn cmd_watch(
     }
 }
 
+/// The flags of `c9watch spawn`, as parsed.
+#[cfg(any(feature = "pm-orchestration", all(unix, feature = "engine")))]
+struct SpawnFlags {
+    cwd: Option<String>,
+    name: Option<String>,
+    append_system_prompt: Option<String>,
+    append_system_prompt_file: Option<String>,
+    permission_mode: String,
+    model: Option<String>,
+    add_dir: Vec<String>,
+    prompt: Option<String>,
+}
+
+/// `c9watch spawn`: `--mode managed` (the default, and the only mode of a
+/// build without the engine) keeps the legacy worker path; in an engine
+/// build `--mode free` calls `agent.create` (C1a-38).
+#[cfg(any(feature = "pm-orchestration", all(unix, feature = "engine")))]
+fn spawn_command(f: SpawnFlags, mode: &SpawnModeArgs, pretty: bool) -> Result<(), String> {
+    #[cfg(all(unix, feature = "engine"))]
+    if mode.mode == engine_spawn::SpawnMode::Free {
+        engine_spawn::check_free_flags(&engine_spawn::ManagedFlags {
+            append_system_prompt: f.append_system_prompt.is_some(),
+            append_system_prompt_file: f.append_system_prompt_file.is_some(),
+            permission_mode: &f.permission_mode,
+            model: f.model.is_some(),
+            add_dir: !f.add_dir.is_empty(),
+            prompt: f.prompt.is_some(),
+        })?;
+        return engine_spawn::cmd_spawn_free(f.cwd.as_deref(), f.name.as_deref(), pretty);
+    }
+    let _ = mode;
+    spawn_managed(f, pretty)
+}
+
+#[cfg(feature = "pm-orchestration")]
+fn spawn_managed(f: SpawnFlags, pretty: bool) -> Result<(), String> {
+    let resolved_cwd = match f.cwd {
+        Some(c) => c,
+        None => std::env::current_dir()
+            .map_err(|e| format!("Failed to get current directory: {}", e))?
+            .to_string_lossy()
+            .to_string(),
+    };
+    let args = pm_worker::SpawnArgs {
+        cwd: resolved_cwd,
+        name: f.name,
+        append_system_prompt: f.append_system_prompt,
+        permission_mode: f.permission_mode,
+        model: f.model,
+        add_dirs: f.add_dir,
+    };
+    pm::cmd_spawn(args, f.append_system_prompt_file, f.prompt, pretty)
+}
+
+/// An engine build without `pm-orchestration` has no legacy workers.
+#[cfg(all(unix, feature = "engine", not(feature = "pm-orchestration")))]
+fn spawn_managed(_f: SpawnFlags, _pretty: bool) -> Result<(), String> {
+    Err(
+        "bad_args: --mode managed needs a build with the pm-orchestration feature; \
+         use --mode free for an engine agent"
+            .into(),
+    )
+}
+
 /// One read of the live sessions for `wait` (and the engine's `watch`):
 /// the snapshots and the payloads their event lines take.
 pub(crate) enum Poll<L> {
@@ -1423,6 +1501,37 @@ mod dispatch_tests {
         }
         #[cfg(not(all(unix, feature = "engine")))]
         assert!(parsed.is_err(), "wait --event parsed in a release CLI");
+    }
+
+    /// `spawn --mode` exists only in engine builds (C1a-38), defaults to
+    /// `managed`, and a PM build without the engine rejects it.
+    #[cfg(any(feature = "pm-orchestration", all(unix, feature = "engine")))]
+    #[test]
+    fn spawn_mode_is_an_engine_build_flag() {
+        let parsed = Cli::try_parse_from(["c9watch", "spawn", "--mode", "free", "--cwd", "/w"]);
+        #[cfg(all(unix, feature = "engine"))]
+        {
+            let mode_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+                Commands::Spawn { mode, .. } => mode.mode,
+                _ => panic!("{args:?}: not a spawn command"),
+            };
+            assert_eq!(
+                mode_of(&["c9watch", "spawn"]),
+                engine_spawn::SpawnMode::Managed
+            );
+            assert_eq!(
+                mode_of(&["c9watch", "spawn", "--mode", "managed"]),
+                engine_spawn::SpawnMode::Managed
+            );
+            let Commands::Spawn { cwd, mode, .. } = parsed.unwrap().command else {
+                panic!("not a spawn command");
+            };
+            assert_eq!(mode.mode, engine_spawn::SpawnMode::Free);
+            assert_eq!(cwd.as_deref(), Some("/w"));
+            assert!(Cli::try_parse_from(["c9watch", "spawn", "--mode", "orch"]).is_err());
+        }
+        #[cfg(not(all(unix, feature = "engine")))]
+        assert!(parsed.is_err(), "spawn --mode parsed without the engine");
     }
 
     #[cfg(all(unix, feature = "engine"))]

@@ -305,6 +305,8 @@ fn a_db_from_a_newer_engine_fails_the_auto_start_with_its_code() {
 /// agent spawn logs its argv, sends the SessionStart hook through the
 /// engine's `c9watch-agent` copy as CC would (source `resume` with
 /// `--resume`), shows CC's idle title and a prompt, and waits to be killed.
+/// A `ready-delay` file next to it holds seconds to wait first, as a slow
+/// CC start would.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 case "$1" in --version) echo "2.1.312 (Claude Code)"; exit 0 ;; esac
 dir=$(dirname "$0")
@@ -320,6 +322,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$settings" ] || exit 1
 echo "$args" >> "$dir/argv.log"
+[ -f "$dir/ready-delay" ] && sleep "$(cat "$dir/ready-delay")"
 home=$(dirname "$(dirname "$settings")")
 printf '{"session_id":"%s","source":"%s","hook_event_name":"SessionStart"}' "$sid" "$source" \
   | "$home/bin/c9watch-agent" hook session-start --kind claude > "$dir/ctx-$C9_AGENT_GEN.out"
@@ -805,4 +808,194 @@ fn wait_for_a_turn_end_auto_starts_the_engine() {
     let err: Value = serde_json::from_slice(&out.stderr).unwrap();
     assert!(err["error"].as_str().unwrap().contains("agt_nope"), "{err}");
     assert!(sb.pid().is_some_and(alive), "no engine was started");
+}
+
+// ── C1a-38: spawn --mode free through agent.create ──────────────────
+
+/// A fake `claude` (FAKE_CLAUDE) first on PATH and a cwd for free agents.
+struct FreeAgents {
+    bin: PathBuf,
+    cwd: PathBuf,
+    path: String,
+}
+
+impl FreeAgents {
+    fn new(sb: &Sandbox) -> Self {
+        let root = sb.home.parent().unwrap().to_path_buf();
+        let bin = root.join("fakebin");
+        std::fs::create_dir(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(&claude, FAKE_CLAUDE).unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cwd = root.join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        FreeAgents {
+            path: format!("{}:/usr/bin:/bin", bin.display()),
+            bin,
+            cwd,
+        }
+    }
+
+    /// `c9watch <args>` in `<root>`, with the create switch on or off.
+    fn run(&self, sb: &Sandbox, args: &[&str], create: bool) -> Output {
+        let mut c = sb.cmd(args);
+        c.env("PATH", &self.path)
+            .current_dir(self.cwd.parent().unwrap());
+        if create {
+            c.env("C9WATCH_EXPERIMENTAL_CREATE", "1");
+        } else {
+            c.env_remove("C9WATCH_EXPERIMENTAL_CREATE");
+        }
+        c.output().unwrap()
+    }
+
+    /// Wait until no fake agent runs.
+    fn all_gone(&self) -> bool {
+        let claude = self.bin.join("claude").display().to_string();
+        wait_for(Duration::from_secs(10), || {
+            let out = Command::new("pgrep")
+                .args(["-f", &claude])
+                .output()
+                .unwrap();
+            out.stdout.is_empty()
+        })
+    }
+}
+
+fn stderr_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// The contract round trip: `spawn --mode free` creates a ready free agent
+/// (waiting past the 5 s read timeout of other calls for a slow start),
+/// `agent.list` shows it, `agent.retire` leaves its tombstone.
+#[test]
+fn spawn_free_creates_an_agent_that_lists_and_retires() {
+    let sb = Sandbox::new();
+    let fa = FreeAgents::new(&sb);
+    std::fs::write(fa.bin.join("ready-delay"), "7").unwrap();
+    let started = Instant::now();
+    // A relative --cwd is taken against the caller's directory.
+    let out = fa.run(
+        &sb,
+        &["spawn", "--mode", "free", "--cwd", "work", "--name", "ann"],
+        true,
+    );
+    assert!(out.status.success(), "{:?} / log {}", out, sb.log());
+    assert!(started.elapsed() >= Duration::from_secs(7));
+    let agent = stdout_json(&out)["agent"].clone();
+    assert_eq!(agent["state"], "ready", "{}", agent);
+    assert_eq!(agent["mode"], "free", "{}", agent);
+    assert_eq!(agent["name"], "ann", "{}", agent);
+    assert_eq!(agent["generation"], 1, "{}", agent);
+    let cwd = std::fs::canonicalize(&fa.cwd).unwrap();
+    assert_eq!(
+        agent["cwd"],
+        cwd.display().to_string().as_str(),
+        "{}",
+        agent
+    );
+    let id = agent["id"].as_str().unwrap().to_string();
+    let argv = std::fs::read_to_string(fa.bin.join("argv.log")).unwrap();
+    assert_eq!(argv.lines().count(), 1, "{}", argv);
+
+    let list = |all: bool| -> Vec<Value> {
+        let params = format!(r#"{{"all":{}}}"#, all);
+        let out = fa.run(&sb, &["api", "agent.list", &params], true);
+        assert!(out.status.success(), "{:?}", out);
+        stdout_json(&out)["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let live = list(false);
+    let row = live.iter().find(|a| a["id"] == id.as_str()).unwrap();
+    assert_eq!(row["state"], "ready", "{}", row);
+
+    let out = fa.run(
+        &sb,
+        &["api", "agent.retire", &format!(r#"{{"id":"{}"}}"#, id)],
+        true,
+    );
+    assert!(out.status.success(), "{:?}", out);
+    assert_eq!(stdout_json(&out)["result"]["agent"]["state"], "retired");
+    assert!(!list(false).iter().any(|a| a["id"] == id.as_str()));
+    let all = list(true);
+    let tomb = all.iter().find(|a| a["id"] == id.as_str()).unwrap();
+    assert_eq!(tomb["state"], "retired", "{}", tomb);
+    assert!(fa.all_gone(), "a fake claude still runs");
+}
+
+/// Before C1a-35, an engine without `C9WATCH_EXPERIMENTAL_CREATE=1`
+/// answers `experimental_disabled`, and nothing is spawned.
+#[test]
+fn spawn_free_without_the_switch_is_experimental_disabled() {
+    let sb = Sandbox::new();
+    let fa = FreeAgents::new(&sb);
+    let out = fa.run(&sb, &["spawn", "--mode", "free", "--cwd", "work"], false);
+    assert_eq!(out.status.code(), Some(1), "{:?}", out);
+    let err = stderr_of(&out);
+    assert!(err.contains("experimental_disabled"), "{err}");
+    assert!(err.contains("C9WATCH_EXPERIMENTAL_CREATE=1"), "{err}");
+    assert!(out.stdout.is_empty(), "{:?}", out);
+    assert!(sb.pid().is_some(), "the engine was not auto-started");
+    assert!(!fa.bin.join("argv.log").exists());
+}
+
+/// An agent (`C9_AGENT_ID` set) gets `not_authorized` without reaching
+/// the engine, and a managed-only flag with `--mode free` is refused
+/// before anything starts.
+#[test]
+fn spawn_free_refuses_agents_and_managed_flags_locally() {
+    let sb = Sandbox::new();
+    let fa = FreeAgents::new(&sb);
+    let mut c = sb.cmd(&["spawn", "--mode", "free", "--cwd", "work"]);
+    let out = c
+        .env("PATH", &fa.path)
+        .env("C9_AGENT_ID", "agt_x")
+        .env("C9WATCH_EXPERIMENTAL_CREATE", "1")
+        .current_dir(fa.cwd.parent().unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{:?}", out);
+    let err = stderr_of(&out);
+    assert!(err.contains("not_authorized"), "{err}");
+    assert!(err.contains("agt_x"), "{err}");
+
+    for flag in [
+        &["--prompt", "hi"][..],
+        &["--model", "x"],
+        &["--permission-mode", "plan"],
+        &["--add-dir", "/tmp"],
+        &["--append-system-prompt", "x"],
+    ] {
+        let args = [&["spawn", "--mode", "free"][..], flag].concat();
+        let out = fa.run(&sb, &args, true);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {:?}", out);
+        let err = stderr_of(&out);
+        assert!(err.contains("bad_args"), "{args:?}: {err}");
+        assert!(err.contains(flag[0]), "{args:?}: {err}");
+    }
+    assert!(
+        !sb.engine.exists(),
+        "a refused spawn touched the engine home"
+    );
+    assert!(sb.pid().is_none());
+}
+
+/// An engine build without `pm-orchestration` has no legacy workers:
+/// `spawn` (managed by default) fails and names `--mode free`.
+#[cfg(not(feature = "pm-orchestration"))]
+#[test]
+fn spawn_managed_needs_the_pm_build() {
+    let sb = Sandbox::new();
+    let fa = FreeAgents::new(&sb);
+    for args in [&["spawn"][..], &["spawn", "--mode", "managed"]] {
+        let out = fa.run(&sb, args, true);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {:?}", out);
+        let err = stderr_of(&out);
+        assert!(err.contains("pm-orchestration"), "{args:?}: {err}");
+        assert!(err.contains("--mode free"), "{args:?}: {err}");
+    }
+    assert!(!sb.engine.exists());
 }
