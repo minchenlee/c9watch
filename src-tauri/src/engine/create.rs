@@ -760,6 +760,7 @@ impl Spawner {
         // The screen's last state: an `Idle` is claimed again when a turn
         // stays open with nothing said for SETTLE_MS (`stale_turn`).
         let mut screen_state: Option<ScreenState> = None;
+        let mut reclaimed = false;
         loop {
             match cmds.recv_timeout(RUN_TICK) {
                 Ok(Cmd::Retire { principal, reply }) => {
@@ -791,12 +792,16 @@ impl Spawner {
             for ev in screen.step(&snap.title, &snap.text, snap.quiet, (self.clock)()) {
                 if let ScreenEvent::State(st) = ev {
                     screen_state = Some(st);
+                    reclaimed = false;
                     self.screen_claim(s, st);
                 }
             }
-            if screen_state == Some(ScreenState::Idle) {
+            // Once per screen state, so a row the claim cannot write is
+            // not asked again every tick.
+            if screen_state == Some(ScreenState::Idle) && !reclaimed {
                 let now = now_ms();
                 if self.merge.peek(&s.id, s.gen, |m| m.stale_turn(now)) == Some(true) {
+                    reclaimed = true;
                     self.screen_claim(s, ScreenState::Idle);
                 }
             }

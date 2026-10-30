@@ -132,7 +132,9 @@ fn apply(
     let p = ev.params;
     let id = p.agent_id.as_str();
     let claim = |a: Activity| Some(Claim::new(Source::Hook, a, now_ms));
-    let call = p.input["tool_use_id"].as_str().map(str::to_string);
+    // The call's `tool_key` (cli::task::trim_input): CC's PermissionRequest
+    // has no `tool_use_id`.
+    let call = p.input["tool_key"].as_str().map(str::to_string);
     let (claim, attention) = match ev.method {
         "hook.session_start" => {
             if let Some(sid) = p.input["session_id"].as_str() {
@@ -149,8 +151,9 @@ fn apply(
         // (Orca's pattern).
         "hook.user_prompt_submit" => (claim(Activity::Working), None),
         // Work goes on after a permission prompt: only the PostToolUse of
-        // the call that waited, from the main thread, and never a turn
-        // start (see below). A sub-agent's calls carry `agent_id`.
+        // the call that waited (same `tool_key`), from the main thread, and
+        // never a turn start (see below). A sub-agent's calls carry
+        // `agent_id`.
         "hook.post_tool_use" => (claim(Activity::Working), None),
         // An auto-mode denial: a human should look (O1 = A).
         "hook.permission_denied" => {
@@ -170,8 +173,11 @@ fn apply(
                     && m.turn_open()
                     && call.as_deref().is_some_and(|c| m.take_blocked_call(c))
             }),
+            // A sub-agent's request does not replace the main thread's.
             "hook.permission_request" => {
-                m.set_blocked_call(call.clone());
+                if !from_subagent {
+                    m.set_blocked_call(call.clone());
+                }
                 claim
             }
             "hook.user_prompt_submit" | "hook.stop" => {
@@ -595,24 +601,20 @@ mod tests {
         );
         assert_eq!(state(&db), "working");
         // A permission prompt, then PostToolUse after the approval.
-        let p = params("claude", "2", json!({"tool_use_id": "toolu_1"}));
+        let p = params("claude", "2", json!({"tool_key": "k1"}));
         send(&db, &merge, "hook.permission_request", 1, Some(1), p, 2_000);
         assert_eq!(state(&db), "blocked");
         // A sub-agent's call, or another call, does not end the wait.
-        let p = params(
-            "claude",
-            "3",
-            json!({"tool_use_id": "toolu_1", "agent_id": "sub1"}),
-        );
+        let p = params("claude", "3", json!({"tool_key": "k1", "agent_id": "sub1"}));
         send(&db, &merge, "hook.post_tool_use", 1, Some(1), p, 3_000);
         assert_eq!(state(&db), "blocked");
-        let p = params("claude", "4", json!({"tool_use_id": "toolu_2"}));
+        let p = params("claude", "4", json!({"tool_key": "k2"}));
         send(&db, &merge, "hook.post_tool_use", 1, Some(1), p, 4_000);
         assert_eq!(state(&db), "blocked");
         let p = params(
             "claude",
             "5",
-            json!({"tool_use_id": "toolu_1", "tool_name": "Bash"}),
+            json!({"tool_key": "k1", "tool_use_id": "toolu_9"}),
         );
         send(&db, &merge, "hook.post_tool_use", 1, Some(1), p, 9_000);
         assert_eq!(state(&db), "working");
@@ -621,7 +623,7 @@ mod tests {
         send(&db, &merge, "hook.stop", 1, Some(1), p, 10_000);
         assert_eq!(state(&db), "ready");
         // A late PostToolUse does not open a new turn.
-        let p = params("claude", "7", json!({"tool_use_id": "toolu_1"}));
+        let p = params("claude", "7", json!({"tool_key": "k1"}));
         send(&db, &merge, "hook.post_tool_use", 1, Some(1), p, 11_000);
         assert_eq!(state(&db), "ready");
         let ends = topics(&db)
