@@ -143,6 +143,14 @@ jobs:
           cargo check --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features engine,live-test
 
+      - name: Crash reconcile test (X9)
+        # Uses the live-test crash failpoint with a fake claude, so it
+        # runs in CI.
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features engine,live-test \
+            --test engine_cli an_engine_killed
+
       - name: Agent binary and default run target
         # C1a-21: Linux builds c9watch-agent by name, and `cargo run` with
         # two binaries still picks c9watch (`default-run`).

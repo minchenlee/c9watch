@@ -1114,9 +1114,9 @@ fn a_stopped_subscriber_gets_every_event_after_it_continues() {
 
     let pid = nc.id() as libc::pid_t;
     unsafe { libc::kill(pid, libc::SIGSTOP) };
-    let stopped = Instant::now();
-    // Each step runs 20 CLIs at once: 2 rounds of `spawn`, then a retire of
-    // every agent.
+    // Each step runs 20 CLIs at once: 5 rounds of `spawn`, then a retire of
+    // every agent. That is more than a Linux socket buffer (~208 KB) plus
+    // the 64-frame write queue, so the stream parks.
     let all = |args: Vec<Vec<String>>| -> Vec<Output> {
         let children: Vec<_> = args
             .iter()
@@ -1138,7 +1138,7 @@ fn a_stopped_subscriber_gets_every_event_after_it_continues() {
         .map(String::from)
         .into();
     let mut ids = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..5 {
         for out in all(vec![spawn.clone(); 20]) {
             assert!(out.status.success(), "{:?} / log {}", out, sb.log());
             ids.push(
@@ -1164,21 +1164,23 @@ fn a_stopped_subscriber_gets_every_event_after_it_continues() {
     let out = fa.run(&sb, &["api", "snapshot.get"], true);
     assert!(out.status.success(), "{:?}", out);
     let head = cursor_seq(&stdout_json(&out)["result"]["cursor"]);
-    assert!(head - start >= 150, "only {} events", head - start);
-    // Keep it stopped a little past the burst.
-    std::thread::sleep(Duration::from_secs(3).saturating_sub(stopped.elapsed()));
-    assert!(next(Duration::ZERO).is_none(), "a stopped nc printed");
+    assert!(head - start >= 375, "only {} events", head - start);
     unsafe { libc::kill(pid, libc::SIGCONT) };
 
-    let mut seqs = Vec::new();
+    let (mut seqs, mut bytes) = (Vec::new(), 0);
     while seqs.last() != Some(&head) {
-        let f = next(Duration::from_secs(30))
-            .unwrap_or_else(|| panic!("stream stalled after seq {:?}", seqs.last()));
+        let line = lines
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("stream stalled after seq {:?}", seqs.last()));
+        bytes += line.len() + 1;
+        let f: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(f["type"], "event", "{f}");
         assert_eq!(f["sub"], "s", "{f}");
         seqs.push(cursor_seq(&f["cursor"]));
     }
     assert_eq!(seqs, (start + 1..=head).collect::<Vec<_>>());
+    // The backlog was larger than what the kernel and the queue hold.
+    assert!(bytes > 256 * 1024, "only {bytes} bytes");
     assert!(fa.all_gone(), "a fake claude still runs");
 }
 
@@ -1313,6 +1315,10 @@ fn an_engine_killed_after_each_create_phase_is_reconciled_on_boot() {
         let before = ops();
         assert_eq!(before.len(), 1, "{phase}: {before:?}");
         assert_eq!(before[0].0, phase, "{phase}: {before:?}");
+        // `bound` finishes the op in its own transaction, so only `row` and
+        // `pty` leave it open for boot; at `bound` boot only kills the
+        // orphan.
+        assert_eq!(before[0].1, phase == "bound", "{phase}: {before:?}");
         // The PTY child the dead engine left, from phase `pty` on.
         let orphan = before[0].2["pid"].as_i64().map(|p| p as libc::pid_t);
         assert_eq!(orphan.is_some(), phase != "row", "{phase}: {before:?}");
