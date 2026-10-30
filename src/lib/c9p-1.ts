@@ -2,7 +2,7 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 3;
+export const C9P_API_MINOR = 4;
 
 /**
  * `agent.create` params. C1a creates only free agents (A:794): no brief,
@@ -134,6 +134,11 @@ export interface C9pClientInfo {
 /** The `error` object of a failed response. */
 export interface C9pErrorBody {
   code: C9pErrorCode;
+  /**
+   * Facts about this error for the caller to act on, such as the
+   * `nearest` name for `unknown_address`. Absent for most errors.
+   */
+  data?: unknown;
   hint: string;
   msg: string;
   retryable: boolean;
@@ -213,6 +218,29 @@ export type C9pErrorCode =
    * until the next engine is up. Retry against the new engine.
    */
   | 'draining'
+  /**
+   * `msg.send`: no agent answers to `to`, its machine is not this one,
+   * or a name matches more than one agent. `data` has `nearest` or
+   * `candidates`.
+   */
+  | 'unknown_address'
+  /**
+   * `msg.send`: the engine does not drive the target's terminal (an
+   * observed session), or the target is retiring or gone. `data` has
+   * `state` and `control`.
+   */
+  | 'not_controlled'
+  /**
+   * `msg.send`: a managed worker takes mail only from its parent and
+   * the human, and sends only to its parent. `data` may have `parent`.
+   */
+  | 'not_owner'
+  /**
+   * `msg.send`: the `idem` key was used for another message, or the same
+   * body went to the same agent within 10 minutes. `data` has `msgId`
+   * and `at`.
+   */
+  | 'duplicate'
   /** An engine-side failure. */
   | 'internal';
 

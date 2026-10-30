@@ -157,11 +157,102 @@ mod tests {
             ErrorCode::CwdCollision,
             ErrorCode::SpawnFailed,
             ErrorCode::UnknownAgent,
+            ErrorCode::Draining,
+            ErrorCode::UnknownAddress,
+            ErrorCode::NotControlled,
+            ErrorCode::NotOwner,
+            ErrorCode::Duplicate,
             ErrorCode::Internal,
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), code.as_str());
             assert!(!code.hint().is_empty());
         }
+    }
+
+    #[test]
+    fn error_data_is_left_out_when_absent() {
+        let resp = Response::err(None, ApiError::new(ErrorCode::NotAllowed, "no"));
+        let v: serde_json::Value = serde_json::from_slice(&encode(&resp)).unwrap();
+        assert!(v["error"].get("data").is_none());
+        assert_eq!(v["error"]["hint"], ErrorCode::NotAllowed.hint());
+    }
+
+    #[test]
+    fn error_data_and_a_case_hint_reach_the_wire_and_read_back() {
+        let e = ApiError::new(ErrorCode::UnknownAddress, "no agent `revewer`")
+            .with_data(serde_json::json!({"nearest": "reviewer"}))
+            .with_hint("did you mean reviewer?");
+        let resp = Response::err(Some("2".into()), e);
+        let v: serde_json::Value = serde_json::from_slice(&encode(&resp)).unwrap();
+        assert_eq!(v["error"]["code"], "unknown_address");
+        assert_eq!(v["error"]["data"]["nearest"], "reviewer");
+        assert_eq!(v["error"]["hint"], "did you mean reviewer?");
+        let back: Response = serde_json::from_value(v).unwrap();
+        assert_eq!(back, resp);
+        // An older engine's error, with no `data`, still reads.
+        let old: ErrorBody = serde_json::from_value(serde_json::json!({
+            "code": "internal", "msg": "x", "retryable": true, "hint": "h"
+        }))
+        .unwrap();
+        assert_eq!(old.data, None);
+    }
+
+    #[test]
+    fn msg_send_params_default_to_info_and_use_camel_case() {
+        let p: MsgSendParams =
+            serde_json::from_value(serde_json::json!({"to": "a", "body": "b"})).unwrap();
+        assert_eq!(p.kind, MsgKind::Info);
+        assert_eq!(p.reply_to, None);
+        let p: MsgSendParams = serde_json::from_value(serde_json::json!({
+            "to": "a", "body": "b", "kind": "request", "replyTo": "msg_1"
+        }))
+        .unwrap();
+        assert_eq!(p.kind, MsgKind::Request);
+        assert_eq!(p.reply_to.as_deref(), Some("msg_1"));
+        assert!(serde_json::from_value::<MsgSendParams>(
+            serde_json::json!({"to": "a", "body": "b", "kind": "shout"})
+        )
+        .is_err());
+        for k in [
+            MsgKind::Request,
+            MsgKind::Info,
+            MsgKind::Result,
+            MsgKind::System,
+        ] {
+            assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
+        }
+    }
+
+    #[test]
+    fn msg_send_result_and_state_event_round_trip() {
+        let r = MsgSendResult {
+            msg_id: "msg_1".into(),
+            state: "queued".into(),
+            to: MsgAddress {
+                id: "agt_k3".into(),
+                name: Some("reviewer".into()),
+                addr: "A/agt_k3".into(),
+            },
+            cursor: "A:3:1042".into(),
+            replayed: false,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        for key in ["msgId", "state", "to", "cursor", "replayed"] {
+            assert!(v.get(key).is_some(), "missing {}", key);
+        }
+        assert_eq!(serde_json::from_value::<MsgSendResult>(v).unwrap(), r);
+        let e = MsgStateEvent {
+            msg_id: "msg_1".into(),
+            from: "agent:agt_p1".into(),
+            to: "agt_k3".into(),
+            state: "delivered".into(),
+            at: 1,
+            attempts: 1,
+            detail: Some("prompt_hook".into()),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["msgId"], "msg_1");
+        assert_eq!(serde_json::from_value::<MsgStateEvent>(v).unwrap(), e);
     }
 
     #[test]

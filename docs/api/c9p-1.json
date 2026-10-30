@@ -302,6 +302,9 @@
         "code": {
           "$ref": "#/$defs/ErrorCode"
         },
+        "data": {
+          "description": "Facts about this error for the caller to act on, such as the\n`nearest` name for `unknown_address`. Absent for most errors."
+        },
         "hint": {
           "type": "string"
         },
@@ -416,6 +419,26 @@
         {
           "const": "draining",
           "description": "The engine is draining after a SIGTERM: no spawn and no injection\nuntil the next engine is up. Retry against the new engine.",
+          "type": "string"
+        },
+        {
+          "const": "unknown_address",
+          "description": "`msg.send`: no agent answers to `to`, its machine is not this one,\nor a name matches more than one agent. `data` has `nearest` or\n`candidates`.",
+          "type": "string"
+        },
+        {
+          "const": "not_controlled",
+          "description": "`msg.send`: the engine does not drive the target's terminal (an\nobserved session), or the target is retiring or gone. `data` has\n`state` and `control`.",
+          "type": "string"
+        },
+        {
+          "const": "not_owner",
+          "description": "`msg.send`: a managed worker takes mail only from its parent and\nthe human, and sends only to its parent. `data` may have `parent`.",
+          "type": "string"
+        },
+        {
+          "const": "duplicate",
+          "description": "`msg.send`: the `idem` key was used for another message, or the same\nbody went to the same agent within 10 minutes. `data` has `msgId`\nand `at`.",
           "type": "string"
         },
         {
@@ -840,7 +863,7 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
-  "apiMinor": 3,
+  "apiMinor": 4,
   "description": "The c9watch engine protocol: one JSON object per line over the engine socket. Within a major version every change is additive.",
   "frames": {
     "event": {
