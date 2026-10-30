@@ -329,10 +329,50 @@ pub fn emit_notifications(
     Ok(sent)
 }
 
+/// How long `session.list` and `snapshot.get` wait for detection's first
+/// pass after the engine starts. A client that reads them allows more
+/// (`cli::engine_sessions`).
+pub const FIRST_TICK_WAIT: Duration = Duration::from_secs(15);
+
+/// Open once detection's first pass is written. Until then the agents table
+/// holds only what the previous engine left, so `session.list` and
+/// `snapshot.get` wait for it (up to `FIRST_TICK_WAIT`): a CLI that starts
+/// the engine reads the sessions, not an empty or stale table.
+pub struct FirstTick(tokio::sync::watch::Sender<bool>);
+
+impl FirstTick {
+    /// Not open: detection has not run yet.
+    pub fn pending() -> FirstTick {
+        FirstTick(tokio::sync::watch::channel(false).0)
+    }
+
+    /// Open: an engine without detection, and tests.
+    pub fn open_now() -> FirstTick {
+        FirstTick(tokio::sync::watch::channel(true).0)
+    }
+
+    pub fn open(&self) {
+        self.0.send_replace(true);
+    }
+
+    pub fn is_open(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Wait until open, up to `timeout`. Returns whether it is open.
+    pub async fn wait(&self, timeout: Duration) -> bool {
+        let mut rx = self.0.subscribe();
+        tokio::time::timeout(timeout, rx.wait_for(|open| *open))
+            .await
+            .is_ok_and(|r| r.is_ok())
+    }
+}
+
 /// Run detection on its own thread every `TICK` until the returned sender
 /// is dropped. A thread, not a blocking task, so a tick in flight (which
-/// may wait on `claude`) never holds up the runtime's shutdown.
-pub fn spawn(db: Arc<Db>) -> Result<mpsc::Sender<()>, String> {
+/// may wait on `claude`) never holds up the runtime's shutdown. `first` is
+/// opened after the first pass, whether it failed or not.
+pub fn spawn(db: Arc<Db>, first: Arc<FirstTick>) -> Result<mpsc::Sender<()>, String> {
     let (stop, stopped) = mpsc::channel::<()>();
     let machine = db.machine_id().to_string();
     std::thread::Builder::new()
@@ -343,6 +383,7 @@ pub fn spawn(db: Arc<Db>) -> Result<mpsc::Sender<()>, String> {
                 if let Err(e) = detector.tick(&db) {
                     eprintln!("[engine] detection: {}", e);
                 }
+                first.open();
                 match stopped.recv_timeout(TICK) {
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     _ => return,

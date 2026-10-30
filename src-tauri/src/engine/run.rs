@@ -8,8 +8,10 @@
 //! lock-holder work. The legacy files are imported from a snapshot copy on
 //! a thread of their own once the socket is bound, so a large legacy tree
 //! never holds up readiness; a failed import only logs. Detection starts
-//! once the db is open, so its first tick (or the rebuild after a new epoch)
-//! is written before clients ask. The engine never talks to the legacy
+//! once the db is open. Until its first tick (or the rebuild after a new
+//! epoch) is written, `session.list` and `snapshot.get` wait for it
+//! (`detect::FirstTick`), so a client that just started the engine never
+//! reads an empty or stale table. The engine never talks to the legacy
 //! `c9watch daemon` and never writes its files.
 //!
 //! `c9watch-agent` is copied into `<home>/bin` before the socket is bound,
@@ -137,7 +139,13 @@ pub async fn run_until(
         .map_err(|e| format!("Failed to register Unix socket: {}", e))?;
 
     let drain_switch = Arc::new(DrainSwitch::new());
+    let first_tick = Arc::new(if config.detection {
+        detect::FirstTick::pending()
+    } else {
+        detect::FirstTick::open_now()
+    });
     let ctx = ServerCtx::new(key.id().to_string())
+        .with_first_tick(first_tick.clone())
         .with_agents(config.agents.clone())
         .with_agent_bin(agent_bin.clone())
         .with_db(db.clone())
@@ -185,7 +193,7 @@ pub async fn run_until(
     }
     let pruner = tokio::spawn(prune_loop(db.clone()));
     let detection = if config.detection {
-        let d = detect::spawn(db.clone())?;
+        let d = detect::spawn(db.clone(), first_tick)?;
         spawn_import(db.clone(), home.to_path_buf());
         Some(d)
     } else {
