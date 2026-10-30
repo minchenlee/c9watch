@@ -38,6 +38,7 @@ use super::db::outbox::NewEvent;
 use super::db::{new_agent_id, now_ms, Db, Tx};
 use super::driver::ChildId;
 use super::generation::emit_upsert;
+use super::mail;
 use super::pty::{kill_orphan, Orphan};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -169,8 +170,9 @@ pub const METHOD_EXIT: &str = "agent.exit";
 /// `reason`, forget its PTY child, and emit `agent.upsert` and
 /// `agent.failed` with `reason` and `detail`. The audit row names
 /// `method`: `KIND_CREATE` for a create that failed, `KIND_RESUME` for a
-/// resume, `METHOD_EXIT` for a ready agent that exited. Does not touch a
-/// row that is already retired or failed.
+/// resume, `METHOD_EXIT` for a ready agent that exited. Its queued mail
+/// fails and mail in flight is `uncertain` (`mail::on_agent_end`). Does
+/// not touch a row that is already retired or failed.
 pub fn fail_agent(
     tx: &mut Tx,
     machine: &str,
@@ -189,6 +191,14 @@ pub fn fail_agent(
     if n == 0 {
         return Ok(false);
     }
+    // Its mail goes with it (C1b-M1 §4.8).
+    mail::on_agent_end(
+        tx,
+        machine,
+        agent_id,
+        &format!("target failed: {}", reason),
+        now,
+    )?;
     let why = format!("{}: {}", reason, detail);
     audit::append(
         tx,

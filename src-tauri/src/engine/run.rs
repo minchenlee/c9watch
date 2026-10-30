@@ -50,6 +50,7 @@ use super::home::{lock_path, sock_path};
 use super::import;
 use super::lock::acquire_engine_lock;
 use super::machine;
+use super::mail;
 use super::ops;
 use super::sock::{bind_private, ShutdownSignal, ShutdownSignals};
 use super::standing;
@@ -126,6 +127,15 @@ pub async fn run_until(
     let reconciled = ops::reconcile(&db, home)?;
     if !reconciled.is_empty() {
         eprintln!("[engine] Boot reconcile: {:?}", reconciled);
+    }
+    // No supervisor holds mail now (C1b-M1 §4.9): after `ops::reconcile`,
+    // which fails the agents that did not survive.
+    let machine_id = key.id().to_string();
+    let (mail, _) = db
+        .write_blocking(move |tx| mail::reconcile_on_boot(tx, &machine_id, db::now_ms()))
+        .map_err(|e| format!("Failed to reconcile the mail: {}", e))?;
+    if mail != mail::Ended::default() {
+        eprintln!("[engine] Mail reconcile: {:?}", mail);
     }
     let (std_listener, socket) = bind_private(&sock_path(home), &lock)?;
     std_listener
