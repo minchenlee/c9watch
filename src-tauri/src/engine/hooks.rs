@@ -472,6 +472,47 @@ mod tests {
         );
     }
 
+    /// X10: after a resume, the old generation's working claims replay
+    /// against a `ready` gen-2 row. They are dropped and audited, and write
+    /// no state and no event.
+    #[test]
+    fn a_replayed_old_generation_working_claim_moves_nothing() {
+        let (_t, db, merge) = setup();
+        db.write_blocking(|tx| {
+            begin_generation(tx, MACHINE, "a1", GenReason::Resume, "s1", None, 2)?;
+            tx.execute("UPDATE agents SET state = 'ready' WHERE id = 'a1'", [])
+        })
+        .unwrap();
+        let before = topics(&db);
+        for (method, seq, input) in [
+            ("hook.user_prompt_submit", "1", json!({"prompt": "hi"})),
+            (
+                "hook.post_tool_use",
+                "2",
+                json!({"tool_key": "k1", "tool_use_id": "toolu_1"}),
+            ),
+        ] {
+            let p = params("claude", seq, input);
+            let out = send(&db, &merge, method, 1, Some(2), p, 1_000);
+            assert_eq!(
+                out,
+                Outcome::Dropped(DropReason::StaleGeneration),
+                "{method}"
+            );
+            assert_eq!(state(&db), "ready", "{method}");
+        }
+        assert_eq!(topics(&db), before, "a dropped event wrote an event");
+        let rows = audit(&db);
+        let why = "stale_generation: event of generation 1, live generation 2, row generation 2";
+        assert_eq!(
+            rows,
+            vec![
+                ("hook.user_prompt_submit".into(), "drop".into(), why.into()),
+                ("hook.post_tool_use".into(), "drop".into(), why.into()),
+            ]
+        );
+    }
+
     #[test]
     fn kind_mismatch_is_dropped_before_dedupe() {
         let (_t, db, merge) = setup();
