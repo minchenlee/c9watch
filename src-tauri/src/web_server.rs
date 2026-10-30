@@ -1,5 +1,5 @@
 use crate::remote_access::{self, RemoteAccess, Transport};
-use crate::ws_auth::{ClientRegistry, Pairing};
+use crate::ws_auth::{client_principal, ClientId, ClientRegistry, Pairing};
 use axum::{
     extract::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
@@ -1003,7 +1003,10 @@ enum AuthReply {
     #[serde(rename = "authOk")]
     AuthOk {
         #[serde(rename = "clientId")]
-        client_id: String,
+        client_id: ClientId,
+        /// `client:<clientId>`, from the verified token. Added in C1a;
+        /// older clients ignore it.
+        principal: String,
         capabilities: WsPolicy,
     },
     /// Sent once, after a code is redeemed. `token` is the client's
@@ -1011,7 +1014,7 @@ enum AuthReply {
     #[serde(rename = "paired")]
     Paired {
         #[serde(rename = "clientId")]
-        client_id: String,
+        client_id: ClientId,
         token: String,
         capabilities: WsPolicy,
     },
@@ -1030,6 +1033,7 @@ fn check_auth_frame(text: &str, state: &WsState) -> Result<AuthReply, u16> {
             clients
                 .verify(&token)
                 .map(|client_id| AuthReply::AuthOk {
+                    principal: client_principal(&client_id),
                     client_id,
                     capabilities: state.policy_now(),
                 })
@@ -1059,9 +1063,10 @@ fn check_auth_frame(text: &str, state: &WsState) -> Result<AuthReply, u16> {
 }
 
 /// Waits for the first frame and checks it. On success the reply is
-/// already sent. On failure the socket gets a close frame with the reason
-/// code. `Err(None)` means the client went away first.
-async fn authenticate(socket: &mut WebSocket, state: &WsState) -> Result<(), Option<u16>> {
+/// already sent and the admitted client's id is returned; it is the only
+/// source of the connection's principal. On failure the socket gets a close
+/// frame with the reason code. `Err(None)` means the client went away first.
+async fn authenticate(socket: &mut WebSocket, state: &WsState) -> Result<ClientId, Option<u16>> {
     let first = tokio::time::timeout(AUTH_TIMEOUT, async {
         loop {
             match socket.recv().await {
@@ -1081,7 +1086,12 @@ async fn authenticate(socket: &mut WebSocket, state: &WsState) -> Result<(), Opt
     };
     let reply = check_auth_frame(&text, state).map_err(Some)?;
     let json = serde_json::to_string(&reply).unwrap_or_default();
-    socket.send(Message::Text(json)).await.map_err(|_| None)
+    socket.send(Message::Text(json)).await.map_err(|_| None)?;
+    // The id of the verified token, or of the token just issued for a
+    // redeemed code.
+    match reply {
+        AuthReply::AuthOk { client_id, .. } | AuthReply::Paired { client_id, .. } => Ok(client_id),
+    }
 }
 
 fn close_with(code: u16, reason: &'static str) -> Message {
@@ -1117,8 +1127,8 @@ async fn handle_socket(
         }
         result = authenticate(&mut socket, &state) => result,
     };
-    match admitted {
-        Ok(()) => {}
+    let client_id = match admitted {
+        Ok(client_id) => client_id,
         Err(Some(code)) => {
             let reason = if code == CLOSE_UNAUTHORIZED {
                 "unauthorized"
@@ -1131,9 +1141,10 @@ async fn handle_socket(
             return;
         }
         Err(None) => return,
-    }
+    };
     drop(slot);
-    crate::debug_log::log_info("[ws-server] Client connected");
+    let principal = client_principal(&client_id);
+    crate::debug_log::log_info(&format!("[ws-server] Client connected as {principal}"));
     let mut sessions_rx = state.sessions_tx.subscribe();
     let mut notifications_rx = state.notifications_tx.subscribe();
     let (progress_tx, mut progress_rx) = broadcast::channel::<String>(32);
@@ -1189,6 +1200,7 @@ async fn handle_socket(
                             Ok(client_msg) => {
                                 let response = handle_message(
                                     client_msg,
+                                    &client_id,
                                     &state.policy_now(),
                                     Arc::clone(&state.detector),
                                 )
@@ -1272,7 +1284,7 @@ async fn handle_socket(
     if let Some(handle) = inflight {
         handle.abort();
     }
-    crate::debug_log::log_info("[ws-server] Client disconnected");
+    crate::debug_log::log_info(&format!("[ws-server] Client disconnected: {principal}"));
 }
 
 fn policy_changed_close() -> Message {
@@ -1347,6 +1359,7 @@ const STOP_SESSION_REMOVED: &str =
 
 async fn handle_message(
     msg: ClientMsg,
+    client_id: &ClientId,
     policy: &WsPolicy,
     detector: Arc<Mutex<crate::session::DetectorState>>,
 ) -> ServerMsg {
@@ -1365,6 +1378,7 @@ async fn handle_message(
     };
     handle_message_with_policy(
         msg,
+        client_id,
         policy,
         crate::session::global_provider_source_owners(),
         stop,
@@ -1376,8 +1390,11 @@ async fn handle_message(
 /// `stop` and `open` act on the session at an address and run on the
 /// blocking pool; tests inject them the way they inject `owners`. `policy`
 /// gates `openSession`; `getConversation` is gated in the socket loop.
+/// `client_id` is the connection's verified client; actions that change a
+/// session are logged with its `client:<id>` principal.
 async fn handle_message_with_policy(
     msg: ClientMsg,
+    client_id: &ClientId,
     policy: &WsPolicy,
     owners: crate::session::ProviderSourceOwners,
     stop: impl FnOnce(String, Option<u32>) -> Result<(), String> + Send + 'static,
@@ -1403,13 +1420,16 @@ async fn handle_message_with_policy(
         },
 
         ClientMsg::SessionStop { addr, pid } => {
-            match tokio::task::spawn_blocking(move || stop(addr, pid)).await {
+            let target = addr.clone();
+            let response = match tokio::task::spawn_blocking(move || stop(addr, pid)).await {
                 Ok(Ok(())) => ServerMsg::Ok,
                 Ok(Err(e)) => ServerMsg::Error { message: e },
                 Err(e) => ServerMsg::Error {
                     message: format!("Stop failed: {e}"),
                 },
-            }
+            };
+            log_action(client_id, "session.stop", &target, &response);
+            response
         }
 
         ClientMsg::StopSession { .. } => ServerMsg::Error {
@@ -1418,13 +1438,16 @@ async fn handle_message_with_policy(
 
         ClientMsg::OpenSession { .. } if !policy.allow_open => capability_disabled("open"),
         ClientMsg::OpenSession { addr, pid } => {
-            match tokio::task::spawn_blocking(move || open(addr, pid)).await {
+            let target = addr.clone();
+            let response = match tokio::task::spawn_blocking(move || open(addr, pid)).await {
                 Ok(Ok(())) => ServerMsg::Ok,
                 Ok(Err(e)) => ServerMsg::Error { message: e },
                 Err(e) => ServerMsg::Error {
                     message: format!("Open failed: {e}"),
                 },
-            }
+            };
+            log_action(client_id, "openSession", &target, &response);
+            response
         }
 
         ClientMsg::RenameSession {
@@ -1432,12 +1455,14 @@ async fn handle_message_with_policy(
             new_name,
             provider,
         } => {
-            match crate::run_validated_rename(provider, &session_id, &owners, || {
+            let response = match crate::run_validated_rename(provider, &session_id, &owners, || {
                 crate::write_session_title(&session_id, &new_name)
             }) {
                 Ok(()) => ServerMsg::Ok,
                 Err(e) => ServerMsg::Error { message: e },
-            }
+            };
+            log_action(client_id, "renameSession", &session_id, &response);
+            response
         }
 
         ClientMsg::GetAwayActivity { requests } => match tokio::task::spawn_blocking(move || {
@@ -1453,6 +1478,29 @@ async fn handle_message_with_policy(
             },
         },
     }
+}
+
+/// Longest target a log line keeps; the target is client input.
+const LOG_TARGET_MAX_CHARS: usize = 128;
+
+/// Logs a session action with the principal that asked for it. Only the
+/// principal, the action, its target (quoted and cut to
+/// `LOG_TARGET_MAX_CHARS`) and ok or refused are logged, never a frame.
+fn log_action(client_id: &ClientId, action: &str, target: &str, response: &ServerMsg) {
+    let outcome = match response {
+        ServerMsg::Error { .. } => "refused",
+        _ => "ok",
+    };
+    let target: String = target.chars().take(LOG_TARGET_MAX_CHARS).collect();
+    crate::debug_log::log_info(&format!(
+        "[ws-server] {} {action} {target:?}: {outcome}",
+        client_principal(client_id)
+    ));
+}
+
+#[cfg(test)]
+fn test_client() -> ClientId {
+    "test-client".to_string()
 }
 
 #[cfg(test)]
@@ -1519,6 +1567,7 @@ mod tests {
                     new_name: "synthetic collision".to_string(),
                     provider: None,
                 },
+                &test_client(),
                 &WsPolicy::default(),
                 owners,
                 no_stop,
@@ -1631,9 +1680,15 @@ mod protocol_tests {
         let request =
             serde_json::from_str(r#"{"type":"session.stop","addr":"claudeCode:x","pid":7}"#)
                 .unwrap();
-        let response =
-            handle_message_with_policy(request, &WsPolicy::default(), no_owners(), stop, no_open)
-                .await;
+        let response = handle_message_with_policy(
+            request,
+            &test_client(),
+            &WsPolicy::default(),
+            no_owners(),
+            stop,
+            no_open,
+        )
+        .await;
         assert!(matches!(response, ServerMsg::Ok));
         assert_eq!(
             *calls.lock().unwrap(),
@@ -1645,9 +1700,15 @@ mod protocol_tests {
     async fn removed_stop_session_by_pid_errors_without_stopping() {
         let (calls, stop) = recording_stop();
         let request = serde_json::from_str(r#"{"type":"stopSession","pid":4242}"#).unwrap();
-        let response =
-            handle_message_with_policy(request, &WsPolicy::default(), no_owners(), stop, no_open)
-                .await;
+        let response = handle_message_with_policy(
+            request,
+            &test_client(),
+            &WsPolicy::default(),
+            no_owners(),
+            stop,
+            no_open,
+        )
+        .await;
         match response {
             ServerMsg::Error { message } => assert!(message.contains("removed")),
             other => panic!("expected the removed error, got {other:?}"),
@@ -1686,9 +1747,15 @@ mod protocol_tests {
         let request =
             serde_json::from_str(r#"{"type":"openSession","addr":"claudeCode:x","pid":7}"#)
                 .unwrap();
-        let response =
-            handle_message_with_policy(request, &WsPolicy::default(), no_owners(), no_stop, open)
-                .await;
+        let response = handle_message_with_policy(
+            request,
+            &test_client(),
+            &WsPolicy::default(),
+            no_owners(),
+            no_stop,
+            open,
+        )
+        .await;
         let value: serde_json::Value =
             serde_json::from_str(&response_json(&response, Some(2))).unwrap();
         assert_eq!(value["type"], "error", "{value}");
@@ -1704,8 +1771,15 @@ mod protocol_tests {
         let request =
             serde_json::from_str(r#"{"type":"openSession","addr":"claudeCode:x","pid":7}"#)
                 .unwrap();
-        let response =
-            handle_message_with_policy(request, &OPEN_ON, no_owners(), no_stop, open).await;
+        let response = handle_message_with_policy(
+            request,
+            &test_client(),
+            &OPEN_ON,
+            no_owners(),
+            no_stop,
+            open,
+        )
+        .await;
         assert!(matches!(response, ServerMsg::Ok), "{response:?}");
         assert_eq!(
             *calls.lock().unwrap(),
@@ -1837,9 +1911,27 @@ mod server_tests {
         }
     }
 
+    /// Reports the same sessions on every scan.
+    struct FixedSource(Vec<DetectedSession>);
+
+    impl SessionSource for FixedSource {
+        fn detect(
+            &mut self,
+        ) -> Result<(Vec<DetectedSession>, DetectionDiagnostics), SessionDetectorError> {
+            Ok((self.0.clone(), DetectionDiagnostics::default()))
+        }
+        fn backend_name(&self) -> &'static str {
+            "fixed"
+        }
+    }
+
     pub(super) fn test_server(dir: &std::path::Path) -> WsServer {
+        test_server_with(dir, Box::new(EmptySource))
+    }
+
+    fn test_server_with(dir: &std::path::Path, source: Box<dyn SessionSource>) -> WsServer {
         let detector = Arc::new(Mutex::new(DetectorState::for_test(
-            Box::new(EmptySource),
+            source,
             BackendMode::ForceCli,
         )));
         let state = Arc::new(WsState::new(
@@ -2456,6 +2548,174 @@ mod server_tests {
             next_event(&mut next).await,
             Event::Text(v) if v["type"] == "authOk" && v["clientId"] == client_id.as_str()
         ));
+    }
+
+    /// Pairs from 127.0.0.1 and returns the new client's id, its token and
+    /// the code it redeemed.
+    async fn pair_in_process(server: &WsServer, addr: SocketAddr) -> (String, String, String) {
+        let code = server.create_pairing_code().unwrap().code;
+        let mut client = open(addr).await;
+        send_json(
+            &mut client,
+            serde_json::json!({"type": "pair", "code": code}),
+        )
+        .await;
+        match next_event(&mut client).await {
+            Event::Text(v) if v["type"] == "paired" => (
+                v["clientId"].as_str().unwrap().to_string(),
+                v["token"].as_str().unwrap().to_string(),
+                code,
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Connects with `token` and returns the socket and its `authOk`.
+    async fn connect_with(addr: SocketAddr, token: &str) -> (Client, serde_json::Value) {
+        let mut client = open(addr).await;
+        send_json(
+            &mut client,
+            serde_json::json!({"type": "auth", "token": token}),
+        )
+        .await;
+        match next_event(&mut client).await {
+            Event::Text(v) if v["type"] == "authOk" => (client, v),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The server logs after it sends a reply, so a line may land a moment
+    /// after the client reads the frame.
+    async fn wait_for_log(needle: &str) {
+        for _ in 0..100 {
+            if crate::debug_log::get_logs()
+                .iter()
+                .any(|entry| entry.message.contains(needle))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no log line contains {needle:?}");
+    }
+
+    // X11 (C1a-30): the principal comes from the verified token. A loopback
+    // peer gets `client:<id>` like any other; there is no `human`.
+    #[tokio::test]
+    async fn a_paired_client_connects_as_its_client_principal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        assert!(addr.ip().is_loopback());
+        let (client_id, token, _) = pair_in_process(&server, addr).await;
+        let (_client, ok) = connect_with(addr, &token).await;
+        assert_eq!(ok["clientId"], client_id.as_str());
+        assert_eq!(ok["principal"], format!("client:{client_id}"));
+
+        // A second client gets its own principal.
+        let (other_id, other_token, _) = pair_in_process(&server, addr).await;
+        assert_ne!(other_id, client_id);
+        let (_other, ok) = connect_with(addr, &other_token).await;
+        assert_eq!(ok["principal"], format!("client:{other_id}"));
+    }
+
+    // Older clients keep working: `authOk` still has `clientId` and
+    // `capabilities`, and `principal` is only added.
+    #[tokio::test]
+    async fn auth_ok_keeps_its_old_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        let (_client, ok) = signed_in(&server, addr).await;
+        let mut keys: Vec<&str> = ok.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["capabilities", "clientId", "principal", "type"]);
+    }
+
+    // E3: neither the token nor the pairing code reaches the log; the
+    // connection is logged by its principal.
+    #[tokio::test]
+    async fn the_log_has_the_principal_and_no_token_or_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, addr) = loopback_server(dir.path()).await;
+        let (client_id, token, code) = pair_in_process(&server, addr).await;
+        let (mut client, _) = connect_with(addr, &token).await;
+        send_json(
+            &mut client,
+            serde_json::json!({"type": "session.stop", "addr": "claudeCode:none", "requestId": 1}),
+        )
+        .await;
+        assert!(matches!(next_event(&mut client).await, Event::Text(v) if v["type"] == "error"));
+        // A wrong token is refused without echoing it.
+        let wrong = "f".repeat(64);
+        let mut refused = open(addr).await;
+        send_json(
+            &mut refused,
+            serde_json::json!({"type": "auth", "token": wrong}),
+        )
+        .await;
+        assert!(matches!(
+            next_event(&mut refused).await,
+            Event::Close(Some(CLOSE_UNAUTHORIZED))
+        ));
+
+        let principal = format!("client:{client_id}");
+        wait_for_log(&format!("Client connected as {principal}")).await;
+        wait_for_log(&format!(
+            "{principal} session.stop \"claudeCode:none\": refused"
+        ))
+        .await;
+        for entry in crate::debug_log::get_logs() {
+            assert!(!entry.message.contains(&token), "{}", entry.message);
+            assert!(!entry.message.contains(&wrong), "{}", entry.message);
+            assert!(!entry.message.contains(&code), "{}", entry.message);
+        }
+    }
+
+    // E4: a stop whose pid is not the detected pid is refused, and the log
+    // names the principal that asked.
+    #[tokio::test]
+    async fn a_stop_with_the_wrong_pid_is_refused() {
+        // Past the macOS pid range, so even a mistaken signal hits nothing.
+        const PID: u32 = 4_000_000;
+        let session = DetectedSession {
+            process_start_secs: Some(1_000),
+            ..DetectedSession::with_legacy_defaults(
+                PID,
+                "/tmp".into(),
+                "/tmp/proj".into(),
+                Some("wrong-pid-fixture".to_string()),
+                "proj".to_string(),
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let server = test_server_with(dir.path(), Box::new(FixedSource(vec![session])));
+        let addr = server.apply(RemoteAccess::default()).await.unwrap()[0];
+        let (mut client, ok) = signed_in(&server, addr).await;
+        let principal = ok["principal"].as_str().unwrap().to_string();
+        send_json(
+            &mut client,
+            serde_json::json!({
+                "type": "session.stop",
+                "addr": "claudeCode:wrong-pid-fixture",
+                "pid": PID + 1,
+                "requestId": 7,
+            }),
+        )
+        .await;
+        match next_event(&mut client).await {
+            Event::Text(v) => {
+                assert_eq!(v["type"], "error", "{v}");
+                assert_eq!(v["requestId"], 7);
+                assert!(
+                    v["message"].as_str().unwrap().contains("no longer running"),
+                    "{v}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        wait_for_log(&format!(
+            "{principal} session.stop \"claudeCode:wrong-pid-fixture\": refused"
+        ))
+        .await;
     }
 
     #[tokio::test]
