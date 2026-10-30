@@ -2967,8 +2967,13 @@ mod tests {
         assert_eq!(l2.spawns.load(Ordering::SeqCst), 2);
         assert!(events(&e.db, "agent.failed").is_empty());
 
-        // The argv of the last spawn (ids sort, so it is `want[1]`).
-        let last = &want[1];
+        // The argv of the last spawn: the resumes may run in either order,
+        // so find the agent by its settings path.
+        let got = strings(lock(&l2.argv).clone());
+        let last = want
+            .iter()
+            .find(|id| got.contains(&settings_path_of(&e.home, id, 2).display().to_string()))
+            .expect("the last argv names a resumed agent");
         let sid = row(&e.db, last).provider_sid.unwrap();
         let settings = settings_path_of(&e.home, last, 2).display().to_string();
         let mut argv = vec![
@@ -2984,7 +2989,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string()),
         );
-        assert_eq!(strings(lock(&l2.argv).clone()), argv);
+        assert_eq!(got, argv);
         let env = lock(&l2.env).clone();
         let gen_env = env.iter().find(|(k, _)| k == "C9_AGENT_GEN").unwrap();
         assert_eq!(gen_env.1, "2");
