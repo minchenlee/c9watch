@@ -135,6 +135,14 @@ jobs:
           cargo test --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features engine
 
+      - name: Live-test build check
+        # The test-only `live-test` feature (tests/live/*.sh) is never
+        # shipped and the scripts need a real claude. Only check that it
+        # still compiles.
+        run: |
+          cargo check --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features engine,live-test
+
       - name: Agent binary and default run target
         # C1a-21: Linux builds c9watch-agent by name, and `cargo run` with
         # two binaries still picks c9watch (`default-run`).

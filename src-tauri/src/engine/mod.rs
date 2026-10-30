@@ -83,3 +83,6 @@ pub mod drain;
 
 #[cfg(unix)]
 pub mod run;
+
+#[cfg(all(unix, feature = "live-test"))]
+pub mod live_test;

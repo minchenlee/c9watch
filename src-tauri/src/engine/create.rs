@@ -12,7 +12,8 @@
 //!    (`.c9watch/worktrees`) with `cwd_collision` (D22.9), and a cwd that
 //!    holds the engine home.
 //! 2. One transaction: `cwd_collision` when a live engine agent's cwd is
-//!    above or below this one, then the `agents` row (`creating`, `created_by` = the
+//!    above or below this one, or any other cwd at all (one cwd at a time,
+//!    M7 reviews H1), then the `agents` row (`creating`, `created_by` = the
 //!    caller's principal), its first generation with the `--session-id`,
 //!    and the create op in phase `row` (`engine::ops`).
 //! 3. A supervisor thread writes the per-spawn settings, spawns the agent
@@ -455,6 +456,18 @@ impl Spawner {
                         ),
                     )));
                 }
+                if let Some(other) = other_live_cwd(tx, &s.cwd)? {
+                    return Ok(Err(ApiError::new(
+                        ErrorCode::CwdCollision,
+                        format!(
+                            "live agent {} runs in another cwd {:?}: its deny rules do not \
+                             name {:?}, so one agent could rewrite the other's .claude/ \
+                             (one cwd at a time until a rule for every live agent is \
+                             verified live)",
+                            other.0, other.1, s.cwd
+                        ),
+                    )));
+                }
                 let cwd = s.cwd.display().to_string();
                 tx.execute(
                     "INSERT INTO agents (id, mode, role, control, provider, source, created_by, \
@@ -574,6 +587,14 @@ impl Spawner {
                 format!("{}: {}", s.id, why),
             ))
         };
+        // The other live agents' cwds: their `.claude/` is denied too
+        // (C1a-32). A failed read spawns nothing rather than spawn without.
+        let peers = match self.db.reader().map_err(|e| e.to_string()).and_then(|c| {
+            peer_cwds(&c, &s.id).map_err(|e| format!("Failed to read the peer cwds: {}", e))
+        }) {
+            Ok(p) => p,
+            Err(e) => return fail(e),
+        };
         let profile = match Profile::new(
             self.agent_bin.path(),
             &self.config.sock,
@@ -582,8 +603,8 @@ impl Spawner {
             s.gen,
             &s.sid,
         ) {
-            Ok(p) if s.kind == Kind::Resume => p.resuming(),
-            Ok(p) => p,
+            Ok(p) if s.kind == Kind::Resume => p.resuming().with_peers(peers),
+            Ok(p) => p.with_peers(peers),
             Err(e) => return fail(e),
         };
         // The realpath again: a path part swapped for a symlink since the
@@ -732,6 +753,8 @@ impl Spawner {
         mut screen: CcScreen,
         cmds: &Receiver<Cmd>,
     ) {
+        #[cfg(feature = "live-test")]
+        let mut last_screen = String::new();
         loop {
             match cmds.recv_timeout(RUN_TICK) {
                 Ok(Cmd::Retire { principal, reply }) => {
@@ -752,6 +775,14 @@ impl Spawner {
             // Nobody reads the bytes yet; the screen keeps up regardless.
             let _ = driver.output(Duration::ZERO);
             let snap = driver.screen();
+            #[cfg(feature = "live-test")]
+            {
+                use super::live_test;
+                live_test::dump_screen(&self.config.home, &s.id, &snap.text, &mut last_screen);
+                if let Some(keys) = live_test::take_input(&self.config.home, &s.id) {
+                    self.pty_write(&s.id, driver.as_mut(), &keys);
+                }
+            }
             for ev in screen.step(&snap.title, &snap.text, snap.quiet, (self.clock)()) {
                 if let ScreenEvent::State(st) = ev {
                     self.screen_claim(s, st);
@@ -1382,6 +1413,18 @@ fn engine_row(conn: &Connection, id: &str) -> rusqlite::Result<Option<AgentRow>>
     .optional()
 }
 
+/// The cwds of the live engine agents other than `id`: the peers whose
+/// `.claude/` the profile of `id` denies (C1a-32). Only agents that exist
+/// at this spawn: one created later is not in this agent's rules.
+fn peer_cwds(conn: &Connection, id: &str) -> rusqlite::Result<Vec<PathBuf>> {
+    let mut st = conn.prepare(
+        "SELECT cwd FROM agents WHERE source = 'engine' AND gone_at IS NULL \
+         AND cwd IS NOT NULL AND id != ?1",
+    )?;
+    let rows = st.query_map([id], |r| r.get::<_, String>(0))?;
+    rows.map(|r| r.map(PathBuf::from)).collect()
+}
+
 /// A live engine agent whose cwd is strictly above or below `cwd`, as
 /// `(id, cwd)` (reviews M4). The outer agent's sandbox may write the inner
 /// one's `.claude/`, which CC hot-reloads. The same cwd is fine: both deny
@@ -1404,6 +1447,28 @@ fn nested_cwd(conn: &Connection, cwd: &Path) -> rusqlite::Result<Option<(String,
         }
     }
     Ok(None)
+}
+
+/// A live engine agent whose cwd differs from `cwd`, as `(id, cwd)` (M7
+/// reviews H1). An agent's rules deny the `.claude/` of only the agents
+/// live at its spawn (`peer_cwds`), so an agent created earlier could
+/// still write a later agent's settings, which CC hot-reloads. Until a
+/// rule that names every live agent is verified live, `agent.create`
+/// takes one cwd at a time. The same cwd is fine: both deny it. A boot
+/// resume reads every live row, so resumed agents deny each other. In the
+/// create transaction, so two creates cannot race past it.
+fn other_live_cwd(conn: &Connection, cwd: &Path) -> rusqlite::Result<Option<(String, PathBuf)>> {
+    let mut st = conn.prepare(
+        "SELECT id, cwd FROM agents WHERE source = 'engine' AND gone_at IS NULL \
+         AND cwd IS NOT NULL AND cwd != ?1 ORDER BY created_at, id LIMIT 1",
+    )?;
+    st.query_row([cwd.display().to_string()], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            PathBuf::from(r.get::<_, String>(1)?),
+        ))
+    })
+    .optional()
 }
 
 fn name_taken(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
@@ -2084,6 +2149,47 @@ mod tests {
         assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 1);
         assert_eq!(e.launcher.kills.load(Ordering::SeqCst), 1);
         assert_eq!(only_row(&e.db).state.as_deref(), Some("failed"));
+    }
+
+    #[tokio::test]
+    async fn a_second_cwd_is_refused_while_an_agent_is_live() {
+        // M7 reviews H1: A's rules, built at A's spawn, do not name B's
+        // .claude/, so A could rewrite B's settings (live X14 row 8, the
+        // other way round). One cwd at a time.
+        let e = setup(Script::Ready, true, None);
+        let l = Principal::LocalUnverified;
+        let a = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let other = e.t.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let err = e.sp.create(&l, create_params(&other)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::CwdCollision);
+        assert!(err.msg.contains(&a.id), "{}", err.msg);
+        // The same cwd is fine: both agents deny its .claude/.
+        let a2 = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let conn = e.db.reader().unwrap();
+        assert!(peer_cwds(&conn, &a2.id)
+            .unwrap()
+            .iter()
+            .all(|p| *p == e.cwd.canonicalize().unwrap()));
+        drop(conn);
+        // With no agent live, the other cwd is taken.
+        for id in [&a.id, &a2.id] {
+            e.sp.retire(&l, serde_json::json!({ "id": id }))
+                .await
+                .unwrap();
+        }
+        let b = e.sp.create(&l, create_params(&other)).await.unwrap();
+        let conn = e.db.reader().unwrap();
+        assert!(peer_cwds(&conn, &b.id).unwrap().is_empty());
+        assert!(other_live_cwd(&conn, &other.canonicalize().unwrap())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            other_live_cwd(&conn, &e.cwd.canonicalize().unwrap())
+                .unwrap()
+                .map(|(id, _)| id),
+            Some(b.id.clone())
+        );
     }
 
     #[tokio::test]
