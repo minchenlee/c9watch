@@ -102,8 +102,12 @@ of the c9 engine. They auto-start it and read its sessions (`session.list`;
 `snapshot.get`, then `events.subscribe` from its cursor for `watch` and
 `wait`). The event lines keep the fields above. The differences:
 
-- `session` is the engine's row (c9p/1 `AgentRow`, `docs/api/c9p-1.json`),
-  and `pendingToolName` is not known.
+- `session` (and each `list` row) keeps the `--direct` names the engine
+  can fill: `id` (the provider's session id), `sessionKey`, `sessionName`,
+  `projectPath`, `status`, `pid` and `provider`. The engine's row (c9p/1
+  `AgentRow`, `docs/api/c9p-1.json`) is under `engine`. Fields the engine
+  does not know (`canStop`, `firstPrompt`, `modified`, ...) and
+  `pendingToolName` are left out; `list` has no `diagnostics`.
 - Lines follow the engine's events, so `--interval` does not apply.
 - After an `engine restart`, `watch` and `wait` reconnect and go on; a
   session that did not change prints nothing. For 15 s after the stream

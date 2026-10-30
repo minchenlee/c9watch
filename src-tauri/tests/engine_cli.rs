@@ -559,10 +559,20 @@ fn list_and_status_auto_start_the_engine_and_read_its_sessions() {
 
     let listed = engine_lists_the_session(&sb, &d);
     assert!(sb.pid().is_some(), "list did not auto-start the engine");
-    // The payload is the engine's row, and there are no diagnostics.
+    // The payload keeps the --direct names, with the engine's row under
+    // `engine`; there are no diagnostics.
     assert!(listed.get("diagnostics").is_none(), "{}", listed);
-    let row = &listed["sessions"][0];
-    assert_eq!(row["sessionKey"], key.as_str());
+    let s = &listed["sessions"][0];
+    assert_eq!(s["id"], DETECT_SID);
+    assert_eq!(s["sessionKey"], key.as_str());
+    assert_eq!(s["status"], "Connecting");
+    assert_eq!(s["sessionName"], "proj");
+    assert!(
+        s["projectPath"].as_str().unwrap().ends_with("work/proj"),
+        "{}",
+        s
+    );
+    let row = &s["engine"];
     assert_eq!(row["providerSid"], DETECT_SID);
     assert_eq!(row["role"], "observed");
     assert_eq!(row["status"], "connecting");
@@ -696,7 +706,9 @@ fn watch_and_wait_follow_the_engine_events() {
         serde_json::from_str(&lines.recv_timeout(Duration::from_secs(30)).unwrap()).unwrap();
     assert_eq!(started["event"], "started");
     assert_eq!(started["sessionKey"], key.as_str());
-    assert_eq!(started["session"]["status"], "connecting");
+    assert_eq!(started["session"]["status"], "Connecting");
+    assert_eq!(started["session"]["id"], DETECT_SID);
+    assert_eq!(started["session"]["engine"]["status"], "connecting");
     // Let `wait` take its snapshot before the session ends. The engine is
     // warm, so this is one local round trip; the margin is for a loaded CI
     // host, and a miss shows `wait`'s stderr below.
@@ -982,7 +994,7 @@ fn spawn_free_without_the_switch_is_experimental_disabled() {
     assert!(!fa.bin.join("argv.log").exists());
 }
 
-/// An agent (`C9_AGENT_ID` set) gets `not_authorized` without reaching
+/// An agent (`C9_AGENT_ID` set) gets `not_allowed` without reaching
 /// the engine, and a managed-only flag with `--mode free` is refused
 /// before anything starts.
 #[test]
@@ -999,7 +1011,7 @@ fn spawn_free_refuses_agents_and_managed_flags_locally() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "{:?}", out);
     let err = stderr_of(&out);
-    assert!(err.contains("not_authorized"), "{err}");
+    assert!(err.contains("not_allowed"), "{err}");
     assert!(err.contains("agt_x"), "{err}");
 
     for flag in [

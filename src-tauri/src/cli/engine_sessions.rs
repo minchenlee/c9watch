@@ -3,7 +3,10 @@
 //! The engine detects sessions (C1a-15). These commands auto-start it, then
 //! read `session.list`; `watch` and `wait` read `snapshot.get` and follow
 //! `events.subscribe` from its cursor, so no change between the two is
-//! lost. Each session's payload is the engine's row (c9p/1 `AgentRow`).
+//! lost. Each session's payload keeps the `--direct` field names that the
+//! engine can fill, and carries the engine's row (c9p/1 `AgentRow`) under
+//! `engine` (owner, 2026-10-30: scripts that read `id`, `sessionName` or
+//! `projectPath` keep working).
 //!
 //! `--direct` keeps in-process detection. A caller inside an engine agent
 //! (`C9_AGENT_ID` set) gets `--direct` without asking: agents may not
@@ -144,7 +147,7 @@ fn project_name(row: &AgentRow) -> String {
         .unwrap_or_default()
 }
 
-/// Fields of a `--compact` row.
+/// Fields of the `engine` object in a `--compact` row.
 const COMPACT_FIELDS: &[&str] = &[
     "id",
     "sessionKey",
@@ -156,9 +159,9 @@ const COMPACT_FIELDS: &[&str] = &[
     "pid",
 ];
 
-/// A session payload: the whole row, or with `compact` its
-/// `COMPACT_FIELDS` that are not null.
-pub fn row_json(row: &AgentRow, compact: bool) -> serde_json::Value {
+/// The engine's row as the `engine` object: the whole row, or with
+/// `compact` its `COMPACT_FIELDS` that are not null.
+fn engine_json(row: &AgentRow, compact: bool) -> serde_json::Value {
     let full = serde_json::to_value(row).unwrap_or_default();
     if !compact {
         return full;
@@ -172,6 +175,32 @@ pub fn row_json(row: &AgentRow, compact: bool) -> serde_json::Value {
         }
     }
     serde_json::Value::Object(out)
+}
+
+/// A session payload in the `--direct` shape: `id` is the provider's
+/// session id, not the engine's `agt_` id, and `status` uses the
+/// `--direct` name. Fields the engine does not know (`canStop`,
+/// `firstPrompt`, `modified`, ...) are left out; the engine's row is under
+/// `engine`.
+pub fn row_json(row: &AgentRow, compact: bool) -> serde_json::Value {
+    let (key_provider, key_sid) = match row.session_key.as_deref() {
+        Some(k) => match k.split_once(':') {
+            Some((p, s)) => (Some(p), Some(s)),
+            None => (None, None),
+        },
+        None => (None, None),
+    };
+    let name = row.name.clone().unwrap_or_else(|| project_name(row));
+    serde_json::json!({
+        "id": row.provider_sid.as_deref().or(key_sid),
+        "sessionKey": row.session_key,
+        "sessionName": name,
+        "projectPath": row.cwd,
+        "status": status_label(&row_status(row)),
+        "pid": row.pid,
+        "provider": key_provider.unwrap_or(&row.provider),
+        "engine": engine_json(row, compact),
+    })
 }
 
 /// What `list` prints for `rows`.
@@ -518,11 +547,23 @@ mod tests {
         );
         assert!(ids(list_output(&rows, None, Some("NeedsAttention"), false)).is_empty());
 
-        // The full payload is the c9p/1 row; compact keeps a few set fields.
+        // The payload has the --direct names, and the c9p/1 row under
+        // `engine`; compact keeps a few set fields of that row.
         let full = list_output(&rows, Some("alpha"), None, false);
-        assert_eq!(full["sessions"][0], serde_json::to_value(&rows[0]).unwrap());
+        let s = &full["sessions"][0];
+        assert_eq!(s["engine"], serde_json::to_value(&rows[0]).unwrap());
+        assert_eq!(s["id"], "a");
+        assert_eq!(s["sessionKey"], "claudeCode:a");
+        assert_eq!(s["provider"], "claudeCode");
+        assert_eq!(s["projectPath"], "/w/alpha");
+        assert_eq!(s["sessionName"], "alpha");
+        assert_eq!(s["status"], "Working");
         let compact = list_output(&rows, Some("alpha"), None, true);
-        let keys: Vec<&String> = compact["sessions"][0].as_object().unwrap().keys().collect();
+        let keys: Vec<&String> = compact["sessions"][0]["engine"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
         assert_eq!(
             keys,
             [
@@ -560,10 +601,10 @@ mod tests {
     fn self_is_the_row_of_the_claude_pid() {
         let mut rows = vec![at("claudeCode:a", "working", "/w/alpha")];
         rows[0].pid = Some(7);
-        assert_eq!(
-            self_output(&rows, 7).unwrap(),
-            serde_json::to_value(&rows[0]).unwrap()
-        );
+        let me = self_output(&rows, 7).unwrap();
+        assert_eq!(me["id"], "a");
+        assert_eq!(me["pid"], 7);
+        assert_eq!(me["engine"], serde_json::to_value(&rows[0]).unwrap());
         assert_eq!(
             self_output(&rows, 8).unwrap_err(),
             "Found claude process (PID 8) but no matching session"
