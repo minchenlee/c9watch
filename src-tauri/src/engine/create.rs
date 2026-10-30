@@ -94,6 +94,7 @@ use super::driver::{Driver, SpawnSpec};
 use super::generation;
 use super::generation::{begin_generation, emit_upsert, GenReason};
 use super::hooks;
+use super::machine::HeaderKey;
 use super::merge::{Activity, MergeTable};
 use super::ops::{self, CreatePayload, Phase};
 use super::principal::Principal;
@@ -273,6 +274,8 @@ pub struct Spawner {
     stopping: AtomicBool,
     /// The engine's drain switch (C1a-27).
     drain: Arc<DrainSwitch>,
+    /// The mail header key (C1b-M1-7). `None` only in tests.
+    header_key: Option<HeaderKey>,
 }
 
 impl Spawner {
@@ -295,7 +298,20 @@ impl Spawner {
             live: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
             drain: Arc::new(DrainSwitch::new()),
+            header_key: None,
         }
+    }
+
+    /// Stamp mail with tokens from the engine's header key.
+    pub fn with_header_key(mut self, key: HeaderKey) -> Spawner {
+        self.header_key = Some(key);
+        self
+    }
+
+    /// The mail header token of `agent_id`, as its SessionStart context
+    /// states it. `None` without a header key (tests).
+    pub fn header_token(&self, agent_id: &str) -> Option<String> {
+        self.header_key.as_ref().map(|k| k.token(agent_id))
     }
 
     /// Share the engine's drain switch.

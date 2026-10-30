@@ -108,6 +108,7 @@ pub async fn run_until(
         .map_err(|e| format!("Failed to install signal handlers: {}", e))?;
     let lock = acquire_engine_lock(&lock_path(home))?;
     let key = machine::load_or_create(home)?;
+    let header_key = key.header_key();
     let db = Arc::new(db::open(home, key.id())?);
     let agent_bin = Arc::new(AgentBin::install(home, &config.agent_source));
     match (agent_bin.sha256_hex(), agent_bin.missing_reason()) {
@@ -145,7 +146,8 @@ pub async fn run_until(
         .with_agent_bin(agent_bin.clone())
         .with_db(db.clone())
         .with_standing_orders(standing::path(home))
-        .with_drain(drain_switch.clone());
+        .with_drain(drain_switch.clone())
+        .with_header_key(header_key.clone());
     let spawner = Arc::new(
         Spawner::new(
             SpawnerConfig {
@@ -158,7 +160,8 @@ pub async fn run_until(
             ctx.merge.clone(),
             agent_bin,
         )
-        .with_drain(drain_switch),
+        .with_drain(drain_switch)
+        .with_header_key(header_key),
     );
     let ctx = Arc::new(ctx.with_spawner(spawner.clone()));
     match spawner.resume_on_boot() {

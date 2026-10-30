@@ -37,6 +37,7 @@ use super::db::{now_ms, AgentFilter, Db};
 use super::detect::{FirstTick, FIRST_TICK_WAIT};
 use super::drain::DrainSwitch;
 use super::hooks::{self, HookEvent, Outcome};
+use super::machine::HeaderKey;
 use super::merge::MergeTable;
 use super::peer::{self, PeerCred};
 use super::principal::{self, LiveAgents, NoLiveAgents, Principal};
@@ -102,6 +103,9 @@ pub struct ServerCtx {
     /// Detection's first pass: `session.list` and `snapshot.get` wait for
     /// it (`detect::FirstTick`).
     pub first_tick: Arc<FirstTick>,
+    /// The mail header key (`MachineKey::header_key`): each agent's token
+    /// goes out in its `hook.session_start` context. `None` only in tests.
+    pub header_key: Option<HeaderKey>,
 }
 
 impl ServerCtx {
@@ -120,6 +124,7 @@ impl ServerCtx {
             spawner: None,
             drain: Arc::new(DrainSwitch::new()),
             first_tick: Arc::new(FirstTick::open_now()),
+            header_key: None,
         }
     }
 
@@ -156,6 +161,11 @@ impl ServerCtx {
 
     pub fn with_first_tick(mut self, first_tick: Arc<FirstTick>) -> Self {
         self.first_tick = first_tick;
+        self
+    }
+
+    pub fn with_header_key(mut self, key: HeaderKey) -> Self {
+        self.header_key = Some(key);
         self
     }
 
@@ -760,6 +770,10 @@ async fn hook_intake(
         }
         _ => None,
     };
+    let token = match (&ctx.header_key, method) {
+        (Some(key), "hook.session_start") => Some(key.token(&params.agent_id)),
+        _ => None,
+    };
     // Read now, not at accept: a resume since then makes the event stale.
     let live_gen = ctx.agents.current_gen(&params.agent_id);
     let agent_id = params.agent_id.clone();
@@ -786,6 +800,7 @@ async fn hook_intake(
                     &merge,
                     &ev,
                     orders.as_deref(),
+                    token.as_deref(),
                     draining,
                     now_ms(),
                 )
@@ -1160,6 +1175,7 @@ mod tests {
             spawner: None,
             drain: Arc::new(DrainSwitch::new()),
             first_tick: Arc::new(FirstTick::open_now()),
+            header_key: None,
         })
     }
 
@@ -1501,6 +1517,7 @@ mod tests {
             spawner: None,
             drain: Arc::new(DrainSwitch::new()),
             first_tick: Arc::new(FirstTick::open_now()),
+            header_key: None,
         });
         (t, ctx, db)
     }
@@ -2128,6 +2145,11 @@ mod tests {
             .with_db(db.clone())
             .with_standing_orders(orders)
             .with_drain(drain.clone());
+        let key = crate::engine::machine::load_or_create(t.path())
+            .unwrap()
+            .header_key();
+        let token = key.token("a1");
+        let ctx = ctx.with_header_key(key);
         let principal = Principal::Agent {
             id: "a1".into(),
             gen: 1,
@@ -2180,6 +2202,12 @@ mod tests {
             .unwrap();
         let context = context.unwrap();
         assert!(context.starts_with(&standing::header(1)), "{}", context);
+        // The agent's header token goes out with it (C1b-M1-7).
+        assert!(
+            context.contains(&standing::mail_rules(Some(&token))),
+            "{}",
+            context
+        );
         assert_eq!(note(), 0);
     }
 }

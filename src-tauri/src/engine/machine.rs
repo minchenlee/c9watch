@@ -12,7 +12,7 @@
 //! processes race, one link wins and the other process reads the winner's
 //! key.
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -51,6 +51,59 @@ impl MachineKey {
     pub fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
         self.signing.verifying_key()
     }
+
+    /// The key behind the per-agent mail header tokens (C1b-M1-7): the
+    /// first 32 bytes of the signature of `HEADER_KEY_LABEL`. ed25519
+    /// signing is deterministic, so every start of the engine derives the
+    /// same key, and nothing more is stored.
+    pub fn header_key(&self) -> HeaderKey {
+        let sig = self.signing.sign(HEADER_KEY_LABEL).to_bytes();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&sig[..32]);
+        HeaderKey(key)
+    }
+}
+
+/// What the machine key signs to derive the header key.
+const HEADER_KEY_LABEL: &[u8] = b"c9 header-token v1";
+
+/// The secret behind the mail header tokens. No `Debug`: it is a secret.
+#[derive(Clone)]
+pub struct HeaderKey([u8; 32]);
+
+impl HeaderKey {
+    /// The header token of `agent_id`: the first 16 hex digits of
+    /// HMAC-SHA256(key, agent id). The engine stamps it on every mail it
+    /// pastes into the agent and tells the agent in its SessionStart
+    /// context, so a body that fakes a mail header without it reads as
+    /// text. It is tied to the agent id, not the generation: a resume
+    /// keeps the old context, and with it the token.
+    pub fn token(&self, agent_id: &str) -> String {
+        let mut t = hex(&hmac_sha256(&self.0, agent_id.as_bytes()));
+        t.truncate(16);
+        t
+    }
+}
+
+/// HMAC-SHA256 (RFC 2104) of `msg` under a key of at most one block.
+fn hmac_sha256(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for (i, k) in key.iter().enumerate() {
+        ipad[i] ^= k;
+        opad[i] ^= k;
+    }
+    let inner = Sha256::new()
+        .chain_update(ipad)
+        .chain_update(msg)
+        .finalize();
+    Sha256::new()
+        .chain_update(opad)
+        .chain_update(inner)
+        .finalize()
+        .into()
 }
 
 /// Load `<home>/machine.key`, or create it when it does not exist. `home`
@@ -188,6 +241,41 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, [KEY_NAME]);
+    }
+
+    #[test]
+    fn hmac_matches_the_rfc_4231_vector() {
+        // RFC 4231 test case 2 has a 4-byte key; zero padding to 32 bytes
+        // gives the same HMAC, since HMAC pads short keys with zeros.
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(b"Jefe");
+        assert_eq!(
+            hex(&hmac_sha256(&key, b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn header_tokens_are_stable_per_key_and_differ_per_agent() {
+        let t = home();
+        let k1 = load_or_create(t.path()).unwrap().header_key();
+        // A restart derives the same header key.
+        let k2 = load_or_create(t.path()).unwrap().header_key();
+        assert_eq!(k1.0, k2.0);
+        let a = k1.token("agt_a");
+        assert_eq!(a.len(), 16);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(a, k2.token("agt_a"));
+        assert_ne!(a, k1.token("agt_b"));
+        // Another machine key gives other tokens.
+        let other = home();
+        assert_ne!(
+            load_or_create(other.path())
+                .unwrap()
+                .header_key()
+                .token("agt_a"),
+            a
+        );
     }
 
     #[test]

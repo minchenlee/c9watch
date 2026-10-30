@@ -14,9 +14,10 @@ use c9watch_lib::engine::agents::LiveTable;
 use c9watch_lib::engine::db::db_path;
 use c9watch_lib::engine::driver::{Driver, SpawnSpec};
 use c9watch_lib::engine::home::{sock_path, ENGINE_HOME_ENV};
+use c9watch_lib::engine::machine;
 use c9watch_lib::engine::pty::NativePty;
 use c9watch_lib::engine::run::{run_until, EngineConfig};
-use c9watch_lib::engine::standing::header;
+use c9watch_lib::engine::standing::{header, mail_rules};
 use c9watch_lib::engine_proto::client::Conn;
 use c9watch_lib::engine_proto::wire::HOOK_METHODS;
 use serde_json::Value;
@@ -306,7 +307,16 @@ fn session_start_prints_the_standing_orders() {
     };
     // A compaction does not take the note; the next start does, once.
     // Every block names generation 1 and replaces earlier ones (D24).
-    let want = format!("{}\n\nOrders for agt_t.\n", header(1));
+    // Then the mail rules with the agent's header token (C1b-M1-7).
+    let token = machine::load_or_create(&engine.home)
+        .unwrap()
+        .header_key()
+        .token(AGENT_ID);
+    let want = format!(
+        "{}\n\nOrders for agt_t.\n\n{}",
+        header(1),
+        mail_rules(Some(&token))
+    );
     let (out, ctx, _) = context("compact");
     assert_eq!(ctx, want, "{}", out);
     assert_eq!(pending(), 1);
