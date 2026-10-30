@@ -385,8 +385,9 @@ pub struct ModelCost {
 /// Bump this when pricing or token counting logic changes to force cache rebuild.
 const CACHE_VERSION: u32 = 6;
 
-/// Threads that scan changed transcripts. Each holds one parsed line at a
-/// time, so this bounds parallel I/O rather than memory.
+/// Threads that scan changed transcripts. Each streams its file but keeps
+/// that file's usage entries until it ends, so this caps how many files'
+/// entries are held at once.
 const COST_SCAN_WORKERS: usize = 4;
 
 /// Cache structure stored at ~/.claude/cost-cache.json

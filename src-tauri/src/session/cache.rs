@@ -62,18 +62,22 @@ impl LineBatches {
     pub(crate) fn next_batch(&mut self) -> io::Result<Option<Vec<String>>> {
         let mut lines = Vec::new();
         let mut bytes = 0;
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         while !self.done && bytes < LINE_BATCH_BYTES {
             buf.clear();
-            let n = self.reader.read_line(&mut buf)?;
-            if n == 0 || !buf.ends_with('\n') {
+            // Bytes first: a line cut mid-write can end inside a UTF-8
+            // character, and must stay unconsumed rather than fail the read.
+            let n = self.reader.read_until(b'\n', &mut buf)?;
+            if n == 0 || buf.last() != Some(&b'\n') {
                 // EOF, or an incomplete trailing line — stop without consuming it.
                 self.done = true;
                 break;
             }
+            let line = std::str::from_utf8(&buf)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             self.consumed += n as u64;
             bytes += n;
-            let trimmed = buf.trim_end_matches(['\n', '\r']);
+            let trimmed = line.trim_end_matches(['\n', '\r']);
             if !trimmed.trim().is_empty() {
                 lines.push(trimmed.to_string());
             }
@@ -587,6 +591,20 @@ mod tests {
         // the unterminated trailing line is left for the next read.
         assert_eq!(sizes.iter().sum::<usize>(), count);
         assert_eq!(batches.consumed(), ((line.len() + 1) * count + 1) as u64);
+    }
+
+    #[test]
+    fn line_batches_leave_a_line_cut_inside_a_character() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("t.jsonl");
+        let mut bytes = "a\n".as_bytes().to_vec();
+        bytes.extend_from_slice(&"中".as_bytes()[..2]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut batches = LineBatches::open(&path, 0).unwrap();
+        assert_eq!(batches.next_batch().unwrap(), Some(vec!["a".into()]));
+        assert_eq!(batches.next_batch().unwrap(), None);
+        assert_eq!(batches.consumed(), 2);
     }
 
     #[test]
