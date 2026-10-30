@@ -1,0 +1,15 @@
+{
+  "exit": 0,
+  "stderr": [],
+  "stdout": [
+    {
+      "diagnostics": {
+        "claudeProcessesFound": 0,
+        "fdaLikelyNeeded": false,
+        "hiddenClaudeSessions": [],
+        "processesWithCwd": 0
+      },
+      "sessions": []
+    }
+  ]
+}

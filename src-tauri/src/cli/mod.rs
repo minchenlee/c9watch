@@ -26,6 +26,8 @@ mod session_ref;
 #[cfg(all(unix, feature = "engine"))]
 pub mod engine_client;
 #[cfg(all(unix, feature = "engine"))]
+pub mod engine_sessions;
+#[cfg(all(unix, feature = "engine"))]
 pub mod task;
 
 use cost::cmd_cost;
@@ -125,6 +127,26 @@ pub struct Cli {
     pub pretty: bool,
 }
 
+/// How a detection command (`list`, `status`, `self`, `watch`, `wait`)
+/// finds sessions. An engine build adds `--direct`; in other builds it
+/// holds nothing, so the release CLI is unchanged.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct DetectArgs {
+    /// Detect sessions in this process instead of asking the engine
+    #[cfg(all(unix, feature = "engine"))]
+    #[arg(long)]
+    pub direct: bool,
+}
+
+impl DetectArgs {
+    /// Whether to read sessions from the engine (C1a-36): not with
+    /// `--direct`, and not inside an engine agent (`C9_AGENT_ID` set, N5).
+    #[cfg(all(unix, feature = "engine"))]
+    fn via_engine(&self) -> bool {
+        engine_sessions::use_engine(self.direct, &|k| std::env::var_os(k))
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Capture Claude Code status-line quotas locally (no API requests)
@@ -160,6 +182,9 @@ pub enum Commands {
         /// Compact output: only id, status, projectPath, pid, pendingToolName
         #[arg(long)]
         compact: bool,
+
+        #[command(flatten)]
+        detect: DetectArgs,
     },
 
     /// Aggregate status summary of all active sessions
@@ -167,6 +192,9 @@ pub enum Commands {
         /// Filter by project path (substring match)
         #[arg(long)]
         project: Option<String>,
+
+        #[command(flatten)]
+        detect: DetectArgs,
     },
 
     /// View conversation for a session
@@ -210,7 +238,10 @@ pub enum Commands {
 
     /// Identify this session (find the calling agent's own session by PID ancestry)
     #[command(name = "self")]
-    SelfId,
+    SelfId {
+        #[command(flatten)]
+        detect: DetectArgs,
+    },
 
     /// Stop a session. Worker lookup wins over PID parsing: if the target
     /// matches a live PM worker's session id (exact or unique prefix), the
@@ -250,6 +281,9 @@ pub enum Commands {
         /// Accepted for scripts; output is always NDJSON (see docs/cli-events.md)
         #[arg(long)]
         json: bool,
+
+        #[command(flatten)]
+        detect: DetectArgs,
     },
 
     /// Wait until a live session meets a condition, then print that event
@@ -272,6 +306,9 @@ pub enum Commands {
         /// Poll interval in seconds
         #[arg(short, long, default_value = "2")]
         interval: u64,
+
+        #[command(flatten)]
+        detect: DetectArgs,
     },
 
     /// Show tasks/todos for a session
@@ -448,8 +485,15 @@ pub fn run(cli: Cli) {
             project,
             status,
             compact,
-        } => cmd_list(project.as_deref(), status.as_deref(), compact, cli.pretty),
-        Commands::Status { project } => cmd_status(project.as_deref(), cli.pretty),
+            detect,
+        } => cmd_list(
+            project.as_deref(),
+            status.as_deref(),
+            compact,
+            cli.pretty,
+            &detect,
+        ),
+        Commands::Status { project, detect } => cmd_status(project.as_deref(), cli.pretty, &detect),
         Commands::View { session_id, last } => cmd_view(&session_id, last, cli.pretty),
         Commands::History { limit } => cmd_history(limit, cli.pretty),
         Commands::Search {
@@ -466,7 +510,7 @@ pub fn run(cli: Cli) {
             whole_word,
             cli.pretty,
         ),
-        Commands::SelfId => cmd_self(cli.pretty),
+        Commands::SelfId { detect } => cmd_self(cli.pretty, &detect),
         Commands::Stop { target } => cmd_stop(&target, cli.pretty),
         Commands::Watch {
             interval,
@@ -474,13 +518,15 @@ pub fn run(cli: Cli) {
             compact,
             changes_only,
             json: _,
-        } => cmd_watch(interval, project.as_deref(), compact, changes_only),
+            detect,
+        } => cmd_watch(interval, project.as_deref(), compact, changes_only, &detect),
         Commands::Wait {
             session_id,
             until,
             timeout,
             interval,
-        } => match cmd_wait(&session_id, until, timeout, interval) {
+            detect,
+        } => match cmd_wait(&session_id, until, timeout, interval, &detect) {
             Ok(0) => Ok(()),
             Ok(code) => process::exit(code),
             Err(e) => Err(e),
@@ -596,7 +642,13 @@ fn cmd_list(
     status_filter: Option<&str>,
     compact: bool,
     pretty: bool,
+    detect: &DetectArgs,
 ) -> Result<(), String> {
+    #[cfg(all(unix, feature = "engine"))]
+    if detect.via_engine() {
+        return engine_sessions::cmd_list(project_filter, status_filter, compact, pretty);
+    }
+    let _ = detect;
     let (sessions, diagnostics) = session::enrichment::detect_and_enrich_sessions()?;
 
     let sessions: Vec<serde_json::Value> = sessions
@@ -629,7 +681,16 @@ fn cmd_list(
     print_json(&output, pretty)
 }
 
-fn cmd_status(project_filter: Option<&str>, pretty: bool) -> Result<(), String> {
+fn cmd_status(
+    project_filter: Option<&str>,
+    pretty: bool,
+    detect: &DetectArgs,
+) -> Result<(), String> {
+    #[cfg(all(unix, feature = "engine"))]
+    if detect.via_engine() {
+        return engine_sessions::cmd_status(project_filter, pretty);
+    }
+    let _ = detect;
     let (sessions, _) = session::enrichment::detect_and_enrich_sessions()?;
 
     let filtered: Vec<_> = sessions
@@ -761,12 +822,18 @@ fn cmd_search_output(
 
 /// Identify the calling agent's own session by walking up the PID tree
 /// to find a parent claude process, then matching it to an active session.
-fn cmd_self(pretty: bool) -> Result<(), String> {
+fn cmd_self(pretty: bool, detect: &DetectArgs) -> Result<(), String> {
     let my_pid = std::process::id();
 
     // Walk up the process tree to find a claude ancestor
     let claude_pid = find_claude_ancestor(my_pid)
         .ok_or("No claude parent process found — this command must be called from within a Claude Code session")?;
+
+    #[cfg(all(unix, feature = "engine"))]
+    if detect.via_engine() {
+        return engine_sessions::cmd_self(claude_pid, pretty);
+    }
+    let _ = detect;
 
     // Find the matching session
     let (sessions, _) = session::enrichment::detect_and_enrich_sessions()?;
@@ -978,7 +1045,13 @@ fn cmd_watch(
     project_filter: Option<&str>,
     compact: bool,
     changes_only: bool,
+    detect: &DetectArgs,
 ) -> Result<(), String> {
+    #[cfg(all(unix, feature = "engine"))]
+    if detect.via_engine() {
+        return engine_sessions::cmd_watch(project_filter, compact, changes_only);
+    }
+    let _ = detect;
     let interval = std::time::Duration::from_secs(interval_secs);
     let mut prev = std::collections::HashMap::new();
 
@@ -992,6 +1065,17 @@ fn cmd_watch(
     }
 }
 
+/// One read of the live sessions for `wait` (and the engine's `watch`):
+/// the snapshots and the payloads their event lines take.
+pub(crate) enum Poll<L> {
+    Live(Vec<watch::Snapshot>, L),
+    /// This read failed; a later one may work.
+    Missed,
+    /// No read will work again.
+    #[cfg_attr(not(all(unix, feature = "engine")), allow(dead_code))]
+    Failed(String),
+}
+
 /// `c9watch wait`: returns the process exit code (see `watch::EXIT_*`).
 ///
 /// Polls run on a background thread: one poll can take many seconds with
@@ -1001,26 +1085,52 @@ fn cmd_wait(
     until: watch::Until,
     timeout_secs: Option<u64>,
     interval_secs: u64,
+    detect: &DetectArgs,
 ) -> Result<i32, String> {
-    use std::sync::mpsc::{self, RecvTimeoutError};
-    use std::time::{Duration, Instant};
+    #[cfg(all(unix, feature = "engine"))]
+    if detect.via_engine() {
+        return engine_sessions::cmd_wait(reference, until, timeout_secs);
+    }
+    let _ = detect;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
-    let deadline = timeout_secs.map(|t| Instant::now() + Duration::from_secs(t));
     let interval = Duration::from_secs(interval_secs.max(1));
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || loop {
-        if tx.send(poll_sessions(None)).is_err() {
+        let poll = match poll_sessions(None) {
+            Some((snapshots, sessions)) => Poll::Live(snapshots, sessions),
+            None => Poll::Missed,
+        };
+        if tx.send(poll).is_err() {
             return;
         }
         std::thread::sleep(interval);
     });
+    wait_loop(reference, until, timeout_secs, rx, |change, sessions| {
+        change_line(change, sessions, true)
+    })
+}
 
+/// The `wait` loop over `polls`, from in-process detection or the engine.
+/// `line` makes the event line printed when the condition is met.
+fn wait_loop<L>(
+    reference: &str,
+    until: watch::Until,
+    timeout_secs: Option<u64>,
+    polls: std::sync::mpsc::Receiver<Poll<L>>,
+    line: impl Fn(&watch::Change, &L) -> serde_json::Value,
+) -> Result<i32, String> {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::{Duration, Instant};
+
+    let deadline = timeout_secs.map(|t| Instant::now() + Duration::from_secs(t));
     let mut key: Option<String> = None;
     let mut prev = std::collections::HashMap::new();
     loop {
         let poll = match deadline {
             Some(deadline) => {
-                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                match polls.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(poll) => poll,
                     Err(RecvTimeoutError::Timeout) => return Ok(watch::EXIT_TIMEOUT),
                     Err(RecvTimeoutError::Disconnected) => {
@@ -1028,15 +1138,17 @@ fn cmd_wait(
                     }
                 }
             }
-            None => rx
+            None => polls
                 .recv()
                 .map_err(|_| "The session poller stopped".to_string())?,
         };
-        let Some((snapshots, sessions)) = poll else {
-            if key.is_none() {
-                return Err("Failed to read the live sessions".to_string());
+        let (snapshots, payload) = match poll {
+            Poll::Live(snapshots, payload) => (snapshots, payload),
+            Poll::Missed if key.is_none() => {
+                return Err("Failed to read the live sessions".to_string())
             }
-            continue;
+            Poll::Missed => continue,
+            Poll::Failed(e) => return Err(e),
         };
         let target = match &key {
             Some(target) => target.clone(),
@@ -1051,7 +1163,7 @@ fn cmd_wait(
         let mine = snapshots.into_iter().filter(|s| s.key == target).collect();
         for change in watch::diff_sessions(&mut prev, mine, true) {
             if let Some(outcome) = watch::wait_outcome(until, &change) {
-                print_line(&change_line(&change, &sessions, true));
+                print_line(&line(&change, &payload));
                 return Ok(match outcome {
                     watch::WaitOutcome::Met => 0,
                     watch::WaitOutcome::EndedFirst => watch::EXIT_ENDED_FIRST,
@@ -1180,6 +1292,7 @@ mod dispatch_tests {
             until,
             timeout,
             interval,
+            ..
         } = cli.command
         else {
             panic!("not a wait command");
@@ -1190,6 +1303,38 @@ mod dispatch_tests {
         assert_eq!(interval, 2);
         assert!(Cli::try_parse_from(["c9watch", "wait", "abc"]).is_err());
         assert!(Cli::try_parse_from(["c9watch", "watch", "--json"]).is_ok());
+    }
+
+    /// `--direct` exists only in engine builds, on the five detection
+    /// commands (C1a-36); a release CLI rejects it.
+    #[test]
+    fn direct_is_an_engine_build_flag() {
+        let with_direct: [&[&str]; 5] = [
+            &["c9watch", "list", "--direct"],
+            &["c9watch", "status", "--direct"],
+            &["c9watch", "self", "--direct"],
+            &["c9watch", "watch", "--direct"],
+            &["c9watch", "wait", "abc", "--until", "done", "--direct"],
+        ];
+        for args in with_direct {
+            let parsed = Cli::try_parse_from(args);
+            #[cfg(all(unix, feature = "engine"))]
+            {
+                let cli = parsed.unwrap_or_else(|e| panic!("{args:?}: {e}"));
+                let detect = match cli.command {
+                    Commands::List { detect, .. }
+                    | Commands::Status { detect, .. }
+                    | Commands::SelfId { detect }
+                    | Commands::Watch { detect, .. }
+                    | Commands::Wait { detect, .. } => detect,
+                    _ => panic!("{args:?}: wrong command"),
+                };
+                assert!(detect.direct, "{args:?}");
+            }
+            #[cfg(not(all(unix, feature = "engine")))]
+            assert!(parsed.is_err(), "{args:?} parsed in a release CLI");
+        }
+        assert!(Cli::try_parse_from(["c9watch", "view", "abc", "--direct"]).is_err());
     }
 
     /// A release CLI (`--features cli`) has no engine commands (v3.1 M-a).

@@ -24,6 +24,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Error code: a caller inside an engine agent (`C9_AGENT_ID` set) may not
@@ -33,7 +34,7 @@ pub const AGENT_CALLER_REFUSED: &str = "agent_caller_refused";
 /// Error code: the engine did not answer `hello` in time.
 pub const ENGINE_NOT_READY: &str = "engine_not_ready";
 
-const ENV_AGENT_ID: &str = "C9_AGENT_ID";
+pub(crate) const ENV_AGENT_ID: &str = "C9_AGENT_ID";
 
 /// How long a client waits for a new engine to answer `hello`.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -126,7 +127,7 @@ pub enum ConnectError {
 }
 
 impl ConnectError {
-    fn into_msg(self) -> String {
+    pub(crate) fn into_msg(self) -> String {
         match self {
             ConnectError::Unreachable(m) | ConnectError::Refused(m) => m,
         }
@@ -202,6 +203,52 @@ impl EngineConn {
     }
 }
 
+/// The frames an `events.subscribe` connection reads after its response.
+/// A reader thread sends each line, with no read timeout, until the
+/// connection closes. Dropping it shuts the connection down, which ends the
+/// thread.
+pub struct Frames {
+    pub lines: mpsc::Receiver<String>,
+    stream: UnixStream,
+}
+
+impl Drop for Frames {
+    fn drop(&mut self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+impl EngineConn {
+    /// Read the rest of the connection on a thread, line by line. Lines the
+    /// reader already buffered come first, so no frame is lost.
+    pub fn into_frames(self) -> Result<Frames, String> {
+        let stream = self
+            .writer
+            .try_clone()
+            .map_err(|e| format!("Failed to clone socket: {}", e))?;
+        let mut reader = self.reader;
+        let _ = reader.get_ref().set_read_timeout(None);
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _writer = self.writer;
+            let mut buf = String::new();
+            loop {
+                buf.clear();
+                match reader.read_line(&mut buf) {
+                    Ok(n) if n > 0 && buf.ends_with('\n') => {
+                        if tx.send(buf.trim_end().to_string()).is_err() {
+                            return;
+                        }
+                    }
+                    // EOF, an error, or a last line cut short.
+                    _ => return,
+                }
+            }
+        });
+        Ok(Frames { lines, stream })
+    }
+}
+
 fn placeholder_hello() -> HelloResult {
     HelloResult {
         api_major: 0,
@@ -215,7 +262,7 @@ fn placeholder_hello() -> HelloResult {
 }
 
 /// `"<code>: <msg>"` of an error response.
-fn error_line(resp: &Response) -> String {
+pub(crate) fn error_line(resp: &Response) -> String {
     match &resp.error {
         Some(e) => format!("{}: {}", e.code, e.msg),
         None => "the engine sent ok:false without an error".into(),
@@ -447,7 +494,10 @@ fn restart_engine_with(
             }
         }
         let deadline = Instant::now() + EXIT_TIMEOUT;
-        while engine_lock_held(&lock)? {
+        // Wait for this engine to let go. A lock held by another pid is a
+        // new engine that some other client (say a `watch` reconnecting)
+        // already started: the old one is gone.
+        while engine_lock_held(&lock)? && engine_pid(&lock)? == Some(pid) {
             if Instant::now() >= deadline {
                 return Err(format!(
                     "Engine pid {} still holds {:?} {} s after SIGTERM",
@@ -464,7 +514,7 @@ fn restart_engine_with(
 
 // ── Commands ──────────────────────────────────────────────────────────
 
-fn current_exe() -> Result<PathBuf, String> {
+pub(crate) fn current_exe() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| format!("Failed to get current exe path: {}", e))
 }
 

@@ -418,3 +418,370 @@ fn engine_restart_with_a_live_agent_drains_then_resumes_it() {
     });
     assert!(gone, "a fake claude still runs");
 }
+
+// ── C1a-36: list, status, self, watch and wait through the engine ────
+
+const DETECT_SID: &str = "22222222-3333-4444-5555-666666666666";
+
+/// A stand-in `claude` for detection only (never the real one):
+/// `--version` gets a version CLI detection accepts, `agents --json`
+/// prints `agents.json` next to the script, anything else fails.
+const DETECT_CLAUDE: &str = r#"#!/bin/sh
+case "$1" in
+  --version) echo "2.1.312 (Claude Code)"; exit 0 ;;
+  agents) cat "$(dirname "$0")/agents.json"; exit 0 ;;
+esac
+exit 1
+"#;
+
+/// One detected session: a `sleep` that `claude agents --json` reports,
+/// in `<root>/work/proj`. `path` puts the stand-in first on PATH.
+struct Detected {
+    path: String,
+    sleeper: std::process::Child,
+}
+
+impl Detected {
+    fn new(sb: &Sandbox) -> Self {
+        let root = sb.home.parent().unwrap().to_path_buf();
+        let bin = root.join("detectbin");
+        std::fs::create_dir(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(&claude, DETECT_CLAUDE).unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cwd = root.join("work/proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let sleeper = Command::new("sleep").arg("300").spawn().unwrap();
+        let started_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 1000;
+        let agents = serde_json::json!([{
+            "pid": sleeper.id(), "cwd": cwd, "kind": "interactive",
+            "startedAt": started_ms, "sessionId": DETECT_SID, "status": "busy",
+        }]);
+        std::fs::write(bin.join("agents.json"), agents.to_string()).unwrap();
+        Detected {
+            path: format!("{}:/usr/bin:/bin", bin.display()),
+            sleeper,
+        }
+    }
+
+    fn cmd(&self, sb: &Sandbox, args: &[&str]) -> Command {
+        let mut c = sb.cmd(args);
+        c.env("PATH", &self.path);
+        c
+    }
+
+    fn run(&self, sb: &Sandbox, args: &[&str]) -> Output {
+        self.cmd(sb, args).output().unwrap()
+    }
+
+    fn end_session(&mut self) {
+        let _ = self.sleeper.kill();
+        let _ = self.sleeper.wait();
+    }
+}
+
+impl Drop for Detected {
+    fn drop(&mut self) {
+        self.end_session();
+    }
+}
+
+/// Run `list` until the engine's detection lists the session.
+fn engine_lists_the_session(sb: &Sandbox, d: &Detected) -> Value {
+    let mut last = Value::Null;
+    let listed = wait_for(Duration::from_secs(30), || {
+        let out = d.run(sb, &["list"]);
+        assert!(out.status.success(), "{:?} / log {}", out, sb.log());
+        last = stdout_json(&out);
+        last["sessions"].as_array().is_some_and(|s| !s.is_empty())
+    });
+    assert!(listed, "{} / log {}", last, sb.log());
+    last
+}
+
+/// A child that is killed and reaped when the test ends, pass or fail, so
+/// a `watch` cannot outlive its sandbox and start engines in it.
+struct Reap(std::process::Child);
+
+impl std::ops::Deref for Reap {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Reap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for Reap {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Lines a child prints, read on a thread so a caller can wait with a
+/// deadline without losing a line.
+fn lines_of(child: &mut std::process::Child) -> std::sync::mpsc::Receiver<String> {
+    use std::io::BufRead;
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+#[test]
+fn list_and_status_auto_start_the_engine_and_read_its_sessions() {
+    let sb = Sandbox::new();
+    let d = Detected::new(&sb);
+    let key = format!("claudeCode:{}", DETECT_SID);
+
+    let listed = engine_lists_the_session(&sb, &d);
+    assert!(sb.pid().is_some(), "list did not auto-start the engine");
+    // The payload is the engine's row, and there are no diagnostics.
+    assert!(listed.get("diagnostics").is_none(), "{}", listed);
+    let row = &listed["sessions"][0];
+    assert_eq!(row["sessionKey"], key.as_str());
+    assert_eq!(row["providerSid"], DETECT_SID);
+    assert_eq!(row["role"], "observed");
+    assert_eq!(row["status"], "connecting");
+    assert!(row["id"].as_str().unwrap().starts_with("agt_"), "{}", row);
+    assert!(
+        row["cwd"].as_str().unwrap().ends_with("work/proj"),
+        "{}",
+        row
+    );
+
+    // Filters apply to the rows; `--status` takes either spelling.
+    for (args, n) in [
+        (&["list", "--status", "Connecting"][..], 1),
+        (&["list", "--status", "connecting"][..], 1),
+        (&["list", "--status", "Working"][..], 0),
+        (&["list", "--project", "proj"][..], 1),
+        (&["list", "--project", "nope"][..], 0),
+    ] {
+        let out = d.run(&sb, args);
+        assert!(out.status.success(), "{args:?}: {:?}", out);
+        let got = stdout_json(&out)["sessions"].as_array().unwrap().len();
+        assert_eq!(got, n, "{args:?}");
+    }
+    let out = d.run(&sb, &["list", "--compact"]);
+    let compact = stdout_json(&out)["sessions"][0].clone();
+    assert_eq!(compact["sessionKey"], key.as_str());
+    assert!(compact.get("role").is_none(), "{}", compact);
+
+    let out = d.run(&sb, &["status"]);
+    assert!(out.status.success(), "{:?}", out);
+    let status = stdout_json(&out);
+    assert_eq!(status["total"], 1);
+    assert_eq!(status["byStatus"]["Connecting"], 1);
+    assert_eq!(status["byProject"]["proj"], 1);
+
+    // `--direct` keeps in-process detection and its shape.
+    let out = d.run(&sb, &["list", "--direct"]);
+    assert!(out.status.success(), "{:?}", out);
+    let direct = stdout_json(&out);
+    assert!(direct.get("diagnostics").is_some(), "{}", direct);
+    assert_eq!(direct["sessions"][0]["sessionKey"], key.as_str());
+    assert_eq!(direct["sessions"][0]["status"], "Connecting");
+}
+
+#[test]
+fn watch_and_wait_follow_the_engine_events() {
+    use wait_timeout::ChildExt;
+    let sb = Sandbox::new();
+    let mut d = Detected::new(&sb);
+    engine_lists_the_session(&sb, &d);
+    let key = format!("claudeCode:{}", DETECT_SID);
+
+    // `done` is met at once: the session is not working.
+    let out = d.run(
+        &sb,
+        &[
+            "wait",
+            &DETECT_SID[..8],
+            "--until",
+            "done",
+            "--timeout",
+            "20",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{:?}", out);
+    let line = stdout_json(&out);
+    assert_eq!(line["event"], "started");
+    assert_eq!(line["status"], "Connecting");
+    assert_eq!(line["session"]["sessionKey"], key.as_str());
+    // No live session matches: exit 2, as with `--direct`.
+    let out = d.run(&sb, &["wait", "ffff", "--until", "done", "--timeout", "20"]);
+    assert_eq!(out.status.code(), Some(2), "{:?}", out);
+    // A timeout is exit 124.
+    let out = d.run(
+        &sb,
+        &[
+            "wait",
+            &DETECT_SID[..8],
+            "--until",
+            "ended",
+            "--timeout",
+            "1",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(124), "{:?}", out);
+
+    let mut watch = d
+        .cmd(&sb, &["watch", "--compact"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(Reap)
+        .unwrap();
+    let lines = lines_of(&mut watch);
+    let mut wait = d
+        .cmd(
+            &sb,
+            &["wait", DETECT_SID, "--until", "ended", "--timeout", "60"],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(Reap)
+        .unwrap();
+    let waited = lines_of(&mut wait);
+    let started: Value =
+        serde_json::from_str(&lines.recv_timeout(Duration::from_secs(30)).unwrap()).unwrap();
+    assert_eq!(started["event"], "started");
+    assert_eq!(started["sessionKey"], key.as_str());
+    assert_eq!(started["session"]["status"], "connecting");
+    // Let `wait` take its snapshot before the session ends.
+    std::thread::sleep(Duration::from_secs(2));
+
+    d.end_session();
+    let stopped: Value =
+        serde_json::from_str(&lines.recv_timeout(Duration::from_secs(30)).unwrap()).unwrap();
+    assert_eq!(stopped["event"], "stopped", "{}", stopped);
+    assert_eq!(stopped["sessionKey"], key.as_str());
+    assert_eq!(stopped["previousStatus"], "Connecting");
+
+    let status = wait.wait_timeout(Duration::from_secs(30)).unwrap();
+    assert_eq!(status.and_then(|s| s.code()), Some(0));
+    let line: Value =
+        serde_json::from_str(&waited.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+    assert_eq!(line["event"], "stopped");
+}
+
+#[test]
+fn an_agent_caller_detects_directly_and_starts_no_engine() {
+    let sb = Sandbox::new();
+    let d = Detected::new(&sb);
+    for args in [
+        &["list"][..],
+        &["status"][..],
+        &[
+            "wait",
+            &DETECT_SID[..8],
+            "--until",
+            "done",
+            "--timeout",
+            "20",
+        ][..],
+    ] {
+        let out = d
+            .cmd(&sb, args)
+            .env("C9_AGENT_ID", "agt_x")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {:?}", out);
+        assert!(out.stderr.is_empty(), "{args:?}: {:?}", out);
+    }
+    // The in-process shape, with the session.
+    let out = d
+        .cmd(&sb, &["list"])
+        .env("C9_AGENT_ID", "agt_x")
+        .output()
+        .unwrap();
+    let list = stdout_json(&out);
+    assert!(list.get("diagnostics").is_some(), "{}", list);
+    assert_eq!(list["sessions"][0]["status"], "Connecting");
+    assert!(
+        !sb.engine.exists(),
+        "an agent caller touched the engine home"
+    );
+    assert!(sb.pid().is_none());
+}
+
+#[test]
+fn an_unreachable_engine_fails_with_a_hint_to_direct() {
+    let sb = Sandbox::new();
+    let d = Detected::new(&sb);
+    // An engine refuses to start on a db from a newer engine.
+    std::fs::create_dir(&sb.engine).unwrap();
+    std::fs::set_permissions(&sb.engine, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let conn = rusqlite::Connection::open(sb.engine.join("engine.db")).unwrap();
+    conn.execute_batch("CREATE TABLE t (x INTEGER); PRAGMA user_version = 9999;")
+        .unwrap();
+    drop(conn);
+    for args in [
+        &["list"][..],
+        &["status"][..],
+        &["watch"][..],
+        &["wait", "x", "--until", "done"][..],
+    ] {
+        let out = d.run(&sb, args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {:?}", out);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("engine_unreachable"), "{args:?}: {err}");
+        assert!(err.contains("--direct"), "{args:?}: {err}");
+        assert!(out.stdout.is_empty(), "{args:?}: {:?}", out);
+    }
+    assert!(sb.pid().is_none());
+    // `--direct` still works.
+    let out = d.run(&sb, &["list", "--direct"]);
+    assert!(out.status.success(), "{:?}", out);
+}
+
+#[test]
+fn watch_follows_a_new_engine_after_a_restart() {
+    let sb = Sandbox::new();
+    let mut d = Detected::new(&sb);
+    engine_lists_the_session(&sb, &d);
+    let mut watch = d
+        .cmd(&sb, &["watch"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(Reap)
+        .unwrap();
+    let lines = lines_of(&mut watch);
+    let started: Value =
+        serde_json::from_str(&lines.recv_timeout(Duration::from_secs(30)).unwrap()).unwrap();
+    assert_eq!(started["event"], "started");
+    let old = sb.pid().unwrap();
+
+    let out = d.run(&sb, &["engine", "restart"]);
+    assert!(out.status.success(), "{:?}", out);
+    assert_ne!(sb.pid(), Some(old));
+    // The same session on the new engine is no change.
+    assert!(
+        lines.recv_timeout(Duration::from_secs(5)).is_err(),
+        "watch printed a line for an unchanged session"
+    );
+
+    d.end_session();
+    let stopped: Value =
+        serde_json::from_str(&lines.recv_timeout(Duration::from_secs(30)).unwrap()).unwrap();
+    assert_eq!(stopped["event"], "stopped", "{}", stopped);
+}

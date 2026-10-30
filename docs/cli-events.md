@@ -95,6 +95,24 @@ build is about ten times slower). `--timeout` is exact even while a poll is
 running. With a timeout shorter than one poll, `wait` exits `124` before it
 can check the session.
 
+## Engine builds (`--features engine`, not released)
+
+In an engine build, `list`, `status`, `self`, `watch` and `wait` are clients
+of the c9 engine. They auto-start it and read its sessions (`session.list`;
+`snapshot.get`, then `events.subscribe` from its cursor for `watch` and
+`wait`). The event lines keep the fields above. The differences:
+
+- `session` is the engine's row (c9p/1 `AgentRow`, `docs/api/c9p-1.json`),
+  and `pendingToolName` is not known.
+- Lines follow the engine's events, so `--interval` does not apply.
+- After an `engine restart`, `watch` and `wait` reconnect and go on; a
+  session that did not change prints nothing.
+- `--direct` keeps in-process detection and the output above. A caller with
+  `C9_AGENT_ID` set (inside an engine agent) gets `--direct` without asking
+  and never starts the engine.
+- When no engine answers and none can start, the command exits `1` with
+  `engine_unreachable` and a hint to use `--direct`.
+
 ## Shell example: notify me when a session needs me
 
 ```bash

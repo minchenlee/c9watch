@@ -1,0 +1,32 @@
+{
+  "exit": 0,
+  "stderr": [],
+  "stdout": [
+    {
+      "diagnostics": {
+        "claudeProcessesFound": 0,
+        "fdaLikelyNeeded": false,
+        "hiddenClaudeSessions": [],
+        "processesWithCwd": 0
+      },
+      "sessions": [
+        {
+          "agentKind": "root",
+          "canOpen": true,
+          "canRename": true,
+          "canStop": true,
+          "id": "11111111-2222-3333-4444-555555555555",
+          "kind": "interactive",
+          "pid": "<PID>",
+          "projectPath": "<ROOT>/work/proj",
+          "provider": "claudeCode",
+          "sessionKey": "claudeCode:11111111-2222-3333-4444-555555555555",
+          "sessionName": "proj",
+          "sourceHealth": "partial",
+          "status": "Connecting",
+          "surface": "claudeCode"
+        }
+      ]
+    }
+  ]
+}
