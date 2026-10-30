@@ -32,9 +32,9 @@
 //!   run X14 one agent rewrote another agent's `settings.json` with a Bash
 //!   redirect. Rules built at spawn cannot name a later agent, so
 //!   `agent.create` takes one cwd at a time (M7 reviews H1).
-//! - Layer 1 also denies, for every agent, `~/.claude`, `~/.claude.json`
-//!   and every `.claude/` (`STATIC_DENY`), and the store and machine key
-//!   in both layers (M7 reviews M3, M4).
+//! - Both layers also cover the store and machine key (M7 reviews M3).
+//!   The owner's `~/.claude`, `~/.claude.json` and CLAUDE.md are left to
+//!   CC's own sandbox and auto-mode classifier (owner, 2026-10-30).
 //! - The env carries only `C9_AGENT_ID`, `C9_AGENT_GEN` and
 //!   `C9_ENGINE_SOCK`, none of them a secret. There is no `C9_AGENT_TOKEN`
 //!   (D28 Q6=B) and no `C9_STANDING_ORDERS` (spike `c0-engine.rs:407`):
@@ -276,21 +276,6 @@ pub fn engine_files(p: &Profile) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Layer-1 rules that do not depend on which agents are live (M7 reviews
-/// H1, M4). CC does not sandbox its file tools, so without them a Write
-/// outside the cwd meets only the auto-mode classifier:
-/// - `~/.claude/**` and `~/.claude.json`: the user source and MCP config of
-///   the owner's next CC session, whose hooks run unsandboxed.
-/// - `//**/.claude/**`: every other `.claude/` (a peer agent's, another
-///   repo's), whenever it was created. The `**` glob in an absolute rule is
-///   not live-verified (plan §6 item 6), so the create gate
-///   (`create::other_live_cwd`) does not rely on it.
-pub const STATIC_DENY: &[&str] = &[
-    "Edit(~/.claude/**)",
-    "Edit(~/.claude.json)",
-    "Edit(//**/.claude/**)",
-];
-
 /// Layer 1, deny rules for CC's own file tools. `Edit` covers every file
 /// tool; CC 2.1.312 warns that a `Write(path)` rule is not matched by file
 /// permission checks. Paths use the `//abs` form: CC roots `//x` at `/`,
@@ -314,7 +299,9 @@ pub const STATIC_DENY: &[&str] = &[
 ///    must not rewrite another agent's settings, which CC hot-reloads.
 ///    Only the agents live at this spawn; `create` therefore refuses a
 ///    second cwd while an agent is live (M7 reviews H1).
-/// 5. `STATIC_DENY`: the user's `~/.claude` and every other `.claude/`.
+///
+/// No rule names the owner's `~/.claude` or `~/.claude.json`: CC's own
+/// sandbox and auto-mode classifier guard them (owner, 2026-10-30).
 ///
 /// Layer 2 is `sandbox.filesystem.denyWrite` (`deny_write`) and layer 3
 /// `allowUnsandboxedCommands:false` (`settings`). No layer is enough alone.
@@ -337,7 +324,6 @@ pub fn deny_rules(p: &Profile) -> Vec<String> {
         );
         v.push(format!("Edit(/{}/.claude/**)", cwd));
     }
-    v.extend(STATIC_DENY.iter().map(|r| r.to_string()));
     v
 }
 
@@ -892,9 +878,6 @@ mod tests {
             format!("Edit(/{}/.claude/settings.json)", cwd),
             format!("Edit(/{}/.claude/settings.local.json)", cwd),
             format!("Edit(/{}/.claude/**)", cwd),
-            "Edit(~/.claude/**)".into(),
-            "Edit(~/.claude.json)".into(),
-            "Edit(//**/.claude/**)".into(),
         ]);
         assert_eq!(s["permissions"]["deny"], json!(want));
         // Layer 2: sandbox.filesystem.denyWrite, the same places.
@@ -919,10 +902,10 @@ mod tests {
         );
     }
     #[test]
-    fn engine_store_and_owner_claude_are_denied() {
-        // M7 reviews M3, M4: the store, the machine key and the owner's
-        // ~/.claude are outside the cwd, where the file tools meet only the
-        // classifier.
+    fn engine_store_is_denied_and_owner_claude_is_not() {
+        // M7 reviews M3: the store and the machine key are outside the cwd,
+        // where the file tools meet only the classifier. The owner's
+        // ~/.claude is left to CC (owner, 2026-10-30).
         let t = tempfile::tempdir().unwrap();
         let p = p_in(t.path());
         let deny = deny_rules(&p);
@@ -933,11 +916,8 @@ mod tests {
             assert!(dw.contains(&path), "{:?}", dw);
         }
         assert!(!dw.iter().any(|d| d.ends_with(".sock")));
-        for r in STATIC_DENY {
-            assert!(deny.contains(&r.to_string()), "{}", r);
-        }
-        // The static rules hold for an agent with no peers too.
-        assert!(p.peers.is_empty());
+        assert!(!deny.iter().any(|r| r.contains("~/.claude")), "{:?}", deny);
+        assert!(!deny.iter().any(|r| r.contains("//**/")), "{:?}", deny);
     }
 
     #[cfg(feature = "live-test")]
