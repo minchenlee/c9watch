@@ -26,6 +26,8 @@ mod session_ref;
 #[cfg(all(unix, feature = "engine"))]
 pub mod engine_client;
 #[cfg(all(unix, feature = "engine"))]
+pub mod engine_send;
+#[cfg(all(unix, feature = "engine"))]
 pub mod engine_sessions;
 #[cfg(all(unix, feature = "engine"))]
 pub mod engine_spawn;
@@ -403,7 +405,7 @@ pub enum Commands {
         #[arg(long)]
         add_dir: Vec<String>,
         /// Initial prompt sent at spawn time. REQUIRED for bg backend (CC >= 2.1.150).
-        /// PrintBackend ignores this — prompts come via `c9watch send` after spawn.
+        /// The only prompt a managed worker gets: `c9watch send` mails engine agents only.
         #[arg(long)]
         prompt: Option<String>,
 
@@ -411,21 +413,12 @@ pub enum Commands {
         mode: SpawnModeArgs,
     },
 
-    /// Send a message to a spawned worker session
-    #[cfg(feature = "pm-orchestration")]
-    Send {
-        session_id: String,
-        #[arg(long)]
-        message: Option<String>,
-        #[arg(long)]
-        stdin: bool,
-        #[arg(long)]
-        file: Option<String>,
-        #[arg(long)]
-        wait: bool,
-        #[arg(long, default_value = "300")]
-        timeout: u64,
-    },
+    /// Mail an engine agent: it reads the message as its next prompt.
+    /// Prints `{"msg": ...}`; with `--wait`, a second line once the agent's
+    /// turn after the message ended. Exit codes: 0 sent (answered), 1 an
+    /// engine error or not delivered, 2 `--wait` timed out
+    #[cfg(all(unix, feature = "engine"))]
+    Send(engine_send::SendArgs),
 
     /// List workers spawned by c9watch
     #[cfg(feature = "pm-orchestration")]
@@ -642,15 +635,12 @@ pub fn run(cli: Cli) {
             &mode,
             cli.pretty,
         ),
-        #[cfg(feature = "pm-orchestration")]
-        Commands::Send {
-            session_id,
-            message,
-            stdin,
-            file,
-            wait,
-            timeout,
-        } => pm::cmd_send(session_id, message, stdin, file, wait, timeout, cli.pretty),
+        #[cfg(all(unix, feature = "engine"))]
+        Commands::Send(args) => match engine_send::cmd_send(&args, cli.pretty) {
+            Ok(0) => Ok(()),
+            Ok(code) => process::exit(code),
+            Err(e) => Err(e),
+        },
         #[cfg(feature = "pm-orchestration")]
         Commands::Workers { all } => pm::cmd_workers(all, cli.pretty),
         #[cfg(feature = "pm-orchestration")]

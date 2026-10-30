@@ -29,38 +29,6 @@ fn callback_inbox_hint(worker_session_id: &str) -> String {
     format!("~/.claude/c9watch/inbox/{}/", worker_session_id)
 }
 
-// ── `send --wait` response shapes ─────────────────────────────────────────────
-//
-// Shared by the Bg and Print branches of `handle_send` so the
-// `turnCompleted` / `WORKER_CRASHED` contract is defined once.
-
-fn turn_completed_json(
-    full_id: &str,
-    assistant_text: &str,
-    ended_at: &str,
-    callback_inbox: &str,
-) -> serde_json::Value {
-    serde_json::json!({
-        "ok": true,
-        "sessionId": full_id,
-        "sent": true,
-        "turnCompleted": true,
-        "assistantText": assistant_text,
-        "endedAt": ended_at,
-        "callbackInbox": callback_inbox,
-    })
-}
-
-fn turn_timeout_json(full_id: &str, callback_inbox: &str) -> serde_json::Value {
-    serde_json::json!({
-        "ok": true,
-        "sessionId": full_id,
-        "sent": true,
-        "turnCompleted": false,
-        "callbackInbox": callback_inbox,
-    })
-}
-
 /// Per-worker entry shared by `handle_list` and `handle_workers_all`.
 fn worker_json(session_id: &str, alive: bool, meta: &pm_fs::WorkerMeta) -> serde_json::Value {
     serde_json::json!({
@@ -72,15 +40,6 @@ fn worker_json(session_id: &str, alive: bool, meta: &pm_fs::WorkerMeta) -> serde
         "spawnedBy": meta.spawned_by,
         "pmPid": meta.pm_pid,
         "alive": alive,
-    })
-}
-
-fn worker_crashed_json(full_id: &str, callback_inbox: &str) -> serde_json::Value {
-    serde_json::json!({
-        "ok": false,
-        "error": "WORKER_CRASHED",
-        "sessionId": full_id,
-        "callbackInbox": callback_inbox,
     })
 }
 
@@ -344,12 +303,6 @@ async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>, m
             let ctx = SpawnContext { spawned_by, pm_pid };
             handle_spawn(state, args, ctx, initial_prompt, max_workers).await
         }
-        RpcRequest::Send {
-            session_id,
-            text,
-            wait,
-            timeout_ms,
-        } => handle_send(state, session_id, text, wait, timeout_ms).await,
         RpcRequest::List => handle_list(state).await,
         RpcRequest::Stop { session_id } => handle_stop(state, session_id).await,
         RpcRequest::Shutdown => handle_shutdown(state).await,
@@ -458,7 +411,7 @@ async fn handle_spawn(
     let canonical_cwd = args.cwd.clone();
 
     // Validate the initial prompt against the selected backend. Bg backend
-    // requires a non-empty prompt; Print backend ignores it.
+    // requires a non-empty prompt; Print backend takes it when given.
     let backend = select_backend();
     let resolved_prompt = match validate_initial_prompt(backend, initial_prompt) {
         Ok(p) => p,
@@ -475,10 +428,12 @@ async fn handle_spawn(
                 Err(e) => return err_response(&e),
             }
         }
-        BackendKind::Print => match WorkerHandle::spawn(session_id.clone(), args, ctx).await {
-            Ok(w) => AnyWorkerHandle::Print(w),
-            Err(e) => return err_response(&e),
-        },
+        BackendKind::Print => {
+            match WorkerHandle::spawn(session_id.clone(), args, ctx, resolved_prompt).await {
+                Ok(w) => AnyWorkerHandle::Print(w),
+                Err(e) => return err_response(&e),
+            }
+        }
     };
 
     let pid = worker.meta().pid;
@@ -542,140 +497,6 @@ async fn handle_spawn(
         "spawnedBy": spawned_by,
         "callbackInbox": callback_inbox,
     })
-}
-
-async fn handle_send(
-    state: Arc<Mutex<DaemonState>>,
-    session_id: String,
-    text: String,
-    wait: bool,
-    timeout_ms: u64,
-) -> serde_json::Value {
-    // Resolve the full session ID and send the message while holding the lock
-    let full_id = {
-        let st = state.lock().await;
-        match resolve_worker_id(&st.workers, &session_id) {
-            Ok(id) => id,
-            Err(e) => return err_response(&e),
-        }
-    };
-
-    // Send the message under the lock, then release it before awaiting the
-    // turn result so other RPCs aren't blocked for up to `timeout_ms`.
-    //
-    // For Bg backend: no mpsc receiver to take — `wait_for_turn` consumes the
-    // subscribe broadcast directly. We branch below.
-    let (rx_opt, callback_inbox, is_bg) = {
-        let mut st = state.lock().await;
-        let worker = match st.workers.get_mut(&full_id) {
-            Some(w) => w,
-            None => return err_response("WORKER_NOT_FOUND"),
-        };
-        if let Err(e) = worker.send_message(&text).await {
-            return err_response(&e);
-        }
-        let callback_inbox = callback_inbox_hint(&full_id);
-        let is_bg = matches!(worker, AnyWorkerHandle::Bg(_));
-        let rx = if wait && timeout_ms > 0 && !is_bg {
-            match worker.take_result_receiver() {
-                Some(r) => Some(r),
-                None => {
-                    return err_response(
-                        "SEND_BUSY: another --wait is already pending for this worker",
-                    );
-                }
-            }
-        } else {
-            None
-        };
-        (rx, callback_inbox, is_bg)
-    };
-
-    if !wait || timeout_ms == 0 {
-        return serde_json::json!({
-            "ok": true,
-            "sessionId": full_id,
-            "sent": true,
-            "callbackInbox": callback_inbox,
-        });
-    }
-
-    let timeout = Duration::from_millis(timeout_ms);
-
-    if is_bg {
-        // Bg backend: there is no mpsc receiver — `wait_for_turn` consumes
-        // events from the broadcast subscribe channel that lives on the
-        // BgWorkerHandle. To avoid holding the daemon state lock across a
-        // potentially long await (which would block all other RPCs for up
-        // to `timeout_ms`), the wait_for_turn future runs UNDER the lock.
-        //
-        // This is a known concern: we accept that Bg --wait serializes the
-        // daemon during the wait. Acceptable because the bg worker can only
-        // service one prompt at a time anyway, so concurrent --wait against
-        // the same worker would race regardless. Print backend remains lock-
-        // free via the receiver-take pattern.
-        let mut st = state.lock().await;
-        let worker = match st.workers.get_mut(&full_id) {
-            Some(w) => w,
-            None => return err_response("WORKER_CRASHED"),
-        };
-        let result = worker.wait_for_turn(timeout).await;
-        let still_alive = worker.is_alive();
-        drop(st);
-
-        return match result {
-            Ok(turn) => turn_completed_json(
-                &full_id,
-                &turn.assistant_text,
-                &turn.ended_at,
-                &callback_inbox,
-            ),
-            Err(e) if e == "WAIT_TIMEOUT" && !still_alive => {
-                worker_crashed_json(&full_id, &callback_inbox)
-            }
-            Err(e) if e == "WAIT_TIMEOUT" => turn_timeout_json(&full_id, &callback_inbox),
-            Err(e) => serde_json::json!({
-                "ok": false,
-                "error": e,
-                "sessionId": full_id,
-            }),
-        };
-    }
-
-    // Print backend: existing receiver-based wait path.
-    // rx_opt is Some here because wait && timeout_ms > 0 && !is_bg
-    let mut rx = rx_opt.expect("rx must be Some when wait && timeout_ms > 0 && !is_bg");
-
-    // Await the turn result WITHOUT holding the state lock
-    let turn_result = tokio::time::timeout(timeout, rx.recv()).await;
-
-    // Return the receiver (and peek worker liveness) so the worker can be used
-    // for future --wait calls, and so we can distinguish a genuine timeout
-    // from a worker crash (M2).
-    let still_alive = {
-        let mut st = state.lock().await;
-        if let Some(worker) = st.workers.get_mut(&full_id) {
-            worker.return_result_receiver(rx);
-            worker.is_alive()
-        } else {
-            false
-        }
-    };
-
-    match turn_result {
-        Ok(Some(turn)) => turn_completed_json(
-            &full_id,
-            &turn.assistant_text,
-            &turn.ended_at,
-            &callback_inbox,
-        ),
-        Ok(None) => serde_json::json!({
-            "ok": false,
-            "error": "result channel closed — worker stdout tee task exited",
-        }),
-        Err(_timeout) if !still_alive => worker_crashed_json(&full_id, &callback_inbox),
-        Err(_timeout) => turn_timeout_json(&full_id, &callback_inbox),
-    }
 }
 
 async fn handle_list(state: Arc<Mutex<DaemonState>>) -> serde_json::Value {
@@ -817,8 +638,8 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     // Reject empty prefix — otherwise `"".starts_with("")` would match every
-    // worker and `c9watch send "" --message ...` would silently target the
-    // sole live worker.
+    // worker and `c9watch stop ""` would silently target the sole live
+    // worker.
     if prefix.is_empty() {
         return Err("worker id/prefix required".to_string());
     }
@@ -1114,56 +935,6 @@ fn resolve_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn turn_completed_json_shape() {
-        let v = turn_completed_json("sid-1", "hello", "2026-01-01T00:00:00Z", "~/inbox/sid-1/");
-        assert_eq!(
-            v,
-            serde_json::json!({
-                "ok": true,
-                "sessionId": "sid-1",
-                "sent": true,
-                "turnCompleted": true,
-                "assistantText": "hello",
-                "endedAt": "2026-01-01T00:00:00Z",
-                "callbackInbox": "~/inbox/sid-1/",
-            })
-        );
-        assert_eq!(
-            v.to_string(),
-            r#"{"assistantText":"hello","callbackInbox":"~/inbox/sid-1/","endedAt":"2026-01-01T00:00:00Z","ok":true,"sent":true,"sessionId":"sid-1","turnCompleted":true}"#
-        );
-    }
-
-    #[test]
-    fn turn_timeout_json_shape() {
-        let v = turn_timeout_json("sid-1", "~/inbox/sid-1/");
-        assert_eq!(
-            v,
-            serde_json::json!({
-                "ok": true,
-                "sessionId": "sid-1",
-                "sent": true,
-                "turnCompleted": false,
-                "callbackInbox": "~/inbox/sid-1/",
-            })
-        );
-    }
-
-    #[test]
-    fn worker_crashed_json_shape() {
-        let v = worker_crashed_json("sid-1", "~/inbox/sid-1/");
-        assert_eq!(
-            v,
-            serde_json::json!({
-                "ok": false,
-                "error": "WORKER_CRASHED",
-                "sessionId": "sid-1",
-                "callbackInbox": "~/inbox/sid-1/",
-            })
-        );
-    }
 
     #[test]
     fn resolve_worker_id_rejects_empty_prefix() {

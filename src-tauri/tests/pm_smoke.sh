@@ -5,23 +5,25 @@ set -euo pipefail
 
 C9W="${C9W:-./target/debug/c9watch}"
 
+# A worker takes its only prompt at spawn (`c9watch send` mails engine
+# agents, not workers). Wait up to 60 s for an event file under the inbox
+# dir $1.
+wait_for_event() {
+    for _ in $(seq 60); do
+        if find "$1" -maxdepth 1 -name '*.json' 2>/dev/null | grep -q .; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 echo "=== Test 1: c9watch spawn --help works ==="
 $C9W spawn --help | grep -q "permission-mode" && echo "PASS" || { echo "FAIL"; exit 1; }
-
-echo "=== Test 2: c9watch send --help works ==="
-$C9W send --help | grep -q "wait" && echo "PASS" || { echo "FAIL"; exit 1; }
 
 echo "=== Test 3: c9watch workers returns empty list ==="
 OUT=$($C9W workers)
 echo "$OUT" | jq -e '.ok == true' > /dev/null && echo "PASS" || { echo "FAIL: $OUT"; exit 1; }
-
-echo "=== Test 4: c9watch send to nonexistent session fails ==="
-if $C9W send nonexistent-uuid --message "hello" 2>/dev/null; then
-  echo "FAIL: should have errored"
-  exit 1
-else
-  echo "PASS"
-fi
 
 echo "=== Test 5: spawnedBy in workers listing is not hardcoded ==="
 FAKE_PID=$$
@@ -64,7 +66,8 @@ echo "{\"pid\":${FAKE_PID6},\"sessionId\":\"${FAKE_SID6}\",\"cwd\":\"/tmp\",\"st
 $C9W inbox --pm-id "$FAKE_SID6" --clear >/dev/null 2>&1 || true
 
 TMP_CWD6=$(mktemp -d)
-SPAWN_OUT6=$($C9W spawn --cwd "$TMP_CWD6" --name smoke-inbox 2>/dev/null || true)
+SPAWN_OUT6=$($C9W spawn --cwd "$TMP_CWD6" --name smoke-inbox \
+    --prompt "Say ready then stop." 2>/dev/null || true)
 WORKER_ID6=$(echo "$SPAWN_OUT6" | jq -r .sessionId 2>/dev/null || echo "")
 
 cleanup_test6() {
@@ -85,15 +88,11 @@ else
         exit 1
     fi
 
-    # Send a trivial message so the worker produces a result event
-    $C9W send "$WORKER_ID6" --message "Say ready then stop." --wait --timeout 60 >/dev/null 2>&1 || true
-
-    # Give the stdout tee a moment to flush the inbox file
-    sleep 1
-
     # Read directly from worker-keyed inbox dir (the CLI `c9watch inbox` now
-    # requires a real CC ancestor PID chain we can't fake from bash).
+    # requires a real CC ancestor PID chain we can't fake from bash). The
+    # spawn prompt's turn writes the event.
     INBOX_DIR="$HOME/.claude/c9watch/inbox/${WORKER_ID6}"
+    wait_for_event "$INBOX_DIR" || true
     EVENT_FILE=$(find "$INBOX_DIR" -maxdepth 1 -name '*.json' 2>/dev/null | head -1 || true)
     if [ -z "$EVENT_FILE" ]; then
         echo "FAIL Test 6: no event file under $INBOX_DIR"
@@ -130,7 +129,8 @@ echo "{\"pid\":${FAKE_PID8},\"sessionId\":\"${FAKE_SID8_A}\",\"cwd\":\"/tmp\",\"
     > "$FAKE_SESSION_FILE8"
 
 TMP_CWD8=$(mktemp -d)
-SPAWN_OUT8=$($C9W spawn --cwd "$TMP_CWD8" --name smoke-clear 2>/dev/null || true)
+SPAWN_OUT8=$($C9W spawn --cwd "$TMP_CWD8" --name smoke-clear \
+    --prompt "Reply OK." 2>/dev/null || true)
 WORKER_ID8=$(echo "$SPAWN_OUT8" | jq -r .sessionId 2>/dev/null || echo "")
 
 cleanup_test8() {
@@ -144,10 +144,8 @@ trap cleanup_test8 EXIT
 if [ -z "$WORKER_ID8" ] || [ "$WORKER_ID8" = "null" ]; then
     echo "SKIP (needs claude CLI for actual spawn)"
 else
-    $C9W send "$WORKER_ID8" --message "Reply OK." --wait --timeout 60 >/dev/null 2>&1 || true
-    sleep 1
-
     WORKER_INBOX="$HOME/.claude/c9watch/inbox/${WORKER_ID8}"
+    wait_for_event "$WORKER_INBOX" || true
     COUNT8=$(find "$WORKER_INBOX" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
     if [ "$COUNT8" -lt 1 ]; then
         echo "FAIL Test 8: no event under worker inbox $WORKER_INBOX"
@@ -262,7 +260,7 @@ echo ""
 echo "To run the full integration test (requires claude CLI + API access):"
 echo "  export C9W=./target/debug/c9watch"
 echo "  TMPDIR=\$(mktemp -d)"
-echo "  WORKER=\$(\$C9W spawn --cwd \$TMPDIR --name test-worker | jq -r .sessionId)"
-echo "  \$C9W send \$WORKER --message 'Reply with exactly: PONG' --wait --timeout 60"
+echo "  WORKER=\$(\$C9W spawn --cwd \$TMPDIR --name test-worker --prompt 'Reply with exactly: PONG' | jq -r .sessionId)"
+echo "  ls ~/.claude/c9watch/inbox/\$WORKER/   # the turn's event, within a minute"
 echo "  \$C9W workers --pretty"
 echo "  \$C9W view \$WORKER --pretty"

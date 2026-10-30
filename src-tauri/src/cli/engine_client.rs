@@ -181,6 +181,17 @@ impl EngineConn {
 
     /// Send one request and read its response.
     pub fn call(&mut self, method: &str, params: serde_json::Value) -> Result<Response, String> {
+        self.call_idem(method, params, None)
+    }
+
+    /// `call` with the envelope's `idem` key, which makes a resend safe for
+    /// a method that honours it (`msg.send`).
+    pub fn call_idem(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        idem: Option<&str>,
+    ) -> Result<Response, String> {
         let id = self.next_id.to_string();
         self.next_id += 1;
         let req = Request {
@@ -188,7 +199,7 @@ impl EngineConn {
             id: Some(id),
             method: Some(method.to_string()),
             params,
-            idem: None,
+            idem: idem.map(str::to_string),
         };
         let mut line =
             serde_json::to_vec(&req).map_err(|e| format!("Failed to encode the request: {}", e))?;

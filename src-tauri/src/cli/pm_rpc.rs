@@ -25,13 +25,6 @@ pub enum RpcRequest {
         #[serde(rename = "initialPrompt", default)]
         initial_prompt: Option<String>,
     },
-    #[serde(rename = "send")]
-    Send {
-        session_id: String,
-        text: String,
-        wait: bool,
-        timeout_ms: u64,
-    },
     #[serde(rename = "list")]
     List,
     #[serde(rename = "stop")]
@@ -264,27 +257,6 @@ mod tests {
         assert!(
             json.contains("\"pmPid\":42"),
             "should contain pmPid, got: {}",
-            json
-        );
-    }
-
-    #[test]
-    fn test_send_request_serializes() {
-        let req = RpcRequest::Send {
-            session_id: "abc-123".to_string(),
-            text: "Hello, worker!".to_string(),
-            wait: true,
-            timeout_ms: 30_000,
-        };
-        let json = serde_json::to_string(&req).expect("serialize should succeed");
-        assert!(
-            json.contains("\"op\":\"send\""),
-            "should contain op:send, got: {}",
-            json
-        );
-        assert!(
-            json.contains("\"wait\":true"),
-            "should contain wait:true, got: {}",
             json
         );
     }
