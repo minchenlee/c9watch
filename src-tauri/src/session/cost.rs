@@ -4,7 +4,8 @@ use super::project_name_from_path;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Per-model pricing in USD per million tokens.
 struct ModelPricing {
@@ -384,6 +385,10 @@ pub struct ModelCost {
 /// Bump this when pricing or token counting logic changes to force cache rebuild.
 const CACHE_VERSION: u32 = 6;
 
+/// Threads that scan changed transcripts. Each holds one parsed line at a
+/// time, so this bounds parallel I/O rather than memory.
+const COST_SCAN_WORKERS: usize = 4;
+
 /// Cache structure stored at ~/.claude/cost-cache.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CostCache {
@@ -416,10 +421,11 @@ fn date_from_timestamp(ts: &str) -> String {
 
 /// Scan a single JSONL file and return per-(session, date) cost records.
 fn scan_file(path: &std::path::Path) -> Vec<SessionCostRecord> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return vec![],
+    // Stream line by line: a live transcript can be hundreds of MB.
+    let Ok(file) = std::fs::File::open(path) else {
+        return vec![];
     };
+    let lines = std::io::BufRead::lines(std::io::BufReader::new(file)).map_while(Result::ok);
 
     // Group entries by (session_id, date) in a single pass, and collect session name info
     let mut by_key: HashMap<(String, String), Vec<UsageEntry>> = HashMap::new();
@@ -427,8 +433,8 @@ fn scan_file(path: &std::path::Path) -> Vec<SessionCostRecord> {
     let mut custom_titles: HashMap<String, String> = HashMap::new();
     let mut first_user_msg: HashMap<String, String> = HashMap::new();
 
-    for line in content.lines() {
-        match parse_line(line) {
+    for line in lines {
+        match parse_line(&line) {
             Some(ParsedLine::Usage(entry)) => {
                 if !entry.session_id.is_empty() {
                     let sid = entry.session_id.clone();
@@ -671,25 +677,32 @@ pub fn get_cost_data() -> Result<CostData, String> {
         // We need to identify which sessions came from which file.
         // Since we don't track that, re-scan all changed files and
         // remove sessions whose session_id appears in the new scan.
+        // A few workers share the file list, so only a few transcripts are
+        // in memory at once, whatever the number of changed files.
         let new_records: Vec<SessionCostRecord> = {
-            let matched: Arc<Mutex<Vec<SessionCostRecord>>> = Arc::new(Mutex::new(Vec::new()));
-            let handles: Vec<_> = files_to_scan
-                .iter()
-                .map(|(_, path)| {
-                    let matched = Arc::clone(&matched);
-                    let path = path.clone();
-                    std::thread::spawn(move || {
-                        let records = scan_file(&path);
-                        let mut guard = matched.lock().unwrap();
-                        guard.extend(records);
+            let matched: Mutex<Vec<SessionCostRecord>> = Mutex::new(Vec::new());
+            let next = AtomicUsize::new(0);
+            let workers = std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(COST_SCAN_WORKERS);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            while let Some((_, path)) =
+                                files_to_scan.get(next.fetch_add(1, Ordering::Relaxed))
+                            {
+                                let records = scan_file(path);
+                                matched.lock().unwrap().extend(records);
+                            }
+                        })
                     })
-                })
-                .collect();
-            for h in handles {
-                let _ = h.join();
-            }
-            Arc::try_unwrap(matched)
-                .map_err(|_| "Arc unwrap failed")?
+                    .collect();
+                for h in handles {
+                    let _ = h.join();
+                }
+            });
+            matched
                 .into_inner()
                 .map_err(|e| format!("Mutex poisoned: {e}"))?
         };

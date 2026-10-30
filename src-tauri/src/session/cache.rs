@@ -23,42 +23,91 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 const HASH_LANES: usize = 8;
 
+/// Upper bound on the line bytes one `LineBatches` batch holds. Callers parse
+/// a batch before asking for the next one, so a cold read of an 800 MB live
+/// transcript costs about one batch of memory instead of the whole file.
+pub(crate) const LINE_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
 /// Reads non-empty JSONL lines starting at `offset` bytes into the file, up
-/// to EOF. Returns the lines plus the byte offset immediately after the last
-/// *complete* line consumed.
+/// to EOF, in batches of about `LINE_BATCH_BYTES`. `consumed` is the byte
+/// offset immediately after the last *complete* line read so far.
 ///
 /// A trailing line with no terminating newline (the file was read mid-write)
-/// is left unconsumed rather than parsed: its bytes are not counted in the
-/// returned offset, so the next call re-reads it from the start once it's
+/// is left unconsumed rather than parsed: its bytes are not counted in
+/// `consumed`, so the next read re-reads it from the start once it's
 /// actually complete, instead of an incremental reader silently resuming
 /// from the middle of a line.
-///
-/// Shared by any incremental, offset-tracking file cache (subagent
-/// detection, message counting); a full read is just `offset: 0`.
-pub(crate) fn read_lines_from_offset(path: &Path, offset: u64) -> io::Result<(Vec<String>, u64)> {
-    let mut file = fs::File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut reader = BufReader::new(file);
-    let mut lines = Vec::new();
-    let mut consumed = offset;
-    let mut buf = String::new();
-    loop {
-        buf.clear();
-        let n = reader.read_line(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        if !buf.ends_with('\n') {
-            // Incomplete trailing line — stop without consuming it.
-            break;
-        }
-        consumed += n as u64;
-        let trimmed = buf.trim_end_matches(['\n', '\r']);
-        if !trimmed.trim().is_empty() {
-            lines.push(trimmed.to_string());
-        }
+pub(crate) struct LineBatches {
+    reader: BufReader<fs::File>,
+    consumed: u64,
+    done: bool,
+}
+
+impl LineBatches {
+    pub(crate) fn open(path: &Path, offset: u64) -> io::Result<Self> {
+        let mut file = fs::File::open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        Ok(Self {
+            reader: BufReader::new(file),
+            consumed: offset,
+            done: false,
+        })
     }
-    Ok((lines, consumed))
+
+    pub(crate) fn consumed(&self) -> u64 {
+        self.consumed
+    }
+
+    /// The next batch, or `None` at EOF (or at an incomplete trailing line).
+    pub(crate) fn next_batch(&mut self) -> io::Result<Option<Vec<String>>> {
+        let mut lines = Vec::new();
+        let mut bytes = 0;
+        let mut buf = String::new();
+        while !self.done && bytes < LINE_BATCH_BYTES {
+            buf.clear();
+            let n = self.reader.read_line(&mut buf)?;
+            if n == 0 || !buf.ends_with('\n') {
+                // EOF, or an incomplete trailing line — stop without consuming it.
+                self.done = true;
+                break;
+            }
+            self.consumed += n as u64;
+            bytes += n;
+            let trimmed = buf.trim_end_matches(['\n', '\r']);
+            if !trimmed.trim().is_empty() {
+                lines.push(trimmed.to_string());
+            }
+        }
+        Ok((bytes > 0).then_some(lines))
+    }
+
+    /// Folds every remaining batch into `value`.
+    pub(crate) fn fold<T>(
+        &mut self,
+        mut value: T,
+        mut fold: impl FnMut(T, &[String]) -> T,
+    ) -> io::Result<T> {
+        while let Some(batch) = self.next_batch()? {
+            value = fold(value, &batch);
+        }
+        Ok(value)
+    }
+}
+
+/// `build` over the first batch of `path`, then `fold` over each later one,
+/// so a cold read holds one batch at a time. Returns the value and the
+/// offset after the last complete line.
+pub(crate) fn build_from_line_batches<T>(
+    path: &Path,
+    build: impl FnOnce(&[String]) -> T,
+    fold: impl FnMut(T, &[String]) -> T,
+) -> io::Result<(T, u64)> {
+    let mut batches = LineBatches::open(path, 0)?;
+    let first = batches.next_batch()?.unwrap_or_default();
+    let value = build(&first);
+    drop(first);
+    let value = batches.fold(value, fold)?;
+    Ok((value, batches.consumed()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,7 +381,7 @@ pub(crate) fn refresh_incremental_entry<T>(
     stamp: FileVersion,
     now: Instant,
     build: impl FnOnce(&[String]) -> T,
-    fold: impl FnOnce(T, &[String]) -> T,
+    mut fold: impl FnMut(T, &[String]) -> T,
 ) -> Option<IncrementalEntry<T>> {
     if let Some(mut existing) = previous {
         if let Some(previous_prefix) = existing.prefix {
@@ -373,9 +422,11 @@ pub(crate) fn refresh_incremental_entry<T>(
                     existing.last_full_validation_at,
                     now,
                 ) {
-                    if let Ok((new_lines, new_offset)) =
-                        read_lines_from_offset(path, existing.offset)
-                    {
+                    let delta = LineBatches::open(path, existing.offset).and_then(|mut batches| {
+                        let value = batches.fold(existing.value, &mut fold)?;
+                        Ok((value, batches.consumed()))
+                    });
+                    if let Ok((value, new_offset)) = delta {
                         if let Ok(prefix) = extend_prefix_snapshot(
                             path,
                             existing.offset,
@@ -386,7 +437,7 @@ pub(crate) fn refresh_incremental_entry<T>(
                             return Some(IncrementalEntry {
                                 stamp,
                                 offset: new_offset,
-                                value: fold(existing.value, &new_lines),
+                                value,
                                 prefix: Some(prefix),
                                 next_full_verify_offset: if full_validation {
                                     next_full_verify_offset(new_offset)
@@ -409,11 +460,11 @@ pub(crate) fn refresh_incremental_entry<T>(
         }
     }
 
-    let (lines, offset) = read_lines_from_offset(path, 0).ok()?;
+    let (value, offset) = build_from_line_batches(path, build, fold).ok()?;
     Some(IncrementalEntry {
         stamp,
         offset,
-        value: build(&lines),
+        value,
         prefix: hash_file_prefix(path, offset).ok(),
         next_full_verify_offset: next_full_verify_offset(offset),
         last_full_validation_at: now,
@@ -513,7 +564,45 @@ pub(crate) fn has_strong_file_stamp(changed_nanos: u128, file_id: u64) -> bool {
 mod tests {
     use super::{can_incrementally_read, has_strong_file_stamp, FileVersion};
     use super::{hash_file_prefix, next_full_verify_offset, validate_cached_prefix};
+    use super::{LineBatches, LINE_BATCH_BYTES};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn line_batches_split_large_reads_and_keep_every_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("big.jsonl");
+        let line = format!("{{\"pad\":\"{}\"}}", "x".repeat(1000));
+        let count = 2 * LINE_BATCH_BYTES / line.len() + 10;
+        std::fs::write(&path, format!("{line}\n").repeat(count) + "\n{\"partial\"").unwrap();
+
+        let mut batches = LineBatches::open(&path, 0).unwrap();
+        let mut sizes = Vec::new();
+        while let Some(batch) = batches.next_batch().unwrap() {
+            assert!(batch.iter().all(|l| *l == line));
+            sizes.push(batch.len());
+        }
+
+        assert_eq!(sizes.len(), 3, "two full batches and a remainder");
+        // The blank line counts toward the offset but yields no entry, and
+        // the unterminated trailing line is left for the next read.
+        assert_eq!(sizes.iter().sum::<usize>(), count);
+        assert_eq!(batches.consumed(), ((line.len() + 1) * count + 1) as u64);
+    }
+
+    #[test]
+    fn line_batches_resume_from_offset() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("t.jsonl");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+
+        let mut batches = LineBatches::open(&path, 2).unwrap();
+        assert_eq!(
+            batches.next_batch().unwrap(),
+            Some(vec!["b".into(), "c".into()])
+        );
+        assert_eq!(batches.next_batch().unwrap(), None);
+        assert_eq!(batches.consumed(), 6);
+    }
 
     #[test]
     fn rejects_missing_or_seconds_only_metadata() {
