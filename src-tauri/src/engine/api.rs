@@ -1922,9 +1922,9 @@ mod tests {
     }
 
     /// Reviews: an agent's create or retire is `not_allowed` and audited,
-    /// also on an engine that cannot create.
+    /// also on an engine with no spawner.
     #[tokio::test]
-    async fn an_agent_may_not_create_or_retire_even_with_the_switch_off() {
+    async fn an_agent_may_not_create_or_retire_even_without_a_spawner() {
         let (_t, ctx, db) = ctx_db(as_agent("a7"));
         let (mut c, _) = Client::new(ctx).await;
         for (i, m) in ["agent.create", "agent.retire"].iter().enumerate() {

@@ -354,8 +354,11 @@ if [ -n "$CID" ]; then
 fi
 
 # --- cleanup through the test engine: retire A, then SIGTERM (drain).
-# Since C1a-35 the restart boot-resumes A: a real `claude --resume` that
-# gets no prompt, so it is outside MAX_PROMPTS. The retire below kills it.
+# Since C1a-35 the restart boot-resumes every agent the dead engine left
+# live: a real `claude --resume` that gets no prompt, so it is outside
+# MAX_PROMPTS. The retire below kills A; the SIGTERM drain pauses any B or
+# C still left, so they show as paused(drain) at a higher generation in
+# agents-final.json and agents-db.txt.
 if ! kill -0 "$EPID" 2>/dev/null; then
     log "restarting the test engine (it boot-resumes A; the retire kills it)"
     env C9WATCH_ENGINE_HOME="$H" "$C9" engine >"$WORK/engine2.log" 2>&1 &

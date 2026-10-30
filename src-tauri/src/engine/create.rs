@@ -329,7 +329,6 @@ impl Spawner {
         self
     }
 
-    /// Whether `agent.create` is switched on.
     /// The engine took a SessionStart hook of `agent_id`'s generation
     /// `gen`: one input of `ready` (D24.4).
     pub fn session_started(&self, agent_id: &str, gen: i64) {
