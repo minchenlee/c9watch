@@ -18,6 +18,7 @@ use c9watch_lib::engine::pty::NativePty;
 use c9watch_lib::engine::run::{run_until, EngineConfig};
 use c9watch_lib::engine::standing::header;
 use c9watch_lib::engine_proto::client::Conn;
+use c9watch_lib::engine_proto::wire::HOOK_METHODS;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -363,14 +364,25 @@ fn an_agent_running_another_binary_is_refused() {
     assert_eq!(rc, 1, "{}", out);
     assert!(out.contains("peer_not_authorized"), "{}", out);
     // The main binary's raw `api` escape hatch, from inside the agent, for
-    // `task.done` and for a hook.
-    for (method, params) in [
-        ("task.done", r#"{"agentId":"agt_t","report":"r","seq":"1"}"#),
+    // `task.done`, `agent.handoff` and every hook method (X17).
+    let mut calls = vec![
         (
-            "hook.stop",
-            r#"{"agentId":"agt_t","kind":"claude","seq":"2","input":{}}"#,
+            "task.done",
+            r#"{"agentId":"agt_t","report":"r","seq":"1"}"#.to_string(),
         ),
-    ] {
+        (
+            "agent.handoff",
+            r#"{"agentId":"agt_t","note":"n","seq":"2"}"#.to_string(),
+        ),
+    ];
+    for (i, method) in HOOK_METHODS.iter().enumerate() {
+        let params = format!(
+            r#"{{"agentId":"agt_t","kind":"claude","seq":"{}","input":{{}}}}"#,
+            i + 3
+        );
+        calls.push((*method, params));
+    }
+    for (method, params) in &calls {
         let cmd = format!(
             "env -u C9_AGENT_ID {}={} {} api {} '{}'",
             ENGINE_HOME_ENV,
@@ -383,16 +395,10 @@ fn an_agent_running_another_binary_is_refused() {
         assert_eq!(rc, 1, "{}: {}", method, out);
         assert!(out.contains("peer_not_authorized"), "{}: {}", method, out);
     }
-    let denials = engine.denials();
     let agent = format!("agent:{}", AGENT_ID);
-    assert_eq!(
-        denials,
-        vec![
-            (agent.clone(), "task.done".to_string()),
-            (agent.clone(), "task.done".to_string()),
-            (agent, "hook.stop".to_string()),
-        ]
-    );
+    let mut want = vec![(agent.clone(), "task.done".to_string())];
+    want.extend(calls.iter().map(|(m, _)| (agent.clone(), m.to_string())));
+    assert_eq!(engine.denials(), want);
 }
 
 /// Security review H1: `local-unverified` may retire (and create), but not

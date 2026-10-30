@@ -397,6 +397,8 @@ impl Spawner {
         let gen = self
             .write_row(&start, desc, principal, p.name.clone())
             .await?;
+        #[cfg(feature = "live-test")]
+        super::live_test::crash_after(Phase::Row);
         let start = Start { gen, ..start };
         let (reply, answer) = oneshot::channel();
         self.supervise(start, reply)?;
@@ -650,7 +652,10 @@ impl Spawner {
             return fail(e);
         }
         match self.write_pty(s, child) {
-            Ok(true) => {}
+            Ok(true) => {
+                #[cfg(feature = "live-test")]
+                super::live_test::crash_after(Phase::Pty);
+            }
             Ok(false) => return retired_meanwhile(driver),
             Err(e) => {
                 let _ = driver.kill();
@@ -699,7 +704,11 @@ impl Spawner {
             }
             if ready {
                 return match self.write_bound(s) {
-                    Ok(Some(row)) => Up::Ready(driver, Box::new(row), Box::new(screen)),
+                    Ok(Some(row)) => {
+                        #[cfg(feature = "live-test")]
+                        super::live_test::crash_after(Phase::Bound);
+                        Up::Ready(driver, Box::new(row), Box::new(screen))
+                    }
                     Ok(None) => retired_meanwhile(driver),
                     Err(e) => {
                         let _ = driver.kill();

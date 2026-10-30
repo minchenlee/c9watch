@@ -889,7 +889,7 @@ impl FreeAgents {
     }
 
     /// `c9watch <args>` in `<root>`, with the create switch on or off.
-    fn run(&self, sb: &Sandbox, args: &[&str], create: bool) -> Output {
+    fn cmd(&self, sb: &Sandbox, args: &[&str], create: bool) -> Command {
         let mut c = sb.cmd(args);
         c.env("PATH", &self.path)
             .current_dir(self.cwd.parent().unwrap());
@@ -898,7 +898,11 @@ impl FreeAgents {
         } else {
             c.env_remove("C9WATCH_EXPERIMENTAL_CREATE");
         }
-        c.output().unwrap()
+        c
+    }
+
+    fn run(&self, sb: &Sandbox, args: &[&str], create: bool) -> Output {
+        self.cmd(sb, args, create).output().unwrap()
     }
 
     /// Wait until no fake agent runs.
@@ -1052,4 +1056,296 @@ fn spawn_managed_needs_the_pm_build() {
         assert!(err.contains("--mode free"), "{args:?}: {err}");
     }
     assert!(!sb.engine.exists());
+}
+
+// ── C1a exit criteria X2, X9, X15 ───────────────────────────────────
+
+/// The `seq` of a `<machine>:<epoch>:<seq>` cursor.
+fn cursor_seq(cursor: &Value) -> i64 {
+    let c = cursor
+        .as_str()
+        .unwrap_or_else(|| panic!("no cursor: {cursor}"));
+    c.rsplit(':').next().unwrap().parse().unwrap()
+}
+
+/// X2: a subscriber process stopped with SIGSTOP while the engine writes a
+/// burst of events gets every one of them after SIGCONT, with contiguous
+/// seqs. The exit criterion stops it for 10 minutes; the stop here lasts
+/// seconds. What a long stop adds is a full socket buffer and a full write
+/// queue (64 frames), and the burst (~160 events of ~800 bytes from 40
+/// free agents created and retired) fills both, so the stream parks as it
+/// would over 10 minutes. `nc -U` is the subscriber: a plain process the
+/// test can stop.
+#[test]
+fn a_stopped_subscriber_gets_every_event_after_it_continues() {
+    let sb = Sandbox::new();
+    let fa = FreeAgents::new(&sb);
+    assert!(fa.run(&sb, &["api", "hello"], true).status.success());
+    let mut nc = Command::new("nc")
+        .arg("-U")
+        .arg(sock_path(&sb.engine))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(Reap)
+        .expect("nc is on PATH");
+    {
+        use std::io::Write;
+        let stdin = nc.stdin.as_mut().unwrap();
+        stdin
+            .write_all(
+                b"{\"v\":1,\"id\":\"h\",\"method\":\"hello\",\"params\":{}}\n\
+                  {\"v\":1,\"id\":\"s\",\"method\":\"events.subscribe\",\"params\":{}}\n",
+            )
+            .unwrap();
+    }
+    let lines = lines_of(&mut nc);
+    let next = |d: Duration| -> Option<Value> {
+        let line = lines.recv_timeout(d).ok()?;
+        Some(serde_json::from_str(&line).unwrap())
+    };
+    let hello = next(Duration::from_secs(10)).expect("hello answers");
+    assert_eq!(hello["ok"], true, "{hello}");
+    let sub = next(Duration::from_secs(10)).expect("subscribe answers");
+    assert_eq!(sub["id"], "s", "{sub}");
+    assert_eq!(sub["ok"], true, "{sub}");
+    let start = cursor_seq(&sub["result"]["cursor"]);
+
+    let pid = nc.id() as libc::pid_t;
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    let stopped = Instant::now();
+    // Each step runs 20 CLIs at once: 2 rounds of `spawn`, then a retire of
+    // every agent.
+    let all = |args: Vec<Vec<String>>| -> Vec<Output> {
+        let children: Vec<_> = args
+            .iter()
+            .map(|a| {
+                let a: Vec<&str> = a.iter().map(String::as_str).collect();
+                fa.cmd(&sb, &a, true)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        children
+            .into_iter()
+            .map(|c| c.wait_with_output().unwrap())
+            .collect()
+    };
+    let spawn: Vec<String> = ["spawn", "--mode", "free", "--cwd", "work"]
+        .map(String::from)
+        .into();
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        for out in all(vec![spawn.clone(); 20]) {
+            assert!(out.status.success(), "{:?} / log {}", out, sb.log());
+            ids.push(
+                stdout_json(&out)["agent"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+    }
+    for chunk in ids.chunks(20) {
+        let retire = chunk
+            .iter()
+            .map(|id| {
+                let params = format!(r#"{{"id":"{}"}}"#, id);
+                vec!["api".into(), "agent.retire".into(), params]
+            })
+            .collect();
+        for out in all(retire) {
+            assert!(out.status.success(), "{:?} / log {}", out, sb.log());
+        }
+    }
+    let out = fa.run(&sb, &["api", "snapshot.get"], true);
+    assert!(out.status.success(), "{:?}", out);
+    let head = cursor_seq(&stdout_json(&out)["result"]["cursor"]);
+    assert!(head - start >= 150, "only {} events", head - start);
+    // Keep it stopped a little past the burst.
+    std::thread::sleep(Duration::from_secs(3).saturating_sub(stopped.elapsed()));
+    assert!(next(Duration::ZERO).is_none(), "a stopped nc printed");
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+
+    let mut seqs = Vec::new();
+    while seqs.last() != Some(&head) {
+        let f = next(Duration::from_secs(30))
+            .unwrap_or_else(|| panic!("stream stalled after seq {:?}", seqs.last()));
+        assert_eq!(f["type"], "event", "{f}");
+        assert_eq!(f["sub"], "s", "{f}");
+        seqs.push(cursor_seq(&f["cursor"]));
+    }
+    assert_eq!(seqs, (start + 1..=head).collect::<Vec<_>>());
+    assert!(fa.all_gone(), "a fake claude still runs");
+}
+
+/// Every `*.sock` under `dir`, at any depth.
+fn socks_under(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return found;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            found.extend(socks_under(&p));
+        } else if p.extension().is_some_and(|x| x == "sock") {
+            found.push(p);
+        }
+    }
+    found
+}
+
+/// X15: once its clients are closed (a `watch` here), a foreground engine
+/// stopped with SIGTERM, or with SIGINT, exits and leaves no socket in its
+/// home. This is measured after the stop, not after a restart.
+#[test]
+fn a_stopped_engine_leaves_no_socket_once_its_clients_close() {
+    use wait_timeout::ChildExt;
+    for (name, sig) in [("SIGTERM", libc::SIGTERM), ("SIGINT", libc::SIGINT)] {
+        let sb = Sandbox::new();
+        let d = Detected::new(&sb);
+        let mut engine = d
+            .cmd(&sb, &["engine"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(Reap)
+            .unwrap();
+        let sock = sock_path(&sb.engine);
+        assert!(
+            wait_for(Duration::from_secs(10), || sock.exists()),
+            "{name}: log {}",
+            sb.log()
+        );
+
+        let mut watch = d
+            .cmd(&sb, &["watch", "--compact"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(Reap)
+            .unwrap();
+        let lines = lines_of(&mut watch);
+        let first: Value = serde_json::from_str(
+            &lines
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|_| panic!("{name}: no first frame / log {}", sb.log())),
+        )
+        .unwrap();
+        assert_eq!(first["event"], "started", "{name}: {first}");
+        watch.kill().unwrap();
+        watch.wait().unwrap();
+        assert_eq!(sb.pid(), Some(engine.id() as libc::pid_t), "{name}");
+
+        unsafe { libc::kill(engine.id() as libc::pid_t, sig) };
+        let status = engine
+            .wait_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap_or_else(|| panic!("the engine did not exit on {name}"));
+        assert!(status.success(), "{name}: {:?}", status);
+        let socks = socks_under(&sb.engine);
+        assert!(socks.is_empty(), "{name}: {socks:?}");
+        assert!(sb.pid().is_none(), "{name}");
+    }
+}
+
+/// X9: a real engine SIGKILLed right after each create phase (the
+/// `live-test` failpoint, `engine::live_test::crash_after`) is reconciled
+/// by the next boot: every op has `done_at`, and the agent it left running
+/// is killed. The fake agent ignores SIGHUP, so the engine's death (which
+/// closes the PTY) does not end it and only boot reconcile can. The next
+/// engine runs without the create switch, so it resumes nothing.
+#[cfg(feature = "live-test")]
+#[test]
+fn an_engine_killed_after_each_create_phase_is_reconciled_on_boot() {
+    use c9watch_lib::engine::db::db_path;
+    use c9watch_lib::engine::live_test::CRASH_AFTER_ENV;
+    use std::os::unix::process::ExitStatusExt;
+    use wait_timeout::ChildExt;
+    for phase in ["row", "pty", "bound"] {
+        let sb = Sandbox::new();
+        let fa = FreeAgents::new(&sb);
+        let hardy = FAKE_CLAUDE.replacen("#!/bin/sh\n", "#!/bin/sh\ntrap '' HUP\n", 1);
+        std::fs::write(fa.bin.join("claude"), hardy).unwrap();
+        let mut engine = fa
+            .cmd(&sb, &["engine"], true)
+            .env(CRASH_AFTER_ENV, phase)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(Reap)
+            .unwrap();
+        let sock = sock_path(&sb.engine);
+        assert!(
+            wait_for(Duration::from_secs(10), || sock.exists()),
+            "{phase}: log {}",
+            sb.log()
+        );
+        let out = fa.run(&sb, &["spawn", "--mode", "free", "--cwd", "work"], true);
+        assert!(!out.status.success(), "{phase}: {:?}", out);
+        let status = engine
+            .wait_timeout(Duration::from_secs(30))
+            .unwrap()
+            .unwrap_or_else(|| panic!("{phase}: the engine did not crash"));
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{phase}");
+
+        let ops = || -> Vec<(String, bool, Value)> {
+            let conn = rusqlite::Connection::open(db_path(&sb.engine)).unwrap();
+            let mut st = conn
+                .prepare("SELECT phase, done_at IS NOT NULL, payload FROM ops ORDER BY created_at")
+                .unwrap();
+            let rows = st
+                .query_map([], |r| {
+                    let payload: String = r.get(2)?;
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        serde_json::from_str(&payload).unwrap(),
+                    ))
+                })
+                .unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        let before = ops();
+        assert_eq!(before.len(), 1, "{phase}: {before:?}");
+        assert_eq!(before[0].0, phase, "{phase}: {before:?}");
+        // The PTY child the dead engine left, from phase `pty` on.
+        let orphan = before[0].2["pid"].as_i64().map(|p| p as libc::pid_t);
+        assert_eq!(orphan.is_some(), phase != "row", "{phase}: {before:?}");
+        // It ignores SIGHUP: kill it if the test fails before boot does.
+        struct KillOnPanic(Option<libc::pid_t>);
+        impl Drop for KillOnPanic {
+            fn drop(&mut self) {
+                if let (Some(pid), true) = (self.0, std::thread::panicking()) {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+        let _guard = KillOnPanic(orphan);
+        if let Some(pid) = orphan {
+            assert!(alive(pid), "{phase}: the agent died with the engine");
+        }
+
+        // The next engine, auto-started without the switch.
+        let out = fa.run(&sb, &["api", "hello"], false);
+        assert!(
+            out.status.success(),
+            "{phase}: {:?} / log {}",
+            out,
+            sb.log()
+        );
+        let done = wait_for(Duration::from_secs(10), || ops().iter().all(|o| o.1));
+        assert!(done, "{phase}: {:?} / log {}", ops(), sb.log());
+        if let Some(pid) = orphan {
+            assert!(
+                wait_for(Duration::from_secs(10), || !alive(pid)),
+                "{phase}: orphan {pid} still runs"
+            );
+        }
+        assert!(fa.all_gone(), "{phase}: a fake claude still runs");
+    }
 }

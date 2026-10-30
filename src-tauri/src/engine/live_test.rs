@@ -14,6 +14,12 @@
 //!
 //! The directory is created 0700 by the test script; the engine never
 //! creates it, so without it nothing here does anything.
+//!
+//! - Crash: with `C9WATCH_LIVE_TEST_CRASH_AFTER=<phase>` (`row`, `pty` or
+//!   `bound`) in its env, the engine SIGKILLs itself right after it
+//!   commits that phase of a create (`tests/engine_cli.rs`, exit
+//!   criterion X9). The CLI's auto-start does not pass the variable on, so
+//!   only a foreground `c9watch engine` started with it crashes.
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +42,19 @@ pub fn take_input(home: &Path, agent_id: &str) -> Option<Vec<u8>> {
     let bytes = if ok { std::fs::read(&path).ok() } else { None };
     let _ = std::fs::remove_file(&path);
     bytes.filter(|b| !b.is_empty())
+}
+
+/// The env variable of the crash failpoint.
+pub const CRASH_AFTER_ENV: &str = "C9WATCH_LIVE_TEST_CRASH_AFTER";
+
+/// SIGKILL this process when `CRASH_AFTER_ENV` names `phase`. It waits
+/// 1 s first, on the thread that would write the next phase, so an agent
+/// spawned in phase `pty` is past its start when the engine dies.
+pub fn crash_after(phase: super::ops::Phase) {
+    if std::env::var(CRASH_AFTER_ENV).as_deref() == Ok(phase.as_str()) {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+    }
 }
 
 /// Write `text` as the screen of `agent_id` when it differs from `last`.
