@@ -1,4 +1,4 @@
--- user_version 4
+-- user_version 5
 -- index agents_detected_key
 CREATE UNIQUE INDEX agents_detected_key ON agents (session_key) WHERE source = 'detected';
 -- index agents_legacy_sid
@@ -8,6 +8,14 @@ CREATE UNIQUE INDEX agents_legacy_sid ON agents (provider, provider_sid)
 CREATE INDEX agents_provider_sid ON agents (provider, provider_sid);
 -- index events_ts
 CREATE INDEX events_ts ON events (ts);
+-- index message_status_msg
+CREATE INDEX message_status_msg ON message_status (msg_id, seq);
+-- index messages_idem
+CREATE UNIQUE INDEX messages_idem ON messages (from_principal, idem) WHERE idem IS NOT NULL;
+-- index messages_pair
+CREATE INDEX messages_pair ON messages (from_principal, to_agent, created_at);
+-- index messages_queue
+CREATE INDEX messages_queue ON messages (to_agent, state, created_at);
 -- index ops_open
 CREATE INDEX ops_open ON ops (done_at) WHERE done_at IS NULL;
 -- index session_alias_agent
@@ -76,6 +84,39 @@ CREATE TABLE machines (
     id      TEXT PRIMARY KEY,
     label   TEXT,
     is_self INTEGER NOT NULL DEFAULT 0
+) STRICT;
+-- table message_status
+CREATE TABLE message_status (
+    seq    INTEGER PRIMARY KEY,
+    msg_id TEXT NOT NULL REFERENCES messages (id),
+    state  TEXT NOT NULL,
+    at     INTEGER NOT NULL,
+    detail TEXT
+) STRICT;
+-- table messages
+CREATE TABLE messages (
+    id             TEXT PRIMARY KEY,               -- msg_<ulid>
+    from_principal TEXT NOT NULL,                  -- 'agent:<id>' | 'local-unverified'
+    from_agent     TEXT REFERENCES agents (id),    -- null for local-unverified
+    to_agent       TEXT NOT NULL REFERENCES agents (id),
+    to_addr        TEXT NOT NULL,                  -- <machine>/<id>
+    origin_kind    TEXT NOT NULL CHECK (origin_kind IN ('agent', 'local-unverified')),
+    kind           TEXT NOT NULL DEFAULT 'info' CHECK (kind IN ('request', 'info', 'result', 'system')),
+    reply_to       TEXT,
+    thread_id      TEXT,                           -- reply_to's thread, or the row's own id
+    provenance     TEXT NOT NULL,                  -- the tag line injected above the body
+    body           TEXT NOT NULL,
+    body_hash      TEXT NOT NULL,                  -- sha256 hex of body
+    req_hash       TEXT NOT NULL,                  -- sha256 hex of (to_agent, kind, reply_to, body)
+    idem           TEXT,
+    -- Current state, denormalized from the latest message_status row and
+    -- written in the same transaction, so the delivery loop reads one row.
+    state          TEXT NOT NULL CHECK (state IN ('queued', 'delivering', 'delivered', 'read',
+                     'acked', 'failed', 'expired', 'rejected', 'uncertain', 'overdue')),
+    state_at       INTEGER NOT NULL,
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    created_at     INTEGER NOT NULL,
+    cursor         TEXT                            -- cursor of the queued event, for idem replay
 ) STRICT;
 -- table meta
 CREATE TABLE meta (
