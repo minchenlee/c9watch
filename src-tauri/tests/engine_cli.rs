@@ -6,6 +6,7 @@
 
 use c9watch_lib::engine::home::{lock_path, sock_path, ENGINE_HOME_ENV};
 use c9watch_lib::engine::lock::{engine_lock_held, engine_pid};
+use c9watch_lib::engine::peer::proc_entry;
 use serde_json::Value;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -82,8 +83,10 @@ fn wait_for(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
     f()
 }
 
+/// Whether `pid` runs something. A zombie does not: a container whose PID 1
+/// reaps nothing keeps a killed orphan as one.
 fn alive(pid: libc::pid_t) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    proc_entry(pid).is_some_and(|e| !e.zombie)
 }
 
 fn stdout_json(out: &Output) -> Value {
