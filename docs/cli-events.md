@@ -140,6 +140,16 @@ command, the engine auto-start included.
 {"schema":1,"event":"turn_ended","agentId":"agt_01J…","name":"w1","generation":1,"by":"hook","at":1767000000000,"cursor":"m:e:42","timestamp":"2026-10-30T10:00:00+00:00"}
 ```
 
+After `c9watch send`, its `cursor` works as `--since`, with two limits.
+The cursor is where the message was queued, not where the agent read it:
+if the agent was mid-turn, the wait ends with that turn, which did not
+read the message. And a cursor older than the 24 h event retention (an
+`--idem` replay returns the first send's cursor) fails with
+`cursor_expired`. `send --wait` has neither problem: it follows the
+message's `msg.state` events (`queued`, `delivering`, then `delivered`,
+`failed` or `uncertain`) and counts only the first turn end after
+`delivered`.
+
 `by` names the signal that saw the turn end (`hook`, `screen`, `transcript`
 or `process`), or `snapshot` when the engine had pruned the event and the
 agent, mid-turn before, was idle in a new snapshot (`at` is then null). Exit codes: `0` the turn ended, `2` no live engine agent

@@ -1,7 +1,8 @@
 //! Test-only input and screen path for `tests/live/cc_sandbox.sh` (plan
 //! C1a-32). Built only with the `live-test` feature, which no release,
-//! default or CI build turns on: c9p/1 has no method that types into an
-//! agent's terminal in C1a, and the live X14 run needs one.
+//! default or CI build turns on. The live X14 run (C1a) needs raw keys;
+//! `msg.send` (C1b-M1) types only a fenced mail paste into an agent's
+//! terminal, never keys of the caller's choosing.
 //!
 //! - Input: a file `<home>/live-test/<agent_id>.in`. The supervisor of a
 //!   ready agent reads it, removes it and sends its bytes as they are

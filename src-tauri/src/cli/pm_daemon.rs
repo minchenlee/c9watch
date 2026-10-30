@@ -804,7 +804,7 @@ async fn handle_inbox_read(
 
     let targets: Vec<String> = if let Some(wid) = &worker_id_filter {
         // Accept exact id OR unambiguous prefix of an owned worker, matching
-        // the ergonomics of `send`/`stop`/`view`. Previously only exact UUIDs
+        // the ergonomics of `stop`/`view`. Previously only exact UUIDs
         // worked, which didn't match the rest of the CLI.
         match resolve_worker_id_from_keys(owned.iter().map(|s| s.as_str()), wid) {
             Ok(full) => vec![full],

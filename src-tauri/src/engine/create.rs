@@ -44,8 +44,8 @@
 //!
 //! **Drain (C1a-27, `engine::drain`).** Once the engine's drain switch is
 //! on, `agent.create` answers `draining`, a create that has its row but no
-//! PTY spawns nothing (its op is left to boot reconcile), and a PTY write
-//! is not sent but audited. A drained supervisor kills its agent and then
+//! PTY spawns nothing (its op is left to boot reconcile), a PTY write
+//! is not sent but audited, and mail stays queued. A drained supervisor kills its agent and then
 //! writes `paused(drain)` or `interrupted` (`drain::settle`); a kill that
 //! fails writes nothing, so boot reconcile still finds and kills the
 //! process by its `agent_state` (reviews M1).
