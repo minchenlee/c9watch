@@ -192,11 +192,6 @@ export type C9pErrorCode =
    */
   | 'agent_bin_mismatch'
   /**
-   * `agent.create` while the engine runs without
-   * `C9WATCH_EXPERIMENTAL_CREATE=1` (C1a).
-   */
-  | 'experimental_disabled'
-  /**
    * The principal may not call this method (`agent.create` and
    * `agent.retire` take only a local client in C1a).
    */

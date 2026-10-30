@@ -127,9 +127,6 @@ pub enum ErrorCode {
     /// The engine's `c9watch-agent` copy no longer has the sha256 it had
     /// when the engine installed it.
     AgentBinMismatch,
-    /// `agent.create` while the engine runs without
-    /// `C9WATCH_EXPERIMENTAL_CREATE=1` (C1a).
-    ExperimentalDisabled,
     /// The principal may not call this method (`agent.create` and
     /// `agent.retire` take only a local client in C1a).
     NotAllowed,
@@ -165,7 +162,6 @@ impl ErrorCode {
             ErrorCode::UnsupportedInC1a => "unsupported_in_c1a",
             ErrorCode::AgentBinMissing => "agent_bin_missing",
             ErrorCode::AgentBinMismatch => "agent_bin_mismatch",
-            ErrorCode::ExperimentalDisabled => "experimental_disabled",
             ErrorCode::NotAllowed => "not_allowed",
             ErrorCode::CwdCollision => "cwd_collision",
             ErrorCode::SpawnFailed => "spawn_failed",
@@ -219,9 +215,6 @@ impl ErrorCode {
             ErrorCode::AgentBinMismatch => {
                 "`c9watch engine restart` copies c9watch-agent again; check what changed \
                  the engine's copy"
-            }
-            ErrorCode::ExperimentalDisabled => {
-                "restart the engine with C9WATCH_EXPERIMENTAL_CREATE=1 to try agent creation"
             }
             ErrorCode::NotAllowed => "call this from the CLI or the GUI, not from an agent",
             ErrorCode::CwdCollision => {

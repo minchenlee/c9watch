@@ -64,7 +64,6 @@ pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
     "XDG_RUNTIME_DIR",
     "RUST_BACKTRACE",
     crate::engine::home::ENGINE_HOME_ENV,
-    "C9WATCH_EXPERIMENTAL_CREATE",
 ];
 
 /// Fail with `agent_caller_refused` when `C9_AGENT_ID` is set to anything
@@ -671,7 +670,6 @@ mod tests {
             ("HOME", "/h"),
             ("PATH", "/bin"),
             (ENGINE_HOME_ENV, "/e"),
-            ("C9WATCH_EXPERIMENTAL_CREATE", "1"),
             ("C9_AGENT_ID", "a1"),
             ("C9_ENGINE_SOCK", "/s"),
             ("C9_AGENT_TOKEN", "t"),
@@ -684,15 +682,7 @@ mod tests {
             .map(|(k, _)| k.into_string().unwrap())
             .collect();
         kept.sort();
-        assert_eq!(
-            kept,
-            [
-                "C9WATCH_ENGINE_HOME",
-                "C9WATCH_EXPERIMENTAL_CREATE",
-                "HOME",
-                "PATH"
-            ]
-        );
+        assert_eq!(kept, ["C9WATCH_ENGINE_HOME", "HOME", "PATH"]);
     }
 
     #[test]
