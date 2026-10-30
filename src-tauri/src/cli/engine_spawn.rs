@@ -8,7 +8,7 @@
 //!
 //! Until C1a-35 the engine answers `experimental_disabled` unless it runs
 //! with `C9WATCH_EXPERIMENTAL_CREATE=1`. A caller inside an engine agent
-//! (`C9_AGENT_ID` set) gets `not_authorized` here, without a connection:
+//! (`C9_AGENT_ID` set) gets `not_allowed` here, the engine's code for the same refusal,, without a connection:
 //! C1a has no orch, and only an orch may create agents (A:262, §1.1).
 
 use super::engine_client::{current_exe, ensure_engine, EngineConn, ENV_AGENT_ID};
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Error code: an agent (`C9_AGENT_ID` set) may not create agents in C1a.
-pub const NOT_AUTHORIZED: &str = "not_authorized";
+pub const NOT_ALLOWED: &str = "not_allowed";
 
 /// How long `spawn --mode free` waits for the `agent.create` response: the
 /// engine's ready timeout (30 s) plus room for the spawn and the reply.
@@ -72,12 +72,12 @@ pub fn check_free_flags(f: &ManagedFlags) -> Result<(), String> {
     }
 }
 
-/// Fail with `not_authorized` when `C9_AGENT_ID` is set to anything but "".
+/// Fail with `not_allowed` when `C9_AGENT_ID` is set to anything but "".
 pub fn refuse_agent_caller(env: &dyn Fn(&str) -> Option<OsString>) -> Result<(), String> {
     match env(ENV_AGENT_ID).filter(|v| !v.is_empty()) {
         Some(id) => Err(format!(
             "{}: {} is set ({}); an agent may not create agents in C1a (only an orch may)",
-            NOT_AUTHORIZED,
+            NOT_ALLOWED,
             ENV_AGENT_ID,
             id.to_string_lossy()
         )),
@@ -150,9 +150,9 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_caller_is_not_authorized() {
+    fn an_agent_caller_is_not_allowed() {
         let err = refuse_agent_caller(&env_of(&[("C9_AGENT_ID", "agt_1")])).unwrap_err();
-        assert!(err.starts_with("not_authorized: "), "{}", err);
+        assert!(err.starts_with("not_allowed: "), "{}", err);
         assert!(err.contains("agt_1"), "{}", err);
         assert!(refuse_agent_caller(&env_of(&[("C9_AGENT_ID", "")])).is_ok());
         assert!(refuse_agent_caller(&env_of(&[])).is_ok());

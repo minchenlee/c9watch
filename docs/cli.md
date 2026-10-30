@@ -224,7 +224,7 @@ c9watch spawn --mode free --cwd /path/to/project --name researcher
 - It auto-starts the engine and calls `agent.create`. It takes only `--cwd` (default: the current directory) and `--name`; any other option fails with `bad_args`.
 - It prints `{"agent": <row>}` (c9p/1 `AgentRow`) once the agent is `ready`. This can take up to 30 s, plus a margin.
 - Until the create switch is removed (C1a-35), the engine answers `experimental_disabled` unless it runs with `C9WATCH_EXPERIMENTAL_CREATE=1`.
-- A caller with `C9_AGENT_ID` set (inside an engine agent) gets `not_authorized` and never reaches the engine.
+- A caller with `C9_AGENT_ID` set (inside an engine agent) gets `not_allowed` (the engine's code for the same refusal) and never reaches the engine.
 - Errors exit `1` with `{"error":"<code>: <msg>; <hint>"}`. Retire the agent with `c9watch api agent.retire '{"id":"agt_..."}'`.
 
 ### `send` — Message a Worker
