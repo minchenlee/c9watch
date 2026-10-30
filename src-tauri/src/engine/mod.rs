@@ -79,6 +79,9 @@ pub mod ops;
 pub mod create;
 
 #[cfg(unix)]
+pub mod mail;
+
+#[cfg(unix)]
 pub mod drain;
 
 #[cfg(unix)]

@@ -84,6 +84,12 @@ impl Tx<'_> {
         self.last = Some(seq);
         Ok(seq)
     }
+
+    /// The db's epoch, for a cursor that has to be stored in the same
+    /// transaction as its event.
+    pub fn epoch(&self) -> &str {
+        &self.epoch
+    }
 }
 
 impl std::ops::Deref for Tx<'_> {
