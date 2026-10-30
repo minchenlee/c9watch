@@ -3964,7 +3964,7 @@ mod tests {
         secs.store(1, Ordering::SeqCst);
         wait_for("the CR", || sent(&e).len() == 2);
         assert_eq!(sent(&e)[1], KEY_CR);
-        assert_eq!(*lock(&e.launcher.prompts), [fenced.clone()]);
+        assert_eq!(*lock(&e.launcher.prompts), std::slice::from_ref(&fenced));
         let machine = MACHINE.to_string();
         let (agent, prompt) = (r.id.clone(), fenced);
         e.db.write_blocking(move |tx| {

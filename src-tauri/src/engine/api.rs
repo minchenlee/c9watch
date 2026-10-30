@@ -594,7 +594,12 @@ async fn dispatch(
     streams: usize,
 ) -> Result<Served, ApiError> {
     match method {
-        "agent.create" | "agent.retire" => Ok(Served::result(
+        // One arm per method: scripts/test-ipc-contract.mjs reads the
+        // served methods off these arms.
+        "agent.create" => Ok(Served::result(
+            agent_lifecycle(method, req, ctx, peer, principal).await?,
+        )),
+        "agent.retire" => Ok(Served::result(
             agent_lifecycle(method, req, ctx, peer, principal).await?,
         )),
         "snapshot.get" => Ok(Served::result(snapshot_get(ctx).await?)),
