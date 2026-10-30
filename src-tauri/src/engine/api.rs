@@ -441,6 +441,8 @@ pub const METHODS: &[&str] = &[
     "hook.permission_request",
     "hook.permission_denied",
     "hook.notification",
+    "hook.user_prompt_submit",
+    "hook.post_tool_use",
     "task.done",
     "agent.handoff",
 ];
@@ -1828,6 +1830,8 @@ mod tests {
         "hook.permission_request",
         "hook.permission_denied",
         "hook.notification",
+        "hook.user_prompt_submit",
+        "hook.post_tool_use",
         "task.done",
         "agent.handoff",
     ];

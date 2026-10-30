@@ -7,9 +7,10 @@
 //! claims made after it: a lagging or racing weaker source cannot undo a
 //! hook within that window (the screen still shows the spinner just after
 //! the Stop hook). After the window the newest evidence wins again, so a
-//! new turn the hook cannot report (CC has no turn-start hook in the
-//! profile) still shows as `working`. Process evidence only says the
-//! process lives, which is `Unknown`; with nothing else the merge is
+//! change the hooks miss (an Esc interrupt fires no Stop hook) still shows.
+//! The window can end with no new claim, so the supervisor asks
+//! `stale_row_state` and writes the result (`hooks::expire_hold`).
+//! Process evidence only says the process lives, which is `Unknown`; with nothing else the merge is
 //! `Unknown`, never idle (A:1037).
 //!
 //! Turn end (D24.6): Stop hook, then JSONL `turn_duration`, then the
@@ -151,6 +152,11 @@ pub struct AgentMerge {
     turn_open: bool,
     last_turn_end: Option<TurnEnd>,
     attention: Option<Attention>,
+    /// The `row_state` last written to the row.
+    written: Option<&'static str>,
+    /// The `tool_use_id` of the call a hook said is waiting for
+    /// permission: only that call's PostToolUse means work goes on.
+    blocked_call: Option<String>,
 }
 
 impl AgentMerge {
@@ -223,6 +229,47 @@ impl AgentMerge {
         merge(&claims, now_ms)
     }
 
+    /// Whether a turn is open.
+    pub fn turn_open(&self) -> bool {
+        self.turn_open
+    }
+
+    /// A turn is open and no source has said anything for `SETTLE_MS`:
+    /// the screen's unchanged `ready` should be claimed again (a turn
+    /// start with no turn end, such as a hook `working` the screen never
+    /// showed).
+    pub fn stale_turn(&self, now_ms: i64) -> bool {
+        self.turn_open && self.claims.values().all(|c| now_ms - c.at_ms >= SETTLE_MS)
+    }
+
+    /// Note the call a hook said waits for permission.
+    pub fn set_blocked_call(&mut self, call: Option<String>) {
+        self.blocked_call = call;
+    }
+
+    /// Whether `call` is the one that waited for permission; it is
+    /// forgotten when it matches.
+    pub fn take_blocked_call(&mut self, call: &str) -> bool {
+        let hit = self.blocked_call.as_deref() == Some(call);
+        if hit {
+            self.blocked_call = None;
+        }
+        hit
+    }
+
+    /// Record that `state` was written to the row.
+    pub fn written(&mut self, state: Option<&'static str>) {
+        if state.is_some() {
+            self.written = state;
+        }
+    }
+
+    /// The `row_state` at `now_ms` when it differs from the one last
+    /// written: a hold ran out with no new claim.
+    pub fn stale_row_state(&self, now_ms: i64) -> Option<&'static str> {
+        self.row_state(now_ms).filter(|s| self.written != Some(*s))
+    }
+
     /// The `agents.state` for the merge, or `None` while it is `Unknown`
     /// (the row keeps what it has). Detection owns `agents.status` of a pty
     /// row (C1a-15); the merge owns `state`.
@@ -259,6 +306,21 @@ impl MergeTable {
             *entry = (gen, AgentMerge::new());
         }
         f(&mut entry.1)
+    }
+
+    /// Run `f` on the merge of `agent_id` only when it is at generation
+    /// `gen`; nothing is created or replaced.
+    pub fn peek<R>(
+        &self,
+        agent_id: &str,
+        gen: i64,
+        f: impl FnOnce(&mut AgentMerge) -> R,
+    ) -> Option<R> {
+        let mut map = self.agents.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get_mut(agent_id) {
+            Some((g, m)) if *g == gen => Some(f(m)),
+            _ => None,
+        }
     }
 
     /// Forget `agent_id` (retired or gone).
@@ -481,5 +543,30 @@ mod tests {
         assert_eq!(t.with("a1", 1, |m| m.row_state(10)), Some("blocked"));
         assert_eq!(t.with("a1", 2, |m| m.row_state(10)), None);
         t.remove("a1");
+    }
+
+    #[test]
+    fn a_turn_with_no_new_claim_goes_stale() {
+        let mut m = AgentMerge::new();
+        assert!(!m.stale_turn(10_000));
+        m.claim(c(Hook, Working, 1_000));
+        assert!(m.turn_open());
+        assert!(!m.stale_turn(1_000 + SETTLE_MS - 1));
+        assert!(m.stale_turn(1_000 + SETTLE_MS));
+        // The screen's `ready`, claimed again, closes it.
+        m.claim(c(Screen, Ready, 1_000 + SETTLE_MS));
+        assert!(!m.turn_open());
+        assert!(!m.stale_turn(9_000));
+        // A blocked call is forgotten once it matches.
+        m.set_blocked_call(Some("toolu_1".into()));
+        assert!(!m.take_blocked_call("toolu_2"));
+        assert!(m.take_blocked_call("toolu_1"));
+        assert!(!m.take_blocked_call("toolu_1"));
+        let t = MergeTable::new();
+        assert_eq!(t.peek("a1", 1, |m| m.turn_open()), None);
+        t.with("a1", 1, |m| m.claim(c(Hook, Working, 0)));
+        assert_eq!(t.peek("a1", 1, |m| m.turn_open()), Some(true));
+        assert_eq!(t.peek("a1", 2, |m| m.turn_open()), None);
+        assert_eq!(t.peek("a1", 1, |m| m.turn_open()), Some(true));
     }
 }

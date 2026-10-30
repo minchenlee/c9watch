@@ -461,11 +461,19 @@ export interface C9pMethods {
     params: C9pHookParams;
     result: C9pHookResult;
   };
+  'hook.post_tool_use': {
+    params: C9pHookParams;
+    result: C9pHookResult;
+  };
   'hook.session_start': {
     params: C9pHookParams;
     result: C9pHookResult;
   };
   'hook.stop': {
+    params: C9pHookParams;
+    result: C9pHookResult;
+  };
+  'hook.user_prompt_submit': {
     params: C9pHookParams;
     result: C9pHookResult;
   };

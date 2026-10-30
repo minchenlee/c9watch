@@ -24,7 +24,8 @@
 //!      `ready` and goes the same way. After that the supervisor kills it
 //!      and the row becomes `interrupted` with reason `drain`, its
 //!      `resume_argv` and `interrupted_note_pending`. A ready agent's
-//!      supervisor reports a turn from its screen (`hooks::screen_claim`).
+//!      turn shows through its hooks and, as the fallback, its screen
+//!      (`hooks::screen_claim`).
 //!    - An agent whose create or resume op is still open (`creating`,
 //!      `starting` before `bound`): left as it is. The engine kills its PTY
 //!      when it stops; boot reconcile fails a create (A:231), and a resume
