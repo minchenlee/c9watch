@@ -727,8 +727,9 @@ mod tests {
         read_until(&mut pty, "40 120");
         pty.resize(100, 50).unwrap();
         pty.write(b"\n").unwrap();
-        read_until(&mut pty, "50 100");
-        read_until(&mut pty, "done");
+        // One read: "50 100" and "done" can arrive in one chunk.
+        let text = read_until(&mut pty, "done");
+        assert!(text.contains("50 100"), "{:?}", text);
     }
 
     #[test]
