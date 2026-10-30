@@ -1020,12 +1020,18 @@ impl Spawner {
                 Delivery::Pasted { id, at }
             }
             Delivery::Submitted { id, at } => {
-                let state = self.db.reader().ok().and_then(|c| {
-                    mail::state_of(&c, &id).unwrap_or_else(|e| {
+                let read = match self.db.reader() {
+                    Ok(c) => mail::state_of(&c, &id).map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+                // A failed read keeps the message tracked: try the next tick.
+                let state = match read {
+                    Ok(state) => state,
+                    Err(e) => {
                         eprintln!("[engine] Failed to read mail {}: {}", id, e);
-                        None
-                    })
-                });
+                        return Delivery::Submitted { id, at };
+                    }
+                };
                 // The prompt hook confirmed it, or an end path took it.
                 if state != Some(MsgState::Delivering) {
                     return Delivery::Idle;
