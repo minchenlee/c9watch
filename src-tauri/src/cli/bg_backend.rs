@@ -51,7 +51,7 @@ use tokio::net::UnixStream;
 /// Send one request, read one reply, drop the connection.
 ///
 /// The daemon closes the connection after each one-shot reply, so this is
-/// the only safe pattern for `reply`/`kill`/`nudge`/`ping`. Do NOT use for
+/// the only safe pattern for `kill`/`nudge`/`ping`. Do NOT use for
 /// `subscribe` (subscribe takes over the connection — use [`subscribe`]).
 pub async fn rpc(sock: &Path, req: Request) -> Result<OneShotReply, String> {
     let wire = req.to_wire();
