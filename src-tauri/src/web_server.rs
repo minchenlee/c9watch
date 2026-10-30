@@ -1436,7 +1436,11 @@ async fn handle_message_with_policy(
             message: STOP_SESSION_REMOVED.into(),
         },
 
-        ClientMsg::OpenSession { .. } if !policy.allow_open => capability_disabled("open"),
+        ClientMsg::OpenSession { addr, .. } if !policy.allow_open => {
+            let response = capability_disabled("open");
+            log_action(client_id, "openSession", &addr, &response);
+            response
+        }
         ClientMsg::OpenSession { addr, pid } => {
             let target = addr.clone();
             let response = match tokio::task::spawn_blocking(move || open(addr, pid)).await {
@@ -1486,10 +1490,13 @@ const LOG_TARGET_MAX_CHARS: usize = 128;
 /// Logs a session action with the principal that asked for it. Only the
 /// principal, the action, its target (quoted and cut to
 /// `LOG_TARGET_MAX_CHARS`) and ok or refused are logged, never a frame.
+/// Only `ServerMsg::Ok` counts as ok. These lines go to the debug log, a
+/// ring buffer of `debug_log::MAX_ENTRIES` lines that a busy client can
+/// push old lines out of; it is not an audit log.
 fn log_action(client_id: &ClientId, action: &str, target: &str, response: &ServerMsg) {
     let outcome = match response {
-        ServerMsg::Error { .. } => "refused",
-        _ => "ok",
+        ServerMsg::Ok => "ok",
+        _ => "refused",
     };
     let target: String = target.chars().take(LOG_TARGET_MAX_CHARS).collect();
     crate::debug_log::log_info(&format!(
@@ -2633,7 +2640,12 @@ mod server_tests {
     // E3: neither the token nor the pairing code reaches the log; the
     // connection is logged by its principal.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn the_log_has_the_principal_and_no_token_or_code() {
+        // Hold the log lock: debug_log tests clear and flood the buffer.
+        let _log_lock = crate::debug_log::TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let (server, addr) = loopback_server(dir.path()).await;
         let (client_id, token, code) = pair_in_process(&server, addr).await;
@@ -2673,7 +2685,12 @@ mod server_tests {
     // E4: a stop whose pid is not the detected pid is refused, and the log
     // names the principal that asked.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_stop_with_the_wrong_pid_is_refused() {
+        // Hold the log lock: debug_log tests clear and flood the buffer.
+        let _log_lock = crate::debug_log::TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Past the macOS pid range, so even a mistaken signal hits nothing.
         const PID: u32 = 4_000_000;
         let session = DetectedSession {
