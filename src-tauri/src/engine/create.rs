@@ -1705,6 +1705,7 @@ mod tests {
     use crate::engine::driver::{ChildId, KillReport, Output, ScreenSnapshot};
     use crate::engine::home::sock_path;
     use crate::engine::peer;
+    use std::collections::VecDeque;
     use std::ffi::OsString;
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
@@ -1740,6 +1741,19 @@ mod tests {
         exit_now: Arc<AtomicBool>,
         /// Bytes sent to the terminal, in writes.
         writes: Arc<AtomicUsize>,
+        /// Every write's bytes, failed ones included, in order.
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        /// Set by a test: the results of the next writes, in order. `None`
+        /// is `Ok`; when empty, every write succeeds.
+        write_results: Arc<Mutex<VecDeque<Option<io::ErrorKind>>>>,
+        /// Set by a test: a whole screen text per agent id, in place of
+        /// the script's.
+        screens: Arc<Mutex<HashMap<String, String>>>,
+        /// What a submitted prompt (CR on a non-empty box) carried.
+        prompts: Arc<Mutex<Vec<String>>>,
+        /// `Script::Ready`'s input box. `None` until the first prompt shows
+        /// CC's placeholder; after it, an empty box.
+        input: FakeInput,
         /// Set by a test: `kill` does not return until it is cleared.
         stuck: Arc<AtomicBool>,
         /// The agent id, from the spawn's env.
@@ -1753,6 +1767,77 @@ mod tests {
         drain_on_screen: Option<Arc<DrainSwitch>>,
     }
 
+    /// The input box of a fake CC (`Script::Ready`), after the real CC
+    /// 2.1.314 layouts in `tests/fixtures/cc_screens/`.
+    #[derive(Default)]
+    struct FakeInput {
+        /// What the box holds now: typed text, a one-line paste, or the
+        /// `[Pasted text #n +k lines]` of a longer one.
+        text: String,
+        /// The full text behind `text`, as CC submits it.
+        full: String,
+        /// A prompt was submitted: the placeholder is gone.
+        submitted: bool,
+        /// Pastes so far, for the `#n` of the collapsed form.
+        pastes: usize,
+    }
+
+    impl FakeInput {
+        /// Apply one successful write. A bracketed paste fills the box
+        /// (collapsed when it has a newline), CR on a non-empty box
+        /// submits it and returns the prompt, other escape sequences are
+        /// keys that change nothing, and other bytes are typed.
+        fn apply(&mut self, bytes: &[u8]) -> Option<String> {
+            let text = String::from_utf8_lossy(bytes);
+            if let Some(body) = text
+                .strip_prefix("\x1b[200~")
+                .and_then(|t| t.strip_suffix("\x1b[201~"))
+            {
+                self.pastes += 1;
+                self.full.push_str(body);
+                self.text = if body.contains('\n') {
+                    format!(
+                        "[Pasted text #{} +{} lines]",
+                        self.pastes,
+                        body.matches('\n').count()
+                    )
+                } else {
+                    format!("{}{}", self.text, body)
+                };
+                None
+            } else if bytes == crate::engine::cc_screen::KEY_CR {
+                if self.full.is_empty() {
+                    return None;
+                }
+                self.text.clear();
+                self.submitted = true;
+                Some(std::mem::take(&mut self.full))
+            } else if bytes.first() == Some(&0x1b) {
+                None
+            } else {
+                self.text.push_str(&text);
+                self.full.push_str(&text);
+                None
+            }
+        }
+
+        /// The screen: chat, the box between two rules, the status line.
+        fn screen(&self) -> String {
+            let inside = if !self.text.is_empty() {
+                self.text.as_str()
+            } else if self.submitted {
+                ""
+            } else {
+                "Try \"fix lint errors\""
+            };
+            let rule = "\u{2500}".repeat(40);
+            format!(
+                "\u{23fa} earlier output\n{}\n\u{276f} {}\n{}\n  \u{23f5}\u{23f5} auto mode on",
+                rule, inside, rule
+            )
+        }
+    }
+
     impl Driver for FakeDriver {
         fn spawn(_: &SpawnSpec) -> io::Result<Self> {
             Err(io::Error::other("use FakeLauncher"))
@@ -1760,8 +1845,18 @@ mod tests {
         fn child(&self) -> ChildId {
             self.child
         }
-        fn write(&mut self, _: &[u8]) -> io::Result<()> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
             self.writes.fetch_add(1, Ordering::SeqCst);
+            lock(&self.sent).push(bytes.to_vec());
+            if let Some(kind) = lock(&self.write_results).pop_front().flatten() {
+                return Err(io::Error::new(kind, "fake write error"));
+            }
+            if let Some(prompt) = self.input.apply(bytes) {
+                lock(&self.prompts).push(prompt);
+                // CR submits: the title turns busy until the test ends
+                // the turn.
+                lock(&self.busy).insert(self.id.clone());
+            }
             Ok(())
         }
         fn output(&mut self, _: Duration) -> Output {
@@ -1775,9 +1870,10 @@ mod tests {
                 d.start();
             }
             let busy = lock(&self.busy).contains(&self.id);
+            let ready_screen = self.input.screen();
             let (title, text) = match self.script {
-                Script::Ready if busy => ("\u{25d0} Claude Code", "\u{276f} \n  auto mode on"),
-                Script::Ready => ("\u{2733} Claude Code", "\u{276f} \n  auto mode on"),
+                Script::Ready if busy => ("\u{25d0} Claude Code", ready_screen.as_str()),
+                Script::Ready => ("\u{2733} Claude Code", ready_screen.as_str()),
                 Script::Refuse => (
                     "",
                     " \u{23bf}  Claude usage limit reached. Your limit resets 5pm\n",
@@ -1789,8 +1885,12 @@ mod tests {
                     " Do you trust this folder?\n   1. Yes, I trust this folder\n   2. No, exit\n",
                 ),
             };
+            let text = lock(&self.screens)
+                .get(&self.id)
+                .cloned()
+                .unwrap_or_else(|| text.to_string());
             ScreenSnapshot {
-                text: text.into(),
+                text,
                 title: title.into(),
                 title_seq: 1,
                 cursor: (0, 0),
@@ -1835,6 +1935,10 @@ mod tests {
         kills: Arc<AtomicUsize>,
         exit_now: Arc<AtomicBool>,
         writes: Arc<AtomicUsize>,
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        write_results: Arc<Mutex<VecDeque<Option<io::ErrorKind>>>>,
+        screens: Arc<Mutex<HashMap<String, String>>>,
+        prompts: Arc<Mutex<Vec<String>>>,
         stuck: Arc<AtomicBool>,
         busy: Arc<Mutex<HashSet<String>>>,
         kill_fails: Arc<AtomicBool>,
@@ -1885,6 +1989,11 @@ mod tests {
                 kills: self.kills.clone(),
                 exit_now: self.exit_now.clone(),
                 writes: self.writes.clone(),
+                sent: self.sent.clone(),
+                write_results: self.write_results.clone(),
+                screens: self.screens.clone(),
+                prompts: self.prompts.clone(),
+                input: FakeInput::default(),
                 stuck: self.stuck.clone(),
                 id: env_of(spec, "C9_AGENT_ID").unwrap_or_default(),
                 busy: self.busy.clone(),
@@ -1949,6 +2058,10 @@ mod tests {
             kills: Arc::new(AtomicUsize::new(0)),
             exit_now: Arc::new(AtomicBool::new(false)),
             writes: Arc::new(AtomicUsize::new(0)),
+            sent: Arc::new(Mutex::new(Vec::new())),
+            write_results: Arc::new(Mutex::new(VecDeque::new())),
+            screens: Arc::new(Mutex::new(HashMap::new())),
+            prompts: Arc::new(Mutex::new(Vec::new())),
             stuck: Arc::new(AtomicBool::new(false)),
             busy: Arc::new(Mutex::new(HashSet::new())),
             kill_fails: Arc::new(AtomicBool::new(false)),
@@ -2774,6 +2887,64 @@ mod tests {
         no_supervisors(&e.sp);
         assert_eq!(drained(&e.db, &r.id), drain_facts(&r, "interrupted"));
         e.sp.shutdown();
+    }
+
+    /// C1b-M1-4: the fake CC's input box reads like the real one, a paste
+    /// shows in it, and CR submits the full text and turns the title busy.
+    #[test]
+    fn fake_cc_draws_the_input_box_and_takes_a_paste() {
+        use crate::engine::cc_screen::{input_box, paste_payload, InputBox, KEY_CR};
+        let mut b = FakeInput::default();
+        assert_eq!(input_box(&b.screen()), InputBox::Placeholder);
+        assert_eq!(b.apply(KEY_CR), None, "CR on an empty box does nothing");
+        assert_eq!(b.apply(&paste_payload("[c9watch mail msg_1]")), None);
+        assert_eq!(
+            input_box(&b.screen()),
+            InputBox::Text("[c9watch mail msg_1]".into())
+        );
+        assert_eq!(b.apply(KEY_CR).as_deref(), Some("[c9watch mail msg_1]"));
+        assert_eq!(input_box(&b.screen()), InputBox::Empty);
+        b.apply(&paste_payload("a\nb\nc"));
+        assert_eq!(
+            input_box(&b.screen()),
+            InputBox::Text("[Pasted text #2 +2 lines]".into())
+        );
+        assert_eq!(b.apply(b"\x1b[B"), None);
+        assert_eq!(b.apply(KEY_CR).as_deref(), Some("a\nb\nc"));
+        b.apply(b"hi");
+        assert_eq!(input_box(&b.screen()), InputBox::Text("hi".into()));
+    }
+
+    /// C1b-M1-4: a test scripts the fake's write results and screen, and
+    /// every write's bytes are kept.
+    #[test]
+    fn fake_driver_scripts_write_results_and_keeps_the_bytes() {
+        let e = setup(Script::Hang, None);
+        let spec = SpawnSpec::new(vec!["claude".into()], e.cwd.clone());
+        let mut d = e.launcher.spawn(&spec).unwrap();
+        lock(&e.launcher.write_results).extend([
+            Some(io::ErrorKind::WouldBlock),
+            None,
+            Some(io::ErrorKind::TimedOut),
+            Some(io::ErrorKind::BrokenPipe),
+        ]);
+        let kinds: Vec<Option<io::ErrorKind>> = (0..5)
+            .map(|i| d.write(&[b'a' + i]).err().map(|e| e.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                Some(io::ErrorKind::WouldBlock),
+                None,
+                Some(io::ErrorKind::TimedOut),
+                Some(io::ErrorKind::BrokenPipe),
+                None
+            ]
+        );
+        assert_eq!(*lock(&e.launcher.sent), [b"a", b"b", b"c", b"d", b"e"]);
+        assert_eq!(e.launcher.writes.load(Ordering::SeqCst), 5);
+        lock(&e.launcher.screens).insert(String::new(), "a menu".into());
+        assert_eq!(d.screen().text, "a menu");
     }
 
     /// C1b-M1-3: a write the drain stops is `Blocked`, sends nothing and
