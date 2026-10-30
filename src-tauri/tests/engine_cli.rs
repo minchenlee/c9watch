@@ -785,3 +785,24 @@ fn watch_follows_a_new_engine_after_a_restart() {
         serde_json::from_str(&lines.recv_timeout(Duration::from_secs(30)).unwrap()).unwrap();
     assert_eq!(stopped["event"], "stopped", "{}", stopped);
 }
+
+/// `wait --event turn_ended` outside an agent auto-starts the engine
+/// (C1a-37); an agent it does not know exits 2.
+#[test]
+fn wait_for_a_turn_end_auto_starts_the_engine() {
+    let sb = Sandbox::new();
+    let out = sb.run(&[
+        "wait",
+        "--event",
+        "turn_ended",
+        "--agent",
+        "agt_nope",
+        "--timeout",
+        "20",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{:?}", out);
+    assert!(out.stdout.is_empty(), "{:?}", out);
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert!(err["error"].as_str().unwrap().contains("agt_nope"), "{err}");
+    assert!(sb.pid().is_some_and(alive), "no engine was started");
+}

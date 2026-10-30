@@ -113,6 +113,26 @@ of the c9 engine. They auto-start it and read its sessions (`session.list`;
 - When no engine answers and none can start, the command exits `1` with
   `engine_unreachable` and a hint to use `--direct`.
 
+### `wait --event turn_ended --agent <id|name>`
+
+An engine build also waits for the next turn end of one engine agent (an
+agent the engine runs in a PTY). A turn end means only that the agent is
+idle; it does not mean its work is done. The command reads `snapshot.get`
+and follows `agent.turn_end` events from its cursor, and after an `engine
+restart` it goes on from the last cursor it saw.
+
+```json
+{"schema":1,"event":"turn_ended","agentId":"agt_01J…","name":"w1","generation":1,"by":"hook","at":1767000000000,"cursor":"m:e:42","timestamp":"2026-10-30T10:00:00+00:00"}
+```
+
+`by` names the signal that saw the turn end (`hook`, `screen`, `transcript`
+or `process`). Exit codes: `0` the turn ended, `2` no live engine agent
+matches, `3` the agent stopped first (the line has `"event":"agent_ended"`
+and a `reason`: its final state, `gone` or `failed`), `124` timeout. Inside
+an engine agent (`C9_AGENT_ID` set) the command connects only to
+`C9_ENGINE_SOCK`, never starts the engine, and exits `1` with
+`engine_unreachable` when no engine answers there.
+
 ## Shell example: notify me when a session needs me
 
 ```bash

@@ -28,6 +28,8 @@ pub mod engine_client;
 #[cfg(all(unix, feature = "engine"))]
 pub mod engine_sessions;
 #[cfg(all(unix, feature = "engine"))]
+pub mod engine_wait;
+#[cfg(all(unix, feature = "engine"))]
 pub mod task;
 
 use cost::cmd_cost;
@@ -145,6 +147,30 @@ impl DetectArgs {
     fn via_engine(&self) -> bool {
         engine_sessions::use_engine(self.direct, &|k| std::env::var_os(k))
     }
+}
+
+/// `wait --event turn_ended --agent X` (C1a-37). An engine build adds the
+/// flags; in other builds it holds nothing, so the release CLI is
+/// unchanged.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct WaitEventArgs {
+    /// Wait for this event of one engine agent (`--agent`) instead of a
+    /// session condition. `turn_ended`: the agent's next turn end, which
+    /// means only that it is idle. Exit codes: 0 the turn ended, 2 no live
+    /// engine agent matches, 3 the agent stopped first, 124 timeout
+    #[cfg(all(unix, feature = "engine"))]
+    #[arg(
+        long,
+        value_enum,
+        requires = "agent",
+        conflicts_with_all = ["session_id", "until", "interval", "direct"]
+    )]
+    pub event: Option<engine_wait::WaitEvent>,
+
+    /// The engine agent for `--event`: its id (`agt_...`) or name
+    #[cfg(all(unix, feature = "engine"))]
+    #[arg(long, requires = "event")]
+    pub agent: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -293,11 +319,21 @@ pub enum Commands {
     /// `done` is met at once when the session is not Working at the start.
     Wait {
         /// Session key (`provider:id`), session ID, or unique prefix of a live session
+        #[cfg(not(all(unix, feature = "engine")))]
         session_id: String,
+        /// Session key (`provider:id`), session ID, or unique prefix of a live session
+        #[cfg(all(unix, feature = "engine"))]
+        #[arg(required_unless_present = "event")]
+        session_id: Option<String>,
 
         /// Condition to wait for
+        #[cfg(not(all(unix, feature = "engine")))]
         #[arg(long, value_enum)]
         until: watch::Until,
+        /// Condition to wait for
+        #[cfg(all(unix, feature = "engine"))]
+        #[arg(long, value_enum, required_unless_present = "event")]
+        until: Option<watch::Until>,
 
         /// Give up after this many seconds (exit 124). Default: wait forever
         #[arg(long)]
@@ -309,6 +345,9 @@ pub enum Commands {
 
         #[command(flatten)]
         detect: DetectArgs,
+
+        #[command(flatten)]
+        event: WaitEventArgs,
     },
 
     /// Show tasks/todos for a session
@@ -526,7 +565,8 @@ pub fn run(cli: Cli) {
             timeout,
             interval,
             detect,
-        } => match cmd_wait(&session_id, until, timeout, interval, &detect) {
+            event,
+        } => match wait_command(session_id, until, timeout, interval, &detect, &event) {
             Ok(0) => Ok(()),
             Ok(code) => process::exit(code),
             Err(e) => Err(e),
@@ -1076,6 +1116,42 @@ pub(crate) enum Poll<L> {
     Failed(String),
 }
 
+/// `c9watch wait` as parsed: the session form, or in an engine build
+/// `--event turn_ended --agent X` (C1a-37).
+#[cfg(not(all(unix, feature = "engine")))]
+fn wait_command(
+    session_id: String,
+    until: watch::Until,
+    timeout_secs: Option<u64>,
+    interval_secs: u64,
+    detect: &DetectArgs,
+    _event: &WaitEventArgs,
+) -> Result<i32, String> {
+    cmd_wait(&session_id, until, timeout_secs, interval_secs, detect)
+}
+
+/// `c9watch wait` as parsed: the session form, or in an engine build
+/// `--event turn_ended --agent X` (C1a-37).
+#[cfg(all(unix, feature = "engine"))]
+fn wait_command(
+    session_id: Option<String>,
+    until: Option<watch::Until>,
+    timeout_secs: Option<u64>,
+    interval_secs: u64,
+    detect: &DetectArgs,
+    event: &WaitEventArgs,
+) -> Result<i32, String> {
+    if let (Some(engine_wait::WaitEvent::TurnEnded), Some(agent)) = (event.event, &event.agent) {
+        return engine_wait::cmd_wait_turn(agent, timeout_secs);
+    }
+    match (session_id, until) {
+        (Some(session_id), Some(until)) => {
+            cmd_wait(&session_id, until, timeout_secs, interval_secs, detect)
+        }
+        _ => Err("wait needs <SESSION_ID> --until, or --event with --agent".into()),
+    }
+}
+
 /// `c9watch wait`: returns the process exit code (see `watch::EXIT_*`).
 ///
 /// Polls run on a background thread: one poll can take many seconds with
@@ -1297,12 +1373,61 @@ mod dispatch_tests {
         else {
             panic!("not a wait command");
         };
+        #[cfg(all(unix, feature = "engine"))]
+        let (session_id, until) = (session_id.unwrap(), until.unwrap());
         assert_eq!(session_id, "abc");
         assert_eq!(until, watch::Until::NeedsInput);
         assert_eq!(timeout, Some(5));
         assert_eq!(interval, 2);
         assert!(Cli::try_parse_from(["c9watch", "wait", "abc"]).is_err());
         assert!(Cli::try_parse_from(["c9watch", "watch", "--json"]).is_ok());
+    }
+
+    /// `wait --event turn_ended --agent X` exists only in engine builds
+    /// (C1a-37), and replaces the session form instead of adding to it.
+    #[test]
+    fn wait_event_is_an_engine_build_form() {
+        let event = ["c9watch", "wait", "--event", "turn_ended", "--agent", "w"];
+        let parsed = Cli::try_parse_from(event);
+        #[cfg(all(unix, feature = "engine"))]
+        {
+            let cli = parsed.unwrap();
+            let Commands::Wait {
+                session_id,
+                until,
+                event,
+                timeout,
+                ..
+            } = cli.command
+            else {
+                panic!("not a wait command");
+            };
+            assert_eq!(event.event, Some(engine_wait::WaitEvent::TurnEnded));
+            assert_eq!(event.agent.as_deref(), Some("w"));
+            assert_eq!((session_id, until, timeout), (None, None, None));
+            let ok = |args: &[&str]| Cli::try_parse_from(args).is_ok();
+            assert!(ok(&[&event_args()[..], &["--timeout", "3"]].concat()));
+            for bad in [
+                &["c9watch", "wait", "--event", "turn_ended"][..],
+                &["c9watch", "wait", "--agent", "w"],
+                &["c9watch", "wait", "--event", "turn-ended", "--agent", "w"],
+                &[&event_args()[..], &["abc"]].concat(),
+                &[&event_args()[..], &["--until", "done"]].concat(),
+                &[&event_args()[..], &["--direct"]].concat(),
+                &[&event_args()[..], &["--interval", "3"]].concat(),
+                &["c9watch", "wait", "--until", "done"],
+                &["c9watch", "wait"],
+            ] {
+                assert!(!ok(bad), "{bad:?} parsed");
+            }
+        }
+        #[cfg(not(all(unix, feature = "engine")))]
+        assert!(parsed.is_err(), "wait --event parsed in a release CLI");
+    }
+
+    #[cfg(all(unix, feature = "engine"))]
+    fn event_args() -> Vec<&'static str> {
+        vec!["c9watch", "wait", "--event", "turn_ended", "--agent", "w"]
     }
 
     /// `--direct` exists only in engine builds, on the five detection
