@@ -27,7 +27,15 @@ enum After {
     Send(Vec<Value>),
     /// Send these frames, then close the connection.
     SendAndClose(Vec<Value>),
+    /// Answer the first `events.subscribe` with `cursor_expired`; then
+    /// `snapshot.get` returns `agents` at `EXPIRED_CURSOR`, and the next
+    /// subscribe goes on as `then`.
+    Expired { agents: Value, then: Box<After> },
+    /// Answer nothing, not even `hello`.
+    Mute,
 }
+
+const EXPIRED_CURSOR: &str = "m1:e1:40";
 
 /// The fake engine. Connection `n` follows `script[n]` (the last entry
 /// repeats). Every request is recorded with its connection number.
@@ -89,6 +97,7 @@ fn serve(
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
+    let (mut agents, mut after, mut cursor) = (agents, after, SNAP_CURSOR);
     loop {
         line.clear();
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -97,6 +106,9 @@ fn serve(
         let req: Value = serde_json::from_str(line.trim_end()).unwrap();
         requests.lock().unwrap().push((n, req.clone()));
         let id = req["id"].clone();
+        if matches!(after, After::Mute) {
+            continue;
+        }
         let ok = |result: Value| json!({"v": 1, "id": id, "ok": true, "result": result});
         let resp = match req["method"].as_str().unwrap_or("") {
             "hello" => ok(json!({
@@ -105,8 +117,17 @@ fn serve(
                 "capabilities": [], "cursor": SNAP_CURSOR,
             })),
             "snapshot.get" => ok(json!({
-                "cursor": SNAP_CURSOR, "machineId": MACHINE, "agents": agents,
+                "cursor": cursor, "machineId": MACHINE, "agents": agents,
             })),
+            "events.subscribe" if matches!(after, After::Expired { .. }) => {
+                let After::Expired { agents: a, then } = after else {
+                    unreachable!()
+                };
+                (agents, after, cursor) = (a, *then, EXPIRED_CURSOR);
+                json!({"v": 1, "id": id, "ok": false,
+                       "error": {"code": "cursor_expired", "msg": "pruned",
+                                 "retryable": true, "hint": "snapshot.get"}})
+            }
             "events.subscribe" => {
                 let since = req["params"]["since"].clone();
                 if !write_line(&mut writer, &ok(json!({ "cursor": since }))) {
@@ -115,6 +136,7 @@ fn serve(
                 let (frames, close) = match &after {
                     After::Send(f) => (f, false),
                     After::SendAndClose(f) => (f, true),
+                    After::Expired { .. } | After::Mute => unreachable!(),
                 };
                 for f in frames {
                     let mut f = f.clone();
@@ -129,7 +151,8 @@ fn serve(
                 continue;
             }
             m => json!({"v": 1, "id": id, "ok": false,
-                        "error": {"code": "unknown_method", "msg": m}}),
+                        "error": {"code": "unknown_method", "msg": m,
+                                  "retryable": false, "hint": ""}}),
         };
         if !write_line(&mut writer, &resp) {
             return;
@@ -374,4 +397,93 @@ fn an_agent_caller_without_its_engine_sock_fails_and_starts_nothing() {
     }
     assert!(fake.requests.lock().unwrap().is_empty());
     fake.assert_no_engine_home();
+}
+
+#[test]
+fn an_expired_cursor_reads_a_new_snapshot() {
+    let only = |row: Value| json!([row]);
+    // Still mid-turn: subscribe from the new snapshot and go on.
+    let fake = FakeEngine::start(
+        agents(),
+        vec![After::Expired {
+            agents: only(agent_row("agt_1", "w1", "working")),
+            then: Box::new(After::Send(vec![turn_end(41, "agt_1")])),
+        }],
+    );
+    let out = fake.wait(&["--event", "turn_ended", "--agent", "agt_1"]);
+    assert_eq!(out.status.code(), Some(0), "{:?}", out);
+    assert_eq!(stdout_line(&out)["by"], "hook");
+    let subs = fake.subscribes();
+    assert_eq!(subs.len(), 2, "{subs:?}");
+    assert_eq!(subs[0].1["since"], SNAP_CURSOR);
+    assert_eq!(subs[1].1["since"], EXPIRED_CURSOR);
+
+    // Gone from the new snapshot: exit 3, `gone`.
+    let fake = FakeEngine::start(
+        agents(),
+        vec![After::Expired {
+            agents: only(agent_row("agt_other", "other", "working")),
+            then: Box::new(After::Send(Vec::new())),
+        }],
+    );
+    let out = fake.wait(&["--event", "turn_ended", "--agent", "agt_1"]);
+    assert_eq!(out.status.code(), Some(3), "{:?}", out);
+    let line = stdout_line(&out);
+    assert_eq!(line["event"], "agent_ended");
+    assert_eq!(line["reason"], "gone");
+
+    // Mid-turn when the wait began and idle now: the turn ended in the
+    // pruned events.
+    let fake = FakeEngine::start(
+        agents(),
+        vec![After::Expired {
+            agents: only(agent_row("agt_1", "w1", "ready")),
+            then: Box::new(After::Send(Vec::new())),
+        }],
+    );
+    let out = fake.wait(&["--event", "turn_ended", "--agent", "agt_1"]);
+    assert_eq!(out.status.code(), Some(0), "{:?}", out);
+    let line = stdout_line(&out);
+    assert_eq!(line["event"], "turn_ended");
+    assert_eq!(line["by"], "snapshot");
+    assert_eq!(line["cursor"], EXPIRED_CURSOR);
+    assert_eq!(fake.subscribes().len(), 1);
+    fake.assert_no_engine_home();
+}
+
+#[test]
+fn since_subscribes_from_the_given_cursor() {
+    let fake = FakeEngine::start(agents(), vec![After::Send(vec![turn_end(2, "agt_1")])]);
+    let out = fake.wait(&[
+        "--event",
+        "turn_ended",
+        "--agent",
+        "agt_1",
+        "--since",
+        "m1:e1:1",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{:?}", out);
+    assert_eq!(stdout_line(&out)["cursor"], "m1:e1:2");
+    assert_eq!(fake.subscribes()[0].1["since"], "m1:e1:1");
+}
+
+#[test]
+fn the_timeout_covers_an_engine_that_does_not_answer() {
+    let fake = FakeEngine::start(agents(), vec![After::Mute]);
+    let start = Instant::now();
+    let out = fake.wait(&[
+        "--event",
+        "turn_ended",
+        "--agent",
+        "agt_1",
+        "--timeout",
+        "1",
+    ]);
+    assert_eq!(out.status.code(), Some(124), "{:?}", out);
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(out.stdout.is_empty());
 }

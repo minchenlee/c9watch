@@ -185,6 +185,15 @@ pub struct WaitEventArgs {
     #[cfg(all(unix, feature = "engine"))]
     #[arg(long, requires = "event")]
     pub agent: Option<String>,
+
+    /// For `--event`: count events after this engine cursor (the `cursor`
+    /// of the last line `wait` printed, or one taken before a send) instead
+    /// of after now. Without it a turn that ended before the wait started
+    /// does not count, and without `--timeout` the wait can last until the
+    /// next turn ends
+    #[cfg(all(unix, feature = "engine"))]
+    #[arg(long, requires = "event")]
+    pub since: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -381,8 +390,14 @@ pub enum Commands {
         append_system_prompt: Option<String>,
         #[arg(long)]
         append_system_prompt_file: Option<String>,
+        #[cfg(not(all(unix, feature = "engine")))]
         #[arg(long, default_value = "bypassPermissions")]
         permission_mode: String,
+        /// Permission mode of a managed worker [default: bypassPermissions].
+        /// Not with `--mode free`: the engine sets a free agent's profile
+        #[cfg(all(unix, feature = "engine"))]
+        #[arg(long)]
+        permission_mode: Option<String>,
         #[arg(long)]
         model: Option<String>,
         #[arg(long)]
@@ -617,7 +632,9 @@ pub fn run(cli: Cli) {
                 name,
                 append_system_prompt,
                 append_system_prompt_file,
-                permission_mode,
+                // `Some` when given; a build without the engine always has
+                // its default here.
+                permission_mode: permission_mode.into(),
                 model,
                 add_dir,
                 prompt,
@@ -1126,11 +1143,17 @@ struct SpawnFlags {
     name: Option<String>,
     append_system_prompt: Option<String>,
     append_system_prompt_file: Option<String>,
-    permission_mode: String,
+    /// `None`: not given, so a managed worker gets
+    /// `DEFAULT_PERMISSION_MODE`.
+    permission_mode: Option<String>,
     model: Option<String>,
     add_dir: Vec<String>,
     prompt: Option<String>,
 }
+
+/// The `--permission-mode` of a managed worker that was not given one.
+#[cfg(feature = "pm-orchestration")]
+const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 
 /// `c9watch spawn`: `--mode managed` (the default, and the only mode of a
 /// build without the engine) keeps the legacy worker path; in an engine
@@ -1142,7 +1165,7 @@ fn spawn_command(f: SpawnFlags, mode: &SpawnModeArgs, pretty: bool) -> Result<()
         engine_spawn::check_free_flags(&engine_spawn::ManagedFlags {
             append_system_prompt: f.append_system_prompt.is_some(),
             append_system_prompt_file: f.append_system_prompt_file.is_some(),
-            permission_mode: &f.permission_mode,
+            permission_mode: f.permission_mode.is_some(),
             model: f.model.is_some(),
             add_dir: !f.add_dir.is_empty(),
             prompt: f.prompt.is_some(),
@@ -1166,7 +1189,9 @@ fn spawn_managed(f: SpawnFlags, pretty: bool) -> Result<(), String> {
         cwd: resolved_cwd,
         name: f.name,
         append_system_prompt: f.append_system_prompt,
-        permission_mode: f.permission_mode,
+        permission_mode: f
+            .permission_mode
+            .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.to_string()),
         model: f.model,
         add_dirs: f.add_dir,
     };
@@ -1220,7 +1245,7 @@ fn wait_command(
     event: &WaitEventArgs,
 ) -> Result<i32, String> {
     if let (Some(engine_wait::WaitEvent::TurnEnded), Some(agent)) = (event.event, &event.agent) {
-        return engine_wait::cmd_wait_turn(agent, timeout_secs);
+        return engine_wait::cmd_wait_turn(agent, event.since.as_deref(), timeout_secs);
     }
     match (session_id, until) {
         (Some(session_id), Some(until)) => {

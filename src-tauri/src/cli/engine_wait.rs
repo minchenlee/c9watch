@@ -6,15 +6,22 @@
 //!
 //! The command reads `snapshot.get` to find the agent, then follows
 //! `events.subscribe` from the snapshot's cursor, so a turn that ends
-//! between the two calls is not lost. When the stream ends (an `engine
-//! restart`), it connects again and subscribes from the last cursor it saw.
+//! between the two calls is not lost. A turn that ended before the snapshot
+//! does not count: a caller that sent a prompt and then waits passes the
+//! cursor it had before the send (`--since`, for example the `cursor` of
+//! the last line `wait` printed), or the wait goes on until the next turn
+//! ends. When the stream ends (an `engine restart`), it connects again and
+//! subscribes from the last cursor it saw. `--timeout` covers the whole
+//! command, the engine auto-start included.
 //!
 //! A caller inside an engine agent (`C9_AGENT_ID` set) connects only to
 //! `C9_ENGINE_SOCK`. It never auto-starts the engine, and an engine that
 //! does not answer there is an error. Other callers auto-start the engine.
 
 use super::engine_client::{current_exe, ensure_engine, error_line, EngineConn, ENV_AGENT_ID};
-use super::engine_sessions::ENGINE_UNREACHABLE;
+use super::engine_sessions::{
+    DETECTED_READ_TIMEOUT, ENGINE_UNREACHABLE, RECONNECT_EVERY, RESTART_GRACE,
+};
 use super::print_line;
 use super::task::ENV_SOCK;
 use super::watch;
@@ -42,7 +49,6 @@ pub const AGENT_ENDED: &str = "agent_ended";
 /// stream ended: an `engine restart` drains for up to 90 s.
 const RECONNECT_FOR: Duration =
     Duration::from_secs(crate::engine::drain::HARD_DEADLINE.as_secs() + 30);
-const RECONNECT_EVERY: Duration = Duration::from_secs(1);
 
 /// Engine lifecycle states after which no turn of the agent ends.
 const FINAL_STATES: &[&str] = &["retiring", "retired", "failed", "orphaned"];
@@ -73,17 +79,23 @@ pub fn target(env: &dyn Fn(&str) -> Option<OsString>) -> Result<Target, String> 
     }
 }
 
-fn connect(target: &Target) -> Result<EngineConn, String> {
+/// Connect to `target`; with `auto_start`, an `AutoStart` target starts
+/// the engine first if none runs.
+fn connect(target: &Target, auto_start: bool) -> Result<EngineConn, String> {
     let unreachable = |e: String| format!("{}: {}", ENGINE_UNREACHABLE, e);
     let sock = match target {
         Target::AgentSock(sock) => sock.clone(),
         Target::AutoStart => {
             let home = engine_home().map_err(unreachable)?;
-            ensure_engine(&home, &current_exe()?).map_err(unreachable)?;
+            if auto_start {
+                ensure_engine(&home, &current_exe()?).map_err(unreachable)?;
+            }
             sock_path(&home)
         }
     };
-    EngineConn::connect(&sock).map_err(|e| unreachable(e.into_msg()))
+    let mut conn = EngineConn::connect(&sock).map_err(|e| unreachable(e.into_msg()))?;
+    conn.set_read_timeout(DETECTED_READ_TIMEOUT);
+    Ok(conn)
 }
 
 fn call(
@@ -113,15 +125,24 @@ fn finished(row: &AgentRow) -> bool {
             .is_some_and(|s| FINAL_STATES.contains(&s))
 }
 
-/// The live agent that `reference` names: its id or its name. Only agents
-/// the engine runs in a PTY have turn ends.
+/// Whether the engine runs `row` in a PTY: only such agents have turn ends.
+fn runs_in_pty(row: &AgentRow) -> bool {
+    row.source == "engine" && row.control == "pty"
+}
+
+/// The live agent that `reference` names: its id, else the name of an
+/// agent the engine runs. A detected session often has the same name (its
+/// project directory), so a name names one of those only when no engine
+/// agent has it.
 pub fn resolve<'a>(rows: &'a [AgentRow], reference: &str) -> Result<&'a AgentRow, String> {
-    let row = rows
-        .iter()
-        .filter(|r| !finished(r))
-        .find(|r| r.id == reference || r.name.as_deref() == Some(reference))
+    let live = || rows.iter().filter(|r| !finished(r));
+    let named = |r: &&AgentRow| r.name.as_deref() == Some(reference);
+    let row = live()
+        .find(|r| r.id == reference)
+        .or_else(|| live().filter(|r| runs_in_pty(r)).find(named))
+        .or_else(|| live().find(named))
         .ok_or_else(|| format!("No live engine agent matches '{}'", reference))?;
-    if row.source != "engine" || row.control != "pty" {
+    if !runs_in_pty(row) {
         return Err(format!(
             "'{}' is not an agent the engine runs, so it has no turn ends; \
              use wait <session> --until done",
@@ -195,10 +216,35 @@ pub fn outcome_line(agent: &AgentRow, outcome: &Outcome, timestamp: &str) -> ser
     line
 }
 
-/// What the follower thread sends.
+/// What the waiting thread sends.
 enum Feed {
-    Done(Outcome),
+    Done(Box<AgentRow>, Outcome),
+    /// No live engine agent matches: the message.
+    NotFound(String),
     Failed(String),
+}
+
+/// Whether `state` is a turn in progress.
+fn mid_turn(state: Option<&str>) -> bool {
+    matches!(state, Some("working" | "blocked"))
+}
+
+/// A turn end read off a snapshot, for a turn whose `agent.turn_end` event
+/// the engine no longer keeps (`by` is `snapshot`, `at` is null).
+fn snapshot_turn_end(row: &AgentRow, subject: &str, cursor: &str) -> EventFrame {
+    EventFrame {
+        v: 1,
+        kind: crate::engine::proto::EventType::Event,
+        sub: None,
+        cursor: cursor.to_string(),
+        topic: "agent.turn_end".into(),
+        subject: Some(subject.to_string()),
+        ts: chrono::Utc::now().timestamp_millis(),
+        origin: None,
+        data: serde_json::json!({
+            "id": row.id, "generation": row.generation, "by": "snapshot", "at": null,
+        }),
+    }
 }
 
 fn subscribe_params(cursor: &str, subject: &str) -> serde_json::Value {
@@ -222,6 +268,10 @@ struct Follower {
     cursor: String,
     id: String,
     subject: String,
+    /// Whether the agent was mid-turn since the wait began (or the caller
+    /// gave `--since`): then an idle agent after a `cursor_expired` means
+    /// the turn ended in the gap.
+    turn_seen: bool,
 }
 
 /// Why one subscription stopped without an outcome.
@@ -235,7 +285,8 @@ enum Stop {
 impl Follower {
     /// One subscription on `conn`. A cursor the engine no longer keeps
     /// (`cursor_expired`) is replaced by a new snapshot's cursor, and the
-    /// agent must still be live in that snapshot.
+    /// agent must still be live in that snapshot. If the agent was mid-turn
+    /// and is `ready` in it, the turn ended in the events that were pruned.
     fn subscribe(&mut self, mut conn: EngineConn) -> Result<Outcome, Stop> {
         loop {
             let resp = conn
@@ -252,12 +303,20 @@ impl Follower {
                 return Err(Stop::Refused(e));
             }
             let snap = snapshot(&mut conn).map_err(|_| Stop::Lost)?;
-            if !snap.agents.iter().any(|r| r.id == self.id && !finished(r)) {
+            let Some(row) = snap.agents.iter().find(|r| r.id == self.id && !finished(r)) else {
                 return Ok(Outcome::Ended {
                     why: "gone".into(),
                     cursor: snap.cursor,
                 });
+            };
+            if self.turn_seen && row.state.as_deref() == Some("ready") {
+                return Ok(Outcome::TurnEnded(snapshot_turn_end(
+                    row,
+                    &self.subject,
+                    &snap.cursor,
+                )));
             }
+            self.turn_seen |= mid_turn(row.state.as_deref());
             self.cursor = snap.cursor;
         }
         let frames = conn.into_frames().map_err(|_| Stop::Lost)?;
@@ -268,6 +327,9 @@ impl Follower {
                 break;
             };
             self.cursor = frame.cursor.clone();
+            if frame.topic == "agent.upsert" && names(&frame, &self.id) {
+                self.turn_seen |= mid_turn(frame.data.get("state").and_then(|v| v.as_str()));
+            }
             if let Some(outcome) = judge(&self.id, frame) {
                 return Ok(outcome);
             }
@@ -276,19 +338,26 @@ impl Follower {
     }
 
     /// Subscribe until an outcome. After a lost connection, connect again
-    /// for up to `RECONNECT_FOR` and go on from the last cursor.
-    fn run(mut self, mut conn: EngineConn) -> Feed {
+    /// for up to `RECONNECT_FOR` and go on from the last cursor; for the
+    /// first `RESTART_GRACE` only connect, so an `engine restart` starts
+    /// the new engine, not this command.
+    fn run(mut self, mut conn: EngineConn) -> Result<Outcome, String> {
         loop {
+            let opened_at = Instant::now();
             match self.subscribe(conn) {
-                Ok(outcome) => return Feed::Done(outcome),
-                Err(Stop::Refused(e)) => return Feed::Failed(e),
+                Ok(outcome) => return Ok(outcome),
+                Err(Stop::Refused(e)) => return Err(e),
                 Err(Stop::Lost) => {}
             }
-            let since = Instant::now();
+            // A stream that ends at once is not reopened in a busy loop.
+            if opened_at.elapsed() < RECONNECT_EVERY {
+                std::thread::sleep(RECONNECT_EVERY);
+            }
+            let lost_at = Instant::now();
             conn = loop {
-                match connect(&self.target) {
+                match connect(&self.target, lost_at.elapsed() >= RESTART_GRACE) {
                     Ok(conn) => break conn,
-                    Err(e) if since.elapsed() >= RECONNECT_FOR => return Feed::Failed(e),
+                    Err(e) if lost_at.elapsed() >= RECONNECT_FOR => return Err(e),
                     Err(_) => std::thread::sleep(RECONNECT_EVERY),
                 }
             };
@@ -296,48 +365,66 @@ impl Follower {
     }
 }
 
-/// `c9watch wait --event turn_ended --agent X`. Returns the exit code: 0
-/// the turn ended, 2 no live engine agent matches, 3 the agent stopped
-/// first, 124 timeout.
-pub fn cmd_wait_turn(reference: &str, timeout_secs: Option<u64>) -> Result<i32, String> {
-    let deadline = timeout_secs.map(|t| Instant::now() + Duration::from_secs(t));
-    let target = target(&|k| std::env::var_os(k))?;
-    let mut conn = connect(&target)?;
-    let snap = snapshot(&mut conn)?;
+/// Connect, find the agent, and follow it until an outcome.
+fn wait_turn(target: Target, reference: &str, since: Option<&str>) -> Feed {
+    let mut conn = match connect(&target, true) {
+        Ok(conn) => conn,
+        Err(e) => return Feed::Failed(e),
+    };
+    let snap = match snapshot(&mut conn) {
+        Ok(snap) => snap,
+        Err(e) => return Feed::Failed(e),
+    };
     let agent = match resolve(&snap.agents, reference) {
         Ok(agent) => agent.clone(),
-        Err(e) => {
-            eprintln!("{}", serde_json::json!({ "error": e }));
-            return Ok(watch::EXIT_NOT_FOUND);
-        }
+        Err(e) => return Feed::NotFound(e),
     };
-    let subject = format!("{}/{}", snap.machine_id, agent.id);
     let follower = Follower {
         target,
-        cursor: snap.cursor,
+        cursor: since.map_or(snap.cursor, str::to_string),
+        subject: format!("{}/{}", snap.machine_id, agent.id),
         id: agent.id.clone(),
-        subject,
+        turn_seen: since.is_some() || mid_turn(agent.state.as_deref()),
     };
+    match follower.run(conn) {
+        Ok(outcome) => Feed::Done(Box::new(agent), outcome),
+        Err(e) => Feed::Failed(e),
+    }
+}
+
+/// `c9watch wait --event turn_ended --agent X [--since <cursor>]`. Returns
+/// the exit code: 0 the turn ended, 2 no live engine agent matches, 3 the
+/// agent stopped first, 124 timeout. The timeout counts from the start, so
+/// it covers connecting and the engine auto-start too.
+pub fn cmd_wait_turn(
+    reference: &str,
+    since: Option<&str>,
+    timeout_secs: Option<u64>,
+) -> Result<i32, String> {
+    let deadline = timeout_secs.map(|t| Instant::now() + Duration::from_secs(t));
+    let target = target(&|k| std::env::var_os(k))?;
     let (tx, rx) = mpsc::channel();
+    let (reference, since) = (reference.to_string(), since.map(str::to_string));
     std::thread::spawn(move || {
-        let _ = tx.send(follower.run(conn));
+        let _ = tx.send(wait_turn(target, &reference, since.as_deref()));
     });
+    let stopped = || "The engine feed stopped".to_string();
     let feed = match deadline {
         Some(deadline) => {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(feed) => feed,
                 Err(mpsc::RecvTimeoutError::Timeout) => return Ok(watch::EXIT_TIMEOUT),
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("The engine feed stopped".to_string())
-                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(stopped()),
             }
         }
-        None => rx
-            .recv()
-            .map_err(|_| "The engine feed stopped".to_string())?,
+        None => rx.recv().map_err(|_| stopped())?,
     };
-    let outcome = match feed {
-        Feed::Done(outcome) => outcome,
+    let (agent, outcome) = match feed {
+        Feed::Done(agent, outcome) => (agent, outcome),
+        Feed::NotFound(e) => {
+            eprintln!("{}", serde_json::json!({ "error": e }));
+            return Ok(watch::EXIT_NOT_FOUND);
+        }
         Feed::Failed(e) => return Err(e),
     };
     print_line(&outcome_line(
@@ -427,6 +514,12 @@ mod tests {
         assert!(resolve(&rows, "agt_0").is_err());
         assert!(resolve(&rows, "nope").unwrap_err().contains("No live"));
         assert!(resolve(&rows, "obs").unwrap_err().contains("--until done"));
+        // A detected session with the same name, listed first, does not
+        // hide the engine agent.
+        let mut same = row("claudeCode:p", "working");
+        same.name = Some("w".into());
+        let rows = vec![same, engine_agent("agt_3", "w")];
+        assert_eq!(resolve(&rows, "w").unwrap().id, "agt_3");
         let mut retiring = engine_agent("agt_2", "r");
         retiring.state = Some("retiring".into());
         assert!(resolve(&[retiring], "agt_2").is_err());

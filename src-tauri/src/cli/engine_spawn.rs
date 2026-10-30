@@ -36,19 +36,17 @@ pub enum SpawnMode {
     Free,
 }
 
-/// The `spawn` flags that only `--mode managed` uses, as given.
+/// The `spawn` flags that only `--mode managed` uses: whether each was
+/// given.
 #[derive(Debug, Default)]
-pub struct ManagedFlags<'a> {
+pub struct ManagedFlags {
     pub append_system_prompt: bool,
     pub append_system_prompt_file: bool,
-    pub permission_mode: &'a str,
+    pub permission_mode: bool,
     pub model: bool,
     pub add_dir: bool,
     pub prompt: bool,
 }
-
-/// The default of `spawn --permission-mode`.
-pub const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 
 /// Fail when a managed-only flag is given with `--mode free`: the engine
 /// sets the profile of a free agent itself (C1a-23).
@@ -56,10 +54,7 @@ pub fn check_free_flags(f: &ManagedFlags) -> Result<(), String> {
     let given: Vec<&str> = [
         (f.append_system_prompt, "--append-system-prompt"),
         (f.append_system_prompt_file, "--append-system-prompt-file"),
-        (
-            f.permission_mode != DEFAULT_PERMISSION_MODE,
-            "--permission-mode",
-        ),
+        (f.permission_mode, "--permission-mode"),
         (f.model, "--model"),
         (f.add_dir, "--add-dir"),
         (f.prompt, "--prompt"),
@@ -193,13 +188,10 @@ mod tests {
 
     #[test]
     fn free_mode_refuses_the_managed_flags() {
-        let none = ManagedFlags {
-            permission_mode: DEFAULT_PERMISSION_MODE,
-            ..Default::default()
-        };
-        assert!(check_free_flags(&none).is_ok());
+        assert!(check_free_flags(&ManagedFlags::default()).is_ok());
+        // Any given value is refused, the managed default included.
         let some = ManagedFlags {
-            permission_mode: "plan",
+            permission_mode: true,
             prompt: true,
             ..Default::default()
         };

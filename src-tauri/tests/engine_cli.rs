@@ -432,7 +432,9 @@ const DETECT_SID: &str = "22222222-3333-4444-5555-666666666666";
 const DETECT_CLAUDE: &str = r#"#!/bin/sh
 case "$1" in
   --version) echo "2.1.312 (Claude Code)"; exit 0 ;;
-  agents) cat "$(dirname "$0")/agents.json"; exit 0 ;;
+  agents)
+    [ -f "$(dirname "$0")/agents-delay" ] && sleep "$(cat "$(dirname "$0")/agents-delay")"
+    cat "$(dirname "$0")/agents.json"; exit 0 ;;
 esac
 exit 1
 "#;
@@ -441,6 +443,7 @@ exit 1
 /// in `<root>/work/proj`. `path` puts the stand-in first on PATH.
 struct Detected {
     path: String,
+    bin: PathBuf,
     sleeper: std::process::Child,
 }
 
@@ -467,6 +470,7 @@ impl Detected {
         std::fs::write(bin.join("agents.json"), agents.to_string()).unwrap();
         Detected {
             path: format!("{}:/usr/bin:/bin", bin.display()),
+            bin,
             sleeper,
         }
     }
@@ -603,6 +607,30 @@ fn list_and_status_auto_start_the_engine_and_read_its_sessions() {
     assert_eq!(direct["sessions"][0]["status"], "Connecting");
 }
 
+/// The first `list` after a cold start already has the session: the engine
+/// answers once its first detection pass is written (reviews H1), even when
+/// `claude agents --json` is slow.
+#[test]
+fn the_first_list_after_a_cold_start_has_the_session() {
+    let sb = Sandbox::new();
+    let d = Detected::new(&sb);
+    std::fs::write(d.bin.join("agents-delay"), "1").unwrap();
+    let out = d.run(&sb, &["list"]);
+    assert!(out.status.success(), "{:?} / log {}", out, sb.log());
+    let list = stdout_json(&out);
+    assert_eq!(
+        list["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "{} / log {}",
+        list,
+        sb.log()
+    );
+    let out = d.run(&sb, &["engine", "restart"]);
+    assert!(out.status.success(), "{:?}", out);
+    let out = d.run(&sb, &["status"]);
+    assert_eq!(stdout_json(&out)["total"], 1, "{:?}", out);
+}
+
 #[test]
 fn watch_and_wait_follow_the_engine_events() {
     use wait_timeout::ChildExt;
@@ -659,7 +687,7 @@ fn watch_and_wait_follow_the_engine_events() {
             &["wait", DETECT_SID, "--until", "ended", "--timeout", "60"],
         )
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map(Reap)
         .unwrap();
@@ -669,8 +697,10 @@ fn watch_and_wait_follow_the_engine_events() {
     assert_eq!(started["event"], "started");
     assert_eq!(started["sessionKey"], key.as_str());
     assert_eq!(started["session"]["status"], "connecting");
-    // Let `wait` take its snapshot before the session ends.
-    std::thread::sleep(Duration::from_secs(2));
+    // Let `wait` take its snapshot before the session ends. The engine is
+    // warm, so this is one local round trip; the margin is for a loaded CI
+    // host, and a miss shows `wait`'s stderr below.
+    std::thread::sleep(Duration::from_secs(5));
 
     d.end_session();
     let stopped: Value =
@@ -680,7 +710,12 @@ fn watch_and_wait_follow_the_engine_events() {
     assert_eq!(stopped["previousStatus"], "Connecting");
 
     let status = wait.wait_timeout(Duration::from_secs(30)).unwrap();
-    assert_eq!(status.and_then(|s| s.code()), Some(0));
+    let mut err = String::new();
+    if let Some(mut e) = wait.stderr.take() {
+        use std::io::Read;
+        let _ = e.read_to_string(&mut err);
+    }
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "wait stderr: {err}");
     let line: Value =
         serde_json::from_str(&waited.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
     assert_eq!(line["event"], "stopped");
@@ -787,6 +822,11 @@ fn watch_follows_a_new_engine_after_a_restart() {
     let stopped: Value =
         serde_json::from_str(&lines.recv_timeout(Duration::from_secs(30)).unwrap()).unwrap();
     assert_eq!(stopped["event"], "stopped", "{}", stopped);
+    // Exactly one line after the restart: no `stopped` (or `started`) for
+    // the unchanged session came late and stood in for this one.
+    let extra: Vec<String> =
+        std::iter::from_fn(|| lines.recv_timeout(Duration::from_secs(3)).ok()).collect();
+    assert!(extra.is_empty(), "extra lines: {extra:?}");
 }
 
 /// `wait --event turn_ended` outside an agent auto-starts the engine
@@ -966,6 +1006,8 @@ fn spawn_free_refuses_agents_and_managed_flags_locally() {
         &["--prompt", "hi"][..],
         &["--model", "x"],
         &["--permission-mode", "plan"],
+        // The managed default, given by hand, is refused too.
+        &["--permission-mode", "bypassPermissions"],
         &["--add-dir", "/tmp"],
         &["--append-system-prompt", "x"],
     ] {

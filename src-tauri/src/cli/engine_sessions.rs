@@ -32,7 +32,16 @@ pub const ENGINE_UNREACHABLE: &str = "engine_unreachable";
 /// event stream ends: an `engine restart` drains for up to 90 s.
 const RECONNECT_FOR: Duration =
     Duration::from_secs(crate::engine::drain::HARD_DEADLINE.as_secs() + 30);
-const RECONNECT_EVERY: Duration = Duration::from_secs(1);
+pub(crate) const RECONNECT_EVERY: Duration = Duration::from_secs(1);
+/// For this long after an event stream ends, `watch` and `wait` only
+/// connect and do not start an engine: an `engine restart` starts its own,
+/// with its binary and its environment (reviews M2).
+pub(crate) const RESTART_GRACE: Duration = Duration::from_secs(15);
+/// Read timeout of a call that may wait for detection's first pass
+/// (`session.list`, `snapshot.get`): the engine waits up to
+/// `detect::FIRST_TICK_WAIT` for it.
+pub(crate) const DETECTED_READ_TIMEOUT: Duration =
+    Duration::from_secs(crate::engine::detect::FIRST_TICK_WAIT.as_secs() + 5);
 
 /// Whether a detection command reads sessions from the engine: not with
 /// `--direct`, and not when `C9_AGENT_ID` is set to anything but "".
@@ -49,9 +58,18 @@ fn unreachable(e: impl std::fmt::Display) -> String {
 
 /// Auto-start the engine and connect to it.
 fn connect() -> Result<EngineConn, String> {
+    connect_with(true)
+}
+
+/// Connect to the engine; with `auto_start`, start one first if none runs.
+fn connect_with(auto_start: bool) -> Result<EngineConn, String> {
     let home = engine_home().map_err(unreachable)?;
-    ensure_engine(&home, &current_exe()?).map_err(unreachable)?;
-    EngineConn::connect(&sock_path(&home)).map_err(|e| unreachable(e.into_msg()))
+    if auto_start {
+        ensure_engine(&home, &current_exe()?).map_err(unreachable)?;
+    }
+    let mut conn = EngineConn::connect(&sock_path(&home)).map_err(|e| unreachable(e.into_msg()))?;
+    conn.set_read_timeout(DETECTED_READ_TIMEOUT);
+    Ok(conn)
 }
 
 /// One request; an `ok:false` response is `"<code>: <msg>"`.
@@ -304,8 +322,8 @@ pub fn apply(rows: &mut Vec<AgentRow>, frame: EventFrame) {
 
 /// `snapshot.get`, then `events.subscribe` from its cursor for the row
 /// events, on one connection.
-fn open_feed() -> Result<(Vec<AgentRow>, Frames), String> {
-    let mut conn = connect()?;
+fn open_feed(auto_start: bool) -> Result<(Vec<AgentRow>, Frames), String> {
+    let mut conn = connect_with(auto_start)?;
     let snap: SnapshotResult =
         serde_json::from_value(call(&mut conn, "snapshot.get", serde_json::json!({}))?)
             .map_err(|e| format!("Bad snapshot.get result from the engine: {}", e))?;
@@ -324,19 +342,21 @@ fn open_feed() -> Result<(Vec<AgentRow>, Frames), String> {
 /// restarted, or the subscription failed), it reads a new snapshot and
 /// goes on; the receiver's diff hides what did not change. It sends
 /// `Poll::Failed` and stops when the engine cannot be reached at first, or
-/// for `RECONNECT_FOR` after a stream ended.
+/// for `RECONNECT_FOR` after a stream ended. For `RESTART_GRACE` after a
+/// stream ended it only connects, so an `engine restart` starts the new
+/// engine, not this command.
 pub(crate) fn spawn_feed(project: Option<String>) -> mpsc::Receiver<Poll<Vec<AgentRow>>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let project = project.as_deref();
-        let mut down_since: Option<Instant> = None;
-        let mut opened = false;
+        // When the last stream ended; `None` before the first one opened.
+        let mut lost_at: Option<Instant> = None;
         loop {
-            let (mut rows, frames) = match open_feed() {
+            let auto_start = lost_at.is_none_or(|t| t.elapsed() >= RESTART_GRACE);
+            let (mut rows, frames) = match open_feed(auto_start) {
                 Ok(feed) => feed,
                 Err(e) => {
-                    let since = *down_since.get_or_insert_with(Instant::now);
-                    if !opened || since.elapsed() >= RECONNECT_FOR {
+                    if lost_at.is_none_or(|t| t.elapsed() >= RECONNECT_FOR) {
                         let _ = tx.send(Poll::Failed(e));
                         return;
                     }
@@ -344,8 +364,7 @@ pub(crate) fn spawn_feed(project: Option<String>) -> mpsc::Receiver<Poll<Vec<Age
                     continue;
                 }
             };
-            opened = true;
-            down_since = None;
+            let opened_at = Instant::now();
             let send = |rows: &[AgentRow]| {
                 let (snapshots, live) = view(rows, project);
                 tx.send(Poll::Live(snapshots, live)).is_ok()
@@ -363,6 +382,11 @@ pub(crate) fn spawn_feed(project: Option<String>) -> mpsc::Receiver<Poll<Vec<Age
                 if !send(&rows) {
                     return;
                 }
+            }
+            lost_at = Some(Instant::now());
+            // A stream that ends at once is not reopened in a busy loop.
+            if opened_at.elapsed() < RECONNECT_EVERY {
+                std::thread::sleep(RECONNECT_EVERY);
             }
         }
     });

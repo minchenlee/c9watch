@@ -515,6 +515,16 @@ fn restart_engine_with(
             }
             std::thread::sleep(POLL);
         }
+        // `watch` and `wait` wait `RESTART_GRACE` before they start an
+        // engine, so this is rare; the new engine then runs the other
+        // client's binary and environment, not ours.
+        if let Some(other) = engine_pid(&lock)?.filter(|p| *p != pid) {
+            eprintln!(
+                "[c9watch] Another client started engine pid {} before this restart; \
+                 it runs that client's binary and environment",
+                other
+            );
+        }
     }
     ensure_engine_with(home, exe, env)
 }
