@@ -92,6 +92,8 @@ The protocol changes are:
 - `addr` is the session key (`sessionKey` in a session object). `pid` is
   optional. When you send it and it differs from the pid the server detects,
   the server refuses the request.
+- `authOk` also carries `principal`, `"client:<clientId>"`: the name the
+  server logs your actions under. It was added in C1a; a client can ignore it.
 - `capabilities` is `{"conversation": bool, "open": bool}`. A request for a
   capability that is off gets
   `{"type":"error","code":"capabilityDisabled","capability":"conversation"|"open","message":...,"requestId":N}`.

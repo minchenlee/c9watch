@@ -19,6 +19,15 @@ const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 pub type ClientId = String;
 
+/// The principal a WS connection acts as: `client:<id>`. The id is the one
+/// the registry returned for a verified token (or just issued for a redeemed
+/// pairing code), so it is a fact about the connection, never a claim the
+/// client makes. There is no other principal on this gateway: a loopback
+/// peer is not trusted more than a LAN peer.
+pub fn client_principal(client_id: &str) -> String {
+    format!("client:{client_id}")
+}
+
 fn hash_token(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
 }
@@ -164,6 +173,14 @@ mod tests {
         let (id, token) = reg.issue();
         assert_eq!(token.len(), 64);
         assert_eq!(reg.verify(&token), Some(id));
+    }
+
+    #[test]
+    fn principal_is_client_prefix_and_id() {
+        let mut reg = ClientRegistry::new();
+        let (id, token) = reg.issue();
+        let verified = reg.verify(&token).unwrap();
+        assert_eq!(client_principal(&verified), format!("client:{id}"));
     }
 
     #[test]

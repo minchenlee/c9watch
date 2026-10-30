@@ -85,14 +85,14 @@ pub fn log_error(message: &str) {
     debug_log(LogLevel::Error, message);
 }
 
+/// Serializes tests that clear, flood or read the global LOG_BUFFER, here
+/// and in other modules, so one test cannot evict another's lines.
+#[cfg(test)]
+pub(crate) static TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serialize tests that share the global LOG_BUFFER to prevent races.
-    /// Both tests write to and read from the same static ring buffer, so
-    /// running them concurrently causes eviction-based flakiness.
-    static TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn clear_buffer() {
         let mut buffer = LOG_BUFFER.lock().unwrap();
@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn test_log_and_retrieve() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_buffer();
 
         log_info("test_lar_hello");
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_ring_buffer_capacity() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_buffer();
 
         let prefix = "cap_test_";
