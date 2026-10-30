@@ -139,6 +139,10 @@ pub const CC_HOOKS: &[(&str, &str)] = &[
     ("PostToolUse", "post-tool-use"),
 ];
 
+/// CC hooks that run `async`: CC does not wait for them. PostToolUse runs
+/// once per tool call, and nothing in its answer goes back to CC.
+pub const CC_ASYNC_HOOKS: &[&str] = &["PostToolUse"];
+
 /// CC's own hook timeout, in seconds. The client gives up after 0.5 s
 /// (A:1054), 4 s for `session-start` (`cli::task::hook_timeout`); this
 /// only bounds a stuck process.
@@ -158,16 +162,15 @@ pub fn claude_hook_settings(agent_bin: &Path) -> serde_json::Value {
     let bin = sh_quote(&agent_bin.to_string_lossy());
     let mut hooks = serde_json::Map::new();
     for (cc_event, event) in CC_HOOKS {
-        hooks.insert(
-            (*cc_event).into(),
-            serde_json::json!([{
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("{} hook {} --kind {}", bin, event, CLAUDE.kind),
-                    "timeout": CC_HOOK_TIMEOUT_S,
-                }]
-            }]),
-        );
+        let mut hook = serde_json::json!({
+            "type": "command",
+            "command": format!("{} hook {} --kind {}", bin, event, CLAUDE.kind),
+            "timeout": CC_HOOK_TIMEOUT_S,
+        });
+        if CC_ASYNC_HOOKS.contains(cc_event) {
+            hook["async"] = true.into();
+        }
+        hooks.insert((*cc_event).into(), serde_json::json!([{ "hooks": [hook] }]));
     }
     serde_json::json!({ "hooks": hooks })
 }
@@ -235,6 +238,13 @@ mod tests {
             let h = &hooks[*cc_event][0]["hooks"][0];
             assert_eq!(h["type"], "command");
             assert_eq!(h["timeout"], CC_HOOK_TIMEOUT_S);
+            // Only PostToolUse runs without CC waiting for it.
+            assert_eq!(
+                h["async"].as_bool(),
+                CC_ASYNC_HOOKS.contains(cc_event).then_some(true),
+                "{}",
+                cc_event
+            );
             // The client gives up before CC does.
             assert!(
                 crate::cli::task::hook_timeout(event)

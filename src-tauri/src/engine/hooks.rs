@@ -132,6 +132,7 @@ fn apply(
     let p = ev.params;
     let id = p.agent_id.as_str();
     let claim = |a: Activity| Some(Claim::new(Source::Hook, a, now_ms));
+    let call = p.input["tool_use_id"].as_str().map(str::to_string);
     let (claim, attention) = match ev.method {
         "hook.session_start" => {
             if let Some(sid) = p.input["session_id"].as_str() {
@@ -144,9 +145,13 @@ fn apply(
         "hook.stop" => (claim(Activity::Ready), None),
         // D24.5: confirms the screen's `blocked`.
         "hook.permission_request" => (claim(Activity::Blocked), None),
-        // Turn start, and work again after a permission prompt: the hook
-        // tells `working` before the screen does (Orca's pattern).
-        "hook.user_prompt_submit" | "hook.post_tool_use" => (claim(Activity::Working), None),
+        // Turn start: the hook tells `working` before the screen does
+        // (Orca's pattern).
+        "hook.user_prompt_submit" => (claim(Activity::Working), None),
+        // Work goes on after a permission prompt: only the PostToolUse of
+        // the call that waited, from the main thread, and never a turn
+        // start (see below). A sub-agent's calls carry `agent_id`.
+        "hook.post_tool_use" => (claim(Activity::Working), None),
         // An auto-mode denial: a human should look (O1 = A).
         "hook.permission_denied" => {
             let reason = p.input["reason"]
@@ -157,7 +162,24 @@ fn apply(
         // Information only; the screen and transcript tell the state.
         _ => (None, None),
     };
+    let from_subagent = p.input["agent_id"].as_str().is_some_and(|a| !a.is_empty());
     let (change, row_state, attention) = merge.with(id, ev.gen, |m| {
+        let claim = match ev.method {
+            "hook.post_tool_use" => claim.filter(|_| {
+                !from_subagent
+                    && m.turn_open()
+                    && call.as_deref().is_some_and(|c| m.take_blocked_call(c))
+            }),
+            "hook.permission_request" => {
+                m.set_blocked_call(call.clone());
+                claim
+            }
+            "hook.user_prompt_submit" | "hook.stop" => {
+                m.set_blocked_call(None);
+                claim
+            }
+            _ => claim,
+        };
         let change = claim.map(|c| m.claim(c)).unwrap_or_default();
         if let Some(a) = &attention {
             m.attention(a, now_ms);
@@ -280,14 +302,18 @@ pub fn expire_hold(
             |r| r.get(0),
         )
         .optional()?;
+    let row_state = merge
+        .peek(id, gen, |m| {
+            let s = m.row_state(now_ms);
+            m.written(s);
+            s
+        })
+        .flatten();
+    // No live row of this generation: noted as written above, so the
+    // supervisor does not ask again every tick.
     let Some(state) = row else {
         return Ok(false);
     };
-    let row_state = merge.with(id, gen, |m| {
-        let s = m.row_state(now_ms);
-        m.written(s);
-        s
-    });
     write_change(
         tx,
         machine,
@@ -569,15 +595,34 @@ mod tests {
         );
         assert_eq!(state(&db), "working");
         // A permission prompt, then PostToolUse after the approval.
-        let p = params("claude", "2", json!({}));
+        let p = params("claude", "2", json!({"tool_use_id": "toolu_1"}));
         send(&db, &merge, "hook.permission_request", 1, Some(1), p, 2_000);
         assert_eq!(state(&db), "blocked");
-        let p = params("claude", "3", json!({"tool_name": "Bash"}));
+        // A sub-agent's call, or another call, does not end the wait.
+        let p = params(
+            "claude",
+            "3",
+            json!({"tool_use_id": "toolu_1", "agent_id": "sub1"}),
+        );
+        send(&db, &merge, "hook.post_tool_use", 1, Some(1), p, 3_000);
+        assert_eq!(state(&db), "blocked");
+        let p = params("claude", "4", json!({"tool_use_id": "toolu_2"}));
+        send(&db, &merge, "hook.post_tool_use", 1, Some(1), p, 4_000);
+        assert_eq!(state(&db), "blocked");
+        let p = params(
+            "claude",
+            "5",
+            json!({"tool_use_id": "toolu_1", "tool_name": "Bash"}),
+        );
         send(&db, &merge, "hook.post_tool_use", 1, Some(1), p, 9_000);
         assert_eq!(state(&db), "working");
         // Stop ends the one turn.
-        let p = params("claude", "4", json!({}));
+        let p = params("claude", "6", json!({}));
         send(&db, &merge, "hook.stop", 1, Some(1), p, 10_000);
+        assert_eq!(state(&db), "ready");
+        // A late PostToolUse does not open a new turn.
+        let p = params("claude", "7", json!({"tool_use_id": "toolu_1"}));
+        send(&db, &merge, "hook.post_tool_use", 1, Some(1), p, 11_000);
         assert_eq!(state(&db), "ready");
         let ends = topics(&db)
             .iter()
@@ -590,7 +635,7 @@ mod tests {
     fn an_expired_hold_is_written_without_a_new_claim() {
         let (_t, db, merge) = setup();
         let p = params("claude", "1", json!({}));
-        send(&db, &merge, "hook.post_tool_use", 1, Some(1), p, 1_000);
+        send(&db, &merge, "hook.user_prompt_submit", 1, Some(1), p, 1_000);
         assert_eq!(state(&db), "working");
         // Esc: the screen goes idle within the hook's hold, and no Stop
         // hook comes. The hold keeps the row `working` for now.
@@ -626,5 +671,30 @@ mod tests {
             .unwrap()
             .0;
         assert!(!other);
+    }
+
+    #[test]
+    fn expire_hold_on_a_gone_row_is_asked_once() {
+        let (_t, db, merge) = setup();
+        let p = params("claude", "1", json!({}));
+        send(&db, &merge, "hook.user_prompt_submit", 1, Some(1), p, 1_000);
+        merge.with("a1", 1, |m| {
+            m.claim(Claim::new(Source::Screen, Activity::Ready, 1_500))
+        });
+        db.write_blocking(|tx| tx.execute("UPDATE agents SET gone_at = 1", []))
+            .unwrap();
+        let after = 1_000 + crate::engine::merge::SETTLE_MS;
+        assert_eq!(
+            merge.with("a1", 1, |m| m.stale_row_state(after)),
+            Some("ready")
+        );
+        let m2 = merge.clone();
+        let wrote = db
+            .write_blocking(move |tx| expire_hold(tx, MACHINE, &m2, "a1", 1, after))
+            .unwrap()
+            .0;
+        assert!(!wrote);
+        // Noted as written: the supervisor does not ask on the next tick.
+        assert_eq!(merge.with("a1", 1, |m| m.stale_row_state(after + 1)), None);
     }
 }

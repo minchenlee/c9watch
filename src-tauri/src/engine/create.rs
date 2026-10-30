@@ -757,6 +757,9 @@ impl Spawner {
     ) {
         #[cfg(feature = "live-test")]
         let mut last_screen = String::new();
+        // The screen's last state: an `Idle` is claimed again when a turn
+        // stays open with nothing said for SETTLE_MS (`stale_turn`).
+        let mut screen_state: Option<ScreenState> = None;
         loop {
             match cmds.recv_timeout(RUN_TICK) {
                 Ok(Cmd::Retire { principal, reply }) => {
@@ -787,7 +790,14 @@ impl Spawner {
             }
             for ev in screen.step(&snap.title, &snap.text, snap.quiet, (self.clock)()) {
                 if let ScreenEvent::State(st) = ev {
+                    screen_state = Some(st);
                     self.screen_claim(s, st);
+                }
+            }
+            if screen_state == Some(ScreenState::Idle) {
+                let now = now_ms();
+                if self.merge.peek(&s.id, s.gen, |m| m.stale_turn(now)) == Some(true) {
+                    self.screen_claim(s, ScreenState::Idle);
                 }
             }
             self.expire_hold(s);
@@ -876,7 +886,8 @@ impl Spawner {
         let now = now_ms();
         if self
             .merge
-            .with(&s.id, s.gen, |m| m.stale_row_state(now))
+            .peek(&s.id, s.gen, |m| m.stale_row_state(now))
+            .flatten()
             .is_none()
         {
             return;

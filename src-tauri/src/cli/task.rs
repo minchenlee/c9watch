@@ -40,6 +40,36 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// with `truncated: true`, so the event still arrives.
 pub const MAX_HOOK_INPUT: usize = 256 * 1024;
 
+/// The read limit for an event whose input is cut down to `kept_keys`
+/// first: a PostToolUse input carries the whole tool output.
+pub const MAX_TRIMMED_INPUT: usize = 16 * 1024 * 1024;
+
+/// The input keys an event keeps, or `None` to send all of it. The engine
+/// reads only these, and the prompt and tool input and output stay out of
+/// the socket.
+pub fn kept_keys(event: &str) -> Option<&'static [&'static str]> {
+    match event {
+        "prompt-submit" => Some(&["session_id"]),
+        "post-tool-use" => Some(&["session_id", "tool_use_id", "tool_name", "agent_id"]),
+        _ => None,
+    }
+}
+
+/// `input` with only `keys` kept; input that is not a JSON object is
+/// returned as it is.
+pub fn trim_input(input: &[u8], keys: &[&str]) -> Vec<u8> {
+    match serde_json::from_slice::<Value>(input) {
+        Ok(Value::Object(o)) => {
+            let kept: serde_json::Map<String, Value> = o
+                .into_iter()
+                .filter(|(k, _)| keys.contains(&k.as_str()))
+                .collect();
+            serde_json::to_vec(&kept).unwrap_or_default()
+        }
+        _ => input.to_vec(),
+    }
+}
+
 /// The adapter kind `hook` sends unless told otherwise.
 pub const DEFAULT_HOOK_KIND: &str = "claude";
 
@@ -240,14 +270,21 @@ pub fn run_hook(
     let env = engine_env(get).ok()?;
     let method = hook_method(event)?;
     let kind = kind.to_string();
+    let keys = kept_keys(event);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("hook".into())
         .spawn(move || {
             let mut input = Vec::new();
-            let _ = stdin
-                .take(MAX_HOOK_INPUT as u64 + 1)
-                .read_to_end(&mut input);
+            let limit = if keys.is_some() {
+                MAX_TRIMMED_INPUT
+            } else {
+                MAX_HOOK_INPUT
+            };
+            let _ = stdin.take(limit as u64 + 1).read_to_end(&mut input);
+            if let Some(keys) = keys {
+                input = trim_input(&input, keys);
+            }
             let params = hook_params(&env, &kind, &input, seq_now());
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -580,5 +617,24 @@ mod tests {
             t.elapsed()
         );
         held.join().unwrap();
+    }
+
+    #[test]
+    fn hook_input_keeps_only_the_keys_the_engine_reads() {
+        assert_eq!(kept_keys("stop"), None);
+        let keys = kept_keys("post-tool-use").unwrap();
+        let input = br#"{"session_id":"s1","tool_use_id":"t1","tool_name":"Bash","tool_input":{"command":"ls"},"tool_response":"secret"}"#;
+        let out: Value = serde_json::from_slice(&trim_input(input, keys)).unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({"session_id": "s1", "tool_use_id": "t1", "tool_name": "Bash"})
+        );
+        let keys = kept_keys("prompt-submit").unwrap();
+        let out: Value =
+            serde_json::from_slice(&trim_input(br#"{"session_id":"s1","prompt":"hi"}"#, keys))
+                .unwrap();
+        assert_eq!(out, serde_json::json!({"session_id": "s1"}));
+        // Input that is not an object goes as it is.
+        assert_eq!(trim_input(b"not json", keys), b"not json".to_vec());
     }
 }
