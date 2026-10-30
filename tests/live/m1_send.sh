@@ -25,6 +25,7 @@
 #      the restart resumes A
 #
 # Usage: tests/live/m1_send.sh <dir with c9watch and c9watch-agent> <WORK>
+#   ONLY=s7 runs one step.
 # Results: <WORK>/results.txt, <WORK>/evidence/, <WORK>/pids.
 # The script never signals a process it did not start (pids in <WORK>/pids).
 
@@ -33,6 +34,8 @@ BUILD=${1:?build dir}
 WORK=${2:?work dir}
 MODEL=claude-haiku-5-5
 NONCE=$(date +%s)
+ONLY=${ONLY:-}
+want() { [ -z "$ONLY" ] || [ "$ONLY" = "$1" ]; }
 
 check_work() { # path
     case "$1" in
@@ -193,6 +196,7 @@ echo "agent-b $BID" >>"$WORK/pids"
 log "A=$AID B=$BID"
 
 # --- s3: terminal -> A, --wait
+if want s3; then
 send s3 m1-a "Reply with exactly PONG-$NONCE and nothing else." --wait --timeout 180
 M3=$(msg_id "$EV/s3.out")
 D3=$(msg_detail "$M3" delivered)
@@ -201,8 +205,10 @@ if [ $RC -eq 0 ] && [ "$D3" = prompt_hook ] && said "[c9watch mail $M3" "PONG-$N
 else
     fail s3 "rc $RC, delivered detail '$D3', $(said "[c9watch mail $M3" "PONG-$NONCE")"
 fi
+fi
 
 # --- s4: > 3 KiB multi-line body
+if want s4; then
 {
     echo "Reply with exactly LINES-$NONCE and nothing else. The lines below are filler."
     for i in $(seq 1 80); do echo "filler line $i: the quick brown fox jumps over the lazy dog"; done
@@ -215,8 +221,10 @@ if [ $RC -eq 0 ] && [ "$D4" = prompt_hook ] && said "[c9watch mail $M4" "LINES-$
 else
     fail s4 "rc $RC, delivered detail '$D4', $(said "[c9watch mail $M4" "LINES-$NONCE")"
 fi
+fi
 
 # --- s5: A mails B from its Bash
+if want s5; then
 send s5 m1-a "Use the Bash tool to run exactly this one command, once: \"$C9\" send m1-b \"Reply with exactly BETA-$NONCE and nothing else.\" Then end your turn with one line: SENT." --wait --timeout 180
 MB=$(q "SELECT id FROM messages WHERE to_agent = '$BID' AND from_agent = '$AID' ORDER BY created_at LIMIT 1")
 if [ -n "$MB" ] && wait_msg "$MB" delivered 120 && wait_state "$BID" ready 180 &&
@@ -225,8 +233,10 @@ if [ -n "$MB" ] && wait_msg "$MB" delivered 120 && wait_state "$BID" ready 180 &
 else
     fail s5 "A's mail '${MB:-none}' state '$(msg_state "${MB:-x}")', B $(state_of "$BID")"
 fi
+fi
 
 # --- s6: mail to B while B works
+if want s6; then
 send s6a m1-b "Use the Bash tool to run: sleep 25. Then reply with exactly SLEPT-$NONCE." --kind request
 wait_state "$BID" working 60 || log "s6: B never showed working"
 "$C9" send m1-b "Reply with exactly AFTER-$NONCE and nothing else." --wait --timeout 240 >"$EV/s6b.out" 2>"$EV/s6b.err" &
@@ -242,17 +252,24 @@ if [ "$S6_EARLY" = queued ] && [ $RC -eq 0 ] && said "AFTER-$NONCE" "AFTER-$NONC
 else
     fail s6 "6 s in: '$S6_EARLY' while B $B6; rc $RC"
 fi
+fi
 
 # --- s7: 32 KiB body
+if want s7; then
 python3 -I - "$WORK/s7.txt" "$NONCE" <<'PY'
 import sys
 out, n = sys.argv[1], sys.argv[2]
 lines = ["Reply with exactly BIG-%s and nothing else. The lines below are filler." % n]
 i = 0
-while sum(len(l) + 1 for l in lines) < 32768:
+while True:
     i += 1
-    lines.append("filler %05d: lorem ipsum dolor sit amet, consectetur adipiscing elit" % i)
-open(out, "w").write("\n".join(lines) + "\n")
+    # Every 4th line is CJK (wide, 3-byte UTF-8 characters).
+    line = ("填充 %05d：敏捷的棕色狐狸跳過懶狗，寬字元測試" % i if i % 4 == 0 else
+            "filler %05d: lorem ipsum dolor sit amet, consectetur adipiscing elit" % i)
+    if sum(len(l.encode()) + 1 for l in lines + [line]) > 32768:
+        break
+    lines.append(line)
+open(out, "w", encoding="utf-8").write("\n".join(lines) + "\n")
 PY
 send s7 m1-a --file "$WORK/s7.txt" --wait --timeout 240
 M7=$(msg_id "$EV/s7.out")
@@ -262,8 +279,10 @@ if [ $RC -eq 0 ] && [ "$(msg_detail "$M7" delivered)" = prompt_hook ]; then
 else
     fail s7 "rc $RC, state '$(msg_state "$M7")', ${T7:-?} ms"
 fi
+fi
 
 # --- s8: mail during drain, delivered after the restart resumes A
+if want s8; then
 send s8a m1-a "Use the Bash tool to run: sleep 20. Then reply with exactly DRAINED-$NONCE." --kind request
 wait_state "$AID" working 60 || log "s8: A never showed working"
 log "SIGTERM the engine ($EPID): drain"
@@ -281,6 +300,7 @@ if [ $S8_RC -eq 0 ] && [ "$S8_STOPPED" = queued ] && wait_msg "$M8" delivered 24
     pass s8 "accepted during drain, queued at stop, delivered($(msg_detail "$M8" delivered)) after resume"
 else
     fail s8 "send rc $S8_RC, at stop '$S8_STOPPED', now '$(msg_state "${M8:-x}")', A $(state_of "$AID")"
+fi
 fi
 
 # --- cleanup through the test engine: retire both, then SIGTERM.
