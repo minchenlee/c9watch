@@ -785,21 +785,30 @@ async fn queue_mail(
             let principal = who.to_string();
             let body_hash = mail::sha256_hex(params.body.as_bytes());
             let sender = mail::sender(tx, &who)?;
-            let sent = match mail::resolve(tx, &machine, &params.to)? {
-                Ok(target) => match mail::check_target(&sender, &target) {
-                    Ok(()) => mail::enqueue(
-                        tx,
-                        &machine,
-                        &sender,
-                        &target,
-                        &params,
-                        idem.as_deref(),
-                        &person,
-                        now_ms(),
-                    )?,
+            // A resend of a known idem replays before the target is
+            // checked again: it may have ended or lost its name since.
+            let replay = match idem.as_deref() {
+                Some(key) => mail::replay(tx, &machine, &sender, &params, key)?,
+                None => None,
+            };
+            let sent = match replay {
+                Some(r) => r,
+                None => match mail::resolve(tx, &machine, &params.to)? {
+                    Ok(target) => match mail::check_target(&sender, &target) {
+                        Ok(()) => mail::enqueue(
+                            tx,
+                            &machine,
+                            &sender,
+                            &target,
+                            &params,
+                            idem.as_deref(),
+                            &person,
+                            now_ms(),
+                        )?,
+                        Err(e) => Err(e),
+                    },
                     Err(e) => Err(e),
                 },
-                Err(e) => Err(e),
             };
             let (target, decision, reason) = match &sent {
                 Ok(r) if r.replayed => (
@@ -2546,6 +2555,50 @@ mod tests {
             .unwrap();
         assert_eq!(from, "local-unverified");
         assert_eq!(mail_audit(&db)[0].2, "allow");
+    }
+
+    /// A resend with the same `idem` replays even after the target ended
+    /// and its name became ambiguous; another body is still `duplicate`.
+    #[tokio::test]
+    async fn an_idem_replays_after_the_target_ended() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let send = |to: &str, body: &str| MsgSendParams {
+            to: to.into(),
+            body: body.into(),
+            ..Default::default()
+        };
+        let l = Principal::LocalUnverified;
+        let first = queue_mail(&ctx, &l, send("bob", "hi"), Some("ci-42".into()))
+            .await
+            .unwrap();
+        db.write(|tx| {
+            tx.execute(
+                "UPDATE agents SET state = 'retired' WHERE id = 'agt_b1'",
+                [],
+            )?;
+            tx.execute("UPDATE messages SET state = 'failed'", [])
+        })
+        .await
+        .unwrap();
+        mail_agent(&db, "agt_b2", "bob", "pty").await;
+        mail_agent(&db, "agt_b3", "bob", "pty").await;
+        for to in ["agt_b1", "bob", &format!("{}/agt_b1", MACHINE)] {
+            let again = queue_mail(&ctx, &l, send(to, "hi"), Some("ci-42".into()))
+                .await
+                .unwrap();
+            assert!(again.replayed, "{}", to);
+            assert_eq!(again.msg_id, first.msg_id);
+            assert_eq!(again.state, "failed");
+            assert_eq!(again.to.id, "agt_b1");
+        }
+        for (to, body) in [("agt_b1", "other"), ("agt_b2", "hi")] {
+            let e = queue_mail(&ctx, &l, send(to, body), Some("ci-42".into()))
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, ErrorCode::Duplicate, "{} {}", to, body);
+        }
+        assert_eq!(message_count(&db), 1);
     }
 
     /// E5: every refusal answers its code, `data` and hint, writes a

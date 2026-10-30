@@ -488,6 +488,76 @@ fn ts(ms: i64) -> String {
         .unwrap_or_else(|| ms.to_string())
 }
 
+/// The answer to a resend of `idem` from `sender`, or `None` when the key
+/// is new. A request for the same target (named by id, address or name),
+/// kind, `replyTo` and body replays the first message with its state now,
+/// whatever the target's state; any other request is `duplicate`. It runs
+/// before `resolve` and `check_target`, so a target that has since ended or
+/// whose name has become ambiguous still replays.
+pub fn replay(
+    conn: &Connection,
+    machine: &str,
+    sender: &Sender,
+    params: &MsgSendParams,
+    idem: &str,
+) -> rusqlite::Result<Option<Result<MsgSendResult, ApiError>>> {
+    let first: Option<(String, String, String, String, Option<String>, i64)> = conn
+        .query_row(
+            "SELECT id, to_agent, req_hash, state, cursor, created_at FROM messages \
+             WHERE from_principal = ?1 AND idem = ?2",
+            params![sender.principal.to_string(), idem],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id, to_agent, hash, state, cursor, at)) = first else {
+        return Ok(None);
+    };
+    let target = targets(conn)?.into_iter().find(|t| t.id == to_agent);
+    let to = params.to.trim();
+    let named = match to.split_once('/') {
+        Some((m, rest)) => m == machine && rest == to_agent,
+        None => to == to_agent || target.as_ref().and_then(|t| t.name.as_deref()) == Some(to),
+    };
+    let req = req_hash(
+        &to_agent,
+        params.kind,
+        params.reply_to.as_deref(),
+        &params.body,
+    );
+    if !named || hash != req {
+        return Ok(Some(Err(ApiError::new(
+            ErrorCode::Duplicate,
+            format!("idem {:?} was used for {}", idem, id),
+        )
+        .with_data(json!({ "msgId": id, "at": at }))
+        .with_hint(format!("idem {} was used for another message", idem)))));
+    }
+    let to = match target {
+        Some(t) => t.address(machine),
+        None => MsgAddress {
+            addr: format!("{}/{}", machine, to_agent),
+            id: to_agent,
+            name: None,
+        },
+    };
+    Ok(Some(Ok(MsgSendResult {
+        msg_id: id,
+        state,
+        to,
+        cursor: cursor.unwrap_or_default(),
+        replayed: true,
+    })))
+}
+
 /// Write a new message from `sender` to `target`, after the §3.2 checks,
 /// as `queued`, and emit its `msg.state`. A replay writes nothing and
 /// returns the first message, its state now and its cursor. Call
@@ -509,30 +579,8 @@ pub fn enqueue(
     let req = req_hash(&target.id, params.kind, reply_to, &params.body);
 
     if let Some(key) = idem {
-        let first: Option<(String, String, String, Option<String>, i64)> = tx
-            .query_row(
-                "SELECT id, req_hash, state, cursor, created_at FROM messages \
-                 WHERE from_principal = ?1 AND idem = ?2",
-                params![from, key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .optional()?;
-        if let Some((id, hash, state, cursor, at)) = first {
-            if hash != req {
-                return Ok(Err(ApiError::new(
-                    ErrorCode::Duplicate,
-                    format!("idem {:?} was used for {}", key, id),
-                )
-                .with_data(json!({ "msgId": id, "at": at }))
-                .with_hint(format!("idem {} was used for another message", key))));
-            }
-            return Ok(Ok(MsgSendResult {
-                msg_id: id,
-                state,
-                to: target.address(machine),
-                cursor: cursor.unwrap_or_default(),
-                replayed: true,
-            }));
+        if let Some(r) = replay(tx, machine, sender, params, key)? {
+            return Ok(r);
         }
     } else if sender.agent_id().is_some() {
         let same: Option<(String, i64)> = tx

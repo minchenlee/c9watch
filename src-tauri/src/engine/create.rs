@@ -96,8 +96,8 @@ use super::adapter::{self, Descriptor};
 use super::agent_bin::{AgentBin, Rehash};
 use super::agents::LiveTable;
 use super::cc_screen::{
-    box_has_paste, box_is_free, input_box, paste_payload, vendor_refusal, CcScreen, InputBox,
-    ScreenEvent, ScreenFailure, ScreenState, KEY_CR, READY_TIMEOUT,
+    box_has_paste, box_is_free, input_box, paste_payload, vendor_refusal, CcScreen, ScreenEvent,
+    ScreenFailure, ScreenState, KEY_CR, READY_TIMEOUT,
 };
 use super::db::audit::{self, AuditEntry};
 use super::db::outbox::NewEvent;
@@ -208,6 +208,14 @@ pub enum PtyWriteError {
     Io(io::ErrorKind, String),
 }
 
+/// Stop taking mail after an `uncertain` write on screen `text` (§4.6).
+fn hold(text: &str, mail_pending: &mut bool) -> Delivery {
+    *mail_pending = false;
+    Delivery::Held {
+        seen: text.to_string(),
+    }
+}
+
 enum Cmd {
     /// Kill the agent and make its row a tombstone.
     Retire { principal: String, reply: Reply },
@@ -234,6 +242,12 @@ enum Delivery {
     Submitted {
         id: String,
         at: Instant,
+    },
+    /// A paste or CR write went `uncertain` on screen `seen`: the agent
+    /// may not read its terminal, and its bytes may still arrive. No mail
+    /// goes until the screen changes, or a nudge comes, with a free box.
+    Held {
+        seen: String,
     },
 }
 
@@ -973,7 +987,7 @@ impl Spawner {
                     }
                     Err(PtyWriteError::Io(_, e)) => {
                         self.mail_uncertain(s, &m.id, &format!("paste may be partial: {}", e));
-                        Delivery::Idle
+                        hold(text, mail_pending)
                     }
                 }
             }
@@ -995,13 +1009,13 @@ impl Spawner {
                         }
                         Err(PtyWriteError::Io(_, e)) => {
                             self.mail_uncertain(s, &id, &format!("cr write: {}", e));
-                            return Delivery::Idle;
+                            return hold(text, mail_pending);
                         }
                     }
                 }
                 if waited >= PASTE_TIMEOUT {
                     self.mail_uncertain(s, &id, "paste not seen in input box");
-                    return Delivery::Idle;
+                    return hold(text, mail_pending);
                 }
                 Delivery::Pasted { id, at }
             }
@@ -1021,10 +1035,8 @@ impl Spawner {
                     return Delivery::Submitted { id, at };
                 }
                 let turn_open = self.merge.peek(&s.id, s.gen, |m| m.turn_open()) == Some(true);
-                let in_box = match input_box(text) {
-                    InputBox::Text(t) => t.contains(&format!("[c9watch mail {}", id)),
-                    _ => false,
-                };
+                // As for the CR: CC collapses the fence to `[Pasted text #`.
+                let in_box = box_has_paste(&input_box(text), &id);
                 if turn_open && !in_box {
                     self.mark_mail(s, &id, MsgState::Delivered, "turn_open");
                 } else {
@@ -1032,6 +1044,14 @@ impl Spawner {
                     self.mail_uncertain(s, &id, &why);
                 }
                 Delivery::Idle
+            }
+            Delivery::Held { seen } => {
+                if (text != seen || *mail_pending) && box_is_free(&input_box(text)) {
+                    // The queue may have mail the hold kept back.
+                    *mail_pending = true;
+                    return Delivery::Idle;
+                }
+                Delivery::Held { seen }
             }
         }
     }
@@ -1055,7 +1075,7 @@ impl Spawner {
     /// `uncertain` (`submitted`). Before the kill.
     fn stop_delivery(&self, s: &Start, delivery: &Delivery, pasted: &str, submitted: &str) {
         match delivery {
-            Delivery::Idle => {}
+            Delivery::Idle | Delivery::Held { .. } => {}
             Delivery::Pasted { id, .. } => self.requeue_mail(s, id, pasted),
             Delivery::Submitted { id, .. } => self.mail_uncertain(s, id, submitted),
         }
@@ -4226,7 +4246,9 @@ mod tests {
 
     /// §4.5 fallback: with no prompt hook within SUBMIT_CONFIRM, an open
     /// turn and a box without the paste confirm it (`turn_open`); a box
-    /// that still shows it is `uncertain`.
+    /// that still shows it, as its fence line or as CC's collapsed
+    /// `[Pasted text #n +k lines]` (a CR that got lost while a background
+    /// turn opened), is `uncertain`.
     #[tokio::test]
     async fn without_the_hook_an_open_turn_confirms_delivery() {
         let (clock, secs) = hand_clock();
@@ -4234,24 +4256,59 @@ mod tests {
         let l = Principal::LocalUnverified;
         let a = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
         let b = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let c = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
         let (aid, bid) = (queue(&e.db, &a.id, "a"), queue(&e.db, &b.id, "b"));
-        e.sp.nudge_mail(&a.id);
-        e.sp.nudge_mail(&b.id);
-        wait_for("both pastes", || sent(&e).len() == 2);
+        let cid = queue(&e.db, &c.id, "c");
+        for agent in [&a, &b, &c] {
+            e.sp.nudge_mail(&agent.id);
+        }
+        wait_for("three pastes", || sent(&e).len() == 3);
         secs.store(1, Ordering::SeqCst);
-        wait_for("both CRs", || sent(&e).len() == 4);
-        wait_for("a's turn", || {
-            row(&e.db, &a.id).state.as_deref() == Some("working")
-        });
+        wait_for("three CRs", || sent(&e).len() == 6);
+        for agent in [&a, &b, &c] {
+            wait_for("the turn", || {
+                row(&e.db, &agent.id).state.as_deref() == Some("working")
+            });
+        }
         lock(&e.launcher.screens).insert(b.id.clone(), boxed(&format!("[c9watch mail {}]", bid)));
+        lock(&e.launcher.screens).insert(c.id.clone(), boxed("[Pasted text #1 +4 lines]"));
         ticks();
         secs.store(12, Ordering::SeqCst);
         assert_eq!(
             wait_mail(&e.db, &aid, "delivered").as_deref(),
             Some("turn_open")
         );
-        let detail = wait_mail(&e.db, &bid, "uncertain").unwrap();
-        assert!(detail.starts_with("no prompt hook after"), "{}", detail);
+        for id in [&bid, &cid] {
+            let detail = wait_mail(&e.db, id, "uncertain").unwrap();
+            assert!(detail.starts_with("no prompt hook after"), "{}", detail);
+        }
+        e.sp.shutdown();
+    }
+
+    /// §4.6: after a paste that timed out the agent may not read its
+    /// terminal, so the next message waits (no second write) until the
+    /// screen changes with a free box.
+    #[tokio::test]
+    async fn an_uncertain_paste_holds_the_queue_until_the_screen_moves() {
+        let (clock, _secs) = hand_clock();
+        let e = setup(Script::Ready, Some(clock));
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        lock(&e.launcher.write_results).push_back(Some(io::ErrorKind::TimedOut));
+        let first = queue(&e.db, &r.id, "one");
+        let second = queue(&e.db, &r.id, "two");
+        e.sp.nudge_mail(&r.id);
+        let detail = wait_mail(&e.db, &first, "uncertain").unwrap();
+        assert!(detail.starts_with("paste may be partial"), "{}", detail);
+        ticks();
+        assert_eq!(sent(&e).len(), 1, "no second write");
+        assert_eq!(mail_of(&e.db, &second).0, "queued");
+        // New output with a free box: the agent reads again.
+        lock(&e.launcher.screens).insert(r.id.clone(), boxed(""));
+        wait_for("the second paste", || sent(&e).len() == 2);
+        assert!(is_paste(&sent(&e)[1], &second));
         e.sp.shutdown();
     }
 
