@@ -2171,3 +2171,24 @@ fn a_late_entry_cancels_the_pending_system_mail() {
         1
     );
 }
+
+#[test]
+fn m2fix_cc_listener_is_absent_when_gate_is_unset_or_off() {
+    for gate in [None, Some("off")] {
+        let sb = Sandbox::new();
+        let mut cmd = sb.cmd(&["list"]);
+        if let Some(value) = gate {
+            cmd.env("C9_MAIL_SOCKET", value);
+        } else {
+            cmd.env_remove("C9_MAIL_SOCKET");
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{out:?} {}", sb.log());
+        let sockdir = sb.home.parent().unwrap().join("socks");
+        assert_eq!(
+            std::fs::read_dir(&sockdir).unwrap().count(),
+            0,
+            "gate={gate:?}"
+        );
+    }
+}

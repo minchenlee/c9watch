@@ -45,6 +45,9 @@ impl Sockets {
         *self.spawner.lock().unwrap() = Arc::downgrade(s);
     }
     pub fn bind(self: &Arc<Self>, dir: &Path) -> Result<PathBuf, String> {
+        if !cc_inbox::enabled() {
+            return Err("CC mail socket is disabled".into());
+        }
         cc_inbox::check_namespace(dir)?;
         if !dir.try_exists().map_err(|e| e.to_string())? {
             use std::os::unix::fs::DirBuilderExt;
@@ -118,6 +121,9 @@ impl Sockets {
         Ok(path)
     }
     async fn receive(&self, mut stream: tokio::net::UnixStream) -> Result<(), String> {
+        if !cc_inbox::enabled() {
+            return Err("CC mail socket is disabled".into());
+        }
         let cred = peer::peer_cred(stream.as_raw_fd())?;
         peer::check_peer_uid(&cred, peer::engine_uid())?;
         {
@@ -368,6 +374,73 @@ mod tests {
     };
     use crate::engine_proto::wire::MsgSendParams;
     use serde_json::json;
+    // Keep gate settings in child processes: these tests run concurrently.
+    fn socket_gate_child(name: &str, enabled: bool) -> bool {
+        if std::env::var("C9_TEST_CC_GATE_CHILD").as_deref() == Ok(name) {
+            return true;
+        }
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            &format!("engine::cc_listener::tests::{name}"),
+            "--nocapture",
+        ])
+        .env("C9_TEST_CC_GATE_CHILD", name);
+        if enabled {
+            cmd.env("C9_MAIL_SOCKET", "on");
+        } else {
+            cmd.env_remove("C9_MAIL_SOCKET");
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        false
+    }
+    #[tokio::test]
+    async fn m2fix_disabled_socket_rejects_inbound_without_side_effects() {
+        if !socket_gate_child(
+            "m2fix_disabled_socket_rejects_inbound_without_side_effects",
+            false,
+        ) {
+            return;
+        }
+        use tokio::io::AsyncWriteExt;
+        let (_t, db, _id, _wire) = setup();
+        let pid = std::process::id() as i32;
+        let start = peer::proc_info(pid).unwrap().start;
+        db.write_blocking(move |tx| tx.execute("INSERT INTO agent_state(agent_id,gen,pty_child_pid,pty_child_start) VALUES ('b',1,?1,?2)", params![pid,start as i64])).unwrap();
+        let db = Arc::new(db);
+        let sockets = Sockets::new(db.clone(), Arc::new(MergeTable::new()));
+        let namespace = tempfile::tempdir().unwrap();
+        let disabled_dir = namespace.path().join("disabled");
+        assert!(sockets
+            .bind(&disabled_dir)
+            .unwrap_err()
+            .contains("disabled"));
+        assert!(!disabled_dir.exists());
+        let (server, mut client) = tokio::net::UnixStream::pair().unwrap();
+        client
+            .write_all(b"{\"type\":\"user\",\"message\":{\"content\":\"reply\"}}\n")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        assert!(sockets
+            .receive(server)
+            .await
+            .unwrap_err()
+            .contains("disabled"));
+        let c = db.reader().unwrap();
+        for sql in [
+            "SELECT count(*) FROM audit WHERE method='cc.inbound'",
+            "SELECT count(*) FROM messages WHERE kind='system'",
+        ] {
+            assert_eq!(c.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
+    }
     fn setup() -> (tempfile::TempDir, Db, String, String) {
         let (t, db) = db_with_agent("a");
         db.write_blocking(|tx| { tx.execute("UPDATE agents SET state='ready', control='pty', generation=1 WHERE id='a'",[])?;tx.execute("INSERT INTO agents(id,name,role,provider,source,control,state,generation) VALUES ('b','b','worker','claudeCode','engine','pty','ready',1)",[])?;Ok(()) }).unwrap();
@@ -543,6 +616,12 @@ mod tests {
     }
     #[tokio::test]
     async fn eof_closes_after_the_sendmessage_audit_and_notice_commit() {
+        if !socket_gate_child(
+            "eof_closes_after_the_sendmessage_audit_and_notice_commit",
+            true,
+        ) {
+            return;
+        }
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (_t, db, _id, _wire) = setup();
         let pid = std::process::id() as i32;
@@ -614,6 +693,12 @@ mod tests {
     }
     #[tokio::test]
     async fn oversized_lines_are_disconnected_and_only_sixteen_inbound_slots_exist() {
+        if !socket_gate_child(
+            "oversized_lines_are_disconnected_and_only_sixteen_inbound_slots_exist",
+            true,
+        ) {
+            return;
+        }
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (_t, db, _id, _wire) = setup();
         let sockets = Sockets::new(Arc::new(db), Arc::new(MergeTable::new()));
