@@ -97,6 +97,11 @@ jobs:
           test -n "$APPLE_PASSWORD"
           test -n "$APPLE_TEAM_ID"
 
+      - name: Build headless core companion
+        env:
+          C9WATCH_CHANNEL: prod
+        run: sh scripts/prepare-engine-companion.sh ${{ matrix.target }}
+
       - name: Build Tauri app
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -111,13 +116,18 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           # Release channel: build.rs leaves cfg c9_channel_dev off.
           C9WATCH_CHANNEL: prod
-        run: npx tauri build --target ${{ matrix.target }}
+        run: npx tauri build --target ${{ matrix.target }} --features engine --config src-tauri/tauri.engine.conf.json
 
       - name: Validate signed and notarized native bundle
         run: |
           BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle"
           APP=$(find "$BUNDLE/macos" -maxdepth 1 -type d -name '*.app' -print -quit)
           test -n "$APP"
+          test -x "$APP/Contents/MacOS/c9watch-agent"
+          codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/c9watch-agent"
+          "$APP/Contents/MacOS/c9watch-agent" --version
+          "$APP/Contents/MacOS/c9watch" --help | grep -Eq '^[[:space:]]+engine([[:space:]]|$)'
+          "$APP/Contents/MacOS/c9watch" engine --help
           codesign --verify --deep --strict --verbose=2 "$APP"
           xcrun stapler validate "$APP"
           spctl --assess --type execute --verbose=4 "$APP"
@@ -134,7 +144,7 @@ jobs:
           "$BINARY" --version
           "$BINARY" > "$RUNNER_TEMP/c9watch-native.log" 2>&1 &
           PID=$!
-          cleanup() { kill "$PID" 2>/dev/null || true; }
+          cleanup() { "$BINARY" engine stop 2>/dev/null || true; kill "$PID" 2>/dev/null || true; }
           trap cleanup EXIT
           for _ in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:9210/health >/dev/null; then
