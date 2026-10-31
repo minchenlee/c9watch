@@ -31,6 +31,11 @@
 	let deepSearchResults = $state<Map<string, string> | null>(null);
 	const entryKey = (entry: HistoryEntry) => providerSessionKey(entry.provider, entry.sessionId);
 
+	// Rows are drawn in pages: the first PAGE_ROWS, then PAGE_ROWS more each
+	// time the sentinel below the list scrolls into view.
+	const PAGE_ROWS = 100;
+	let visibleRows = $state(PAGE_ROWS);
+
 	// Conversation viewer state
 	let selectedEntry = $state<HistoryEntry | null>(null);
 	let conversation = $state<Conversation | null>(null);
@@ -196,6 +201,47 @@
 		}
 		return offsets;
 	});
+
+	// A new filter, sort or grouping starts again from the first page.
+	$effect(() => {
+		void filtered;
+		void groupByProject;
+		visibleRows = PAGE_ROWS;
+	});
+
+	let shownFlat = $derived(filtered.slice(0, visibleRows));
+
+	// Groups cut so that all groups together draw at most `visibleRows` rows.
+	let shownGroups = $derived.by(() => {
+		if (!groups) return null;
+		let left = visibleRows;
+		const out: typeof groups = [];
+		for (const g of groups) {
+			if (left <= 0) break;
+			const take = collapsedProjects.has(g.project) ? 0 : Math.min(g.entries.length, left);
+			out.push({ ...g, entries: g.entries.slice(0, take) });
+			left -= take;
+		}
+		return out;
+	});
+
+	let moreRows = $derived(
+		groups
+			? groups.reduce((n, g) => n + (collapsedProjects.has(g.project) ? 0 : g.entries.length), 0) > visibleRows
+			: filtered.length > visibleRows
+	);
+
+	/** Draw the next page when `node` (below the last row) comes into view. */
+	function loadMore(node: HTMLElement) {
+		const observer = new IntersectionObserver(
+			(entries) => {
+				if (entries.some((e) => e.isIntersecting)) visibleRows += PAGE_ROWS;
+			},
+			{ rootMargin: '400px' }
+		);
+		observer.observe(node);
+		return { destroy: () => observer.disconnect() };
+	}
 
 	// ── Collapse state ───────────────────────────────────────────────
 	$effect(() => {
@@ -367,8 +413,8 @@
 			<div class="state-msg error">Error: {error}</div>
 		{:else if filtered.length === 0}
 				<div class="state-msg">No {providerFilterLabel($providerFilter)} sessions found.</div>
-		{:else if groupByProject && groups}
-			{#each groups as group, gi (group.project)}
+		{:else if groupByProject && shownGroups}
+			{#each shownGroups as group, gi (group.project)}
 				{@const baseIdx = (groupOffsets[gi] ?? 0) + 3}
 				<div class="project-group" in:flyIn|global={{ index: baseIdx, duration: 350, stride: 25 }}>
 					<!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -382,7 +428,7 @@
 					>
 						<span class="collapse-toggle" aria-hidden="true">{collapsedProjects.has(group.project) ? '▶' : '▼'}</span>
 						<span class="group-name">{group.projectName}</span>
-						<span class="group-count">{group.entries.length}</span>
+						<span class="group-count">{groups?.[gi]?.entries.length ?? group.entries.length}</span>
 					</div>
 					{#if !collapsedProjects.has(group.project)}
 						{#each group.entries as entry, i (entryKey(entry))}
@@ -406,7 +452,7 @@
 				</div>
 			{/each}
 		{:else}
-			{#each filtered as entry, i (entryKey(entry))}
+			{#each shownFlat as entry, i (entryKey(entry))}
 				{@const snippet = query.trim() ? (deepSearchResults?.get(entryKey(entry)) ?? null) : null}
 				<button
 					class="session-row session-row-flat"
@@ -429,6 +475,9 @@
 				</button>
 			{/each}
 		{/if}
+		{#if moreRows && !loading && !error}
+			{#key visibleRows}<div class="load-more" use:loadMore aria-hidden="true"></div>{/key}
+		{/if}
 
 	</div>
 </div>
@@ -447,6 +496,10 @@
 {/if}
 
 <style>
+	.load-more {
+		height: 1px;
+	}
+
 	.history-container {
 		display: flex;
 		flex-direction: column;
