@@ -63,10 +63,19 @@ use super::proto::{
     TaskDoneParams, TaskDoneResult, API_MAJOR, API_MINOR, HOOK_METHODS, MAX_FRAME,
 };
 use super::proto::{
+    ConversationGetParams, ConversationGetResult, CostGetParams, DiagDetectionParams,
+    HistoryListParams, HistoryListResult, HistorySearchParams, HistorySearchResult,
+    MemoryListParams, MemoryListResult, OpencodeConnectParams, OpencodeStatusParams, ProgressFrame,
+    SessionTasksParams, SessionTasksResult, SubagentListParams, SubagentListResult,
+    SubagentTranscriptParams, UsageSubscriptionsParams, UsageSubscriptionsResult,
+};
+use super::proto::{
     DetectRecheckParams, SessionAwayParams, SessionAwayResult, SessionRenameParams,
     SessionStopParams, SessionViewsParams, SessionViewsResult, TickResult,
 };
 use super::standing;
+use super::views;
+use super::views::conversation::{Progress, PROGRESS_CAPABILITY};
 use super::views::sessions as session_views;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -127,6 +136,15 @@ pub struct ServerCtx {
     /// Session detection and its views. `None` in an engine without
     /// detection, and in tests.
     pub detection: Option<Arc<Detection>>,
+    /// The user home the data readers look under (`views::user_home`).
+    /// `None` is the engine user's home; tests point it at a fixture.
+    pub user_home: Option<PathBuf>,
+    /// The engine's own cost cache (`<home>/cost-cache.json`). `None` (only
+    /// in tests) answers `cost.get` with `internal`.
+    pub cost_cache: Option<PathBuf>,
+    /// Where `usage.subscriptions` reads. `None` (only in tests) answers
+    /// `internal`.
+    pub usage: Option<views::usage::UsageSource>,
 }
 
 impl ServerCtx {
@@ -147,6 +165,9 @@ impl ServerCtx {
             first_tick: Arc::new(FirstTick::open_now()),
             header_key: None,
             detection: None,
+            user_home: None,
+            cost_cache: None,
+            usage: None,
         }
     }
 
@@ -196,6 +217,16 @@ impl ServerCtx {
         self
     }
 
+    pub fn with_cost_cache(mut self, path: PathBuf) -> Self {
+        self.cost_cache = Some(path);
+        self
+    }
+
+    pub fn with_usage(mut self, usage: views::usage::UsageSource) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
     /// Wait for detection's first pass; past `FIRST_TICK_WAIT` answer with
     /// what the table holds.
     pub(crate) async fn detected(&self) {
@@ -214,15 +245,35 @@ impl ServerCtx {
     }
 }
 
+/// Connections the socket serves at once. One more is answered `busy` and
+/// closed: each connection holds a task, a write queue and up to
+/// `MAX_STREAMS` SQLite readers.
+pub const MAX_CONNECTIONS: usize = 64;
+
 /// Accept connections until the listener fails. Each connection runs in its
 /// own task. The caller stops the engine by dropping this future (for
 /// example in a `select!` with `ShutdownSignals::recv`).
 pub async fn serve(listener: UnixListener, ctx: Arc<ServerCtx>) {
+    serve_with_cap(listener, ctx, MAX_CONNECTIONS).await
+}
+
+/// `serve` with at most `cap` connections at once.
+pub async fn serve_with_cap(listener: UnixListener, ctx: Arc<ServerCtx>, cap: usize) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(cap));
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => {
-                tokio::spawn(serve_conn(stream, ctx.clone()));
-            }
+            Ok((stream, _)) => match slots.clone().try_acquire_owned() {
+                Ok(slot) => {
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        serve_conn(stream, ctx).await;
+                        drop(slot);
+                    });
+                }
+                Err(_) => {
+                    tokio::spawn(refuse_busy(stream, cap));
+                }
+            },
             Err(e) => {
                 eprintln!("[engine] Accept error: {}", e);
                 // EMFILE and friends: back off instead of spinning.
@@ -230,6 +281,19 @@ pub async fn serve(listener: UnixListener, ctx: Arc<ServerCtx>) {
             }
         }
     }
+}
+
+/// Answer a connection past the cap with `busy` and close it.
+async fn refuse_busy(mut stream: UnixStream, cap: usize) {
+    let resp = Response::err(
+        None,
+        ApiError::new(
+            ErrorCode::Busy,
+            format!("the engine already serves {} connections", cap),
+        ),
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(1), stream.write_all(&encode(&resp))).await;
+    let _ = stream.shutdown().await;
 }
 
 /// The process on the other end, as read at accept.
@@ -243,6 +307,8 @@ struct Peer {
 /// The connection's state after `hello`.
 struct Conn {
     principal: Principal,
+    /// The capabilities `hello` granted.
+    capabilities: Vec<String>,
 }
 
 /// What the reader does after handling a frame.
@@ -335,8 +401,16 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
         }
         // A stream that ended (expired, or the store closed) frees its slot.
         streams.retain(|h| !h.is_finished());
-        let (resp, next, stream) =
-            handle_frame(&frame, &ctx, peer, &principal, &mut conn, streams.len()).await;
+        let (resp, next, stream) = handle_frame(
+            &frame,
+            &ctx,
+            peer,
+            &principal,
+            &mut conn,
+            streams.len(),
+            &tx,
+        )
+        .await;
         if tx.send(encode(&resp)).await.is_err() {
             break;
         }
@@ -365,6 +439,7 @@ async fn handle_frame(
     principal: &Principal,
     conn: &mut Option<Conn>,
     streams: usize,
+    tx: &mpsc::Sender<Vec<u8>>,
 ) -> (Response, Next, Option<EventStream>) {
     match check_frame(frame, ctx, peer.cred, principal, conn) {
         Checked::Done(resp, next) => (resp, next, None),
@@ -377,7 +452,14 @@ async fn handle_frame(
         }
         Checked::Call(req, method) => {
             let id = req.id.clone();
-            match dispatch(&method, req, ctx, peer, principal, streams).await {
+            let progress = conn
+                .as_ref()
+                .is_some_and(|c| c.capabilities.iter().any(|w| w == PROGRESS_CAPABILITY))
+                .then(|| Progress {
+                    tx: tx.clone(),
+                    id: id.clone(),
+                });
+            match dispatch(&method, req, ctx, peer, principal, streams, progress).await {
                 Ok(served) => {
                     let mut resp = Response::ok(id, served.result);
                     resp.seq = served.seq;
@@ -492,6 +574,18 @@ pub const METHODS: &[&str] = &[
     "detect.recheck",
     "session.stop",
     "session.rename",
+    "diag.detection",
+    "conversation.get",
+    "history.list",
+    "history.search",
+    "cost.get",
+    "memory.list",
+    "subagent.list",
+    "subagent.transcript",
+    "session.tasks",
+    "usage.subscriptions",
+    "provider.opencode.status",
+    "provider.opencode.connect",
 ];
 
 /// The c9p/1 JSON Schema (A:245): the frame types, a `methods` table with
@@ -514,6 +608,7 @@ pub fn schema() -> serde_json::Value {
         "request": de.subschema_for::<Request>(),
         "response": ser.subschema_for::<Response>(),
         "event": ser.subschema_for::<EventFrame>(),
+        "progress": ser.subschema_for::<ProgressFrame>(),
     });
     let methods = serde_json::json!({
         "hello": {
@@ -577,6 +672,55 @@ pub fn schema() -> serde_json::Value {
             "params": de.subschema_for::<SessionRenameParams>(),
             "result": ser.subschema_for::<TickResult>(),
         },
+        "diag.detection": {
+            "params": de.subschema_for::<DiagDetectionParams>(),
+            "result": ser.subschema_for::<crate::session::DetectionDiagnostics>(),
+        },
+        "conversation.get": {
+            "params": de.subschema_for::<ConversationGetParams>(),
+            "result": ser.subschema_for::<ConversationGetResult>(),
+            "progress": ser.subschema_for::<ProgressFrame>(),
+        },
+        "history.list": {
+            "params": de.subschema_for::<HistoryListParams>(),
+            "result": ser.subschema_for::<HistoryListResult>(),
+        },
+        "history.search": {
+            "params": de.subschema_for::<HistorySearchParams>(),
+            "result": ser.subschema_for::<HistorySearchResult>(),
+        },
+        "cost.get": {
+            "params": de.subschema_for::<CostGetParams>(),
+            "result": ser.subschema_for::<crate::session::CostData>(),
+        },
+        "memory.list": {
+            "params": de.subschema_for::<MemoryListParams>(),
+            "result": ser.subschema_for::<MemoryListResult>(),
+        },
+        "subagent.list": {
+            "params": de.subschema_for::<SubagentListParams>(),
+            "result": ser.subschema_for::<SubagentListResult>(),
+        },
+        "subagent.transcript": {
+            "params": de.subschema_for::<SubagentTranscriptParams>(),
+            "result": ser.subschema_for::<crate::session::subagents::SubagentTranscript>(),
+        },
+        "session.tasks": {
+            "params": de.subschema_for::<SessionTasksParams>(),
+            "result": ser.subschema_for::<SessionTasksResult>(),
+        },
+        "usage.subscriptions": {
+            "params": de.subschema_for::<UsageSubscriptionsParams>(),
+            "result": ser.subschema_for::<UsageSubscriptionsResult>(),
+        },
+        "provider.opencode.status": {
+            "params": de.subschema_for::<OpencodeStatusParams>(),
+            "result": ser.subschema_for::<crate::session::opencode::ConnectionStatus>(),
+        },
+        "provider.opencode.connect": {
+            "params": de.subschema_for::<OpencodeConnectParams>(),
+            "result": ser.subschema_for::<crate::session::opencode::ConnectionStatus>(),
+        },
     });
     let mut methods = methods;
     for m in HOOK_METHODS {
@@ -638,6 +782,7 @@ async fn dispatch(
     peer: Peer,
     principal: &Principal,
     streams: usize,
+    progress: Option<Progress>,
 ) -> Result<Served, ApiError> {
     match method {
         // One arm per method: scripts/test-ipc-contract.mjs reads the
@@ -663,6 +808,65 @@ async fn dispatch(
         "session.rename" => Ok(Served::result(
             local_mutation(method, req, ctx, peer, principal).await?,
         )),
+        "provider.opencode.connect" => Ok(Served::result(
+            local_mutation(method, req, ctx, peer, principal).await?,
+        )),
+        "diag.detection" => Ok(Served::result(
+            session_views::diag_detection(req, ctx).await?,
+        )),
+        "provider.opencode.status" => Ok(Served::result(
+            views::opencode::opencode_status(req, ctx).await?,
+        )),
+        "conversation.get" => {
+            local_read(method, ctx, principal).await?;
+            Ok(Served::result(
+                views::conversation::conversation_get(req, ctx, progress).await?,
+            ))
+        }
+        "history.list" => {
+            local_read(method, ctx, principal).await?;
+            Ok(Served::result(
+                views::history::history_list(req, ctx).await?,
+            ))
+        }
+        "history.search" => {
+            local_read(method, ctx, principal).await?;
+            Ok(Served::result(
+                views::history::history_search(req, ctx).await?,
+            ))
+        }
+        "cost.get" => {
+            local_read(method, ctx, principal).await?;
+            Ok(Served::result(views::cost::cost_get(req, ctx).await?))
+        }
+        "memory.list" => {
+            local_read(method, ctx, principal).await?;
+            Ok(Served::result(views::memory::memory_list(req, ctx).await?))
+        }
+        "subagent.list" => {
+            local_read(method, ctx, principal).await?;
+            Ok(Served::result(
+                views::subagents::subagent_list(req, ctx).await?,
+            ))
+        }
+        "subagent.transcript" => {
+            local_read(method, ctx, principal).await?;
+            Ok(Served::result(
+                views::subagents::subagent_transcript(req, ctx).await?,
+            ))
+        }
+        "session.tasks" => {
+            local_read(method, ctx, principal).await?;
+            Ok(Served::result(
+                views::subagents::session_tasks(req, ctx).await?,
+            ))
+        }
+        "usage.subscriptions" => {
+            local_read(method, ctx, principal).await?;
+            Ok(Served::result(
+                views::usage::usage_subscriptions(req, ctx).await?,
+            ))
+        }
         "events.subscribe" => {
             if streams >= MAX_STREAMS {
                 return Err(ApiError::new(
@@ -731,8 +935,24 @@ async fn local_mutation(
     match method {
         "detect.recheck" => session_views::detect_recheck(ctx).await,
         "session.stop" => session_views::session_stop(req, ctx).await,
+        "provider.opencode.connect" => views::opencode::opencode_connect(req, ctx).await,
         _ => session_views::session_rename(req, ctx).await,
     }
+}
+
+/// The reads an agent may not make (owner decision Q5=A): conversations,
+/// history, memory, cost, subagents, tasks and subscription usage. A
+/// refusal is audited, as an agent's refused mutation is.
+async fn local_read(method: &str, ctx: &ServerCtx, principal: &Principal) -> Result<(), ApiError> {
+    if matches!(principal, Principal::LocalUnverified) {
+        return Ok(());
+    }
+    let e = ApiError::new(
+        ErrorCode::NotAllowed,
+        format!("{} may not call {}", principal, method),
+    );
+    audit_refusal(ctx, principal, method, "", &e).await;
+    Err(e)
 }
 
 /// Who may call `agent.create` or `agent.retire`: never an agent, so its
@@ -1329,8 +1549,8 @@ impl EventStream {
     }
 }
 
-/// Capabilities this engine offers. Empty until the first optional feature.
-const CAPABILITIES: &[&str] = &[];
+/// Capabilities this engine offers; a client gets the ones it `want`s.
+const CAPABILITIES: &[&str] = &[PROGRESS_CAPABILITY];
 
 fn hello(
     req: Request,
@@ -1376,11 +1596,21 @@ fn hello(
             Next::Close,
         );
     }
+    let capabilities: Vec<String> = params
+        .want
+        .iter()
+        .filter(|w| CAPABILITIES.contains(&w.as_str()))
+        .cloned()
+        .collect();
     let principal = match conn {
-        Some(c) => c.principal.clone(),
+        Some(c) => {
+            c.capabilities = capabilities.clone();
+            c.principal.clone()
+        }
         None => {
             *conn = Some(Conn {
                 principal: principal.clone(),
+                capabilities: capabilities.clone(),
             });
             principal.clone()
         }
@@ -1393,12 +1623,6 @@ fn hello(
             cred.pid, principal, client.kind, client.name, client.version
         );
     }
-    let capabilities = params
-        .want
-        .iter()
-        .filter(|w| CAPABILITIES.contains(&w.as_str()))
-        .cloned()
-        .collect();
     let result = HelloResult {
         api_major: API_MAJOR,
         api_minor: API_MINOR,
@@ -1438,6 +1662,9 @@ mod tests {
             first_tick: Arc::new(FirstTick::open_now()),
             header_key: None,
             detection: None,
+            user_home: Some(PathBuf::from("/nonexistent/c9watch-test-home")),
+            cost_cache: None,
+            usage: None,
         })
     }
 
@@ -1754,11 +1981,23 @@ mod tests {
             } else if *m == "agent.create" || *m == "agent.retire" {
                 // This test engine has no spawner.
                 assert_eq!(r["error"]["code"], "internal", "{}: {}", m, r);
-            } else if ["msg.send", "session.stop", "session.rename"].contains(m) {
-                // `to` and `body`, `sessionKey`, `sessionId` are required.
+            } else if [
+                "msg.send",
+                "session.stop",
+                "session.rename",
+                "conversation.get",
+                "history.search",
+                "subagent.transcript",
+                "session.tasks",
+                "provider.opencode.connect",
+            ]
+            .contains(m)
+            {
+                // Each needs a param `{}` lacks (`to`, `sessionKey`, `query`, …).
                 assert_eq!(r["error"]["code"], "bad_request", "{}: {}", m, r);
-            } else if *m == "detect.recheck" {
-                // This test engine runs no detection.
+            } else if ["detect.recheck", "cost.get", "usage.subscriptions"].contains(m) {
+                // This test engine runs no detection, keeps no cost cache and
+                // reads no subscription usage.
                 assert_eq!(r["error"]["code"], "internal", "{}: {}", m, r);
             } else {
                 assert_eq!(r["ok"], true, "{}: {}", m, r);
@@ -1793,6 +2032,7 @@ mod tests {
             Ok(Observation {
                 sessions: self.0.lock().unwrap().0.clone(),
                 failed: Vec::new(),
+                diagnostics: None,
             })
         }
         fn detected(&mut self) -> Result<Vec<DetectedSession>, String> {
@@ -2052,6 +2292,9 @@ mod tests {
             first_tick: Arc::new(FirstTick::open_now()),
             header_key: None,
             detection: None,
+            user_home: Some(t.path().join("home")),
+            cost_cache: None,
+            usage: None,
         });
         (t, ctx, db)
     }
@@ -2064,12 +2307,17 @@ mod tests {
     impl Client {
         /// Connect and say `hello`; returns the hello result too.
         async fn new(ctx: Arc<ServerCtx>) -> (Client, Value) {
+            Client::hello(ctx, json!({})).await
+        }
+
+        /// Connect and say `hello` with `params`.
+        async fn hello(ctx: Arc<ServerCtx>, params: Value) -> (Client, Value) {
             let (read, write) = connect(ctx).into_split();
             let mut c = Client {
                 lines: BufReader::new(read).lines(),
                 write,
             };
-            let r = c.call("h", "hello", json!({})).await;
+            let r = c.call("h", "hello", params).await;
             assert_eq!(r["ok"], true, "{}", r);
             (c, r["result"].clone())
         }
@@ -3054,5 +3302,312 @@ mod tests {
             .query_row("SELECT state FROM messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(state, "queued");
+    }
+
+    // ── Data views (core-public M-a2) ─────────────────────────────────
+
+    const PROJECT: &str = "/p/demo";
+
+    /// A user home with one Claude Code session `sess-1` (history entry and
+    /// transcript), one memory file and a task list for `sess-1`.
+    fn data_home(home: &std::path::Path) {
+        let claude = home.join(".claude");
+        let project = claude
+            .join("projects")
+            .join(crate::session::detector::encode_path_for_matching(PROJECT));
+        std::fs::create_dir_all(project.join("memory")).unwrap();
+        std::fs::write(
+            claude.join("history.jsonl"),
+            format!(
+                "{}\n",
+                json!({"display": "fix the bug", "timestamp": 1000, "project": PROJECT, "sessionId": "sess-1"})
+            ),
+        )
+        .unwrap();
+        let mut transcript = String::new();
+        for i in 0..5 {
+            let (kind, content) = ("user", json!(format!("question {}", i)));
+            transcript.push_str(&format!(
+                "{}\n",
+                json!({
+                    "type": kind,
+                    "uuid": format!("u{}", i),
+                    "sessionId": "sess-1",
+                    "cwd": PROJECT,
+                    "timestamp": format!("2026-10-31T00:00:0{}Z", i),
+                    "message": {"role": kind, "content": content},
+                })
+            ));
+        }
+        std::fs::write(project.join("sess-1.jsonl"), transcript).unwrap();
+        std::fs::write(project.join("memory").join("MEMORY.md"), "# notes\n").unwrap();
+        let tasks = claude.join("tasks").join("sess-1");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            tasks.join("1.json"),
+            json!({"id": "1", "subject": "write tests", "status": "pending"}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn ctx_home(agents: Arc<dyn LiveAgents>) -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Db>) {
+        let (t, ctx, db) = ctx_db(agents);
+        data_home(&t.path().join("home"));
+        (t, ctx, db)
+    }
+
+    /// Parity (§3.1): each data method answers what the GUI command's
+    /// reader returns for the same home.
+    #[tokio::test]
+    async fn data_methods_answer_what_the_gui_readers_return() {
+        let (t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let home = t.path().join("home");
+        let (mut c, _) = Client::new(ctx).await;
+
+        let r = c.call("1", "history.list", json!({})).await;
+        let gui = crate::session::history::get_history_in(&home).unwrap();
+        assert_eq!(gui.len(), 1);
+        assert_eq!(
+            r["result"]["entries"],
+            serde_json::to_value(&gui).unwrap(),
+            "{}",
+            r
+        );
+
+        let r = c
+            .call("2", "history.search", json!({"query": "question 3"}))
+            .await;
+        let gui =
+            crate::session::history::deep_search_under(&home, "question 3", false, false).unwrap();
+        assert!(!gui.is_empty());
+        assert_eq!(
+            r["result"]["hits"],
+            serde_json::to_value(&gui).unwrap(),
+            "{}",
+            r
+        );
+        let r = c.call("3", "history.search", json!({"query": "  "})).await;
+        assert_eq!(r["result"]["hits"], json!([]), "{}", r);
+
+        let r = c.call("4", "memory.list", json!({})).await;
+        let gui = crate::session::memory::get_memory_files_from_home(&home).unwrap();
+        assert_eq!(gui.len(), 1);
+        assert_eq!(
+            r["result"]["projects"],
+            serde_json::to_value(&gui).unwrap(),
+            "{}",
+            r
+        );
+
+        let r = c
+            .call("5", "session.tasks", json!({"sessionId": "sess-1"}))
+            .await;
+        let gui = crate::session::tasks::read_session_tasks_in(&home, "sess-1").unwrap();
+        assert_eq!(gui.len(), 1);
+        assert_eq!(
+            r["result"]["tasks"],
+            serde_json::to_value(&gui).unwrap(),
+            "{}",
+            r
+        );
+        let r = c
+            .call("6", "session.tasks", json!({"sessionId": "../sess-1"}))
+            .await;
+        assert_eq!(r["error"]["code"], "bad_request", "{}", r);
+
+        let r = c
+            .call(
+                "7",
+                "conversation.get",
+                json!({"sessionKey": "claudeCode:sess-1"}),
+            )
+            .await;
+        let gui = crate::session::conversation::get_conversation_data_in(
+            &home,
+            "sess-1",
+            Some(crate::session::SessionProvider::ClaudeCode),
+            false,
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(gui.messages.len(), 5);
+        assert_eq!(
+            r["result"]["messages"],
+            serde_json::to_value(&gui.messages).unwrap(),
+            "{}",
+            r
+        );
+        assert_eq!(r["result"]["total"], 5);
+        assert_eq!(r["result"]["nextOffset"], Value::Null, "{}", r);
+        let r = c
+            .call(
+                "8",
+                "conversation.get",
+                json!({"sessionKey": "claudeCode:nope"}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "unknown_session", "{}", r);
+
+        let r = c
+            .call("9", "subagent.list", json!({"sessionIds": ["sess-1"]}))
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let r = c
+            .call(
+                "10",
+                "subagent.transcript",
+                json!({"parentSessionId": "sess-1", "subagentId": "nope"}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "unknown_session", "{}", r);
+    }
+
+    /// `conversation.get` pages: `nextOffset` walks the whole transcript.
+    #[tokio::test]
+    async fn conversation_get_pages_through_the_transcript() {
+        let (_t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        let mut offset = Some(0u64);
+        let mut seen = Vec::new();
+        let mut i = 0;
+        while let Some(o) = offset {
+            i += 1;
+            let r = c
+                .call(
+                    &i.to_string(),
+                    "conversation.get",
+                    json!({"sessionKey": "claudeCode:sess-1", "page": {"offset": o, "limit": 2}}),
+                )
+                .await;
+            assert_eq!(r["result"]["offset"], o, "{}", r);
+            assert_eq!(r["result"]["total"], 5, "{}", r);
+            for m in r["result"]["messages"].as_array().unwrap() {
+                seen.push(m["content"].clone());
+            }
+            offset = r["result"]["nextOffset"].as_u64();
+        }
+        assert_eq!(i, 3);
+        assert_eq!(seen.len(), 5);
+        // An offset past the end is an empty last page.
+        let r = c
+            .call(
+                "x",
+                "conversation.get",
+                json!({"sessionKey": "claudeCode:sess-1", "page": {"offset": 99}}),
+            )
+            .await;
+        assert_eq!(r["result"]["messages"], json!([]), "{}", r);
+        assert_eq!(r["result"]["offset"], 5, "{}", r);
+    }
+
+    /// With `conversation.progress` granted, `progress` frames come before
+    /// the response and end at the file size; without it, none come.
+    #[tokio::test]
+    async fn conversation_get_sends_progress_only_when_asked() {
+        let (_t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let (mut c, hello) = Client::hello(
+            ctx.clone(),
+            json!({"want": ["conversation.progress", "nope"]}),
+        )
+        .await;
+        assert_eq!(hello["capabilities"], json!(["conversation.progress"]));
+        c.send(
+            "c1",
+            "conversation.get",
+            json!({"sessionKey": "claudeCode:sess-1"}),
+        )
+        .await;
+        let mut progress = Vec::new();
+        let resp = loop {
+            let f = c.next().await;
+            if f["type"] == "progress" {
+                assert_eq!(f["id"], "c1", "{}", f);
+                progress.push((
+                    f["bytesRead"].as_u64().unwrap(),
+                    f["bytesTotal"].as_u64().unwrap(),
+                ));
+            } else {
+                break f;
+            }
+        };
+        assert_eq!(resp["ok"], true, "{}", resp);
+        let (read, total) = *progress.last().expect("a progress frame");
+        assert!(total > 0 && read == total, "{:?}", progress);
+
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["capabilities"], json!([]));
+        let r = c
+            .call(
+                "c2",
+                "conversation.get",
+                json!({"sessionKey": "claudeCode:sess-1"}),
+            )
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+    }
+
+    /// Principal table §3.2 (owner Q5=A): an agent may not read
+    /// conversations, history, memory, cost, subagents, tasks or usage;
+    /// each refusal is audited.
+    #[tokio::test]
+    async fn an_agent_may_not_read_user_data() {
+        let (_t, ctx, db) = ctx_home(as_agent("a7"));
+        let (mut c, _) = Client::new(ctx).await;
+        let denied = [
+            (
+                "conversation.get",
+                json!({"sessionKey": "claudeCode:sess-1"}),
+            ),
+            ("history.list", json!({})),
+            ("history.search", json!({"query": "bug"})),
+            ("cost.get", json!({})),
+            ("memory.list", json!({})),
+            ("subagent.list", json!({})),
+            (
+                "subagent.transcript",
+                json!({"parentSessionId": "sess-1", "subagentId": "x"}),
+            ),
+            ("session.tasks", json!({"sessionId": "sess-1"})),
+            ("usage.subscriptions", json!({})),
+            ("provider.opencode.connect", json!({"url": ""})),
+        ];
+        for (i, (m, p)) in denied.iter().enumerate() {
+            let r = c.call(&i.to_string(), m, p.clone()).await;
+            assert_eq!(r["error"]["code"], "not_allowed", "{}: {}", m, r);
+        }
+        let rows: Vec<String> = audit_rows(&db)
+            .into_iter()
+            .filter(|r| r.2 == "deny")
+            .map(|r| r.1)
+            .collect();
+        let want: Vec<&str> = denied.iter().map(|(m, _)| *m).collect();
+        assert_eq!(rows, want);
+        // An agent still reads the detection diagnostics and the OpenCode
+        // status (neither carries user content).
+        let r = c.call("d", "diag.detection", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let r = c.call("o", "provider.opencode.status", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+    }
+
+    /// `usage.subscriptions` answers from the engine's usage source.
+    #[tokio::test]
+    async fn usage_subscriptions_reads_the_usage_source() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = calls.clone();
+        ctx.usage = Some(Arc::new(move || {
+            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                vec![crate::session::subscription_usage::unavailable(
+                    "claude", "Claude", "test",
+                )]
+            })
+        }));
+        let (mut c, _) = Client::new(Arc::new(ctx)).await;
+        let r = c.call("1", "usage.subscriptions", json!({})).await;
+        assert_eq!(r["result"]["usage"][0]["provider"], "claude", "{}", r);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

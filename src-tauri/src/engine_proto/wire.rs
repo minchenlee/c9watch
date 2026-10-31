@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
 /// Protocol minor version. Raised for additive changes.
-pub const API_MINOR: u32 = 5;
+pub const API_MINOR: u32 = 6;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -166,6 +166,9 @@ pub enum ErrorCode {
     /// session itself: it cannot be stopped, it runs as another process
     /// now, or the write failed. `msg` says which.
     ActionFailed,
+    /// The engine is at a limit that frees up soon: the connection cap, or
+    /// a scan of the same kind that is still running. Retry shortly.
+    Busy,
     /// An engine-side failure.
     Internal,
 }
@@ -198,6 +201,7 @@ impl ErrorCode {
             ErrorCode::Duplicate => "duplicate",
             ErrorCode::UnknownSession => "unknown_session",
             ErrorCode::ActionFailed => "action_failed",
+            ErrorCode::Busy => "busy",
             ErrorCode::Internal => "internal",
         }
     }
@@ -206,7 +210,7 @@ impl ErrorCode {
     pub fn retryable(self) -> bool {
         matches!(
             self,
-            ErrorCode::HelloTimeout | ErrorCode::Draining | ErrorCode::Internal
+            ErrorCode::HelloTimeout | ErrorCode::Draining | ErrorCode::Busy | ErrorCode::Internal
         )
     }
 
@@ -264,6 +268,7 @@ impl ErrorCode {
             ErrorCode::Duplicate => "pass a new idem to send it again",
             ErrorCode::UnknownSession => "see `session.views` for the live session keys",
             ErrorCode::ActionFailed => "read `msg`; `session.views` shows the session now",
+            ErrorCode::Busy => "retry in a second",
             ErrorCode::Internal => "retry; if it persists, check the engine log",
         }
     }
@@ -544,6 +549,210 @@ pub struct SessionRenameParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<crate::session::SessionProvider>,
 }
+
+/// `conversation.get` params: one session's transcript, as the GUI's
+/// `get_conversation` reads it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationGetParams {
+    /// `<provider>:<session id>`. A bare session id (no known provider
+    /// prefix) is looked up in every provider, or in `provider`.
+    pub session_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<crate::session::SessionProvider>,
+    /// Keep tool-use and tool-result messages. Default false, as in the GUI.
+    #[serde(default)]
+    pub include_tools: bool,
+    /// Without it, every message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<PageParams>,
+}
+
+/// A window of a list: `limit` items from `offset`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PageParams {
+    #[serde(default)]
+    pub offset: usize,
+    /// At most this many items; without it, all from `offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// `conversation.get` result. `messages` are the page asked for, in
+/// transcript order. Each call reads the transcript again.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationGetResult {
+    pub session_id: String,
+    pub provider: crate::session::SessionProvider,
+    pub messages: Vec<crate::session::ConversationMessage>,
+    /// Messages in the whole conversation.
+    pub total: usize,
+    pub offset: usize,
+    /// `offset` of the next page; `null` after the last one.
+    pub next_offset: Option<usize>,
+}
+
+/// A `progress` frame: how far a read for request `id` has got. Sent only
+/// to a connection that asked for the `conversation.progress` capability,
+/// before that request's response. Never stored; a slow client may miss
+/// some.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ProgressFrame {
+    pub v: u32,
+    #[serde(rename = "type")]
+    pub kind: ProgressType,
+    /// The `id` of the request it reports on.
+    pub id: Option<String>,
+    pub bytes_read: u64,
+    pub bytes_total: u64,
+}
+
+/// The `type` of a progress frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub enum ProgressType {
+    #[serde(rename = "progress")]
+    Progress,
+}
+
+/// `history.list` params. There are none yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct HistoryListParams {}
+
+/// `history.list` result: past sessions of every provider, newest first,
+/// as the GUI's `get_session_history` lists them.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct HistoryListResult {
+    pub entries: Vec<crate::session::HistoryEntry>,
+}
+
+/// `history.search` params: a phrase search over Claude Code transcripts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct HistorySearchParams {
+    pub query: String,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub whole_word: bool,
+}
+
+/// `history.search` result: one hit per matching session. A blank query
+/// has none.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct HistorySearchResult {
+    pub hits: Vec<crate::session::DeepSearchHit>,
+}
+
+/// `cost.get` params. There are none yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct CostGetParams {}
+
+/// `memory.list` params. There are none yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct MemoryListParams {}
+
+/// `memory.list` result: memory files grouped by project, as the GUI's
+/// `get_memory_files` reads them.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct MemoryListResult {
+    pub projects: Vec<crate::session::ProjectMemory>,
+}
+
+/// `subagent.list` params: the raw Claude Code session ids the caller
+/// shows (not session keys).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentListParams {
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+}
+
+/// `subagent.list` result: parent session id → its subagent invocations.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct SubagentListResult {
+    pub subagents: std::collections::HashMap<String, Vec<crate::session::subagents::SubagentInfo>>,
+}
+
+/// `subagent.transcript` params.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentTranscriptParams {
+    pub parent_session_id: String,
+    /// The Agent tool's `tool_use_id`.
+    pub subagent_id: String,
+}
+
+/// `session.tasks` params.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTasksParams {
+    /// The raw Claude Code session id.
+    pub session_id: String,
+}
+
+/// `session.tasks` result: the session's TodoWrite tasks as Claude Code
+/// wrote them, sorted by numeric `id`.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct SessionTasksResult {
+    pub tasks: Vec<serde_json::Value>,
+}
+
+/// `usage.subscriptions` params. There are none yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct UsageSubscriptionsParams {}
+
+/// `usage.subscriptions` result: one snapshot per provider plan. The
+/// engine reads the providers at most once a minute.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct UsageSubscriptionsResult {
+    pub usage: Vec<crate::session::subscription_usage::SubscriptionUsage>,
+}
+
+/// `provider.opencode.status` params. There are none yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct OpencodeStatusParams {}
+
+/// `provider.opencode.connect` params: the OpenCode server detection
+/// reads. An empty `url` disconnects. The engine keeps the credentials in
+/// memory only and never returns them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct OpencodeConnectParams {
+    pub url: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+/// `diag.detection` params. There are none yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct DiagDetectionParams {}
 
 /// `agent.list` params.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

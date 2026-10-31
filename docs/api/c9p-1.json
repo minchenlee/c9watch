@@ -362,8 +362,275 @@
       },
       "type": "object"
     },
+    "ConversationGetParams": {
+      "description": "`conversation.get` params: one session's transcript, as the GUI's\n`get_conversation` reads it.",
+      "properties": {
+        "includeTools": {
+          "default": false,
+          "description": "Keep tool-use and tool-result messages. Default false, as in the GUI.",
+          "type": "boolean"
+        },
+        "page": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PageParams"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Without it, every message."
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionProvider"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sessionKey": {
+          "description": "`<provider>:<session id>`. A bare session id (no known provider\nprefix) is looked up in every provider, or in `provider`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionKey"
+      ],
+      "type": "object"
+    },
+    "ConversationGetResult": {
+      "description": "`conversation.get` result. `messages` are the page asked for, in\ntranscript order. Each call reads the transcript again.",
+      "properties": {
+        "messages": {
+          "items": {
+            "$ref": "#/$defs/ConversationMessage"
+          },
+          "type": "array"
+        },
+        "nextOffset": {
+          "description": "`offset` of the next page; `null` after the last one.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provider": {
+          "$ref": "#/$defs/SessionProvider"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "total": {
+          "description": "Messages in the whole conversation.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sessionId",
+        "provider",
+        "messages",
+        "total",
+        "offset",
+        "nextOffset"
+      ],
+      "type": "object"
+    },
+    "ConversationMessage": {
+      "description": "Individual message in a conversation",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "images": {
+          "description": "Images attached to this message (screenshots pasted by the user)",
+          "items": {
+            "$ref": "#/$defs/ImageBlock"
+          },
+          "type": "array"
+        },
+        "messageType": {
+          "$ref": "#/$defs/MessageType"
+        },
+        "timestamp": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "timestamp",
+        "messageType",
+        "content"
+      ],
+      "type": "object"
+    },
+    "CostData": {
+      "description": "Aggregated cost data returned to the frontend.",
+      "properties": {
+        "dailyCosts": {
+          "items": {
+            "$ref": "#/$defs/DailyCost"
+          },
+          "type": "array"
+        },
+        "modelCosts": {
+          "items": {
+            "$ref": "#/$defs/ModelCost"
+          },
+          "type": "array"
+        },
+        "projectCosts": {
+          "items": {
+            "$ref": "#/$defs/ProjectCost"
+          },
+          "type": "array"
+        },
+        "totalCost": {
+          "format": "double",
+          "type": "number"
+        },
+        "totalTokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unpricedTokens": {
+          "description": "Tokens whose provider/model has no local USD pricing table.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "totalCost",
+        "totalTokens",
+        "unpricedTokens",
+        "dailyCosts",
+        "projectCosts",
+        "modelCosts"
+      ],
+      "type": "object"
+    },
+    "CostGetParams": {
+      "description": "`cost.get` params. There are none yet.",
+      "type": "object"
+    },
+    "DailyCost": {
+      "properties": {
+        "cost": {
+          "format": "double",
+          "type": "number"
+        },
+        "date": {
+          "type": "string"
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/SessionCostRecord"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "date",
+        "cost",
+        "sessions"
+      ],
+      "type": "object"
+    },
+    "DeepSearchHit": {
+      "description": "A single deep-search hit: session ID + first matching snippet (truncated).",
+      "properties": {
+        "agentKind": {
+          "default": "root",
+          "type": "string"
+        },
+        "modified": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projectPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "default": "claudeCode",
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "snippet": {
+          "description": "Up to 200 chars of context around the first keyword match, from the matching line.",
+          "type": "string"
+        },
+        "surface": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionId",
+        "snippet",
+        "provider",
+        "agentKind"
+      ],
+      "type": "object"
+    },
     "DetectRecheckParams": {
       "description": "`detect.recheck` params. There are none yet; the engine ignores any it\ngets.",
+      "type": "object"
+    },
+    "DetectionDiagnostics": {
+      "properties": {
+        "claudeProcessesFound": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fdaLikelyNeeded": {
+          "type": "boolean"
+        },
+        "hiddenClaudeSessions": {
+          "default": [],
+          "description": "Live Claude Code sessions that Claude Code itself keeps out of its\nregistry, so c9watch can count them but not show them.",
+          "items": {
+            "$ref": "#/$defs/HiddenClaudeSession"
+          },
+          "type": "array"
+        },
+        "processesWithCwd": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "claudeProcessesFound",
+        "processesWithCwd",
+        "fdaLikelyNeeded",
+        "hiddenClaudeSessions"
+      ],
+      "type": "object"
+    },
+    "DiagDetectionParams": {
+      "description": "`diag.detection` params. There are none yet.",
       "type": "object"
     },
     "ErrorBody": {
@@ -519,6 +786,11 @@
         {
           "const": "action_failed",
           "description": "`session.stop` or `session.rename` was refused or failed on the\nsession itself: it cannot be stopped, it runs as another process\nnow, or the write failed. `msg` says which.",
+          "type": "string"
+        },
+        {
+          "const": "busy",
+          "description": "The engine is at a limit that frees up soon: the connection cap, or\na scan of the same kind that is still running. Retry shortly.",
           "type": "string"
         },
         {
@@ -694,6 +966,178 @@
       ],
       "type": "object"
     },
+    "HiddenClaudeSession": {
+      "properties": {
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parentClaudePid": {
+          "description": "`CLAUDE_PID` from the hidden process: the Claude Code process that\nopened the app it runs in, when it's set.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pid": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reason": {
+          "$ref": "#/$defs/HiddenReason"
+        }
+      },
+      "required": [
+        "pid",
+        "cwd",
+        "reason",
+        "parentClaudePid"
+      ],
+      "type": "object"
+    },
+    "HiddenReason": {
+      "oneOf": [
+        {
+          "const": "childSessionMarker",
+          "description": "The process inherited `CLAUDE_CODE_CHILD_SESSION`, so Claude Code\nturned off its registry entry and transcript.",
+          "type": "string"
+        }
+      ]
+    },
+    "HistoryEntry": {
+      "description": "A deduplicated, enriched history entry returned to the frontend",
+      "properties": {
+        "agentKind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "aiTitle": {
+          "description": "Claude Code's auto-generated title (`ai-title` in the session JSONL).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "codexTitle": {
+          "description": "Codex's current UI thread name from ~/.codex/session_index.jsonl.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursorTitle": {
+          "description": "Cursor's current UI composer name from state.vscdb.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "customTitle": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display": {
+          "type": "string"
+        },
+        "project": {
+          "type": "string"
+        },
+        "projectName": {
+          "type": "string"
+        },
+        "provider": {
+          "default": "claudeCode",
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "surface": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timestamp": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sessionId",
+        "display",
+        "timestamp",
+        "project",
+        "projectName",
+        "customTitle",
+        "provider"
+      ],
+      "type": "object"
+    },
+    "HistoryListParams": {
+      "description": "`history.list` params. There are none yet.",
+      "type": "object"
+    },
+    "HistoryListResult": {
+      "description": "`history.list` result: past sessions of every provider, newest first,\nas the GUI's `get_session_history` lists them.",
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/HistoryEntry"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "entries"
+      ],
+      "type": "object"
+    },
+    "HistorySearchParams": {
+      "description": "`history.search` params: a phrase search over Claude Code transcripts.",
+      "properties": {
+        "caseSensitive": {
+          "default": false,
+          "type": "boolean"
+        },
+        "query": {
+          "type": "string"
+        },
+        "wholeWord": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "HistorySearchResult": {
+      "description": "`history.search` result: one hit per matching session. A blank query\nhas none.",
+      "properties": {
+        "hits": {
+          "items": {
+            "$ref": "#/$defs/DeepSearchHit"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "hits"
+      ],
+      "type": "object"
+    },
     "HookParams": {
       "description": "`hook.*` params: one Claude Code hook event, sent by `c9watch-agent\nhook <event>`. The engine alone writes the log (A:1167).",
       "properties": {
@@ -742,6 +1186,109 @@
       },
       "required": [
         "accepted"
+      ],
+      "type": "object"
+    },
+    "ImageBlock": {
+      "description": "User message structure\n\nIn Claude Code's JSONL format, user message content can be either:\n- A plain string (for actual user prompts)\n- An array of content blocks (for tool results sent back to Claude)\nA base64-encoded image found in a user message content array",
+      "properties": {
+        "data": {
+          "type": "string"
+        },
+        "mediaType": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mediaType",
+        "data"
+      ],
+      "type": "object"
+    },
+    "MemoryFile": {
+      "description": "A single memory file (e.g., MEMORY.md, profile.md)",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "filename": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "filename",
+        "content"
+      ],
+      "type": "object"
+    },
+    "MemoryListParams": {
+      "description": "`memory.list` params. There are none yet.",
+      "type": "object"
+    },
+    "MemoryListResult": {
+      "description": "`memory.list` result: memory files grouped by project, as the GUI's\n`get_memory_files` reads them.",
+      "properties": {
+        "projects": {
+          "items": {
+            "$ref": "#/$defs/ProjectMemory"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "projects"
+      ],
+      "type": "object"
+    },
+    "MessageType": {
+      "description": "Message type enumeration",
+      "enum": [
+        "User",
+        "Assistant",
+        "Thinking",
+        "ToolUse",
+        "ToolResult",
+        "System"
+      ],
+      "type": "string"
+    },
+    "ModelCost": {
+      "properties": {
+        "cost": {
+          "format": "double",
+          "type": "number"
+        },
+        "costAvailable": {
+          "type": "boolean"
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "percentage": {
+          "format": "double",
+          "type": "number"
+        },
+        "provider": {
+          "default": "claudeCode",
+          "type": "string"
+        },
+        "totalTokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "model",
+        "displayName",
+        "provider",
+        "cost",
+        "percentage",
+        "totalTokens",
+        "costAvailable"
       ],
       "type": "object"
     },
@@ -850,6 +1397,190 @@
       ],
       "type": "string"
     },
+    "OpencodeConnectParams": {
+      "description": "`provider.opencode.connect` params: the OpenCode server detection\nreads. An empty `url` disconnects. The engine keeps the credentials in\nmemory only and never returns them.",
+      "properties": {
+        "password": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": "string"
+        },
+        "username": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "OpencodeStatus": {
+      "properties": {
+        "connected": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionCount": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "connected",
+        "error",
+        "sessionCount"
+      ],
+      "type": "object"
+    },
+    "OpencodeStatusParams": {
+      "description": "`provider.opencode.status` params. There are none yet.",
+      "type": "object"
+    },
+    "PageParams": {
+      "description": "A window of a list: `limit` items from `offset`.",
+      "properties": {
+        "limit": {
+          "description": "At most this many items; without it, all from `offset`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "default": 0,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ProgressFrame": {
+      "description": "A `progress` frame: how far a read for request `id` has got. Sent only\nto a connection that asked for the `conversation.progress` capability,\nbefore that request's response. Never stored; a slow client may miss\nsome.",
+      "properties": {
+        "bytesRead": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "bytesTotal": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "id": {
+          "description": "The `id` of the request it reports on.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/ProgressType"
+        },
+        "v": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "id",
+        "bytesRead",
+        "bytesTotal"
+      ],
+      "type": "object"
+    },
+    "ProgressType": {
+      "description": "The `type` of a progress frame.",
+      "enum": [
+        "progress"
+      ],
+      "type": "string"
+    },
+    "ProjectCost": {
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "projectName": {
+          "type": "string"
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/SessionCostRecord"
+          },
+          "type": "array"
+        },
+        "totalCost": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "project",
+        "projectName",
+        "totalCost",
+        "sessions"
+      ],
+      "type": "object"
+    },
+    "ProjectMemory": {
+      "description": "All memory files for a single project",
+      "properties": {
+        "files": {
+          "description": "Memory files found in this project",
+          "items": {
+            "$ref": "#/$defs/MemoryFile"
+          },
+          "type": "array"
+        },
+        "memoryDirPath": {
+          "description": "Absolute path to the memory directory (for \"Reveal in Finder\")",
+          "type": "string"
+        },
+        "projectName": {
+          "description": "Human-readable project name (last path segment, e.g. \"c9watch\")",
+          "type": "string"
+        },
+        "projectPath": {
+          "description": "Decoded full project path (e.g. \"/Users/liminchen/Documents/GitHub/c9watch\")",
+          "type": "string"
+        },
+        "provider": {
+          "$ref": "#/$defs/SessionProvider",
+          "default": "claudeCode",
+          "description": "Provider that owns this memory group. Older payloads default to Claude Code."
+        }
+      },
+      "required": [
+        "provider",
+        "projectName",
+        "projectPath",
+        "memoryDirPath",
+        "files"
+      ],
+      "type": "object"
+    },
     "Request": {
       "description": "A request frame. Every field is optional on the wire, so that a frame\nwith a missing field still gets an error that echoes its `id`.",
       "properties": {
@@ -950,6 +1681,105 @@
       },
       "required": [
         "activity"
+      ],
+      "type": "object"
+    },
+    "SessionCostRecord": {
+      "description": "A single session's cost record (stored in cache).",
+      "properties": {
+        "agentKind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cachedInputTokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cost": {
+          "format": "double",
+          "type": "number"
+        },
+        "costAvailable": {
+          "default": false,
+          "type": "boolean"
+        },
+        "date": {
+          "type": "string"
+        },
+        "inputTokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "model": {
+          "type": "string"
+        },
+        "outputTokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "project": {
+          "type": "string"
+        },
+        "projectName": {
+          "type": "string"
+        },
+        "provider": {
+          "default": "claudeCode",
+          "type": "string"
+        },
+        "reasoningOutputTokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "sessionName": {
+          "default": "",
+          "type": "string"
+        },
+        "surface": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timestamp": {
+          "type": "string"
+        },
+        "totalTokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sessionId",
+        "project",
+        "projectName",
+        "model",
+        "provider",
+        "cost",
+        "costAvailable",
+        "inputTokens",
+        "cachedInputTokens",
+        "outputTokens",
+        "reasoningOutputTokens",
+        "totalTokens",
+        "timestamp",
+        "date",
+        "sessionName"
       ],
       "type": "object"
     },
@@ -1076,6 +1906,32 @@
         "unknown"
       ],
       "type": "string"
+    },
+    "SessionTasksParams": {
+      "description": "`session.tasks` params.",
+      "properties": {
+        "sessionId": {
+          "description": "The raw Claude Code session id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "type": "object"
+    },
+    "SessionTasksResult": {
+      "description": "`session.tasks` result: the session's TodoWrite tasks as Claude Code\nwrote them, sorted by numeric `id`.",
+      "properties": {
+        "tasks": {
+          "items": true,
+          "type": "array"
+        }
+      },
+      "required": [
+        "tasks"
+      ],
+      "type": "object"
     },
     "SessionView": {
       "description": "Combined session information",
@@ -1377,6 +2233,195 @@
       ],
       "type": "string"
     },
+    "SubagentInfo": {
+      "description": "A subagent invocation found in a parent session's JSONL.",
+      "properties": {
+        "agentType": {
+          "description": "`subagent_type` from the Agent tool input (e.g. \"general-purpose\", \"Explore\").",
+          "type": "string"
+        },
+        "completedAt": {
+          "description": "ISO-8601 timestamp when the tool_result was recorded (None if still running).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "description": "Short description of the task (`description` field of Agent tool input).",
+          "type": "string"
+        },
+        "id": {
+          "description": "The Agent tool's `tool_use_id` — unique within the parent session.",
+          "type": "string"
+        },
+        "parentSessionId": {
+          "description": "Parent session's UUID.",
+          "type": "string"
+        },
+        "startedAt": {
+          "description": "ISO-8601 timestamp when the tool_use was recorded.",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/SubagentStatus",
+          "description": "Running or Completed."
+        }
+      },
+      "required": [
+        "id",
+        "agentType",
+        "description",
+        "startedAt",
+        "completedAt",
+        "parentSessionId",
+        "status"
+      ],
+      "type": "object"
+    },
+    "SubagentListParams": {
+      "description": "`subagent.list` params: the raw Claude Code session ids the caller\nshows (not session keys).",
+      "properties": {
+        "sessionIds": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "SubagentListResult": {
+      "description": "`subagent.list` result: parent session id → its subagent invocations.",
+      "properties": {
+        "subagents": {
+          "additionalProperties": {
+            "items": {
+              "$ref": "#/$defs/SubagentInfo"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "subagents"
+      ],
+      "type": "object"
+    },
+    "SubagentStatus": {
+      "description": "Status of a detected subagent.",
+      "enum": [
+        "running",
+        "completed"
+      ],
+      "type": "string"
+    },
+    "SubagentTranscript": {
+      "description": "Full transcript of a single subagent invocation — the prompt (Agent tool\ninput), the final result text, and usage stats when available.",
+      "properties": {
+        "agentId": {
+          "description": "Internal agent id from `toolUseResult.agentId` (CC sub-agent handle).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentType": {
+          "type": "string"
+        },
+        "completedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": "string"
+        },
+        "durationMs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "parentSessionId": {
+          "type": "string"
+        },
+        "prompt": {
+          "description": "Prompt sent to the subagent (from the Agent tool_use input).",
+          "type": "string"
+        },
+        "result": {
+          "description": "Final result text from the subagent, if completed. Concatenation of\ntext blocks in the matching tool_result content array, preferring\n`toolUseResult.content[].text` when present.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/SubagentStatus"
+        },
+        "toolUses": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "totalTokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "agentType",
+        "description",
+        "parentSessionId",
+        "startedAt",
+        "completedAt",
+        "status",
+        "prompt",
+        "result",
+        "agentId",
+        "totalTokens",
+        "toolUses",
+        "durationMs"
+      ],
+      "type": "object"
+    },
+    "SubagentTranscriptParams": {
+      "description": "`subagent.transcript` params.",
+      "properties": {
+        "parentSessionId": {
+          "type": "string"
+        },
+        "subagentId": {
+          "description": "The Agent tool's `tool_use_id`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "parentSessionId",
+        "subagentId"
+      ],
+      "type": "object"
+    },
     "SubscribeParams": {
       "description": "`events.subscribe` params (A:218). Empty filters match everything.",
       "properties": {
@@ -1414,6 +2459,50 @@
       },
       "required": [
         "cursor"
+      ],
+      "type": "object"
+    },
+    "SubscriptionUsage": {
+      "properties": {
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "plan": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "windows": {
+          "items": {
+            "$ref": "#/$defs/UsageWindow"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "provider",
+        "name",
+        "plan",
+        "windows",
+        "updatedAt",
+        "message"
       ],
       "type": "object"
     },
@@ -1465,6 +2554,58 @@
       "required": [
         "cursor",
         "backend"
+      ],
+      "type": "object"
+    },
+    "UsageSubscriptionsParams": {
+      "description": "`usage.subscriptions` params. There are none yet.",
+      "type": "object"
+    },
+    "UsageSubscriptionsResult": {
+      "description": "`usage.subscriptions` result: one snapshot per provider plan. The\nengine reads the providers at most once a minute.",
+      "properties": {
+        "usage": {
+          "items": {
+            "$ref": "#/$defs/SubscriptionUsage"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "usage"
+      ],
+      "type": "object"
+    },
+    "UsageWindow": {
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "resetsAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "usedPercent": {
+          "format": "double",
+          "type": "number"
+        },
+        "windowSeconds": {
+          "description": "Full window length, so the UI can show how far into the window `now` is.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "label",
+        "usedPercent",
+        "resetsAt",
+        "windowSeconds"
       ],
       "type": "object"
     },
@@ -1528,11 +2669,14 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
-  "apiMinor": 5,
+  "apiMinor": 6,
   "description": "The c9watch engine protocol: one JSON object per line over the engine socket. Within a major version every change is additive.",
   "frames": {
     "event": {
       "$ref": "#/$defs/EventFrame"
+    },
+    "progress": {
+      "$ref": "#/$defs/ProgressFrame"
     },
     "request": {
       "$ref": "#/$defs/Request"
@@ -1574,12 +2718,39 @@
         "$ref": "#/$defs/AgentRetireResult"
       }
     },
+    "conversation.get": {
+      "params": {
+        "$ref": "#/$defs/ConversationGetParams"
+      },
+      "progress": {
+        "$ref": "#/$defs/ProgressFrame"
+      },
+      "result": {
+        "$ref": "#/$defs/ConversationGetResult"
+      }
+    },
+    "cost.get": {
+      "params": {
+        "$ref": "#/$defs/CostGetParams"
+      },
+      "result": {
+        "$ref": "#/$defs/CostData"
+      }
+    },
     "detect.recheck": {
       "params": {
         "$ref": "#/$defs/DetectRecheckParams"
       },
       "result": {
         "$ref": "#/$defs/TickResult"
+      }
+    },
+    "diag.detection": {
+      "params": {
+        "$ref": "#/$defs/DiagDetectionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/DetectionDiagnostics"
       }
     },
     "events.subscribe": {
@@ -1599,6 +2770,22 @@
       },
       "result": {
         "$ref": "#/$defs/HelloResult"
+      }
+    },
+    "history.list": {
+      "params": {
+        "$ref": "#/$defs/HistoryListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HistoryListResult"
+      }
+    },
+    "history.search": {
+      "params": {
+        "$ref": "#/$defs/HistorySearchParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HistorySearchResult"
       }
     },
     "hook.notification": {
@@ -1657,12 +2844,36 @@
         "$ref": "#/$defs/HookResult"
       }
     },
+    "memory.list": {
+      "params": {
+        "$ref": "#/$defs/MemoryListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MemoryListResult"
+      }
+    },
     "msg.send": {
       "params": {
         "$ref": "#/$defs/MsgSendParams"
       },
       "result": {
         "$ref": "#/$defs/MsgSendResult"
+      }
+    },
+    "provider.opencode.connect": {
+      "params": {
+        "$ref": "#/$defs/OpencodeConnectParams"
+      },
+      "result": {
+        "$ref": "#/$defs/OpencodeStatus"
+      }
+    },
+    "provider.opencode.status": {
+      "params": {
+        "$ref": "#/$defs/OpencodeStatusParams"
+      },
+      "result": {
+        "$ref": "#/$defs/OpencodeStatus"
       }
     },
     "session.away": {
@@ -1697,6 +2908,14 @@
         "$ref": "#/$defs/TickResult"
       }
     },
+    "session.tasks": {
+      "params": {
+        "$ref": "#/$defs/SessionTasksParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionTasksResult"
+      }
+    },
     "session.views": {
       "params": {
         "$ref": "#/$defs/SessionViewsParams"
@@ -1713,12 +2932,36 @@
         "$ref": "#/$defs/SnapshotResult"
       }
     },
+    "subagent.list": {
+      "params": {
+        "$ref": "#/$defs/SubagentListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SubagentListResult"
+      }
+    },
+    "subagent.transcript": {
+      "params": {
+        "$ref": "#/$defs/SubagentTranscriptParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SubagentTranscript"
+      }
+    },
     "task.done": {
       "params": {
         "$ref": "#/$defs/TaskDoneParams"
       },
       "result": {
         "$ref": "#/$defs/TaskDoneResult"
+      }
+    },
+    "usage.subscriptions": {
+      "params": {
+        "$ref": "#/$defs/UsageSubscriptionsParams"
+      },
+      "result": {
+        "$ref": "#/$defs/UsageSubscriptionsResult"
       }
     }
   },

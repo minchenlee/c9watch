@@ -15,6 +15,7 @@
 //! `detect.recheck`, `session.stop` and `session.rename` (their principal
 //! check is in `api`).
 
+use super::params;
 use crate::engine::api::{blocking, internal, ServerCtx};
 use crate::engine::db::outbox::NewEvent;
 use crate::engine::detect::{Detection, StopError};
@@ -22,7 +23,7 @@ use crate::engine::proto::{
     ApiError, ErrorCode, Request, SessionAwayParams, SessionAwayResult, SessionGoneEvent,
     SessionRenameParams, SessionStopParams, SessionViewsResult, TickResult,
 };
-use crate::session::Session;
+use crate::session::{DetectionDiagnostics, Session};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -50,6 +51,8 @@ struct Committed {
 #[derive(Default)]
 pub struct SessionViews {
     state: Mutex<Option<Committed>>,
+    /// The last detection diagnostics; `None` before the first tick.
+    diagnostics: Mutex<Option<DetectionDiagnostics>>,
 }
 
 /// What one tick changes, computed before its write and committed after.
@@ -137,27 +140,23 @@ impl SessionViews {
         });
     }
 
+    pub fn diagnostics(&self) -> Option<DetectionDiagnostics> {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub fn set_diagnostics(&self, d: DetectionDiagnostics) {
+        *self.diagnostics.lock().unwrap_or_else(|p| p.into_inner()) = Some(d);
+    }
+
     /// The current views and their cursor; `None` before the first commit.
     pub fn current(&self) -> Option<(String, Vec<Session>)> {
         self.lock()
             .as_ref()
             .map(|c| (c.cursor.clone(), c.sessions.clone()))
     }
-}
-
-fn params<T: serde::de::DeserializeOwned + Default>(
-    method: &str,
-    req: Request,
-) -> Result<T, ApiError> {
-    if req.params.is_null() {
-        return Ok(T::default());
-    }
-    serde_json::from_value(req.params).map_err(|e| {
-        ApiError::new(
-            ErrorCode::BadRequest,
-            format!("bad {} params: {}", method, e),
-        )
-    })
 }
 
 fn detection(ctx: &ServerCtx) -> Result<&Arc<Detection>, ApiError> {
@@ -180,6 +179,19 @@ pub async fn session_views(ctx: &ServerCtx) -> Result<serde_json::Value, ApiErro
         serde_json::to_value(SessionViewsResult { cursor, sessions })
             .expect("SessionViewsResult serializes"),
     )
+}
+
+/// `diag.detection`: the diagnostics of the last tick, as the GUI's
+/// `get_detection_diagnostics` (all zero before the first tick).
+pub async fn diag_detection(req: Request, ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
+    let _: crate::engine::proto::DiagDetectionParams = params("diag.detection", req)?;
+    ctx.detected().await;
+    let d = ctx
+        .detection
+        .as_ref()
+        .and_then(|d| d.views.diagnostics())
+        .unwrap_or_default();
+    Ok(serde_json::to_value(d).expect("DetectionDiagnostics serializes"))
 }
 
 /// `session.away`: the away-activity index that each detection tick keeps

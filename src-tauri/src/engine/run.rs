@@ -158,7 +158,9 @@ pub async fn run_until(
         .with_db(db.clone())
         .with_standing_orders(standing::path(home))
         .with_drain(drain_switch.clone())
-        .with_header_key(header_key.clone());
+        .with_header_key(header_key.clone())
+        .with_cost_cache(home.join("cost-cache.json"))
+        .with_usage(crate::engine::views::usage::live_source());
     if config.detection {
         ctx = ctx.with_detection(detection.clone());
     }

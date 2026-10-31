@@ -59,6 +59,10 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Emitted when a tick's detection diagnostics differ from the last
+/// tick's, as the GUI's `diagnostic-update`. Subject: the machine id.
+pub const DIAG_TOPIC: &str = "diag.detection";
+
 /// Time between ticks; the GUI polls at the same rate.
 pub const TICK: Duration = Duration::from_millis(3500);
 
@@ -82,6 +86,9 @@ pub struct Observation {
     /// Providers (`SessionProvider::as_key`) that did not answer: the pass
     /// says nothing about their sessions.
     pub failed: Vec<&'static str>,
+    /// What the GUI's `diagnostic-update` carries for this pass; `None`
+    /// when the source has none.
+    pub diagnostics: Option<DetectionDiagnostics>,
 }
 
 /// Where a tick's sessions come from.
@@ -102,7 +109,10 @@ pub trait Observe: Send {
     }
 }
 
-type Enrich = fn(Vec<DetectedSession>, DetectionDiagnostics) -> Result<Vec<Session>, String>;
+type Enrich = fn(
+    Vec<DetectedSession>,
+    DetectionDiagnostics,
+) -> Result<(Vec<Session>, DetectionDiagnostics), String>;
 
 /// Detection plus enrichment, as the GUI poll runs them.
 pub struct Live {
@@ -114,9 +124,7 @@ impl Live {
     /// Picks the backend, which may probe `claude`: call it on the
     /// detection thread.
     pub fn new() -> Self {
-        Self::with(DetectorState::new(), |d, diag| {
-            enrich_detected_sessions(d, diag).map(|(s, _)| s)
-        })
+        Self::with(DetectorState::new(), enrich_detected_sessions)
     }
 
     pub fn with(state: DetectorState, enrich: Enrich) -> Self {
@@ -155,9 +163,11 @@ impl Observe for Live {
             .iter()
             .map(|p| p.as_key())
             .collect();
+        let (sessions, diagnostics) = (self.enrich)(detected, diag)?;
         Ok(Observation {
-            sessions: (self.enrich)(detected, diag)?,
+            sessions,
             failed,
+            diagnostics: Some(diagnostics),
         })
     }
 }
@@ -374,15 +384,28 @@ impl Detector {
         let seen: Vec<Observed> = obs.sessions.iter().map(Observed::from_session).collect();
         let change = self.views.diff(&obs.sessions);
         let view_events = change.events(&self.machine_id);
+        let diag = obs
+            .diagnostics
+            .take()
+            .filter(|d| self.views.diagnostics().as_ref() != Some(d));
+        let diag_event = diag.as_ref().map(|d| NewEvent {
+            topic: DIAG_TOPIC.into(),
+            subject: Some(self.machine_id.clone()),
+            origin: None,
+            data: serde_json::to_value(d).expect("DetectionDiagnostics serializes"),
+        });
         let machine = self.machine_id.clone();
         let (applied, _) = db.write_blocking(move |tx| {
             let mut applied = apply(tx, &machine, &seen, now_ms(), &held)?;
             applied.notified = emit_notifications(tx, &machine, &notes)?;
-            for e in &view_events {
+            for e in view_events.iter().chain(&diag_event) {
                 tx.emit(e)?;
             }
             Ok(applied)
         })?;
+        if let Some(d) = diag {
+            self.views.set_diagnostics(d);
+        }
         self.notifier = notifier;
         // Only ticks write `session.*` events, one at a time (`Detection`
         // holds its lock across a tick), so the head now has every one of
@@ -859,6 +882,7 @@ mod tests {
             *self.0.lock().unwrap() = Ok(Observation {
                 sessions,
                 failed: failed.to_vec(),
+                diagnostics: None,
             });
         }
         fn fail(&self) {
@@ -1601,7 +1625,7 @@ mod tests {
         let clock = now.clone();
         let state = DetectorState::for_test(Box::new(Named("legacy")), BackendMode::Auto)
             .with_test_backends(Box::new(move || *clock.lock().unwrap()), Box::new(|| true));
-        let mut live = Live::with(state, |_, _| Ok(Vec::new()));
+        let mut live = Live::with(state, |_, d| Ok((Vec::new(), d)));
         live.observe().unwrap();
         assert_eq!(live.backend_name(), "legacy");
 
