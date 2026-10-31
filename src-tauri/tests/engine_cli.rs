@@ -1567,8 +1567,8 @@ fn cursor_seq(cursor: &Value) -> i64 {
 /// burst of events gets every one of them after SIGCONT, with contiguous
 /// seqs. The exit criterion stops it for 10 minutes; the stop here lasts
 /// seconds. What a long stop adds is a full socket buffer and a full write
-/// queue (64 frames), and the burst (~160 events of ~800 bytes from 40
-/// free agents created and retired) fills both, so the stream parks as it
+/// queue (64 frames), and the backlog (at least 375 events from 100 free
+/// agents created and retired) fills both, so the stream parks as it
 /// would over 10 minutes. `nc -U` is the subscriber: a plain process the
 /// test can stop.
 #[test]
@@ -1609,52 +1609,21 @@ fn a_stopped_subscriber_gets_every_event_after_it_continues() {
 
     let pid = nc.id() as libc::pid_t;
     unsafe { libc::kill(pid, libc::SIGSTOP) };
-    // Each step runs 20 CLIs at once: 5 rounds of `spawn`, then a retire of
-    // every agent. That is more than a Linux socket buffer (~208 KB) plus
-    // the 64-frame write queue, so the stream parks.
-    let all = |args: Vec<Vec<String>>| -> Vec<Output> {
-        let children: Vec<_> = args
-            .iter()
-            .map(|a| {
-                let a: Vec<&str> = a.iter().map(String::as_str).collect();
-                fa.cmd(&sb, &a)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap()
-            })
-            .collect();
-        children
-            .into_iter()
-            .map(|c| c.wait_with_output().unwrap())
-            .collect()
-    };
-    let spawn: Vec<String> = ["spawn", "--mode", "free", "--cwd", "work"]
-        .map(String::from)
-        .into();
-    let mut ids = Vec::new();
-    for _ in 0..5 {
-        for out in all(vec![spawn.clone(); 20]) {
-            assert!(out.status.success(), "{:?} / log {}", out, sb.log());
-            ids.push(
-                stdout_json(&out)["agent"]["id"]
-                    .as_str()
-                    .unwrap()
-                    .to_string(),
-            );
-        }
-    }
-    for chunk in ids.chunks(20) {
-        let retire = chunk
-            .iter()
-            .map(|id| {
-                let params = format!(r#"{{"id":"{}"}}"#, id);
-                vec!["api".into(), "agent.retire".into(), params]
-            })
-            .collect();
-        for out in all(retire) {
-            assert!(out.status.success(), "{:?} / log {}", out, sb.log());
-        }
+    // Fill the stopped subscriber's socket and 64-frame write queue with
+    // the same 100 creates and retires, one live fake agent at a time.
+    // Parallel creates contend on the agent-binary rehash lock with the
+    // SessionStart hook's shorter deadline; a lost hook can never become
+    // ready, however long we wait. Producer concurrency is not needed to
+    // build a backlog while nc is stopped.
+    for _ in 0..100 {
+        let out = fa.run(&sb, &["spawn", "--mode", "free", "--cwd", "work"]);
+        assert!(out.status.success(), "{:?} / log {}", out, sb.log());
+        let agent = stdout_json(&out)["agent"].clone();
+        assert_eq!(agent["state"], "ready", "{agent}");
+        let id = agent["id"].as_str().unwrap();
+        let params = format!(r#"{{"id":"{}"}}"#, id);
+        let out = fa.run(&sb, &["api", "agent.retire", &params]);
+        assert!(out.status.success(), "{:?} / log {}", out, sb.log());
     }
     let out = fa.run(&sb, &["api", "snapshot.get"]);
     assert!(out.status.success(), "{:?}", out);
@@ -1677,6 +1646,7 @@ fn a_stopped_subscriber_gets_every_event_after_it_continues() {
     // The backlog was larger than what the kernel and the queue hold.
     assert!(bytes > 256 * 1024, "only {bytes} bytes");
     assert!(fa.all_gone(), "a fake claude still runs");
+    eprintln!("recovered {} contiguous events ({bytes} bytes)", seqs.len());
 }
 
 /// Every `*.sock` under `dir`, at any depth.
