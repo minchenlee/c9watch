@@ -6,11 +6,27 @@
 
 import { get, writable } from 'svelte/store';
 import { getSessionHistory } from '../api';
+import { providerSessionKey } from '../provider';
 import type { HistoryEntry } from '../types';
 
 export const historyEntries = writable<HistoryEntry[]>([]);
 export const historyLoading = writable<boolean>(true);
 export const historyError = writable<string | null>(null);
+
+/**
+ * Drop rows whose provider + session id was already seen. The list is keyed by
+ * that pair, and Svelte stops updating the whole page on a repeated key.
+ * The backend returns rows newest first, so the newest copy is kept.
+ */
+function uniqueBySession(entries: HistoryEntry[]): HistoryEntry[] {
+	const seen = new Set<string>();
+	return entries.filter((entry) => {
+		const key = providerSessionKey(entry.provider, entry.sessionId);
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
 
 let inFlight: Promise<void> | null = null;
 let loadedAt = 0;
@@ -30,7 +46,7 @@ export async function refreshSessionHistory(): Promise<void> {
 	inFlight = (async () => {
 		try {
 			const entries = await getSessionHistory();
-			historyEntries.set(entries);
+			historyEntries.set(uniqueBySession(entries));
 			loadedAt = Date.now();
 		} catch (e) {
 			historyError.set(String(e));

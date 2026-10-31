@@ -540,7 +540,7 @@ pub fn cursor_history_entries(home_dir: &Path) -> Vec<crate::session::history::H
     // request's critical path. The background loader fills the cache for the
     // next refresh; small databases still get a short compatibility grace wait.
     let composers = cursor_history_composer_overlays(default_vscdb_path(home_dir).as_deref());
-    collect_transcript_refs(&projects_root)
+    let entries: Vec<_> = collect_transcript_refs(&projects_root)
         .into_iter()
         .filter(|item| item.agent_kind == AgentKind::Root)
         .filter_map(|item| {
@@ -580,7 +580,21 @@ pub fn cursor_history_entries(home_dir: &Path) -> Vec<crate::session::history::H
                 agent_kind: Some("root".to_string()),
             })
         })
-        .collect()
+        .collect();
+
+    // Cursor keeps a copy of a chat's transcript under every project folder it
+    // has lived in (for example `empty-window` and then the real workspace).
+    // History rows are keyed by session id, so keep only the newest copy.
+    let mut newest: HashMap<String, crate::session::history::HistoryEntry> = HashMap::new();
+    for entry in entries {
+        match newest.get(&entry.session_id) {
+            Some(kept) if kept.timestamp >= entry.timestamp => {}
+            _ => {
+                newest.insert(entry.session_id.clone(), entry);
+            }
+        }
+    }
+    newest.into_values().collect()
 }
 
 /// Read only through the first user turn for a history row. The conversation
@@ -2312,6 +2326,35 @@ mod tests {
         assert!(
             entries[0].timestamp > 0,
             "history should sort by last write, not birth"
+        );
+    }
+
+    #[test]
+    fn history_keeps_newest_copy_of_a_chat_in_two_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join(".cursor").join("projects");
+        let old_path = layout(&projects, "empty-window").join(format!("{PARENT}.jsonl"));
+        let new_path = layout(&projects, "real-project").join(format!("{PARENT}.jsonl"));
+        write_jsonl(&old_path, &[&user_line("root prompt")]);
+        write_jsonl(&new_path, &[&user_line("root prompt")]);
+        let set_mtime = |path: &Path, secs: u64| {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        set_mtime(&old_path, 1_000);
+        set_mtime(&new_path, 2_000);
+
+        let entries = cursor_history_entries(tmp.path());
+        assert_eq!(entries.len(), 1, "one row per chat: {entries:?}");
+        assert_eq!(entries[0].timestamp, 2_000_000);
+        assert!(
+            !entries[0].project.contains("empty"),
+            "{}",
+            entries[0].project
         );
     }
 
