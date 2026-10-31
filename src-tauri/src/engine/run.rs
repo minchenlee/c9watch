@@ -150,7 +150,8 @@ pub async fn run_until(
     } else {
         detect::FirstTick::open_now()
     });
-    let ctx = ServerCtx::new(key.id().to_string())
+    let detection = detect::Detection::new(db.clone());
+    let mut ctx = ServerCtx::new(key.id().to_string())
         .with_first_tick(first_tick.clone())
         .with_agents(config.agents.clone())
         .with_agent_bin(agent_bin.clone())
@@ -158,6 +159,9 @@ pub async fn run_until(
         .with_standing_orders(standing::path(home))
         .with_drain(drain_switch.clone())
         .with_header_key(header_key.clone());
+    if config.detection {
+        ctx = ctx.with_detection(detection.clone());
+    }
     let spawner = Arc::new(
         Spawner::new(
             SpawnerConfig {
@@ -191,7 +195,7 @@ pub async fn run_until(
     }
     let pruner = tokio::spawn(prune_loop(db.clone()));
     let detection = if config.detection {
-        let d = detect::spawn(db.clone(), first_tick)?;
+        let d = detect::spawn(detection, first_tick)?;
         spawn_import(db.clone(), home.to_path_buf());
         Some(d)
     } else {

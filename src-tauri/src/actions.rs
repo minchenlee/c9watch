@@ -3,6 +3,7 @@ use std::process::Command;
 
 /// The strongest native target supported by the existing focus mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum OpenTarget {
     Terminal,

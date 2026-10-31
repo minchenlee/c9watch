@@ -25,7 +25,14 @@
 //!   `notification.waiting_for_input`, by the rule the GUI uses
 //!   (`session::transitions`) and with its 30 s cooldown per session. The
 //!   GUI keeps firing its own notifications; these events are for engine
-//!   clients.
+//!   clients. Their data carries the text the GUI shows (`title`,
+//!   `redactedTitle`, `body`; `session::notification`), `pid` and
+//!   `provider`. The engine's cooldown is the only cooldown on them.
+//! - The tick adds the workers overlay to its sessions, keeps the
+//!   away-activity index current (`session::away::refresh_index`; a
+//!   transcript that did not grow costs one metadata read), and emits
+//!   `session.view` and `session.gone` for the sessions whose view changed
+//!   (`views::sessions`), in the same transaction.
 //!
 //! A failed detection writes nothing, so one bad pass does not mark every
 //! session gone. A pass where only some providers failed (say `claude
@@ -38,16 +45,18 @@
 
 use super::db::outbox::NewEvent;
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
-use super::proto::AgentRow;
+use super::proto::{AgentRow, TickResult};
+use super::views::sessions::SessionViews;
 use crate::session::enrichment::enrich_detected_sessions;
 use crate::session::transitions::notification_transitions;
 use crate::session::{
-    DetectedSession, DetectionDiagnostics, DetectorState, Session, SessionStatus,
+    DetectedSession, DetectionDiagnostics, DetectorState, Session, SessionProvider, SessionStatus,
 };
 use rusqlite::{params, OptionalExtension};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Time between ticks; the GUI polls at the same rate.
@@ -78,6 +87,19 @@ pub struct Observation {
 /// Where a tick's sessions come from.
 pub trait Observe: Send {
     fn observe(&mut self) -> Result<Observation, String>;
+
+    /// The detected sessions without enrichment, for `session.stop`.
+    fn detected(&mut self) -> Result<Vec<DetectedSession>, String> {
+        Err("this detector cannot list its sessions".into())
+    }
+
+    /// Pick the backend again, as the GUI does on window focus.
+    fn recheck(&mut self) {}
+
+    /// `cli` or `legacy`.
+    fn backend_name(&self) -> &'static str {
+        "none"
+    }
 }
 
 type Enrich = fn(Vec<DetectedSession>, DetectionDiagnostics) -> Result<Vec<Session>, String>;
@@ -107,6 +129,21 @@ impl Live {
 }
 
 impl Observe for Live {
+    fn detected(&mut self) -> Result<Vec<DetectedSession>, String> {
+        self.state
+            .detect()
+            .map(|(detected, _)| detected)
+            .map_err(|e| format!("Detect failed: {}", e))
+    }
+
+    fn recheck(&mut self) {
+        self.state.recheck_and_maybe_swap();
+    }
+
+    fn backend_name(&self) -> &'static str {
+        self.state.backend_name()
+    }
+
     fn observe(&mut self) -> Result<Observation, String> {
         let (detected, diag) = self
             .state
@@ -170,8 +207,8 @@ pub struct Applied {
     pub notified: Vec<(String, String)>,
 }
 
-/// A notification a tick emits. It carries no conversation text: the
-/// session name and the pending tool name only.
+/// A notification a tick emits. `title` and `body` can carry conversation
+/// text (the first prompt, a session title); `redacted_title` does not.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Notification {
     pub topic: &'static str,
@@ -179,6 +216,11 @@ pub struct Notification {
     pub status: &'static str,
     pub name: String,
     pub pending_tool: Option<String>,
+    pub title: String,
+    pub redacted_title: String,
+    pub body: String,
+    pub pid: u32,
+    pub provider: SessionProvider,
 }
 
 /// Which sessions notify, tick to tick.
@@ -210,6 +252,10 @@ impl Notifier {
             .collect();
         let mut out = Vec::new();
         for s in notification_transitions(&mut self.prev, first, sessions) {
+            // Transitions end only in the two statuses that have a text.
+            let Some(text) = crate::session::notification::notification_text(s) else {
+                continue;
+            };
             let cooling = self
                 .last
                 .get(&s.session_key)
@@ -228,6 +274,11 @@ impl Notifier {
                 status: status_name(&s.status),
                 name: s.session_name.clone(),
                 pending_tool: s.pending_tool_name.clone(),
+                title: text.title,
+                redacted_title: text.redacted_title,
+                body: text.body,
+                pid: s.pid,
+                provider: s.provider,
             });
         }
         for (k, v) in kept {
@@ -252,6 +303,12 @@ pub struct Detector {
     notifier: Notifier,
     /// Failed passes in a row, per provider key.
     misses: HashMap<&'static str, u32>,
+    views: Arc<SessionViews>,
+    /// Keep the away-activity index (a process-wide table) current. Off
+    /// by default so unit tests do not touch it.
+    away: bool,
+    /// Where the workers overlay is read; `None` adds none.
+    workers_dir: Option<PathBuf>,
 }
 
 impl Detector {
@@ -261,12 +318,45 @@ impl Detector {
             machine_id,
             notifier: Notifier::default(),
             misses: HashMap::new(),
+            views: Arc::new(SessionViews::default()),
+            away: false,
+            workers_dir: None,
         }
+    }
+
+    /// What the engine runs: the away index and the workers overlay of
+    /// `~/.claude/c9watch/workers`, as the GUI poll keeps them.
+    pub fn live(observe: Box<dyn Observe>, machine_id: String) -> Self {
+        let mut d = Self::new(observe, machine_id);
+        d.away = true;
+        d.workers_dir = crate::session::workers::workers_dir();
+        d
+    }
+
+    pub fn with_away(mut self, on: bool) -> Self {
+        self.away = on;
+        self
+    }
+
+    pub fn with_workers_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.workers_dir = dir;
+        self
+    }
+
+    pub fn views(&self) -> &Arc<SessionViews> {
+        &self.views
     }
 
     /// Detect once and write the result. Blocking.
     pub fn tick(&mut self, db: &Db) -> Result<Applied, String> {
-        let obs = self.observe.observe()?;
+        let mut obs = self.observe.observe()?;
+        if let Some(dir) = &self.workers_dir {
+            let overlay = crate::session::workers::load_workers_overlay_at(dir);
+            crate::session::workers::apply_workers_overlay_from(&mut obs.sessions, &overlay);
+        }
+        if self.away {
+            crate::session::away::refresh_index(&obs.sessions);
+        }
         self.misses.retain(|p, _| obs.failed.contains(p));
         for p in &obs.failed {
             *self.misses.entry(p).or_insert(0) += 1;
@@ -282,14 +372,124 @@ impl Detector {
         let mut notifier = self.notifier.clone();
         let notes = notifier.step(&obs.sessions, &held, Instant::now());
         let seen: Vec<Observed> = obs.sessions.iter().map(Observed::from_session).collect();
+        let change = self.views.diff(&obs.sessions);
+        let view_events = change.events(&self.machine_id);
         let machine = self.machine_id.clone();
         let (applied, _) = db.write_blocking(move |tx| {
             let mut applied = apply(tx, &machine, &seen, now_ms(), &held)?;
             applied.notified = emit_notifications(tx, &machine, &notes)?;
+            for e in &view_events {
+                tx.emit(e)?;
+            }
             Ok(applied)
         })?;
         self.notifier = notifier;
+        // Only ticks write `session.*` events, one at a time (`Detection`
+        // holds its lock across a tick), so the head now has every one of
+        // them that these views reflect.
+        self.views.commit(change, db.head_cursor().to_string());
         Ok(applied)
+    }
+}
+
+/// Why `Detection::stop` did not stop a session.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StopError {
+    /// No detected session has the key.
+    Unknown(String),
+    /// The session cannot be stopped, runs as another pid, or the signal
+    /// failed.
+    Failed(String),
+    /// Detection failed or has not started.
+    Internal(String),
+}
+
+/// The engine's one detector, shared by its clock and the c9p calls that
+/// run a tick (`detect.recheck`, `session.stop`, `session.rename`). One
+/// tick runs at a time.
+pub struct Detection {
+    db: Arc<Db>,
+    detector: Mutex<Option<Detector>>,
+    pub views: Arc<SessionViews>,
+}
+
+impl Detection {
+    /// No detector yet: `spawn` installs one on its thread.
+    pub fn new(db: Arc<Db>) -> Arc<Self> {
+        Arc::new(Detection {
+            db,
+            detector: Mutex::new(None),
+            views: Arc::new(SessionViews::default()),
+        })
+    }
+
+    /// Use `d`; its ticks commit to these views.
+    pub fn install(&self, mut d: Detector) {
+        d.views = self.views.clone();
+        *self.lock() = Some(d);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Detector>> {
+        self.detector.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&mut Detector) -> Result<R, String>) -> Result<R, String> {
+        match self.lock().as_mut() {
+            Some(d) => f(d),
+            None => Err("detection has not started".into()),
+        }
+    }
+
+    fn result(&self, d: &Detector) -> TickResult {
+        TickResult {
+            cursor: self
+                .views
+                .current()
+                .map(|(c, _)| c)
+                .unwrap_or_else(|| self.db.head_cursor().to_string()),
+            backend: d.observe.backend_name().to_string(),
+        }
+    }
+
+    /// One tick. Blocking.
+    pub fn tick(&self) -> Result<TickResult, String> {
+        self.with(|d| {
+            d.tick(&self.db)?;
+            Ok(self.result(d))
+        })
+    }
+
+    /// Pick the backend again, then one tick. Blocking.
+    pub fn recheck(&self) -> Result<TickResult, String> {
+        self.with(|d| {
+            d.observe.recheck();
+            d.tick(&self.db)?;
+            Ok(self.result(d))
+        })
+    }
+
+    /// SIGTERM the stoppable session `key`, as the GUI's `stop_session`
+    /// does; the pid comes from detection, never from the caller. Returns
+    /// the pid. Blocking; runs no tick.
+    pub fn stop(&self, key: &str, expect_pid: Option<u32>) -> Result<u32, StopError> {
+        let detected = self
+            .with(|d| d.observe.detected())
+            .map_err(StopError::Internal)?;
+        if !detected
+            .iter()
+            .any(|s| s.identity_key().as_deref() == Some(key))
+        {
+            return Err(StopError::Unknown(format!(
+                "No running session matches {key}"
+            )));
+        }
+        crate::actions::stop_session_by_key(
+            key,
+            expect_pid,
+            move || Ok(detected),
+            crate::actions::process_start_secs,
+        )
+        .map_err(StopError::Failed)
     }
 }
 
@@ -322,6 +522,11 @@ pub fn emit_notifications(
                 "status": n.status,
                 "name": n.name,
                 "pendingTool": n.pending_tool,
+                "title": n.title,
+                "redactedTitle": n.redacted_title,
+                "body": n.body,
+                "pid": n.pid,
+                "provider": n.provider,
             }),
         })?;
         sent.push((n.topic.to_string(), id));
@@ -372,15 +577,15 @@ impl FirstTick {
 /// is dropped. A thread, not a blocking task, so a tick in flight (which
 /// may wait on `claude`) never holds up the runtime's shutdown. `first` is
 /// opened after the first pass, whether it failed or not.
-pub fn spawn(db: Arc<Db>, first: Arc<FirstTick>) -> Result<mpsc::Sender<()>, String> {
+pub fn spawn(detection: Arc<Detection>, first: Arc<FirstTick>) -> Result<mpsc::Sender<()>, String> {
     let (stop, stopped) = mpsc::channel::<()>();
-    let machine = db.machine_id().to_string();
+    let machine = detection.db.machine_id().to_string();
     std::thread::Builder::new()
         .name("engine-detect".into())
         .spawn(move || {
-            let mut detector = Detector::new(Box::new(Live::new()), machine);
+            detection.install(Detector::live(Box::new(Live::new()), machine));
             loop {
-                if let Err(e) = detector.tick(&db) {
+                if let Err(e) = detection.tick() {
                     eprintln!("[engine] detection: {}", e);
                 }
                 first.open();
@@ -683,10 +888,13 @@ mod tests {
         db.agents(filter).unwrap()
     }
 
+    /// The agent and notification events; `session.*` has its own tests.
     fn topics(db: &Db) -> Vec<(String, String)> {
         db.reader()
             .unwrap()
-            .prepare("SELECT topic, subject FROM events ORDER BY seq")
+            .prepare(
+                "SELECT topic, subject FROM events WHERE topic NOT LIKE 'session.%' ORDER BY seq",
+            )
             .unwrap()
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
@@ -1188,6 +1396,187 @@ mod tests {
         assert_eq!(data["sessionKey"], "claudeCode:p");
         assert_eq!(data["status"], "needs_attention");
         assert!(data.get("firstPrompt").is_none());
+    }
+
+    /// `(topic, data)` of every `session.*` event, in order.
+    fn session_events(db: &Db) -> Vec<(String, serde_json::Value)> {
+        db.reader()
+            .unwrap()
+            .prepare("SELECT topic, payload FROM events WHERE topic LIKE 'session.%' ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(|r| {
+                let (t, p) = r.unwrap();
+                (t, serde_json::from_str(&p).unwrap())
+            })
+            .collect()
+    }
+
+    /// The notification data carries the GUI's text (the code
+    /// `polling::fire_notification` runs), the pid and the provider.
+    #[test]
+    fn notification_data_carries_the_gui_payload() {
+        let (_t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let script = Script::default();
+        let mut d = detector(&script);
+        script.set(vec![
+            s("a", SessionStatus::Working),
+            s("q", SessionStatus::Working),
+        ]);
+        d.tick(&db).unwrap();
+        let mut a = s("a", SessionStatus::NeedsAttention);
+        a.pending_tool_name = Some("Bash".into());
+        a.ai_title = Some("Fix the build".into());
+        let q = s("q", SessionStatus::WaitingForInput);
+        script.set(vec![a.clone(), q.clone()]);
+        d.tick(&db).unwrap();
+        let r = db.reader().unwrap();
+        for (topic, session) in [
+            ("notification.needs_attention", &a),
+            ("notification.waiting_for_input", &q),
+        ] {
+            let data: String = r
+                .query_row(
+                    "SELECT payload FROM events WHERE topic = ?1",
+                    [topic],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let data: serde_json::Value = serde_json::from_str(&data).unwrap();
+            let want = crate::session::notification::notification_text(session).unwrap();
+            assert_eq!(data["title"], want.title.as_str(), "{}", topic);
+            assert_eq!(data["redactedTitle"], want.redacted_title.as_str());
+            assert_eq!(data["body"], want.body.as_str());
+            assert_eq!(data["pid"], session.pid);
+            assert_eq!(data["provider"], "claudeCode");
+            assert_eq!(data["sessionKey"], session.session_key.as_str());
+        }
+    }
+
+    /// A tick emits `session.view` for new and changed sessions and
+    /// `session.gone` for ended ones, and nothing when nothing changed; the
+    /// views are the GUI's JSON, with the workers overlay.
+    #[test]
+    fn a_tick_emits_session_views_only_for_changes() {
+        let (_t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let workers = h.parent().unwrap().join("workers");
+        std::fs::create_dir_all(workers.join("w1")).unwrap();
+        std::fs::write(
+            workers.join("w1").join("meta.json"),
+            serde_json::json!({"sessionId": "b", "spawnedBy": "pm-9"}).to_string(),
+        )
+        .unwrap();
+        let script = Script::default();
+        let mut d = detector(&script).with_workers_dir(Some(workers));
+        script.set(vec![
+            s("a", SessionStatus::Working),
+            s("b", SessionStatus::Working),
+        ]);
+        d.tick(&db).unwrap();
+        let ev = session_events(&db);
+        assert_eq!(ev.len(), 2);
+        assert!(ev.iter().all(|(t, _)| t == "session.view"));
+        let mut b = s("b", SessionStatus::Working);
+        b.worker_of = Some("pm-9".into());
+        assert_eq!(ev[1].1, serde_json::to_value(&b).unwrap());
+        let (cursor, views) = d.views().current().unwrap();
+        assert_eq!(cursor, db.head_cursor().to_string());
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[1].worker_of.as_deref(), Some("pm-9"));
+
+        // Unchanged: no event.
+        d.tick(&db).unwrap();
+        assert_eq!(session_events(&db).len(), 2);
+
+        // `a` changes, `b` ends.
+        script.set(vec![s("a", SessionStatus::WaitingForInput)]);
+        d.tick(&db).unwrap();
+        let ev = session_events(&db);
+        assert_eq!(ev.len(), 4);
+        assert_eq!(ev[2].0, "session.view");
+        assert_eq!(ev[2].1["status"], "WaitingForInput");
+        assert_eq!(ev[3].0, "session.gone");
+        assert_eq!(
+            ev[3].1,
+            serde_json::json!({"sessionKey": "claudeCode:b", "id": "b"})
+        );
+        assert_eq!(d.views().current().unwrap().1.len(), 1);
+    }
+
+    /// A tick whose write fails keeps the old views, so the next tick
+    /// emits the change again.
+    #[test]
+    fn a_failed_detection_keeps_the_views() {
+        let (_t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let script = Script::default();
+        let mut d = detector(&script);
+        script.set(vec![s("a", SessionStatus::Working)]);
+        d.tick(&db).unwrap();
+        script.fail();
+        assert!(d.tick(&db).is_err());
+        assert_eq!(d.views().current().unwrap().1.len(), 1);
+        assert_eq!(session_events(&db).len(), 1);
+    }
+
+    /// Away parity: the tick keeps the away index current as a transcript
+    /// grows, and `session.away`'s reader answers what the GUI's
+    /// `get_away_activity` (the same `away::away_activity`) does.
+    #[test]
+    fn the_tick_keeps_the_away_index_current_as_a_transcript_grows() {
+        use crate::session::away::{away_activity, AwayRequest};
+        use std::io::Write;
+        let (t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let path = t.path().join("away.jsonl");
+        let tool = |ts: &str, id: &str, name: &str| {
+            serde_json::json!({
+                "type": "assistant", "timestamp": ts, "uuid": id,
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": id, "name": name, "input": {"command": "ls"}}
+                ]}
+            })
+            .to_string()
+                + "\n"
+        };
+        std::fs::write(&path, tool("2026-07-13T00:00:01Z", "tu-away-1", "Bash")).unwrap();
+        // A key no other test uses: the index is process-wide.
+        let mut one = s("away-parity-7c1f", SessionStatus::Working);
+        one.transcript_path = Some(path.clone());
+        let script = Script::default();
+        let mut d = detector(&script).with_away(true);
+        script.set(vec![one.clone()]);
+        let req = vec![AwayRequest {
+            session_key: one.session_key.clone(),
+            since_ms: 0,
+        }];
+        let away = |d: &mut Detector| {
+            d.tick(&db).unwrap();
+            away_activity(&req)
+                .get(&one.session_key)
+                .cloned()
+                .expect("an index for the session")
+        };
+        let first = away(&mut d);
+        assert_eq!((first.tool_calls, first.commands_run), (1, 1));
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(tool("2026-07-13T00:00:02Z", "tu-away-2", "Edit").as_bytes())
+            .unwrap();
+        drop(f);
+        let grown = away(&mut d);
+        assert_eq!(grown.tool_calls, 2, "{:?}", grown);
+        // An unchanged transcript keeps the counts.
+        assert_eq!(away(&mut d), grown);
+        // A session that ends drops its index.
+        script.set(vec![]);
+        d.tick(&db).unwrap();
+        assert!(away_activity(&req).is_empty());
     }
 
     /// A backend that always succeeds with no sessions.

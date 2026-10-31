@@ -4,7 +4,7 @@
 // scripts/test-ipc-contract.mjs fails while the two differ.
 //
 // It covers only the JSON Schema the engine emits: $ref, const, enum,
-// oneOf/anyOf, type lists, objects, arrays, and the `true` schema or one
+// oneOf/anyOf, type lists, objects, maps, arrays, and the `true` schema or one
 // with no type at all (a `serde_json::Value` with a doc comment).
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -61,7 +61,12 @@ function tsType(s, indent) {
       return /[ |]/.test(item) ? `(${item})[]` : `${item}[]`;
     }
     case 'object':
-      return s.properties ? `{\n${members(s, `${indent}  `)}${indent}}` : 'Record<string, unknown>';
+      if (s.properties) return `{\n${members(s, `${indent}  `)}${indent}}`;
+      // A map (`HashMap<String, T>`): its values' type.
+      if (s.additionalProperties && s.additionalProperties !== true) {
+        return `Record<string, ${tsType(s.additionalProperties, indent)}>`;
+      }
+      return 'Record<string, unknown>';
     default:
       throw new Error(`unsupported schema ${JSON.stringify(s)}`);
   }

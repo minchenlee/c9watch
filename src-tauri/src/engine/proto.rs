@@ -162,6 +162,8 @@ mod tests {
             ErrorCode::NotControlled,
             ErrorCode::NotOwner,
             ErrorCode::Duplicate,
+            ErrorCode::UnknownSession,
+            ErrorCode::ActionFailed,
             ErrorCode::Internal,
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), code.as_str());

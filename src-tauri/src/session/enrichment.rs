@@ -27,6 +27,8 @@ use std::time::Instant;
 
 /// Combined session information
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "engine", schemars(rename = "SessionView"))]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
     pub id: String,
@@ -72,7 +74,8 @@ pub struct Session {
     #[serde(skip)]
     pub transcript_path: Option<PathBuf>,
     /// Session ID of the PM that spawned this session (if it's a c9watch worker).
-    /// Populated in polling.rs by overlay from `~/.claude/c9watch/workers/*/meta.json`.
+    /// Set by the workers overlay from `~/.claude/c9watch/workers/*/meta.json`
+    /// (`session::workers`), after detection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_of: Option<String>,
     /// User-set name from `claude agents` (Ctrl+T background-pinned sessions).

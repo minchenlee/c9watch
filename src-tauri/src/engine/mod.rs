@@ -40,6 +40,9 @@ pub mod machine;
 pub mod detect;
 
 #[cfg(unix)]
+pub mod views;
+
+#[cfg(unix)]
 pub mod import;
 
 #[cfg(unix)]

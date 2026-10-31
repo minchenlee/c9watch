@@ -29,6 +29,13 @@
 //! (`local-unverified`); an agent gets `not_allowed`, which is audited. The
 //! work is in `engine::create` (C1a-26).
 //!
+//! `session.views` and `session.away` serve the session views and the
+//! away-activity index that each detection tick keeps (`views::sessions`).
+//! Every principal may read them. `detect.recheck`, `session.stop` and
+//! `session.rename` take only a local client that passes the mutation
+//! check, as `agent.create` does; each runs one detection tick before it
+//! answers.
+//!
 //! `msg.send` (C1b-M1) takes the terminal and agents (`engine::mail`
 //! checks both), queues the message and nudges the target's supervisor,
 //! which delivers it. Its response carries the cursor of the message's
@@ -39,7 +46,7 @@ use super::create::Spawner;
 use super::db::audit::{self, AuditEntry};
 use super::db::outbox::{Cursor, Event, ReadError, Subscription, READ_BATCH};
 use super::db::{now_ms, AgentFilter, Db};
-use super::detect::{FirstTick, FIRST_TICK_WAIT};
+use super::detect::{Detection, FirstTick, FIRST_TICK_WAIT};
 use super::drain::DrainSwitch;
 use super::hooks::{self, HookEvent, Outcome};
 use super::machine::HeaderKey;
@@ -55,7 +62,12 @@ use super::proto::{
     SessionListResult, SnapshotParams, SnapshotResult, SubscribeParams, SubscribeResult,
     TaskDoneParams, TaskDoneResult, API_MAJOR, API_MINOR, HOOK_METHODS, MAX_FRAME,
 };
+use super::proto::{
+    DetectRecheckParams, SessionAwayParams, SessionAwayResult, SessionRenameParams,
+    SessionStopParams, SessionViewsParams, SessionViewsResult, TickResult,
+};
 use super::standing;
+use super::views::sessions as session_views;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -112,6 +124,9 @@ pub struct ServerCtx {
     /// The mail header key (`MachineKey::header_key`): each agent's token
     /// goes out in its `hook.session_start` context. `None` only in tests.
     pub header_key: Option<HeaderKey>,
+    /// Session detection and its views. `None` in an engine without
+    /// detection, and in tests.
+    pub detection: Option<Arc<Detection>>,
 }
 
 impl ServerCtx {
@@ -131,6 +146,7 @@ impl ServerCtx {
             drain: Arc::new(DrainSwitch::new()),
             first_tick: Arc::new(FirstTick::open_now()),
             header_key: None,
+            detection: None,
         }
     }
 
@@ -175,9 +191,14 @@ impl ServerCtx {
         self
     }
 
+    pub fn with_detection(mut self, detection: Arc<Detection>) -> Self {
+        self.detection = Some(detection);
+        self
+    }
+
     /// Wait for detection's first pass; past `FIRST_TICK_WAIT` answer with
     /// what the table holds.
-    async fn detected(&self) {
+    pub(crate) async fn detected(&self) {
         if !self.first_tick.is_open() && !self.first_tick.wait(FIRST_TICK_WAIT).await {
             eprintln!(
                 "[engine] detection's first pass took over {:?}; answering anyway",
@@ -186,7 +207,7 @@ impl ServerCtx {
         }
     }
 
-    fn db(&self) -> Result<&Arc<Db>, ApiError> {
+    pub(crate) fn db(&self) -> Result<&Arc<Db>, ApiError> {
         self.db
             .as_ref()
             .ok_or_else(|| ApiError::new(ErrorCode::Internal, "the engine has no store"))
@@ -466,6 +487,11 @@ pub const METHODS: &[&str] = &[
     "task.done",
     "agent.handoff",
     "msg.send",
+    "session.views",
+    "session.away",
+    "detect.recheck",
+    "session.stop",
+    "session.rename",
 ];
 
 /// The c9p/1 JSON Schema (A:245): the frame types, a `methods` table with
@@ -530,6 +556,26 @@ pub fn schema() -> serde_json::Value {
         "msg.send": {
             "params": de.subschema_for::<MsgSendParams>(),
             "result": ser.subschema_for::<MsgSendResult>(),
+        },
+        "session.views": {
+            "params": de.subschema_for::<SessionViewsParams>(),
+            "result": ser.subschema_for::<SessionViewsResult>(),
+        },
+        "session.away": {
+            "params": de.subschema_for::<SessionAwayParams>(),
+            "result": ser.subschema_for::<SessionAwayResult>(),
+        },
+        "detect.recheck": {
+            "params": de.subschema_for::<DetectRecheckParams>(),
+            "result": ser.subschema_for::<TickResult>(),
+        },
+        "session.stop": {
+            "params": de.subschema_for::<SessionStopParams>(),
+            "result": ser.subschema_for::<TickResult>(),
+        },
+        "session.rename": {
+            "params": de.subschema_for::<SessionRenameParams>(),
+            "result": ser.subschema_for::<TickResult>(),
         },
     });
     let mut methods = methods;
@@ -606,6 +652,17 @@ async fn dispatch(
         "session.list" => Ok(Served::result(session_list(ctx).await?)),
         "agent.list" => Ok(Served::result(agent_list(req, ctx).await?)),
         "msg.send" => msg_send(req, ctx, peer, principal).await,
+        "session.views" => Ok(Served::result(session_views::session_views(ctx).await?)),
+        "session.away" => Ok(Served::result(session_views::session_away(req, ctx).await?)),
+        "detect.recheck" => Ok(Served::result(
+            local_mutation(method, req, ctx, peer, principal).await?,
+        )),
+        "session.stop" => Ok(Served::result(
+            local_mutation(method, req, ctx, peer, principal).await?,
+        )),
+        "session.rename" => Ok(Served::result(
+            local_mutation(method, req, ctx, peer, principal).await?,
+        )),
         "events.subscribe" => {
             if streams >= MAX_STREAMS {
                 return Err(ApiError::new(
@@ -648,6 +705,34 @@ async fn agent_lifecycle(
         }
     }
     r
+}
+
+/// `detect.recheck`, `session.stop` and `session.rename`: the principal
+/// rule of `agent.create` (a local client that passes the mutation check;
+/// a refusal is audited), then the work in `views::sessions`.
+async fn local_mutation(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+) -> Result<serde_json::Value, ApiError> {
+    let claimed = ["sessionKey", "sessionId"]
+        .iter()
+        .find_map(|k| req.params.get(*k).and_then(|v| v.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    if let Err(e) = check_local_peer(method, ctx, peer, principal).await {
+        if e.code == ErrorCode::NotAllowed {
+            audit_refusal(ctx, principal, method, &claimed, &e).await;
+        }
+        return Err(e);
+    }
+    match method {
+        "detect.recheck" => session_views::detect_recheck(ctx).await,
+        "session.stop" => session_views::session_stop(req, ctx).await,
+        _ => session_views::session_rename(req, ctx).await,
+    }
 }
 
 /// Who may call `agent.create` or `agent.retire`: never an agent, so its
@@ -1069,7 +1154,7 @@ async fn audit_refusal(
     }
 }
 
-fn internal(e: impl std::fmt::Display) -> ApiError {
+pub(crate) fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::new(ErrorCode::Internal, e.to_string())
 }
 
@@ -1081,7 +1166,7 @@ fn read_error(e: ReadError) -> ApiError {
 }
 
 /// Run blocking store work off the async workers.
-async fn blocking<R, F>(f: F) -> Result<R, ApiError>
+pub(crate) async fn blocking<R, F>(f: F) -> Result<R, ApiError>
 where
     F: FnOnce() -> Result<R, ApiError> + Send + 'static,
     R: Send + 'static,
@@ -1352,6 +1437,7 @@ mod tests {
             drain: Arc::new(DrainSwitch::new()),
             first_tick: Arc::new(FirstTick::open_now()),
             header_key: None,
+            detection: None,
         })
     }
 
@@ -1668,15 +1754,283 @@ mod tests {
             } else if *m == "agent.create" || *m == "agent.retire" {
                 // This test engine has no spawner.
                 assert_eq!(r["error"]["code"], "internal", "{}: {}", m, r);
-            } else if *m == "msg.send" {
-                // `to` and `body` are required.
+            } else if ["msg.send", "session.stop", "session.rename"].contains(m) {
+                // `to` and `body`, `sessionKey`, `sessionId` are required.
                 assert_eq!(r["error"]["code"], "bad_request", "{}: {}", m, r);
+            } else if *m == "detect.recheck" {
+                // This test engine runs no detection.
+                assert_eq!(r["error"]["code"], "internal", "{}: {}", m, r);
             } else {
                 assert_eq!(r["ok"], true, "{}: {}", m, r);
             }
         }
         let r = c.call("x", "no.such", json!({})).await;
         assert_eq!(r["error"]["code"], "unknown_method");
+    }
+
+    // ── Session views (core-public M-a1) ──────────────────────────────
+
+    use crate::engine::detect::{Detector, Observation, Observe};
+    use crate::session::{DetectedSession, Session, SessionStatus};
+
+    /// What the next tick sees, set by the test.
+    #[derive(Clone, Default)]
+    struct Scripted(Arc<std::sync::Mutex<(Vec<Session>, Vec<DetectedSession>, u32)>>);
+
+    impl Scripted {
+        fn set(&self, sessions: Vec<Session>, detected: Vec<DetectedSession>) {
+            let mut g = self.0.lock().unwrap();
+            g.0 = sessions;
+            g.1 = detected;
+        }
+        fn rechecks(&self) -> u32 {
+            self.0.lock().unwrap().2
+        }
+    }
+
+    impl Observe for Scripted {
+        fn observe(&mut self) -> Result<Observation, String> {
+            Ok(Observation {
+                sessions: self.0.lock().unwrap().0.clone(),
+                failed: Vec::new(),
+            })
+        }
+        fn detected(&mut self) -> Result<Vec<DetectedSession>, String> {
+            Ok(self.0.lock().unwrap().1.clone())
+        }
+        fn recheck(&mut self) {
+            self.0.lock().unwrap().2 += 1;
+        }
+        fn backend_name(&self) -> &'static str {
+            "script"
+        }
+    }
+
+    /// `ctx_db` with a detection that runs `script`, after one tick.
+    fn ctx_detect(
+        agents: Arc<dyn LiveAgents>,
+        script: &Scripted,
+    ) -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Db>, Arc<Detection>) {
+        let (t, ctx, db) = ctx_db(agents);
+        let detection = Detection::new(db.clone());
+        detection.install(Detector::new(Box::new(script.clone()), MACHINE.into()));
+        detection.tick().unwrap();
+        let ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .unwrap()
+            .with_detection(detection.clone());
+        (t, Arc::new(ctx), db, detection)
+    }
+
+    fn fixture(id: &str, status: SessionStatus) -> Session {
+        Session::fixture(id, status)
+    }
+
+    /// Parity: `session.views` answers the sessions of the last tick as the
+    /// GUI's JSON, and a subscriber from its cursor sees `session.view` and
+    /// `session.gone` for what `detect.recheck`'s tick changed.
+    #[tokio::test]
+    async fn session_views_answer_the_gui_json_and_stream_changes() {
+        let script = Scripted::default();
+        let a = fixture("a", SessionStatus::Working);
+        let b = fixture("b", SessionStatus::Working);
+        script.set(vec![a.clone(), b.clone()], vec![]);
+        let (_t, ctx, _db, _d) = ctx_detect(Arc::new(NoLiveAgents), &script);
+        let (mut c, _) = Client::new(ctx.clone()).await;
+        let r = c.call("1", "session.views", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        assert_eq!(
+            r["result"]["sessions"],
+            serde_json::to_value(vec![a.clone(), b.clone()]).unwrap()
+        );
+        let cursor = r["result"]["cursor"].as_str().unwrap().to_string();
+
+        let (mut sub, _) = Client::new(ctx.clone()).await;
+        let r = sub
+            .call(
+                "s",
+                "events.subscribe",
+                json!({"since": cursor, "topics": ["session.*"]}),
+            )
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+
+        let a2 = fixture("a", SessionStatus::WaitingForInput);
+        script.set(vec![a2.clone()], vec![]);
+        let r = c.call("2", "detect.recheck", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        assert_eq!(r["result"]["backend"], "script");
+        assert_eq!(script.rechecks(), 1);
+        let view = sub.next().await;
+        assert_eq!(view["topic"], "session.view", "{}", view);
+        assert_eq!(view["subject"], format!("{}/claudeCode:a", MACHINE));
+        assert_eq!(view["data"], serde_json::to_value(&a2).unwrap());
+        let gone = sub.next().await;
+        assert_eq!(gone["topic"], "session.gone", "{}", gone);
+        assert_eq!(gone["data"]["sessionKey"], "claudeCode:b");
+        // The answer's cursor is at or after both events.
+        assert!(seq_of(&r["result"]) >= seq_of(&gone));
+        let r = c.call("3", "session.views", json!({})).await;
+        assert_eq!(
+            r["result"]["sessions"],
+            serde_json::to_value(vec![a2]).unwrap()
+        );
+    }
+
+    /// `session.away` answers `away::away_activity`, the reader of the
+    /// GUI's `get_away_activity`; an unknown session is absent.
+    #[tokio::test]
+    async fn session_away_reads_the_away_index() {
+        let script = Scripted::default();
+        let (_t, ctx, _db, _d) = ctx_detect(Arc::new(NoLiveAgents), &script);
+        let (mut c, _) = Client::new(ctx).await;
+        let requests = json!([{"sessionKey": "claudeCode:nobody-away-api", "sinceMs": 0}]);
+        let r = c
+            .call("1", "session.away", json!({"requests": requests}))
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let reqs: Vec<crate::session::away::AwayRequest> =
+            serde_json::from_value(requests).unwrap();
+        assert_eq!(
+            r["result"]["activity"],
+            serde_json::to_value(crate::session::away::away_activity(&reqs)).unwrap()
+        );
+        assert_eq!(r["result"]["activity"], json!({}));
+        let r = c.call("2", "session.away", json!({"requests": 3})).await;
+        assert_eq!(r["error"]["code"], "bad_request", "{}", r);
+    }
+
+    /// `session.stop` signals the detected pid, and its tick writes
+    /// `session.gone` before the answer.
+    #[tokio::test]
+    async fn session_stop_writes_session_gone_before_it_answers() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = crate::actions::process_start_secs(pid).expect("the sleep's start time");
+        let detected = DetectedSession {
+            process_start_secs: Some(start),
+            ..DetectedSession::with_legacy_defaults(
+                pid,
+                "/tmp".into(),
+                "/tmp/proj".into(),
+                Some("stop-api".to_string()),
+                "proj".to_string(),
+            )
+        };
+        let mut live = fixture("stop-api", SessionStatus::Working);
+        live.pid = pid;
+        let script = Scripted::default();
+        script.set(vec![live], vec![detected]);
+        let (_t, ctx, db, _d) = ctx_detect(Arc::new(NoLiveAgents), &script);
+        // Reap the sleep once the signal lands; detection then sees it gone.
+        let reaper = {
+            let script = script.clone();
+            std::thread::spawn(move || {
+                child.wait().unwrap();
+                script.set(vec![], vec![]);
+            })
+        };
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c
+            .call(
+                "1",
+                "session.stop",
+                json!({"sessionKey": "claudeCode:nope"}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "unknown_session", "{}", r);
+        let r = c
+            .call(
+                "2",
+                "session.stop",
+                json!({"sessionKey": "claudeCode:stop-api", "pid": pid + 1}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "action_failed", "{}", r);
+        let r = c
+            .call(
+                "3",
+                "session.stop",
+                json!({"sessionKey": "claudeCode:stop-api"}),
+            )
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let answered = seq_of(&r["result"]);
+        let gone: i64 = db
+            .reader()
+            .unwrap()
+            .query_row(
+                "SELECT seq FROM events WHERE topic = 'session.gone' \
+                 AND json_extract(payload, '$.sessionKey') = 'claudeCode:stop-api'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            gone <= answered,
+            "gone {} after the answer {}",
+            gone,
+            answered
+        );
+        reaper.join().unwrap();
+    }
+
+    /// `session.rename` validates like the GUI: a provider other than
+    /// Claude Code is refused before anything is written.
+    #[tokio::test]
+    async fn session_rename_refuses_other_providers() {
+        let script = Scripted::default();
+        let (_t, ctx, _db, _d) = ctx_detect(Arc::new(NoLiveAgents), &script);
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c
+            .call(
+                "1",
+                "session.rename",
+                json!({"sessionId": "x", "newName": "n", "provider": "codex"}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "bad_request", "{}", r);
+    }
+
+    /// Principal table: an agent reads the views and the away index, and
+    /// may not recheck, stop or rename; each refusal is audited.
+    #[tokio::test]
+    async fn an_agent_reads_session_views_but_may_not_act_on_sessions() {
+        let script = Scripted::default();
+        script.set(vec![fixture("a", SessionStatus::Working)], vec![]);
+        let (_t, ctx, db, _d) = ctx_detect(as_agent("a7"), &script);
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["principal"], "agent:a7");
+        let r = c.call("1", "session.views", json!({})).await;
+        assert_eq!(
+            r["result"]["sessions"].as_array().unwrap().len(),
+            1,
+            "{}",
+            r
+        );
+        let r = c.call("2", "session.away", json!({"requests": []})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        for (i, (m, p)) in [
+            ("detect.recheck", json!({})),
+            ("session.stop", json!({"sessionKey": "claudeCode:a"})),
+            ("session.rename", json!({"sessionId": "a", "newName": "n"})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let r = c.call(&format!("m{}", i), m, p).await;
+            assert_eq!(r["error"]["code"], "not_allowed", "{}: {}", m, r);
+        }
+        assert_eq!(script.rechecks(), 0);
+        let denied: Vec<String> = audit_rows(&db)
+            .into_iter()
+            .filter(|r| r.2 == "deny")
+            .map(|r| r.1)
+            .collect();
+        assert_eq!(denied, ["detect.recheck", "session.stop", "session.rename"]);
     }
 
     /// A server context with a fresh store, and the store.
@@ -1697,6 +2051,7 @@ mod tests {
             drain: Arc::new(DrainSwitch::new()),
             first_tick: Arc::new(FirstTick::open_now()),
             header_key: None,
+            detection: None,
         });
         (t, ctx, db)
     }
