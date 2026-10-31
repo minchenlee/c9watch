@@ -14,21 +14,14 @@
 //! `engine` feature, and are re-exported here.
 
 pub use crate::engine_proto::home::{
-    engine_home, resolve_home, sock_path, Channel, ENGINE_HOME_ENV, ENGINE_SOCK_NAME,
+    engine_home, lock_path, resolve_home, sock_path, Channel, ENGINE_HOME_ENV, ENGINE_LOCK_NAME,
+    ENGINE_SOCK_NAME,
 };
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-/// The engine's lifetime lock inside the home.
-pub const ENGINE_LOCK_NAME: &str = "engine.lock";
-
 /// Error code for a socket path that does not fit in `sun_path`.
 pub const SOCKET_PATH_TOO_LONG: &str = "socket_path_too_long";
-
-/// `<home>/engine.lock`
-pub fn lock_path(home: &Path) -> PathBuf {
-    home.join(ENGINE_LOCK_NAME)
-}
 
 /// Prepare the selected socket's parent. A runtime directory must already
 /// exist with the XDG per-user ownership and 0700 mode; never chmod a shared

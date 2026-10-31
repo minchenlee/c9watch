@@ -2192,3 +2192,83 @@ fn m2fix_cc_listener_is_absent_when_gate_is_unset_or_off() {
         );
     }
 }
+
+#[test]
+fn explicit_engine_stop_is_idempotent_and_never_auto_starts() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["engine", "stop"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(sb.pid().is_none());
+    assert!(!sock_path(&sb.engine).exists());
+    assert!(sb.run(&["api", "hello"]).status.success());
+    let pid = sb.pid().unwrap();
+    let out = sb.run(&["engine", "stop"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(wait_for(Duration::from_secs(5), || !alive(pid)));
+    assert!(sb.pid().is_none());
+    assert!(sb.run(&["engine", "stop"]).status.success());
+    assert!(sb.pid().is_none());
+}
+
+// An inert child fixture, never a GUI or real agent. Invoked only by the
+// newer-version test below. It has the same uid, socket and lifetime-lock
+// identity checks as a real engine.
+#[test]
+#[ignore]
+fn newer_core_fixture() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    let Some(home) = std::env::var_os("C9_TEST_NEWER_HOME") else {
+        return;
+    };
+    let home = PathBuf::from(home);
+    std::fs::create_dir_all(&home).unwrap();
+    let _lock = c9watch_lib::engine::lock::acquire_engine_lock(&lock_path(&home)).unwrap();
+    let listener = UnixListener::bind(sock_path(&home)).unwrap();
+    let version = std::env::var("C9_TEST_NEWER_VERSION").unwrap_or_else(|_| "999.0.0".into());
+    let minor: u32 = std::env::var("C9_TEST_NEWER_MINOR")
+        .unwrap_or_else(|_| "999".into())
+        .parse()
+        .unwrap();
+    for socket in listener.incoming() {
+        let mut socket = socket.unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        while {
+            line.clear();
+            reader.read_line(&mut line).unwrap_or(0) > 0
+        } {
+            let request: Value = serde_json::from_str(&line).unwrap();
+            writeln!(socket, "{}", serde_json::json!({"v":1,"id":request["id"],"ok":true,"result":{
+                "apiMajor":1,"apiMinor":minor,"engineVersion":version,"machineId":"test","principal":"local-unverified","capabilities":[],"cursor":null
+            }})).unwrap();
+        }
+    }
+}
+
+#[test]
+fn cli_restart_refuses_a_newer_core_without_signalling_it() {
+    for (version, minor) in [("999.0.0", "6"), (env!("CARGO_PKG_VERSION"), "999")] {
+        let sb = Sandbox::new();
+        let mut fixture = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "newer_core_fixture"])
+            .env("C9_TEST_NEWER_HOME", &sb.engine)
+            .env("C9_TEST_NEWER_VERSION", version)
+            .env("C9_TEST_NEWER_MINOR", minor)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(wait_for(Duration::from_secs(5), || sock_path(&sb.engine).exists()));
+        let out = sb.run(&["engine", "restart"]);
+        let survived = fixture.try_wait().unwrap().is_none();
+        let _ = fixture.kill();
+        let _ = fixture.wait();
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("engine_newer"),
+            "{out:?}"
+        );
+        assert!(survived, "restart signalled a newer core");
+    }
+}
