@@ -2,7 +2,7 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 9;
+export const C9P_API_MINOR = 10;
 
 /** `agent.attention` data: an agent needs the user. */
 export interface C9pAgentAttentionEvent {
@@ -17,15 +17,15 @@ export interface C9pAgentAttentionEvent {
 }
 
 /**
- * `agent.create` params. C1a creates only free agents : no brief,
+ * `agent.create` params. Only free agents are supported: no brief,
  * no worktree, the given cwd.
  */
 export interface C9pAgentCreateParams {
   /** An absolute directory. The engine uses its realpath. */
   cwd: string;
-  /** The adapter kind. Only `claude` in C1a. */
+  /** The adapter kind. Only `claude` is supported. */
   kind?: string;
-  /** `free`. `managed` comes in C1b and answers `unsupported_in_c1a`. */
+  /** `free`. `managed` is not supported and answers `unsupported`. */
   mode: 'free' | 'managed' | string;
   /**
    * A display name: letters, digits, `.`, `_` and `-`, unique among
@@ -74,7 +74,7 @@ export interface C9pAgentRetireParams {
 }
 
 /**
- * `agent.retire` result: the tombstone row . Retiring a retired or
+ * `agent.retire` result: the tombstone row. Retiring a retired or
  * failed agent changes nothing and returns its row.
  */
 export interface C9pAgentRetireResult {
@@ -82,7 +82,7 @@ export interface C9pAgentRetireResult {
 }
 
 /**
- * One row of the `agents` table , as `snapshot.get`,
+ * One row of the `agents` table, as `snapshot.get`,
  * `session.list` and `agent.list` send it.
  */
 export interface C9pAgentRow {
@@ -434,10 +434,10 @@ export interface C9pErrorBody {
  * Typed error codes. New codes are additive; a client that does not know a
  * code still has `msg`, `retryable` and `hint`.
  */
-export type C9pErrorCode = 'hop_limit' | 'not_cancellable' | string | 'upgrade_required' | 'hello_required' | 'hello_timeout' | 'frame_too_large' | 'bad_request' | 'unknown_method' | 'peer_uid_mismatch' | 'cursor_expired' | 'rate_limited' | 'peer_not_authorized' | 'no_task' | 'unsupported_in_c1a' | 'agent_bin_missing' | 'agent_bin_mismatch' | 'not_allowed' | 'confirmation_required' | 'cwd_collision' | 'spawn_failed' | 'unknown_agent' | 'draining' | 'unknown_address' | 'not_controlled' | 'not_owner' | 'duplicate' | 'unknown_session' | 'action_failed' | 'busy' | 'limit_exceeded' | 'internal';
+export type C9pErrorCode = 'hop_limit' | 'not_cancellable' | string | 'upgrade_required' | 'hello_required' | 'hello_timeout' | 'frame_too_large' | 'bad_request' | 'unknown_method' | 'peer_uid_mismatch' | 'cursor_expired' | 'rate_limited' | 'peer_not_authorized' | 'no_task' | 'unsupported' | 'agent_bin_missing' | 'agent_bin_mismatch' | 'not_allowed' | 'confirmation_required' | 'cwd_collision' | 'spawn_failed' | 'unknown_agent' | 'draining' | 'unknown_address' | 'not_controlled' | 'not_owner' | 'duplicate' | 'unknown_session' | 'action_failed' | 'busy' | 'limit_exceeded' | 'internal';
 
 /**
- * One event on the wire . `sub` is the `id` of the subscribe
+ * One event on the wire. `sub` is the `id` of the subscribe
  * request, so a connection can carry several subscriptions.
  */
 export interface C9pEventFrame {
@@ -460,7 +460,7 @@ export type C9pEventType = 'event' | string;
 
 /**
  * `hello` params. `client` is the caller's own claim. The engine only logs
- * it as unverified; it never decides the principal .
+ * it as unverified; it never decides the principal.
  */
 export interface C9pHelloParams {
   apiMajor?: number | null;
@@ -684,7 +684,7 @@ export interface C9pMsgIdParams {
 }
 
 /**
- * What a message asks of its reader . A caller sends `request` or
+ * What a message asks of its reader. A caller sends `request` or
  * `info`; `result` and `system` are written by the engine.
  */
 export type C9pMsgKind = 'request' | 'info' | 'result' | 'system' | string;
@@ -1248,7 +1248,7 @@ export interface C9pSubagentTranscriptParams {
   subagentId: string;
 }
 
-/** `events.subscribe` params . Empty filters match everything. */
+/** `events.subscribe` params. Empty filters match everything. */
 export interface C9pSubscribeParams {
   /**
    * The last cursor the client has seen. Without it, the stream starts at

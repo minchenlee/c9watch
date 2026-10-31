@@ -2456,7 +2456,7 @@ fn check_kind_and_mode(p: &AgentCreateParams) -> Result<&'static Descriptor, Api
         "free" => {}
         "managed" => {
             return Err(ApiError::new(
-                ErrorCode::UnsupportedInC1a,
+                ErrorCode::Unsupported,
                 "managed agents come in C1b; use mode \"free\"",
             ))
         }
@@ -3115,7 +3115,7 @@ mod tests {
             ),
             (
                 serde_json::json!({"mode": "managed", "cwd": e.cwd}),
-                ErrorCode::UnsupportedInC1a,
+                ErrorCode::Unsupported,
             ),
             (
                 serde_json::json!({"mode": "free", "kind": "codex", "cwd": e.cwd}),

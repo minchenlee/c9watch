@@ -1,9 +1,9 @@
 //! c9p/1 wire types.
 //!
-//! These serde types are the single source of truth for the protocol
-//! (A:245): one JSON object per line, a request/response envelope, typed
-//! error codes with a hint, and the `hello` handshake. Within major 1 every
-//! change is additive, so unknown fields are ignored on input.
+//! These serde types are the single source of truth for the protocol:
+//! one JSON object per line, a request/response envelope, typed
+//! error codes with a hint, and the `hello` handshake. Unknown input fields
+//! are ignored; preview clients detect breaking changes through discovery.
 //!
 //! They live outside the `engine` feature, so the GUI can read the engine
 //! without being built with it. The JSON Schema derive exists only in
@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
-/// Protocol minor version. Raised for additive changes.
-pub const API_MINOR: u32 = 9;
+/// Protocol minor version. Preview breaks also raise method revisions.
+pub const API_MINOR: u32 = 10;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -122,9 +122,8 @@ pub enum ErrorCode {
     PeerNotAuthorized,
     /// `task.done` from an agent without a task (every free agent).
     NoTask,
-    /// The method is part of the wire format but does nothing before C1b
-    /// (`agent.handoff`).
-    UnsupportedInC1a,
+    /// The operation is part of the wire format but is not supported yet.
+    Unsupported,
     /// The engine has no `c9watch-agent` copy: none was next to the engine
     /// binary when it started, or the copy is gone.
     AgentBinMissing,
@@ -132,7 +131,7 @@ pub enum ErrorCode {
     /// when the engine installed it.
     AgentBinMismatch,
     /// The principal may not call this method (`agent.create` and
-    /// `agent.retire` take only a local client in C1a).
+    /// `agent.retire` take only a local client).
     NotAllowed,
     /// A widening permission change needs a fresh native confirmation.
     ConfirmationRequired,
@@ -193,7 +192,7 @@ impl ErrorCode {
             ErrorCode::RateLimited => "rate_limited",
             ErrorCode::PeerNotAuthorized => "peer_not_authorized",
             ErrorCode::NoTask => "no_task",
-            ErrorCode::UnsupportedInC1a => "unsupported_in_c1a",
+            ErrorCode::Unsupported => "unsupported",
             ErrorCode::AgentBinMissing => "agent_bin_missing",
             ErrorCode::AgentBinMismatch => "agent_bin_mismatch",
             ErrorCode::NotAllowed => "not_allowed",
@@ -238,7 +237,7 @@ impl ErrorCode {
             ErrorCode::BadRequest => {
                 "send one JSON object per line with `v`, `id`, `method` and `params`"
             }
-            ErrorCode::UnknownMethod => "see `capabilities` in the hello result",
+            ErrorCode::UnknownMethod => "see `hello.result.methods`",
             ErrorCode::PeerUidMismatch => "connect as the user that runs the engine",
             ErrorCode::CursorExpired => {
                 "call `snapshot.get`, then `events.subscribe` with the snapshot's cursor"
@@ -252,7 +251,7 @@ impl ErrorCode {
                  engine's own copy"
             }
             ErrorCode::NoTask => "free agents have no task; just end the turn",
-            ErrorCode::UnsupportedInC1a => "this engine does not support it yet",
+            ErrorCode::Unsupported => "this engine does not support it yet",
             ErrorCode::AgentBinMissing => {
                 "install c9watch-agent next to the c9watch binary, then \
                  `c9watch engine restart`"
@@ -276,7 +275,7 @@ impl ErrorCode {
                 "the engine is stopping; reconnect once the next engine is up and send it again"
             }
             ErrorCode::UnknownAddress => "see `agent.list` for the agent ids and names",
-            ErrorCode::NotControlled => "take over first (D10)",
+            ErrorCode::NotControlled => "take over first",
             ErrorCode::NotOwner => "managed workers take mail only from their parent and the human",
             ErrorCode::Duplicate => "pass a new idem to send it again",
             ErrorCode::HopLimit => "the thread is too deep; a person must start a new one",
@@ -344,7 +343,7 @@ impl From<ApiError> for ErrorBody {
 }
 
 /// `hello` params. `client` is the caller's own claim. The engine only logs
-/// it as unverified; it never decides the principal (N1).
+/// it as unverified; it never decides the principal.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
@@ -539,7 +538,7 @@ pub struct SnapshotResult {
     pub agents: Vec<AgentRow>,
 }
 
-/// One row of the `agents` table (A:340), as `snapshot.get`,
+/// One row of the `agents` table, as `snapshot.get`,
 /// `session.list` and `agent.list` send it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
@@ -1048,16 +1047,16 @@ pub struct AgentListResult {
     pub agents: Vec<AgentRow>,
 }
 
-/// `agent.create` params. C1a creates only free agents (A:794): no brief,
+/// `agent.create` params. Only free agents are supported: no brief,
 /// no worktree, the given cwd.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCreateParams {
-    /// The adapter kind. Only `claude` in C1a.
+    /// The adapter kind. Only `claude` is supported.
     #[serde(default = "default_kind")]
     pub kind: String,
-    /// `free`. `managed` comes in C1b and answers `unsupported_in_c1a`.
+    /// `free`. `managed` is not supported and answers `unsupported`.
     pub mode: String,
     /// An absolute directory. The engine uses its realpath.
     pub cwd: String,
@@ -1086,7 +1085,7 @@ pub struct AgentRetireParams {
     pub id: String,
 }
 
-/// `agent.retire` result: the tombstone row (A:828). Retiring a retired or
+/// `agent.retire` result: the tombstone row. Retiring a retired or
 /// failed agent changes nothing and returns its row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
@@ -1094,7 +1093,7 @@ pub struct AgentRetireResult {
     pub agent: AgentRow,
 }
 
-/// What a message asks of its reader (A:418). A caller sends `request` or
+/// What a message asks of its reader. A caller sends `request` or
 /// `info`; `result` and `system` are written by the engine.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
@@ -1204,7 +1203,7 @@ pub struct MsgStateEvent {
     pub preview: Option<String>,
 }
 
-/// `events.subscribe` params (A:218). Empty filters match everything.
+/// `events.subscribe` params. Empty filters match everything.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
@@ -1233,7 +1232,7 @@ pub struct SubscribeResult {
     pub cursor: String,
 }
 
-/// One event on the wire (A:203). `sub` is the `id` of the subscribe
+/// One event on the wire. `sub` is the `id` of the subscribe
 /// request, so a connection can carry several subscriptions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
@@ -1262,8 +1261,8 @@ pub enum EventType {
     Event,
 }
 
-/// The hook-class methods (§1.1). Only a live agent may call them, and only
-/// through the engine's own copy of `c9watch-agent` (C1a-21).
+/// The hook-class methods. Only a live agent may call them, and only
+/// through the engine's own copy of `c9watch-agent`.
 pub const HOOK_METHODS: &[&str] = &[
     "hook.session_start",
     "hook.stop",
@@ -1281,7 +1280,7 @@ pub fn is_hook_class(method: &str) -> bool {
 }
 
 /// `hook.*` params: one Claude Code hook event, sent by `c9watch-agent
-/// hook <event>`. The engine alone writes the log (A:1167).
+/// hook <event>`. The engine alone writes the log.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
@@ -1289,7 +1288,7 @@ pub struct HookParams {
     /// `C9_AGENT_ID` of the sender. It must be the agent the engine stamped.
     pub agent_id: String,
     /// The adapter kind of the hook (`claude`). The engine compares it with
-    /// the agent row (A:1056).
+    /// the agent row.
     pub kind: String,
     /// The sender's clock in ns, as a string. With `agentId` it dedupes.
     pub seq: String,
@@ -1328,7 +1327,7 @@ pub struct TaskDoneParams {
     pub seq: String,
 }
 
-/// `task.done` result. In C1a every agent is free, so the call fails with
+/// `task.done` result. Free agents have no task, so the call fails with
 /// `no_task` instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
@@ -1338,7 +1337,7 @@ pub struct TaskDoneResult {
 }
 
 /// `agent.handoff` params (`c9watch-agent handoff --note -`). The wire
-/// format is fixed now; the engine answers `unsupported_in_c1a` until C1b.
+/// format is reserved; the engine currently answers `unsupported`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
@@ -1351,7 +1350,7 @@ pub struct HandoffParams {
     pub seq: String,
 }
 
-/// `agent.handoff` result (C1b).
+/// `agent.handoff` result (reserved).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]

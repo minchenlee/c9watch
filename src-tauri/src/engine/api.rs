@@ -1511,7 +1511,7 @@ async fn hook_class(
         "agent.handoff" => {
             serde_json::from_value::<HandoffParams>(req.params).map_err(bad)?;
             Err(ApiError::new(
-                ErrorCode::UnsupportedInC1a,
+                ErrorCode::Unsupported,
                 "agent.handoff comes with refresh in C1b",
             ))
         }
@@ -2376,6 +2376,17 @@ mod tests {
     }
 
     #[test]
+    fn schema_has_no_internal_design_codes() {
+        let text = serde_json::to_string(&schema()).unwrap();
+        let codes = regex::Regex::new(r"A:[0-9]+|C1a-[0-9]+|§|\b[DQN][0-9]+\b").unwrap();
+        assert!(
+            !codes.is_match(&text),
+            "internal design code in schema: {:?}",
+            codes.find(&text)
+        );
+    }
+
+    #[test]
     fn schema_lists_every_method_and_resolves_every_ref() {
         let s = schema();
         let methods: Vec<&str> = s["methods"]
@@ -3139,6 +3150,14 @@ mod tests {
         let (_t, ctx, db) = ctx_with_bin(Arc::new(NoLiveAgents));
         let (mut c, hello) = Client::new(ctx).await;
         assert_eq!(hello["principal"], "local-unverified");
+        let rules = c.call("rules", "auth.rules", json!({})).await;
+        assert_eq!(rules["result"]["methods"], hello["methods"]);
+        for m in HOOK_CLASS {
+            assert!(hello["methods"].get(*m).is_none(), "{m}");
+            let review = c.call("can", "auth.can", json!({"method": m})).await;
+            assert_eq!(review["result"]["allowed"], false, "{m}: {review}");
+        }
+        assert!(audit_rows(&db).is_empty(), "discovery must not audit");
         for (i, m) in HOOK_CLASS.iter().enumerate() {
             let r = c.call(&i.to_string(), m, hook_params("a7")).await;
             assert_eq!(r["error"]["code"], "peer_not_authorized", "{}: {}", m, r);
@@ -4304,12 +4323,23 @@ mod tests {
         let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
         let (_c, hello) = Client::hello(ctx, json!({"apiMinor": API_MINOR})).await;
         let methods = hello["methods"].as_object().unwrap();
-        assert_eq!(methods.len(), METHODS.len());
+        let expected: Vec<_> = METHODS
+            .iter()
+            .filter(|m| !is_hook_class(m))
+            .copied()
+            .collect();
+        assert_eq!(methods.len(), expected.len());
+        for name in expected {
+            assert!(methods.contains_key(name), "{name}");
+        }
         assert_eq!(
             hello["methods"]["conversation.get"],
             json!({"since": 6, "rev": 1, "stability": "preview"})
         );
-        assert_eq!(hello["methods"]["hook.stop"]["stability"], "internal");
+        assert!(!methods.contains_key("hook.stop"));
+        let (_t, agent_ctx, _db) = ctx_db(as_agent("a7"));
+        let (_c, agent_hello) = Client::new(agent_ctx).await;
+        assert_eq!(agent_hello["methods"]["hook.stop"]["stability"], "internal");
         assert_eq!(hello["methods"]["hello"]["since"], 0);
         assert_eq!(hello["breakingSince"], json!([]));
         assert_eq!(hello["stability"], "preview");
@@ -4322,6 +4352,10 @@ mod tests {
         assert_eq!(hello["limits"]["maxConnections"], MAX_CONNECTIONS as u64);
         assert_eq!(hello["limits"]["retentionHours"], 24);
         assert_eq!(hello["limits"]["retentionEvents"], 50_000);
+        let (_t, old_ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let (_c, old_hello) = Client::hello(old_ctx, json!({"apiMinor": 9})).await;
+        assert_eq!(old_hello["breakingSince"], json!(["agent.create"]));
+        assert_eq!(hello["methods"]["agent.create"]["rev"], 2);
         // A client without `apiMinor` (minor 5 and older) still says hello.
         let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
         let (_c, hello) = Client::new(ctx).await;

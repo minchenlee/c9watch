@@ -88,7 +88,7 @@ pub fn method(name: &str) -> Option<Rule> {
         | "hook.user_prompt_submit"
         | "hook.post_tool_use"
         | "task.done"
-        | "agent.handoff" => rule("hook", "write", &[L, A], None, &["agent_exe"]),
+        | "agent.handoff" => rule("hook", "write", &[A], None, &["agent_exe"]),
         _ => return None,
     })
 }
@@ -179,11 +179,19 @@ pub fn authorize(
     if checked.allowed {
         return Ok(method(name).expect("reviewed declaration"));
     }
-    Err(ApiError::new(
-        ErrorCode::NotAllowed,
-        checked.reason.clone().unwrap_or_default(),
+    // Discovery uses the agent-only declaration. Preserve the established
+    // local hook refusal code; dispatch audits this denial exactly once.
+    let code = if matches!(principal, Principal::LocalUnverified)
+        && method(name).is_some_and(|r| r.admission.contains(&"agent_exe"))
+    {
+        ErrorCode::PeerNotAuthorized
+    } else {
+        ErrorCode::NotAllowed
+    };
+    Err(
+        ApiError::new(code, checked.reason.clone().unwrap_or_default())
+            .with_data(serde_json::json!({"needs": checked.needs})),
     )
-    .with_data(serde_json::json!({"needs": checked.needs})))
 }
 
 pub fn methods(principal: &Principal, access: Option<&Access>) -> BTreeMap<String, MethodInfo> {
@@ -397,6 +405,37 @@ mod tests {
         assert_eq!(needs.scopes, ["conversation:read"]);
         assert_eq!(needs.ceiling, Some(Ceiling::Conversation));
     }
+    #[test]
+    fn hook_discovery_is_agent_only_and_local_refusals_keep_their_code() {
+        let local = Principal::LocalUnverified;
+        let agent = Principal::Agent {
+            id: "a".into(),
+            gen: 1,
+        };
+        let client = Principal::Client { id: "c".into() };
+        for name in super::super::api::METHODS
+            .iter()
+            .filter(|m| super::super::proto::is_hook_class(m))
+        {
+            assert_eq!(method(name).unwrap().principals, &[A]);
+            for p in [&local, &client] {
+                assert!(!can(name, p, None).allowed, "{p}: {name}");
+                assert!(!methods(p, None).contains_key(*name), "{p}: {name}");
+                assert!(!rules(p, None).methods.contains_key(*name), "{p}: {name}");
+            }
+            assert_eq!(
+                authorize(name, &local, None).unwrap_err().code,
+                ErrorCode::PeerNotAuthorized
+            );
+            assert_eq!(
+                authorize(name, &client, None).unwrap_err().code,
+                ErrorCode::NotAllowed
+            );
+            assert!(can(name, &agent, None).allowed, "{name}");
+            assert!(methods(&agent, None).contains_key(*name), "{name}");
+        }
+    }
+
     #[test]
     fn mail_is_local_only_and_controls_are_human_only() {
         let local = Principal::LocalUnverified;

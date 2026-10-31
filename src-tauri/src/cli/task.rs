@@ -227,7 +227,7 @@ pub fn cmd_task_done(report: &str) -> Result<(), String> {
 // ── handoff ───────────────────────────────────────────────────────────
 
 /// Send `note` as `agent.handoff`. C1a engines answer
-/// `unsupported_in_c1a`.
+/// `unsupported`.
 pub fn handoff(env: &EngineEnv, note: &str) -> Result<Value, String> {
     if note.trim().is_empty() {
         return Err("handoff: the note is empty".into());
@@ -500,9 +500,9 @@ mod tests {
     fn handoff_sends_the_note() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("e.sock");
-        let h = serve_one(&path, |_| Err(("unsupported_in_c1a", "C1b")));
+        let h = serve_one(&path, |_| Err(("unsupported", "C1b")));
         let err = handoff(&env(path.to_str().unwrap()), "next steps").unwrap_err();
-        assert!(err.contains("unsupported_in_c1a"), "{err}");
+        assert!(err.contains("unsupported"), "{err}");
         let req = h.join().unwrap();
         assert_eq!(req.method.as_deref(), Some("agent.handoff"));
         assert_eq!(req.params["note"], "next steps");

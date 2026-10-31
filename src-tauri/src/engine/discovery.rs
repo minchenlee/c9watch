@@ -42,7 +42,11 @@ pub const METHOD_INFO: &[Method] = &[
     m("events.subscribe", 1, PREVIEW),
     m("session.list", 1, PREVIEW),
     m("agent.list", 1, PREVIEW),
-    m("agent.create", 3, PREVIEW),
+    Method {
+        rev: 2,
+        rev_minor: 10,
+        ..m("agent.create", 3, PREVIEW)
+    },
     m("agent.retire", 3, PREVIEW),
     m("hook.session_start", 2, INTERNAL),
     m("hook.stop", 2, INTERNAL),
@@ -52,7 +56,11 @@ pub const METHOD_INFO: &[Method] = &[
     m("hook.user_prompt_submit", 4, INTERNAL),
     m("hook.post_tool_use", 4, INTERNAL),
     m("task.done", 2, INTERNAL),
-    m("agent.handoff", 2, INTERNAL),
+    Method {
+        rev: 2,
+        rev_minor: 10,
+        ..m("agent.handoff", 2, INTERNAL)
+    },
     m("msg.send", 4, PREVIEW),
     // C1b-M2: mailbox data and human controls.
     m("msg.list", 7, PREVIEW),

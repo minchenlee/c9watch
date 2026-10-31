@@ -49,7 +49,7 @@ Export the contract offline, including from a CLI-only build:
 c9watch api schema --public > c9p-public.json
 ```
 
-The checked-in [full schema](c9p-1.json) also contains private methods for internal contract tests. Public export removes internal methods, topics, fields and unused types. It keeps actual wire error names, including the legacy `unsupported_in_c1a` name. That name awaits the separate cleanup minor.
+The checked-in [full schema](c9p-1.json) also contains private methods for internal contract tests. Public export removes internal methods, topics, fields and unused types. It keeps actual wire error names, including `unsupported` for operations the engine does not implement yet.
 
 **SQLite is not an interface.** Do not query `engine.db`, its tables or its outbox on disk. They can change in any minor. Use c9p queries, streams or `c9watch export`.
 
