@@ -2,15 +2,24 @@
 //! `get_conversation` reader, in pages. A connection that asked for the
 //! `conversation.progress` capability gets `progress` frames for the read
 //! before the response.
+//!
+//! Each call loads the whole transcript into memory, so at most
+//! `MAX_READS` reads run at once; one more answers `busy`.
 
-use super::{params, to_value, user_home};
+use super::{check_id, omitted, params, take_page, to_value, user_home, window};
 use crate::engine::api::{blocking, ServerCtx};
 use crate::engine::proto::{
     encode_progress, ApiError, ConversationGetParams, ConversationGetResult, ErrorCode,
     ProgressFrame, ProgressType, Request, API_MAJOR,
 };
-use crate::session::SessionProvider;
-use tokio::sync::mpsc;
+use crate::session::{ConversationMessage, SessionProvider};
+use std::sync::{Arc, LazyLock};
+use tokio::sync::{mpsc, Semaphore};
+
+/// Transcript reads that may run at once, in the whole process.
+pub const MAX_READS: usize = 4;
+
+static READS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(MAX_READS)));
 
 /// The capability that turns on `progress` frames.
 pub const PROGRESS_CAPABILITY: &str = "conversation.progress";
@@ -66,10 +75,38 @@ fn read_error(e: String) -> ApiError {
     }
 }
 
+/// The id of a session key is joined into file paths by the readers, so it
+/// must be a plain session id. An OpenCode id may carry its
+/// `?directory=<path>` scope, which its reader checks itself.
+fn check_session_id(provider: Option<SessionProvider>, id: &str) -> Result<(), ApiError> {
+    let raw = match provider {
+        Some(SessionProvider::Opencode) | None => id.split_once('?').map_or(id, |(raw, _)| raw),
+        Some(_) => id,
+    };
+    check_id("conversation.get", "sessionKey", raw)
+}
+
+/// A message too large for a page: its content becomes a note.
+fn shrink(m: &mut ConversationMessage) {
+    m.content = omitted(m.content.len());
+    m.images.clear();
+    m.truncated = true;
+}
+
 pub async fn conversation_get(
     req: Request,
     ctx: &ServerCtx,
     progress: Option<Progress>,
+) -> Result<serde_json::Value, ApiError> {
+    conversation_get_gated(req, ctx, progress, &READS).await
+}
+
+/// `conversation_get` with its read gate given; tests pass their own.
+pub(crate) async fn conversation_get_gated(
+    req: Request,
+    ctx: &ServerCtx,
+    progress: Option<Progress>,
+    gate: &Arc<Semaphore>,
 ) -> Result<serde_json::Value, ApiError> {
     let p: ConversationGetParams = params("conversation.get", req)?;
     if p.session_key.is_empty() {
@@ -79,37 +116,42 @@ pub async fn conversation_get(
         ));
     }
     let (provider, id) = split_key(&p.session_key, p.provider)?;
+    check_session_id(provider, &id)?;
+    let w = window("conversation.get", p.page)?;
     let home = user_home(ctx)?;
     let include_tools = p.include_tools;
-    let conv = blocking(move || {
+    // Never queue: a full gate answers `busy` at once.
+    let permit = gate.clone().try_acquire_owned().map_err(|_| {
+        ApiError::new(
+            ErrorCode::Busy,
+            "too many conversation reads in progress; retry shortly",
+        )
+    })?;
+    blocking(move || {
+        // Held by the job, so a cancelled caller does not free it early.
+        let _permit = permit;
         let mut on_progress = |read: u64, total: u64| {
             if let Some(pr) = &progress {
                 pr.send(read, total);
             }
         };
-        crate::session::conversation::get_conversation_data_in(
+        let conv = crate::session::conversation::get_conversation_data_in(
             &home,
             &id,
             provider,
             include_tools,
             &mut on_progress,
         )
-        .map_err(read_error)
+        .map_err(read_error)?;
+        let page = take_page(conv.messages, w, shrink);
+        Ok(to_value(&ConversationGetResult {
+            session_id: conv.session_id,
+            provider: conv.provider,
+            messages: page.items,
+            total: page.total,
+            offset: page.offset,
+            next_offset: page.next_offset,
+        }))
     })
-    .await?;
-    let total = conv.messages.len();
-    let page = p.page.unwrap_or_default();
-    let offset = page.offset.min(total);
-    let end = page
-        .limit
-        .map_or(total, |l| offset.saturating_add(l).min(total));
-    let messages = conv.messages[offset..end].to_vec();
-    Ok(to_value(&ConversationGetResult {
-        session_id: conv.session_id,
-        provider: conv.provider,
-        messages,
-        total,
-        offset,
-        next_offset: (end < total).then_some(end),
-    }))
+    .await
 }

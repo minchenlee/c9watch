@@ -748,6 +748,7 @@ fn parse_conversation(
                 message_type,
                 content,
                 images: Vec::new(),
+                truncated: false,
             });
         }
     }

@@ -3655,6 +3655,190 @@ mod tests {
         assert_eq!(r["result"]["offset"], 5, "{}", r);
     }
 
+    /// A session key whose id is a path is `bad_request`, even where the
+    /// file it names exists; OpenCode's `?directory=` scope still passes
+    /// the id check.
+    #[tokio::test]
+    async fn conversation_get_refuses_path_ids() {
+        let (t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let home = t.path().join("home");
+        let project = home
+            .join(".claude")
+            .join("projects")
+            .join(crate::session::detector::encode_path_for_matching(PROJECT));
+        let stolen = std::fs::read(project.join("sess-1.jsonl")).unwrap();
+        std::fs::write(home.join("x.jsonl"), &stolen).unwrap();
+        let (mut c, _) = Client::new(ctx).await;
+        let abs = format!("claudeCode:{}", home.join("x").display());
+        for key in [
+            abs.as_str(),
+            "claudeCode:../../../x",
+            "../../../x",
+            "codex:../x",
+            "opencode:../x?directory=%2Ftmp",
+        ] {
+            let r = c
+                .call_past_busy("1", "conversation.get", json!({"sessionKey": key}))
+                .await;
+            assert_eq!(r["error"]["code"], "bad_request", "{}: {}", key, r);
+        }
+        let r = c
+            .call_past_busy(
+                "2",
+                "conversation.get",
+                json!({"sessionKey": "opencode:ses_abc?directory=%2Ftmp%2Fp"}),
+            )
+            .await;
+        assert_ne!(r["error"]["code"], "bad_request", "{}", r);
+        let r = c
+            .call_past_busy(
+                "3",
+                "conversation.get",
+                json!({"sessionKey": "claudeCode:sess-1"}),
+            )
+            .await;
+        assert_eq!(r["result"]["total"], 5, "{}", r);
+    }
+
+    /// `page.limit: 0` is `bad_request` on every paged method.
+    #[tokio::test]
+    async fn a_zero_page_limit_is_a_bad_request() {
+        let (_t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        let zero = json!({"offset": 0, "limit": 0});
+        for (m, p) in [
+            (
+                "conversation.get",
+                json!({"sessionKey": "claudeCode:sess-1", "page": zero}),
+            ),
+            ("history.list", json!({"page": zero})),
+            ("memory.list", json!({"page": zero})),
+        ] {
+            let r = c.call_past_busy("1", m, p).await;
+            assert_eq!(r["error"]["code"], "bad_request", "{}: {}", m, r);
+        }
+    }
+
+    /// `history.list` and `memory.list` page: the no-params call is the
+    /// first page, and a page walks to `nextOffset: null`.
+    #[tokio::test]
+    async fn history_and_memory_lists_page() {
+        let (_t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        for (m, field) in [("history.list", "entries"), ("memory.list", "projects")] {
+            let r = c.call("1", m, json!({})).await;
+            assert_eq!(r["result"]["total"], 1, "{}", r);
+            assert_eq!(r["result"]["offset"], 0, "{}", r);
+            assert_eq!(r["result"]["nextOffset"], Value::Null, "{}", r);
+            assert_eq!(r["result"][field].as_array().unwrap().len(), 1, "{}", r);
+            let r = c
+                .call("2", m, json!({"page": {"offset": 1, "limit": 1}}))
+                .await;
+            assert_eq!(r["result"][field], json!([]), "{}", r);
+            assert_eq!(r["result"]["nextOffset"], Value::Null, "{}", r);
+        }
+    }
+
+    /// Large messages: a page stops at the byte budget, a message too large
+    /// for any page comes alone as a `truncated` note, every response fits
+    /// in `MAX_FRAME`, and `nextOffset` walks the whole transcript.
+    #[tokio::test]
+    async fn conversation_get_pages_by_bytes() {
+        let (t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let project = t
+            .path()
+            .join("home")
+            .join(".claude")
+            .join("projects")
+            .join(crate::session::detector::encode_path_for_matching(PROJECT));
+        let sizes = [300_000, 300_000, 2 * MAX_FRAME, 10, 300_000];
+        let mut transcript = String::new();
+        for (i, n) in sizes.iter().enumerate() {
+            transcript.push_str(&format!(
+                "{}\n",
+                json!({
+                    "type": "user",
+                    "uuid": format!("b{}", i),
+                    "sessionId": "big",
+                    "cwd": PROJECT,
+                    "timestamp": format!("2026-10-31T00:00:0{}Z", i),
+                    "message": {"role": "user", "content": "x".repeat(*n)},
+                })
+            ));
+        }
+        std::fs::write(project.join("big.jsonl"), transcript).unwrap();
+        let (mut c, _) = Client::new(ctx).await;
+        let mut offset = Some(0u64);
+        let mut pages = Vec::new();
+        while let Some(o) = offset {
+            assert!(pages.len() < 10, "nextOffset must move forward");
+            let r = c
+                .call_past_busy(
+                    "1",
+                    "conversation.get",
+                    json!({"sessionKey": "claudeCode:big", "page": {"offset": o}}),
+                )
+                .await;
+            assert!(
+                serde_json::to_vec(&r).unwrap().len() < MAX_FRAME,
+                "frame too big"
+            );
+            assert_eq!(r["result"]["total"], 5, "{}", r["error"]);
+            let msgs = r["result"]["messages"].as_array().unwrap().clone();
+            pages.push(
+                msgs.iter()
+                    .map(|m| (m["content"].as_str().unwrap().len(), m["truncated"] == true))
+                    .collect::<Vec<_>>(),
+            );
+            offset = r["result"]["nextOffset"].as_u64();
+        }
+        // Half a frame holds one 300 kB message; the 2 MiB one is a note,
+        // with room after it.
+        assert_eq!(pages.len(), 3, "{:?}", pages);
+        assert_eq!(pages[0], vec![(300_000, false)]);
+        assert_eq!(pages[1], vec![(300_000, false)]);
+        assert_eq!(pages[2].len(), 3, "{:?}", pages);
+        assert!(pages[2][0].1 && pages[2][0].0 < 200, "{:?}", pages);
+        assert_eq!(pages[2][1..], [(10, false), (300_000, false)]);
+    }
+
+    /// A full read gate answers the retryable `busy` without reading; a
+    /// free one reads.
+    #[tokio::test]
+    async fn conversation_get_is_busy_when_the_read_gate_is_full() {
+        let (_t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let req = |key: &str| Request {
+            v: Some(API_MAJOR),
+            id: Some("1".into()),
+            method: Some("conversation.get".into()),
+            params: json!({"sessionKey": key}),
+            idem: None,
+        };
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = gate.clone().try_acquire_owned().unwrap();
+        let e = views::conversation::conversation_get_gated(
+            req("claudeCode:sess-1"),
+            &ctx,
+            None,
+            &gate,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Busy, "{}", e.msg);
+        assert!(e.code.retryable());
+        drop(held);
+        let r = views::conversation::conversation_get_gated(
+            req("claudeCode:sess-1"),
+            &ctx,
+            None,
+            &gate,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["total"], 5);
+        assert_eq!(gate.available_permits(), 1, "the job frees its permit");
+    }
+
     /// With `conversation.progress` granted, `progress` frames come before
     /// the response and end at the file size; without it, none come.
     #[tokio::test]

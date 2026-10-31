@@ -39,6 +39,10 @@ pub struct ConversationMessage {
     /// Images attached to this message (screenshots pasted by the user)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageBlock>,
+    /// The engine replaced `content` with a short note (and dropped
+    /// `images`): the message alone was larger than a c9p page may be.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 fn claude_conversation(
@@ -68,6 +72,7 @@ fn claude_conversation(
                 message_type: msg_type,
                 content,
                 images,
+                truncated: false,
             },
         )
         .collect();
@@ -99,6 +104,7 @@ fn codex_conversation(
                 message_type: message.message_type,
                 content: message.content,
                 images: Vec::new(),
+                truncated: false,
             })
             .collect(),
     })
@@ -124,6 +130,7 @@ fn cursor_conversation(
                 message_type: message.message_type,
                 content: message.content,
                 images: Vec::new(),
+                truncated: false,
             })
             .collect(),
     })
@@ -149,6 +156,7 @@ fn pi_conversation(
                 message_type: message.message_type,
                 content: message.content,
                 images: Vec::new(),
+                truncated: false,
             })
             .collect(),
     })

@@ -66,6 +66,7 @@ const BY_NAME: &[(&str, &str)] = &[
     ("costAvailable", P),
     ("partial", P),
     ("legacy", P),
+    ("truncated", P),
     ("replayed", P),
     ("accepted", P),
     ("ended", P),
@@ -152,12 +153,10 @@ const BY_NAME: &[(&str, &str)] = &[
     ("workerOf", M),
     ("agentType", M),
     ("agentRole", M),
-    ("agentNickname", M),
     ("pendingTool", M),
     ("pendingToolName", M),
     ("waitingFor", M),
     ("tool", M),
-    ("redactedTitle", M),
     ("hiddenClaudeSessions", M),
     // Money, tokens and models.
     ("cost", M),
@@ -201,6 +200,11 @@ const BY_NAME: &[(&str, &str)] = &[
     ("customTitle", C),
     ("codexTitle", C),
     ("cursorTitle", C),
+    // Cursor copies its conversation title into the nickname.
+    ("agentNickname", C),
+    // The custom or provider title, else the session name: both can be
+    // the first prompt.
+    ("redactedTitle", C),
     ("summary", C),
     ("firstPrompt", C),
     ("latestMessage", C),

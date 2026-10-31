@@ -12,6 +12,10 @@ const CODEX_MEMORY_FILES: [&str; 2] = ["MEMORY.md", "memory_summary.md"];
 pub struct MemoryFile {
     pub filename: String,
     pub content: String,
+    /// The engine replaced `content` with a short note: its project was
+    /// larger than a c9p page may be.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// All memory files for a single project
@@ -116,7 +120,11 @@ fn get_claude_memory_files(home_dir: &Path) -> Result<Vec<ProjectMemory>, String
                         .to_string();
 
                     if let Ok(content) = fs::read_to_string(&file_path) {
-                        files.push(MemoryFile { filename, content });
+                        files.push(MemoryFile {
+                            filename,
+                            content,
+                            truncated: false,
+                        });
                     }
                 }
             }
@@ -160,6 +168,7 @@ fn get_codex_memory_files(home_dir: &Path) -> Option<ProjectMemory> {
                 .map(|content| MemoryFile {
                     filename: (*filename).to_string(),
                     content,
+                    truncated: false,
                 })
         })
         .collect::<Vec<_>>();

@@ -43,6 +43,10 @@ pub struct HistoryEntry {
     pub surface: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_kind: Option<String>,
+    /// The engine replaced `display` (and any long title) with a short
+    /// note: the entry was larger than a c9p page may be.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 fn default_provider() -> String {
@@ -109,6 +113,7 @@ pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
                 provider: default_provider(),
                 surface: None,
                 agent_kind: None,
+                truncated: false,
             }
         })
         .collect();
@@ -163,6 +168,7 @@ fn codex_history_entries(home_dir: &std::path::Path) -> Vec<HistoryEntry> {
                 provider: "codex".to_string(),
                 surface: Some(snapshot.surface.as_str().to_string()),
                 agent_kind: Some(snapshot.agent_kind.as_str().to_string()),
+                truncated: false,
             }
         })
         .collect()
@@ -697,6 +703,7 @@ mod tests {
                 provider: default_provider(),
                 surface: None,
                 agent_kind: None,
+                truncated: false,
             },
             HistoryEntry {
                 session_id: "drop-sid".into(),
@@ -711,6 +718,7 @@ mod tests {
                 provider: default_provider(),
                 surface: None,
                 agent_kind: None,
+                truncated: false,
             },
         ];
 
@@ -753,6 +761,7 @@ mod tests {
             provider: default_provider(),
             surface: None,
             agent_kind: None,
+            truncated: false,
         };
 
         let out = filter_and_enrich(vec![entry("ai-only"), entry("both")], tmp.path(), true);
@@ -778,6 +787,7 @@ mod tests {
             provider: default_provider(),
             surface: None,
             agent_kind: None,
+            truncated: false,
         }];
         let out = filter_and_enrich(entries, tmp.path(), false);
         assert!(out.is_empty());

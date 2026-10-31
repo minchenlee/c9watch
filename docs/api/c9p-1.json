@@ -529,7 +529,7 @@
               "type": "null"
             }
           ],
-          "description": "Without it, every message."
+          "description": "Without it, the first page (`offset` 0, the default `limit`)."
         },
         "provider": {
           "anyOf": [
@@ -552,7 +552,7 @@
       "type": "object"
     },
     "ConversationGetResult": {
-      "description": "`conversation.get` result. `messages` are the page asked for, in\ntranscript order. Each call reads the transcript again.",
+      "description": "`conversation.get` result. `messages` are the page asked for, in\ntranscript order (see `PageParams` for the page size). Each call reads\nthe transcript again.",
       "properties": {
         "messages": {
           "items": {
@@ -624,6 +624,11 @@
         },
         "timestamp": {
           "type": "string",
+          "x-sensitivity": "public"
+        },
+        "truncated": {
+          "description": "The engine replaced `content` with a short note (and dropped\n`images`): the message alone was larger than a c9p page may be.",
+          "type": "boolean",
           "x-sensitivity": "public"
         }
       },
@@ -1349,6 +1354,11 @@
           "minimum": 0,
           "type": "integer",
           "x-sensitivity": "public"
+        },
+        "truncated": {
+          "description": "The engine replaced `display` (and any long title) with a short\nnote: the entry was larger than a c9p page may be.",
+          "type": "boolean",
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -1363,11 +1373,24 @@
       "type": "object"
     },
     "HistoryListParams": {
-      "description": "`history.list` params. There are none yet.",
+      "description": "`history.list` params.",
+      "properties": {
+        "page": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PageParams"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Without it, the first page (`offset` 0, the default `limit`)."
+        }
+      },
       "type": "object"
     },
     "HistoryListResult": {
-      "description": "`history.list` result: past sessions of every provider, newest first,\nas the GUI's `get_session_history` lists them.",
+      "description": "`history.list` result: one page of past sessions of every provider,\nnewest first, as the GUI's `get_session_history` lists them.",
       "properties": {
         "entries": {
           "items": {
@@ -1375,10 +1398,36 @@
           },
           "type": "array",
           "x-sensitivity": "conversation"
+        },
+        "nextOffset": {
+          "description": "`offset` of the next page; `null` after the last one.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "offset": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "total": {
+          "description": "Entries in the whole history.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
         }
       },
       "required": [
-        "entries"
+        "entries",
+        "total",
+        "offset",
+        "nextOffset"
       ],
       "type": "object"
     },
@@ -1574,6 +1623,11 @@
         "filename": {
           "type": "string",
           "x-sensitivity": "metadata"
+        },
+        "truncated": {
+          "description": "The engine replaced `content` with a short note: its project was\nlarger than a c9p page may be.",
+          "type": "boolean",
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -1583,22 +1637,61 @@
       "type": "object"
     },
     "MemoryListParams": {
-      "description": "`memory.list` params. There are none yet.",
+      "description": "`memory.list` params.",
+      "properties": {
+        "page": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PageParams"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Without it, the first page (`offset` 0, the default `limit`)."
+        }
+      },
       "type": "object"
     },
     "MemoryListResult": {
-      "description": "`memory.list` result: memory files grouped by project, as the GUI's\n`get_memory_files` reads them.",
+      "description": "`memory.list` result: one page of memory files grouped by project, as\nthe GUI's `get_memory_files` reads them. A page item is a project.",
       "properties": {
+        "nextOffset": {
+          "description": "`offset` of the next page; `null` after the last one.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "offset": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
         "projects": {
           "items": {
             "$ref": "#/$defs/ProjectMemory"
           },
           "type": "array",
           "x-sensitivity": "conversation"
+        },
+        "total": {
+          "description": "Projects in the whole list.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
         }
       },
       "required": [
-        "projects"
+        "projects",
+        "total",
+        "offset",
+        "nextOffset"
       ],
       "type": "object"
     },
@@ -1885,7 +1978,7 @@
         "redactedTitle": {
           "description": "`title` without conversation text.",
           "type": "string",
-          "x-sensitivity": "metadata"
+          "x-sensitivity": "conversation"
         },
         "sessionKey": {
           "type": "string",
@@ -1984,12 +2077,12 @@
       "type": "object"
     },
     "PageParams": {
-      "description": "A window of a list: `limit` items from `offset`.",
+      "description": "A window of a list: at most `limit` items from `offset`.\n\nA page also stops before its items would pass a byte budget (half of\n`limits.maxFrame`), so it can hold fewer than `limit` items. A page from\nan `offset` before the end always holds at least one item, so\n`nextOffset` always moves forward. An item too large for the budget on\nits own comes alone, with its large text replaced by a short note and\n`truncated: true`.",
       "properties": {
         "limit": {
-          "description": "At most this many items; without it, all from `offset`.",
+          "description": "At most this many items. Default 200; a value over 1000 is treated\nas 1000; 0 is `bad_request`.",
           "format": "uint",
-          "minimum": 0,
+          "minimum": 1,
           "type": [
             "integer",
             "null"
@@ -2557,7 +2650,7 @@
             "string",
             "null"
           ],
-          "x-sensitivity": "metadata"
+          "x-sensitivity": "conversation"
         },
         "agentPath": {
           "type": [

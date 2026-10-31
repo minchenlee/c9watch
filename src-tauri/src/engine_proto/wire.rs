@@ -723,25 +723,43 @@ pub struct ConversationGetParams {
     /// Keep tool-use and tool-result messages. Default false, as in the GUI.
     #[serde(default)]
     pub include_tools: bool,
-    /// Without it, every message.
+    /// Without it, the first page (`offset` 0, the default `limit`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<PageParams>,
 }
 
-/// A window of a list: `limit` items from `offset`.
+/// The default `PageParams::limit`.
+pub const PAGE_DEFAULT_LIMIT: usize = 200;
+/// The largest `PageParams::limit`; a larger one is treated as this.
+pub const PAGE_MAX_LIMIT: usize = 1000;
+/// The serialized size a page's items stay under, well below
+/// `MAX_FRAME` so that the response envelope fits too.
+pub const PAGE_BUDGET: usize = MAX_FRAME / 2;
+
+/// A window of a list: at most `limit` items from `offset`.
+///
+/// A page also stops before its items would pass a byte budget (half of
+/// `limits.maxFrame`), so it can hold fewer than `limit` items. A page from
+/// an `offset` before the end always holds at least one item, so
+/// `nextOffset` always moves forward. An item too large for the budget on
+/// its own comes alone, with its large text replaced by a short note and
+/// `truncated: true`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct PageParams {
     #[serde(default)]
     pub offset: usize,
-    /// At most this many items; without it, all from `offset`.
+    /// At most this many items. Default 200; a value over 1000 is treated
+    /// as 1000; 0 is `bad_request`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "engine", schemars(range(min = 1)))]
     pub limit: Option<usize>,
 }
 
 /// `conversation.get` result. `messages` are the page asked for, in
-/// transcript order. Each call reads the transcript again.
+/// transcript order (see `PageParams` for the page size). Each call reads
+/// the transcript again.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
@@ -781,17 +799,28 @@ pub enum ProgressType {
     Progress,
 }
 
-/// `history.list` params. There are none yet.
+/// `history.list` params.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
-pub struct HistoryListParams {}
+#[serde(rename_all = "camelCase")]
+pub struct HistoryListParams {
+    /// Without it, the first page (`offset` 0, the default `limit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<PageParams>,
+}
 
-/// `history.list` result: past sessions of every provider, newest first,
-/// as the GUI's `get_session_history` lists them.
+/// `history.list` result: one page of past sessions of every provider,
+/// newest first, as the GUI's `get_session_history` lists them.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
 pub struct HistoryListResult {
     pub entries: Vec<crate::session::HistoryEntry>,
+    /// Entries in the whole history.
+    pub total: usize,
+    pub offset: usize,
+    /// `offset` of the next page; `null` after the last one.
+    pub next_offset: Option<usize>,
 }
 
 /// `history.search` params: a phrase search over Claude Code transcripts.
@@ -819,17 +848,28 @@ pub struct HistorySearchResult {
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct CostGetParams {}
 
-/// `memory.list` params. There are none yet.
+/// `memory.list` params.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
-pub struct MemoryListParams {}
+#[serde(rename_all = "camelCase")]
+pub struct MemoryListParams {
+    /// Without it, the first page (`offset` 0, the default `limit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<PageParams>,
+}
 
-/// `memory.list` result: memory files grouped by project, as the GUI's
-/// `get_memory_files` reads them.
+/// `memory.list` result: one page of memory files grouped by project, as
+/// the GUI's `get_memory_files` reads them. A page item is a project.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
 pub struct MemoryListResult {
     pub projects: Vec<crate::session::ProjectMemory>,
+    /// Projects in the whole list.
+    pub total: usize,
+    pub offset: usize,
+    /// `offset` of the next page; `null` after the last one.
+    pub next_offset: Option<usize>,
 }
 
 /// `subagent.list` params: the raw Claude Code session ids the caller

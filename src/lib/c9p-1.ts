@@ -196,7 +196,7 @@ export interface C9pClientInfo {
 export interface C9pConversationGetParams {
   /** Keep tool-use and tool-result messages. Default false, as in the GUI. */
   includeTools?: boolean;
-  /** Without it, every message. */
+  /** Without it, the first page (`offset` 0, the default `limit`). */
   page?: C9pPageParams | null;
   provider?: C9pSessionProvider | null;
   /**
@@ -208,7 +208,8 @@ export interface C9pConversationGetParams {
 
 /**
  * `conversation.get` result. `messages` are the page asked for, in
- * transcript order. Each call reads the transcript again.
+ * transcript order (see `PageParams` for the page size). Each call reads
+ * the transcript again.
  */
 export interface C9pConversationGetResult {
   messages: C9pConversationMessage[];
@@ -228,6 +229,11 @@ export interface C9pConversationMessage {
   images?: C9pImageBlock[];
   messageType: C9pMessageType;
   timestamp: string;
+  /**
+   * The engine replaced `content` with a short note (and dropped
+   * `images`): the message alone was larger than a c9p page may be.
+   */
+  truncated?: boolean;
 }
 
 /** Aggregated cost data returned to the frontend. */
@@ -524,17 +530,30 @@ export interface C9pHistoryEntry {
   sessionId: string;
   surface?: string | null;
   timestamp: number;
+  /**
+   * The engine replaced `display` (and any long title) with a short
+   * note: the entry was larger than a c9p page may be.
+   */
+  truncated?: boolean;
 }
 
-/** `history.list` params. There are none yet. */
-export type C9pHistoryListParams = Record<string, unknown>;
+/** `history.list` params. */
+export interface C9pHistoryListParams {
+  /** Without it, the first page (`offset` 0, the default `limit`). */
+  page?: C9pPageParams | null;
+}
 
 /**
- * `history.list` result: past sessions of every provider, newest first,
- * as the GUI's `get_session_history` lists them.
+ * `history.list` result: one page of past sessions of every provider,
+ * newest first, as the GUI's `get_session_history` lists them.
  */
 export interface C9pHistoryListResult {
   entries: C9pHistoryEntry[];
+  /** `offset` of the next page; `null` after the last one. */
+  nextOffset: number | null;
+  offset: number;
+  /** Entries in the whole history. */
+  total: number;
 }
 
 /** `history.search` params: a phrase search over Claude Code transcripts. */
@@ -629,17 +648,30 @@ export interface C9pLimits {
 export interface C9pMemoryFile {
   content: string;
   filename: string;
+  /**
+   * The engine replaced `content` with a short note: its project was
+   * larger than a c9p page may be.
+   */
+  truncated?: boolean;
 }
 
-/** `memory.list` params. There are none yet. */
-export type C9pMemoryListParams = Record<string, unknown>;
+/** `memory.list` params. */
+export interface C9pMemoryListParams {
+  /** Without it, the first page (`offset` 0, the default `limit`). */
+  page?: C9pPageParams | null;
+}
 
 /**
- * `memory.list` result: memory files grouped by project, as the GUI's
- * `get_memory_files` reads them.
+ * `memory.list` result: one page of memory files grouped by project, as
+ * the GUI's `get_memory_files` reads them. A page item is a project.
  */
 export interface C9pMemoryListResult {
+  /** `offset` of the next page; `null` after the last one. */
+  nextOffset: number | null;
+  offset: number;
   projects: C9pProjectMemory[];
+  /** Projects in the whole list. */
+  total: number;
 }
 
 /** Message type enumeration */
@@ -784,9 +816,21 @@ export interface C9pOpencodeStatus {
 /** `provider.opencode.status` params. There are none yet. */
 export type C9pOpencodeStatusParams = Record<string, unknown>;
 
-/** A window of a list: `limit` items from `offset`. */
+/**
+ * A window of a list: at most `limit` items from `offset`.
+ *
+ * A page also stops before its items would pass a byte budget (half of
+ * `limits.maxFrame`), so it can hold fewer than `limit` items. A page from
+ * an `offset` before the end always holds at least one item, so
+ * `nextOffset` always moves forward. An item too large for the budget on
+ * its own comes alone, with its large text replaced by a short note and
+ * `truncated: true`.
+ */
 export interface C9pPageParams {
-  /** At most this many items; without it, all from `offset`. */
+  /**
+   * At most this many items. Default 200; a value over 1000 is treated
+   * as 1000; 0 is `bad_request`.
+   */
   limit?: number | null;
   offset?: number;
 }
