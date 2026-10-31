@@ -33,7 +33,7 @@ jobs:
         run: |
           npm run lint:data
           npm run test:lint-data
-          node --conditions=browser --test scripts/test-data-client.mjs
+          node --conditions=browser --test scripts/test-data-client.mjs scripts/test-annotations.mjs
 
       - name: Svelte check
         run: npm run check

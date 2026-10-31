@@ -36,6 +36,10 @@ export function annotationFeed(t: Transport, apply: (rows: AnnotationMap) => voi
         unsubscribe?.(); unsubscribe = null;
         failed(error);
         if (retry) clearTimeout(retry);
+        retry = null;
+        // A denied method/topic cannot recover by replaying the same request.
+        // Keep the last snapshot and expose the error until this feed is recreated.
+        if (error && typeof error === 'object' && 'code' in error && error.code === 'not_allowed') return;
         retry = setTimeout(() => { retry = null; void refresh(); }, 1000);
     }
     async function refresh() {

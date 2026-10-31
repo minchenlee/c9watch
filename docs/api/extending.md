@@ -53,6 +53,8 @@ c9watch annotate list --session-key 'claudeCode:session-id' --namespace ci
 c9watch annotate delete 'claudeCode:session-id' ci/tests
 ```
 
+These shortcuts print the JSON result object, without the c9p response frame: list prints `{annotations,cursor}`, set prints `{annotation}`, and delete prints `{deleted}`. Use `c9watch api annotation.list '{}'` for the complete protocol response.
+
 These commands require an engine-enabled build. They use c9p and the same admission rules as any other client. SQLite is not a write interface.
 
 ### Patches and sequences
@@ -94,6 +96,8 @@ A supplied foreign namespace is refused with `not_allowed`. Local patches requir
 Labels are trimmed, stripped of control characters and truncated at 32 characters. Units have at most 12 characters and no controls. Formats use a namespace-style identifier of at most 32 bytes; known hints include `integer`, `percent`, `bytes`, `relative-time` and `badge`.
 
 Limits are 32 keys per source per target, 128 keys per target, and 2,000 keys per source across targets. One patch touches 1–32 keys; limits are checked on the resulting map, so a clear and replacement can fit at capacity. Writes share a principal budget of 10/s with a burst of 20, across connections and sources. Count and rate limits return `limit_exceeded`. Invalid shapes and TTLs return `bad_request`; a target without a live session returns `unknown_session`.
+
+Source records (including sequence watermarks with no keys) also have limits: 128 per target and 2,000 per source across targets. At capacity, creating a new record returns `limit_exceeded`; existing sources can still update or clear keys. Unsequenced empty sources are removed after clears/expiry, and absent-key deletes without a sequence create no source record. Accepted sequence watermarks are retained until target cleanup, so clearing/expiry/restart never admits stale sequences.
 
 Patch `ttlMs` is 1 ms through 24 hours, independently assigned to each touched key. Set `ttlSeconds` is 60 seconds through 24 hours. List excludes expired keys immediately; each detection tick sweeps expired rows, even if provider observation fails. Persistent rows are removed 30 days after their target disappears. Return before that deadline cancels cleanup; disappearance times survive restarts.
 

@@ -61,8 +61,22 @@ fn request(action: Action) -> Result<(&'static str, Value), String> {
     })
 }
 pub fn run(action: Action, pretty: bool) -> Result<(), String> {
+    use super::engine_client::{
+        current_exe, ensure_engine, error_line, process_env, refuse_agent_caller, ConnectError,
+        EngineConn,
+    };
+    use crate::engine::home::{engine_home, sock_path};
+
     let (method, params) = request(action)?;
-    super::engine_client::cmd_api(method, &params.to_string(), pretty)
+    refuse_agent_caller(&process_env)?;
+    let home = engine_home()?;
+    ensure_engine(&home, &current_exe()?)?;
+    let mut conn = EngineConn::connect(&sock_path(&home)).map_err(ConnectError::into_msg)?;
+    let response = conn.call(method, params)?;
+    if !response.ok {
+        return Err(error_line(&response));
+    }
+    super::print_json(&response.result.unwrap_or_default(), pretty)
 }
 #[cfg(test)]
 mod tests {

@@ -2427,6 +2427,9 @@ mod tests {
                 "provider.opencode.connect",
                 "events.unsubscribe",
                 "auth.can",
+                "annotation.set",
+                "annotation.delete",
+                "annotation.patch",
             ]
             .contains(m)
             {

@@ -63,3 +63,37 @@ test('annotation identity includes kind, session and key; Classic has no annotat
     }
     assert.match(readFileSync(new URL('../tests/visual/classic/fixtures/index.ts',import.meta.url),'utf8'),/export const annotations/);
 });
+test('not_allowed is terminal for requests, subscription admission and active streams', async () => {
+    for (const phase of ['request', 'subscribe', 'during-subscribe', 'stream']) {
+        const feed = load(); const seen = []; const errors = [];
+        const denied = {code:'not_allowed',msg:'annotation access denied',retryable:false};
+        let requests = 0; let subscriptions = 0; let stops = 0; let receive;
+        const transport = {
+            async request() {
+                requests++;
+                if (phase === 'request') throw denied;
+                return {annotations:[row('ci/x',1)],cursor:'m:e:1'};
+            },
+            async subscribe(_p, cb) {
+                subscriptions++; receive = cb;
+                if (phase === 'subscribe') throw denied;
+                if (phase === 'during-subscribe') cb({v:1,ok:false,error:denied});
+                return () => {stops++;};
+            }
+        };
+        const stop = feed.annotationFeed(transport, m => seen.push(values(m)), e => errors.push(e));
+        await settle();
+        if (phase === 'stream') {
+            receive({v:1,ok:false,error:denied});
+            receive(change('ci',{late:row('ci/late',9)}));
+            assert.deepEqual(seen.at(-1),[['ci/x',1]]);
+        }
+        assert.equal(errors.at(-1),denied,phase);
+        assert.equal(feed.timers.length,0,phase);
+        assert.equal(requests,1,phase);
+        assert.equal(subscriptions,phase === 'request' ? 0 : 1,phase);
+        if (phase === 'stream' || phase === 'during-subscribe') assert.equal(stops,1,phase);
+        stop();
+        if (phase === 'stream' || phase === 'during-subscribe') assert.equal(stops,1,phase);
+    }
+});

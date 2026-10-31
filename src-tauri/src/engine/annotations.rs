@@ -13,6 +13,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_TTL_MS: u64 = 86_400_000;
 pub const TARGET_GRACE_MS: i64 = 30 * 86_400_000;
+// Reserve bounded source slots, including sequence tombstones. Evicting an
+// accepted watermark would let an old request resurrect a cleared/expired key.
+const MAX_SOURCES_PER_TARGET: i64 = 128;
+const MAX_TARGETS_PER_SOURCE: i64 = 2000;
 pub fn is_write(method: &str) -> bool {
     matches!(
         method,
@@ -354,7 +358,8 @@ fn apply(
             "target is not a live session",
         )));
     }
-    let previous=tx.query_row("SELECT last_seq FROM annotation_sources WHERE target_kind=?1 AND target_id=?2 AND namespace=?3",params![p.target.kind,p.target.session_key,p.source],|r|r.get::<_,Option<i64>>(0)).optional()?.flatten();
+    let source_seq=tx.query_row("SELECT last_seq FROM annotation_sources WHERE target_kind=?1 AND target_id=?2 AND namespace=?3",params![p.target.kind,p.target.session_key,p.source],|r|r.get::<_,Option<i64>>(0)).optional()?;
+    let previous = source_seq.flatten();
     let before = source_map(tx, &p.target, &p.source, now)?;
     if p.seq.zip(previous).is_some_and(|(n, old)| n <= old) {
         return Ok(Ok(json!(AnnotationPatchResult {
@@ -384,7 +389,29 @@ fn apply(
             "annotation key count exceeded (32/source/target, 128/target, 2000/source)",
         )));
     }
-    tx.execute("INSERT INTO annotation_sources(target_kind,target_id,namespace,last_seq) VALUES (?1,?2,?3,?4) ON CONFLICT(target_kind,target_id,namespace) DO UPDATE SET last_seq=coalesce(excluded.last_seq,last_seq),gone_at=NULL",params![p.target.kind,p.target.session_key,p.source,p.seq])?;
+    let keep_source = !names.is_empty() || p.seq.is_some() || previous.is_some();
+    if keep_source && source_seq.is_none() {
+        let target_sources: i64 = tx.query_row(
+            "SELECT count(*) FROM annotation_sources WHERE target_kind=?1 AND target_id=?2",
+            params![p.target.kind, p.target.session_key],
+            |r| r.get(0),
+        )?;
+        let source_targets: i64 = tx.query_row(
+            "SELECT count(*) FROM annotation_sources WHERE namespace=?1",
+            [&p.source],
+            |r| r.get(0),
+        )?;
+        if target_sources >= MAX_SOURCES_PER_TARGET || source_targets >= MAX_TARGETS_PER_SOURCE {
+            return Ok(Err(limit(
+                "annotation source record count exceeded (128/target, 2000/source)",
+            )));
+        }
+    }
+    if keep_source {
+        tx.execute("INSERT INTO annotation_sources(target_kind,target_id,namespace,last_seq) VALUES (?1,?2,?3,?4) ON CONFLICT(target_kind,target_id,namespace) DO UPDATE SET last_seq=coalesce(excluded.last_seq,last_seq),gone_at=NULL",params![p.target.kind,p.target.session_key,p.source,p.seq])?;
+    } else {
+        tx.execute("DELETE FROM annotation_sources WHERE target_kind=?1 AND target_id=?2 AND namespace=?3 AND last_seq IS NULL",params![p.target.kind,p.target.session_key,p.source])?;
+    }
     for (name, v) in &p.values {
         if let Some(v) = v {
             let (ty, class) = value_info(v);
@@ -524,6 +551,9 @@ pub fn sweep(tx: &mut Tx, now: i64) -> rusqlite::Result<()> {
         "DELETE FROM annotation_sources WHERE gone_at<=?1",
         [now - TARGET_GRACE_MS],
     )?;
+    // No sequence to preserve: release slots after expiry or legacy no-op
+    // deletes, even while the target remains live.
+    tx.execute("DELETE FROM annotation_sources WHERE last_seq IS NULL AND NOT EXISTS(SELECT 1 FROM annotations a WHERE a.target_kind=annotation_sources.target_kind AND a.target_id=annotation_sources.target_id AND a.namespace=annotation_sources.namespace)", [])?;
     tx.execute(
         "DELETE FROM annotation_rates WHERE updated_at<?1",
         [now - MAX_TTL_MS as i64],
@@ -719,6 +749,204 @@ mod tests {
             .unwrap(),
             2
         );
+    }
+    #[test]
+    fn empty_unsequenced_sources_do_not_accumulate_and_expiry_releases_them() {
+        let (_t, db) = db();
+        for i in 0..256 {
+            let source = format!("source{i}");
+            let at = 1000 + i * 300;
+            let absent = parse(
+                "annotation.delete",
+                json!({
+                    "target":{"kind":"session","sessionKey":"claudeCode:s"},
+                    "key":format!("{source}/x")
+                }),
+            )
+            .unwrap();
+            db.write_blocking(move |tx| {
+                apply(tx, &absent, "local-unverified", "annotation.delete", at)
+            })
+            .unwrap()
+            .0
+            .unwrap();
+            assert_eq!(
+                db.reader()
+                    .unwrap()
+                    .query_row("SELECT count(*) FROM annotation_sources", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            apply_at(
+                &db,
+                patch(request(
+                    &source,
+                    json!({"x":{"type":"bool","v":true}}),
+                    None,
+                    None,
+                )),
+                at + 100,
+            )
+            .unwrap();
+            apply_at(
+                &db,
+                patch(request(&source, json!({"x":null}), None, None)),
+                at + 200,
+            )
+            .unwrap();
+        }
+        db.write_blocking(|tx| {
+            assert_eq!(tx.query_row("SELECT count(*) FROM annotation_sources", [], |r| r.get::<_, i64>(0))?, 0);
+            // Also collect records left by the old absent-delete implementation.
+            tx.execute("INSERT INTO annotation_sources(target_kind,target_id,namespace) VALUES ('session','claudeCode:s','legacy')", [])?;
+            Ok(())
+        }).unwrap();
+        apply_at(
+            &db,
+            patch(request(
+                "ttl",
+                json!({"x":{"type":"bool","v":true}}),
+                None,
+                Some(1),
+            )),
+            100_000,
+        )
+        .unwrap();
+        db.write_blocking(|tx| {
+            sweep(tx, 100_001)?;
+            assert_eq!(
+                tx.query_row("SELECT count(*) FROM annotation_sources", [], |r| r
+                    .get::<_, i64>(0))?,
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+    #[test]
+    fn sequence_tombstones_are_bounded_without_evicting_accepted_watermarks() {
+        let (t, db) = db();
+        // Reserve one slot via a value, then expiry. Reserve the others with
+        // sequenced clears against absent keys; none may disappear on a sweep.
+        apply_at(
+            &db,
+            patch(request(
+                "source0",
+                json!({"x":{"type":"bool","v":true}}),
+                Some(5),
+                Some(1),
+            )),
+            1000,
+        )
+        .unwrap();
+        for i in 1..MAX_SOURCES_PER_TARGET {
+            apply_at(
+                &db,
+                patch(request(
+                    &format!("source{i}"),
+                    json!({"x":null}),
+                    Some(5),
+                    None,
+                )),
+                1000 + i * 100,
+            )
+            .unwrap();
+        }
+        db.write_blocking(|tx| sweep(tx, 20_000)).unwrap();
+        let head = db.head_cursor();
+        let err = apply_at(
+            &db,
+            patch(request("overflow", json!({"x":null}), Some(1), None)),
+            20_100,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::LimitExceeded);
+        assert_eq!(db.head_cursor(), head);
+        let err = apply_at(
+            &db,
+            patch(request(
+                "overflow",
+                json!({"x":{"type":"bool","v":true}}),
+                None,
+                None,
+            )),
+            20_200,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::LimitExceeded);
+        // No-op unsequenced deletes remain harmless at capacity.
+        apply_at(
+            &db,
+            patch(request("overflow", json!({"x":null}), None, None)),
+            20_300,
+        )
+        .unwrap();
+        drop(db);
+        let db = super::super::db::open(&t.path().join("engine"), "m").unwrap();
+        let stale = apply_at(
+            &db,
+            patch(request(
+                "source0",
+                json!({"x":{"type":"bool","v":true}}),
+                Some(5),
+                None,
+            )),
+            20_400,
+        )
+        .unwrap();
+        assert_eq!(stale["applied"], false);
+        assert!(stale["values"].as_object().unwrap().is_empty());
+        // Existing source operations still work at capacity. An unsequenced
+        // clear must preserve the earlier sequenced watermark.
+        apply_at(
+            &db,
+            patch(request(
+                "source0",
+                json!({"x":{"type":"bool","v":true}}),
+                Some(6),
+                None,
+            )),
+            20_500,
+        )
+        .unwrap();
+        apply_at(
+            &db,
+            patch(request("source0", json!({"x":null}), None, None)),
+            20_600,
+        )
+        .unwrap();
+        drop(db);
+        let db = super::super::db::open(&t.path().join("engine"), "m").unwrap();
+        let stale = apply_at(
+            &db,
+            patch(request(
+                "source0",
+                json!({"x":{"type":"bool","v":true}}),
+                Some(6),
+                None,
+            )),
+            20_700,
+        )
+        .unwrap();
+        assert_eq!(stale["applied"], false);
+        db.write_blocking(|tx| {
+            assert_eq!(
+                tx.query_row("SELECT count(*) FROM annotation_sources", [], |r| r
+                    .get::<_, i64>(0))?,
+                MAX_SOURCES_PER_TARGET
+            );
+            tx.execute("UPDATE agents SET gone_at=21000", [])?;
+            track_targets(tx, 21_000)?;
+            sweep(tx, 21_000 + TARGET_GRACE_MS)?;
+            assert_eq!(
+                tx.query_row("SELECT count(*) FROM annotation_sources", [], |r| r
+                    .get::<_, i64>(0))?,
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
     }
     #[test]
     fn thirty_third_key_is_refused_atomically_but_replace_at_capacity_works() {
@@ -996,7 +1224,7 @@ mod tests {
         .unwrap();
         let c = db.reader().unwrap();
         let rows: Vec<(String, String, String)> = c
-            .prepare("SELECT payload_hash,annotation_keys,coalesce(reason,'') FROM audit")
+            .prepare("SELECT payload_hash,annotation_keys,coalesce(reason,'') FROM audit WHERE method IN ('annotation.set','annotation.delete')")
             .unwrap()
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .unwrap()

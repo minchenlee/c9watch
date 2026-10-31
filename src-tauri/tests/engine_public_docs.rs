@@ -314,6 +314,11 @@ print('python annotation patch and event replay: ok')
         "claudeCode:annotation-session",
     ]));
     assert_eq!(listed[0]["annotations"].as_array().unwrap().len(), 2);
+    assert!(listed[0]["cursor"].is_string());
+    assert!(
+        listed[0].get("result").is_none(),
+        "annotate prints the result, not a response frame"
+    );
     let exported = lines(&f.run(&["export", "annotations"]));
     assert_eq!(exported.len(), 2);
     assert!(!serde_json::to_string(&exported)
@@ -343,4 +348,5 @@ print('python annotation patch and event replay: ok')
         "ci/tests",
     ]));
     assert_eq!(deleted[0]["deleted"], true);
+    assert!(deleted[0].get("result").is_none());
 }
