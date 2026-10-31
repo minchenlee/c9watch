@@ -51,7 +51,12 @@
         },
         "mode": {
           "description": "`free`. `managed` comes in C1b and answers `unsupported_in_c1a`.",
-          "type": "string"
+          "enum": [
+            "free",
+            "managed"
+          ],
+          "type": "string",
+          "x-open-enum": true
         },
         "name": {
           "description": "A display name: letters, digits, `.`, `_` and `-`, unique among\nthe live engine agents.",
@@ -134,7 +139,8 @@
         "subagent",
         "internal"
       ],
-      "type": "string"
+      "type": "string",
+      "x-open-enum": true
     },
     "AgentListParams": {
       "description": "`agent.list` params.",
@@ -194,7 +200,12 @@
       "properties": {
         "control": {
           "description": "`pty` or `none`.",
+          "enum": [
+            "pty",
+            "none"
+          ],
           "type": "string",
+          "x-open-enum": true,
           "x-sensitivity": "public"
         },
         "createdAt": {
@@ -244,7 +255,8 @@
         },
         "interruptedNotePending": {
           "type": "boolean",
-          "x-sensitivity": "public"
+          "x-sensitivity": "public",
+          "x-visibility": "internal"
         },
         "lastSeen": {
           "description": "Unix ms of a detection tick that saw the agent. While nothing else\nin the row changes, it moves at most once a minute.",
@@ -265,10 +277,16 @@
         },
         "mode": {
           "description": "`managed` or `free`; `null` for an observed agent.",
+          "enum": [
+            "managed",
+            "free",
+            null
+          ],
           "type": [
             "string",
             "null"
           ],
+          "x-open-enum": true,
           "x-sensitivity": "public"
         },
         "name": {
@@ -310,11 +328,19 @@
         "resumeCount": {
           "format": "int64",
           "type": "integer",
-          "x-sensitivity": "public"
+          "x-sensitivity": "public",
+          "x-visibility": "internal"
         },
         "role": {
           "description": "`human`, `orch`, `worker` or `observed`.",
+          "enum": [
+            "human",
+            "orch",
+            "worker",
+            "observed"
+          ],
           "type": "string",
+          "x-open-enum": true,
           "x-sensitivity": "public"
         },
         "sessionKey": {
@@ -327,7 +353,13 @@
         },
         "source": {
           "description": "`detected`, `engine` or `legacy_import`.",
+          "enum": [
+            "detected",
+            "engine",
+            "legacy_import"
+          ],
           "type": "string",
+          "x-open-enum": true,
           "x-sensitivity": "public"
         },
         "startedAt": {
@@ -341,10 +373,26 @@
         },
         "state": {
           "description": "Engine lifecycle state (`creating`, `starting`, `ready`, `working`,\n`blocked`, `paused`, `refreshing`, `interrupted`, `retiring`,\n`retired`, `failed`, `orphaned`); `null` for an observed agent.",
+          "enum": [
+            "creating",
+            "starting",
+            "ready",
+            "working",
+            "blocked",
+            "paused",
+            "refreshing",
+            "interrupted",
+            "retiring",
+            "retired",
+            "failed",
+            "orphaned",
+            null
+          ],
           "type": [
             "string",
             "null"
           ],
+          "x-open-enum": true,
           "x-sensitivity": "public"
         },
         "stateReason": {
@@ -353,14 +401,23 @@
             "string",
             "null"
           ],
-          "x-sensitivity": "metadata"
+          "x-sensitivity": "metadata",
+          "x-visibility": "internal"
         },
         "status": {
           "description": "The detected session status: `working`, `needs_attention`,\n`waiting_for_input` or `connecting`.",
+          "enum": [
+            "working",
+            "needs_attention",
+            "waiting_for_input",
+            "connecting",
+            null
+          ],
           "type": [
             "string",
             "null"
           ],
+          "x-open-enum": true,
           "x-sensitivity": "public"
         }
       },
@@ -988,7 +1045,8 @@
           "description": "An engine-side failure.",
           "type": "string"
         }
-      ]
+      ],
+      "x-open-enum": true
     },
     "EventFrame": {
       "description": "One event on the wire (A:203). `sub` is the `id` of the subscribe\nrequest, so a connection can carry several subscriptions.",
@@ -1052,7 +1110,8 @@
       "enum": [
         "event"
       ],
-      "type": "string"
+      "type": "string",
+      "x-open-enum": true
     },
     "HandoffParams": {
       "description": "`agent.handoff` params (`c9watch-agent handoff --note -`). The wire\nformat is fixed now; the engine answers `unsupported_in_c1a` until C1b.",
@@ -1278,7 +1337,8 @@
           "description": "The process inherited `CLAUDE_CODE_CHILD_SESSION`, so Claude Code\nturned off its registry entry and transcript.",
           "type": "string"
         }
-      ]
+      ],
+      "x-open-enum": true
     },
     "HistoryEntry": {
       "description": "A deduplicated, enriched history entry returned to the frontend",
@@ -1705,7 +1765,8 @@
         "ToolResult",
         "System"
       ],
-      "type": "string"
+      "type": "string",
+      "x-open-enum": true
     },
     "MethodInfo": {
       "description": "One method in `hello.result.methods`.",
@@ -1819,7 +1880,8 @@
         "result",
         "system"
       ],
-      "type": "string"
+      "type": "string",
+      "x-open-enum": true
     },
     "MsgSendParams": {
       "description": "`msg.send` params. The envelope's `idem` makes a resend safe: the same\nsender, key and request get the first message back.",
@@ -1871,7 +1933,15 @@
         },
         "state": {
           "description": "The message's state now: `queued` for a new message.",
+          "enum": [
+            "queued",
+            "delivering",
+            "delivered",
+            "failed",
+            "uncertain"
+          ],
           "type": "string",
+          "x-open-enum": true,
           "x-sensitivity": "public"
         },
         "to": {
@@ -1922,7 +1992,15 @@
         },
         "state": {
           "description": "`queued`, `delivering`, `delivered`, `failed` or `uncertain`.",
+          "enum": [
+            "queued",
+            "delivering",
+            "delivered",
+            "failed",
+            "uncertain"
+          ],
           "type": "string",
+          "x-open-enum": true,
           "x-sensitivity": "public"
         },
         "to": {
@@ -1986,7 +2064,12 @@
         },
         "status": {
           "description": "`needs_attention` or `waiting_for_input`.",
+          "enum": [
+            "needs_attention",
+            "waiting_for_input"
+          ],
           "type": "string",
+          "x-open-enum": true,
           "x-sensitivity": "public"
         },
         "title": {
@@ -2016,7 +2099,8 @@
         "project",
         "application"
       ],
-      "type": "string"
+      "type": "string",
+      "x-open-enum": true
     },
     "OpencodeConnectParams": {
       "description": "`provider.opencode.connect` params: the OpenCode server detection\nreads. An empty `url` disconnects. The engine keeps the credentials in\nmemory only and never returns them.",
@@ -2164,7 +2248,8 @@
       "enum": [
         "progress"
       ],
-      "type": "string"
+      "type": "string",
+      "x-open-enum": true
     },
     "ProjectCost": {
       "properties": {
@@ -2492,7 +2577,8 @@
         "background",
         "unknown"
       ],
-      "type": "string"
+      "type": "string",
+      "x-open-enum": true
     },
     "SessionListParams": {
       "description": "`session.list` params. There are none yet; the engine ignores any it\ngets.",
@@ -2522,7 +2608,8 @@
         "pi",
         "opencode"
       ],
-      "type": "string"
+      "type": "string",
+      "x-open-enum": true
     },
     "SessionRenameParams": {
       "description": "`session.rename` params: set a Claude Code session's custom title.",
@@ -2575,7 +2662,8 @@
           "description": "Session starting up or no recent activity",
           "type": "string"
         }
-      ]
+      ],
+      "x-open-enum": true
     },
     "SessionStopParams": {
       "description": "`session.stop` params: stop an observed Claude Code session with\nSIGTERM. The pid comes from the engine's own detection.",
@@ -2609,7 +2697,8 @@
         "cursor",
         "unknown"
       ],
-      "type": "string"
+      "type": "string",
+      "x-open-enum": true
     },
     "SessionTasksParams": {
       "description": "`session.tasks` params.",
@@ -2980,7 +3069,8 @@
         "unavailable",
         "unknown"
       ],
-      "type": "string"
+      "type": "string",
+      "x-open-enum": true
     },
     "SubagentInfo": {
       "description": "A subagent invocation found in a parent session's JSONL.",
@@ -3073,7 +3163,8 @@
         "running",
         "completed"
       ],
-      "type": "string"
+      "type": "string",
+      "x-open-enum": true
     },
     "SubagentTranscript": {
       "description": "Full transcript of a single subagent invocation — the prompt (Agent tool\ninput), the final result text, and usage stats when available.",
@@ -3486,7 +3577,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
   "apiMinor": 6,
-  "description": "The c9watch engine protocol: one JSON object per line over the engine socket. Within a major version every change is additive.",
+  "description": "Preview: the c9watch engine protocol. One JSON object per line over the engine socket. A preview minor may break a method; check breakingSince.",
   "frames": {
     "event": {
       "$ref": "#/$defs/EventFrame"
@@ -3518,7 +3609,8 @@
       "result": {
         "$ref": "#/$defs/HandoffResult"
       },
-      "x-stability": "internal"
+      "x-stability": "internal",
+      "x-visibility": "internal"
     },
     "agent.list": {
       "params": {
@@ -3632,7 +3724,8 @@
       "result": {
         "$ref": "#/$defs/HookResult"
       },
-      "x-stability": "internal"
+      "x-stability": "internal",
+      "x-visibility": "internal"
     },
     "hook.permission_denied": {
       "params": {
@@ -3641,7 +3734,8 @@
       "result": {
         "$ref": "#/$defs/HookResult"
       },
-      "x-stability": "internal"
+      "x-stability": "internal",
+      "x-visibility": "internal"
     },
     "hook.permission_request": {
       "params": {
@@ -3650,7 +3744,8 @@
       "result": {
         "$ref": "#/$defs/HookResult"
       },
-      "x-stability": "internal"
+      "x-stability": "internal",
+      "x-visibility": "internal"
     },
     "hook.post_tool_use": {
       "params": {
@@ -3659,7 +3754,8 @@
       "result": {
         "$ref": "#/$defs/HookResult"
       },
-      "x-stability": "internal"
+      "x-stability": "internal",
+      "x-visibility": "internal"
     },
     "hook.session_start": {
       "params": {
@@ -3668,7 +3764,8 @@
       "result": {
         "$ref": "#/$defs/HookResult"
       },
-      "x-stability": "internal"
+      "x-stability": "internal",
+      "x-visibility": "internal"
     },
     "hook.stop": {
       "params": {
@@ -3677,7 +3774,8 @@
       "result": {
         "$ref": "#/$defs/HookResult"
       },
-      "x-stability": "internal"
+      "x-stability": "internal",
+      "x-visibility": "internal"
     },
     "hook.user_prompt_submit": {
       "params": {
@@ -3686,7 +3784,8 @@
       "result": {
         "$ref": "#/$defs/HookResult"
       },
-      "x-stability": "internal"
+      "x-stability": "internal",
+      "x-visibility": "internal"
     },
     "memory.list": {
       "params": {
@@ -3821,7 +3920,8 @@
       "result": {
         "$ref": "#/$defs/TaskDoneResult"
       },
-      "x-stability": "internal"
+      "x-stability": "internal",
+      "x-visibility": "internal"
     },
     "usage.subscriptions": {
       "params": {
@@ -3875,7 +3975,8 @@
       "data": {
         "$ref": "#/$defs/LegacyInboxEvent"
       },
-      "x-stability": "internal"
+      "x-stability": "internal",
+      "x-visibility": "internal"
     },
     "msg.state": {
       "data": {
