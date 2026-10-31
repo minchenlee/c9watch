@@ -65,6 +65,11 @@ test('only core_unavailable permits the native fallback; denial retains the comp
     });
     await assert.rejects(bridge.tauriTransport.request('session.views',{}),e=>e.code===failure.code && e.hint===failure.hint && e.data.needs===1);
     assert.equal(calls.length,1);
+    // Tauri ACL failures are unstructured strings. They must not widen into
+    // local reads; the IPC capability gate prevents missing window grants.
+    failure='c9p_request not allowed. Permissions associated with this command: allow-c9p-request';
+    await assert.rejects(bridge.tauriTransport.request('session.views',{}),e=>e===failure);
+    assert.equal(calls.length,2);
     failure={code:'core_unavailable'};
     const result=await bridge.tauriTransport.request('session.views',{});
     assert.deepEqual(asJSON(result.sessions),asJSON(fx.sessions));
