@@ -2,9 +2,11 @@ use crate::session::parser::parse_all_entries_with_progress;
 use crate::session::{extract_messages, ImageBlock, MessageType};
 use crate::session::{find_claude_session_file_under, SessionProvider};
 use serde::Serialize;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Conversation structure
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Conversation {
@@ -27,6 +29,7 @@ pub struct ConversationProgress {
 }
 
 /// Individual message in a conversation
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationMessage {
@@ -36,15 +39,19 @@ pub struct ConversationMessage {
     /// Images attached to this message (screenshots pasted by the user)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageBlock>,
+    /// The engine replaced `content` with a short note (and dropped
+    /// `images`): the message alone was larger than a c9p page may be.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 fn claude_conversation(
+    home_dir: &Path,
     session_id: &str,
     include_tools: bool,
     on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Conversation, String> {
-    let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
-    let Some(session_file) = find_claude_session_file_under(&home_dir, session_id) else {
+    let Some(session_file) = find_claude_session_file_under(home_dir, session_id) else {
         return Err(format!(
             "Claude Code session {} not found in any project directory",
             session_id
@@ -65,6 +72,7 @@ fn claude_conversation(
                 message_type: msg_type,
                 content,
                 images,
+                truncated: false,
             },
         )
         .collect();
@@ -96,6 +104,7 @@ fn codex_conversation(
                 message_type: message.message_type,
                 content: message.content,
                 images: Vec::new(),
+                truncated: false,
             })
             .collect(),
     })
@@ -121,6 +130,7 @@ fn cursor_conversation(
                 message_type: message.message_type,
                 content: message.content,
                 images: Vec::new(),
+                truncated: false,
             })
             .collect(),
     })
@@ -146,19 +156,23 @@ fn pi_conversation(
                 message_type: message.message_type,
                 content: message.content,
                 images: Vec::new(),
+                truncated: false,
             })
             .collect(),
     })
 }
 
 fn load_for_provider(
+    home_dir: &Path,
     session_id: &str,
     provider: SessionProvider,
     include_tools: bool,
     on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Conversation, String> {
     match provider {
-        SessionProvider::ClaudeCode => claude_conversation(session_id, include_tools, on_progress),
+        SessionProvider::ClaudeCode => {
+            claude_conversation(home_dir, session_id, include_tools, on_progress)
+        }
         SessionProvider::Codex => codex_conversation(session_id, include_tools, on_progress),
         SessionProvider::Cursor => cursor_conversation(session_id, include_tools, on_progress),
         SessionProvider::Pi => pi_conversation(session_id, include_tools, on_progress),
@@ -191,6 +205,20 @@ pub fn get_conversation_data_for_provider_with_progress(
     include_tools: bool,
     on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Conversation, String> {
+    let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
+    get_conversation_data_in(&home_dir, session_id, provider, include_tools, on_progress)
+}
+
+/// `get_conversation_data_for_provider_with_progress` with Claude Code
+/// transcripts read under the user home `home_dir`. The other providers
+/// read their own stores, as there.
+pub fn get_conversation_data_in(
+    home_dir: &Path,
+    session_id: &str,
+    provider: Option<SessionProvider>,
+    include_tools: bool,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<Conversation, String> {
     let mut last_read = u64::MAX;
     let mut last_at = Instant::now()
         .checked_sub(Duration::from_secs(1))
@@ -209,11 +237,11 @@ pub fn get_conversation_data_for_provider_with_progress(
     };
 
     if let Some(provider) = provider {
-        return load_for_provider(session_id, provider, include_tools, &mut report);
+        return load_for_provider(home_dir, session_id, provider, include_tools, &mut report);
     }
 
     probe_providerless_conversation(session_id, |provider| {
-        load_for_provider(session_id, provider, include_tools, &mut report)
+        load_for_provider(home_dir, session_id, provider, include_tools, &mut report)
     })
 }
 

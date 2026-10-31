@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
 /// Protocol minor version. Raised for additive changes.
-pub const API_MINOR: u32 = 5;
+pub const API_MINOR: u32 = 6;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -166,6 +166,9 @@ pub enum ErrorCode {
     /// session itself: it cannot be stopped, it runs as another process
     /// now, or the write failed. `msg` says which.
     ActionFailed,
+    /// The engine is at a limit that frees up soon: the connection cap, or
+    /// a scan of the same kind that is still running. Retry shortly.
+    Busy,
     /// An engine-side failure.
     Internal,
 }
@@ -198,6 +201,7 @@ impl ErrorCode {
             ErrorCode::Duplicate => "duplicate",
             ErrorCode::UnknownSession => "unknown_session",
             ErrorCode::ActionFailed => "action_failed",
+            ErrorCode::Busy => "busy",
             ErrorCode::Internal => "internal",
         }
     }
@@ -206,7 +210,7 @@ impl ErrorCode {
     pub fn retryable(self) -> bool {
         matches!(
             self,
-            ErrorCode::HelloTimeout | ErrorCode::Draining | ErrorCode::Internal
+            ErrorCode::HelloTimeout | ErrorCode::Draining | ErrorCode::Busy | ErrorCode::Internal
         )
     }
 
@@ -264,6 +268,7 @@ impl ErrorCode {
             ErrorCode::Duplicate => "pass a new idem to send it again",
             ErrorCode::UnknownSession => "see `session.views` for the live session keys",
             ErrorCode::ActionFailed => "read `msg`; `session.views` shows the session now",
+            ErrorCode::Busy => "retry in a second",
             ErrorCode::Internal => "retry; if it persists, check the engine log",
         }
     }
@@ -332,6 +337,11 @@ pub struct HelloParams {
     pub client: Option<ClientInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub want: Vec<String>,
+    /// The minor the client was built against. `hello.result.breakingSince`
+    /// lists the preview methods that changed shape after it. Without it,
+    /// the engine assumes minor 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_minor: Option<u32>,
 }
 
 /// What a client says about itself in `hello`. Unverified.
@@ -347,7 +357,7 @@ pub struct ClientInfo {
 }
 
 /// `hello` result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct HelloResult {
@@ -360,6 +370,78 @@ pub struct HelloResult {
     pub capabilities: Vec<String>,
     /// Cursor of the newest committed event. `null` only without a store.
     pub cursor: Option<String>,
+    /// Every method this engine serves (minor 6).
+    #[serde(default)]
+    pub methods: std::collections::BTreeMap<String, MethodInfo>,
+    /// The preview methods whose shape changed after the client's
+    /// `apiMinor`. A client refuses to call them; it does not guess.
+    #[serde(default)]
+    pub breaking_since: Vec<String>,
+    /// `preview` until the protocol is declared stable.
+    #[serde(default)]
+    pub stability: String,
+    /// The event topics this connection can receive.
+    #[serde(default)]
+    pub topics: Vec<String>,
+    #[serde(default)]
+    pub limits: Limits,
+}
+
+/// One method in `hello.result.methods`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct MethodInfo {
+    /// The minor that added the method.
+    pub since: u32,
+    /// Goes up by one on each breaking change to the method's shape.
+    pub rev: u32,
+    /// `preview`, `internal` or `deprecated`.
+    pub stability: String,
+}
+
+/// The engine's limits, in `hello.result.limits`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct Limits {
+    /// Bytes in one frame, newline included.
+    pub max_frame: u64,
+    /// Event streams on one connection.
+    pub max_streams: u64,
+    /// Connections the socket serves at once.
+    pub max_connections: u64,
+    /// Hours the outbox keeps an event.
+    pub retention_hours: u64,
+    /// Events the outbox keeps at most.
+    pub retention_events: u64,
+}
+
+/// `events.unsubscribe` params: the `id` of the `events.subscribe` request.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct UnsubscribeParams {
+    pub sub: String,
+}
+
+/// `events.unsubscribe` result. No event frame of the stream follows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct UnsubscribeResult {
+    /// `false` when the connection held no stream with that `sub`.
+    pub ended: bool,
+}
+
+/// `ping` params. There are none.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct PingParams {}
+
+/// `ping` result: the engine's clock.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct PingResult {
+    /// Unix milliseconds.
+    pub ts: i64,
 }
 
 /// `snapshot.get` params. There are none yet; the engine ignores any it
@@ -483,6 +565,88 @@ pub struct SessionGoneEvent {
     pub id: String,
 }
 
+/// `agent.attention` data: an agent needs the user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAttentionEvent {
+    pub id: String,
+    pub generation: i64,
+    /// Why: a permission prompt, a notification, `mail_uncertain: <msg>`.
+    pub reason: String,
+    /// The message whose delivery is uncertain, for `mail_uncertain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_id: Option<String>,
+    /// The hook's `tool_use_id` (may be `null`), for a hook's attention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<serde_json::Value>,
+}
+
+/// `agent.turn_end` data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct AgentTurnEndEvent {
+    pub id: String,
+    pub generation: i64,
+    /// What saw the turn end: `hook` or `screen`.
+    pub by: String,
+    /// Unix milliseconds.
+    pub at: i64,
+}
+
+/// `agent.gone` data: the session behind an observed agent ended.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AgentGoneEvent {
+    pub id: String,
+    pub session_key: String,
+    /// Unix milliseconds.
+    pub gone_at: i64,
+}
+
+/// `agent.failed` data: a managed agent could not be started or kept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct AgentFailedEvent {
+    pub id: String,
+    pub reason: String,
+    pub detail: String,
+}
+
+/// `notification.needs_attention` and `notification.waiting_for_input`
+/// data: what the GUI shows in its system notification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationEvent {
+    /// The agent id of the session.
+    pub id: String,
+    pub session_key: String,
+    /// `needs_attention` or `waiting_for_input`.
+    pub status: String,
+    pub name: String,
+    pub pending_tool: Option<String>,
+    /// Can carry conversation text (the first prompt, a session title).
+    pub title: String,
+    /// `title` without conversation text.
+    pub redacted_title: String,
+    pub body: String,
+    pub pid: u32,
+    pub provider: crate::session::SessionProvider,
+}
+
+/// `legacy.inbox` data: one imported worker inbox line, as it was.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct LegacyInboxEvent {
+    pub legacy: bool,
+    /// The worker's agent id, when the import found its row.
+    pub id: Option<String>,
+    /// The original inbox line.
+    pub event: serde_json::Value,
+}
+
 /// `session.away` params: one request per session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
@@ -544,6 +708,250 @@ pub struct SessionRenameParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<crate::session::SessionProvider>,
 }
+
+/// `conversation.get` params: one session's transcript, as the GUI's
+/// `get_conversation` reads it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationGetParams {
+    /// `<provider>:<session id>`. A bare session id (no known provider
+    /// prefix) is looked up in every provider, or in `provider`.
+    pub session_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<crate::session::SessionProvider>,
+    /// Keep tool-use and tool-result messages. Default false, as in the GUI.
+    #[serde(default)]
+    pub include_tools: bool,
+    /// Without it, the first page (`offset` 0, the default `limit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<PageParams>,
+}
+
+/// The default `PageParams::limit`.
+pub const PAGE_DEFAULT_LIMIT: usize = 200;
+/// The largest `PageParams::limit`; a larger one is treated as this.
+pub const PAGE_MAX_LIMIT: usize = 1000;
+/// The serialized size a page's items stay under, well below
+/// `MAX_FRAME` so that the response envelope fits too.
+pub const PAGE_BUDGET: usize = MAX_FRAME / 2;
+
+/// A window of a list: at most `limit` items from `offset`.
+///
+/// A page also stops before its items would pass a byte budget (half of
+/// `limits.maxFrame`), so it can hold fewer than `limit` items. A page from
+/// an `offset` before the end always holds at least one item, so
+/// `nextOffset` always moves forward. An item too large for the budget on
+/// its own comes alone, with its large text replaced by a short note and
+/// `truncated: true`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PageParams {
+    #[serde(default)]
+    pub offset: usize,
+    /// At most this many items. Default 200; a value over 1000 is treated
+    /// as 1000; 0 is `bad_request`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "engine", schemars(range(min = 1)))]
+    pub limit: Option<usize>,
+}
+
+/// `conversation.get` result. `messages` are the page asked for, in
+/// transcript order (see `PageParams` for the page size). Each call reads
+/// the transcript again.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationGetResult {
+    pub session_id: String,
+    pub provider: crate::session::SessionProvider,
+    pub messages: Vec<crate::session::ConversationMessage>,
+    /// Messages in the whole conversation.
+    pub total: usize,
+    pub offset: usize,
+    /// `offset` of the next page; `null` after the last one.
+    pub next_offset: Option<usize>,
+}
+
+/// A `progress` frame: how far a read for request `id` has got. Sent only
+/// to a connection that asked for the `conversation.progress` capability,
+/// before that request's response. Never stored; a slow client may miss
+/// some.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ProgressFrame {
+    pub v: u32,
+    #[serde(rename = "type")]
+    pub kind: ProgressType,
+    /// The `id` of the request it reports on.
+    pub id: Option<String>,
+    pub bytes_read: u64,
+    pub bytes_total: u64,
+}
+
+/// The `type` of a progress frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub enum ProgressType {
+    #[serde(rename = "progress")]
+    Progress,
+}
+
+/// `history.list` params.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryListParams {
+    /// Without it, the first page (`offset` 0, the default `limit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<PageParams>,
+}
+
+/// `history.list` result: one page of past sessions of every provider,
+/// newest first, as the GUI's `get_session_history` lists them.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryListResult {
+    pub entries: Vec<crate::session::HistoryEntry>,
+    /// Entries in the whole history.
+    pub total: usize,
+    pub offset: usize,
+    /// `offset` of the next page; `null` after the last one.
+    pub next_offset: Option<usize>,
+}
+
+/// `history.search` params: a phrase search over Claude Code transcripts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct HistorySearchParams {
+    pub query: String,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub whole_word: bool,
+}
+
+/// `history.search` result: one hit per matching session. A blank query
+/// has none.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct HistorySearchResult {
+    pub hits: Vec<crate::session::DeepSearchHit>,
+}
+
+/// `cost.get` params. There are none yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct CostGetParams {}
+
+/// `memory.list` params.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryListParams {
+    /// Without it, the first page (`offset` 0, the default `limit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<PageParams>,
+}
+
+/// `memory.list` result: one page of memory files grouped by project, as
+/// the GUI's `get_memory_files` reads them. A page item is a project.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryListResult {
+    pub projects: Vec<crate::session::ProjectMemory>,
+    /// Projects in the whole list.
+    pub total: usize,
+    pub offset: usize,
+    /// `offset` of the next page; `null` after the last one.
+    pub next_offset: Option<usize>,
+}
+
+/// `subagent.list` params: the raw Claude Code session ids the caller
+/// shows (not session keys).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentListParams {
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+}
+
+/// `subagent.list` result: parent session id → its subagent invocations.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct SubagentListResult {
+    pub subagents: std::collections::HashMap<String, Vec<crate::session::subagents::SubagentInfo>>,
+}
+
+/// `subagent.transcript` params.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentTranscriptParams {
+    pub parent_session_id: String,
+    /// The Agent tool's `tool_use_id`.
+    pub subagent_id: String,
+}
+
+/// `session.tasks` params.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTasksParams {
+    /// The raw Claude Code session id.
+    pub session_id: String,
+}
+
+/// `session.tasks` result: the session's TodoWrite tasks as Claude Code
+/// wrote them, sorted by numeric `id`.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct SessionTasksResult {
+    pub tasks: Vec<serde_json::Value>,
+}
+
+/// `usage.subscriptions` params. There are none yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct UsageSubscriptionsParams {}
+
+/// `usage.subscriptions` result: one snapshot per provider plan. The
+/// engine reads the providers at most once a minute.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct UsageSubscriptionsResult {
+    pub usage: Vec<crate::session::subscription_usage::SubscriptionUsage>,
+}
+
+/// `provider.opencode.status` params. There are none yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct OpencodeStatusParams {}
+
+/// `provider.opencode.connect` params: the OpenCode server detection
+/// reads. An empty `url` disconnects. The engine keeps the credentials in
+/// memory only and never returns them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct OpencodeConnectParams {
+    pub url: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+/// `diag.detection` params. There are none yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct DiagDetectionParams {}
 
 /// `agent.list` params.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

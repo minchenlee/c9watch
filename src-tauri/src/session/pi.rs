@@ -972,6 +972,7 @@ pub(crate) fn pi_history_entries(home: &Path) -> Vec<crate::session::history::Hi
             provider: "pi".to_string(),
             surface: Some("cli".to_string()),
             agent_kind: Some("root".to_string()),
+            truncated: false,
         });
     }
     entries

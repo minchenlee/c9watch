@@ -43,6 +43,12 @@ pub mod detect;
 pub mod views;
 
 #[cfg(unix)]
+pub mod discovery;
+
+#[cfg(all(unix, feature = "engine"))]
+pub mod sensitivity;
+
+#[cfg(unix)]
 pub mod import;
 
 #[cfg(unix)]

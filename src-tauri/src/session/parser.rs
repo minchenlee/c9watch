@@ -94,6 +94,7 @@ pub struct SessionEntryBase {
 /// - A plain string (for actual user prompts)
 /// - An array of content blocks (for tool results sent back to Claude)
 /// A base64-encoded image found in a user message content array
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageBlock {
@@ -639,6 +640,7 @@ pub fn extract_messages(
 }
 
 /// Message type enumeration
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MessageType {
     User,

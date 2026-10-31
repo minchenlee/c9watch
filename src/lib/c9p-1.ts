@@ -2,7 +2,19 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 5;
+export const C9P_API_MINOR = 6;
+
+/** `agent.attention` data: an agent needs the user. */
+export interface C9pAgentAttentionEvent {
+  generation: number;
+  id: string;
+  /** The message whose delivery is uncertain, for `mail_uncertain`. */
+  msgId?: string | null;
+  /** Why: a permission prompt, a notification, `mail_uncertain: <msg>`. */
+  reason: string;
+  /** The hook's `tool_use_id` (may be `null`), for a hook's attention. */
+  toolUseId?: unknown;
+}
 
 /**
  * `agent.create` params. C1a creates only free agents (A:794): no brief,
@@ -25,6 +37,21 @@ export interface C9pAgentCreateParams {
 /** `agent.create` result: the agent once it is `ready`. */
 export interface C9pAgentCreateResult {
   agent: C9pAgentRow;
+}
+
+/** `agent.failed` data: a managed agent could not be started or kept. */
+export interface C9pAgentFailedEvent {
+  detail: string;
+  id: string;
+  reason: string;
+}
+
+/** `agent.gone` data: the session behind an observed agent ended. */
+export interface C9pAgentGoneEvent {
+  /** Unix milliseconds. */
+  goneAt: number;
+  id: string;
+  sessionKey: string;
 }
 
 export type C9pAgentKind = 'root' | 'subagent' | 'internal';
@@ -126,6 +153,16 @@ export interface C9pAgentRow {
   status: string | null;
 }
 
+/** `agent.turn_end` data. */
+export interface C9pAgentTurnEndEvent {
+  /** Unix milliseconds. */
+  at: number;
+  /** What saw the turn end: `hook` or `screen`. */
+  by: string;
+  generation: number;
+  id: string;
+}
+
 /** Counts of what happened after `since_ms`. */
 export interface C9pAwayActivity {
   commandsRun: number;
@@ -153,10 +190,103 @@ export interface C9pClientInfo {
 }
 
 /**
+ * `conversation.get` params: one session's transcript, as the GUI's
+ * `get_conversation` reads it.
+ */
+export interface C9pConversationGetParams {
+  /** Keep tool-use and tool-result messages. Default false, as in the GUI. */
+  includeTools?: boolean;
+  /** Without it, the first page (`offset` 0, the default `limit`). */
+  page?: C9pPageParams | null;
+  provider?: C9pSessionProvider | null;
+  /**
+   * `<provider>:<session id>`. A bare session id (no known provider
+   * prefix) is looked up in every provider, or in `provider`.
+   */
+  sessionKey: string;
+}
+
+/**
+ * `conversation.get` result. `messages` are the page asked for, in
+ * transcript order (see `PageParams` for the page size). Each call reads
+ * the transcript again.
+ */
+export interface C9pConversationGetResult {
+  messages: C9pConversationMessage[];
+  /** `offset` of the next page; `null` after the last one. */
+  nextOffset: number | null;
+  offset: number;
+  provider: C9pSessionProvider;
+  sessionId: string;
+  /** Messages in the whole conversation. */
+  total: number;
+}
+
+/** Individual message in a conversation */
+export interface C9pConversationMessage {
+  content: string;
+  /** Images attached to this message (screenshots pasted by the user) */
+  images?: C9pImageBlock[];
+  messageType: C9pMessageType;
+  timestamp: string;
+  /**
+   * The engine replaced `content` with a short note (and dropped
+   * `images`): the message alone was larger than a c9p page may be.
+   */
+  truncated?: boolean;
+}
+
+/** Aggregated cost data returned to the frontend. */
+export interface C9pCostData {
+  dailyCosts: C9pDailyCost[];
+  modelCosts: C9pModelCost[];
+  projectCosts: C9pProjectCost[];
+  totalCost: number;
+  totalTokens: number;
+  /** Tokens whose provider/model has no local USD pricing table. */
+  unpricedTokens: number;
+}
+
+/** `cost.get` params. There are none yet. */
+export type C9pCostGetParams = Record<string, unknown>;
+
+export interface C9pDailyCost {
+  cost: number;
+  date: string;
+  sessions: C9pSessionCostRecord[];
+}
+
+/** A single deep-search hit: session ID + first matching snippet (truncated). */
+export interface C9pDeepSearchHit {
+  agentKind: string;
+  modified?: string | null;
+  projectPath?: string | null;
+  provider: string;
+  sessionId: string;
+  /** Up to 200 chars of context around the first keyword match, from the matching line. */
+  snippet: string;
+  surface?: string | null;
+}
+
+/**
  * `detect.recheck` params. There are none yet; the engine ignores any it
  * gets.
  */
 export type C9pDetectRecheckParams = Record<string, unknown>;
+
+export interface C9pDetectionDiagnostics {
+  claudeProcessesFound: number;
+  fdaLikelyNeeded: boolean;
+  /**
+   * Live Claude Code sessions that Claude Code itself keeps out of its
+   * registry, so c9watch can count them but not show them.
+   */
+  hiddenClaudeSessions: C9pHiddenClaudeSession[];
+  processesWithCwd: number;
+}
+
+/** `diag.detection` params. There are none yet. */
+export type C9pDiagDetectionParams = Record<string, unknown>;
 
 /** The `error` object of a failed response. */
 export interface C9pErrorBody {
@@ -276,6 +406,11 @@ export type C9pErrorCode =
    * now, or the write failed. `msg` says which.
    */
   | 'action_failed'
+  /**
+   * The engine is at a limit that frees up soon: the connection cap, or
+   * a scan of the same kind that is still running. Retry shortly.
+   */
+  | 'busy'
   /** An engine-side failure. */
   | 'internal';
 
@@ -325,6 +460,12 @@ export interface C9pHandoffResult {
  */
 export interface C9pHelloParams {
   apiMajor?: number | null;
+  /**
+   * The minor the client was built against. `hello.result.breakingSince`
+   * lists the preview methods that changed shape after it. Without it,
+   * the engine assumes minor 0.
+   */
+  apiMinor?: number | null;
   client?: C9pClientInfo | null;
   want?: string[];
 }
@@ -333,13 +474,101 @@ export interface C9pHelloParams {
 export interface C9pHelloResult {
   apiMajor: number;
   apiMinor: number;
+  /**
+   * The preview methods whose shape changed after the client's
+   * `apiMinor`. A client refuses to call them; it does not guess.
+   */
+  breakingSince: string[];
   capabilities: string[];
   /** Cursor of the newest committed event. `null` only without a store. */
   cursor: string | null;
   engineVersion: string;
+  limits: C9pLimits;
   machineId: string;
+  /** Every method this engine serves (minor 6). */
+  methods: Record<string, C9pMethodInfo>;
   /** Stamped by the engine from connection facts. */
   principal: string;
+  /** `preview` until the protocol is declared stable. */
+  stability: string;
+  /** The event topics this connection can receive. */
+  topics: string[];
+}
+
+export interface C9pHiddenClaudeSession {
+  cwd: string | null;
+  /**
+   * `CLAUDE_PID` from the hidden process: the Claude Code process that
+   * opened the app it runs in, when it's set.
+   */
+  parentClaudePid: number | null;
+  pid: number;
+  reason: C9pHiddenReason;
+}
+
+export type C9pHiddenReason =
+  /**
+   * The process inherited `CLAUDE_CODE_CHILD_SESSION`, so Claude Code
+   * turned off its registry entry and transcript.
+   */
+  | 'childSessionMarker';
+
+/** A deduplicated, enriched history entry returned to the frontend */
+export interface C9pHistoryEntry {
+  agentKind?: string | null;
+  /** Claude Code's auto-generated title (`ai-title` in the session JSONL). */
+  aiTitle?: string | null;
+  /** Codex's current UI thread name from ~/.codex/session_index.jsonl. */
+  codexTitle?: string | null;
+  /** Cursor's current UI composer name from state.vscdb. */
+  cursorTitle?: string | null;
+  customTitle: string | null;
+  display: string;
+  project: string;
+  projectName: string;
+  provider: string;
+  sessionId: string;
+  surface?: string | null;
+  timestamp: number;
+  /**
+   * The engine replaced `display` (and any long title) with a short
+   * note: the entry was larger than a c9p page may be.
+   */
+  truncated?: boolean;
+}
+
+/** `history.list` params. */
+export interface C9pHistoryListParams {
+  /** Without it, the first page (`offset` 0, the default `limit`). */
+  page?: C9pPageParams | null;
+}
+
+/**
+ * `history.list` result: one page of past sessions of every provider,
+ * newest first, as the GUI's `get_session_history` lists them.
+ */
+export interface C9pHistoryListResult {
+  entries: C9pHistoryEntry[];
+  /** `offset` of the next page; `null` after the last one. */
+  nextOffset: number | null;
+  offset: number;
+  /** Entries in the whole history. */
+  total: number;
+}
+
+/** `history.search` params: a phrase search over Claude Code transcripts. */
+export interface C9pHistorySearchParams {
+  caseSensitive?: boolean;
+  query: string;
+  wholeWord?: boolean;
+}
+
+/**
+ * `history.search` result: one hit per matching session. A blank query
+ * has none.
+ */
+export interface C9pHistorySearchResult {
+  hits: C9pDeepSearchHit[];
 }
 
 /**
@@ -377,6 +606,95 @@ export interface C9pHookResult {
    * `hookSpecificOutput.additionalContext`.
    */
   additionalContext?: string | null;
+}
+
+/**
+ * User message structure
+ *
+ * In Claude Code's JSONL format, user message content can be either:
+ * - A plain string (for actual user prompts)
+ * - An array of content blocks (for tool results sent back to Claude)
+ * A base64-encoded image found in a user message content array
+ */
+export interface C9pImageBlock {
+  data: string;
+  mediaType: string;
+}
+
+/** `legacy.inbox` data: one imported worker inbox line, as it was. */
+export interface C9pLegacyInboxEvent {
+  /** The original inbox line. */
+  event: unknown;
+  /** The worker's agent id, when the import found its row. */
+  id: string | null;
+  legacy: boolean;
+}
+
+/** The engine's limits, in `hello.result.limits`. */
+export interface C9pLimits {
+  /** Connections the socket serves at once. */
+  maxConnections: number;
+  /** Bytes in one frame, newline included. */
+  maxFrame: number;
+  /** Event streams on one connection. */
+  maxStreams: number;
+  /** Events the outbox keeps at most. */
+  retentionEvents: number;
+  /** Hours the outbox keeps an event. */
+  retentionHours: number;
+}
+
+/** A single memory file (e.g., MEMORY.md, profile.md) */
+export interface C9pMemoryFile {
+  content: string;
+  filename: string;
+  /**
+   * The engine replaced `content` with a short note: its project was
+   * larger than a c9p page may be.
+   */
+  truncated?: boolean;
+}
+
+/** `memory.list` params. */
+export interface C9pMemoryListParams {
+  /** Without it, the first page (`offset` 0, the default `limit`). */
+  page?: C9pPageParams | null;
+}
+
+/**
+ * `memory.list` result: one page of memory files grouped by project, as
+ * the GUI's `get_memory_files` reads them. A page item is a project.
+ */
+export interface C9pMemoryListResult {
+  /** `offset` of the next page; `null` after the last one. */
+  nextOffset: number | null;
+  offset: number;
+  projects: C9pProjectMemory[];
+  /** Projects in the whole list. */
+  total: number;
+}
+
+/** Message type enumeration */
+export type C9pMessageType = 'User' | 'Assistant' | 'Thinking' | 'ToolUse' | 'ToolResult' | 'System';
+
+/** One method in `hello.result.methods`. */
+export interface C9pMethodInfo {
+  /** Goes up by one on each breaking change to the method's shape. */
+  rev: number;
+  /** The minor that added the method. */
+  since: number;
+  /** `preview`, `internal` or `deprecated`. */
+  stability: string;
+}
+
+export interface C9pModelCost {
+  cost: number;
+  costAvailable: boolean;
+  displayName: string;
+  model: string;
+  percentage: number;
+  provider: string;
+  totalTokens: number;
 }
 
 /** The agent a message went to. */
@@ -430,8 +748,140 @@ export interface C9pMsgSendResult {
   to: C9pMsgAddress;
 }
 
+/**
+ * `data` of a `msg.state` event: one per state change of a message. The
+ * event's subject is the target's `<machine>/<id>`.
+ */
+export interface C9pMsgStateEvent {
+  /** Unix ms. */
+  at: number;
+  /** Delivery attempts so far. */
+  attempts: number;
+  /**
+   * Why: for `delivered`, `prompt_hook` or `turn_open`; for `failed` and
+   * `uncertain`, what went wrong.
+   */
+  detail: string | null;
+  /** The sender's principal: `agent:<id>` or `local-unverified`. */
+  from: string;
+  msgId: string;
+  /** `queued`, `delivering`, `delivered`, `failed` or `uncertain`. */
+  state: string;
+  /** The target's agent id. */
+  to: string;
+}
+
+/**
+ * `notification.needs_attention` and `notification.waiting_for_input`
+ * data: what the GUI shows in its system notification.
+ */
+export interface C9pNotificationEvent {
+  body: string;
+  /** The agent id of the session. */
+  id: string;
+  name: string;
+  pendingTool: string | null;
+  pid: number;
+  provider: C9pSessionProvider;
+  /** `title` without conversation text. */
+  redactedTitle: string;
+  sessionKey: string;
+  /** `needs_attention` or `waiting_for_input`. */
+  status: string;
+  /** Can carry conversation text (the first prompt, a session title). */
+  title: string;
+}
+
 /** The strongest native target supported by the existing focus mechanism. */
 export type C9pOpenTarget = 'terminal' | 'project' | 'application';
+
+/**
+ * `provider.opencode.connect` params: the OpenCode server detection
+ * reads. An empty `url` disconnects. The engine keeps the credentials in
+ * memory only and never returns them.
+ */
+export interface C9pOpencodeConnectParams {
+  password?: string | null;
+  url: string;
+  username?: string;
+}
+
+export interface C9pOpencodeStatus {
+  connected: boolean;
+  error: string | null;
+  sessionCount: number;
+  url: string;
+}
+
+/** `provider.opencode.status` params. There are none yet. */
+export type C9pOpencodeStatusParams = Record<string, unknown>;
+
+/**
+ * A window of a list: at most `limit` items from `offset`.
+ *
+ * A page also stops before its items would pass a byte budget (half of
+ * `limits.maxFrame`), so it can hold fewer than `limit` items. A page from
+ * an `offset` before the end always holds at least one item, so
+ * `nextOffset` always moves forward. An item too large for the budget on
+ * its own comes alone, with its large text replaced by a short note and
+ * `truncated: true`.
+ */
+export interface C9pPageParams {
+  /**
+   * At most this many items. Default 200; a value over 1000 is treated
+   * as 1000; 0 is `bad_request`.
+   */
+  limit?: number | null;
+  offset?: number;
+}
+
+/** `ping` params. There are none. */
+export type C9pPingParams = Record<string, unknown>;
+
+/** `ping` result: the engine's clock. */
+export interface C9pPingResult {
+  /** Unix milliseconds. */
+  ts: number;
+}
+
+/**
+ * A `progress` frame: how far a read for request `id` has got. Sent only
+ * to a connection that asked for the `conversation.progress` capability,
+ * before that request's response. Never stored; a slow client may miss
+ * some.
+ */
+export interface C9pProgressFrame {
+  bytesRead: number;
+  bytesTotal: number;
+  /** The `id` of the request it reports on. */
+  id: string | null;
+  type: C9pProgressType;
+  v: number;
+}
+
+/** The `type` of a progress frame. */
+export type C9pProgressType = 'progress';
+
+export interface C9pProjectCost {
+  project: string;
+  projectName: string;
+  sessions: C9pSessionCostRecord[];
+  totalCost: number;
+}
+
+/** All memory files for a single project */
+export interface C9pProjectMemory {
+  /** Memory files found in this project */
+  files: C9pMemoryFile[];
+  /** Absolute path to the memory directory (for "Reveal in Finder") */
+  memoryDirPath: string;
+  /** Human-readable project name (last path segment, e.g. "c9watch") */
+  projectName: string;
+  /** Decoded full project path (e.g. "/Users/liminchen/Documents/GitHub/c9watch") */
+  projectPath: string;
+  /** Provider that owns this memory group. Older payloads default to Claude Code. */
+  provider: C9pSessionProvider;
+}
 
 /**
  * A request frame. Every field is optional on the wire, so that a frame
@@ -468,6 +918,35 @@ export interface C9pSessionAwayParams {
  */
 export interface C9pSessionAwayResult {
   activity: Record<string, C9pAwayActivity>;
+}
+
+/** A single session's cost record (stored in cache). */
+export interface C9pSessionCostRecord {
+  agentKind?: string | null;
+  cachedInputTokens: number;
+  cost: number;
+  costAvailable: boolean;
+  date: string;
+  inputTokens: number;
+  model: string;
+  outputTokens: number;
+  project: string;
+  projectName: string;
+  provider: string;
+  reasoningOutputTokens: number;
+  sessionId: string;
+  sessionName: string;
+  surface?: string | null;
+  timestamp: string;
+  totalTokens: number;
+}
+
+/** `session.gone` data. */
+export interface C9pSessionGoneEvent {
+  /** The provider session id. */
+  id: string;
+  /** `<provider>:<session id>`. */
+  sessionKey: string;
 }
 
 export type C9pSessionKind = 'interactive' | 'background' | 'unknown';
@@ -523,6 +1002,20 @@ export interface C9pSessionStopParams {
 }
 
 export type C9pSessionSurface = 'claudeCode' | 'app' | 'cli' | 'exec' | 'integration' | 'cursor' | 'unknown';
+
+/** `session.tasks` params. */
+export interface C9pSessionTasksParams {
+  /** The raw Claude Code session id. */
+  sessionId: string;
+}
+
+/**
+ * `session.tasks` result: the session's TodoWrite tasks as Claude Code
+ * wrote them, sorted by numeric `id`.
+ */
+export interface C9pSessionTasksResult {
+  tasks: unknown[];
+}
 
 /** Combined session information */
 export interface C9pSessionView {
@@ -640,6 +1133,74 @@ export interface C9pSnapshotResult {
  */
 export type C9pSourceHealth = 'fresh' | 'stale' | 'partial' | 'unavailable' | 'unknown';
 
+/** A subagent invocation found in a parent session's JSONL. */
+export interface C9pSubagentInfo {
+  /** `subagent_type` from the Agent tool input (e.g. "general-purpose", "Explore"). */
+  agentType: string;
+  /** ISO-8601 timestamp when the tool_result was recorded (None if still running). */
+  completedAt: string | null;
+  /** Short description of the task (`description` field of Agent tool input). */
+  description: string;
+  /** The Agent tool's `tool_use_id` — unique within the parent session. */
+  id: string;
+  /** Parent session's UUID. */
+  parentSessionId: string;
+  /** ISO-8601 timestamp when the tool_use was recorded. */
+  startedAt: string;
+  /** Running or Completed. */
+  status: C9pSubagentStatus;
+}
+
+/**
+ * `subagent.list` params: the raw Claude Code session ids the caller
+ * shows (not session keys).
+ */
+export interface C9pSubagentListParams {
+  sessionIds?: string[];
+}
+
+/** `subagent.list` result: parent session id → its subagent invocations. */
+export interface C9pSubagentListResult {
+  subagents: Record<string, C9pSubagentInfo[]>;
+}
+
+/** Status of a detected subagent. */
+export type C9pSubagentStatus = 'running' | 'completed';
+
+/**
+ * Full transcript of a single subagent invocation — the prompt (Agent tool
+ * input), the final result text, and usage stats when available.
+ */
+export interface C9pSubagentTranscript {
+  /** Internal agent id from `toolUseResult.agentId` (CC sub-agent handle). */
+  agentId: string | null;
+  agentType: string;
+  completedAt: string | null;
+  description: string;
+  durationMs: number | null;
+  id: string;
+  parentSessionId: string;
+  /** Prompt sent to the subagent (from the Agent tool_use input). */
+  prompt: string;
+  /**
+   * Final result text from the subagent, if completed. Concatenation of
+   * text blocks in the matching tool_result content array, preferring
+   * `toolUseResult.content[].text` when present.
+   */
+  result: string | null;
+  startedAt: string;
+  status: C9pSubagentStatus;
+  toolUses: number | null;
+  totalTokens: number | null;
+}
+
+/** `subagent.transcript` params. */
+export interface C9pSubagentTranscriptParams {
+  parentSessionId: string;
+  /** The Agent tool's `tool_use_id`. */
+  subagentId: string;
+}
+
 /** `events.subscribe` params (A:218). Empty filters match everything. */
 export interface C9pSubscribeParams {
   /**
@@ -662,6 +1223,15 @@ export interface C9pSubscribeParams {
 export interface C9pSubscribeResult {
   /** Where the stream starts: events after this cursor follow. */
   cursor: string;
+}
+
+export interface C9pSubscriptionUsage {
+  message: string | null;
+  name: string;
+  plan: string | null;
+  provider: string;
+  updatedAt: number | null;
+  windows: C9pUsageWindow[];
 }
 
 /** `task.done` params (`c9watch-agent task done --report`). */
@@ -692,6 +1262,36 @@ export interface C9pTickResult {
   cursor: string;
 }
 
+/** `events.unsubscribe` params: the `id` of the `events.subscribe` request. */
+export interface C9pUnsubscribeParams {
+  sub: string;
+}
+
+/** `events.unsubscribe` result. No event frame of the stream follows it. */
+export interface C9pUnsubscribeResult {
+  /** `false` when the connection held no stream with that `sub`. */
+  ended: boolean;
+}
+
+/** `usage.subscriptions` params. There are none yet. */
+export type C9pUsageSubscriptionsParams = Record<string, unknown>;
+
+/**
+ * `usage.subscriptions` result: one snapshot per provider plan. The
+ * engine reads the providers at most once a minute.
+ */
+export interface C9pUsageSubscriptionsResult {
+  usage: C9pSubscriptionUsage[];
+}
+
+export interface C9pUsageWindow {
+  label: string;
+  resetsAt: number | null;
+  usedPercent: number;
+  /** Full window length, so the UI can show how far into the window `now` is. */
+  windowSeconds: number | null;
+}
+
 /**
  * What a session needs from the user. Tool arguments are never included:
  * only the tool *name* leaves the backend.
@@ -710,6 +1310,7 @@ export type C9pWaitingFor = {
 /** The frame types on the engine socket. */
 export interface C9pFrames {
   event: C9pEventFrame;
+  progress: C9pProgressFrame;
   request: C9pRequest;
   response: C9pResponse;
 }
@@ -732,18 +1333,43 @@ export interface C9pMethods {
     params: C9pAgentRetireParams;
     result: C9pAgentRetireResult;
   };
+  'conversation.get': {
+    params: C9pConversationGetParams;
+    progress: C9pProgressFrame;
+    result: C9pConversationGetResult;
+  };
+  'cost.get': {
+    params: C9pCostGetParams;
+    result: C9pCostData;
+  };
   'detect.recheck': {
     params: C9pDetectRecheckParams;
     result: C9pTickResult;
+  };
+  'diag.detection': {
+    params: C9pDiagDetectionParams;
+    result: C9pDetectionDiagnostics;
   };
   'events.subscribe': {
     events: C9pEventFrame;
     params: C9pSubscribeParams;
     result: C9pSubscribeResult;
   };
+  'events.unsubscribe': {
+    params: C9pUnsubscribeParams;
+    result: C9pUnsubscribeResult;
+  };
   hello: {
     params: C9pHelloParams;
     result: C9pHelloResult;
+  };
+  'history.list': {
+    params: C9pHistoryListParams;
+    result: C9pHistoryListResult;
+  };
+  'history.search': {
+    params: C9pHistorySearchParams;
+    result: C9pHistorySearchResult;
   };
   'hook.notification': {
     params: C9pHookParams;
@@ -773,9 +1399,25 @@ export interface C9pMethods {
     params: C9pHookParams;
     result: C9pHookResult;
   };
+  'memory.list': {
+    params: C9pMemoryListParams;
+    result: C9pMemoryListResult;
+  };
   'msg.send': {
     params: C9pMsgSendParams;
     result: C9pMsgSendResult;
+  };
+  ping: {
+    params: C9pPingParams;
+    result: C9pPingResult;
+  };
+  'provider.opencode.connect': {
+    params: C9pOpencodeConnectParams;
+    result: C9pOpencodeStatus;
+  };
+  'provider.opencode.status': {
+    params: C9pOpencodeStatusParams;
+    result: C9pOpencodeStatus;
   };
   'session.away': {
     params: C9pSessionAwayParams;
@@ -793,6 +1435,10 @@ export interface C9pMethods {
     params: C9pSessionStopParams;
     result: C9pTickResult;
   };
+  'session.tasks': {
+    params: C9pSessionTasksParams;
+    result: C9pSessionTasksResult;
+  };
   'session.views': {
     params: C9pSessionViewsParams;
     result: C9pSessionViewsResult;
@@ -801,10 +1447,64 @@ export interface C9pMethods {
     params: C9pSnapshotParams;
     result: C9pSnapshotResult;
   };
+  'subagent.list': {
+    params: C9pSubagentListParams;
+    result: C9pSubagentListResult;
+  };
+  'subagent.transcript': {
+    params: C9pSubagentTranscriptParams;
+    result: C9pSubagentTranscript;
+  };
   'task.done': {
     params: C9pTaskDoneParams;
     result: C9pTaskDoneResult;
   };
+  'usage.subscriptions': {
+    params: C9pUsageSubscriptionsParams;
+    result: C9pUsageSubscriptionsResult;
+  };
 }
 
 export type C9pMethod = keyof C9pMethods;
+
+/** Each event topic's `data`. */
+export interface C9pTopics {
+  'agent.attention': {
+    data: C9pAgentAttentionEvent;
+  };
+  'agent.failed': {
+    data: C9pAgentFailedEvent;
+  };
+  'agent.gone': {
+    data: C9pAgentGoneEvent;
+  };
+  'agent.turn_end': {
+    data: C9pAgentTurnEndEvent;
+  };
+  'agent.upsert': {
+    data: C9pAgentRow;
+  };
+  'diag.detection': {
+    data: C9pDetectionDiagnostics;
+  };
+  'legacy.inbox': {
+    data: C9pLegacyInboxEvent;
+  };
+  'msg.state': {
+    data: C9pMsgStateEvent;
+  };
+  'notification.needs_attention': {
+    data: C9pNotificationEvent;
+  };
+  'notification.waiting_for_input': {
+    data: C9pNotificationEvent;
+  };
+  'session.gone': {
+    data: C9pSessionGoneEvent;
+  };
+  'session.view': {
+    data: C9pSessionView;
+  };
+}
+
+export type C9pTopic = keyof C9pTopics;

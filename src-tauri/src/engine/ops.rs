@@ -217,7 +217,12 @@ pub fn fail_agent(
         topic: "agent.failed".into(),
         subject: Some(format!("{}/{}", machine, agent_id)),
         origin: None,
-        data: serde_json::json!({ "id": agent_id, "reason": reason, "detail": detail }),
+        data: serde_json::to_value(crate::engine::proto::AgentFailedEvent {
+            id: agent_id.to_string(),
+            reason: reason.to_string(),
+            detail: detail.to_string(),
+        })
+        .expect("AgentFailedEvent serializes"),
     })?;
     Ok(true)
 }

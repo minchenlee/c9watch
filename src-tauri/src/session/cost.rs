@@ -303,6 +303,7 @@ fn parse_line(line: &str) -> Option<ParsedLine> {
 }
 
 /// A single session's cost record (stored in cache).
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionCostRecord {
@@ -340,6 +341,7 @@ fn default_provider() -> String {
 }
 
 /// Aggregated cost data returned to the frontend.
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CostData {
@@ -352,6 +354,7 @@ pub struct CostData {
     pub model_costs: Vec<ModelCost>,
 }
 
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailyCost {
@@ -360,6 +363,7 @@ pub struct DailyCost {
     pub sessions: Vec<SessionCostRecord>,
 }
 
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectCost {
@@ -369,6 +373,7 @@ pub struct ProjectCost {
     pub sessions: Vec<SessionCostRecord>,
 }
 
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCost {
@@ -603,11 +608,21 @@ fn codex_cost_records(home_dir: &std::path::Path) -> Vec<SessionCostRecord> {
 /// Load cache from disk, scan new/modified files, update cache, return aggregated CostData.
 pub fn get_cost_data() -> Result<CostData, String> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
-    let projects_dir = home_dir.join(".claude").join("projects");
     let cache_path = home_dir.join(".claude").join("cost-cache.json");
+    get_cost_data_in(&home_dir, &cache_path)
+}
+
+/// `get_cost_data` for the user home `home_dir`, with its cache at
+/// `cache_path`. The engine keeps its own cache file, so it never races the
+/// GUI's writes to `~/.claude/cost-cache.json`.
+pub fn get_cost_data_in(
+    home_dir: &std::path::Path,
+    cache_path: &std::path::Path,
+) -> Result<CostData, String> {
+    let projects_dir = home_dir.join(".claude").join("projects");
 
     // Load existing cache, rebuild if version mismatch (pricing/logic changed)
-    let mut cache: CostCache = std::fs::read_to_string(&cache_path)
+    let mut cache: CostCache = std::fs::read_to_string(cache_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .map(|c: CostCache| {
@@ -730,13 +745,13 @@ pub fn get_cost_data() -> Result<CostData, String> {
 
         // Write updated cache
         if let Ok(json) = serde_json::to_string(&cache) {
-            let _ = std::fs::write(&cache_path, json);
+            let _ = std::fs::write(cache_path, json);
         }
     }
 
     let mut sessions = cache.sessions;
-    sessions.extend(codex_cost_records(&home_dir));
-    sessions.extend(crate::session::pi::pi_cost_records(&home_dir));
+    sessions.extend(codex_cost_records(home_dir));
+    sessions.extend(crate::session::pi::pi_cost_records(home_dir));
     Ok(aggregate(&sessions))
 }
 

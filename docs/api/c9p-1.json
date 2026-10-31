@@ -1,5 +1,42 @@
 {
   "$defs": {
+    "AgentAttentionEvent": {
+      "description": "`agent.attention` data: an agent needs the user.",
+      "properties": {
+        "generation": {
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "id": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "msgId": {
+          "description": "The message whose delivery is uncertain, for `mail_uncertain`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "reason": {
+          "description": "Why: a permission prompt, a notification, `mail_uncertain: <msg>`.",
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "toolUseId": {
+          "description": "The hook's `tool_use_id` (may be `null`), for a hook's attention.",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "id",
+        "generation",
+        "reason"
+      ],
+      "type": "object"
+    },
     "AgentCreateParams": {
       "description": "`agent.create` params. C1a creates only free agents (A:794): no brief,\nno worktree, the given cwd.",
       "properties": {
@@ -34,11 +71,60 @@
       "description": "`agent.create` result: the agent once it is `ready`.",
       "properties": {
         "agent": {
-          "$ref": "#/$defs/AgentRow"
+          "$ref": "#/$defs/AgentRow",
+          "x-sensitivity": "conversation"
         }
       },
       "required": [
         "agent"
+      ],
+      "type": "object"
+    },
+    "AgentFailedEvent": {
+      "description": "`agent.failed` data: a managed agent could not be started or kept.",
+      "properties": {
+        "detail": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "id": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "reason": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        }
+      },
+      "required": [
+        "id",
+        "reason",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "AgentGoneEvent": {
+      "description": "`agent.gone` data: the session behind an observed agent ended.",
+      "properties": {
+        "goneAt": {
+          "description": "Unix milliseconds.",
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "id": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "sessionKey": {
+          "type": "string",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "id",
+        "sessionKey",
+        "goneAt"
       ],
       "type": "object"
     },
@@ -68,7 +154,8 @@
           "items": {
             "$ref": "#/$defs/AgentRow"
           },
-          "type": "array"
+          "type": "array",
+          "x-sensitivity": "conversation"
         }
       },
       "required": [
@@ -93,7 +180,8 @@
       "description": "`agent.retire` result: the tombstone row (A:828). Retiring a retired or\nfailed agent changes nothing and returns its row.",
       "properties": {
         "agent": {
-          "$ref": "#/$defs/AgentRow"
+          "$ref": "#/$defs/AgentRow",
+          "x-sensitivity": "conversation"
         }
       },
       "required": [
@@ -106,7 +194,8 @@
       "properties": {
         "control": {
           "description": "`pty` or `none`.",
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "createdAt": {
           "description": "Unix ms.",
@@ -114,26 +203,30 @@
           "type": [
             "integer",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "createdBy": {
           "description": "The principal that created the agent.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "metadata"
         },
         "cwd": {
           "description": "The working directory; for an observed agent, the project path.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "metadata"
         },
         "generation": {
           "description": "+1 on spawn, resume, refresh and takeover.",
           "format": "int64",
-          "type": "integer"
+          "type": "integer",
+          "x-sensitivity": "public"
         },
         "goneAt": {
           "description": "Unix ms; `null` while the agent is alive.",
@@ -141,14 +234,17 @@
           "type": [
             "integer",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "id": {
           "description": "`agt_<ulid>`.",
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "interruptedNotePending": {
-          "type": "boolean"
+          "type": "boolean",
+          "x-sensitivity": "public"
         },
         "lastSeen": {
           "description": "Unix ms of a detection tick that saw the agent. While nothing else\nin the row changes, it moves at most once a minute.",
@@ -156,71 +252,83 @@
           "type": [
             "integer",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "machineId": {
           "description": "The machine the agent runs on.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "mode": {
           "description": "`managed` or `free`; `null` for an observed agent.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "name": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "conversation"
         },
         "parentId": {
           "description": "The agent that owns this one; for an imported legacy worker, the PM\nthat adopted it.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "pid": {
           "format": "int64",
           "type": [
             "integer",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "provider": {
           "description": "The adapter kind: `claude`, `codex`, ...",
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "providerSid": {
           "description": "The provider session id of the current generation.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "resumeCount": {
           "format": "int64",
-          "type": "integer"
+          "type": "integer",
+          "x-sensitivity": "public"
         },
         "role": {
           "description": "`human`, `orch`, `worker` or `observed`.",
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "sessionKey": {
           "description": "`SessionIdentity::key()` (`<provider>:<session id>`) of the session\ndetection matched to this agent.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "source": {
           "description": "`detected`, `engine` or `legacy_import`.",
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "startedAt": {
           "description": "Unix ms, as the provider reports it.",
@@ -228,28 +336,32 @@
           "type": [
             "integer",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "state": {
           "description": "Engine lifecycle state (`creating`, `starting`, `ready`, `working`,\n`blocked`, `paused`, `refreshing`, `interrupted`, `retiring`,\n`retired`, `failed`, `orphaned`); `null` for an observed agent.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "stateReason": {
           "description": "Why the agent is in its `state`: `drain` for a `paused` or\n`interrupted` agent that an engine drain stopped; for a `failed`\nagent the failure reason, such as `spawn_failed`, `resume_failed`,\n`exited` or `create_interrupted`.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "metadata"
         },
         "status": {
           "description": "The detected session status: `working`, `needs_attention`,\n`waiting_for_input` or `connecting`.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -280,36 +392,74 @@
       ],
       "type": "object"
     },
+    "AgentTurnEndEvent": {
+      "description": "`agent.turn_end` data.",
+      "properties": {
+        "at": {
+          "description": "Unix milliseconds.",
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "by": {
+          "description": "What saw the turn end: `hook` or `screen`.",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "generation": {
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "id": {
+          "type": "string",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "id",
+        "generation",
+        "by",
+        "at"
+      ],
+      "type": "object"
+    },
     "AwayActivity": {
       "description": "Counts of what happened after `since_ms`.",
       "properties": {
         "commandsRun": {
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": "integer",
+          "x-sensitivity": "public"
         },
         "filesEdited": {
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": "integer",
+          "x-sensitivity": "public"
         },
         "partial": {
           "description": "The index dropped events newer than `since_ms`, so the counts are a\nlower bound.",
-          "type": "boolean"
+          "type": "boolean",
+          "x-sensitivity": "public"
         },
         "sinceMs": {
           "format": "int64",
-          "type": "integer"
+          "type": "integer",
+          "x-sensitivity": "public"
         },
         "subagentsCompleted": {
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": "integer",
+          "x-sensitivity": "public"
         },
         "toolCalls": {
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": "integer",
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -362,27 +512,334 @@
       },
       "type": "object"
     },
+    "ConversationGetParams": {
+      "description": "`conversation.get` params: one session's transcript, as the GUI's\n`get_conversation` reads it.",
+      "properties": {
+        "includeTools": {
+          "default": false,
+          "description": "Keep tool-use and tool-result messages. Default false, as in the GUI.",
+          "type": "boolean"
+        },
+        "page": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PageParams"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Without it, the first page (`offset` 0, the default `limit`)."
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionProvider"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sessionKey": {
+          "description": "`<provider>:<session id>`. A bare session id (no known provider\nprefix) is looked up in every provider, or in `provider`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionKey"
+      ],
+      "type": "object"
+    },
+    "ConversationGetResult": {
+      "description": "`conversation.get` result. `messages` are the page asked for, in\ntranscript order (see `PageParams` for the page size). Each call reads\nthe transcript again.",
+      "properties": {
+        "messages": {
+          "items": {
+            "$ref": "#/$defs/ConversationMessage"
+          },
+          "type": "array",
+          "x-sensitivity": "conversation"
+        },
+        "nextOffset": {
+          "description": "`offset` of the next page; `null` after the last one.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "offset": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "provider": {
+          "$ref": "#/$defs/SessionProvider",
+          "x-sensitivity": "public"
+        },
+        "sessionId": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "total": {
+          "description": "Messages in the whole conversation.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "sessionId",
+        "provider",
+        "messages",
+        "total",
+        "offset",
+        "nextOffset"
+      ],
+      "type": "object"
+    },
+    "ConversationMessage": {
+      "description": "Individual message in a conversation",
+      "properties": {
+        "content": {
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "images": {
+          "description": "Images attached to this message (screenshots pasted by the user)",
+          "items": {
+            "$ref": "#/$defs/ImageBlock"
+          },
+          "type": "array",
+          "x-sensitivity": "conversation"
+        },
+        "messageType": {
+          "$ref": "#/$defs/MessageType",
+          "x-sensitivity": "public"
+        },
+        "timestamp": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "truncated": {
+          "description": "The engine replaced `content` with a short note (and dropped\n`images`): the message alone was larger than a c9p page may be.",
+          "type": "boolean",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "timestamp",
+        "messageType",
+        "content"
+      ],
+      "type": "object"
+    },
+    "CostData": {
+      "description": "Aggregated cost data returned to the frontend.",
+      "properties": {
+        "dailyCosts": {
+          "items": {
+            "$ref": "#/$defs/DailyCost"
+          },
+          "type": "array",
+          "x-sensitivity": "metadata"
+        },
+        "modelCosts": {
+          "items": {
+            "$ref": "#/$defs/ModelCost"
+          },
+          "type": "array",
+          "x-sensitivity": "metadata"
+        },
+        "projectCosts": {
+          "items": {
+            "$ref": "#/$defs/ProjectCost"
+          },
+          "type": "array",
+          "x-sensitivity": "metadata"
+        },
+        "totalCost": {
+          "format": "double",
+          "type": "number",
+          "x-sensitivity": "metadata"
+        },
+        "totalTokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "metadata"
+        },
+        "unpricedTokens": {
+          "description": "Tokens whose provider/model has no local USD pricing table.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "metadata"
+        }
+      },
+      "required": [
+        "totalCost",
+        "totalTokens",
+        "unpricedTokens",
+        "dailyCosts",
+        "projectCosts",
+        "modelCosts"
+      ],
+      "type": "object"
+    },
+    "CostGetParams": {
+      "description": "`cost.get` params. There are none yet.",
+      "type": "object"
+    },
+    "DailyCost": {
+      "properties": {
+        "cost": {
+          "format": "double",
+          "type": "number",
+          "x-sensitivity": "metadata"
+        },
+        "date": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/SessionCostRecord"
+          },
+          "type": "array",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "date",
+        "cost",
+        "sessions"
+      ],
+      "type": "object"
+    },
+    "DeepSearchHit": {
+      "description": "A single deep-search hit: session ID + first matching snippet (truncated).",
+      "properties": {
+        "agentKind": {
+          "default": "root",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "modified": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "projectPath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "provider": {
+          "default": "claudeCode",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "sessionId": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "snippet": {
+          "description": "Up to 200 chars of context around the first keyword match, from the matching line.",
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "surface": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "sessionId",
+        "snippet",
+        "provider",
+        "agentKind"
+      ],
+      "type": "object"
+    },
     "DetectRecheckParams": {
       "description": "`detect.recheck` params. There are none yet; the engine ignores any it\ngets.",
+      "type": "object"
+    },
+    "DetectionDiagnostics": {
+      "properties": {
+        "claudeProcessesFound": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "fdaLikelyNeeded": {
+          "type": "boolean",
+          "x-sensitivity": "public"
+        },
+        "hiddenClaudeSessions": {
+          "default": [],
+          "description": "Live Claude Code sessions that Claude Code itself keeps out of its\nregistry, so c9watch can count them but not show them.",
+          "items": {
+            "$ref": "#/$defs/HiddenClaudeSession"
+          },
+          "type": "array",
+          "x-sensitivity": "metadata"
+        },
+        "processesWithCwd": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "claudeProcessesFound",
+        "processesWithCwd",
+        "fdaLikelyNeeded",
+        "hiddenClaudeSessions"
+      ],
+      "type": "object"
+    },
+    "DiagDetectionParams": {
+      "description": "`diag.detection` params. There are none yet.",
       "type": "object"
     },
     "ErrorBody": {
       "description": "The `error` object of a failed response.",
       "properties": {
         "code": {
-          "$ref": "#/$defs/ErrorCode"
+          "$ref": "#/$defs/ErrorCode",
+          "x-sensitivity": "public"
         },
         "data": {
-          "description": "Facts about this error for the caller to act on, such as the\n`nearest` name for `unknown_address`. Absent for most errors."
+          "description": "Facts about this error for the caller to act on, such as the\n`nearest` name for `unknown_address`. Absent for most errors.",
+          "x-sensitivity": "metadata"
         },
         "hint": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "metadata"
         },
         "msg": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "metadata"
         },
         "retryable": {
-          "type": "boolean"
+          "type": "boolean",
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -522,6 +979,11 @@
           "type": "string"
         },
         {
+          "const": "busy",
+          "description": "The engine is at a limit that frees up soon: the connection cap, or\na scan of the same kind that is still running. Retry shortly.",
+          "type": "string"
+        },
+        {
           "const": "internal",
           "description": "An engine-side failure.",
           "type": "string"
@@ -532,36 +994,47 @@
       "description": "One event on the wire (A:203). `sub` is the `id` of the subscribe\nrequest, so a connection can carry several subscriptions.",
       "properties": {
         "cursor": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
-        "data": true,
-        "origin": true,
+        "data": {
+          "x-sensitivity": "conversation"
+        },
+        "origin": {
+          "x-sensitivity": "metadata"
+        },
         "sub": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "subject": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "topic": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "ts": {
           "format": "int64",
-          "type": "integer"
+          "type": "integer",
+          "x-sensitivity": "public"
         },
         "type": {
-          "$ref": "#/$defs/EventType"
+          "$ref": "#/$defs/EventType",
+          "x-sensitivity": "public"
         },
         "v": {
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": "integer",
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -608,7 +1081,8 @@
       "description": "`agent.handoff` result (C1b).",
       "properties": {
         "accepted": {
-          "type": "boolean"
+          "type": "boolean",
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -620,6 +1094,15 @@
       "description": "`hello` params. `client` is the caller's own claim. The engine only logs\nit as unverified; it never decides the principal (N1).",
       "properties": {
         "apiMajor": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "apiMinor": {
+          "description": "The minor the client was built against. `hello.result.breakingSince`\nlists the preview methods that changed shape after it. Without it,\nthe engine assumes minor 0.",
           "format": "uint32",
           "minimum": 0,
           "type": [
@@ -652,35 +1135,86 @@
         "apiMajor": {
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": "integer",
+          "x-sensitivity": "public"
         },
         "apiMinor": {
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "breakingSince": {
+          "default": [],
+          "description": "The preview methods whose shape changed after the client's\n`apiMinor`. A client refuses to call them; it does not guess.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-sensitivity": "public"
         },
         "capabilities": {
           "items": {
             "type": "string"
           },
-          "type": "array"
+          "type": "array",
+          "x-sensitivity": "public"
         },
         "cursor": {
           "description": "Cursor of the newest committed event. `null` only without a store.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "engineVersion": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "limits": {
+          "$ref": "#/$defs/Limits",
+          "default": {
+            "maxConnections": 0,
+            "maxFrame": 0,
+            "maxStreams": 0,
+            "retentionEvents": 0,
+            "retentionHours": 0
+          },
+          "x-sensitivity": "public"
         },
         "machineId": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "methods": {
+          "additionalProperties": {
+            "$ref": "#/$defs/MethodInfo"
+          },
+          "default": {},
+          "description": "Every method this engine serves (minor 6).",
+          "type": "object",
+          "x-sensitivity": "public"
         },
         "principal": {
           "description": "Stamped by the engine from connection facts.",
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "stability": {
+          "default": "",
+          "description": "`preview` until the protocol is declared stable.",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "topics": {
+          "default": [],
+          "description": "The event topics this connection can receive.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -690,7 +1224,246 @@
         "machineId",
         "principal",
         "capabilities",
-        "cursor"
+        "cursor",
+        "methods",
+        "breakingSince",
+        "stability",
+        "topics",
+        "limits"
+      ],
+      "type": "object"
+    },
+    "HiddenClaudeSession": {
+      "properties": {
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "parentClaudePid": {
+          "description": "`CLAUDE_PID` from the hidden process: the Claude Code process that\nopened the app it runs in, when it's set.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "pid": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "reason": {
+          "$ref": "#/$defs/HiddenReason",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "pid",
+        "cwd",
+        "reason",
+        "parentClaudePid"
+      ],
+      "type": "object"
+    },
+    "HiddenReason": {
+      "oneOf": [
+        {
+          "const": "childSessionMarker",
+          "description": "The process inherited `CLAUDE_CODE_CHILD_SESSION`, so Claude Code\nturned off its registry entry and transcript.",
+          "type": "string"
+        }
+      ]
+    },
+    "HistoryEntry": {
+      "description": "A deduplicated, enriched history entry returned to the frontend",
+      "properties": {
+        "agentKind": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "aiTitle": {
+          "description": "Claude Code's auto-generated title (`ai-title` in the session JSONL).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "conversation"
+        },
+        "codexTitle": {
+          "description": "Codex's current UI thread name from ~/.codex/session_index.jsonl.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "conversation"
+        },
+        "cursorTitle": {
+          "description": "Cursor's current UI composer name from state.vscdb.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "conversation"
+        },
+        "customTitle": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "conversation"
+        },
+        "display": {
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "project": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "projectName": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "provider": {
+          "default": "claudeCode",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "sessionId": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "surface": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "timestamp": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "truncated": {
+          "description": "The engine replaced `display` (and any long title) with a short\nnote: the entry was larger than a c9p page may be.",
+          "type": "boolean",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "sessionId",
+        "display",
+        "timestamp",
+        "project",
+        "projectName",
+        "customTitle",
+        "provider"
+      ],
+      "type": "object"
+    },
+    "HistoryListParams": {
+      "description": "`history.list` params.",
+      "properties": {
+        "page": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PageParams"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Without it, the first page (`offset` 0, the default `limit`)."
+        }
+      },
+      "type": "object"
+    },
+    "HistoryListResult": {
+      "description": "`history.list` result: one page of past sessions of every provider,\nnewest first, as the GUI's `get_session_history` lists them.",
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/HistoryEntry"
+          },
+          "type": "array",
+          "x-sensitivity": "conversation"
+        },
+        "nextOffset": {
+          "description": "`offset` of the next page; `null` after the last one.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "offset": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "total": {
+          "description": "Entries in the whole history.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "entries",
+        "total",
+        "offset",
+        "nextOffset"
+      ],
+      "type": "object"
+    },
+    "HistorySearchParams": {
+      "description": "`history.search` params: a phrase search over Claude Code transcripts.",
+      "properties": {
+        "caseSensitive": {
+          "default": false,
+          "type": "boolean"
+        },
+        "query": {
+          "type": "string"
+        },
+        "wholeWord": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "HistorySearchResult": {
+      "description": "`history.search` result: one hit per matching session. A blank query\nhas none.",
+      "properties": {
+        "hits": {
+          "items": {
+            "$ref": "#/$defs/DeepSearchHit"
+          },
+          "type": "array",
+          "x-sensitivity": "conversation"
+        }
+      },
+      "required": [
+        "hits"
       ],
       "type": "object"
     },
@@ -730,18 +1503,284 @@
       "properties": {
         "accepted": {
           "description": "The engine took the event. A dropped event (an old generation, a\nduplicate) still gets `ok:true`, with `accepted:false`.",
-          "type": "boolean"
+          "type": "boolean",
+          "x-sensitivity": "public"
         },
         "additionalContext": {
           "description": "For `hook.session_start`: context the hook prints as\n`hookSpecificOutput.additionalContext`.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "conversation"
         }
       },
       "required": [
         "accepted"
+      ],
+      "type": "object"
+    },
+    "ImageBlock": {
+      "description": "User message structure\n\nIn Claude Code's JSONL format, user message content can be either:\n- A plain string (for actual user prompts)\n- An array of content blocks (for tool results sent back to Claude)\nA base64-encoded image found in a user message content array",
+      "properties": {
+        "data": {
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "mediaType": {
+          "type": "string",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "mediaType",
+        "data"
+      ],
+      "type": "object"
+    },
+    "LegacyInboxEvent": {
+      "description": "`legacy.inbox` data: one imported worker inbox line, as it was.",
+      "properties": {
+        "event": {
+          "description": "The original inbox line.",
+          "x-sensitivity": "conversation"
+        },
+        "id": {
+          "description": "The worker's agent id, when the import found its row.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "legacy": {
+          "type": "boolean",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "legacy",
+        "id",
+        "event"
+      ],
+      "type": "object"
+    },
+    "Limits": {
+      "description": "The engine's limits, in `hello.result.limits`.",
+      "properties": {
+        "maxConnections": {
+          "description": "Connections the socket serves at once.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "maxFrame": {
+          "description": "Bytes in one frame, newline included.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "maxStreams": {
+          "description": "Event streams on one connection.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "retentionEvents": {
+          "description": "Events the outbox keeps at most.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "retentionHours": {
+          "description": "Hours the outbox keeps an event.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "maxFrame",
+        "maxStreams",
+        "maxConnections",
+        "retentionHours",
+        "retentionEvents"
+      ],
+      "type": "object"
+    },
+    "MemoryFile": {
+      "description": "A single memory file (e.g., MEMORY.md, profile.md)",
+      "properties": {
+        "content": {
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "filename": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "truncated": {
+          "description": "The engine replaced `content` with a short note: its project was\nlarger than a c9p page may be.",
+          "type": "boolean",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "filename",
+        "content"
+      ],
+      "type": "object"
+    },
+    "MemoryListParams": {
+      "description": "`memory.list` params.",
+      "properties": {
+        "page": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PageParams"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Without it, the first page (`offset` 0, the default `limit`)."
+        }
+      },
+      "type": "object"
+    },
+    "MemoryListResult": {
+      "description": "`memory.list` result: one page of memory files grouped by project, as\nthe GUI's `get_memory_files` reads them. A page item is a project.",
+      "properties": {
+        "nextOffset": {
+          "description": "`offset` of the next page; `null` after the last one.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "offset": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "projects": {
+          "items": {
+            "$ref": "#/$defs/ProjectMemory"
+          },
+          "type": "array",
+          "x-sensitivity": "conversation"
+        },
+        "total": {
+          "description": "Projects in the whole list.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "projects",
+        "total",
+        "offset",
+        "nextOffset"
+      ],
+      "type": "object"
+    },
+    "MessageType": {
+      "description": "Message type enumeration",
+      "enum": [
+        "User",
+        "Assistant",
+        "Thinking",
+        "ToolUse",
+        "ToolResult",
+        "System"
+      ],
+      "type": "string"
+    },
+    "MethodInfo": {
+      "description": "One method in `hello.result.methods`.",
+      "properties": {
+        "rev": {
+          "description": "Goes up by one on each breaking change to the method's shape.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "since": {
+          "description": "The minor that added the method.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "stability": {
+          "description": "`preview`, `internal` or `deprecated`.",
+          "type": "string",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "since",
+        "rev",
+        "stability"
+      ],
+      "type": "object"
+    },
+    "ModelCost": {
+      "properties": {
+        "cost": {
+          "format": "double",
+          "type": "number",
+          "x-sensitivity": "metadata"
+        },
+        "costAvailable": {
+          "type": "boolean",
+          "x-sensitivity": "public"
+        },
+        "displayName": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "model": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "percentage": {
+          "format": "double",
+          "type": "number",
+          "x-sensitivity": "metadata"
+        },
+        "provider": {
+          "default": "claudeCode",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "totalTokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "metadata"
+        }
+      },
+      "required": [
+        "model",
+        "displayName",
+        "provider",
+        "cost",
+        "percentage",
+        "totalTokens",
+        "costAvailable"
       ],
       "type": "object"
     },
@@ -750,16 +1789,19 @@
       "properties": {
         "addr": {
           "description": "`<machine>/<id>`.",
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "metadata"
         },
         "id": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "name": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "conversation"
         }
       },
       "required": [
@@ -814,22 +1856,27 @@
       "properties": {
         "cursor": {
           "description": "Cursor of the message's `msg.state` `queued` event. For a replay it\nis the first send's cursor, which may be past event retention.",
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "msgId": {
           "description": "`msg_<ulid>`.",
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "replayed": {
           "description": "The same sender sent the same request with this `idem` before; no\nnew message was written.",
-          "type": "boolean"
+          "type": "boolean",
+          "x-sensitivity": "public"
         },
         "state": {
           "description": "The message's state now: `queued` for a new message.",
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "to": {
-          "$ref": "#/$defs/MsgAddress"
+          "$ref": "#/$defs/MsgAddress",
+          "x-sensitivity": "metadata"
         }
       },
       "required": [
@@ -841,6 +1888,127 @@
       ],
       "type": "object"
     },
+    "MsgStateEvent": {
+      "description": "`data` of a `msg.state` event: one per state change of a message. The\nevent's subject is the target's `<machine>/<id>`.",
+      "properties": {
+        "at": {
+          "description": "Unix ms.",
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "attempts": {
+          "description": "Delivery attempts so far.",
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "detail": {
+          "description": "Why: for `delivered`, `prompt_hook` or `turn_open`; for `failed` and\n`uncertain`, what went wrong.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "from": {
+          "description": "The sender's principal: `agent:<id>` or `local-unverified`.",
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "msgId": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "state": {
+          "description": "`queued`, `delivering`, `delivered`, `failed` or `uncertain`.",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "to": {
+          "description": "The target's agent id.",
+          "type": "string",
+          "x-sensitivity": "metadata"
+        }
+      },
+      "required": [
+        "msgId",
+        "from",
+        "to",
+        "state",
+        "at",
+        "attempts",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "NotificationEvent": {
+      "description": "`notification.needs_attention` and `notification.waiting_for_input`\ndata: what the GUI shows in its system notification.",
+      "properties": {
+        "body": {
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "id": {
+          "description": "The agent id of the session.",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "name": {
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "pendingTool": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "pid": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "provider": {
+          "$ref": "#/$defs/SessionProvider",
+          "x-sensitivity": "public"
+        },
+        "redactedTitle": {
+          "description": "`title` without conversation text.",
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "sessionKey": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "status": {
+          "description": "`needs_attention` or `waiting_for_input`.",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "title": {
+          "description": "Can carry conversation text (the first prompt, a session title).",
+          "type": "string",
+          "x-sensitivity": "conversation"
+        }
+      },
+      "required": [
+        "id",
+        "sessionKey",
+        "status",
+        "name",
+        "pendingTool",
+        "title",
+        "redactedTitle",
+        "body",
+        "pid",
+        "provider"
+      ],
+      "type": "object"
+    },
     "OpenTarget": {
       "description": "The strongest native target supported by the existing focus mechanism.",
       "enum": [
@@ -849,6 +2017,227 @@
         "application"
       ],
       "type": "string"
+    },
+    "OpencodeConnectParams": {
+      "description": "`provider.opencode.connect` params: the OpenCode server detection\nreads. An empty `url` disconnects. The engine keeps the credentials in\nmemory only and never returns them.",
+      "properties": {
+        "password": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": "string"
+        },
+        "username": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "OpencodeStatus": {
+      "properties": {
+        "connected": {
+          "type": "boolean",
+          "x-sensitivity": "public"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "sessionCount": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "url": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        }
+      },
+      "required": [
+        "url",
+        "connected",
+        "error",
+        "sessionCount"
+      ],
+      "type": "object"
+    },
+    "OpencodeStatusParams": {
+      "description": "`provider.opencode.status` params. There are none yet.",
+      "type": "object"
+    },
+    "PageParams": {
+      "description": "A window of a list: at most `limit` items from `offset`.\n\nA page also stops before its items would pass a byte budget (half of\n`limits.maxFrame`), so it can hold fewer than `limit` items. A page from\nan `offset` before the end always holds at least one item, so\n`nextOffset` always moves forward. An item too large for the budget on\nits own comes alone, with its large text replaced by a short note and\n`truncated: true`.",
+      "properties": {
+        "limit": {
+          "description": "At most this many items. Default 200; a value over 1000 is treated\nas 1000; 0 is `bad_request`.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "default": 0,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "PingParams": {
+      "description": "`ping` params. There are none.",
+      "type": "object"
+    },
+    "PingResult": {
+      "description": "`ping` result: the engine's clock.",
+      "properties": {
+        "ts": {
+          "description": "Unix milliseconds.",
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "ts"
+      ],
+      "type": "object"
+    },
+    "ProgressFrame": {
+      "description": "A `progress` frame: how far a read for request `id` has got. Sent only\nto a connection that asked for the `conversation.progress` capability,\nbefore that request's response. Never stored; a slow client may miss\nsome.",
+      "properties": {
+        "bytesRead": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "bytesTotal": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "id": {
+          "description": "The `id` of the request it reports on.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "type": {
+          "$ref": "#/$defs/ProgressType",
+          "x-sensitivity": "public"
+        },
+        "v": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "id",
+        "bytesRead",
+        "bytesTotal"
+      ],
+      "type": "object"
+    },
+    "ProgressType": {
+      "description": "The `type` of a progress frame.",
+      "enum": [
+        "progress"
+      ],
+      "type": "string"
+    },
+    "ProjectCost": {
+      "properties": {
+        "project": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "projectName": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/SessionCostRecord"
+          },
+          "type": "array",
+          "x-sensitivity": "public"
+        },
+        "totalCost": {
+          "format": "double",
+          "type": "number",
+          "x-sensitivity": "metadata"
+        }
+      },
+      "required": [
+        "project",
+        "projectName",
+        "totalCost",
+        "sessions"
+      ],
+      "type": "object"
+    },
+    "ProjectMemory": {
+      "description": "All memory files for a single project",
+      "properties": {
+        "files": {
+          "description": "Memory files found in this project",
+          "items": {
+            "$ref": "#/$defs/MemoryFile"
+          },
+          "type": "array",
+          "x-sensitivity": "conversation"
+        },
+        "memoryDirPath": {
+          "description": "Absolute path to the memory directory (for \"Reveal in Finder\")",
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "projectName": {
+          "description": "Human-readable project name (last path segment, e.g. \"c9watch\")",
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "projectPath": {
+          "description": "Decoded full project path (e.g. \"/Users/liminchen/Documents/GitHub/c9watch\")",
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "provider": {
+          "$ref": "#/$defs/SessionProvider",
+          "default": "claudeCode",
+          "description": "Provider that owns this memory group. Older payloads default to Claude Code.",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "provider",
+        "projectName",
+        "projectPath",
+        "memoryDirPath",
+        "files"
+      ],
+      "type": "object"
     },
     "Request": {
       "description": "A request frame. Every field is optional on the wire, so that a frame\nwith a missing field still gets an error that echoes its `id`.",
@@ -894,29 +2283,36 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "x-sensitivity": "metadata"
         },
         "id": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "ok": {
-          "type": "boolean"
+          "type": "boolean",
+          "x-sensitivity": "public"
         },
-        "result": true,
+        "result": {
+          "x-sensitivity": "conversation"
+        },
         "seq": {
           "description": "Cursor of the event this write produced (from M2).",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "v": {
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": "integer",
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -945,11 +2341,148 @@
           "additionalProperties": {
             "$ref": "#/$defs/AwayActivity"
           },
-          "type": "object"
+          "type": "object",
+          "x-sensitivity": "metadata"
         }
       },
       "required": [
         "activity"
+      ],
+      "type": "object"
+    },
+    "SessionCostRecord": {
+      "description": "A single session's cost record (stored in cache).",
+      "properties": {
+        "agentKind": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "cachedInputTokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "metadata"
+        },
+        "cost": {
+          "format": "double",
+          "type": "number",
+          "x-sensitivity": "metadata"
+        },
+        "costAvailable": {
+          "default": false,
+          "type": "boolean",
+          "x-sensitivity": "public"
+        },
+        "date": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "inputTokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "metadata"
+        },
+        "model": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "outputTokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "metadata"
+        },
+        "project": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "projectName": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "provider": {
+          "default": "claudeCode",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "reasoningOutputTokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "metadata"
+        },
+        "sessionId": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "sessionName": {
+          "default": "",
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "surface": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "timestamp": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "totalTokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer",
+          "x-sensitivity": "metadata"
+        }
+      },
+      "required": [
+        "sessionId",
+        "project",
+        "projectName",
+        "model",
+        "provider",
+        "cost",
+        "costAvailable",
+        "inputTokens",
+        "cachedInputTokens",
+        "outputTokens",
+        "reasoningOutputTokens",
+        "totalTokens",
+        "timestamp",
+        "date",
+        "sessionName"
+      ],
+      "type": "object"
+    },
+    "SessionGoneEvent": {
+      "description": "`session.gone` data.",
+      "properties": {
+        "id": {
+          "description": "The provider session id.",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "sessionKey": {
+          "description": "`<provider>:<session id>`.",
+          "type": "string",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "sessionKey",
+        "id"
       ],
       "type": "object"
     },
@@ -972,7 +2505,8 @@
           "items": {
             "$ref": "#/$defs/AgentRow"
           },
-          "type": "array"
+          "type": "array",
+          "x-sensitivity": "conversation"
         }
       },
       "required": [
@@ -1077,119 +2611,168 @@
       ],
       "type": "string"
     },
+    "SessionTasksParams": {
+      "description": "`session.tasks` params.",
+      "properties": {
+        "sessionId": {
+          "description": "The raw Claude Code session id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "type": "object"
+    },
+    "SessionTasksResult": {
+      "description": "`session.tasks` result: the session's TodoWrite tasks as Claude Code\nwrote them, sorted by numeric `id`.",
+      "properties": {
+        "tasks": {
+          "items": true,
+          "type": "array",
+          "x-sensitivity": "conversation"
+        }
+      },
+      "required": [
+        "tasks"
+      ],
+      "type": "object"
+    },
     "SessionView": {
       "description": "Combined session information",
       "properties": {
         "agentKind": {
-          "$ref": "#/$defs/AgentKind"
+          "$ref": "#/$defs/AgentKind",
+          "x-sensitivity": "public"
         },
         "agentNickname": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "conversation"
         },
         "agentPath": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "metadata"
         },
         "agentRole": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "metadata"
         },
         "aiTitle": {
           "description": "Claude Code's auto-generated title (`ai-title` in the session JSONL).",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "conversation"
         },
         "canOpen": {
-          "type": "boolean"
+          "type": "boolean",
+          "x-sensitivity": "public"
         },
         "canRename": {
-          "type": "boolean"
+          "type": "boolean",
+          "x-sensitivity": "public"
         },
         "canStop": {
-          "type": "boolean"
+          "type": "boolean",
+          "x-sensitivity": "public"
         },
         "codexTitle": {
           "description": "Codex's current UI thread name from ~/.codex/session_index.jsonl.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "conversation"
         },
         "cursorTitle": {
           "description": "Cursor's current UI composer name from state.vscdb.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "conversation"
         },
         "customTitle": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "conversation"
         },
         "entrypoint": {
           "description": "Raw `entrypoint` from `~/.claude/sessions/<pid>.json` (e.g. \"cli\", \"sdk-cli\",\n\"claude-vscode\", \"mcp\", \"remote_desktop\"...). Only the CLI backend populates\nthis; `None` covers the legacy backend and non-Claude-Code providers.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "firstPrompt": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "conversation"
         },
         "gitBranch": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "metadata"
         },
         "id": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "internalKind": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "kind": {
           "$ref": "#/$defs/SessionKind",
-          "description": "Interactive vs. background-pinned (`claude agents --json`'s `kind`).\nProviders other than Claude Code always report `Interactive`."
+          "description": "Interactive vs. background-pinned (`claude agents --json`'s `kind`).\nProviders other than Claude Code always report `Interactive`.",
+          "x-sensitivity": "public"
         },
         "lastAssistantMessage": {
           "description": "One-line, tag-free preview of the last assistant text.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "conversation"
         },
         "latestMessage": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "conversation"
         },
         "messageCount": {
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": "integer",
+          "x-sensitivity": "public"
         },
         "modified": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "officialName": {
           "description": "User-set name from `claude agents` (Ctrl+T background-pinned sessions).\nOnly populated by the CLI backend; legacy backend leaves this None.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "conversation"
         },
         "openTarget": {
           "anyOf": [
@@ -1200,46 +2783,56 @@
               "type": "null"
             }
           ],
-          "description": "Native target guarantee; absent means no verified exact native target."
+          "description": "Native target guarantee; absent means no verified exact native target.",
+          "x-sensitivity": "public"
         },
         "parentThreadId": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "pendingToolInput": {
-          "description": "The input/arguments of the pending tool (when status is NeedsPermission)"
+          "description": "The input/arguments of the pending tool (when status is NeedsPermission)",
+          "x-sensitivity": "conversation"
         },
         "pendingToolName": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "metadata"
         },
         "pid": {
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": "integer",
+          "x-sensitivity": "public"
         },
         "projectPath": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "metadata"
         },
         "provider": {
-          "$ref": "#/$defs/SessionProvider"
+          "$ref": "#/$defs/SessionProvider",
+          "x-sensitivity": "public"
         },
         "rootSessionId": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "sessionKey": {
           "description": "Provider-scoped identity used by frontend selection and backend maps.",
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "sessionName": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "conversation"
         },
         "sourceHealth": {
           "anyOf": [
@@ -1250,7 +2843,8 @@
               "type": "null"
             }
           ],
-          "description": "Health of the source observation, independent of the session status."
+          "description": "Health of the source observation, independent of the session status.",
+          "x-sensitivity": "public"
         },
         "startedAtMs": {
           "description": "Session start time in ms since epoch (from `claude agents --json`).\nOnly populated by the CLI backend; legacy backend leaves this None.",
@@ -1258,19 +2852,23 @@
           "type": [
             "integer",
             "null"
-          ]
+          ],
+          "x-sensitivity": "public"
         },
         "status": {
-          "$ref": "#/$defs/SessionStatus"
+          "$ref": "#/$defs/SessionStatus",
+          "x-sensitivity": "public"
         },
         "summary": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "conversation"
         },
         "surface": {
-          "$ref": "#/$defs/SessionSurface"
+          "$ref": "#/$defs/SessionSurface",
+          "x-sensitivity": "public"
         },
         "waitingFor": {
           "anyOf": [
@@ -1281,14 +2879,16 @@
               "type": "null"
             }
           ],
-          "description": "What the session needs from the user (tool name only, never arguments)."
+          "description": "What the session needs from the user (tool name only, never arguments).",
+          "x-sensitivity": "metadata"
         },
         "workerOf": {
           "description": "Session ID of the PM that spawned this session (if it's a c9watch worker).\nSet by the workers overlay from `~/.claude/c9watch/workers/*/meta.json`\n(`session::workers`), after detection.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "x-sensitivity": "metadata"
         }
       },
       "required": [
@@ -1324,13 +2924,15 @@
       "description": "`session.views` result: the sessions of the last detection tick, as the\nGUI shows them, in detection order, and the cursor they are consistent\nwith. Subscribing to `session.*` with `since` = `cursor` continues with\nno gap: `session.view` carries a new or changed session in full,\n`session.gone` (`SessionGoneEvent`) one that ended.",
       "properties": {
         "cursor": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "sessions": {
           "items": {
             "$ref": "#/$defs/SessionView"
           },
-          "type": "array"
+          "type": "array",
+          "x-sensitivity": "conversation"
         }
       },
       "required": [
@@ -1350,13 +2952,16 @@
           "items": {
             "$ref": "#/$defs/AgentRow"
           },
-          "type": "array"
+          "type": "array",
+          "x-sensitivity": "conversation"
         },
         "cursor": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "machineId": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -1376,6 +2981,216 @@
         "unknown"
       ],
       "type": "string"
+    },
+    "SubagentInfo": {
+      "description": "A subagent invocation found in a parent session's JSONL.",
+      "properties": {
+        "agentType": {
+          "description": "`subagent_type` from the Agent tool input (e.g. \"general-purpose\", \"Explore\").",
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "completedAt": {
+          "description": "ISO-8601 timestamp when the tool_result was recorded (None if still running).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "description": {
+          "description": "Short description of the task (`description` field of Agent tool input).",
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "id": {
+          "description": "The Agent tool's `tool_use_id` — unique within the parent session.",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "parentSessionId": {
+          "description": "Parent session's UUID.",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "startedAt": {
+          "description": "ISO-8601 timestamp when the tool_use was recorded.",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "status": {
+          "$ref": "#/$defs/SubagentStatus",
+          "description": "Running or Completed.",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "id",
+        "agentType",
+        "description",
+        "startedAt",
+        "completedAt",
+        "parentSessionId",
+        "status"
+      ],
+      "type": "object"
+    },
+    "SubagentListParams": {
+      "description": "`subagent.list` params: the raw Claude Code session ids the caller\nshows (not session keys).",
+      "properties": {
+        "sessionIds": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "SubagentListResult": {
+      "description": "`subagent.list` result: parent session id → its subagent invocations.",
+      "properties": {
+        "subagents": {
+          "additionalProperties": {
+            "items": {
+              "$ref": "#/$defs/SubagentInfo"
+            },
+            "type": "array"
+          },
+          "type": "object",
+          "x-sensitivity": "conversation"
+        }
+      },
+      "required": [
+        "subagents"
+      ],
+      "type": "object"
+    },
+    "SubagentStatus": {
+      "description": "Status of a detected subagent.",
+      "enum": [
+        "running",
+        "completed"
+      ],
+      "type": "string"
+    },
+    "SubagentTranscript": {
+      "description": "Full transcript of a single subagent invocation — the prompt (Agent tool\ninput), the final result text, and usage stats when available.",
+      "properties": {
+        "agentId": {
+          "description": "Internal agent id from `toolUseResult.agentId` (CC sub-agent handle).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "agentType": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "completedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "description": {
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "durationMs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "id": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "parentSessionId": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "prompt": {
+          "description": "Prompt sent to the subagent (from the Agent tool_use input).",
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "result": {
+          "description": "Final result text from the subagent, if completed. Concatenation of\ntext blocks in the matching tool_result content array, preferring\n`toolUseResult.content[].text` when present.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "conversation"
+        },
+        "startedAt": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "status": {
+          "$ref": "#/$defs/SubagentStatus",
+          "x-sensitivity": "public"
+        },
+        "toolUses": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "totalTokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        }
+      },
+      "required": [
+        "id",
+        "agentType",
+        "description",
+        "parentSessionId",
+        "startedAt",
+        "completedAt",
+        "status",
+        "prompt",
+        "result",
+        "agentId",
+        "totalTokens",
+        "toolUses",
+        "durationMs"
+      ],
+      "type": "object"
+    },
+    "SubagentTranscriptParams": {
+      "description": "`subagent.transcript` params.",
+      "properties": {
+        "parentSessionId": {
+          "type": "string"
+        },
+        "subagentId": {
+          "description": "The Agent tool's `tool_use_id`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "parentSessionId",
+        "subagentId"
+      ],
+      "type": "object"
     },
     "SubscribeParams": {
       "description": "`events.subscribe` params (A:218). Empty filters match everything.",
@@ -1409,11 +3224,62 @@
       "properties": {
         "cursor": {
           "description": "Where the stream starts: events after this cursor follow.",
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         }
       },
       "required": [
         "cursor"
+      ],
+      "type": "object"
+    },
+    "SubscriptionUsage": {
+      "properties": {
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "name": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "plan": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "provider": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "updatedAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "windows": {
+          "items": {
+            "$ref": "#/$defs/UsageWindow"
+          },
+          "type": "array",
+          "x-sensitivity": "metadata"
+        }
+      },
+      "required": [
+        "provider",
+        "name",
+        "plan",
+        "windows",
+        "updatedAt",
+        "message"
       ],
       "type": "object"
     },
@@ -1443,7 +3309,8 @@
       "description": "`task.done` result. In C1a every agent is free, so the call fails with\n`no_task` instead.",
       "properties": {
         "taskId": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -1456,15 +3323,100 @@
       "properties": {
         "backend": {
           "description": "The detection backend after the tick: `cli` or `legacy`.",
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         },
         "cursor": {
-          "type": "string"
+          "type": "string",
+          "x-sensitivity": "public"
         }
       },
       "required": [
         "cursor",
         "backend"
+      ],
+      "type": "object"
+    },
+    "UnsubscribeParams": {
+      "description": "`events.unsubscribe` params: the `id` of the `events.subscribe` request.",
+      "properties": {
+        "sub": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sub"
+      ],
+      "type": "object"
+    },
+    "UnsubscribeResult": {
+      "description": "`events.unsubscribe` result. No event frame of the stream follows it.",
+      "properties": {
+        "ended": {
+          "description": "`false` when the connection held no stream with that `sub`.",
+          "type": "boolean",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "ended"
+      ],
+      "type": "object"
+    },
+    "UsageSubscriptionsParams": {
+      "description": "`usage.subscriptions` params. There are none yet.",
+      "type": "object"
+    },
+    "UsageSubscriptionsResult": {
+      "description": "`usage.subscriptions` result: one snapshot per provider plan. The\nengine reads the providers at most once a minute.",
+      "properties": {
+        "usage": {
+          "items": {
+            "$ref": "#/$defs/SubscriptionUsage"
+          },
+          "type": "array",
+          "x-sensitivity": "metadata"
+        }
+      },
+      "required": [
+        "usage"
+      ],
+      "type": "object"
+    },
+    "UsageWindow": {
+      "properties": {
+        "label": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "resetsAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "usedPercent": {
+          "format": "double",
+          "type": "number",
+          "x-sensitivity": "metadata"
+        },
+        "windowSeconds": {
+          "description": "Full window length, so the UI can show how far into the window `now` is.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "label",
+        "usedPercent",
+        "resetsAt",
+        "windowSeconds"
       ],
       "type": "object"
     },
@@ -1475,10 +3427,12 @@
           "properties": {
             "kind": {
               "const": "approval",
-              "type": "string"
+              "type": "string",
+              "x-sensitivity": "public"
             },
             "tool": {
-              "type": "string"
+              "type": "string",
+              "x-sensitivity": "metadata"
             }
           },
           "required": [
@@ -1491,7 +3445,8 @@
           "properties": {
             "kind": {
               "const": "question",
-              "type": "string"
+              "type": "string",
+              "x-sensitivity": "public"
             }
           },
           "required": [
@@ -1503,7 +3458,8 @@
           "properties": {
             "kind": {
               "const": "attention",
-              "type": "string"
+              "type": "string",
+              "x-sensitivity": "public"
             }
           },
           "required": [
@@ -1515,7 +3471,8 @@
           "properties": {
             "kind": {
               "const": "input",
-              "type": "string"
+              "type": "string",
+              "x-sensitivity": "public"
             }
           },
           "required": [
@@ -1528,11 +3485,14 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
-  "apiMinor": 5,
+  "apiMinor": 6,
   "description": "The c9watch engine protocol: one JSON object per line over the engine socket. Within a major version every change is additive.",
   "frames": {
     "event": {
       "$ref": "#/$defs/EventFrame"
+    },
+    "progress": {
+      "$ref": "#/$defs/ProgressFrame"
     },
     "request": {
       "$ref": "#/$defs/Request"
@@ -1548,7 +3508,8 @@
       },
       "result": {
         "$ref": "#/$defs/AgentCreateResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "agent.handoff": {
       "params": {
@@ -1556,7 +3517,8 @@
       },
       "result": {
         "$ref": "#/$defs/HandoffResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "agent.list": {
       "params": {
@@ -1564,7 +3526,8 @@
       },
       "result": {
         "$ref": "#/$defs/AgentListResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "agent.retire": {
       "params": {
@@ -1572,7 +3535,29 @@
       },
       "result": {
         "$ref": "#/$defs/AgentRetireResult"
-      }
+      },
+      "x-stability": "preview"
+    },
+    "conversation.get": {
+      "params": {
+        "$ref": "#/$defs/ConversationGetParams"
+      },
+      "progress": {
+        "$ref": "#/$defs/ProgressFrame"
+      },
+      "result": {
+        "$ref": "#/$defs/ConversationGetResult"
+      },
+      "x-stability": "preview"
+    },
+    "cost.get": {
+      "params": {
+        "$ref": "#/$defs/CostGetParams"
+      },
+      "result": {
+        "$ref": "#/$defs/CostData"
+      },
+      "x-stability": "preview"
     },
     "detect.recheck": {
       "params": {
@@ -1580,7 +3565,17 @@
       },
       "result": {
         "$ref": "#/$defs/TickResult"
-      }
+      },
+      "x-stability": "preview"
+    },
+    "diag.detection": {
+      "params": {
+        "$ref": "#/$defs/DiagDetectionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/DetectionDiagnostics"
+      },
+      "x-stability": "preview"
     },
     "events.subscribe": {
       "events": {
@@ -1591,7 +3586,17 @@
       },
       "result": {
         "$ref": "#/$defs/SubscribeResult"
-      }
+      },
+      "x-stability": "preview"
+    },
+    "events.unsubscribe": {
+      "params": {
+        "$ref": "#/$defs/UnsubscribeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/UnsubscribeResult"
+      },
+      "x-stability": "preview"
     },
     "hello": {
       "params": {
@@ -1599,7 +3604,26 @@
       },
       "result": {
         "$ref": "#/$defs/HelloResult"
-      }
+      },
+      "x-stability": "preview"
+    },
+    "history.list": {
+      "params": {
+        "$ref": "#/$defs/HistoryListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HistoryListResult"
+      },
+      "x-stability": "preview"
+    },
+    "history.search": {
+      "params": {
+        "$ref": "#/$defs/HistorySearchParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HistorySearchResult"
+      },
+      "x-stability": "preview"
     },
     "hook.notification": {
       "params": {
@@ -1607,7 +3631,8 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "hook.permission_denied": {
       "params": {
@@ -1615,7 +3640,8 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "hook.permission_request": {
       "params": {
@@ -1623,7 +3649,8 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "hook.post_tool_use": {
       "params": {
@@ -1631,7 +3658,8 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "hook.session_start": {
       "params": {
@@ -1639,7 +3667,8 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "hook.stop": {
       "params": {
@@ -1647,7 +3676,8 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "hook.user_prompt_submit": {
       "params": {
@@ -1655,7 +3685,17 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
-      }
+      },
+      "x-stability": "internal"
+    },
+    "memory.list": {
+      "params": {
+        "$ref": "#/$defs/MemoryListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MemoryListResult"
+      },
+      "x-stability": "preview"
     },
     "msg.send": {
       "params": {
@@ -1663,7 +3703,35 @@
       },
       "result": {
         "$ref": "#/$defs/MsgSendResult"
-      }
+      },
+      "x-stability": "preview"
+    },
+    "ping": {
+      "params": {
+        "$ref": "#/$defs/PingParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PingResult"
+      },
+      "x-stability": "preview"
+    },
+    "provider.opencode.connect": {
+      "params": {
+        "$ref": "#/$defs/OpencodeConnectParams"
+      },
+      "result": {
+        "$ref": "#/$defs/OpencodeStatus"
+      },
+      "x-stability": "preview"
+    },
+    "provider.opencode.status": {
+      "params": {
+        "$ref": "#/$defs/OpencodeStatusParams"
+      },
+      "result": {
+        "$ref": "#/$defs/OpencodeStatus"
+      },
+      "x-stability": "preview"
     },
     "session.away": {
       "params": {
@@ -1671,7 +3739,8 @@
       },
       "result": {
         "$ref": "#/$defs/SessionAwayResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "session.list": {
       "params": {
@@ -1679,7 +3748,8 @@
       },
       "result": {
         "$ref": "#/$defs/SessionListResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "session.rename": {
       "params": {
@@ -1687,7 +3757,8 @@
       },
       "result": {
         "$ref": "#/$defs/TickResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "session.stop": {
       "params": {
@@ -1695,7 +3766,17 @@
       },
       "result": {
         "$ref": "#/$defs/TickResult"
-      }
+      },
+      "x-stability": "preview"
+    },
+    "session.tasks": {
+      "params": {
+        "$ref": "#/$defs/SessionTasksParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionTasksResult"
+      },
+      "x-stability": "preview"
     },
     "session.views": {
       "params": {
@@ -1703,7 +3784,8 @@
       },
       "result": {
         "$ref": "#/$defs/SessionViewsResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "snapshot.get": {
       "params": {
@@ -1711,7 +3793,26 @@
       },
       "result": {
         "$ref": "#/$defs/SnapshotResult"
-      }
+      },
+      "x-stability": "preview"
+    },
+    "subagent.list": {
+      "params": {
+        "$ref": "#/$defs/SubagentListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SubagentListResult"
+      },
+      "x-stability": "preview"
+    },
+    "subagent.transcript": {
+      "params": {
+        "$ref": "#/$defs/SubagentTranscriptParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SubagentTranscript"
+      },
+      "x-stability": "preview"
     },
     "task.done": {
       "params": {
@@ -1719,8 +3820,93 @@
       },
       "result": {
         "$ref": "#/$defs/TaskDoneResult"
-      }
+      },
+      "x-stability": "internal"
+    },
+    "usage.subscriptions": {
+      "params": {
+        "$ref": "#/$defs/UsageSubscriptionsParams"
+      },
+      "result": {
+        "$ref": "#/$defs/UsageSubscriptionsResult"
+      },
+      "x-stability": "preview"
     }
   },
-  "title": "c9p/1"
+  "title": "c9p/1",
+  "topics": {
+    "agent.attention": {
+      "data": {
+        "$ref": "#/$defs/AgentAttentionEvent"
+      },
+      "x-stability": "preview"
+    },
+    "agent.failed": {
+      "data": {
+        "$ref": "#/$defs/AgentFailedEvent"
+      },
+      "x-stability": "preview"
+    },
+    "agent.gone": {
+      "data": {
+        "$ref": "#/$defs/AgentGoneEvent"
+      },
+      "x-stability": "preview"
+    },
+    "agent.turn_end": {
+      "data": {
+        "$ref": "#/$defs/AgentTurnEndEvent"
+      },
+      "x-stability": "preview"
+    },
+    "agent.upsert": {
+      "data": {
+        "$ref": "#/$defs/AgentRow"
+      },
+      "x-stability": "preview"
+    },
+    "diag.detection": {
+      "data": {
+        "$ref": "#/$defs/DetectionDiagnostics"
+      },
+      "x-stability": "preview"
+    },
+    "legacy.inbox": {
+      "data": {
+        "$ref": "#/$defs/LegacyInboxEvent"
+      },
+      "x-stability": "internal"
+    },
+    "msg.state": {
+      "data": {
+        "$ref": "#/$defs/MsgStateEvent"
+      },
+      "x-stability": "preview"
+    },
+    "notification.needs_attention": {
+      "data": {
+        "$ref": "#/$defs/NotificationEvent"
+      },
+      "x-stability": "preview"
+    },
+    "notification.waiting_for_input": {
+      "data": {
+        "$ref": "#/$defs/NotificationEvent"
+      },
+      "x-stability": "preview"
+    },
+    "session.gone": {
+      "data": {
+        "$ref": "#/$defs/SessionGoneEvent"
+      },
+      "x-stability": "preview"
+    },
+    "session.view": {
+      "data": {
+        "$ref": "#/$defs/SessionView"
+      },
+      "description": "Latest state: the log keeps only the newest view of each live session (and none of an ended one). A subscriber that reads on from an old cursor gets the newest view of every live session, not every view in between. Live subscribers still get each view as it is written.",
+      "x-stability": "preview"
+    }
+  }
 }

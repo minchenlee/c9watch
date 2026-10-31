@@ -211,10 +211,14 @@ fn apply(
             topic: "agent.attention".into(),
             subject: Some(format!("{}/{}", machine, id)),
             origin: None,
-            data: serde_json::json!({
-                "id": id, "generation": ev.gen, "reason": reason,
-                "toolUseId": p.input["tool_use_id"],
-            }),
+            data: serde_json::to_value(crate::engine::proto::AgentAttentionEvent {
+                id: id.to_string(),
+                generation: ev.gen,
+                reason: reason.to_string(),
+                msg_id: None,
+                tool_use_id: Some(p.input["tool_use_id"].clone()),
+            })
+            .expect("AgentAttentionEvent serializes"),
         })?;
     }
     Ok(())
@@ -246,9 +250,13 @@ fn write_change(
             topic: "agent.turn_end".into(),
             subject: Some(format!("{}/{}", machine, id)),
             origin: None,
-            data: serde_json::json!({
-                "id": id, "generation": gen, "by": end.by.as_str(), "at": end.at_ms,
-            }),
+            data: serde_json::to_value(crate::engine::proto::AgentTurnEndEvent {
+                id: id.to_string(),
+                generation: gen,
+                by: end.by.as_str().to_string(),
+                at: end.at_ms,
+            })
+            .expect("AgentTurnEndEvent serializes"),
         })?;
     }
     Ok(())

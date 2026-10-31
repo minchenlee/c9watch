@@ -56,6 +56,11 @@ pub fn encode_event(ev: &EventFrame) -> Vec<u8> {
     encode_line(ev)
 }
 
+/// Serialize a progress frame as one NDJSON line.
+pub fn encode_progress(p: &ProgressFrame) -> Vec<u8> {
+    encode_line(p)
+}
+
 fn encode_line<T: serde::Serialize>(v: &T) -> Vec<u8> {
     // Frames hold only strings, numbers and JSON values, so serialization
     // cannot fail.
@@ -164,6 +169,7 @@ mod tests {
             ErrorCode::Duplicate,
             ErrorCode::UnknownSession,
             ErrorCode::ActionFailed,
+            ErrorCode::Busy,
             ErrorCode::Internal,
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), code.as_str());
@@ -267,6 +273,7 @@ mod tests {
             principal: "local-unverified".into(),
             capabilities: vec![],
             cursor: None,
+            ..Default::default()
         };
         let v = serde_json::to_value(r).unwrap();
         for key in [

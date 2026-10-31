@@ -14,12 +14,26 @@ pub fn find_claude_session_file_under(home: &Path, session_id: &str) -> Option<P
     find_session_file_in_projects_dir(&home.join(".claude").join("projects"), session_id)
 }
 
+/// A session id that names one file inside a project directory: not
+/// empty, not absolute, and without separators, `..` or NUL.
+fn is_plain_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && !session_id.contains(['/', '\\', '\0'])
+        && !session_id.contains("..")
+        && !Path::new(session_id).is_absolute()
+}
+
 /// Scan the direct child directories of `projects_dir` for `<session_id>.jsonl`.
-/// Files at the `projects_dir` level are ignored.
+/// Files at the `projects_dir` level are ignored. An id that is not a plain
+/// file name (`is_plain_session_id`) finds nothing, so a caller's id can
+/// never reach outside the project directories.
 pub(crate) fn find_session_file_in_projects_dir(
     projects_dir: &Path,
     session_id: &str,
 ) -> Option<PathBuf> {
+    if !is_plain_session_id(session_id) {
+        return None;
+    }
     let session_filename = format!("{}.jsonl", session_id);
     std::fs::read_dir(projects_dir)
         .ok()?
@@ -72,6 +86,39 @@ mod tests {
         assert_eq!(
             find_claude_session_file_under(home.path(), SESSION_ID),
             None
+        );
+    }
+
+    /// An id that is a path, or climbs out with `..`, finds nothing, even
+    /// where `<id>.jsonl` exists; a plain id is still found.
+    #[test]
+    fn path_like_ids_find_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".claude").join("projects");
+        let project = projects.join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(format!("{SESSION_ID}.jsonl")), "").unwrap();
+        let outside = home.path().join("secret");
+        std::fs::write(home.path().join("secret.jsonl"), "").unwrap();
+        std::fs::write(projects.join("up.jsonl"), "").unwrap();
+
+        for id in [
+            outside.to_str().unwrap(),
+            "../../../secret",
+            "../up",
+            "..",
+            "",
+            "a\0b",
+        ] {
+            assert_eq!(
+                find_claude_session_file_under(home.path(), id),
+                None,
+                "{id}"
+            );
+        }
+        assert_eq!(
+            find_claude_session_file_under(home.path(), SESSION_ID),
+            Some(project.join(format!("{SESSION_ID}.jsonl")))
         );
     }
 

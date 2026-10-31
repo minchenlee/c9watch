@@ -15,6 +15,7 @@
 //! `detect.recheck`, `session.stop` and `session.rename` (their principal
 //! check is in `api`).
 
+use super::params;
 use crate::engine::api::{blocking, internal, ServerCtx};
 use crate::engine::db::outbox::NewEvent;
 use crate::engine::detect::{Detection, StopError};
@@ -22,7 +23,7 @@ use crate::engine::proto::{
     ApiError, ErrorCode, Request, SessionAwayParams, SessionAwayResult, SessionGoneEvent,
     SessionRenameParams, SessionStopParams, SessionViewsResult, TickResult,
 };
-use crate::session::Session;
+use crate::session::{DetectionDiagnostics, Session};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -38,6 +39,9 @@ pub const STOP_SETTLE: Duration = Duration::from_millis(300);
 struct Seen {
     id: String,
     json: String,
+    /// The `seq` of the stored `session.view` event with this view, once
+    /// written. A newer view (or the session's end) deletes that event.
+    view_seq: Option<i64>,
 }
 
 struct Committed {
@@ -50,6 +54,8 @@ struct Committed {
 #[derive(Default)]
 pub struct SessionViews {
     state: Mutex<Option<Committed>>,
+    /// The last detection diagnostics; `None` before the first tick.
+    diagnostics: Mutex<Option<DetectionDiagnostics>>,
 }
 
 /// What one tick changes, computed before its write and committed after.
@@ -59,6 +65,12 @@ pub struct ViewChange {
     /// `(session key, view)` of new or changed sessions, in detection order.
     pub changed: Vec<(String, serde_json::Value)>,
     pub gone: Vec<SessionGoneEvent>,
+    /// The stored `session.view` events this change supersedes: the last
+    /// view of each changed or ended session.
+    pub superseded: Vec<i64>,
+    /// The first diff since the engine started: views stored by an earlier
+    /// run are superseded too (`outbox::compact_views_before`).
+    pub first: bool,
 }
 
 impl ViewChange {
@@ -78,6 +90,16 @@ impl ViewChange {
         });
         view.chain(gone).collect()
     }
+
+    /// Record the `seq` of each `session.view` event the tick wrote, in
+    /// `changed` order.
+    pub fn written(&mut self, seqs: &[i64]) {
+        for ((key, _), seq) in self.changed.iter().zip(seqs) {
+            if let Some(seen) = self.by_key.get_mut(key) {
+                seen.view_seq = Some(*seq);
+            }
+        }
+    }
 }
 
 impl SessionViews {
@@ -94,37 +116,51 @@ impl SessionViews {
         let before = state.as_ref().map_or(&empty, |c| &c.by_key);
         let mut by_key = HashMap::new();
         let mut changed = Vec::new();
+        let mut superseded = Vec::new();
         for s in sessions {
             if by_key.contains_key(&s.session_key) {
                 continue;
             }
             let value = serde_json::to_value(s).expect("Session serializes");
             let json = value.to_string();
-            if before.get(&s.session_key).is_none_or(|b| b.json != json) {
-                changed.push((s.session_key.clone(), value));
-            }
+            let prev = before.get(&s.session_key);
+            let view_seq = match prev {
+                Some(b) if b.json == json => b.view_seq,
+                _ => {
+                    changed.push((s.session_key.clone(), value));
+                    superseded.extend(prev.and_then(|b| b.view_seq));
+                    None
+                }
+            };
             by_key.insert(
                 s.session_key.clone(),
                 Seen {
                     id: s.id.clone(),
                     json,
+                    view_seq,
                 },
             );
         }
         let mut gone: Vec<SessionGoneEvent> = before
             .iter()
             .filter(|(k, _)| !by_key.contains_key(*k))
-            .map(|(k, b)| SessionGoneEvent {
-                session_key: k.clone(),
-                id: b.id.clone(),
+            .map(|(k, b)| {
+                superseded.extend(b.view_seq);
+                SessionGoneEvent {
+                    session_key: k.clone(),
+                    id: b.id.clone(),
+                }
             })
             .collect();
         gone.sort_by(|a, b| a.session_key.cmp(&b.session_key));
+        superseded.sort_unstable();
         ViewChange {
             sessions: sessions.to_vec(),
             by_key,
             changed,
             gone,
+            superseded,
+            first: state.is_none(),
         }
     }
 
@@ -137,27 +173,23 @@ impl SessionViews {
         });
     }
 
+    pub fn diagnostics(&self) -> Option<DetectionDiagnostics> {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub fn set_diagnostics(&self, d: DetectionDiagnostics) {
+        *self.diagnostics.lock().unwrap_or_else(|p| p.into_inner()) = Some(d);
+    }
+
     /// The current views and their cursor; `None` before the first commit.
     pub fn current(&self) -> Option<(String, Vec<Session>)> {
         self.lock()
             .as_ref()
             .map(|c| (c.cursor.clone(), c.sessions.clone()))
     }
-}
-
-fn params<T: serde::de::DeserializeOwned + Default>(
-    method: &str,
-    req: Request,
-) -> Result<T, ApiError> {
-    if req.params.is_null() {
-        return Ok(T::default());
-    }
-    serde_json::from_value(req.params).map_err(|e| {
-        ApiError::new(
-            ErrorCode::BadRequest,
-            format!("bad {} params: {}", method, e),
-        )
-    })
 }
 
 fn detection(ctx: &ServerCtx) -> Result<&Arc<Detection>, ApiError> {
@@ -180,6 +212,19 @@ pub async fn session_views(ctx: &ServerCtx) -> Result<serde_json::Value, ApiErro
         serde_json::to_value(SessionViewsResult { cursor, sessions })
             .expect("SessionViewsResult serializes"),
     )
+}
+
+/// `diag.detection`: the diagnostics of the last tick, as the GUI's
+/// `get_detection_diagnostics` (all zero before the first tick).
+pub async fn diag_detection(req: Request, ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
+    let _: crate::engine::proto::DiagDetectionParams = params("diag.detection", req)?;
+    ctx.detected().await;
+    let d = ctx
+        .detection
+        .as_ref()
+        .and_then(|d| d.views.diagnostics())
+        .unwrap_or_default();
+    Ok(serde_json::to_value(d).expect("DetectionDiagnostics serializes"))
 }
 
 /// `session.away`: the away-activity index that each detection tick keeps

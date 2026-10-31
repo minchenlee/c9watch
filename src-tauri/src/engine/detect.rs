@@ -43,7 +43,7 @@
 //! against from the db. After `quick_check` starts a new epoch, the next
 //! tick rebuilds the observed rows from provider data (A:497).
 
-use super::db::outbox::NewEvent;
+use super::db::outbox::{self, NewEvent};
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
 use super::proto::{AgentRow, TickResult};
 use super::views::sessions::SessionViews;
@@ -58,6 +58,10 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Emitted when a tick's detection diagnostics differ from the last
+/// tick's, as the GUI's `diagnostic-update`. Subject: the machine id.
+pub const DIAG_TOPIC: &str = "diag.detection";
 
 /// Time between ticks; the GUI polls at the same rate.
 pub const TICK: Duration = Duration::from_millis(3500);
@@ -82,6 +86,9 @@ pub struct Observation {
     /// Providers (`SessionProvider::as_key`) that did not answer: the pass
     /// says nothing about their sessions.
     pub failed: Vec<&'static str>,
+    /// What the GUI's `diagnostic-update` carries for this pass; `None`
+    /// when the source has none.
+    pub diagnostics: Option<DetectionDiagnostics>,
 }
 
 /// Where a tick's sessions come from.
@@ -102,7 +109,10 @@ pub trait Observe: Send {
     }
 }
 
-type Enrich = fn(Vec<DetectedSession>, DetectionDiagnostics) -> Result<Vec<Session>, String>;
+type Enrich = fn(
+    Vec<DetectedSession>,
+    DetectionDiagnostics,
+) -> Result<(Vec<Session>, DetectionDiagnostics), String>;
 
 /// Detection plus enrichment, as the GUI poll runs them.
 pub struct Live {
@@ -114,9 +124,7 @@ impl Live {
     /// Picks the backend, which may probe `claude`: call it on the
     /// detection thread.
     pub fn new() -> Self {
-        Self::with(DetectorState::new(), |d, diag| {
-            enrich_detected_sessions(d, diag).map(|(s, _)| s)
-        })
+        Self::with(DetectorState::new(), enrich_detected_sessions)
     }
 
     pub fn with(state: DetectorState, enrich: Enrich) -> Self {
@@ -155,9 +163,11 @@ impl Observe for Live {
             .iter()
             .map(|p| p.as_key())
             .collect();
+        let (sessions, diagnostics) = (self.enrich)(detected, diag)?;
         Ok(Observation {
-            sessions: (self.enrich)(detected, diag)?,
+            sessions,
             failed,
+            diagnostics: Some(diagnostics),
         })
     }
 }
@@ -372,17 +382,45 @@ impl Detector {
         let mut notifier = self.notifier.clone();
         let notes = notifier.step(&obs.sessions, &held, Instant::now());
         let seen: Vec<Observed> = obs.sessions.iter().map(Observed::from_session).collect();
-        let change = self.views.diff(&obs.sessions);
+        let mut change = self.views.diff(&obs.sessions);
         let view_events = change.events(&self.machine_id);
+        let n_views = change.changed.len();
+        let superseded = change.superseded.clone();
+        let first = change.first;
+        let diag = obs
+            .diagnostics
+            .take()
+            .filter(|d| self.views.diagnostics().as_ref() != Some(d));
+        let diag_event = diag.as_ref().map(|d| NewEvent {
+            topic: DIAG_TOPIC.into(),
+            subject: Some(self.machine_id.clone()),
+            origin: None,
+            data: serde_json::to_value(d).expect("DetectionDiagnostics serializes"),
+        });
         let machine = self.machine_id.clone();
-        let (applied, _) = db.write_blocking(move |tx| {
+        let ((applied, view_seqs), _) = db.write_blocking(move |tx| {
             let mut applied = apply(tx, &machine, &seen, now_ms(), &held)?;
             applied.notified = emit_notifications(tx, &machine, &notes)?;
-            for e in &view_events {
-                tx.emit(e)?;
+            let mut view_seqs = Vec::with_capacity(n_views);
+            for (i, e) in view_events.iter().chain(&diag_event).enumerate() {
+                let seq = tx.emit(e)?;
+                if i < n_views {
+                    view_seqs.push(seq);
+                }
             }
-            Ok(applied)
+            // One stored view per live session: the newest supersedes the
+            // last (see `outbox::compact_views`).
+            if first {
+                let before = view_seqs.first().copied().unwrap_or(i64::MAX);
+                outbox::compact_views_before(tx, before)?;
+            }
+            outbox::compact_views(tx, &superseded)?;
+            Ok((applied, view_seqs))
         })?;
+        change.written(&view_seqs);
+        if let Some(d) = diag {
+            self.views.set_diagnostics(d);
+        }
         self.notifier = notifier;
         // Only ticks write `session.*` events, one at a time (`Detection`
         // holds its lock across a tick), so the head now has every one of
@@ -516,18 +554,19 @@ pub fn emit_notifications(
             topic: n.topic.into(),
             subject: Some(subject(machine, &id)),
             origin: None,
-            data: serde_json::json!({
-                "id": id,
-                "sessionKey": n.key,
-                "status": n.status,
-                "name": n.name,
-                "pendingTool": n.pending_tool,
-                "title": n.title,
-                "redactedTitle": n.redacted_title,
-                "body": n.body,
-                "pid": n.pid,
-                "provider": n.provider,
-            }),
+            data: serde_json::to_value(crate::engine::proto::NotificationEvent {
+                id: id.clone(),
+                session_key: n.key.clone(),
+                status: n.status.to_string(),
+                name: n.name.clone(),
+                pending_tool: n.pending_tool.clone(),
+                title: n.title.clone(),
+                redacted_title: n.redacted_title.clone(),
+                body: n.body.clone(),
+                pid: n.pid,
+                provider: n.provider,
+            })
+            .expect("NotificationEvent serializes"),
         })?;
         sent.push((n.topic.to_string(), id));
     }
@@ -656,7 +695,12 @@ fn mark_gone(
         topic: "agent.gone".into(),
         subject: Some(subject(machine, id)),
         origin: None,
-        data: serde_json::json!({ "id": id, "sessionKey": key, "goneAt": now }),
+        data: serde_json::to_value(crate::engine::proto::AgentGoneEvent {
+            id: id.to_string(),
+            session_key: key.to_string(),
+            gone_at: now,
+        })
+        .expect("AgentGoneEvent serializes"),
     })?;
     applied.gone.push(id.to_string());
     Ok(())
@@ -859,6 +903,7 @@ mod tests {
             *self.0.lock().unwrap() = Ok(Observation {
                 sessions,
                 failed: failed.to_vec(),
+                diagnostics: None,
             });
         }
         fn fail(&self) {
@@ -1398,6 +1443,151 @@ mod tests {
         assert!(data.get("firstPrompt").is_none());
     }
 
+    /// Volume (core-public M-a2): a session that changes on every tick
+    /// keeps one stored `session.view`, and a subscriber that reads on from
+    /// a cursor taken before all those ticks gets its newest view, with no
+    /// `cursor_expired`.
+    #[test]
+    fn the_log_keeps_one_view_per_live_session() {
+        let (_t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let script = Script::default();
+        let mut d = detector(&script);
+        script.set(vec![s("b", SessionStatus::WaitingForInput)]);
+        d.tick(&db).unwrap();
+        let start = outbox::head(&db.reader().unwrap()).unwrap();
+        const TICKS: u32 = 200;
+        for i in 0..TICKS {
+            let mut a = s("a", SessionStatus::Working);
+            a.message_count = i;
+            script.set(vec![a, s("b", SessionStatus::WaitingForInput)]);
+            d.tick(&db).unwrap();
+        }
+        let ev = session_events(&db);
+        let views_of = |key: &str| {
+            ev.iter()
+                .filter(|(t, v)| t == "session.view" && v["sessionKey"] == key)
+                .count()
+        };
+        // Without compaction this would be TICKS views of `a`.
+        assert_eq!(views_of("claudeCode:a"), 1);
+        assert_eq!(views_of("claudeCode:b"), 1);
+        let conn = db.reader().unwrap();
+        let read = outbox::read_after(&conn, start, 10_000).unwrap();
+        let views: Vec<&outbox::Event> =
+            read.iter().filter(|e| e.topic == "session.view").collect();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].data["messageCount"], TICKS - 1);
+        // From the very first cursor too.
+        assert!(outbox::read_after(&conn, 0, 10_000).is_ok());
+
+        // A new engine run on the same log: its first tick supersedes the
+        // views the earlier run stored.
+        let mut d = detector(&script);
+        let mut a = s("a", SessionStatus::Working);
+        a.message_count = 7;
+        script.set(vec![a]);
+        d.tick(&db).unwrap();
+        let ev = session_events(&db);
+        let views: Vec<_> = ev.iter().filter(|(t, _)| t == "session.view").collect();
+        assert_eq!(views.len(), 1, "{:?}", ev);
+        assert_eq!(views[0].1["messageCount"], 7);
+    }
+
+    /// Tick cost and log size with five sessions that change on every
+    /// tick. Run by hand: `cargo test ... tick_cost -- --ignored
+    /// --nocapture`. Prints the stored rows and bytes against what the log
+    /// would hold without compaction (every view kept).
+    #[test]
+    #[ignore]
+    fn tick_cost() {
+        let (_t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let script = Script::default();
+        let mut d = detector(&script);
+        let ticks: u32 = std::env::var("C9_TICKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000);
+        let mut emitted_bytes = 0usize;
+        let mut times = Vec::with_capacity(ticks as usize);
+        for i in 0..ticks {
+            let sessions: Vec<Session> = (0..5)
+                .map(|k| {
+                    let mut x = s(&format!("s{}", k), SessionStatus::Working);
+                    x.message_count = i;
+                    x.latest_message = "x".repeat(400);
+                    x
+                })
+                .collect();
+            emitted_bytes += sessions
+                .iter()
+                .map(|x| serde_json::to_string(x).unwrap().len())
+                .sum::<usize>();
+            script.set(sessions);
+            let t0 = Instant::now();
+            d.tick(&db).unwrap();
+            times.push(t0.elapsed());
+        }
+        times.sort();
+        let conn = db.reader().unwrap();
+        let (rows, bytes): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), coalesce(sum(length(payload)), 0) FROM events \
+                 WHERE topic = 'session.view'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let total: std::time::Duration = times.iter().sum();
+        println!(
+            "tick_cost: ticks={} sessions=5 mean={:?} p50={:?} p99={:?} \
+             stored_views={} stored_bytes={} uncompacted_views={} uncompacted_bytes={}",
+            ticks,
+            total / ticks,
+            times[times.len() / 2],
+            times[times.len() * 99 / 100],
+            rows,
+            bytes,
+            ticks * 5,
+            emitted_bytes,
+        );
+        assert_eq!(rows, 5);
+    }
+
+    /// `compact_views` keeps the oldest stored event, so it never makes an
+    /// old cursor expire; it deletes only `session.view` rows.
+    #[test]
+    fn compaction_never_moves_the_expiry_line() {
+        let (_t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let ev = |topic: &str| NewEvent {
+            topic: topic.into(),
+            subject: Some("m/x".into()),
+            origin: None,
+            data: serde_json::json!({}),
+        };
+        let (seqs, _) = db
+            .write_blocking(move |tx| {
+                let a = tx.emit(&ev("session.view"))?;
+                let b = tx.emit(&ev("agent.upsert"))?;
+                let c = tx.emit(&ev("session.view"))?;
+                Ok(vec![a, b, c])
+            })
+            .unwrap();
+        let (n, _) = db
+            .write_blocking(move |tx| Ok(outbox::compact_views(tx, &seqs)?))
+            .unwrap();
+        assert_eq!(n, 1);
+        let conn = db.reader().unwrap();
+        let left: Vec<String> = outbox::read_after(&conn, 0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.topic)
+            .collect();
+        assert_eq!(left, ["session.view", "agent.upsert"]);
+    }
+
     /// `(topic, data)` of every `session.*` event, in order.
     fn session_events(db: &Db) -> Vec<(String, serde_json::Value)> {
         db.reader()
@@ -1491,16 +1681,17 @@ mod tests {
         d.tick(&db).unwrap();
         assert_eq!(session_events(&db).len(), 2);
 
-        // `a` changes, `b` ends.
+        // `a` changes, `b` ends. The stored views of both go: the log keeps
+        // one view per live session.
         script.set(vec![s("a", SessionStatus::WaitingForInput)]);
         d.tick(&db).unwrap();
         let ev = session_events(&db);
-        assert_eq!(ev.len(), 4);
-        assert_eq!(ev[2].0, "session.view");
-        assert_eq!(ev[2].1["status"], "WaitingForInput");
-        assert_eq!(ev[3].0, "session.gone");
+        assert_eq!(ev.len(), 2, "{:?}", ev);
+        assert_eq!(ev[0].0, "session.view");
+        assert_eq!(ev[0].1["status"], "WaitingForInput");
+        assert_eq!(ev[1].0, "session.gone");
         assert_eq!(
-            ev[3].1,
+            ev[1].1,
             serde_json::json!({"sessionKey": "claudeCode:b", "id": "b"})
         );
         assert_eq!(d.views().current().unwrap().1.len(), 1);
@@ -1601,7 +1792,7 @@ mod tests {
         let clock = now.clone();
         let state = DetectorState::for_test(Box::new(Named("legacy")), BackendMode::Auto)
             .with_test_backends(Box::new(move || *clock.lock().unwrap()), Box::new(|| true));
-        let mut live = Live::with(state, |_, _| Ok(Vec::new()));
+        let mut live = Live::with(state, |_, d| Ok((Vec::new(), d)));
         live.observe().unwrap();
         assert_eq!(live.backend_name(), "legacy");
 

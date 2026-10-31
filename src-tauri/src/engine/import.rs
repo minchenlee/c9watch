@@ -704,7 +704,12 @@ fn apply(tx: &mut Tx, machine: &str, legacy: &Legacy, now: i64) -> rusqlite::Res
             topic: "legacy.inbox".into(),
             subject: worker.as_deref().map(|id| subject(machine, id)),
             origin: Some(json!({"kind": "system", "legacy": true})),
-            data: json!({"legacy": true, "id": worker, "event": ev.raw}),
+            data: serde_json::to_value(crate::engine::proto::LegacyInboxEvent {
+                legacy: true,
+                id: worker,
+                event: ev.raw.clone(),
+            })
+            .expect("LegacyInboxEvent serializes"),
         })?;
         applied.events += 1;
     }
