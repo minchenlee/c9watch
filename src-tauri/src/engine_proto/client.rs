@@ -156,6 +156,21 @@ pub fn session_list(
     Ok(list.sessions)
 }
 
+/// Connect to `sock` as `kind` and return the engine's `session.views`:
+/// the GUI's session JSON, one value per session.
+pub fn session_views(
+    sock: &Path,
+    kind: &str,
+    timeout: Duration,
+) -> Result<Vec<serde_json::Value>, ClientError> {
+    let mut conn = Conn::connect(sock, kind, timeout)?;
+    let mut result = conn.call("session.views", serde_json::json!({}))?;
+    match result["sessions"].take() {
+        serde_json::Value::Array(a) => Ok(a),
+        _ => Err(ClientError::Failed("bad session.views result".into())),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -189,6 +204,13 @@ pub(crate) mod tests {
                             "capabilities": [], "cursor": null
                         }),
                         Some("session.list") => serde_json::json!({ "sessions": rows }),
+                        Some("session.views") => serde_json::json!({
+                            "cursor": "c",
+                            "sessions": rows.iter().map(|r| serde_json::json!({
+                                "sessionKey": r.session_key,
+                                "status": r.status,
+                            })).collect::<Vec<_>>(),
+                        }),
                         _ => serde_json::Value::Null,
                     };
                     let mut out = serde_json::to_vec(&Response::ok(req.id, result)).unwrap();

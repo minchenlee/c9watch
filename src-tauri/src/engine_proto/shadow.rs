@@ -17,6 +17,16 @@
 //!   compared ticks with a diff that outlived its slack.
 //!   `c9watch engine shadow-report` prints these rows.
 //!
+//! - Field diff (core-public M-a2, GUI builds): after the workers overlay,
+//!   each GUI session's JSON is compared field by field with the engine's
+//!   `session.views`, by session key. Each field has a rule: `stable`
+//!   (exact, one tick of slack), `volatile` (exact, two ticks of slack:
+//!   counters and last messages move between the two clocks) or `text`
+//!   (exact, one tick of slack, compared and written as SHA-256 only).
+//!   A diff row is `{ts, day, kind: "field", key, field, rule, gui,
+//!   engine}`; `gui` and `engine` are numbers, `null`, or the SHA-256 of the
+//!   JSON value, never the text itself.
+//!
 //! `<home>` is the engine home of this build's channel (`engine-dev` for a
 //! dev build). The GUI never creates it: until the engine has made it, the
 //! counters stay in memory.
@@ -62,6 +72,15 @@ pub struct Coverage {
     pub mismatches: u64,
     /// Compared ticks with a diff that was also there on the tick before.
     pub unexplained: u64,
+    /// Ticks that compared session fields with `session.views`.
+    #[serde(default)]
+    pub field_ticks: u64,
+    /// Field-compared ticks with any field diff.
+    #[serde(default)]
+    pub field_mismatches: u64,
+    /// Field-compared ticks with a field diff that outlived its slack.
+    #[serde(default)]
+    pub field_unexplained: u64,
 }
 
 /// One session as one side sees it.
@@ -165,6 +184,9 @@ pub struct ShadowDiff {
     last_error: Option<String>,
     /// Per socket operation; `ENGINE_TIMEOUT` outside tests.
     timeout: Duration,
+    /// `(session key, field)` → compared ticks in a row it differed.
+    #[cfg(any(feature = "gui", feature = "engine"))]
+    field_streaks: HashMap<(String, String), u32>,
 }
 
 impl ShadowDiff {
@@ -188,6 +210,8 @@ impl ShadowDiff {
             last_flush: None,
             last_error: None,
             timeout: ENGINE_TIMEOUT,
+            #[cfg(any(feature = "gui", feature = "engine"))]
+            field_streaks: HashMap::new(),
         }
     }
 
@@ -204,6 +228,68 @@ impl ShadowDiff {
         if self.last_flush.is_none_or(|t| t.elapsed() >= FLUSH_EVERY) {
             self.flush();
         }
+    }
+
+    /// One GUI poll after the workers overlay: compare each session's
+    /// fields with the engine's `session.views`.
+    #[cfg(any(feature = "gui", feature = "engine"))]
+    pub fn tick_views(&mut self, sessions: &[Session]) {
+        let gui: Vec<serde_json::Value> = sessions
+            .iter()
+            .filter_map(|s| serde_json::to_value(s).ok())
+            .collect();
+        let engine = client::session_views(&sock_path(&self.home), "gui-shadow", self.timeout);
+        let now = chrono::Local::now();
+        let day = now.format("%Y-%m-%d").to_string();
+        self.record_fields(&day, now.timestamp_millis(), &gui, engine.ok());
+    }
+
+    /// Count one field comparison. `engine` is `None` when the engine could
+    /// not be read; the slack starts over after it. Returns the field diffs
+    /// written to the diff file this tick.
+    #[cfg(any(feature = "gui", feature = "engine"))]
+    pub fn record_fields(
+        &mut self,
+        day: &str,
+        ts_ms: i64,
+        gui: &[serde_json::Value],
+        engine: Option<Vec<serde_json::Value>>,
+    ) -> Vec<FieldDiff> {
+        let Some(engine) = engine else {
+            self.field_streaks.clear();
+            return Vec::new();
+        };
+        let diffs = compare_fields(gui, &engine);
+        let mut streaks = HashMap::new();
+        let mut written = Vec::new();
+        let mut unexplained = false;
+        for d in diffs.iter() {
+            let id = (d.key.clone(), d.field.clone());
+            let n = self.field_streaks.get(&id).copied().unwrap_or(0) + 1;
+            let slack = d.rule.slack();
+            if n > slack {
+                unexplained = true;
+                // Written once, when the diff first outlives its slack.
+                if n == slack + 1 {
+                    written.push(d.clone());
+                }
+            }
+            streaks.insert(id, n);
+        }
+        self.field_streaks = streaks;
+        for d in &written {
+            self.append_row(&d.row(day, ts_ms));
+        }
+        if let Some(today) = self.today.as_mut().filter(|c| c.day == day) {
+            today.field_ticks += 1;
+            if !diffs.is_empty() {
+                today.field_mismatches += 1;
+            }
+            if unexplained {
+                today.field_unexplained += 1;
+            }
+        }
+        written
     }
 
     /// Log when the reason the engine cannot be read changes, not every
@@ -282,6 +368,13 @@ impl ShadowDiff {
     }
 
     fn append_diff(&self, day: &str, ts_ms: i64, d: &Diff) {
+        let mut row = serde_json::to_value(d).unwrap_or_default();
+        row["ts"] = ts_ms.into();
+        row["day"] = day.into();
+        self.append_row(&row);
+    }
+
+    fn append_row(&self, row: &serde_json::Value) {
         if !self.home.is_dir() {
             return;
         }
@@ -289,9 +382,6 @@ impl ShadowDiff {
         if std::fs::symlink_metadata(&path).is_ok_and(|m| m.len() >= MAX_DIFF_FILE) {
             return;
         }
-        let mut row = serde_json::to_value(d).unwrap_or_default();
-        row["ts"] = ts_ms.into();
-        row["day"] = day.into();
         let mut line = row.to_string();
         line.push('\n');
         let res = open_private(&path, OpenOptions::new().append(true).create(true))
@@ -313,6 +403,132 @@ impl ShadowDiff {
             crate::debug_log::log_warn(&format!("Shadow diff: cannot write coverage: {}", e));
         }
     }
+}
+
+/// How a session field is compared.
+#[cfg(any(feature = "gui", feature = "engine"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rule {
+    /// Exact, one tick of slack.
+    Stable,
+    /// Exact, two ticks of slack: it moves between the two clocks.
+    Volatile,
+    /// Exact, one tick of slack; conversation text, so written as a hash.
+    Text,
+}
+
+#[cfg(any(feature = "gui", feature = "engine"))]
+impl Rule {
+    /// Field names are the GUI's camelCase `Session` keys.
+    pub fn of(field: &str) -> Rule {
+        match field {
+            "modified"
+            | "messageCount"
+            | "latestMessage"
+            | "lastAssistantMessage"
+            | "pendingToolName"
+            | "pendingToolInput"
+            | "waitingFor" => Rule::Volatile,
+            "firstPrompt" | "summary" | "sessionName" | "officialName" | "aiTitle"
+            | "customTitle" | "codexTitle" | "cursorTitle" | "agentNickname" => Rule::Text,
+            _ => Rule::Stable,
+        }
+    }
+
+    /// Compared ticks in a row a diff may last and still be explained.
+    pub fn slack(self) -> u32 {
+        match self {
+            Rule::Volatile => 2,
+            Rule::Stable | Rule::Text => 1,
+        }
+    }
+}
+
+/// One field that differs between the GUI's session and the engine's view.
+/// `gui` and `engine` are what a diff row holds: a number, `null`, or the
+/// SHA-256 of the value's JSON.
+#[cfg(any(feature = "gui", feature = "engine"))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldDiff {
+    pub key: String,
+    pub field: String,
+    pub rule: Rule,
+    pub gui: serde_json::Value,
+    pub engine: serde_json::Value,
+}
+
+#[cfg(any(feature = "gui", feature = "engine"))]
+impl FieldDiff {
+    fn row(&self, day: &str, ts_ms: i64) -> serde_json::Value {
+        serde_json::json!({
+            "ts": ts_ms,
+            "day": day,
+            "kind": "field",
+            "key": self.key,
+            "field": self.field,
+            "rule": self.rule,
+            "gui": self.gui,
+            "engine": self.engine,
+        })
+    }
+}
+
+/// A value as a diff row may hold it: numbers and `null` as they are,
+/// anything else (strings, flags, lists, objects) as the SHA-256 of its
+/// JSON, so no text reaches the file.
+#[cfg(any(feature = "gui", feature = "engine"))]
+pub fn fingerprint(v: &serde_json::Value) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    match v {
+        serde_json::Value::Null | serde_json::Value::Number(_) => v.clone(),
+        other => {
+            let digest = Sha256::digest(other.to_string().as_bytes());
+            let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+            serde_json::Value::String(format!("sha256:{}", hex))
+        }
+    }
+}
+
+/// The field diffs of the sessions both sides have, by `sessionKey`, in a
+/// stable order. A session on one side only is the presence diff's job.
+#[cfg(any(feature = "gui", feature = "engine"))]
+pub fn compare_fields(gui: &[serde_json::Value], engine: &[serde_json::Value]) -> Vec<FieldDiff> {
+    let by_key = |vs: &[serde_json::Value]| -> std::collections::BTreeMap<
+        String,
+        serde_json::Map<String, serde_json::Value>,
+    > {
+        let mut out = std::collections::BTreeMap::new();
+        for v in vs {
+            if let (Some(k), Some(o)) = (v["sessionKey"].as_str(), v.as_object()) {
+                // A key listed twice counts once, by its first entry.
+                out.entry(k.to_string()).or_insert_with(|| o.clone());
+            }
+        }
+        out
+    };
+    let g = by_key(gui);
+    let e = by_key(engine);
+    let null = serde_json::Value::Null;
+    let mut out = Vec::new();
+    for (key, gs) in &g {
+        let Some(es) = e.get(key) else { continue };
+        let fields: BTreeSet<&String> = gs.keys().chain(es.keys()).collect();
+        for field in fields {
+            let gv = gs.get(field).unwrap_or(&null);
+            let ev = es.get(field).unwrap_or(&null);
+            if gv != ev {
+                out.push(FieldDiff {
+                    key: key.clone(),
+                    field: field.clone(),
+                    rule: Rule::of(field),
+                    gui: fingerprint(gv),
+                    engine: fingerprint(ev),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Open `path` 0600 without following a symlink.
@@ -423,6 +639,7 @@ mod tests {
                 unreachable: 0,
                 mismatches: 0,
                 unexplained: 0,
+                ..Coverage::default()
             }]
         );
         assert!(!dir.path().join(DIFF_FILE).exists());
@@ -618,5 +835,108 @@ mod tests {
         assert_eq!(Side::from_row(&r), Some(side("claudeCode:a", "working")));
         r.session_key = None;
         assert_eq!(Side::from_row(&r), None);
+    }
+
+    // ── Field diff (core-public M-a2) ─────────────────────────────────
+
+    #[cfg(any(feature = "gui", feature = "engine"))]
+    fn view(key: &str, status: &str, first: &str, count: u64) -> serde_json::Value {
+        serde_json::json!({
+            "sessionKey": key, "status": status, "firstPrompt": first,
+            "messageCount": count, "pid": 7,
+        })
+    }
+
+    /// Rules: a stable or text diff is written on its second tick, a
+    /// volatile one on its third; each once; the coverage counts them.
+    #[cfg(any(feature = "gui", feature = "engine"))]
+    #[test]
+    fn field_diffs_obey_their_slack_and_are_written_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sd = ShadowDiff::new(dir.path().to_path_buf());
+        let gui = [view("k:a", "working", "secret prompt", 5)];
+        let engine = vec![view("k:a", "idle", "other prompt", 4)];
+        let mut written = Vec::new();
+        for ts in 1..=4 {
+            sd.record(DAY, ts, &[], Some(vec![]));
+            let w = sd.record_fields(DAY, ts, &gui, Some(engine.clone()));
+            written.push(w.iter().map(|d| d.field.clone()).collect::<Vec<_>>());
+        }
+        assert_eq!(
+            written,
+            vec![
+                vec![],
+                vec!["firstPrompt".to_string(), "status".to_string()],
+                vec!["messageCount".to_string()],
+                vec![],
+            ]
+        );
+        sd.flush();
+        let cov = &read_coverage(dir.path()).unwrap()[0];
+        assert_eq!(
+            (cov.field_ticks, cov.field_mismatches, cov.field_unexplained),
+            (4, 4, 3)
+        );
+        let rows = rows(dir.path(), DIFF_FILE);
+        assert_eq!(rows.len(), 3);
+        let first = rows.iter().find(|r| r["field"] == "firstPrompt").unwrap();
+        assert_eq!(first["kind"], "field");
+        assert_eq!(first["rule"], "text");
+        assert_eq!(first["key"], "k:a");
+        let count = rows.iter().find(|r| r["field"] == "messageCount").unwrap();
+        assert_eq!(
+            (count["gui"].clone(), count["engine"].clone()),
+            (5.into(), 4.into())
+        );
+        assert_eq!(count["rule"], "volatile");
+        // No text reaches the file: strings are SHA-256 only.
+        let text = std::fs::read_to_string(dir.path().join(DIFF_FILE)).unwrap();
+        for word in ["secret", "other prompt", "working", "idle"] {
+            assert!(!text.contains(word), "{} leaked: {}", word, text);
+        }
+        assert!(first["gui"].as_str().unwrap().starts_with("sha256:"));
+        assert_eq!(first["gui"], fingerprint(&"secret prompt".into()));
+    }
+
+    /// A diff that clears within its slack is never written; an unreachable
+    /// tick starts the slack over.
+    #[cfg(any(feature = "gui", feature = "engine"))]
+    #[test]
+    fn field_diffs_within_slack_or_across_a_gap_are_explained() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sd = ShadowDiff::new(dir.path().to_path_buf());
+        let same = [view("k:a", "working", "p", 1)];
+        let moved = vec![view("k:a", "working", "p", 2)];
+        assert!(sd
+            .record_fields(DAY, 1, &same, Some(moved.clone()))
+            .is_empty());
+        assert!(sd
+            .record_fields(DAY, 2, &same, Some(moved.clone()))
+            .is_empty());
+        assert!(sd
+            .record_fields(DAY, 3, &same, Some(same.to_vec()))
+            .is_empty());
+        let other = vec![view("k:a", "idle", "p", 1)];
+        assert!(sd
+            .record_fields(DAY, 4, &same, Some(other.clone()))
+            .is_empty());
+        assert!(sd.record_fields(DAY, 5, &same, None).is_empty());
+        assert!(sd.record_fields(DAY, 6, &same, Some(other)).is_empty());
+        // Sessions on one side only are not field diffs.
+        assert!(compare_fields(&same, &[view("k:b", "idle", "p", 1)]).is_empty());
+        assert!(!dir.path().join(DIFF_FILE).exists());
+    }
+
+    #[cfg(any(feature = "gui", feature = "engine"))]
+    #[test]
+    fn tick_views_reads_a_running_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_sock, server) = fake_engine(dir.path(), vec![row("claudeCode:a", "working")], 1);
+        let mut sd = ShadowDiff::new(dir.path().to_path_buf());
+        sd.timeout = Duration::from_secs(2);
+        sd.record(DAY, 1, &[], Some(vec![]));
+        sd.tick_views(&[]);
+        server.join().unwrap();
+        assert!(sd.field_streaks.is_empty());
     }
 }

@@ -103,6 +103,13 @@ pub fn start_polling(
                     // Overlay worker_of from ~/.claude/c9watch/workers/*/meta.json
                     crate::session::workers::apply_workers_overlay(&mut sessions);
 
+                    // The engine's views carry the same overlay: compare the
+                    // GUI's session JSON field by field (dev only).
+                    #[cfg(all(unix, c9_channel_dev))]
+                    if let Some(shadow) = shadow.as_mut() {
+                        shadow.tick_views(&sessions);
+                    }
+
                     // Track current session IDs to clean up stale entries
                     let current_session_ids: HashSet<String> =
                         sessions.iter().map(|s| s.session_key.clone()).collect();
