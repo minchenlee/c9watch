@@ -4,7 +4,7 @@
  * getSessionHistory IPC blocks the main thread and lags the tab highlight).
  */
 
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import { getSessionHistory } from '../api';
 import type { HistoryEntry } from '../types';
 
@@ -23,7 +23,9 @@ export async function refreshSessionHistory(): Promise<void> {
 	// potentially expensive archive scan immediately.
 	if (loadedAt > 0 && Date.now() - loadedAt < HISTORY_CACHE_TTL_MS) return;
 	if (inFlight) return inFlight;
-	historyLoading.set(true);
+	// Only the first load shows "Loading": a refetch keeps the rows on screen,
+	// so reopening the tab does not tear the list down and draw it again.
+	if (get(historyEntries).length === 0) historyLoading.set(true);
 	historyError.set(null);
 	inFlight = (async () => {
 		try {
