@@ -161,6 +161,31 @@ impl std::fmt::Display for UnknownModel {
 
 impl std::error::Error for UnknownModel {}
 
+impl Descriptor {
+    /// Read-only integration inventory. This checkout ships only CC's
+    /// per-spawn hook settings. The other P1 readers are passive: there is
+    /// no engine hook/extension/plugin installer or versioned template to
+    /// compare against. Do not mistake the CC helper's presence for a
+    /// working integration of a different kind, or claim a foreign file.
+    pub fn integration_report(&self, agent_bin: &Path) -> serde_json::Value {
+        if self.kind == "claude" {
+            serde_json::json!({
+                "descriptor": self,
+                "status": claude_integration_status(agent_bin),
+                "delivery": "per_spawn_settings",
+                "agentBin": agent_bin,
+            })
+        } else {
+            serde_json::json!({
+                "descriptor": self,
+                "status": IntegrationStatus::Missing,
+                "delivery": "unavailable",
+                "integrationFiles": [],
+                "reason": "engine_integration_not_implemented",
+            })
+        }
+    }
+}
 
 /// Claude Code.
 pub const CLAUDE: Descriptor = Descriptor {
