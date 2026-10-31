@@ -30,7 +30,14 @@ pub mod notification;
 pub mod rename;
 pub mod state;
 pub mod transitions;
+pub mod tasks;
 pub mod workers;
+
+// Readers that the GUI and the engine both call; both need tokio.
+#[cfg(any(feature = "gui", feature = "engine"))]
+pub mod blocking;
+#[cfg(any(feature = "gui", feature = "engine"))]
+pub mod subscription_usage;
 pub use parser::{
     extract_messages, parse_all_entries, parse_last_n_entries, parse_sessions_index, ImageBlock,
     MessageContent, MessageType, SessionEntry, SessionIndexEntry, SessionsIndex,

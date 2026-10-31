@@ -1,7 +1,9 @@
 //! Admission control before dispatching synchronous scans to the blocking pool.
+//! The GUI's commands and the engine's c9p methods share these gates.
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Semaphore;
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub(crate) static DISCOVERY: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(1)));
 pub(crate) static SUBAGENTS: LazyLock<Arc<Semaphore>> =
@@ -9,21 +11,49 @@ pub(crate) static SUBAGENTS: LazyLock<Arc<Semaphore>> =
 pub(crate) static SUBAGENT_TRANSCRIPT: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(1)));
 
-pub(crate) async fn scan<T: Send + 'static>(
+/// Why `try_scan` did not run its job, or how the job failed.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ScanError {
+    /// Another scan holds the gate.
+    Busy,
+    /// The job failed, or its task panicked.
+    Failed(String),
+}
+
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScanError::Busy => f.write_str("Scan already in progress; retry shortly"),
+            ScanError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+/// Run `job` on the blocking pool if `gate` is free; never queue.
+pub(crate) async fn try_scan<T: Send + 'static>(
     gate: &Arc<Semaphore>,
     job: impl FnOnce() -> Result<T, String> + Send + 'static,
-) -> Result<T, String> {
+) -> Result<T, ScanError> {
     // No unbounded queue of async waiters or already-spawned blocking jobs.
     let permit = gate
         .clone()
         .try_acquire_owned()
-        .map_err(|_| "Scan already in progress; retry shortly")?;
+        .map_err(|_| ScanError::Busy)?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit; // Remains held if the caller is cancelled.
         job()
     })
     .await
-    .map_err(|error| format!("Scan failed: {error}"))?
+    .map_err(|error| ScanError::Failed(format!("Scan failed: {error}")))?
+    .map_err(ScanError::Failed)
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub(crate) async fn scan<T: Send + 'static>(
+    gate: &Arc<Semaphore>,
+    job: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    try_scan(gate, job).await.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ pub mod session;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod auth;
 #[cfg(all(not(mobile), feature = "gui"))]
-mod blocking;
+pub(crate) use session::blocking;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod notifications;
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -22,7 +22,7 @@ pub mod polling;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod remote_access;
 #[cfg(all(not(mobile), feature = "gui"))]
-pub mod subscription_usage;
+pub use session::subscription_usage;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod web_server;
 #[cfg(all(not(mobile), feature = "gui"))]
@@ -289,7 +289,7 @@ async fn get_subagent_transcript(
 #[cfg(all(not(mobile), feature = "gui", feature = "cli"))]
 #[tauri::command]
 async fn get_session_tasks(session_id: String) -> Result<Vec<serde_json::Value>, String> {
-    cli::read_session_tasks(&session_id)
+    session::tasks::read_session_tasks(&session_id)
 }
 
 /// Save base64-encoded PNG data to a temp file and return the path.

@@ -351,7 +351,9 @@ static CACHE: LazyLock<Arc<Mutex<Cache>>> = LazyLock::new(|| {
     }))
 });
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "engine", schemars(rename = "OpencodeStatus"))]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionStatus {
     url: String,
@@ -363,6 +365,23 @@ pub struct ConnectionStatus {
 #[cfg(feature = "gui")]
 #[tauri::command]
 pub fn opencode_connection_status() -> ConnectionStatus {
+    connection_status()
+}
+
+/// Credentials stay in process memory and are never returned to the UI or logged.
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub fn opencode_connect(
+    url: String,
+    username: String,
+    password: Option<String>,
+) -> Result<(), String> {
+    connect(url, username, password)
+}
+
+/// The OpenCode server connection now, after one detection pass. The GUI's
+/// `opencode_connection_status` and the engine's `provider.opencode.status`.
+pub fn connection_status() -> ConnectionStatus {
     detect();
     let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     ConnectionStatus {
@@ -377,14 +396,9 @@ pub fn opencode_connection_status() -> ConnectionStatus {
     }
 }
 
-/// Credentials stay in process memory and are never returned to the UI or logged.
-#[cfg(feature = "gui")]
-#[tauri::command]
-pub fn opencode_connect(
-    url: String,
-    username: String,
-    password: Option<String>,
-) -> Result<(), String> {
+/// Point detection at another OpenCode server (an empty `url` disconnects).
+/// Credentials stay in process memory and are never returned or logged.
+pub fn connect(url: String, username: String, password: Option<String>) -> Result<(), String> {
     let connection = if url.trim().is_empty() {
         None
     } else {

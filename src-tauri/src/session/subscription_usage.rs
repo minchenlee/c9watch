@@ -12,6 +12,7 @@ use tokio::{
 };
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UsageWindow {
     label: String,
@@ -21,6 +22,7 @@ pub struct UsageWindow {
     window_seconds: Option<i64>,
 }
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionUsage {
     provider: String,
@@ -389,13 +391,25 @@ async fn read_claude() -> Result<SubscriptionUsage, String> {
     ))
 }
 
+/// How long the GUI reuses a snapshot.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub const GUI_MAX_AGE: Duration = Duration::from_secs(55);
+
 /// Shared cache coalesces desktop/mobile polling and bounds subprocess creation.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub async fn get_subscription_usage() -> Vec<SubscriptionUsage> {
+    get_subscription_usage_within(GUI_MAX_AGE).await
+}
+
+/// The snapshot, read again only when the cached one is older than
+/// `max_age`. Callers that arrive while a read runs wait for it, so one
+/// read serves them all.
+pub async fn get_subscription_usage_within(max_age: Duration) -> Vec<SubscriptionUsage> {
     type Cache = Option<(Instant, Vec<SubscriptionUsage>)>;
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     let mut cache = CACHE.get_or_init(|| Mutex::new(None)).lock().await;
     if let Some((at, data)) = cache.as_ref() {
-        if at.elapsed() < Duration::from_secs(55) {
+        if at.elapsed() < max_age {
             return data.clone();
         }
     }
