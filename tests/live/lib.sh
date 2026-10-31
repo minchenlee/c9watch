@@ -86,4 +86,3 @@ for tr in sys.argv[3:]:
 print("prompt=%s answer=%s" % (seen_p, seen_a))
 sys.exit(0 if seen_p and seen_a else 1)' "$1" "$2"
 }
-

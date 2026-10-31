@@ -89,7 +89,7 @@ if want s4; then
     q "SELECT * FROM message_status WHERE msg_id='$M4'" >"$EV/s4-status.txt"
     wait_state "$BID" ready 180 || true
     EARLY=$(q "SELECT count(*) FROM messages m WHERE m.id='$M4' AND m.state_at < (SELECT min(ts) FROM events WHERE topic='agent.turn_end' AND subject LIKE '%/$BID' AND ts>=m.created_at)")
-    [ "$EARLY" = 1 ] || fail s4 'peer evidence was not before the target turn end' 
+    [ "$EARLY" = 1 ] || fail s4 'peer evidence was not before the target turn end'
 fi
 if want s5; then
     send s5 "$BID" "Use Bash to run once: \"$C9\" send $AID --reply-to $M3 \"Explicit CLI reply\". Then end your turn." --wait --timeout 180
