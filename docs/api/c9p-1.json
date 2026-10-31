@@ -1976,9 +1976,9 @@
           "x-sensitivity": "public"
         },
         "redactedTitle": {
-          "description": "`title` without conversation text.",
+          "description": "`title` without conversation text: the project folder name, else the\nprovider's name (e.g. `Claude Code`). Never a session title or name.",
           "type": "string",
-          "x-sensitivity": "conversation"
+          "x-sensitivity": "metadata"
         },
         "sessionKey": {
           "type": "string",

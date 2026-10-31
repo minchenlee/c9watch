@@ -183,8 +183,8 @@ fn redact_sessions(data: &mut serde_json::Value, policy: &WsPolicy) {
 }
 
 /// A notification's `title` can be the session's first prompt. With
-/// conversations off it becomes `redactedTitle` (the session's own title or
-/// name). `redactedTitle` itself never goes out.
+/// conversations off it becomes `redactedTitle` (the project name, else the
+/// provider's name). `redactedTitle` itself never goes out.
 fn redact_notification(data: &mut serde_json::Value, policy: &WsPolicy) {
     let Some(notification) = data.as_object_mut() else {
         return;
