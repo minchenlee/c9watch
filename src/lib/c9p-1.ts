@@ -2,7 +2,7 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 7;
+export const C9P_API_MINOR = 8;
 
 /** `agent.attention` data: an agent needs the user. */
 export interface C9pAgentAttentionEvent {
@@ -212,7 +212,7 @@ export interface C9pAwayRequest {
 }
 
 /** A sensitivity ceiling. Ordering is also the egress ordering. */
-export type C9pCeiling = 'public' | 'metadata' | 'conversation';
+export type C9pCeiling = 'public' | 'metadata' | 'conversation' | string;
 
 /** What a client says about itself in `hello`. Unverified. */
 export interface C9pClientInfo {
@@ -337,7 +337,7 @@ export interface C9pErrorBody {
  * Typed error codes. New codes are additive; a client that does not know a
  * code still has `msg`, `retryable` and `hint`.
  */
-export type C9pErrorCode = 'hop_limit' | 'not_cancellable' | string | 'upgrade_required' | 'hello_required' | 'hello_timeout' | 'frame_too_large' | 'bad_request' | 'unknown_method' | 'peer_uid_mismatch' | 'cursor_expired' | 'rate_limited' | 'peer_not_authorized' | 'no_task' | 'unsupported_in_c1a' | 'agent_bin_missing' | 'agent_bin_mismatch' | 'not_allowed' | 'cwd_collision' | 'spawn_failed' | 'unknown_agent' | 'draining' | 'unknown_address' | 'not_controlled' | 'not_owner' | 'duplicate' | 'unknown_session' | 'action_failed' | 'busy' | 'internal';
+export type C9pErrorCode = 'hop_limit' | 'not_cancellable' | string | 'upgrade_required' | 'hello_required' | 'hello_timeout' | 'frame_too_large' | 'bad_request' | 'unknown_method' | 'peer_uid_mismatch' | 'cursor_expired' | 'rate_limited' | 'peer_not_authorized' | 'no_task' | 'unsupported_in_c1a' | 'agent_bin_missing' | 'agent_bin_mismatch' | 'not_allowed' | 'confirmation_required' | 'cwd_collision' | 'spawn_failed' | 'unknown_agent' | 'draining' | 'unknown_address' | 'not_controlled' | 'not_owner' | 'duplicate' | 'unknown_session' | 'action_failed' | 'busy' | 'internal';
 
 /**
  * One event on the wire (A:203). `sub` is the `id` of the subscribe

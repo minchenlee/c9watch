@@ -2,7 +2,7 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 7;
+export const C9P_API_MINOR = 8;
 
 /** `agent.attention` data: an agent needs the user. */
 export interface C9pAgentAttentionEvent {
@@ -154,6 +154,35 @@ export interface C9pAgentTurnEndEvent {
   id: string;
 }
 
+/** Ask about the caller's own authority. Params are inspected, never executed. */
+export interface C9pAuthCanParams {
+  method: string;
+  params?: unknown;
+}
+
+export interface C9pAuthCanResult {
+  allowed: boolean;
+  needs?: C9pAuthNeeds | null;
+  reason?: string | null;
+}
+
+/** Additional authority a caller would need. */
+export interface C9pAuthNeeds {
+  ceiling?: C9pCeiling | null;
+  confirmation?: boolean | null;
+  scopes?: string[];
+}
+
+export interface C9pAuthRulesResult {
+  ceiling: C9pCeiling;
+  expiresAt?: number | null;
+  idleExpiresAt?: number | null;
+  methods: Record<string, C9pMethodInfo>;
+  principal: string;
+  scopes: string[];
+  topics: string[];
+}
+
 /** Counts of what happened after `since_ms`. */
 export interface C9pAwayActivity {
   commandsRun: number;
@@ -172,6 +201,9 @@ export interface C9pAwayRequest {
   sessionKey: string;
   sinceMs: number;
 }
+
+/** A sensitivity ceiling. Ordering is also the egress ordering. */
+export type C9pCeiling = 'public' | 'metadata' | 'conversation' | string;
 
 /** What a client says about itself in `hello`. Unverified. */
 export interface C9pClientInfo {
@@ -296,7 +328,7 @@ export interface C9pErrorBody {
  * Typed error codes. New codes are additive; a client that does not know a
  * code still has `msg`, `retryable` and `hint`.
  */
-export type C9pErrorCode = 'hop_limit' | 'not_cancellable' | string | 'upgrade_required' | 'hello_required' | 'hello_timeout' | 'frame_too_large' | 'bad_request' | 'unknown_method' | 'peer_uid_mismatch' | 'cursor_expired' | 'rate_limited' | 'peer_not_authorized' | 'no_task' | 'unsupported_in_c1a' | 'agent_bin_missing' | 'agent_bin_mismatch' | 'not_allowed' | 'cwd_collision' | 'spawn_failed' | 'unknown_agent' | 'draining' | 'unknown_address' | 'not_controlled' | 'not_owner' | 'duplicate' | 'unknown_session' | 'action_failed' | 'busy' | 'internal';
+export type C9pErrorCode = 'hop_limit' | 'not_cancellable' | string | 'upgrade_required' | 'hello_required' | 'hello_timeout' | 'frame_too_large' | 'bad_request' | 'unknown_method' | 'peer_uid_mismatch' | 'cursor_expired' | 'rate_limited' | 'peer_not_authorized' | 'no_task' | 'unsupported_in_c1a' | 'agent_bin_missing' | 'agent_bin_mismatch' | 'not_allowed' | 'confirmation_required' | 'cwd_collision' | 'spawn_failed' | 'unknown_agent' | 'draining' | 'unknown_address' | 'not_controlled' | 'not_owner' | 'duplicate' | 'unknown_session' | 'action_failed' | 'busy' | 'internal';
 
 /**
  * One event on the wire . `sub` is the `id` of the subscribe
@@ -508,6 +540,7 @@ export type C9pMessageType = 'User' | 'Assistant' | 'Thinking' | 'ToolUse' | 'To
 
 /** One method in `hello.result.methods`. */
 export interface C9pMethodInfo {
+  needs?: C9pAuthNeeds | null;
   /** Goes up by one on each breaking change to the method's shape. */
   rev: number;
   /** The minor that added the method. */
@@ -1220,6 +1253,14 @@ export interface C9pMethods {
     params: C9pAgentRetireParams;
     result: C9pAgentRetireResult;
   };
+  'auth.can': {
+    params: C9pAuthCanParams;
+    result: C9pAuthCanResult;
+  };
+  'auth.rules': {
+    params: C9pPingParams;
+    result: C9pAuthRulesResult;
+  };
   'conversation.get': {
     params: C9pConversationGetParams;
     progress: C9pProgressFrame;
@@ -1381,5 +1422,5 @@ export interface C9pTopics {
 
 export type C9pTopic = keyof C9pTopics;
 
-export const C9P_PUBLIC_METHODS = ["agent.create","agent.list","agent.retire","conversation.get","cost.get","detect.recheck","diag.detection","events.subscribe","events.unsubscribe","hello","history.list","history.search","mail.pause","mail.resume","memory.list","msg.cancel","msg.list","msg.read","msg.send","ping","provider.opencode.connect","provider.opencode.status","session.away","session.list","session.rename","session.stop","session.tasks","session.views","snapshot.get","subagent.list","subagent.transcript","usage.subscriptions"] as const;
+export const C9P_PUBLIC_METHODS = ["agent.create","agent.list","agent.retire","auth.can","auth.rules","conversation.get","cost.get","detect.recheck","diag.detection","events.subscribe","events.unsubscribe","hello","history.list","history.search","mail.pause","mail.resume","memory.list","msg.cancel","msg.list","msg.read","msg.send","ping","provider.opencode.connect","provider.opencode.status","session.away","session.list","session.rename","session.stop","session.tasks","session.views","snapshot.get","subagent.list","subagent.transcript","usage.subscriptions"] as const;
 export const C9P_PUBLIC_TOPICS = ["agent.attention","agent.failed","agent.gone","agent.turn_end","agent.upsert","diag.detection","msg.state","notification.needs_attention","notification.waiting_for_input","session.gone","session.view"] as const;

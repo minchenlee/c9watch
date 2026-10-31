@@ -18,6 +18,12 @@ function walk(v) {
   Object.values(v).forEach(walk);
 }
 walk(expected);
+for (const group of ['methods', 'topics']) {
+  for (const [name, entry] of Object.entries(expected[group])) {
+    assert(entry['x-authz'], `missing public authority: ${group}.${name}`);
+    assert.deepEqual(entry['x-authz'], input[group][name]['x-authz'], `changed public authority: ${group}.${name}`);
+  }
+}
 assert(!expected.topics['legacy.inbox']);
 assert(!Object.keys(expected.methods).some((m) => m.startsWith('hook.')));
 assert(!expected.methods['task.done']); assert(!expected.methods['agent.handoff']);

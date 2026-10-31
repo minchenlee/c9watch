@@ -106,6 +106,16 @@ mod tests {
                 .unwrap()
                 .contains(&Value::from(field)));
         }
-        assert_eq!(s["apiMinor"], embedded()["apiMinor"]);
+        let full = embedded();
+        for group in ["methods", "topics"] {
+            for (name, entry) in s[group].as_object().unwrap() {
+                assert!(entry["x-authz"].is_object(), "{group}.{name}");
+                assert_eq!(
+                    entry["x-authz"], full[group][name]["x-authz"],
+                    "{group}.{name}"
+                );
+            }
+        }
+        assert_eq!(s["apiMinor"], full["apiMinor"]);
     }
 }

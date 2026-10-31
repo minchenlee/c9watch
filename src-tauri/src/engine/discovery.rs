@@ -79,8 +79,8 @@ pub const METHOD_INFO: &[Method] = &[
     m("provider.opencode.connect", 6, PREVIEW),
     m("events.unsubscribe", 6, PREVIEW),
     m("ping", 6, PREVIEW),
-    m("auth.can", 7, PREVIEW),
-    m("auth.rules", 7, PREVIEW),
+    m("auth.can", 8, PREVIEW),
+    m("auth.rules", 8, PREVIEW),
 ];
 
 /// Every event topic and its stability. `legacy.inbox` carries the

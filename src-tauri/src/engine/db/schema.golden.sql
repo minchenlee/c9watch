@@ -1,4 +1,4 @@
--- user_version 6
+-- user_version 7
 -- index agents_detected_key
 CREATE UNIQUE INDEX agents_detected_key ON agents (session_key) WHERE source = 'detected';
 -- index agents_legacy_sid
