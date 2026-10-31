@@ -162,9 +162,8 @@ async fn exports_page_history_redact_events_and_preserve_output_files() {
     assert_eq!(std::fs::read(&file).unwrap(), saved);
     assert!(lines(&f.run(&["export", "sessions"])).is_empty());
     assert!(lines(&f.run(&["export", "cost"])).is_empty());
-    let unsupported = f.run(&["export", "annotations"]);
-    assert!(!unsupported.status.success());
-    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("annotation.list"));
+    // L1 is available starting at 1.9; an empty fixture is a successful list.
+    assert!(lines(&f.run(&["export", "annotations"])).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -265,4 +264,83 @@ fn export_auto_starts_core_in_its_isolated_home() {
     }
     assert!(engine_lock_held(&lock_path(&engine)).unwrap());
     assert!(engine_pid(&lock_path(&engine)).unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn python_annotations_cli_and_event_replay_share_the_fixture_engine() {
+    let f = Fixture::new();
+    f.db.write_blocking(|tx| {
+        tx.execute("INSERT INTO agents(id,role,provider,source,session_key) VALUES ('annotation-session','observed','claudeCode','detected','claudeCode:annotation-session')", [])?;
+        Ok(())
+    }).unwrap();
+    let script = r#"
+import json, os, socket
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(10)
+s.connect(os.path.join(os.environ['C9WATCH_ENGINE_HOME'], 'engine-v1.sock'))
+f = s.makefile('rwb')
+def send(i, method, params):
+    f.write((json.dumps(dict(v=1, id=i, method=method, params=params))+'\n').encode())
+    f.flush()
+def read():
+    return json.loads(f.readline())
+send('hello', 'hello', dict(apiMajor=1, apiMinor=9))
+assert read()['ok']
+send('before', 'annotation.list', {})
+cursor = read()['result']['cursor']
+send('set', 'annotation.patch', dict(target=dict(kind='session', sessionKey='claudeCode:annotation-session'), source='ci', seq=1, values=dict(tests=dict(type='number', v=42), note=dict(type='string', v='secret annotation'))))
+assert read()['result']['applied']
+send('events', 'events.subscribe', dict(topics=['annotation.changed'], since=cursor))
+assert read()['ok']
+event = read()
+assert event['topic'] == 'annotation.changed'
+assert event['data']['values']['tests']['value']['v'] == 42
+print('python annotation patch and event replay: ok')
+"#;
+    let out = f.cmd("python3").args(["-c", script]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "python annotation patch and event replay: ok"
+    );
+    let listed = lines(&f.run(&[
+        "annotate",
+        "list",
+        "--session-key",
+        "claudeCode:annotation-session",
+    ]));
+    assert_eq!(listed[0]["annotations"].as_array().unwrap().len(), 2);
+    let exported = lines(&f.run(&["export", "annotations"]));
+    assert_eq!(exported.len(), 2);
+    assert!(!serde_json::to_string(&exported)
+        .unwrap()
+        .contains("secret annotation"));
+    assert!(serde_json::to_string(&lines(&f.run(&[
+        "export",
+        "annotations",
+        "--include-conversation"
+    ])))
+    .unwrap()
+    .contains("secret annotation"));
+    assert!(f
+        .run(&[
+            "annotate",
+            "set",
+            "claudeCode:annotation-session",
+            "ci/tests",
+            r#"{"type":"number","v":43}"#
+        ])
+        .status
+        .success());
+    let deleted = lines(&f.run(&[
+        "annotate",
+        "delete",
+        "claudeCode:annotation-session",
+        "ci/tests",
+    ]));
+    assert_eq!(deleted[0]["deleted"], true);
 }

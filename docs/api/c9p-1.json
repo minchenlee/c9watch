@@ -481,6 +481,488 @@
       ],
       "type": "object"
     },
+    "Annotation": {
+      "properties": {
+        "createdAt": {
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "expiresAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "format": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "key": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "redacted": {
+          "type": "boolean",
+          "x-sensitivity": "public"
+        },
+        "sensitivity": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "target": {
+          "$ref": "#/$defs/AnnotationTarget",
+          "x-sensitivity": "public"
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "updatedAt": {
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AnnotationValue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Omitted by a gateway when the value exceeds its ceiling.",
+          "x-redaction-flag": "redacted",
+          "x-sensitivity": "metadata",
+          "x-sensitivity-by-type": {
+            "bool": "metadata",
+            "duration": "metadata",
+            "money": "metadata",
+            "number": "metadata",
+            "string": "conversation"
+          }
+        },
+        "writer": {
+          "type": "string",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "target",
+        "key",
+        "sensitivity",
+        "writer",
+        "createdAt",
+        "updatedAt",
+        "expiresAt"
+      ],
+      "type": "object"
+    },
+    "AnnotationChangedEvent": {
+      "properties": {
+        "source": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "target": {
+          "$ref": "#/$defs/AnnotationTarget",
+          "x-sensitivity": "public"
+        },
+        "values": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Annotation"
+          },
+          "description": "Resulting source map, including per-key writer, expiry and sensitivity.",
+          "type": "object",
+          "x-sensitivity": "metadata"
+        }
+      },
+      "required": [
+        "target",
+        "source",
+        "values"
+      ],
+      "type": "object"
+    },
+    "AnnotationDeleteParams": {
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/AnnotationTarget"
+        }
+      },
+      "required": [
+        "target",
+        "key"
+      ],
+      "type": "object"
+    },
+    "AnnotationDeleteResult": {
+      "properties": {
+        "deleted": {
+          "type": "boolean",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "deleted"
+      ],
+      "type": "object"
+    },
+    "AnnotationListParams": {
+      "properties": {
+        "namespace": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AnnotationTarget"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "type": "object"
+    },
+    "AnnotationListResult": {
+      "properties": {
+        "annotations": {
+          "items": {
+            "$ref": "#/$defs/Annotation"
+          },
+          "type": "array",
+          "x-sensitivity": "public"
+        },
+        "cursor": {
+          "description": "Snapshot cursor; subscribe from it to close the list/watch race.",
+          "type": "string",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "cursor",
+        "annotations"
+      ],
+      "type": "object"
+    },
+    "AnnotationPatchParams": {
+      "properties": {
+        "seq": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "$ref": "#/$defs/AnnotationTarget"
+        },
+        "ttlMs": {
+          "default": null,
+          "description": "Per touched key, from 1 millisecond through 24 hours.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "values": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/AnnotationValue"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "target",
+        "values"
+      ],
+      "type": "object"
+    },
+    "AnnotationPatchResult": {
+      "properties": {
+        "applied": {
+          "description": "False means the sequence was already accepted or is stale.",
+          "type": "boolean",
+          "x-sensitivity": "public"
+        },
+        "source": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "target": {
+          "$ref": "#/$defs/AnnotationTarget",
+          "x-sensitivity": "public"
+        },
+        "values": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Annotation"
+          },
+          "type": "object",
+          "x-sensitivity": "metadata"
+        }
+      },
+      "required": [
+        "applied",
+        "target",
+        "source",
+        "values"
+      ],
+      "type": "object"
+    },
+    "AnnotationRemovedEvent": {
+      "properties": {
+        "key": {
+          "type": "string",
+          "x-sensitivity": "metadata"
+        },
+        "reason": {
+          "description": "target_gone; expiry and explicit clears emit annotation.changed.",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "target": {
+          "$ref": "#/$defs/AnnotationTarget",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "target",
+        "key",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "AnnotationSetParams": {
+      "properties": {
+        "format": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "$ref": "#/$defs/AnnotationTarget"
+        },
+        "ttlSeconds": {
+          "default": null,
+          "description": "One-key shortcut TTL: 60 seconds through 24 hours.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "unit": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "$ref": "#/$defs/AnnotationValue"
+        }
+      },
+      "required": [
+        "target",
+        "key",
+        "value"
+      ],
+      "type": "object"
+    },
+    "AnnotationSetResult": {
+      "properties": {
+        "annotation": {
+          "$ref": "#/$defs/Annotation",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "annotation"
+      ],
+      "type": "object"
+    },
+    "AnnotationTarget": {
+      "properties": {
+        "kind": {
+          "description": "Open enum; only session targets are supported in preview.",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "sessionKey": {
+          "type": "string",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "kind",
+        "sessionKey"
+      ],
+      "type": "object"
+    },
+    "AnnotationValue": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "number",
+              "type": "string",
+              "x-sensitivity": "public"
+            },
+            "v": {
+              "format": "double",
+              "type": "number",
+              "x-sensitivity": "metadata"
+            }
+          },
+          "required": [
+            "type",
+            "v"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "string",
+              "type": "string",
+              "x-sensitivity": "public"
+            },
+            "v": {
+              "type": "string",
+              "x-sensitivity": "conversation"
+            }
+          },
+          "required": [
+            "type",
+            "v"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "bool",
+              "type": "string",
+              "x-sensitivity": "public"
+            },
+            "v": {
+              "type": "boolean",
+              "x-sensitivity": "metadata"
+            }
+          },
+          "required": [
+            "type",
+            "v"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer",
+              "x-sensitivity": "metadata"
+            },
+            "type": {
+              "const": "duration",
+              "type": "string",
+              "x-sensitivity": "public"
+            }
+          },
+          "required": [
+            "type",
+            "ms"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "amount": {
+              "type": "string",
+              "x-sensitivity": "metadata"
+            },
+            "currency": {
+              "type": "string",
+              "x-sensitivity": "metadata"
+            },
+            "type": {
+              "const": "money",
+              "type": "string",
+              "x-sensitivity": "public"
+            }
+          },
+          "required": [
+            "type",
+            "amount",
+            "currency"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "AuthCanParams": {
       "description": "Ask about the caller's own authority. Params are inspected, never executed.",
       "properties": {
@@ -1194,6 +1676,11 @@
         {
           "const": "busy",
           "description": "The engine is at a limit that frees up soon: the connection cap, or\na scan of the same kind that is still running. Retry shortly.",
+          "type": "string"
+        },
+        {
+          "const": "limit_exceeded",
+          "description": "An annotation count, size or write-rate limit was exceeded.",
           "type": "string"
         },
         {
@@ -4166,7 +4653,7 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
-  "apiMinor": 8,
+  "apiMinor": 9,
   "description": "Preview: the c9watch engine protocol. One JSON object per line over the engine socket. A preview minor may break a method; check breakingSince.",
   "frames": {
     "event": {
@@ -4257,6 +4744,91 @@
           "local-unverified"
         ],
         "resource": "agent",
+        "verb": "write"
+      },
+      "x-stability": "preview"
+    },
+    "annotation.delete": {
+      "params": {
+        "$ref": "#/$defs/AnnotationDeleteParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AnnotationDeleteResult"
+      },
+      "x-authz": {
+        "admission": [
+          "annotation_namespace",
+          "annotation_peer"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "annotation",
+        "verb": "write"
+      },
+      "x-stability": "preview"
+    },
+    "annotation.list": {
+      "params": {
+        "$ref": "#/$defs/AnnotationListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AnnotationListResult"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "annotation",
+        "verb": "read"
+      },
+      "x-stability": "preview"
+    },
+    "annotation.patch": {
+      "params": {
+        "$ref": "#/$defs/AnnotationPatchParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AnnotationPatchResult"
+      },
+      "x-authz": {
+        "admission": [
+          "annotation_namespace",
+          "annotation_peer"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "annotation",
+        "verb": "write"
+      },
+      "x-stability": "preview"
+    },
+    "annotation.set": {
+      "params": {
+        "$ref": "#/$defs/AnnotationSetParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AnnotationSetResult"
+      },
+      "x-authz": {
+        "admission": [
+          "annotation_namespace",
+          "annotation_peer"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "annotation",
         "verb": "write"
       },
       "x-stability": "preview"
@@ -5103,6 +5675,38 @@
           "client"
         ],
         "resource": "agent",
+        "verb": "read"
+      },
+      "x-stability": "preview"
+    },
+    "annotation.changed": {
+      "data": {
+        "$ref": "#/$defs/AnnotationChangedEvent"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "annotation",
+        "verb": "read"
+      },
+      "x-stability": "preview"
+    },
+    "annotation.removed": {
+      "data": {
+        "$ref": "#/$defs/AnnotationRemovedEvent"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "annotation",
         "verb": "read"
       },
       "x-stability": "preview"

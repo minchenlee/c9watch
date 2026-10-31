@@ -136,10 +136,33 @@ fn project_at(
             let mut out = Map::new();
             if let Some(props) = schema["properties"].as_object() {
                 for (name, field) in props {
-                    let Some(class) = Sensitivity::parse(&field["x-sensitivity"]) else {
+                    let Some(mut class) = Sensitivity::parse(&field["x-sensitivity"]) else {
                         continue;
                     };
+                    if let Some(by_type) = field.get("x-sensitivity-by-type") {
+                        let declared = input
+                            .get(name)
+                            .and_then(|v| v["type"].as_str())
+                            .and_then(|t| by_type.get(t))
+                            .and_then(Sensitivity::parse);
+                        class = declared.unwrap_or(Sensitivity::Conversation).max(class);
+                        // Unknown value variants have no authority, even at the
+                        // conversation ceiling. Set a typed redaction marker.
+                        if declared.is_none() || class > ceiling {
+                            if input.contains_key(name) {
+                                if let Some(flag) = field["x-redaction-flag"].as_str() {
+                                    out.insert(flag.into(), true.into());
+                                }
+                            }
+                            continue;
+                        }
+                    }
                     if class > ceiling {
+                        if input.contains_key(name) {
+                            if let Some(flag) = field["x-redaction-flag"].as_str() {
+                                out.insert(flag.into(), true.into());
+                            }
+                        }
                         continue;
                     }
                     if let Some(v) = input.get(name) {

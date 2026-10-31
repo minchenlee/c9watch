@@ -359,6 +359,7 @@ impl Detector {
 
     /// Detect once and write the result. Blocking.
     pub fn tick(&mut self, db: &Db) -> Result<Applied, String> {
+        db.write_blocking(|tx| super::annotations::sweep(tx, now_ms()))?;
         let mut obs = self.observe.observe()?;
         if let Some(dir) = &self.workers_dir {
             let overlay = crate::session::workers::load_workers_overlay_at(dir);
@@ -400,6 +401,7 @@ impl Detector {
         let machine = self.machine_id.clone();
         let ((applied, view_seqs), _) = db.write_blocking(move |tx| {
             let mut applied = apply(tx, &machine, &seen, now_ms(), &held)?;
+            super::annotations::track_targets(tx, now_ms())?;
             applied.notified = emit_notifications(tx, &machine, &notes)?;
             let mut view_seqs = Vec::with_capacity(n_views);
             for (i, e) in view_events.iter().chain(&diag_event).enumerate() {

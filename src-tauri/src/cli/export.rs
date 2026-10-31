@@ -82,45 +82,17 @@ fn call(conn: &mut EngineConn, method: &str, params: Value) -> Result<Value, Str
 /// Schema-driven projection. Unknown object fields are always dropped. A
 /// classified free-form value is retained only at its field's allowed class.
 fn project(value: &Value, shape: &Value, schema: &Value, conversation: bool) -> Value {
-    if let Some(reference) = shape["$ref"].as_str() {
-        return project(
-            value,
-            &schema["$defs"][reference.trim_start_matches("#/$defs/")],
-            schema,
-            conversation,
-        );
-    }
-    if value.is_null() {
-        return Value::Null;
-    }
-    if let Some(alts) = shape["anyOf"]
-        .as_array()
-        .or_else(|| shape["oneOf"].as_array())
-    {
-        if let Some(s) = alts.iter().find(|s| s["type"] != "null") {
-            return project(value, s, schema, conversation);
-        }
-    }
-    match value {
-        Value::Object(o) if shape["properties"].is_object() => {
-            let mut out = serde_json::Map::new();
-            for (k, v) in o {
-                let s = &shape["properties"][k];
-                let class = s["x-sensitivity"].as_str();
-                if matches!(class, Some("public" | "metadata"))
-                    || (conversation && class == Some("conversation"))
-                {
-                    out.insert(k.clone(), project(v, s, schema, conversation));
-                }
-            }
-            out.into()
-        }
-        Value::Array(a) if shape.get("items").is_some() => a
-            .iter()
-            .map(|v| project(v, &shape["items"], schema, conversation))
-            .collect(),
-        _ => value.clone(),
-    }
+    use crate::gateway::redaction::{project, Sensitivity};
+    project(
+        value,
+        shape,
+        schema,
+        if conversation {
+            Sensitivity::Conversation
+        } else {
+            Sensitivity::Metadata
+        },
+    )
 }
 
 fn rows(v: Value, field: &str) -> Result<Vec<Value>, String> {
@@ -278,7 +250,17 @@ pub fn run(args: ExportArgs) -> Result<(), String> {
         What::Annotations => rows(
             call(&mut conn, "annotation.list", json!({}))?,
             "annotations",
-        )?,
+        )?
+        .into_iter()
+        .map(|v| {
+            project(
+                &v,
+                &schema["$defs"]["Annotation"],
+                &schema,
+                args.include_conversation,
+            )
+        })
+        .collect(),
         What::History => {
             let mut out = Vec::new();
             let mut offset = 0;

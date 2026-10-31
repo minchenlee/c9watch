@@ -47,6 +47,14 @@ pub fn method(name: &str) -> Option<Rule> {
         "snapshot.get" | "session.list" | "session.views" | "session.away" | "diag.detection" => {
             rule("session", "read", ALL, None, &[])
         }
+        "annotation.list" => rule("annotation", "read", ALL, None, &[]),
+        "annotation.set" | "annotation.delete" | "annotation.patch" => rule(
+            "annotation",
+            "write",
+            ALL,
+            None,
+            &["annotation_namespace", "annotation_peer"],
+        ),
         "agent.list" => rule("agent", "read", ALL, None, &[]),
         "agent.create" | "agent.retire" => rule("agent", "write", &[L], None, &["mutating_peer"]),
         "detect.recheck" => rule("detect", "write", &[L], None, &["mutating_peer"]),
@@ -95,6 +103,7 @@ pub fn topic(name: &str) -> Option<Rule> {
         "agent.upsert" | "agent.attention" | "agent.turn_end" | "agent.gone" | "agent.failed" => {
             rule("agent", "read", ALL, None, &[])
         }
+        "annotation.changed" | "annotation.removed" => rule("annotation", "read", ALL, None, &[]),
         "msg.state" => rule("msg", "read", &[L, A], None, &[]),
         "legacy.inbox" => rule("legacy", "read", &[L], None, &[]),
         _ => return None,
@@ -234,6 +243,14 @@ pub fn audit_level(
 ) -> AuditLevel {
     if matches!(name, "auth.can" | "auth.rules") {
         return AuditLevel::None;
+    }
+    if (name == "annotation.list" && !allowed)
+        || matches!(
+            name,
+            "annotation.set" | "annotation.delete" | "annotation.patch"
+        )
+    {
+        return AuditLevel::Hash;
     }
     if !allowed {
         return AuditLevel::Metadata;

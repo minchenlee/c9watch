@@ -612,6 +612,9 @@ mod tests {
             [
                 "agent_state",
                 "agents",
+                "annotation_rates",
+                "annotation_sources",
+                "annotations",
                 "audit",
                 "dedupe",
                 "events",

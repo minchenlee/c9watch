@@ -42,6 +42,7 @@
 //! `queued` event in `seq`. Every send and every refusal is audited.
 
 use super::agent_bin::AgentBin;
+use super::annotations;
 use super::authz;
 use super::create::Spawner;
 use super::db::audit::{self, AuditEntry};
@@ -63,6 +64,11 @@ use super::proto::{
     HookParams, HookResult, MsgSendParams, MsgSendResult, Request, Response, SessionListParams,
     SessionListResult, SnapshotParams, SnapshotResult, SubscribeParams, SubscribeResult,
     TaskDoneParams, TaskDoneResult, API_MAJOR, API_MINOR, HOOK_METHODS, MAX_FRAME,
+};
+use super::proto::{
+    AnnotationChangedEvent, AnnotationDeleteParams, AnnotationDeleteResult, AnnotationListParams,
+    AnnotationListResult, AnnotationPatchParams, AnnotationPatchResult, AnnotationRemovedEvent,
+    AnnotationSetParams, AnnotationSetResult,
 };
 use super::proto::{AuthCanParams, AuthCanResult, AuthRulesResult, Ceiling};
 use super::proto::{
@@ -616,6 +622,10 @@ pub const METHODS: &[&str] = &[
     "ping",
     "auth.can",
     "auth.rules",
+    "annotation.set",
+    "annotation.delete",
+    "annotation.patch",
+    "annotation.list",
 ];
 
 /// The c9p/1 JSON Schema (A:245): the frame types, a `methods` table with
@@ -774,6 +784,11 @@ pub fn schema() -> serde_json::Value {
         },
     });
     let mut methods = methods;
+    methods["annotation.set"] = serde_json::json!({"params": de.subschema_for::<AnnotationSetParams>(), "result": ser.subschema_for::<AnnotationSetResult>()});
+    methods["annotation.delete"] = serde_json::json!({"params": de.subschema_for::<AnnotationDeleteParams>(), "result": ser.subschema_for::<AnnotationDeleteResult>()});
+    methods["annotation.patch"] = serde_json::json!({"params": de.subschema_for::<AnnotationPatchParams>(), "result": ser.subschema_for::<AnnotationPatchResult>()});
+    methods["annotation.list"] = serde_json::json!({"params": de.subschema_for::<AnnotationListParams>(), "result": ser.subschema_for::<AnnotationListResult>()});
+
     for m in HOOK_METHODS {
         methods[*m] = serde_json::json!({
             "params": de.subschema_for::<HookParams>(),
@@ -785,6 +800,8 @@ pub fn schema() -> serde_json::Value {
         LegacyInboxEvent, MsgStateEvent, NotificationEvent, SessionGoneEvent,
     };
     let data = serde_json::json!({
+        "annotation.changed": ser.subschema_for::<AnnotationChangedEvent>(),
+        "annotation.removed": ser.subschema_for::<AnnotationRemovedEvent>(),
         "agent.upsert": ser.subschema_for::<AgentRow>(),
         "agent.attention": ser.subschema_for::<AgentAttentionEvent>(),
         "agent.turn_end": ser.subschema_for::<AgentTurnEndEvent>(),
@@ -960,7 +977,7 @@ impl Served {
 /// streams the connection holds.
 async fn dispatch(
     method: &str,
-    req: Request,
+    mut req: Request,
     ctx: &ServerCtx,
     peer: Peer,
     principal: &Principal,
@@ -979,6 +996,14 @@ async fn dispatch(
         mail::sha256_hex(&serde_json::to_vec(&req.params).expect("params serialize"));
     let admission = async {
         let rule = authz::authorize(method, principal, None)?;
+        if rule.admission.contains(&"annotation_namespace") {
+            annotations::admit(method, &mut req.params, principal)?;
+        }
+        if rule.admission.contains(&"annotation_peer")
+            && matches!(principal, Principal::LocalUnverified)
+        {
+            check_local_peer(method, ctx, peer, principal).await?;
+        }
         if rule.admission.contains(&"mutating_peer") {
             check_local_peer(method, ctx, peer, principal).await?;
         }
@@ -986,15 +1011,27 @@ async fn dispatch(
     }
     .await;
     if let Err(e) = admission {
-        audit_refusal(ctx, principal, method, &target, &e).await;
+        if method.starts_with("annotation.") {
+            audit_annotation_refusal(ctx, principal, method, req.params, &e).await?;
+        } else {
+            audit_refusal(ctx, principal, method, &target, &e).await;
+        }
         return Err(e);
     }
+    let annotation_params = method
+        .starts_with("annotation.")
+        .then(|| req.params.clone());
     let result = execute(method, req, ctx, peer, principal, streams, progress).await;
+    if let (Some(params), Err(e)) = (annotation_params, &result) {
+        audit_annotation_refusal(ctx, principal, method, params, e).await?;
+        return result;
+    }
     // Atomic mutation handlers already write exactly one audit row.
     let owned_audit = matches!(
         method,
         "agent.create" | "agent.retire" | "msg.send" | "msg.cancel" | "mail.pause" | "mail.resume"
-    ) || is_hook_class(method);
+    ) || is_hook_class(method)
+        || annotations::is_write(method);
     if !owned_audit {
         match authz::audit_level(method, principal, result.is_ok(), Ceiling::Conversation) {
             authz::AuditLevel::None => {}
@@ -1040,6 +1077,18 @@ async fn execute(
             .map(Served::result);
     }
     match method {
+        "annotation.set" => Ok(Served::result(
+            annotations::write(ctx.db()?, method, req.params, principal).await?,
+        )),
+        "annotation.delete" => Ok(Served::result(
+            annotations::write(ctx.db()?, method, req.params, principal).await?,
+        )),
+        "annotation.patch" => Ok(Served::result(
+            annotations::write(ctx.db()?, method, req.params, principal).await?,
+        )),
+        "annotation.list" => Ok(Served::result(
+            annotations::list(ctx.db()?, req.params).await?,
+        )),
         // One arm per method: scripts/test-ipc-contract.mjs reads the
         // served methods off these arms.
         "agent.create" => Ok(Served::result(
@@ -1921,7 +1970,7 @@ impl EventStream {
 }
 
 /// Capabilities this engine offers; a client gets the ones it `want`s.
-const CAPABILITIES: &[&str] = &[PROGRESS_CAPABILITY];
+const CAPABILITIES: &[&str] = &[PROGRESS_CAPABILITY, "annotations"];
 
 fn hello(
     req: Request,
@@ -4712,6 +4761,60 @@ mod tests {
             assert_eq!(err.code, ErrorCode::NotAllowed, "{method}: {err:?}");
         }
     }
+    #[tokio::test]
+    async fn annotation_dispatch_audits_all_writes_and_refusals_once_without_values() {
+        let (_t, ctx, db) = ctx_db(as_agent("a7"));
+        db.write(|tx| {
+            tx.execute("INSERT INTO agents(id,role,provider,source,session_key) VALUES ('ann','observed','claudeCode','detected','claudeCode:ann')", [])?;
+            Ok(())
+        }).await.unwrap();
+        let (mut c, hello) = Client::hello(ctx, json!({"want":["annotations"]})).await;
+        assert_eq!(hello["capabilities"], json!(["annotations"]));
+        let target = json!({"kind":"session","sessionKey":"claudeCode:ann"});
+        let foreign = c.call("foreign", "annotation.set", json!({"target":target,"key":"agent.other/note","value":{"type":"string","v":"secret payload"}})).await;
+        assert_eq!(foreign["error"]["code"], "not_allowed");
+        let malformed = c
+            .call(
+                "bad",
+                "annotation.patch",
+                json!({"target":target,"values":{"note":{"type":"number","v":"secret payload"}}}),
+            )
+            .await;
+        assert_eq!(malformed["error"]["code"], "bad_request");
+        let accepted = c.call("set", "annotation.patch", json!({"target":target,"seq":1,"values":{"note":{"type":"string","v":"secret payload"}}})).await;
+        assert_eq!(accepted["result"]["applied"], true, "{accepted}");
+        assert_eq!(accepted["result"]["values"]["note"]["writer"], "agent:a7");
+        let ignored = c
+            .call(
+                "old",
+                "annotation.patch",
+                json!({"target":target,"seq":1,"values":{"note":null}}),
+            )
+            .await;
+        assert_eq!(ignored["result"]["applied"], false);
+        let deleted = c
+            .call(
+                "delete",
+                "annotation.delete",
+                json!({"target":target,"key":"agent.a7/note"}),
+            )
+            .await;
+        assert_eq!(deleted["result"]["deleted"], true);
+        let list = c.call("list", "annotation.list", json!({})).await;
+        assert_eq!(list["result"]["annotations"], json!([]));
+        let conn = db.reader().unwrap();
+        let audits: Vec<(String,String,String,String)> = conn.prepare("SELECT decision,payload_hash,annotation_keys,coalesce(reason,'') FROM audit WHERE method LIKE 'annotation.%' ORDER BY seq").unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect();
+        assert_eq!(audits.len(), 5);
+        assert_eq!(
+            audits.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["deny", "deny", "allow", "allow", "allow"]
+        );
+        for (_, hash, keys, reason) in audits {
+            assert_eq!(hash.len(), 64);
+            assert!(keys.contains("note"));
+            assert!(!format!("{hash}{keys}{reason}").contains("secret payload"));
+        }
+    }
 }
 
 // C1b-M2 mailbox APIs. Mutations require the same verified local ancestry
@@ -4863,4 +4966,33 @@ async fn mail_control(
         }
     }
     Ok(serde_json::json!({"ok": true}))
+}
+
+async fn audit_annotation_refusal(
+    ctx: &ServerCtx,
+    principal: &Principal,
+    method: &str,
+    params: serde_json::Value,
+    error: &ApiError,
+) -> Result<(), ApiError> {
+    let Some(db) = &ctx.db else { return Ok(()) };
+    let (principal, method, reason) = (
+        principal.to_string(),
+        method.to_string(),
+        error.code.to_string(),
+    );
+    db.write(move |tx| {
+        annotations::audit_request(
+            tx,
+            &principal,
+            &method,
+            &params,
+            "deny",
+            Some(&reason),
+            now_ms(),
+        )
+    })
+    .await
+    .map_err(internal)?;
+    Ok(())
 }

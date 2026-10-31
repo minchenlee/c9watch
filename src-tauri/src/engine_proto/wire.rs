@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
 /// Protocol minor version. Raised for additive changes.
-pub const API_MINOR: u32 = 8;
+pub const API_MINOR: u32 = 9;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -173,6 +173,8 @@ pub enum ErrorCode {
     /// The engine is at a limit that frees up soon: the connection cap, or
     /// a scan of the same kind that is still running. Retry shortly.
     Busy,
+    /// An annotation count, size or write-rate limit was exceeded.
+    LimitExceeded,
     /// An engine-side failure.
     Internal,
 }
@@ -209,6 +211,7 @@ impl ErrorCode {
             ErrorCode::UnknownSession => "unknown_session",
             ErrorCode::ActionFailed => "action_failed",
             ErrorCode::Busy => "busy",
+            ErrorCode::LimitExceeded => "limit_exceeded",
             ErrorCode::Internal => "internal",
         }
     }
@@ -281,6 +284,9 @@ impl ErrorCode {
             ErrorCode::UnknownSession => "see `session.views` for the live session keys",
             ErrorCode::ActionFailed => "read `msg`; `session.views` shows the session now",
             ErrorCode::Busy => "retry in a second",
+            ErrorCode::LimitExceeded => {
+                "reduce annotation keys or wait for the write budget to refill"
+            }
             ErrorCode::Internal => "retry; if it persists, check the engine log",
         }
     }
@@ -1430,3 +1436,6 @@ pub struct MsgReadResult {
 pub struct MailControlResult {
     pub ok: bool,
 }
+
+// L1 annotation types are shared with clients outside the engine feature.
+pub use super::annotations::*;
