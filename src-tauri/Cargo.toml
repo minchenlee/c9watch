@@ -22,7 +22,6 @@ gui = [
     "dep:tauri",
     "dep:tauri-build",
     "dep:tauri-plugin-notification",
-    "dep:tauri-plugin-dialog",
     "dep:ed25519-dalek",
     "dep:notify-rust",
     "dep:tauri-plugin-opener",
@@ -73,7 +72,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # ── GUI-only dependencies ────────────────────────────────────────────
 tauri = { version = "2", features = ["tray-icon"], optional = true }
 tauri-plugin-notification = { version = "2", optional = true }
-tauri-plugin-dialog = { version = "2", optional = true }
 tauri-plugin-opener = { version = "2", optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
 tauri-plugin-updater = { version = "2", optional = true }

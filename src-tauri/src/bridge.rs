@@ -35,8 +35,22 @@ impl BridgeError {
     }
 }
 
+// The GUI connection is stamped local-unverified by the Unix transport.
+// Consult the generated authority declarations even in GUI-only builds.
+fn gui_authorized(section: &str, name: &str) -> bool {
+    static SCHEMA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    let schema = SCHEMA.get_or_init(|| {
+        serde_json::from_str(include_str!("../../docs/api/c9p-1.json"))
+            .expect("committed c9p schema")
+    });
+    schema[section][name]["x-authz"]["principals"]
+        .as_array()
+        .is_some_and(|principals| principals.iter().any(|p| p == "local-unverified"))
+}
+
 pub fn allowed(method: &str, popover: bool) -> bool {
     GUI_METHODS.contains(&method)
+        && gui_authorized("methods", method)
         && !matches!(method, "events.subscribe" | "events.unsubscribe")
         && (!popover
             || !matches!(
@@ -198,13 +212,13 @@ impl Bridge {
         app: &AppHandle,
         method: &str,
         params: Value,
-        difference: &str,
+        previous: &Value,
     ) -> Result<Value, String> {
         let mut lease = self.lease.lock().unwrap();
         lease
             .as_mut()
             .ok_or("Core gateway is not leased by this GUI")?
-            .write(app, method, params, difference)
+            .write(app, method, params, previous)
     }
 }
 fn connect(home: &std::path::Path) -> Result<EngineConn, String> {
@@ -243,12 +257,24 @@ pub async fn c9p_request(
 
 fn allowed_topics(params: &SubscribeParams, popover: bool) -> bool {
     !params.topics.is_empty()
-        && params.topics.iter().all(|t| match t.as_str() {
-            "session.view" | "session.gone" | "session.*" | "diag.detection" => true,
-            "agent.*" | "notification.needs_attention" | "notification.waiting_for_input" => {
-                !popover
-            }
-            _ => false,
+        && gui_authorized("methods", "events.subscribe")
+        && params.topics.iter().all(|t| {
+            let topics: &[&str] = match t.as_str() {
+                "session.*" => &["session.view", "session.gone"],
+                "agent.*" if !popover => &[
+                    "agent.upsert",
+                    "agent.attention",
+                    "agent.turn_end",
+                    "agent.gone",
+                    "agent.failed",
+                ],
+                "session.view" | "session.gone" | "diag.detection" => &[t.as_str()],
+                "notification.needs_attention" | "notification.waiting_for_input" if !popover => {
+                    &[t.as_str()]
+                }
+                _ => return false,
+            };
+            topics.iter().all(|topic| gui_authorized("topics", topic))
         })
 }
 #[tauri::command]
@@ -729,6 +755,37 @@ mod tests {
         assert!(!allowed("session.stop", true));
         assert!(!allowed("provider.opencode.connect", true));
         assert!(allowed("session.views", true));
+    }
+    #[cfg(feature = "engine")]
+    #[test]
+    fn webview_allowlist_is_a_subset_of_central_authority() {
+        use crate::engine::{authz, principal::Principal};
+        for method in GUI_METHODS {
+            assert!(
+                authz::can(method, &Principal::LocalUnverified, None).allowed,
+                "{method}"
+            );
+            assert!(gui_authorized("methods", method), "{method}");
+        }
+        for method in crate::engine::discovery::methods().keys() {
+            if allowed(method, false) {
+                assert!(
+                    authz::can(method, &Principal::LocalUnverified, None).allowed,
+                    "{method}"
+                );
+            }
+            if method.starts_with("msg.")
+                || method.starts_with("mail.")
+                || method.starts_with("gateway.")
+                || method.starts_with("hook.")
+                || matches!(
+                    method.as_str(),
+                    "agent.create" | "agent.retire" | "gui.confirmer.attach"
+                )
+            {
+                assert!(!allowed(method, false), "{method}");
+            }
+        }
     }
     #[test]
     fn popover_topics_are_read_only_and_no_wildcard_escape() {

@@ -16,9 +16,9 @@ export function sessionFeed(transport: Transport, apply: (sessions: Session[]) =
         flushTimer = null;
         if (stopped) return;
         for (const frame of batch.splice(0)) {
-            if (!('type' in frame) || frame.type !== 'event') continue;
+            if (!('data' in frame) || !('topic' in frame) || frame.type !== 'event') continue;
             const data = frame.data as any;
-            if (typeof data.sessionKey !== 'string') continue;
+            if (!data || typeof data.sessionKey !== 'string') continue;
             if (frame.topic === 'session.gone') rows = rows.filter(s => s.sessionKey !== data.sessionKey);
             if (frame.topic === 'session.view') {
                 const session = sessionFromView(data as C9pSessionView);

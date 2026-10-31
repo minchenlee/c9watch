@@ -51,3 +51,5 @@ pub mod compatibility;
 pub mod fsutil;
 pub mod lock;
 pub mod spawn;
+
+pub mod confirmation;

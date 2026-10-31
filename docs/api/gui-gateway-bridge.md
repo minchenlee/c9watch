@@ -21,17 +21,20 @@ native confirmer attachment, `gateway.open {lease:true}`, and a fresh hello
 with `gateway` all succeed. The lease connection stays open in Rust. On a
 core without gateway methods, none of these methods is sent.
 
-The plan defines the confirmation claims but does not fix their encoding.
-This branch uses the following concrete encoding, for integration review:
+The native GUI and core now share `engine_proto::confirmation` (the engine
+re-exports it). Native dialogs and widening detection use `gateway::consent`
+on both the legacy fallback and the leased path. There is one signing format
+and one native dialog implementation:
 
 - `gui.confirmer.attach {publicKey}`: lowercase hex Ed25519 public key.
 - SHA-256 `paramsHash`: lowercase hex of compact JSON of params, before a
-  confirmation member is added. Object keys are recursively sorted (the
-  serde_json default map order).
-- `confirmation: {claims: {grantId,method,paramsHash,expiresAt}, signature}`
-  inside write params. `signature` is lowercase hex Ed25519 over the compact,
-  sorted JSON claims. `expiresAt` is Unix milliseconds, 60 seconds after
-  confirmation. Only Rust holds the secret key.
+  confirmation member is added. Object keys use the serde_json default map order.
+- `confirmation: {grantId,method,paramsHash,expiresAt,signature}` inside write
+  params, serialized directly from the shared `Grant` type. `signature` is the
+  JSON byte array produced by the shared Ed25519 signer over compact JSON claims.
+  `expiresAt` is Unix milliseconds, 60 seconds after confirmation. Only Rust
+  holds the secret key. The core verifier binds exact params, method, ID and
+  expiry and consumes each grant once.
 - `gateway.policy.get/set` return/take the policy object directly. Classic's
   four fields are merged over the complete core policy, preserving hidden
   core-only fields.
@@ -52,8 +55,11 @@ The browser adapter follows the current plan's raw-token HMAC; Classic never
 selects it automatically. The owner must resolve that contract, then the
 integrator must align and test both ends before enabling /c9p pairing.
 
-If M-b uses a different encoding, align these adapters before enabling
-handover. A refused attachment/write fails closed. The baseline includes no
+M-b currently exposes no gateway attachment/write endpoints. Handover remains
+disabled unless all advertised capabilities and lease steps succeed. Public-key
+attachment and write-envelope composition still require transport admission
+review when those endpoints are implemented; no endpoint or handshake is added
+here. A refused attachment/write fails closed. The baseline includes no
 native OS dialogs. A narrowing write does not show a dialog. Legacy GUI-owned
 pairing and widening policy changes also get the native dialog.
 

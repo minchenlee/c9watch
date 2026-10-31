@@ -722,23 +722,42 @@ async fn create_pairing_code(
     app: AppHandle,
     server: tauri::State<'_, Arc<web_server::WsServer>>,
 ) -> Result<web_server::PairingCode, String> {
-    let server = server.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(unix)]
-        if let Some(core) = gateway_control::core_bridge(&app) {
+    let _guard = server.confirmation.lock().await;
+    #[cfg(unix)]
+    if let Some(core) = gateway_control::core_bridge(&app) {
+        let server = server.inner().clone();
+        return tauri::async_runtime::spawn_blocking(move || {
             use sha2::Digest;
             let pairing = server.create_pairing_code()?;
-            let code_hash: String = sha2::Sha256::digest(pairing.code.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+            let code_hash: String = sha2::Sha256::digest(pairing.code.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             core.gateway_write(&app, "gateway.pair.register", serde_json::json!({
                 "codeHash": code_hash, "expiresAt": pairing.expires_at,
                 "scopes": ["session:read", "cost:read", "annotation:read"], "ceiling": "metadata",
-            }), "New device: viewer access (session:read, cost:read, annotation:read), metadata only")?;
-            return Ok(pairing);
-        }
-        #[cfg(unix)]
-        gateway_control::confirm_pairing(&app, &server.remote())?;
-        server.create_pairing_code()
-    }).await.map_err(|e| e.to_string())?
+            }), &serde_json::Value::Null)?;
+            Ok(pairing)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    let remote = server.remote();
+    let mut scopes = vec![
+        "session:read",
+        "session:stop",
+        "session:rename",
+        "cost:read",
+    ];
+    if remote.allow_conversation {
+        scopes.push("conversation:read");
+    }
+    let params = serde_json::json!({"scopes":scopes,"ceiling":if remote.allow_conversation {"conversation"} else {"metadata"}, "allowOpen":remote.allow_open});
+    gateway::consent::confirm(&serde_json::Value::Null, &params, |message| {
+        gateway::consent::native_dialog(app, message)
+    })
+    .await?;
+    server.create_pairing_code()
 }
 
 /// Forget every paired device and close their sockets.
@@ -787,34 +806,30 @@ async fn set_remote_access(
     server: tauri::State<'_, Arc<web_server::WsServer>>,
     mut remote: remote_access::RemoteAccess,
 ) -> Result<remote_access::RemoteAccess, String> {
+    let _guard = server.confirmation.lock().await;
     remote.extra_allowed_hosts = remote_access::normalize_hosts(&remote.extra_allowed_hosts)?;
-    let previous = server.remote();
+    remote.allowed_origins = remote_access::normalize_origins(&remote.allowed_origins)?;
     #[cfg(unix)]
     if let Some(core) = gateway_control::core_bridge(&app) {
         return tauri::async_runtime::spawn_blocking(move || {
             let mut policy = core.gateway_call("gateway.policy.get", serde_json::json!({}))?;
-            let old: remote_access::RemoteAccess =
-                serde_json::from_value(policy.clone()).map_err(|e| e.to_string())?;
-            let difference = gateway_control::policy_difference(&old, &remote);
+            let previous = policy.clone();
             // Preserve core-only fields that Classic does not expose.
             for (key, value) in serde_json::to_value(&remote).unwrap().as_object().unwrap() {
                 policy[key] = value.clone();
             }
-            let updated = core.gateway_write(&app, "gateway.policy.set", policy, &difference)?;
+            let updated = core.gateway_write(&app, "gateway.policy.set", policy, &previous)?;
             serde_json::from_value(updated).map_err(|e| e.to_string())
         })
         .await
         .map_err(|e| e.to_string())?;
     }
-    #[cfg(unix)]
-    {
-        let confirm_remote = remote.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            gateway_control::confirm_policy(&app, &previous, &confirm_remote)
-        })
-        .await
-        .map_err(|e| e.to_string())??;
-    }
+    let old = serde_json::to_value(server.remote()).map_err(|e| e.to_string())?;
+    let next = serde_json::to_value(&remote).map_err(|e| e.to_string())?;
+    gateway::consent::confirm(&old, &next, |message| {
+        gateway::consent::native_dialog(app, message)
+    })
+    .await?;
     server.update(remote).await
 }
 
@@ -891,7 +906,6 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_sharekit::init());
 
     // macOS: NSPanel plugin for popover (must appear above fullscreen apps)

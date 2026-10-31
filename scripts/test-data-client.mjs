@@ -84,6 +84,10 @@ test('c9p event feed batches deltas, keeps last data on failure, and replaces on
     const settle = async () => { for(let i=0;i<8;i++) await Promise.resolve(); };
     const stop=feed.sessionFeed(t,rows=>published.push(asJSON(rows)));
     await settle(); assert.equal(published.length,1); assert.equal(published[0].length,1);
+    // Open frame enums must not let progress/future/malformed frames become sessions.
+    onFrame({type:'progress',bytesRead:1,bytesTotal:2});
+    onFrame({type:'future-frame',topic:'session.view',data:{sessionKey:'unknown'}});
+    onFrame({type:'event',topic:'session.view',data:null});
     for(let i=0;i<3;i++) onFrame({type:'event',topic:'session.view',data:{...fx.sessions[0],sessionKey:'claudeCode:next',messageCount:i}});
     assert.equal(published.length,1,'deltas are batched until a flush');
     for(const [id,fn] of timers) { timers.delete(id); fn(); }

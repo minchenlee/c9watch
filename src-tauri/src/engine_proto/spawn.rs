@@ -695,7 +695,17 @@ mod tests {
             .map(|(k, _)| k.into_string().unwrap())
             .collect();
         kept.sort();
-        assert_eq!(kept, ["C9WATCH_ENGINE_HOME", "C9_CC_SESSIONS_DIR", "C9_CC_SOCK_DIR", "C9_MAIL_SOCKET", "HOME", "PATH"]);
+        assert_eq!(
+            kept,
+            [
+                "C9WATCH_ENGINE_HOME",
+                "C9_CC_SESSIONS_DIR",
+                "C9_CC_SOCK_DIR",
+                "C9_MAIL_SOCKET",
+                "HOME",
+                "PATH"
+            ]
+        );
     }
 
     #[test]

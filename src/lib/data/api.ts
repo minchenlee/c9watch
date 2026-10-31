@@ -15,8 +15,10 @@ export type { ServerInfo, PairingCode, RemoteAccess } from './platform';
 export async function getSessions(): Promise<Session[]> {
     return (await request('session.views', {})).sessions.map(sessionFromView);
 }
+// The wire model has open enums; Classic's retained model has closed unions.
+// Keep payloads and extension values intact at this compatibility boundary.
 export async function getDetectionDiagnostics(): Promise<DetectionDiagnostics | null> {
-    return request('diag.detection', {});
+    return request('diag.detection', {}) as Promise<DetectionDiagnostics>;
 }
 /** Fetch every bounded page before replacing Classic's conversation/list.
  * Failure keeps the caller's last data; it never publishes a partial result. */
@@ -37,8 +39,8 @@ export async function getConversation(sessionId: string, provider?: SessionProvi
     const source = transport();
     const messages = await allPages(async offset => {
         const page = await source.request('conversation.get', { sessionKey: providerSessionKey(provider, sessionId), provider, includeTools, page: { offset, limit: 1000 } });
-        resolvedProvider = page.provider ?? resolvedProvider;
-        return { items: page.messages, nextOffset: page.nextOffset };
+        resolvedProvider = (page.provider as SessionProvider | null | undefined) ?? resolvedProvider;
+        return { items: page.messages as Conversation['messages'], nextOffset: page.nextOffset };
     });
     return { sessionId, provider: resolvedProvider, messages };
 }
@@ -72,7 +74,7 @@ export async function getMemoryFiles(): Promise<ProjectMemory[]> {
     const source = transport();
     return allPages(async offset => {
         const p = await source.request('memory.list', { page: { offset, limit: 1000 } });
-        return { items: p.projects, nextOffset: p.nextOffset };
+        return { items: p.projects as ProjectMemory[], nextOffset: p.nextOffset };
     });
 }
 export async function getSubscriptionUsage(): Promise<import('../subscription-usage').SubscriptionUsage[]> {
