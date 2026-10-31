@@ -28,6 +28,9 @@ impl Sandbox {
         let home = dir.path().join("h");
         std::fs::create_dir(&home).unwrap();
         let engine = dir.path().join("e");
+        let socks = dir.path().join("socks");
+        std::fs::create_dir(&socks).unwrap();
+        std::fs::set_permissions(&socks, std::fs::Permissions::from_mode(0o700)).unwrap();
         Sandbox {
             _dir: dir,
             home,
@@ -40,6 +43,11 @@ impl Sandbox {
         c.args(args)
             .env("HOME", &self.home)
             .env(ENGINE_HOME_ENV, &self.engine)
+            .env("C9_CC_SOCK_DIR", self.home.parent().unwrap().join("socks"))
+            .env(
+                "C9_CC_SESSIONS_DIR",
+                self.home.parent().unwrap().join("cc-sessions"),
+            )
             .env_remove("C9_AGENT_ID")
             .env_remove("C9_ENGINE_SOCK")
             .env_remove("XDG_STATE_HOME")
@@ -383,6 +391,7 @@ fn a_db_from_a_newer_engine_fails_the_auto_start_with_its_code() {
 /// `linger <secs>` (from a body line, default 0.3 s). A body line
 /// `forward to <to>` makes it mail `<to>` with the `c9watch` next to it.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
+if [ "${FAKE_CC_SOCKET:-}" = 1 ] || [ -f "$(dirname "$0")/socket-enabled" ]; then exec /usr/bin/env python3 "$(dirname "$0")/fake-socket-cc.py" "$@"; fi
 case "$1" in --version) echo "2.1.312 (Claude Code)"; exit 0 ;; esac
 dir=$(dirname "$0")
 args="$*"
@@ -1086,6 +1095,11 @@ impl FreeAgents {
         std::fs::create_dir(&bin).unwrap();
         let claude = bin.join("claude");
         std::fs::write(&claude, FAKE_CLAUDE).unwrap();
+        std::fs::write(
+            bin.join("fake-socket-cc.py"),
+            include_str!("fixtures/fake_socket_cc.py"),
+        )
+        .unwrap();
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::os::unix::fs::symlink(BIN, bin.join("c9watch")).unwrap();
         let cwd = root.join("work");
@@ -1854,5 +1868,327 @@ fn an_engine_killed_after_each_create_phase_is_reconciled_on_boot() {
             assert!(out.status.success(), "{phase}: {:?}", out);
         }
         assert!(fa.all_gone(), "{phase}: a fake claude still runs");
+    }
+}
+
+// C1b-M2 synthetic CC socket acceptance. The fake is a real PTY child,
+// runs no model, and writes an explicitly synthetic JSONL transcript.
+fn socket_agents() -> (Sandbox, FreeAgents) {
+    let sb = Sandbox::new();
+    let f = FreeAgents::new(&sb);
+    std::fs::write(f.bin.join("socket-enabled"), "").unwrap();
+    let out = f
+        .cmd(&sb, &["list"])
+        .env("FAKE_CC_SOCKET", "1")
+        .env("C9_MAIL_SOCKET", "on")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?} {}", out, sb.log());
+    (sb, f)
+}
+fn socket_spawn(sb: &Sandbox, f: &FreeAgents, name: &str) -> String {
+    let out = f
+        .cmd(
+            sb,
+            &["spawn", "--mode", "free", "--cwd", "work", "--name", name],
+        )
+        .env("FAKE_CC_SOCKET", "1")
+        .env("C9_MAIL_SOCKET", "on")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?} {}", out, sb.log());
+    stdout_json(&out)["agent"]["id"].as_str().unwrap().into()
+}
+fn ledger(sb: &Sandbox) -> rusqlite::Connection {
+    rusqlite::Connection::open(sb.engine.join("engine.db")).unwrap()
+}
+fn socket_wait(sb: &Sandbox, sql: &str, expected: i64) {
+    assert!(
+        wait_for(Duration::from_secs(15), || ledger(sb)
+            .query_row(sql, [], |r| r.get::<_, i64>(0))
+            .ok()
+            == Some(expected)),
+        "{} != {}; log {}",
+        sql,
+        expected,
+        sb.log()
+    );
+}
+fn send_body(sb: &Sandbox, f: &FreeAgents, to: &str, body: &str) -> String {
+    let out = f.run(sb, &["send", to, body]);
+    assert!(out.status.success(), "{:?} {}", out, sb.log());
+    stdout_json(&out)["msg"]["msgId"].as_str().unwrap().into()
+}
+#[test]
+fn agent_to_agent_mail_goes_by_socket_and_a_cli_reply_links_to_the_original() {
+    let (sb, f) = socket_agents();
+    let a = socket_spawn(&sb, &f, "A");
+    let b = socket_spawn(&sb, &f, "B");
+    send_body(&sb, &f, &a, &format!("forward to {}", b));
+    socket_wait(&sb,"SELECT count(*) FROM messages WHERE origin_kind='agent' AND state='delivered' AND via='socket'",1);
+    let c = ledger(&sb);
+    let original: String = c
+        .query_row(
+            "SELECT id FROM messages WHERE origin_kind='agent'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    send_body(&sb, &f, &b, &format!("reply to {} about {}", a, original));
+    socket_wait(
+        &sb,
+        "SELECT count(*) FROM messages WHERE hop=1 AND state='delivered' AND via='socket'",
+        1,
+    );
+    assert_eq!(
+        c.query_row("SELECT reply_to FROM messages WHERE hop=1", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        original
+    );
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM messages WHERE origin_kind='local-unverified' AND via='pty'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+    let out = f.run(&sb, &["mail", "list", "--pretty"]);
+    assert!(out.status.success(), "{:?}", out);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Thread msg_"));
+    assert!(text.contains("[peer]"));
+    assert!(text.contains("[paste]"));
+    assert!(text.contains("re:"));
+}
+#[test]
+fn a_sendmessage_reply_is_audited_and_the_replier_is_told_to_use_the_cli() {
+    let (sb, f) = socket_agents();
+    let a = socket_spawn(&sb, &f, "A");
+    let b = socket_spawn(&sb, &f, "B");
+    let c = ledger(&sb);
+    send_body(
+        &sb,
+        &f,
+        &a,
+        &format!("forward to {} with use SendMessage", b),
+    );
+    socket_wait(
+        &sb,
+        "SELECT count(*) FROM audit WHERE method='cc.inbound' AND reason='use_cli'",
+        2,
+    );
+    socket_wait(
+        &sb,
+        "SELECT count(*) FROM messages WHERE kind='system' AND state='delivered'",
+        1,
+    );
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM messages WHERE kind='system'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert!(f.prompts(&b).contains("Use `c9watch send"));
+}
+#[test]
+fn held_mail_shows_in_msg_state_and_waits_for_evidence() {
+    let (sb, f) = socket_agents();
+    let a = socket_spawn(&sb, &f, "A");
+    let b = socket_spawn(&sb, &f, "B");
+    std::fs::write(f.bin.join(format!("socket-mode-{}", b)), "held").unwrap();
+    send_body(&sb, &f, &a, &format!("forward to {}", b));
+    socket_wait(
+        &sb,
+        "SELECT count(*) FROM message_status WHERE state='delivering' AND detail LIKE 'held:%'",
+        1,
+    );
+    assert_eq!(
+        ledger(&sb)
+            .query_row(
+                "SELECT count(*) FROM messages WHERE via='socket' AND state='delivered'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    let out = f.run(&sb, &["mail", "list", "--pretty"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("held:"));
+    std::fs::write(f.bin.join(format!("release-{}", b)), "").unwrap();
+    socket_wait(
+        &sb,
+        "SELECT count(*) FROM messages WHERE via='socket' AND state='delivered'",
+        1,
+    );
+}
+#[test]
+fn without_peer_protocol_mail_goes_by_paste() {
+    let (sb, f) = socket_agents();
+    std::fs::write(f.bin.join("no-peer-protocol"), "").unwrap();
+    let a = socket_spawn(&sb, &f, "A");
+    let b = socket_spawn(&sb, &f, "B");
+    send_body(&sb, &f, &a, &format!("forward to {}", b));
+    socket_wait(&sb,"SELECT count(*) FROM messages WHERE origin_kind='agent' AND via='pty' AND state='delivered'",1);
+}
+#[test]
+fn cancel_and_pause_work_from_the_cli_and_human_mail_continues() {
+    let (sb, f) = socket_agents();
+    let a = socket_spawn(&sb, &f, "A");
+    let b = socket_spawn(&sb, &f, "B");
+    assert!(f.run(&sb, &["mail", "pause", &b]).status.success());
+    send_body(&sb, &f, &a, &format!("forward to {}", b));
+    socket_wait(
+        &sb,
+        "SELECT count(*) FROM messages WHERE origin_kind='agent' AND state='queued'",
+        1,
+    );
+    let id: String = ledger(&sb)
+        .query_row(
+            "SELECT id FROM messages WHERE origin_kind='agent'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let human = send_body(&sb, &f, &b, "human still reaches B");
+    socket_wait(
+        &sb,
+        &format!(
+            "SELECT count(*) FROM messages WHERE id='{}' AND state='delivered'",
+            human
+        ),
+        1,
+    );
+    assert!(f.run(&sb, &["mail", "cancel", &id]).status.success());
+    assert!(f.run(&sb, &["mail", "resume", &b]).status.success());
+    socket_wait(
+        &sb,
+        "SELECT count(*) FROM messages WHERE kind='system' AND state='delivered'",
+        1,
+    );
+    let out = f.run(&sb, &["mail", "read", &id]);
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out)["state"], "cancelled");
+}
+#[test]
+fn the_engine_socket_is_bound_at_boot_and_removed_on_shutdown() {
+    let (sb, _f) = socket_agents();
+    let sockdir = sb.home.parent().unwrap().join("socks");
+    let sockets: Vec<_> = std::fs::read_dir(&sockdir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(sockets.len(), 1);
+    assert!(sockets[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("c9w-"));
+    let pid = sb.pid().unwrap();
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    assert!(wait_for(Duration::from_secs(10), || !sockets[0].exists()));
+}
+
+fn socket_wait_long(sb: &Sandbox, sql: &str, expected: i64, secs: u64) {
+    assert!(
+        wait_for(Duration::from_secs(secs), || ledger(sb)
+            .query_row(sql, [], |r| r.get::<_, i64>(0))
+            .ok()
+            == Some(expected)),
+        "{}; log {}",
+        sql,
+        sb.log()
+    );
+}
+#[test]
+fn an_uncertain_mail_sends_one_delayed_system_mail() {
+    let (sb, f) = socket_agents();
+    let a = socket_spawn(&sb, &f, "A");
+    let b = socket_spawn(&sb, &f, "B");
+    std::fs::write(f.bin.join(format!("socket-mode-{}", b)), "no-evidence").unwrap();
+    send_body(&sb, &f, &a, &format!("forward to {}", b));
+    socket_wait_long(
+        &sb,
+        "SELECT count(*) FROM messages WHERE origin_kind='agent' AND state='uncertain'",
+        1,
+        45,
+    );
+    let c = ledger(&sb);
+    assert_eq!(c.query_row("SELECT count(*) FROM messages WHERE kind='system' AND state='queued' AND not_before > created_at",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    socket_wait_long(
+        &sb,
+        "SELECT count(*) FROM messages WHERE kind='system' AND state='delivered'",
+        1,
+        80,
+    );
+    assert!(f.prompts(&a).contains("may have arrived"));
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM messages WHERE kind='system'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+#[test]
+fn a_late_entry_cancels_the_pending_system_mail() {
+    let (sb, f) = socket_agents();
+    let a = socket_spawn(&sb, &f, "A");
+    let b = socket_spawn(&sb, &f, "B");
+    // Delay before even enqueuing so the no-evidence timer genuinely fires.
+    std::fs::write(f.bin.join(format!("socket-mode-{}", b)), "late-33").unwrap();
+    send_body(&sb, &f, &a, &format!("forward to {}", b));
+    socket_wait_long(
+        &sb,
+        "SELECT count(*) FROM messages WHERE kind='system' AND state='cancelled'",
+        1,
+        50,
+    );
+    let c = ledger(&sb);
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM messages WHERE origin_kind='agent' AND state='delivered'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM message_status WHERE detail LIKE 'late_evidence:%'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn m2fix_cc_listener_is_absent_when_gate_is_unset_or_off() {
+    for gate in [None, Some("off")] {
+        let sb = Sandbox::new();
+        let mut cmd = sb.cmd(&["list"]);
+        if let Some(value) = gate {
+            cmd.env("C9_MAIL_SOCKET", value);
+        } else {
+            cmd.env_remove("C9_MAIL_SOCKET");
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{out:?} {}", sb.log());
+        let sockdir = sb.home.parent().unwrap().join("socks");
+        assert_eq!(
+            std::fs::read_dir(&sockdir).unwrap().count(),
+            0,
+            "gate={gate:?}"
+        );
     }
 }

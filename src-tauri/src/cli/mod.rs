@@ -29,6 +29,8 @@ mod session_ref;
 #[cfg(all(unix, feature = "engine"))]
 pub mod engine_client;
 #[cfg(all(unix, feature = "engine"))]
+pub mod engine_mail;
+#[cfg(all(unix, feature = "engine"))]
 pub mod engine_send;
 #[cfg(all(unix, feature = "engine"))]
 pub mod engine_sessions;
@@ -99,6 +101,7 @@ pub const CLI_COMMANDS: &[&str] = &[
     "integration",
     "spawn",
     "send",
+    "mail",
     "workers",
     "inbox",
     "adopt",
@@ -423,6 +426,8 @@ pub enum Commands {
     /// engine error or not delivered, 2 `--wait` timed out
     #[cfg(all(unix, feature = "engine"))]
     Send(engine_send::SendArgs),
+    #[cfg(all(unix, feature = "engine"))]
+    Mail(engine_mail::MailArgs),
 
     /// List workers spawned by c9watch
     #[cfg(feature = "pm-orchestration")]
@@ -669,6 +674,8 @@ pub fn run(cli: Cli) {
             &mode,
             cli.pretty,
         ),
+        #[cfg(all(unix, feature = "engine"))]
+        Commands::Mail(args) => engine_mail::cmd_mail(&args, cli.pretty),
         #[cfg(all(unix, feature = "engine"))]
         Commands::Send(args) => match engine_send::cmd_send(&args, cli.pretty) {
             Ok(0) => Ok(()),

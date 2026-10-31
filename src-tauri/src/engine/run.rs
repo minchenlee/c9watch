@@ -126,6 +126,19 @@ pub async fn run_until(
         Ok(false) => {}
         Err(e) => eprintln!("[engine] {}", e),
     }
+    let mail_merge = Arc::new(super::merge::MergeTable::new());
+    let mail_sockets = if super::cc_inbox::enabled() {
+        let sockets = super::cc_listener::Sockets::new(db.clone(), mail_merge.clone());
+        if let Err(e) = sockets.bind(&super::cc_inbox::default_socket_dir()) {
+            eprintln!("[engine] CC return socket unavailable: {}", e);
+        }
+        Some(sockets)
+    } else {
+        None
+    };
+    let _mail_socket_cleanup = mail_sockets
+        .as_ref()
+        .map(|s| super::cc_listener::SocketCleanup(s.clone()));
     let reconciled = ops::reconcile(&db, home)?;
     if !reconciled.is_empty() {
         eprintln!("[engine] Boot reconcile: {:?}", reconciled);
@@ -163,24 +176,30 @@ pub async fn run_until(
         .with_header_key(header_key.clone())
         .with_cost_cache(home.join("cost-cache.json"))
         .with_usage(crate::engine::views::usage::live_source());
+    ctx.merge = mail_merge;
     if config.detection {
         ctx = ctx.with_detection(detection.clone());
     }
-    let spawner = Arc::new(
-        Spawner::new(
-            SpawnerConfig {
-                home: home.to_path_buf(),
-                sock: socket.path().to_path_buf(),
-                claude: config.claude.clone(),
-            },
-            db.clone(),
-            config.agents.clone(),
-            ctx.merge.clone(),
-            agent_bin,
-        )
-        .with_drain(drain_switch)
-        .with_header_key(header_key),
-    );
+    let mut spawner = Spawner::new(
+        SpawnerConfig {
+            home: home.to_path_buf(),
+            sock: socket.path().to_path_buf(),
+            claude: config.claude.clone(),
+        },
+        db.clone(),
+        config.agents.clone(),
+        ctx.merge.clone(),
+        agent_bin,
+    )
+    .with_drain(drain_switch)
+    .with_header_key(header_key);
+    if let Some(sockets) = &mail_sockets {
+        spawner = spawner.with_mail_sockets(sockets.clone());
+    }
+    let spawner = Arc::new(spawner);
+    if let Some(sockets) = &mail_sockets {
+        sockets.set_spawner(&spawner);
+    }
     let ctx = Arc::new(ctx.with_spawner(spawner.clone()));
     match spawner.resume_on_boot() {
         Ok(r) if r == Default::default() => {}
@@ -273,6 +292,9 @@ pub async fn run_until(
     // db as open. Connection tasks may still hold the `Db`; `close` shuts
     // its writer anyway.
     drop(socket);
+    if let Some(sockets) = &mail_sockets {
+        sockets.close();
+    }
     db.close();
     drop(lock);
     Ok(())

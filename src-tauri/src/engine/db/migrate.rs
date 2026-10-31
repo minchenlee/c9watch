@@ -17,6 +17,7 @@ pub const DB_NEWER_THAN_ENGINE: &str = "db_newer_than_engine";
 pub struct Migration {
     pub version: u32,
     pub sql: &'static str,
+    pub fk_off: bool,
 }
 
 /// Every migration, in order. Versions start at 1 and have no gaps.
@@ -24,22 +25,32 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_init.sql"),
+        fk_off: false,
     },
     Migration {
         version: 2,
         sql: include_str!("migrations/0002_detection.sql"),
+        fk_off: false,
     },
     Migration {
         version: 3,
         sql: include_str!("migrations/0003_legacy_import.sql"),
+        fk_off: false,
     },
     Migration {
         version: 4,
         sql: include_str!("migrations/0004_drain.sql"),
+        fk_off: false,
     },
     Migration {
         version: 5,
         sql: include_str!("migrations/0005_messages.sql"),
+        fk_off: false,
+    },
+    Migration {
+        version: 6,
+        sql: include_str!("migrations/0006_mail_socket.sql"),
+        fk_off: true,
     },
 ];
 
@@ -116,16 +127,37 @@ pub fn migrate(
         if start > 0 {
             backup(conn, &backups.join(format!("pre-{}.db", m.version)))?;
         }
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("Failed to begin migration {}: {}", m.version, e))?;
-        tx.execute_batch(m.sql)
-            .map_err(|e| format!("Migration {} failed: {}", m.version, e))?;
-        // user_version lives in the db header, which this transaction owns.
-        tx.pragma_update(None, "user_version", m.version)
-            .map_err(|e| format!("Failed to set user_version {}: {}", m.version, e))?;
-        tx.commit()
-            .map_err(|e| format!("Failed to commit migration {}: {}", m.version, e))?;
+        if m.fk_off {
+            conn.pragma_update(None, "foreign_keys", false)
+                .map_err(|e| e.to_string())?;
+        }
+        let applied = (|| -> Result<(), String> {
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute_batch(m.sql)
+                .map_err(|e| format!("Migration {} failed: {}", m.version, e))?;
+            if m.fk_off {
+                let bad = tx
+                    .prepare("PRAGMA foreign_key_check")
+                    .map_err(|e| e.to_string())?
+                    .exists([])
+                    .map_err(|e| e.to_string())?;
+                if bad {
+                    return Err(format!("Migration {} failed: foreign_key_check", m.version));
+                }
+            }
+            tx.pragma_update(None, "user_version", m.version)
+                .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())
+        })();
+        // Always restore, including SQL, FK-check and commit failures.
+        let restored = if m.fk_off {
+            conn.pragma_update(None, "foreign_keys", true)
+                .map_err(|e| e.to_string())
+        } else {
+            Ok(())
+        };
+        restored?;
+        applied?;
         have = m.version;
         ran.push(m.version);
     }
@@ -165,10 +197,12 @@ mod tests {
             .map(|m| Migration {
                 version: m.version,
                 sql: m.sql,
+                fk_off: m.fk_off,
             })
             .chain(std::iter::once(Migration {
                 version: latest_version() + 1,
                 sql,
+                fk_off: false,
             }))
             .collect()
     }
@@ -231,8 +265,8 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), [5]);
-        assert_eq!(user_version(&conn).unwrap(), 5);
+        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), [5, 6]);
+        assert_eq!(user_version(&conn).unwrap(), latest_version());
         let backup = Connection::open(t.path().join("pre-5.db")).unwrap();
         assert_eq!(user_version(&backup).unwrap(), 4);
         let n: i64 = conn
@@ -265,10 +299,10 @@ mod tests {
             conn.execute(
                 "INSERT INTO messages (id, from_principal, to_agent, to_addr, \
                  origin_kind, provenance, body, body_hash, req_hash, idem, state, \
-                 state_at, created_at) \
+                 state_at, created_at, wire_id) \
                  VALUES (?1, ?2, 'agt_1', 'm/agt_1', 'local-unverified', 'p', 'b', \
-                 'h', 'r', ?3, 'queued', 0, 0)",
-                rusqlite::params![id, from, idem],
+                 'h', 'r', ?3, 'queued', 0, 0, ?4)",
+                rusqlite::params![id, from, idem, uuid::Uuid::new_v4().to_string()],
             )
         };
         put("msg_1", "local-unverified", None).unwrap();
@@ -354,5 +388,80 @@ mod tests {
         let err = migrate(&mut conn, MIGRATIONS, t.path()).unwrap_err();
         assert!(err.starts_with(DB_NEWER_THAN_ENGINE), "{}", err);
         assert_eq!(user_version(&conn).unwrap(), next());
+    }
+    #[test]
+    fn v5_rows_statuses_uuid_and_foreign_keys_survive_the_rebuild() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = Connection::open(t.path().join("db")).unwrap();
+        c.pragma_update(None, "foreign_keys", true).unwrap();
+        migrate(&mut c, &MIGRATIONS[..5], t.path()).unwrap();
+        c.execute("INSERT INTO agents(id,role,provider,source) VALUES ('a','worker','claudeCode','engine')",[]).unwrap();
+        for (n, state) in ["queued", "delivered", "uncertain"].iter().enumerate() {
+            c.execute("INSERT INTO messages(id,from_principal,to_agent,to_addr,origin_kind,provenance,body,body_hash,req_hash,state,state_at,created_at) VALUES (?1,'local-unverified','a','m/a','local-unverified','p','b','h','h',?2,1,1)",rusqlite::params![format!("msg_{}",n),state]).unwrap();
+            c.execute(
+                "INSERT INTO message_status(msg_id,state,at) VALUES (?1,?2,1)",
+                rusqlite::params![format!("msg_{}", n), state],
+            )
+            .unwrap();
+        }
+        migrate(&mut c, MIGRATIONS, t.path()).unwrap();
+        let wires = c
+            .prepare("SELECT wire_id FROM messages")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(wires.len(), 3);
+        for wire in &wires {
+            assert_eq!(uuid::Uuid::parse_str(wire).unwrap().get_version_num(), 4);
+        }
+        assert_eq!(
+            wires.iter().collect::<std::collections::HashSet<_>>().len(),
+            3
+        );
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM message_status", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert!(!c
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap());
+        assert!(c
+            .query_row("PRAGMA foreign_keys", [], |r| r.get::<_, bool>(0))
+            .unwrap());
+    }
+    #[test]
+    fn a_bad_v5_foreign_key_rolls_back_and_restores_the_pragma() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = Connection::open(t.path().join("db")).unwrap();
+        migrate(&mut c, &MIGRATIONS[..5], t.path()).unwrap();
+        c.pragma_update(None, "foreign_keys", false).unwrap();
+        c.execute(
+            "INSERT INTO message_status(msg_id,state,at) VALUES ('missing','queued',1)",
+            [],
+        )
+        .unwrap();
+        c.pragma_update(None, "foreign_keys", true).unwrap();
+        assert!(migrate(&mut c, MIGRATIONS, t.path())
+            .unwrap_err()
+            .contains("foreign_key_check"));
+        assert_eq!(user_version(&c).unwrap(), 5);
+        assert!(c
+            .query_row("PRAGMA foreign_keys", [], |r| r.get::<_, bool>(0))
+            .unwrap());
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM pragma_table_info('messages') WHERE name='wire_id'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
     }
 }

@@ -561,6 +561,11 @@ pub const METHODS: &[&str] = &[
     "task.done",
     "agent.handoff",
     "msg.send",
+    "msg.list",
+    "msg.read",
+    "msg.cancel",
+    "mail.pause",
+    "mail.resume",
     "session.views",
     "session.away",
     "detect.recheck",
@@ -642,6 +647,11 @@ pub fn schema() -> serde_json::Value {
             "params": de.subschema_for::<HandoffParams>(),
             "result": ser.subschema_for::<HandoffResult>(),
         },
+        "msg.list": { "params": de.subschema_for::<crate::engine_proto::wire::MsgListParams>(), "result": ser.subschema_for::<crate::engine_proto::wire::MsgListResult>() },
+        "msg.read": { "params": de.subschema_for::<crate::engine_proto::wire::MsgIdParams>(), "result": ser.subschema_for::<crate::engine_proto::wire::MsgReadResult>() },
+        "msg.cancel": { "params": de.subschema_for::<crate::engine_proto::wire::MsgIdParams>(), "result": ser.subschema_for::<crate::engine_proto::wire::MailControlResult>() },
+        "mail.pause": { "params": de.subschema_for::<crate::engine_proto::wire::MailAgentParams>(), "result": ser.subschema_for::<crate::engine_proto::wire::MailControlResult>() },
+        "mail.resume": { "params": de.subschema_for::<crate::engine_proto::wire::MailAgentParams>(), "result": ser.subschema_for::<crate::engine_proto::wire::MailControlResult>() },
         "msg.send": {
             "params": de.subschema_for::<MsgSendParams>(),
             "result": ser.subschema_for::<MsgSendResult>(),
@@ -929,6 +939,21 @@ async fn dispatch(
         "session.list" => Ok(Served::result(session_list(ctx).await?)),
         "agent.list" => Ok(Served::result(agent_list(req, ctx).await?)),
         "msg.send" => msg_send(req, ctx, peer, principal).await,
+        "msg.list" => Ok(Served::result(
+            mail_query("msg.list", req, ctx, peer, principal).await?,
+        )),
+        "msg.read" => Ok(Served::result(
+            mail_query("msg.read", req, ctx, peer, principal).await?,
+        )),
+        "msg.cancel" => Ok(Served::result(
+            mail_control("msg.cancel", req, ctx, peer, principal).await?,
+        )),
+        "mail.pause" => Ok(Served::result(
+            mail_control("mail.pause", req, ctx, peer, principal).await?,
+        )),
+        "mail.resume" => Ok(Served::result(
+            mail_control("mail.resume", req, ctx, peer, principal).await?,
+        )),
         "session.views" => Ok(Served::result(session_views::session_views(ctx).await?)),
         "session.away" => Ok(Served::result(session_views::session_away(req, ctx).await?)),
         "detect.recheck" => Ok(Served::result(
@@ -1009,7 +1034,7 @@ async fn dispatch(
                     ),
                 ));
             }
-            let (result, stream) = events_subscribe(req, ctx).await?;
+            let (result, stream) = events_subscribe(req, ctx, peer, principal).await?;
             Ok(Served {
                 result,
                 stream: Some(stream),
@@ -1427,7 +1452,7 @@ async fn hook_intake(
     method: &str,
     principal: &Principal,
     gen: i64,
-    params: HookParams,
+    mut params: HookParams,
 ) -> Result<(Outcome, Option<String>), ApiError> {
     let db = ctx.db()?.clone();
     let machine = ctx.machine_id.clone();
@@ -1449,6 +1474,7 @@ async fn hook_intake(
     let agent_id = params.agent_id.clone();
     let is_start = method == "hook.session_start";
     let drain = ctx.drain.clone();
+    let header_key = ctx.header_key.clone();
     let (method, principal) = (method.to_string(), principal.to_string());
     let (answer, _) = db
         .write(move |tx| {
@@ -1456,6 +1482,16 @@ async fn hook_intake(
             // that commits after the drain began gets no context (reviews
             // L1).
             let draining = drain.on();
+            let signed_headers = if method == "hook.user_prompt_submit" {
+                params.input["mail"].as_str().map(str::to_string)
+            } else {
+                None
+            };
+            // With a production key, only signed evidence is accepted. Keep the
+            // intake responsible for hook ordering/dedupe, then confirm below.
+            if header_key.is_some() && signed_headers.is_some() {
+                params.input["mail"] = serde_json::Value::Null;
+            }
             let ev = HookEvent {
                 method: &method,
                 principal: &principal,
@@ -1475,7 +1511,20 @@ async fn hook_intake(
                     now_ms(),
                 )
             } else {
-                hooks::intake(tx, &machine, &merge, &ev, now_ms()).map(|o| (o, None))
+                let out = hooks::intake(tx, &machine, &merge, &ev, now_ms())?;
+                if out == Outcome::Accepted {
+                    if let (Some(key), Some(headers)) = (&header_key, &signed_headers) {
+                        mail::confirm_signed(
+                            tx,
+                            &machine,
+                            &params.agent_id,
+                            headers,
+                            key,
+                            now_ms(),
+                        )?;
+                    }
+                }
+                Ok((out, None))
             }
         })
         .await
@@ -1629,6 +1678,8 @@ async fn agent_list(req: Request, ctx: &ServerCtx) -> Result<serde_json::Value, 
 async fn events_subscribe(
     req: Request,
     ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
 ) -> Result<(serde_json::Value, EventStream), ApiError> {
     let params: SubscribeParams = if req.params.is_null() {
         SubscribeParams::default()
@@ -1645,6 +1696,13 @@ async fn events_subscribe(
         Some(s) => Some(Cursor::parse(s).map_err(|e| ApiError::new(ErrorCode::BadRequest, e))?),
         None => None,
     };
+    // A shallow local stamp is not proof of unrestricted mailbox access.
+    // Failed verification drops mail events while preserving other topics.
+    let mail_principal = check_mail_peer(ctx, peer, principal)
+        .await
+        .ok()
+        .map(|_| principal.clone());
+    let mail_db = db.clone();
     let (start, sub) = blocking(move || {
         let after = match since {
             Some(c) => db.check_cursor(&c).map_err(read_error)?,
@@ -1664,6 +1722,8 @@ async fn events_subscribe(
         epoch: start.epoch,
         topics: params.topics,
         subjects: params.subjects,
+        mail_principal,
+        mail_db,
     };
     Ok((
         serde_json::to_value(result).expect("SubscribeResult serializes"),
@@ -1680,6 +1740,9 @@ struct EventStream {
     epoch: String,
     topics: Vec<String>,
     subjects: Vec<String>,
+    /// None means local ancestry verification failed: no mail may leave.
+    mail_principal: Option<Principal>,
+    mail_db: Arc<Db>,
 }
 
 impl EventStream {
@@ -1697,6 +1760,40 @@ impl EventStream {
                 .as_ref()
                 .is_some_and(|s| self.subjects.contains(s));
         topic_ok && subject_ok
+    }
+
+    /// Apply ownership to every batch, including replay and catch-up. Use
+    /// the stored message, not client filters or optional event metadata.
+    async fn filter_mail(&self, mut batch: Vec<Event>) -> Vec<Event> {
+        match &self.mail_principal {
+            Some(Principal::LocalUnverified) => batch,
+            None => {
+                batch.retain(|e| e.topic != mail::TOPIC);
+                batch
+            }
+            Some(who) => {
+                if !batch.iter().any(|e| e.topic == mail::TOPIC) {
+                    return batch;
+                }
+                let who = who.clone();
+                let db = self.mail_db.clone();
+                blocking(move || {
+                    let conn = db.reader().ok();
+                    batch.retain(|e| {
+                        if e.topic != mail::TOPIC {
+                            return true;
+                        }
+                        match (conn.as_ref(), e.data.get("msgId").and_then(|v| v.as_str())) {
+                            (Some(c), Some(id)) => mail::visible(c, &who, id).unwrap_or(false),
+                            _ => false,
+                        }
+                    });
+                    Ok(batch)
+                })
+                .await
+                .unwrap_or_default()
+            }
+        }
     }
 
     fn frame(&self, e: Event) -> EventFrame {
@@ -1727,7 +1824,7 @@ impl EventStream {
                     return;
                 }
             };
-            for e in batch {
+            for e in self.filter_mail(batch).await {
                 if !self.wants(&e) {
                     continue;
                 }
@@ -2181,6 +2278,10 @@ mod tests {
                 assert_eq!(r["error"]["code"], "internal", "{}: {}", m, r);
             } else if [
                 "msg.send",
+                "msg.read",
+                "msg.cancel",
+                "mail.pause",
+                "mail.resume",
                 "session.stop",
                 "session.rename",
                 "conversation.get",
@@ -4164,4 +4265,409 @@ mod tests {
         assert!(served);
         server.abort();
     }
+    #[tokio::test]
+    async fn m2_queries_are_private_and_agent_controls_are_refused() {
+        let (_t, ctx, db) = ctx_db(as_agent("agt_a7"));
+        mail_agent(&db, "agt_a7", "alice", "pty").await;
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        mail_agent(&db, "agt_c1", "cat", "pty").await;
+        let (mut c, _) = Client::new(ctx).await;
+        let sent = c
+            .call("s", "msg.send", json!({"to":"bob","body":"hello"}))
+            .await;
+        assert_eq!(sent["ok"], true, "{}", sent);
+        let id = sent["result"]["msgId"].as_str().unwrap();
+        let listed = c.call("l", "msg.list", json!({})).await;
+        assert_eq!(listed["result"]["items"].as_array().unwrap().len(), 1);
+        let read = c.call("r", "msg.read", json!({"msgId":id})).await;
+        assert_eq!(read["result"]["body"], "hello");
+        assert_eq!(read["result"]["state"], "queued");
+        for (method, params) in [
+            ("msg.cancel", json!({"msgId":id})),
+            ("mail.pause", json!({"agent":"bob"})),
+            ("mail.resume", json!({"agent":"bob"})),
+        ] {
+            let r = c.call("c", method, params).await;
+            assert_eq!(r["error"]["code"], "not_allowed", "{}", r);
+        }
+        let n:i64=db.reader().unwrap().query_row("SELECT count(*) FROM audit WHERE method IN ('msg.cancel','mail.pause','mail.resume') AND decision='deny'",[],|r|r.get(0)).unwrap();
+        assert_eq!(n, 3);
+    }
+    #[tokio::test]
+    async fn m2fix_unverified_queries_require_complete_peer_verification() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let sent = queue_mail(
+            &ctx,
+            &Principal::LocalUnverified,
+            MsgSendParams {
+                to: "bob".into(),
+                body: "private".into(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let pid = std::process::id() as libc::pid_t;
+        let start = peer::proc_info(pid).unwrap().start;
+        let cases = [
+            (ctx.clone(), pid, None),
+            (ctx.clone(), pid, Some(start + 1)),
+            (ctx.clone(), i32::MAX, Some(start)),
+            (
+                Arc::new(
+                    ServerCtx::new(MACHINE.into())
+                        .with_db(db.clone())
+                        .with_agents(as_agent("hidden")),
+                ),
+                pid,
+                Some(start),
+            ),
+        ];
+        for (ctx, pid, start) in cases {
+            for (method, params) in [
+                ("msg.list", json!({})),
+                ("msg.read", json!({"msgId":sent.msg_id})),
+            ] {
+                let req = Request {
+                    params,
+                    ..Default::default()
+                };
+                let result = dispatch(
+                    method,
+                    req,
+                    &ctx,
+                    Peer {
+                        cred: PeerCred {
+                            pid,
+                            uid: peer::engine_uid(),
+                        },
+                        start,
+                    },
+                    &Principal::LocalUnverified,
+                    &mut Streams::default(),
+                    None,
+                )
+                .await;
+                assert_eq!(
+                    result
+                        .err()
+                        .expect("unverified query must fail closed")
+                        .code,
+                    ErrorCode::NotAllowed
+                );
+            }
+        }
+        let (mut c, _) = Client::new(ctx).await;
+        assert_eq!(
+            c.call("l", "msg.list", json!({})).await["result"]["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            c.call("r", "msg.read", json!({"msgId":sent.msg_id})).await["result"]["body"],
+            "private"
+        );
+    }
+
+    #[tokio::test]
+    async fn m2fix_mail_events_enforce_ownership_for_live_and_replay() {
+        for replay in [false, true] {
+            for filtered in [false, true] {
+                for who in ["alice", "bob", "cat", "local"] {
+                    let agents = if who == "local" {
+                        Arc::new(NoLiveAgents) as Arc<dyn LiveAgents>
+                    } else {
+                        as_agent(who)
+                    };
+                    let (_t, ctx, db) = ctx_db(agents);
+                    for name in ["alice", "bob", "cat"] {
+                        mail_agent(&db, name, name, "pty").await;
+                    }
+                    let since = db.head_cursor().to_string();
+                    let (mut c, _) = Client::new(ctx.clone()).await;
+                    let mut params = json!({});
+                    if replay {
+                        params["since"] = json!(since);
+                    }
+                    if filtered {
+                        params["topics"] = json!(["msg.*", "agent.upsert"]);
+                        params["subjects"] = json!([format!("{}/bob", MACHINE)]);
+                    }
+                    if !replay {
+                        assert_eq!(
+                            c.call("s", "events.subscribe", params.clone()).await["ok"],
+                            true
+                        );
+                    }
+                    let sent = queue_mail(
+                        &ctx,
+                        &Principal::Agent {
+                            id: "alice".into(),
+                            gen: 1,
+                        },
+                        MsgSendParams {
+                            to: "bob".into(),
+                            body: "private preview".into(),
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    let id = sent.msg_id.clone();
+                    db.write(move |tx| mail::note(tx, MACHINE, &id, "private detail", now_ms()))
+                        .await
+                        .unwrap();
+                    let marker = event("agent.upsert", &format!("{}/bob", MACHINE), 99, 0);
+                    db.write(move |tx| tx.emit(&marker)).await.unwrap();
+                    if replay {
+                        assert_eq!(c.call("s", "events.subscribe", params).await["ok"], true);
+                    }
+                    let mut mail_events = Vec::new();
+                    loop {
+                        let frame = c.next().await;
+                        if frame["topic"] == "agent.upsert" {
+                            break;
+                        }
+                        mail_events.push(frame);
+                    }
+                    assert_eq!(
+                        mail_events.len(),
+                        if who == "cat" { 0 } else { 2 },
+                        "who={who} replay={replay} filtered={filtered}: {mail_events:?}"
+                    );
+                    if who != "cat" {
+                        assert_eq!(mail_events[0]["data"]["preview"], "private preview");
+                        assert_eq!(mail_events[1]["data"]["detail"], "private detail");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn m2fix_unverified_subscribers_drop_mail_but_keep_other_events() {
+        let (_t, ctx, db) = ctx_db(as_agent("hidden"));
+        mail_agent(&db, "bob", "bob", "pty").await;
+        queue_mail(
+            &ctx,
+            &Principal::LocalUnverified,
+            MsgSendParams {
+                to: "bob".into(),
+                body: "private".into(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let marker = event("agent.upsert", "bob", 99, 0);
+        db.write(move |tx| tx.emit(&marker)).await.unwrap();
+        let pid = std::process::id() as libc::pid_t;
+        // Exercise the same shallow LocalUnverified stamp a deep descendant
+        // gets, and an unreadable start token, through the subscribe path.
+        for start in [None, Some(peer::proc_info(pid).unwrap().start)] {
+            let (_, stream) = events_subscribe(
+                Request {
+                    id: Some("s".into()),
+                    params: json!({"since":format!("{}:{}:0", MACHINE, db.epoch())}),
+                    ..Default::default()
+                },
+                &ctx,
+                Peer {
+                    cred: PeerCred {
+                        pid,
+                        uid: peer::engine_uid(),
+                    },
+                    start,
+                },
+                &Principal::LocalUnverified,
+            )
+            .await
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(8);
+            let task = tokio::spawn(stream.run(tx));
+            let bytes = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let frame: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(frame["topic"], "agent.upsert", "{frame}");
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn m2_human_controls_audit_and_cancel_only_queued() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let (mut c, _) = Client::new(ctx).await;
+        for method in ["mail.pause", "mail.resume"] {
+            let r = c.call("p", method, json!({"agent":"bob"})).await;
+            assert_eq!(r["ok"], true, "{}", r);
+        }
+        let s = c
+            .call("s", "msg.send", json!({"to":"bob","body":"hello"}))
+            .await;
+        let id = s["result"]["msgId"].as_str().unwrap();
+        let r = c.call("c", "msg.cancel", json!({"msgId":id})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let r = c.call("d", "msg.cancel", json!({"msgId":id})).await;
+        assert_eq!(r["error"]["code"], "not_cancellable");
+        assert_eq!(r["error"]["data"]["state"], "cancelled");
+        assert_eq!(db.reader().unwrap().query_row("SELECT count(*) FROM audit WHERE method IN ('msg.cancel','mail.pause','mail.resume') AND decision='allow'",[],|r|r.get::<_,i64>(0)).unwrap(),3);
+    }
+}
+
+// C1b-M2 mailbox APIs. Mutations require the same verified local ancestry
+// as msg.send, plus the human-only principal restriction.
+async fn mail_query(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    peer: Peer,
+    who: &Principal,
+) -> Result<serde_json::Value, ApiError> {
+    use crate::engine_proto::wire::{MsgIdParams, MsgListParams};
+    check_mail_peer(ctx, peer, who).await?;
+    let db = ctx.db()?.clone();
+    let machine = ctx.machine_id.clone();
+    let who = who.clone();
+    let method = method.to_string();
+    blocking(move || {
+        let c = db.reader().map_err(internal)?;
+        if method == "msg.list" {
+            let p: MsgListParams = serde_json::from_value(req.params)
+                .map_err(|e| ApiError::new(ErrorCode::BadRequest, e.to_string()))?;
+            Ok(
+                serde_json::to_value(mail::list(&c, &machine, &who, &p).map_err(internal)??)
+                    .expect("mail list"),
+            )
+        } else {
+            let p: MsgIdParams = serde_json::from_value(req.params)
+                .map_err(|e| ApiError::new(ErrorCode::BadRequest, e.to_string()))?;
+            Ok(
+                serde_json::to_value(mail::read(&c, &machine, &who, &p.msg_id).map_err(internal)??)
+                    .expect("mail read"),
+            )
+        }
+    })
+    .await
+}
+/// Unrestricted mail reads need the same complete peer verification as
+/// mailbox controls. Agent reads remain restricted by message ownership.
+async fn check_mail_peer(ctx: &ServerCtx, peer: Peer, who: &Principal) -> Result<(), ApiError> {
+    if !matches!(who, Principal::LocalUnverified) {
+        return Ok(());
+    }
+    let agents = ctx.agents.clone();
+    let who = who.clone();
+    blocking(move || {
+        Ok(mail::check_sender(
+            &who,
+            peer.cred.pid,
+            peer.start,
+            agents.as_ref(),
+        ))
+    })
+    .await?
+}
+
+async fn mail_control(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    peer: Peer,
+    who: &Principal,
+) -> Result<serde_json::Value, ApiError> {
+    use crate::engine_proto::wire::{MailAgentParams, MsgIdParams};
+    let method = method.to_string();
+    let target = req
+        .params
+        .get("agent")
+        .or_else(|| req.params.get("msgId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let checked = if !matches!(who, Principal::LocalUnverified) {
+        Err(ApiError::new(
+            ErrorCode::NotAllowed,
+            "mail controls require a person",
+        ))
+    } else {
+        let agents = ctx.agents.clone();
+        let who = who.clone();
+        blocking(move || {
+            Ok(mail::check_sender(
+                &who,
+                peer.cred.pid,
+                peer.start,
+                agents.as_ref(),
+            ))
+        })
+        .await?
+    };
+    if let Err(e) = checked {
+        audit_refusal(ctx, who, &method, &target, &e).await;
+        return Err(e);
+    }
+    let parsed = if method == "msg.cancel" {
+        serde_json::from_value::<MsgIdParams>(req.params).map(|p| p.msg_id)
+    } else {
+        serde_json::from_value::<MailAgentParams>(req.params).map(|p| p.agent)
+    }
+    .map_err(|e| ApiError::new(ErrorCode::BadRequest, e.to_string()));
+    let id = match parsed {
+        Ok(id) => id,
+        Err(e) => {
+            audit_refusal(ctx, who, &method, &target, &e).await;
+            return Err(e);
+        }
+    };
+    let db = ctx.db()?.clone();
+    let machine = ctx.machine_id.clone();
+    let principal = who.to_string();
+    let m = method.clone();
+    let (out, _) = db
+        .write(move |tx| {
+            let out = if m == "msg.cancel" {
+                mail::cancel(tx, &machine, &id, &principal, now_ms())?.map(|_| None)
+            } else {
+                match mail::resolve(tx, &machine, &id)? {
+                    Ok(t) => {
+                        mail::pause(tx, &machine, &t.id, &principal, m == "mail.pause", now_ms())?;
+                        Ok(Some(t.id))
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            let reason = out.as_ref().err().map(|e| e.code.to_string());
+            audit::append(
+                tx,
+                now_ms(),
+                &AuditEntry {
+                    principal: &principal,
+                    method: &m,
+                    target: Some(&id),
+                    decision: if out.is_ok() { "allow" } else { "deny" },
+                    reason: reason.as_deref(),
+                    ..Default::default()
+                },
+            )?;
+            Ok(out)
+        })
+        .await
+        .map_err(internal)?;
+    if let Some(agent) = out? {
+        if method == "mail.resume" {
+            if let Some(s) = &ctx.spawner {
+                s.nudge_mail(&agent);
+            }
+        }
+    }
+    Ok(serde_json::json!({"ok": true}))
 }

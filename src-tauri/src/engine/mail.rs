@@ -1,10 +1,10 @@
-//! The mail ledger (plan C1b-M1 §3-§5, A:418-429).
+//! The mail ledger (C1b-M1/M2): PTY user input and opt-in CC peer mail.
 //!
 //! `msg.send` writes a `messages` row; the target's supervisor thread takes
 //! it, pastes it into the agent's PTY and submits it (`engine::create`).
 //! Every state change of a message goes through `record`, which updates
 //! `messages.state`, appends a `message_status` row and emits `msg.state`
-//! in one transaction (A:219). States in M1:
+//! in one transaction (A:219). Cancelled, rejected and expired are final.
 //!
 //! ```text
 //! queued ──take_next──► delivering ──confirm_from_prompt / mark──► delivered
@@ -14,9 +14,8 @@
 //!                           └──mark──► failed
 //! ```
 //!
-//! `delivered`, `failed` and `uncertain` are final: nothing here moves a
-//! message out of them, so a late hook and a supervisor timeout cannot both
-//! win. An `uncertain` message is never sent again on its own (A:684).
+//! Only authenticated late evidence within ten minutes can move uncertain
+//! to delivered. Uncertain mail is never sent again automatically (A:684).
 //!
 //! Who may mail whom (§5.2): the terminal (`local-unverified`, standing in
 //! for the human) mails any agent the engine drives; an agent mails any
@@ -69,6 +68,9 @@ pub enum MsgState {
     Delivered,
     Failed,
     Uncertain,
+    Rejected,
+    Expired,
+    Cancelled,
 }
 
 impl MsgState {
@@ -79,6 +81,9 @@ impl MsgState {
             MsgState::Delivered => "delivered",
             MsgState::Failed => "failed",
             MsgState::Uncertain => "uncertain",
+            MsgState::Rejected => "rejected",
+            MsgState::Expired => "expired",
+            MsgState::Cancelled => "cancelled",
         }
     }
 
@@ -89,6 +94,9 @@ impl MsgState {
             "delivered" => MsgState::Delivered,
             "failed" => MsgState::Failed,
             "uncertain" => MsgState::Uncertain,
+            "rejected" => MsgState::Rejected,
+            "expired" => MsgState::Expired,
+            "cancelled" => MsgState::Cancelled,
             _ => return None,
         })
     }
@@ -552,6 +560,11 @@ pub fn replay(
     Ok(Some(Ok(MsgSendResult {
         msg_id: id,
         state,
+        paused: if sender.agent_id().is_some() && paused(conn, &to.id)? {
+            Some(true)
+        } else {
+            None
+        },
         to,
         cursor: cursor.unwrap_or_default(),
         replayed: true,
@@ -640,11 +653,29 @@ pub fn enqueue(
             .flatten(),
         None => None,
     };
+    let hop: i64 = match reply_to {
+        Some(parent) => tx
+            .query_row(
+                "SELECT hop + 1 FROM messages WHERE id = ?1",
+                [parent],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0),
+        None => 0,
+    };
+    if hop > 8 {
+        return Ok(Err(ApiError::new(
+            ErrorCode::HopLimit,
+            "mail hop limit exceeded",
+        )
+        .with_data(json!({"hop": hop}))));
+    }
     tx.execute(
         "INSERT INTO messages (id, from_principal, from_agent, to_agent, to_addr, origin_kind, \
          kind, reply_to, thread_id, provenance, body, body_hash, req_hash, idem, state, \
-         state_at, attempts, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'queued', ?15, 0, ?15)",
+         state_at, attempts, created_at, wire_id, hop) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'queued', ?15, 0, ?15, ?16, ?17)",
         params![
             id,
             from,
@@ -660,7 +691,9 @@ pub fn enqueue(
             body_hash,
             req,
             idem,
-            now
+            now,
+            uuid::Uuid::new_v4().to_string(),
+            hop
         ],
     )?;
     let seq = append_status(tx, machine, &id, MsgState::Queued, None, now)?;
@@ -680,6 +713,11 @@ pub fn enqueue(
         to: target.address(machine),
         cursor,
         replayed: false,
+        paused: if sender.agent_id().is_some() && paused(tx, &target.id)? {
+            Some(true)
+        } else {
+            None
+        },
     }))
 }
 
@@ -703,6 +741,13 @@ fn append_status(
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     let data = MsgStateEvent {
+        via: None,
+        sender: None,
+        recipient: None,
+        thread_id: None,
+        reply_to: None,
+        kind: None,
+        preview: None,
         msg_id: msg_id.to_string(),
         from,
         to: to.clone(),
@@ -711,11 +756,22 @@ fn append_status(
         attempts,
         detail: detail.map(str::to_string),
     };
+    let mut data = serde_json::to_value(data).expect("MsgStateEvent serializes");
+    let summary = summary(tx, machine, msg_id)?;
+    data["via"] = json!(summary.via);
+    if state == MsgState::Queued {
+        data["sender"] = json!(summary.from);
+        data["recipient"] = json!(summary.to);
+        data["threadId"] = json!(summary.thread_id);
+        data["replyTo"] = json!(summary.reply_to);
+        data["kind"] = json!(summary.kind);
+        data["preview"] = json!(summary.preview);
+    }
     tx.emit(&NewEvent {
         topic: TOPIC.into(),
         subject: Some(format!("{}/{}", machine, to)),
         origin: None,
-        data: serde_json::to_value(data).expect("MsgStateEvent serializes"),
+        data,
     })
 }
 
@@ -744,6 +800,16 @@ fn record(
         params![msg_id, state.as_str(), now],
     )?;
     append_status(tx, machine, msg_id, state, detail, now)?;
+    if matches!(
+        state,
+        MsgState::Uncertain
+            | MsgState::Failed
+            | MsgState::Rejected
+            | MsgState::Expired
+            | MsgState::Cancelled
+    ) {
+        notify_sender(tx, machine, msg_id, now)?;
+    }
     Ok(true)
 }
 
@@ -759,17 +825,38 @@ pub struct Mail {
 
 /// Take `agent_id`'s oldest `queued` message: it becomes `delivering` and
 /// its attempt count goes up. `None` when its queue is empty.
+/// Snapshot the eligible head. A supervisor binds route selection to this id
+/// and rechecks it in the writer transaction, so cancellation/pause/receipts
+/// cannot make an agent message inherit a different message's PTY route.
+pub fn peek_next_id(conn: &Connection, agent: &str, now: i64) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT id FROM messages WHERE to_agent = ?1 AND state = 'queued' AND (not_before IS NULL OR not_before <= ?2) AND NOT EXISTS (SELECT 1 FROM messages d WHERE d.to_agent = ?1 AND d.state = 'delivering') AND (origin_kind = 'local-unverified' OR NOT EXISTS (SELECT 1 FROM mail_pause p WHERE p.agent_id = ?1)) ORDER BY created_at, rowid LIMIT 1", params![agent, now], |r| r.get(0)).optional()
+}
+
 pub fn take_next(
     tx: &mut Tx,
     machine: &str,
     agent_id: &str,
     now: i64,
 ) -> rusqlite::Result<Option<Mail>> {
+    take_next_via(tx, machine, agent_id, None, now)
+}
+
+pub fn take_next_via(
+    tx: &mut Tx,
+    machine: &str,
+    agent_id: &str,
+    via: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<Option<Mail>> {
     let next: Option<(String, String, String, i64)> = tx
         .query_row(
             "SELECT id, provenance, body, attempts FROM messages \
-             WHERE to_agent = ?1 AND state = 'queued' ORDER BY created_at, rowid LIMIT 1",
-            [agent_id],
+             WHERE to_agent = ?1 AND state = 'queued' \
+             AND (not_before IS NULL OR not_before <= ?2) \
+             AND NOT EXISTS (SELECT 1 FROM messages d WHERE d.to_agent = ?1 AND d.state = 'delivering') \
+             AND (origin_kind = 'local-unverified' OR NOT EXISTS (SELECT 1 FROM mail_pause p WHERE p.agent_id = ?1)) \
+             ORDER BY created_at, rowid LIMIT 1",
+            params![agent_id, now],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
@@ -777,8 +864,8 @@ pub fn take_next(
         return Ok(None);
     };
     tx.execute(
-        "UPDATE messages SET attempts = attempts + 1 WHERE id = ?1",
-        [&id],
+        "UPDATE messages SET attempts = attempts + 1, via = coalesce(?2, via) WHERE id = ?1",
+        params![id, via],
     )?;
     record(
         tx,
@@ -807,15 +894,7 @@ pub fn requeue(
     why: &str,
     now: i64,
 ) -> rusqlite::Result<bool> {
-    record(
-        tx,
-        machine,
-        msg_id,
-        &[MsgState::Delivering],
-        MsgState::Queued,
-        Some(why),
-        now,
-    )
+    requeue_after(tx, machine, msg_id, why, None, now)
 }
 
 /// Move a `queued` or `delivering` message to `state` (`delivered`,
@@ -877,7 +956,7 @@ pub fn confirm_from_prompt(
         let ours: bool = tx
             .query_row(
                 "SELECT count(*) FROM messages WHERE id = ?1 AND to_agent = ?2 \
-                 AND state = 'delivering'",
+                 AND state = 'delivering' AND coalesce(via, 'pty') = 'pty'",
                 params![id, agent_id],
                 |r| r.get::<_, i64>(0),
             )
@@ -994,6 +1073,510 @@ pub fn reconcile_on_boot(tx: &mut Tx, machine: &str, now: i64) -> rusqlite::Resu
         }
     }
     Ok(ended)
+}
+
+// C1b-M2: ledger controls, evidence and read models.
+use crate::engine_proto::wire::{
+    MsgFrom, MsgListParams, MsgListResult, MsgReadResult, MsgStatus, MsgSummary,
+};
+
+pub const LATE_WINDOW_MS: i64 = 10 * 60 * 1000;
+pub const SOCKET_MAX_ATTEMPTS: i64 = 5;
+pub fn backoff(attempts: i64) -> i64 {
+    match attempts {
+        0 | 1 => 2_000,
+        2 => 10_000,
+        3 => 30_000,
+        _ => 60_000,
+    }
+}
+
+pub fn requeue_after(
+    tx: &mut Tx,
+    machine: &str,
+    id: &str,
+    why: &str,
+    not_before: Option<i64>,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    if state_of(tx, id)? != Some(MsgState::Delivering) {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE messages SET not_before = ?2 WHERE id = ?1",
+        params![id, not_before],
+    )?;
+    record(
+        tx,
+        machine,
+        id,
+        &[MsgState::Delivering],
+        MsgState::Queued,
+        Some(why),
+        now,
+    )
+}
+pub fn set_via(tx: &Tx, id: &str, via: &str) -> rusqlite::Result<()> {
+    tx.execute(
+        "UPDATE messages SET via = ?2 WHERE id = ?1",
+        params![id, via],
+    )?;
+    Ok(())
+}
+pub fn note(tx: &mut Tx, machine: &str, id: &str, detail: &str, now: i64) -> rusqlite::Result<()> {
+    if let Some(state) = state_of(tx, id)? {
+        append_status(tx, machine, id, state, Some(detail), now)?;
+    }
+    Ok(())
+}
+pub fn late_evidence(
+    tx: &mut Tx,
+    machine: &str,
+    id: &str,
+    basis: &str,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    let recent: bool = tx.query_row("SELECT count(*) > 0 FROM messages WHERE id = ?1 AND state = 'uncertain' AND state_at >= ?2", params![id, now - LATE_WINDOW_MS], |r| r.get(0))?;
+    if !recent {
+        return Ok(false);
+    }
+    let changed = record(
+        tx,
+        machine,
+        id,
+        &[MsgState::Uncertain],
+        MsgState::Delivered,
+        Some(&format!("late_evidence: {}", basis)),
+        now,
+    )?;
+    if changed {
+        let notice: Option<String> =
+            tx.query_row("SELECT notice_id FROM messages WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })?;
+        if let Some(notice) = notice {
+            // A merged notice must retain all still-unresolved results.
+            let remaining: i64 = tx.query_row(
+                "SELECT count(*) FROM messages WHERE notice_id = ?1 AND state != 'delivered'",
+                [&notice],
+                |r| r.get(0),
+            )?;
+            if remaining == 0 {
+                record(
+                    tx,
+                    machine,
+                    &notice,
+                    &[MsgState::Queued],
+                    MsgState::Cancelled,
+                    Some("late_evidence"),
+                    now,
+                )?;
+            } else if state_of(tx, &notice)? == Some(MsgState::Queued) {
+                refresh_notice(tx, &notice)?;
+            }
+        }
+    }
+    Ok(changed)
+}
+pub fn cancel(
+    tx: &mut Tx,
+    machine: &str,
+    id: &str,
+    principal: &str,
+    now: i64,
+) -> rusqlite::Result<Result<(), ApiError>> {
+    let state: Option<String> = tx
+        .query_row("SELECT state FROM messages WHERE id=?1", [id], |r| r.get(0))
+        .optional()?;
+    if state.as_deref() != Some("queued") {
+        return Ok(Err(ApiError::new(
+            ErrorCode::NotCancellable,
+            "only queued mail can be cancelled",
+        )
+        .with_data(json!({"state": state}))));
+    }
+    record(
+        tx,
+        machine,
+        id,
+        &[MsgState::Queued],
+        MsgState::Cancelled,
+        Some(&format!("cancelled by {}", principal)),
+        now,
+    )?;
+    Ok(Ok(()))
+}
+pub fn paused(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT count(*) > 0 FROM mail_pause WHERE agent_id = ?1",
+        [id],
+        |r| r.get(0),
+    )
+}
+pub fn pause(
+    tx: &mut Tx,
+    machine: &str,
+    id: &str,
+    principal: &str,
+    on: bool,
+    now: i64,
+) -> rusqlite::Result<()> {
+    if on {
+        tx.execute("INSERT INTO mail_pause (agent_id, at, by) VALUES (?1, ?2, ?3) ON CONFLICT(agent_id) DO UPDATE SET at = excluded.at, by = excluded.by", params![id, now, principal])?;
+        tx.emit(&NewEvent {
+            topic: "agent.attention".into(),
+            subject: Some(format!("{}/{}", machine, id)),
+            origin: None,
+            data: json!({"id": id, "reason": "mail_paused"}),
+        })?;
+    } else {
+        tx.execute("DELETE FROM mail_pause WHERE agent_id = ?1", [id])?;
+    }
+    Ok(())
+}
+
+/// A system notice cannot recursively generate a notice. It bypasses pair limits,
+/// while the queue and pause rules apply exactly as for agent mail.
+pub fn system(
+    tx: &mut Tx,
+    machine: &str,
+    to: &str,
+    body: &str,
+    reply_to: Option<&str>,
+    not_before: i64,
+    now: i64,
+) -> rusqlite::Result<String> {
+    let id = system_row(tx, machine, to, body, reply_to, not_before, now)?;
+    append_status(tx, machine, &id, MsgState::Queued, None, now)?;
+    Ok(id)
+}
+fn system_row(
+    tx: &mut Tx,
+    machine: &str,
+    to: &str,
+    body: &str,
+    reply_to: Option<&str>,
+    not_before: i64,
+    now: i64,
+) -> rusqlite::Result<String> {
+    let id = new_msg_id();
+    let thread: Option<String> = match reply_to {
+        Some(r) => tx
+            .query_row("SELECT thread_id FROM messages WHERE id = ?1", [r], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten(),
+        None => None,
+    };
+    tx.execute("INSERT INTO messages (id, from_principal, to_agent, to_addr, origin_kind, kind, reply_to, thread_id, provenance, body, body_hash, req_hash, state, state_at, created_at, wire_id, not_before) VALUES (?1, 'engine', ?2, ?3, 'engine', 'system', ?4, ?5, '[from c9watch engine]', ?6, ?7, ?7, 'queued', ?8, ?8, ?9, ?10)", params![id, to, format!("{}/{}", machine, to), reply_to, thread.as_deref().unwrap_or(&id), body, sha256_hex(body.as_bytes()), now, uuid::Uuid::new_v4().to_string(), not_before])?;
+    Ok(id)
+}
+fn notify_sender(tx: &mut Tx, machine: &str, id: &str, now: i64) -> rusqlite::Result<()> {
+    let sender: Option<String> = tx.query_row("SELECT m.from_agent FROM messages m JOIN agents a ON a.id = m.from_agent WHERE m.id = ?1 AND m.kind != 'system' AND m.notice_id IS NULL AND a.state NOT IN ('retiring', 'retired', 'failed', 'orphaned')", [id], |r| r.get(0)).optional()?.flatten();
+    let Some(sender) = sender else {
+        return Ok(());
+    };
+    let existing: Option<String> = tx.query_row("SELECT id FROM messages WHERE to_agent = ?1 AND kind = 'system' AND reply_to IS NOT NULL AND state = 'queued' ORDER BY created_at, rowid LIMIT 1", [&sender], |r| r.get(0)).optional()?;
+    let state = state_of(tx, id)?;
+    let delay = if state == Some(MsgState::Uncertain) {
+        60_000
+    } else {
+        0
+    };
+    let notice = match existing {
+        Some(n) => n,
+        None => system_row(tx, machine, &sender, "", Some(id), now + delay, now)?,
+    };
+    tx.execute(
+        "UPDATE messages SET notice_id = ?2 WHERE id = ?1",
+        params![id, notice],
+    )?;
+    // An uncertain result must never shorten a notice's safety delay.
+    tx.execute(
+        "UPDATE messages SET not_before = max(coalesce(not_before, 0), ?2) WHERE id = ?1",
+        params![notice, now + delay],
+    )?;
+    refresh_notice(tx, &notice)?;
+    append_status(
+        tx,
+        machine,
+        &notice,
+        MsgState::Queued,
+        Some("system notice updated"),
+        now,
+    )?;
+    Ok(())
+}
+fn refresh_notice(tx: &Tx, notice: &str) -> rusqlite::Result<()> {
+    let mut st = tx.prepare("SELECT m.id, m.state, coalesce((SELECT detail FROM message_status WHERE msg_id = m.id ORDER BY seq DESC LIMIT 1), ''), coalesce(a.name, a.id) FROM messages m JOIN agents a ON a.id = m.to_agent WHERE m.notice_id = ?1 AND m.state != 'delivered' ORDER BY m.created_at, m.rowid")?;
+    let rows = st
+        .query_map([notice], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut body = format!(
+        "[c9watch system] Your mail to {} has a result:\n",
+        rows.first().map(|r| r.3.as_str()).unwrap_or("an agent")
+    );
+    for (id, state, detail, _) in &rows {
+        body.push_str(&format!("- {} is {}: {}.\n", id, state, detail));
+    }
+    body.push_str("Nothing was resent.\n");
+    if rows.iter().any(|r| r.1 == "uncertain") {
+        body.push_str(&format!(
+            "For uncertain mail: it may have arrived. Ask {} before you send it again.\n",
+            rows.first()
+                .map(|r| r.3.as_str())
+                .unwrap_or("the recipient")
+        ));
+    }
+    body.push_str("Do not reply to this message.");
+    tx.execute(
+        "UPDATE messages SET body = ?2, body_hash = ?3 WHERE id = ?1",
+        params![notice, body, sha256_hex(body.as_bytes())],
+    )?;
+    Ok(())
+}
+
+pub fn signed_fence(
+    id: &str,
+    token: Option<&str>,
+    key: Option<&super::machine::HeaderKey>,
+    provenance: &str,
+    body: &str,
+) -> String {
+    let text = fence(id, token, provenance, body);
+    match key {
+        Some(k) => text.replacen("]\n", &format!(" · sig {}]\n", k.signature(id)), 1),
+        None => text,
+    }
+}
+pub fn confirm_signed(
+    tx: &mut Tx,
+    machine: &str,
+    agent: &str,
+    prompt: &str,
+    key: &super::machine::HeaderKey,
+    now: i64,
+) -> rusqlite::Result<Vec<String>> {
+    let mut out = vec![];
+    for line in prompt.lines().filter(|l| l.starts_with(HEADER)) {
+        let Some(id) = fenced_ids(line).first().copied() else {
+            continue;
+        };
+        let expected = format!(" · sig {}]", key.signature(id));
+        if !line.ends_with(&expected) {
+            continue;
+        }
+        if evidence(tx, machine, agent, id, "prompt_hook", now)? {
+            out.push(id.to_string());
+        }
+    }
+    Ok(out)
+}
+/// A user resubmission still needs the per-message signature. Record the
+/// explanatory note before the delivery transition, keeping its basis exact.
+pub fn confirm_user_entry(
+    tx: &mut Tx,
+    machine: &str,
+    agent: &str,
+    headers: &str,
+    key: &super::machine::HeaderKey,
+    now: i64,
+) -> rusqlite::Result<()> {
+    for line in headers.lines().filter(|l| l.starts_with(HEADER)) {
+        let Some(id) = fenced_ids(line).first().copied() else {
+            continue;
+        };
+        if !line.ends_with(&format!(" · sig {}]", key.signature(id))) {
+            continue;
+        }
+        let ours: bool = tx.query_row("SELECT count(*) > 0 FROM messages WHERE id=?1 AND to_agent=?2 AND (state='delivering' OR (state='uncertain' AND state_at>=?3))", params![id,agent,now-LATE_WINDOW_MS], |r| r.get(0))?;
+        if ours {
+            note(tx, machine, id, "resubmitted by the user", now)?;
+            evidence(tx, machine, agent, id, "prompt_hook", now)?;
+        }
+    }
+    Ok(())
+}
+pub fn evidence(
+    tx: &mut Tx,
+    machine: &str,
+    agent: &str,
+    id: &str,
+    basis: &str,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    let ours: bool = tx.query_row(
+        "SELECT count(*) > 0 FROM messages WHERE id = ?1 AND to_agent = ?2",
+        params![id, agent],
+        |r| r.get(0),
+    )?;
+    if !ours {
+        return Ok(false);
+    }
+    if state_of(tx, id)? == Some(MsgState::Uncertain) {
+        return late_evidence(tx, machine, id, basis, now);
+    }
+    record(
+        tx,
+        machine,
+        id,
+        &[MsgState::Delivering],
+        MsgState::Delivered,
+        Some(basis),
+        now,
+    )
+}
+pub fn socket_inflight(conn: &Connection, agent: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT id FROM messages WHERE to_agent = ?1 AND via = 'socket' AND state = 'delivering' LIMIT 1", [agent], |r| r.get(0)).optional()
+}
+pub fn latest_detail(conn: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT detail FROM message_status WHERE msg_id = ?1 ORDER BY seq DESC LIMIT 1",
+        [id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map(Option::flatten)
+}
+
+pub fn summary(conn: &Connection, machine: &str, id: &str) -> rusqlite::Result<MsgSummary> {
+    conn.query_row("SELECT m.id, m.origin_kind, m.from_agent, f.name, m.to_agent, t.name, m.to_addr, m.kind, m.state, m.state_at, (SELECT detail FROM message_status WHERE msg_id = m.id ORDER BY seq DESC LIMIT 1), m.via, m.reply_to, m.thread_id, m.notice_id, m.hop, m.created_at, m.body FROM messages m LEFT JOIN agents f ON f.id = m.from_agent JOIN agents t ON t.id = m.to_agent WHERE m.id = ?1", [id], |r| {
+        let from: Option<String> = r.get(2)?;
+        let origin: String = r.get(1)?;
+        Ok(MsgSummary { msg_id: r.get(0)?, from: MsgFrom { kind: match origin.as_str() { "agent" => "agent", "engine" => "engine", _ => "human" }.into(), addr: from.map(|f| format!("{}/{}", machine, f)), name: r.get(3)? }, to: MsgAddress { id: r.get(4)?, name: r.get(5)?, addr: r.get(6)? }, kind: r.get(7)?, state: r.get(8)?, state_at: r.get(9)?, detail: r.get(10)?, via: r.get(11)?, reply_to: r.get(12)?, thread_id: r.get(13)?, notice_id: r.get(14)?, hop: r.get(15)?, created_at: r.get(16)?, preview: r.get::<_, String>(17)?.chars().take(200).collect() })
+    })
+}
+/// LocalUnverified callers must first verify the complete peer ancestry.
+pub(super) fn visible(
+    conn: &Connection,
+    principal: &Principal,
+    id: &str,
+) -> rusqlite::Result<bool> {
+    match principal {
+        Principal::LocalUnverified => Ok(true),
+        Principal::Agent { id: agent, .. } => conn.query_row("SELECT count(*) > 0 FROM messages WHERE id = ?1 AND (from_agent = ?2 OR to_agent = ?2)", params![id, agent], |r| r.get(0)),
+    }
+}
+pub fn read(
+    conn: &Connection,
+    machine: &str,
+    who: &Principal,
+    id: &str,
+) -> rusqlite::Result<Result<MsgReadResult, ApiError>> {
+    if !visible(conn, who, id)? {
+        return Ok(Err(ApiError::new(
+            ErrorCode::NotAllowed,
+            "mail belongs to another agent",
+        )));
+    }
+    let exists: bool = conn.query_row(
+        "SELECT count(*) > 0 FROM messages WHERE id = ?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(Err(ApiError::new(ErrorCode::BadRequest, "unknown message")));
+    }
+    let summary = summary(conn, machine, id)?;
+    let (body, provenance, attempts) = conn.query_row(
+        "SELECT body, provenance, attempts FROM messages WHERE id = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let mut st = conn
+        .prepare("SELECT state, at, detail FROM message_status WHERE msg_id = ?1 ORDER BY seq")?;
+    let status = st
+        .query_map([id], |r| {
+            Ok(MsgStatus {
+                state: r.get(0)?,
+                at: r.get(1)?,
+                detail: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Ok(MsgReadResult {
+        summary,
+        body,
+        provenance,
+        attempts,
+        status,
+    }))
+}
+pub fn list(
+    conn: &Connection,
+    machine: &str,
+    who: &Principal,
+    p: &MsgListParams,
+) -> rusqlite::Result<Result<MsgListResult, ApiError>> {
+    let agent = match p.agent.as_deref() {
+        Some(a) => match resolve(conn, machine, a)? {
+            Ok(t) => Some(t.id),
+            Err(e) => return Ok(Err(e)),
+        },
+        None => None,
+    };
+    let before = match p.before.as_deref() {
+        Some(b) => {
+            if !visible(conn, who, b)? {
+                return Ok(Err(ApiError::new(
+                    ErrorCode::NotAllowed,
+                    "mail belongs to another agent",
+                )));
+            }
+            match conn
+                .query_row(
+                    "SELECT created_at, rowid FROM messages WHERE id = ?1",
+                    [b],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .optional()?
+            {
+                Some(x) => Some(x),
+                None => {
+                    return Ok(Err(ApiError::new(
+                        ErrorCode::BadRequest,
+                        "unknown before message",
+                    )))
+                }
+            }
+        }
+        None => None,
+    };
+    let own = match who {
+        Principal::Agent { id, .. } => Some(id.as_str()),
+        _ => None,
+    };
+    let limit = p.limit.unwrap_or(50).clamp(1, 200);
+    let mut st = conn.prepare("SELECT id FROM messages WHERE (?1 IS NULL OR from_agent = ?1 OR to_agent = ?1) AND (?2 IS NULL OR from_agent = ?2 OR to_agent = ?2) AND (?3 IS NULL OR thread_id = ?3) AND (?4 IS NULL OR created_at < ?4 OR (created_at = ?4 AND rowid < ?5)) ORDER BY created_at DESC, rowid DESC LIMIT ?6")?;
+    let mut ids = st
+        .query_map(
+            params![
+                own,
+                agent,
+                p.thread,
+                before.map(|b| b.0),
+                before.map(|b| b.1),
+                limit as i64 + 1
+            ],
+            |r| r.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let more = ids.len() > limit;
+    ids.truncate(limit);
+    let next = if more { ids.last().cloned() } else { None };
+    let items = ids
+        .iter()
+        .map(|id| summary(conn, machine, id))
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Ok(MsgListResult { items, next }))
 }
 
 #[cfg(test)]
@@ -1995,5 +2578,224 @@ mod tests {
         assert_eq!(levenshtein("kitten", "sitting"), 3);
         assert_eq!(levenshtein("審查者", "審查"), 1);
         assert_eq!(levenshtein("abc", ""), 3);
+    }
+    #[test]
+    fn m2_queue_guards_pause_backoff_and_one_inflight() {
+        let (_t, db) = two();
+        let a = ok(send(
+            &db,
+            &agent("agt_a"),
+            params("beta", "agent"),
+            Some("a"),
+            T0,
+        ));
+        let b = ok(send(
+            &db,
+            &LocalUnverified,
+            params("beta", "human"),
+            None,
+            T0 + 1,
+        ));
+        db.write_blocking(|tx| pause(tx, M, "agt_b", "local-unverified", true, T0))
+            .unwrap();
+        assert_eq!(take(&db, "agt_b").unwrap().id, b.msg_id);
+        assert!(take(&db, "agt_b").is_none());
+        set(&db, &b.msg_id, MsgState::Delivered, "prompt_hook");
+        assert!(take(&db, "agt_b").is_none());
+        db.write_blocking(|tx| pause(tx, M, "agt_b", "local-unverified", false, T0))
+            .unwrap();
+        assert_eq!(take(&db, "agt_b").unwrap().id, a.msg_id);
+        let id = a.msg_id.clone();
+        db.write_blocking(move |tx| requeue_after(tx, M, &id, "connect", Some(T0 + 100), T0))
+            .unwrap();
+        assert!(take(&db, "agt_b").is_none());
+        let m = db
+            .write_blocking(|tx| take_next(tx, M, "agt_b", T0 + 100))
+            .unwrap()
+            .0
+            .unwrap();
+        assert_eq!(m.attempts, 2);
+    }
+    #[test]
+    fn m2_signed_evidence_and_late_correction_cancel_the_notice() {
+        let (t, db) = two();
+        let key = super::super::machine::load_or_create(t.path())
+            .unwrap()
+            .header_key();
+        let m = ok(send(&db, &agent("agt_a"), params("beta", "body"), None, T0));
+        take(&db, "agt_b").unwrap();
+        let id = m.msg_id.clone();
+        db.write_blocking(move |tx| set_via(tx, &id, "socket"))
+            .unwrap();
+        let id = m.msg_id.clone();
+        let k = key.clone();
+        db.write_blocking(move |tx| {
+            assert!(
+                confirm_from_prompt(tx, M, "agt_b", &format!("[c9watch mail {}]", id), T0)?
+                    .is_empty()
+            );
+            assert!(confirm_signed(
+                tx,
+                M,
+                "agt_b",
+                &format!("[c9watch mail {} · sig wrong]", id),
+                &k,
+                T0
+            )?
+            .is_empty());
+            Ok(())
+        })
+        .unwrap();
+        set(&db, &m.msg_id, MsgState::Uncertain, "no evidence");
+        let c = db.reader().unwrap();
+        let (notice,at):(String,i64)=c.query_row("SELECT n.id, n.not_before FROM messages m JOIN messages n ON n.id = m.notice_id WHERE m.id = ?1",[&m.msg_id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(at, T0 + 60_000);
+        let signed = signed_fence(&m.msg_id, Some("tok"), Some(&key), "provenance", "body");
+        let id = m.msg_id.clone();
+        db.write_blocking(move |tx| {
+            assert_eq!(confirm_signed(tx, M, "agt_b", &signed, &key, T0 + 1)?, [id]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(state(&db, &m.msg_id), Some(MsgState::Delivered));
+        assert_eq!(state(&db, &notice), Some(MsgState::Cancelled));
+        assert!(statuses(&db, &m.msg_id)
+            .last()
+            .unwrap()
+            .1
+            .as_deref()
+            .unwrap()
+            .starts_with("late_evidence:"));
+    }
+    #[test]
+    fn m2_cancel_hop_controls_and_read_visibility() {
+        let (_t, db) = two();
+        add(&db, "agt_c", "gamma", "ready", "pty", Some("free"));
+        let mut parent = ok(send(
+            &db,
+            &agent("agt_a"),
+            params("beta", "root"),
+            Some("root"),
+            T0,
+        ));
+        for hop in 1..=8 {
+            let mut p = params("beta", &format!("reply {}", hop));
+            p.reply_to = Some(parent.msg_id);
+            parent = ok(send(
+                &db,
+                &agent("agt_a"),
+                p,
+                Some(&hop.to_string()),
+                T0 + hop,
+            ));
+        }
+        let mut p = params("beta", "too deep");
+        p.reply_to = Some(parent.msg_id.clone());
+        let e = err(send(&db, &agent("agt_a"), p, Some("last"), T0 + 9));
+        assert_eq!(e.code, ErrorCode::HopLimit);
+        assert_eq!(e.data.unwrap()["hop"], 9);
+        let c = db.reader().unwrap();
+        assert!(read(&c, M, &agent("agt_c"), &parent.msg_id)
+            .unwrap()
+            .is_err());
+        let first = list(
+            &c,
+            M,
+            &agent("agt_a"),
+            &MsgListParams {
+                limit: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.items.len(), 2);
+        assert!(first.next.is_some());
+        let second = list(
+            &c,
+            M,
+            &agent("agt_a"),
+            &MsgListParams {
+                limit: Some(2),
+                before: first.next,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(first.items[0].msg_id, second.items[0].msg_id);
+        let before = state(&db, &parent.msg_id);
+        assert!(read(&c, M, &agent("agt_a"), &parent.msg_id)
+            .unwrap()
+            .is_ok());
+        assert_eq!(state(&db, &parent.msg_id), before);
+        let id = parent.msg_id.clone();
+        db.write_blocking(move |tx| cancel(tx, M, &id, "local-unverified", T0 + 10))
+            .unwrap()
+            .0
+            .unwrap();
+        assert_eq!(state(&db, &parent.msg_id), Some(MsgState::Cancelled));
+        let id = parent.msg_id;
+        assert_eq!(
+            db.write_blocking(move |tx| cancel(tx, M, &id, "local-unverified", T0 + 11))
+                .unwrap()
+                .0
+                .unwrap_err()
+                .code,
+            ErrorCode::NotCancellable
+        );
+    }
+    #[test]
+    fn m2_system_notices_merge_do_not_loop_and_have_one_late_exit() {
+        let (_t, db) = two();
+        for n in 0..2 {
+            let m = ok(send(
+                &db,
+                &agent("agt_a"),
+                params("beta", &format!("body{}", n)),
+                Some(&n.to_string()),
+                T0 + n,
+            ));
+            take(&db, "agt_b").unwrap();
+            set(&db, &m.msg_id, MsgState::Uncertain, "lost");
+        }
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM messages WHERE kind='system'"),
+            1
+        );
+        let c = db.reader().unwrap();
+        let (id, body): (String, String) = c
+            .query_row(
+                "SELECT id, body FROM messages WHERE kind='system'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(body.matches(" is uncertain:").count(), 2);
+        assert!(body.contains("Nothing was resent."));
+        assert!(body.contains("may have arrived"));
+        set(&db, &id, MsgState::Failed, "also lost");
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM messages WHERE kind='system'"),
+            1
+        );
+        let id2 = id.clone();
+        assert!(
+            !db.write_blocking(move |tx| late_evidence(tx, M, &id2, "peer_jsonl", T0 + 1))
+                .unwrap()
+                .0
+        );
+        let human = ok(send(
+            &db,
+            &LocalUnverified,
+            params("beta", "human"),
+            None,
+            T0,
+        ));
+        set(&db, &human.msg_id, MsgState::Failed, "gone");
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM messages WHERE kind='system'"),
+            1
+        );
     }
 }

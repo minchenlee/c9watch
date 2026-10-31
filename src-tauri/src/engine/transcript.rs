@@ -310,3 +310,91 @@ mod tests {
         }
     }
 }
+
+/// Mail evidence is separate from state inference. A socket write or a CC
+/// `delivered` receipt alone never establishes model context delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MailFact {
+    Enqueued {
+        id: String,
+    },
+    PeerEntry {
+        wire_id: String,
+        uuid: Option<String>,
+    },
+    UserEntry {
+        headers: String,
+    },
+}
+pub fn mail_fact(v: &Value) -> Vec<MailFact> {
+    fn text(v: &Value) -> String {
+        match v {
+            Value::String(s) => s.clone(),
+            Value::Array(a) => a
+                .iter()
+                .filter_map(|c| c["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        }
+    }
+    if v["type"] == "user" && v["turnOrigin"] == "peer" && v["origin"]["kind"] == "peer" {
+        return v["origin"]["msg_id"]
+            .as_str()
+            .map(|id| {
+                vec![MailFact::PeerEntry {
+                    wire_id: id.into(),
+                    uuid: v["uuid"].as_str().map(str::to_string),
+                }]
+            })
+            .unwrap_or_default();
+    }
+    let content = if v["type"] == "queue-operation" {
+        text(&v["content"])
+    } else {
+        text(&v["message"]["content"])
+    };
+    let Some(headers) = crate::cli::task::mail_headers(&content) else {
+        return vec![];
+    };
+    if v["type"] == "queue-operation" && v["operation"] == "enqueue" {
+        headers
+            .lines()
+            .filter_map(|l| {
+                l.strip_prefix("[c9watch mail ")
+                    .and_then(|s| s.split([' ', ']']).next())
+            })
+            .map(|id| MailFact::Enqueued { id: id.into() })
+            .collect()
+    } else if v["type"] == "user" {
+        vec![MailFact::UserEntry { headers }]
+    } else {
+        vec![]
+    }
+}
+
+#[cfg(test)]
+mod mail_tests {
+    use super::*;
+    #[test]
+    fn synthetic_mail_shapes_are_separate_from_authority_and_other_sessions() {
+        let facts: Vec<_> = include_str!("../../tests/fixtures/cc_jsonl/mail.jsonl")
+            .lines()
+            .flat_map(|line| mail_fact(&serde_json::from_str(line).unwrap()))
+            .collect();
+        assert!(matches!(&facts[0],MailFact::Enqueued{id} if id=="msg_example"));
+        assert!(
+            matches!(&facts[1],MailFact::PeerEntry{wire_id,uuid:Some(_)} if wire_id=="00000000-0000-4000-8000-000000000001")
+        );
+        assert!(
+            matches!(&facts[2],MailFact::UserEntry{headers} if headers.starts_with("[c9watch mail msg_example"))
+        );
+        for v in [
+            serde_json::json!({"type":"user","turnOrigin":"peer","origin":{"kind":"other","msg_id":"wire"}}),
+            serde_json::json!({"type":"queue-operation","operation":"dequeue","content":"[c9watch mail msg_example]"}),
+            serde_json::json!({"type":"assistant","message":{"content":"[c9watch mail msg_example]"}}),
+        ] {
+            assert!(mail_fact(&v).is_empty());
+        }
+    }
+}

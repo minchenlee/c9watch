@@ -178,6 +178,11 @@ impl Watch {
                 if ev.msg_id != msg_id {
                     return None;
                 }
+                if ev.state == "delivering"
+                    && ev.detail.as_deref().is_some_and(|d| d.starts_with("held:"))
+                {
+                    eprintln!("held by {}'s Claude Code; waiting up to 15 min", agent_id);
+                }
                 match ev.state.as_str() {
                     "queued" | "delivering" => self.turn_end = None,
                     // Without the prompt hook, the engine marks a message
@@ -189,7 +194,9 @@ impl Watch {
                         }
                         _ => self.delivered = Some(ev),
                     },
-                    "failed" | "uncertain" => return Some(Outcome::Undelivered(ev)),
+                    "failed" | "uncertain" | "rejected" | "expired" | "cancelled" => {
+                        return Some(Outcome::Undelivered(ev))
+                    }
                     _ => {}
                 }
                 None
@@ -532,11 +539,34 @@ mod tests {
                 },
                 cursor: "m:e:1".into(),
                 replayed: false,
+                paused: None,
             };
             let line = outcome_line(&sent, &Outcome::Undelivered(ev));
             assert_eq!(line["msg"]["state"], s);
             assert_eq!(line["msg"]["detail"], "pty gone");
             assert!(line.get("turnEnd").is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod m2_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn held_waits_and_rejected_expired_cancelled_exit_one() {
+        for state in ["rejected", "expired", "cancelled", "delivering"] {
+            let data = json!({"msgId":"msg_one","from":"agent:a","to":"b","state":state,"at":1,"attempts":1,"detail":"held: test"});
+            let frame: EventFrame = serde_json::from_value(
+                json!({"v":1,"type":"event","topic":"msg.state","cursor":"m:e:1","ts":1,"data":data}),
+            )
+            .unwrap();
+            let outcome = Watch::default().judge("msg_one", "b", &frame);
+            if state == "delivering" {
+                assert!(outcome.is_none());
+            } else {
+                assert!(matches!(outcome, Some(Outcome::Undelivered(_))));
+            }
         }
     }
 }

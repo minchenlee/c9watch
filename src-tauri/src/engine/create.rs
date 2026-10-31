@@ -211,7 +211,7 @@ pub enum PtyWriteError {
 /// Stop taking mail after an `uncertain` write on screen `text` (§4.6).
 fn hold(text: &str, mail_pending: &mut bool) -> Delivery {
     *mail_pending = false;
-    Delivery::Held {
+    Delivery::PasteHeld {
         seen: text.to_string(),
     }
 }
@@ -243,10 +243,22 @@ enum Delivery {
         id: String,
         at: Instant,
     },
+    SocketSending {
+        id: String,
+        at: Instant,
+    },
+    SocketAwaiting {
+        id: String,
+        since: Instant,
+        enqueued: Option<Instant>,
+        turn_ended: Option<Instant>,
+        held: Option<Instant>,
+        receipt_seq: i64,
+    },
     /// A paste or CR write went `uncertain` on screen `seen`: the agent
     /// may not read its terminal, and its bytes may still arrive. No mail
     /// goes until the screen changes, or a nudge comes, with a free box.
-    Held {
+    PasteHeld {
         seen: String,
     },
 }
@@ -339,6 +351,10 @@ pub struct Spawner {
     drain: Arc<DrainSwitch>,
     /// The mail header key (C1b-M1-7). `None` only in tests.
     header_key: Option<HeaderKey>,
+    sockets: Option<Arc<super::cc_listener::Sockets>>,
+    socket_jobs: Mutex<HashMap<String, std::sync::mpsc::Receiver<super::cc_inbox::SocketOutcome>>>,
+    socket_seen: Mutex<HashSet<(String, i64)>>,
+    peer_tailers: Mutex<HashMap<(String, i64), super::peer_log::Tailer>>,
 }
 
 impl Spawner {
@@ -362,7 +378,16 @@ impl Spawner {
             stopping: AtomicBool::new(false),
             drain: Arc::new(DrainSwitch::new()),
             header_key: None,
+            sockets: None,
+            socket_jobs: Mutex::new(HashMap::new()),
+            socket_seen: Mutex::new(HashSet::new()),
+            peer_tailers: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_mail_sockets(mut self, sockets: Arc<super::cc_listener::Sockets>) -> Self {
+        self.sockets = Some(sockets);
+        self
     }
 
     /// Stamp mail with tokens from the engine's header key.
@@ -871,7 +896,7 @@ impl Spawner {
                     return;
                 }
                 Ok(Cmd::Drain) => {
-                    self.stop_delivery(s, &delivery, "drain before submit", "drain");
+                    self.drain_delivery(s, &delivery);
                     self.drain_now(s, driver);
                     return;
                 }
@@ -909,6 +934,7 @@ impl Spawner {
                 }
             }
             self.expire_hold(s);
+            self.poll_peer_log(s);
             delivery = self.deliver(
                 s,
                 driver.as_mut(),
@@ -934,6 +960,8 @@ impl Spawner {
         }
     }
 
+    /// PTY uses the ready input box; socket delivery can run mid-turn.
+    /// Socket writes and CC acceptance are never context-delivery evidence.
     /// One step of mail delivery (§4.5) on this tick's screen; returns
     /// the next step.
     fn deliver(
@@ -948,23 +976,55 @@ impl Spawner {
         let now = (self.clock)();
         match delivery {
             Delivery::Idle => {
-                if !*mail_pending || !self.may_deliver(s, screen, text) {
+                if self.drain.on() {
                     return Delivery::Idle;
                 }
+                // Adopt an in-flight socket delivery before considering the queue.
+                if let Ok(c) = self.db.reader() {
+                    if let Ok(Some(id)) = mail::socket_inflight(&c, &s.id) {
+                        return socket_awaiting(id, now);
+                    }
+                }
+                let candidate = match self
+                    .db
+                    .reader()
+                    .ok()
+                    .and_then(|c| mail::peek_next_id(&c, &s.id, now_ms()).ok())
+                    .flatten()
+                {
+                    Some(id) => id,
+                    None => {
+                        *mail_pending = false;
+                        return Delivery::Idle;
+                    }
+                };
+                let route = self.socket_route(s, &candidate);
+                if route.is_none() && !self.may_deliver(s, screen, text) {
+                    return Delivery::Idle;
+                }
+                let selected_via = if route.is_some() { "socket" } else { "pty" };
                 let (machine, id) = (self.db.machine_id().to_string(), s.id.clone());
-                let taken =
-                    self.mail_write(s, move |tx| mail::take_next(tx, &machine, &id, now_ms()));
+                let taken = self.mail_write(s, move |tx| {
+                    if mail::peek_next_id(tx, &id, now_ms())?.as_deref() != Some(&candidate) {
+                        return Ok(None);
+                    }
+                    mail::take_next_via(tx, &machine, &id, Some(selected_via), now_ms())
+                });
                 let Some(Some(m)) = taken else {
                     // Empty, or the store failed: a nudge asks again.
                     *mail_pending = false;
                     return Delivery::Idle;
                 };
-                let fenced = mail::fence(
+                let fenced = mail::signed_fence(
                     &m.id,
                     self.header_token(&s.id).as_deref(),
+                    self.header_key.as_ref(),
                     &m.provenance,
                     &m.body,
                 );
+                if let Some(route) = route {
+                    return self.start_socket(s, &m, route, &fenced, now);
+                }
                 match self.pty_write(&s.id, driver, &paste_payload(&fenced)) {
                     Ok(()) => Delivery::Pasted { id: m.id, at: now },
                     Err(PtyWriteError::Blocked) => {
@@ -1051,15 +1111,494 @@ impl Spawner {
                 }
                 Delivery::Idle
             }
-            Delivery::Held { seen } => {
+            Delivery::SocketSending { id, at } => {
+                let result =
+                    self.socket_jobs
+                        .lock()
+                        .unwrap()
+                        .get(&id)
+                        .and_then(|rx| match rx.try_recv() {
+                            Ok(r) => Some(r),
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                Some(super::cc_inbox::SocketOutcome::MaybeSent(
+                                    "writer disconnected".into(),
+                                ))
+                            }
+                            Err(_) => None,
+                        });
+                if let Some(out) = result {
+                    self.socket_jobs.lock().unwrap().remove(&id);
+                    // A receipt may have committed before the worker's result.
+                    if self
+                        .db
+                        .reader()
+                        .ok()
+                        .and_then(|c| mail::state_of(&c, &id).ok())
+                        .flatten()
+                        != Some(MsgState::Delivering)
+                    {
+                        return Delivery::Idle;
+                    }
+                    match out {
+                        super::cc_inbox::SocketOutcome::NotSent(e) => {
+                            if self.drain.on() {
+                                self.requeue_mail(s, &id, "drain");
+                            } else {
+                                self.retry_socket(s, &id, &e);
+                            }
+                            Delivery::Idle
+                        }
+                        super::cc_inbox::SocketOutcome::Blocked => {
+                            self.requeue_mail(s, &id, "drain");
+                            Delivery::Idle
+                        }
+                        super::cc_inbox::SocketOutcome::Sent => socket_awaiting(id, at),
+                        super::cc_inbox::SocketOutcome::MaybeSent(e) => {
+                            self.note_mail(s, &id, &e);
+                            socket_awaiting(id, at)
+                        }
+                    }
+                } else {
+                    Delivery::SocketSending { id, at }
+                }
+            }
+            Delivery::SocketAwaiting {
+                id,
+                mut since,
+                mut enqueued,
+                mut turn_ended,
+                mut held,
+                mut receipt_seq,
+            } => {
+                let Ok(c) = self.db.reader() else {
+                    return Delivery::SocketAwaiting {
+                        id,
+                        since,
+                        enqueued,
+                        turn_ended,
+                        held,
+                        receipt_seq,
+                    };
+                };
+                if mail::state_of(&c, &id).ok().flatten() != Some(MsgState::Delivering) {
+                    return Delivery::Idle;
+                }
+                // Replay all unseen notes so a later enqueue cannot hide a held receipt.
+                let notes = (|| -> rusqlite::Result<Vec<(i64, Option<String>)>> {
+                    let mut st = c.prepare("SELECT seq, detail FROM message_status WHERE msg_id = ?1 AND seq > ?2 ORDER BY seq")?;
+                    let rows = st.query_map(rusqlite::params![id, receipt_seq], |r| Ok((r.get(0)?, r.get(1)?)))?.collect(); rows
+                })().unwrap_or_default();
+                for (seq, detail) in notes {
+                    receipt_seq = seq;
+                    match detail.as_deref() {
+                        Some(d) if d.starts_with("held:") => {
+                            if held.is_none() {
+                                held = Some(now);
+                            }
+                        }
+                        Some("cc accepted; awaiting evidence") => {
+                            held = None;
+                            since = now;
+                            enqueued = None;
+                            turn_ended = None;
+                        }
+                        Some("cc enqueued") => {
+                            if enqueued.is_none() {
+                                enqueued = Some(now);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let ended = self
+                    .merge
+                    .peek(&s.id, s.gen, |m| m.last_turn_end())
+                    .flatten();
+                if let (Some(enqueued_at), Some(end)) = (enqueued, ended) {
+                    // An old idle/turn-end observed before this enqueue is no evidence.
+                    let age = now_ms().saturating_sub(end.at_ms).max(0) as u64;
+                    let end_at = now
+                        .checked_sub(Duration::from_millis(age))
+                        .unwrap_or(enqueued_at);
+                    if end_at >= since && turn_ended.is_none() {
+                        turn_ended = Some(end_at);
+                    }
+                }
+                let why = if held.is_some_and(|at| {
+                    now.saturating_duration_since(at) >= Duration::from_secs(15 * 60)
+                }) {
+                    Some("held, no decision in 15 min".to_string())
+                } else if held.is_some() {
+                    None
+                } else if enqueued.is_none()
+                    && now.saturating_duration_since(since) >= Duration::from_secs(30)
+                {
+                    Some(format!(
+                        "no queue-operation after {} ms",
+                        now.saturating_duration_since(since).as_millis()
+                    ))
+                } else if turn_ended
+                    .is_some_and(|at| now.saturating_duration_since(at) >= Duration::from_secs(15))
+                {
+                    Some("queued in CC, not seen after turn end".into())
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    self.mail_uncertain(s, &id, &why);
+                    Delivery::Idle
+                } else {
+                    Delivery::SocketAwaiting {
+                        id,
+                        since,
+                        enqueued,
+                        turn_ended,
+                        held,
+                        receipt_seq,
+                    }
+                }
+            }
+            Delivery::PasteHeld { seen } => {
                 if (text != seen || *mail_pending) && box_is_free(&input_box(text)) {
                     // The queue may have mail the hold kept back.
                     *mail_pending = true;
                     return Delivery::Idle;
                 }
-                Delivery::Held { seen }
+                Delivery::PasteHeld { seen }
             }
         }
+    }
+
+    /// Select socket only for agent/engine mail. Human input always retains
+    /// user authority through PTY. The return socket must be bound first.
+    fn socket_route(&self, s: &Start, msg_id: &str) -> Option<super::cc_inbox::Gate> {
+        use super::cc_inbox::{self, Gate};
+        if !cc_inbox::enabled() {
+            return None;
+        }
+        let c = match self.db.reader() {
+            Ok(c) => c,
+            Err(e) => return Some(Gate::Unknown(e)),
+        };
+        let origin: String = match c.query_row(
+            "SELECT origin_kind FROM messages WHERE id = ?1 AND to_agent = ?2",
+            params![msg_id, s.id],
+            |r| r.get(0),
+        ) {
+            Ok(o) => o,
+            Err(e) => return Some(Gate::Unknown(e.to_string())),
+        };
+        if origin == "local-unverified" {
+            return None;
+        }
+        let state = self
+            .merge
+            .peek(&s.id, s.gen, |m| m.row_state(now_ms()))
+            .flatten();
+        if matches!(
+            state,
+            Some("paused" | "interrupted" | "retired" | "retiring" | "failed" | "orphaned")
+        ) {
+            return None;
+        }
+        let identity: Option<(String, i32, i64, String)> = match c.query_row("SELECT a.provider, st.pty_child_pid, st.pty_child_start, coalesce(a.provider_sid, ?3) FROM agents a JOIN agent_state st ON st.agent_id = a.id AND st.gen = a.generation WHERE a.id = ?1 AND a.generation = ?2", rusqlite::params![s.id, s.gen, s.sid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional() { Ok(identity) => identity, Err(e) => return Some(Gate::Unknown(e.to_string())) };
+        let Some((provider, pid, start, sid)) = identity else {
+            return Some(Gate::Unknown("CC child identity unavailable".into()));
+        };
+        let seen = {
+            let mut generations = self.socket_seen.lock().unwrap();
+            generations.retain(|(id, gen)| id != &s.id || *gen == s.gen);
+            generations.contains(&(s.id.clone(), s.gen))
+        };
+        let gate = cc_inbox::gate(
+            &provider,
+            pid,
+            start as u64,
+            &sid,
+            &cc_inbox::sessions_dir(),
+            seen,
+        );
+        match gate {
+            Gate::NoProtocol => None,
+            Gate::Socket(ref endpoint) => {
+                self.socket_seen
+                    .lock()
+                    .unwrap()
+                    .insert((s.id.clone(), s.gen));
+                match self
+                    .sockets
+                    .as_ref()
+                    .ok_or_else(|| "engine return socket unavailable".to_string())
+                    .and_then(|s| s.bind(endpoint.path.parent().expect("gate checked parent")))
+                {
+                    Ok(_) => Some(gate),
+                    Err(e) => Some(Gate::Unreachable(e)),
+                }
+            }
+            g => Some(g),
+        }
+    }
+    fn transcript_path(&self, s: &Start) -> Option<PathBuf> {
+        self.db.reader().ok()?.query_row("SELECT transcript_path FROM session_alias WHERE agent_id = ?1 AND generation = ?2 AND transcript_path IS NOT NULL ORDER BY rowid DESC LIMIT 1", rusqlite::params![s.id, s.gen], |r| r.get::<_, String>(0)).optional().ok()?.map(PathBuf::from)
+    }
+    fn start_socket(
+        &self,
+        s: &Start,
+        m: &mail::Mail,
+        gate: super::cc_inbox::Gate,
+        fenced: &str,
+        now: Instant,
+    ) -> Delivery {
+        use super::cc_inbox::{self, Gate};
+        let endpoint = match gate {
+            Gate::Socket(e) => e,
+            Gate::Unknown(e) | Gate::Unreachable(e) => {
+                self.retry_socket(s, &m.id, &e);
+                return Delivery::Idle;
+            }
+            Gate::NoProtocol => unreachable!(),
+        };
+        let c = match self.db.reader() {
+            Ok(c) => c,
+            Err(_) => {
+                self.requeue_mail(s, &m.id, "store unavailable");
+                return Delivery::Idle;
+            }
+        };
+        let (wire, from, sender_name, kind): (String, Option<String>, Option<String>, String) = match c.query_row("SELECT m.wire_id, m.from_agent, a.name, m.kind FROM messages m LEFT JOIN agents a ON a.id = m.from_agent WHERE m.id = ?1", [&m.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))) { Ok(v) => v, Err(_) => { self.requeue_mail(s, &m.id, "store unavailable"); return Delivery::Idle; } };
+        let return_path = match self
+            .sockets
+            .as_ref()
+            .and_then(|s| s.bind(endpoint.path.parent()?).ok())
+        {
+            Some(p) => p,
+            None => {
+                self.retry_socket(s, &m.id, "return socket unavailable");
+                return Delivery::Idle;
+            }
+        };
+        let addr = match cc_inbox::address(&return_path) {
+            Ok(a) => a,
+            Err(e) => {
+                self.retry_socket(s, &m.id, &e);
+                return Delivery::Idle;
+            }
+        };
+        let from_addr = from
+            .as_ref()
+            .map(|f| format!("{}/{}", self.db.machine_id(), f));
+        let reply = if kind == "system" {
+            None
+        } else {
+            from_addr.as_deref().map(|f| (f, m.id.as_str()))
+        };
+        let label = if kind == "system" {
+            "c9watch engine".into()
+        } else {
+            format!(
+                "{} via c9watch",
+                sender_name
+                    .as_deref()
+                    .or(from.as_deref())
+                    .unwrap_or("agent")
+            )
+        };
+        let wrapper = cc_inbox::wrapper(
+            &addr,
+            &label,
+            if kind == "system" {
+                "prompting"
+            } else {
+                super::adapter::cc::profile::peer_mode()
+            },
+            fenced,
+            reply,
+        );
+        let (line, uuid) = cc_inbox::frame(&endpoint, &wire, &addr, &wrapper);
+        let (machine, msg) = (self.db.machine_id().to_string(), m.id.clone());
+        let wrote = self.mail_write(s, move |tx| {
+            mail::set_via(tx, &msg, "socket")?;
+            mail::note(tx, &machine, &msg, &format!("uuid={}", uuid), now_ms())
+        });
+        if wrote.is_none() {
+            return Delivery::Idle;
+        }
+        // fstat before starting the helper, not on the first polling tick.
+        if let Some(path) = self.transcript_path(s) {
+            let offset = super::peer_log::offset(&path);
+            self.peer_tailers
+                .lock()
+                .unwrap()
+                .entry((s.id.clone(), s.gen))
+                .or_insert_with(|| super::peer_log::Tailer::at(&path, offset));
+        }
+        let rx = self.socket_write(&s.id, endpoint, line);
+        self.socket_jobs.lock().unwrap().insert(m.id.clone(), rx);
+        Delivery::SocketSending {
+            id: m.id.clone(),
+            at: now,
+        }
+    }
+    /// All outgoing socket injection goes through this drain gate. A second
+    /// check on the helper closes the scheduling gap before connect/write.
+    fn socket_write(
+        &self,
+        agent: &str,
+        endpoint: super::cc_inbox::Endpoint,
+        line: String,
+    ) -> std::sync::mpsc::Receiver<super::cc_inbox::SocketOutcome> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (db, drain, agent) = (self.db.clone(), self.drain.clone(), agent.to_string());
+        std::thread::spawn(move || {
+            let outcome = super::cc_inbox::write_guarded(&endpoint, &line, || drain.on());
+            if outcome == super::cc_inbox::SocketOutcome::Blocked {
+                let _ = db.write_blocking(move |tx| {
+                    drain::audit_blocked(tx, "engine", &agent, InjectionPath::Socket, now_ms())
+                });
+            }
+            let _ = tx.send(outcome);
+        });
+        rx
+    }
+    fn retry_socket(&self, s: &Start, id: &str, why: &str) {
+        let (machine, msg, why) = (
+            self.db.machine_id().to_string(),
+            id.to_string(),
+            why.to_string(),
+        );
+        let failed = self.mail_write(s, move |tx| {
+            let attempts: i64 =
+                tx.query_row("SELECT attempts FROM messages WHERE id = ?1", [&msg], |r| {
+                    r.get(0)
+                })?;
+            if attempts >= mail::SOCKET_MAX_ATTEMPTS {
+                mail::mark(
+                    tx,
+                    &machine,
+                    &msg,
+                    MsgState::Failed,
+                    Some(&format!("socket unreachable: {}", why)),
+                    now_ms(),
+                )
+            } else {
+                mail::requeue_after(
+                    tx,
+                    &machine,
+                    &msg,
+                    &format!("socket: {}", why),
+                    Some(now_ms() + mail::backoff(attempts)),
+                    now_ms(),
+                )?;
+                Ok(false)
+            }
+        });
+        if failed == Some(true) {
+            self.mail_attention(s, id, "mail_unreachable");
+        }
+    }
+    fn note_mail(&self, s: &Start, id: &str, detail: &str) {
+        let (machine, id, detail) = (
+            self.db.machine_id().to_string(),
+            id.to_string(),
+            detail.to_string(),
+        );
+        self.mail_write(s, move |tx| {
+            mail::note(tx, &machine, &id, &detail, now_ms())
+        });
+    }
+    fn mail_attention(&self, s: &Start, id: &str, reason: &str) {
+        self.merge.peek(&s.id, s.gen, |m| {
+            m.attention(&format!("{}: {}", reason, id), now_ms())
+        });
+        let (machine, agent, gen, id, reason) = (
+            self.db.machine_id().to_string(),
+            s.id.clone(),
+            s.gen,
+            id.to_string(),
+            reason.to_string(),
+        );
+        self.mail_write(s, move |tx| {
+            tx.emit(&NewEvent {
+                topic: "agent.attention".into(),
+                subject: Some(format!("{}/{}", machine, agent)),
+                origin: None,
+                data: serde_json::json!({"id":agent,"generation":gen,"reason":reason,"msgId":id}),
+            })
+            .map(|_| ())
+        });
+    }
+    fn poll_peer_log(&self, s: &Start) {
+        use super::transcript::MailFact;
+        let Ok(c) = self.db.reader() else {
+            return;
+        };
+        let eligible: bool = c.query_row("SELECT count(*) > 0 FROM messages WHERE to_agent = ?1 AND via = 'socket' AND (state = 'delivering' OR (state = 'uncertain' AND state_at >= ?2))", rusqlite::params![s.id, now_ms() - mail::LATE_WINDOW_MS], |r| r.get(0)).unwrap_or(false);
+        if !eligible {
+            self.peer_tailers
+                .lock()
+                .unwrap()
+                .remove(&(s.id.clone(), s.gen));
+            return;
+        }
+        let Some(path) = self.transcript_path(s) else {
+            return;
+        };
+        let facts = self
+            .peer_tailers
+            .lock()
+            .unwrap()
+            .entry((s.id.clone(), s.gen))
+            .or_insert_with(|| super::peer_log::Tailer::at(&path, 0))
+            .read(&path, true)
+            .unwrap_or_default();
+        if facts.is_empty() {
+            return;
+        }
+        let (machine, agent, key) = (
+            self.db.machine_id().to_string(),
+            s.id.clone(),
+            self.header_key.clone(),
+        );
+        self.mail_write(s, move |tx| {
+            for fact in facts {
+                match fact {
+                    MailFact::Enqueued {id} => {
+                        let ours: bool = tx.query_row("SELECT count(*) > 0 FROM messages WHERE id = ?1 AND to_agent = ?2 AND via = 'socket' AND state = 'delivering'", rusqlite::params![id, agent], |r| r.get(0))?;
+                        if ours { mail::note(tx, &machine, &id, "cc enqueued", now_ms())?; }
+                    }
+                    MailFact::PeerEntry {wire_id, ..} => {
+                        let id: Option<String> = tx.query_row("SELECT id FROM messages WHERE wire_id = ?1 AND to_agent = ?2 AND via = 'socket'", rusqlite::params![wire_id, agent], |r| r.get(0)).optional()?;
+                        if let Some(id) = id { mail::evidence(tx, &machine, &agent, &id, "peer_jsonl", now_ms())?; }
+                    }
+                    MailFact::UserEntry {headers} => { if let Some(k) = &key {
+                        mail::confirm_user_entry(tx, &machine, &agent, &headers, k, now_ms())?;
+                    } }
+                }
+            }
+            Ok(())
+        });
+    }
+    fn drain_delivery(&self, s: &Start, delivery: &Delivery) {
+        match delivery {
+            Delivery::SocketSending { id, .. } => {
+                let result = self
+                    .socket_jobs
+                    .lock()
+                    .unwrap()
+                    .remove(id)
+                    .and_then(|rx| rx.recv_timeout(super::cc_inbox::WRITE_TIMEOUT).ok());
+                match result {
+                    Some(
+                        super::cc_inbox::SocketOutcome::NotSent(_)
+                        | super::cc_inbox::SocketOutcome::Blocked,
+                    ) => self.requeue_mail(s, id, "drain"),
+                    _ => {} // preserve in-flight row; drain_now settles as interrupted.
+                }
+            }
+            Delivery::SocketAwaiting { .. } => {}
+            _ => self.stop_delivery(s, delivery, "drain before submit", "drain"),
+        }
+        self.poll_peer_log(s);
     }
 
     /// §4.3: the engine does not drain, the screen is ready, the merge
@@ -1081,9 +1620,14 @@ impl Spawner {
     /// `uncertain` (`submitted`). Before the kill.
     fn stop_delivery(&self, s: &Start, delivery: &Delivery, pasted: &str, submitted: &str) {
         match delivery {
-            Delivery::Idle | Delivery::Held { .. } => {}
+            Delivery::Idle | Delivery::PasteHeld { .. } => {}
             Delivery::Pasted { id, .. } => self.requeue_mail(s, id, pasted),
             Delivery::Submitted { id, .. } => self.mail_uncertain(s, id, submitted),
+            Delivery::SocketSending { id, .. } => {
+                self.socket_jobs.lock().unwrap().remove(id);
+                self.mail_uncertain(s, id, "stopped while sending");
+            }
+            Delivery::SocketAwaiting { id, .. } => self.mail_uncertain(s, id, submitted),
         }
     }
 
@@ -1166,10 +1710,16 @@ impl Spawner {
     /// stay for boot reconcile, which kills the process by pid and start
     /// time before anything resumes it (reviews M1).
     fn drain_now(&self, s: &Start, mut driver: Box<dyn Driver>) {
-        let before = drain::state_of(&self.db, &s.id).unwrap_or_else(|e| {
+        let mut before = drain::state_of(&self.db, &s.id).unwrap_or_else(|e| {
             eprintln!("[engine] Drain: {}", e);
             None
         });
+        if let Ok(c) = self.db.reader() {
+            if let Ok(Some(id)) = mail::socket_inflight(&c, &s.id) {
+                before = Some("working".into());
+                self.mail_uncertain(s, &id, "drain");
+            }
+        }
         let (machine, id) = (self.db.machine_id().to_string(), s.id.clone());
         if let Err(e) = driver.kill() {
             let why = e.to_string();
@@ -4401,5 +4951,327 @@ mod tests {
             ("uncertain".into(), Some(why.clone()))
         );
         assert_eq!(mail_of(&e.db, &second), ("failed".into(), Some(why)));
+    }
+    // M2 state-machine fixtures: use the real store and FakeDriver with a
+    // hand clock, without running a background supervisor or a live CC.
+    fn socket_fixture() -> (Env, Start, Box<dyn Driver>, Arc<AtomicU64>) {
+        let (clock, secs) = hand_clock();
+        let e = setup(Script::Ready, Some(clock));
+        e.db.write_blocking(|tx| {
+            tx.execute("INSERT INTO agents(id,role,mode,control,provider,provider_sid,source,state,generation) VALUES ('agt_socket','worker','free','pty','claudeCode','s1','engine','ready',1)",[])?;
+            Ok(())
+        }).unwrap();
+        let s = Start {
+            id: "agt_socket".into(),
+            gen: 1,
+            sid: "s1".into(),
+            op_id: "op_test".into(),
+            cwd: e.cwd.clone(),
+            claude: PathBuf::from("/bin/false"),
+            kind: Kind::Create,
+            from: None,
+        };
+        let mut spec = SpawnSpec::new(vec!["/bin/false".into()], e.cwd.clone());
+        spec.env("C9_AGENT_ID", &s.id).env("C9_AGENT_GEN", "1");
+        let driver = e.launcher.spawn(&spec).unwrap();
+        (e, s, driver, secs)
+    }
+    fn socket_taken(e: &Env, s: &Start) -> String {
+        let id = queue(&e.db, &s.id, "socket body");
+        let (agent, msg) = (s.id.clone(), id.clone());
+        e.db.write_blocking(move |tx| {
+            mail::take_next(tx, MACHINE, &agent, now_ms())?;
+            mail::set_via(tx, &msg, "socket")
+        })
+        .unwrap();
+        id
+    }
+    fn socket_step(e: &Env, s: &Start, d: &mut dyn Driver, delivery: Delivery) -> Delivery {
+        e.sp.deliver(s, d, &CcScreen::new(e.sp.now()), "", delivery, &mut true)
+    }
+    #[test]
+    fn no_queue_operation_in_thirty_seconds_is_uncertain() {
+        let (e, s, mut d, secs) = socket_fixture();
+        let id = socket_taken(&e, &s);
+        let state = socket_awaiting(id.clone(), e.sp.now());
+        secs.store(31, Ordering::SeqCst);
+        assert_eq!(socket_step(&e, &s, d.as_mut(), state), Delivery::Idle);
+        assert_eq!(mail_of(&e.db, &id).0, "uncertain");
+        assert!(mail_of(&e.db, &id)
+            .1
+            .unwrap()
+            .starts_with("no queue-operation"));
+        assert!(sent(&e).is_empty());
+    }
+    #[test]
+    fn queued_in_cc_waits_while_the_target_works() {
+        let (e, s, mut d, secs) = socket_fixture();
+        let id = socket_taken(&e, &s);
+        e.sp.note_mail(&s, &id, "cc enqueued");
+        let state = socket_awaiting(id.clone(), e.sp.now());
+        secs.store(200, Ordering::SeqCst);
+        assert!(matches!(
+            socket_step(&e, &s, d.as_mut(), state),
+            Delivery::SocketAwaiting {
+                enqueued: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(mail_of(&e.db, &id).0, "delivering");
+        assert!(sent(&e).is_empty());
+    }
+    #[test]
+    fn queued_but_not_seen_after_turn_end_is_uncertain() {
+        let (e, s, mut d, secs) = socket_fixture();
+        let id = socket_taken(&e, &s);
+        let now = e.sp.now();
+        let state = Delivery::SocketAwaiting {
+            id: id.clone(),
+            since: now,
+            enqueued: Some(now),
+            turn_ended: Some(now),
+            held: None,
+            receipt_seq: 0,
+        };
+        secs.store(16, Ordering::SeqCst);
+        assert_eq!(socket_step(&e, &s, d.as_mut(), state), Delivery::Idle);
+        assert_eq!(
+            mail_of(&e.db, &id).1.as_deref(),
+            Some("queued in CC, not seen after turn end")
+        );
+    }
+    #[test]
+    fn an_orphaned_socket_delivery_is_adopted_on_idle() {
+        let (e, s, mut d, _secs) = socket_fixture();
+        let id = socket_taken(&e, &s);
+        assert!(
+            matches!(socket_step(&e,&s,d.as_mut(),Delivery::Idle),Delivery::SocketAwaiting{id:ref got,..} if got==&id)
+        );
+        assert!(sent(&e).is_empty());
+    }
+    #[test]
+    fn held_blocks_the_queue_until_held_wait_and_delivered_restarts_the_timer() {
+        let (e, s, mut d, secs) = socket_fixture();
+        let id = socket_taken(&e, &s);
+        let next = queue(&e.db, &s.id, "second");
+        e.sp.note_mail(&s, &id, "held: synthetic");
+        let state = socket_step(&e, &s, d.as_mut(), socket_awaiting(id.clone(), e.sp.now()));
+        assert!(matches!(
+            state,
+            Delivery::SocketAwaiting { held: Some(_), .. }
+        ));
+        secs.store(899, Ordering::SeqCst);
+        let state = socket_step(&e, &s, d.as_mut(), state);
+        assert_eq!(mail_of(&e.db, &next).0, "queued");
+        e.sp.note_mail(&s, &id, "cc accepted; awaiting evidence");
+        let state = socket_step(&e, &s, d.as_mut(), state);
+        assert!(matches!(state, Delivery::SocketAwaiting { held: None, .. }));
+        secs.store(929, Ordering::SeqCst);
+        assert_eq!(socket_step(&e, &s, d.as_mut(), state), Delivery::Idle);
+        assert_eq!(mail_of(&e.db, &id).0, "uncertain");
+    }
+    #[test]
+    fn held_without_a_decision_eventually_becomes_uncertain() {
+        let (e, s, mut d, secs) = socket_fixture();
+        let id = socket_taken(&e, &s);
+        e.sp.note_mail(&s, &id, "held: synthetic");
+        let state = socket_step(&e, &s, d.as_mut(), socket_awaiting(id.clone(), e.sp.now()));
+        secs.store(900, Ordering::SeqCst);
+        assert_eq!(socket_step(&e, &s, d.as_mut(), state), Delivery::Idle);
+        assert_eq!(
+            mail_of(&e.db, &id).1.as_deref(),
+            Some("held, no decision in 15 min")
+        );
+    }
+    #[test]
+    fn a_receipt_before_the_writer_result_does_not_resend_at_once() {
+        let (e, s, mut d, _secs) = socket_fixture();
+        let id = socket_taken(&e, &s);
+        let msg = id.clone();
+        e.db.write_blocking(move |tx| {
+            mail::requeue_after(
+                tx,
+                MACHINE,
+                &msg,
+                "rate-limited",
+                Some(now_ms() + 10000),
+                now_ms(),
+            )
+        })
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(super::super::cc_inbox::SocketOutcome::Sent)
+            .unwrap();
+        e.sp.socket_jobs.lock().unwrap().insert(id.clone(), rx);
+        assert_eq!(
+            socket_step(
+                &e,
+                &s,
+                d.as_mut(),
+                Delivery::SocketSending {
+                    id: id.clone(),
+                    at: e.sp.now()
+                }
+            ),
+            Delivery::Idle
+        );
+        assert_eq!(mail_of(&e.db, &id).0, "queued");
+        assert!(sent(&e).is_empty());
+    }
+    #[test]
+    fn retire_while_sending_is_uncertain_without_waiting() {
+        let (e, s, _d, _secs) = socket_fixture();
+        let id = socket_taken(&e, &s);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        e.sp.socket_jobs.lock().unwrap().insert(id.clone(), rx);
+        let now = Instant::now();
+        e.sp.stop_delivery(
+            &s,
+            &Delivery::SocketSending {
+                id: id.clone(),
+                at: e.sp.now(),
+            },
+            "retired",
+            "retired",
+        );
+        assert!(now.elapsed() < Duration::from_millis(500));
+        assert_eq!(
+            mail_of(&e.db, &id).1.as_deref(),
+            Some("stopped while sending")
+        );
+    }
+    #[test]
+    fn drain_keeps_awaiting_and_settles_interrupted() {
+        let (e, s, d, _secs) = socket_fixture();
+        let id = socket_taken(&e, &s);
+        let state = socket_awaiting(id.clone(), e.sp.now());
+        e.sp.drain_switch().start();
+        e.sp.drain_delivery(&s, &state);
+        assert_eq!(mail_of(&e.db, &id).0, "delivering");
+        e.sp.drain_now(&s, d);
+        assert_eq!(mail_of(&e.db, &id).1.as_deref(), Some("drain"));
+        assert_eq!(row(&e.db, &s.id).state.as_deref(), Some("interrupted"));
+    }
+    #[test]
+    fn while_draining_no_socket_write_is_sent_and_the_path_is_audited() {
+        let (e, s, _d, _secs) = socket_fixture();
+        e.sp.drain_switch().start();
+        let pid = std::process::id() as i32;
+        let endpoint = super::super::cc_inbox::Endpoint {
+            path: e.t.path().join("missing.sock"),
+            session_id: "s1".into(),
+            pid,
+            start: peer::proc_info(pid).unwrap().start,
+        };
+        assert_eq!(
+            e.sp.socket_write(&s.id, endpoint, "{}\n".into())
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            super::super::cc_inbox::SocketOutcome::Blocked
+        );
+        assert_eq!(e.db.reader().unwrap().query_row("SELECT count(*) FROM audit WHERE method='drain.blocked_injection' AND reason='path=socket'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+    #[test]
+    fn five_failed_connects_fail_the_mail_and_notify_without_any_paste() {
+        let (e, s, _d, _secs) = socket_fixture();
+        e.db.write_blocking(|tx|tx.execute("INSERT INTO agents(id,role,mode,control,provider,source,state) VALUES ('agt_sender','worker','free','pty','claudeCode','engine','ready')",[])).unwrap();
+        let id = socket_taken(&e, &s);
+        let msg = id.clone();
+        e.db.write_blocking(move|tx|tx.execute("UPDATE messages SET from_agent='agt_sender',from_principal='agent:agt_sender',origin_kind='agent' WHERE id=?1",[msg])).unwrap();
+        for attempt in 1..=5 {
+            e.sp.retry_socket(&s, &id, "connection refused");
+            if attempt < 5 {
+                assert_eq!(mail_of(&e.db, &id).0, "queued");
+                let c = e.db.reader().unwrap();
+                let after: i64 = c
+                    .query_row("SELECT not_before FROM messages WHERE id=?1", [&id], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert!(after > now_ms());
+                let agent = s.id.clone();
+                e.db.write_blocking(move |tx| {
+                    assert!(mail::take_next(tx, MACHINE, &agent, after)?.is_some());
+                    Ok(())
+                })
+                .unwrap();
+            }
+        }
+        assert_eq!(mail_of(&e.db, &id).0, "failed");
+        assert!(mail_of(&e.db, &id)
+            .1
+            .unwrap()
+            .starts_with("socket unreachable:"));
+        assert!(sent(&e).is_empty());
+        let c = e.db.reader().unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM messages WHERE kind='system' AND to_agent='agt_sender'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert!(events(&e.db, "agent.attention")
+            .iter()
+            .any(|e| e["reason"] == "mail_unreachable"));
+    }
+    #[test]
+    fn unknown_gate_and_close_timeout_never_switch_to_paste() {
+        let (e, s, mut d, _secs) = socket_fixture();
+        let id = socket_taken(&e, &s);
+        let m = mail::Mail {
+            id: id.clone(),
+            provenance: "p".into(),
+            body: "b".into(),
+            attempts: 1,
+        };
+        assert_eq!(
+            e.sp.start_socket(
+                &s,
+                &m,
+                super::super::cc_inbox::Gate::Unknown("half-written pid.json".into()),
+                "fence",
+                e.sp.now()
+            ),
+            Delivery::Idle
+        );
+        assert_eq!(mail_of(&e.db, &id).0, "queued");
+        assert!(sent(&e).is_empty());
+        let agent = s.id.clone();
+        e.db.write_blocking(move |tx| mail::take_next(tx, MACHINE, &agent, now_ms() + 10000))
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(super::super::cc_inbox::SocketOutcome::MaybeSent(
+            "close_timeout".into(),
+        ))
+        .unwrap();
+        e.sp.socket_jobs.lock().unwrap().insert(id.clone(), rx);
+        assert!(matches!(
+            socket_step(
+                &e,
+                &s,
+                d.as_mut(),
+                Delivery::SocketSending {
+                    id: id.clone(),
+                    at: e.sp.now()
+                }
+            ),
+            Delivery::SocketAwaiting { .. }
+        ));
+        assert_eq!(mail_of(&e.db, &id).0, "delivering");
+        assert!(sent(&e).is_empty());
+    }
+}
+
+fn socket_awaiting(id: String, now: Instant) -> Delivery {
+    Delivery::SocketAwaiting {
+        id,
+        since: now,
+        enqueued: None,
+        turn_ended: None,
+        held: None,
+        receipt_seq: 0,
     }
 }

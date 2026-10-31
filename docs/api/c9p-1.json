@@ -911,6 +911,14 @@
       "description": "Typed error codes. New codes are additive; a client that does not know a\ncode still has `msg`, `retryable` and `hint`.",
       "oneOf": [
         {
+          "enum": [
+            "hop_limit",
+            "not_cancellable"
+          ],
+          "type": "string",
+          "x-open-enum": true
+        },
+        {
           "const": "upgrade_required",
           "description": "The client speaks another major version.",
           "type": "string"
@@ -1045,8 +1053,7 @@
           "description": "An engine-side failure.",
           "type": "string"
         }
-      ],
-      "x-open-enum": true
+      ]
     },
     "EventFrame": {
       "description": "One event on the wire (A:203). `sub` is the `id` of the subscribe\nrequest, so a connection can carry several subscriptions.",
@@ -1673,6 +1680,30 @@
       ],
       "type": "object"
     },
+    "MailAgentParams": {
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent"
+      ],
+      "type": "object"
+    },
+    "MailControlResult": {
+      "properties": {
+        "ok": {
+          "type": "boolean",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "type": "object"
+    },
     "MemoryFile": {
       "description": "A single memory file (e.g., MEMORY.md, profile.md)",
       "properties": {
@@ -1872,6 +1903,46 @@
       ],
       "type": "object"
     },
+    "MsgFrom": {
+      "properties": {
+        "addr": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "kind": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "conversation"
+        }
+      },
+      "required": [
+        "kind",
+        "addr",
+        "name"
+      ],
+      "type": "object"
+    },
+    "MsgIdParams": {
+      "additionalProperties": false,
+      "properties": {
+        "msgId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "msgId"
+      ],
+      "type": "object"
+    },
     "MsgKind": {
       "description": "What a message asks of its reader (A:418). A caller sends `request` or\n`info`; `result` and `system` are written by the engine.",
       "enum": [
@@ -1882,6 +1953,181 @@
       ],
       "type": "string",
       "x-open-enum": true
+    },
+    "MsgListParams": {
+      "additionalProperties": false,
+      "description": "Mailbox query. Reads never mark a message read by the model.",
+      "properties": {
+        "agent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "before": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "thread": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "MsgListResult": {
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/MsgSummary"
+          },
+          "type": "array",
+          "x-sensitivity": "conversation"
+        },
+        "next": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "items",
+        "next"
+      ],
+      "type": "object"
+    },
+    "MsgReadResult": {
+      "properties": {
+        "attempts": {
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "body": {
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "createdAt": {
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "from": {
+          "$ref": "#/$defs/MsgFrom",
+          "x-sensitivity": "conversation"
+        },
+        "hop": {
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "kind": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "msgId": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "noticeId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "preview": {
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "provenance": {
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "replyTo": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "state": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "stateAt": {
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "status": {
+          "items": {
+            "$ref": "#/$defs/MsgStatus"
+          },
+          "type": "array",
+          "x-sensitivity": "public"
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "to": {
+          "$ref": "#/$defs/MsgAddress",
+          "x-sensitivity": "conversation"
+        },
+        "via": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "msgId",
+        "from",
+        "to",
+        "kind",
+        "state",
+        "stateAt",
+        "detail",
+        "via",
+        "replyTo",
+        "threadId",
+        "noticeId",
+        "hop",
+        "createdAt",
+        "preview",
+        "body",
+        "provenance",
+        "attempts",
+        "status"
+      ],
+      "type": "object"
     },
     "MsgSendParams": {
       "description": "`msg.send` params. The envelope's `idem` makes a resend safe: the same\nsender, key and request get the first message back.",
@@ -1924,6 +2170,13 @@
         "msgId": {
           "description": "`msg_<ulid>`.",
           "type": "string",
+          "x-sensitivity": "public"
+        },
+        "paused": {
+          "type": [
+            "boolean",
+            "null"
+          ],
           "x-sensitivity": "public"
         },
         "replayed": {
@@ -1974,7 +2227,7 @@
           "x-sensitivity": "public"
         },
         "detail": {
-          "description": "Why: for `delivered`, `prompt_hook` or `turn_open`; for `failed` and\n`uncertain`, what went wrong.",
+          "description": "Why: for `delivered`, `prompt_hook`, `peer_jsonl`, `late_evidence` or `turn_open`; for `failed` and\n`uncertain`, what went wrong.",
           "type": [
             "string",
             "null"
@@ -1986,12 +2239,55 @@
           "type": "string",
           "x-sensitivity": "metadata"
         },
+        "kind": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
         "msgId": {
           "type": "string",
           "x-sensitivity": "public"
         },
+        "preview": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "conversation"
+        },
+        "recipient": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MsgAddress"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-sensitivity": "conversation"
+        },
+        "replyTo": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "sender": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MsgFrom"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-sensitivity": "conversation"
+        },
         "state": {
-          "description": "`queued`, `delivering`, `delivered`, `failed` or `uncertain`.",
+          "description": "`queued`, `delivering`, `delivered`, `failed`, `uncertain`, `rejected`, `expired` or `cancelled`.",
           "enum": [
             "queued",
             "delivering",
@@ -2003,10 +2299,24 @@
           "x-open-enum": true,
           "x-sensitivity": "public"
         },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
         "to": {
           "description": "The target's agent id.",
           "type": "string",
           "x-sensitivity": "metadata"
+        },
+        "via": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -2017,6 +2327,127 @@
         "at",
         "attempts",
         "detail"
+      ],
+      "type": "object"
+    },
+    "MsgStatus": {
+      "properties": {
+        "at": {
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "state": {
+          "type": "string",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "state",
+        "at",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "MsgSummary": {
+      "properties": {
+        "createdAt": {
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "from": {
+          "$ref": "#/$defs/MsgFrom",
+          "x-sensitivity": "conversation"
+        },
+        "hop": {
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "kind": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "msgId": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "noticeId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "preview": {
+          "type": "string",
+          "x-sensitivity": "conversation"
+        },
+        "replyTo": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "state": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "stateAt": {
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "to": {
+          "$ref": "#/$defs/MsgAddress",
+          "x-sensitivity": "conversation"
+        },
+        "via": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "msgId",
+        "from",
+        "to",
+        "kind",
+        "state",
+        "stateAt",
+        "detail",
+        "via",
+        "replyTo",
+        "threadId",
+        "noticeId",
+        "hop",
+        "createdAt",
+        "preview"
       ],
       "type": "object"
     },
@@ -3576,7 +4007,7 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
-  "apiMinor": 6,
+  "apiMinor": 7,
   "description": "Preview: the c9watch engine protocol. One JSON object per line over the engine socket. A preview minor may break a method; check breakingSince.",
   "frames": {
     "event": {
@@ -3787,12 +4218,57 @@
       "x-stability": "internal",
       "x-visibility": "internal"
     },
+    "mail.pause": {
+      "params": {
+        "$ref": "#/$defs/MailAgentParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MailControlResult"
+      },
+      "x-stability": "preview"
+    },
+    "mail.resume": {
+      "params": {
+        "$ref": "#/$defs/MailAgentParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MailControlResult"
+      },
+      "x-stability": "preview"
+    },
     "memory.list": {
       "params": {
         "$ref": "#/$defs/MemoryListParams"
       },
       "result": {
         "$ref": "#/$defs/MemoryListResult"
+      },
+      "x-stability": "preview"
+    },
+    "msg.cancel": {
+      "params": {
+        "$ref": "#/$defs/MsgIdParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MailControlResult"
+      },
+      "x-stability": "preview"
+    },
+    "msg.list": {
+      "params": {
+        "$ref": "#/$defs/MsgListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MsgListResult"
+      },
+      "x-stability": "preview"
+    },
+    "msg.read": {
+      "params": {
+        "$ref": "#/$defs/MsgIdParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MsgReadResult"
       },
       "x-stability": "preview"
     },

@@ -110,6 +110,7 @@ pub enum InjectionPath {
     Hook,
     /// Bytes written to the agent's terminal.
     Pty,
+    Socket,
 }
 
 impl InjectionPath {
@@ -117,6 +118,7 @@ impl InjectionPath {
         match self {
             InjectionPath::Hook => "hook",
             InjectionPath::Pty => "pty",
+            InjectionPath::Socket => "socket",
         }
     }
 }
@@ -313,7 +315,17 @@ fn look(db: &Db, agent_id: &str) -> Result<(Option<String>, bool), String> {
         .optional()
         .map_err(fail)?
         .is_some();
-    Ok((state, open))
+    let socket = super::mail::socket_inflight(&conn, agent_id)
+        .map_err(fail)?
+        .is_some();
+    Ok((
+        if socket && state.as_deref() == Some("ready") {
+            Some("working".into())
+        } else {
+            state
+        },
+        open,
+    ))
 }
 
 /// Drain the agents of `sp` (see the module doc). The caller has turned

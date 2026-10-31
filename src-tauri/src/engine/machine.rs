@@ -78,6 +78,10 @@ impl HeaderKey {
     /// context, so a body that fakes a mail header without it reads as
     /// text. It is tied to the agent id, not the generation: a resume
     /// keeps the old context, and with it the token.
+    pub fn signature(&self, msg_id: &str) -> String {
+        hex(&hmac_sha256(&self.0, msg_id.as_bytes()))[..16].to_string()
+    }
+
     pub fn token(&self, agent_id: &str) -> String {
         let mut t = hex(&hmac_sha256(&self.0, agent_id.as_bytes()));
         t.truncate(16);

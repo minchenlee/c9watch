@@ -2,7 +2,7 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 6;
+export const C9P_API_MINOR = 7;
 
 /** `agent.attention` data: an agent needs the user. */
 export interface C9pAgentAttentionEvent {
@@ -296,115 +296,7 @@ export interface C9pErrorBody {
  * Typed error codes. New codes are additive; a client that does not know a
  * code still has `msg`, `retryable` and `hint`.
  */
-export type C9pErrorCode =
-  /** The client speaks another major version. */
-  | 'upgrade_required'
-  /** The first frame was not `hello`. */
-  | 'hello_required'
-  /** No `hello` arrived in time. */
-  | 'hello_timeout'
-  /** A frame is larger than `MAX_FRAME`. */
-  | 'frame_too_large'
-  /** The frame is not valid JSON or misses a required field. */
-  | 'bad_request'
-  /** The engine has no such method. */
-  | 'unknown_method'
-  /** The peer runs under another uid. */
-  | 'peer_uid_mismatch'
-  /**
-   * The cursor's events are gone: pruned, another epoch or machine, or
-   * ahead of the log.
-   */
-  | 'cursor_expired'
-  /**
-   * The caller is over a limit, such as the event streams per
-   * connection.
-   */
-  | 'rate_limited'
-  /**
-   * A hook-class method (`hook.*`, `task.done`, `agent.handoff`) from a
-   * caller that is not a live agent running the engine's own
-   * `c9watch-agent` copy, or that names another agent.
-   */
-  | 'peer_not_authorized'
-  /** `task.done` from an agent without a task (every free agent). */
-  | 'no_task'
-  /**
-   * The method is part of the wire format but does nothing before C1b
-   * (`agent.handoff`).
-   */
-  | 'unsupported_in_c1a'
-  /**
-   * The engine has no `c9watch-agent` copy: none was next to the engine
-   * binary when it started, or the copy is gone.
-   */
-  | 'agent_bin_missing'
-  /**
-   * The engine's `c9watch-agent` copy no longer has the sha256 it had
-   * when the engine installed it.
-   */
-  | 'agent_bin_mismatch'
-  /**
-   * The principal may not call this method (`agent.create` and
-   * `agent.retire` take only a local client in C1a).
-   */
-  | 'not_allowed'
-  /**
-   * The canonical cwd of a free agent is inside the engine home or a
-   * managed worktree home.
-   */
-  | 'cwd_collision'
-  /**
-   * The agent process exited, showed a vendor refusal (usage limit,
-   * login) or was not ready in time. The engine does not retry.
-   */
-  | 'spawn_failed'
-  /** No engine agent has this id. */
-  | 'unknown_agent'
-  /**
-   * The engine is draining after a SIGTERM: no spawn and no injection
-   * until the next engine is up. Retry against the new engine.
-   */
-  | 'draining'
-  /**
-   * `msg.send`: no agent answers to `to`, its machine is not this one,
-   * or a name matches more than one agent. `data` has `nearest` or
-   * `candidates`.
-   */
-  | 'unknown_address'
-  /**
-   * `msg.send`: the engine does not drive the target's terminal (an
-   * observed session), or the target is retiring or gone. `data` has
-   * `state` and `control`.
-   */
-  | 'not_controlled'
-  /**
-   * `msg.send`: a managed worker takes mail only from its parent and
-   * the human, and sends only to its parent. `data` may have `parent`.
-   */
-  | 'not_owner'
-  /**
-   * `msg.send`: the `idem` key was used for another message, or the same
-   * body went to the same agent within 10 minutes. `data` has `msgId`
-   * and `at`.
-   */
-  | 'duplicate'
-  /** `session.stop`: no live session has this key. */
-  | 'unknown_session'
-  /**
-   * `session.stop` or `session.rename` was refused or failed on the
-   * session itself: it cannot be stopped, it runs as another process
-   * now, or the write failed. `msg` says which.
-   */
-  | 'action_failed'
-  /**
-   * The engine is at a limit that frees up soon: the connection cap, or
-   * a scan of the same kind that is still running. Retry shortly.
-   */
-  | 'busy'
-  /** An engine-side failure. */
-  | 'internal'
-  | string;
+export type C9pErrorCode = 'hop_limit' | 'not_cancellable' | string | 'upgrade_required' | 'hello_required' | 'hello_timeout' | 'frame_too_large' | 'bad_request' | 'unknown_method' | 'peer_uid_mismatch' | 'cursor_expired' | 'rate_limited' | 'peer_not_authorized' | 'no_task' | 'unsupported_in_c1a' | 'agent_bin_missing' | 'agent_bin_mismatch' | 'not_allowed' | 'cwd_collision' | 'spawn_failed' | 'unknown_agent' | 'draining' | 'unknown_address' | 'not_controlled' | 'not_owner' | 'duplicate' | 'unknown_session' | 'action_failed' | 'busy' | 'internal';
 
 /**
  * One event on the wire . `sub` is the `id` of the subscribe
@@ -573,6 +465,14 @@ export interface C9pLimits {
   retentionHours: number;
 }
 
+export interface C9pMailAgentParams {
+  agent: string;
+}
+
+export interface C9pMailControlResult {
+  ok: boolean;
+}
+
 /** A single memory file (e.g., MEMORY.md, profile.md) */
 export interface C9pMemoryFile {
   content: string;
@@ -634,11 +534,55 @@ export interface C9pMsgAddress {
   name: string | null;
 }
 
+export interface C9pMsgFrom {
+  addr: string | null;
+  kind: string;
+  name: string | null;
+}
+
+export interface C9pMsgIdParams {
+  msgId: string;
+}
+
 /**
  * What a message asks of its reader . A caller sends `request` or
  * `info`; `result` and `system` are written by the engine.
  */
 export type C9pMsgKind = 'request' | 'info' | 'result' | 'system' | string;
+
+/** Mailbox query. Reads never mark a message read by the model. */
+export interface C9pMsgListParams {
+  agent?: string | null;
+  before?: string | null;
+  limit?: number | null;
+  thread?: string | null;
+}
+
+export interface C9pMsgListResult {
+  items: C9pMsgSummary[];
+  next: string | null;
+}
+
+export interface C9pMsgReadResult {
+  attempts: number;
+  body: string;
+  createdAt: number;
+  detail: string | null;
+  from: C9pMsgFrom;
+  hop: number;
+  kind: string;
+  msgId: string;
+  noticeId: string | null;
+  preview: string;
+  provenance: string;
+  replyTo: string | null;
+  state: string;
+  stateAt: number;
+  status: C9pMsgStatus[];
+  threadId: string | null;
+  to: C9pMsgAddress;
+  via: string | null;
+}
 
 /**
  * `msg.send` params. The envelope's `idem` makes a resend safe: the same
@@ -667,6 +611,7 @@ export interface C9pMsgSendResult {
   cursor: string;
   /** `msg_<ulid>`. */
   msgId: string;
+  paused?: boolean | null;
   /**
    * The same sender sent the same request with this `idem` before; no
    * new message was written.
@@ -687,17 +632,47 @@ export interface C9pMsgStateEvent {
   /** Delivery attempts so far. */
   attempts: number;
   /**
-   * Why: for `delivered`, `prompt_hook` or `turn_open`; for `failed` and
+   * Why: for `delivered`, `prompt_hook`, `peer_jsonl`, `late_evidence` or `turn_open`; for `failed` and
    * `uncertain`, what went wrong.
    */
   detail: string | null;
   /** The sender's principal: `agent:<id>` or `local-unverified`. */
   from: string;
+  kind?: string | null;
   msgId: string;
-  /** `queued`, `delivering`, `delivered`, `failed` or `uncertain`. */
+  preview?: string | null;
+  recipient?: C9pMsgAddress | null;
+  replyTo?: string | null;
+  sender?: C9pMsgFrom | null;
+  /** `queued`, `delivering`, `delivered`, `failed`, `uncertain`, `rejected`, `expired` or `cancelled`. */
   state: 'queued' | 'delivering' | 'delivered' | 'failed' | 'uncertain' | string;
+  threadId?: string | null;
   /** The target's agent id. */
   to: string;
+  via?: string | null;
+}
+
+export interface C9pMsgStatus {
+  at: number;
+  detail: string | null;
+  state: string;
+}
+
+export interface C9pMsgSummary {
+  createdAt: number;
+  detail: string | null;
+  from: C9pMsgFrom;
+  hop: number;
+  kind: string;
+  msgId: string;
+  noticeId: string | null;
+  preview: string;
+  replyTo: string | null;
+  state: string;
+  stateAt: number;
+  threadId: string | null;
+  to: C9pMsgAddress;
+  via: string | null;
 }
 
 /**
@@ -1283,9 +1258,29 @@ export interface C9pMethods {
     params: C9pHistorySearchParams;
     result: C9pHistorySearchResult;
   };
+  'mail.pause': {
+    params: C9pMailAgentParams;
+    result: C9pMailControlResult;
+  };
+  'mail.resume': {
+    params: C9pMailAgentParams;
+    result: C9pMailControlResult;
+  };
   'memory.list': {
     params: C9pMemoryListParams;
     result: C9pMemoryListResult;
+  };
+  'msg.cancel': {
+    params: C9pMsgIdParams;
+    result: C9pMailControlResult;
+  };
+  'msg.list': {
+    params: C9pMsgListParams;
+    result: C9pMsgListResult;
+  };
+  'msg.read': {
+    params: C9pMsgIdParams;
+    result: C9pMsgReadResult;
   };
   'msg.send': {
     params: C9pMsgSendParams;
@@ -1386,5 +1381,5 @@ export interface C9pTopics {
 
 export type C9pTopic = keyof C9pTopics;
 
-export const C9P_PUBLIC_METHODS = ["agent.create","agent.list","agent.retire","conversation.get","cost.get","detect.recheck","diag.detection","events.subscribe","events.unsubscribe","hello","history.list","history.search","memory.list","msg.send","ping","provider.opencode.connect","provider.opencode.status","session.away","session.list","session.rename","session.stop","session.tasks","session.views","snapshot.get","subagent.list","subagent.transcript","usage.subscriptions"] as const;
+export const C9P_PUBLIC_METHODS = ["agent.create","agent.list","agent.retire","conversation.get","cost.get","detect.recheck","diag.detection","events.subscribe","events.unsubscribe","hello","history.list","history.search","mail.pause","mail.resume","memory.list","msg.cancel","msg.list","msg.read","msg.send","ping","provider.opencode.connect","provider.opencode.status","session.away","session.list","session.rename","session.stop","session.tasks","session.views","snapshot.get","subagent.list","subagent.transcript","usage.subscriptions"] as const;
 export const C9P_PUBLIC_TOPICS = ["agent.attention","agent.failed","agent.gone","agent.turn_end","agent.upsert","diag.detection","msg.state","notification.needs_attention","notification.waiting_for_input","session.gone","session.view"] as const;
