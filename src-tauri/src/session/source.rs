@@ -82,8 +82,6 @@ impl SessionProvider {
     }
 
     /// Human-readable product name for user-facing text.
-    // Only notifications.rs (GUI build) calls this.
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::ClaudeCode => "Claude Code",

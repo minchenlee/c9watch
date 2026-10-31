@@ -141,6 +141,9 @@ const BY_NAME: &[(&str, &str)] = &[
     ("project", M),
     ("projectPath", M),
     ("projectName", M),
+    // The project folder name, else the provider's name; never a session
+    // title or name (`session::notification`).
+    ("redactedTitle", M),
     ("memoryDirPath", M),
     ("agentPath", M),
     ("filename", M),
@@ -202,9 +205,6 @@ const BY_NAME: &[(&str, &str)] = &[
     ("cursorTitle", C),
     // Cursor copies its conversation title into the nickname.
     ("agentNickname", C),
-    // The custom or provider title, else the session name: both can be
-    // the first prompt.
-    ("redactedTitle", C),
     ("summary", C),
     ("firstPrompt", C),
     ("latestMessage", C),

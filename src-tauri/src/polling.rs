@@ -260,7 +260,7 @@ mod tests {
             web_notification(&s, text),
             serde_json::json!({
                 "title": "investigate",
-                "redactedTitle": "name-a",
+                "redactedTitle": "project",
                 "body": "🔐 name-a: Needs permission for Bash",
                 "sessionId": "a",
                 "sessionKey": "claudeCode:a",

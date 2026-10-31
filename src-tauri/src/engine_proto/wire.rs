@@ -629,7 +629,8 @@ pub struct NotificationEvent {
     pub pending_tool: Option<String>,
     /// Can carry conversation text (the first prompt, a session title).
     pub title: String,
-    /// `title` without conversation text.
+    /// `title` without conversation text: the project folder name, else the
+    /// provider's name (e.g. `Claude Code`). Never a session title or name.
     pub redacted_title: String,
     pub body: String,
     pub pid: u32,
