@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>c9p preview session board</title></head>
+<body>
+<h1>c9p preview session board</h1>
+<p>Needs M-b: the core WebSocket gateway. Pairing grants access to session metadata.</p>
+<form>
+<label>Gateway <input name="gateway" value="ws://localhost:9210/c9p" required></label>
+<label>One-time pairing code <input name="code" autocomplete="off" required></label>
+<button>Pair and connect</button>
+</form>
+<output role="status">Ready</output>
+<ul aria-label="Sessions"></ul>
+<script type="module" src="./main.ts"></script>
+</body>
+</html>

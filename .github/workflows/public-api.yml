@@ -1,0 +1,50 @@
+name: Public API preview
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  public-api:
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Linux TLS dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+      - run: npm ci
+      - name: SDK unit tests and generated public types
+        run: npm test --prefix packages/c9p-client
+      - name: Check and build the static example
+        run: |
+          npx tsc -p examples/ts-web-board/tsconfig.json
+          npx tsc -p examples/ts-web-board/tsconfig.smoke.json
+          npx vite build examples/ts-web-board --outDir dist
+      - name: Contract, Python watcher, web reducer and exports on a fixture engine
+        env:
+          C9P_DOC_EXAMPLES: '1'
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features engine --test engine_public_docs
+      - name: CLI-only offline schema export
+        run: |
+          cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --features cli -- api schema --public > /tmp/c9p-public.json
+          node -e 'const s = require("/tmp/c9p-public.json"); if (!s.methods.hello || s.methods["hook.stop"]) process.exit(1)'

@@ -1,120 +1,56 @@
-# c9p/1 local API (preview)
+> **Preview.** c9p/1 may change before v1 stable. A preview minor can break a method. Read the changelog and check `hello.breakingSince` before calling it.
 
-c9watch's headless core serves newline-delimited JSON on a Unix socket. The
-[schema](c9p-1.json) describes requests, responses and events. SQLite is private
-engine state, not a supported interface. Methods in preview may change between
-minor versions; check `hello` before using them.
+# c9p/1 public API
 
-## Linux core and CLI
+c9p connects scripts and clients to the c9watch core. Core detects sessions and serves their state. Clients do not scan provider files.
 
-Linux tarballs for x86_64 and aarch64 contain `c9watch` and `c9watch-agent`.
-Keep both executables together when installing them, for example in
-`~/.local/bin`. No Linux Tauri GUI is shipped. These binaries require a GNU/Linux
-system with OpenSSL available (the builds use native TLS).
+This guide targets **c9p 1.6**. It describes the API in this checkout. The WebSocket gateway described in [gateway.md](gateway.md) needs M-b. Annotations need the later L1 milestone. Neither is available in the 1.6 golden schema.
+
+Start core with an engine-enabled build:
 
 ```sh
-tar -xzf c9watch-cli-x86_64-unknown-linux-gnu.tar.gz
-install -d "$HOME/.local/bin"
-install -m 755 c9watch c9watch-agent "$HOME/.local/bin/"
-export PATH="$HOME/.local/bin:$PATH"
-c9watch engine                     # foreground; Ctrl-C drains and stops core
+cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --features engine
+/path/to/c9watch engine
 ```
 
-In another terminal, or without first starting the foreground core:
+`c9watch api <method> '<json>'` and `c9watch export` start core when needed. Third-party socket clients connect to a running core. They do not start one.
+
+The socket is private to your OS user. Find `engine-v1.sock` under:
+
+| System | Production core home |
+| --- | --- |
+| macOS | `~/Library/Application Support/c9watch/engine/` |
+| Linux | `$XDG_RUNTIME_DIR/c9watch/engine-v1.sock` when the runtime dir is set; else `$XDG_STATE_HOME/c9watch/engine/` (or `~/.local/state/c9watch/engine/`) |
+
+Development builds use `engine-dev/`. `C9WATCH_ENGINE_HOME` overrides the whole home with an absolute path. Do not mix development and production sockets. On Linux the default socket lives in the runtime directory; see [Linux](linux.md). A custom home keeps its socket inside the home.
+
+Send one JSON object per line over a Unix stream socket. Send `hello` first:
+
+```json
+{"v":1,"id":"1","method":"hello","params":{"apiMajor":1,"apiMinor":6,"client":{"kind":"script","name":"my-board"},"want":[]}}
+```
+
+Read its response. Then call `session.views` for a snapshot and subscribe to `session.view` and `session.gone` from the snapshot's cursor. This closes the gap between reading state and starting the stream.
+
+Read next:
+
+- [Protocol](c9p-1.md): framing, discovery, versions, errors and retention.
+- [Topics](topics.md): every public event and its data type.
+- [Gateway](gateway.md): pairing, origins, scopes and authentication. Needs M-b.
+- [Extending](extending.md): exports and external aggregation.
+- [Changelog](CHANGELOG.md): preview changes by minor.
+- [Linux](linux.md): headless core install, socket paths and the optional systemd service.
+- [TypeScript SDK](../../packages/c9p-client/README.md): Node socket and browser/Node WebSocket transports.
+- [Python watch](../../examples/python-watch/README.md) and [web board](../../examples/ts-web-board/README.md): runnable clients.
+
+Export the contract offline, including from a CLI-only build:
 
 ```sh
-c9watch api hello '{}'
-c9watch list
-c9watch api session.views '{}'
-c9watch api history.list '{}'
-c9watch api cost.get '{}'
-c9watch spawn --mode free --cwd /absolute/project --name helper
-c9watch api agent.list '{}'
+c9watch api schema --public > c9p-public.json
 ```
 
-CLI data commands automatically start core when needed. It keeps running after
-the CLI exits. `c9watch engine restart` drains it and starts a new process.
-Core needs Claude Code on `PATH` to spawn free agents; no paid API is required
-just to run the core or read local session data.
+The checked-in [full schema](c9p-1.json) also contains private methods for internal contract tests. Public export removes internal methods, topics, fields and unused types. It keeps actual wire error names, including the legacy `unsupported_in_c1a` name. That name awaits the separate cleanup minor.
 
-Build the pair from source with:
+**SQLite is not an interface.** Do not query `engine.db`, its tables or its outbox on disk. They can change in any minor. Use c9p queries, streams or `c9watch export`.
 
-```sh
-cd src-tauri
-C9WATCH_CHANNEL=prod cargo build --release --no-default-features --features engine,cli --bins
-```
-
-## Socket and state paths
-
-| Platform/configuration | Socket | Persistent state, lock and log |
-| --- | --- | --- |
-| Linux release | `$XDG_RUNTIME_DIR/c9watch/engine-v1.sock` | `$XDG_STATE_HOME/c9watch/engine/` |
-| Linux dev build | `$XDG_RUNTIME_DIR/c9watch/engine-dev-v1.sock` | `$XDG_STATE_HOME/c9watch/engine-dev/` |
-| Linux without an absolute, nonempty `XDG_RUNTIME_DIR` | `<engine home>/engine-v1.sock` | Same as above |
-| macOS release/dev | `<engine home>/engine-v1.sock` | `~/Library/Application Support/c9watch/engine[-dev]/` |
-| Custom `C9WATCH_ENGINE_HOME` | `<custom home>/engine-v1.sock` | The absolute custom home |
-
-`XDG_STATE_HOME` defaults to `~/.local/state`; relative values are ignored.
-An override equal to the default state home uses the default runtime socket,
-including when a CLI pins that home for an auto-started engine.
-
-The runtime directory must already exist, belong to your uid, and have mode
-0700. Core refuses insecure runtime directories; it never changes their owner
-or repairs their permissions. It creates its `c9watch` subdirectory as 0700,
-binds sockets as 0600, and checks kernel peer credentials on both ends of the
-connection. Another uid cannot substitute its engine for yours. Do not share
-an engine home between users. Avoid the fallback on NFS homes: Unix sockets
-need a local filesystem. Use the login session's runtime directory instead.
-These rules follow the [XDG Base Directory specification](https://specifications.freedesktop.org/basedir/latest/).
-
-The gateway's listeners, port selection and authentication are a separate
-milestone. This core/CLI build does not expose a network listener or web UI.
-The planned Linux gateway default is `20000 + (uid % 10000)`, recorded in
-`<engine home>/gateway.json`; do not assume that port is listening in this build.
-
-## Optional systemd user service
-
-CLI auto-start needs no service manager. If you prefer a user service, review
-the [example unit](../systemd/c9watch-engine.service), adjust its executable and
-PATH for your installation, then install it yourself:
-
-```sh
-mkdir -p "$HOME/.config/systemd/user"
-cp docs/systemd/c9watch-engine.service "$HOME/.config/systemd/user/"
-systemctl --user daemon-reload
-systemctl --user enable --now c9watch-engine.service
-journalctl --user -u c9watch-engine.service
-# Stop through systemd when it owns core:
-systemctl --user stop c9watch-engine.service
-```
-
-Stop an auto-started core before enabling the service to avoid two launchers
-contending for its lifetime lock. The example is never installed automatically.
-While the service owns core, use `systemctl --user restart c9watch-engine.service`
-to restart it, so the replacement stays managed by systemd.
-Its stop timeout allows the core's 90-second drain, and `KillMode=mixed` lets
-core handle its agent children before the final timeout.
-
-Do not add `ProtectHome`, `PrivateTmp`, `ProtectSystem`, `PrivateDevices`, bind
-mounts, root images or other filesystem namespace isolation to this unit.
-Core compares a Linux peer's mount namespace with its own to prevent sandboxed
-agents from obtaining local write authority. If systemd isolates core, ordinary
-terminals appear confined and writes return `not_allowed`. Flatpak/snap
-terminals can have the same problem: run core and the terminal client in the
-same host namespace. Read calls do not grant write authority. See
-[systemd execution environment documentation](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html).
-
-## Subscription tools and Linux verification
-
-`usage.subscriptions` resolves `codex` from the user's installation or PATH and
-`curl` from PATH on Linux. For a service, check its PATH includes both
-(`command -v codex; command -v curl` in an equivalent environment). Missing
-tools are reported as provider failures; running core does not install them.
-
-Linux CI runs the headless engine unit/integration suite and packages both
-executables. Tests use temporary homes and fake Claude Code scripts. Real
-Linux acceptance still needs a host with Claude Code sessions, `history.list`,
-`cost.get` and subscription tools. Cursor's Linux `state.vscdb` discovery,
-gateway dual-stack/two-user tests, web-client acceptance and export examples
-require their respective milestones and a Linux host; they are not established
-by a macOS test run.
+SDK publication is a separate owner decision. This checkout contains a private `0.x` package. It has not been published to npm. Preview wording and gateway documentation still need owner review before announcement.
