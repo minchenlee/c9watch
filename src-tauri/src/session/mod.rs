@@ -26,8 +26,11 @@ pub use detector::LegacySessionSource;
 pub use hidden_sessions::HiddenClaudeSession;
 pub mod detector_cli;
 pub use detector_cli::CliSessionSource;
+pub mod notification;
+pub mod rename;
 pub mod state;
 pub mod transitions;
+pub mod workers;
 pub use parser::{
     extract_messages, parse_all_entries, parse_last_n_entries, parse_sessions_index, ImageBlock,
     MessageContent, MessageType, SessionEntry, SessionIndexEntry, SessionsIndex,

@@ -25,8 +25,9 @@ use std::time::Instant;
 pub const LAST_ASSISTANT_MESSAGE_MAX_CHARS: usize = 140;
 
 /// What a session needs from the user. Tool arguments are never included:
-/// only the tool *name* leaves the backend (see PR #141).
+/// only the tool *name* leaves the backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum WaitingFor {
     Approval { tool: String },
@@ -64,6 +65,7 @@ pub fn last_assistant_line(text: Option<&str>) -> Option<String> {
 
 /// Counts of what happened after `since_ms`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AwayActivity {
     pub since_ms: i64,
@@ -76,7 +78,8 @@ pub struct AwayActivity {
     pub partial: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AwayRequest {
     pub session_key: String,
@@ -424,6 +427,20 @@ fn updated_entry(previous: Option<IndexEntry>, path: &Path, now: Instant) -> Opt
         last_full_validation_at: now,
         index,
     })
+}
+
+/// Keep the per-transcript index current for every session with a
+/// transcript, and drop the indexes of sessions that ended. Run once per
+/// poll by the GUI and once per detection tick by the engine, never by
+/// one-shot CLI commands. An unchanged transcript costs one metadata read.
+pub fn refresh_index(sessions: &[crate::session::Session]) {
+    for session in sessions {
+        if let Some(path) = &session.transcript_path {
+            refresh(&session.session_key, path);
+        }
+    }
+    let live: HashSet<&str> = sessions.iter().map(|s| s.session_key.as_str()).collect();
+    retain_sessions(&live);
 }
 
 /// Drop indexes for sessions that are no longer live.
