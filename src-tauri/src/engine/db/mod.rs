@@ -596,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_has_the_c1b_m1_tables_and_no_token_hash() {
+    fn schema_has_the_c1b_m2_tables_and_no_token_hash() {
         let (_t, h) = home();
         let db = open(&h, M).unwrap();
         let r = db.reader().unwrap();
@@ -617,6 +617,7 @@ mod tests {
                 "events",
                 "legacy_events",
                 "machines",
+                "mail_pause",
                 "message_status",
                 "messages",
                 "meta",

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
 /// Protocol minor version. Raised for additive changes.
-pub const API_MINOR: u32 = 6;
+pub const API_MINOR: u32 = 7;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -162,6 +162,8 @@ pub enum ErrorCode {
     Duplicate,
     /// `session.stop`: no live session has this key.
     UnknownSession,
+    HopLimit,
+    NotCancellable,
     /// `session.stop` or `session.rename` was refused or failed on the
     /// session itself: it cannot be stopped, it runs as another process
     /// now, or the write failed. `msg` says which.
@@ -199,6 +201,8 @@ impl ErrorCode {
             ErrorCode::NotControlled => "not_controlled",
             ErrorCode::NotOwner => "not_owner",
             ErrorCode::Duplicate => "duplicate",
+            ErrorCode::HopLimit => "hop_limit",
+            ErrorCode::NotCancellable => "not_cancellable",
             ErrorCode::UnknownSession => "unknown_session",
             ErrorCode::ActionFailed => "action_failed",
             ErrorCode::Busy => "busy",
@@ -266,6 +270,8 @@ impl ErrorCode {
             ErrorCode::NotControlled => "take over first (D10)",
             ErrorCode::NotOwner => "managed workers take mail only from their parent and the human",
             ErrorCode::Duplicate => "pass a new idem to send it again",
+            ErrorCode::HopLimit => "the thread is too deep; a person must start a new one",
+            ErrorCode::NotCancellable => "only queued mail can be cancelled",
             ErrorCode::UnknownSession => "see `session.views` for the live session keys",
             ErrorCode::ActionFailed => "read `msg`; `session.views` shows the session now",
             ErrorCode::Busy => "retry in a second",
@@ -1086,6 +1092,8 @@ pub struct MsgSendResult {
     /// The same sender sent the same request with this `idem` before; no
     /// new message was written.
     pub replayed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<bool>,
 }
 
 /// `data` of a `msg.state` event: one per state change of a message. The
@@ -1099,15 +1107,29 @@ pub struct MsgStateEvent {
     pub from: String,
     /// The target's agent id.
     pub to: String,
-    /// `queued`, `delivering`, `delivered`, `failed` or `uncertain`.
+    /// `queued`, `delivering`, `delivered`, `failed`, `uncertain`, `rejected`, `expired` or `cancelled`.
     pub state: String,
     /// Unix ms.
     pub at: i64,
     /// Delivery attempts so far.
     pub attempts: i64,
-    /// Why: for `delivered`, `prompt_hook` or `turn_open`; for `failed` and
+    /// Why: for `delivered`, `prompt_hook`, `peer_jsonl`, `late_evidence` or `turn_open`; for `failed` and
     /// `uncertain`, what went wrong.
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<MsgFrom>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<MsgAddress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 /// `events.subscribe` params (A:218). Empty filters match everything.
@@ -1263,4 +1285,82 @@ pub struct HandoffParams {
 #[serde(rename_all = "camelCase")]
 pub struct HandoffResult {
     pub accepted: bool,
+}
+
+/// Mailbox query. Reads never mark a message read by the model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MsgListParams {
+    pub agent: Option<String>,
+    pub thread: Option<String>,
+    pub before: Option<String>,
+    pub limit: Option<usize>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MsgIdParams {
+    pub msg_id: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MailAgentParams {
+    pub agent: String,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct MsgFrom {
+    pub kind: String,
+    pub addr: Option<String>,
+    pub name: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct MsgSummary {
+    pub msg_id: String,
+    pub from: MsgFrom,
+    pub to: MsgAddress,
+    pub kind: String,
+    pub state: String,
+    pub state_at: i64,
+    pub detail: Option<String>,
+    pub via: Option<String>,
+    pub reply_to: Option<String>,
+    pub thread_id: Option<String>,
+    pub notice_id: Option<String>,
+    pub hop: i64,
+    pub created_at: i64,
+    pub preview: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct MsgListResult {
+    pub items: Vec<MsgSummary>,
+    pub next: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct MsgStatus {
+    pub state: String,
+    pub at: i64,
+    pub detail: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct MsgReadResult {
+    #[serde(flatten)]
+    pub summary: MsgSummary,
+    pub body: String,
+    pub provenance: String,
+    pub attempts: i64,
+    pub status: Vec<MsgStatus>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct MailControlResult {
+    pub ok: bool,
 }

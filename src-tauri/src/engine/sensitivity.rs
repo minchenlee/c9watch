@@ -24,6 +24,20 @@ const C: &str = CONVERSATION;
 
 /// Classes by field name, for every type.
 const BY_NAME: &[(&str, &str)] = &[
+    // C1b-M2 mail. Address/name containers are conversation data.
+    ("via", P),
+    ("paused", P),
+    ("hop", P),
+    ("stateAt", P),
+    ("threadId", P),
+    ("replyTo", P),
+    ("noticeId", P),
+    ("next", P),
+    ("preview", C),
+    ("provenance", C),
+    ("sender", C),
+    ("recipient", C),
+    ("items", C),
     // Ids, keys, states and flags.
     ("id", P),
     ("agentId", P),
@@ -234,6 +248,10 @@ const BY_NAME: &[(&str, &str)] = &[
 
 /// Classes for one type's field, where its name means something else.
 const OVERRIDES: &[(&str, &str, &str)] = &[
+    ("MsgSummary", "from", C),
+    ("MsgSummary", "to", C),
+    ("MsgReadResult", "from", C),
+    ("MsgReadResult", "to", C),
     ("SubscriptionUsage", "name", M),
     ("ErrorBody", "data", M),
     ("HiddenClaudeSession", "reason", P),

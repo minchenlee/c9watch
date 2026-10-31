@@ -1,0 +1,10 @@
+1970-01-01 00:00:00 UTC  A → B  delivered (peer_jsonl) [peer] re: original  msg_example
+  hello
+
+[from m/agt_a (free) for user]
+hello
+world
+
+History (1 attempts):
+  0 queued
+  1000 delivered: peer_jsonl

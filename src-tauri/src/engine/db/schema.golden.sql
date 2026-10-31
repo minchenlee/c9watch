@@ -1,4 +1,4 @@
--- user_version 5
+-- user_version 6
 -- index agents_detected_key
 CREATE UNIQUE INDEX agents_detected_key ON agents (session_key) WHERE source = 'detected';
 -- index agents_legacy_sid
@@ -16,6 +16,10 @@ CREATE UNIQUE INDEX messages_idem ON messages (from_principal, idem) WHERE idem 
 CREATE INDEX messages_pair ON messages (from_principal, to_agent, created_at);
 -- index messages_queue
 CREATE INDEX messages_queue ON messages (to_agent, state, created_at);
+-- index messages_thread
+CREATE INDEX messages_thread ON messages (thread_id, created_at);
+-- index messages_wire
+CREATE UNIQUE INDEX messages_wire ON messages (wire_id);
 -- index ops_open
 CREATE INDEX ops_open ON ops (done_at) WHERE done_at IS NULL;
 -- index session_alias_agent
@@ -85,6 +89,12 @@ CREATE TABLE machines (
     label   TEXT,
     is_self INTEGER NOT NULL DEFAULT 0
 ) STRICT;
+-- table mail_pause
+CREATE TABLE mail_pause (
+    agent_id TEXT PRIMARY KEY REFERENCES agents (id),
+    at INTEGER NOT NULL,
+    by TEXT NOT NULL
+) STRICT;
 -- table message_status
 CREATE TABLE message_status (
     seq    INTEGER PRIMARY KEY,
@@ -94,13 +104,13 @@ CREATE TABLE message_status (
     detail TEXT
 ) STRICT;
 -- table messages
-CREATE TABLE messages (
+CREATE TABLE "messages" (
     id             TEXT PRIMARY KEY,               -- msg_<ulid>
     from_principal TEXT NOT NULL,                  -- 'agent:<id>' | 'local-unverified'
     from_agent     TEXT REFERENCES agents (id),    -- null for local-unverified
     to_agent       TEXT NOT NULL REFERENCES agents (id),
     to_addr        TEXT NOT NULL,                  -- <machine>/<id>
-    origin_kind    TEXT NOT NULL CHECK (origin_kind IN ('agent', 'local-unverified')),
+    origin_kind    TEXT NOT NULL CHECK (origin_kind IN ('agent', 'local-unverified', 'engine')),
     kind           TEXT NOT NULL DEFAULT 'info' CHECK (kind IN ('request', 'info', 'result', 'system')),
     reply_to       TEXT,
     thread_id      TEXT,                           -- reply_to's thread, or the row's own id
@@ -112,11 +122,16 @@ CREATE TABLE messages (
     -- Current state, denormalized from the latest message_status row and
     -- written in the same transaction, so the delivery loop reads one row.
     state          TEXT NOT NULL CHECK (state IN ('queued', 'delivering', 'delivered', 'read',
-                     'acked', 'failed', 'expired', 'rejected', 'uncertain', 'overdue')),
+                     'acked', 'failed', 'expired', 'rejected', 'uncertain', 'overdue', 'cancelled')),
     state_at       INTEGER NOT NULL,
     attempts       INTEGER NOT NULL DEFAULT 0,
     created_at     INTEGER NOT NULL,
     cursor         TEXT                            -- cursor of the queued event, for idem replay
+    ,via TEXT CHECK (via IN ('pty', 'socket'))
+    ,wire_id TEXT NOT NULL
+    ,not_before INTEGER
+    ,hop INTEGER NOT NULL DEFAULT 0
+    ,notice_id TEXT REFERENCES messages (id)
 ) STRICT;
 -- table meta
 CREATE TABLE meta (

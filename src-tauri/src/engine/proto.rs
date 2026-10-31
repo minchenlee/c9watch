@@ -243,6 +243,7 @@ mod tests {
             },
             cursor: "A:3:1042".into(),
             replayed: false,
+            paused: None,
         };
         let v = serde_json::to_value(&r).unwrap();
         for key in ["msgId", "state", "to", "cursor", "replayed"] {
@@ -250,6 +251,13 @@ mod tests {
         }
         assert_eq!(serde_json::from_value::<MsgSendResult>(v).unwrap(), r);
         let e = MsgStateEvent {
+            via: None,
+            sender: None,
+            recipient: None,
+            thread_id: None,
+            reply_to: None,
+            kind: None,
+            preview: None,
             msg_id: "msg_1".into(),
             from: "agent:agt_p1".into(),
             to: "agt_k3".into(),

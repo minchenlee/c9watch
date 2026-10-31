@@ -1,0 +1,3 @@
+{"type":"queue-operation","operation":"enqueue","content":"[c9watch mail msg_example · tok token · sig signature]\nbody"}
+{"type":"user","isMeta":true,"turnOrigin":"peer","promptSource":"system","origin":{"kind":"peer","from":"uds:/tmp/cc-socks/c9w-example.sock","msg_id":"00000000-0000-4000-8000-000000000001"},"uuid":"00000000-0000-4000-8000-000000000002","message":{"role":"user","content":"body"}}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[c9watch mail msg_example · tok token · sig signature]\nbody"}]}}

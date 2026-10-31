@@ -54,6 +54,12 @@ pub const METHOD_INFO: &[Method] = &[
     m("task.done", 2, INTERNAL),
     m("agent.handoff", 2, INTERNAL),
     m("msg.send", 4, PREVIEW),
+    // C1b-M2: mailbox data and human controls.
+    m("msg.list", 7, PREVIEW),
+    m("msg.read", 7, PREVIEW),
+    m("msg.cancel", 7, PREVIEW),
+    m("mail.pause", 7, PREVIEW),
+    m("mail.resume", 7, PREVIEW),
     m("session.views", 5, PREVIEW),
     m("session.away", 5, PREVIEW),
     m("detect.recheck", 5, PREVIEW),

@@ -65,6 +65,9 @@ pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
     "XDG_STATE_HOME",
     "XDG_RUNTIME_DIR",
     "RUST_BACKTRACE",
+    "C9_MAIL_SOCKET",
+    "C9_CC_SESSIONS_DIR",
+    "C9_CC_SOCK_DIR",
     crate::engine::home::ENGINE_HOME_ENV,
 ];
 
@@ -682,6 +685,9 @@ mod tests {
             ("C9_AGENT_TOKEN", "t"),
             ("ANTHROPIC_API_KEY", "k"),
             ("CLAUDECODE", "1"),
+            ("C9_MAIL_SOCKET", "on"),
+            ("C9_CC_SESSIONS_DIR", "/fixture/sessions"),
+            ("C9_CC_SOCK_DIR", "/fixture/socks"),
         ]
         .map(|(k, v)| (OsString::from(k), OsString::from(v)));
         let mut kept: Vec<String> = engine_env(vars)
@@ -689,7 +695,17 @@ mod tests {
             .map(|(k, _)| k.into_string().unwrap())
             .collect();
         kept.sort();
-        assert_eq!(kept, ["C9WATCH_ENGINE_HOME", "HOME", "PATH"]);
+        assert_eq!(
+            kept,
+            [
+                "C9WATCH_ENGINE_HOME",
+                "C9_CC_SESSIONS_DIR",
+                "C9_CC_SOCK_DIR",
+                "C9_MAIL_SOCKET",
+                "HOME",
+                "PATH"
+            ]
+        );
     }
 
     #[test]

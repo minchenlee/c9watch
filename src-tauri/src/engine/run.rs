@@ -126,6 +126,12 @@ pub async fn run_until(
         Ok(false) => {}
         Err(e) => eprintln!("[engine] {}", e),
     }
+    let mail_merge = Arc::new(super::merge::MergeTable::new());
+    let mail_sockets = super::cc_listener::Sockets::new(db.clone(), mail_merge.clone());
+    let _mail_socket_cleanup = super::cc_listener::SocketCleanup(mail_sockets.clone());
+    if let Err(e) = mail_sockets.bind(&super::cc_inbox::default_socket_dir()) {
+        eprintln!("[engine] CC return socket unavailable: {}", e);
+    }
     let reconciled = ops::reconcile(&db, home)?;
     if !reconciled.is_empty() {
         eprintln!("[engine] Boot reconcile: {:?}", reconciled);
@@ -163,6 +169,7 @@ pub async fn run_until(
         .with_header_key(header_key.clone())
         .with_cost_cache(home.join("cost-cache.json"))
         .with_usage(crate::engine::views::usage::live_source());
+    ctx.merge = mail_merge;
     if config.detection {
         ctx = ctx.with_detection(detection.clone());
     }
@@ -179,8 +186,10 @@ pub async fn run_until(
             agent_bin,
         )
         .with_drain(drain_switch)
-        .with_header_key(header_key),
+        .with_header_key(header_key)
+        .with_mail_sockets(mail_sockets.clone()),
     );
+    mail_sockets.set_spawner(&spawner);
     let ctx = Arc::new(ctx.with_spawner(spawner.clone()));
     match spawner.resume_on_boot() {
         Ok(r) if r == Default::default() => {}
@@ -273,6 +282,7 @@ pub async fn run_until(
     // db as open. Connection tasks may still hold the `Db`; `close` shuts
     // its writer anyway.
     drop(socket);
+    mail_sockets.close();
     db.close();
     drop(lock);
     Ok(())

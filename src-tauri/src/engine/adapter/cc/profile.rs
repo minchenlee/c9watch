@@ -937,3 +937,17 @@ mod tests {
         assert!(deny_rules(&p).contains(&format!("Edit(/{}/**)", dir)));
     }
 }
+
+/// Peer permission label of the actual spawn profile (all free agents use auto).
+pub fn peer_mode() -> &'static str {
+    if CLAUDE.permission_flags.auto.iter().any(|flag| {
+        matches!(
+            *flag,
+            "bypassPermissions" | "--dangerously-skip-permissions"
+        )
+    }) {
+        "bypass"
+    } else {
+        "prompting"
+    }
+}
