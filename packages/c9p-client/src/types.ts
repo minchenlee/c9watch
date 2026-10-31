@@ -712,7 +712,10 @@ export interface C9pNotificationEvent {
   pendingTool: string | null;
   pid: number;
   provider: C9pSessionProvider;
-  /** `title` without conversation text. */
+  /**
+   * `title` without conversation text: the project folder name, else the
+   * provider's name (e.g. `Claude Code`). Never a session title or name.
+   */
   redactedTitle: string;
   sessionKey: string;
   /** `needs_attention` or `waiting_for_input`. */
