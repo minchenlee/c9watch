@@ -154,6 +154,35 @@ pub fn prune_with(conn: &Connection, cutoff_ts: i64, keep: i64) -> rusqlite::Res
     )
 }
 
+/// Delete the `session.view` events `seqs`: a newer view of the same
+/// session (or its `session.gone`) supersedes each. `session.view` is a
+/// latest-state topic: a subscriber reading on from any cursor still gets
+/// the newest view of every live session, but not every view between.
+/// The oldest stored event stays, so compaction never moves the
+/// `cursor_expired` line (only `prune` does). Returns how many went.
+pub fn compact_views(conn: &Connection, seqs: &[i64]) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare_cached(
+        "DELETE FROM events WHERE seq = ?1 AND topic = 'session.view' \
+         AND seq > (SELECT min(seq) FROM events)",
+    )?;
+    let mut n = 0;
+    for seq in seqs {
+        n += stmt.execute(params![seq])?;
+    }
+    Ok(n)
+}
+
+/// Delete every `session.view` event before `seq` but the oldest stored
+/// event: the views an earlier engine run wrote, superseded by the first
+/// tick of this one.
+pub fn compact_views_before(conn: &Connection, seq: i64) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM events WHERE topic = 'session.view' AND seq < ?1 \
+         AND seq > (SELECT min(seq) FROM events)",
+        params![seq],
+    )
+}
+
 /// Check that a client that has seen up to `after` can read on without a
 /// gap: `after` is not ahead of the log and nothing after it was pruned.
 fn check_after(conn: &Connection, after: i64) -> Result<(), ReadError> {

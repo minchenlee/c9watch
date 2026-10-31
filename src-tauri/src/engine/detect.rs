@@ -43,7 +43,7 @@
 //! against from the db. After `quick_check` starts a new epoch, the next
 //! tick rebuilds the observed rows from provider data (A:497).
 
-use super::db::outbox::NewEvent;
+use super::db::outbox::{self, NewEvent};
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
 use super::proto::{AgentRow, TickResult};
 use super::views::sessions::SessionViews;
@@ -382,8 +382,11 @@ impl Detector {
         let mut notifier = self.notifier.clone();
         let notes = notifier.step(&obs.sessions, &held, Instant::now());
         let seen: Vec<Observed> = obs.sessions.iter().map(Observed::from_session).collect();
-        let change = self.views.diff(&obs.sessions);
+        let mut change = self.views.diff(&obs.sessions);
         let view_events = change.events(&self.machine_id);
+        let n_views = change.changed.len();
+        let superseded = change.superseded.clone();
+        let first = change.first;
         let diag = obs
             .diagnostics
             .take()
@@ -395,14 +398,26 @@ impl Detector {
             data: serde_json::to_value(d).expect("DetectionDiagnostics serializes"),
         });
         let machine = self.machine_id.clone();
-        let (applied, _) = db.write_blocking(move |tx| {
+        let ((applied, view_seqs), _) = db.write_blocking(move |tx| {
             let mut applied = apply(tx, &machine, &seen, now_ms(), &held)?;
             applied.notified = emit_notifications(tx, &machine, &notes)?;
-            for e in view_events.iter().chain(&diag_event) {
-                tx.emit(e)?;
+            let mut view_seqs = Vec::with_capacity(n_views);
+            for (i, e) in view_events.iter().chain(&diag_event).enumerate() {
+                let seq = tx.emit(e)?;
+                if i < n_views {
+                    view_seqs.push(seq);
+                }
             }
-            Ok(applied)
+            // One stored view per live session: the newest supersedes the
+            // last (see `outbox::compact_views`).
+            if first {
+                let before = view_seqs.first().copied().unwrap_or(i64::MAX);
+                outbox::compact_views_before(tx, before)?;
+            }
+            outbox::compact_views(tx, &superseded)?;
+            Ok((applied, view_seqs))
         })?;
+        change.written(&view_seqs);
         if let Some(d) = diag {
             self.views.set_diagnostics(d);
         }
@@ -1428,6 +1443,90 @@ mod tests {
         assert!(data.get("firstPrompt").is_none());
     }
 
+    /// Volume (core-public M-a2): a session that changes on every tick
+    /// keeps one stored `session.view`, and a subscriber that reads on from
+    /// a cursor taken before all those ticks gets its newest view, with no
+    /// `cursor_expired`.
+    #[test]
+    fn the_log_keeps_one_view_per_live_session() {
+        let (_t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let script = Script::default();
+        let mut d = detector(&script);
+        script.set(vec![s("b", SessionStatus::WaitingForInput)]);
+        d.tick(&db).unwrap();
+        let start = outbox::head(&db.reader().unwrap()).unwrap();
+        const TICKS: u32 = 200;
+        for i in 0..TICKS {
+            let mut a = s("a", SessionStatus::Working);
+            a.message_count = i;
+            script.set(vec![a, s("b", SessionStatus::WaitingForInput)]);
+            d.tick(&db).unwrap();
+        }
+        let ev = session_events(&db);
+        let views_of = |key: &str| {
+            ev.iter()
+                .filter(|(t, v)| t == "session.view" && v["sessionKey"] == key)
+                .count()
+        };
+        // Without compaction this would be TICKS views of `a`.
+        assert_eq!(views_of("claudeCode:a"), 1);
+        assert_eq!(views_of("claudeCode:b"), 1);
+        let conn = db.reader().unwrap();
+        let read = outbox::read_after(&conn, start, 10_000).unwrap();
+        let views: Vec<&outbox::Event> =
+            read.iter().filter(|e| e.topic == "session.view").collect();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].data["messageCount"], TICKS - 1);
+        // From the very first cursor too.
+        assert!(outbox::read_after(&conn, 0, 10_000).is_ok());
+
+        // A new engine run on the same log: its first tick supersedes the
+        // views the earlier run stored.
+        let mut d = detector(&script);
+        let mut a = s("a", SessionStatus::Working);
+        a.message_count = 7;
+        script.set(vec![a]);
+        d.tick(&db).unwrap();
+        let ev = session_events(&db);
+        let views: Vec<_> = ev.iter().filter(|(t, _)| t == "session.view").collect();
+        assert_eq!(views.len(), 1, "{:?}", ev);
+        assert_eq!(views[0].1["messageCount"], 7);
+    }
+
+    /// `compact_views` keeps the oldest stored event, so it never makes an
+    /// old cursor expire; it deletes only `session.view` rows.
+    #[test]
+    fn compaction_never_moves_the_expiry_line() {
+        let (_t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let ev = |topic: &str| NewEvent {
+            topic: topic.into(),
+            subject: Some("m/x".into()),
+            origin: None,
+            data: serde_json::json!({}),
+        };
+        let (seqs, _) = db
+            .write_blocking(move |tx| {
+                let a = tx.emit(&ev("session.view"))?;
+                let b = tx.emit(&ev("agent.upsert"))?;
+                let c = tx.emit(&ev("session.view"))?;
+                Ok(vec![a, b, c])
+            })
+            .unwrap();
+        let (n, _) = db
+            .write_blocking(move |tx| Ok(outbox::compact_views(tx, &seqs)?))
+            .unwrap();
+        assert_eq!(n, 1);
+        let conn = db.reader().unwrap();
+        let left: Vec<String> = outbox::read_after(&conn, 0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.topic)
+            .collect();
+        assert_eq!(left, ["session.view", "agent.upsert"]);
+    }
+
     /// `(topic, data)` of every `session.*` event, in order.
     fn session_events(db: &Db) -> Vec<(String, serde_json::Value)> {
         db.reader()
@@ -1521,16 +1620,17 @@ mod tests {
         d.tick(&db).unwrap();
         assert_eq!(session_events(&db).len(), 2);
 
-        // `a` changes, `b` ends.
+        // `a` changes, `b` ends. The stored views of both go: the log keeps
+        // one view per live session.
         script.set(vec![s("a", SessionStatus::WaitingForInput)]);
         d.tick(&db).unwrap();
         let ev = session_events(&db);
-        assert_eq!(ev.len(), 4);
-        assert_eq!(ev[2].0, "session.view");
-        assert_eq!(ev[2].1["status"], "WaitingForInput");
-        assert_eq!(ev[3].0, "session.gone");
+        assert_eq!(ev.len(), 2, "{:?}", ev);
+        assert_eq!(ev[0].0, "session.view");
+        assert_eq!(ev[0].1["status"], "WaitingForInput");
+        assert_eq!(ev[1].0, "session.gone");
         assert_eq!(
-            ev[3].1,
+            ev[1].1,
             serde_json::json!({"sessionKey": "claudeCode:b", "id": "b"})
         );
         assert_eq!(d.views().current().unwrap().1.len(), 1);

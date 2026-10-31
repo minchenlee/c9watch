@@ -754,10 +754,11 @@ pub fn schema() -> serde_json::Value {
         let d = data
             .get(*name)
             .unwrap_or_else(|| panic!("topic {} has no data type", name));
-        topics.insert(
-            name.to_string(),
-            serde_json::json!({"data": d, "x-stability": stability}),
-        );
+        let mut t = serde_json::json!({"data": d, "x-stability": stability});
+        if let Some(text) = discovery::topic_description(name) {
+            t["description"] = text.into();
+        }
+        topics.insert(name.to_string(), t);
     }
     for (name, entry) in methods.as_object_mut().expect("methods is an object") {
         let stability = discovery::stability(name).expect("every method has a stability");

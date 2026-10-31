@@ -113,8 +113,8 @@ export function generate(schema) {
       .map(
         ([name, parts]) =>
           `  ${key(name)}: {\n${Object.entries(parts)
-            // `x-stability` and the other markers are not part of the type.
-            .filter(([part]) => !part.startsWith('x-'))
+            // `x-stability`, the other markers and notes are not part of the type.
+            .filter(([part]) => !part.startsWith('x-') && part !== 'description')
             .map(([part, s]) => `    ${part}: ${tsType(s, '    ')};\n`)
             .join('')}  };\n`
       )

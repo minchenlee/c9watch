@@ -3812,6 +3812,7 @@
       "data": {
         "$ref": "#/$defs/SessionView"
       },
+      "description": "Latest state: the log keeps only the newest view of each live session (and none of an ended one). A subscriber that reads on from an old cursor gets the newest view of every live session, not every view in between. Live subscribers still get each view as it is written.",
       "x-stability": "preview"
     }
   }

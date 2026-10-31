@@ -92,6 +92,19 @@ pub const TOPICS: &[(&str, &str)] = &[
     ("diag.detection", PREVIEW),
 ];
 
+/// What a subscriber must know about a topic beyond its data type.
+pub fn topic_description(topic: &str) -> Option<&'static str> {
+    match topic {
+        "session.view" => Some(
+            "Latest state: the log keeps only the newest view of each live \
+             session (and none of an ended one). A subscriber that reads on from \
+             an old cursor gets the newest view of every live session, not every \
+             view in between. Live subscribers still get each view as it is written.",
+        ),
+        _ => None,
+    }
+}
+
 pub fn stability(method: &str) -> Option<&'static str> {
     METHOD_INFO
         .iter()

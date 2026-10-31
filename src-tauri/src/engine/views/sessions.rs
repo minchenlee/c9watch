@@ -39,6 +39,9 @@ pub const STOP_SETTLE: Duration = Duration::from_millis(300);
 struct Seen {
     id: String,
     json: String,
+    /// The `seq` of the stored `session.view` event with this view, once
+    /// written. A newer view (or the session's end) deletes that event.
+    view_seq: Option<i64>,
 }
 
 struct Committed {
@@ -62,6 +65,12 @@ pub struct ViewChange {
     /// `(session key, view)` of new or changed sessions, in detection order.
     pub changed: Vec<(String, serde_json::Value)>,
     pub gone: Vec<SessionGoneEvent>,
+    /// The stored `session.view` events this change supersedes: the last
+    /// view of each changed or ended session.
+    pub superseded: Vec<i64>,
+    /// The first diff since the engine started: views stored by an earlier
+    /// run are superseded too (`outbox::compact_views_before`).
+    pub first: bool,
 }
 
 impl ViewChange {
@@ -81,6 +90,16 @@ impl ViewChange {
         });
         view.chain(gone).collect()
     }
+
+    /// Record the `seq` of each `session.view` event the tick wrote, in
+    /// `changed` order.
+    pub fn written(&mut self, seqs: &[i64]) {
+        for ((key, _), seq) in self.changed.iter().zip(seqs) {
+            if let Some(seen) = self.by_key.get_mut(key) {
+                seen.view_seq = Some(*seq);
+            }
+        }
+    }
 }
 
 impl SessionViews {
@@ -97,37 +116,51 @@ impl SessionViews {
         let before = state.as_ref().map_or(&empty, |c| &c.by_key);
         let mut by_key = HashMap::new();
         let mut changed = Vec::new();
+        let mut superseded = Vec::new();
         for s in sessions {
             if by_key.contains_key(&s.session_key) {
                 continue;
             }
             let value = serde_json::to_value(s).expect("Session serializes");
             let json = value.to_string();
-            if before.get(&s.session_key).is_none_or(|b| b.json != json) {
-                changed.push((s.session_key.clone(), value));
-            }
+            let prev = before.get(&s.session_key);
+            let view_seq = match prev {
+                Some(b) if b.json == json => b.view_seq,
+                _ => {
+                    changed.push((s.session_key.clone(), value));
+                    superseded.extend(prev.and_then(|b| b.view_seq));
+                    None
+                }
+            };
             by_key.insert(
                 s.session_key.clone(),
                 Seen {
                     id: s.id.clone(),
                     json,
+                    view_seq,
                 },
             );
         }
         let mut gone: Vec<SessionGoneEvent> = before
             .iter()
             .filter(|(k, _)| !by_key.contains_key(*k))
-            .map(|(k, b)| SessionGoneEvent {
-                session_key: k.clone(),
-                id: b.id.clone(),
+            .map(|(k, b)| {
+                superseded.extend(b.view_seq);
+                SessionGoneEvent {
+                    session_key: k.clone(),
+                    id: b.id.clone(),
+                }
             })
             .collect();
         gone.sort_by(|a, b| a.session_key.cmp(&b.session_key));
+        superseded.sort_unstable();
         ViewChange {
             sessions: sessions.to_vec(),
             by_key,
             changed,
             gone,
+            superseded,
+            first: state.is_none(),
         }
     }
 
