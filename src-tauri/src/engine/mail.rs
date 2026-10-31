@@ -1454,7 +1454,12 @@ pub fn summary(conn: &Connection, machine: &str, id: &str) -> rusqlite::Result<M
         Ok(MsgSummary { msg_id: r.get(0)?, from: MsgFrom { kind: match origin.as_str() { "agent" => "agent", "engine" => "engine", _ => "human" }.into(), addr: from.map(|f| format!("{}/{}", machine, f)), name: r.get(3)? }, to: MsgAddress { id: r.get(4)?, name: r.get(5)?, addr: r.get(6)? }, kind: r.get(7)?, state: r.get(8)?, state_at: r.get(9)?, detail: r.get(10)?, via: r.get(11)?, reply_to: r.get(12)?, thread_id: r.get(13)?, notice_id: r.get(14)?, hop: r.get(15)?, created_at: r.get(16)?, preview: r.get::<_, String>(17)?.chars().take(200).collect() })
     })
 }
-fn visible(conn: &Connection, principal: &Principal, id: &str) -> rusqlite::Result<bool> {
+/// LocalUnverified callers must first verify the complete peer ancestry.
+pub(super) fn visible(
+    conn: &Connection,
+    principal: &Principal,
+    id: &str,
+) -> rusqlite::Result<bool> {
     match principal {
         Principal::LocalUnverified => Ok(true),
         Principal::Agent { id: agent, .. } => conn.query_row("SELECT count(*) > 0 FROM messages WHERE id = ?1 AND (from_agent = ?2 OR to_agent = ?2)", params![id, agent], |r| r.get(0)),

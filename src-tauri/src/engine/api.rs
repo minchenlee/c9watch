@@ -940,10 +940,10 @@ async fn dispatch(
         "agent.list" => Ok(Served::result(agent_list(req, ctx).await?)),
         "msg.send" => msg_send(req, ctx, peer, principal).await,
         "msg.list" => Ok(Served::result(
-            mail_query("msg.list", req, ctx, principal).await?,
+            mail_query("msg.list", req, ctx, peer, principal).await?,
         )),
         "msg.read" => Ok(Served::result(
-            mail_query("msg.read", req, ctx, principal).await?,
+            mail_query("msg.read", req, ctx, peer, principal).await?,
         )),
         "msg.cancel" => Ok(Served::result(
             mail_control("msg.cancel", req, ctx, peer, principal).await?,
@@ -1034,7 +1034,7 @@ async fn dispatch(
                     ),
                 ));
             }
-            let (result, stream) = events_subscribe(req, ctx).await?;
+            let (result, stream) = events_subscribe(req, ctx, peer, principal).await?;
             Ok(Served {
                 result,
                 stream: Some(stream),
@@ -1678,6 +1678,8 @@ async fn agent_list(req: Request, ctx: &ServerCtx) -> Result<serde_json::Value, 
 async fn events_subscribe(
     req: Request,
     ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
 ) -> Result<(serde_json::Value, EventStream), ApiError> {
     let params: SubscribeParams = if req.params.is_null() {
         SubscribeParams::default()
@@ -1694,6 +1696,13 @@ async fn events_subscribe(
         Some(s) => Some(Cursor::parse(s).map_err(|e| ApiError::new(ErrorCode::BadRequest, e))?),
         None => None,
     };
+    // A shallow local stamp is not proof of unrestricted mailbox access.
+    // Failed verification drops mail events while preserving other topics.
+    let mail_principal = check_mail_peer(ctx, peer, principal)
+        .await
+        .ok()
+        .map(|_| principal.clone());
+    let mail_db = db.clone();
     let (start, sub) = blocking(move || {
         let after = match since {
             Some(c) => db.check_cursor(&c).map_err(read_error)?,
@@ -1713,6 +1722,8 @@ async fn events_subscribe(
         epoch: start.epoch,
         topics: params.topics,
         subjects: params.subjects,
+        mail_principal,
+        mail_db,
     };
     Ok((
         serde_json::to_value(result).expect("SubscribeResult serializes"),
@@ -1729,6 +1740,9 @@ struct EventStream {
     epoch: String,
     topics: Vec<String>,
     subjects: Vec<String>,
+    /// None means local ancestry verification failed: no mail may leave.
+    mail_principal: Option<Principal>,
+    mail_db: Arc<Db>,
 }
 
 impl EventStream {
@@ -1746,6 +1760,40 @@ impl EventStream {
                 .as_ref()
                 .is_some_and(|s| self.subjects.contains(s));
         topic_ok && subject_ok
+    }
+
+    /// Apply ownership to every batch, including replay and catch-up. Use
+    /// the stored message, not client filters or optional event metadata.
+    async fn filter_mail(&self, mut batch: Vec<Event>) -> Vec<Event> {
+        match &self.mail_principal {
+            Some(Principal::LocalUnverified) => batch,
+            None => {
+                batch.retain(|e| e.topic != mail::TOPIC);
+                batch
+            }
+            Some(who) => {
+                if !batch.iter().any(|e| e.topic == mail::TOPIC) {
+                    return batch;
+                }
+                let who = who.clone();
+                let db = self.mail_db.clone();
+                blocking(move || {
+                    let conn = db.reader().ok();
+                    batch.retain(|e| {
+                        if e.topic != mail::TOPIC {
+                            return true;
+                        }
+                        match (conn.as_ref(), e.data.get("msgId").and_then(|v| v.as_str())) {
+                            (Some(c), Some(id)) => mail::visible(c, &who, id).unwrap_or(false),
+                            _ => false,
+                        }
+                    });
+                    Ok(batch)
+                })
+                .await
+                .unwrap_or_default()
+            }
+        }
     }
 
     fn frame(&self, e: Event) -> EventFrame {
@@ -1776,7 +1824,7 @@ impl EventStream {
                     return;
                 }
             };
-            for e in batch {
+            for e in self.filter_mail(batch).await {
                 if !self.wants(&e) {
                     continue;
                 }
@@ -4246,6 +4294,214 @@ mod tests {
         assert_eq!(n, 3);
     }
     #[tokio::test]
+    async fn m2fix_unverified_queries_require_complete_peer_verification() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let sent = queue_mail(
+            &ctx,
+            &Principal::LocalUnverified,
+            MsgSendParams {
+                to: "bob".into(),
+                body: "private".into(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let pid = std::process::id() as libc::pid_t;
+        let start = peer::proc_info(pid).unwrap().start;
+        let cases = [
+            (ctx.clone(), pid, None),
+            (ctx.clone(), pid, Some(start + 1)),
+            (ctx.clone(), i32::MAX, Some(start)),
+            (
+                Arc::new(
+                    ServerCtx::new(MACHINE.into())
+                        .with_db(db.clone())
+                        .with_agents(as_agent("hidden")),
+                ),
+                pid,
+                Some(start),
+            ),
+        ];
+        for (ctx, pid, start) in cases {
+            for (method, params) in [
+                ("msg.list", json!({})),
+                ("msg.read", json!({"msgId":sent.msg_id})),
+            ] {
+                let req = Request {
+                    params,
+                    ..Default::default()
+                };
+                let result = dispatch(
+                    method,
+                    req,
+                    &ctx,
+                    Peer {
+                        cred: PeerCred {
+                            pid,
+                            uid: peer::engine_uid(),
+                        },
+                        start,
+                    },
+                    &Principal::LocalUnverified,
+                    &mut Streams::default(),
+                    None,
+                )
+                .await;
+                assert_eq!(
+                    result
+                        .err()
+                        .expect("unverified query must fail closed")
+                        .code,
+                    ErrorCode::NotAllowed
+                );
+            }
+        }
+        let (mut c, _) = Client::new(ctx).await;
+        assert_eq!(
+            c.call("l", "msg.list", json!({})).await["result"]["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            c.call("r", "msg.read", json!({"msgId":sent.msg_id})).await["result"]["body"],
+            "private"
+        );
+    }
+
+    #[tokio::test]
+    async fn m2fix_mail_events_enforce_ownership_for_live_and_replay() {
+        for replay in [false, true] {
+            for filtered in [false, true] {
+                for who in ["alice", "bob", "cat", "local"] {
+                    let agents = if who == "local" {
+                        Arc::new(NoLiveAgents) as Arc<dyn LiveAgents>
+                    } else {
+                        as_agent(who)
+                    };
+                    let (_t, ctx, db) = ctx_db(agents);
+                    for name in ["alice", "bob", "cat"] {
+                        mail_agent(&db, name, name, "pty").await;
+                    }
+                    let since = db.head_cursor().to_string();
+                    let (mut c, _) = Client::new(ctx.clone()).await;
+                    let mut params = json!({});
+                    if replay {
+                        params["since"] = json!(since);
+                    }
+                    if filtered {
+                        params["topics"] = json!(["msg.*", "agent.upsert"]);
+                        params["subjects"] = json!([format!("{}/bob", MACHINE)]);
+                    }
+                    if !replay {
+                        assert_eq!(
+                            c.call("s", "events.subscribe", params.clone()).await["ok"],
+                            true
+                        );
+                    }
+                    let sent = queue_mail(
+                        &ctx,
+                        &Principal::Agent {
+                            id: "alice".into(),
+                            gen: 1,
+                        },
+                        MsgSendParams {
+                            to: "bob".into(),
+                            body: "private preview".into(),
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    let id = sent.msg_id.clone();
+                    db.write(move |tx| mail::note(tx, MACHINE, &id, "private detail", now_ms()))
+                        .await
+                        .unwrap();
+                    let marker = event("agent.upsert", &format!("{}/bob", MACHINE), 99, 0);
+                    db.write(move |tx| tx.emit(&marker)).await.unwrap();
+                    if replay {
+                        assert_eq!(c.call("s", "events.subscribe", params).await["ok"], true);
+                    }
+                    let mut mail_events = Vec::new();
+                    loop {
+                        let frame = c.next().await;
+                        if frame["topic"] == "agent.upsert" {
+                            break;
+                        }
+                        mail_events.push(frame);
+                    }
+                    assert_eq!(
+                        mail_events.len(),
+                        if who == "cat" { 0 } else { 2 },
+                        "who={who} replay={replay} filtered={filtered}: {mail_events:?}"
+                    );
+                    if who != "cat" {
+                        assert_eq!(mail_events[0]["data"]["preview"], "private preview");
+                        assert_eq!(mail_events[1]["data"]["detail"], "private detail");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn m2fix_unverified_subscribers_drop_mail_but_keep_other_events() {
+        let (_t, ctx, db) = ctx_db(as_agent("hidden"));
+        mail_agent(&db, "bob", "bob", "pty").await;
+        queue_mail(
+            &ctx,
+            &Principal::LocalUnverified,
+            MsgSendParams {
+                to: "bob".into(),
+                body: "private".into(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let marker = event("agent.upsert", "bob", 99, 0);
+        db.write(move |tx| tx.emit(&marker)).await.unwrap();
+        let pid = std::process::id() as libc::pid_t;
+        // Exercise the same shallow LocalUnverified stamp a deep descendant
+        // gets, and an unreadable start token, through the subscribe path.
+        for start in [None, Some(peer::proc_info(pid).unwrap().start)] {
+            let (_, stream) = events_subscribe(
+                Request {
+                    id: Some("s".into()),
+                    params: json!({"since":format!("{}:{}:0", MACHINE, db.epoch())}),
+                    ..Default::default()
+                },
+                &ctx,
+                Peer {
+                    cred: PeerCred {
+                        pid,
+                        uid: peer::engine_uid(),
+                    },
+                    start,
+                },
+                &Principal::LocalUnverified,
+            )
+            .await
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(8);
+            let task = tokio::spawn(stream.run(tx));
+            let bytes = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let frame: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(frame["topic"], "agent.upsert", "{frame}");
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn m2_human_controls_audit_and_cancel_only_queued() {
         let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
         mail_agent(&db, "agt_b1", "bob", "pty").await;
@@ -4273,9 +4529,11 @@ async fn mail_query(
     method: &str,
     req: Request,
     ctx: &ServerCtx,
+    peer: Peer,
     who: &Principal,
 ) -> Result<serde_json::Value, ApiError> {
     use crate::engine_proto::wire::{MsgIdParams, MsgListParams};
+    check_mail_peer(ctx, peer, who).await?;
     let db = ctx.db()?.clone();
     let machine = ctx.machine_id.clone();
     let who = who.clone();
@@ -4300,6 +4558,25 @@ async fn mail_query(
     })
     .await
 }
+/// Unrestricted mail reads need the same complete peer verification as
+/// mailbox controls. Agent reads remain restricted by message ownership.
+async fn check_mail_peer(ctx: &ServerCtx, peer: Peer, who: &Principal) -> Result<(), ApiError> {
+    if !matches!(who, Principal::LocalUnverified) {
+        return Ok(());
+    }
+    let agents = ctx.agents.clone();
+    let who = who.clone();
+    blocking(move || {
+        Ok(mail::check_sender(
+            &who,
+            peer.cred.pid,
+            peer.start,
+            agents.as_ref(),
+        ))
+    })
+    .await?
+}
+
 async fn mail_control(
     method: &str,
     req: Request,
