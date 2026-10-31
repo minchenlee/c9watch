@@ -773,7 +773,7 @@ pub fn schema() -> serde_json::Value {
             }
         }
     }
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "c9p/1",
         "description": "The c9watch engine protocol: one JSON object per line over \
@@ -784,7 +784,9 @@ pub fn schema() -> serde_json::Value {
         "methods": methods,
         "topics": topics,
         "$defs": defs,
-    })
+    });
+    super::sensitivity::mark(&mut out);
+    out
 }
 
 /// What `dispatch` answers: the result, the event stream to start after

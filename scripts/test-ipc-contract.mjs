@@ -120,3 +120,36 @@ test('every c9p/1 $ref resolves', () => {
   for (const name of refs) assert.ok(name in c9pSchema.$defs, `dangling $ref ${name}`);
   for (const part of ['request', 'response', 'event']) assert.ok(c9pSchema.frames[part], part);
 });
+
+test('every c9p/1 result and event field has an x-sensitivity class', () => {
+  const roots = [];
+  for (const m of Object.values(c9pSchema.methods))
+    for (const [part, s] of Object.entries(m)) if (part !== 'params' && !part.startsWith('x-')) roots.push(s);
+  for (const t of Object.values(c9pSchema.topics ?? {})) roots.push(t.data);
+  for (const [k, s] of Object.entries(c9pSchema.frames)) if (k !== 'request') roots.push(s);
+  const written = new Set();
+  const walk = (n) => {
+    if (!n || typeof n !== 'object') return;
+    if (Array.isArray(n)) return n.forEach(walk);
+    const name = n.$ref?.replace('#/$defs/', '');
+    if (name && !written.has(name)) {
+      written.add(name);
+      walk(c9pSchema.$defs[name]);
+    }
+    Object.values(n).forEach(walk);
+  };
+  roots.forEach(walk);
+  assert.ok(written.has('SessionView'));
+  const classes = new Set(['public', 'metadata', 'conversation']);
+  const missing = [];
+  for (const name of written) {
+    const def = c9pSchema.$defs[name];
+    const maps = [def.properties, ...[...(def.oneOf ?? []), ...(def.anyOf ?? [])].map((v) => v.properties)];
+    for (const props of maps.filter(Boolean))
+      for (const [field, s] of Object.entries(props))
+        if (!classes.has(s?.['x-sensitivity'])) missing.push(`${name}.${field}`);
+  }
+  assert.deepEqual(missing, [], 'fields without x-sensitivity (class them in engine/sensitivity.rs)');
+  for (const [topic, t] of Object.entries(c9pSchema.topics ?? {}))
+    assert.ok(['preview', 'internal', 'deprecated'].includes(t['x-stability']), topic);
+});
