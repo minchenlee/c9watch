@@ -539,18 +539,19 @@ pub fn emit_notifications(
             topic: n.topic.into(),
             subject: Some(subject(machine, &id)),
             origin: None,
-            data: serde_json::json!({
-                "id": id,
-                "sessionKey": n.key,
-                "status": n.status,
-                "name": n.name,
-                "pendingTool": n.pending_tool,
-                "title": n.title,
-                "redactedTitle": n.redacted_title,
-                "body": n.body,
-                "pid": n.pid,
-                "provider": n.provider,
-            }),
+            data: serde_json::to_value(crate::engine::proto::NotificationEvent {
+                id: id.clone(),
+                session_key: n.key.clone(),
+                status: n.status.to_string(),
+                name: n.name.clone(),
+                pending_tool: n.pending_tool.clone(),
+                title: n.title.clone(),
+                redacted_title: n.redacted_title.clone(),
+                body: n.body.clone(),
+                pid: n.pid,
+                provider: n.provider,
+            })
+            .expect("NotificationEvent serializes"),
         })?;
         sent.push((n.topic.to_string(), id));
     }
@@ -679,7 +680,12 @@ fn mark_gone(
         topic: "agent.gone".into(),
         subject: Some(subject(machine, id)),
         origin: None,
-        data: serde_json::json!({ "id": id, "sessionKey": key, "goneAt": now }),
+        data: serde_json::to_value(crate::engine::proto::AgentGoneEvent {
+            id: id.to_string(),
+            session_key: key.to_string(),
+            gone_at: now,
+        })
+        .expect("AgentGoneEvent serializes"),
     })?;
     applied.gone.push(id.to_string());
     Ok(())

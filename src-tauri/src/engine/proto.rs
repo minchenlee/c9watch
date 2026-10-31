@@ -273,6 +273,7 @@ mod tests {
             principal: "local-unverified".into(),
             capabilities: vec![],
             cursor: None,
+            ..Default::default()
         };
         let v = serde_json::to_value(r).unwrap();
         for key in [

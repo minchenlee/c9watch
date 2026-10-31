@@ -14,7 +14,9 @@ use crate::engine::fsutil::ensure_private_dir;
 use crate::engine::home::{engine_home, lock_path, sock_path};
 use crate::engine::lock::{engine_lock_held, engine_pid};
 use crate::engine::peer::{self, PeerCred};
-use crate::engine::proto::{ClientInfo, HelloParams, HelloResult, Request, Response, API_MAJOR};
+use crate::engine::proto::{
+    ClientInfo, HelloParams, HelloResult, Request, Response, API_MAJOR, API_MINOR,
+};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -156,6 +158,7 @@ impl EngineConn {
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             }),
             want: Vec::new(),
+            api_minor: Some(API_MINOR),
         };
         let params = serde_json::to_value(params)
             .map_err(|e| ConnectError::Refused(format!("Failed to encode hello: {}", e)))?;
@@ -275,6 +278,7 @@ fn placeholder_hello() -> HelloResult {
         principal: String::new(),
         capabilities: Vec::new(),
         cursor: None,
+        ..Default::default()
     }
 }
 

@@ -4,6 +4,18 @@
 export const C9P_API_MAJOR = 1;
 export const C9P_API_MINOR = 6;
 
+/** `agent.attention` data: an agent needs the user. */
+export interface C9pAgentAttentionEvent {
+  generation: number;
+  id: string;
+  /** The message whose delivery is uncertain, for `mail_uncertain`. */
+  msgId?: string | null;
+  /** Why: a permission prompt, a notification, `mail_uncertain: <msg>`. */
+  reason: string;
+  /** The hook's `tool_use_id` (may be `null`), for a hook's attention. */
+  toolUseId?: unknown;
+}
+
 /**
  * `agent.create` params. C1a creates only free agents (A:794): no brief,
  * no worktree, the given cwd.
@@ -25,6 +37,21 @@ export interface C9pAgentCreateParams {
 /** `agent.create` result: the agent once it is `ready`. */
 export interface C9pAgentCreateResult {
   agent: C9pAgentRow;
+}
+
+/** `agent.failed` data: a managed agent could not be started or kept. */
+export interface C9pAgentFailedEvent {
+  detail: string;
+  id: string;
+  reason: string;
+}
+
+/** `agent.gone` data: the session behind an observed agent ended. */
+export interface C9pAgentGoneEvent {
+  /** Unix milliseconds. */
+  goneAt: number;
+  id: string;
+  sessionKey: string;
 }
 
 export type C9pAgentKind = 'root' | 'subagent' | 'internal';
@@ -124,6 +151,16 @@ export interface C9pAgentRow {
    * `waiting_for_input` or `connecting`.
    */
   status: string | null;
+}
+
+/** `agent.turn_end` data. */
+export interface C9pAgentTurnEndEvent {
+  /** Unix milliseconds. */
+  at: number;
+  /** What saw the turn end: `hook` or `screen`. */
+  by: string;
+  generation: number;
+  id: string;
 }
 
 /** Counts of what happened after `since_ms`. */
@@ -417,6 +454,12 @@ export interface C9pHandoffResult {
  */
 export interface C9pHelloParams {
   apiMajor?: number | null;
+  /**
+   * The minor the client was built against. `hello.result.breakingSince`
+   * lists the preview methods that changed shape after it. Without it,
+   * the engine assumes minor 0.
+   */
+  apiMinor?: number | null;
   client?: C9pClientInfo | null;
   want?: string[];
 }
@@ -425,13 +468,25 @@ export interface C9pHelloParams {
 export interface C9pHelloResult {
   apiMajor: number;
   apiMinor: number;
+  /**
+   * The preview methods whose shape changed after the client's
+   * `apiMinor`. A client refuses to call them; it does not guess.
+   */
+  breakingSince: string[];
   capabilities: string[];
   /** Cursor of the newest committed event. `null` only without a store. */
   cursor: string | null;
   engineVersion: string;
+  limits: C9pLimits;
   machineId: string;
+  /** Every method this engine serves (minor 6). */
+  methods: Record<string, C9pMethodInfo>;
   /** Stamped by the engine from connection facts. */
   principal: string;
+  /** `preview` until the protocol is declared stable. */
+  stability: string;
+  /** The event topics this connection can receive. */
+  topics: string[];
 }
 
 export interface C9pHiddenClaudeSession {
@@ -547,6 +602,29 @@ export interface C9pImageBlock {
   mediaType: string;
 }
 
+/** `legacy.inbox` data: one imported worker inbox line, as it was. */
+export interface C9pLegacyInboxEvent {
+  /** The original inbox line. */
+  event: unknown;
+  /** The worker's agent id, when the import found its row. */
+  id: string | null;
+  legacy: boolean;
+}
+
+/** The engine's limits, in `hello.result.limits`. */
+export interface C9pLimits {
+  /** Connections the socket serves at once. */
+  maxConnections: number;
+  /** Bytes in one frame, newline included. */
+  maxFrame: number;
+  /** Event streams on one connection. */
+  maxStreams: number;
+  /** Events the outbox keeps at most. */
+  retentionEvents: number;
+  /** Hours the outbox keeps an event. */
+  retentionHours: number;
+}
+
 /** A single memory file (e.g., MEMORY.md, profile.md) */
 export interface C9pMemoryFile {
   content: string;
@@ -566,6 +644,16 @@ export interface C9pMemoryListResult {
 
 /** Message type enumeration */
 export type C9pMessageType = 'User' | 'Assistant' | 'Thinking' | 'ToolUse' | 'ToolResult' | 'System';
+
+/** One method in `hello.result.methods`. */
+export interface C9pMethodInfo {
+  /** Goes up by one on each breaking change to the method's shape. */
+  rev: number;
+  /** The minor that added the method. */
+  since: number;
+  /** `preview`, `internal` or `deprecated`. */
+  stability: string;
+}
 
 export interface C9pModelCost {
   cost: number;
@@ -628,6 +716,50 @@ export interface C9pMsgSendResult {
   to: C9pMsgAddress;
 }
 
+/**
+ * `data` of a `msg.state` event: one per state change of a message. The
+ * event's subject is the target's `<machine>/<id>`.
+ */
+export interface C9pMsgStateEvent {
+  /** Unix ms. */
+  at: number;
+  /** Delivery attempts so far. */
+  attempts: number;
+  /**
+   * Why: for `delivered`, `prompt_hook` or `turn_open`; for `failed` and
+   * `uncertain`, what went wrong.
+   */
+  detail: string | null;
+  /** The sender's principal: `agent:<id>` or `local-unverified`. */
+  from: string;
+  msgId: string;
+  /** `queued`, `delivering`, `delivered`, `failed` or `uncertain`. */
+  state: string;
+  /** The target's agent id. */
+  to: string;
+}
+
+/**
+ * `notification.needs_attention` and `notification.waiting_for_input`
+ * data: what the GUI shows in its system notification.
+ */
+export interface C9pNotificationEvent {
+  body: string;
+  /** The agent id of the session. */
+  id: string;
+  name: string;
+  pendingTool: string | null;
+  pid: number;
+  provider: C9pSessionProvider;
+  /** `title` without conversation text. */
+  redactedTitle: string;
+  sessionKey: string;
+  /** `needs_attention` or `waiting_for_input`. */
+  status: string;
+  /** Can carry conversation text (the first prompt, a session title). */
+  title: string;
+}
+
 /** The strongest native target supported by the existing focus mechanism. */
 export type C9pOpenTarget = 'terminal' | 'project' | 'application';
 
@@ -657,6 +789,15 @@ export interface C9pPageParams {
   /** At most this many items; without it, all from `offset`. */
   limit?: number | null;
   offset?: number;
+}
+
+/** `ping` params. There are none. */
+export type C9pPingParams = Record<string, unknown>;
+
+/** `ping` result: the engine's clock. */
+export interface C9pPingResult {
+  /** Unix milliseconds. */
+  ts: number;
 }
 
 /**
@@ -754,6 +895,14 @@ export interface C9pSessionCostRecord {
   surface?: string | null;
   timestamp: string;
   totalTokens: number;
+}
+
+/** `session.gone` data. */
+export interface C9pSessionGoneEvent {
+  /** The provider session id. */
+  id: string;
+  /** `<provider>:<session id>`. */
+  sessionKey: string;
 }
 
 export type C9pSessionKind = 'interactive' | 'background' | 'unknown';
@@ -1069,6 +1218,17 @@ export interface C9pTickResult {
   cursor: string;
 }
 
+/** `events.unsubscribe` params: the `id` of the `events.subscribe` request. */
+export interface C9pUnsubscribeParams {
+  sub: string;
+}
+
+/** `events.unsubscribe` result. No event frame of the stream follows it. */
+export interface C9pUnsubscribeResult {
+  /** `false` when the connection held no stream with that `sub`. */
+  ended: boolean;
+}
+
 /** `usage.subscriptions` params. There are none yet. */
 export type C9pUsageSubscriptionsParams = Record<string, unknown>;
 
@@ -1151,6 +1311,10 @@ export interface C9pMethods {
     params: C9pSubscribeParams;
     result: C9pSubscribeResult;
   };
+  'events.unsubscribe': {
+    params: C9pUnsubscribeParams;
+    result: C9pUnsubscribeResult;
+  };
   hello: {
     params: C9pHelloParams;
     result: C9pHelloResult;
@@ -1198,6 +1362,10 @@ export interface C9pMethods {
   'msg.send': {
     params: C9pMsgSendParams;
     result: C9pMsgSendResult;
+  };
+  ping: {
+    params: C9pPingParams;
+    result: C9pPingResult;
   };
   'provider.opencode.connect': {
     params: C9pOpencodeConnectParams;
@@ -1254,3 +1422,45 @@ export interface C9pMethods {
 }
 
 export type C9pMethod = keyof C9pMethods;
+
+/** Each event topic's `data`. */
+export interface C9pTopics {
+  'agent.attention': {
+    data: C9pAgentAttentionEvent;
+  };
+  'agent.failed': {
+    data: C9pAgentFailedEvent;
+  };
+  'agent.gone': {
+    data: C9pAgentGoneEvent;
+  };
+  'agent.turn_end': {
+    data: C9pAgentTurnEndEvent;
+  };
+  'agent.upsert': {
+    data: C9pAgentRow;
+  };
+  'diag.detection': {
+    data: C9pDetectionDiagnostics;
+  };
+  'legacy.inbox': {
+    data: C9pLegacyInboxEvent;
+  };
+  'msg.state': {
+    data: C9pMsgStateEvent;
+  };
+  'notification.needs_attention': {
+    data: C9pNotificationEvent;
+  };
+  'notification.waiting_for_input': {
+    data: C9pNotificationEvent;
+  };
+  'session.gone': {
+    data: C9pSessionGoneEvent;
+  };
+  'session.view': {
+    data: C9pSessionView;
+  };
+}
+
+export type C9pTopic = keyof C9pTopics;

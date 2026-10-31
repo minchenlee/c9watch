@@ -9,7 +9,7 @@
 use super::peer::{check_peer_uid, engine_uid, peer_cred};
 use super::wire::{
     AgentRow, ClientInfo, HelloParams, HelloResult, Request, Response, SessionListResult,
-    API_MAJOR, MAX_FRAME,
+    API_MAJOR, API_MINOR, MAX_FRAME,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -68,6 +68,7 @@ impl Conn {
                 principal: String::new(),
                 capabilities: Vec::new(),
                 cursor: None,
+                ..Default::default()
             },
         };
         let params = HelloParams {
@@ -78,6 +79,7 @@ impl Conn {
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             }),
             want: Vec::new(),
+            api_minor: Some(API_MINOR),
         };
         let params = serde_json::to_value(params)
             .map_err(|e| ClientError::Failed(format!("Failed to encode hello: {}", e)))?;

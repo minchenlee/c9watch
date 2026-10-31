@@ -113,6 +113,8 @@ export function generate(schema) {
       .map(
         ([name, parts]) =>
           `  ${key(name)}: {\n${Object.entries(parts)
+            // `x-stability` and the other markers are not part of the type.
+            .filter(([part]) => !part.startsWith('x-'))
             .map(([part, s]) => `    ${part}: ${tsType(s, '    ')};\n`)
             .join('')}  };\n`
       )
@@ -127,6 +129,12 @@ export function generate(schema) {
     )}}\n`
   );
   out.push('export type C9pMethod = keyof C9pMethods;\n');
+  out.push(
+    `/** Each event topic's \`data\`. */\nexport interface C9pTopics {\n${table(
+      Object.entries(schema.topics ?? {})
+    )}}\n`
+  );
+  out.push('export type C9pTopic = keyof C9pTopics;\n');
   return out.join('\n');
 }
 

@@ -1145,9 +1145,14 @@ impl Spawner {
                     topic: "agent.attention".into(),
                     subject: Some(format!("{}/{}", machine, agent)),
                     origin: None,
-                    data: serde_json::json!({
-                        "id": agent, "generation": gen, "reason": reason, "msgId": id,
-                    }),
+                    data: serde_json::to_value(crate::engine::proto::AgentAttentionEvent {
+                        id: agent.to_string(),
+                        generation: gen,
+                        reason: reason.to_string(),
+                        msg_id: Some(id.to_string()),
+                        tool_use_id: None,
+                    })
+                    .expect("AgentAttentionEvent serializes"),
                 })?;
             }
             Ok(())

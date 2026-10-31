@@ -1,5 +1,37 @@
 {
   "$defs": {
+    "AgentAttentionEvent": {
+      "description": "`agent.attention` data: an agent needs the user.",
+      "properties": {
+        "generation": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "msgId": {
+          "description": "The message whose delivery is uncertain, for `mail_uncertain`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "Why: a permission prompt, a notification, `mail_uncertain: <msg>`.",
+          "type": "string"
+        },
+        "toolUseId": {
+          "description": "The hook's `tool_use_id` (may be `null`), for a hook's attention."
+        }
+      },
+      "required": [
+        "id",
+        "generation",
+        "reason"
+      ],
+      "type": "object"
+    },
     "AgentCreateParams": {
       "description": "`agent.create` params. C1a creates only free agents (A:794): no brief,\nno worktree, the given cwd.",
       "properties": {
@@ -39,6 +71,48 @@
       },
       "required": [
         "agent"
+      ],
+      "type": "object"
+    },
+    "AgentFailedEvent": {
+      "description": "`agent.failed` data: a managed agent could not be started or kept.",
+      "properties": {
+        "detail": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "reason",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "AgentGoneEvent": {
+      "description": "`agent.gone` data: the session behind an observed agent ended.",
+      "properties": {
+        "goneAt": {
+          "description": "Unix milliseconds.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "sessionKey",
+        "goneAt"
       ],
       "type": "object"
     },
@@ -277,6 +351,34 @@
         "lastSeen",
         "parentId",
         "stateReason"
+      ],
+      "type": "object"
+    },
+    "AgentTurnEndEvent": {
+      "description": "`agent.turn_end` data.",
+      "properties": {
+        "at": {
+          "description": "Unix milliseconds.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "by": {
+          "description": "What saw the turn end: `hook` or `screen`.",
+          "type": "string"
+        },
+        "generation": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "generation",
+        "by",
+        "at"
       ],
       "type": "object"
     },
@@ -899,6 +1001,15 @@
             "null"
           ]
         },
+        "apiMinor": {
+          "description": "The minor the client was built against. `hello.result.breakingSince`\nlists the preview methods that changed shape after it. Without it,\nthe engine assumes minor 0.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "client": {
           "anyOf": [
             {
@@ -931,6 +1042,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "breakingSince": {
+          "default": [],
+          "description": "The preview methods whose shape changed after the client's\n`apiMinor`. A client refuses to call them; it does not guess.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "capabilities": {
           "items": {
             "type": "string"
@@ -947,12 +1066,43 @@
         "engineVersion": {
           "type": "string"
         },
+        "limits": {
+          "$ref": "#/$defs/Limits",
+          "default": {
+            "maxConnections": 0,
+            "maxFrame": 0,
+            "maxStreams": 0,
+            "retentionEvents": 0,
+            "retentionHours": 0
+          }
+        },
         "machineId": {
           "type": "string"
+        },
+        "methods": {
+          "additionalProperties": {
+            "$ref": "#/$defs/MethodInfo"
+          },
+          "default": {},
+          "description": "Every method this engine serves (minor 6).",
+          "type": "object"
         },
         "principal": {
           "description": "Stamped by the engine from connection facts.",
           "type": "string"
+        },
+        "stability": {
+          "default": "",
+          "description": "`preview` until the protocol is declared stable.",
+          "type": "string"
+        },
+        "topics": {
+          "default": [],
+          "description": "The event topics this connection can receive.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -962,7 +1112,12 @@
         "machineId",
         "principal",
         "capabilities",
-        "cursor"
+        "cursor",
+        "methods",
+        "breakingSince",
+        "stability",
+        "topics",
+        "limits"
       ],
       "type": "object"
     },
@@ -1205,6 +1360,73 @@
       ],
       "type": "object"
     },
+    "LegacyInboxEvent": {
+      "description": "`legacy.inbox` data: one imported worker inbox line, as it was.",
+      "properties": {
+        "event": {
+          "description": "The original inbox line."
+        },
+        "id": {
+          "description": "The worker's agent id, when the import found its row.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "legacy": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "legacy",
+        "id",
+        "event"
+      ],
+      "type": "object"
+    },
+    "Limits": {
+      "description": "The engine's limits, in `hello.result.limits`.",
+      "properties": {
+        "maxConnections": {
+          "description": "Connections the socket serves at once.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maxFrame": {
+          "description": "Bytes in one frame, newline included.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maxStreams": {
+          "description": "Event streams on one connection.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retentionEvents": {
+          "description": "Events the outbox keeps at most.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retentionHours": {
+          "description": "Hours the outbox keeps an event.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "maxFrame",
+        "maxStreams",
+        "maxConnections",
+        "retentionHours",
+        "retentionEvents"
+      ],
+      "type": "object"
+    },
     "MemoryFile": {
       "description": "A single memory file (e.g., MEMORY.md, profile.md)",
       "properties": {
@@ -1251,6 +1473,33 @@
         "System"
       ],
       "type": "string"
+    },
+    "MethodInfo": {
+      "description": "One method in `hello.result.methods`.",
+      "properties": {
+        "rev": {
+          "description": "Goes up by one on each breaking change to the method's shape.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "since": {
+          "description": "The minor that added the method.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stability": {
+          "description": "`preview`, `internal` or `deprecated`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "since",
+        "rev",
+        "stability"
+      ],
+      "type": "object"
     },
     "ModelCost": {
       "properties": {
@@ -1388,6 +1637,110 @@
       ],
       "type": "object"
     },
+    "MsgStateEvent": {
+      "description": "`data` of a `msg.state` event: one per state change of a message. The\nevent's subject is the target's `<machine>/<id>`.",
+      "properties": {
+        "at": {
+          "description": "Unix ms.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "attempts": {
+          "description": "Delivery attempts so far.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "detail": {
+          "description": "Why: for `delivered`, `prompt_hook` or `turn_open`; for `failed` and\n`uncertain`, what went wrong.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "from": {
+          "description": "The sender's principal: `agent:<id>` or `local-unverified`.",
+          "type": "string"
+        },
+        "msgId": {
+          "type": "string"
+        },
+        "state": {
+          "description": "`queued`, `delivering`, `delivered`, `failed` or `uncertain`.",
+          "type": "string"
+        },
+        "to": {
+          "description": "The target's agent id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "msgId",
+        "from",
+        "to",
+        "state",
+        "at",
+        "attempts",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "NotificationEvent": {
+      "description": "`notification.needs_attention` and `notification.waiting_for_input`\ndata: what the GUI shows in its system notification.",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "id": {
+          "description": "The agent id of the session.",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "pendingTool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pid": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provider": {
+          "$ref": "#/$defs/SessionProvider"
+        },
+        "redactedTitle": {
+          "description": "`title` without conversation text.",
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        },
+        "status": {
+          "description": "`needs_attention` or `waiting_for_input`.",
+          "type": "string"
+        },
+        "title": {
+          "description": "Can carry conversation text (the first prompt, a session title).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "sessionKey",
+        "status",
+        "name",
+        "pendingTool",
+        "title",
+        "redactedTitle",
+        "body",
+        "pid",
+        "provider"
+      ],
+      "type": "object"
+    },
     "OpenTarget": {
       "description": "The strongest native target supported by the existing focus mechanism.",
       "enum": [
@@ -1470,6 +1823,24 @@
           "type": "integer"
         }
       },
+      "type": "object"
+    },
+    "PingParams": {
+      "description": "`ping` params. There are none.",
+      "type": "object"
+    },
+    "PingResult": {
+      "description": "`ping` result: the engine's clock.",
+      "properties": {
+        "ts": {
+          "description": "Unix milliseconds.",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ts"
+      ],
       "type": "object"
     },
     "ProgressFrame": {
@@ -1780,6 +2151,24 @@
         "timestamp",
         "date",
         "sessionName"
+      ],
+      "type": "object"
+    },
+    "SessionGoneEvent": {
+      "description": "`session.gone` data.",
+      "properties": {
+        "id": {
+          "description": "The provider session id.",
+          "type": "string"
+        },
+        "sessionKey": {
+          "description": "`<provider>:<session id>`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionKey",
+        "id"
       ],
       "type": "object"
     },
@@ -2557,6 +2946,31 @@
       ],
       "type": "object"
     },
+    "UnsubscribeParams": {
+      "description": "`events.unsubscribe` params: the `id` of the `events.subscribe` request.",
+      "properties": {
+        "sub": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sub"
+      ],
+      "type": "object"
+    },
+    "UnsubscribeResult": {
+      "description": "`events.unsubscribe` result. No event frame of the stream follows it.",
+      "properties": {
+        "ended": {
+          "description": "`false` when the connection held no stream with that `sub`.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ended"
+      ],
+      "type": "object"
+    },
     "UsageSubscriptionsParams": {
       "description": "`usage.subscriptions` params. There are none yet.",
       "type": "object"
@@ -2692,7 +3106,8 @@
       },
       "result": {
         "$ref": "#/$defs/AgentCreateResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "agent.handoff": {
       "params": {
@@ -2700,7 +3115,8 @@
       },
       "result": {
         "$ref": "#/$defs/HandoffResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "agent.list": {
       "params": {
@@ -2708,7 +3124,8 @@
       },
       "result": {
         "$ref": "#/$defs/AgentListResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "agent.retire": {
       "params": {
@@ -2716,7 +3133,8 @@
       },
       "result": {
         "$ref": "#/$defs/AgentRetireResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "conversation.get": {
       "params": {
@@ -2727,7 +3145,8 @@
       },
       "result": {
         "$ref": "#/$defs/ConversationGetResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "cost.get": {
       "params": {
@@ -2735,7 +3154,8 @@
       },
       "result": {
         "$ref": "#/$defs/CostData"
-      }
+      },
+      "x-stability": "preview"
     },
     "detect.recheck": {
       "params": {
@@ -2743,7 +3163,8 @@
       },
       "result": {
         "$ref": "#/$defs/TickResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "diag.detection": {
       "params": {
@@ -2751,7 +3172,8 @@
       },
       "result": {
         "$ref": "#/$defs/DetectionDiagnostics"
-      }
+      },
+      "x-stability": "preview"
     },
     "events.subscribe": {
       "events": {
@@ -2762,7 +3184,17 @@
       },
       "result": {
         "$ref": "#/$defs/SubscribeResult"
-      }
+      },
+      "x-stability": "preview"
+    },
+    "events.unsubscribe": {
+      "params": {
+        "$ref": "#/$defs/UnsubscribeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/UnsubscribeResult"
+      },
+      "x-stability": "preview"
     },
     "hello": {
       "params": {
@@ -2770,7 +3202,8 @@
       },
       "result": {
         "$ref": "#/$defs/HelloResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "history.list": {
       "params": {
@@ -2778,7 +3211,8 @@
       },
       "result": {
         "$ref": "#/$defs/HistoryListResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "history.search": {
       "params": {
@@ -2786,7 +3220,8 @@
       },
       "result": {
         "$ref": "#/$defs/HistorySearchResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "hook.notification": {
       "params": {
@@ -2794,7 +3229,8 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "hook.permission_denied": {
       "params": {
@@ -2802,7 +3238,8 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "hook.permission_request": {
       "params": {
@@ -2810,7 +3247,8 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "hook.post_tool_use": {
       "params": {
@@ -2818,7 +3256,8 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "hook.session_start": {
       "params": {
@@ -2826,7 +3265,8 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "hook.stop": {
       "params": {
@@ -2834,7 +3274,8 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "hook.user_prompt_submit": {
       "params": {
@@ -2842,7 +3283,8 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "memory.list": {
       "params": {
@@ -2850,7 +3292,8 @@
       },
       "result": {
         "$ref": "#/$defs/MemoryListResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "msg.send": {
       "params": {
@@ -2858,7 +3301,17 @@
       },
       "result": {
         "$ref": "#/$defs/MsgSendResult"
-      }
+      },
+      "x-stability": "preview"
+    },
+    "ping": {
+      "params": {
+        "$ref": "#/$defs/PingParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PingResult"
+      },
+      "x-stability": "preview"
     },
     "provider.opencode.connect": {
       "params": {
@@ -2866,7 +3319,8 @@
       },
       "result": {
         "$ref": "#/$defs/OpencodeStatus"
-      }
+      },
+      "x-stability": "preview"
     },
     "provider.opencode.status": {
       "params": {
@@ -2874,7 +3328,8 @@
       },
       "result": {
         "$ref": "#/$defs/OpencodeStatus"
-      }
+      },
+      "x-stability": "preview"
     },
     "session.away": {
       "params": {
@@ -2882,7 +3337,8 @@
       },
       "result": {
         "$ref": "#/$defs/SessionAwayResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "session.list": {
       "params": {
@@ -2890,7 +3346,8 @@
       },
       "result": {
         "$ref": "#/$defs/SessionListResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "session.rename": {
       "params": {
@@ -2898,7 +3355,8 @@
       },
       "result": {
         "$ref": "#/$defs/TickResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "session.stop": {
       "params": {
@@ -2906,7 +3364,8 @@
       },
       "result": {
         "$ref": "#/$defs/TickResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "session.tasks": {
       "params": {
@@ -2914,7 +3373,8 @@
       },
       "result": {
         "$ref": "#/$defs/SessionTasksResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "session.views": {
       "params": {
@@ -2922,7 +3382,8 @@
       },
       "result": {
         "$ref": "#/$defs/SessionViewsResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "snapshot.get": {
       "params": {
@@ -2930,7 +3391,8 @@
       },
       "result": {
         "$ref": "#/$defs/SnapshotResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "subagent.list": {
       "params": {
@@ -2938,7 +3400,8 @@
       },
       "result": {
         "$ref": "#/$defs/SubagentListResult"
-      }
+      },
+      "x-stability": "preview"
     },
     "subagent.transcript": {
       "params": {
@@ -2946,7 +3409,8 @@
       },
       "result": {
         "$ref": "#/$defs/SubagentTranscript"
-      }
+      },
+      "x-stability": "preview"
     },
     "task.done": {
       "params": {
@@ -2954,7 +3418,8 @@
       },
       "result": {
         "$ref": "#/$defs/TaskDoneResult"
-      }
+      },
+      "x-stability": "internal"
     },
     "usage.subscriptions": {
       "params": {
@@ -2962,8 +3427,83 @@
       },
       "result": {
         "$ref": "#/$defs/UsageSubscriptionsResult"
-      }
+      },
+      "x-stability": "preview"
     }
   },
-  "title": "c9p/1"
+  "title": "c9p/1",
+  "topics": {
+    "agent.attention": {
+      "data": {
+        "$ref": "#/$defs/AgentAttentionEvent"
+      },
+      "x-stability": "preview"
+    },
+    "agent.failed": {
+      "data": {
+        "$ref": "#/$defs/AgentFailedEvent"
+      },
+      "x-stability": "preview"
+    },
+    "agent.gone": {
+      "data": {
+        "$ref": "#/$defs/AgentGoneEvent"
+      },
+      "x-stability": "preview"
+    },
+    "agent.turn_end": {
+      "data": {
+        "$ref": "#/$defs/AgentTurnEndEvent"
+      },
+      "x-stability": "preview"
+    },
+    "agent.upsert": {
+      "data": {
+        "$ref": "#/$defs/AgentRow"
+      },
+      "x-stability": "preview"
+    },
+    "diag.detection": {
+      "data": {
+        "$ref": "#/$defs/DetectionDiagnostics"
+      },
+      "x-stability": "preview"
+    },
+    "legacy.inbox": {
+      "data": {
+        "$ref": "#/$defs/LegacyInboxEvent"
+      },
+      "x-stability": "internal"
+    },
+    "msg.state": {
+      "data": {
+        "$ref": "#/$defs/MsgStateEvent"
+      },
+      "x-stability": "preview"
+    },
+    "notification.needs_attention": {
+      "data": {
+        "$ref": "#/$defs/NotificationEvent"
+      },
+      "x-stability": "preview"
+    },
+    "notification.waiting_for_input": {
+      "data": {
+        "$ref": "#/$defs/NotificationEvent"
+      },
+      "x-stability": "preview"
+    },
+    "session.gone": {
+      "data": {
+        "$ref": "#/$defs/SessionGoneEvent"
+      },
+      "x-stability": "preview"
+    },
+    "session.view": {
+      "data": {
+        "$ref": "#/$defs/SessionView"
+      },
+      "x-stability": "preview"
+    }
+  }
 }

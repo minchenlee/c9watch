@@ -337,6 +337,11 @@ pub struct HelloParams {
     pub client: Option<ClientInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub want: Vec<String>,
+    /// The minor the client was built against. `hello.result.breakingSince`
+    /// lists the preview methods that changed shape after it. Without it,
+    /// the engine assumes minor 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_minor: Option<u32>,
 }
 
 /// What a client says about itself in `hello`. Unverified.
@@ -352,7 +357,7 @@ pub struct ClientInfo {
 }
 
 /// `hello` result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct HelloResult {
@@ -365,6 +370,78 @@ pub struct HelloResult {
     pub capabilities: Vec<String>,
     /// Cursor of the newest committed event. `null` only without a store.
     pub cursor: Option<String>,
+    /// Every method this engine serves (minor 6).
+    #[serde(default)]
+    pub methods: std::collections::BTreeMap<String, MethodInfo>,
+    /// The preview methods whose shape changed after the client's
+    /// `apiMinor`. A client refuses to call them; it does not guess.
+    #[serde(default)]
+    pub breaking_since: Vec<String>,
+    /// `preview` until the protocol is declared stable.
+    #[serde(default)]
+    pub stability: String,
+    /// The event topics this connection can receive.
+    #[serde(default)]
+    pub topics: Vec<String>,
+    #[serde(default)]
+    pub limits: Limits,
+}
+
+/// One method in `hello.result.methods`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct MethodInfo {
+    /// The minor that added the method.
+    pub since: u32,
+    /// Goes up by one on each breaking change to the method's shape.
+    pub rev: u32,
+    /// `preview`, `internal` or `deprecated`.
+    pub stability: String,
+}
+
+/// The engine's limits, in `hello.result.limits`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct Limits {
+    /// Bytes in one frame, newline included.
+    pub max_frame: u64,
+    /// Event streams on one connection.
+    pub max_streams: u64,
+    /// Connections the socket serves at once.
+    pub max_connections: u64,
+    /// Hours the outbox keeps an event.
+    pub retention_hours: u64,
+    /// Events the outbox keeps at most.
+    pub retention_events: u64,
+}
+
+/// `events.unsubscribe` params: the `id` of the `events.subscribe` request.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct UnsubscribeParams {
+    pub sub: String,
+}
+
+/// `events.unsubscribe` result. No event frame of the stream follows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct UnsubscribeResult {
+    /// `false` when the connection held no stream with that `sub`.
+    pub ended: bool,
+}
+
+/// `ping` params. There are none.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct PingParams {}
+
+/// `ping` result: the engine's clock.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct PingResult {
+    /// Unix milliseconds.
+    pub ts: i64,
 }
 
 /// `snapshot.get` params. There are none yet; the engine ignores any it
@@ -486,6 +563,88 @@ pub struct SessionGoneEvent {
     pub session_key: String,
     /// The provider session id.
     pub id: String,
+}
+
+/// `agent.attention` data: an agent needs the user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAttentionEvent {
+    pub id: String,
+    pub generation: i64,
+    /// Why: a permission prompt, a notification, `mail_uncertain: <msg>`.
+    pub reason: String,
+    /// The message whose delivery is uncertain, for `mail_uncertain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_id: Option<String>,
+    /// The hook's `tool_use_id` (may be `null`), for a hook's attention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<serde_json::Value>,
+}
+
+/// `agent.turn_end` data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct AgentTurnEndEvent {
+    pub id: String,
+    pub generation: i64,
+    /// What saw the turn end: `hook` or `screen`.
+    pub by: String,
+    /// Unix milliseconds.
+    pub at: i64,
+}
+
+/// `agent.gone` data: the session behind an observed agent ended.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AgentGoneEvent {
+    pub id: String,
+    pub session_key: String,
+    /// Unix milliseconds.
+    pub gone_at: i64,
+}
+
+/// `agent.failed` data: a managed agent could not be started or kept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct AgentFailedEvent {
+    pub id: String,
+    pub reason: String,
+    pub detail: String,
+}
+
+/// `notification.needs_attention` and `notification.waiting_for_input`
+/// data: what the GUI shows in its system notification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationEvent {
+    /// The agent id of the session.
+    pub id: String,
+    pub session_key: String,
+    /// `needs_attention` or `waiting_for_input`.
+    pub status: String,
+    pub name: String,
+    pub pending_tool: Option<String>,
+    /// Can carry conversation text (the first prompt, a session title).
+    pub title: String,
+    /// `title` without conversation text.
+    pub redacted_title: String,
+    pub body: String,
+    pub pid: u32,
+    pub provider: crate::session::SessionProvider,
+}
+
+/// `legacy.inbox` data: one imported worker inbox line, as it was.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct LegacyInboxEvent {
+    pub legacy: bool,
+    /// The worker's agent id, when the import found its row.
+    pub id: Option<String>,
+    /// The original inbox line.
+    pub event: serde_json::Value,
 }
 
 /// `session.away` params: one request per session.

@@ -47,6 +47,7 @@ use super::db::audit::{self, AuditEntry};
 use super::db::outbox::{Cursor, Event, ReadError, Subscription, READ_BATCH};
 use super::db::{now_ms, AgentFilter, Db};
 use super::detect::{Detection, FirstTick, FIRST_TICK_WAIT};
+use super::discovery;
 use super::drain::DrainSwitch;
 use super::hooks::{self, HookEvent, Outcome};
 use super::machine::HeaderKey;
@@ -73,6 +74,7 @@ use super::proto::{
     DetectRecheckParams, SessionAwayParams, SessionAwayResult, SessionRenameParams,
     SessionStopParams, SessionViewsParams, SessionViewsResult, TickResult,
 };
+use super::proto::{PingParams, PingResult, UnsubscribeParams, UnsubscribeResult};
 use super::standing;
 use super::views;
 use super::views::conversation::{Progress, PROGRESS_CAPABILITY};
@@ -360,7 +362,7 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
 
     let mut reader = BufReader::new(read);
     let mut conn: Option<Conn> = None;
-    let mut streams: Vec<JoinHandle<()>> = Vec::new();
+    let mut streams = Streams::default();
     loop {
         let frame = if conn.is_none() {
             match tokio::time::timeout_at(hello_deadline, read_frame(&mut reader, MAX_FRAME)).await
@@ -400,32 +402,22 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
             continue;
         }
         // A stream that ended (expired, or the store closed) frees its slot.
-        streams.retain(|h| !h.is_finished());
-        let (resp, next, stream) = handle_frame(
-            &frame,
-            &ctx,
-            peer,
-            &principal,
-            &mut conn,
-            streams.len(),
-            &tx,
-        )
-        .await;
+        streams.reap();
+        let (resp, next, stream) =
+            handle_frame(&frame, &ctx, peer, &principal, &mut conn, &mut streams, &tx).await;
         if tx.send(encode(&resp)).await.is_err() {
             break;
         }
         // Start the stream only after its subscribe response is queued, so
         // that response comes first.
         if let Some(s) = stream {
-            streams.push(tokio::spawn(s.run(tx.clone())));
+            streams.start(s, tx.clone());
         }
         if let Next::Close = next {
             break;
         }
     }
-    for s in &streams {
-        s.abort();
-    }
+    streams.abort_all();
     drop(tx);
     let _ = writer.await;
 }
@@ -438,7 +430,7 @@ async fn handle_frame(
     peer: Peer,
     principal: &Principal,
     conn: &mut Option<Conn>,
-    streams: usize,
+    streams: &mut Streams,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> (Response, Next, Option<EventStream>) {
     match check_frame(frame, ctx, peer.cred, principal, conn) {
@@ -586,6 +578,8 @@ pub const METHODS: &[&str] = &[
     "usage.subscriptions",
     "provider.opencode.status",
     "provider.opencode.connect",
+    "events.unsubscribe",
+    "ping",
 ];
 
 /// The c9p/1 JSON Schema (A:245): the frame types, a `methods` table with
@@ -721,6 +715,14 @@ pub fn schema() -> serde_json::Value {
             "params": de.subschema_for::<OpencodeConnectParams>(),
             "result": ser.subschema_for::<crate::session::opencode::ConnectionStatus>(),
         },
+        "events.unsubscribe": {
+            "params": de.subschema_for::<UnsubscribeParams>(),
+            "result": ser.subschema_for::<UnsubscribeResult>(),
+        },
+        "ping": {
+            "params": de.subschema_for::<PingParams>(),
+            "result": ser.subschema_for::<PingResult>(),
+        },
     });
     let mut methods = methods;
     for m in HOOK_METHODS {
@@ -728,6 +730,38 @@ pub fn schema() -> serde_json::Value {
             "params": de.subschema_for::<HookParams>(),
             "result": ser.subschema_for::<HookResult>(),
         });
+    }
+    use super::proto::{
+        AgentAttentionEvent, AgentFailedEvent, AgentGoneEvent, AgentRow, AgentTurnEndEvent,
+        LegacyInboxEvent, MsgStateEvent, NotificationEvent, SessionGoneEvent,
+    };
+    let data = serde_json::json!({
+        "agent.upsert": ser.subschema_for::<AgentRow>(),
+        "agent.attention": ser.subschema_for::<AgentAttentionEvent>(),
+        "agent.turn_end": ser.subschema_for::<AgentTurnEndEvent>(),
+        "agent.gone": ser.subschema_for::<AgentGoneEvent>(),
+        "agent.failed": ser.subschema_for::<AgentFailedEvent>(),
+        "msg.state": ser.subschema_for::<MsgStateEvent>(),
+        "legacy.inbox": ser.subschema_for::<LegacyInboxEvent>(),
+        "session.view": ser.subschema_for::<crate::session::Session>(),
+        "session.gone": ser.subschema_for::<SessionGoneEvent>(),
+        "notification.needs_attention": ser.subschema_for::<NotificationEvent>(),
+        "notification.waiting_for_input": ser.subschema_for::<NotificationEvent>(),
+        "diag.detection": ser.subschema_for::<crate::session::DetectionDiagnostics>(),
+    });
+    let mut topics = serde_json::Map::new();
+    for (name, stability) in discovery::TOPICS {
+        let d = data
+            .get(*name)
+            .unwrap_or_else(|| panic!("topic {} has no data type", name));
+        topics.insert(
+            name.to_string(),
+            serde_json::json!({"data": d, "x-stability": stability}),
+        );
+    }
+    for (name, entry) in methods.as_object_mut().expect("methods is an object") {
+        let stability = discovery::stability(name).expect("every method has a stability");
+        entry["x-stability"] = stability.into();
     }
     let mut defs = de.take_definitions(true);
     for (name, def) in ser.take_definitions(true) {
@@ -748,6 +782,7 @@ pub fn schema() -> serde_json::Value {
         "apiMinor": API_MINOR,
         "frames": frames,
         "methods": methods,
+        "topics": topics,
         "$defs": defs,
     })
 }
@@ -781,7 +816,7 @@ async fn dispatch(
     ctx: &ServerCtx,
     peer: Peer,
     principal: &Principal,
-    streams: usize,
+    streams: &mut Streams,
     progress: Option<Progress>,
 ) -> Result<Served, ApiError> {
     match method {
@@ -868,10 +903,13 @@ async fn dispatch(
             ))
         }
         "events.subscribe" => {
-            if streams >= MAX_STREAMS {
+            if streams.len() >= MAX_STREAMS {
                 return Err(ApiError::new(
                     ErrorCode::RateLimited,
-                    format!("this connection already holds {} event streams", streams),
+                    format!(
+                        "this connection already holds {} event streams",
+                        streams.len()
+                    ),
                 ));
             }
             let (result, stream) = events_subscribe(req, ctx).await?;
@@ -881,11 +919,66 @@ async fn dispatch(
                 seq: None,
             })
         }
+        "events.unsubscribe" => {
+            let p: UnsubscribeParams = views::params(method, req)?;
+            let ended = streams.end(&p.sub).await;
+            Ok(Served::result(to_json(&UnsubscribeResult { ended })))
+        }
+        "ping" => {
+            let _: PingParams = views::params(method, req)?;
+            Ok(Served::result(to_json(&PingResult { ts: now_ms() })))
+        }
         _ => Err(ApiError::new(
             ErrorCode::UnknownMethod,
             format!("unknown method {:?}", method),
         )),
     }
+}
+
+/// The event streams of one connection, with the `id` of the subscribe
+/// request that started each.
+#[derive(Default)]
+struct Streams(Vec<(Option<String>, JoinHandle<()>)>);
+
+impl Streams {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Forget the streams that ended (expired, or the store closed).
+    fn reap(&mut self) {
+        self.0.retain(|(_, h)| !h.is_finished());
+    }
+
+    fn start(&mut self, s: EventStream, tx: mpsc::Sender<Vec<u8>>) {
+        let id = s.id.clone();
+        self.0.push((id, tokio::spawn(s.run(tx))));
+    }
+
+    /// End every stream started by subscribe request `sub`, and wait until
+    /// each has stopped, so no frame of it follows the caller's response.
+    async fn end(&mut self, sub: &str) -> bool {
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.0)
+            .into_iter()
+            .partition(|(id, _)| id.as_deref() == Some(sub));
+        self.0 = kept;
+        let ended = !gone.is_empty();
+        for (_, h) in gone {
+            h.abort();
+            let _ = h.await;
+        }
+        ended
+    }
+
+    fn abort_all(&self) {
+        for (_, h) in &self.0 {
+            h.abort();
+        }
+    }
+}
+
+fn to_json<T: serde::Serialize>(v: &T) -> serde_json::Value {
+    serde_json::to_value(v).expect("a wire type serializes")
 }
 
 /// `agent.create` and `agent.retire` (C1a-26, `engine::create`). An agent
@@ -1631,6 +1724,14 @@ fn hello(
         principal: principal.to_string(),
         capabilities,
         cursor: ctx.db.as_ref().map(|db| db.head_cursor().to_string()),
+        methods: discovery::methods(),
+        breaking_since: discovery::breaking_since(
+            discovery::METHOD_INFO,
+            params.api_minor.unwrap_or(0),
+        ),
+        stability: discovery::PREVIEW.into(),
+        topics: discovery::topics(),
+        limits: discovery::limits(),
     };
     let result = serde_json::to_value(result).expect("HelloResult serializes");
     (Response::ok(id, result), Next::Continue)
@@ -1974,7 +2075,7 @@ mod tests {
         let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
         let (mut c, _) = Client::new(ctx).await;
         for (i, m) in METHODS.iter().enumerate() {
-            let r = c.call(&i.to_string(), m, json!({})).await;
+            let r = c.call_past_busy(&i.to_string(), m, json!({})).await;
             if is_hook_class(m) {
                 // Served, but only to an agent (C1a-21).
                 assert_eq!(r["error"]["code"], "peer_not_authorized", "{}: {}", m, r);
@@ -1990,6 +2091,7 @@ mod tests {
                 "subagent.transcript",
                 "session.tasks",
                 "provider.opencode.connect",
+                "events.unsubscribe",
             ]
             .contains(m)
             {
@@ -2342,6 +2444,19 @@ mod tests {
         async fn call(&mut self, id: &str, method: &str, params: Value) -> Value {
             self.send(id, method, params).await;
             self.next().await
+        }
+
+        /// `call`, again while it answers `busy`: the subagent reads share
+        /// one process-wide scan gate with the tests running beside this one.
+        async fn call_past_busy(&mut self, id: &str, method: &str, params: Value) -> Value {
+            for _ in 0..100 {
+                let r = self.call(id, method, params.clone()).await;
+                if r["error"]["code"] != "busy" {
+                    return r;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("{} stayed busy", method)
         }
     }
 
@@ -3449,11 +3564,11 @@ mod tests {
         assert_eq!(r["error"]["code"], "unknown_session", "{}", r);
 
         let r = c
-            .call("9", "subagent.list", json!({"sessionIds": ["sess-1"]}))
+            .call_past_busy("9", "subagent.list", json!({"sessionIds": ["sess-1"]}))
             .await;
         assert_eq!(r["ok"], true, "{}", r);
         let r = c
-            .call(
+            .call_past_busy(
                 "10",
                 "subagent.transcript",
                 json!({"parentSessionId": "sess-1", "subagentId": "nope"}),
@@ -3609,5 +3724,126 @@ mod tests {
         let r = c.call("1", "usage.subscriptions", json!({})).await;
         assert_eq!(r["result"]["usage"][0]["provider"], "claude", "{}", r);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // ── Discovery, unsubscribe, ping, connection cap (core-public M-a2) ─
+
+    #[tokio::test]
+    async fn hello_lists_methods_topics_and_limits() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let (_c, hello) = Client::hello(ctx, json!({"apiMinor": API_MINOR})).await;
+        let methods = hello["methods"].as_object().unwrap();
+        assert_eq!(methods.len(), METHODS.len());
+        assert_eq!(
+            hello["methods"]["conversation.get"],
+            json!({"since": 6, "rev": 1, "stability": "preview"})
+        );
+        assert_eq!(hello["methods"]["hook.stop"]["stability"], "internal");
+        assert_eq!(hello["methods"]["hello"]["since"], 0);
+        assert_eq!(hello["breakingSince"], json!([]));
+        assert_eq!(hello["stability"], "preview");
+        assert!(hello["topics"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("session.view")));
+        assert_eq!(hello["limits"]["maxFrame"], MAX_FRAME as u64);
+        assert_eq!(hello["limits"]["maxStreams"], MAX_STREAMS as u64);
+        assert_eq!(hello["limits"]["maxConnections"], MAX_CONNECTIONS as u64);
+        assert_eq!(hello["limits"]["retentionHours"], 24);
+        assert_eq!(hello["limits"]["retentionEvents"], 50_000);
+        // A client without `apiMinor` (minor 5 and older) still says hello.
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let (_c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["breakingSince"], json!([]));
+    }
+
+    /// The schema marks every method and topic with its stability, and
+    /// gives every topic a data type.
+    #[test]
+    fn schema_marks_stability_and_types_every_topic() {
+        let s = schema();
+        for (name, m) in s["methods"].as_object().unwrap() {
+            let want = discovery::stability(name).unwrap();
+            assert_eq!(m["x-stability"], want, "{}", name);
+        }
+        let topics = s["topics"].as_object().unwrap();
+        assert_eq!(topics.len(), discovery::TOPICS.len());
+        for (name, t) in topics {
+            assert!(t["data"].is_object(), "{}", name);
+            assert!(t["x-stability"].is_string(), "{}", name);
+        }
+        assert_eq!(
+            s["topics"]["msg.state"]["data"]["$ref"],
+            "#/$defs/MsgStateEvent"
+        );
+    }
+
+    /// After `events.unsubscribe` answers, no frame of that stream comes;
+    /// the other stream goes on.
+    #[tokio::test]
+    async fn unsubscribe_ends_one_stream() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        assert_eq!(c.call("a", "events.subscribe", json!({})).await["ok"], true);
+        assert_eq!(c.call("b", "events.subscribe", json!({})).await["ok"], true);
+        let r = c.call("u", "events.unsubscribe", json!({"sub": "a"})).await;
+        assert_eq!(r["result"], json!({"ended": true}), "{}", r);
+        let r = c
+            .call("u2", "events.unsubscribe", json!({"sub": "a"}))
+            .await;
+        assert_eq!(r["result"], json!({"ended": false}), "{}", r);
+        emit(&db, 2, 0).await;
+        for _ in 0..2 {
+            let f = c.next().await;
+            assert_eq!(f["type"], "event", "{}", f);
+            assert_eq!(f["sub"], "b", "{}", f);
+        }
+        // The freed slot takes a new stream.
+        assert_eq!(c.call("c", "events.subscribe", json!({})).await["ok"], true);
+        let r = c.call("p", "ping", json!({})).await;
+        assert_eq!(r["id"], "p", "{}", r);
+        assert!(
+            r["result"]["ts"].as_i64().unwrap() > 1_700_000_000_000,
+            "{}",
+            r
+        );
+    }
+
+    /// Past the cap, a connection is answered `busy` and closed; once one
+    /// closes, the next is served.
+    #[tokio::test]
+    async fn connections_past_the_cap_are_busy() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("e.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(serve_with_cap(listener, ctx(HELLO_TIMEOUT), 2));
+        let mut held = Vec::new();
+        for i in 0..2 {
+            let mut c = UnixStream::connect(&path).await.unwrap();
+            send(&mut c, hello_req(&i.to_string(), json!({}))).await;
+            assert_eq!(read_one(&mut c).await["ok"], true);
+            held.push(c);
+        }
+        let over = UnixStream::connect(&path).await.unwrap();
+        let got = read_all(over).await;
+        assert_eq!(got.len(), 1, "{:?}", got);
+        assert_eq!(got[0]["error"]["code"], "busy", "{:?}", got);
+        assert_eq!(got[0]["error"]["retryable"], true, "{:?}", got);
+        drop(held.pop());
+        // The slot frees when its task ends; retry for a moment.
+        let mut served = false;
+        for _ in 0..50 {
+            let mut c = UnixStream::connect(&path).await.unwrap();
+            // A served connection waits for hello; a refused one gets `busy`.
+            let early = tokio::time::timeout(Duration::from_millis(100), read_one(&mut c)).await;
+            if early.is_err() {
+                send(&mut c, hello_req("n", json!({}))).await;
+                assert_eq!(read_one(&mut c).await["ok"], true);
+                served = true;
+                break;
+            }
+        }
+        assert!(served);
+        server.abort();
     }
 }

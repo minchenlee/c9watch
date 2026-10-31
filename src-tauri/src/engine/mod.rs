@@ -43,6 +43,9 @@ pub mod detect;
 pub mod views;
 
 #[cfg(unix)]
+pub mod discovery;
+
+#[cfg(unix)]
 pub mod import;
 
 #[cfg(unix)]
