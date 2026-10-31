@@ -397,12 +397,72 @@ pub struct HelloResult {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct MethodInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs: Option<AuthNeeds>,
     /// The minor that added the method.
     pub since: u32,
     /// Goes up by one on each breaking change to the method's shape.
     pub rev: u32,
     /// `preview`, `internal` or `deprecated`.
     pub stability: String,
+}
+
+/// A sensitivity ceiling. Ordering is also the egress ordering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum Ceiling {
+    Public,
+    #[default]
+    Metadata,
+    Conversation,
+}
+
+/// Additional authority a caller would need.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AuthNeeds {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<Ceiling>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<bool>,
+}
+
+/// Ask about the caller's own authority. Params are inspected, never executed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct AuthCanParams {
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct AuthCanResult {
+    pub allowed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs: Option<AuthNeeds>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AuthRulesResult {
+    pub principal: String,
+    pub scopes: Vec<String>,
+    pub ceiling: Ceiling,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_expires_at: Option<i64>,
+    pub methods: std::collections::BTreeMap<String, MethodInfo>,
+    pub topics: Vec<String>,
 }
 
 /// The engine's limits, in `hello.result.limits`.

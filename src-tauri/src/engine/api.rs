@@ -42,6 +42,7 @@
 //! `queued` event in `seq`. Every send and every refusal is audited.
 
 use super::agent_bin::AgentBin;
+use super::authz;
 use super::create::Spawner;
 use super::db::audit::{self, AuditEntry};
 use super::db::outbox::{Cursor, Event, ReadError, Subscription, READ_BATCH};
@@ -63,6 +64,7 @@ use super::proto::{
     SessionListResult, SnapshotParams, SnapshotResult, SubscribeParams, SubscribeResult,
     TaskDoneParams, TaskDoneResult, API_MAJOR, API_MINOR, HOOK_METHODS, MAX_FRAME,
 };
+use super::proto::{AuthCanParams, AuthCanResult, AuthRulesResult, Ceiling};
 use super::proto::{
     ConversationGetParams, ConversationGetResult, CostGetParams, DiagDetectionParams,
     HistoryListParams, HistoryListResult, HistorySearchParams, HistorySearchResult,
@@ -435,13 +437,6 @@ async fn handle_frame(
 ) -> (Response, Next, Option<EventStream>) {
     match check_frame(frame, ctx, peer.cred, principal, conn) {
         Checked::Done(resp, next) => (resp, next, None),
-        Checked::Call(req, method) if is_hook_class(&method) => {
-            let id = req.id.clone();
-            match hook_class(&method, req, ctx, peer, principal).await {
-                Ok(result) => (Response::ok(id, result), Next::Continue, None),
-                Err(e) => (Response::err(id, e), Next::Continue, None),
-            }
-        }
         Checked::Call(req, method) => {
             let id = req.id.clone();
             let progress = conn
@@ -585,6 +580,8 @@ pub const METHODS: &[&str] = &[
     "provider.opencode.connect",
     "events.unsubscribe",
     "ping",
+    "auth.can",
+    "auth.rules",
 ];
 
 /// The c9p/1 JSON Schema (A:245): the frame types, a `methods` table with
@@ -610,6 +607,14 @@ pub fn schema() -> serde_json::Value {
         "progress": ser.subschema_for::<ProgressFrame>(),
     });
     let methods = serde_json::json!({
+        "auth.can": {
+            "params": de.subschema_for::<AuthCanParams>(),
+            "result": ser.subschema_for::<AuthCanResult>(),
+        },
+        "auth.rules": {
+            "params": de.subschema_for::<PingParams>(),
+            "result": ser.subschema_for::<AuthRulesResult>(),
+        },
         "hello": {
             "params": de.subschema_for::<HelloParams>(),
             "result": ser.subschema_for::<HelloResult>(),
@@ -768,6 +773,7 @@ pub fn schema() -> serde_json::Value {
         if let Some(text) = discovery::topic_description(name) {
             t["description"] = text.into();
         }
+        t["x-authz"] = to_json(&authz::topic(name).expect("every topic has authority"));
         topics.insert(name.to_string(), t);
     }
     for (name, entry) in methods.as_object_mut().expect("methods is an object") {
@@ -776,6 +782,7 @@ pub fn schema() -> serde_json::Value {
         if stability == "internal" {
             entry["x-visibility"] = "internal".into();
         }
+        entry["x-authz"] = to_json(&authz::method(name).expect("every method has authority"));
     }
     let mut defs = de.take_definitions(true);
     for (name, def) in ser.take_definitions(true) {
@@ -926,14 +933,78 @@ async fn dispatch(
     streams: &mut Streams,
     progress: Option<Progress>,
 ) -> Result<Served, ApiError> {
+    if !METHODS.contains(&method) {
+        return Err(ApiError::new(ErrorCode::UnknownMethod, "unknown method"));
+    }
+    let target = ["sessionKey", "sessionId", "agentId"]
+        .iter()
+        .find_map(|k| req.params.get(*k).and_then(|v| v.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    let payload_hash =
+        mail::sha256_hex(&serde_json::to_vec(&req.params).expect("params serialize"));
+    let admission = async {
+        let rule = authz::authorize(method, principal, None)?;
+        if rule.admission.contains(&"mutating_peer") {
+            check_local_peer(method, ctx, peer, principal).await?;
+        }
+        Ok::<(), ApiError>(())
+    }
+    .await;
+    if let Err(e) = admission {
+        audit_refusal(ctx, principal, method, &target, &e).await;
+        return Err(e);
+    }
+    let result = execute(method, req, ctx, peer, principal, streams, progress).await;
+    // Atomic mutation handlers already write exactly one audit row.
+    let owned_audit =
+        matches!(method, "agent.create" | "agent.retire" | "msg.send" | "msg.cancel" | "mail.pause" | "mail.resume") || is_hook_class(method);
+    if !owned_audit {
+        match authz::audit_level(method, principal, result.is_ok(), Ceiling::Conversation) {
+            authz::AuditLevel::None => {}
+            _ if result.is_err() => {
+                audit_refusal(
+                    ctx,
+                    principal,
+                    method,
+                    &target,
+                    result.as_ref().err().unwrap(),
+                )
+                .await
+            }
+            authz::AuditLevel::Hash => {
+                audit_success(ctx, principal, method, &target, Some(&payload_hash)).await
+            }
+            authz::AuditLevel::Metadata => {
+                audit_success(ctx, principal, method, &target, None).await
+            }
+        }
+    }
+    result
+}
+
+async fn execute(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+    streams: &mut Streams,
+    progress: Option<Progress>,
+) -> Result<Served, ApiError> {
+    if is_hook_class(method) {
+        return hook_class(method, req, ctx, peer, principal)
+            .await
+            .map(Served::result);
+    }
     match method {
         // One arm per method: scripts/test-ipc-contract.mjs reads the
         // served methods off these arms.
         "agent.create" => Ok(Served::result(
-            agent_lifecycle(method, req, ctx, peer, principal).await?,
+            spawn_or_retire(method, req, ctx, principal).await?,
         )),
         "agent.retire" => Ok(Served::result(
-            agent_lifecycle(method, req, ctx, peer, principal).await?,
+            spawn_or_retire(method, req, ctx, principal).await?,
         )),
         "snapshot.get" => Ok(Served::result(snapshot_get(ctx).await?)),
         "session.list" => Ok(Served::result(session_list(ctx).await?)),
@@ -956,74 +1027,39 @@ async fn dispatch(
         )),
         "session.views" => Ok(Served::result(session_views::session_views(ctx).await?)),
         "session.away" => Ok(Served::result(session_views::session_away(req, ctx).await?)),
-        "detect.recheck" => Ok(Served::result(
-            local_mutation(method, req, ctx, peer, principal).await?,
-        )),
-        "session.stop" => Ok(Served::result(
-            local_mutation(method, req, ctx, peer, principal).await?,
-        )),
-        "session.rename" => Ok(Served::result(
-            local_mutation(method, req, ctx, peer, principal).await?,
-        )),
-        "provider.opencode.connect" => Ok(Served::result(
-            local_mutation(method, req, ctx, peer, principal).await?,
-        )),
+        "detect.recheck" => Ok(Served::result(local_mutation(method, req, ctx).await?)),
+        "session.stop" => Ok(Served::result(local_mutation(method, req, ctx).await?)),
+        "session.rename" => Ok(Served::result(local_mutation(method, req, ctx).await?)),
+        "provider.opencode.connect" => Ok(Served::result(local_mutation(method, req, ctx).await?)),
         "diag.detection" => Ok(Served::result(
             session_views::diag_detection(req, ctx).await?,
         )),
         "provider.opencode.status" => Ok(Served::result(
             views::opencode::opencode_status(req, ctx).await?,
         )),
-        "conversation.get" => {
-            local_read(method, ctx, principal).await?;
-            Ok(Served::result(
-                views::conversation::conversation_get(req, ctx, progress).await?,
-            ))
-        }
-        "history.list" => {
-            local_read(method, ctx, principal).await?;
-            Ok(Served::result(
-                views::history::history_list(req, ctx).await?,
-            ))
-        }
-        "history.search" => {
-            local_read(method, ctx, principal).await?;
-            Ok(Served::result(
-                views::history::history_search(req, ctx).await?,
-            ))
-        }
-        "cost.get" => {
-            local_read(method, ctx, principal).await?;
-            Ok(Served::result(views::cost::cost_get(req, ctx).await?))
-        }
-        "memory.list" => {
-            local_read(method, ctx, principal).await?;
-            Ok(Served::result(views::memory::memory_list(req, ctx).await?))
-        }
-        "subagent.list" => {
-            local_read(method, ctx, principal).await?;
-            Ok(Served::result(
-                views::subagents::subagent_list(req, ctx).await?,
-            ))
-        }
-        "subagent.transcript" => {
-            local_read(method, ctx, principal).await?;
-            Ok(Served::result(
-                views::subagents::subagent_transcript(req, ctx).await?,
-            ))
-        }
-        "session.tasks" => {
-            local_read(method, ctx, principal).await?;
-            Ok(Served::result(
-                views::subagents::session_tasks(req, ctx).await?,
-            ))
-        }
-        "usage.subscriptions" => {
-            local_read(method, ctx, principal).await?;
-            Ok(Served::result(
-                views::usage::usage_subscriptions(req, ctx).await?,
-            ))
-        }
+        "conversation.get" => Ok(Served::result(
+            views::conversation::conversation_get(req, ctx, progress).await?,
+        )),
+        "history.list" => Ok(Served::result(
+            views::history::history_list(req, ctx).await?,
+        )),
+        "history.search" => Ok(Served::result(
+            views::history::history_search(req, ctx).await?,
+        )),
+        "cost.get" => Ok(Served::result(views::cost::cost_get(req, ctx).await?)),
+        "memory.list" => Ok(Served::result(views::memory::memory_list(req, ctx).await?)),
+        "subagent.list" => Ok(Served::result(
+            views::subagents::subagent_list(req, ctx).await?,
+        )),
+        "subagent.transcript" => Ok(Served::result(
+            views::subagents::subagent_transcript(req, ctx).await?,
+        )),
+        "session.tasks" => Ok(Served::result(
+            views::subagents::session_tasks(req, ctx).await?,
+        )),
+        "usage.subscriptions" => Ok(Served::result(
+            views::usage::usage_subscriptions(req, ctx).await?,
+        )),
         "events.subscribe" => {
             if streams.len() >= MAX_STREAMS {
                 return Err(ApiError::new(
@@ -1034,7 +1070,8 @@ async fn dispatch(
                     ),
                 ));
             }
-            let (result, stream) = events_subscribe(req, ctx, peer, principal).await?;
+            let (result, mut stream) = events_subscribe(req, ctx, peer, principal).await?;
+            stream.allowed_topics = authz::topics(principal, None);
             Ok(Served {
                 result,
                 stream: Some(stream),
@@ -1045,6 +1082,16 @@ async fn dispatch(
             let p: UnsubscribeParams = views::params(method, req)?;
             let ended = streams.end(&p.sub).await;
             Ok(Served::result(to_json(&UnsubscribeResult { ended })))
+        }
+        "auth.can" => {
+            let p: AuthCanParams = views::params(method, req)?;
+            Ok(Served::result(to_json(&authz::can(
+                &p.method, principal, None,
+            ))))
+        }
+        "auth.rules" => {
+            let _: PingParams = views::params(method, req)?;
+            Ok(Served::result(to_json(&authz::rules(principal, None))))
         }
         "ping" => {
             let _: PingParams = views::params(method, req)?;
@@ -1103,71 +1150,17 @@ fn to_json<T: serde::Serialize>(v: &T) -> serde_json::Value {
     serde_json::to_value(v).expect("a wire type serializes")
 }
 
-/// `agent.create` and `agent.retire` (C1a-26, `engine::create`). An agent
-/// principal's call is refused and audited. So is a `local-unverified`
-/// peer that fails `principal::check_mutating_peer`: an ancestry that does
-/// not reach init, a live agent's PTY child at any depth, or a sandbox.
-async fn agent_lifecycle(
-    method: &str,
-    req: Request,
-    ctx: &ServerCtx,
-    peer: Peer,
-    principal: &Principal,
-) -> Result<serde_json::Value, ApiError> {
-    let r = match check_local_peer(method, ctx, peer, principal).await {
-        Ok(()) => spawn_or_retire(method, req, ctx, principal).await,
-        Err(e) => Err(e),
-    };
-    if let Err(e) = &r {
-        if e.code == ErrorCode::NotAllowed {
-            audit_refusal(ctx, principal, method, "", e).await;
-        }
-    }
-    r
-}
-
-/// `detect.recheck`, `session.stop` and `session.rename`: the principal
-/// rule of `agent.create` (a local client that passes the mutation check;
-/// a refusal is audited), then the work in `views::sessions`.
 async fn local_mutation(
     method: &str,
     req: Request,
     ctx: &ServerCtx,
-    peer: Peer,
-    principal: &Principal,
 ) -> Result<serde_json::Value, ApiError> {
-    let claimed = ["sessionKey", "sessionId"]
-        .iter()
-        .find_map(|k| req.params.get(*k).and_then(|v| v.as_str()))
-        .unwrap_or_default()
-        .to_string();
-    if let Err(e) = check_local_peer(method, ctx, peer, principal).await {
-        if e.code == ErrorCode::NotAllowed {
-            audit_refusal(ctx, principal, method, &claimed, &e).await;
-        }
-        return Err(e);
-    }
     match method {
         "detect.recheck" => session_views::detect_recheck(ctx).await,
         "session.stop" => session_views::session_stop(req, ctx).await,
         "provider.opencode.connect" => views::opencode::opencode_connect(req, ctx).await,
         _ => session_views::session_rename(req, ctx).await,
     }
-}
-
-/// The reads an agent may not make (owner decision Q5=A): conversations,
-/// history, memory, cost, subagents, tasks and subscription usage. A
-/// refusal is audited, as an agent's refused mutation is.
-async fn local_read(method: &str, ctx: &ServerCtx, principal: &Principal) -> Result<(), ApiError> {
-    if matches!(principal, Principal::LocalUnverified) {
-        return Ok(());
-    }
-    let e = ApiError::new(
-        ErrorCode::NotAllowed,
-        format!("{} may not call {}", principal, method),
-    );
-    audit_refusal(ctx, principal, method, "", &e).await;
-    Err(e)
 }
 
 /// Who may call `agent.create` or `agent.retire`: never an agent, so its
@@ -1389,7 +1382,7 @@ async fn hook_class(
         let bin = ctx.agent_bin.clone();
         let principal = principal.clone();
         let claimed = claimed.clone();
-        blocking(move || Ok(authorize(bin.as_deref(), peer, &principal, &claimed))).await?
+        blocking(move || Ok(authorize_hook(bin.as_deref(), peer, &principal, &claimed))).await?
     };
     if let Err(e) = checked {
         audit_refusal(ctx, principal, method, &claimed, &e).await;
@@ -1544,7 +1537,7 @@ async fn hook_intake(
 /// params name, and the peer runs the engine's `c9watch-agent` copy. The
 /// exe check reads the peer pid again, so it must still be the process that
 /// was stamped at accept. Blocking.
-fn authorize(
+fn authorize_hook(
     bin: Option<&AgentBin>,
     peer: Peer,
     principal: &Principal,
@@ -1591,7 +1584,7 @@ async fn audit_refusal(
         method.to_string(),
         claimed.to_string(),
     );
-    let reason = format!("{}: {}", e.code, e.msg);
+    let reason = e.code.to_string();
     let wrote = db
         .write(move |tx| {
             audit::append(
@@ -1611,6 +1604,38 @@ async fn audit_refusal(
     if let Err(e) = wrote {
         eprintln!("[engine] Failed to audit a refused hook-class call: {}", e);
     }
+}
+
+async fn audit_success(
+    ctx: &ServerCtx,
+    principal: &Principal,
+    method: &str,
+    target: &str,
+    hash: Option<&str>,
+) {
+    let Some(db) = ctx.db.clone() else { return };
+    let payload_hash = hash.map(str::to_string);
+    let (principal, method, target) = (
+        principal.to_string(),
+        method.to_string(),
+        target.to_string(),
+    );
+    let _ = db
+        .write(move |tx| {
+            audit::append(
+                tx,
+                now_ms(),
+                &AuditEntry {
+                    principal: &principal,
+                    method: &method,
+                    target: (!target.is_empty()).then_some(target.as_str()),
+                    decision: "allow",
+                    payload_hash: payload_hash.as_deref(),
+                    ..Default::default()
+                },
+            )
+        })
+        .await;
 }
 
 pub(crate) fn internal(e: impl std::fmt::Display) -> ApiError {
@@ -1724,6 +1749,7 @@ async fn events_subscribe(
         subjects: params.subjects,
         mail_principal,
         mail_db,
+        allowed_topics: authz::topics(principal, None),
     };
     Ok((
         serde_json::to_value(result).expect("SubscribeResult serializes"),
@@ -1743,6 +1769,7 @@ struct EventStream {
     /// None means local ancestry verification failed: no mail may leave.
     mail_principal: Option<Principal>,
     mail_db: Arc<Db>,
+    allowed_topics: Vec<String>,
 }
 
 impl EventStream {
@@ -1759,7 +1786,7 @@ impl EventStream {
             || e.subject
                 .as_ref()
                 .is_some_and(|s| self.subjects.contains(s));
-        topic_ok && subject_ok
+        self.allowed_topics.contains(&e.topic) && topic_ok && subject_ok
     }
 
     /// Apply ownership to every batch, including replay and catch-up. Use
@@ -1918,13 +1945,13 @@ fn hello(
         principal: principal.to_string(),
         capabilities,
         cursor: ctx.db.as_ref().map(|db| db.head_cursor().to_string()),
-        methods: discovery::methods(),
+        methods: authz::methods(&principal, None),
         breaking_since: discovery::breaking_since(
             discovery::METHOD_INFO,
             params.api_minor.unwrap_or(0),
         ),
         stability: discovery::PREVIEW.into(),
-        topics: discovery::topics(),
+        topics: authz::topics(&principal, None),
         limits: discovery::limits(),
     };
     let result = serde_json::to_value(result).expect("HelloResult serializes");
@@ -2290,6 +2317,7 @@ mod tests {
                 "session.tasks",
                 "provider.opencode.connect",
                 "events.unsubscribe",
+                "auth.can",
             ]
             .contains(m)
             {
@@ -2857,7 +2885,7 @@ mod tests {
         )
         .await;
         let mut got = Vec::new();
-        while got.len() < 4 {
+        while got.len() < 3 {
             let f = c.next().await;
             if f["type"] == "event" {
                 got.push((f["sub"].as_str().unwrap().to_string(), seq_of(&f)));
@@ -2870,11 +2898,23 @@ mod tests {
             got,
             [
                 ("s".to_string(), 3),
-                ("s".to_string(), 4),
                 ("t".to_string(), 1),
                 ("t".to_string(), 3)
             ]
         );
+        // Unclassified topics (session.seen and agentx.y) must not pass,
+        // even on an otherwise unrestricted local subscription. A subsequent
+        // classified event proves both streams advanced beyond the hidden rows.
+        let e = event("agent.upsert", "m/a2", 1, 0);
+        db.write(move |tx| tx.emit(&e)).await.unwrap();
+        let mut subs = Vec::new();
+        for _ in 0..2 {
+            let f = c.next().await;
+            assert_eq!(seq_of(&f), 5, "unclassified topic leaked: {f}");
+            subs.push(f["sub"].as_str().unwrap().to_string());
+        }
+        subs.sort();
+        assert_eq!(subs, ["s", "t"]);
     }
 
     #[tokio::test]
@@ -4520,6 +4560,45 @@ mod tests {
         assert_eq!(r["error"]["code"], "not_cancellable");
         assert_eq!(r["error"]["data"]["state"], "cancelled");
         assert_eq!(db.reader().unwrap().query_row("SELECT count(*) FROM audit WHERE method IN ('msg.cancel','mail.pause','mail.resume') AND decision='allow'",[],|r|r.get::<_,i64>(0)).unwrap(),3);
+    }
+    #[tokio::test]
+    async fn schema_generated_agent_denials_and_self_queries_use_the_same_table() {
+        let (_t, ctx, db) = ctx_db(as_agent("a7"));
+        let (mut c, hello) = Client::new(ctx).await;
+        let schema = schema();
+        let initial: i64 = db
+            .reader()
+            .unwrap()
+            .query_row("SELECT count(*) FROM audit", [], |r| r.get(0))
+            .unwrap();
+        for (name, entry) in schema["methods"].as_object().unwrap() {
+            let listed = entry["x-authz"]["principals"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("agent"));
+            assert_eq!(hello["methods"].get(name).is_some(), listed, "{name}");
+            let review = c.call("can", "auth.can", json!({"method": name})).await;
+            assert_eq!(review["result"]["allowed"], listed, "{name}: {review}");
+        }
+        let rules = c.call("rules", "auth.rules", json!({})).await;
+        assert_eq!(rules["result"]["methods"], hello["methods"]);
+        assert_eq!(rules["result"]["topics"], hello["topics"]);
+        let after: i64 = db
+            .reader()
+            .unwrap()
+            .query_row("SELECT count(*) FROM audit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(initial, after, "self queries never audit or execute");
+        for (name, entry) in schema["methods"].as_object().unwrap() {
+            if !entry["x-authz"]["principals"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("agent"))
+            {
+                let r = c.call("denied", name, json!({})).await;
+                assert_eq!(r["error"]["code"], "not_allowed", "{name}: {r}");
+            }
+        }
     }
 }
 

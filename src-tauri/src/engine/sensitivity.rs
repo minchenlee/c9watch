@@ -132,6 +132,15 @@ const BY_NAME: &[(&str, &str)] = &[
     ("subagentsCompleted", P),
     ("claudeProcessesFound", P),
     ("processesWithCwd", P),
+    // Authorization introspection is public; it contains no result values.
+    ("needs", P),
+    ("scopes", P),
+    ("ceiling", P),
+    ("confirmation", P),
+    ("allowed", P),
+    ("reason", P),
+    ("expiresAt", P),
+    ("idleExpiresAt", P),
     // The hello facts.
     ("apiMajor", P),
     ("apiMinor", P),

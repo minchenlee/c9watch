@@ -590,6 +590,45 @@ pub fn cmd_api(method: &str, params: &str, pretty: bool) -> Result<(), String> {
     }
 }
 
+/// Self queries use a real engine-stamped connection, never CLI assumptions.
+pub fn cmd_auth(action: &super::AuthAction, pretty: bool) -> Result<(), String> {
+    let home = engine_home()?;
+    // An agent can inspect its existing connection, but cannot start core.
+    let mut conn = match EngineConn::connect(&sock_path(&home)) {
+        Ok(conn) => conn,
+        Err(_) => {
+            refuse_agent_caller(&process_env)?;
+            ensure_engine(&home, &current_exe()?)?;
+            EngineConn::connect(&sock_path(&home)).map_err(ConnectError::into_msg)?
+        }
+    };
+    let (method, params) = match action {
+        super::AuthAction::CanI { method, .. } => {
+            ("auth.can", serde_json::json!({"method": method}))
+        }
+        super::AuthAction::Rules => ("auth.rules", serde_json::json!({})),
+    };
+    let resp = conn.call(method, params)?;
+    if !resp.ok {
+        return Err(error_line(&resp));
+    }
+    let result = resp.result.unwrap_or_default();
+    match action {
+        super::AuthAction::CanI { json: false, .. } => {
+            let allowed = result["allowed"].as_bool().unwrap_or(false);
+            println!("{}", if allowed { "yes" } else { "no" });
+            if !allowed {
+                return Err(result["reason"]
+                    .as_str()
+                    .unwrap_or("not allowed")
+                    .to_string());
+            }
+        }
+        _ => super::print_json(&result, pretty)?,
+    }
+    Ok(())
+}
+
 /// `c9watch integration status|show`: the adapters the engine knows and
 /// their integration files. Reads files only; never starts the engine and
 /// never writes a vendor config (managed CC gets its hooks per spawn

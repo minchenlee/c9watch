@@ -1,7 +1,8 @@
 //! Principal stamping. The engine decides who a connection is from
 //! connection facts only; what the client says in `hello` never counts.
 //!
-//! C1a has two principals:
+//! Unix connections have two possible principals. Authenticated gateway
+//! connections additionally have `client:<id>`:
 //! 1. `agent:<id>`: the peer's ancestry (at most `MAX_ANCESTRY` levels)
 //!    reaches the PTY child of a live agent, with the same pid **and** start
 //!    time. The principal carries that agent's generation, as the engine
@@ -10,7 +11,7 @@
 //!    an observed session is never an agent (A:186).
 //! 2. `local-unverified`: everything else (A:187).
 //!
-//! C1a never stamps `human` (that waits for the C1.5 code-signature check)
+//! Unix stamping never returns `human` (that waits for the C1.5 code-signature check)
 //! and never stamps `client:<id>` on the engine socket: `kind=gateway` in
 //! `hello` is a claim any same-uid process can make (N1, N2).
 
@@ -27,6 +28,10 @@ pub enum Principal {
         gen: i64,
     },
     LocalUnverified,
+    /// Only constructed after gateway token authentication; never by stamp_peer.
+    Client {
+        id: String,
+    },
 }
 
 impl std::fmt::Display for Principal {
@@ -34,6 +39,7 @@ impl std::fmt::Display for Principal {
         match self {
             Principal::Agent { id, .. } => write!(f, "agent:{}", id),
             Principal::LocalUnverified => f.write_str("local-unverified"),
+            Principal::Client { id } => write!(f, "client:{}", id),
         }
     }
 }

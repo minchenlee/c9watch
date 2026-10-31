@@ -120,7 +120,7 @@ impl Sender {
     fn agent_id(&self) -> Option<&str> {
         match &self.principal {
             Principal::Agent { id, .. } => Some(id),
-            Principal::LocalUnverified => None,
+            Principal::LocalUnverified | Principal::Client { .. } => None,
         }
     }
 }
@@ -137,6 +137,7 @@ pub fn sender(conn: &Connection, principal: &Principal) -> rusqlite::Result<Send
             .optional()?
             .unwrap_or((None, None)),
         Principal::LocalUnverified => (None, None),
+        Principal::Client { .. } => return Err(rusqlite::Error::InvalidQuery),
     };
     Ok(Sender {
         principal: principal.clone(),
@@ -313,6 +314,10 @@ pub fn check_sender(
     live: &dyn LiveAgents,
 ) -> Result<(), ApiError> {
     match principal {
+        Principal::Client { .. } => Err(ApiError::new(
+            ErrorCode::NotAllowed,
+            "gateway peers cannot send mail",
+        )),
         Principal::LocalUnverified => principal::check_mutating_peer(pid, peer_start, live)
             .map_err(|why| {
                 ApiError::new(

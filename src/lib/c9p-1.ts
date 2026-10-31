@@ -163,6 +163,35 @@ export interface C9pAgentTurnEndEvent {
   id: string;
 }
 
+/** Ask about the caller's own authority. Params are inspected, never executed. */
+export interface C9pAuthCanParams {
+  method: string;
+  params?: unknown;
+}
+
+export interface C9pAuthCanResult {
+  allowed: boolean;
+  needs?: C9pAuthNeeds | null;
+  reason?: string | null;
+}
+
+/** Additional authority a caller would need. */
+export interface C9pAuthNeeds {
+  ceiling?: C9pCeiling | null;
+  confirmation?: boolean | null;
+  scopes?: string[];
+}
+
+export interface C9pAuthRulesResult {
+  ceiling: C9pCeiling;
+  expiresAt?: number | null;
+  idleExpiresAt?: number | null;
+  methods: Record<string, C9pMethodInfo>;
+  principal: string;
+  scopes: string[];
+  topics: string[];
+}
+
 /** Counts of what happened after `since_ms`. */
 export interface C9pAwayActivity {
   commandsRun: number;
@@ -181,6 +210,9 @@ export interface C9pAwayRequest {
   sessionKey: string;
   sinceMs: number;
 }
+
+/** A sensitivity ceiling. Ordering is also the egress ordering. */
+export type C9pCeiling = 'public' | 'metadata' | 'conversation';
 
 /** What a client says about itself in `hello`. Unverified. */
 export interface C9pClientInfo {
@@ -581,6 +613,7 @@ export type C9pMessageType = 'User' | 'Assistant' | 'Thinking' | 'ToolUse' | 'To
 
 /** One method in `hello.result.methods`. */
 export interface C9pMethodInfo {
+  needs?: C9pAuthNeeds | null;
   /** Goes up by one on each breaking change to the method's shape. */
   rev: number;
   /** The minor that added the method. */
@@ -1313,6 +1346,14 @@ export interface C9pMethods {
   'agent.retire': {
     params: C9pAgentRetireParams;
     result: C9pAgentRetireResult;
+  };
+  'auth.can': {
+    params: C9pAuthCanParams;
+    result: C9pAuthCanResult;
+  };
+  'auth.rules': {
+    params: C9pPingParams;
+    result: C9pAuthRulesResult;
   };
   'conversation.get': {
     params: C9pConversationGetParams;
