@@ -347,4 +347,17 @@ pub(crate) mod tests {
         );
         assert_eq!(serde_json::to_value(agent("x")).unwrap(), "agent:x");
     }
+    #[test]
+    fn unix_stamp_never_constructs_a_client() {
+        let (principal, _) = stamp_peer(
+            std::process::id() as libc::pid_t,
+            peer::start_token_now(),
+            &NoLiveAgents,
+        );
+        assert!(matches!(principal, Principal::LocalUnverified));
+        assert!(!matches!(
+            stamp(&bash_tool_chain(100), &FakeAgents::one("a1", 10, 100)),
+            Principal::Client { .. }
+        ));
+    }
 }

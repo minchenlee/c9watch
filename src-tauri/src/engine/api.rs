@@ -300,12 +300,46 @@ async fn refuse_busy(mut stream: UnixStream, cap: usize) {
     let _ = stream.shutdown().await;
 }
 
-/// The process on the other end, as read at accept.
+/// Transport identity. Gateway calls never borrow core's own Unix pid.
 #[derive(Debug, Clone, Copy)]
-struct Peer {
+pub(crate) enum Peer {
+    Unix {
+        cred: PeerCred,
+        start: Option<u64>,
+    },
+    Gateway {
+        client_id: uuid::Uuid,
+        remote_addr: std::net::SocketAddr,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UnixPeer {
     cred: PeerCred,
-    /// Start time of `cred.pid`; `None` when it could not be read.
     start: Option<u64>,
+}
+
+impl Peer {
+    fn unix(self) -> Result<UnixPeer, ApiError> {
+        match self {
+            Self::Unix { cred, start } => Ok(UnixPeer { cred, start }),
+            Self::Gateway { .. } => Err(ApiError::new(
+                ErrorCode::NotAllowed,
+                "this operation requires a Unix peer",
+            )),
+        }
+    }
+    /// This second gate is independent of x-authz and its admission list.
+    fn mutation(self, method: &str) -> Result<(), ApiError> {
+        match self {
+            Self::Unix { .. } => Ok(()),
+            Self::Gateway { .. } if matches!(method, "session.stop" | "session.rename") => Ok(()),
+            Self::Gateway { .. } => Err(ApiError::new(
+                ErrorCode::NotAllowed,
+                "gateway peer cannot perform this mutation",
+            )),
+        }
+    }
 }
 
 /// The connection's state after `hello`.
@@ -360,7 +394,7 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
     // The peer's start time comes from the same read as the principal, so
     // a later exe check reads the process the principal came from.
     let (principal, start) = principal::stamp_peer(cred.pid, accepted, ctx.agents.as_ref());
-    let peer = Peer { cred, start };
+    let peer = Peer::Unix { cred, start };
 
     let mut reader = BufReader::new(read);
     let mut conn: Option<Conn> = None;
@@ -435,7 +469,7 @@ async fn handle_frame(
     streams: &mut Streams,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> (Response, Next, Option<EventStream>) {
-    match check_frame(frame, ctx, peer.cred, principal, conn) {
+    match check_frame(frame, ctx, peer, principal, conn) {
         Checked::Done(resp, next) => (resp, next, None),
         Checked::Call(req, method) => {
             let id = req.id.clone();
@@ -470,7 +504,7 @@ enum Checked {
 fn check_frame(
     frame: &[u8],
     ctx: &ServerCtx,
-    cred: PeerCred,
+    peer: Peer,
     principal: &Principal,
     conn: &mut Option<Conn>,
 ) -> Checked {
@@ -518,7 +552,7 @@ fn check_frame(
         );
     };
     if method == "hello" {
-        let (resp, next) = hello(req, ctx, cred, principal, conn);
+        let (resp, next) = hello(req, ctx, peer, principal, conn);
         return Checked::Done(resp, next);
     }
     if conn.is_none() {
@@ -957,8 +991,10 @@ async fn dispatch(
     }
     let result = execute(method, req, ctx, peer, principal, streams, progress).await;
     // Atomic mutation handlers already write exactly one audit row.
-    let owned_audit =
-        matches!(method, "agent.create" | "agent.retire" | "msg.send" | "msg.cancel" | "mail.pause" | "mail.resume") || is_hook_class(method);
+    let owned_audit = matches!(
+        method,
+        "agent.create" | "agent.retire" | "msg.send" | "msg.cancel" | "mail.pause" | "mail.resume"
+    ) || is_hook_class(method);
     if !owned_audit {
         match authz::audit_level(method, principal, result.is_ok(), Ceiling::Conversation) {
             authz::AuditLevel::None => {}
@@ -992,6 +1028,12 @@ async fn execute(
     streams: &mut Streams,
     progress: Option<Progress>,
 ) -> Result<Served, ApiError> {
+    if matches!(
+        method,
+        "msg.list" | "msg.read" | "msg.cancel" | "mail.pause" | "mail.resume"
+    ) {
+        peer.mutation(method)?;
+    }
     if is_hook_class(method) {
         return hook_class(method, req, ctx, peer, principal)
             .await
@@ -1001,10 +1043,10 @@ async fn execute(
         // One arm per method: scripts/test-ipc-contract.mjs reads the
         // served methods off these arms.
         "agent.create" => Ok(Served::result(
-            spawn_or_retire(method, req, ctx, principal).await?,
+            spawn_or_retire(method, req, ctx, peer, principal).await?,
         )),
         "agent.retire" => Ok(Served::result(
-            spawn_or_retire(method, req, ctx, principal).await?,
+            spawn_or_retire(method, req, ctx, peer, principal).await?,
         )),
         "snapshot.get" => Ok(Served::result(snapshot_get(ctx).await?)),
         "session.list" => Ok(Served::result(session_list(ctx).await?)),
@@ -1027,10 +1069,18 @@ async fn execute(
         )),
         "session.views" => Ok(Served::result(session_views::session_views(ctx).await?)),
         "session.away" => Ok(Served::result(session_views::session_away(req, ctx).await?)),
-        "detect.recheck" => Ok(Served::result(local_mutation(method, req, ctx).await?)),
-        "session.stop" => Ok(Served::result(local_mutation(method, req, ctx).await?)),
-        "session.rename" => Ok(Served::result(local_mutation(method, req, ctx).await?)),
-        "provider.opencode.connect" => Ok(Served::result(local_mutation(method, req, ctx).await?)),
+        "detect.recheck" => Ok(Served::result(
+            local_mutation(method, req, ctx, peer).await?,
+        )),
+        "session.stop" => Ok(Served::result(
+            local_mutation(method, req, ctx, peer).await?,
+        )),
+        "session.rename" => Ok(Served::result(
+            local_mutation(method, req, ctx, peer).await?,
+        )),
+        "provider.opencode.connect" => Ok(Served::result(
+            local_mutation(method, req, ctx, peer).await?,
+        )),
         "diag.detection" => Ok(Served::result(
             session_views::diag_detection(req, ctx).await?,
         )),
@@ -1154,7 +1204,9 @@ async fn local_mutation(
     method: &str,
     req: Request,
     ctx: &ServerCtx,
+    peer: Peer,
 ) -> Result<serde_json::Value, ApiError> {
+    peer.mutation(method)?;
     match method {
         "detect.recheck" => session_views::detect_recheck(ctx).await,
         "session.stop" => session_views::session_stop(req, ctx).await,
@@ -1178,6 +1230,7 @@ async fn check_local_peer(
             format!("{} may not call {} in C1a", principal, method),
         ));
     }
+    let peer = peer.unix()?;
     let agents = ctx.agents.clone();
     let checked = blocking(move || {
         Ok(principal::check_mutating_peer(
@@ -1199,8 +1252,10 @@ async fn spawn_or_retire(
     method: &str,
     req: Request,
     ctx: &ServerCtx,
+    peer: Peer,
     principal: &Principal,
 ) -> Result<serde_json::Value, ApiError> {
+    peer.unix()?;
     let Some(spawner) = &ctx.spawner else {
         return Err(ApiError::new(
             ErrorCode::Internal,
@@ -1241,6 +1296,7 @@ async fn msg_send(
         .unwrap_or_default()
         .to_string();
     let checked: Result<MsgSendParams, ApiError> = async {
+        let peer = peer.unix()?;
         let params = serde_json::from_value::<MsgSendParams>(req.params).map_err(|e| {
             ApiError::new(
                 ErrorCode::BadRequest,
@@ -1543,6 +1599,7 @@ fn authorize_hook(
     principal: &Principal,
     claimed: &str,
 ) -> Result<(), ApiError> {
+    let peer = peer.unix()?;
     let denied = |m: String| ApiError::new(ErrorCode::PeerNotAuthorized, m);
     let Principal::Agent { id, .. } = principal else {
         return Err(denied(format!("{} is not an agent", principal)));
@@ -1869,11 +1926,14 @@ const CAPABILITIES: &[&str] = &[PROGRESS_CAPABILITY];
 fn hello(
     req: Request,
     ctx: &ServerCtx,
-    cred: PeerCred,
+    peer: Peer,
     principal: &Principal,
     conn: &mut Option<Conn>,
 ) -> (Response, Next) {
     let id = req.id.clone();
+    if let Err(e) = authz::authorize("hello", principal, None) {
+        return (Response::err(id, e), Next::Close);
+    }
     let params: HelloParams = if req.params.is_null() {
         HelloParams::default()
     } else {
@@ -1934,7 +1994,7 @@ fn hello(
     if let Some(client) = &params.client {
         eprintln!(
             "[engine] hello pid={} principal={} unverified client claim kind={:?} name={:?} version={:?}",
-            cred.pid, principal, client.kind, client.name, client.version
+            peer.unix().map(|p| p.cred.pid).unwrap_or(0), principal, client.kind, client.name, client.version
         );
     }
     let result = HelloResult {
@@ -3616,7 +3676,7 @@ mod tests {
             id: "agt_a7".into(),
             gen: 2,
         };
-        let peer = Peer {
+        let peer = Peer::Unix {
             cred: PeerCred {
                 pid: std::process::id() as libc::pid_t,
                 uid: peer::engine_uid(),
@@ -4378,7 +4438,7 @@ mod tests {
                     method,
                     req,
                     &ctx,
-                    Peer {
+                    Peer::Unix {
                         cred: PeerCred {
                             pid,
                             uid: peer::engine_uid(),
@@ -4518,7 +4578,7 @@ mod tests {
                     ..Default::default()
                 },
                 &ctx,
-                Peer {
+                Peer::Unix {
                     cred: PeerCred {
                         pid,
                         uid: peer::engine_uid(),
@@ -4600,6 +4660,58 @@ mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn gateway_type_refuses_local_mutations_even_if_authority_is_bypassed() {
+        let ctx = ServerCtx::new("test".into());
+        let peer = Peer::Gateway {
+            client_id: uuid::Uuid::new_v4(),
+            remote_addr: "127.0.0.1:4000".parse().unwrap(),
+        };
+        let principal = Principal::Client { id: "test".into() };
+        for method in [
+            "agent.create",
+            "agent.retire",
+            "msg.send",
+            "msg.list",
+            "msg.read",
+            "msg.cancel",
+            "mail.pause",
+            "mail.resume",
+            "detect.recheck",
+            "provider.opencode.connect",
+            "hook.stop",
+            "task.done",
+        ] {
+            // Simulate a bad authorization declaration allowing this client.
+            let mut declaration = authz::method(method).unwrap();
+            declaration.principals = &["client"];
+            let access = authz::Access {
+                scopes: [format!("{}:{}", declaration.resource, declaration.verb)].into(),
+                ceiling: Ceiling::Conversation,
+                ..Default::default()
+            };
+            assert!(authz::review(Some(&declaration), &principal, Some(&access)).allowed);
+            let req = Request {
+                params: json!({}),
+                ..Default::default()
+            };
+            let err = match execute(
+                method,
+                req,
+                &ctx,
+                peer,
+                &principal,
+                &mut Streams::default(),
+                None,
+            )
+            .await
+            {
+                Err(e) => e,
+                Ok(_) => panic!("{method} bypassed the gateway type gate"),
+            };
+            assert_eq!(err.code, ErrorCode::NotAllowed, "{method}: {err:?}");
+        }
+    }
 }
 
 // C1b-M2 mailbox APIs. Mutations require the same verified local ancestry
@@ -4640,6 +4752,7 @@ async fn mail_query(
 /// Unrestricted mail reads need the same complete peer verification as
 /// mailbox controls. Agent reads remain restricted by message ownership.
 async fn check_mail_peer(ctx: &ServerCtx, peer: Peer, who: &Principal) -> Result<(), ApiError> {
+    let peer = peer.unix()?;
     if !matches!(who, Principal::LocalUnverified) {
         return Ok(());
     }
@@ -4664,6 +4777,7 @@ async fn mail_control(
     who: &Principal,
 ) -> Result<serde_json::Value, ApiError> {
     use crate::engine_proto::wire::{MailAgentParams, MsgIdParams};
+    let peer = peer.unix()?;
     let method = method.to_string();
     let target = req
         .params

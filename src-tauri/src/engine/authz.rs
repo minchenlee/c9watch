@@ -381,6 +381,42 @@ mod tests {
         assert_eq!(needs.ceiling, Some(Ceiling::Conversation));
     }
     #[test]
+    fn mail_is_local_only_and_controls_are_human_only() {
+        let local = Principal::LocalUnverified;
+        let agent = Principal::Agent {
+            id: "a".into(),
+            gen: 1,
+        };
+        let client = Principal::Client { id: "c".into() };
+        let access = Access {
+            scopes: ["msg:read", "msg:cancel", "mail:write"]
+                .map(String::from)
+                .into(),
+            ceiling: Ceiling::Conversation,
+            ..Default::default()
+        };
+        for name in [
+            "msg.list",
+            "msg.read",
+            "msg.cancel",
+            "mail.pause",
+            "mail.resume",
+        ] {
+            assert!(can(name, &local, None).allowed, "{name}");
+            assert_eq!(
+                can(name, &agent, None).allowed,
+                matches!(name, "msg.list" | "msg.read"),
+                "{name}"
+            );
+            assert!(!can(name, &client, Some(&access)).allowed, "{name}");
+            assert!(
+                !methods(&client, Some(&access)).contains_key(name),
+                "{name}"
+            );
+        }
+        assert!(!topics(&client, Some(&access)).contains(&"msg.state".into()));
+    }
+    #[test]
     fn audit_never_records_local_reads_or_self_queries() {
         let l = Principal::LocalUnverified;
         let c = Principal::Client { id: "c".into() };
