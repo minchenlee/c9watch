@@ -472,3 +472,16 @@ export const remoteAccess = { lanEnabled: false, allowConversation: false, allow
 export const serverInfo = { port: 9210, localIp: '127.0.0.1', lanEnabled: false, bind: 'loopback', lanAddresses: [] as string[] };
 
 export const appVersion = '0.11.1';
+
+// L1 data exists alongside Classic fixtures; Classic must never render/read it.
+export const annotations = [{
+    target: { kind: 'session', sessionKey: sessions[0].sessionKey },
+    key: 'ci/tests', value: { type: 'number', v: 42 }, label: 'Tests',
+    sensitivity: 'metadata', writer: 'local-unverified',
+    createdAt: 1793491200000, updatedAt: 1793491200000, expiresAt: null
+}, {
+    target: { kind: 'session', sessionKey: sessions[0].sessionKey },
+    key: 'ci/note', value: { type: 'string', v: 'Annotation text must never enter Classic' },
+    sensitivity: 'conversation', writer: 'local-unverified',
+    createdAt: 1793491200000, updatedAt: 1793491200000, expiresAt: null
+}];

@@ -2,6 +2,12 @@
 
 # c9p/1 changelog
 
+## 1.9 — L1 annotations
+
+- Add preview `annotation.set`, `annotation.delete`, `annotation.patch` and `annotation.list`, capability `annotations`, and typed `annotation.changed`/`annotation.removed` topics.
+- Enforce per-principal namespaces, typed values, patch sequence watermarks, per-key TTL, count/rate limits, hash-only write/refusal audit and schema-driven value redaction.
+- Add `annotate set|delete|list`, annotation exports, and the opt-in data-layer store. Classic rendering is unchanged; gateway handshake remains disabled.
+
 ## 1.8 — authorization and gateway foundations
 
 - Add central `x-authz`, principal-filtered discovery, `auth.can` and `auth.rules`; gateway transport remains disabled.
