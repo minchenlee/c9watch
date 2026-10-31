@@ -277,22 +277,32 @@ pub fn write_guarded(endpoint: &Endpoint, line: &str, blocked: impl Fn() -> bool
     }
     std::thread::sleep(Duration::from_millis(150));
     let _ = stream.shutdown(std::net::Shutdown::Write);
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return SocketOutcome::MaybeSent("close_timeout".into());
-    }
-    let _ = stream.set_read_timeout(Some(remaining));
+    wait_for_close(deadline, |remaining, b| {
+        let _ = stream.set_read_timeout(Some(remaining));
+        stream.read(b)
+    })
+}
+
+fn wait_for_close(
+    deadline: Instant,
+    mut read: impl FnMut(Duration, &mut [u8]) -> std::io::Result<usize>,
+) -> SocketOutcome {
     let mut b = [0u8; 1024];
     loop {
-        match stream.read(&mut b) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let result = read(remaining, &mut b);
+        // A socket timeout is relative to the read, and the thread can be
+        // descheduled before or during it. EOF observed after our absolute
+        // deadline is still uncertain delivery, even if read returned Ok(0).
+        if Instant::now() >= deadline {
+            break;
+        }
+        match result {
             Ok(0) => return SocketOutcome::Sent,
-            Ok(_) => {
-                let r = deadline.saturating_duration_since(Instant::now());
-                if r.is_zero() {
-                    break;
-                }
-                let _ = stream.set_read_timeout(Some(r));
-            }
+            Ok(_) => {}
             Err(_) => break,
         }
     }
@@ -455,18 +465,38 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let e = endpoint(t.path().join("cc.sock"));
         let listener = UnixListener::bind(&e.path).unwrap();
+        let (release, held) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
             let mut b = vec![];
             s.read_to_end(&mut b).unwrap();
-            std::thread::sleep(Duration::from_millis(5200));
+            // Hold the peer open until write has returned, even if the writer
+            // is descheduled for longer than its timeout. A fixed sleep races
+            // its read on a loaded runner.
+            held.recv().unwrap();
+            drop(s);
             b
         });
-        assert_eq!(
-            write(&e, "{}\n"),
-            SocketOutcome::MaybeSent("close_timeout".into())
-        );
-        assert_eq!(worker.join().unwrap(), b"{}\n");
+        let outcome = write(&e, "{}\n");
+        release.send(()).unwrap();
+        let received = worker.join().unwrap();
+        assert_eq!(outcome, SocketOutcome::MaybeSent("close_timeout".into()));
+        assert_eq!(received, b"{}\n");
+    }
+    #[test]
+    fn eof_observed_after_the_deadline_is_possible_delivery() {
+        let (mut writer, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let outcome = wait_for_close(deadline, |remaining, b| {
+            writer.set_read_timeout(Some(remaining)).unwrap();
+            // Model the writer being descheduled between setting the socket's
+            // relative timeout and entering read. The peer closes only after
+            // the absolute deadline, so the next read returns EOF immediately.
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            peer.shutdown(std::net::Shutdown::Write).unwrap();
+            writer.read(b)
+        });
+        assert_eq!(outcome, SocketOutcome::MaybeSent("close_timeout".into()));
     }
     #[test]
     fn unsafe_socket_nodes_and_directories_are_unreachable() {
