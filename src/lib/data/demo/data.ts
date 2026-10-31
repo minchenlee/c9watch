@@ -1,0 +1,509 @@
+/**
+ * Demo session and conversation data for UI exploration
+ */
+
+import type { Session, Conversation, HistoryEntry, CostData, SessionCostRecord, AwayActivity, AwayRequest, WaitingFor, DetectionDiagnostics } from '../../types';
+import { SessionStatus } from '../../types';
+import { isQuestionTool } from '../../status-utils';
+
+function minutesAgo(minutes: number): string {
+	return new Date(Date.now() - minutes * 60 * 1000).toISOString();
+}
+
+/**
+ * Status-specific messages that make transitions feel realistic.
+ * Each session ID maps to messages for each possible status.
+ */
+export const statusMessages: Record<string, Record<SessionStatus, string>> = {
+	'demo-1': {
+		[SessionStatus.Working]: 'Writing OAuth2 callback handler for Google provider...',
+		[SessionStatus.NeedsAttention]: 'I need to write to src/auth/providers.ts — may I proceed?',
+		[SessionStatus.WaitingForInput]: 'OAuth2 providers are configured. Want me to add session persistence next?',
+		[SessionStatus.Connecting]: 'Starting session...'
+	},
+	'demo-2': {
+		[SessionStatus.Working]: 'Running the profiler on the VirtualizedTable component to identify the bottleneck...',
+		[SessionStatus.NeedsAttention]: 'I need to modify src/components/Table.tsx — allow?',
+		[SessionStatus.WaitingForInput]: 'Render time reduced from 340ms to 18ms. The fix is in the memoization of row components.',
+		[SessionStatus.Connecting]: 'Starting session...'
+	},
+	'demo-3': {
+		[SessionStatus.Working]: 'Implementing the token bucket algorithm with Redis MULTI/EXEC...',
+		[SessionStatus.NeedsAttention]: 'I need to run `npm install ioredis` — allow?',
+		[SessionStatus.WaitingForInput]: 'Rate limiter middleware is ready. Run `npm test` to verify.',
+		[SessionStatus.Connecting]: 'Starting session...'
+	},
+	'demo-4': {
+		[SessionStatus.Working]: 'Writing test case for subscription renewal webhook with idempotency check...',
+		[SessionStatus.NeedsAttention]: 'I need to run `npm test -- --watch payments` — allow?',
+		[SessionStatus.WaitingForInput]: 'All 23 webhook test cases pass. Coverage is at 94%.',
+		[SessionStatus.Connecting]: 'Starting session...'
+	},
+	'demo-5': {
+		[SessionStatus.Working]: 'Adding validation rules for the project name prompt...',
+		[SessionStatus.NeedsAttention]: 'I need to write to src/commands/init.ts — allow?',
+		[SessionStatus.WaitingForInput]: 'Done! The wizard is at src/commands/init.ts. Run `cli-tools init` to try it.',
+		[SessionStatus.Connecting]: 'Starting session...'
+	},
+	'demo-6': {
+		[SessionStatus.Working]: 'Migrating the `deploy` command handler to Result<T, E> pattern...',
+		[SessionStatus.NeedsAttention]: 'I need to modify src/commands/deploy.ts — allow?',
+		[SessionStatus.WaitingForInput]: 'All 14 command handlers have been migrated to the Result pattern. Tests pass.',
+		[SessionStatus.Connecting]: 'Starting session...'
+	}
+};
+
+/**
+ * Defines the possible transitions from each status.
+ * Working can transition to NeedsAttention or WaitingForInput.
+ * NeedsAttention transitions to Working (user responded).
+ * WaitingForInput transitions to Working (user gave new input).
+ */
+export const statusTransitions: Record<SessionStatus, SessionStatus[]> = {
+	[SessionStatus.Working]: [SessionStatus.Working, SessionStatus.Working, SessionStatus.NeedsAttention, SessionStatus.WaitingForInput],
+	[SessionStatus.NeedsAttention]: [SessionStatus.Working],
+	[SessionStatus.WaitingForInput]: [SessionStatus.Working, SessionStatus.WaitingForInput],
+	[SessionStatus.Connecting]: [SessionStatus.Working]
+};
+
+/**
+ * Returns 6 demo sessions with dynamic timestamps relative to now.
+ * Spread across 3 project paths to showcase project grouping.
+ */
+/** Mirrors the backend's `waiting_for` derivation for demo sessions. */
+export function demoWaitingFor(status: SessionStatus, pendingToolName: string | null): WaitingFor | undefined {
+	if (status === SessionStatus.WaitingForInput) return { kind: 'input' };
+	if (status !== SessionStatus.NeedsAttention) return undefined;
+	if (isQuestionTool(pendingToolName)) return { kind: 'question' };
+	return pendingToolName ? { kind: 'approval', tool: pendingToolName } : { kind: 'attention' };
+}
+
+/** Last assistant line per demo session (what the backend would send). */
+const demoLastAssistant: Record<string, string> = {
+	'demo-1': 'Google and GitHub providers are wired; next I write src/auth/providers.ts.',
+	'demo-3': 'Cache layer is ready. It needs the ioredis package before tests can run.',
+	'demo-5': 'Done! The wizard is at src/commands/init.ts. Run `cli-tools init` to try it.',
+	'demo-6': 'All 14 command handlers have been migrated to the Result pattern. Tests pass.'
+};
+
+/** Activity "while you were away" per demo session (Claude Code only, like the backend). */
+const demoAway: Record<string, Omit<AwayActivity, 'sinceMs'>> = {
+	'demo-1': { toolCalls: 18, filesEdited: 4, commandsRun: 6, subagentsCompleted: 2, partial: false },
+	'demo-3': { toolCalls: 7, filesEdited: 2, commandsRun: 3, subagentsCompleted: 0, partial: false },
+	'demo-5': { toolCalls: 31, filesEdited: 9, commandsRun: 11, subagentsCompleted: 1, partial: false },
+	'demo-6': { toolCalls: 0, filesEdited: 0, commandsRun: 0, subagentsCompleted: 0, partial: false }
+};
+
+export function getDemoAwayActivity(requests: AwayRequest[]): Record<string, AwayActivity> {
+	const out: Record<string, AwayActivity> = {};
+	for (const { sessionKey, sinceMs } of requests) {
+		const activity = demoAway[sessionKey.slice(sessionKey.indexOf(':') + 1)];
+		if (activity) out[sessionKey] = { ...activity, sinceMs };
+	}
+	return out;
+}
+
+export function withDemoAwayFields(session: Session): Session {
+	return {
+		...session,
+		waitingFor: demoWaitingFor(session.status, session.pendingToolName),
+		lastAssistantMessage: demoLastAssistant[session.id]
+	};
+}
+
+export function getDemoSessions(): Session[] {
+	return demoSessions().map(withDemoAwayFields);
+}
+
+function demoSessions(): Session[] {
+	return [
+		// Project 1: web-app — NeedsAttention + Working
+		{
+			id: 'demo-1',
+			pid: 90001,
+			sessionName: 'web-app',
+			customTitle: null,
+			projectPath: '/Users/demo/projects/web-app',
+			gitBranch: 'feat/auth-flow',
+			firstPrompt: 'Add OAuth2 login with Google and GitHub providers',
+			summary: 'Implementing OAuth2 authentication flow with multiple providers',
+			messageCount: 34,
+			modified: minutesAgo(2),
+			status: SessionStatus.NeedsAttention,
+			latestMessage: 'I need to write to src/auth/providers.ts — may I proceed?',
+			pendingToolName: 'Write',
+			sourceHealth: 'fresh',
+			provider: 'claudeCode',
+			surface: 'claudeCode',
+			agentKind: 'root'
+		},
+		{
+			id: 'demo-2',
+			pid: 90002,
+			sessionName: 'web-app',
+			customTitle: null,
+			projectPath: '/Users/demo/projects/web-app',
+			gitBranch: 'fix/perf-regression',
+			firstPrompt: 'Profile and fix the rendering performance regression in the dashboard',
+			summary: 'Investigating slow renders in dashboard table component',
+			messageCount: 87,
+			modified: minutesAgo(5),
+			status: SessionStatus.Working,
+			latestMessage: 'Running the profiler on the VirtualizedTable component to identify the bottleneck...',
+			pendingToolName: null,
+			provider: 'claudeCode',
+			surface: 'claudeCode',
+			agentKind: 'root'
+		},
+
+		// Project 2: api-server — NeedsAttention + Working
+		{
+			id: 'demo-3',
+			pid: 90003,
+			sessionName: 'api-server',
+			customTitle: null,
+			projectPath: '/Users/demo/projects/api-server',
+			gitBranch: 'feat/rate-limiting',
+			firstPrompt: 'Implement token-bucket rate limiting middleware',
+			summary: 'Adding rate limiting with Redis-backed token bucket',
+			messageCount: 21,
+			modified: minutesAgo(1),
+			status: SessionStatus.NeedsAttention,
+			latestMessage: 'I need to run `npm install ioredis` — allow?',
+			pendingToolName: 'Bash',
+			sourceHealth: 'fresh'
+		},
+		{
+			id: 'demo-4',
+			pid: 90004,
+			sessionName: 'api-server',
+			customTitle: null,
+			projectPath: '/Users/demo/projects/api-server',
+			gitBranch: 'main',
+			firstPrompt: 'Write integration tests for the payments webhook handler',
+			summary: 'Creating comprehensive test suite for Stripe webhook processing',
+			messageCount: 156,
+			modified: minutesAgo(8),
+			status: SessionStatus.Working,
+			latestMessage: 'Writing test case for subscription renewal webhook with idempotency check...',
+			pendingToolName: null
+		},
+
+		// Project 3: cli-tools — WaitingForInput x2
+		{
+			id: 'demo-5',
+			pid: 90005,
+			sessionName: 'cli-tools',
+			customTitle: null,
+			projectPath: '/Users/demo/projects/cli-tools',
+			gitBranch: 'feat/config-wizard',
+			firstPrompt: 'Build an interactive configuration wizard for first-time setup',
+			summary: 'Created interactive CLI wizard with prompts, validation, and config file generation',
+			messageCount: 42,
+			modified: minutesAgo(15),
+			status: SessionStatus.WaitingForInput,
+			latestMessage: 'Done! The wizard is at src/commands/init.ts. Run `cli-tools init` to try it.',
+			pendingToolName: null
+		},
+		{
+			id: 'demo-6',
+			pid: 90006,
+			sessionName: 'cli-tools',
+			customTitle: null,
+			projectPath: '/Users/demo/projects/cli-tools',
+			gitBranch: 'refactor/error-handling',
+			firstPrompt: 'Refactor error handling to use typed Result pattern',
+			summary: 'Migrated all error handling from try/catch to Result<T, E> pattern',
+			messageCount: 63,
+			modified: minutesAgo(60),
+			status: SessionStatus.WaitingForInput,
+			latestMessage: 'All 14 command handlers have been migrated to the Result pattern. Tests pass.',
+			pendingToolName: null
+		},
+		{
+				id: 'demo-codex-root', pid: 91001, sessionName: 'c9watch', customTitle: 'Codex monitoring rollout',
+				projectPath: '/Users/demo/projects/c9watch', gitBranch: 'feature/codex-monitoring',
+				firstPrompt: 'Implement mixed-provider monitoring', summary: 'Coordinating Codex monitoring across app and CLI',
+				messageCount: 28, modified: minutesAgo(3), status: SessionStatus.Working,
+				latestMessage: 'Reviewing the frontend provider contract and rollout hierarchy...', pendingToolName: null,
+				provider: 'codex', surface: 'app', agentKind: 'root', rootSessionId: 'demo-codex-root',
+				canOpen: false, canStop: false, canRename: false
+		},
+		{
+				id: 'demo-codex-subagent', pid: 91002, sessionName: 'c9watch', customTitle: null,
+				projectPath: '/Users/demo/projects/c9watch', gitBranch: 'feature/codex-monitoring',
+				firstPrompt: 'Audit provider filtering', summary: 'Auditing provider filtering across session surfaces',
+				messageCount: 11, modified: minutesAgo(2), status: SessionStatus.Working,
+				latestMessage: 'Checking history and cost records for real provider filtering...', pendingToolName: null,
+				provider: 'codex', surface: 'exec', agentKind: 'subagent', parentThreadId: 'demo-codex-root',
+				rootSessionId: 'demo-codex-root', agentPath: '/root/provider-audit', agentNickname: 'provider-audit', agentRole: 'reviewer',
+				canOpen: false, canStop: false, canRename: false
+		},
+		{
+				id: 'demo-codex-guardian', pid: 91003, sessionName: 'c9watch', customTitle: null,
+				projectPath: '/Users/demo/projects/c9watch', gitBranch: 'feature/codex-monitoring',
+				firstPrompt: 'Internal review guard', summary: 'Internal guardian process', messageCount: 2,
+				modified: minutesAgo(1), status: SessionStatus.Working, latestMessage: 'Validating policy state', pendingToolName: null,
+				provider: 'codex', surface: 'app', agentKind: 'internal', parentThreadId: 'demo-codex-root',
+				rootSessionId: 'demo-codex-root', internalKind: 'guardian'
+		},
+		{
+				id: 'demo-cursor-root', pid: 92001, sessionName: 'c9watch', customTitle: 'Cursor agent detection',
+				projectPath: '/Users/demo/projects/c9watch', gitBranch: 'feature/cursor-agent-detection',
+				firstPrompt: 'Detect Cursor Agent sessions and their Task subagents', summary: 'Watching Cursor transcripts',
+				messageCount: 14, modified: minutesAgo(1), status: SessionStatus.Working,
+				latestMessage: 'Parsing agent-transcripts JSONL and grouping Task subagents...', pendingToolName: null,
+				provider: 'cursor', surface: 'cursor', agentKind: 'root', rootSessionId: 'demo-cursor-root',
+				canOpen: false, canStop: false, canRename: false
+		},
+		{
+				id: 'demo-cursor-subagent', pid: 92002, sessionName: 'c9watch', customTitle: null,
+				projectPath: '/Users/demo/projects/c9watch', gitBranch: 'feature/cursor-agent-detection',
+				firstPrompt: 'Explore how Cursor stores agent transcripts', summary: 'Exploring Cursor transcript layout',
+				messageCount: 6, modified: minutesAgo(1), status: SessionStatus.Working,
+				latestMessage: 'Reading ~/.cursor/projects/*/agent-transcripts...', pendingToolName: null,
+				provider: 'cursor', surface: 'cursor', agentKind: 'subagent', parentThreadId: 'demo-cursor-root',
+				rootSessionId: 'demo-cursor-root', agentNickname: 'Explore session discovery', agentRole: 'explore',
+				canOpen: false, canStop: false, canRename: false
+		}
+	];
+}
+
+export function getDemoHistoryEntries(): HistoryEntry[] {
+	return [
+		{
+			sessionId: 'demo-1', display: 'Add OAuth2 login with Google and GitHub providers',
+			timestamp: Date.now() - 30 * 60_000, project: '/Users/demo/projects/web-app', projectName: 'web-app',
+			customTitle: null, provider: 'claudeCode', surface: 'claudeCode'
+		},
+		{
+			sessionId: 'demo-codex-root', display: 'Implement mixed-provider monitoring',
+			timestamp: Date.now() - 12 * 60_000, project: '/Users/demo/projects/c9watch', projectName: 'c9watch',
+			customTitle: 'Codex monitoring rollout', provider: 'codex', surface: 'app'
+		},
+		{
+			sessionId: 'demo-cursor-root', display: 'Detect Cursor Agent sessions and their Task subagents',
+			timestamp: Date.now() - 4 * 60_000, project: '/Users/demo/projects/c9watch', projectName: 'c9watch',
+			customTitle: 'Cursor agent detection', provider: 'cursor', surface: 'cursor'
+		}
+	];
+}
+
+/** Two sessions hidden by the child-session marker, so demo mode shows the notice. */
+export function getDemoDiagnostics(): DetectionDiagnostics {
+	return {
+		claudeProcessesFound: 0,
+		processesWithCwd: 0,
+		fdaLikelyNeeded: false,
+		hiddenClaudeSessions: [
+			{ pid: 48211, cwd: '/Users/demo/projects/api-server', reason: 'childSessionMarker', parentClaudePid: 47102 },
+			{ pid: 48230, cwd: '/Users/demo/projects/web-dashboard', reason: 'childSessionMarker', parentClaudePid: 47102 }
+		]
+	};
+}
+
+export function getDemoCostData(): CostData {
+	const date = new Date().toISOString().slice(0, 10);
+	const sessions: SessionCostRecord[] = [
+		{ sessionId: 'demo-1', project: '/Users/demo/projects/web-app', projectName: 'web-app', model: 'claude-sonnet-4-5', cost: 0.42, costAvailable: true, inputTokens: 45_000, cachedInputTokens: 12_000, outputTokens: 17_000, reasoningOutputTokens: 0, timestamp: minutesAgo(30), date, totalTokens: 62_000, sessionName: 'OAuth2 authentication', provider: 'claudeCode', surface: 'claudeCode' },
+		{ sessionId: 'demo-codex-root', project: '/Users/demo/projects/c9watch', projectName: 'c9watch', model: 'gpt-5.4', cost: 0, costAvailable: false, inputTokens: 23_000, cachedInputTokens: 8_000, outputTokens: 8_000, reasoningOutputTokens: 2_000, timestamp: minutesAgo(12), date, totalTokens: 31_000, sessionName: 'Codex monitoring rollout', provider: 'codex', surface: 'app' }
+	];
+	return {
+		totalCost: 0.42,
+		totalTokens: 93_000,
+		unpricedTokens: 31_000,
+		dailyCosts: [{ date, cost: 0.42, sessions }],
+		projectCosts: [
+			{ project: sessions[0].project, projectName: sessions[0].projectName, totalCost: sessions[0].cost, sessions: [sessions[0]] },
+			{ project: sessions[1].project, projectName: sessions[1].projectName, totalCost: sessions[1].cost, sessions: [sessions[1]] }
+		],
+		modelCosts: [
+			{ model: sessions[0].model, displayName: 'Sonnet', provider: 'claudeCode', cost: sessions[0].cost, percentage: 100, totalTokens: sessions[0].totalTokens, costAvailable: true },
+			{ model: sessions[1].model, displayName: 'GPT-5.4', provider: 'codex', cost: 0, percentage: 0, totalTokens: sessions[1].totalTokens, costAvailable: false }
+		]
+	};
+}
+
+/**
+ * Demo conversation data for expanded card view.
+ * Provides realistic message histories for 3 sessions.
+ */
+export const demoConversations: Record<string, Conversation> = {
+	'demo-codex-root': {
+		sessionId: 'demo-codex-root',
+		messages: [
+			{ timestamp: minutesAgo(12), messageType: 'User', content: 'Implement mixed-provider monitoring with shared filters.' },
+			{ timestamp: minutesAgo(3), messageType: 'Assistant', content: 'I am coordinating provider UI and delegated a filter audit to a Codex subagent.' }
+		]
+	},
+	'demo-codex-subagent': {
+		sessionId: 'demo-codex-subagent',
+		messages: [
+			{ timestamp: minutesAgo(5), messageType: 'User', content: 'Audit provider filtering across all session surfaces.' },
+			{ timestamp: minutesAgo(2), messageType: 'Assistant', content: 'History, cost, monitor, and popover now consume the same persisted provider filter.' }
+		]
+	},
+	'demo-cursor-root': {
+		sessionId: 'demo-cursor-root',
+		messages: [
+			{ timestamp: minutesAgo(4), messageType: 'User', content: 'Detect Cursor Agent sessions and their Task subagents' },
+			{ timestamp: minutesAgo(1), messageType: 'Assistant', content: 'Parsing agent-transcripts JSONL and grouping Task subagents under the parent chat.' }
+		]
+	},
+	'demo-cursor-subagent': {
+		sessionId: 'demo-cursor-subagent',
+		messages: [
+			{ timestamp: minutesAgo(3), messageType: 'User', content: 'Explore how Cursor stores agent transcripts' },
+			{ timestamp: minutesAgo(1), messageType: 'Assistant', content: 'Root chats live at <uuid>/<uuid>.jsonl; Task children are sibling files under subagents/.' }
+		]
+	},
+	'demo-1': {
+		sessionId: 'demo-1',
+		messages: [
+			{
+				timestamp: minutesAgo(30),
+				messageType: 'User',
+				content: 'Add OAuth2 login with Google and GitHub providers'
+			},
+			{
+				timestamp: minutesAgo(29),
+				messageType: 'Thinking',
+				content:
+					'The user wants OAuth2 authentication with Google and GitHub. I should:\n1. Set up the OAuth2 configuration\n2. Create provider-specific handlers\n3. Add the login routes\n4. Create the callback handler'
+			},
+			{
+				timestamp: minutesAgo(29),
+				messageType: 'Assistant',
+				content:
+					"I'll implement OAuth2 login with Google and GitHub providers. Let me start by examining the existing auth setup."
+			},
+			{
+				timestamp: minutesAgo(28),
+				messageType: 'ToolUse',
+				content: 'Read src/auth/index.ts'
+			},
+			{
+				timestamp: minutesAgo(28),
+				messageType: 'ToolResult',
+				content:
+					'```typescript\nimport { Router } from "express";\nimport { sessionMiddleware } from "./session";\n\nexport const authRouter = Router();\nauthRouter.use(sessionMiddleware);\n\n// TODO: Add OAuth providers\n```'
+			},
+			{
+				timestamp: minutesAgo(27),
+				messageType: 'Assistant',
+				content:
+					"Good, there's a placeholder for OAuth providers. Let me set up the provider configuration and handlers.\n\nFirst, I'll create the OAuth2 provider configuration:"
+			},
+			{
+				timestamp: minutesAgo(26),
+				messageType: 'ToolUse',
+				content: 'Write src/auth/oauth-config.ts'
+			},
+			{
+				timestamp: minutesAgo(26),
+				messageType: 'ToolResult',
+				content: 'File written successfully.'
+			},
+			{
+				timestamp: minutesAgo(10),
+				messageType: 'Assistant',
+				content:
+					"Now I need to create the provider-specific handlers. I'll write to `src/auth/providers.ts` to add the Google and GitHub OAuth2 flows."
+			},
+			{
+				timestamp: minutesAgo(2),
+				messageType: 'ToolUse',
+				content: 'Write src/auth/providers.ts — **Waiting for permission**'
+			}
+		]
+	},
+	'demo-3': {
+		sessionId: 'demo-3',
+		messages: [
+			{
+				timestamp: minutesAgo(18),
+				messageType: 'User',
+				content: 'Implement token-bucket rate limiting middleware'
+			},
+			{
+				timestamp: minutesAgo(17),
+				messageType: 'Thinking',
+				content:
+					'Token bucket rate limiting — I need to:\n1. Create a Redis-backed token bucket implementation\n2. Build Express middleware that checks the bucket\n3. Add configuration for different rate limit tiers\n4. Handle edge cases like Redis connection failures'
+			},
+			{
+				timestamp: minutesAgo(17),
+				messageType: 'Assistant',
+				content:
+					"I'll implement a Redis-backed token bucket rate limiter. This approach gives us:\n\n- **Distributed rate limiting** across multiple server instances\n- **Sliding window** accuracy with the token bucket algorithm\n- **Configurable tiers** for different API endpoints\n\nLet me start by checking the existing middleware setup."
+			},
+			{
+				timestamp: minutesAgo(16),
+				messageType: 'ToolUse',
+				content: 'Read src/middleware/index.ts'
+			},
+			{
+				timestamp: minutesAgo(16),
+				messageType: 'ToolResult',
+				content:
+					'```typescript\nimport cors from "cors";\nimport helmet from "helmet";\nimport { requestLogger } from "./logging";\n\nexport { cors, helmet, requestLogger };\n```'
+			},
+			{
+				timestamp: minutesAgo(15),
+				messageType: 'Assistant',
+				content:
+					"I need to install `ioredis` as a dependency for the Redis client. This is the most widely-used Redis client for Node.js with built-in TypeScript support."
+			},
+			{
+				timestamp: minutesAgo(1),
+				messageType: 'ToolUse',
+				content: 'Bash: npm install ioredis — **Waiting for permission**'
+			}
+		]
+	},
+	'demo-5': {
+		sessionId: 'demo-5',
+		messages: [
+			{
+				timestamp: minutesAgo(50),
+				messageType: 'User',
+				content: 'Build an interactive configuration wizard for first-time setup'
+			},
+			{
+				timestamp: minutesAgo(49),
+				messageType: 'Thinking',
+				content:
+					'An interactive CLI wizard. I should use inquirer or prompts for the interactive portions. Let me check what dependencies are already available.'
+			},
+			{
+				timestamp: minutesAgo(49),
+				messageType: 'Assistant',
+				content:
+					"I'll create an interactive setup wizard. Let me check the existing CLI structure first."
+			},
+			{
+				timestamp: minutesAgo(48),
+				messageType: 'ToolUse',
+				content: 'Read src/commands/index.ts'
+			},
+			{
+				timestamp: minutesAgo(48),
+				messageType: 'ToolResult',
+				content:
+					'```typescript\nimport { Command } from "commander";\nimport { runCommand } from "./run";\nimport { buildCommand } from "./build";\n\nexport function registerCommands(program: Command) {\n  program.addCommand(runCommand);\n  program.addCommand(buildCommand);\n}\n```'
+			},
+			{
+				timestamp: minutesAgo(40),
+				messageType: 'Assistant',
+				content:
+					"I've created the wizard with the following features:\n\n- **Project name** — validated for npm naming conventions\n- **Template selection** — TypeScript, JavaScript, or minimal\n- **Package manager** — auto-detects from lockfile, or asks\n- **Git initialization** — optional, sets up `.gitignore`\n- **Config file** — writes `cli-tools.config.json`\n\n```typescript\n// src/commands/init.ts\nexport const initCommand = new Command('init')\n  .description('Interactive first-time setup wizard')\n  .action(async () => {\n    const config = await runWizard();\n    await writeConfig(config);\n    console.log('Setup complete!');\n  });\n```"
+			},
+			{
+				timestamp: minutesAgo(15),
+				messageType: 'Assistant',
+				content:
+					'Done! The wizard is at `src/commands/init.ts`. Run `cli-tools init` to try it. All existing tests still pass.'
+			}
+		]
+	}
+};

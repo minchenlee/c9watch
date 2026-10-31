@@ -6,7 +6,7 @@ import { test } from 'node:test';
 
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 const modal = read('src/lib/components/QRCodeModal.svelte');
-const api = read('src/lib/api.ts');
+const api = read('src/lib/data/platform.ts');
 
 test('ServerInfo carries the bind mode', () => {
   assert.match(api, /lanEnabled: boolean;/);

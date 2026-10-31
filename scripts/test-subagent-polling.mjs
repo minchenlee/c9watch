@@ -8,7 +8,7 @@ const sessions = stores.writable([]);
 const requests = [];
 const timers = new Set();
 const exports = {};
-const source = readFileSync(new URL('../src/lib/stores/subagents.ts', import.meta.url), 'utf8');
+const source = readFileSync(new URL('../src/lib/data/stores/subagents.ts', import.meta.url), 'utf8');
 const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
 }).outputText;
@@ -16,12 +16,12 @@ vm.runInNewContext(compiled, {
   exports,
   require(name) {
     if (name === 'svelte/store') return stores;
-    if (name === '@tauri-apps/api/core') return {
+    if (name === '$lib/data/commands') return {
       invoke: (command, args) => new Promise((resolve, reject) => requests.push({ command, args, resolve, reject }))
     };
     if (name === './sessions') return { sessions };
-    if (name === '../ws') return { isTauri: () => true };
-    if (name === '../provider') return {
+    if (name === '../../ws') return { isTauri: () => true };
+    if (name === '../../provider') return {
       providerOf: (session) => session.provider || 'claudeCode',
       providerSessionKey: (p, id) => `${p}:${id}`
     };

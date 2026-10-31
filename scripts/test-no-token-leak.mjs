@@ -85,7 +85,7 @@ test('the leak scan sees every logging form', () => {
 });
 
 const libRs = readFileSync(join(root, 'src-tauri/src/lib.rs'), 'utf8');
-const api = readFileSync(join(root, 'src/lib/api.ts'), 'utf8');
+const api = readFileSync(join(root, 'src/lib/data/platform.ts'), 'utf8');
 
 test('ServerInfo carries no token and no token-bearing URL', () => {
   const rust = libRs.match(/pub struct ServerInfo \{([\s\S]*?)\n\}/);

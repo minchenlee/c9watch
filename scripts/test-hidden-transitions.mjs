@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import ts from 'typescript';
 
 const source = readFileSync(new URL('../src/lib/transitions.ts', import.meta.url), 'utf8');
-const wsCode = ts.transpileModule(readFileSync(new URL('../src/lib/ws.ts', import.meta.url), 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText;
+const wsCode = ts.transpileModule(readFileSync(new URL('../src/lib/data/ws-legacy-client.ts', import.meta.url), 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText;
 const wsUrl = 'data:text/javascript;base64,' + Buffer.from(wsCode).toString('base64');
 const code = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 }

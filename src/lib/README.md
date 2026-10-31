@@ -7,7 +7,8 @@ This directory contains the core TypeScript/Svelte libraries for the c9watch fro
 ```
 lib/
 ├── types.ts              # TypeScript type definitions
-├── api.ts                # Tauri command wrappers
+├── api.ts                # Classic compatibility exports from data/api.ts
+├── data/                 # Shared c9p client, transports, platform wrappers and stores
 └── stores/
     └── sessions.ts       # Svelte stores for state management
 ```
@@ -55,7 +56,12 @@ await openSession(session);
 
 ## Event Listeners
 
-The stores automatically listen for Tauri events from the backend:
+The shared stores consume complete snapshots from the native core subscription
+(or the retained in-process fallback), legacy WebSocket pushes, or a c9p
+snapshot/cursor feed for new browser clients. Classic keeps its existing imports.
+Only `data/` may import Tauri APIs or plugins; `npm run lint:data` enforces this.
+
+The native snapshot event remains:
 
 - `sessions-updated`: Emitted when the backend polling loop detects session changes
 

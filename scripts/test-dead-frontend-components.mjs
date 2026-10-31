@@ -18,7 +18,7 @@ test('removed dead components and barrel files stay deleted', () => {
 });
 
 test('sessions store does not export the unused statusSummary or selectedSessionId', () => {
-  const sessions = read('../src/lib/stores/sessions.ts');
+  const sessions = read('../src/lib/data/stores/sessions.ts');
   assert.doesNotMatch(sessions, /export const statusSummary\b/);
   assert.doesNotMatch(sessions, /export const selectedSessionId\b/);
 });

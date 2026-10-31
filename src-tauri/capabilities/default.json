@@ -2,7 +2,9 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main", "popover"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
@@ -13,6 +15,36 @@
     "notification:allow-is-permission-granted",
     "notification:allow-request-permission",
     "notification:allow-register-listener",
-    "sharekit:default"
+    "sharekit:default",
+    "allow-get-sessions",
+    "allow-get-detection-diagnostics",
+    "allow-get-subscription-usage",
+    "allow-get-conversation",
+    "allow-get-away-activity",
+    "allow-get-session-history",
+    "allow-deep-search-sessions",
+    "allow-get-cost-data",
+    "allow-get-memory-files",
+    "allow-get-subagents",
+    "allow-get-subagent-transcript",
+    "allow-get-session-tasks",
+    "allow-save-temp-image",
+    "allow-reveal-in-file-manager",
+    "allow-stop-session",
+    "allow-open-session",
+    "allow-rename-session",
+    "allow-show-main-window",
+    "allow-get-server-info",
+    "allow-create-pairing-code",
+    "allow-forget-paired-clients",
+    "allow-get-remote-access",
+    "allow-set-remote-access",
+    "allow-get-debug-logs",
+    "allow-get-build-channel",
+    "allow-opencode-connection-status",
+    "allow-opencode-connect",
+    "allow-get-notification-preferences",
+    "allow-save-notification-preferences",
+    "allow-test-native-notification"
   ]
 }

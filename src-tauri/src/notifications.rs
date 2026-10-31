@@ -316,6 +316,33 @@ pub fn notify(app: &AppHandle, session: &Session) {
         Err(e) => crate::debug_log::log_error(&format!("Notification failed: {e}")),
     }
 }
+/// Core already applied its cooldown. Only local preferences and delivery
+/// remain here, so reconnecting cannot introduce a second cooldown.
+#[cfg(unix)]
+pub fn notify_core(app: &AppHandle, payload: &crate::engine_proto::wire::NotificationEvent) {
+    let event = match payload.status.as_str() {
+        "waiting_for_input" => Event::Reply,
+        "needs_attention" if is_question_tool(payload.pending_tool.as_deref()) => Event::Question,
+        "needs_attention" => Event::Permission,
+        _ => return,
+    };
+    let state = app.state::<NotificationState>();
+    let Ok(data) = state.data.lock() else {
+        return;
+    };
+    if !event.enabled(&data.prefs) {
+        return;
+    }
+    let body = if data.prefs.detail == Detail::Brief {
+        event.label()
+    } else {
+        &payload.body
+    };
+    if let Err(e) = show(app, &payload.title, body, data.prefs.sound) {
+        crate::debug_log::log_error(&format!("Notification failed: {e}"));
+    }
+}
+
 #[tauri::command]
 pub fn test_native_notification(
     app: AppHandle,

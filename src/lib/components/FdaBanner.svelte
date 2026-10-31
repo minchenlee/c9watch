@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { openUrl } from '@tauri-apps/plugin-opener';
+	import { openUrl } from '$lib/data/platform';
 	import { isTauri } from '$lib/ws';
 
 	interface Props {

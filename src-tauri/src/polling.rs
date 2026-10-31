@@ -74,7 +74,22 @@ pub fn start_polling(
         #[cfg(all(unix, c9_channel_dev))]
         let mut shadow = crate::engine_proto::shadow::ShadowDiff::for_gui();
 
+        let mut was_core = false;
         loop {
+            #[cfg(unix)]
+            if crate::bridge::core_active(&app_handle) {
+                was_core = true;
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            if was_core {
+                // Do not replay the core's already-delivered transitions.
+                is_first_cycle = true;
+                previous_status.clear();
+                last_notification_time.clear();
+                prev_sessions_hash = None;
+                was_core = false;
+            }
             // Lock the shared DetectorState only for the detection step itself,
             // then drop the guard BEFORE the slow enrichment pass so other call
             // sites (Tauri commands, focus handler) aren't blocked.
@@ -91,6 +106,10 @@ pub fn start_polling(
                 Err(e) => Err(format!("Detect failed: {}", e)),
             };
 
+            #[cfg(unix)]
+            if crate::bridge::core_active(&app_handle) {
+                continue;
+            }
             match enriched {
                 Ok((mut sessions, diagnostics)) => {
                     // Before the workers overlay, so both sides compare
