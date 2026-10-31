@@ -1,3 +1,6 @@
+use crate::gateway::assets::Assets;
+use crate::gateway::limits::*;
+use crate::gateway::security::*;
 use crate::remote_access::{self, RemoteAccess, Transport};
 use crate::ws_auth::{client_principal, ClientId, ClientRegistry, Pairing};
 use axum::{
@@ -11,7 +14,6 @@ use axum::{
     routing::get,
     Extension, Json, Router,
 };
-use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -19,13 +21,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, oneshot, watch};
 
-/// Embed the SvelteKit build output into the binary
-#[derive(Embed)]
-#[folder = "../build/"]
-struct Assets;
-
-/// WebSocket server port
-pub const WS_PORT: u16 = 9210;
+pub use crate::gateway::limits::WS_PORT;
 
 /// Shared state for the WebSocket server
 pub struct WsState {
@@ -140,42 +136,24 @@ fn capability_disabled(capability: &'static str) -> ServerMsg {
     }
 }
 
-/// Session fields that carry conversation text. With conversations off they
-/// are blanked (string fields the client expects) or dropped (optional ones).
-/// AI-generated titles (`aiTitle`, `codexTitle`, `cursorTitle`) summarise
-/// the conversation, so they go too.
-const BLANKED_SESSION_FIELDS: &[&str] = &["firstPrompt", "latestMessage"];
-const DROPPED_SESSION_FIELDS: &[&str] = &[
-    "lastAssistantMessage",
-    "pendingToolInput",
-    "aiTitle",
-    "codexTitle",
-    "cursorTitle",
-];
-
-/// Removes what the policy keeps from remote clients out of a session array
-/// (`sessions`, `sessionsUpdated`). User-set names (`sessionName`,
-/// `customTitle`), status and the pending tool's name stay, so a card still
-/// says what it is and what it waits for.
+/// Legacy transport adaptation over the same schema projection used by c9p.
 fn redact_sessions(data: &mut serde_json::Value, policy: &WsPolicy) {
-    let Some(sessions) = data.as_array_mut() else {
-        return;
-    };
-    for session in sessions.iter_mut().filter_map(|s| s.as_object_mut()) {
-        if !policy.allow_conversation {
-            for field in BLANKED_SESSION_FIELDS {
-                if session.contains_key(*field) {
-                    session.insert((*field).into(), "".into());
-                }
-            }
-            for field in DROPPED_SESSION_FIELDS {
-                session.remove(*field);
-            }
-            if session.contains_key("summary") {
-                session.insert("summary".into(), serde_json::Value::Null);
-            }
-        }
-        if !policy.allow_open {
+    use crate::gateway::redaction::{self, Sensitivity};
+    redaction::legacy_sessions(
+        data,
+        if policy.allow_conversation {
+            Sensitivity::Conversation
+        } else {
+            Sensitivity::Metadata
+        },
+    );
+    if !policy.allow_open {
+        for session in data
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_object_mut)
+        {
             session.insert("canOpen".into(), false.into());
             session.remove("openTarget");
         }
@@ -186,13 +164,15 @@ fn redact_sessions(data: &mut serde_json::Value, policy: &WsPolicy) {
 /// conversations off it becomes `redactedTitle` (the project name, else the
 /// provider's name). `redactedTitle` itself never goes out.
 fn redact_notification(data: &mut serde_json::Value, policy: &WsPolicy) {
-    let Some(notification) = data.as_object_mut() else {
-        return;
-    };
-    let redacted = notification.remove("redactedTitle");
-    if !policy.allow_conversation {
-        notification.insert("title".into(), redacted.unwrap_or_else(|| "c9watch".into()));
-    }
+    use crate::gateway::redaction::{self, Sensitivity};
+    redaction::legacy_notification(
+        data,
+        if policy.allow_conversation {
+            Sensitivity::Conversation
+        } else {
+            Sensitivity::Metadata
+        },
+    );
 }
 
 // ── Protocol types ──────────────────────────────────────────────────
@@ -349,11 +329,6 @@ pub async fn serve(
     }
 }
 
-/// A peer may connect when it is loopback, or when LAN access is on.
-fn peer_allowed(lan_enabled: bool, peer: IpAddr) -> bool {
-    lan_enabled || remote_access::is_loopback_peer(peer)
-}
-
 /// Rejects non-loopback peers while LAN access is off. The listeners are
 /// loopback-only then anyway; this also covers a keep-alive connection that
 /// a LAN listener accepted before LAN was turned off.
@@ -372,95 +347,6 @@ async fn peer_guard(
 
 // ── Host and Origin checks ──────────────────────────────────────────
 
-/// Loopback names a page or client may use for this server. Each one must
-/// carry the listener's port.
-const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
-
-/// Splits a `Host` value (or an allowed-host entry) into a lowercase host and
-/// an optional port. IPv6 literals keep their brackets. Returns `None` for a
-/// value that is not a bare `host` or `host:port`.
-fn split_host(value: &str) -> Option<(String, Option<u16>)> {
-    let value = value.trim().to_ascii_lowercase();
-    let (host, port) = if value.starts_with('[') {
-        let end = value.find(']')?;
-        let (host, rest) = value.split_at(end + 1);
-        match rest {
-            "" => (host.to_string(), None),
-            _ => (host.to_string(), Some(rest.strip_prefix(':')?)),
-        }
-    } else {
-        match value.split_once(':') {
-            Some((host, port)) => (host.to_string(), Some(port)),
-            None => (value.clone(), None),
-        }
-    };
-    let ok_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']');
-    if host.is_empty() || !host.chars().all(ok_char) {
-        return None;
-    }
-    let port = match port {
-        Some(p) => Some(p.parse::<u16>().ok()?),
-        None => None,
-    };
-    Some((host, port))
-}
-
-/// The IP address a `Host` names, when it is an IP literal.
-fn host_ip(host: &str) -> Option<IpAddr> {
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    bare.parse().ok()
-}
-
-/// True when this server answers to `host` (a `Host` header value). This
-/// blocks DNS rebinding: a page on `evil.example` that resolves to
-/// 127.0.0.1 still sends `Host: evil.example`.
-///
-/// - A loopback name with the listener's port.
-/// - An `extraAllowedHosts` entry. An entry with a port must match exactly.
-///   An entry without a port matches the host with no port (a proxy on its
-///   default port, such as `tailscale serve` on 443) or with the
-///   listener's port.
-/// - In LAN mode, an IP address of a local interface with the listener's
-///   port. `local_ips` is called only then, so the addresses are read fresh
-///   per request and never cached.
-fn host_allowed(
-    host: &str,
-    remote: &RemoteAccess,
-    port: u16,
-    local_ips: impl FnOnce() -> Vec<IpAddr>,
-) -> bool {
-    let Some((name, given_port)) = split_host(host) else {
-        return false;
-    };
-    if LOOPBACK_HOSTS.contains(&name.as_str()) && given_port == Some(port) {
-        return true;
-    }
-    let extra = remote
-        .extra_allowed_hosts
-        .iter()
-        .any(|entry| match split_host(entry) {
-            Some((entry_name, Some(entry_port))) => {
-                entry_name == name && given_port == Some(entry_port)
-            }
-            Some((entry_name, None)) => {
-                entry_name == name && (given_port.is_none() || given_port == Some(port))
-            }
-            None => false,
-        });
-    if extra {
-        return true;
-    }
-    if remote.lan_enabled && given_port == Some(port) {
-        if let Some(ip) = host_ip(&name) {
-            return local_ips().contains(&ip);
-        }
-    }
-    false
-}
-
 /// The `Host` of a request. HTTP/2 carries it in the URI authority instead.
 fn request_host(request: &Request) -> Option<String> {
     request
@@ -469,44 +355,6 @@ fn request_host(request: &Request) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
         .or_else(|| request.uri().authority().map(|a| a.as_str().to_string()))
-}
-
-/// Origins allowed in debug builds only: the Vite dev server.
-#[cfg(debug_assertions)]
-const DEV_ORIGINS: &[&str] = &["http://localhost:1420"];
-#[cfg(not(debug_assertions))]
-const DEV_ORIGINS: &[&str] = &[];
-
-/// True when a WS upgrade with this `Origin` may proceed.
-///
-/// No `Origin` is allowed on purpose. Browsers always send `Origin` on a
-/// WebSocket upgrade, so a missing one means a client that is not a
-/// browser (a script, the CLI, a native app). Such a client cannot be
-/// driven by a hostile web page, which is what this check stops, and it
-/// still has to present a valid token.
-///
-/// A present `Origin` must be `http://` or `https://` plus a host that
-/// [`host_allowed`] accepts. `null` and every other scheme are rejected.
-fn origin_allowed(
-    origin: Option<&str>,
-    remote: &RemoteAccess,
-    port: u16,
-    local_ips: impl FnOnce() -> Vec<IpAddr>,
-) -> bool {
-    let Some(origin) = origin else {
-        return true;
-    };
-    let origin = origin.trim().to_ascii_lowercase();
-    if DEV_ORIGINS.contains(&origin.as_str()) {
-        return true;
-    }
-    let Some(host) = origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
-    else {
-        return false;
-    };
-    !host.contains('/') && host_allowed(host, remote, port, local_ips)
 }
 
 /// Rejects a request whose `Host` this server does not answer to. Runs on
@@ -548,87 +396,15 @@ async fn host_guard(
 #[derive(Debug, Clone)]
 struct CheckedHost(String);
 
-/// One `'sha256-…'` source per inline `<script>` (a script without `src`)
-/// in `html`. The hash covers the exact text between the tags, as the
-/// browser computes it.
-fn inline_script_hashes(html: &str) -> Vec<String> {
-    use base64::Engine;
-    use sha2::{Digest, Sha256};
-    // ASCII lowercasing keeps byte offsets, so slices of `lower` index `html`.
-    let lower = html.to_ascii_lowercase();
-    let mut hashes = Vec::new();
-    let mut at = 0;
-    while let Some(found) = lower[at..].find("<script") {
-        let start = at + found;
-        let name_end = start + "<script".len();
-        let Some(open_len) = lower[name_end..].find('>') else {
-            break;
-        };
-        let open_end = name_end + open_len;
-        let Some(close_len) = lower[open_end..].find("</script") else {
-            break;
-        };
-        let close = open_end + close_len;
-        at = close;
-        let attrs = &lower[name_end..open_end];
-        if !attrs.is_empty() && !attrs.starts_with(|c: char| c.is_ascii_whitespace()) {
-            continue; // e.g. `<scripts>`, not a script tag
-        }
-        let has_src = attrs
-            .split(|c: char| c.is_ascii_whitespace())
-            .any(|attr| attr == "src" || attr.starts_with("src="));
-        if has_src {
-            continue;
-        }
-        let digest = Sha256::digest(&html.as_bytes()[open_end + 1..close]);
-        let hash = base64::engine::general_purpose::STANDARD.encode(digest);
-        let source = format!("'sha256-{hash}'");
-        if !hashes.contains(&source) {
-            hashes.push(source);
-        }
-    }
-    hashes
-}
-
 /// The hashes of the inline scripts in the embedded `index.html` (the
 /// SvelteKit bootstrap), computed once.
 fn embedded_script_hashes() -> &'static str {
     static HASHES: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HASHES.get_or_init(|| {
-        Assets::get("index.html")
-            .map(|file| inline_script_hashes(&String::from_utf8_lossy(&file.data)).join(" "))
+        Assets::read("index.html")
+            .map(|file| inline_script_hashes(&String::from_utf8_lossy(&file)).join(" "))
             .unwrap_or_default()
     })
-}
-
-/// The CSP for every response. `connect-src` lists each loopback alias,
-/// because the page may connect its socket to a different alias than the
-/// one it was loaded from (`localhost` is rewritten to `127.0.0.1`), plus
-/// the checked `Host` for LAN and proxy pages.
-fn content_security_policy(script_hashes: &str, port: u16, host: Option<&str>) -> String {
-    let mut connect = vec!["'self'".to_string()];
-    let mut add = |source: String| {
-        if !connect.contains(&source) {
-            connect.push(source);
-        }
-    };
-    for alias in LOOPBACK_HOSTS {
-        add(format!("ws://{alias}:{port}"));
-    }
-    if let Some(host) = host {
-        add(format!("ws://{host}"));
-        add(format!("wss://{host}"));
-    }
-    let script = match script_hashes {
-        "" => "'self'".to_string(),
-        hashes => format!("'self' {hashes}"),
-    };
-    format!(
-        "default-src 'self'; script-src {script}; style-src 'self' 'unsafe-inline'; \
-         img-src 'self' data:; font-src 'self'; connect-src {}; object-src 'none'; \
-         base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
-        connect.join(" ")
-    )
 }
 
 /// Adds the security headers to every response, rejections included.
@@ -688,6 +464,8 @@ pub struct WsServer {
     port: u16,
     config_path: PathBuf,
     listening: tokio::sync::Mutex<Vec<Listening>>,
+    /// Serialize native consent with the exact policy/code write it approves.
+    pub(crate) confirmation: tokio::sync::Mutex<()>,
 }
 
 impl WsServer {
@@ -697,6 +475,7 @@ impl WsServer {
             port,
             config_path,
             listening: tokio::sync::Mutex::new(Vec::new()),
+            confirmation: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -824,6 +603,7 @@ impl WsServer {
     pub async fn update(&self, remote: RemoteAccess) -> Result<RemoteAccess, String> {
         let remote = RemoteAccess {
             extra_allowed_hosts: remote_access::normalize_hosts(&remote.extra_allowed_hosts)?,
+            allowed_origins: remote_access::normalize_origins(&remote.allowed_origins)?,
             ..remote
         };
         let previous = self.remote();
@@ -889,22 +669,22 @@ async fn serve_static_fallback(uri: axum::http::Uri) -> impl IntoResponse {
 }
 
 fn serve_embedded_file(path: &str) -> impl IntoResponse {
-    match Assets::get(path) {
+    match Assets::read(path) {
         Some(file) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, mime.as_ref().to_string())],
-                file.data.into_owned(),
+                file,
             )
                 .into_response()
         }
         // SPA fallback: serve index.html for unmatched routes
-        None => match Assets::get("index.html") {
+        None => match Assets::read("index.html") {
             Some(file) => (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/html".to_string())],
-                file.data.into_owned(),
+                file,
             )
                 .into_response(),
             None => (StatusCode::NOT_FOUND, "Not found").into_response(),
@@ -916,16 +696,13 @@ fn serve_embedded_file(path: &str) -> impl IntoResponse {
 
 /// At most this many sockets may be waiting to authenticate at once. Each
 /// can hold a buffered frame for up to `AUTH_TIMEOUT`.
-const MAX_UNAUTHENTICATED: usize = 16;
 /// Largest first frame read as an auth frame. A token or code frame is
 /// well under 200 bytes.
-const MAX_AUTH_FRAME_BYTES: usize = 4 * 1024;
 /// Largest message (and frame) a client may send. Requests are small JSON;
 /// `getAwayActivity` with a few hundred sessions is the biggest. axum sets
 /// this for the whole socket at upgrade, so it is also the bound on what an
 /// unauthenticated client can make the server buffer (axum's default is
 /// 64 MiB).
-const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// One reserved unauthenticated-socket slot; released on drop.
 struct UnauthenticatedSlot(Arc<WsState>);
@@ -974,15 +751,11 @@ async fn ws_handler(
 // ── Handshake ───────────────────────────────────────────────────────
 
 /// How long a client has to send its first frame and get it accepted.
-const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Close code: the first frame was missing, late, or not an auth frame.
-const CLOSE_BAD_HANDSHAKE: u16 = 4400;
 /// Close code: the token or pairing code was not accepted. The client
 /// must pair again; it should not retry on its own.
-const CLOSE_UNAUTHORIZED: u16 = 4401;
 /// Close code: the pairing code was wrong, expired or already used. Unlike
 /// 4401 it says nothing about a token the client may already hold.
-const CLOSE_PAIR_REJECTED: u16 = 4403;
 
 /// The first frame a client sends. Nothing else is read before it.
 #[derive(Deserialize)]
@@ -1103,7 +876,6 @@ fn close_with(code: u16, reason: &'static str) -> Message {
 
 /// Close code sent when the remote-access policy changes (1012, "service
 /// restart"); the client reconnects.
-const CLOSE_POLICY_CHANGED: u16 = 1012;
 
 async fn handle_socket(
     mut socket: WebSocket,
@@ -1830,9 +1602,9 @@ mod protocol_tests {
         assert!(s.get("cursorTitle").is_none());
         assert!(!data.to_string().contains("secret"), "{data}");
         assert!(!data.to_string().contains("id_rsa"), "{data}");
-        // User-set names and status stay: the card still shows what it is.
-        assert_eq!(s["sessionName"], "proj");
-        assert_eq!(s["customTitle"], "My title");
+        // Session and custom titles are conversation-class too.
+        assert_eq!(s["sessionName"], "");
+        assert!(s.get("customTitle").is_none());
         assert_eq!(s["pendingToolName"], "Bash");
         assert_eq!(s["canOpen"], false);
         assert!(s.get("openTarget").is_none());
@@ -1840,14 +1612,16 @@ mod protocol_tests {
     }
 
     #[test]
-    fn sessions_keep_everything_when_both_are_on() {
+    fn sessions_keep_classified_content_and_drop_unclassified_content_at_conversation_ceiling() {
         let mut data = serde_json::json!([content_session()]);
         let all = WsPolicy {
             allow_conversation: true,
             allow_open: true,
         };
         redact_sessions(&mut data, &all);
-        assert_eq!(data, serde_json::json!([content_session()]));
+        let mut expected = content_session();
+        expected["pendingToolInput"] = serde_json::json!({});
+        assert_eq!(data, serde_json::json!([expected]));
     }
 
     #[test]
@@ -1864,6 +1638,7 @@ mod protocol_tests {
         redact_notification(&mut off, &WsPolicy::default());
         assert_eq!(off["title"], "proj");
         assert!(off.get("redactedTitle").is_none());
+        assert!(off.get("body").is_none());
         assert!(!off.to_string().contains("secret"));
 
         let mut on = push();
@@ -2074,158 +1849,6 @@ mod server_tests {
 
     const PORT: u16 = 9210;
     const LAN_IP: &str = "192.168.1.20";
-
-    fn lan_ips() -> Vec<IpAddr> {
-        vec![LAN_IP.parse().unwrap(), "fd00::20".parse().unwrap()]
-    }
-
-    fn policy(lan_enabled: bool, extra: &[&str]) -> RemoteAccess {
-        RemoteAccess {
-            lan_enabled,
-            extra_allowed_hosts: extra.iter().map(|h| h.to_string()).collect(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn host_check_table() {
-        let off = policy(false, &[]);
-        let lan = policy(true, &[]);
-        let extra = policy(false, &["mac.tail1234.ts.net", "box.lan:8000"]);
-        let cases: &[(&str, &RemoteAccess, bool)] = &[
-            ("127.0.0.1:9210", &off, true),
-            ("localhost:9210", &off, true),
-            ("LOCALHOST:9210", &off, true),
-            ("[::1]:9210", &off, true),
-            ("evil.example:9210", &off, false),
-            ("evil.example", &off, false),
-            ("localhost", &off, false),
-            ("127.0.0.1:8000", &off, false),
-            ("localhost:9211", &off, false),
-            ("localhost:x", &off, false),
-            ("localhost.:9210", &off, false),
-            ("", &off, false),
-            ("192.168.1.20:9210", &off, false),
-            ("192.168.1.20:9210", &lan, true),
-            ("[fd00::20]:9210", &lan, true),
-            ("192.168.1.20:8000", &lan, false),
-            ("192.168.1.99:9210", &lan, false),
-            ("evil.example:9210", &lan, false),
-            ("mac.tail1234.ts.net", &extra, true),
-            ("mac.tail1234.ts.net:9210", &extra, true),
-            ("mac.tail1234.ts.net:443", &extra, false),
-            ("box.lan:8000", &extra, true),
-            ("box.lan", &extra, false),
-            ("box.lan:9210", &extra, false),
-            ("other.ts.net", &extra, false),
-        ];
-        for (host, remote, want) in cases {
-            assert_eq!(
-                host_allowed(host, remote, PORT, lan_ips),
-                *want,
-                "Host {host:?} lan={}",
-                remote.lan_enabled
-            );
-        }
-    }
-
-    #[test]
-    fn inline_script_hashes_skip_external_scripts() {
-        let html = "<head><script src=\"/a.js\"></script>\
-                    <SCRIPT type=\"module\" src=/b.js></SCRIPT></head>\
-                    <body><script>alert(1)</script><scripts></scripts>\
-                    <script type=\"text/javascript\">\n  run();\n</script>\
-                    <script>alert(1)</script></body>";
-        assert_eq!(
-            inline_script_hashes(html),
-            [
-                "'sha256-bhHHL3z2vDgxUt0W3dWQOrprscmda2Y5pLsLg4GF+pI='",
-                "'sha256-2P5SgcCngN/gHHrSMQVmAm2SPYlTnahjTR7WEmfSs8Y='",
-            ]
-        );
-        assert!(inline_script_hashes("<p>no scripts</p>").is_empty());
-    }
-
-    #[test]
-    fn csp_adds_the_checked_host_and_the_script_hashes() {
-        let csp = content_security_policy("'sha256-abc='", PORT, Some("192.168.1.20:9210"));
-        assert!(csp.contains("script-src 'self' 'sha256-abc=';"), "{csp}");
-        assert!(
-            csp.contains(
-                "connect-src 'self' ws://127.0.0.1:9210 ws://localhost:9210 \
-                 ws://[::1]:9210 ws://192.168.1.20:9210 wss://192.168.1.20:9210;"
-            ),
-            "{csp}"
-        );
-        let loopback = content_security_policy("", PORT, Some("localhost:9210"));
-        assert!(loopback.contains("script-src 'self';"), "{loopback}");
-        assert_eq!(
-            loopback.matches("ws://localhost:9210").count(),
-            1,
-            "{loopback}"
-        );
-    }
-
-    #[test]
-    fn interface_ips_are_read_only_for_lan_ip_hosts() {
-        let never = || -> Vec<IpAddr> { panic!("interfaces read") };
-        assert!(host_allowed(
-            "localhost:9210",
-            &policy(true, &[]),
-            PORT,
-            never
-        ));
-        assert!(!host_allowed(
-            "192.168.1.20:9210",
-            &policy(false, &[]),
-            PORT,
-            never
-        ));
-    }
-
-    #[test]
-    fn origin_check_table() {
-        let off = policy(false, &[]);
-        let lan = policy(true, &[]);
-        let extra = policy(false, &["mac.tail1234.ts.net"]);
-        let cases: &[(Option<&str>, &RemoteAccess, bool)] = &[
-            (None, &off, true),
-            (Some("http://127.0.0.1:9210"), &off, true),
-            (Some("http://localhost:9210"), &off, true),
-            (Some("http://[::1]:9210"), &off, true),
-            (Some("https://mac.tail1234.ts.net"), &extra, true),
-            (Some("http://192.168.1.20:9210"), &lan, true),
-            (Some("http://192.168.1.20:9210"), &off, false),
-            (Some("http://evil.example"), &off, false),
-            (Some("http://evil.localhost:8000"), &off, false),
-            (Some("http://localhost:8000"), &off, false),
-            (Some("null"), &off, false),
-            (Some(""), &off, false),
-            (Some("tauri://localhost"), &off, false),
-            (Some("ws://localhost:9210"), &off, false),
-            (Some("http://localhost:9210/x"), &off, false),
-        ];
-        for (origin, remote, want) in cases {
-            assert_eq!(
-                origin_allowed(*origin, remote, PORT, lan_ips),
-                *want,
-                "Origin {origin:?}"
-            );
-        }
-        assert_eq!(
-            origin_allowed(Some("http://localhost:1420"), &off, PORT, lan_ips),
-            cfg!(debug_assertions),
-            "the Vite dev origin is a debug-build exception"
-        );
-    }
-
-    #[test]
-    fn non_loopback_peers_need_lan() {
-        let lan_peer: IpAddr = "192.168.1.20".parse().unwrap();
-        assert!(!peer_allowed(false, lan_peer));
-        assert!(peer_allowed(true, lan_peer));
-        assert!(peer_allowed(false, "::ffff:127.0.0.1".parse().unwrap()));
-    }
 
     #[tokio::test]
     async fn default_policy_serves_on_loopback_only() {

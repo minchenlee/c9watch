@@ -252,7 +252,7 @@ mod tests {
     /// The web notification is the pre-move JSON, built from the same
     /// `notification_text` the engine's `notification.*` data uses.
     #[test]
-    fn web_notification_payload_is_unchanged() {
+    fn web_notification_keeps_its_shape_and_uses_project_for_redacted_title() {
         let mut s = Session::fixture("a", SessionStatus::NeedsAttention);
         s.pending_tool_name = Some("Bash".into());
         let text = crate::session::notification::notification_text(&s).unwrap();

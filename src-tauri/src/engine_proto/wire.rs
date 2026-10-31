@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
 /// Protocol minor version. Raised for additive changes.
-pub const API_MINOR: u32 = 7;
+pub const API_MINOR: u32 = 8;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -134,6 +134,8 @@ pub enum ErrorCode {
     /// The principal may not call this method (`agent.create` and
     /// `agent.retire` take only a local client in C1a).
     NotAllowed,
+    /// A widening permission change needs a fresh native confirmation.
+    ConfirmationRequired,
     /// The canonical cwd of a free agent is inside the engine home or a
     /// managed worktree home.
     CwdCollision,
@@ -193,6 +195,7 @@ impl ErrorCode {
             ErrorCode::AgentBinMissing => "agent_bin_missing",
             ErrorCode::AgentBinMismatch => "agent_bin_mismatch",
             ErrorCode::NotAllowed => "not_allowed",
+            ErrorCode::ConfirmationRequired => "confirmation_required",
             ErrorCode::CwdCollision => "cwd_collision",
             ErrorCode::SpawnFailed => "spawn_failed",
             ErrorCode::UnknownAgent => "unknown_agent",
@@ -255,7 +258,10 @@ impl ErrorCode {
                 "`c9watch engine restart` copies c9watch-agent again; check what changed \
                  the engine's copy"
             }
-            ErrorCode::NotAllowed => "call this from the CLI or the GUI, not from an agent",
+            ErrorCode::NotAllowed => "inspect auth.can for the required authority",
+            ErrorCode::ConfirmationRequired => {
+                "confirm the exact permission change in the native GUI dialog"
+            }
             ErrorCode::CwdCollision => {
                 "pick a cwd outside the engine home and outside `.c9watch/worktrees`"
             }
@@ -397,12 +403,72 @@ pub struct HelloResult {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct MethodInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs: Option<AuthNeeds>,
     /// The minor that added the method.
     pub since: u32,
     /// Goes up by one on each breaking change to the method's shape.
     pub rev: u32,
     /// `preview`, `internal` or `deprecated`.
     pub stability: String,
+}
+
+/// A sensitivity ceiling. Ordering is also the egress ordering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum Ceiling {
+    Public,
+    #[default]
+    Metadata,
+    Conversation,
+}
+
+/// Additional authority a caller would need.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AuthNeeds {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<Ceiling>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<bool>,
+}
+
+/// Ask about the caller's own authority. Params are inspected, never executed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct AuthCanParams {
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct AuthCanResult {
+    pub allowed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs: Option<AuthNeeds>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AuthRulesResult {
+    pub principal: String,
+    pub scopes: Vec<String>,
+    pub ceiling: Ceiling,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_expires_at: Option<i64>,
+    pub methods: std::collections::BTreeMap<String, MethodInfo>,
+    pub topics: Vec<String>,
 }
 
 /// The engine's limits, in `hello.result.limits`.

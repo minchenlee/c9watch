@@ -98,6 +98,8 @@ pub const CLI_COMMANDS: &[&str] = &[
     #[cfg(all(unix, feature = "engine"))]
     "export",
     #[cfg(all(unix, feature = "engine"))]
+    "auth",
+    #[cfg(all(unix, feature = "engine"))]
     "integration",
     "spawn",
     "send",
@@ -116,7 +118,7 @@ pub const CLI_COMMANDS: &[&str] = &[
 /// moved to `c9watch-agent` (C1a-21). They stay out of `CLI_COMMANDS`, but
 /// `is_cli_invocation` still routes them to Clap, so the user gets an
 /// unknown-command error instead of the GUI.
-pub const RESERVED_ENGINE_COMMANDS: &[&str] = &["task", "engine", "export", "integration"];
+pub const RESERVED_ENGINE_COMMANDS: &[&str] = &["task", "engine", "export", "integration", "auth"];
 
 /// Whether `first` (the first argument) selects the CLI.
 pub fn is_cli_invocation(first: &str) -> bool {
@@ -203,6 +205,19 @@ pub struct WaitEventArgs {
     #[cfg(all(unix, feature = "engine"))]
     #[arg(long, requires = "event")]
     pub since: Option<String>,
+}
+
+#[cfg(all(unix, feature = "engine"))]
+#[derive(Subcommand)]
+pub enum AuthAction {
+    /// Whether this connection may call a method (does not execute it)
+    CanI {
+        method: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List this connection's methods, topics, scopes and ceiling
+    Rules,
 }
 
 #[derive(Subcommand)]
@@ -483,6 +498,12 @@ pub enum Commands {
     /// Export data through c9p; starts core if needed
     #[cfg(all(unix, feature = "engine"))]
     Export(export::ExportArgs),
+    /// Inspect the caller's own engine permissions
+    #[cfg(all(unix, feature = "engine"))]
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
 
     /// Show the engine's agent adapters and their integration files
     #[cfg(all(unix, feature = "engine"))]
@@ -645,6 +666,8 @@ pub fn run(cli: Cli) {
         })(),
         #[cfg(all(unix, feature = "engine"))]
         Commands::Export(args) => export::run(args),
+        #[cfg(all(unix, feature = "engine"))]
+        Commands::Auth { action } => engine_client::cmd_auth(&action, cli.pretty),
         #[cfg(all(unix, feature = "engine"))]
         Commands::Integration { action } => engine_client::cmd_integration(&action, cli.pretty),
         #[cfg(any(feature = "pm-orchestration", all(unix, feature = "engine")))]
@@ -1676,5 +1699,23 @@ mod dispatch_tests {
         assert!(!CLI_COMMANDS.contains(&"task"));
         assert!(is_cli_invocation("task"));
         assert!(Cli::try_parse_from(["c9watch", "task", "done", "--report", "ok"]).is_err());
+    }
+    #[cfg(all(unix, feature = "engine"))]
+    #[test]
+    fn auth_commands_route_to_cli_and_parse_self_queries() {
+        assert!(is_cli_invocation("auth"));
+        let parsed =
+            Cli::try_parse_from(["c9watch", "auth", "can-i", "conversation.get", "--json"])
+                .unwrap();
+        assert!(
+            matches!(parsed.command, Commands::Auth { action: AuthAction::CanI { method, json: true } } if method == "conversation.get")
+        );
+        let parsed = Cli::try_parse_from(["c9watch", "auth", "rules"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Commands::Auth {
+                action: AuthAction::Rules
+            }
+        ));
     }
 }

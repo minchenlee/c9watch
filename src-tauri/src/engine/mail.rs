@@ -120,7 +120,7 @@ impl Sender {
     fn agent_id(&self) -> Option<&str> {
         match &self.principal {
             Principal::Agent { id, .. } => Some(id),
-            Principal::LocalUnverified => None,
+            Principal::LocalUnverified | Principal::Client { .. } => None,
         }
     }
 }
@@ -137,6 +137,7 @@ pub fn sender(conn: &Connection, principal: &Principal) -> rusqlite::Result<Send
             .optional()?
             .unwrap_or((None, None)),
         Principal::LocalUnverified => (None, None),
+        Principal::Client { .. } => return Err(rusqlite::Error::InvalidQuery),
     };
     Ok(Sender {
         principal: principal.clone(),
@@ -313,6 +314,10 @@ pub fn check_sender(
     live: &dyn LiveAgents,
 ) -> Result<(), ApiError> {
     match principal {
+        Principal::Client { .. } => Err(ApiError::new(
+            ErrorCode::NotAllowed,
+            "gateway peers cannot send mail",
+        )),
         Principal::LocalUnverified => principal::check_mutating_peer(pid, peer_start, live)
             .map_err(|why| {
                 ApiError::new(
@@ -1462,6 +1467,7 @@ pub(super) fn visible(
 ) -> rusqlite::Result<bool> {
     match principal {
         Principal::LocalUnverified => Ok(true),
+        Principal::Client { .. } => Ok(false),
         Principal::Agent { id: agent, .. } => conn.query_row("SELECT count(*) > 0 FROM messages WHERE id = ?1 AND (from_agent = ?2 OR to_agent = ?2)", params![id, agent], |r| r.get(0)),
     }
 }
@@ -1516,6 +1522,12 @@ pub fn list(
     who: &Principal,
     p: &MsgListParams,
 ) -> rusqlite::Result<Result<MsgListResult, ApiError>> {
+    if matches!(who, Principal::Client { .. }) {
+        return Ok(Err(ApiError::new(
+            ErrorCode::NotAllowed,
+            "mail is local-only",
+        )));
+    }
     let agent = match p.agent.as_deref() {
         Some(a) => match resolve(conn, machine, a)? {
             Ok(t) => Some(t.id),

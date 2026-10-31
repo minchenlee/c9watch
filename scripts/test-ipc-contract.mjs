@@ -99,8 +99,8 @@ test('c9p/1 schema lists exactly the methods the engine serves', () => {
   assert.ok(list, 'METHODS not found in engine/api.rs');
   const methods = matches(list[1], /"([a-z._]+)"/g);
   assert.deepEqual(sorted(Object.keys(c9pSchema.methods)), sorted(methods));
-  const dispatch = engineApi.match(/async fn dispatch\([\s\S]*?\n\}/);
-  assert.ok(dispatch, 'dispatch not found in engine/api.rs');
+  const dispatch = engineApi.match(/async fn execute\([\s\S]*?\n\}/);
+  assert.ok(dispatch, 'authorized handler dispatch not found in engine/api.rs');
   const served = matches(dispatch[0], /^\s*"([a-z._]+)" =>/gm);
   served.add('hello'); // handled before dispatch
   // Hook-class methods (C1a-21): `task.done` and `agent.handoff` by name,
@@ -152,4 +152,15 @@ test('every c9p/1 result and event field has an x-sensitivity class', () => {
   assert.deepEqual(missing, [], 'fields without x-sensitivity (class them in engine/sensitivity.rs)');
   for (const [topic, t] of Object.entries(c9pSchema.topics ?? {}))
     assert.ok(['preview', 'internal', 'deprecated'].includes(t['x-stability']), topic);
+});
+
+// The runtime's sole authority table is exported for every served name.
+test('every c9p method and topic declares x-authz', () => {
+  for (const section of ['methods', 'topics']) {
+    for (const [name, entry] of Object.entries(c9pSchema[section])) {
+      const rule = entry['x-authz'];
+      assert.ok(rule && rule.resource && rule.verb, `${section}.${name}: missing x-authz`);
+      assert.ok(Array.isArray(rule.principals) && Array.isArray(rule.admission), name);
+    }
+  }
 });

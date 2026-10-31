@@ -10,6 +10,9 @@ pub mod claude_usage;
 pub mod debug_log;
 pub mod session;
 
+#[cfg(any(feature = "gui", all(unix, feature = "engine")))]
+pub mod gateway;
+
 // ── GUI-only modules ────────────────────────────────────────────────
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod auth;
@@ -700,8 +703,27 @@ async fn get_server_info(
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn create_pairing_code(
+    app: tauri::AppHandle,
     server: tauri::State<'_, Arc<web_server::WsServer>>,
 ) -> Result<web_server::PairingCode, String> {
+    let _guard = server.confirmation.lock().await;
+    // The GUI still hosts the legacy server until M-c. Its existing access
+    // is stated explicitly; new core tokens use the viewer preset instead.
+    let remote = server.remote();
+    let mut scopes = vec![
+        "session:read",
+        "session:stop",
+        "session:rename",
+        "cost:read",
+    ];
+    if remote.allow_conversation {
+        scopes.push("conversation:read");
+    }
+    let params = serde_json::json!({"scopes":scopes,"ceiling":if remote.allow_conversation {"conversation"} else {"metadata"}, "allowOpen":remote.allow_open});
+    gateway::consent::confirm(&serde_json::Value::Null, &params, |message| {
+        gateway::consent::native_dialog(app, message)
+    })
+    .await?;
     server.create_pairing_code()
 }
 
@@ -727,9 +749,22 @@ async fn get_remote_access(
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn set_remote_access(
+    app: tauri::AppHandle,
     server: tauri::State<'_, Arc<web_server::WsServer>>,
     remote: remote_access::RemoteAccess,
 ) -> Result<remote_access::RemoteAccess, String> {
+    let _guard = server.confirmation.lock().await;
+    let remote = remote_access::RemoteAccess {
+        extra_allowed_hosts: remote_access::normalize_hosts(&remote.extra_allowed_hosts)?,
+        allowed_origins: remote_access::normalize_origins(&remote.allowed_origins)?,
+        ..remote
+    };
+    let old = serde_json::to_value(server.remote()).map_err(|e| e.to_string())?;
+    let next = serde_json::to_value(&remote).map_err(|e| e.to_string())?;
+    gateway::consent::confirm(&old, &next, |message| {
+        gateway::consent::native_dialog(app, message)
+    })
+    .await?;
     server.update(remote).await
 }
 
@@ -778,6 +813,7 @@ pub fn run() {
     let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_sharekit::init());
 

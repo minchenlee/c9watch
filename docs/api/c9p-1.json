@@ -23,7 +23,7 @@
         "reason": {
           "description": "Why: a permission prompt, a notification, `mail_uncertain: <msg>`.",
           "type": "string",
-          "x-sensitivity": "metadata"
+          "x-sensitivity": "public"
         },
         "toolUseId": {
           "description": "The hook's `tool_use_id` (may be `null`), for a hook's attention.",
@@ -98,7 +98,7 @@
         },
         "reason": {
           "type": "string",
-          "x-sensitivity": "metadata"
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -161,7 +161,7 @@
             "$ref": "#/$defs/AgentRow"
           },
           "type": "array",
-          "x-sensitivity": "conversation"
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -481,6 +481,139 @@
       ],
       "type": "object"
     },
+    "AuthCanParams": {
+      "description": "Ask about the caller's own authority. Params are inspected, never executed.",
+      "properties": {
+        "method": {
+          "type": "string"
+        },
+        "params": {
+          "default": null
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object"
+    },
+    "AuthCanResult": {
+      "properties": {
+        "allowed": {
+          "type": "boolean",
+          "x-sensitivity": "public"
+        },
+        "needs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthNeeds"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-sensitivity": "public"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "allowed"
+      ],
+      "type": "object"
+    },
+    "AuthNeeds": {
+      "description": "Additional authority a caller would need.",
+      "properties": {
+        "ceiling": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ceiling"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-sensitivity": "public"
+        },
+        "confirmation": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "scopes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-sensitivity": "public"
+        }
+      },
+      "type": "object"
+    },
+    "AuthRulesResult": {
+      "properties": {
+        "ceiling": {
+          "$ref": "#/$defs/Ceiling",
+          "x-sensitivity": "public"
+        },
+        "expiresAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "idleExpiresAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "methods": {
+          "additionalProperties": {
+            "$ref": "#/$defs/MethodInfo"
+          },
+          "type": "object",
+          "x-sensitivity": "public"
+        },
+        "principal": {
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "scopes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-sensitivity": "public"
+        },
+        "topics": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "principal",
+        "scopes",
+        "ceiling",
+        "methods",
+        "topics"
+      ],
+      "type": "object"
+    },
     "AwayActivity": {
       "description": "Counts of what happened after `since_ms`.",
       "properties": {
@@ -544,6 +677,16 @@
         "sinceMs"
       ],
       "type": "object"
+    },
+    "Ceiling": {
+      "description": "A sensitivity ceiling. Ordering is also the egress ordering.",
+      "enum": [
+        "public",
+        "metadata",
+        "conversation"
+      ],
+      "type": "string",
+      "x-open-enum": true
     },
     "ClientInfo": {
       "description": "What a client says about itself in `hello`. Unverified.",
@@ -991,6 +1134,11 @@
         {
           "const": "not_allowed",
           "description": "The principal may not call this method (`agent.create` and\n`agent.retire` take only a local client in C1a).",
+          "type": "string"
+        },
+        {
+          "const": "confirmation_required",
+          "description": "A widening permission change needs a fresh native confirmation.",
           "type": "string"
         },
         {
@@ -1802,6 +1950,17 @@
     "MethodInfo": {
       "description": "One method in `hello.result.methods`.",
       "properties": {
+        "needs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthNeeds"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-sensitivity": "public"
+        },
         "rev": {
           "description": "Goes up by one on each breaking change to the method's shape.",
           "format": "uint32",
@@ -3023,7 +3182,7 @@
             "$ref": "#/$defs/AgentRow"
           },
           "type": "array",
-          "x-sensitivity": "conversation"
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -3452,7 +3611,7 @@
             "$ref": "#/$defs/SessionView"
           },
           "type": "array",
-          "x-sensitivity": "conversation"
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -3473,7 +3632,7 @@
             "$ref": "#/$defs/AgentRow"
           },
           "type": "array",
-          "x-sensitivity": "conversation"
+          "x-sensitivity": "public"
         },
         "cursor": {
           "type": "string",
@@ -4007,7 +4166,7 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
-  "apiMinor": 7,
+  "apiMinor": 8,
   "description": "Preview: the c9watch engine protocol. One JSON object per line over the engine socket. A preview minor may break a method; check breakingSince.",
   "frames": {
     "event": {
@@ -4031,6 +4190,16 @@
       "result": {
         "$ref": "#/$defs/AgentCreateResult"
       },
+      "x-authz": {
+        "admission": [
+          "mutating_peer"
+        ],
+        "principals": [
+          "local-unverified"
+        ],
+        "resource": "agent",
+        "verb": "write"
+      },
       "x-stability": "preview"
     },
     "agent.handoff": {
@@ -4039,6 +4208,17 @@
       },
       "result": {
         "$ref": "#/$defs/HandoffResult"
+      },
+      "x-authz": {
+        "admission": [
+          "agent_exe"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent"
+        ],
+        "resource": "hook",
+        "verb": "write"
       },
       "x-stability": "internal",
       "x-visibility": "internal"
@@ -4050,6 +4230,16 @@
       "result": {
         "$ref": "#/$defs/AgentListResult"
       },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "agent",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "agent.retire": {
@@ -4058,6 +4248,54 @@
       },
       "result": {
         "$ref": "#/$defs/AgentRetireResult"
+      },
+      "x-authz": {
+        "admission": [
+          "mutating_peer"
+        ],
+        "principals": [
+          "local-unverified"
+        ],
+        "resource": "agent",
+        "verb": "write"
+      },
+      "x-stability": "preview"
+    },
+    "auth.can": {
+      "params": {
+        "$ref": "#/$defs/AuthCanParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AuthCanResult"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "protocol",
+        "verb": "read"
+      },
+      "x-stability": "preview"
+    },
+    "auth.rules": {
+      "params": {
+        "$ref": "#/$defs/PingParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AuthRulesResult"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "protocol",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4071,6 +4309,16 @@
       "result": {
         "$ref": "#/$defs/ConversationGetResult"
       },
+      "x-authz": {
+        "admission": [],
+        "minCeiling": "conversation",
+        "principals": [
+          "local-unverified",
+          "client"
+        ],
+        "resource": "conversation",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "cost.get": {
@@ -4079,6 +4327,15 @@
       },
       "result": {
         "$ref": "#/$defs/CostData"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "client"
+        ],
+        "resource": "cost",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4089,6 +4346,16 @@
       "result": {
         "$ref": "#/$defs/TickResult"
       },
+      "x-authz": {
+        "admission": [
+          "mutating_peer"
+        ],
+        "principals": [
+          "local-unverified"
+        ],
+        "resource": "detect",
+        "verb": "write"
+      },
       "x-stability": "preview"
     },
     "diag.detection": {
@@ -4097,6 +4364,16 @@
       },
       "result": {
         "$ref": "#/$defs/DetectionDiagnostics"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "session",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4110,6 +4387,16 @@
       "result": {
         "$ref": "#/$defs/SubscribeResult"
       },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "protocol",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "events.unsubscribe": {
@@ -4118,6 +4405,16 @@
       },
       "result": {
         "$ref": "#/$defs/UnsubscribeResult"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "protocol",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4128,6 +4425,16 @@
       "result": {
         "$ref": "#/$defs/HelloResult"
       },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "protocol",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "history.list": {
@@ -4136,6 +4443,16 @@
       },
       "result": {
         "$ref": "#/$defs/HistoryListResult"
+      },
+      "x-authz": {
+        "admission": [],
+        "minCeiling": "conversation",
+        "principals": [
+          "local-unverified",
+          "client"
+        ],
+        "resource": "history",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4146,6 +4463,15 @@
       "result": {
         "$ref": "#/$defs/HistorySearchResult"
       },
+      "x-authz": {
+        "admission": [],
+        "minCeiling": "conversation",
+        "principals": [
+          "local-unverified"
+        ],
+        "resource": "history",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "hook.notification": {
@@ -4154,6 +4480,17 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
+      },
+      "x-authz": {
+        "admission": [
+          "agent_exe"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent"
+        ],
+        "resource": "hook",
+        "verb": "write"
       },
       "x-stability": "internal",
       "x-visibility": "internal"
@@ -4165,6 +4502,17 @@
       "result": {
         "$ref": "#/$defs/HookResult"
       },
+      "x-authz": {
+        "admission": [
+          "agent_exe"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent"
+        ],
+        "resource": "hook",
+        "verb": "write"
+      },
       "x-stability": "internal",
       "x-visibility": "internal"
     },
@@ -4174,6 +4522,17 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
+      },
+      "x-authz": {
+        "admission": [
+          "agent_exe"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent"
+        ],
+        "resource": "hook",
+        "verb": "write"
       },
       "x-stability": "internal",
       "x-visibility": "internal"
@@ -4185,6 +4544,17 @@
       "result": {
         "$ref": "#/$defs/HookResult"
       },
+      "x-authz": {
+        "admission": [
+          "agent_exe"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent"
+        ],
+        "resource": "hook",
+        "verb": "write"
+      },
       "x-stability": "internal",
       "x-visibility": "internal"
     },
@@ -4194,6 +4564,17 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
+      },
+      "x-authz": {
+        "admission": [
+          "agent_exe"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent"
+        ],
+        "resource": "hook",
+        "verb": "write"
       },
       "x-stability": "internal",
       "x-visibility": "internal"
@@ -4205,6 +4586,17 @@
       "result": {
         "$ref": "#/$defs/HookResult"
       },
+      "x-authz": {
+        "admission": [
+          "agent_exe"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent"
+        ],
+        "resource": "hook",
+        "verb": "write"
+      },
       "x-stability": "internal",
       "x-visibility": "internal"
     },
@@ -4214,6 +4606,17 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
+      },
+      "x-authz": {
+        "admission": [
+          "agent_exe"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent"
+        ],
+        "resource": "hook",
+        "verb": "write"
       },
       "x-stability": "internal",
       "x-visibility": "internal"
@@ -4225,6 +4628,16 @@
       "result": {
         "$ref": "#/$defs/MailControlResult"
       },
+      "x-authz": {
+        "admission": [
+          "mutating_peer"
+        ],
+        "principals": [
+          "local-unverified"
+        ],
+        "resource": "mail",
+        "verb": "write"
+      },
       "x-stability": "preview"
     },
     "mail.resume": {
@@ -4233,6 +4646,16 @@
       },
       "result": {
         "$ref": "#/$defs/MailControlResult"
+      },
+      "x-authz": {
+        "admission": [
+          "mutating_peer"
+        ],
+        "principals": [
+          "local-unverified"
+        ],
+        "resource": "mail",
+        "verb": "write"
       },
       "x-stability": "preview"
     },
@@ -4243,6 +4666,16 @@
       "result": {
         "$ref": "#/$defs/MemoryListResult"
       },
+      "x-authz": {
+        "admission": [],
+        "minCeiling": "conversation",
+        "principals": [
+          "local-unverified",
+          "client"
+        ],
+        "resource": "memory",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "msg.cancel": {
@@ -4251,6 +4684,16 @@
       },
       "result": {
         "$ref": "#/$defs/MailControlResult"
+      },
+      "x-authz": {
+        "admission": [
+          "mutating_peer"
+        ],
+        "principals": [
+          "local-unverified"
+        ],
+        "resource": "msg",
+        "verb": "cancel"
       },
       "x-stability": "preview"
     },
@@ -4261,6 +4704,17 @@
       "result": {
         "$ref": "#/$defs/MsgListResult"
       },
+      "x-authz": {
+        "admission": [
+          "mail_peer"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent"
+        ],
+        "resource": "msg",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "msg.read": {
@@ -4269,6 +4723,17 @@
       },
       "result": {
         "$ref": "#/$defs/MsgReadResult"
+      },
+      "x-authz": {
+        "admission": [
+          "mail_peer"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent"
+        ],
+        "resource": "msg",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4279,6 +4744,17 @@
       "result": {
         "$ref": "#/$defs/MsgSendResult"
       },
+      "x-authz": {
+        "admission": [
+          "mail_sender"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent"
+        ],
+        "resource": "msg",
+        "verb": "send"
+      },
       "x-stability": "preview"
     },
     "ping": {
@@ -4287,6 +4763,16 @@
       },
       "result": {
         "$ref": "#/$defs/PingResult"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "protocol",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4297,6 +4783,16 @@
       "result": {
         "$ref": "#/$defs/OpencodeStatus"
       },
+      "x-authz": {
+        "admission": [
+          "mutating_peer"
+        ],
+        "principals": [
+          "local-unverified"
+        ],
+        "resource": "provider",
+        "verb": "write"
+      },
       "x-stability": "preview"
     },
     "provider.opencode.status": {
@@ -4305,6 +4801,15 @@
       },
       "result": {
         "$ref": "#/$defs/OpencodeStatus"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent"
+        ],
+        "resource": "provider",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4315,6 +4820,16 @@
       "result": {
         "$ref": "#/$defs/SessionAwayResult"
       },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "session",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "session.list": {
@@ -4323,6 +4838,16 @@
       },
       "result": {
         "$ref": "#/$defs/SessionListResult"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "session",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4333,6 +4858,17 @@
       "result": {
         "$ref": "#/$defs/TickResult"
       },
+      "x-authz": {
+        "admission": [
+          "mutating_peer"
+        ],
+        "principals": [
+          "local-unverified",
+          "client"
+        ],
+        "resource": "session",
+        "verb": "rename"
+      },
       "x-stability": "preview"
     },
     "session.stop": {
@@ -4341,6 +4877,17 @@
       },
       "result": {
         "$ref": "#/$defs/TickResult"
+      },
+      "x-authz": {
+        "admission": [
+          "mutating_peer"
+        ],
+        "principals": [
+          "local-unverified",
+          "client"
+        ],
+        "resource": "session",
+        "verb": "stop"
       },
       "x-stability": "preview"
     },
@@ -4351,6 +4898,16 @@
       "result": {
         "$ref": "#/$defs/SessionTasksResult"
       },
+      "x-authz": {
+        "admission": [],
+        "minCeiling": "conversation",
+        "principals": [
+          "local-unverified",
+          "client"
+        ],
+        "resource": "conversation",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "session.views": {
@@ -4359,6 +4916,16 @@
       },
       "result": {
         "$ref": "#/$defs/SessionViewsResult"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "session",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4369,6 +4936,16 @@
       "result": {
         "$ref": "#/$defs/SnapshotResult"
       },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "session",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "subagent.list": {
@@ -4377,6 +4954,15 @@
       },
       "result": {
         "$ref": "#/$defs/SubagentListResult"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "client"
+        ],
+        "resource": "cost",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4387,6 +4973,16 @@
       "result": {
         "$ref": "#/$defs/SubagentTranscript"
       },
+      "x-authz": {
+        "admission": [],
+        "minCeiling": "conversation",
+        "principals": [
+          "local-unverified",
+          "client"
+        ],
+        "resource": "conversation",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "task.done": {
@@ -4395,6 +4991,17 @@
       },
       "result": {
         "$ref": "#/$defs/TaskDoneResult"
+      },
+      "x-authz": {
+        "admission": [
+          "agent_exe"
+        ],
+        "principals": [
+          "local-unverified",
+          "agent"
+        ],
+        "resource": "hook",
+        "verb": "write"
       },
       "x-stability": "internal",
       "x-visibility": "internal"
@@ -4406,6 +5013,15 @@
       "result": {
         "$ref": "#/$defs/UsageSubscriptionsResult"
       },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "client"
+        ],
+        "resource": "cost",
+        "verb": "read"
+      },
       "x-stability": "preview"
     }
   },
@@ -4415,11 +5031,31 @@
       "data": {
         "$ref": "#/$defs/AgentAttentionEvent"
       },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "agent",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "agent.failed": {
       "data": {
         "$ref": "#/$defs/AgentFailedEvent"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "agent",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4427,11 +5063,31 @@
       "data": {
         "$ref": "#/$defs/AgentGoneEvent"
       },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "agent",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "agent.turn_end": {
       "data": {
         "$ref": "#/$defs/AgentTurnEndEvent"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "agent",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4439,17 +5095,45 @@
       "data": {
         "$ref": "#/$defs/AgentRow"
       },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "agent",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "diag.detection": {
       "data": {
         "$ref": "#/$defs/DetectionDiagnostics"
       },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "session",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "legacy.inbox": {
       "data": {
         "$ref": "#/$defs/LegacyInboxEvent"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified"
+        ],
+        "resource": "legacy",
+        "verb": "read"
       },
       "x-stability": "internal",
       "x-visibility": "internal"
@@ -4458,11 +5142,30 @@
       "data": {
         "$ref": "#/$defs/MsgStateEvent"
       },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent"
+        ],
+        "resource": "msg",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "notification.needs_attention": {
       "data": {
         "$ref": "#/$defs/NotificationEvent"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "session",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4470,11 +5173,31 @@
       "data": {
         "$ref": "#/$defs/NotificationEvent"
       },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "session",
+        "verb": "read"
+      },
       "x-stability": "preview"
     },
     "session.gone": {
       "data": {
         "$ref": "#/$defs/SessionGoneEvent"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "session",
+        "verb": "read"
       },
       "x-stability": "preview"
     },
@@ -4483,6 +5206,16 @@
         "$ref": "#/$defs/SessionView"
       },
       "description": "Latest state: the log keeps only the newest view of each live session (and none of an ended one). A subscriber that reads on from an old cursor gets the newest view of every live session, not every view in between. Live subscribers still get each view as it is written.",
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "session",
+        "verb": "read"
+      },
       "x-stability": "preview"
     }
   }

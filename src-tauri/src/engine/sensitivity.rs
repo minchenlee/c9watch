@@ -132,6 +132,15 @@ const BY_NAME: &[(&str, &str)] = &[
     ("subagentsCompleted", P),
     ("claudeProcessesFound", P),
     ("processesWithCwd", P),
+    // Authorization introspection is public; it contains no result values.
+    ("needs", P),
+    ("scopes", P),
+    ("ceiling", P),
+    ("confirmation", P),
+    ("allowed", P),
+    ("reason", P),
+    ("expiresAt", P),
+    ("idleExpiresAt", P),
     // The hello facts.
     ("apiMajor", P),
     ("apiMinor", P),
@@ -255,8 +264,10 @@ const OVERRIDES: &[(&str, &str, &str)] = &[
     ("SubscriptionUsage", "name", M),
     ("ErrorBody", "data", M),
     ("HiddenClaudeSession", "reason", P),
-    ("SessionListResult", "sessions", C),
-    ("SessionViewsResult", "sessions", C),
+    ("SessionListResult", "sessions", P),
+    ("AgentListResult", "agents", P),
+    ("SnapshotResult", "agents", P),
+    ("SessionViewsResult", "sessions", P),
 ];
 
 pub fn class(def: &str, field: &str) -> Option<&'static str> {

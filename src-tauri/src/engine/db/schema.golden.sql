@@ -1,4 +1,4 @@
--- user_version 6
+-- user_version 7
 -- index agents_detected_key
 CREATE UNIQUE INDEX agents_detected_key ON agents (session_key) WHERE source = 'detected';
 -- index agents_legacy_sid
@@ -8,6 +8,8 @@ CREATE UNIQUE INDEX agents_legacy_sid ON agents (provider, provider_sid)
 CREATE INDEX agents_provider_sid ON agents (provider, provider_sid);
 -- index events_ts
 CREATE INDEX events_ts ON events (ts);
+-- index gateway_tokens_expiry
+CREATE INDEX gateway_tokens_expiry ON gateway_tokens (expires_at);
 -- index message_status_msg
 CREATE INDEX message_status_msg ON message_status (msg_id, seq);
 -- index messages_idem
@@ -78,6 +80,19 @@ CREATE TABLE events (
     payload TEXT,                                        -- JSON
     ts      INTEGER NOT NULL
 ) STRICT;
+-- table gateway_tokens
+CREATE TABLE gateway_tokens (
+    client_id TEXT PRIMARY KEY,
+    sha256 BLOB NOT NULL UNIQUE CHECK (length(sha256) = 32),
+    label TEXT NOT NULL,
+    origin TEXT,
+    aud TEXT NOT NULL,
+    scopes TEXT NOT NULL CHECK (json_valid(scopes) AND json_type(scopes) = 'array'),
+    ceiling TEXT NOT NULL CHECK (ceiling IN ('public', 'metadata', 'conversation')),
+    created_at INTEGER NOT NULL,
+    last_used_at INTEGER NOT NULL CHECK (last_used_at >= created_at),
+    expires_at INTEGER NOT NULL CHECK (expires_at > created_at AND expires_at <= created_at + 15552000000)
+);
 -- table legacy_events
 CREATE TABLE legacy_events (
     event_id    TEXT PRIMARY KEY,

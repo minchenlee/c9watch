@@ -2,6 +2,14 @@
 
 # c9p/1 changelog
 
+## 1.8 — authorization and gateway foundations
+
+- Add central `x-authz`, principal-filtered discovery, `auth.can` and `auth.rules`; gateway transport remains disabled.
+
+## 1.7 — local mailbox APIs
+
+- Add `msg.list`, `msg.read`, human-only `msg.cancel`, `mail.pause` and `mail.resume`, ownership-filtered mail events and opt-in CC socket delivery.
+
 ## 1.6 — public preview tooling
 
 - Add offline `c9watch api schema [--public]`, also in CLI-only builds.

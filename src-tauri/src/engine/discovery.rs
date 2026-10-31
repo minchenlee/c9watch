@@ -79,6 +79,8 @@ pub const METHOD_INFO: &[Method] = &[
     m("provider.opencode.connect", 6, PREVIEW),
     m("events.unsubscribe", 6, PREVIEW),
     m("ping", 6, PREVIEW),
+    m("auth.can", 8, PREVIEW),
+    m("auth.rules", 8, PREVIEW),
 ];
 
 /// Every event topic and its stability. `legacy.inbox` carries the
@@ -126,6 +128,7 @@ pub fn methods() -> BTreeMap<String, MethodInfo> {
             (
                 x.name.to_string(),
                 MethodInfo {
+                    needs: None,
                     since: x.since,
                     rev: x.rev,
                     stability: x.stability.to_string(),
