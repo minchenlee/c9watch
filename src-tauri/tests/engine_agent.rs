@@ -175,10 +175,17 @@ fn an_agent_running_the_copy_is_authorized() {
     let (out, rc) = as_agent(&engine, &format!("echo n | {} handoff --note -", bin), true);
     assert_eq!(rc, 1, "{}", out);
     assert!(out.contains("unsupported_in_c1a"), "{}", out);
-    // The hook goes through quietly.
+    // A hook promises empty stdout and exit 0 even when a loaded runner
+    // exhausts its 500ms budget. A PTY merges stdout and stderr, so capture
+    // diagnostics separately rather than treating a timeout as stdout.
+    let stderr = engine.dir.path().join("hook.stderr");
     let (out, rc) = as_agent(
         &engine,
-        &format!("echo '{{\"session_id\":\"s\"}}' | {} hook stop", bin),
+        &format!(
+            "echo '{{\"session_id\":\"s\"}}' | {} hook stop 2>{}",
+            bin,
+            q(&stderr)
+        ),
         true,
     );
     assert_eq!(rc, 0, "{}", out);
@@ -189,6 +196,13 @@ fn an_agent_running_the_copy_is_authorized() {
         .filter(|l| !l.is_empty() && *l != "go")
         .collect();
     assert_eq!(lines, ["rc=0."], "{:?}", out);
+    let diagnostics = std::fs::read_to_string(stderr).unwrap();
+    assert!(
+        diagnostics.is_empty()
+            || diagnostics.trim() == "c9watch-agent hook stop: no answer within 500ms",
+        "unexpected hook error: {:?}",
+        diagnostics
+    );
     assert!(engine.denials().is_empty(), "{:?}", engine.denials());
 }
 
