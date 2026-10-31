@@ -17,20 +17,20 @@ name = "c9watch_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-default = ["gui", "cli"]
+default = ["gui", "cli", "gateway-assets"]
 gui = [
     "dep:tauri",
     "dep:tauri-build",
     "dep:tauri-plugin-notification",
     "dep:notify-rust",
     "dep:tauri-plugin-opener",
+    "dep:tauri-plugin-dialog",
     "dep:tauri-plugin-updater",
     "dep:tauri-plugin-process",
     "dep:tauri-plugin-sharekit",
     "dep:axum",
     "dep:tokio",
     "dep:rand",
-    "dep:rust-embed",
     "dep:mime_guess",
     "dep:base64",
     "dep:sha2",
@@ -44,7 +44,8 @@ cli = ["dep:clap", "dep:regex", "dep:tokio"]
 pm-orchestration = ["cli"]
 # Agent engine (C1a): `c9watch engine` and `api`, plus the `c9watch-agent`
 # binary, unix only.
-engine = ["cli", "dep:ed25519-dalek", "dep:rand", "dep:schemars", "dep:sha2"]
+engine = ["cli", "dep:ed25519-dalek", "dep:rand", "dep:schemars", "dep:sha2", "dep:axum", "dep:base64", "dep:subtle", "dep:mime_guess"]
+gateway-assets = ["dep:rust-embed"]
 # Test-only PTY input and screen files for tests/live/cc_sandbox.sh (C1a-32).
 # Never in release, default or CI builds.
 live-test = ["engine"]
@@ -70,6 +71,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tauri = { version = "2", features = ["tray-icon"], optional = true }
 tauri-plugin-notification = { version = "2", optional = true }
 tauri-plugin-opener = { version = "2", optional = true }
+tauri-plugin-dialog = { version = "2", optional = true }
 tauri-plugin-updater = { version = "2", optional = true }
 tauri-plugin-process = { version = "2", optional = true }
 tauri-plugin-sharekit = { version = "0.3", optional = true }

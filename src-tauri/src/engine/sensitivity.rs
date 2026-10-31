@@ -264,8 +264,10 @@ const OVERRIDES: &[(&str, &str, &str)] = &[
     ("SubscriptionUsage", "name", M),
     ("ErrorBody", "data", M),
     ("HiddenClaudeSession", "reason", P),
-    ("SessionListResult", "sessions", C),
-    ("SessionViewsResult", "sessions", C),
+    ("SessionListResult", "sessions", P),
+    ("AgentListResult", "agents", P),
+    ("SnapshotResult", "agents", P),
+    ("SessionViewsResult", "sessions", P),
 ];
 
 pub fn class(def: &str, field: &str) -> Option<&'static str> {

@@ -253,6 +253,68 @@ pub fn audit_level(
     AuditLevel::None
 }
 
+/// Every scope that can be granted to a gateway token. Presets expand once.
+pub const SCOPES: &[&str] = &[
+    "session:read",
+    "session:stop",
+    "session:rename",
+    "conversation:read",
+    "history:read",
+    "memory:read",
+    "cost:read",
+    "agent:read",
+    "annotation:read",
+    "annotation:write",
+];
+
+pub fn subset(
+    principal: &Principal,
+    scopes: &BTreeSet<String>,
+    ceiling: Ceiling,
+    policy: &crate::gateway::policy::RemoteAccess,
+) -> Result<(), ApiError> {
+    if !matches!(principal, Principal::LocalUnverified) {
+        return Err(ApiError::new(
+            ErrorCode::NotAllowed,
+            "only a local grantor can grant authority",
+        ));
+    }
+    for scope in scopes {
+        let permitted = SCOPES.contains(&scope.as_str())
+            && match scope.as_str() {
+                "conversation:read" => policy.allow_conversation,
+                "history:read" => policy.allow_history,
+                "memory:read" => policy.allow_memory,
+                _ => true,
+            };
+        if !permitted {
+            return Err(ApiError::new(
+                ErrorCode::NotAllowed,
+                "grant exceeds the machine policy",
+            ));
+        }
+        if matches!(
+            scope.as_str(),
+            "conversation:read" | "history:read" | "memory:read"
+        ) && ceiling < Ceiling::Conversation
+        {
+            return Err(ApiError::new(
+                ErrorCode::NotAllowed,
+                "content scopes require a conversation ceiling",
+            ));
+        }
+    }
+    if ceiling == Ceiling::Conversation && !policy.allow_conversation {
+        return Err(ApiError::new(
+            ErrorCode::NotAllowed,
+            "grant exceeds the machine ceiling",
+        ));
+    }
+    Ok(())
+}
+
+pub use crate::gateway::policy::is_widening;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +408,116 @@ mod tests {
             audit_level("hook.stop", &l, true, Ceiling::Conversation),
             AuditLevel::None
         );
+    }
+    #[test]
+    fn subset_prevents_granting_past_principal_and_policy() {
+        let scopes = ["session:read".into(), "conversation:read".into()].into();
+        let mut policy = crate::gateway::policy::RemoteAccess::default();
+        let local = Principal::LocalUnverified;
+        assert!(subset(&local, &scopes, Ceiling::Conversation, &policy).is_err());
+        policy.allow_conversation = true;
+        assert!(subset(&local, &scopes, Ceiling::Conversation, &policy).is_ok());
+        assert!(subset(&local, &scopes, Ceiling::Metadata, &policy).is_err());
+        for p in [
+            Principal::Client { id: "c".into() },
+            Principal::Agent {
+                id: "a".into(),
+                gen: 1,
+            },
+        ] {
+            assert_eq!(
+                subset(&p, &scopes, Ceiling::Conversation, &policy)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::NotAllowed
+            );
+        }
+        assert!(subset(
+            &local,
+            &["gateway:write".into()].into(),
+            Ceiling::Metadata,
+            &policy
+        )
+        .is_err());
+        assert!(subset(
+            &local,
+            &["history:read".into()].into(),
+            Ceiling::Conversation,
+            &policy
+        )
+        .is_err());
+    }
+    #[test]
+    fn widening_is_mechanical_and_new_fields_fail_closed() {
+        use serde_json::json;
+        let old = json!({"scopes":["session:read"],"ceiling":"metadata","expiresAt":1000,"lanEnabled":false,"allowedOrigins":[],"extraAllowedHosts":[]});
+        assert!(!is_widening(&old, &old));
+        for (key, value) in [
+            ("scopes", json!(["session:read", "session:stop"])),
+            ("ceiling", json!("conversation")),
+            ("expiresAt", json!(1001)),
+            ("lanEnabled", json!(true)),
+            ("allowedOrigins", json!(["https://view.example:443"])),
+            ("extraAllowedHosts", json!(["box.example"])),
+        ] {
+            let mut next = old.clone();
+            next[key] = value;
+            assert!(is_widening(&old, &next), "{key}");
+        }
+        let narrow = json!({"scopes":[],"ceiling":"public","expiresAt":999,"lanEnabled":false,"allowedOrigins":[],"extraAllowedHosts":[]});
+        assert!(!is_widening(&old, &narrow));
+        assert!(
+            is_widening(&old, &json!({"futureFlag":false})),
+            "unknown field cannot silently skip confirmation"
+        );
+        let policy = serde_json::to_value(crate::gateway::policy::RemoteAccess::default()).unwrap();
+        assert!(
+            !is_widening(&policy, &policy),
+            "every serialized policy field must be explicitly classified"
+        );
+    }
+    #[test]
+    fn every_scope_gated_method_and_topic_requires_its_own_scope_and_ceiling() {
+        let client = Principal::Client { id: "c".into() };
+        for name in super::super::api::METHODS {
+            let r = method(name).unwrap();
+            let full = Access {
+                scopes: SCOPES.iter().map(|s| s.to_string()).collect(),
+                ceiling: Ceiling::Conversation,
+                ..Default::default()
+            };
+            if !r.principals.contains(&C) {
+                assert!(!can(name, &client, Some(&full)).allowed, "{name}");
+                continue;
+            }
+            if r.resource == "protocol" {
+                continue;
+            }
+            let needed = format!("{}:{}", r.resource, r.verb);
+            let mut access = full.clone();
+            access.scopes.remove(&needed);
+            let review = can(name, &client, Some(&access));
+            assert!(!review.allowed, "{name}");
+            assert_eq!(review.needs.unwrap().scopes, [needed.clone()], "{name}");
+            access.scopes.insert(needed);
+            assert!(can(name, &client, Some(&access)).allowed, "{name}");
+            if r.min_ceiling == Some(Ceiling::Conversation) {
+                access.ceiling = Ceiling::Metadata;
+                assert!(!can(name, &client, Some(&access)).allowed, "{name}");
+            }
+        }
+        for (name, _) in super::super::discovery::TOPICS {
+            let r = topic(name).unwrap();
+            if !r.principals.contains(&C) {
+                assert!(!review(Some(&r), &client, None).allowed);
+                continue;
+            }
+            let access = Access {
+                scopes: [format!("{}:{}", r.resource, r.verb)].into(),
+                ..Default::default()
+            };
+            assert!(review(Some(&r), &client, Some(&access)).allowed, "{name}");
+            assert!(!review(Some(&r), &client, None).allowed, "{name}");
+        }
     }
 }

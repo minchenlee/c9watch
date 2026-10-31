@@ -134,6 +134,8 @@ pub enum ErrorCode {
     /// The principal may not call this method (`agent.create` and
     /// `agent.retire` take only a local client in C1a).
     NotAllowed,
+    /// A widening permission change needs a fresh native confirmation.
+    ConfirmationRequired,
     /// The canonical cwd of a free agent is inside the engine home or a
     /// managed worktree home.
     CwdCollision,
@@ -193,6 +195,7 @@ impl ErrorCode {
             ErrorCode::AgentBinMissing => "agent_bin_missing",
             ErrorCode::AgentBinMismatch => "agent_bin_mismatch",
             ErrorCode::NotAllowed => "not_allowed",
+            ErrorCode::ConfirmationRequired => "confirmation_required",
             ErrorCode::CwdCollision => "cwd_collision",
             ErrorCode::SpawnFailed => "spawn_failed",
             ErrorCode::UnknownAgent => "unknown_agent",
@@ -255,7 +258,10 @@ impl ErrorCode {
                 "`c9watch engine restart` copies c9watch-agent again; check what changed \
                  the engine's copy"
             }
-            ErrorCode::NotAllowed => "call this from the CLI or the GUI, not from an agent",
+            ErrorCode::NotAllowed => "inspect auth.can for the required authority",
+            ErrorCode::ConfirmationRequired => {
+                "confirm the exact permission change in the native GUI dialog"
+            }
             ErrorCode::CwdCollision => {
                 "pick a cwd outside the engine home and outside `.c9watch/worktrees`"
             }

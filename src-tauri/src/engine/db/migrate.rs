@@ -52,6 +52,11 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0006_mail_socket.sql"),
         fk_off: true,
     },
+    Migration {
+        version: 7,
+        sql: include_str!("migrations/0007_gateway_tokens.sql"),
+        fk_off: false,
+    },
 ];
 
 /// The schema version this engine writes.
@@ -265,7 +270,7 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), [5, 6]);
+        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), [5, 6, 7]);
         assert_eq!(user_version(&conn).unwrap(), latest_version());
         let backup = Connection::open(t.path().join("pre-5.db")).unwrap();
         assert_eq!(user_version(&backup).unwrap(), 4);

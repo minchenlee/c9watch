@@ -155,7 +155,7 @@
             "$ref": "#/$defs/AgentRow"
           },
           "type": "array",
-          "x-sensitivity": "conversation"
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -1076,6 +1076,11 @@
         {
           "const": "not_allowed",
           "description": "The principal may not call this method (`agent.create` and\n`agent.retire` take only a local client in C1a).",
+          "type": "string"
+        },
+        {
+          "const": "confirmation_required",
+          "description": "A widening permission change needs a fresh native confirmation.",
           "type": "string"
         },
         {
@@ -2570,7 +2575,7 @@
         "redactedTitle": {
           "description": "`title` without conversation text.",
           "type": "string",
-          "x-sensitivity": "conversation"
+          "x-sensitivity": "metadata"
         },
         "sessionKey": {
           "type": "string",
@@ -3098,7 +3103,7 @@
             "$ref": "#/$defs/AgentRow"
           },
           "type": "array",
-          "x-sensitivity": "conversation"
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -3524,7 +3529,7 @@
             "$ref": "#/$defs/SessionView"
           },
           "type": "array",
-          "x-sensitivity": "conversation"
+          "x-sensitivity": "public"
         }
       },
       "required": [
@@ -3545,7 +3550,7 @@
             "$ref": "#/$defs/AgentRow"
           },
           "type": "array",
-          "x-sensitivity": "conversation"
+          "x-sensitivity": "public"
         },
         "cursor": {
           "type": "string",
