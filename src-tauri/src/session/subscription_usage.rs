@@ -32,7 +32,7 @@ pub struct SubscriptionUsage {
     updated_at: Option<i64>,
     message: Option<String>,
 }
-fn unavailable(provider: &str, name: &str, message: &str) -> SubscriptionUsage {
+pub(crate) fn unavailable(provider: &str, name: &str, message: &str) -> SubscriptionUsage {
     SubscriptionUsage {
         provider: provider.into(),
         name: name.into(),

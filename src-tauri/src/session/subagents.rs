@@ -36,6 +36,7 @@ const TAG_USAGE: &str = "usage";
 const TAG_NOTIFICATION: &str = "task-notification";
 
 /// Status of a detected subagent.
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubagentStatus {
@@ -44,6 +45,7 @@ pub enum SubagentStatus {
 }
 
 /// A subagent invocation found in a parent session's JSONL.
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentInfo {
@@ -386,6 +388,7 @@ fn cached_active_subagents_for_path_at(
 
 /// Full transcript of a single subagent invocation — the prompt (Agent tool
 /// input), the final result text, and usage stats when available.
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentTranscript {

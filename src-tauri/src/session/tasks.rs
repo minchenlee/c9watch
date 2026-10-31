@@ -7,7 +7,8 @@ pub fn read_session_tasks(session_id: &str) -> Result<Vec<serde_json::Value>, St
     read_session_tasks_in(&home_dir, session_id)
 }
 
-pub(crate) fn read_session_tasks_in(
+/// `read_session_tasks` for the user home `home_dir`.
+pub fn read_session_tasks_in(
     home_dir: &std::path::Path,
     session_id: &str,
 ) -> Result<Vec<serde_json::Value>, String> {

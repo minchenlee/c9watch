@@ -211,6 +211,7 @@ impl SessionIdentity {
     }
 }
 
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DetectionDiagnostics {

@@ -6,6 +6,7 @@ use std::path::Path;
 const CODEX_MEMORY_FILES: [&str; 2] = ["MEMORY.md", "memory_summary.md"];
 
 /// A single memory file (e.g., MEMORY.md, profile.md)
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryFile {
@@ -14,6 +15,7 @@ pub struct MemoryFile {
 }
 
 /// All memory files for a single project
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectMemory {
@@ -46,7 +48,8 @@ pub fn get_memory_files() -> Result<Vec<ProjectMemory>, String> {
     get_memory_files_from_home(&home_dir)
 }
 
-fn get_memory_files_from_home(home_dir: &Path) -> Result<Vec<ProjectMemory>, String> {
+/// `get_memory_files` for the user home `home_dir`.
+pub fn get_memory_files_from_home(home_dir: &Path) -> Result<Vec<ProjectMemory>, String> {
     let mut results = get_claude_memory_files(home_dir)?;
 
     if let Some(codex_memory) = get_codex_memory_files(home_dir) {

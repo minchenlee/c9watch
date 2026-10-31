@@ -18,6 +18,7 @@ struct RawHistoryLine {
 }
 
 /// A deduplicated, enriched history entry returned to the frontend
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryEntry {
@@ -120,6 +121,11 @@ pub fn parse_history_jsonl(content: &str) -> Vec<HistoryEntry> {
 /// Custom titles from session-monitor-titles.json are applied when available.
 pub fn get_history() -> Result<Vec<HistoryEntry>, String> {
     let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
+    get_history_in(&home_dir)
+}
+
+/// `get_history` for the user home `home_dir`.
+pub fn get_history_in(home_dir: &Path) -> Result<Vec<HistoryEntry>, String> {
     let path = home_dir.join(".claude").join("history.jsonl");
     let projects_dir = home_dir.join(".claude").join("projects");
     let mut entries = if path.exists() {
@@ -130,9 +136,9 @@ pub fn get_history() -> Result<Vec<HistoryEntry>, String> {
         Vec::new()
     };
 
-    entries.extend(codex_history_entries(&home_dir));
-    entries.extend(crate::session::cursor::cursor_history_entries(&home_dir));
-    entries.extend(crate::session::pi::pi_history_entries(&home_dir));
+    entries.extend(codex_history_entries(home_dir));
+    entries.extend(crate::session::cursor::cursor_history_entries(home_dir));
+    entries.extend(crate::session::pi::pi_history_entries(home_dir));
     entries.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
     Ok(entries)
 }
@@ -200,6 +206,7 @@ pub(crate) fn filter_and_enrich(
 }
 
 /// A single deep-search hit: session ID + first matching snippet (truncated).
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepSearchHit {
@@ -373,7 +380,7 @@ pub fn deep_search(
     deep_search_under(&home_dir, query, case_sensitive, whole_word)
 }
 
-pub(crate) fn deep_search_under(
+pub fn deep_search_under(
     home_dir: &Path,
     query: &str,
     case_sensitive: bool,
