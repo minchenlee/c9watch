@@ -1,6 +1,6 @@
 //! Adapter descriptors (plan C1a-22, A:1017-1032): what the engine knows
-//! about one agent kind as data, plus the few runtime facts C1a needs for
-//! Claude Code, the only kind it runs.
+//! about one P1 agent kind as data. Recognition does not enable spawning:
+//! the create supervisor still supports only Claude Code.
 //!
 //! - `Descriptor`: kind, executables, tier, hook trust, permission flags,
 //!   prompt delivery, path guard, and the hook kinds the engine accepts
@@ -87,6 +87,104 @@ impl Descriptor {
     pub fn accepts_hook_kind(&self, kind: &str) -> bool {
         self.hook_kinds.contains(&kind)
     }
+
+    /// Resume a specific session, never a vendor's "latest" picker. Pi's
+    /// session reference is its transcript path; the other kinds accept ids
+    /// (OMP also accepts a path). No shell evaluates the reference.
+    pub fn resume_argv(&self, session_ref: &str) -> Vec<String> {
+        let flag = match self.kind {
+            "claude" | "omp" | "cursor" => "--resume",
+            "codex" => "resume",
+            "pi" | "opencode" | "kilo" => "--session",
+            _ => unreachable!("every descriptor has a resume form"),
+        };
+        vec![self.executables[0].into(), flag.into(), session_ref.into()]
+    }
+
+    /// Map an optional brief model using a caller-supplied, trusted catalogue
+    /// of models supported by this kind/version. The catalogue owns the
+    /// vendor's model vocabulary and argv (including version differences),
+    /// rather than silently passing an unknown id or inventing model aliases.
+    /// Managed briefs and catalogue discovery are outside the free spawn API.
+    pub fn model_argv(
+        &self,
+        model: Option<&str>,
+        catalogue: &[ModelArgv<'_>],
+    ) -> Result<Vec<String>, UnknownModel> {
+        let Some(model) = model else {
+            return Ok(Vec::new());
+        };
+        catalogue
+            .iter()
+            .find(|entry| entry.kind == self.kind && entry.model == model && !model.is_empty())
+            .map(|entry| entry.argv.iter().map(|arg| (*arg).to_string()).collect())
+            .ok_or_else(|| UnknownModel {
+                kind: self.kind,
+                model: model.to_string(),
+            })
+    }
+}
+
+/// A model mapping verified for a particular adapter and CLI version. The
+/// caller supplies these as data; model names never become shell commands.
+pub struct ModelArgv<'a> {
+    pub kind: &'a str,
+    pub model: &'a str,
+    pub argv: &'a [&'a str],
+}
+
+/// D19's adapter error. A future managed-create caller maps `code()` into its
+/// wire error before creating a row or launching a process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownModel {
+    pub kind: &'static str,
+    pub model: String,
+}
+
+impl UnknownModel {
+    pub fn code(&self) -> &'static str {
+        "unknown_model"
+    }
+}
+
+impl std::fmt::Display for UnknownModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: {:?} for adapter {}",
+            self.code(),
+            self.model,
+            self.kind
+        )
+    }
+}
+
+impl std::error::Error for UnknownModel {}
+
+impl Descriptor {
+    /// Read-only integration inventory. This checkout ships only CC's
+    /// per-spawn hook settings. The other P1 readers are passive: there is
+    /// no engine hook/extension/plugin installer or versioned template to
+    /// compare against. Do not mistake the CC helper's presence for a
+    /// working integration of a different kind, or claim a foreign file.
+    pub fn integration_report(&self, agent_bin: &Path) -> serde_json::Value {
+        if self.kind == "claude" {
+            serde_json::json!({
+                "descriptor": self,
+                "status": claude_integration_status(agent_bin),
+                "delivery": "per_spawn_settings",
+                "agentBin": agent_bin,
+            })
+        } else {
+            serde_json::json!({
+                "descriptor": self,
+                "status": IntegrationStatus::Missing,
+                "delivery": "unavailable",
+                "integrationFiles": [],
+                "reason": "engine_integration_not_implemented",
+            })
+        }
+    }
 }
 
 /// Claude Code.
@@ -106,22 +204,140 @@ pub const CLAUDE: Descriptor = Descriptor {
     hook_kinds: &["claude"],
 };
 
-/// Every kind the engine knows. C1a: Claude Code only.
-pub const DESCRIPTORS: &[&Descriptor] = &[&CLAUDE];
+/// Codex CLI. Flags verified with the locally installed CLI's `--help`.
+pub const CODEX: Descriptor = Descriptor {
+    kind: "codex",
+    provider: "codex",
+    executables: &["codex"],
+    tier: Tier::Full,
+    hook_trust: HookTrust::TurnEnd,
+    permission_flags: PermissionFlags {
+        manual: &[
+            "--ask-for-approval",
+            "on-request",
+            "--sandbox",
+            "workspace-write",
+        ],
+        auto: &["--approve-for-me"],
+        yolo: &["--dangerously-bypass-approvals-and-sandbox"],
+    },
+    prompt_delivery: PromptDelivery::BracketedPaste,
+    path_guard: "merge_only",
+    hook_kinds: &["codex"],
+};
+
+/// Pi has no tool-approval posture flags in its installed `--help`.
+/// `--approve` trusts project files; it is not a tool permission mode.
+pub const PI: Descriptor = Descriptor {
+    kind: "pi",
+    provider: "pi",
+    executables: &["pi"],
+    tier: Tier::Full,
+    hook_trust: HookTrust::Authoritative,
+    permission_flags: PermissionFlags {
+        manual: &[],
+        auto: &[],
+        yolo: &[],
+    },
+    prompt_delivery: PromptDelivery::BracketedPaste,
+    path_guard: "merge_only",
+    hook_kinds: &["pi"],
+};
+
+/// OMP reuses Pi's reader and extension. The installed help calls `write`
+/// an approval mode, but does not define it as an automatic reviewer.
+pub const OMP: Descriptor = Descriptor {
+    kind: "omp",
+    provider: "pi",
+    executables: &["omp"],
+    tier: Tier::Full,
+    hook_trust: HookTrust::Authoritative,
+    permission_flags: PermissionFlags {
+        manual: &["--approval-mode", "always-ask"],
+        auto: &[],
+        yolo: &["--approval-mode", "yolo"],
+    },
+    prompt_delivery: PromptDelivery::BracketedPaste,
+    path_guard: "merge_only",
+    hook_kinds: &["omp", "pi"],
+};
+
+/// OpenCode, including the opencode2 executable. Only `--auto` is exposed
+/// as a permission flag by the installed v2 CLI's help.
+pub const OPENCODE: Descriptor = Descriptor {
+    kind: "opencode",
+    provider: "opencode",
+    executables: &["opencode", "opencode2"],
+    tier: Tier::Full,
+    hook_trust: HookTrust::Authoritative,
+    permission_flags: PermissionFlags {
+        manual: &[],
+        auto: &["--auto"],
+        yolo: &[],
+    },
+    prompt_delivery: PromptDelivery::BracketedPaste,
+    path_guard: "merge_only",
+    hook_kinds: &["opencode"],
+};
+
+/// Kilo reuses OpenCode's reader and plugin. No local Kilo binary was
+/// available to verify its permission flags; empty is not a supported mode.
+pub const KILO: Descriptor = Descriptor {
+    kind: "kilo",
+    provider: "opencode",
+    executables: &["kilo"],
+    tier: Tier::Full,
+    hook_trust: HookTrust::Authoritative,
+    permission_flags: PermissionFlags {
+        manual: &[],
+        auto: &[],
+        yolo: &[],
+    },
+    prompt_delivery: PromptDelivery::BracketedPaste,
+    path_guard: "merge_only",
+    hook_kinds: &["kilo", "opencode"],
+};
+
+/// Cursor Agent CLI (`cursor` is the provider's existing wire key).
+pub const CURSOR: Descriptor = Descriptor {
+    kind: "cursor",
+    provider: "cursor",
+    executables: &["cursor-agent", "agent"],
+    tier: Tier::Full,
+    hook_trust: HookTrust::IdentityOnly,
+    permission_flags: PermissionFlags {
+        manual: &[],
+        auto: &["--auto-review"],
+        yolo: &["--yolo"],
+    },
+    prompt_delivery: PromptDelivery::BracketedPaste,
+    path_guard: "merge_only",
+    hook_kinds: &["cursor"],
+};
+
+/// Every P1 kind the engine knows (A:1080).
+pub const DESCRIPTORS: &[&Descriptor] = &[&CLAUDE, &CODEX, &PI, &OMP, &OPENCODE, &KILO, &CURSOR];
 
 /// The descriptor of `kind`.
 pub fn descriptor(kind: &str) -> Option<&'static Descriptor> {
     DESCRIPTORS.iter().copied().find(|d| d.kind == kind)
 }
 
-/// The descriptor of the kind whose `agents.provider` is `provider`.
+/// The descriptor whose `agents.provider` is `provider`, only when unique.
+/// Pi/OMP and OpenCode/Kilo share readers. A provider alone cannot safely
+/// select their executable, hook acceptance rules or resume syntax.
 pub fn descriptor_for_provider(provider: &str) -> Option<&'static Descriptor> {
-    DESCRIPTORS.iter().copied().find(|d| d.provider == provider)
+    let mut matches = DESCRIPTORS
+        .iter()
+        .copied()
+        .filter(|d| d.provider == provider);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 /// argv that resumes a CC session (A:1040).
 pub fn claude_resume_argv(session_id: &str) -> Vec<String> {
-    vec!["claude".into(), "--resume".into(), session_id.into()]
+    CLAUDE.resume_argv(session_id)
 }
 
 /// CC hook events in the per-spawn settings, and the `c9watch-agent hook`
@@ -208,7 +424,7 @@ mod tests {
     fn the_claude_descriptor() {
         let d = descriptor("claude").unwrap();
         assert_eq!(d, &CLAUDE);
-        assert!(descriptor("codex").is_none());
+        assert!(descriptor("no-such-kind").is_none());
         assert_eq!(
             d.provider,
             crate::session::source::SessionProvider::ClaudeCode.as_key()
@@ -224,6 +440,108 @@ mod tests {
         let v = serde_json::to_value(d).unwrap();
         assert_eq!(v["hookTrust"], "turn_end");
         assert_eq!(v["promptDelivery"], "bracketed_paste");
+    }
+
+    #[test]
+    fn p1_descriptors_reuse_existing_provider_keys() {
+        use crate::session::source::SessionProvider;
+        assert_eq!(DESCRIPTORS.len(), 7);
+        let expected = [
+            ("claude", "claudeCode", HookTrust::TurnEnd),
+            ("codex", "codex", HookTrust::TurnEnd),
+            ("pi", "pi", HookTrust::Authoritative),
+            ("omp", "pi", HookTrust::Authoritative),
+            ("opencode", "opencode", HookTrust::Authoritative),
+            ("kilo", "opencode", HookTrust::Authoritative),
+            ("cursor", "cursor", HookTrust::IdentityOnly),
+        ];
+        let mut kinds = std::collections::HashSet::new();
+        for (kind, provider, trust) in expected {
+            let d = descriptor(kind).unwrap();
+            assert!(kinds.insert(d.kind));
+            assert_eq!(d.provider, provider);
+            assert!(SessionProvider::from_key(d.provider).is_some());
+            assert_eq!(d.hook_trust, trust);
+            assert_eq!(d.tier, Tier::Full);
+            assert_eq!(d.path_guard, "merge_only");
+            assert_eq!(d.prompt_delivery, PromptDelivery::BracketedPaste);
+            assert!(!d.executables.is_empty());
+            assert!(d.accepts_hook_kind(kind));
+            assert!(!d.accepts_hook_kind("grok"));
+        }
+        assert!(OMP.accepts_hook_kind("pi"));
+        assert!(KILO.accepts_hook_kind("opencode"));
+        assert!(!PI.accepts_hook_kind("omp"));
+        assert!(!OPENCODE.accepts_hook_kind("kilo"));
+        assert_eq!(CODEX.permission_flags.auto, ["--approve-for-me"]);
+        assert_eq!(
+            OMP.permission_flags.manual,
+            ["--approval-mode", "always-ask"]
+        );
+        assert_eq!(OPENCODE.permission_flags.auto, ["--auto"]);
+        assert_eq!(CURSOR.permission_flags.auto, ["--auto-review"]);
+        assert!(KILO.permission_flags.yolo.is_empty());
+        assert!(PI.permission_flags.auto.is_empty());
+    }
+
+    #[test]
+    fn resumes_use_each_cli_and_keep_the_session_ref_in_one_argument() {
+        let forms = [
+            ("claude", "claude", "--resume"),
+            ("codex", "codex", "resume"),
+            ("pi", "pi", "--session"),
+            ("omp", "omp", "--resume"),
+            ("opencode", "opencode", "--session"),
+            ("kilo", "kilo", "--session"),
+            ("cursor", "cursor-agent", "--resume"),
+        ];
+        for (kind, exe, flag) in forms {
+            let d = descriptor(kind).unwrap();
+            assert_eq!(d.resume_argv("sid-1"), [exe, flag, "sid-1"]);
+            let path = "/tmp/session dir/a'$(touch nope).jsonl";
+            assert_eq!(d.resume_argv(path), [exe, flag, path]);
+        }
+        assert_eq!(descriptor_for_provider("codex"), Some(&CODEX));
+        assert_eq!(descriptor_for_provider("cursor"), Some(&CURSOR));
+        assert_eq!(descriptor_for_provider("pi"), None);
+        assert_eq!(descriptor_for_provider("opencode"), None);
+    }
+
+    #[test]
+    fn models_are_optional_and_unknown_values_fail_closed_for_every_kind() {
+        for d in DESCRIPTORS {
+            let catalogue = [ModelArgv {
+                kind: d.kind,
+                model: "verified-model",
+                argv: &["--model", "vendor/native-model"],
+            }];
+            assert!(d.model_argv(None, &[]).unwrap().is_empty());
+            assert_eq!(
+                d.model_argv(Some("verified-model"), &catalogue).unwrap(),
+                ["--model", "vendor/native-model"]
+            );
+            // An id unverified for this adapter/version is never passed on.
+            for model in ["", "unknown", "--yolo", "verified-model "] {
+                let err = d.model_argv(Some(model), &catalogue).unwrap_err();
+                assert_eq!(err.code(), "unknown_model");
+                assert_eq!(err.kind, d.kind);
+                assert_eq!(err.model, model);
+            }
+            assert!(d.model_argv(Some("verified-model"), &[]).is_err());
+        }
+        let claude_only = [ModelArgv {
+            kind: "claude",
+            model: "sonnet",
+            argv: &["--model", "sonnet"],
+        }];
+        assert!(CLAUDE.model_argv(Some("sonnet"), &claude_only).is_ok());
+        assert_eq!(
+            CODEX
+                .model_argv(Some("sonnet"), &claude_only)
+                .unwrap_err()
+                .code(),
+            "unknown_model"
+        );
     }
 
     #[test]

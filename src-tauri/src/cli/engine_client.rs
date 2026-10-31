@@ -602,28 +602,20 @@ pub fn integration_report(
     action: &super::IntegrationAction,
     home: &Path,
 ) -> Result<serde_json::Value, String> {
-    use crate::engine::adapter::{
-        claude_hook_settings, claude_integration_status, descriptor, DESCRIPTORS,
-    };
+    use crate::engine::adapter::{claude_hook_settings, descriptor, DESCRIPTORS};
     use crate::engine::agent_bin::installed_path;
     let bin = installed_path(home);
     match action {
         super::IntegrationAction::Status => {
             let kinds: Vec<serde_json::Value> = DESCRIPTORS
                 .iter()
-                .map(|d| {
-                    serde_json::json!({
-                        "descriptor": d,
-                        "status": claude_integration_status(&bin),
-                        "delivery": "per_spawn_settings",
-                        "agentBin": bin,
-                    })
-                })
+                .map(|d| d.integration_report(&bin))
                 .collect();
             Ok(serde_json::json!({ "adapters": kinds }))
         }
         super::IntegrationAction::Show { kind } => match descriptor(kind) {
             Some(d) if d.kind == "claude" => Ok(claude_hook_settings(&bin)),
+            Some(d) => Ok(d.integration_report(&bin)),
             _ => Err(format!("integration: unknown adapter kind {:?}", kind)),
         },
     }
@@ -811,5 +803,50 @@ mod tests {
             kind: "grok".into(),
         };
         assert!(integration_report(&bad, &home).is_err());
+    }
+
+    #[test]
+    fn all_p1_kinds_are_reported_without_installing_or_claiming_unshipped_hooks() {
+        use super::super::IntegrationAction;
+        use crate::engine::adapter::DESCRIPTORS;
+        use crate::engine::agent_bin::installed_path;
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("engine");
+        let status = integration_report(&IntegrationAction::Status, &home).unwrap();
+        assert!(
+            !home.exists(),
+            "status must not create an engine or vendor home"
+        );
+        let adapters = status["adapters"].as_array().unwrap();
+        assert_eq!(adapters.len(), 7);
+        for (d, actual) in DESCRIPTORS.iter().zip(adapters) {
+            assert_eq!(actual["descriptor"]["kind"], d.kind);
+            assert_eq!(actual["status"], "missing");
+        }
+        // Installing CC's agent binary must not mark the other kinds current.
+        let bin = installed_path(&home);
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"fake helper").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let status = integration_report(&IntegrationAction::Status, &home).unwrap();
+        assert_eq!(status["adapters"][0]["status"], "current");
+        for (i, d) in DESCRIPTORS.iter().enumerate().skip(1) {
+            let shown = integration_report(
+                &IntegrationAction::Show {
+                    kind: d.kind.into(),
+                },
+                &home,
+            )
+            .unwrap();
+            assert_eq!(shown, status["adapters"][i]);
+            assert_eq!(shown["status"], "missing");
+            assert_eq!(shown["reason"], "engine_integration_not_implemented");
+            assert_eq!(shown["integrationFiles"], serde_json::json!([]));
+        }
+        assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(home.join("bin")).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&bin).unwrap(), b"fake helper");
     }
 }
