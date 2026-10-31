@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
 /// Protocol minor version. Raised for additive changes.
-pub const API_MINOR: u32 = 4;
+pub const API_MINOR: u32 = 5;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -160,6 +160,12 @@ pub enum ErrorCode {
     /// body went to the same agent within 10 minutes. `data` has `msgId`
     /// and `at`.
     Duplicate,
+    /// `session.stop`: no live session has this key.
+    UnknownSession,
+    /// `session.stop` or `session.rename` was refused or failed on the
+    /// session itself: it cannot be stopped, it runs as another process
+    /// now, or the write failed. `msg` says which.
+    ActionFailed,
     /// An engine-side failure.
     Internal,
 }
@@ -190,6 +196,8 @@ impl ErrorCode {
             ErrorCode::NotControlled => "not_controlled",
             ErrorCode::NotOwner => "not_owner",
             ErrorCode::Duplicate => "duplicate",
+            ErrorCode::UnknownSession => "unknown_session",
+            ErrorCode::ActionFailed => "action_failed",
             ErrorCode::Internal => "internal",
         }
     }
@@ -254,6 +262,8 @@ impl ErrorCode {
             ErrorCode::NotControlled => "take over first (D10)",
             ErrorCode::NotOwner => "managed workers take mail only from their parent and the human",
             ErrorCode::Duplicate => "pass a new idem to send it again",
+            ErrorCode::UnknownSession => "see `session.views` for the live session keys",
+            ErrorCode::ActionFailed => "read `msg`; `session.views` shows the session now",
             ErrorCode::Internal => "retry; if it persists, check the engine log",
         }
     }
@@ -442,6 +452,97 @@ pub struct SessionListParams {}
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct SessionListResult {
     pub sessions: Vec<AgentRow>,
+}
+
+/// `session.views` params. There are none yet; the engine ignores any it
+/// gets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct SessionViewsParams {}
+
+/// `session.views` result: the sessions of the last detection tick, as the
+/// GUI shows them, in detection order, and the cursor they are consistent
+/// with. Subscribing to `session.*` with `since` = `cursor` continues with
+/// no gap: `session.view` carries a new or changed session in full,
+/// `session.gone` (`SessionGoneEvent`) one that ended.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct SessionViewsResult {
+    pub cursor: String,
+    pub sessions: Vec<crate::session::Session>,
+}
+
+/// `session.gone` data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionGoneEvent {
+    /// `<provider>:<session id>`.
+    pub session_key: String,
+    /// The provider session id.
+    pub id: String,
+}
+
+/// `session.away` params: one request per session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct SessionAwayParams {
+    #[serde(default)]
+    pub requests: Vec<crate::session::away::AwayRequest>,
+}
+
+/// `session.away` result: what each session did after its `sinceMs`,
+/// keyed by session key. A session without an index (not Claude Code, or
+/// not seen by a detection tick yet) is absent.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct SessionAwayResult {
+    pub activity: std::collections::HashMap<String, crate::session::away::AwayActivity>,
+}
+
+/// `detect.recheck` params. There are none yet; the engine ignores any it
+/// gets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct DetectRecheckParams {}
+
+/// `detect.recheck`, `session.stop` and `session.rename` result. The call
+/// ran one detection tick before it answered: its `session.view` and
+/// `session.gone` events are at or before `cursor`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct TickResult {
+    pub cursor: String,
+    /// The detection backend after the tick: `cli` or `legacy`.
+    pub backend: String,
+}
+
+/// `session.stop` params: stop an observed Claude Code session with
+/// SIGTERM. The pid comes from the engine's own detection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStopParams {
+    /// `<provider>:<session id>`.
+    pub session_key: String,
+    /// When given, detection must still see the session as this pid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+/// `session.rename` params: set a Claude Code session's custom title.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRenameParams {
+    /// The provider session id.
+    pub session_id: String,
+    pub new_name: String,
+    /// Only `claudeCode`. Without it, an id that another provider also
+    /// has is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<crate::session::SessionProvider>,
 }
 
 /// `agent.list` params.

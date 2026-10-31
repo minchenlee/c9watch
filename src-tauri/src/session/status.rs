@@ -12,6 +12,7 @@ fn get_permission_checker() -> Arc<PermissionChecker> {
 
 /// Represents the current status of a Claude Code session
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "PascalCase")]
 pub enum SessionStatus {
     /// Claude is actively executing tools or thinking

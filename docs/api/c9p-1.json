@@ -42,6 +42,14 @@
       ],
       "type": "object"
     },
+    "AgentKind": {
+      "enum": [
+        "root",
+        "subagent",
+        "internal"
+      ],
+      "type": "string"
+    },
     "AgentListParams": {
       "description": "`agent.list` params.",
       "properties": {
@@ -272,6 +280,64 @@
       ],
       "type": "object"
     },
+    "AwayActivity": {
+      "description": "Counts of what happened after `since_ms`.",
+      "properties": {
+        "commandsRun": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "filesEdited": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "partial": {
+          "description": "The index dropped events newer than `since_ms`, so the counts are a\nlower bound.",
+          "type": "boolean"
+        },
+        "sinceMs": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "subagentsCompleted": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "toolCalls": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sinceMs",
+        "toolCalls",
+        "filesEdited",
+        "commandsRun",
+        "subagentsCompleted",
+        "partial"
+      ],
+      "type": "object"
+    },
+    "AwayRequest": {
+      "properties": {
+        "sessionKey": {
+          "type": "string"
+        },
+        "sinceMs": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sessionKey",
+        "sinceMs"
+      ],
+      "type": "object"
+    },
     "ClientInfo": {
       "description": "What a client says about itself in `hello`. Unverified.",
       "properties": {
@@ -294,6 +360,10 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "DetectRecheckParams": {
+      "description": "`detect.recheck` params. There are none yet; the engine ignores any it\ngets.",
       "type": "object"
     },
     "ErrorBody": {
@@ -439,6 +509,16 @@
         {
           "const": "duplicate",
           "description": "`msg.send`: the `idem` key was used for another message, or the same\nbody went to the same agent within 10 minutes. `data` has `msgId`\nand `at`.",
+          "type": "string"
+        },
+        {
+          "const": "unknown_session",
+          "description": "`session.stop`: no live session has this key.",
+          "type": "string"
+        },
+        {
+          "const": "action_failed",
+          "description": "`session.stop` or `session.rename` was refused or failed on the\nsession itself: it cannot be stopped, it runs as another process\nnow, or the write failed. `msg` says which.",
           "type": "string"
         },
         {
@@ -761,6 +841,15 @@
       ],
       "type": "object"
     },
+    "OpenTarget": {
+      "description": "The strongest native target supported by the existing focus mechanism.",
+      "enum": [
+        "terminal",
+        "project",
+        "application"
+      ],
+      "type": "string"
+    },
     "Request": {
       "description": "A request frame. Every field is optional on the wire, so that a frame\nwith a missing field still gets an error that echoes its `id`.",
       "properties": {
@@ -836,6 +925,42 @@
       ],
       "type": "object"
     },
+    "SessionAwayParams": {
+      "description": "`session.away` params: one request per session.",
+      "properties": {
+        "requests": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AwayRequest"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "SessionAwayResult": {
+      "description": "`session.away` result: what each session did after its `sinceMs`,\nkeyed by session key. A session without an index (not Claude Code, or\nnot seen by a detection tick yet) is absent.",
+      "properties": {
+        "activity": {
+          "additionalProperties": {
+            "$ref": "#/$defs/AwayActivity"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "activity"
+      ],
+      "type": "object"
+    },
+    "SessionKind": {
+      "enum": [
+        "interactive",
+        "background",
+        "unknown"
+      ],
+      "type": "string"
+    },
     "SessionListParams": {
       "description": "`session.list` params. There are none yet; the engine ignores any it\ngets.",
       "type": "object"
@@ -851,6 +976,365 @@
         }
       },
       "required": [
+        "sessions"
+      ],
+      "type": "object"
+    },
+    "SessionProvider": {
+      "enum": [
+        "claudeCode",
+        "codex",
+        "cursor",
+        "pi",
+        "opencode"
+      ],
+      "type": "string"
+    },
+    "SessionRenameParams": {
+      "description": "`session.rename` params: set a Claude Code session's custom title.",
+      "properties": {
+        "newName": {
+          "type": "string"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionProvider"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Only `claudeCode`. Without it, an id that another provider also\nhas is refused."
+        },
+        "sessionId": {
+          "description": "The provider session id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "newName"
+      ],
+      "type": "object"
+    },
+    "SessionStatus": {
+      "description": "Represents the current status of a Claude Code session",
+      "oneOf": [
+        {
+          "const": "Working",
+          "description": "Claude is actively executing tools or thinking",
+          "type": "string"
+        },
+        {
+          "const": "NeedsAttention",
+          "description": "Waiting for user attention (tool approval, question, etc.)",
+          "type": "string"
+        },
+        {
+          "const": "WaitingForInput",
+          "description": "Idle, ready for next prompt",
+          "type": "string"
+        },
+        {
+          "const": "Connecting",
+          "description": "Session starting up or no recent activity",
+          "type": "string"
+        }
+      ]
+    },
+    "SessionStopParams": {
+      "description": "`session.stop` params: stop an observed Claude Code session with\nSIGTERM. The pid comes from the engine's own detection.",
+      "properties": {
+        "pid": {
+          "description": "When given, detection must still see the session as this pid.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sessionKey": {
+          "description": "`<provider>:<session id>`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionKey"
+      ],
+      "type": "object"
+    },
+    "SessionSurface": {
+      "enum": [
+        "claudeCode",
+        "app",
+        "cli",
+        "exec",
+        "integration",
+        "cursor",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "SessionView": {
+      "description": "Combined session information",
+      "properties": {
+        "agentKind": {
+          "$ref": "#/$defs/AgentKind"
+        },
+        "agentNickname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "aiTitle": {
+          "description": "Claude Code's auto-generated title (`ai-title` in the session JSONL).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "canOpen": {
+          "type": "boolean"
+        },
+        "canRename": {
+          "type": "boolean"
+        },
+        "canStop": {
+          "type": "boolean"
+        },
+        "codexTitle": {
+          "description": "Codex's current UI thread name from ~/.codex/session_index.jsonl.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursorTitle": {
+          "description": "Cursor's current UI composer name from state.vscdb.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "customTitle": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entrypoint": {
+          "description": "Raw `entrypoint` from `~/.claude/sessions/<pid>.json` (e.g. \"cli\", \"sdk-cli\",\n\"claude-vscode\", \"mcp\", \"remote_desktop\"...). Only the CLI backend populates\nthis; `None` covers the legacy backend and non-Claude-Code providers.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "firstPrompt": {
+          "type": "string"
+        },
+        "gitBranch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "internalKind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/SessionKind",
+          "description": "Interactive vs. background-pinned (`claude agents --json`'s `kind`).\nProviders other than Claude Code always report `Interactive`."
+        },
+        "lastAssistantMessage": {
+          "description": "One-line, tag-free preview of the last assistant text.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "latestMessage": {
+          "type": "string"
+        },
+        "messageCount": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "modified": {
+          "type": "string"
+        },
+        "officialName": {
+          "description": "User-set name from `claude agents` (Ctrl+T background-pinned sessions).\nOnly populated by the CLI backend; legacy backend leaves this None.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "openTarget": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpenTarget"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Native target guarantee; absent means no verified exact native target."
+        },
+        "parentThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pendingToolInput": {
+          "description": "The input/arguments of the pending tool (when status is NeedsPermission)"
+        },
+        "pendingToolName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pid": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "projectPath": {
+          "type": "string"
+        },
+        "provider": {
+          "$ref": "#/$defs/SessionProvider"
+        },
+        "rootSessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionKey": {
+          "description": "Provider-scoped identity used by frontend selection and backend maps.",
+          "type": "string"
+        },
+        "sessionName": {
+          "type": "string"
+        },
+        "sourceHealth": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceHealth"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Health of the source observation, independent of the session status."
+        },
+        "startedAtMs": {
+          "description": "Session start time in ms since epoch (from `claude agents --json`).\nOnly populated by the CLI backend; legacy backend leaves this None.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/SessionStatus"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "surface": {
+          "$ref": "#/$defs/SessionSurface"
+        },
+        "waitingFor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WaitingFor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the session needs from the user (tool name only, never arguments)."
+        },
+        "workerOf": {
+          "description": "Session ID of the PM that spawned this session (if it's a c9watch worker).\nSet by the workers overlay from `~/.claude/c9watch/workers/*/meta.json`\n(`session::workers`), after detection.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "sessionKey",
+        "pid",
+        "sessionName",
+        "customTitle",
+        "projectPath",
+        "gitBranch",
+        "firstPrompt",
+        "summary",
+        "messageCount",
+        "modified",
+        "status",
+        "latestMessage",
+        "pendingToolName",
+        "provider",
+        "surface",
+        "kind",
+        "agentKind",
+        "canOpen",
+        "canStop",
+        "canRename"
+      ],
+      "type": "object"
+    },
+    "SessionViewsParams": {
+      "description": "`session.views` params. There are none yet; the engine ignores any it\ngets.",
+      "type": "object"
+    },
+    "SessionViewsResult": {
+      "description": "`session.views` result: the sessions of the last detection tick, as the\nGUI shows them, in detection order, and the cursor they are consistent\nwith. Subscribing to `session.*` with `since` = `cursor` continues with\nno gap: `session.view` carries a new or changed session in full,\n`session.gone` (`SessionGoneEvent`) one that ended.",
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/SessionView"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "cursor",
         "sessions"
       ],
       "type": "object"
@@ -881,6 +1365,17 @@
         "agents"
       ],
       "type": "object"
+    },
+    "SourceHealth": {
+      "description": "Health of the source observation used to produce a session card.\n\nThis is deliberately separate from `SessionStatus`: a session can be\nwaiting for input while its source is fresh, partial, or unavailable.",
+      "enum": [
+        "fresh",
+        "stale",
+        "partial",
+        "unavailable",
+        "unknown"
+      ],
+      "type": "string"
     },
     "SubscribeParams": {
       "description": "`events.subscribe` params (A:218). Empty filters match everything.",
@@ -955,11 +1450,85 @@
         "taskId"
       ],
       "type": "object"
+    },
+    "TickResult": {
+      "description": "`detect.recheck`, `session.stop` and `session.rename` result. The call\nran one detection tick before it answered: its `session.view` and\n`session.gone` events are at or before `cursor`.",
+      "properties": {
+        "backend": {
+          "description": "The detection backend after the tick: `cli` or `legacy`.",
+          "type": "string"
+        },
+        "cursor": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "cursor",
+        "backend"
+      ],
+      "type": "object"
+    },
+    "WaitingFor": {
+      "description": "What a session needs from the user. Tool arguments are never included:\nonly the tool *name* leaves the backend.",
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "approval",
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "tool"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "question",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "attention",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "input",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
-  "apiMinor": 4,
+  "apiMinor": 5,
   "description": "The c9watch engine protocol: one JSON object per line over the engine socket. Within a major version every change is additive.",
   "frames": {
     "event": {
@@ -1003,6 +1572,14 @@
       },
       "result": {
         "$ref": "#/$defs/AgentRetireResult"
+      }
+    },
+    "detect.recheck": {
+      "params": {
+        "$ref": "#/$defs/DetectRecheckParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TickResult"
       }
     },
     "events.subscribe": {
@@ -1088,12 +1665,44 @@
         "$ref": "#/$defs/MsgSendResult"
       }
     },
+    "session.away": {
+      "params": {
+        "$ref": "#/$defs/SessionAwayParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionAwayResult"
+      }
+    },
     "session.list": {
       "params": {
         "$ref": "#/$defs/SessionListParams"
       },
       "result": {
         "$ref": "#/$defs/SessionListResult"
+      }
+    },
+    "session.rename": {
+      "params": {
+        "$ref": "#/$defs/SessionRenameParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TickResult"
+      }
+    },
+    "session.stop": {
+      "params": {
+        "$ref": "#/$defs/SessionStopParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TickResult"
+      }
+    },
+    "session.views": {
+      "params": {
+        "$ref": "#/$defs/SessionViewsParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionViewsResult"
       }
     },
     "snapshot.get": {

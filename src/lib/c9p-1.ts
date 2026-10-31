@@ -2,7 +2,7 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 4;
+export const C9P_API_MINOR = 5;
 
 /**
  * `agent.create` params. C1a creates only free agents (A:794): no brief,
@@ -26,6 +26,8 @@ export interface C9pAgentCreateParams {
 export interface C9pAgentCreateResult {
   agent: C9pAgentRow;
 }
+
+export type C9pAgentKind = 'root' | 'subagent' | 'internal';
 
 /** `agent.list` params. */
 export interface C9pAgentListParams {
@@ -124,12 +126,37 @@ export interface C9pAgentRow {
   status: string | null;
 }
 
+/** Counts of what happened after `since_ms`. */
+export interface C9pAwayActivity {
+  commandsRun: number;
+  filesEdited: number;
+  /**
+   * The index dropped events newer than `since_ms`, so the counts are a
+   * lower bound.
+   */
+  partial: boolean;
+  sinceMs: number;
+  subagentsCompleted: number;
+  toolCalls: number;
+}
+
+export interface C9pAwayRequest {
+  sessionKey: string;
+  sinceMs: number;
+}
+
 /** What a client says about itself in `hello`. Unverified. */
 export interface C9pClientInfo {
   kind?: string | null;
   name?: string | null;
   version?: string | null;
 }
+
+/**
+ * `detect.recheck` params. There are none yet; the engine ignores any it
+ * gets.
+ */
+export type C9pDetectRecheckParams = Record<string, unknown>;
 
 /** The `error` object of a failed response. */
 export interface C9pErrorBody {
@@ -241,6 +268,14 @@ export type C9pErrorCode =
    * and `at`.
    */
   | 'duplicate'
+  /** `session.stop`: no live session has this key. */
+  | 'unknown_session'
+  /**
+   * `session.stop` or `session.rename` was refused or failed on the
+   * session itself: it cannot be stopped, it runs as another process
+   * now, or the write failed. `msg` says which.
+   */
+  | 'action_failed'
   /** An engine-side failure. */
   | 'internal';
 
@@ -395,6 +430,9 @@ export interface C9pMsgSendResult {
   to: C9pMsgAddress;
 }
 
+/** The strongest native target supported by the existing focus mechanism. */
+export type C9pOpenTarget = 'terminal' | 'project' | 'application';
+
 /**
  * A request frame. Every field is optional on the wire, so that a frame
  * with a missing field still gets an error that echoes its `id`.
@@ -418,6 +456,22 @@ export interface C9pResponse {
   v: number;
 }
 
+/** `session.away` params: one request per session. */
+export interface C9pSessionAwayParams {
+  requests?: C9pAwayRequest[];
+}
+
+/**
+ * `session.away` result: what each session did after its `sinceMs`,
+ * keyed by session key. A session without an index (not Claude Code, or
+ * not seen by a detection tick yet) is absent.
+ */
+export interface C9pSessionAwayResult {
+  activity: Record<string, C9pAwayActivity>;
+}
+
+export type C9pSessionKind = 'interactive' | 'background' | 'unknown';
+
 /**
  * `session.list` params. There are none yet; the engine ignores any it
  * gets.
@@ -430,6 +484,136 @@ export type C9pSessionListParams = Record<string, unknown>;
  */
 export interface C9pSessionListResult {
   sessions: C9pAgentRow[];
+}
+
+export type C9pSessionProvider = 'claudeCode' | 'codex' | 'cursor' | 'pi' | 'opencode';
+
+/** `session.rename` params: set a Claude Code session's custom title. */
+export interface C9pSessionRenameParams {
+  newName: string;
+  /**
+   * Only `claudeCode`. Without it, an id that another provider also
+   * has is refused.
+   */
+  provider?: C9pSessionProvider | null;
+  /** The provider session id. */
+  sessionId: string;
+}
+
+/** Represents the current status of a Claude Code session */
+export type C9pSessionStatus =
+  /** Claude is actively executing tools or thinking */
+  | 'Working'
+  /** Waiting for user attention (tool approval, question, etc.) */
+  | 'NeedsAttention'
+  /** Idle, ready for next prompt */
+  | 'WaitingForInput'
+  /** Session starting up or no recent activity */
+  | 'Connecting';
+
+/**
+ * `session.stop` params: stop an observed Claude Code session with
+ * SIGTERM. The pid comes from the engine's own detection.
+ */
+export interface C9pSessionStopParams {
+  /** When given, detection must still see the session as this pid. */
+  pid?: number | null;
+  /** `<provider>:<session id>`. */
+  sessionKey: string;
+}
+
+export type C9pSessionSurface = 'claudeCode' | 'app' | 'cli' | 'exec' | 'integration' | 'cursor' | 'unknown';
+
+/** Combined session information */
+export interface C9pSessionView {
+  agentKind: C9pAgentKind;
+  agentNickname?: string | null;
+  agentPath?: string | null;
+  agentRole?: string | null;
+  /** Claude Code's auto-generated title (`ai-title` in the session JSONL). */
+  aiTitle?: string | null;
+  canOpen: boolean;
+  canRename: boolean;
+  canStop: boolean;
+  /** Codex's current UI thread name from ~/.codex/session_index.jsonl. */
+  codexTitle?: string | null;
+  /** Cursor's current UI composer name from state.vscdb. */
+  cursorTitle?: string | null;
+  customTitle: string | null;
+  /**
+   * Raw `entrypoint` from `~/.claude/sessions/<pid>.json` (e.g. "cli", "sdk-cli",
+   * "claude-vscode", "mcp", "remote_desktop"...). Only the CLI backend populates
+   * this; `None` covers the legacy backend and non-Claude-Code providers.
+   */
+  entrypoint?: string | null;
+  firstPrompt: string;
+  gitBranch: string | null;
+  id: string;
+  internalKind?: string | null;
+  /**
+   * Interactive vs. background-pinned (`claude agents --json`'s `kind`).
+   * Providers other than Claude Code always report `Interactive`.
+   */
+  kind: C9pSessionKind;
+  /** One-line, tag-free preview of the last assistant text. */
+  lastAssistantMessage?: string | null;
+  latestMessage: string;
+  messageCount: number;
+  modified: string;
+  /**
+   * User-set name from `claude agents` (Ctrl+T background-pinned sessions).
+   * Only populated by the CLI backend; legacy backend leaves this None.
+   */
+  officialName?: string | null;
+  /** Native target guarantee; absent means no verified exact native target. */
+  openTarget?: C9pOpenTarget | null;
+  parentThreadId?: string | null;
+  /** The input/arguments of the pending tool (when status is NeedsPermission) */
+  pendingToolInput?: unknown;
+  pendingToolName: string | null;
+  pid: number;
+  projectPath: string;
+  provider: C9pSessionProvider;
+  rootSessionId?: string | null;
+  /** Provider-scoped identity used by frontend selection and backend maps. */
+  sessionKey: string;
+  sessionName: string;
+  /** Health of the source observation, independent of the session status. */
+  sourceHealth?: C9pSourceHealth | null;
+  /**
+   * Session start time in ms since epoch (from `claude agents --json`).
+   * Only populated by the CLI backend; legacy backend leaves this None.
+   */
+  startedAtMs?: number | null;
+  status: C9pSessionStatus;
+  summary: string | null;
+  surface: C9pSessionSurface;
+  /** What the session needs from the user (tool name only, never arguments). */
+  waitingFor?: C9pWaitingFor | null;
+  /**
+   * Session ID of the PM that spawned this session (if it's a c9watch worker).
+   * Set by the workers overlay from `~/.claude/c9watch/workers/*\/meta.json`
+   * (`session::workers`), after detection.
+   */
+  workerOf?: string | null;
+}
+
+/**
+ * `session.views` params. There are none yet; the engine ignores any it
+ * gets.
+ */
+export type C9pSessionViewsParams = Record<string, unknown>;
+
+/**
+ * `session.views` result: the sessions of the last detection tick, as the
+ * GUI shows them, in detection order, and the cursor they are consistent
+ * with. Subscribing to `session.*` with `since` = `cursor` continues with
+ * no gap: `session.view` carries a new or changed session in full,
+ * `session.gone` (`SessionGoneEvent`) one that ended.
+ */
+export interface C9pSessionViewsResult {
+  cursor: string;
+  sessions: C9pSessionView[];
 }
 
 /**
@@ -447,6 +631,14 @@ export interface C9pSnapshotResult {
   cursor: string;
   machineId: string;
 }
+
+/**
+ * Health of the source observation used to produce a session card.
+ *
+ * This is deliberately separate from `SessionStatus`: a session can be
+ * waiting for input while its source is fresh, partial, or unavailable.
+ */
+export type C9pSourceHealth = 'fresh' | 'stale' | 'partial' | 'unavailable' | 'unknown';
 
 /** `events.subscribe` params (A:218). Empty filters match everything. */
 export interface C9pSubscribeParams {
@@ -489,6 +681,32 @@ export interface C9pTaskDoneResult {
   taskId: string;
 }
 
+/**
+ * `detect.recheck`, `session.stop` and `session.rename` result. The call
+ * ran one detection tick before it answered: its `session.view` and
+ * `session.gone` events are at or before `cursor`.
+ */
+export interface C9pTickResult {
+  /** The detection backend after the tick: `cli` or `legacy`. */
+  backend: string;
+  cursor: string;
+}
+
+/**
+ * What a session needs from the user. Tool arguments are never included:
+ * only the tool *name* leaves the backend.
+ */
+export type C9pWaitingFor = {
+  kind: 'approval';
+  tool: string;
+} | {
+  kind: 'question';
+} | {
+  kind: 'attention';
+} | {
+  kind: 'input';
+};
+
 /** The frame types on the engine socket. */
 export interface C9pFrames {
   event: C9pEventFrame;
@@ -513,6 +731,10 @@ export interface C9pMethods {
   'agent.retire': {
     params: C9pAgentRetireParams;
     result: C9pAgentRetireResult;
+  };
+  'detect.recheck': {
+    params: C9pDetectRecheckParams;
+    result: C9pTickResult;
   };
   'events.subscribe': {
     events: C9pEventFrame;
@@ -555,9 +777,25 @@ export interface C9pMethods {
     params: C9pMsgSendParams;
     result: C9pMsgSendResult;
   };
+  'session.away': {
+    params: C9pSessionAwayParams;
+    result: C9pSessionAwayResult;
+  };
   'session.list': {
     params: C9pSessionListParams;
     result: C9pSessionListResult;
+  };
+  'session.rename': {
+    params: C9pSessionRenameParams;
+    result: C9pTickResult;
+  };
+  'session.stop': {
+    params: C9pSessionStopParams;
+    result: C9pTickResult;
+  };
+  'session.views': {
+    params: C9pSessionViewsParams;
+    result: C9pSessionViewsResult;
   };
   'snapshot.get': {
     params: C9pSnapshotParams;

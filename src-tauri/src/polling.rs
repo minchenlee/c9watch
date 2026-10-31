@@ -2,48 +2,16 @@ use crate::session::enrichment::enrich_detected_sessions;
 pub use crate::session::enrichment::{detect_and_enrich_sessions, truncate_string, Session};
 use crate::session::transitions::notification_transitions;
 
-/// Keep the per-transcript away-activity index current and drop indexes for
-/// sessions that ended. Lives in the GUI poll (not enrichment) so one-shot CLI
-/// commands never build it.
-fn refresh_away_index(sessions: &[Session]) {
-    for session in sessions {
-        if let Some(path) = &session.transcript_path {
-            crate::session::away::refresh(&session.session_key, path);
-        }
-    }
-    let live: HashSet<&str> = sessions.iter().map(|s| s.session_key.as_str()).collect();
-    crate::session::away::retain_sessions(&live);
-}
-use crate::session::{is_question_tool, pid_is_alive, DetectorState, SessionStatus};
-use serde::Deserialize;
+use crate::session::{DetectorState, SessionStatus};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 #[cfg(not(target_os = "macos"))]
 use tauri_plugin_notification::NotificationExt;
-
-/// Cached overlay: session_id -> spawnedBy (i.e. worker_of).
-/// Invalidated when the `~/.claude/c9watch/workers/` dir mtime changes.
-static WORKERS_OVERLAY: LazyLock<Mutex<Option<WorkersCache>>> = LazyLock::new(|| Mutex::new(None));
-
-struct WorkersCache {
-    dir_mtime: SystemTime,
-    map: Arc<HashMap<String, String>>,
-}
-
-/// Narrow view of worker meta.json — only the fields the overlay needs.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkerMetaOverlay {
-    session_id: Option<String>,
-    spawned_by: Option<String>,
-    stopped_at: Option<String>,
-    pid: Option<u64>,
-}
 
 fn hash_serialized_session_payload(serialized: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -62,59 +30,6 @@ fn session_payload_changed(previous_hash: &mut Option<u64>, serialized: Option<&
         *previous_hash = current_hash;
     }
     changed
-}
-
-fn load_workers_overlay() -> Arc<HashMap<String, String>> {
-    let workers_dir = match dirs::home_dir() {
-        Some(h) => h.join(".claude").join("c9watch").join("workers"),
-        None => return Arc::new(HashMap::new()),
-    };
-
-    let dir_mtime = match std::fs::metadata(&workers_dir).and_then(|m| m.modified()) {
-        Ok(m) => m,
-        Err(_) => return Arc::new(HashMap::new()),
-    };
-
-    if let Ok(guard) = WORKERS_OVERLAY.lock() {
-        if let Some(cache) = guard.as_ref() {
-            if cache.dir_mtime == dir_mtime {
-                return Arc::clone(&cache.map);
-            }
-        }
-    }
-
-    let mut map = HashMap::new();
-    if let Ok(entries) = std::fs::read_dir(&workers_dir) {
-        for entry in entries.flatten() {
-            let meta_path = entry.path().join("meta.json");
-            let Ok(content) = std::fs::read_to_string(&meta_path) else {
-                continue;
-            };
-            let Ok(meta) = serde_json::from_str::<WorkerMetaOverlay>(&content) else {
-                continue;
-            };
-            if meta.stopped_at.is_some() {
-                continue;
-            }
-            if let Some(pid) = meta.pid {
-                if !pid_is_alive(pid as u32) {
-                    continue;
-                }
-            }
-            if let (Some(sid), Some(by)) = (meta.session_id, meta.spawned_by) {
-                map.insert(sid, by);
-            }
-        }
-    }
-
-    let map = Arc::new(map);
-    if let Ok(mut guard) = WORKERS_OVERLAY.lock() {
-        *guard = Some(WorkersCache {
-            dir_mtime,
-            map: Arc::clone(&map),
-        });
-    }
-    map
 }
 
 /// The diagnostics from the latest poll, for pages that start listening for
@@ -186,20 +101,13 @@ pub fn start_polling(
                     }
 
                     // Overlay worker_of from ~/.claude/c9watch/workers/*/meta.json
-                    let overlay = load_workers_overlay();
-                    for s in sessions.iter_mut() {
-                        if s.provider == crate::session::SessionProvider::ClaudeCode {
-                            if let Some(by) = overlay.get(&s.id) {
-                                s.worker_of = Some(by.clone());
-                            }
-                        }
-                    }
+                    crate::session::workers::apply_workers_overlay(&mut sessions);
 
                     // Track current session IDs to clean up stale entries
                     let current_session_ids: HashSet<String> =
                         sessions.iter().map(|s| s.session_key.clone()).collect();
 
-                    refresh_away_index(&sessions);
+                    crate::session::away::refresh_index(&sessions);
 
                     // Process status transitions and fire notifications
                     for session in
@@ -285,33 +193,10 @@ fn fire_notification(
     notifications_tx: &tokio::sync::broadcast::Sender<String>,
     session: &Session,
 ) {
-    let custom_title = session
-        .custom_title
-        .as_deref()
-        .or(session.codex_title.as_deref())
-        .or(session.cursor_title.as_deref())
-        .or(session.ai_title.as_deref());
-    let session_name = &session.session_name;
-    let pending_tool_name = session.pending_tool_name.as_deref();
-    let title = truncate_string(custom_title.unwrap_or(&session.first_prompt), 60);
-    // The WS server sends this instead of `title` when remote clients may not
-    // see conversation text (`title` can be the first prompt).
-    let redacted_title = truncate_string(custom_title.unwrap_or(session_name), 60);
-
-    // Build the body based on the status
-    let body = match session.status {
-        SessionStatus::NeedsAttention => {
-            if is_question_tool(pending_tool_name) {
-                format!("❓ {}: Waiting for your response", session_name)
-            } else {
-                let tool_name = pending_tool_name.unwrap_or("unknown tool");
-                format!("🔐 {}: Needs permission for {}", session_name, tool_name)
-            }
-        }
-        SessionStatus::WaitingForInput => {
-            format!("✅ {}: Finished working", session_name)
-        }
-        _ => return, // Should not happen based on the caller's logic
+    // Only NeedsAttention and WaitingForInput have a text; the caller's
+    // transitions send no other status.
+    let Some(text) = crate::session::notification::notification_text(session) else {
+        return;
     };
 
     // Fire native notification via Tauri plugin
@@ -320,32 +205,63 @@ fn fire_notification(
     if let Err(e) = app_handle
         .notification()
         .builder()
-        .title(&title)
-        .body(&body)
+        .title(&text.title)
+        .body(&text.body)
         .show()
     {
         crate::debug_log::log_error(&format!("Failed to show notification: {}", e));
     }
 
     // Broadcast to WebSocket clients for web notifications
-    let ws_notification = serde_json::json!({
-        "title": title,
-        "redactedTitle": redacted_title,
-        "body": body,
+    let ws_notification = web_notification(session, text);
+    if let Ok(json) = serde_json::to_string(&ws_notification) {
+        let _ = notifications_tx.send(json);
+    }
+}
+
+/// The notification the WS server broadcasts to web clients. The WS server
+/// sends `redactedTitle` instead of `title` when remote clients may not see
+/// conversation text (`title` can be the first prompt).
+fn web_notification(
+    session: &Session,
+    text: crate::session::notification::NotificationText,
+) -> serde_json::Value {
+    serde_json::json!({
+        "title": text.title,
+        "redactedTitle": text.redacted_title,
+        "body": text.body,
         "sessionId": session.id,
         "sessionKey": session.session_key,
         "provider": session.provider,
         "pid": session.pid,
-    });
-    if let Ok(json) = serde_json::to_string(&ws_notification) {
-        let _ = notifications_tx.send(json);
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::SessionSource;
+
+    /// The web notification is the pre-move JSON, built from the same
+    /// `notification_text` the engine's `notification.*` data uses.
+    #[test]
+    fn web_notification_payload_is_unchanged() {
+        let mut s = Session::fixture("a", SessionStatus::NeedsAttention);
+        s.pending_tool_name = Some("Bash".into());
+        let text = crate::session::notification::notification_text(&s).unwrap();
+        assert_eq!(
+            web_notification(&s, text),
+            serde_json::json!({
+                "title": "investigate",
+                "redactedTitle": "name-a",
+                "body": "🔐 name-a: Needs permission for Bash",
+                "sessionId": "a",
+                "sessionKey": "claudeCode:a",
+                "provider": "claudeCode",
+                "pid": 4242,
+            })
+        );
+    }
 
     #[test]
     fn empty_session_payload_after_nonempty_payload_is_emitted_as_change() {

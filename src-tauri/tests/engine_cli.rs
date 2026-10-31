@@ -682,6 +682,68 @@ fn the_first_list_after_a_cold_start_has_the_session() {
     assert_eq!(stdout_json(&out)["total"], 1, "{:?}", out);
 }
 
+/// M-a1: `session.views` answers the GUI's session JSON, and a subscriber
+/// sees the `session.view` that put it there and the `session.gone` when
+/// the session ends.
+#[test]
+fn session_views_and_their_events_through_the_engine() {
+    use std::io::{BufRead, BufReader, Write};
+    let sb = Sandbox::new();
+    let mut d = Detected::new(&sb);
+    engine_lists_the_session(&sb, &d);
+    let key = format!("claudeCode:{}", DETECT_SID);
+
+    let out = d.run(&sb, &["api", "session.views", "{}"]);
+    assert!(out.status.success(), "{:?} / log {}", out, sb.log());
+    let resp = stdout_json(&out);
+    assert_eq!(resp["ok"], true, "{}", resp);
+    let views = &resp["result"];
+    let sessions = views["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), 1, "{}", views);
+    assert_eq!(sessions[0]["id"], DETECT_SID);
+    assert_eq!(sessions[0]["sessionKey"], key.as_str());
+    let cursor = views["cursor"].as_str().expect("cursor").to_string();
+
+    // Replay from the start of the epoch: the first tick's view is there.
+    let (prefix, _) = cursor.rsplit_once(':').unwrap();
+    let since = format!("{}:0", prefix);
+    let mut sock = std::os::unix::net::UnixStream::connect(sock_path(&sb.engine)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    for req in [
+        serde_json::json!({"v": 1, "id": "h", "method": "hello", "params": {}}),
+        serde_json::json!({"v": 1, "id": "s", "method": "events.subscribe",
+            "params": {"since": since, "topics": ["session.*"]}}),
+    ] {
+        writeln!(sock, "{}", req).unwrap();
+    }
+    let mut lines = BufReader::new(sock.try_clone().unwrap()).lines();
+    let mut next_event = |topic: &str| -> Value {
+        loop {
+            let line = lines
+                .next()
+                .unwrap_or_else(|| panic!("no {topic} / log {}", sb.log()))
+                .unwrap();
+            let f: Value = serde_json::from_str(&line).unwrap();
+            if f.get("ok") == Some(&Value::Bool(false)) {
+                panic!("error frame {f}");
+            }
+            if f["type"] == "event" && f["topic"] == topic {
+                return f;
+            }
+        }
+    };
+    let view = next_event("session.view");
+    assert_eq!(view["data"]["id"], DETECT_SID);
+    assert_eq!(view["data"]["sessionKey"], key.as_str());
+    assert!(view["subject"].as_str().unwrap().ends_with(&key));
+
+    d.end_session();
+    let gone = next_event("session.gone");
+    assert_eq!(gone["data"]["sessionKey"], key.as_str());
+    assert_eq!(gone["data"]["id"], DETECT_SID);
+}
+
 #[test]
 fn watch_and_wait_follow_the_engine_events() {
     use wait_timeout::ChildExt;

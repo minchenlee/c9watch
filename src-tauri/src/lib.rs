@@ -357,18 +357,7 @@ async fn open_session(pid: u32, project_path: String) -> Result<(), String> {
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
-pub(crate) fn run_validated_rename<F>(
-    provider: Option<session::SessionProvider>,
-    session_id: &str,
-    owners: &session::ProviderSourceOwners,
-    write: F,
-) -> Result<(), String>
-where
-    F: FnOnce() -> Result<(), String>,
-{
-    session::validate_rename_request(provider, session_id, owners)?;
-    write()
-}
+pub(crate) use session::rename::{run_validated_rename, write_session_title};
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
@@ -385,18 +374,6 @@ async fn rename_session(
     })?;
 
     emit_sessions_snapshot(&app, detector.inner())
-}
-
-/// Persist a session rename for both the Tauri command and the WebSocket
-/// handler: Claude Code's native JSONL entry (primary) plus c9watch's own
-/// custom titles file (fallback for the history view).
-#[cfg(all(not(mobile), feature = "gui"))]
-pub(crate) fn write_session_title(session_id: &str, new_name: &str) -> Result<(), String> {
-    write_native_custom_title(session_id, new_name);
-
-    let mut custom_titles = session::CustomTitles::load();
-    custom_titles.set(session_id.to_string(), new_name.to_string());
-    custom_titles.save()
 }
 
 /// Append a `custom-title` entry to the session's JSONL file in Claude Code's native format.
