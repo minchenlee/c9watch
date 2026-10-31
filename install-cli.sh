@@ -8,7 +8,8 @@
 # This script:
 #   1. Detects your OS and architecture
 #   2. Downloads the latest c9watch CLI binary from GitHub
-#   3. Installs it to ~/.local/bin (or /usr/local/bin if --global)
+#   3. Installs it and the headless core's agent binary (when present)
+#      to ~/.local/bin (or /usr/local/bin if --global)
 #
 set -euo pipefail
 
@@ -66,14 +67,14 @@ info "Latest version: ${LATEST_TAG}"
 # --- Download and extract ---
 
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${BINARY_NAME}-cli-${TARGET}.tar.gz"
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+DOWNLOAD_DIR=$(mktemp -d)
+trap 'rm -rf "$DOWNLOAD_DIR"' EXIT
 
 info "Downloading c9watch CLI for ${TARGET}..."
-curl -fSL --progress-bar "$DOWNLOAD_URL" -o "$TMPDIR/c9watch-cli.tar.gz"
+curl -fSL --progress-bar "$DOWNLOAD_URL" -o "$DOWNLOAD_DIR/c9watch-cli.tar.gz"
 
 info "Extracting..."
-tar -xzf "$TMPDIR/c9watch-cli.tar.gz" -C "$TMPDIR"
+tar -xzf "$DOWNLOAD_DIR/c9watch-cli.tar.gz" -C "$DOWNLOAD_DIR"
 
 # --- Install ---
 
@@ -83,8 +84,15 @@ if [ -f "$INSTALL_DIR/$BINARY_NAME" ]; then
   info "Replacing existing installation..."
 fi
 
-cp "$TMPDIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+cp "$DOWNLOAD_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
 chmod +x "$INSTALL_DIR/$BINARY_NAME"
+
+# Linux core archives ship the pair. Older releases and macOS CLI-only
+# archives still install normally without an agent binary.
+if [ -f "$DOWNLOAD_DIR/c9watch-agent" ]; then
+  cp "$DOWNLOAD_DIR/c9watch-agent" "$INSTALL_DIR/c9watch-agent"
+  chmod +x "$INSTALL_DIR/c9watch-agent"
+fi
 
 # --- Verify ---
 

@@ -145,7 +145,7 @@ pub fn check_mutation(
     }
     match confined {
         Some(false) => Ok(()),
-        Some(true) => Err("the peer runs in a sandbox".into()),
+        Some(true) => Err("the peer runs in a sandbox or a different mount namespace; on Linux, run the core and terminal in the same namespace (systemd ProtectHome/PrivateTmp/ProtectSystem/PrivateDevices and flatpak/snap terminals can isolate them)".into()),
         None => Err("whether the peer runs in a sandbox could not be told".into()),
     }
 }

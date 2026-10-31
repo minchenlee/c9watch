@@ -43,6 +43,7 @@ impl Sandbox {
             .env_remove("C9_AGENT_ID")
             .env_remove("C9_ENGINE_SOCK")
             .env_remove("XDG_STATE_HOME")
+            .env_remove("XDG_RUNTIME_DIR")
             .stdin(Stdio::null());
         c
     }
@@ -132,6 +133,68 @@ fn api_auto_starts_the_engine_and_round_trips() {
     let out = sb.run(&["api", "hello", "{not json"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("not JSON"));
+}
+
+/// Exercise actual Linux resolution in separate CLI/engine processes,
+/// without changing the test runner's environment or touching the real home.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_default_home_auto_start_restart_and_runtime_fallback() {
+    use c9watch_lib::engine_proto::home::{linux_sock_path, Channel};
+    for runtime_value in [None, Some("relative"), Some("runtime")] {
+        let mut sb = Sandbox::new();
+        sb.engine = sb
+            .home
+            .join(".local/state/c9watch")
+            .join(match Channel::current() {
+                Channel::Prod => "engine",
+                Channel::Dev => "engine-dev",
+            });
+        let runtime = sb.home.parent().unwrap().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let run = |args: &[&str]| {
+            let mut cmd = sb.cmd(args);
+            cmd.env_remove(ENGINE_HOME_ENV);
+            match runtime_value {
+                Some("runtime") => {
+                    cmd.env("XDG_RUNTIME_DIR", &runtime);
+                }
+                Some(value) => {
+                    cmd.env("XDG_RUNTIME_DIR", value);
+                }
+                None => {}
+            }
+            cmd.output().unwrap()
+        };
+        let sock = linux_sock_path(
+            Channel::current(),
+            &sb.engine,
+            runtime_value.map(|v| {
+                if v == "runtime" {
+                    runtime.as_os_str()
+                } else {
+                    std::ffi::OsStr::new(v)
+                }
+            }),
+        );
+        let out = run(&["api", "hello"]);
+        assert!(out.status.success(), "{out:?} / log {}", sb.log());
+        assert_eq!(mode(&sock), 0o600);
+        assert_eq!(mode(sock.parent().unwrap()), 0o700);
+        assert!(sb.engine.join("engine.db").exists());
+        let old = sb.pid().unwrap();
+        let out = run(&["engine", "restart"]);
+        assert!(out.status.success(), "{out:?} / log {}", sb.log());
+        assert_ne!(sb.pid(), Some(old));
+        assert_eq!(mode(&sock), 0o600);
+        assert!(run(&["api", "session.views"]).status.success());
+        if runtime_value == Some("runtime") {
+            assert!(!sb.engine.join("engine-v1.sock").exists());
+        }
+        drop(sb);
+        assert!(!sock.exists(), "SIGTERM must remove the selected socket");
+    }
 }
 
 #[test]
@@ -690,6 +753,25 @@ fn session_views_and_their_events_through_the_engine() {
     use std::io::{BufRead, BufReader, Write};
     let sb = Sandbox::new();
     let mut d = Detected::new(&sb);
+    let cwd = sb.home.parent().unwrap().join("work/proj");
+    let project: String = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let project_dir = sb.home.join(".claude/projects").join(project);
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let transcript = project_dir.join(format!("{DETECT_SID}.jsonl"));
+    let message = |text: &str| {
+        serde_json::json!({
+            "type": "user", "sessionId": DETECT_SID, "uuid": uuid::Uuid::new_v4().to_string(),
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "message": {"role": "user", "content": text},
+        })
+        .to_string()
+            + "\n"
+    };
+    std::fs::write(&transcript, message("before fixture change")).unwrap();
     engine_lists_the_session(&sb, &d);
     let key = format!("claudeCode:{}", DETECT_SID);
 
@@ -702,6 +784,7 @@ fn session_views_and_their_events_through_the_engine() {
     assert_eq!(sessions.len(), 1, "{}", views);
     assert_eq!(sessions[0]["id"], DETECT_SID);
     assert_eq!(sessions[0]["sessionKey"], key.as_str());
+    assert_eq!(sessions[0]["latestMessage"], "before fixture change");
     let cursor = views["cursor"].as_str().expect("cursor").to_string();
 
     // Replay from the start of the epoch: the first tick's view is there.
@@ -737,6 +820,27 @@ fn session_views_and_their_events_through_the_engine() {
     assert_eq!(view["data"]["id"], DETECT_SID);
     assert_eq!(view["data"]["sessionKey"], key.as_str());
     assert!(view["subject"].as_str().unwrap().ends_with(&key));
+
+    // A transcript change must reach the live subscriber, not just replay
+    // the initial detection event. The same CLI read sees the changed view.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    file.write_all(message("after fixture transcript change").as_bytes())
+        .unwrap();
+    loop {
+        let changed = next_event("session.view");
+        if changed["data"]["latestMessage"] == "after fixture transcript change" {
+            break;
+        }
+    }
+    let out = d.run(&sb, &["api", "session.views"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        stdout_json(&out)["result"]["sessions"][0]["latestMessage"],
+        "after fixture transcript change"
+    );
 
     d.end_session();
     let gone = next_event("session.gone");
