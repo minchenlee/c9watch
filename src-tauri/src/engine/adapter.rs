@@ -87,7 +87,80 @@ impl Descriptor {
     pub fn accepts_hook_kind(&self, kind: &str) -> bool {
         self.hook_kinds.contains(&kind)
     }
+
+    /// Resume a specific session, never a vendor's "latest" picker. Pi's
+    /// session reference is its transcript path; the other kinds accept ids
+    /// (OMP also accepts a path). No shell evaluates the reference.
+    pub fn resume_argv(&self, session_ref: &str) -> Vec<String> {
+        let flag = match self.kind {
+            "claude" | "omp" | "cursor" => "--resume",
+            "codex" => "resume",
+            "pi" | "opencode" | "kilo" => "--session",
+            _ => unreachable!("every descriptor has a resume form"),
+        };
+        vec![self.executables[0].into(), flag.into(), session_ref.into()]
+    }
+
+    /// Map an optional brief model using a caller-supplied, trusted catalogue
+    /// of models supported by this kind/version. The catalogue owns the
+    /// vendor's model vocabulary and argv (including version differences),
+    /// rather than silently passing an unknown id or inventing model aliases.
+    /// Managed briefs and catalogue discovery are outside the free spawn API.
+    pub fn model_argv(
+        &self,
+        model: Option<&str>,
+        catalogue: &[ModelArgv<'_>],
+    ) -> Result<Vec<String>, UnknownModel> {
+        let Some(model) = model else {
+            return Ok(Vec::new());
+        };
+        catalogue
+            .iter()
+            .find(|entry| entry.kind == self.kind && entry.model == model && !model.is_empty())
+            .map(|entry| entry.argv.iter().map(|arg| (*arg).to_string()).collect())
+            .ok_or_else(|| UnknownModel {
+                kind: self.kind,
+                model: model.to_string(),
+            })
+    }
 }
+
+/// A model mapping verified for a particular adapter and CLI version. The
+/// caller supplies these as data; model names never become shell commands.
+pub struct ModelArgv<'a> {
+    pub kind: &'a str,
+    pub model: &'a str,
+    pub argv: &'a [&'a str],
+}
+
+/// D19's adapter error. A future managed-create caller maps `code()` into its
+/// wire error before creating a row or launching a process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownModel {
+    pub kind: &'static str,
+    pub model: String,
+}
+
+impl UnknownModel {
+    pub fn code(&self) -> &'static str {
+        "unknown_model"
+    }
+}
+
+impl std::fmt::Display for UnknownModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: {:?} for adapter {}",
+            self.code(),
+            self.model,
+            self.kind
+        )
+    }
+}
+
+impl std::error::Error for UnknownModel {}
+
 
 /// Claude Code.
 pub const CLAUDE: Descriptor = Descriptor {
@@ -225,14 +298,21 @@ pub fn descriptor(kind: &str) -> Option<&'static Descriptor> {
     DESCRIPTORS.iter().copied().find(|d| d.kind == kind)
 }
 
-/// The descriptor of the kind whose `agents.provider` is `provider`.
+/// The descriptor whose `agents.provider` is `provider`, only when unique.
+/// Pi/OMP and OpenCode/Kilo share readers. A provider alone cannot safely
+/// select their executable, hook acceptance rules or resume syntax.
 pub fn descriptor_for_provider(provider: &str) -> Option<&'static Descriptor> {
-    DESCRIPTORS.iter().copied().find(|d| d.provider == provider)
+    let mut matches = DESCRIPTORS
+        .iter()
+        .copied()
+        .filter(|d| d.provider == provider);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 /// argv that resumes a CC session (A:1040).
 pub fn claude_resume_argv(session_id: &str) -> Vec<String> {
-    vec!["claude".into(), "--resume".into(), session_id.into()]
+    CLAUDE.resume_argv(session_id)
 }
 
 /// CC hook events in the per-spawn settings, and the `c9watch-agent hook`
@@ -377,6 +457,66 @@ mod tests {
         assert_eq!(CURSOR.permission_flags.auto, ["--auto-review"]);
         assert!(KILO.permission_flags.yolo.is_empty());
         assert!(PI.permission_flags.auto.is_empty());
+    }
+
+    #[test]
+    fn resumes_use_each_cli_and_keep_the_session_ref_in_one_argument() {
+        let forms = [
+            ("claude", "claude", "--resume"),
+            ("codex", "codex", "resume"),
+            ("pi", "pi", "--session"),
+            ("omp", "omp", "--resume"),
+            ("opencode", "opencode", "--session"),
+            ("kilo", "kilo", "--session"),
+            ("cursor", "cursor-agent", "--resume"),
+        ];
+        for (kind, exe, flag) in forms {
+            let d = descriptor(kind).unwrap();
+            assert_eq!(d.resume_argv("sid-1"), [exe, flag, "sid-1"]);
+            let path = "/tmp/session dir/a'$(touch nope).jsonl";
+            assert_eq!(d.resume_argv(path), [exe, flag, path]);
+        }
+        assert_eq!(descriptor_for_provider("codex"), Some(&CODEX));
+        assert_eq!(descriptor_for_provider("cursor"), Some(&CURSOR));
+        assert_eq!(descriptor_for_provider("pi"), None);
+        assert_eq!(descriptor_for_provider("opencode"), None);
+    }
+
+    #[test]
+    fn models_are_optional_and_unknown_values_fail_closed_for_every_kind() {
+        for d in DESCRIPTORS {
+            let catalogue = [ModelArgv {
+                kind: d.kind,
+                model: "verified-model",
+                argv: &["--model", "vendor/native-model"],
+            }];
+            assert!(d.model_argv(None, &[]).unwrap().is_empty());
+            assert_eq!(
+                d.model_argv(Some("verified-model"), &catalogue).unwrap(),
+                ["--model", "vendor/native-model"]
+            );
+            // An id unverified for this adapter/version is never passed on.
+            for model in ["", "unknown", "--yolo", "verified-model "] {
+                let err = d.model_argv(Some(model), &catalogue).unwrap_err();
+                assert_eq!(err.code(), "unknown_model");
+                assert_eq!(err.kind, d.kind);
+                assert_eq!(err.model, model);
+            }
+            assert!(d.model_argv(Some("verified-model"), &[]).is_err());
+        }
+        let claude_only = [ModelArgv {
+            kind: "claude",
+            model: "sonnet",
+            argv: &["--model", "sonnet"],
+        }];
+        assert!(CLAUDE.model_argv(Some("sonnet"), &claude_only).is_ok());
+        assert_eq!(
+            CODEX
+                .model_argv(Some("sonnet"), &claude_only)
+                .unwrap_err()
+                .code(),
+            "unknown_model"
+        );
     }
 
     #[test]

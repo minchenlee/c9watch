@@ -172,10 +172,7 @@ pub fn action(state: Option<&str>, create_open: bool) -> Action {
 
 /// The argv that resumes `session_id` of an agent of `provider` (A:1038).
 pub fn resume_argv(provider: &str, session_id: &str) -> Option<Vec<String>> {
-    match adapter::descriptor_for_provider(provider)?.kind {
-        "claude" => Some(adapter::claude_resume_argv(session_id)),
-        _ => None,
-    }
+    Some(adapter::descriptor_for_provider(provider)?.resume_argv(session_id))
 }
 
 /// The write after the supervisor killed a drained agent: `ready` becomes
@@ -539,6 +536,12 @@ mod tests {
             resume_argv("claudeCode", "s"),
             Some(vec!["claude".into(), "--resume".into(), "s".into()])
         );
-        assert_eq!(resume_argv("codex", "s"), None);
+        assert_eq!(
+            resume_argv("codex", "s"),
+            Some(vec!["codex".into(), "resume".into(), "s".into()])
+        );
+        // Shared reader keys cannot pick an executable without a persisted kind.
+        assert_eq!(resume_argv("pi", "s"), None);
+        assert_eq!(resume_argv("opencode", "s"), None);
     }
 }

@@ -1443,6 +1443,11 @@ impl Spawner {
     /// The session, cwd and `claude` of a resume, or why there is none.
     /// Blocking.
     fn resume_plan(&self, r: &Resumable) -> Result<Start, String> {
+        // The drain understands more descriptors than this CC supervisor.
+        // Never resume a different CLI with Claude's executable/settings.
+        if adapter::descriptor_for_provider(&r.provider).is_none_or(|d| d.kind != "claude") {
+            return Err(format!("no spawn integration for a {} agent", r.provider));
+        }
         let argv: Vec<String> = match (&r.argv, &r.sid) {
             (Some(a), _) => serde_json::from_str(a)
                 .map_err(|e| format!("resume_argv {:?} is not an argv: {}", a, e))?,
@@ -3801,6 +3806,29 @@ mod tests {
             )
         );
         assert!(ops::reconcile(&e.db, &e.home).unwrap().is_empty());
+    }
+
+    /// A known reader/provider does not imply a supported spawn profile.
+    #[test]
+    fn descriptor_only_providers_cannot_boot_resume_as_claude() {
+        let e = setup(Script::Ready, None);
+        for provider in ["codex", "pi", "opencode", "cursor"] {
+            let r = Resumable {
+                id: "agt_other".into(),
+                state: "paused".into(),
+                reason: Some("drain".into()),
+                provider: provider.into(),
+                sid: Some("sid-1".into()),
+                cwd: Some(e.cwd.to_string_lossy().into()),
+                argv: Some(r#"["claude","--resume","sid-1"]"#.into()),
+            };
+            assert!(e
+                .sp
+                .resume_plan(&r)
+                .unwrap_err()
+                .contains("no spawn integration"));
+        }
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 0);
     }
 
     /// No resume while draining: the row stays.
