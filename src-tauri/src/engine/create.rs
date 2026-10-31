@@ -1907,7 +1907,17 @@ fn check_kind_and_mode(p: &AgentCreateParams) -> Result<&'static Descriptor, Api
         }
         other => return Err(bad(format!("unknown mode {:?}", other))),
     }
-    adapter::descriptor(&p.kind).ok_or_else(|| bad(format!("unknown agent kind {:?}", p.kind)))
+    let desc = adapter::descriptor(&p.kind)
+        .ok_or_else(|| bad(format!("unknown agent kind {:?}", p.kind)))?;
+    // Descriptor discovery must not route a new kind through the CC-only
+    // settings, executable and screen supervisor below.
+    if desc.kind != "claude" {
+        return Err(bad(format!(
+            "agent kind {:?} is recognized but its spawn integration is not implemented",
+            p.kind
+        )));
+    }
+    Ok(desc)
 }
 
 fn check_name(name: &str) -> Result<(), ApiError> {
@@ -2497,6 +2507,24 @@ mod tests {
                 .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotAllowed);
         assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn descriptor_only_kinds_never_spawn_through_the_claude_supervisor() {
+        let e = setup(Script::Ready, None);
+        for desc in adapter::DESCRIPTORS.iter().filter(|d| d.kind != "claude") {
+            let err =
+                e.sp.create(
+                    &Principal::LocalUnverified,
+                    serde_json::json!({"mode": "free", "kind": desc.kind, "cwd": e.cwd}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::BadRequest);
+            assert!(err.msg.contains("spawn integration is not implemented"));
+        }
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 0);
+        assert!(e.db.agents(AgentFilter::All).unwrap().is_empty());
     }
 
     #[tokio::test]

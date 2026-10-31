@@ -1,6 +1,6 @@
 //! Adapter descriptors (plan C1a-22, A:1017-1032): what the engine knows
-//! about one agent kind as data, plus the few runtime facts C1a needs for
-//! Claude Code, the only kind it runs.
+//! about one P1 agent kind as data. Recognition does not enable spawning:
+//! the create supervisor still supports only Claude Code.
 //!
 //! - `Descriptor`: kind, executables, tier, hook trust, permission flags,
 //!   prompt delivery, path guard, and the hook kinds the engine accepts
@@ -106,8 +106,119 @@ pub const CLAUDE: Descriptor = Descriptor {
     hook_kinds: &["claude"],
 };
 
-/// Every kind the engine knows. C1a: Claude Code only.
-pub const DESCRIPTORS: &[&Descriptor] = &[&CLAUDE];
+/// Codex CLI. Flags verified with the locally installed CLI's `--help`.
+pub const CODEX: Descriptor = Descriptor {
+    kind: "codex",
+    provider: "codex",
+    executables: &["codex"],
+    tier: Tier::Full,
+    hook_trust: HookTrust::TurnEnd,
+    permission_flags: PermissionFlags {
+        manual: &[
+            "--ask-for-approval",
+            "on-request",
+            "--sandbox",
+            "workspace-write",
+        ],
+        auto: &["--approve-for-me"],
+        yolo: &["--dangerously-bypass-approvals-and-sandbox"],
+    },
+    prompt_delivery: PromptDelivery::BracketedPaste,
+    path_guard: "merge_only",
+    hook_kinds: &["codex"],
+};
+
+/// Pi has no tool-approval posture flags in its installed `--help`.
+/// `--approve` trusts project files; it is not a tool permission mode.
+pub const PI: Descriptor = Descriptor {
+    kind: "pi",
+    provider: "pi",
+    executables: &["pi"],
+    tier: Tier::Full,
+    hook_trust: HookTrust::Authoritative,
+    permission_flags: PermissionFlags {
+        manual: &[],
+        auto: &[],
+        yolo: &[],
+    },
+    prompt_delivery: PromptDelivery::BracketedPaste,
+    path_guard: "merge_only",
+    hook_kinds: &["pi"],
+};
+
+/// OMP reuses Pi's reader and extension. The installed help calls `write`
+/// an approval mode, but does not define it as an automatic reviewer.
+pub const OMP: Descriptor = Descriptor {
+    kind: "omp",
+    provider: "pi",
+    executables: &["omp"],
+    tier: Tier::Full,
+    hook_trust: HookTrust::Authoritative,
+    permission_flags: PermissionFlags {
+        manual: &["--approval-mode", "always-ask"],
+        auto: &[],
+        yolo: &["--approval-mode", "yolo"],
+    },
+    prompt_delivery: PromptDelivery::BracketedPaste,
+    path_guard: "merge_only",
+    hook_kinds: &["omp", "pi"],
+};
+
+/// OpenCode, including the opencode2 executable. Only `--auto` is exposed
+/// as a permission flag by the installed v2 CLI's help.
+pub const OPENCODE: Descriptor = Descriptor {
+    kind: "opencode",
+    provider: "opencode",
+    executables: &["opencode", "opencode2"],
+    tier: Tier::Full,
+    hook_trust: HookTrust::Authoritative,
+    permission_flags: PermissionFlags {
+        manual: &[],
+        auto: &["--auto"],
+        yolo: &[],
+    },
+    prompt_delivery: PromptDelivery::BracketedPaste,
+    path_guard: "merge_only",
+    hook_kinds: &["opencode"],
+};
+
+/// Kilo reuses OpenCode's reader and plugin. No local Kilo binary was
+/// available to verify its permission flags; empty is not a supported mode.
+pub const KILO: Descriptor = Descriptor {
+    kind: "kilo",
+    provider: "opencode",
+    executables: &["kilo"],
+    tier: Tier::Full,
+    hook_trust: HookTrust::Authoritative,
+    permission_flags: PermissionFlags {
+        manual: &[],
+        auto: &[],
+        yolo: &[],
+    },
+    prompt_delivery: PromptDelivery::BracketedPaste,
+    path_guard: "merge_only",
+    hook_kinds: &["kilo", "opencode"],
+};
+
+/// Cursor Agent CLI (`cursor` is the provider's existing wire key).
+pub const CURSOR: Descriptor = Descriptor {
+    kind: "cursor",
+    provider: "cursor",
+    executables: &["cursor-agent", "agent"],
+    tier: Tier::Full,
+    hook_trust: HookTrust::IdentityOnly,
+    permission_flags: PermissionFlags {
+        manual: &[],
+        auto: &["--auto-review"],
+        yolo: &["--yolo"],
+    },
+    prompt_delivery: PromptDelivery::BracketedPaste,
+    path_guard: "merge_only",
+    hook_kinds: &["cursor"],
+};
+
+/// Every P1 kind the engine knows (A:1080).
+pub const DESCRIPTORS: &[&Descriptor] = &[&CLAUDE, &CODEX, &PI, &OMP, &OPENCODE, &KILO, &CURSOR];
 
 /// The descriptor of `kind`.
 pub fn descriptor(kind: &str) -> Option<&'static Descriptor> {
@@ -208,7 +319,7 @@ mod tests {
     fn the_claude_descriptor() {
         let d = descriptor("claude").unwrap();
         assert_eq!(d, &CLAUDE);
-        assert!(descriptor("codex").is_none());
+        assert!(descriptor("no-such-kind").is_none());
         assert_eq!(
             d.provider,
             crate::session::source::SessionProvider::ClaudeCode.as_key()
@@ -224,6 +335,48 @@ mod tests {
         let v = serde_json::to_value(d).unwrap();
         assert_eq!(v["hookTrust"], "turn_end");
         assert_eq!(v["promptDelivery"], "bracketed_paste");
+    }
+
+    #[test]
+    fn p1_descriptors_reuse_existing_provider_keys() {
+        use crate::session::source::SessionProvider;
+        assert_eq!(DESCRIPTORS.len(), 7);
+        let expected = [
+            ("claude", "claudeCode", HookTrust::TurnEnd),
+            ("codex", "codex", HookTrust::TurnEnd),
+            ("pi", "pi", HookTrust::Authoritative),
+            ("omp", "pi", HookTrust::Authoritative),
+            ("opencode", "opencode", HookTrust::Authoritative),
+            ("kilo", "opencode", HookTrust::Authoritative),
+            ("cursor", "cursor", HookTrust::IdentityOnly),
+        ];
+        let mut kinds = std::collections::HashSet::new();
+        for (kind, provider, trust) in expected {
+            let d = descriptor(kind).unwrap();
+            assert!(kinds.insert(d.kind));
+            assert_eq!(d.provider, provider);
+            assert!(SessionProvider::from_key(d.provider).is_some());
+            assert_eq!(d.hook_trust, trust);
+            assert_eq!(d.tier, Tier::Full);
+            assert_eq!(d.path_guard, "merge_only");
+            assert_eq!(d.prompt_delivery, PromptDelivery::BracketedPaste);
+            assert!(!d.executables.is_empty());
+            assert!(d.accepts_hook_kind(kind));
+            assert!(!d.accepts_hook_kind("grok"));
+        }
+        assert!(OMP.accepts_hook_kind("pi"));
+        assert!(KILO.accepts_hook_kind("opencode"));
+        assert!(!PI.accepts_hook_kind("omp"));
+        assert!(!OPENCODE.accepts_hook_kind("kilo"));
+        assert_eq!(CODEX.permission_flags.auto, ["--approve-for-me"]);
+        assert_eq!(
+            OMP.permission_flags.manual,
+            ["--approval-mode", "always-ask"]
+        );
+        assert_eq!(OPENCODE.permission_flags.auto, ["--auto"]);
+        assert_eq!(CURSOR.permission_flags.auto, ["--auto-review"]);
+        assert!(KILO.permission_flags.yolo.is_empty());
+        assert!(PI.permission_flags.auto.is_empty());
     }
 
     #[test]
