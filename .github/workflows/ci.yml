@@ -79,6 +79,82 @@ jobs:
             --no-default-features --features engine,pm-orchestration \
             --test engine_cli
 
+  visual-classic:
+    # Classic must stay pixel-identical (core-public plan, M-c0). Fixed
+    # runner image and fixed WebKit: Playwright is pinned exactly in
+    # package.json, and each Playwright version pins one WebKit build.
+    # Baselines are made here only, never on a local machine.
+    #
+    # No baselines yet: run 1 writes them, run 2 must match run 1 with 0
+    # changed pixels, and the PNGs are uploaded as `classic-baseline` for an
+    # owner-approved PR. These steps do not fail the job.
+    # Baselines present: any changed pixel fails the job. Add this job to
+    # the required checks of `main` to make it block merges.
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install Playwright WebKit
+        run: npx playwright install webkit
+
+      - name: Record runner image and WebKit
+        run: |
+          echo "image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          sw_vers
+          npx playwright --version
+
+      - name: Check for Classic baselines
+        id: baseline
+        run: |
+          if ls tests/visual/classic/__screenshots__/*.png >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No Classic baselines yet. This run makes them and uploads the classic-baseline artifact."
+          fi
+
+      - name: Compare with Classic baselines (blocking)
+        if: steps.baseline.outputs.present == 'true'
+        run: npm run test:visual
+
+      - name: Make Classic baselines (run 1)
+        if: steps.baseline.outputs.present == 'false'
+        continue-on-error: true
+        run: npm run test:visual:update
+
+      - name: Stability check (run 2 against run 1, 0 changed pixels)
+        if: steps.baseline.outputs.present == 'false'
+        continue-on-error: true
+        run: npm run test:visual
+
+      - name: Upload classic-baseline
+        if: always() && steps.baseline.outputs.present == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: classic-baseline
+          path: tests/visual/classic/__screenshots__/
+          if-no-files-found: warn
+
+      - name: Upload visual report
+        if: failure() || steps.baseline.outputs.present == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: classic-visual-report
+          path: |
+            tests/visual/.cache/report/
+            tests/visual/.cache/test-results/
+          if-no-files-found: ignore
+
   linux-cli:
     # The CLI-only build must stay portable. The GUI needs macOS (Tauri,
     # NSPanel), so this job builds and tests without the `gui` feature.
