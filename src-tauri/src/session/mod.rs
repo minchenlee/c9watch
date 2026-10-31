@@ -29,8 +29,8 @@ pub use detector_cli::CliSessionSource;
 pub mod notification;
 pub mod rename;
 pub mod state;
-pub mod transitions;
 pub mod tasks;
+pub mod transitions;
 pub mod workers;
 
 // Readers that the GUI and the engine both call; both need tokio.

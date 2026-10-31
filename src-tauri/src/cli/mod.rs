@@ -1628,4 +1628,3 @@ mod dispatch_tests {
         assert!(Cli::try_parse_from(["c9watch", "task", "done", "--report", "ok"]).is_err());
     }
 }
-
