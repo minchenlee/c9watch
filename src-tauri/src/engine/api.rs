@@ -3580,6 +3580,43 @@ mod tests {
         assert_eq!(r["error"]["code"], "unknown_session", "{}", r);
     }
 
+    /// `cost.get` answers what the GUI's reader computes for the same home,
+    /// and keeps its cache in the engine's own file.
+    #[tokio::test]
+    async fn cost_get_answers_what_the_gui_reader_returns() {
+        let (t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let home = t.path().join("home");
+        let project = home
+            .join(".claude")
+            .join("projects")
+            .join(crate::session::detector::encode_path_for_matching(PROJECT));
+        let line = json!({
+            "type": "assistant",
+            "uuid": "c1",
+            "sessionId": "sess-2",
+            "cwd": PROJECT,
+            "timestamp": "2026-10-31T00:00:00Z",
+            "message": {
+                "id": "msg_1", "role": "assistant", "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 1000, "output_tokens": 500},
+            },
+        });
+        std::fs::write(project.join("sess-2.jsonl"), format!("{}\n", line)).unwrap();
+        let cache = t.path().join("engine-cost-cache.json");
+        let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+        ctx.cost_cache = Some(cache.clone());
+        let (mut c, _) = Client::new(Arc::new(ctx)).await;
+        let r = c.call("1", "cost.get", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let gui_cache = t.path().join("gui-cost-cache.json");
+        let gui = crate::session::cost::get_cost_data_in(&home, &gui_cache).unwrap();
+        assert!(gui.total_tokens > 0, "{:?}", gui.total_tokens);
+        assert_eq!(r["result"], serde_json::to_value(&gui).unwrap());
+        assert!(cache.exists(), "the engine writes its own cache");
+        assert!(!home.join(".claude").join("cost-cache.json").exists());
+    }
+
     /// `conversation.get` pages: `nextOffset` walks the whole transcript.
     #[tokio::test]
     async fn conversation_get_pages_through_the_transcript() {

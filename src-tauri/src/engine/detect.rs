@@ -1494,6 +1494,67 @@ mod tests {
         assert_eq!(views[0].1["messageCount"], 7);
     }
 
+    /// Tick cost and log size with five sessions that change on every
+    /// tick. Run by hand: `cargo test ... tick_cost -- --ignored
+    /// --nocapture`. Prints the stored rows and bytes against what the log
+    /// would hold without compaction (every view kept).
+    #[test]
+    #[ignore]
+    fn tick_cost() {
+        let (_t, h) = home();
+        let db = db::open(&h, M).unwrap();
+        let script = Script::default();
+        let mut d = detector(&script);
+        let ticks: u32 = std::env::var("C9_TICKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000);
+        let mut emitted_bytes = 0usize;
+        let mut times = Vec::with_capacity(ticks as usize);
+        for i in 0..ticks {
+            let sessions: Vec<Session> = (0..5)
+                .map(|k| {
+                    let mut x = s(&format!("s{}", k), SessionStatus::Working);
+                    x.message_count = i;
+                    x.latest_message = "x".repeat(400);
+                    x
+                })
+                .collect();
+            emitted_bytes += sessions
+                .iter()
+                .map(|x| serde_json::to_string(x).unwrap().len())
+                .sum::<usize>();
+            script.set(sessions);
+            let t0 = Instant::now();
+            d.tick(&db).unwrap();
+            times.push(t0.elapsed());
+        }
+        times.sort();
+        let conn = db.reader().unwrap();
+        let (rows, bytes): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), coalesce(sum(length(payload)), 0) FROM events \
+                 WHERE topic = 'session.view'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let total: std::time::Duration = times.iter().sum();
+        println!(
+            "tick_cost: ticks={} sessions=5 mean={:?} p50={:?} p99={:?} \
+             stored_views={} stored_bytes={} uncompacted_views={} uncompacted_bytes={}",
+            ticks,
+            total / ticks,
+            times[times.len() / 2],
+            times[times.len() * 99 / 100],
+            rows,
+            bytes,
+            ticks * 5,
+            emitted_bytes,
+        );
+        assert_eq!(rows, 5);
+    }
+
     /// `compact_views` keeps the oldest stored event, so it never makes an
     /// old cursor expire; it deletes only `session.view` rows.
     #[test]
