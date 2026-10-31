@@ -17,11 +17,14 @@ pub enum CostSortDir {
     Desc,
 }
 
+mod api_schema;
 mod cost;
+#[cfg(all(unix, feature = "engine"))]
+mod export;
 mod session_json;
 mod session_ref;
-// Engine commands (`engine`, `api`) talk to the engine over a unix socket.
-// They exist only in engine builds, so a release CLI is unchanged. `task`
+// Engine commands talk to the engine over a unix socket. `api schema`
+// also works offline without the engine feature. `task`
 // holds the calls of the separate `c9watch-agent` binary (C1a-21).
 #[cfg(all(unix, feature = "engine"))]
 pub mod engine_client;
@@ -75,7 +78,7 @@ pub mod worker_backend;
 /// for it (v0.8.1 shipped that bug for `inbox`/`cost`/`adopt`). PM command
 /// names are listed even when the `pm-orchestration` feature is off, so Clap
 /// reports an unknown command instead of launching the GUI. Engine command
-/// names are listed only in engine builds, so a release build is unchanged.
+/// names are listed only in engine builds, except the offline `api schema`.
 pub const CLI_COMMANDS: &[&str] = &[
     "list",
     "status",
@@ -89,8 +92,9 @@ pub const CLI_COMMANDS: &[&str] = &[
     "tasks",
     #[cfg(all(unix, feature = "engine"))]
     "engine",
-    #[cfg(all(unix, feature = "engine"))]
     "api",
+    #[cfg(all(unix, feature = "engine"))]
+    "export",
     #[cfg(all(unix, feature = "engine"))]
     "integration",
     "spawn",
@@ -109,7 +113,7 @@ pub const CLI_COMMANDS: &[&str] = &[
 /// moved to `c9watch-agent` (C1a-21). They stay out of `CLI_COMMANDS`, but
 /// `is_cli_invocation` still routes them to Clap, so the user gets an
 /// unknown-command error instead of the GUI.
-pub const RESERVED_ENGINE_COMMANDS: &[&str] = &["task", "engine", "api", "integration"];
+pub const RESERVED_ENGINE_COMMANDS: &[&str] = &["task", "engine", "export", "integration"];
 
 /// Whether `first` (the first argument) selects the CLI.
 pub fn is_cli_invocation(first: &str) -> bool {
@@ -459,15 +463,21 @@ pub enum Commands {
         action: Option<EngineAction>,
     },
 
-    /// Send one raw c9p/1 request to the engine and print the response
-    #[cfg(all(unix, feature = "engine"))]
+    /// Export the embedded schema, or send a raw c9p/1 request (engine build)
     Api {
         /// Method name, e.g. `hello`
         method: String,
         /// Params as one JSON value
         #[arg(default_value = "{}")]
         params: String,
+        /// Omit private methods, topics, fields and types (schema only)
+        #[arg(long = "public")]
+        public_only: bool,
     },
+
+    /// Export data through c9p; starts core if needed
+    #[cfg(all(unix, feature = "engine"))]
+    Export(export::ExportArgs),
 
     /// Show the engine's agent adapters and their integration files
     #[cfg(all(unix, feature = "engine"))]
@@ -604,8 +614,32 @@ pub fn run(cli: Cli) {
             #[cfg(c9_channel_dev)]
             Some(EngineAction::ShadowReport) => engine_client::cmd_shadow_report(cli.pretty),
         },
+        Commands::Api {
+            method,
+            params,
+            public_only,
+        } => (|| {
+            if method == "schema" {
+                if params != "{}" {
+                    return Err("api schema takes no params".into());
+                }
+                api_schema::print(public_only)
+            } else {
+                if public_only {
+                    return Err("--public is only valid for api schema".into());
+                }
+                #[cfg(all(unix, feature = "engine"))]
+                {
+                    engine_client::cmd_api(&method, &params, cli.pretty)
+                }
+                #[cfg(not(all(unix, feature = "engine")))]
+                {
+                    Err("Raw API calls need an engine build; api schema works offline".into())
+                }
+            }
+        })(),
         #[cfg(all(unix, feature = "engine"))]
-        Commands::Api { method, params } => engine_client::cmd_api(&method, &params, cli.pretty),
+        Commands::Export(args) => export::run(args),
         #[cfg(all(unix, feature = "engine"))]
         Commands::Integration { action } => engine_client::cmd_integration(&action, cli.pretty),
         #[cfg(any(feature = "pm-orchestration", all(unix, feature = "engine")))]
@@ -1390,6 +1424,15 @@ mod dispatch_tests {
     }
 
     #[test]
+    fn offline_schema_routes_to_cli_in_every_build() {
+        assert!(is_cli_invocation("api"));
+        let cli = Cli::try_parse_from(["c9watch", "api", "schema", "--public"]).unwrap();
+        assert!(
+            matches!(cli.command, Commands::Api { method, public_only: true, .. } if method == "schema")
+        );
+    }
+
+    #[test]
     fn wait_routes_to_the_cli_and_the_gui_still_launches_without_args() {
         assert!(is_cli_invocation("wait"));
         assert!(is_cli_invocation("--version"));
@@ -1543,7 +1586,7 @@ mod dispatch_tests {
     #[cfg(not(feature = "engine"))]
     #[test]
     fn cli_build_has_no_engine_commands() {
-        for name in ["engine", "api", "task", "integration"] {
+        for name in ["engine", "export", "task", "integration"] {
             assert!(
                 !CLI_COMMANDS.contains(&name),
                 "{name} in a non-engine build"
@@ -1570,7 +1613,7 @@ mod dispatch_tests {
             }
         ));
         let cli = Cli::try_parse_from(["c9watch", "api", "hello"]).unwrap();
-        let Commands::Api { method, params } = cli.command else {
+        let Commands::Api { method, params, .. } = cli.command else {
             panic!("not api");
         };
         assert_eq!((method.as_str(), params.as_str()), ("hello", "{}"));

@@ -332,3 +332,15 @@ c9watch search "database migration" --project myapp
 - **No stderr noise** — debug warnings are suppressed in CLI mode.
 - **System XML tags** (e.g., `<local-command-caveat>`, `<system-reminder>`) are stripped from all text fields.
 - **Write path** — `spawn` starts new sessions; in an engine build, `send` mails engine agents. All other commands are read-only. Claude Code's stdin for sessions not managed by c9watch is owned by the terminal process that launched them.
+
+### Public preview data
+
+An engine-enabled build also provides `c9watch export <sessions|cost|history|events|annotations>`.
+It reads through c9p and starts core when needed. Use `--format csv`, `--since`,
+`--until`, and `--out` for reports. History and events omit conversation fields
+unless `--include-conversation` is set. Annotation export needs a core with L1.
+See [the export guide](api/extending.md) for exact row and time semantics.
+
+`c9watch api schema [--public]` prints the embedded c9p schema offline. This works
+in CLI-only builds too. Raw `api <method> '<json>'` calls still need the engine
+feature. See [the preview API guide](api/README.md).

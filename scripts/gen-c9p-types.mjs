@@ -40,9 +40,9 @@ function tsType(s, indent) {
     return typeName(s.$ref.slice(REF.length));
   }
   if ('const' in s) return literal(s.const);
-  if (s.enum) return union(s.enum.map(literal));
+  if (s.enum) return union([...s.enum.map(literal), ...(s['x-open-enum'] ? ['string'] : [])]);
   const alts = s.oneOf ?? s.anyOf;
-  if (alts) return union(alts.map((a) => tsType(a, indent)));
+  if (alts) return union([...alts.map((a) => tsType(a, indent)), ...(s['x-open-enum'] ? ['string'] : [])]);
   if (Array.isArray(s.type)) return union(s.type.map((t) => tsType({ ...s, type: t }, indent)));
   switch (s.type) {
     case undefined:
@@ -103,6 +103,7 @@ export function generate(schema) {
     } else if (def.oneOf?.every((a) => 'const' in a)) {
       // A unit enum: one line per value, with its doc.
       const values = def.oneOf.map((a) => `${doc(a.description, '  ')}  | ${literal(a.const)}`);
+      if (def['x-open-enum']) values.push('  | string');
       out.push(`${head}export type ${typeName(name)} =\n${values.join('\n')};\n`);
     } else {
       out.push(`${head}export type ${typeName(name)} = ${tsType(def, '')};\n`);

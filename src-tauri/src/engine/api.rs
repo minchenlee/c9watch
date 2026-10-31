@@ -763,6 +763,9 @@ pub fn schema() -> serde_json::Value {
     for (name, entry) in methods.as_object_mut().expect("methods is an object") {
         let stability = discovery::stability(name).expect("every method has a stability");
         entry["x-stability"] = stability.into();
+        if stability == "internal" {
+            entry["x-visibility"] = "internal".into();
+        }
     }
     let mut defs = de.take_definitions(true);
     for (name, def) in ser.take_definitions(true) {
@@ -777,8 +780,8 @@ pub fn schema() -> serde_json::Value {
     let mut out = serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "c9p/1",
-        "description": "The c9watch engine protocol: one JSON object per line over \
-            the engine socket. Within a major version every change is additive.",
+        "description": "Preview: the c9watch engine protocol. One JSON object per line over \
+            the engine socket. A preview minor may break a method; check breakingSince.",
         "apiMajor": API_MAJOR,
         "apiMinor": API_MINOR,
         "frames": frames,
@@ -787,6 +790,97 @@ pub fn schema() -> serde_json::Value {
         "$defs": defs,
     });
     super::sensitivity::mark(&mut out);
+    // Known strings are discoverable, but clients must accept new values.
+    let mail_states = ["queued", "delivering", "delivered", "failed", "uncertain"];
+    let enum_fields: &[(&str, &str, &[&str])] = &[
+        ("AgentCreateParams", "mode", &["free", "managed"]),
+        ("AgentRow", "mode", &["managed", "free"]),
+        ("AgentRow", "role", &["human", "orch", "worker", "observed"]),
+        ("AgentRow", "control", &["pty", "none"]),
+        (
+            "AgentRow",
+            "source",
+            &["detected", "engine", "legacy_import"],
+        ),
+        (
+            "AgentRow",
+            "state",
+            &[
+                "creating",
+                "starting",
+                "ready",
+                "working",
+                "blocked",
+                "paused",
+                "refreshing",
+                "interrupted",
+                "retiring",
+                "retired",
+                "failed",
+                "orphaned",
+            ],
+        ),
+        (
+            "AgentRow",
+            "status",
+            &[
+                "working",
+                "needs_attention",
+                "waiting_for_input",
+                "connecting",
+            ],
+        ),
+        ("MsgSendResult", "state", &mail_states),
+        ("MsgStateEvent", "state", &mail_states),
+        (
+            "NotificationEvent",
+            "status",
+            &["needs_attention", "waiting_for_input"],
+        ),
+    ];
+    for (name, field, known) in enum_fields {
+        let property = &mut out["$defs"][*name]["properties"][*field];
+        let mut values: Vec<serde_json::Value> = known.iter().map(|v| (*v).into()).collect();
+        if property["type"]
+            .as_array()
+            .is_some_and(|types| types.iter().any(|t| t == "null"))
+        {
+            values.push(serde_json::Value::Null);
+        }
+        property["enum"] = values.into();
+        property["x-open-enum"] = true.into();
+    }
+    fn open_enums(value: &mut serde_json::Value) {
+        if let Some(o) = value.as_object_mut() {
+            let string_enum = o
+                .get("enum")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|a| !a.is_empty() && a.iter().all(serde_json::Value::is_string));
+            let string_variants = o
+                .get("oneOf")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|a| !a.is_empty() && a.iter().all(|v| v["const"].is_string()));
+            if string_enum || string_variants {
+                o.insert("x-open-enum".into(), true.into());
+            }
+            for child in o.values_mut() {
+                open_enums(child);
+            }
+        } else if let Some(a) = value.as_array_mut() {
+            for child in a {
+                open_enums(child);
+            }
+        }
+    }
+    open_enums(&mut out);
+    for field in ["resumeCount", "interruptedNotePending", "stateReason"] {
+        out["$defs"]["AgentRow"]["properties"][field]["x-visibility"] = "internal".into();
+    }
+    for entry in out["topics"].as_object_mut().unwrap().values_mut() {
+        if entry["x-stability"] == "internal" {
+            entry["x-visibility"] = "internal".into();
+        }
+    }
     out
 }
 

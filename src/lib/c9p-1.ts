@@ -26,7 +26,7 @@ export interface C9pAgentCreateParams {
   /** The adapter kind. Only `claude` in C1a. */
   kind?: string;
   /** `free`. `managed` comes in C1b and answers `unsupported_in_c1a`. */
-  mode: string;
+  mode: 'free' | 'managed' | string;
   /**
    * A display name: letters, digits, `.`, `_` and `-`, unique among
    * the live engine agents.
@@ -54,7 +54,7 @@ export interface C9pAgentGoneEvent {
   sessionKey: string;
 }
 
-export type C9pAgentKind = 'root' | 'subagent' | 'internal';
+export type C9pAgentKind = 'root' | 'subagent' | 'internal' | string;
 
 /** `agent.list` params. */
 export interface C9pAgentListParams {
@@ -87,7 +87,7 @@ export interface C9pAgentRetireResult {
  */
 export interface C9pAgentRow {
   /** `pty` or `none`. */
-  control: string;
+  control: 'pty' | 'none' | string;
   /** Unix ms. */
   createdAt: number | null;
   /** The principal that created the agent. */
@@ -109,7 +109,7 @@ export interface C9pAgentRow {
   /** The machine the agent runs on. */
   machineId: string | null;
   /** `managed` or `free`; `null` for an observed agent. */
-  mode: string | null;
+  mode: 'managed' | 'free' | null | string;
   name: string | null;
   /**
    * The agent that owns this one; for an imported legacy worker, the PM
@@ -123,14 +123,14 @@ export interface C9pAgentRow {
   providerSid: string | null;
   resumeCount: number;
   /** `human`, `orch`, `worker` or `observed`. */
-  role: string;
+  role: 'human' | 'orch' | 'worker' | 'observed' | string;
   /**
    * `SessionIdentity::key()` (`<provider>:<session id>`) of the session
    * detection matched to this agent.
    */
   sessionKey: string | null;
   /** `detected`, `engine` or `legacy_import`. */
-  source: string;
+  source: 'detected' | 'engine' | 'legacy_import' | string;
   /** Unix ms, as the provider reports it. */
   startedAt: number | null;
   /**
@@ -138,7 +138,7 @@ export interface C9pAgentRow {
    * `blocked`, `paused`, `refreshing`, `interrupted`, `retiring`,
    * `retired`, `failed`, `orphaned`); `null` for an observed agent.
    */
-  state: string | null;
+  state: 'creating' | 'starting' | 'ready' | 'working' | 'blocked' | 'paused' | 'refreshing' | 'interrupted' | 'retiring' | 'retired' | 'failed' | 'orphaned' | null | string;
   /**
    * Why the agent is in its `state`: `drain` for a `paused` or
    * `interrupted` agent that an engine drain stopped; for a `failed`
@@ -150,7 +150,7 @@ export interface C9pAgentRow {
    * The detected session status: `working`, `needs_attention`,
    * `waiting_for_input` or `connecting`.
    */
-  status: string | null;
+  status: 'working' | 'needs_attention' | 'waiting_for_input' | 'connecting' | null | string;
 }
 
 /** `agent.turn_end` data. */
@@ -412,7 +412,8 @@ export type C9pErrorCode =
    */
   | 'busy'
   /** An engine-side failure. */
-  | 'internal';
+  | 'internal'
+  | string;
 
 /**
  * One event on the wire (A:203). `sub` is the `id` of the subscribe
@@ -434,7 +435,7 @@ export interface C9pEventFrame {
  * The `type` of an event frame. A response frame has no `type`, so a
  * client tells the two apart by `type === "event"`.
  */
-export type C9pEventType = 'event';
+export type C9pEventType = 'event' | string;
 
 /**
  * `agent.handoff` params (`c9watch-agent handoff --note -`). The wire
@@ -511,7 +512,8 @@ export type C9pHiddenReason =
    * The process inherited `CLAUDE_CODE_CHILD_SESSION`, so Claude Code
    * turned off its registry entry and transcript.
    */
-  | 'childSessionMarker';
+  | 'childSessionMarker'
+  | string;
 
 /** A deduplicated, enriched history entry returned to the frontend */
 export interface C9pHistoryEntry {
@@ -675,7 +677,7 @@ export interface C9pMemoryListResult {
 }
 
 /** Message type enumeration */
-export type C9pMessageType = 'User' | 'Assistant' | 'Thinking' | 'ToolUse' | 'ToolResult' | 'System';
+export type C9pMessageType = 'User' | 'Assistant' | 'Thinking' | 'ToolUse' | 'ToolResult' | 'System' | string;
 
 /** One method in `hello.result.methods`. */
 export interface C9pMethodInfo {
@@ -709,7 +711,7 @@ export interface C9pMsgAddress {
  * What a message asks of its reader (A:418). A caller sends `request` or
  * `info`; `result` and `system` are written by the engine.
  */
-export type C9pMsgKind = 'request' | 'info' | 'result' | 'system';
+export type C9pMsgKind = 'request' | 'info' | 'result' | 'system' | string;
 
 /**
  * `msg.send` params. The envelope's `idem` makes a resend safe: the same
@@ -744,7 +746,7 @@ export interface C9pMsgSendResult {
    */
   replayed: boolean;
   /** The message's state now: `queued` for a new message. */
-  state: string;
+  state: 'queued' | 'delivering' | 'delivered' | 'failed' | 'uncertain' | string;
   to: C9pMsgAddress;
 }
 
@@ -766,7 +768,7 @@ export interface C9pMsgStateEvent {
   from: string;
   msgId: string;
   /** `queued`, `delivering`, `delivered`, `failed` or `uncertain`. */
-  state: string;
+  state: 'queued' | 'delivering' | 'delivered' | 'failed' | 'uncertain' | string;
   /** The target's agent id. */
   to: string;
 }
@@ -790,13 +792,13 @@ export interface C9pNotificationEvent {
   redactedTitle: string;
   sessionKey: string;
   /** `needs_attention` or `waiting_for_input`. */
-  status: string;
+  status: 'needs_attention' | 'waiting_for_input' | string;
   /** Can carry conversation text (the first prompt, a session title). */
   title: string;
 }
 
 /** The strongest native target supported by the existing focus mechanism. */
-export type C9pOpenTarget = 'terminal' | 'project' | 'application';
+export type C9pOpenTarget = 'terminal' | 'project' | 'application' | string;
 
 /**
  * `provider.opencode.connect` params: the OpenCode server detection
@@ -863,7 +865,7 @@ export interface C9pProgressFrame {
 }
 
 /** The `type` of a progress frame. */
-export type C9pProgressType = 'progress';
+export type C9pProgressType = 'progress' | string;
 
 export interface C9pProjectCost {
   project: string;
@@ -952,7 +954,7 @@ export interface C9pSessionGoneEvent {
   sessionKey: string;
 }
 
-export type C9pSessionKind = 'interactive' | 'background' | 'unknown';
+export type C9pSessionKind = 'interactive' | 'background' | 'unknown' | string;
 
 /**
  * `session.list` params. There are none yet; the engine ignores any it
@@ -968,7 +970,7 @@ export interface C9pSessionListResult {
   sessions: C9pAgentRow[];
 }
 
-export type C9pSessionProvider = 'claudeCode' | 'codex' | 'cursor' | 'pi' | 'opencode';
+export type C9pSessionProvider = 'claudeCode' | 'codex' | 'cursor' | 'pi' | 'opencode' | string;
 
 /** `session.rename` params: set a Claude Code session's custom title. */
 export interface C9pSessionRenameParams {
@@ -991,7 +993,8 @@ export type C9pSessionStatus =
   /** Idle, ready for next prompt */
   | 'WaitingForInput'
   /** Session starting up or no recent activity */
-  | 'Connecting';
+  | 'Connecting'
+  | string;
 
 /**
  * `session.stop` params: stop an observed Claude Code session with
@@ -1004,7 +1007,7 @@ export interface C9pSessionStopParams {
   sessionKey: string;
 }
 
-export type C9pSessionSurface = 'claudeCode' | 'app' | 'cli' | 'exec' | 'integration' | 'cursor' | 'unknown';
+export type C9pSessionSurface = 'claudeCode' | 'app' | 'cli' | 'exec' | 'integration' | 'cursor' | 'unknown' | string;
 
 /** `session.tasks` params. */
 export interface C9pSessionTasksParams {
@@ -1134,7 +1137,7 @@ export interface C9pSnapshotResult {
  * This is deliberately separate from `SessionStatus`: a session can be
  * waiting for input while its source is fresh, partial, or unavailable.
  */
-export type C9pSourceHealth = 'fresh' | 'stale' | 'partial' | 'unavailable' | 'unknown';
+export type C9pSourceHealth = 'fresh' | 'stale' | 'partial' | 'unavailable' | 'unknown' | string;
 
 /** A subagent invocation found in a parent session's JSONL. */
 export interface C9pSubagentInfo {
@@ -1168,7 +1171,7 @@ export interface C9pSubagentListResult {
 }
 
 /** Status of a detected subagent. */
-export type C9pSubagentStatus = 'running' | 'completed';
+export type C9pSubagentStatus = 'running' | 'completed' | string;
 
 /**
  * Full transcript of a single subagent invocation — the prompt (Agent tool

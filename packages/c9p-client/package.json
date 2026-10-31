@@ -1,0 +1,37 @@
+{
+  "name": "@c9watch/c9p-client",
+  "version": "0.1.0",
+  "description": "Preview c9p/1 client for Node and browsers",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./unix": {
+      "types": "./dist/transport-unix.d.ts",
+      "import": "./dist/transport-unix.js"
+    },
+    "./ws": {
+      "types": "./dist/transport-ws.d.ts",
+      "import": "./dist/transport-ws.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && tsc -p test/tsconfig.json && node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "typescript": "~5.6.2",
+    "@types/node": "^22"
+  }
+}
