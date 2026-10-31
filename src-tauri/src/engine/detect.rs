@@ -359,7 +359,7 @@ impl Detector {
 
     /// Detect once and write the result. Blocking.
     pub fn tick(&mut self, db: &Db) -> Result<Applied, String> {
-        db.write_blocking(|tx| super::annotations::sweep(tx, now_ms()))?;
+        super::annotations::sweep_if_due(db, now_ms())?;
         let mut obs = self.observe.observe()?;
         if let Some(dir) = &self.workers_dir {
             let overlay = crate::session::workers::load_workers_overlay_at(dir);

@@ -504,6 +504,29 @@ pub fn audit_request(
     )?;
     Ok(())
 }
+/// Avoid a writer transaction on idle ticks. Check every kind of sweep work,
+/// including sequence tombstones and rate rows with no remaining annotations.
+/// The writer rechecks the live rows; this read never decides what to delete.
+pub fn sweep_if_due(db: &Db, now: i64) -> Result<bool, String> {
+    let due: bool = db
+        .reader()?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM annotations WHERE expires_at<=?1)
+         OR EXISTS(SELECT 1 FROM annotation_sources WHERE gone_at<=?2)
+         OR EXISTS(SELECT 1 FROM annotation_sources s WHERE last_seq IS NULL
+             AND NOT EXISTS(SELECT 1 FROM annotations a WHERE a.target_kind=s.target_kind
+                 AND a.target_id=s.target_id AND a.namespace=s.namespace))
+         OR EXISTS(SELECT 1 FROM annotation_rates WHERE updated_at<?3)",
+            params![now, now - TARGET_GRACE_MS, now - MAX_TTL_MS as i64],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("Failed to check annotation expiry: {e}"))?;
+    if due {
+        db.write_blocking(move |tx| sweep(tx, now))?;
+    }
+    Ok(due)
+}
+
 /// TTL expires on each detection tick, including a failed observation. The
 /// source map is emitted once per affected source, even if many keys expire.
 pub fn sweep(tx: &mut Tx, now: i64) -> rusqlite::Result<()> {
@@ -1138,6 +1161,83 @@ mod tests {
             2
         );
     }
+    #[test]
+    fn ttl_is_swept_before_observation_even_when_observation_fails() {
+        use crate::engine::detect::{Detector, Observation, Observe};
+        use std::sync::Arc;
+        struct CheckExpiry(Arc<Db>);
+        impl Observe for CheckExpiry {
+            fn observe(&mut self) -> Result<Observation, String> {
+                let c = self.0.reader().unwrap();
+                let remaining: i64 = c
+                    .query_row("SELECT count(*) FROM annotations", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(remaining, 0, "expiry must commit before the observer runs");
+                let payload: String = c.query_row("SELECT payload FROM events WHERE topic='annotation.changed' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+                let event: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(event["values"], serde_json::json!({}));
+                Err("detect failed".into())
+            }
+        }
+        let (_t, db) = db();
+        let db = Arc::new(db);
+        let params = parse(
+            "annotation.patch",
+            serde_json::json!({
+                "target":{"kind":"session","sessionKey":"claudeCode:s"}, "source":"ci",
+                "values":{"x":{"type":"bool","v":true}}, "ttlMs":1, "seq":1
+            }),
+        )
+        .unwrap();
+        db.write_blocking(move |tx| {
+            apply(tx, &params, "local-unverified", "annotation.patch", 1000)
+        })
+        .unwrap()
+        .0
+        .unwrap();
+        let mut detector = Detector::new(Box::new(CheckExpiry(db.clone())), "m".into());
+        assert_eq!(detector.tick(&db).unwrap_err(), "detect failed");
+    }
+
+    #[test]
+    fn sweep_skips_idle_rows_and_cleans_up_each_kind_of_due_work() {
+        let (_t, db) = db();
+        assert!(!sweep_if_due(&db, 1000).unwrap());
+        apply_at(
+            &db,
+            patch(request(
+                "ci",
+                json!({"x":{"type":"bool","v":true}}),
+                Some(1),
+                Some(1000),
+            )),
+            1000,
+        )
+        .unwrap();
+        assert!(!sweep_if_due(&db, 1999).unwrap());
+        assert!(sweep_if_due(&db, 2000).unwrap());
+        assert!(
+            !sweep_if_due(&db, 2000).unwrap(),
+            "a live sequence tombstone must remain"
+        );
+        db.write_blocking(|tx| {
+            tx.execute("UPDATE annotation_sources SET gone_at=2000", [])?;
+            Ok(())
+        })
+        .unwrap();
+        // Remove the old rate budget first; then only target grace is due.
+        assert!(sweep_if_due(&db, 1001 + MAX_TTL_MS as i64).unwrap());
+        assert!(!sweep_if_due(&db, 2000 + TARGET_GRACE_MS - 1).unwrap());
+        assert!(sweep_if_due(&db, 2000 + TARGET_GRACE_MS).unwrap());
+        assert!(!sweep_if_due(&db, 2000 + TARGET_GRACE_MS).unwrap());
+        db.write_blocking(|tx| {
+            tx.execute("INSERT INTO annotation_sources VALUES ('session','claudeCode:s','legacy',NULL,NULL)", [])?;
+            Ok(())
+        }).unwrap();
+        assert!(sweep_if_due(&db, 2000 + TARGET_GRACE_MS).unwrap());
+        assert!(!sweep_if_due(&db, 2000 + TARGET_GRACE_MS).unwrap());
+    }
+
     #[test]
     fn target_disappearance_grace_survives_restart_and_return_cancels_it() {
         let (t, db) = db();
