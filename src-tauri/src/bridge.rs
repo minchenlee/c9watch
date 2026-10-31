@@ -268,7 +268,8 @@ fn allowed_topics(params: &SubscribeParams, popover: bool) -> bool {
                     "agent.gone",
                     "agent.failed",
                 ],
-                "session.view" | "session.gone" | "diag.detection" => &[t.as_str()],
+                "session.view" | "session.gone" | "diag.detection" | "annotation.changed"
+                | "annotation.removed" => &[t.as_str()],
                 "notification.needs_attention" | "notification.waiting_for_input" if !popover => {
                     &[t.as_str()]
                 }
@@ -748,6 +749,9 @@ mod tests {
             "hook.stop",
             "task.done",
             "made.up",
+            "annotation.set",
+            "annotation.delete",
+            "annotation.patch",
         ] {
             assert!(!allowed(m, false), "{m}");
         }
@@ -755,6 +759,8 @@ mod tests {
         assert!(!allowed("session.stop", true));
         assert!(!allowed("provider.opencode.connect", true));
         assert!(allowed("session.views", true));
+        assert!(allowed("annotation.list", false));
+        assert!(allowed("annotation.list", true));
     }
     #[cfg(feature = "engine")]
     #[test]
@@ -785,6 +791,17 @@ mod tests {
             {
                 assert!(!allowed(method, false), "{method}");
             }
+        }
+        for topic in ["annotation.changed", "annotation.removed"] {
+            assert!(authz::topics(&Principal::LocalUnverified, None)
+                .iter()
+                .any(|t| t == topic));
+            let params = SubscribeParams {
+                topics: vec![topic.into()],
+                ..Default::default()
+            };
+            assert!(allowed_topics(&params, false));
+            assert!(allowed_topics(&params, true));
         }
     }
     #[test]

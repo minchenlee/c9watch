@@ -2,7 +2,7 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 8;
+export const C9P_API_MINOR = 9;
 
 /** `agent.attention` data: an agent needs the user. */
 export interface C9pAgentAttentionEvent {
@@ -162,6 +162,112 @@ export interface C9pAgentTurnEndEvent {
   generation: number;
   id: string;
 }
+
+export interface C9pAnnotation {
+  createdAt: number;
+  expiresAt: number | null;
+  format?: string | null;
+  key: string;
+  label?: string | null;
+  redacted?: boolean;
+  sensitivity: string;
+  target: C9pAnnotationTarget;
+  unit?: string | null;
+  updatedAt: number;
+  /** Omitted by a gateway when the value exceeds its ceiling. */
+  value?: C9pAnnotationValue | null;
+  writer: string;
+}
+
+export interface C9pAnnotationChangedEvent {
+  source: string;
+  target: C9pAnnotationTarget;
+  /** Resulting source map, including per-key writer, expiry and sensitivity. */
+  values: Record<string, C9pAnnotation>;
+}
+
+export interface C9pAnnotationDeleteParams {
+  key: string;
+  target: C9pAnnotationTarget;
+}
+
+export interface C9pAnnotationDeleteResult {
+  deleted: boolean;
+}
+
+export interface C9pAnnotationListParams {
+  namespace?: string | null;
+  target?: C9pAnnotationTarget | null;
+}
+
+export interface C9pAnnotationListResult {
+  annotations: C9pAnnotation[];
+  /** Snapshot cursor; subscribe from it to close the list/watch race. */
+  cursor: string;
+}
+
+export interface C9pAnnotationPatchParams {
+  seq?: number | null;
+  source?: string | null;
+  target: C9pAnnotationTarget;
+  /** Per touched key, from 1 millisecond through 24 hours. */
+  ttlMs?: number | null;
+  values: Record<string, C9pAnnotationValue | null>;
+}
+
+export interface C9pAnnotationPatchResult {
+  /** False means the sequence was already accepted or is stale. */
+  applied: boolean;
+  source: string;
+  target: C9pAnnotationTarget;
+  values: Record<string, C9pAnnotation>;
+}
+
+export interface C9pAnnotationRemovedEvent {
+  key: string;
+  /** target_gone; expiry and explicit clears emit annotation.changed. */
+  reason: string;
+  target: C9pAnnotationTarget;
+}
+
+export interface C9pAnnotationSetParams {
+  format?: string | null;
+  key: string;
+  label?: string | null;
+  target: C9pAnnotationTarget;
+  /** One-key shortcut TTL: 60 seconds through 24 hours. */
+  ttlSeconds?: number | null;
+  unit?: string | null;
+  value: C9pAnnotationValue;
+}
+
+export interface C9pAnnotationSetResult {
+  annotation: C9pAnnotation;
+}
+
+export interface C9pAnnotationTarget {
+  /** Open enum; only session targets are supported in preview. */
+  kind: string;
+  sessionKey: string;
+}
+
+export type C9pAnnotationValue = {
+  type: 'number';
+  v: number;
+} | {
+  type: 'string';
+  v: string;
+} | {
+  type: 'bool';
+  v: boolean;
+} | {
+  ms: number;
+  type: 'duration';
+} | {
+  amount: string;
+  currency: string;
+  type: 'money';
+};
 
 /** Ask about the caller's own authority. Params are inspected, never executed. */
 export interface C9pAuthCanParams {
@@ -337,7 +443,7 @@ export interface C9pErrorBody {
  * Typed error codes. New codes are additive; a client that does not know a
  * code still has `msg`, `retryable` and `hint`.
  */
-export type C9pErrorCode = 'hop_limit' | 'not_cancellable' | string | 'upgrade_required' | 'hello_required' | 'hello_timeout' | 'frame_too_large' | 'bad_request' | 'unknown_method' | 'peer_uid_mismatch' | 'cursor_expired' | 'rate_limited' | 'peer_not_authorized' | 'no_task' | 'unsupported_in_c1a' | 'agent_bin_missing' | 'agent_bin_mismatch' | 'not_allowed' | 'confirmation_required' | 'cwd_collision' | 'spawn_failed' | 'unknown_agent' | 'draining' | 'unknown_address' | 'not_controlled' | 'not_owner' | 'duplicate' | 'unknown_session' | 'action_failed' | 'busy' | 'internal';
+export type C9pErrorCode = 'hop_limit' | 'not_cancellable' | string | 'upgrade_required' | 'hello_required' | 'hello_timeout' | 'frame_too_large' | 'bad_request' | 'unknown_method' | 'peer_uid_mismatch' | 'cursor_expired' | 'rate_limited' | 'peer_not_authorized' | 'no_task' | 'unsupported_in_c1a' | 'agent_bin_missing' | 'agent_bin_mismatch' | 'not_allowed' | 'confirmation_required' | 'cwd_collision' | 'spawn_failed' | 'unknown_agent' | 'draining' | 'unknown_address' | 'not_controlled' | 'not_owner' | 'duplicate' | 'unknown_session' | 'action_failed' | 'busy' | 'limit_exceeded' | 'internal';
 
 /**
  * One event on the wire (A:203). `sub` is the `id` of the subscribe
@@ -1347,6 +1453,22 @@ export interface C9pMethods {
     params: C9pAgentRetireParams;
     result: C9pAgentRetireResult;
   };
+  'annotation.delete': {
+    params: C9pAnnotationDeleteParams;
+    result: C9pAnnotationDeleteResult;
+  };
+  'annotation.list': {
+    params: C9pAnnotationListParams;
+    result: C9pAnnotationListResult;
+  };
+  'annotation.patch': {
+    params: C9pAnnotationPatchParams;
+    result: C9pAnnotationPatchResult;
+  };
+  'annotation.set': {
+    params: C9pAnnotationSetParams;
+    result: C9pAnnotationSetResult;
+  };
   'auth.can': {
     params: C9pAuthCanParams;
     result: C9pAuthCanResult;
@@ -1525,6 +1647,12 @@ export interface C9pTopics {
   };
   'agent.upsert': {
     data: C9pAgentRow;
+  };
+  'annotation.changed': {
+    data: C9pAnnotationChangedEvent;
+  };
+  'annotation.removed': {
+    data: C9pAnnotationRemovedEvent;
   };
   'diag.detection': {
     data: C9pDetectionDiagnostics;

@@ -39,6 +39,7 @@ function handle(cmd: string, args: Args): unknown {
             const p = (args?.params ?? {}) as Record<string, any>;
             const id = String(p.sessionKey ?? '').replace(/^(claudeCode|codex|cursor|pi|opencode):/, '');
             switch (args?.method) {
+                case 'annotation.list': return { annotations: fx.annotations, cursor: 'visual:epoch:1' };
                 case 'session.views': return { sessions: live, cursor: 'visual:epoch:1' };
                 case 'diag.detection': return fx.diagnostics;
                 case 'conversation.get': return { ...(fx.conversations[id] ?? { sessionId: id, provider: p.provider, messages: [] }), nextOffset: null };

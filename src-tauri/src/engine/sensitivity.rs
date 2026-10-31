@@ -257,6 +257,29 @@ const BY_NAME: &[(&str, &str)] = &[
 
 /// Classes for one type's field, where its name means something else.
 const OVERRIDES: &[(&str, &str, &str)] = &[
+    ("Annotation", "value", M),
+    ("Annotation", "key", M),
+    ("Annotation", "unit", M),
+    ("Annotation", "format", M),
+    ("Annotation", "sensitivity", P),
+    ("Annotation", "writer", P),
+    ("Annotation", "redacted", P),
+    ("Annotation", "target", P),
+    ("AnnotationSetResult", "annotation", P),
+    ("AnnotationDeleteResult", "deleted", P),
+    ("AnnotationListResult", "annotations", P),
+    ("AnnotationChangedEvent", "target", P),
+    ("AnnotationChangedEvent", "source", M),
+    ("AnnotationChangedEvent", "values", M),
+    ("AnnotationPatchResult", "target", P),
+    ("AnnotationPatchResult", "source", M),
+    ("AnnotationPatchResult", "values", M),
+    ("AnnotationPatchResult", "applied", P),
+    ("AnnotationRemovedEvent", "target", P),
+    ("AnnotationRemovedEvent", "key", M),
+    ("AnnotationValue", "ms", M),
+    ("AnnotationValue", "amount", M),
+    ("AnnotationValue", "currency", M),
     ("MsgSummary", "from", C),
     ("MsgSummary", "to", C),
     ("MsgReadResult", "from", C),
@@ -363,8 +386,16 @@ pub fn mark(schema: &mut Value) {
             continue;
         };
         for props in property_maps(def) {
+            let string_value = props
+                .get("type")
+                .and_then(|t| t.get("const"))
+                .is_some_and(|t| t == "string");
             for (field, s) in props.iter_mut() {
-                let Some(c) = class(name, field) else {
+                let Some(c) = (if name == "AnnotationValue" && field == "v" {
+                    Some(if string_value { C } else { M })
+                } else {
+                    class(name, field)
+                }) else {
                     continue;
                 };
                 // `true` (any value) becomes the equal `{}`, to hold the mark.
@@ -373,6 +404,10 @@ pub fn mark(schema: &mut Value) {
                 }
                 if let Some(o) = s.as_object_mut() {
                     o.insert("x-sensitivity".into(), c.into());
+                    if name == "Annotation" && field == "value" {
+                        o.insert("x-sensitivity-by-type".into(), serde_json::json!({"number":M,"bool":M,"duration":M,"money":M,"string":C}));
+                        o.insert("x-redaction-flag".into(), "redacted".into());
+                    }
                 }
             }
         }

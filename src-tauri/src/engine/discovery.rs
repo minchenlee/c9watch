@@ -79,6 +79,10 @@ pub const METHOD_INFO: &[Method] = &[
     m("provider.opencode.connect", 6, PREVIEW),
     m("events.unsubscribe", 6, PREVIEW),
     m("ping", 6, PREVIEW),
+    m("annotation.set", 9, PREVIEW),
+    m("annotation.delete", 9, PREVIEW),
+    m("annotation.patch", 9, PREVIEW),
+    m("annotation.list", 9, PREVIEW),
     m("auth.can", 8, PREVIEW),
     m("auth.rules", 8, PREVIEW),
 ];
@@ -98,6 +102,8 @@ pub const TOPICS: &[(&str, &str)] = &[
     ("notification.needs_attention", PREVIEW),
     ("notification.waiting_for_input", PREVIEW),
     ("diag.detection", PREVIEW),
+    ("annotation.changed", PREVIEW),
+    ("annotation.removed", PREVIEW),
 ];
 
 /// What a subscriber must know about a topic beyond its data type.

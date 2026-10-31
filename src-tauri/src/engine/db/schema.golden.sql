@@ -1,4 +1,4 @@
--- user_version 7
+-- user_version 8
 -- index agents_detected_key
 CREATE UNIQUE INDEX agents_detected_key ON agents (session_key) WHERE source = 'detected';
 -- index agents_legacy_sid
@@ -6,6 +6,8 @@ CREATE UNIQUE INDEX agents_legacy_sid ON agents (provider, provider_sid)
     WHERE source = 'legacy_import';
 -- index agents_provider_sid
 CREATE INDEX agents_provider_sid ON agents (provider, provider_sid);
+-- index annotations_expiry
+CREATE INDEX annotations_expiry ON annotations(expires_at) WHERE expires_at IS NOT NULL;
 -- index events_ts
 CREATE INDEX events_ts ON events (ts);
 -- index gateway_tokens_expiry
@@ -51,6 +53,39 @@ CREATE TABLE agents (
     'creating', 'starting', 'ready', 'working', 'blocked', 'paused', 'refreshing',
     'interrupted', 'retiring', 'retired', 'failed', 'orphaned')), status TEXT CHECK (status IN (
     'working', 'needs_attention', 'waiting_for_input', 'connecting')), cwd TEXT, name TEXT, pid INTEGER, started_at INTEGER, created_at INTEGER, last_seen INTEGER, parent_id TEXT REFERENCES agents (id), state_reason TEXT, resume_argv TEXT) STRICT;
+-- table annotation_rates
+CREATE TABLE annotation_rates (
+    principal TEXT PRIMARY KEY,
+    tokens REAL NOT NULL,
+    updated_at INTEGER NOT NULL
+) STRICT;
+-- table annotation_sources
+CREATE TABLE annotation_sources (
+    target_kind TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    last_seq INTEGER,
+    gone_at INTEGER,
+    PRIMARY KEY (target_kind, target_id, namespace)
+) STRICT;
+-- table annotations
+CREATE TABLE annotations (
+    target_kind TEXT NOT NULL CHECK (target_kind = 'session'),
+    target_id TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    name TEXT NOT NULL,
+    value_type TEXT NOT NULL CHECK (value_type IN ('number','string','bool','duration','money')),
+    value_json TEXT NOT NULL CHECK (json_valid(value_json)),
+    label TEXT,
+    unit TEXT,
+    format TEXT,
+    sensitivity TEXT NOT NULL CHECK (sensitivity IN ('metadata','conversation')),
+    writer_principal TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    PRIMARY KEY (target_kind, target_id, namespace, name)
+) STRICT;
 -- table audit
 CREATE TABLE audit (
     seq          INTEGER PRIMARY KEY,
@@ -62,7 +97,7 @@ CREATE TABLE audit (
     decision     TEXT NOT NULL,
     reason       TEXT,
     payload_hash TEXT
-) STRICT;
+, annotation_keys TEXT) STRICT;
 -- table dedupe
 CREATE TABLE dedupe (
     peer   TEXT NOT NULL,

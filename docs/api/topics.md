@@ -29,3 +29,7 @@ Socket topic discovery in 1.6 lists all topics. M-b derives the allowed set for 
 For OS notifications, subscribe to `notification.*` without `since`. Drop events older than the time you subscribed. Replaying old notifications on app start can create a stale burst.
 
 Future annotation topics are described in [extending.md](extending.md). They are not part of 1.6.
+
+## Annotation topics (1.9)
+
+Both topics use `annotation:read` for clients and are visible to local and agent principals. `annotation.changed` carries `{target,source,values}`: replace that source's complete map, including on expiry or explicit clear. Sequence-suppressed patches emit nothing. `annotation.removed` carries `{target,key,reason:"target_gone"}` after the 30-day disappearance grace. Subject is the target session key. String values are omitted below the conversation ceiling and marked `redacted:true`; numeric values require metadata. See [L1 annotations](extending.md#l1-annotations-preview-c9p-19).

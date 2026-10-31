@@ -17,6 +17,8 @@ pub enum CostSortDir {
     Desc,
 }
 
+#[cfg(all(unix, feature = "engine"))]
+mod annotate;
 mod api_schema;
 mod cost;
 #[cfg(all(unix, feature = "engine"))]
@@ -100,6 +102,8 @@ pub const CLI_COMMANDS: &[&str] = &[
     #[cfg(all(unix, feature = "engine"))]
     "auth",
     #[cfg(all(unix, feature = "engine"))]
+    "annotate",
+    #[cfg(all(unix, feature = "engine"))]
     "integration",
     "spawn",
     "send",
@@ -118,7 +122,14 @@ pub const CLI_COMMANDS: &[&str] = &[
 /// moved to `c9watch-agent` (C1a-21). They stay out of `CLI_COMMANDS`, but
 /// `is_cli_invocation` still routes them to Clap, so the user gets an
 /// unknown-command error instead of the GUI.
-pub const RESERVED_ENGINE_COMMANDS: &[&str] = &["task", "engine", "export", "integration", "auth"];
+pub const RESERVED_ENGINE_COMMANDS: &[&str] = &[
+    "task",
+    "engine",
+    "export",
+    "integration",
+    "auth",
+    "annotate",
+];
 
 /// Whether `first` (the first argument) selects the CLI.
 pub fn is_cli_invocation(first: &str) -> bool {
@@ -498,6 +509,12 @@ pub enum Commands {
     /// Export data through c9p; starts core if needed
     #[cfg(all(unix, feature = "engine"))]
     Export(export::ExportArgs),
+    /// Set, clear or list typed values on sessions
+    #[cfg(all(unix, feature = "engine"))]
+    Annotate {
+        #[command(subcommand)]
+        action: annotate::Action,
+    },
     /// Inspect the caller's own engine permissions
     #[cfg(all(unix, feature = "engine"))]
     Auth {
@@ -670,6 +687,8 @@ pub fn run(cli: Cli) {
         })(),
         #[cfg(all(unix, feature = "engine"))]
         Commands::Export(args) => export::run(args),
+        #[cfg(all(unix, feature = "engine"))]
+        Commands::Annotate { action } => annotate::run(action, cli.pretty),
         #[cfg(all(unix, feature = "engine"))]
         Commands::Auth { action } => engine_client::cmd_auth(&action, cli.pretty),
         #[cfg(all(unix, feature = "engine"))]

@@ -8,6 +8,7 @@ pub const GUI_METHODS: &[&str] = &[
     "events.subscribe",
     "events.unsubscribe",
     "agent.list",
+    "annotation.list",
     "session.views",
     "session.away",
     "session.stop",
