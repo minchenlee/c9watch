@@ -156,8 +156,7 @@ jobs:
           if-no-files-found: ignore
 
   linux-cli:
-    # The CLI-only build must stay portable. The GUI needs macOS (Tauri,
-    # NSPanel), so this job builds and tests without the `gui` feature.
+    # Linux ships the headless core and CLI. The Tauri GUI stays macOS-only.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -237,3 +236,17 @@ jobs:
             --no-default-features --features engine -- --version)
           echo "$out"
           echo "$out" | grep -q '^c9watch '
+
+      - name: Build and smoke-test Linux core tarball
+        env:
+          C9WATCH_CHANNEL: prod
+        run: |
+          cargo build --release --manifest-path src-tauri/Cargo.toml \
+            --no-default-features --features engine,cli --bins
+          stage=$(mktemp -d)
+          tar -czf "$stage/c9watch-linux.tar.gz" -C src-tauri/target/release c9watch c9watch-agent
+          mkdir "$stage/unpacked"
+          tar -xzf "$stage/c9watch-linux.tar.gz" -C "$stage/unpacked"
+          "$stage/unpacked/c9watch" --version
+          "$stage/unpacked/c9watch" engine --help
+          "$stage/unpacked/c9watch-agent" --help

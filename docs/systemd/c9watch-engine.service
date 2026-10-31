@@ -1,0 +1,16 @@
+[Unit]
+Description=c9watch headless core
+Documentation=https://github.com/minchenlee/c9watch
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/c9watch engine
+Environment="PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+Environment=XDG_RUNTIME_DIR=%t
+Restart=on-failure
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=100
+
+[Install]
+WantedBy=default.target

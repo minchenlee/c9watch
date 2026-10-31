@@ -105,6 +105,8 @@ pub async fn run_until(
 ) -> Result<(), String> {
     let home = config.home.as_path();
     ensure_private_dir(home)?;
+    let sock = sock_path(home);
+    super::home::prepare_socket_dir(home, &sock)?;
     let mut signals = ShutdownSignals::install()
         .map_err(|e| format!("Failed to install signal handlers: {}", e))?;
     let lock = acquire_engine_lock(&lock_path(home))?;
@@ -137,7 +139,7 @@ pub async fn run_until(
     if mail != mail::Ended::default() {
         eprintln!("[engine] Mail reconcile: {:?}", mail);
     }
-    let (std_listener, socket) = bind_private(&sock_path(home), &lock)?;
+    let (std_listener, socket) = bind_private(&sock, &lock)?;
     std_listener
         .set_nonblocking(true)
         .map_err(|e| format!("Failed to set socket non-blocking: {}", e))?;
