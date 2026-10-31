@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy, tick } from 'svelte';
-	import { invoke } from '@tauri-apps/api/core';
+	import { invoke } from '$lib/data/commands';
 	import { MILESTONES, tokensToHeight, formatHeight, getCurrentMilestone } from './milestones';
 
 	let { totalTokens, dateRange, onclose }: { totalTokens: number; dateRange: string; onclose: () => void } = $props();
@@ -374,7 +374,7 @@
 		try {
 			const dataUrl = renderShareImage();
 			const filePath = await invoke<string>('save_temp_image', { data: dataUrl });
-			const { shareFile } = await import('@choochmeque/tauri-plugin-sharekit-api');
+			const { shareFile } = await import('$lib/data/platform');
 			await shareFile(filePath, {
 				mimeType: 'image/png',
 				title: 'My Token Journey',

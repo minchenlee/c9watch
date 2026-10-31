@@ -4,7 +4,7 @@ import vm from 'node:vm';
 import ts from 'typescript';
 import { writable, get } from 'svelte/store';
 
-const source = readFileSync(new URL('../src/lib/stores/usage-preferences.ts', import.meta.url), 'utf8');
+const source = readFileSync(new URL('../src/lib/data/stores/usage-preferences.ts', import.meta.url), 'utf8');
 const events = new Map();
 let stored = '{broken';
 let fail = false;

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { invoke } from '@tauri-apps/api/core';
+	import { invoke } from '$lib/data/commands';
 	type ConnectionStatus = { url: string; connected: boolean; error: string | null; sessionCount: number };
 	let url = $state('http://127.0.0.1:4096');
 	let username = $state('opencode');

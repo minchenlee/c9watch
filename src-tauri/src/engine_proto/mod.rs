@@ -46,3 +46,10 @@ mod channel_tests {
         assert!(!exe_contains_reversed("nosjdn.egarevoc-wodahs"));
     }
 }
+
+pub mod compatibility;
+pub mod fsutil;
+pub mod lock;
+pub mod spawn;
+
+pub mod confirmation;

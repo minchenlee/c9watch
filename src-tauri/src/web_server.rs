@@ -25,6 +25,8 @@ pub use crate::gateway::limits::WS_PORT;
 
 /// Shared state for the WebSocket server
 pub struct WsState {
+    #[cfg(unix)]
+    pub core: RwLock<Option<Arc<crate::bridge::Bridge>>>,
     /// Paired clients (token hashes only). In memory: a restart of the
     /// desktop app means pairing again.
     pub clients: Mutex<ClientRegistry>,
@@ -52,6 +54,8 @@ impl WsState {
         detector: Arc<Mutex<crate::session::DetectorState>>,
     ) -> Self {
         Self {
+            #[cfg(unix)]
+            core: RwLock::new(None),
             clients: Mutex::new(ClientRegistry::new()),
             pairing: Mutex::new(Pairing::new()),
             sessions_tx,
@@ -957,8 +961,14 @@ async fn handle_socket(
                                     if socket.send(Message::Text(cancelled)).await.is_err() { break; }
                                 }
                                 let progress_tx = progress_tx.clone();
+                                #[cfg(unix)]
+                                let core = state.core.read().ok().and_then(|b| b.clone()).filter(|b| b.active());
                                 inflight_id = request_id;
                                 inflight = Some(tokio::spawn(async move {
+                                    #[cfg(unix)]
+                                    if let Some(core) = core {
+                                        return core_conversation(core, session_id, provider, include_tools).await;
+                                    }
                                     load_conversation_response(
                                         session_id,
                                         provider,
@@ -970,6 +980,14 @@ async fn handle_socket(
                                 }));
                             }
                             Ok(client_msg) => {
+                                #[cfg(unix)]
+                                let core = state.core.read().ok().and_then(|b| b.clone()).filter(|b| b.active());
+                                #[cfg(unix)]
+                                if let Some(core) = core {
+                                    let response = handle_core_message(core, client_msg, &client_id, &state.policy_now()).await;
+                                    if socket.send(Message::Text(response_json(&response, request_id))).await.is_err() { break; }
+                                    continue;
+                                }
                                 let response = handle_message(
                                     client_msg,
                                     &client_id,
@@ -1108,6 +1126,161 @@ async fn load_conversation_response(
             message: format!("Failed to load conversation: {e}"),
         },
     }
+}
+
+/// Every legacy request is still gated by the GUI's remote policy. Once
+/// core is usable, the GUI gateway reads the core instead of scanning twice.
+#[cfg(unix)]
+async fn core_conversation(
+    core: Arc<crate::bridge::Bridge>,
+    session_id: String,
+    provider: Option<crate::session::SessionProvider>,
+    include_tools: bool,
+) -> ServerMsg {
+    let task = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, String> {
+        let mut messages = Vec::new();
+        let mut offset = 0;
+        let mut conversation = serde_json::Value::Null;
+        loop {
+            let p = serde_json::json!({ "sessionKey": session_id, "provider": provider, "includeTools": include_tools, "page": { "offset": offset, "limit": 1000 } });
+            let page = core.call("conversation.get", p, None).map_err(|e| e.msg())?;
+            messages.extend(page["messages"].as_array().ok_or("Bad conversation page")?.clone());
+            let next = page["nextOffset"].as_u64();
+            if conversation.is_null() { conversation = page; }
+            match next {
+                Some(n) if n > offset => offset = n,
+                Some(_) => return Err("Non-advancing conversation page".into()),
+                None => break,
+            }
+        }
+        conversation["messages"] = messages.into();
+        Ok(conversation)
+    }).await;
+    match task {
+        Ok(Ok(data)) => ServerMsg::Conversation { data },
+        Ok(Err(message)) => ServerMsg::Error { message },
+        Err(e) => ServerMsg::Error {
+            message: e.to_string(),
+        },
+    }
+}
+#[cfg(unix)]
+async fn handle_core_message(
+    core: Arc<crate::bridge::Bridge>,
+    msg: ClientMsg,
+    client: &ClientId,
+    policy: &WsPolicy,
+) -> ServerMsg {
+    if matches!(msg, ClientMsg::OpenSession { .. }) && !policy.allow_open {
+        return capability_disabled("open");
+    }
+    // Open is the one native action. Resolve identity from the core snapshot,
+    // never from a remote-supplied path or a second detection run.
+    if let ClientMsg::OpenSession { addr, pid } = &msg {
+        let target = core
+            .snapshot
+            .lock()
+            .unwrap()
+            .as_array()
+            .and_then(|rows| rows.iter().find(|s| s["sessionKey"] == *addr))
+            .cloned();
+        let response = match target {
+            Some(s)
+                if s["canOpen"] != false
+                    && s["pid"]
+                        .as_u64()
+                        .is_some_and(|p| p > 0 && pid.is_none_or(|asked| p == asked as u64)) =>
+            {
+                let pid = s["pid"].as_u64().unwrap() as u32;
+                let path = s["projectPath"].as_str().unwrap_or("").to_string();
+                match tokio::task::spawn_blocking(move || crate::actions::open_session(pid, path))
+                    .await
+                {
+                    Ok(Ok(())) => ServerMsg::Ok,
+                    Ok(Err(message)) => ServerMsg::Error { message },
+                    Err(e) => ServerMsg::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            _ => ServerMsg::Error {
+                message: "Session is gone or its process identity changed".into(),
+            },
+        };
+        log_action(client, "openSession", addr, &response);
+        return response;
+    }
+    let (method, params, field, action) = match msg {
+        ClientMsg::GetSessions => (
+            "session.views",
+            serde_json::json!({}),
+            Some("sessions"),
+            None,
+        ),
+        ClientMsg::GetSubscriptionUsage => (
+            "usage.subscriptions",
+            serde_json::json!({}),
+            Some("usage"),
+            None,
+        ),
+        ClientMsg::GetAwayActivity { requests } => (
+            "session.away",
+            serde_json::json!({"requests": requests}),
+            Some("activity"),
+            None,
+        ),
+        ClientMsg::SessionStop { addr, pid } => (
+            "session.stop",
+            serde_json::json!({"sessionKey": addr, "pid": pid}),
+            None,
+            Some(("session.stop", addr)),
+        ),
+        ClientMsg::RenameSession {
+            session_id,
+            new_name,
+            provider,
+        } => (
+            "session.rename",
+            serde_json::json!({"sessionId": session_id, "newName": new_name, "provider": provider}),
+            None,
+            Some(("renameSession", session_id)),
+        ),
+        ClientMsg::StopSession { .. } => {
+            return ServerMsg::Error {
+                message: STOP_SESSION_REMOVED.into(),
+            }
+        }
+        _ => {
+            return ServerMsg::Error {
+                message: "Unsupported native action".into(),
+            }
+        }
+    };
+    let task = tokio::task::spawn_blocking(move || core.call(method, params, None)).await;
+    let response = match task {
+        Ok(Ok(mut value)) => match field {
+            Some("sessions") => {
+                let mut data = value["sessions"].take();
+                redact_sessions(&mut data, policy);
+                ServerMsg::Sessions { data }
+            }
+            Some("usage") => ServerMsg::SubscriptionUsage {
+                data: value["usage"].take(),
+            },
+            Some(_) => ServerMsg::AwayActivity {
+                data: value["activity"].take(),
+            },
+            None => ServerMsg::Ok,
+        },
+        Ok(Err(e)) => ServerMsg::Error { message: e.msg() },
+        Err(e) => ServerMsg::Error {
+            message: e.to_string(),
+        },
+    };
+    if let Some((method, target)) = action {
+        log_action(client, method, &target, &response);
+    }
+    response
 }
 
 /// `getSessions` reply. `data` is the session array, the same shape as

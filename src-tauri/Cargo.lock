@@ -475,6 +475,7 @@ dependencies = [
  "rusqlite",
  "rust-embed",
  "schemars 1.2.1",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

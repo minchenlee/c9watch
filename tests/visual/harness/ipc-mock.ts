@@ -1,7 +1,8 @@
 /**
  * Test-only init script. Playwright injects the bundled form of this file
  * before any app code runs. It answers the real Tauri command names from the
- * recorded fixtures with `@tauri-apps/api/mocks`. The app code is unchanged.
+ * recorded fixtures with `@tauri-apps/api/mocks`. Core results enter through
+ * the real data layer; Classic contains no test-only paths.
  *
  * Options come from `window.__C9_VISUAL__`, which an earlier init script sets.
  */
@@ -34,6 +35,31 @@ type Args = Record<string, unknown> | undefined;
 function handle(cmd: string, args: Args): unknown {
 	const live = options.sessions === 'empty' ? [] : fx.sessions;
 	switch (cmd) {
+        case 'c9p_request': {
+            const p = (args?.params ?? {}) as Record<string, any>;
+            const id = String(p.sessionKey ?? '').replace(/^(claudeCode|codex|cursor|pi|opencode):/, '');
+            switch (args?.method) {
+                case 'session.views': return { sessions: live, cursor: 'visual:epoch:1' };
+                case 'diag.detection': return fx.diagnostics;
+                case 'conversation.get': return { ...(fx.conversations[id] ?? { sessionId: id, provider: p.provider, messages: [] }), nextOffset: null };
+                case 'session.away': return { activity: handle('get_away_activity', p) };
+                case 'session.stop': return handle('stop_session', p);
+                case 'session.rename': return null;
+                case 'history.list': return { entries: fx.history, nextOffset: null };
+                case 'history.search': return { hits: [] };
+                case 'cost.get': return fx.cost;
+                case 'memory.list': return { projects: fx.memory, nextOffset: null };
+                case 'usage.subscriptions': return { usage: fx.subscriptionUsage };
+                case 'subagent.list': return { subagents: options.sessions === 'empty' ? {} : fx.subagents };
+                case 'subagent.transcript': return { messages: [] };
+                case 'session.tasks': return { tasks: fx.tasks[String(p.sessionId)] ?? [] };
+                case 'provider.opencode.status': return fx.opencodeStatus;
+                case 'provider.opencode.connect': case 'detect.recheck': return null;
+                default: unhandled.push(`c9p:${String(args?.method)}`); return null;
+            }
+        }
+        case 'c9p_subscribe': return 'visual-sub';
+        case 'c9p_unsubscribe': return null;
 		case 'get_sessions':
 			return live;
 		case 'get_detection_diagnostics':

@@ -29,6 +29,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Data layer import boundary
+        run: |
+          npm run lint:data
+          npm run test:lint-data
+          node --conditions=browser --test scripts/test-data-client.mjs
+
       - name: Svelte check
         run: npm run check
 
@@ -36,7 +42,7 @@ jobs:
         run: node --test scripts/test-ws.mjs scripts/test-hidden-transitions.mjs scripts/test-opencode-provider.mjs scripts/test-opencode-connection.mjs scripts/test-integration-settings.mjs scripts/test-away-summary.mjs scripts/test-hidden-sessions.mjs scripts/test-dense-layout.mjs scripts/test-ipc-contract.mjs scripts/test-no-token-leak.mjs scripts/test-csp.mjs scripts/test-remote-access-ui.mjs
 
       - name: Conversation selection regression tests
-        run: node --conditions=browser --test scripts/test-conversation-selection.mjs
+        run: node --conditions=browser --test scripts/test-conversation-selection.mjs scripts/test-preview-loader.mjs
 
       - name: Usage and polling regressions
         run: |
@@ -49,6 +55,9 @@ jobs:
 
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: GUI with core integration tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features engine
 
       - name: Build frontend
         run: npm run build

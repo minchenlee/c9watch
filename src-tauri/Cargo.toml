@@ -22,6 +22,7 @@ gui = [
     "dep:tauri",
     "dep:tauri-build",
     "dep:tauri-plugin-notification",
+    "dep:ed25519-dalek",
     "dep:notify-rust",
     "dep:tauri-plugin-opener",
     "dep:tauri-plugin-dialog",
@@ -57,6 +58,7 @@ tauri-build = { version = "2", features = [], optional = true }
 # ── Core (always included) ───────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls"] }
 sysinfo = "0.32"
 anyhow = "1.0"

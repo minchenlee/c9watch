@@ -53,6 +53,45 @@ test('every registered Tauri command is invoked, and every invoke is registered'
   for (const name of registered) assert.ok(invoked.has(name), `registered but never invoked: ${name}`);
 });
 
+test('data-layer commands have capabilities for each supported window', () => {
+  const data = files(join(root, 'src/lib/data'), ['.ts'])
+    .map(path => readFileSync(path, 'utf8')).join('\n');
+  for (const call of data.matchAll(/\binvoke(?:<.*?>)?\(\s*([^\s])/g)) {
+    assert.equal(call[1], "'", 'data-layer invoke must name a literal command for capability checking');
+  }
+  const invoked = matches(data, /\binvoke(?:<.*?>)?\(\s*'([a-z_0-9]+)'/g);
+  const build = readFileSync(join(root, 'src-tauri/build.rs'), 'utf8');
+  const manifest = build.match(/AppManifest::new\(\)\.commands\(&\[([\s\S]*?)\]/);
+  assert.ok(manifest, 'Tauri app command manifest not found');
+  const generated = matches(manifest[1], /"([a-z_0-9]+)"/g);
+  // The popover exposes session/usage reads and native open actions only.
+  // New data commands default to requiring both windows: a narrower surface
+  // needs an explicit decision here instead of silently escaping the gate.
+  const mainOnly = new Set([
+    'deep_search_sessions', 'stop_session', 'rename_session',
+    'save_temp_image', 'reveal_in_file_manager', 'get_server_info',
+    'create_pairing_code', 'forget_paired_clients', 'get_remote_access',
+    'set_remote_access', 'get_debug_logs', 'opencode_connection_status',
+    'opencode_connect', 'get_notification_preferences',
+    'save_notification_preferences', 'test_native_notification'
+  ]);
+  for (const command of mainOnly) assert.ok(invoked.has(command), `stale main-only command: ${command}`);
+  for (const [file, window] of [['default.json', 'main'], ['popover.json', 'popover']]) {
+    const capability = JSON.parse(readFileSync(join(root, 'src-tauri/capabilities', file), 'utf8'));
+    assert.ok(capability.windows.includes(window), `${file} must apply to ${window}`);
+    const permissions = new Set(capability.permissions);
+    for (const command of invoked) {
+      assert.ok(generated.has(command), `no generated ACL permission for ${command}`);
+      const permission = `allow-${command.replaceAll('_', '-')}`;
+      if (window === 'popover' && mainOnly.has(command)) {
+        assert.ok(!permissions.has(permission), `popover must not gain ${permission}`);
+      } else {
+        assert.ok(permissions.has(permission), `${window} is missing ${permission}`);
+      }
+    }
+  }
+});
+
 // Requests the server still parses only to answer "removed"; the frontend
 // must not send them.
 const REMOVED_WS_REQUESTS = new Set(['stopSession']);

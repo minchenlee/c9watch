@@ -1,6 +1,6 @@
 <script lang="ts">
     import { onMount } from 'svelte';
-    import { invoke } from '@tauri-apps/api/core';
+    import { invoke } from '$lib/data/commands';
     import { notificationPermission, checkNotificationPermission } from '$lib/stores/sessions';
     type Preferences = { enabled: boolean; replyReady: boolean; questions: boolean; permissions: boolean; detail: 'brief' | 'detailed'; sound: boolean; cooldownSeconds: number };
     let prefs = $state<Preferences | null>(null);

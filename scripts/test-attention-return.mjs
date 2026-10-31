@@ -8,7 +8,7 @@ const transpile = source => ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 }
 }).outputText;
 const provider = await import('data:text/javascript;base64,' + Buffer.from(transpile(read('../src/lib/provider.ts'))).toString('base64'));
-const stores = read('../src/lib/stores/sessions.ts');
+const stores = read('../src/lib/data/stores/sessions.ts');
 const start = stores.indexOf('function attentionTime');
 const end = stores.indexOf('\n/**', start);
 const inbox = new Function('sessions', 'derived', 'SessionStatus', 'providerOf', 'sessionKeyOf', 'sessionReturnKind',

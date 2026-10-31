@@ -550,6 +550,8 @@ pub enum Commands {
 #[cfg(all(unix, feature = "engine"))]
 #[derive(Subcommand)]
 pub enum EngineAction {
+    /// Stop core (agents drain); the GUI never stops it on quit
+    Stop,
     /// Stop the engine with SIGTERM and wait for a new one to answer hello
     Restart,
     /// Print the dev GUI's daily shadow diff coverage (dev builds only)
@@ -637,6 +639,8 @@ pub fn run(cli: Cli) {
         Commands::Engine { action } => match action {
             None => engine_client::cmd_engine_run(),
             Some(EngineAction::Restart) => engine_client::cmd_engine_restart(cli.pretty),
+            Some(EngineAction::Stop) => crate::engine::home::engine_home()
+                .and_then(|home| crate::engine_proto::spawn::stop_engine(&home)),
             #[cfg(c9_channel_dev)]
             Some(EngineAction::ShadowReport) => engine_client::cmd_shadow_report(cli.pretty),
         },

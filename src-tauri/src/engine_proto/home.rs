@@ -169,3 +169,9 @@ mod socket_tests {
         }
     }
 }
+
+/// Lifetime lock shared by engine and spawning clients.
+pub const ENGINE_LOCK_NAME: &str = "engine.lock";
+pub fn lock_path(home: &Path) -> PathBuf {
+    home.join(ENGINE_LOCK_NAME)
+}

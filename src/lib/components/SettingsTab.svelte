@@ -5,7 +5,7 @@
 	import RemoteAccessSettings from './RemoteAccessSettings.svelte';
 	import UsageSettings from './UsageSettings.svelte';
 	import { renderPlainMarkdown } from '$lib/markdown';
-	import { openUrl } from '@tauri-apps/plugin-opener';
+	import { openUrl } from '$lib/data/platform';
 	import { isTauri } from '$lib/ws';
 	import {
 		currentVersion,

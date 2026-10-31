@@ -12,12 +12,12 @@ const transpile = source => ts.transpileModule(source, {
 const dataUrl = code => 'data:text/javascript;base64,' + Buffer.from(code).toString('base64');
 const stubs = {
   'svelte/store': import.meta.resolve('svelte/store'),
-  '@tauri-apps/api/event': dataUrl('export const listen = async () => () => {};'),
+  '$lib/data/platform': dataUrl('export const listen = async () => () => {};'),
   '$lib/api': dataUrl('export const getConversation = () => { throw new Error("not injected"); }; export class CapabilityDisabledError extends Error {}'),
   '$lib/ws': dataUrl('export const isTauri = () => false; export const useWebSocket = () => false; export const wsClient = { on() {} };'),
   '$lib/provider': dataUrl(transpile(read('../src/lib/provider.ts')))
 };
-const code = transpile(read('../src/lib/stores/conversation-loader.ts'))
+const code = transpile(read('../src/lib/data/stores/conversation-loader.ts'))
   .replace(/from '([^']+)'/g, (_, spec) => `from '${stubs[spec] ?? spec}'`);
 const { writable, get } = await import(stubs['svelte/store']);
 const loader = await import(dataUrl(code));

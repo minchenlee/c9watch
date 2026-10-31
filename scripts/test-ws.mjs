@@ -6,7 +6,7 @@ import { test } from 'node:test';
 
 function client() {
   const exports = {};
-  const code = ts.transpileModule(readFileSync(new URL('../src/lib/ws.ts', import.meta.url), 'utf8'), {
+  const code = ts.transpileModule(readFileSync(new URL('../src/lib/data/ws-legacy-client.ts', import.meta.url), 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
   }).outputText;
   vm.runInNewContext(code, { exports, console, setTimeout, clearTimeout, WebSocket: { OPEN: 1 } });
@@ -57,7 +57,7 @@ test('push events do not settle requests and disconnect rejects all pending requ
 
 function harness({ storage = {} } = {}) {
   const exports = {};
-  const code = ts.transpileModule(readFileSync(new URL('../src/lib/ws.ts', import.meta.url), 'utf8'), {
+  const code = ts.transpileModule(readFileSync(new URL('../src/lib/data/ws-legacy-client.ts', import.meta.url), 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
   }).outputText;
   const sockets = [];

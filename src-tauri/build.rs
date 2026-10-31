@@ -18,5 +18,42 @@ fn main() {
     // Only run tauri_build when the gui feature is enabled.
     // CLI-only builds don't need Tauri's code generation.
     #[cfg(feature = "gui")]
-    tauri_build::build();
+    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
+        tauri_build::AppManifest::new().commands(&[
+            "c9p_request",
+            "c9p_subscribe",
+            "c9p_unsubscribe",
+            "get_sessions",
+            "get_detection_diagnostics",
+            "get_subscription_usage",
+            "get_conversation",
+            "get_away_activity",
+            "get_session_history",
+            "deep_search_sessions",
+            "get_cost_data",
+            "get_memory_files",
+            "get_subagents",
+            "get_subagent_transcript",
+            "get_session_tasks",
+            "save_temp_image",
+            "reveal_in_file_manager",
+            "stop_session",
+            "open_session",
+            "rename_session",
+            "show_main_window",
+            "get_server_info",
+            "create_pairing_code",
+            "forget_paired_clients",
+            "get_remote_access",
+            "set_remote_access",
+            "get_debug_logs",
+            "get_build_channel",
+            "opencode_connection_status",
+            "opencode_connect",
+            "get_notification_preferences",
+            "save_notification_preferences",
+            "test_native_notification",
+        ]),
+    ))
+    .expect("Tauri ACL build failed");
 }

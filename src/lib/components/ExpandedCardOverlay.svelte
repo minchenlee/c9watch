@@ -34,7 +34,7 @@
 	import { onDestroy, onMount, tick, untrack } from 'svelte';
 	import { fade } from '$lib/transitions';
 	import { flyIn, flyInX, fadeIn } from '$lib/transitions';
-	import { invoke } from '@tauri-apps/api/core';
+	import { invoke } from '$lib/data/commands';
 	import type { Session, Conversation } from '$lib/types';
 	import { SessionStatus } from '$lib/types';
 	import MessageBubble from './MessageBubble.svelte';

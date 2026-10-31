@@ -31,6 +31,12 @@ pub mod web_server;
 #[cfg(all(not(mobile), feature = "gui"))]
 pub mod ws_auth;
 
+#[cfg(all(unix, not(mobile), feature = "gui"))]
+pub mod bridge;
+
+#[cfg(all(unix, not(mobile), feature = "gui"))]
+pub mod gateway_control;
+
 // ── CLI module ──────────────────────────────────────────────────────
 #[cfg(feature = "cli")]
 pub mod cli;
@@ -654,7 +660,7 @@ async fn show_main_window(app: AppHandle) -> Result<(), String> {
 /// Server connection info for the MOBILE modal and Settings. It carries no
 /// credential: a phone gets its token by redeeming a pairing code.
 #[cfg(all(not(mobile), feature = "gui"))]
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerInfo {
     pub port: u16,
@@ -663,7 +669,7 @@ pub struct ServerInfo {
     pub local_ip: String,
     pub lan_enabled: bool,
     /// `"loopback"` or `"lan"`.
-    pub bind: &'static str,
+    pub bind: String,
     /// This Mac's interface IPs, read now. Empty unless LAN is on.
     pub lan_addresses: Vec<String>,
 }
@@ -685,7 +691,7 @@ fn server_info(server: &web_server::WsServer) -> ServerInfo {
         port,
         local_ip,
         lan_enabled,
-        bind: if lan_enabled { "lan" } else { "loopback" },
+        bind: if lan_enabled { "lan" } else { "loopback" }.into(),
         lan_addresses,
     }
 }
@@ -693,8 +699,18 @@ fn server_info(server: &web_server::WsServer) -> ServerInfo {
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_server_info(
+    app: AppHandle,
     server: tauri::State<'_, Arc<web_server::WsServer>>,
 ) -> Result<ServerInfo, String> {
+    #[cfg(unix)]
+    if let Some(core) = gateway_control::core_bridge(&app) {
+        let value = tauri::async_runtime::spawn_blocking(move || {
+            core.gateway_call("gateway.info", serde_json::json!({}))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        return serde_json::from_value(value).map_err(|e| e.to_string());
+    }
     Ok(server_info(&server))
 }
 
@@ -703,12 +719,29 @@ async fn get_server_info(
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn create_pairing_code(
-    app: tauri::AppHandle,
+    app: AppHandle,
     server: tauri::State<'_, Arc<web_server::WsServer>>,
 ) -> Result<web_server::PairingCode, String> {
     let _guard = server.confirmation.lock().await;
-    // The GUI still hosts the legacy server until M-c. Its existing access
-    // is stated explicitly; new core tokens use the viewer preset instead.
+    #[cfg(unix)]
+    if let Some(core) = gateway_control::core_bridge(&app) {
+        let server = server.inner().clone();
+        return tauri::async_runtime::spawn_blocking(move || {
+            use sha2::Digest;
+            let pairing = server.create_pairing_code()?;
+            let code_hash: String = sha2::Sha256::digest(pairing.code.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            core.gateway_write(&app, "gateway.pair.register", serde_json::json!({
+                "codeHash": code_hash, "expiresAt": pairing.expires_at,
+                "scopes": ["session:read", "cost:read", "annotation:read"], "ceiling": "metadata",
+            }), &serde_json::Value::Null)?;
+            Ok(pairing)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     let remote = server.remote();
     let mut scopes = vec![
         "session:read",
@@ -731,16 +764,36 @@ async fn create_pairing_code(
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn forget_paired_clients(
+    app: AppHandle,
     server: tauri::State<'_, Arc<web_server::WsServer>>,
 ) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Some(core) = gateway_control::core_bridge(&app) {
+        return tauri::async_runtime::spawn_blocking(move || {
+            core.gateway_call("gateway.clients.revoke", serde_json::json!({}))
+                .map(|_| ())
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     server.forget_paired_clients()
 }
 
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_remote_access(
+    app: AppHandle,
     server: tauri::State<'_, Arc<web_server::WsServer>>,
 ) -> Result<remote_access::RemoteAccess, String> {
+    #[cfg(unix)]
+    if let Some(core) = gateway_control::core_bridge(&app) {
+        let value = tauri::async_runtime::spawn_blocking(move || {
+            core.gateway_call("gateway.policy.get", serde_json::json!({}))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        return serde_json::from_value(value).map_err(|e| e.to_string());
+    }
     Ok(server.remote())
 }
 
@@ -749,16 +802,28 @@ async fn get_remote_access(
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn set_remote_access(
-    app: tauri::AppHandle,
+    app: AppHandle,
     server: tauri::State<'_, Arc<web_server::WsServer>>,
-    remote: remote_access::RemoteAccess,
+    mut remote: remote_access::RemoteAccess,
 ) -> Result<remote_access::RemoteAccess, String> {
     let _guard = server.confirmation.lock().await;
-    let remote = remote_access::RemoteAccess {
-        extra_allowed_hosts: remote_access::normalize_hosts(&remote.extra_allowed_hosts)?,
-        allowed_origins: remote_access::normalize_origins(&remote.allowed_origins)?,
-        ..remote
-    };
+    remote.extra_allowed_hosts = remote_access::normalize_hosts(&remote.extra_allowed_hosts)?;
+    remote.allowed_origins = remote_access::normalize_origins(&remote.allowed_origins)?;
+    #[cfg(unix)]
+    if let Some(core) = gateway_control::core_bridge(&app) {
+        return tauri::async_runtime::spawn_blocking(move || {
+            let mut policy = core.gateway_call("gateway.policy.get", serde_json::json!({}))?;
+            let previous = policy.clone();
+            // Preserve core-only fields that Classic does not expose.
+            for (key, value) in serde_json::to_value(&remote).unwrap().as_object().unwrap() {
+                policy[key] = value.clone();
+            }
+            let updated = core.gateway_write(&app, "gateway.policy.set", policy, &previous)?;
+            serde_json::from_value(updated).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     let old = serde_json::to_value(server.remote()).map_err(|e| e.to_string())?;
     let next = serde_json::to_value(&remote).map_err(|e| e.to_string())?;
     gateway::consent::confirm(&old, &next, |message| {
@@ -771,7 +836,33 @@ async fn set_remote_access(
 #[cfg(all(not(mobile), feature = "gui"))]
 #[tauri::command]
 async fn get_debug_logs() -> Result<Vec<debug_log::LogEntry>, String> {
-    Ok(debug_log::get_logs())
+    let mut logs = debug_log::get_logs();
+    #[cfg(unix)]
+    if let Ok(home) = engine_proto::home::engine_home() {
+        use std::io::{Read, Seek, SeekFrom};
+        if let Ok(mut file) = std::fs::File::open(engine_proto::spawn::log_path(&home)) {
+            let len = file.metadata().map_or(0, |m| m.len());
+            let _ = file.seek(SeekFrom::Start(len.saturating_sub(64 * 1024)));
+            let mut tail = String::new();
+            let _ = file.take(64 * 1024).read_to_string(&mut tail);
+            // Engine's log is plain text; the UI's LogEntry structure is kept.
+            for line in tail
+                .lines()
+                .rev()
+                .take(200)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                logs.push(debug_log::LogEntry {
+                    timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                    level: debug_log::LogLevel::Info,
+                    message: format!("[core] {line}"),
+                });
+            }
+        }
+    }
+    Ok(logs)
 }
 
 /// `"dev"` or `"prod"`. A dev channel GUI skips the update check on launch,
@@ -849,10 +940,17 @@ pub fn run() {
             let remote = remote_access::load(&remote_path);
             let ws_server = Arc::new(web_server::WsServer::new(ws_state, port, remote_path));
             app.manage(ws_server.clone());
+            #[cfg(unix)]
+            {
+                *ws_server.state().remote.write().unwrap() = remote;
+                let bridge = Arc::new(bridge::Bridge::default());
+                app.manage(bridge.clone());
+                *ws_server.state().core.write().unwrap() = Some(bridge.clone());
+                bridge::start(app.handle().clone(), bridge, ws_server.clone());
+            }
+            #[cfg(not(unix))]
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = ws_server.apply(remote).await {
-                    debug_log::log_error(&format!("[ws-server] {}", e));
-                }
+                if let Err(e) = ws_server.apply(remote).await { debug_log::log_error(&e); }
             });
             app.manage(polling::LatestDiagnostics::default());
 
@@ -881,9 +979,9 @@ pub fn run() {
                         let _ = main_win_clone.hide();
                     }
                     tauri::WindowEvent::Focused(true) => {
-                        if let Ok(mut state) = detector_for_focus.lock() {
-                            state.recheck_and_maybe_swap();
-                        }
+                        #[cfg(unix)]
+                        if bridge::core_active(main_win_clone.app_handle()) { return; }
+                        if let Ok(mut state) = detector_for_focus.lock() { state.recheck_and_maybe_swap(); }
                     }
                     _ => {}
                 });
@@ -1050,7 +1148,10 @@ pub fn run() {
             get_remote_access,
             set_remote_access,
             get_debug_logs,
-            get_build_channel
+            get_build_channel,
+            bridge::c9p_request,
+            bridge::c9p_subscribe,
+            bridge::c9p_unsubscribe
         ]);
 
     // Mobile: minimal shell (all communication via WebSocket from the frontend)

@@ -16,7 +16,7 @@ function harness() {
     exports, $state: value => value,
     require(name) {
       if (name === 'svelte') return { onMount(fn) { mount = fn; } };
-      if (name === '@tauri-apps/api/core') return { invoke: (command, args) => new Promise((resolve, reject) => requests.push({ command, args, resolve, reject })) };
+      if (name === '$lib/data/commands') return { invoke: (command, args) => new Promise((resolve, reject) => requests.push({ command, args, resolve, reject })) };
       throw Error(name);
     },
     setTimeout(fn) { timers.set(++timerId, fn); return timerId; },

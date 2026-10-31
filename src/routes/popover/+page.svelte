@@ -7,8 +7,8 @@
 	import { countStatusBuckets } from '$lib/status-utils';
 	import { sessionDisplayTitle } from '$lib/session-utils';
 	import type { Session } from '$lib/types';
-	import { invoke } from '@tauri-apps/api/core';
-	import { listen } from '@tauri-apps/api/event';
+	import { invoke } from '$lib/data/commands';
+	import { listen } from '$lib/data/platform';
 	import { isDemoMode, loadDemoDataIfActive } from '$lib/demo';
 	import { providerFilter } from '$lib/stores/provider-filter';
 	import { canSessionAction, matchesProvider, providerFilterLabel, sessionKeyOf } from '$lib/provider';

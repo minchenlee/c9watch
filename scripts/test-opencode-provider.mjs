@@ -74,7 +74,7 @@ test('canSessionAction uses direct booleans, then provider defaults', () => {
 });
 
 test('demo Codex and Cursor cards hide open, stop and rename', () => {
-  const demo = readFileSync(new URL('../src/lib/demo/data.ts', import.meta.url), 'utf8');
+  const demo = readFileSync(new URL('../src/lib/data/demo/data.ts', import.meta.url), 'utf8');
   assert.equal(demo.includes('actionCapabilities'), false);
   assert.equal(demo.match(/canOpen: false, canStop: false, canRename: false/g)?.length, 4);
 });

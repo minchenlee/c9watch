@@ -191,7 +191,45 @@ fn compact(s: &str, limit: usize) -> String {
     }
     result
 }
+// Only the fields used by native notification formatting. This is never
+// serialized: core notifications reuse the GUI's existing session view without
+// adding conversation text to notification events or remote broadcasts.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContentSession {
+    session_name: String,
+    custom_title: Option<String>,
+    codex_title: Option<String>,
+    cursor_title: Option<String>,
+    ai_title: Option<String>,
+    first_prompt: String,
+    project_path: String,
+    provider: crate::session::SessionProvider,
+    #[serde(rename = "lastAssistantMessage")]
+    notification_preview: Option<String>,
+    pending_tool_name: Option<String>,
+    pending_tool_input: Option<serde_json::Value>,
+}
 fn content(s: &Session, event: Event, detail: Detail) -> (String, String) {
+    content_fields(
+        &ContentSession {
+            session_name: s.session_name.clone(),
+            custom_title: s.custom_title.clone(),
+            codex_title: s.codex_title.clone(),
+            cursor_title: s.cursor_title.clone(),
+            ai_title: s.ai_title.clone(),
+            first_prompt: s.first_prompt.clone(),
+            project_path: s.project_path.clone(),
+            provider: s.provider,
+            notification_preview: s.notification_preview.clone(),
+            pending_tool_name: s.pending_tool_name.clone(),
+            pending_tool_input: s.pending_tool_input.clone(),
+        },
+        event,
+        detail,
+    )
+}
+fn content_fields(s: &ContentSession, event: Event, detail: Detail) -> (String, String) {
     let name = s
         .custom_title
         .as_deref()
@@ -299,23 +337,92 @@ pub fn notify(app: &AppHandle, session: &Session) {
     let Ok(mut data) = state.data.lock() else {
         return;
     };
+    if let Err(e) = send_notification(
+        &mut data,
+        &session.session_key,
+        event,
+        |detail| content(session, event, detail),
+        |title, body, sound| show(app, title, body, sound),
+    ) {
+        crate::debug_log::log_error(&format!("Notification failed: {e}"));
+    }
+}
+// Both native sources share the saved preference and successful-delivery
+// history. There is no additional fixed GUI cooldown for core events.
+fn send_notification(
+    data: &mut StateData,
+    session_key: &str,
+    event: Event,
+    make_content: impl FnOnce(Detail) -> (String, String),
+    deliver: impl FnOnce(&str, &str, bool) -> Result<(), String>,
+) -> Result<(), String> {
     if !event.enabled(&data.prefs) {
-        return;
+        return Ok(());
     }
     data.sent
         .retain(|_, time| time.elapsed() < Duration::from_secs(600));
-    let key = (session.session_key.clone(), event);
+    let key = (session_key.to_string(), event);
     if on_cooldown(&data.sent, &key, data.prefs.cooldown_seconds) {
-        return;
+        return Ok(());
     }
-    let (title, body) = content(session, event, data.prefs.detail);
-    match show(app, &title, &body, data.prefs.sound) {
-        Ok(()) => {
-            data.sent.insert(key, Instant::now());
-        }
-        Err(e) => crate::debug_log::log_error(&format!("Notification failed: {e}")),
+    let (title, body) = make_content(data.prefs.detail);
+    deliver(&title, &body, data.prefs.sound)?;
+    data.sent.insert(key, Instant::now());
+    Ok(())
+}
+
+#[cfg(unix)]
+fn core_content(
+    payload: &crate::engine_proto::wire::NotificationEvent,
+    event: Event,
+    detail: Detail,
+    snapshot: Option<&serde_json::Value>,
+) -> (String, String) {
+    if detail == Detail::Brief {
+        return (payload.title.clone(), event.label().into());
+    }
+    let session = snapshot
+        .and_then(|s| s.as_array())
+        .and_then(|rows| {
+            rows.iter()
+                .find(|s| s["sessionKey"].as_str() == Some(payload.session_key.as_str()))
+        })
+        .and_then(|s| serde_json::from_value::<ContentSession>(s.clone()).ok());
+    match session {
+        Some(session) => content_fields(&session, event, detail),
+        None => (payload.title.clone(), payload.body.clone()),
     }
 }
+
+/// Core supplies live transitions; the GUI applies the user's native delivery
+/// preferences and formats details only from its already-cached session view.
+#[cfg(unix)]
+pub fn notify_core(app: &AppHandle, payload: &crate::engine_proto::wire::NotificationEvent) {
+    let event = match payload.status.as_str() {
+        "waiting_for_input" => Event::Reply,
+        "needs_attention" if is_question_tool(payload.pending_tool.as_deref()) => Event::Question,
+        "needs_attention" => Event::Permission,
+        _ => return,
+    };
+    let state = app.state::<NotificationState>();
+    let Ok(mut data) = state.data.lock() else {
+        return;
+    };
+    if let Err(e) = send_notification(
+        &mut data,
+        &payload.session_key,
+        event,
+        |detail| {
+            let bridge = app.try_state::<std::sync::Arc<crate::bridge::Bridge>>();
+            let snapshot = bridge.as_ref().and_then(|b| b.snapshot.lock().ok());
+            core_content(payload, event, detail, snapshot.as_deref())
+        },
+        |title, body, sound| show(app, title, body, sound),
+    ) {
+        crate::debug_log::log_error(&format!("Notification failed: {e}"));
+    }
+}
+
 #[tauri::command]
 pub fn test_native_notification(
     app: AppHandle,
@@ -439,6 +546,154 @@ pub(crate) mod tests {
             30
         ));
         assert!(!on_cooldown(&sent, &("codex:same".into(), Event::Reply), 0));
+    }
+    #[test]
+    fn native_delivery_uses_saved_cooldown_without_a_fixed_minimum() {
+        let mut data = StateData {
+            prefs: serde_json::from_str(r#"{"cooldownSeconds":120,"sound":true}"#).unwrap(),
+            sent: HashMap::from([(
+                ("codex:same".into(), Event::Reply),
+                Instant::now() - Duration::from_secs(45),
+            )]),
+        };
+        let mut delivered = 0;
+        let mut send = |data: &mut StateData, key: &str, event| {
+            send_notification(
+                data,
+                key,
+                event,
+                |detail| {
+                    assert_eq!(detail, Detail::Detailed);
+                    ("title".into(), "body".into())
+                },
+                |_, _, sound| {
+                    assert!(sound);
+                    delivered += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        };
+        send(&mut data, "codex:same", Event::Reply); // user's 120 s, not 30 s
+        send(&mut data, "codex:same", Event::Permission); // separate event
+        send(&mut data, "claudeCode:same", Event::Reply); // separate provider
+        data.sent.insert(
+            ("codex:same".into(), Event::Reply),
+            Instant::now() - Duration::from_secs(121),
+        );
+        send(&mut data, "codex:same", Event::Reply);
+        data.prefs.cooldown_seconds = 0;
+        send(&mut data, "codex:same", Event::Reply);
+        send(&mut data, "codex:same", Event::Reply);
+        data.prefs.cooldown_seconds = 600;
+        data.sent.insert(
+            ("codex:same".into(), Event::Reply),
+            Instant::now() - Duration::from_secs(599),
+        );
+        send(&mut data, "codex:same", Event::Reply);
+        data.sent.insert(
+            ("codex:same".into(), Event::Reply),
+            Instant::now() - Duration::from_secs(601),
+        );
+        send(&mut data, "codex:same", Event::Reply);
+        assert_eq!(delivered, 6);
+    }
+
+    #[test]
+    fn failed_native_delivery_does_not_start_cooldown() {
+        let mut data = StateData {
+            prefs: Preferences::default(),
+            sent: HashMap::new(),
+        };
+        assert!(send_notification(
+            &mut data,
+            "codex:same",
+            Event::Reply,
+            |_| ("title".into(), "body".into()),
+            |_, _, _| Err("queue full".into()),
+        )
+        .is_err());
+        assert!(data.sent.is_empty());
+        data.prefs.enabled = false;
+        send_notification(
+            &mut data,
+            "codex:same",
+            Event::Reply,
+            |_| panic!("disabled notifications must not read content"),
+            |_, _, _| panic!("disabled notifications must not deliver"),
+        )
+        .unwrap();
+        assert!(data.sent.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn core_details_use_only_the_matching_cached_session_and_native_output() {
+        use crate::engine_proto::wire::NotificationEvent;
+        let mut s = fixture();
+        let mut payload = NotificationEvent {
+            id: "agent-id".into(),
+            session_key: s.session_key.clone(),
+            status: "waiting_for_input".into(),
+            name: s.session_name.clone(),
+            pending_tool: None,
+            title: "Core title".into(),
+            redacted_title: "project".into(),
+            body: "Core fallback body".into(),
+            pid: s.pid,
+            provider: s.provider,
+        };
+        s.status = SessionStatus::WaitingForInput;
+        s.notification_preview = Some("Tests passed. Ready for review.".into());
+        // The native-only preview is not serialized; reuse the existing card
+        // preview derived from it, without changing the wire model.
+        s.last_assistant_message =
+            crate::session::away::last_assistant_line(s.notification_preview.as_deref());
+        let original_payload = serde_json::to_value(&payload).unwrap();
+        let check = |s: &Session, event, expected: &str| {
+            let snapshot = serde_json::json!([s]);
+            assert!(snapshot[0].get("notificationPreview").is_none());
+            let (title, body) = core_content(&payload, event, Detail::Detailed, Some(&snapshot));
+            assert_eq!(title, "Codex thread title");
+            assert!(body.contains(expected), "{body}");
+            assert!(!body.contains("never dump unknown fields"));
+            let brief = core_content(&payload, event, Detail::Brief, Some(&snapshot));
+            assert_eq!(brief, (payload.title.clone(), event.label().into()));
+        };
+        check(&s, Event::Reply, "Tests passed. Ready for review.");
+        s.status = SessionStatus::NeedsAttention;
+        s.pending_tool_name = Some("Bash".into());
+        s.pending_tool_input = Some(serde_json::json!({
+            "command": "cargo test", "secret": "never dump unknown fields"
+        }));
+        check(&s, Event::Permission, "Bash: cargo test");
+        s.pending_tool_name = Some("Edit".into());
+        s.pending_tool_input = Some(serde_json::json!({"file_path": "/tmp/project/file.rs"}));
+        check(&s, Event::Permission, "Edit: /tmp/project/file.rs");
+        s.pending_tool_name = Some("AskUserQuestion".into());
+        s.pending_tool_input = Some(serde_json::json!({
+            "questions": [{"question": "Which branch should I use?"}]
+        }));
+        check(&s, Event::Question, "Which branch should I use?");
+        assert_eq!(serde_json::to_value(&payload).unwrap(), original_payload);
+
+        let fallback = (payload.title.clone(), payload.body.clone());
+        assert_eq!(
+            core_content(&payload, Event::Reply, Detail::Detailed, None),
+            fallback
+        );
+        // Same raw id under a different provider must not supply details.
+        payload.session_key = "claudeCode:child-thread".into();
+        let snapshot = serde_json::json!([s]);
+        assert_eq!(
+            core_content(&payload, Event::Reply, Detail::Detailed, Some(&snapshot)),
+            fallback
+        );
+        let malformed = serde_json::json!([{"sessionKey": payload.session_key}]);
+        assert_eq!(
+            core_content(&payload, Event::Reply, Detail::Detailed, Some(&malformed)),
+            fallback
+        );
     }
     #[test]
     fn partial_settings_keep_defaults() {

@@ -1,0 +1,30 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "popover",
+  "description": "Read-only c9p popover; native open actions only. Rust also checks each bridge method.",
+  "windows": [
+    "popover"
+  ],
+  "permissions": [
+    "core:default",
+    "notification:allow-is-permission-granted",
+    "notification:allow-request-permission",
+    "allow-c9p-request",
+    "allow-c9p-subscribe",
+    "allow-c9p-unsubscribe",
+    "allow-get-sessions",
+    "allow-get-detection-diagnostics",
+    "allow-get-subscription-usage",
+    "allow-get-conversation",
+    "allow-get-away-activity",
+    "allow-get-session-history",
+    "allow-get-cost-data",
+    "allow-get-memory-files",
+    "allow-get-subagents",
+    "allow-get-subagent-transcript",
+    "allow-get-session-tasks",
+    "allow-get-build-channel",
+    "allow-show-main-window",
+    "allow-open-session"
+  ]
+}

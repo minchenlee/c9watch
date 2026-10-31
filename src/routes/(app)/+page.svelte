@@ -135,7 +135,7 @@
 		let timer: ReturnType<typeof setTimeout> | null = null;
 
 		(async () => {
-			const { getCurrentWindow } = await import('@tauri-apps/api/window');
+			const { getCurrentWindow } = await import('$lib/data/platform');
 			const win = getCurrentWindow();
 
 			// Check once on mount
@@ -152,7 +152,7 @@
 
 		// Listen for detection diagnostics (FDA banner)
 		if (isTauri()) {
-			import('@tauri-apps/api/event').then(({ listen }) => {
+			import('$lib/data/platform').then(({ listen }) => {
 				listen<DetectionDiagnostics>('diagnostic-update', (event) => {
 					fdaLikelyNeeded = event.payload.fdaLikelyNeeded;
 					if (!get(isDemoMode)) {
