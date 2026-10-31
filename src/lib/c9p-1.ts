@@ -2,7 +2,7 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 9;
+export const C9P_API_MINOR = 10;
 
 /** `agent.attention` data: an agent needs the user. */
 export interface C9pAgentAttentionEvent {
@@ -17,15 +17,15 @@ export interface C9pAgentAttentionEvent {
 }
 
 /**
- * `agent.create` params. C1a creates only free agents (A:794): no brief,
+ * `agent.create` params. Only free agents are supported: no brief,
  * no worktree, the given cwd.
  */
 export interface C9pAgentCreateParams {
   /** An absolute directory. The engine uses its realpath. */
   cwd: string;
-  /** The adapter kind. Only `claude` in C1a. */
+  /** The adapter kind. Only `claude` is supported. */
   kind?: string;
-  /** `free`. `managed` comes in C1b and answers `unsupported_in_c1a`. */
+  /** `free`. `managed` is not supported and answers `unsupported`. */
   mode: 'free' | 'managed' | string;
   /**
    * A display name: letters, digits, `.`, `_` and `-`, unique among
@@ -74,7 +74,7 @@ export interface C9pAgentRetireParams {
 }
 
 /**
- * `agent.retire` result: the tombstone row (A:828). Retiring a retired or
+ * `agent.retire` result: the tombstone row. Retiring a retired or
  * failed agent changes nothing and returns its row.
  */
 export interface C9pAgentRetireResult {
@@ -82,7 +82,7 @@ export interface C9pAgentRetireResult {
 }
 
 /**
- * One row of the `agents` table (A:340), as `snapshot.get`,
+ * One row of the `agents` table, as `snapshot.get`,
  * `session.list` and `agent.list` send it.
  */
 export interface C9pAgentRow {
@@ -443,10 +443,10 @@ export interface C9pErrorBody {
  * Typed error codes. New codes are additive; a client that does not know a
  * code still has `msg`, `retryable` and `hint`.
  */
-export type C9pErrorCode = 'hop_limit' | 'not_cancellable' | string | 'upgrade_required' | 'hello_required' | 'hello_timeout' | 'frame_too_large' | 'bad_request' | 'unknown_method' | 'peer_uid_mismatch' | 'cursor_expired' | 'rate_limited' | 'peer_not_authorized' | 'no_task' | 'unsupported_in_c1a' | 'agent_bin_missing' | 'agent_bin_mismatch' | 'not_allowed' | 'confirmation_required' | 'cwd_collision' | 'spawn_failed' | 'unknown_agent' | 'draining' | 'unknown_address' | 'not_controlled' | 'not_owner' | 'duplicate' | 'unknown_session' | 'action_failed' | 'busy' | 'limit_exceeded' | 'internal';
+export type C9pErrorCode = 'hop_limit' | 'not_cancellable' | string | 'upgrade_required' | 'hello_required' | 'hello_timeout' | 'frame_too_large' | 'bad_request' | 'unknown_method' | 'peer_uid_mismatch' | 'cursor_expired' | 'rate_limited' | 'peer_not_authorized' | 'no_task' | 'unsupported' | 'agent_bin_missing' | 'agent_bin_mismatch' | 'not_allowed' | 'confirmation_required' | 'cwd_collision' | 'spawn_failed' | 'unknown_agent' | 'draining' | 'unknown_address' | 'not_controlled' | 'not_owner' | 'duplicate' | 'unknown_session' | 'action_failed' | 'busy' | 'limit_exceeded' | 'internal';
 
 /**
- * One event on the wire (A:203). `sub` is the `id` of the subscribe
+ * One event on the wire. `sub` is the `id` of the subscribe
  * request, so a connection can carry several subscriptions.
  */
 export interface C9pEventFrame {
@@ -469,7 +469,7 @@ export type C9pEventType = 'event' | string;
 
 /**
  * `agent.handoff` params (`c9watch-agent handoff --note -`). The wire
- * format is fixed now; the engine answers `unsupported_in_c1a` until C1b.
+ * format is reserved; the engine currently answers `unsupported`.
  */
 export interface C9pHandoffParams {
   /** `C9_AGENT_ID` of the sender. */
@@ -480,14 +480,14 @@ export interface C9pHandoffParams {
   seq: string;
 }
 
-/** `agent.handoff` result (C1b). */
+/** `agent.handoff` result (reserved). */
 export interface C9pHandoffResult {
   accepted: boolean;
 }
 
 /**
  * `hello` params. `client` is the caller's own claim. The engine only logs
- * it as unverified; it never decides the principal (N1).
+ * it as unverified; it never decides the principal.
  */
 export interface C9pHelloParams {
   apiMajor?: number | null;
@@ -605,7 +605,7 @@ export interface C9pHistorySearchResult {
 
 /**
  * `hook.*` params: one Claude Code hook event, sent by `c9watch-agent
- * hook <event>`. The engine alone writes the log (A:1167).
+ * hook <event>`. The engine alone writes the log.
  */
 export interface C9pHookParams {
   /** `C9_AGENT_ID` of the sender. It must be the agent the engine stamped. */
@@ -617,7 +617,7 @@ export interface C9pHookParams {
   input?: unknown;
   /**
    * The adapter kind of the hook (`claude`). The engine compares it with
-   * the agent row (A:1056).
+   * the agent row.
    */
   kind: string;
   /** The sender's clock in ns, as a string. With `agentId` it dedupes. */
@@ -757,7 +757,7 @@ export interface C9pMsgIdParams {
 }
 
 /**
- * What a message asks of its reader (A:418). A caller sends `request` or
+ * What a message asks of its reader. A caller sends `request` or
  * `info`; `result` and `system` are written by the engine.
  */
 export type C9pMsgKind = 'request' | 'info' | 'result' | 'system' | string;
@@ -1321,7 +1321,7 @@ export interface C9pSubagentTranscriptParams {
   subagentId: string;
 }
 
-/** `events.subscribe` params (A:218). Empty filters match everything. */
+/** `events.subscribe` params. Empty filters match everything. */
 export interface C9pSubscribeParams {
   /**
    * The last cursor the client has seen. Without it, the stream starts at
@@ -1364,7 +1364,7 @@ export interface C9pTaskDoneParams {
 }
 
 /**
- * `task.done` result. In C1a every agent is free, so the call fails with
+ * `task.done` result. Free agents have no task, so the call fails with
  * `no_task` instead.
  */
 export interface C9pTaskDoneResult {

@@ -174,7 +174,7 @@ fn an_agent_running_the_copy_is_authorized() {
     assert!(out.contains("no_task"), "{}", out);
     let (out, rc) = as_agent(&engine, &format!("echo n | {} handoff --note -", bin), true);
     assert_eq!(rc, 1, "{}", out);
-    assert!(out.contains("unsupported_in_c1a"), "{}", out);
+    assert!(out.contains("unsupported"), "{}", out);
     // A hook promises empty stdout and exit 0 even when a loaded runner
     // exhausts its 500ms budget. A PTY merges stdout and stderr, so capture
     // diagnostics separately rather than treating a timeout as stdout.

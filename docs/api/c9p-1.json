@@ -38,7 +38,7 @@
       "type": "object"
     },
     "AgentCreateParams": {
-      "description": "`agent.create` params. C1a creates only free agents (A:794): no brief,\nno worktree, the given cwd.",
+      "description": "`agent.create` params. Only free agents are supported: no brief,\nno worktree, the given cwd.",
       "properties": {
         "cwd": {
           "description": "An absolute directory. The engine uses its realpath.",
@@ -46,11 +46,11 @@
         },
         "kind": {
           "default": "claude",
-          "description": "The adapter kind. Only `claude` in C1a.",
+          "description": "The adapter kind. Only `claude` is supported.",
           "type": "string"
         },
         "mode": {
-          "description": "`free`. `managed` comes in C1b and answers `unsupported_in_c1a`.",
+          "description": "`free`. `managed` is not supported and answers `unsupported`.",
           "enum": [
             "free",
             "managed"
@@ -183,7 +183,7 @@
       "type": "object"
     },
     "AgentRetireResult": {
-      "description": "`agent.retire` result: the tombstone row (A:828). Retiring a retired or\nfailed agent changes nothing and returns its row.",
+      "description": "`agent.retire` result: the tombstone row. Retiring a retired or\nfailed agent changes nothing and returns its row.",
       "properties": {
         "agent": {
           "$ref": "#/$defs/AgentRow",
@@ -196,7 +196,7 @@
       "type": "object"
     },
     "AgentRow": {
-      "description": "One row of the `agents` table (A:340), as `snapshot.get`,\n`session.list` and `agent.list` send it.",
+      "description": "One row of the `agents` table, as `snapshot.get`,\n`session.list` and `agent.list` send it.",
       "properties": {
         "control": {
           "description": "`pty` or `none`.",
@@ -1599,8 +1599,8 @@
           "type": "string"
         },
         {
-          "const": "unsupported_in_c1a",
-          "description": "The method is part of the wire format but does nothing before C1b\n(`agent.handoff`).",
+          "const": "unsupported",
+          "description": "The operation is part of the wire format but is not supported yet.",
           "type": "string"
         },
         {
@@ -1615,7 +1615,7 @@
         },
         {
           "const": "not_allowed",
-          "description": "The principal may not call this method (`agent.create` and\n`agent.retire` take only a local client in C1a).",
+          "description": "The principal may not call this method (`agent.create` and\n`agent.retire` take only a local client).",
           "type": "string"
         },
         {
@@ -1691,7 +1691,7 @@
       ]
     },
     "EventFrame": {
-      "description": "One event on the wire (A:203). `sub` is the `id` of the subscribe\nrequest, so a connection can carry several subscriptions.",
+      "description": "One event on the wire. `sub` is the `id` of the subscribe\nrequest, so a connection can carry several subscriptions.",
       "properties": {
         "cursor": {
           "type": "string",
@@ -1756,7 +1756,7 @@
       "x-open-enum": true
     },
     "HandoffParams": {
-      "description": "`agent.handoff` params (`c9watch-agent handoff --note -`). The wire\nformat is fixed now; the engine answers `unsupported_in_c1a` until C1b.",
+      "description": "`agent.handoff` params (`c9watch-agent handoff --note -`). The wire\nformat is reserved; the engine currently answers `unsupported`.",
       "properties": {
         "agentId": {
           "description": "`C9_AGENT_ID` of the sender.",
@@ -1779,7 +1779,7 @@
       "type": "object"
     },
     "HandoffResult": {
-      "description": "`agent.handoff` result (C1b).",
+      "description": "`agent.handoff` result (reserved).",
       "properties": {
         "accepted": {
           "type": "boolean",
@@ -1792,7 +1792,7 @@
       "type": "object"
     },
     "HelloParams": {
-      "description": "`hello` params. `client` is the caller's own claim. The engine only logs\nit as unverified; it never decides the principal (N1).",
+      "description": "`hello` params. `client` is the caller's own claim. The engine only logs\nit as unverified; it never decides the principal.",
       "properties": {
         "apiMajor": {
           "format": "uint32",
@@ -2170,7 +2170,7 @@
       "type": "object"
     },
     "HookParams": {
-      "description": "`hook.*` params: one Claude Code hook event, sent by `c9watch-agent\nhook <event>`. The engine alone writes the log (A:1167).",
+      "description": "`hook.*` params: one Claude Code hook event, sent by `c9watch-agent\nhook <event>`. The engine alone writes the log.",
       "properties": {
         "agentId": {
           "description": "`C9_AGENT_ID` of the sender. It must be the agent the engine stamped.",
@@ -2181,7 +2181,7 @@
           "description": "The hook's stdin JSON as the vendor sent it; `null` when it was not\nJSON or too large."
         },
         "kind": {
-          "description": "The adapter kind of the hook (`claude`). The engine compares it with\nthe agent row (A:1056).",
+          "description": "The adapter kind of the hook (`claude`). The engine compares it with\nthe agent row.",
           "type": "string"
         },
         "seq": {
@@ -2590,7 +2590,7 @@
       "type": "object"
     },
     "MsgKind": {
-      "description": "What a message asks of its reader (A:418). A caller sends `request` or\n`info`; `result` and `system` are written by the engine.",
+      "description": "What a message asks of its reader. A caller sends `request` or\n`info`; `result` and `system` are written by the engine.",
       "enum": [
         "request",
         "info",
@@ -4361,7 +4361,7 @@
       "type": "object"
     },
     "SubscribeParams": {
-      "description": "`events.subscribe` params (A:218). Empty filters match everything.",
+      "description": "`events.subscribe` params. Empty filters match everything.",
       "properties": {
         "since": {
           "description": "The last cursor the client has seen. Without it, the stream starts at\nthe current head.",
@@ -4474,7 +4474,7 @@
       "type": "object"
     },
     "TaskDoneResult": {
-      "description": "`task.done` result. In C1a every agent is free, so the call fails with\n`no_task` instead.",
+      "description": "`task.done` result. Free agents have no task, so the call fails with\n`no_task` instead.",
       "properties": {
         "taskId": {
           "type": "string",
@@ -4653,7 +4653,7 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
-  "apiMinor": 9,
+  "apiMinor": 10,
   "description": "Preview: the c9watch engine protocol. One JSON object per line over the engine socket. A preview minor may break a method; check breakingSince.",
   "frames": {
     "event": {
@@ -4701,7 +4701,6 @@
           "agent_exe"
         ],
         "principals": [
-          "local-unverified",
           "agent"
         ],
         "resource": "hook",
@@ -5058,7 +5057,6 @@
           "agent_exe"
         ],
         "principals": [
-          "local-unverified",
           "agent"
         ],
         "resource": "hook",
@@ -5079,7 +5077,6 @@
           "agent_exe"
         ],
         "principals": [
-          "local-unverified",
           "agent"
         ],
         "resource": "hook",
@@ -5100,7 +5097,6 @@
           "agent_exe"
         ],
         "principals": [
-          "local-unverified",
           "agent"
         ],
         "resource": "hook",
@@ -5121,7 +5117,6 @@
           "agent_exe"
         ],
         "principals": [
-          "local-unverified",
           "agent"
         ],
         "resource": "hook",
@@ -5142,7 +5137,6 @@
           "agent_exe"
         ],
         "principals": [
-          "local-unverified",
           "agent"
         ],
         "resource": "hook",
@@ -5163,7 +5157,6 @@
           "agent_exe"
         ],
         "principals": [
-          "local-unverified",
           "agent"
         ],
         "resource": "hook",
@@ -5184,7 +5177,6 @@
           "agent_exe"
         ],
         "principals": [
-          "local-unverified",
           "agent"
         ],
         "resource": "hook",
@@ -5569,7 +5561,6 @@
           "agent_exe"
         ],
         "principals": [
-          "local-unverified",
           "agent"
         ],
         "resource": "hook",

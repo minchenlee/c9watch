@@ -2454,7 +2454,7 @@ mod tests {
             assert_eq!(e.data.as_ref().unwrap()["control"], "none");
             assert_eq!(e.hint, None, "the code's hint: take over first");
         }
-        assert_eq!(ErrorCode::NotControlled.hint(), "take over first (D10)");
+        assert_eq!(ErrorCode::NotControlled.hint(), "take over first");
     }
 
     #[test]

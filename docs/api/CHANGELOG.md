@@ -2,6 +2,13 @@
 
 # c9p/1 changelog
 
+## 1.10 — public error cleanup
+
+- **breaking (preview):** rename the unsupported-operation error to `unsupported` in the engine, CLI and generated contracts. `agent.create` is now revision 2; clients built against minors 3–9 see it in `hello.breakingSince`. Internal `agent.handoff` also advances to revision 2.
+- Correct the `unknown_method` hint to point to `hello.result.methods`, remove the internal reference from the `not_controlled` hint, and remove design codes from schema descriptions. A contract test prevents those codes from returning.
+- Make hook-class discovery agent-only (`hook.*`, `task.done`, `agent.handoff`). Local callers still receive `peer_not_authorized` and exactly one refusal audit row.
+- Skip the annotation sweep's writer transaction when no TTL, target grace, empty source or stale rate budget needs cleanup. Expiry still commits before observation, even if observation fails.
+
 ## 1.9 — L1 annotations
 
 - Add preview `annotation.set`, `annotation.delete`, `annotation.patch` and `annotation.list`, capability `annotations`, and typed `annotation.changed`/`annotation.removed` topics.

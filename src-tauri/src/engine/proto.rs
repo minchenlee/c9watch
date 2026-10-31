@@ -142,6 +142,21 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_error_names_and_hints_are_public() {
+        let v: serde_json::Value = serde_json::from_slice(&encode(&Response::err(
+            Some("1".into()),
+            ApiError::new(ErrorCode::Unsupported, "not supported"),
+        )))
+        .unwrap();
+        assert_eq!(v["error"]["code"], "unsupported");
+        assert_eq!(
+            ErrorCode::UnknownMethod.hint(),
+            "see `hello.result.methods`"
+        );
+        assert_eq!(ErrorCode::NotControlled.hint(), "take over first");
+    }
+
+    #[test]
     fn error_code_names_match_serde() {
         for code in [
             ErrorCode::UpgradeRequired,
@@ -155,7 +170,7 @@ mod tests {
             ErrorCode::RateLimited,
             ErrorCode::PeerNotAuthorized,
             ErrorCode::NoTask,
-            ErrorCode::UnsupportedInC1a,
+            ErrorCode::Unsupported,
             ErrorCode::AgentBinMissing,
             ErrorCode::AgentBinMismatch,
             ErrorCode::NotAllowed,
