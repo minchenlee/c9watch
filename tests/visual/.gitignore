@@ -1,0 +1,7 @@
+# Built init script, test results and the HTML report.
+.cache/
+
+# Baselines come only from the pinned CI image (job `visual-classic`).
+# Never commit a baseline made on a local machine. The owner-approved
+# baseline PR deletes this line and adds the CI-made PNGs.
+classic/__screenshots__/
