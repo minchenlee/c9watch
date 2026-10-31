@@ -182,3 +182,15 @@ Wait for a worker to finish its turn, for up to 10 minutes:
 ```bash
 c9watch wait codex:01a13add --until done --timeout 600 || echo "still working"
 ```
+
+### Engine mail state events (C1b-M2)
+
+`msg.state` includes optional `via` (`socket` or `pty`) and `detail`.
+Queued events additionally carry `sender`, `recipient`, `threadId`,
+`replyTo`, `kind` and a 200-character `preview`. Existing `from`/`to`
+strings remain compatible. `held: …` is a detail of `delivering`, not a
+separate state. `rejected`, `expired` and `cancelled` are terminal failures
+for `send --wait`. Only `uncertain` may change to `delivered`, with
+`late_evidence: peer_jsonl` or `late_evidence: prompt_hook`. Queries do
+not emit `read`. `mail_held`, `mail_unreachable` and `mail_paused` appear
+as agent attention reasons.

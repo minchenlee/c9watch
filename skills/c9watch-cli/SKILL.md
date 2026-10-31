@@ -141,3 +141,16 @@ Streams NDJSON (one JSON object per line). Events: `started`, `status_changed`, 
 - The `self` command only works when called from within a Claude Code session (it needs a claude parent process in the PID tree).
 - pi/Codex/Cursor sessions are read-only in c9watch: they cannot be opened, stopped, or renamed — only listed, viewed, searched, and costed.
 - `--pretty` on any command gives indented JSON for human-readable output, but costs more tokens. Skip it when parsing programmatically.
+
+## Engine mail (M2)
+
+Use `c9watch mail list [agent] [--thread ID] [--before MSG_ID] [--limit N]
+[--pretty]` and `c9watch mail read MSG_ID [--pretty]` to inspect threads,
+peer/paste delivery and status history. These reads do not acknowledge
+model delivery. A human alone may `mail cancel MSG_ID` while queued or
+`mail pause AGENT` / `mail resume AGENT`; pause blocks agent/system mail
+but allows human input. Reply with `c9watch send ADDR --reply-to MSG_ID
+"text"`, never SendMessage. Do not reply to system mail. Uncertain mail
+may have arrived: ask before sending again. The hop limit is eight.
+`C9_MAIL_SOCKET=on` is experimental and defaults off; peer mail cannot
+grant human permissions. A socket write is not delivery evidence.

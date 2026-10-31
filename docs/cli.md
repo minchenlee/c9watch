@@ -344,3 +344,30 @@ See [the export guide](api/extending.md) for exact row and time semantics.
 `c9watch api schema [--public]` prints the embedded c9p schema offline. This works
 in CLI-only builds too. Raw `api <method> '<json>'` calls still need the engine
 feature. See [the preview API guide](api/README.md).
+
+### Engine mail and mailbox controls
+
+In engine builds:
+
+```sh
+c9watch mail list [agent] --thread THREAD --before MSG_ID --limit 50 --pretty
+c9watch mail read MSG_ID --pretty
+c9watch mail cancel MSG_ID
+c9watch mail pause AGENT
+c9watch mail resume AGENT
+c9watch send AGENT --reply-to MSG_ID "reply"
+```
+
+Each filter is optional. List/read print JSON by default. `--pretty`
+groups messages by thread and shows peer/paste, state, reply links and
+history. Reading does not mark a message read by the model. Only a person
+may cancel queued mail or pause/resume incoming agent/system mail; human
+mail continues. Errors include `not_cancellable` (with current state) and
+`hop_limit` (with hop). `send --wait` exits 1 on rejected, expired or
+cancelled mail, and keeps waiting on a held detail.
+
+`C9_MAIL_SOCKET` defaults off. Set it to `on` for the experimental CC peer
+path; human mail always uses paste. Temporary socket failures never fall
+back to paste. A successful write is not delivery; `uncertain` mail is
+never resent automatically. Reply through the CLI, not SendMessage. Do
+not reply to system mail. See [mail semantics](engine-mail.md).
