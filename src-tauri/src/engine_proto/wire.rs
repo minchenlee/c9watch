@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
 /// Protocol minor version. Raised for additive changes.
-pub const API_MINOR: u32 = 3;
+pub const API_MINOR: u32 = 4;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -84,6 +84,10 @@ pub struct ErrorBody {
     pub msg: String,
     pub retryable: bool,
     pub hint: String,
+    /// Facts about this error for the caller to act on, such as the
+    /// `nearest` name for `unknown_address`. Absent for most errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 /// Typed error codes. New codes are additive; a client that does not know a
@@ -141,6 +145,21 @@ pub enum ErrorCode {
     /// The engine is draining after a SIGTERM: no spawn and no injection
     /// until the next engine is up. Retry against the new engine.
     Draining,
+    /// `msg.send`: no agent answers to `to`, its machine is not this one,
+    /// or a name matches more than one agent. `data` has `nearest` or
+    /// `candidates`.
+    UnknownAddress,
+    /// `msg.send`: the engine does not drive the target's terminal (an
+    /// observed session), or the target is retiring or gone. `data` has
+    /// `state` and `control`.
+    NotControlled,
+    /// `msg.send`: a managed worker takes mail only from its parent and
+    /// the human, and sends only to its parent. `data` may have `parent`.
+    NotOwner,
+    /// `msg.send`: the `idem` key was used for another message, or the same
+    /// body went to the same agent within 10 minutes. `data` has `msgId`
+    /// and `at`.
+    Duplicate,
     /// An engine-side failure.
     Internal,
 }
@@ -167,6 +186,10 @@ impl ErrorCode {
             ErrorCode::SpawnFailed => "spawn_failed",
             ErrorCode::UnknownAgent => "unknown_agent",
             ErrorCode::Draining => "draining",
+            ErrorCode::UnknownAddress => "unknown_address",
+            ErrorCode::NotControlled => "not_controlled",
+            ErrorCode::NotOwner => "not_owner",
+            ErrorCode::Duplicate => "duplicate",
             ErrorCode::Internal => "internal",
         }
     }
@@ -227,6 +250,10 @@ impl ErrorCode {
             ErrorCode::Draining => {
                 "the engine is stopping; reconnect once the next engine is up and send it again"
             }
+            ErrorCode::UnknownAddress => "see `agent.list` for the agent ids and names",
+            ErrorCode::NotControlled => "take over first (D10)",
+            ErrorCode::NotOwner => "managed workers take mail only from their parent and the human",
+            ErrorCode::Duplicate => "pass a new idem to send it again",
             ErrorCode::Internal => "retry; if it persists, check the engine log",
         }
     }
@@ -243,6 +270,11 @@ impl std::fmt::Display for ErrorCode {
 pub struct ApiError {
     pub code: ErrorCode,
     pub msg: String,
+    /// Goes on the wire as `error.data`.
+    pub data: Option<serde_json::Value>,
+    /// Replaces the code's fixed hint when the next step depends on the
+    /// case, such as `did you mean <nearest>?`.
+    pub hint: Option<String>,
 }
 
 impl ApiError {
@@ -250,7 +282,19 @@ impl ApiError {
         Self {
             code,
             msg: msg.into(),
+            data: None,
+            hint: None,
         }
+    }
+
+    pub fn with_data(mut self, data: serde_json::Value) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
     }
 }
 
@@ -260,7 +304,8 @@ impl From<ApiError> for ErrorBody {
             code: e.code,
             msg: e.msg,
             retryable: e.code.retryable(),
-            hint: e.code.hint().to_string(),
+            hint: e.hint.unwrap_or_else(|| e.code.hint().to_string()),
+            data: e.data,
         }
     }
 }
@@ -459,6 +504,100 @@ pub struct AgentRetireParams {
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AgentRetireResult {
     pub agent: AgentRow,
+}
+
+/// What a message asks of its reader (A:418). A caller sends `request` or
+/// `info`; `result` and `system` are written by the engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MsgKind {
+    Request,
+    #[default]
+    Info,
+    Result,
+    System,
+}
+
+impl MsgKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MsgKind::Request => "request",
+            MsgKind::Info => "info",
+            MsgKind::Result => "result",
+            MsgKind::System => "system",
+        }
+    }
+}
+
+/// `msg.send` params. The envelope's `idem` makes a resend safe: the same
+/// sender, key and request get the first message back.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct MsgSendParams {
+    /// An agent id (`agt_<ulid>`), a name, or `<machine>/<id>` with this
+    /// machine's id.
+    pub to: String,
+    /// UTF-8 text. No control characters other than `\n` and `\t`.
+    pub body: String,
+    /// `request` or `info`.
+    #[serde(default)]
+    pub kind: MsgKind,
+    /// The id of the message this one answers. Stored, not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+}
+
+/// The agent a message went to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct MsgAddress {
+    pub id: String,
+    pub name: Option<String>,
+    /// `<machine>/<id>`.
+    pub addr: String,
+}
+
+/// `msg.send` result. The response's `seq` is the same cursor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct MsgSendResult {
+    /// `msg_<ulid>`.
+    pub msg_id: String,
+    /// The message's state now: `queued` for a new message.
+    pub state: String,
+    pub to: MsgAddress,
+    /// Cursor of the message's `msg.state` `queued` event. For a replay it
+    /// is the first send's cursor, which may be past event retention.
+    pub cursor: String,
+    /// The same sender sent the same request with this `idem` before; no
+    /// new message was written.
+    pub replayed: bool,
+}
+
+/// `data` of a `msg.state` event: one per state change of a message. The
+/// event's subject is the target's `<machine>/<id>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct MsgStateEvent {
+    pub msg_id: String,
+    /// The sender's principal: `agent:<id>` or `local-unverified`.
+    pub from: String,
+    /// The target's agent id.
+    pub to: String,
+    /// `queued`, `delivering`, `delivered`, `failed` or `uncertain`.
+    pub state: String,
+    /// Unix ms.
+    pub at: i64,
+    /// Delivery attempts so far.
+    pub attempts: i64,
+    /// Why: for `delivered`, `prompt_hook` or `turn_open`; for `failed` and
+    /// `uncertain`, what went wrong.
+    pub detail: Option<String>,
 }
 
 /// `events.subscribe` params (A:218). Empty filters match everything.

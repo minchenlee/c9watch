@@ -1,5 +1,5 @@
 -- C1a store, version 1 (A:340-455, plan C1a-11).
--- Tasks, plans, mail and approvals come with C1b.
+-- Tasks, plans and approvals come with C1b; mail is version 5.
 -- STRICT tables: a wrong type is an error, not a silent coercion.
 
 -- Engine-private key/value facts about this database file, such as its

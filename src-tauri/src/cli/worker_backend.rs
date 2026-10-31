@@ -71,7 +71,9 @@ fn parse_version_ge(ver: &str, min: (u32, u32, u32)) -> bool {
 /// Validate the initial prompt against the selected backend.
 ///
 /// - Bg backend: requires a non-empty prompt — returns it
-/// - Print backend: ignores the prompt (returns None)
+/// - Print backend: optional — returns a non-empty prompt, else None. It is
+///   the only prompt a print worker gets: `c9watch send` reaches engine
+///   agents only (C1b-M1).
 ///
 /// Returns Err with "INITIAL_PROMPT_REQUIRED" prefix when bg backend has no prompt.
 pub fn validate_initial_prompt(
@@ -87,7 +89,7 @@ pub fn validate_initial_prompt(
                     .to_string(),
             ),
         },
-        BackendKind::Print => Ok(None),
+        BackendKind::Print => Ok(initial_prompt.filter(|p| !p.trim().is_empty())),
     }
 }
 
@@ -156,10 +158,10 @@ mod backend_gating_tests {
     }
 
     #[test]
-    fn validate_initial_prompt_print_accepts_any_value() {
-        let result = validate_initial_prompt(BackendKind::Print, Some("ignored".to_string()));
-        assert!(result.is_ok());
-        // Print backend ignores the prompt — return None to signal that.
-        assert!(result.unwrap().is_none());
+    fn validate_initial_prompt_print_passes_a_real_prompt() {
+        let result = validate_initial_prompt(BackendKind::Print, Some("do the thing".to_string()));
+        assert_eq!(result.unwrap().as_deref(), Some("do the thing"));
+        let blank = validate_initial_prompt(BackendKind::Print, Some("  ".to_string()));
+        assert!(blank.unwrap().is_none());
     }
 }

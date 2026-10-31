@@ -72,7 +72,7 @@ pub fn target(env: &dyn Fn(&str) -> Option<OsString>) -> Result<Target, String> 
     match set(ENV_SOCK) {
         Some(sock) => Ok(Target::AgentSock(PathBuf::from(sock))),
         None => Err(format!(
-            "{}: {} is set but {} is not; inside an agent, wait --event connects \
+            "{}: {} is set but {} is not; inside an agent, c9watch connects \
              only through {} and never starts the engine",
             ENGINE_UNREACHABLE, ENV_AGENT_ID, ENV_SOCK, ENV_SOCK
         )),
@@ -81,7 +81,7 @@ pub fn target(env: &dyn Fn(&str) -> Option<OsString>) -> Result<Target, String> 
 
 /// Connect to `target`; with `auto_start`, an `AutoStart` target starts
 /// the engine first if none runs.
-fn connect(target: &Target, auto_start: bool) -> Result<EngineConn, String> {
+pub(crate) fn connect(target: &Target, auto_start: bool) -> Result<EngineConn, String> {
     let unreachable = |e: String| format!("{}: {}", ENGINE_UNREACHABLE, e);
     let sock = match target {
         Target::AgentSock(sock) => sock.clone(),

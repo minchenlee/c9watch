@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Request {
     Subscribe { short: String },
-    Reply { short: String, text: String },
     Kill { short: String },
     Nudge { short: String },
     Ping,
@@ -99,21 +98,6 @@ mod tests {
         assert_eq!(v["proto"], 1);
         assert_eq!(v["op"], "subscribe");
         assert_eq!(v["short"], "abc12345");
-    }
-
-    #[test]
-    fn reply_uses_text_field() {
-        let req = Request::Reply {
-            short: "abc12345".to_string(),
-            text: "go".to_string(),
-        };
-        let wire = req.to_wire();
-        let v: serde_json::Value = serde_json::from_str(&wire).unwrap();
-        assert_eq!(v["op"], "reply");
-        assert_eq!(v["text"], "go");
-        // Negative: must NOT serialize as "message" / "prompt" / "input"
-        // — those were rejected by the daemon during probing.
-        assert!(v.get("message").is_none());
     }
 
     #[test]

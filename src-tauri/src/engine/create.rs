@@ -44,8 +44,8 @@
 //!
 //! **Drain (C1a-27, `engine::drain`).** Once the engine's drain switch is
 //! on, `agent.create` answers `draining`, a create that has its row but no
-//! PTY spawns nothing (its op is left to boot reconcile), and a PTY write
-//! is not sent but audited. A drained supervisor kills its agent and then
+//! PTY spawns nothing (its op is left to boot reconcile), a PTY write
+//! is not sent but audited, and mail stays queued. A drained supervisor kills its agent and then
 //! writes `paused(drain)` or `interrupted` (`drain::settle`); a kill that
 //! fails writes nothing, so boot reconcile still finds and kills the
 //! process by its `agent_state` (reviews M1).
@@ -77,6 +77,17 @@
 //!   which fails it.
 //! - Events of the old generation are dropped as `stale_generation` and
 //!   audited (`engine::hooks`).
+//!
+//! **Mail (C1b-M1 §4).** The supervisor is the only writer of mail to its
+//! agent. One message at a time, it takes the oldest `queued` one when the
+//! agent is ready, its row is `ready`, its input box is free and the
+//! engine does not drain; it pastes the fenced message (bracketed paste)
+//! and sends CR only once the input box shows that paste. The prompt hook
+//! confirms delivery (`engine::hooks`); with no hook within
+//! `SUBMIT_CONFIRM`, an open turn and a box without the paste confirm it.
+//! Anything that may have reached the agent unconfirmed is `uncertain`,
+//! raises attention and is never sent again. Only a write that sent
+//! nothing (queue full, drain) puts the message back in the queue.
 
 use super::adapter::cc::profile::{
     resolve_cwd, settings_path_of, spawn_spec, write_settings, Profile,
@@ -85,15 +96,19 @@ use super::adapter::{self, Descriptor};
 use super::agent_bin::{AgentBin, Rehash};
 use super::agents::LiveTable;
 use super::cc_screen::{
-    vendor_refusal, CcScreen, ScreenEvent, ScreenFailure, ScreenState, READY_TIMEOUT,
+    box_has_paste, box_is_free, input_box, paste_payload, vendor_refusal, CcScreen, ScreenEvent,
+    ScreenFailure, ScreenState, KEY_CR, READY_TIMEOUT,
 };
 use super::db::audit::{self, AuditEntry};
+use super::db::outbox::NewEvent;
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
 use super::drain::{self, DrainSwitch, InjectionPath};
 use super::driver::{Driver, SpawnSpec};
 use super::generation;
 use super::generation::{begin_generation, emit_upsert, GenReason};
 use super::hooks;
+use super::machine::HeaderKey;
+use super::mail::{self, MsgState};
 use super::merge::{Activity, MergeTable};
 use super::ops::{self, CreatePayload, Phase};
 use super::principal::Principal;
@@ -122,6 +137,21 @@ const POLL: Duration = Duration::from_millis(100);
 
 /// How often a ready agent's supervisor checks for commands and an exit.
 const RUN_TICK: Duration = Duration::from_millis(250);
+
+/// Mail (C1b-M1 §4.5): how long a paste settles before the supervisor
+/// looks for it in the input box.
+const PASTE_SETTLE: Duration = Duration::from_millis(600);
+
+/// How long a paste may take to show in the input box, and a CR to get
+/// into a full write queue. After it the message is `uncertain`.
+const PASTE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long after the CR the prompt hook may take to confirm a message.
+const SUBMIT_CONFIRM: Duration = Duration::from_secs(10);
+
+/// Pastes of one message that found the PTY write queue full before it
+/// fails.
+const MAX_ATTEMPTS: i64 = 3;
 
 /// Longest failure detail kept, in chars.
 const MAX_DETAIL: usize = 2000;
@@ -165,6 +195,27 @@ pub struct SpawnerConfig {
 
 type Reply = oneshot::Sender<Result<AgentRow, ApiError>>;
 
+/// Why `Spawner::pty_write` did not send its bytes, or may have sent only
+/// part of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PtyWriteError {
+    /// The engine drains: nothing was sent (audited with path `pty`).
+    Blocked,
+    /// The driver's write failed. For `NativePty`, only `WouldBlock` (the
+    /// write queue is full) means that nothing was sent; after `TimedOut`
+    /// the bytes may still arrive, and any other error may leave a part
+    /// sent.
+    Io(io::ErrorKind, String),
+}
+
+/// Stop taking mail after an `uncertain` write on screen `text` (§4.6).
+fn hold(text: &str, mail_pending: &mut bool) -> Delivery {
+    *mail_pending = false;
+    Delivery::Held {
+        seen: text.to_string(),
+    }
+}
+
 enum Cmd {
     /// Kill the agent and make its row a tombstone.
     Retire { principal: String, reply: Reply },
@@ -172,6 +223,32 @@ enum Cmd {
     Shutdown,
     /// The engine drains: kill the agent, then `drain::settle` its row.
     Drain,
+    /// New mail for the agent (C1b-M1 §4.4). It carries nothing: the
+    /// supervisor reads its queue from the store.
+    Mail,
+}
+
+/// Where the supervisor is with the one message it delivers (§4.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Delivery {
+    Idle,
+    /// The paste went out at `at`; the CR waits for the input box to
+    /// show it.
+    Pasted {
+        id: String,
+        at: Instant,
+    },
+    /// The CR went out at `at`; the prompt hook should confirm it.
+    Submitted {
+        id: String,
+        at: Instant,
+    },
+    /// A paste or CR write went `uncertain` on screen `seen`: the agent
+    /// may not read its terminal, and its bytes may still arrive. No mail
+    /// goes until the screen changes, or a nudge comes, with a free box.
+    Held {
+        seen: String,
+    },
 }
 
 struct Handle {
@@ -260,6 +337,8 @@ pub struct Spawner {
     stopping: AtomicBool,
     /// The engine's drain switch (C1a-27).
     drain: Arc<DrainSwitch>,
+    /// The mail header key (C1b-M1-7). `None` only in tests.
+    header_key: Option<HeaderKey>,
 }
 
 impl Spawner {
@@ -282,7 +361,20 @@ impl Spawner {
             live: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
             drain: Arc::new(DrainSwitch::new()),
+            header_key: None,
         }
+    }
+
+    /// Stamp mail with tokens from the engine's header key.
+    pub fn with_header_key(mut self, key: HeaderKey) -> Spawner {
+        self.header_key = Some(key);
+        self
+    }
+
+    /// The mail header token of `agent_id`, as its SessionStart context
+    /// states it. `None` without a header key (tests).
+    pub fn header_token(&self, agent_id: &str) -> Option<String> {
+        self.header_key.as_ref().map(|k| k.token(agent_id))
     }
 
     /// Share the engine's drain switch.
@@ -317,6 +409,15 @@ impl Spawner {
     pub(super) fn drain_agent(&self, id: &str) -> bool {
         let cmds = lock(&self.live).get(id).map(|h| h.cmds.clone());
         cmds.is_some_and(|c| c.send(Cmd::Drain).is_ok())
+    }
+
+    /// Tell `id`'s supervisor that it has new mail. No-op when `id` has
+    /// none yet (still coming up): a supervisor reads its queue once it is
+    /// ready anyway.
+    pub fn nudge_mail(&self, id: &str) {
+        if let Some(c) = lock(&self.live).get(id).map(|h| h.cmds.clone()) {
+            let _ = c.send(Cmd::Mail);
+        }
     }
 
     pub fn with_launcher(mut self, launcher: Arc<dyn Launcher>) -> Spawner {
@@ -658,7 +759,8 @@ impl Spawner {
                 Ok(Cmd::Shutdown | Cmd::Drain) | Err(TryRecvError::Disconnected) => {
                     return self.cut(s, driver);
                 }
-                Err(TryRecvError::Empty) => {}
+                // `run` reads the queue once the agent is ready.
+                Ok(Cmd::Mail) | Err(TryRecvError::Empty) => {}
             }
             let out = driver.output(POLL);
             let snap = driver.screen();
@@ -672,7 +774,9 @@ impl Spawner {
             let mut ready = false;
             for ev in screen.step(&snap.title, &snap.text, snap.quiet, (self.clock)()) {
                 match ev {
-                    ScreenEvent::Write(keys) => self.pty_write(&s.id, driver.as_mut(), keys),
+                    ScreenEvent::Write(keys) => {
+                        let _ = self.pty_write(&s.id, driver.as_mut(), keys);
+                    }
                     ScreenEvent::Ready { first: true } => ready = true,
                     ScreenEvent::Failed(why) => {
                         let _ = driver.kill();
@@ -749,21 +853,29 @@ impl Spawner {
         // stays open with nothing said for SETTLE_MS (`stale_turn`).
         let mut screen_state: Option<ScreenState> = None;
         let mut reclaimed = false;
+        // A new or resumed supervisor reads its queue once (§4.4): mail
+        // may have come while it was down, or before it was live.
+        let mut mail_pending = true;
+        let mut delivery = Delivery::Idle;
         loop {
             match cmds.recv_timeout(RUN_TICK) {
                 Ok(Cmd::Retire { principal, reply }) => {
+                    self.stop_delivery(s, &delivery, "target retired", "target retired");
                     let _ = driver.kill();
                     let _ = reply.send(self.retire_row(&s.id, s.gen, &principal));
                     return;
                 }
                 Ok(Cmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
+                    self.stop_delivery(s, &delivery, "shutdown before submit", "shutdown");
                     let _ = driver.kill();
                     return;
                 }
                 Ok(Cmd::Drain) => {
+                    self.stop_delivery(s, &delivery, "drain before submit", "drain");
                     self.drain_now(s, driver);
                     return;
                 }
+                Ok(Cmd::Mail) => mail_pending = true,
                 Err(RecvTimeoutError::Timeout) => {}
             }
             // Nobody reads the bytes yet; the screen keeps up regardless.
@@ -773,8 +885,11 @@ impl Spawner {
             {
                 use super::live_test;
                 live_test::dump_screen(&self.config.home, &s.id, &snap.text, &mut last_screen);
-                if let Some(keys) = live_test::take_input(&self.config.home, &s.id) {
-                    self.pty_write(&s.id, driver.as_mut(), &keys);
+                // Not while mail is in the input box: both write the PTY.
+                if delivery == Delivery::Idle {
+                    if let Some(keys) = live_test::take_input(&self.config.home, &s.id) {
+                        let _ = self.pty_write(&s.id, driver.as_mut(), &keys);
+                    }
                 }
             }
             for ev in screen.step(&snap.title, &snap.text, snap.quiet, (self.clock)()) {
@@ -794,6 +909,14 @@ impl Spawner {
                 }
             }
             self.expire_hold(s);
+            delivery = self.deliver(
+                s,
+                driver.as_mut(),
+                &screen,
+                &snap.text,
+                delivery,
+                &mut mail_pending,
+            );
             if let Ok(Some(status)) = driver.try_wait() {
                 let text = driver.screen().text;
                 let _ = driver.kill();
@@ -809,6 +932,226 @@ impl Spawner {
                 return;
             }
         }
+    }
+
+    /// One step of mail delivery (§4.5) on this tick's screen; returns
+    /// the next step.
+    fn deliver(
+        &self,
+        s: &Start,
+        driver: &mut dyn Driver,
+        screen: &CcScreen,
+        text: &str,
+        delivery: Delivery,
+        mail_pending: &mut bool,
+    ) -> Delivery {
+        let now = (self.clock)();
+        match delivery {
+            Delivery::Idle => {
+                if !*mail_pending || !self.may_deliver(s, screen, text) {
+                    return Delivery::Idle;
+                }
+                let (machine, id) = (self.db.machine_id().to_string(), s.id.clone());
+                let taken =
+                    self.mail_write(s, move |tx| mail::take_next(tx, &machine, &id, now_ms()));
+                let Some(Some(m)) = taken else {
+                    // Empty, or the store failed: a nudge asks again.
+                    *mail_pending = false;
+                    return Delivery::Idle;
+                };
+                let fenced = mail::fence(
+                    &m.id,
+                    self.header_token(&s.id).as_deref(),
+                    &m.provenance,
+                    &m.body,
+                );
+                match self.pty_write(&s.id, driver, &paste_payload(&fenced)) {
+                    Ok(()) => Delivery::Pasted { id: m.id, at: now },
+                    Err(PtyWriteError::Blocked) => {
+                        self.requeue_mail(s, &m.id, "drain");
+                        Delivery::Idle
+                    }
+                    Err(PtyWriteError::Io(io::ErrorKind::WouldBlock, _))
+                        if m.attempts < MAX_ATTEMPTS =>
+                    {
+                        self.requeue_mail(s, &m.id, "pty write queue full");
+                        Delivery::Idle
+                    }
+                    Err(PtyWriteError::Io(io::ErrorKind::WouldBlock, _)) => {
+                        self.mark_mail(s, &m.id, MsgState::Failed, "pty write queue full");
+                        Delivery::Idle
+                    }
+                    Err(PtyWriteError::Io(io::ErrorKind::BrokenPipe, e)) => {
+                        self.mark_mail(s, &m.id, MsgState::Failed, &format!("pty gone: {}", e));
+                        Delivery::Idle
+                    }
+                    Err(PtyWriteError::Io(_, e)) => {
+                        self.mail_uncertain(s, &m.id, &format!("paste may be partial: {}", e));
+                        hold(text, mail_pending)
+                    }
+                }
+            }
+            Delivery::Pasted { id, at } => {
+                let waited = now.saturating_duration_since(at);
+                if waited >= PASTE_SETTLE && box_has_paste(&input_box(text), &id) {
+                    match self.pty_write(&s.id, driver, KEY_CR) {
+                        Ok(()) => return Delivery::Submitted { id, at: now },
+                        // Nothing was submitted; the box goes with the
+                        // agent, and a resume delivers it again.
+                        Err(PtyWriteError::Blocked) => {
+                            self.requeue_mail(s, &id, "drain before submit");
+                            return Delivery::Idle;
+                        }
+                        Err(PtyWriteError::Io(io::ErrorKind::WouldBlock, _))
+                            if waited < PASTE_TIMEOUT =>
+                        {
+                            return Delivery::Pasted { id, at };
+                        }
+                        Err(PtyWriteError::Io(_, e)) => {
+                            self.mail_uncertain(s, &id, &format!("cr write: {}", e));
+                            return hold(text, mail_pending);
+                        }
+                    }
+                }
+                if waited >= PASTE_TIMEOUT {
+                    self.mail_uncertain(s, &id, "paste not seen in input box");
+                    return hold(text, mail_pending);
+                }
+                Delivery::Pasted { id, at }
+            }
+            Delivery::Submitted { id, at } => {
+                let read = match self.db.reader() {
+                    Ok(c) => mail::state_of(&c, &id).map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+                // A failed read keeps the message tracked: try the next tick.
+                let state = match read {
+                    Ok(state) => state,
+                    Err(e) => {
+                        eprintln!("[engine] Failed to read mail {}: {}", id, e);
+                        return Delivery::Submitted { id, at };
+                    }
+                };
+                // The prompt hook confirmed it, or an end path took it.
+                if state != Some(MsgState::Delivering) {
+                    return Delivery::Idle;
+                }
+                let waited = now.saturating_duration_since(at);
+                if waited < SUBMIT_CONFIRM {
+                    return Delivery::Submitted { id, at };
+                }
+                let turn_open = self.merge.peek(&s.id, s.gen, |m| m.turn_open()) == Some(true);
+                // As for the CR: CC collapses the fence to `[Pasted text #`.
+                let in_box = box_has_paste(&input_box(text), &id);
+                if turn_open && !in_box {
+                    self.mark_mail(s, &id, MsgState::Delivered, "turn_open");
+                } else {
+                    let why = format!("no prompt hook after {} ms", waited.as_millis());
+                    self.mail_uncertain(s, &id, &why);
+                }
+                Delivery::Idle
+            }
+            Delivery::Held { seen } => {
+                if (text != seen || *mail_pending) && box_is_free(&input_box(text)) {
+                    // The queue may have mail the hold kept back.
+                    *mail_pending = true;
+                    return Delivery::Idle;
+                }
+                Delivery::Held { seen }
+            }
+        }
+    }
+
+    /// §4.3: the engine does not drain, the screen is ready, the merge
+    /// says `ready` or nothing yet (a new agent's first idle screen comes
+    /// before `run` and claims nothing), and the input box is free.
+    fn may_deliver(&self, s: &Start, screen: &CcScreen, text: &str) -> bool {
+        let merged = self
+            .merge
+            .peek(&s.id, s.gen, |m| m.row_state(now_ms()))
+            .flatten();
+        !self.drain.on()
+            && screen.ready_now()
+            && matches!(merged, None | Some("ready"))
+            && box_is_free(&input_box(text))
+    }
+
+    /// The supervisor stops with `delivery` in flight: a paste not yet
+    /// submitted goes back to the queue (`pasted`), a submitted one is
+    /// `uncertain` (`submitted`). Before the kill.
+    fn stop_delivery(&self, s: &Start, delivery: &Delivery, pasted: &str, submitted: &str) {
+        match delivery {
+            Delivery::Idle | Delivery::Held { .. } => {}
+            Delivery::Pasted { id, .. } => self.requeue_mail(s, id, pasted),
+            Delivery::Submitted { id, .. } => self.mail_uncertain(s, id, submitted),
+        }
+    }
+
+    /// Run a mail write; a failed one only logs, and the message stays
+    /// as the store has it.
+    fn mail_write<R, F>(&self, s: &Start, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Tx) -> rusqlite::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        match self.db.write_blocking(f) {
+            Ok((r, _)) => Some(r),
+            Err(e) => {
+                eprintln!("[engine] Failed to record mail to {}: {}", s.id, e);
+                None
+            }
+        }
+    }
+
+    fn requeue_mail(&self, s: &Start, msg_id: &str, why: &str) {
+        let (machine, id, why) = (
+            self.db.machine_id().to_string(),
+            msg_id.to_string(),
+            why.to_string(),
+        );
+        self.mail_write(s, move |tx| {
+            mail::requeue(tx, &machine, &id, &why, now_ms())
+        });
+    }
+
+    fn mark_mail(&self, s: &Start, msg_id: &str, state: MsgState, why: &str) {
+        let (machine, id, why) = (
+            self.db.machine_id().to_string(),
+            msg_id.to_string(),
+            why.to_string(),
+        );
+        self.mail_write(s, move |tx| {
+            mail::mark(tx, &machine, &id, state, Some(&why), now_ms())
+        });
+    }
+
+    /// `msg_id` may have reached the agent: `uncertain`, and the agent
+    /// needs attention (`mail_uncertain: <id>`), raised in the merge and
+    /// emitted as `agent.attention`.
+    fn mail_uncertain(&self, s: &Start, msg_id: &str, why: &str) {
+        let now = now_ms();
+        let reason = format!("mail_uncertain: {}", msg_id);
+        self.merge.peek(&s.id, s.gen, |m| m.attention(&reason, now));
+        let (machine, agent, gen, id, why) = (
+            self.db.machine_id().to_string(),
+            s.id.clone(),
+            s.gen,
+            msg_id.to_string(),
+            why.to_string(),
+        );
+        self.mail_write(s, move |tx| {
+            if mail::mark(tx, &machine, &id, MsgState::Uncertain, Some(&why), now)? {
+                tx.emit(&NewEvent {
+                    topic: "agent.attention".into(),
+                    subject: Some(format!("{}/{}", machine, agent)),
+                    origin: None,
+                    data: serde_json::json!({
+                        "id": agent, "generation": gen, "reason": reason, "msgId": id,
+                    }),
+                })?;
+            }
+            Ok(())
+        });
     }
 
     /// `Cmd::Drain`: SIGTERM first (`Driver::kill`), then `drain::settle`
@@ -900,11 +1243,18 @@ impl Spawner {
     }
 
     /// Send `keys` to the agent's terminal, unless the engine drains: then
-    /// nothing is sent, and the block is audited with path `pty`.
-    fn pty_write(&self, id: &str, driver: &mut dyn Driver, keys: &[u8]) {
+    /// nothing is sent, the block is audited with path `pty`, and the
+    /// result is `Blocked`.
+    fn pty_write(
+        &self,
+        id: &str,
+        driver: &mut dyn Driver,
+        keys: &[u8],
+    ) -> Result<(), PtyWriteError> {
         if !self.drain.on() {
-            let _ = driver.write(keys);
-            return;
+            return driver
+                .write(keys)
+                .map_err(|e| PtyWriteError::Io(e.kind(), e.to_string()));
         }
         let id2 = id.to_string();
         let wrote = self.db.write_blocking(move |tx| {
@@ -916,6 +1266,7 @@ impl Spawner {
                 id, e
             );
         }
+        Err(PtyWriteError::Blocked)
     }
 
     /// Whether the create op of `s` is still open: a retire closes it.
@@ -1403,6 +1754,8 @@ fn retire_tx(
     )?;
     if n > 0 {
         tx.execute("DELETE FROM agent_state WHERE agent_id = ?1", [id])?;
+        // Its mail goes with it (C1b-M1 §4.8).
+        mail::on_agent_end(tx, machine, id, "target retired", now)?;
         let open: Vec<String> = {
             let mut st = tx.prepare(
                 "SELECT id FROM ops WHERE kind IN (?1, ?2) AND done_at IS NULL \
@@ -1682,6 +2035,7 @@ mod tests {
     use crate::engine::driver::{ChildId, KillReport, Output, ScreenSnapshot};
     use crate::engine::home::sock_path;
     use crate::engine::peer;
+    use std::collections::VecDeque;
     use std::ffi::OsString;
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
@@ -1717,6 +2071,19 @@ mod tests {
         exit_now: Arc<AtomicBool>,
         /// Bytes sent to the terminal, in writes.
         writes: Arc<AtomicUsize>,
+        /// Every write's bytes, failed ones included, in order.
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        /// Set by a test: the results of the next writes, in order. `None`
+        /// is `Ok`; when empty, every write succeeds.
+        write_results: Arc<Mutex<VecDeque<Option<io::ErrorKind>>>>,
+        /// Set by a test: a whole screen text per agent id, in place of
+        /// the script's.
+        screens: Arc<Mutex<HashMap<String, String>>>,
+        /// What a submitted prompt (CR on a non-empty box) carried.
+        prompts: Arc<Mutex<Vec<String>>>,
+        /// `Script::Ready`'s input box. `None` until the first prompt shows
+        /// CC's placeholder; after it, an empty box.
+        input: FakeInput,
         /// Set by a test: `kill` does not return until it is cleared.
         stuck: Arc<AtomicBool>,
         /// The agent id, from the spawn's env.
@@ -1730,6 +2097,77 @@ mod tests {
         drain_on_screen: Option<Arc<DrainSwitch>>,
     }
 
+    /// The input box of a fake CC (`Script::Ready`), after the real CC
+    /// 2.1.314 layouts in `tests/fixtures/cc_screens/`.
+    #[derive(Default)]
+    struct FakeInput {
+        /// What the box holds now: typed text, a one-line paste, or the
+        /// `[Pasted text #n +k lines]` of a longer one.
+        text: String,
+        /// The full text behind `text`, as CC submits it.
+        full: String,
+        /// A prompt was submitted: the placeholder is gone.
+        submitted: bool,
+        /// Pastes so far, for the `#n` of the collapsed form.
+        pastes: usize,
+    }
+
+    impl FakeInput {
+        /// Apply one successful write. A bracketed paste fills the box
+        /// (collapsed when it has a newline), CR on a non-empty box
+        /// submits it and returns the prompt, other escape sequences are
+        /// keys that change nothing, and other bytes are typed.
+        fn apply(&mut self, bytes: &[u8]) -> Option<String> {
+            let text = String::from_utf8_lossy(bytes);
+            if let Some(body) = text
+                .strip_prefix("\x1b[200~")
+                .and_then(|t| t.strip_suffix("\x1b[201~"))
+            {
+                self.pastes += 1;
+                self.full.push_str(body);
+                self.text = if body.contains('\n') {
+                    format!(
+                        "[Pasted text #{} +{} lines]",
+                        self.pastes,
+                        body.matches('\n').count()
+                    )
+                } else {
+                    format!("{}{}", self.text, body)
+                };
+                None
+            } else if bytes == crate::engine::cc_screen::KEY_CR {
+                if self.full.is_empty() {
+                    return None;
+                }
+                self.text.clear();
+                self.submitted = true;
+                Some(std::mem::take(&mut self.full))
+            } else if bytes.first() == Some(&0x1b) {
+                None
+            } else {
+                self.text.push_str(&text);
+                self.full.push_str(&text);
+                None
+            }
+        }
+
+        /// The screen: chat, the box between two rules, the status line.
+        fn screen(&self) -> String {
+            let inside = if !self.text.is_empty() {
+                self.text.as_str()
+            } else if self.submitted {
+                ""
+            } else {
+                "Try \"fix lint errors\""
+            };
+            let rule = "\u{2500}".repeat(40);
+            format!(
+                "\u{23fa} earlier output\n{}\n\u{276f} {}\n{}\n  \u{23f5}\u{23f5} auto mode on",
+                rule, inside, rule
+            )
+        }
+    }
+
     impl Driver for FakeDriver {
         fn spawn(_: &SpawnSpec) -> io::Result<Self> {
             Err(io::Error::other("use FakeLauncher"))
@@ -1737,8 +2175,18 @@ mod tests {
         fn child(&self) -> ChildId {
             self.child
         }
-        fn write(&mut self, _: &[u8]) -> io::Result<()> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
             self.writes.fetch_add(1, Ordering::SeqCst);
+            lock(&self.sent).push(bytes.to_vec());
+            if let Some(kind) = lock(&self.write_results).pop_front().flatten() {
+                return Err(io::Error::new(kind, "fake write error"));
+            }
+            if let Some(prompt) = self.input.apply(bytes) {
+                lock(&self.prompts).push(prompt);
+                // CR submits: the title turns busy until the test ends
+                // the turn.
+                lock(&self.busy).insert(self.id.clone());
+            }
             Ok(())
         }
         fn output(&mut self, _: Duration) -> Output {
@@ -1752,9 +2200,10 @@ mod tests {
                 d.start();
             }
             let busy = lock(&self.busy).contains(&self.id);
+            let ready_screen = self.input.screen();
             let (title, text) = match self.script {
-                Script::Ready if busy => ("\u{25d0} Claude Code", "\u{276f} \n  auto mode on"),
-                Script::Ready => ("\u{2733} Claude Code", "\u{276f} \n  auto mode on"),
+                Script::Ready if busy => ("\u{25d0} Claude Code", ready_screen.as_str()),
+                Script::Ready => ("\u{2733} Claude Code", ready_screen.as_str()),
                 Script::Refuse => (
                     "",
                     " \u{23bf}  Claude usage limit reached. Your limit resets 5pm\n",
@@ -1766,8 +2215,12 @@ mod tests {
                     " Do you trust this folder?\n   1. Yes, I trust this folder\n   2. No, exit\n",
                 ),
             };
+            let text = lock(&self.screens)
+                .get(&self.id)
+                .cloned()
+                .unwrap_or_else(|| text.to_string());
             ScreenSnapshot {
-                text: text.into(),
+                text,
                 title: title.into(),
                 title_seq: 1,
                 cursor: (0, 0),
@@ -1812,6 +2265,10 @@ mod tests {
         kills: Arc<AtomicUsize>,
         exit_now: Arc<AtomicBool>,
         writes: Arc<AtomicUsize>,
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        write_results: Arc<Mutex<VecDeque<Option<io::ErrorKind>>>>,
+        screens: Arc<Mutex<HashMap<String, String>>>,
+        prompts: Arc<Mutex<Vec<String>>>,
         stuck: Arc<AtomicBool>,
         busy: Arc<Mutex<HashSet<String>>>,
         kill_fails: Arc<AtomicBool>,
@@ -1862,6 +2319,11 @@ mod tests {
                 kills: self.kills.clone(),
                 exit_now: self.exit_now.clone(),
                 writes: self.writes.clone(),
+                sent: self.sent.clone(),
+                write_results: self.write_results.clone(),
+                screens: self.screens.clone(),
+                prompts: self.prompts.clone(),
+                input: FakeInput::default(),
                 stuck: self.stuck.clone(),
                 id: env_of(spec, "C9_AGENT_ID").unwrap_or_default(),
                 busy: self.busy.clone(),
@@ -1926,6 +2388,10 @@ mod tests {
             kills: Arc::new(AtomicUsize::new(0)),
             exit_now: Arc::new(AtomicBool::new(false)),
             writes: Arc::new(AtomicUsize::new(0)),
+            sent: Arc::new(Mutex::new(Vec::new())),
+            write_results: Arc::new(Mutex::new(VecDeque::new())),
+            screens: Arc::new(Mutex::new(HashMap::new())),
+            prompts: Arc::new(Mutex::new(Vec::new())),
             stuck: Arc::new(AtomicBool::new(false)),
             busy: Arc::new(Mutex::new(HashSet::new())),
             kill_fails: Arc::new(AtomicBool::new(false)),
@@ -2753,6 +3219,82 @@ mod tests {
         e.sp.shutdown();
     }
 
+    /// C1b-M1-4: the fake CC's input box reads like the real one, a paste
+    /// shows in it, and CR submits the full text and turns the title busy.
+    #[test]
+    fn fake_cc_draws_the_input_box_and_takes_a_paste() {
+        use crate::engine::cc_screen::{input_box, paste_payload, InputBox, KEY_CR};
+        let mut b = FakeInput::default();
+        assert_eq!(input_box(&b.screen()), InputBox::Placeholder);
+        assert_eq!(b.apply(KEY_CR), None, "CR on an empty box does nothing");
+        assert_eq!(b.apply(&paste_payload("[c9watch mail msg_1]")), None);
+        assert_eq!(
+            input_box(&b.screen()),
+            InputBox::Text("[c9watch mail msg_1]".into())
+        );
+        assert_eq!(b.apply(KEY_CR).as_deref(), Some("[c9watch mail msg_1]"));
+        assert_eq!(input_box(&b.screen()), InputBox::Empty);
+        b.apply(&paste_payload("a\nb\nc"));
+        assert_eq!(
+            input_box(&b.screen()),
+            InputBox::Text("[Pasted text #2 +2 lines]".into())
+        );
+        assert_eq!(b.apply(b"\x1b[B"), None);
+        assert_eq!(b.apply(KEY_CR).as_deref(), Some("a\nb\nc"));
+        b.apply(b"hi");
+        assert_eq!(input_box(&b.screen()), InputBox::Text("hi".into()));
+    }
+
+    /// C1b-M1-4: a test scripts the fake's write results and screen, and
+    /// every write's bytes are kept.
+    #[test]
+    fn fake_driver_scripts_write_results_and_keeps_the_bytes() {
+        let e = setup(Script::Hang, None);
+        let spec = SpawnSpec::new(vec!["claude".into()], e.cwd.clone());
+        let mut d = e.launcher.spawn(&spec).unwrap();
+        lock(&e.launcher.write_results).extend([
+            Some(io::ErrorKind::WouldBlock),
+            None,
+            Some(io::ErrorKind::TimedOut),
+            Some(io::ErrorKind::BrokenPipe),
+        ]);
+        let kinds: Vec<Option<io::ErrorKind>> = (0..5)
+            .map(|i| d.write(&[b'a' + i]).err().map(|e| e.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                Some(io::ErrorKind::WouldBlock),
+                None,
+                Some(io::ErrorKind::TimedOut),
+                Some(io::ErrorKind::BrokenPipe),
+                None
+            ]
+        );
+        assert_eq!(*lock(&e.launcher.sent), [b"a", b"b", b"c", b"d", b"e"]);
+        assert_eq!(e.launcher.writes.load(Ordering::SeqCst), 5);
+        lock(&e.launcher.screens).insert(String::new(), "a menu".into());
+        assert_eq!(d.screen().text, "a menu");
+    }
+
+    /// C1b-M1-3: a write the drain stops is `Blocked`, sends nothing and
+    /// is audited; a driver error comes back with its kind.
+    #[test]
+    fn pty_write_reports_a_drain_block() {
+        let e = setup(Script::Hang, None);
+        let spec = SpawnSpec::new(vec!["claude".into()], e.cwd.clone());
+        let mut d = e.launcher.spawn(&spec).unwrap();
+        assert_eq!(e.sp.pty_write("agt_x", d.as_mut(), b"hi"), Ok(()));
+        assert_eq!(e.launcher.writes.load(Ordering::SeqCst), 1);
+        e.sp.drain_switch().start();
+        assert_eq!(
+            e.sp.pty_write("agt_x", d.as_mut(), b"hi"),
+            Err(PtyWriteError::Blocked)
+        );
+        assert_eq!(e.launcher.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(blocked_pty_writes(&e.db), 1);
+    }
+
     /// C1a-27: zero sends on the PTY path while draining. The drain starts
     /// at the first look at the screen; the trust dialog's Down is not
     /// written but audited. The open create is left to boot reconcile, and
@@ -3360,5 +3902,443 @@ mod tests {
         assert_eq!(ops_of(&e.db), [("pty".to_string(), false, None)]);
         let id = only_row(&e.db).id;
         assert_eq!(ops::reconcile(&e.db, &e.home).unwrap().failed, [id]);
+    }
+
+    // ── Mail delivery (C1b-M1-9) ───────────────────────────────────────
+
+    /// Queue `body` for `to` from the terminal, as `msg.send` does;
+    /// returns the message id.
+    fn queue(db: &Db, to: &str, body: &str) -> String {
+        let (to, body) = (to.to_string(), body.to_string());
+        db.write_blocking(move |tx| {
+            let sender = mail::sender(tx, &Principal::LocalUnverified)?;
+            let target = mail::resolve(tx, MACHINE, &to)?.unwrap();
+            let p = crate::engine::proto::MsgSendParams {
+                to,
+                body,
+                ..Default::default()
+            };
+            let sent = mail::enqueue(tx, MACHINE, &sender, &target, &p, None, "me", now_ms())?;
+            Ok(sent.unwrap().msg_id)
+        })
+        .unwrap()
+        .0
+    }
+
+    /// (state, detail of its last status) of message `id`.
+    fn mail_of(db: &Db, id: &str) -> (String, Option<String>) {
+        db.reader()
+            .unwrap()
+            .query_row(
+                "SELECT m.state, s.detail FROM messages m JOIN message_status s \
+                 ON s.msg_id = m.id WHERE m.id = ?1 ORDER BY s.rowid DESC LIMIT 1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn wait_mail(db: &Db, id: &str, state: &str) -> Option<String> {
+        wait_for(&format!("{} {}", id, state), || mail_of(db, id).0 == state);
+        mail_of(db, id).1
+    }
+
+    fn sent(e: &Env) -> Vec<Vec<u8>> {
+        lock(&e.launcher.sent).clone()
+    }
+
+    fn is_paste(b: &[u8], msg_id: &str) -> bool {
+        b.starts_with(b"\x1b[200~")
+            && String::from_utf8_lossy(b).contains(&format!("[c9watch mail {}]", msg_id))
+    }
+
+    /// A box between two rules holding `inside`, under the idle title.
+    fn boxed(inside: &str) -> String {
+        let rule = "\u{2500}".repeat(40);
+        format!("{}\n\u{276f} {}\n{}\n  status", rule, inside, rule)
+    }
+
+    /// Let the supervisor run a few ticks.
+    fn ticks() {
+        std::thread::sleep(RUN_TICK * 3);
+    }
+
+    /// E8: when the agent is ready and its box free, the paste is exactly
+    /// `ESC[200~<fence>ESC[201~`; the CR follows only after PASTE_SETTLE
+    /// and once the box shows the paste. The prompt hook confirms it.
+    #[tokio::test]
+    async fn mail_is_pasted_then_submitted_once_the_box_shows_it() {
+        let (clock, secs) = hand_clock();
+        let e = setup(Script::Ready, Some(clock));
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        let id = queue(&e.db, &r.id, "hello\nworld");
+        e.sp.nudge_mail(&r.id);
+        wait_for("the paste", || sent(&e).len() == 1);
+        assert_eq!(mail_of(&e.db, &id).0, "delivering");
+        let prov = mail::provenance(
+            MACHINE,
+            &mail::sender(&e.db.reader().unwrap(), &Principal::LocalUnverified).unwrap(),
+            "me",
+        );
+        let fenced = mail::fence(&id, None, &prov, "hello\nworld");
+        assert_eq!(sent(&e)[0], paste_payload(&fenced));
+        ticks();
+        assert_eq!(sent(&e).len(), 1, "no CR before PASTE_SETTLE");
+        secs.store(1, Ordering::SeqCst);
+        wait_for("the CR", || sent(&e).len() == 2);
+        assert_eq!(sent(&e)[1], KEY_CR);
+        assert_eq!(*lock(&e.launcher.prompts), std::slice::from_ref(&fenced));
+        let machine = MACHINE.to_string();
+        let (agent, prompt) = (r.id.clone(), fenced);
+        e.db.write_blocking(move |tx| {
+            mail::confirm_from_prompt(tx, &machine, &agent, &prompt, now_ms())
+        })
+        .unwrap();
+        assert_eq!(
+            mail_of(&e.db, &id),
+            ("delivered".into(), Some("prompt_hook".into()))
+        );
+        secs.store(30, Ordering::SeqCst);
+        ticks();
+        assert_eq!(mail_of(&e.db, &id).0, "delivered");
+        assert_eq!(sent(&e).len(), 2);
+        e.sp.shutdown();
+    }
+
+    /// E7: a turn, a dialog, a menu with no input box and a half-typed
+    /// box all write nothing; the paste goes once the agent is ready with
+    /// a free box. Two messages go in two rounds.
+    #[tokio::test]
+    async fn mail_waits_for_a_ready_agent_with_a_free_box() {
+        let (clock, secs) = hand_clock();
+        let e = setup(Script::Ready, Some(clock));
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        lock(&e.launcher.busy).insert(r.id.clone());
+        wait_for("working", || {
+            row(&e.db, &r.id).state.as_deref() == Some("working")
+        });
+        let first = queue(&e.db, &r.id, "one");
+        let second = queue(&e.db, &r.id, "two");
+        e.sp.nudge_mail(&r.id);
+        ticks();
+        lock(&e.launcher.busy).remove(&r.id);
+        for screen in [
+            " Do you want to proceed?\n \u{276f} 1. Yes\n   2. No\n".to_string(),
+            " Pick a model\n   1. Opus\n   2. Sonnet\n".to_string(),
+            boxed("half typed"),
+        ] {
+            lock(&e.launcher.screens).insert(r.id.clone(), screen.clone());
+            ticks();
+            assert!(sent(&e).is_empty(), "wrote on {:?}", screen);
+        }
+        assert_eq!(mail_of(&e.db, &first).0, "queued");
+        lock(&e.launcher.screens).remove(&r.id);
+        wait_for("the first paste", || sent(&e).len() == 1);
+        assert!(is_paste(&sent(&e)[0], &first));
+        secs.store(1, Ordering::SeqCst);
+        wait_for("the CR", || sent(&e).len() == 2);
+        // The CR turned the title busy: the second waits for the turn.
+        e.db.write_blocking({
+            let (agent, id) = (r.id.clone(), first.clone());
+            move |tx| {
+                mail::confirm_from_prompt(
+                    tx,
+                    MACHINE,
+                    &agent,
+                    &format!("[c9watch mail {}]", id),
+                    now_ms(),
+                )
+            }
+        })
+        .unwrap();
+        ticks();
+        assert_eq!(sent(&e).len(), 2);
+        assert_eq!(mail_of(&e.db, &second).0, "queued");
+        lock(&e.launcher.busy).remove(&r.id);
+        wait_for("the second paste", || sent(&e).len() == 3);
+        assert!(is_paste(&sent(&e)[2], &second));
+        e.sp.shutdown();
+    }
+
+    /// H2: a paste the box never shows (an unknown menu took the screen)
+    /// gets no CR and is `uncertain`, with attention.
+    #[tokio::test]
+    async fn a_paste_not_seen_in_the_box_is_uncertain_without_cr() {
+        let (clock, secs) = hand_clock();
+        let e = setup(Script::Ready, Some(clock));
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        let id = queue(&e.db, &r.id, "hi");
+        e.sp.nudge_mail(&r.id);
+        wait_for("the paste", || sent(&e).len() == 1);
+        lock(&e.launcher.screens).insert(r.id.clone(), " Pick one\n   1. A\n".into());
+        secs.store(1, Ordering::SeqCst);
+        ticks();
+        assert_eq!(sent(&e).len(), 1);
+        secs.store(5, Ordering::SeqCst);
+        let detail = wait_mail(&e.db, &id, "uncertain");
+        assert_eq!(detail.as_deref(), Some("paste not seen in input box"));
+        assert_eq!(sent(&e).len(), 1, "no CR");
+        let att = events(&e.db, "agent.attention");
+        assert_eq!(att.len(), 1);
+        assert_eq!(att[0]["reason"], format!("mail_uncertain: {}", id));
+        e.sp.shutdown();
+    }
+
+    /// E9 and §4.6: only `WouldBlock` puts a message back (three times at
+    /// most, then `failed`); `TimedOut` is `uncertain` with no second
+    /// paste and no CR; `BrokenPipe` fails it; a CR error is `uncertain`.
+    #[tokio::test]
+    async fn write_errors_are_classified() {
+        use std::io::ErrorKind::{BrokenPipe, Other, TimedOut, WouldBlock};
+        let (clock, secs) = hand_clock();
+        let e = setup(Script::Ready, Some(clock));
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        let results = |r: &[Option<io::ErrorKind>]| lock(&e.launcher.write_results).extend(r);
+
+        results(&[Some(WouldBlock); 3]);
+        let id = queue(&e.db, &r.id, "a");
+        e.sp.nudge_mail(&r.id);
+        let detail = wait_mail(&e.db, &id, "failed");
+        assert_eq!(detail.as_deref(), Some("pty write queue full"));
+        assert_eq!(sent(&e).len(), 3);
+        let statuses: Vec<String> = {
+            let conn = e.db.reader().unwrap();
+            let mut st = conn
+                .prepare("SELECT state FROM message_status WHERE msg_id = ?1 ORDER BY rowid")
+                .unwrap();
+            let rows = st.query_map([&id], |r| r.get(0)).unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert_eq!(
+            statuses,
+            [
+                "queued",
+                "delivering",
+                "queued",
+                "delivering",
+                "queued",
+                "delivering",
+                "failed"
+            ]
+        );
+
+        results(&[Some(TimedOut)]);
+        let id = queue(&e.db, &r.id, "b");
+        e.sp.nudge_mail(&r.id);
+        let detail = wait_mail(&e.db, &id, "uncertain").unwrap();
+        assert!(detail.starts_with("paste may be partial"), "{}", detail);
+        secs.store(10, Ordering::SeqCst);
+        ticks();
+        assert_eq!(sent(&e).len(), 4, "no second paste and no CR");
+
+        results(&[Some(BrokenPipe)]);
+        let id = queue(&e.db, &r.id, "c");
+        e.sp.nudge_mail(&r.id);
+        let detail = wait_mail(&e.db, &id, "failed").unwrap();
+        assert!(detail.starts_with("pty gone"), "{}", detail);
+
+        results(&[None, Some(Other)]);
+        let id = queue(&e.db, &r.id, "d");
+        e.sp.nudge_mail(&r.id);
+        wait_for("the paste", || sent(&e).len() == 6);
+        secs.store(11, Ordering::SeqCst);
+        let detail = wait_mail(&e.db, &id, "uncertain").unwrap();
+        assert!(detail.starts_with("cr write"), "{}", detail);
+        assert_eq!(events(&e.db, "agent.attention").len(), 2);
+        e.sp.shutdown();
+    }
+
+    /// E10: while the engine drains no mail is written (and no PTY write
+    /// is even tried); the message stays `queued`.
+    #[tokio::test]
+    async fn no_mail_is_delivered_while_draining() {
+        let e = setup(Script::Ready, None);
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        e.sp.drain_switch().start();
+        let id = queue(&e.db, &r.id, "hi");
+        e.sp.nudge_mail(&r.id);
+        ticks();
+        assert!(sent(&e).is_empty());
+        assert_eq!(blocked_pty_writes(&e.db), 0);
+        assert_eq!(mail_of(&e.db, &id).0, "queued");
+        e.sp.shutdown();
+    }
+
+    /// §4.6-4.7: a CR the drain blocks, and a drain command while the
+    /// paste waits for its CR, both put the message back in the queue.
+    #[tokio::test]
+    async fn a_drain_before_the_cr_puts_the_mail_back() {
+        let (clock, secs) = hand_clock();
+        let e = setup(Script::Ready, Some(clock));
+        let l = Principal::LocalUnverified;
+        let a = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let b = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let (aid, bid) = (queue(&e.db, &a.id, "a"), queue(&e.db, &b.id, "b"));
+        e.sp.nudge_mail(&a.id);
+        e.sp.nudge_mail(&b.id);
+        wait_for("both pastes", || sent(&e).len() == 2);
+        // b is drained while its paste waits (the clock has not moved).
+        e.sp.drain_agent(&b.id);
+        let detail = wait_mail(&e.db, &bid, "queued");
+        assert_eq!(detail.as_deref(), Some("drain before submit"));
+        // a's CR comes once the drain is on: blocked, audited, queued.
+        e.sp.drain_switch().start();
+        secs.store(1, Ordering::SeqCst);
+        let detail = wait_mail(&e.db, &aid, "queued");
+        assert_eq!(detail.as_deref(), Some("drain before submit"));
+        assert_eq!(blocked_pty_writes(&e.db), 1);
+        assert_eq!(sent(&e).len(), 2, "no CR");
+        e.sp.shutdown();
+    }
+
+    /// §4.7-4.8: a message submitted when a drain, a shutdown or a retire
+    /// comes is `uncertain`; a retire fails the rest of the queue.
+    #[tokio::test]
+    async fn stopping_after_the_cr_leaves_mail_uncertain() {
+        let (clock, secs) = hand_clock();
+        let e = setup(Script::Ready, Some(clock));
+        let l = Principal::LocalUnverified;
+        let mut submitted = Vec::new();
+        let mut agents = Vec::new();
+        for _ in 0..3 {
+            let r = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+            let id = queue(&e.db, &r.id, "x");
+            let n = sent(&e).len();
+            e.sp.nudge_mail(&r.id);
+            wait_for("the paste", || sent(&e).len() == n + 1);
+            secs.fetch_add(1, Ordering::SeqCst);
+            wait_for("the CR", || sent(&e).len() == n + 2);
+            submitted.push(id);
+            agents.push(r);
+        }
+        let rest = queue(&e.db, &agents[2].id, "y");
+        e.sp.drain_agent(&agents[0].id);
+        assert_eq!(
+            wait_mail(&e.db, &submitted[0], "uncertain").as_deref(),
+            Some("drain")
+        );
+        e.sp.retire(&l, serde_json::json!({ "id": agents[2].id }))
+            .await
+            .unwrap();
+        assert_eq!(
+            mail_of(&e.db, &submitted[2]),
+            ("uncertain".into(), Some("target retired".into()))
+        );
+        assert_eq!(
+            mail_of(&e.db, &rest),
+            ("failed".into(), Some("target retired".into()))
+        );
+        e.sp.shutdown();
+        assert_eq!(
+            wait_mail(&e.db, &submitted[1], "uncertain").as_deref(),
+            Some("shutdown")
+        );
+    }
+
+    /// §4.5 fallback: with no prompt hook within SUBMIT_CONFIRM, an open
+    /// turn and a box without the paste confirm it (`turn_open`); a box
+    /// that still shows it, as its fence line or as CC's collapsed
+    /// `[Pasted text #n +k lines]` (a CR that got lost while a background
+    /// turn opened), is `uncertain`.
+    #[tokio::test]
+    async fn without_the_hook_an_open_turn_confirms_delivery() {
+        let (clock, secs) = hand_clock();
+        let e = setup(Script::Ready, Some(clock));
+        let l = Principal::LocalUnverified;
+        let a = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let b = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let c = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let (aid, bid) = (queue(&e.db, &a.id, "a"), queue(&e.db, &b.id, "b"));
+        let cid = queue(&e.db, &c.id, "c");
+        for agent in [&a, &b, &c] {
+            e.sp.nudge_mail(&agent.id);
+        }
+        wait_for("three pastes", || sent(&e).len() == 3);
+        secs.store(1, Ordering::SeqCst);
+        wait_for("three CRs", || sent(&e).len() == 6);
+        for agent in [&a, &b, &c] {
+            wait_for("the turn", || {
+                row(&e.db, &agent.id).state.as_deref() == Some("working")
+            });
+        }
+        lock(&e.launcher.screens).insert(b.id.clone(), boxed(&format!("[c9watch mail {}]", bid)));
+        lock(&e.launcher.screens).insert(c.id.clone(), boxed("[Pasted text #1 +4 lines]"));
+        ticks();
+        secs.store(12, Ordering::SeqCst);
+        assert_eq!(
+            wait_mail(&e.db, &aid, "delivered").as_deref(),
+            Some("turn_open")
+        );
+        for id in [&bid, &cid] {
+            let detail = wait_mail(&e.db, id, "uncertain").unwrap();
+            assert!(detail.starts_with("no prompt hook after"), "{}", detail);
+        }
+        e.sp.shutdown();
+    }
+
+    /// §4.6: after a paste that timed out the agent may not read its
+    /// terminal, so the next message waits (no second write) until the
+    /// screen changes with a free box.
+    #[tokio::test]
+    async fn an_uncertain_paste_holds_the_queue_until_the_screen_moves() {
+        let (clock, _secs) = hand_clock();
+        let e = setup(Script::Ready, Some(clock));
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        lock(&e.launcher.write_results).push_back(Some(io::ErrorKind::TimedOut));
+        let first = queue(&e.db, &r.id, "one");
+        let second = queue(&e.db, &r.id, "two");
+        e.sp.nudge_mail(&r.id);
+        let detail = wait_mail(&e.db, &first, "uncertain").unwrap();
+        assert!(detail.starts_with("paste may be partial"), "{}", detail);
+        ticks();
+        assert_eq!(sent(&e).len(), 1, "no second write");
+        assert_eq!(mail_of(&e.db, &second).0, "queued");
+        // New output with a free box: the agent reads again.
+        lock(&e.launcher.screens).insert(r.id.clone(), boxed(""));
+        wait_for("the second paste", || sent(&e).len() == 2);
+        assert!(is_paste(&sent(&e)[1], &second));
+        e.sp.shutdown();
+    }
+
+    /// §4.8: an agent that exits fails its queue; mail in flight is
+    /// `uncertain` (`ops::fail_agent`).
+    #[tokio::test]
+    async fn an_exit_ends_the_mail_of_the_agent() {
+        let (clock, _secs) = hand_clock();
+        let e = setup(Script::Ready, Some(clock));
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        let first = queue(&e.db, &r.id, "a");
+        let second = queue(&e.db, &r.id, "b");
+        e.sp.nudge_mail(&r.id);
+        wait_for("the paste", || sent(&e).len() == 1);
+        e.launcher.exit_now.store(true, Ordering::SeqCst);
+        no_supervisors(&e.sp);
+        let why = format!("target failed: {}", EXITED);
+        assert_eq!(
+            mail_of(&e.db, &first),
+            ("uncertain".into(), Some(why.clone()))
+        );
+        assert_eq!(mail_of(&e.db, &second), ("failed".into(), Some(why)));
     }
 }

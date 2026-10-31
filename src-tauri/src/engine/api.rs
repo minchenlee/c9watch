@@ -28,6 +28,11 @@
 //! `agent.create` and `agent.retire` take only a local client
 //! (`local-unverified`); an agent gets `not_allowed`, which is audited. The
 //! work is in `engine::create` (C1a-26).
+//!
+//! `msg.send` (C1b-M1) takes the terminal and agents (`engine::mail`
+//! checks both), queues the message and nudges the target's supervisor,
+//! which delivers it. Its response carries the cursor of the message's
+//! `queued` event in `seq`. Every send and every refusal is audited.
 
 use super::agent_bin::AgentBin;
 use super::create::Spawner;
@@ -37,6 +42,8 @@ use super::db::{now_ms, AgentFilter, Db};
 use super::detect::{FirstTick, FIRST_TICK_WAIT};
 use super::drain::DrainSwitch;
 use super::hooks::{self, HookEvent, Outcome};
+use super::machine::HeaderKey;
+use super::mail;
 use super::merge::MergeTable;
 use super::peer::{self, PeerCred};
 use super::principal::{self, LiveAgents, NoLiveAgents, Principal};
@@ -44,9 +51,9 @@ use super::proto::{
     encode, encode_event, is_hook_class, read_frame, AgentCreateParams, AgentCreateResult,
     AgentListParams, AgentListResult, AgentRetireParams, AgentRetireResult, ApiError, ErrorCode,
     EventFrame, EventType, FrameError, HandoffParams, HandoffResult, HelloParams, HelloResult,
-    HookParams, HookResult, Request, Response, SessionListParams, SessionListResult,
-    SnapshotParams, SnapshotResult, SubscribeParams, SubscribeResult, TaskDoneParams,
-    TaskDoneResult, API_MAJOR, API_MINOR, HOOK_METHODS, MAX_FRAME,
+    HookParams, HookResult, MsgSendParams, MsgSendResult, Request, Response, SessionListParams,
+    SessionListResult, SnapshotParams, SnapshotResult, SubscribeParams, SubscribeResult,
+    TaskDoneParams, TaskDoneResult, API_MAJOR, API_MINOR, HOOK_METHODS, MAX_FRAME,
 };
 use super::standing;
 use std::os::unix::io::AsRawFd;
@@ -102,6 +109,9 @@ pub struct ServerCtx {
     /// Detection's first pass: `session.list` and `snapshot.get` wait for
     /// it (`detect::FirstTick`).
     pub first_tick: Arc<FirstTick>,
+    /// The mail header key (`MachineKey::header_key`): each agent's token
+    /// goes out in its `hook.session_start` context. `None` only in tests.
+    pub header_key: Option<HeaderKey>,
 }
 
 impl ServerCtx {
@@ -120,6 +130,7 @@ impl ServerCtx {
             spawner: None,
             drain: Arc::new(DrainSwitch::new()),
             first_tick: Arc::new(FirstTick::open_now()),
+            header_key: None,
         }
     }
 
@@ -156,6 +167,11 @@ impl ServerCtx {
 
     pub fn with_first_tick(mut self, first_tick: Arc<FirstTick>) -> Self {
         self.first_tick = first_tick;
+        self
+    }
+
+    pub fn with_header_key(mut self, key: HeaderKey) -> Self {
+        self.header_key = Some(key);
         self
     }
 
@@ -341,7 +357,11 @@ async fn handle_frame(
         Checked::Call(req, method) => {
             let id = req.id.clone();
             match dispatch(&method, req, ctx, peer, principal, streams).await {
-                Ok((result, stream)) => (Response::ok(id, result), Next::Continue, stream),
+                Ok(served) => {
+                    let mut resp = Response::ok(id, served.result);
+                    resp.seq = served.seq;
+                    (resp, Next::Continue, served.stream)
+                }
                 Err(e) => (Response::err(id, e), Next::Continue, None),
             }
         }
@@ -445,6 +465,7 @@ pub const METHODS: &[&str] = &[
     "hook.post_tool_use",
     "task.done",
     "agent.handoff",
+    "msg.send",
 ];
 
 /// The c9p/1 JSON Schema (A:245): the frame types, a `methods` table with
@@ -506,6 +527,10 @@ pub fn schema() -> serde_json::Value {
             "params": de.subschema_for::<HandoffParams>(),
             "result": ser.subschema_for::<HandoffResult>(),
         },
+        "msg.send": {
+            "params": de.subschema_for::<MsgSendParams>(),
+            "result": ser.subschema_for::<MsgSendResult>(),
+        },
     });
     let mut methods = methods;
     for m in HOOK_METHODS {
@@ -537,6 +562,25 @@ pub fn schema() -> serde_json::Value {
     })
 }
 
+/// What `dispatch` answers: the result, the event stream to start after
+/// the response, and the cursor of the event the call wrote, for
+/// `Response.seq` (only `msg.send` sets it in M1).
+struct Served {
+    result: serde_json::Value,
+    stream: Option<EventStream>,
+    seq: Option<String>,
+}
+
+impl Served {
+    fn result(result: serde_json::Value) -> Self {
+        Served {
+            result,
+            stream: None,
+            seq: None,
+        }
+    }
+}
+
 /// Methods after `hello`, except the hook-class ones. Both C1a principals,
 /// L and A, may call every method here except `agent.create` and
 /// `agent.retire`, which take L only (§1.1). `streams` is how many event
@@ -548,19 +592,20 @@ async fn dispatch(
     peer: Peer,
     principal: &Principal,
     streams: usize,
-) -> Result<(serde_json::Value, Option<EventStream>), ApiError> {
+) -> Result<Served, ApiError> {
     match method {
-        "agent.create" => Ok((
+        // One arm per method: scripts/test-ipc-contract.mjs reads the
+        // served methods off these arms.
+        "agent.create" => Ok(Served::result(
             agent_lifecycle(method, req, ctx, peer, principal).await?,
-            None,
         )),
-        "agent.retire" => Ok((
+        "agent.retire" => Ok(Served::result(
             agent_lifecycle(method, req, ctx, peer, principal).await?,
-            None,
         )),
-        "snapshot.get" => Ok((snapshot_get(ctx).await?, None)),
-        "session.list" => Ok((session_list(ctx).await?, None)),
-        "agent.list" => Ok((agent_list(req, ctx).await?, None)),
+        "snapshot.get" => Ok(Served::result(snapshot_get(ctx).await?)),
+        "session.list" => Ok(Served::result(session_list(ctx).await?)),
+        "agent.list" => Ok(Served::result(agent_list(req, ctx).await?)),
+        "msg.send" => msg_send(req, ctx, peer, principal).await,
         "events.subscribe" => {
             if streams >= MAX_STREAMS {
                 return Err(ApiError::new(
@@ -569,7 +614,11 @@ async fn dispatch(
                 ));
             }
             let (result, stream) = events_subscribe(req, ctx).await?;
-            Ok((result, Some(stream)))
+            Ok(Served {
+                result,
+                stream: Some(stream),
+                seq: None,
+            })
         }
         _ => Err(ApiError::new(
             ErrorCode::UnknownMethod,
@@ -658,6 +707,142 @@ async fn spawn_or_retire(
                 .expect("AgentRetireResult serializes"),
         )
     }
+}
+
+/// `msg.send` (C1b-M1 §5.4): check the sender, then resolve, check the
+/// target and queue the message in one transaction with its audit row. A
+/// refusal writes no message, only a `deny` audit row. After the commit
+/// the target's supervisor is nudged, except while the engine drains: the
+/// message then stays `queued` (Q1).
+async fn msg_send(
+    req: Request,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+) -> Result<Served, ApiError> {
+    const METHOD: &str = "msg.send";
+    let claimed = req
+        .params
+        .get("to")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let checked: Result<MsgSendParams, ApiError> = async {
+        let params = serde_json::from_value::<MsgSendParams>(req.params).map_err(|e| {
+            ApiError::new(
+                ErrorCode::BadRequest,
+                format!("bad {} params: {}", METHOD, e),
+            )
+        })?;
+        mail::validate(&params)?;
+        let (agents, who) = (ctx.agents.clone(), principal.clone());
+        blocking(move || {
+            Ok(mail::check_sender(
+                &who,
+                peer.cred.pid,
+                peer.start,
+                agents.as_ref(),
+            ))
+        })
+        .await??;
+        Ok(params)
+    }
+    .await;
+    let params = match checked {
+        Ok(p) => p,
+        Err(e) => {
+            if e.code != ErrorCode::Internal {
+                audit_refusal(ctx, principal, METHOD, &claimed, &e).await;
+            }
+            return Err(e);
+        }
+    };
+    let sent = queue_mail(ctx, principal, params, req.idem).await?;
+    // A replay answers the first send's cursor, as its result does.
+    let seq = (!sent.cursor.is_empty()).then(|| sent.cursor.clone());
+    Ok(Served {
+        result: serde_json::to_value(&sent).expect("MsgSendResult serializes"),
+        stream: None,
+        seq,
+    })
+}
+
+/// The store half of `msg.send`, after the sender checks: resolve, check
+/// the target, queue, and audit in one transaction; then nudge.
+async fn queue_mail(
+    ctx: &ServerCtx,
+    principal: &Principal,
+    params: MsgSendParams,
+    idem: Option<String>,
+) -> Result<MsgSendResult, ApiError> {
+    const METHOD: &str = "msg.send";
+    let db = ctx.db()?.clone();
+    let machine = ctx.machine_id.clone();
+    let who = principal.clone();
+    let person = mail::person();
+    let (sent, _) = db
+        .write(move |tx| {
+            let principal = who.to_string();
+            let body_hash = mail::sha256_hex(params.body.as_bytes());
+            let sender = mail::sender(tx, &who)?;
+            // A resend of a known idem replays before the target is
+            // checked again: it may have ended or lost its name since.
+            let replay = match idem.as_deref() {
+                Some(key) => mail::replay(tx, &machine, &sender, &params, key)?,
+                None => None,
+            };
+            let sent = match replay {
+                Some(r) => r,
+                None => match mail::resolve(tx, &machine, &params.to)? {
+                    Ok(target) => match mail::check_target(&sender, &target) {
+                        Ok(()) => mail::enqueue(
+                            tx,
+                            &machine,
+                            &sender,
+                            &target,
+                            &params,
+                            idem.as_deref(),
+                            &person,
+                            now_ms(),
+                        )?,
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                },
+            };
+            let (target, decision, reason) = match &sent {
+                Ok(r) if r.replayed => (
+                    r.to.addr.clone(),
+                    "allow",
+                    format!("replay of {}", r.msg_id),
+                ),
+                Ok(r) => (r.to.addr.clone(), "allow", r.msg_id.clone()),
+                Err(e) => (params.to.clone(), "deny", format!("{}: {}", e.code, e.msg)),
+            };
+            audit::append(
+                tx,
+                now_ms(),
+                &AuditEntry {
+                    principal: &principal,
+                    method: METHOD,
+                    target: Some(&target),
+                    decision,
+                    reason: Some(&reason),
+                    payload_hash: Some(&body_hash),
+                    ..Default::default()
+                },
+            )?;
+            Ok(sent)
+        })
+        .await
+        .map_err(internal)?;
+    let sent = sent?;
+    if !sent.replayed && !ctx.drain.on() {
+        if let Some(spawner) = &ctx.spawner {
+            spawner.nudge_mail(&sent.to.id);
+        }
+    }
+    Ok(sent)
 }
 
 /// Hook-class methods (§1.1): `hook.*`, `task.done` and `agent.handoff`.
@@ -760,6 +945,10 @@ async fn hook_intake(
         }
         _ => None,
     };
+    let token = match (&ctx.header_key, method) {
+        (Some(key), "hook.session_start") => Some(key.token(&params.agent_id)),
+        _ => None,
+    };
     // Read now, not at accept: a resume since then makes the event stale.
     let live_gen = ctx.agents.current_gen(&params.agent_id);
     let agent_id = params.agent_id.clone();
@@ -786,6 +975,7 @@ async fn hook_intake(
                     &merge,
                     &ev,
                     orders.as_deref(),
+                    token.as_deref(),
                     draining,
                     now_ms(),
                 )
@@ -840,7 +1030,8 @@ fn authorize(
     bin.check_peer_exe(&exe)
 }
 
-/// Record a refused hook-class call. A failed write only logs.
+/// Record a refused call (hook-class, `agent.*`, `msg.send`). A failed
+/// write only logs.
 async fn audit_refusal(
     ctx: &ServerCtx,
     principal: &Principal,
@@ -1160,6 +1351,7 @@ mod tests {
             spawner: None,
             drain: Arc::new(DrainSwitch::new()),
             first_tick: Arc::new(FirstTick::open_now()),
+            header_key: None,
         })
     }
 
@@ -1476,6 +1668,9 @@ mod tests {
             } else if *m == "agent.create" || *m == "agent.retire" {
                 // This test engine has no spawner.
                 assert_eq!(r["error"]["code"], "internal", "{}: {}", m, r);
+            } else if *m == "msg.send" {
+                // `to` and `body` are required.
+                assert_eq!(r["error"]["code"], "bad_request", "{}: {}", m, r);
             } else {
                 assert_eq!(r["ok"], true, "{}: {}", m, r);
             }
@@ -1501,6 +1696,7 @@ mod tests {
             spawner: None,
             drain: Arc::new(DrainSwitch::new()),
             first_tick: Arc::new(FirstTick::open_now()),
+            header_key: None,
         });
         (t, ctx, db)
     }
@@ -2128,6 +2324,11 @@ mod tests {
             .with_db(db.clone())
             .with_standing_orders(orders)
             .with_drain(drain.clone());
+        let key = crate::engine::machine::load_or_create(t.path())
+            .unwrap()
+            .header_key();
+        let token = key.token("a1");
+        let ctx = ctx.with_header_key(key);
         let principal = Principal::Agent {
             id: "a1".into(),
             gen: 1,
@@ -2180,6 +2381,323 @@ mod tests {
             .unwrap();
         let context = context.unwrap();
         assert!(context.starts_with(&standing::header(1)), "{}", context);
+        // The agent's header token goes out with it (C1b-M1-7).
+        assert!(
+            context.contains(&standing::mail_rules(Some(&token))),
+            "{}",
+            context
+        );
         assert_eq!(note(), 0);
+    }
+
+    // ── msg.send (C1b-M1-8) ────────────────────────────────────────────
+
+    /// An agent row: `pty` rows are engine agents, others observed.
+    async fn mail_agent(db: &Db, id: &str, name: &str, control: &str) {
+        let (id, name, control) = (id.to_string(), name.to_string(), control.to_string());
+        db.write(move |tx| {
+            let (role, source) = if control == "pty" {
+                ("worker", "engine")
+            } else {
+                ("observed", "detected")
+            };
+            tx.execute(
+                "INSERT INTO agents (id, role, control, provider, source, state, machine_id, name) \
+                 VALUES (?1, ?2, ?3, 'claudeCode', ?4, 'ready', ?5, ?6)",
+                rusqlite::params![id, role, control, source, MACHINE, name],
+            )
+        })
+        .await
+        .unwrap();
+    }
+
+    /// `msg.send` audit rows: (principal, target, decision, reason,
+    /// payload_hash).
+    fn mail_audit(db: &Db) -> Vec<(String, String, String, String, Option<String>)> {
+        let conn = db.reader().unwrap();
+        let mut st = conn
+            .prepare(
+                "SELECT principal, coalesce(target, ''), decision, reason, payload_hash \
+                 FROM audit WHERE method = 'msg.send' ORDER BY seq",
+            )
+            .unwrap();
+        let rows = st
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    fn message_count(db: &Db) -> i64 {
+        db.reader()
+            .unwrap()
+            .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// E2: an agent's send is queued, and the response's `seq` is the
+    /// result's cursor, which is the message's `queued` event. Other
+    /// methods still answer no `seq`.
+    #[tokio::test]
+    async fn an_agent_send_answers_its_cursor_as_seq() {
+        let (_t, ctx, db) = ctx_db(as_agent("agt_a7"));
+        mail_agent(&db, "agt_a7", "me", "pty").await;
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["principal"], "agent:agt_a7");
+        let r = c
+            .call("1", "msg.send", json!({"to": "bob", "body": "hi\nthere"}))
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let res = &r["result"];
+        assert_eq!(res["state"], "queued");
+        assert_eq!(res["replayed"], false);
+        assert_eq!(res["to"]["id"], "agt_b1");
+        assert_eq!(res["to"]["addr"], format!("{}/agt_b1", MACHINE));
+        assert_eq!(r["seq"], res["cursor"]);
+        let seq: i64 = res["cursor"]
+            .as_str()
+            .unwrap()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (topic, data): (String, String) = db
+            .reader()
+            .unwrap()
+            .query_row(
+                "SELECT topic, payload FROM events WHERE seq = ?1",
+                [seq],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(topic, "msg.state");
+        let data: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data["msgId"], res["msgId"]);
+        assert_eq!(data["state"], "queued");
+        assert_eq!(data["from"], "agent:agt_a7");
+        let audit = mail_audit(&db);
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].0, "agent:agt_a7");
+        assert_eq!(audit[0].1, format!("{}/agt_b1", MACHINE));
+        assert_eq!(audit[0].2, "allow");
+        assert_eq!(audit[0].3, res["msgId"].as_str().unwrap());
+        assert_eq!(
+            audit[0].4.as_deref(),
+            Some(mail::sha256_hex(b"hi\nthere").as_str())
+        );
+        // Other methods: no seq.
+        let r = c.call("2", "snapshot.get", json!({})).await;
+        assert_eq!(r["ok"], true);
+        assert!(r.get("seq").is_none(), "{}", r);
+        let r = c.call("3", "agent.list", json!({})).await;
+        assert!(r.get("seq").is_none(), "{}", r);
+    }
+
+    /// The same `idem` again replays the first message, with its cursor
+    /// as `seq`; no second message is written.
+    #[tokio::test]
+    async fn a_resend_with_the_same_idem_replays() {
+        let (_t, ctx, db) = ctx_db(as_agent("agt_a7"));
+        mail_agent(&db, "agt_a7", "me", "pty").await;
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let (mut c, _) = Client::new(ctx).await;
+        let mut first = Value::Null;
+        for i in 0..2 {
+            let mut line = serde_json::to_vec(&json!({
+                "v": 1, "id": i.to_string(), "method": "msg.send", "idem": "k1",
+                "params": {"to": "agt_b1", "body": "hi"},
+            }))
+            .unwrap();
+            line.push(b'\n');
+            c.write.write_all(&line).await.unwrap();
+            let r = c.next().await;
+            assert_eq!(r["ok"], true, "{}", r);
+            assert_eq!(r["seq"], r["result"]["cursor"]);
+            if i == 0 {
+                first = r["result"].clone();
+            } else {
+                assert_eq!(r["result"]["replayed"], true);
+                assert_eq!(r["result"]["msgId"], first["msgId"]);
+                assert_eq!(r["result"]["cursor"], first["cursor"]);
+            }
+        }
+        assert_eq!(message_count(&db), 1);
+        let audit = mail_audit(&db);
+        assert_eq!(
+            audit[1].3,
+            format!("replay of {}", first["msgId"].as_str().unwrap())
+        );
+    }
+
+    /// The terminal's send (after `check_sender`, which reads the real
+    /// process tree and is tested in `mail`): queued as
+    /// `local-unverified`.
+    #[tokio::test]
+    async fn a_terminal_send_is_queued() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let params = MsgSendParams {
+            to: format!("{}/agt_b1", MACHINE),
+            body: "hi".into(),
+            ..Default::default()
+        };
+        let sent = queue_mail(&ctx, &Principal::LocalUnverified, params, None)
+            .await
+            .unwrap();
+        assert_eq!(sent.state, "queued");
+        let from: String = db
+            .reader()
+            .unwrap()
+            .query_row("SELECT from_principal FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(from, "local-unverified");
+        assert_eq!(mail_audit(&db)[0].2, "allow");
+    }
+
+    /// A resend with the same `idem` replays even after the target ended
+    /// and its name became ambiguous; another body is still `duplicate`.
+    #[tokio::test]
+    async fn an_idem_replays_after_the_target_ended() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let send = |to: &str, body: &str| MsgSendParams {
+            to: to.into(),
+            body: body.into(),
+            ..Default::default()
+        };
+        let l = Principal::LocalUnverified;
+        let first = queue_mail(&ctx, &l, send("bob", "hi"), Some("ci-42".into()))
+            .await
+            .unwrap();
+        db.write(|tx| {
+            tx.execute(
+                "UPDATE agents SET state = 'retired' WHERE id = 'agt_b1'",
+                [],
+            )?;
+            tx.execute("UPDATE messages SET state = 'failed'", [])
+        })
+        .await
+        .unwrap();
+        mail_agent(&db, "agt_b2", "bob", "pty").await;
+        mail_agent(&db, "agt_b3", "bob", "pty").await;
+        for to in ["agt_b1", "bob", &format!("{}/agt_b1", MACHINE)] {
+            let again = queue_mail(&ctx, &l, send(to, "hi"), Some("ci-42".into()))
+                .await
+                .unwrap();
+            assert!(again.replayed, "{}", to);
+            assert_eq!(again.msg_id, first.msg_id);
+            assert_eq!(again.state, "failed");
+            assert_eq!(again.to.id, "agt_b1");
+        }
+        for (to, body) in [("agt_b1", "other"), ("agt_b2", "hi")] {
+            let e = queue_mail(&ctx, &l, send(to, body), Some("ci-42".into()))
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, ErrorCode::Duplicate, "{} {}", to, body);
+        }
+        assert_eq!(message_count(&db), 1);
+    }
+
+    /// E5: every refusal answers its code, `data` and hint, writes a
+    /// `deny` audit row and no message.
+    #[tokio::test]
+    async fn every_refused_send_is_audited_and_writes_no_message() {
+        let (_t, ctx, db) = ctx_db(as_agent("agt_a7"));
+        mail_agent(&db, "agt_a7", "me", "pty").await;
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        mail_agent(&db, "agt_o1", "obs", "none").await;
+        let (mut c, _) = Client::new(ctx).await;
+        let cases = [
+            (json!({}), "bad_request"),
+            (json!({"to": "bob", "body": "a\r\nb"}), "bad_request"),
+            (json!({"to": "bobb", "body": "hi"}), "unknown_address"),
+            (json!({"to": "agt_o1", "body": "hi"}), "not_controlled"),
+            (json!({"to": "agt_a7", "body": "hi"}), "not_allowed"),
+            (
+                json!({"to": "other/agt_b1", "body": "hi"}),
+                "unknown_address",
+            ),
+        ];
+        for (i, (params, code)) in cases.iter().enumerate() {
+            let r = c.call(&i.to_string(), "msg.send", params.clone()).await;
+            assert_eq!(r["error"]["code"], *code, "{}: {}", params, r);
+            assert!(r.get("seq").is_none(), "{}", r);
+        }
+        let r = c
+            .call("n", "msg.send", json!({"to": "bobb", "body": "hi"}))
+            .await;
+        assert_eq!(r["error"]["data"]["nearest"], "bob", "{}", r);
+        assert_eq!(r["error"]["hint"], "did you mean bob?", "{}", r);
+        let r = c
+            .call("s", "msg.send", json!({"to": "agt_a7", "body": "hi"}))
+            .await;
+        assert_eq!(r["error"]["hint"], "cannot mail yourself", "{}", r);
+        assert_eq!(message_count(&db), 0);
+        let audit = mail_audit(&db);
+        assert_eq!(audit.len(), cases.len() + 2);
+        for (row, (params, code)) in audit.iter().zip(cases.iter()) {
+            assert_eq!(row.0, "agent:agt_a7");
+            assert_eq!(row.1, params["to"].as_str().unwrap_or_default());
+            assert_eq!(row.2, "deny");
+            assert!(row.3.starts_with(code), "{:?}", row);
+        }
+        // A refused send that got past parsing carries the body hash.
+        assert_eq!(
+            audit[2].4.as_deref(),
+            Some(mail::sha256_hex(b"hi").as_str())
+        );
+    }
+
+    /// An agent whose generation is no longer live may not send.
+    #[tokio::test]
+    async fn a_stale_generation_may_not_send() {
+        let (_t, ctx, db) = ctx_db(as_agent("agt_a7"));
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let principal = Principal::Agent {
+            id: "agt_a7".into(),
+            gen: 2,
+        };
+        let peer = Peer {
+            cred: PeerCred {
+                pid: std::process::id() as libc::pid_t,
+                uid: peer::engine_uid(),
+            },
+            start: None,
+        };
+        let req = Request {
+            v: Some(1),
+            id: Some("1".into()),
+            method: Some("msg.send".into()),
+            params: json!({"to": "agt_b1", "body": "hi"}),
+            idem: None,
+        };
+        let e = msg_send(req, &ctx, peer, &principal).await.err().unwrap();
+        assert_eq!(e.code, ErrorCode::NotAllowed);
+        assert_eq!(message_count(&db), 0);
+        assert_eq!(mail_audit(&db)[0].2, "deny");
+    }
+
+    /// Q1: a send while the engine drains is taken and stays `queued`.
+    #[tokio::test]
+    async fn a_send_while_draining_is_queued() {
+        let (_t, ctx, db) = ctx_db(as_agent("agt_a7"));
+        mail_agent(&db, "agt_a7", "me", "pty").await;
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        ctx.drain.start();
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c
+            .call("1", "msg.send", json!({"to": "bob", "body": "hi"}))
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        assert_eq!(r["result"]["state"], "queued");
+        let state: String = db
+            .reader()
+            .unwrap()
+            .query_row("SELECT state FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "queued");
     }
 }

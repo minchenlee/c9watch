@@ -50,6 +50,7 @@ use super::home::{lock_path, sock_path};
 use super::import;
 use super::lock::acquire_engine_lock;
 use super::machine;
+use super::mail;
 use super::ops;
 use super::sock::{bind_private, ShutdownSignal, ShutdownSignals};
 use super::standing;
@@ -108,6 +109,7 @@ pub async fn run_until(
         .map_err(|e| format!("Failed to install signal handlers: {}", e))?;
     let lock = acquire_engine_lock(&lock_path(home))?;
     let key = machine::load_or_create(home)?;
+    let header_key = key.header_key();
     let db = Arc::new(db::open(home, key.id())?);
     let agent_bin = Arc::new(AgentBin::install(home, &config.agent_source));
     match (agent_bin.sha256_hex(), agent_bin.missing_reason()) {
@@ -125,6 +127,15 @@ pub async fn run_until(
     let reconciled = ops::reconcile(&db, home)?;
     if !reconciled.is_empty() {
         eprintln!("[engine] Boot reconcile: {:?}", reconciled);
+    }
+    // No supervisor holds mail now (C1b-M1 §4.9): after `ops::reconcile`,
+    // which fails the agents that did not survive.
+    let machine_id = key.id().to_string();
+    let (mail, _) = db
+        .write_blocking(move |tx| mail::reconcile_on_boot(tx, &machine_id, db::now_ms()))
+        .map_err(|e| format!("Failed to reconcile the mail: {}", e))?;
+    if mail != mail::Ended::default() {
+        eprintln!("[engine] Mail reconcile: {:?}", mail);
     }
     let (std_listener, socket) = bind_private(&sock_path(home), &lock)?;
     std_listener
@@ -145,7 +156,8 @@ pub async fn run_until(
         .with_agent_bin(agent_bin.clone())
         .with_db(db.clone())
         .with_standing_orders(standing::path(home))
-        .with_drain(drain_switch.clone());
+        .with_drain(drain_switch.clone())
+        .with_header_key(header_key.clone());
     let spawner = Arc::new(
         Spawner::new(
             SpawnerConfig {
@@ -158,7 +170,8 @@ pub async fn run_until(
             ctx.merge.clone(),
             agent_bin,
         )
-        .with_drain(drain_switch),
+        .with_drain(drain_switch)
+        .with_header_key(header_key),
     );
     let ctx = Arc::new(ctx.with_spawner(spawner.clone()));
     match spawner.resume_on_boot() {

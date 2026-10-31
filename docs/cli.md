@@ -167,6 +167,8 @@ c9watch wait abc123 --until any-change -i 1
 
 Exit codes: `0` met, `2` no single live session matches, `3` stopped before `needs-input`, `124` timeout. `done` is met at once when the session is not Working. Details: [cli-events.md](cli-events.md).
 
+An engine build also has `wait --event turn_ended --agent <id|name> [--since <cursor>]` for an engine agent's next turn end. `--since` takes a cursor you hold, such as the `cursor` that `send` prints; see the note under `send` on why `send --wait` is the exact wait for an answer.
+
 ### `tasks` — Session Tasks/Todos
 
 Read tasks from `~/.claude/tasks/<session-id>/`.
@@ -213,7 +215,7 @@ c9watch spawn --cwd . --permission-mode plan --model sonnet
 {"ok":true,"sessionId":"abc-1234-...","pid":54321,"name":"researcher"}
 ```
 
-Options: `--cwd`, `--name`, `--append-system-prompt`, `--append-system-prompt-file`, `--permission-mode` (default: bypassPermissions), `--model`, `--add-dir`
+Options: `--cwd`, `--name`, `--prompt` (the worker's only prompt; there is no later `send` to a worker), `--append-system-prompt`, `--append-system-prompt-file`, `--permission-mode` (default: bypassPermissions), `--model`, `--add-dir`
 
 **Engine builds only (`--features engine`, not released):** `--mode managed` (the default) is the worker above. `--mode free` creates an engine agent instead:
 
@@ -226,22 +228,31 @@ c9watch spawn --mode free --cwd /path/to/project --name researcher
 - A caller with `C9_AGENT_ID` set (inside an engine agent) gets `not_allowed` (the engine's code for the same refusal) and never reaches the engine.
 - Errors exit `1` with `{"error":"<code>: <msg>; <hint>"}`. Retire the agent with `c9watch api agent.retire '{"id":"agt_..."}'`.
 
-### `send` — Message a Worker
+### `send` — Mail an Engine Agent
 
-Send a message to a spawned worker session.
+**Engine builds only (`--features engine`, not released).** Sends one message to an engine agent (an agent the engine runs in a PTY, such as one from `spawn --mode free`) through the engine's `msg.send`. The engine queues the message. When the agent is ready and its input box is empty, the engine pastes the message into the box and submits it, so the agent reads it as its next prompt. The legacy worker `send` is removed: a `--mode managed` worker takes its only prompt from `spawn --prompt`.
 
 ```bash
-# Fire-and-forget
-c9watch send abc-1234 --message "Research topic X"
-
-# Wait for reply
-c9watch send abc-1234 --message "Summarize findings" --wait
-
-# Send from file
-c9watch send abc-1234 --file instructions.md --wait --timeout 120
+c9watch send researcher "Summarize findings in notes.md"     # by name
+c9watch send agt_01J... --file instructions.md --kind request
+c9watch send researcher --stdin --idem ci-build-42 < brief.txt
+c9watch send researcher "Review PR 12" --wait --timeout 600
 ```
 
-Exit codes: 0 (success), 1 (error), 2 (`--wait` timed out, message was sent)
+- `TO` is an agent id (`agt_...`), `<machine>/<id>`, or a name. A name that two live agents share fails with `unknown_address` and lists the `candidates`; an unknown name gets the `nearest` one.
+- Give the text exactly once: `MESSAGE`, `--message`, `--stdin` or `--file`. CRLF line ends become LF.
+- `--kind request|info` (default `info`), `--reply-to <msg id>` (the reply joins that message's thread), `--idem <key>`.
+- It prints `{"msg": {"msgId", "state", "to", "cursor", "replayed"}}`. `state` is `queued`.
+- An engine error prints `{"error": {"code", "msg", "hint", "data"}}` on stderr and exits `1`. `data` is there only for some codes, for example `nearest`, `candidates`, or the target's `state` for `not_controlled`. Mail goes only to an agent the engine controls (`control='pty'`) that has not ended.
+- `--idem` makes a resend safe: the same sender, key and request get the first message back with `replayed: true`; the same key with a different request is `duplicate`. The key is unique per sender principal. Every terminal script is the same principal, `local-unverified`, so give each script its own prefix (for example `ci-build-42`, not `42`).
+
+**Waiting for the answer.** `--wait` follows the message from its `cursor`. It waits until the message is `delivered`, then for the agent's next turn end: the turn that answered the message. It prints a second line, `{"msg": {..., "state": "delivered", "detail": ...}, "turnEnd": "<cursor>"}`, and exits `0`. It exits `1` when the message ends `failed` or `uncertain` (the engine is not sure the agent got it, and does not send it again), and `2` when `--timeout` (default 300 s) runs out. After an `engine restart` it reconnects and goes on.
+
+`cursor` can also go to `c9watch wait --event turn_ended --agent <id> --since <cursor>`. That wait is not exact: the cursor is where the message was queued, so if the agent was mid-turn then, the wait ends with that turn, which did not read the message. Use `send --wait` to wait for the answer. A cursor older than the 24 h event retention (an idem replay can return one) gets `cursor_expired`.
+
+A message sent while the engine drains (`engine restart`) is still taken and stays `queued`; the resumed agent gets it.
+
+**From inside an agent** (`C9_AGENT_ID` set), `send` connects only to `C9_ENGINE_SOCK` and never starts the engine. `--wait` is refused there: end the turn instead, and the answer arrives as a new message. Every agent's SessionStart context carries this rule.
 
 ### `workers` — List Managed Workers
 
@@ -320,4 +331,4 @@ c9watch search "database migration" --project myapp
 - **All output is JSON** on stdout. Errors go to stderr as `{"error": "..."}` with exit code 1.
 - **No stderr noise** — debug warnings are suppressed in CLI mode.
 - **System XML tags** (e.g., `<local-command-caveat>`, `<system-reminder>`) are stripped from all text fields.
-- **Write path** — `spawn` starts new managed worker sessions; `send` delivers messages to them. All other commands are read-only. Claude Code's stdin for sessions not managed by c9watch is owned by the terminal process that launched them.
+- **Write path** — `spawn` starts new sessions; in an engine build, `send` mails engine agents. All other commands are read-only. Claude Code's stdin for sessions not managed by c9watch is owned by the terminal process that launched them.

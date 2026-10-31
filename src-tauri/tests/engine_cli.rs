@@ -307,9 +307,18 @@ fn a_db_from_a_newer_engine_fails_the_auto_start_with_its_code() {
 /// gets a version; any other call without `--settings` fails at once. An
 /// agent spawn logs its argv, sends the SessionStart hook through the
 /// engine's `c9watch-agent` copy as CC would (source `resume` with
-/// `--resume`), shows CC's idle title and a prompt, and waits to be killed.
-/// A `ready-delay` file next to it holds seconds to wait first, as a slow
-/// CC start would.
+/// `--resume`), shows CC's idle title and CC's layout (a rule, the input
+/// box with its placeholder, a rule, two status lines) and runs until it
+/// is killed. A `ready-delay` file next to it holds seconds to wait first,
+/// as a slow CC start would; with a `hold` file the box shows a half-typed
+/// draft, so no mail goes in.
+///
+/// Its input is a mail paste (C1b-M1-11): once `ESC[201~` ends the paste
+/// the box shows its first line; a CR then submits it as CC would. The
+/// prompt goes to `in-<agent id>.log` under a `--- gen <n>` line, the
+/// UserPromptSubmit hook carries it, and a Stop hook ends the turn after
+/// `linger <secs>` (from a body line, default 0.3 s). A body line
+/// `forward to <to>` makes it mail `<to>` with the `c9watch` next to it.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 case "$1" in --version) echo "2.1.312 (Claude Code)"; exit 0 ;; esac
 dir=$(dirname "$0")
@@ -327,10 +336,45 @@ done
 echo "$args" >> "$dir/argv.log"
 [ -f "$dir/ready-delay" ] && sleep "$(cat "$dir/ready-delay")"
 home=$(dirname "$(dirname "$settings")")
+hook() { "$home/bin/c9watch-agent" hook "$1" --kind claude; }
 printf '{"session_id":"%s","source":"%s","hook_event_name":"SessionStart"}' "$sid" "$source" \
-  | "$home/bin/c9watch-agent" hook session-start --kind claude > "$dir/ctx-$C9_AGENT_GEN.out"
-printf '\033]0;\342\234\263 Claude Code\007\342\235\257 \r\n'
-while :; do sleep 1; done
+  | hook session-start > "$dir/ctx-$C9_AGENT_GEN.out"
+rule="────────────────────────────────────────"
+draw() {
+  printf '\033[2J\033[H%s\r\n\342\235\257 %s\r\n%s\r\n  auto mode on\r\n  1 agent\r\n' \
+    "$rule" "$1" "$rule"
+}
+printf '\033]0;\342\234\263 Claude Code\007'
+if [ -f "$dir/hold" ]; then draw "a half-typed draft"; else draw 'Try "fix lint errors"'; fi
+esc=$(printf '\033'); cr=$(printf '\r')
+stty -icanon -echo -icrnl min 0 time 2
+buf=""
+while :; do
+  chunk=$(dd bs=4096 count=1 2>/dev/null; echo .)
+  chunk=${chunk%.}
+  if [ -z "$chunk" ]; then sleep 0.2; continue; fi
+  buf="$buf$chunk"
+  case "$buf" in
+    *"$esc[201~"*"$cr"*) ;;
+    *"$esc[201~"*) draw "$(printf '%s\n' "${buf#*"$esc[200~"}" | head -n 1)"; continue ;;
+    *) continue ;;
+  esac
+  p=${buf#*"$esc[200~"}; p=${p%%"$esc[201~"*}; buf=""
+  printf '\033]0;\342\227\220 Claude Code\007'
+  draw ""
+  printf '%s\n' "--- gen $C9_AGENT_GEN" "$p" >> "$dir/in-$C9_AGENT_ID.log"
+  json=$(printf '%s\n' "$p" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+    | awk '{ printf "%s%s", (NR > 1 ? "\\n" : ""), $0 }')
+  printf '{"session_id":"%s","hook_event_name":"UserPromptSubmit","prompt":"%s"}' "$sid" "$json" \
+    | hook prompt-submit > /dev/null
+  to=$(printf '%s\n' "$p" | sed -n 's/^forward to //p' | head -n 1)
+  [ -z "$to" ] || "$dir/c9watch" send "$to" "forwarded by $C9_AGENT_ID" \
+    >> "$dir/fwd-$C9_AGENT_ID.out" 2>&1
+  linger=$(printf '%s\n' "$p" | sed -n 's/^linger //p' | head -n 1)
+  sleep "${linger:-0.3}"
+  printf '{"session_id":"%s","hook_event_name":"Stop"}' "$sid" | hook stop > /dev/null
+  printf '\033]0;\342\234\263 Claude Code\007'
+done
 "#;
 
 /// C1a-28 end to end: `engine restart` with a live agent drains it and the
@@ -861,7 +905,8 @@ fn wait_for_a_turn_end_auto_starts_the_engine() {
 
 // ── C1a-38: spawn --mode free through agent.create ──────────────────
 
-/// A fake `claude` (FAKE_CLAUDE) first on PATH and a cwd for free agents.
+/// A fake `claude` (FAKE_CLAUDE) first on PATH, with this `c9watch` next
+/// to it, and a cwd for free agents.
 struct FreeAgents {
     bin: PathBuf,
     cwd: PathBuf,
@@ -876,6 +921,7 @@ impl FreeAgents {
         let claude = bin.join("claude");
         std::fs::write(&claude, FAKE_CLAUDE).unwrap();
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(BIN, bin.join("c9watch")).unwrap();
         let cwd = root.join("work");
         std::fs::create_dir(&cwd).unwrap();
         FreeAgents {
@@ -895,6 +941,24 @@ impl FreeAgents {
 
     fn run(&self, sb: &Sandbox, args: &[&str]) -> Output {
         self.cmd(sb, args).output().unwrap()
+    }
+
+    /// `spawn --mode free --name <name>` in `work` (live agents share one
+    /// cwd); the ready agent's id.
+    fn spawn(&self, sb: &Sandbox, name: &str) -> String {
+        let out = self.run(
+            sb,
+            &["spawn", "--mode", "free", "--cwd", "work", "--name", name],
+        );
+        assert!(out.status.success(), "{:?} / log {}", out, sb.log());
+        let agent = stdout_json(&out)["agent"].clone();
+        assert_eq!(agent["state"], "ready", "{}", agent);
+        agent["id"].as_str().unwrap().to_string()
+    }
+
+    /// The prompts agent `id` was given, as its `in-<id>.log` has them.
+    fn prompts(&self, id: &str) -> String {
+        std::fs::read_to_string(self.bin.join(format!("in-{}.log", id))).unwrap_or_default()
     }
 
     /// Wait until no fake agent runs.
@@ -1029,6 +1093,284 @@ fn spawn_managed_needs_the_pm_build() {
         assert!(err.contains("--mode free"), "{args:?}: {err}");
     }
     assert!(!sb.engine.exists());
+}
+
+// ── C1b-M1-11: send mail through the engine ─────────────────────────
+
+/// The `message_status` rows of `msg_id`, oldest first: (state, detail).
+fn mail_states(sb: &Sandbox, msg_id: &str) -> Vec<(String, Option<String>)> {
+    use c9watch_lib::engine::db::db_path;
+    let conn = rusqlite::Connection::open(db_path(&sb.engine)).unwrap();
+    let mut st = conn
+        .prepare("SELECT state, detail FROM message_status WHERE msg_id = ?1 ORDER BY seq")
+        .unwrap();
+    let rows = st
+        .query_map([msg_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+/// Wait until `msg_id` is in `state`; its rows.
+fn wait_mail(sb: &Sandbox, msg_id: &str, state: &str) -> Vec<(String, Option<String>)> {
+    let mut rows = Vec::new();
+    let reached = wait_for(Duration::from_secs(30), || {
+        rows = mail_states(sb, msg_id);
+        rows.last().is_some_and(|(s, _)| s == state)
+    });
+    assert!(reached, "{msg_id} not {state}: {rows:?} / log {}", sb.log());
+    rows
+}
+
+/// `c9watch send` that succeeded: its `msg`.
+fn sent(out: &Output) -> Value {
+    assert!(out.status.success(), "{:?}", out);
+    let msg = stdout_json(out)["msg"].clone();
+    assert!(
+        msg["msgId"].as_str().unwrap().starts_with("msg_"),
+        "{}",
+        msg
+    );
+    msg
+}
+
+/// The `error` of the JSON line a failed engine command prints on stderr.
+fn stderr_error(out: &Output) -> Value {
+    let err = stderr_of(out);
+    let line = err
+        .lines()
+        .rev()
+        .find(|l| l.starts_with('{'))
+        .unwrap_or_else(|| panic!("no JSON on stderr: {err}"));
+    serde_json::from_str::<Value>(line).unwrap()["error"].clone()
+}
+
+fn states_only(rows: &[(String, Option<String>)]) -> Vec<&str> {
+    rows.iter().map(|(s, _)| s.as_str()).collect()
+}
+
+/// The terminal (L) mails a free agent by name. The agent's input box gets
+/// the fence (header with the token, provenance, body, end line) as one
+/// prompt, and the prompt hook confirms it: `queued → delivering →
+/// delivered(prompt_hook)`.
+#[test]
+fn send_from_the_terminal_reaches_a_free_agent() {
+    let sb = Sandbox::new();
+    let fa = FreeAgents::new(&sb);
+    let ann = fa.spawn(&sb, "ann");
+    let msg = sent(&fa.run(&sb, &["send", "ann", "hello\nworld"]));
+    assert_eq!(msg["state"], "queued", "{}", msg);
+    assert_eq!(msg["to"]["id"], ann.as_str(), "{}", msg);
+    assert_eq!(msg["replayed"], false, "{}", msg);
+    let id = msg["msgId"].as_str().unwrap();
+    let rows = wait_mail(&sb, id, "delivered");
+    assert_eq!(
+        states_only(&rows),
+        ["queued", "delivering", "delivered"],
+        "{rows:?}"
+    );
+    assert_eq!(rows[2].1.as_deref(), Some("prompt_hook"), "{rows:?}");
+
+    let prompts = fa.prompts(&ann);
+    let header = format!("[c9watch mail {} \u{b7} tok ", id);
+    let fence = prompts
+        .split("--- gen 1\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no prompt: {prompts}"));
+    assert!(fence.starts_with(&header), "{prompts}");
+    assert!(
+        fence.contains("\n[from terminal (local-unverified) for "),
+        "{prompts}"
+    );
+    assert!(
+        fence.contains(&format!("\nhello\nworld\n[end mail {}]", id)),
+        "{prompts}"
+    );
+    // One prompt: the paste went in once and was submitted once.
+    assert_eq!(prompts.matches("--- gen").count(), 1, "{prompts}");
+
+    let out = fa.run(
+        &sb,
+        &["api", "agent.retire", &format!(r#"{{"id":"{}"}}"#, ann)],
+    );
+    assert!(out.status.success(), "{:?}", out);
+    assert!(fa.all_gone(), "a fake claude still runs");
+}
+
+/// `send --wait` returns once the message is delivered and the agent's
+/// turn after it has ended, with a second line naming that turn end.
+#[test]
+fn send_wait_returns_after_the_reply_turn() {
+    let sb = Sandbox::new();
+    let fa = FreeAgents::new(&sb);
+    let ann = fa.spawn(&sb, "ann");
+    let out = fa.run(
+        &sb,
+        &["send", "ann", "linger 2", "--wait", "--timeout", "60"],
+    );
+    assert!(out.status.success(), "{:?} / log {}", out, sb.log());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    let id = lines[0]["msg"]["msgId"].as_str().unwrap();
+    let done = &lines[1];
+    assert_eq!(done["msg"]["msgId"], id, "{done}");
+    assert_eq!(done["msg"]["state"], "delivered", "{done}");
+    assert_eq!(done["msg"]["detail"], "prompt_hook", "{done}");
+    assert!(
+        cursor_seq(&done["turnEnd"]) > cursor_seq(&lines[0]["msg"]["cursor"]),
+        "{stdout}"
+    );
+    // The turn that ended is the one the message started: its Stop came
+    // after the prompt, once the linger was over.
+    assert!(fa.prompts(&ann).contains(id));
+}
+
+/// A name no agent has is `unknown_address`, with the nearest open name.
+#[test]
+fn send_to_an_unknown_name_suggests_the_nearest() {
+    let sb = Sandbox::new();
+    let fa = FreeAgents::new(&sb);
+    fa.spawn(&sb, "ann");
+    let out = fa.run(&sb, &["send", "anne", "hi"]);
+    assert_eq!(out.status.code(), Some(1), "{:?}", out);
+    let err = stderr_error(&out);
+    assert_eq!(err["code"], "unknown_address", "{err}");
+    assert_eq!(err["data"]["nearest"], "ann", "{err}");
+}
+
+/// A detected session (`control='none'`) takes no mail: `not_controlled`,
+/// and no message row.
+#[test]
+fn send_to_an_observed_session_is_not_controlled() {
+    use c9watch_lib::engine::db::db_path;
+    let sb = Sandbox::new();
+    let d = Detected::new(&sb);
+    let listed = engine_lists_the_session(&sb, &d);
+    let id = listed["sessions"][0]["engine"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = d.run(&sb, &["send", &id, "hi"]);
+    assert_eq!(out.status.code(), Some(1), "{:?}", out);
+    let err = stderr_error(&out);
+    assert_eq!(err["code"], "not_controlled", "{err}");
+    let conn = rusqlite::Connection::open(db_path(&sb.engine)).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+/// E12: mail queued while the agent's box is busy (a half-typed draft)
+/// stays queued through `engine restart` and goes to generation 2 after
+/// the resume.
+#[test]
+fn mail_queued_across_an_engine_restart_is_delivered_after_resume() {
+    let sb = Sandbox::new();
+    let fa = FreeAgents::new(&sb);
+    std::fs::write(fa.bin.join("hold"), "").unwrap();
+    let ann = fa.spawn(&sb, "ann");
+    let msg = sent(&fa.run(&sb, &["send", "ann", "after the restart"]));
+    let id = msg["msgId"].as_str().unwrap();
+    // A box with text in it takes no paste.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(states_only(&mail_states(&sb, id)), ["queued"]);
+    assert_eq!(fa.prompts(&ann), "");
+
+    std::fs::remove_file(fa.bin.join("hold")).unwrap();
+    let out = fa.run(&sb, &["engine", "restart"]);
+    assert!(out.status.success(), "{:?} / log {}", out, sb.log());
+    let rows = wait_mail(&sb, id, "delivered");
+    assert_eq!(rows.last().unwrap().1.as_deref(), Some("prompt_hook"));
+    assert!(!rows.iter().any(|(s, _)| s == "uncertain"), "{rows:?}");
+    let prompts = fa.prompts(&ann);
+    assert!(prompts.starts_with("--- gen 2\n"), "{prompts}");
+    assert!(prompts.contains(id), "{prompts}");
+}
+
+/// An agent mails another agent with `c9watch send` (no `--wait`) from
+/// inside its turn: the engine stamps it with the sender agent, and the
+/// second agent gets it.
+#[test]
+fn an_agent_can_mail_another_agent() {
+    let sb = Sandbox::new();
+    let fa = FreeAgents::new(&sb);
+    let ann = fa.spawn(&sb, "ann");
+    let bob = fa.spawn(&sb, "bob");
+    let msg = sent(&fa.run(&sb, &["send", "ann", "forward to bob"]));
+    wait_mail(&sb, msg["msgId"].as_str().unwrap(), "delivered");
+
+    let mut prompts = String::new();
+    let got = wait_for(Duration::from_secs(30), || {
+        prompts = fa.prompts(&bob);
+        prompts.contains(&format!("forwarded by {}", ann))
+    });
+    let fwd = std::fs::read_to_string(fa.bin.join(format!("fwd-{}.out", ann)));
+    assert!(got, "{prompts} / send: {fwd:?} / log {}", sb.log());
+    assert!(
+        prompts.contains(&format!("/{} (free) for ", ann)),
+        "{prompts}"
+    );
+    let fwd: Value = serde_json::from_str(fwd.unwrap().trim()).unwrap();
+    let id = fwd["msg"]["msgId"].as_str().unwrap();
+    assert_eq!(fwd["msg"]["to"]["id"], bob.as_str(), "{fwd}");
+    let rows = wait_mail(&sb, id, "delivered");
+    assert_eq!(rows.last().unwrap().1.as_deref(), Some("prompt_hook"));
+}
+
+/// X5, the mail half (Q1=A): a send during the drain is taken and stays
+/// `queued`; the draining engine writes nothing to the agent, and the
+/// resumed generation gets it.
+#[test]
+fn no_mail_is_delivered_while_draining() {
+    let sb = Sandbox::new();
+    let fa = FreeAgents::new(&sb);
+    let ann = fa.spawn(&sb, "ann");
+    // A turn that lasts, so the drain waits for it.
+    let first = sent(&fa.run(&sb, &["send", "ann", "linger 6"]));
+    let first = first["msgId"].as_str().unwrap().to_string();
+    assert!(
+        wait_for(Duration::from_secs(30), || fa
+            .prompts(&ann)
+            .contains(&first)),
+        "log {}",
+        sb.log()
+    );
+    let mut restart = fa
+        .cmd(&sb, &["engine", "restart"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(Reap)
+        .unwrap();
+    assert!(
+        wait_for(Duration::from_secs(10), || sb
+            .log()
+            .contains("SIGTERM: draining")),
+        "log {}",
+        sb.log()
+    );
+    let msg = sent(&fa.run(&sb, &["send", "ann", "during the drain"]));
+    let id = msg["msgId"].as_str().unwrap();
+    assert_eq!(msg["state"], "queued", "{}", msg);
+    assert!(restart.wait().unwrap().success(), "log {}", sb.log());
+
+    let rows = wait_mail(&sb, id, "delivered");
+    assert_eq!(
+        states_only(&rows),
+        ["queued", "delivering", "delivered"],
+        "{rows:?}"
+    );
+    let prompts = fa.prompts(&ann);
+    let (gen1, gen2) = prompts
+        .split_once("--- gen 2\n")
+        .unwrap_or_else(|| panic!("no generation 2 prompt: {prompts}"));
+    assert!(gen1.contains(&first), "{prompts}");
+    assert!(!gen1.contains(id), "delivered while draining: {prompts}");
+    assert!(gen2.contains(id), "{prompts}");
 }
 
 // ── C1a exit criteria X2, X9, X15 ───────────────────────────────────

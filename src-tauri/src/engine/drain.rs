@@ -11,7 +11,11 @@
 //!      PTY yet spawns nothing and leaves its op to boot reconcile.
 //!    - `hook.session_start` is still taken but answers with no context and
 //!      keeps the interrupted note pending (`engine::standing`).
-//!    - A PTY write (C1a: the trust-dialog keys) is not sent.
+//!    - A PTY write (the trust-dialog keys, a mail paste or its CR) is
+//!      not sent.
+//!    - `msg.send` is still taken: the message stays `queued`, and the
+//!      supervisor takes none from the queue (C1b-M1 §4.7). A paste not
+//!      yet submitted goes back to the queue; the resumed agent gets it.
 //!
 //!    Each blocked injection is an audit row `drain.blocked_injection` with
 //!    reason `path=hook` or `path=pty`.

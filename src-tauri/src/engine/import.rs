@@ -25,7 +25,8 @@
 //!   names a worker with no row (a dangling adoption) is skipped.
 //! - `InboxEvent` (`cli/pm_inbox.rs`): one `legacy.inbox` event each, once
 //!   per `eventId`. `legacy_events` remembers the ids, so an event that
-//!   retention pruned is not imported again. The `messages` table is C1b.
+//!   retention pruned is not imported again. Legacy inbox events are not
+//!   copied into the `messages` table (C1b-M1).
 //!
 //! The legacy types live behind `pm-orchestration`, so the copy is parsed
 //! into the minimal mirrors below, which ignore unknown fields.

@@ -46,10 +46,10 @@ pub const MAX_TRIMMED_INPUT: usize = 16 * 1024 * 1024;
 
 /// The input keys an event keeps, or `None` to send all of it. The engine
 /// reads only these, and the prompt and tool input and output stay out of
-/// the socket. `tool_key` is added by `trim_input`.
+/// the socket. `tool_key` and `mail` are added by `trim_input`.
 pub fn kept_keys(event: &str) -> Option<&'static [&'static str]> {
     match event {
-        "prompt-submit" => Some(&["session_id"]),
+        "prompt-submit" => Some(&["session_id", "mail"]),
         "permission-request" => Some(&["session_id", "tool_name", "agent_id", "tool_key"]),
         "post-tool-use" => Some(&[
             "session_id",
@@ -75,14 +75,51 @@ pub fn tool_key(tool_name: &Value, tool_input: &Value) -> String {
     format!("{:016x}", h)
 }
 
+/// The start of a mail fence header line (`engine::mail::fence`).
+const MAIL_HEADER: &str = "[c9watch mail ";
+/// At most this many fence header lines go to the engine, each cut to
+/// `MAIL_LINE_MAX` bytes. One header names one message.
+const MAIL_LINES_MAX: usize = 16;
+const MAIL_LINE_MAX: usize = 200;
+
+/// The mail fence header lines of a prompt, joined by `\n`, or `None` when
+/// it has none. The engine confirms delivery from them (C1b-M1 §4.5); the
+/// rest of the prompt stays out of the socket.
+pub fn mail_headers(prompt: &str) -> Option<String> {
+    let lines: Vec<&str> = prompt
+        .lines()
+        .filter(|l| l.starts_with(MAIL_HEADER))
+        .take(MAIL_LINES_MAX)
+        .map(|l| {
+            let mut end = l.len().min(MAIL_LINE_MAX);
+            while !l.is_char_boundary(end) {
+                end -= 1;
+            }
+            &l[..end]
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// `input` with only `keys` kept, plus `tool_key` when the input has a
-/// `tool_name`; input that is not a JSON object is returned as it is.
+/// `tool_name` and `mail` (`mail_headers`) when its `prompt` carries a
+/// mail fence; input that is not a JSON object is returned as it is.
 pub fn trim_input(input: &[u8], keys: &[&str]) -> Vec<u8> {
     match serde_json::from_slice::<Value>(input) {
         Ok(Value::Object(mut o)) => {
             if keys.contains(&"tool_key") && o.contains_key("tool_name") {
                 let key = tool_key(&o["tool_name"], o.get("tool_input").unwrap_or(&Value::Null));
                 o.insert("tool_key".into(), key.into());
+            }
+            if keys.contains(&"mail") {
+                match o
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .and_then(mail_headers)
+                {
+                    Some(m) => o.insert("mail".into(), m.into()),
+                    None => o.remove("mail"),
+                };
             }
             let kept: serde_json::Map<String, Value> = o
                 .into_iter()
@@ -670,6 +707,22 @@ mod tests {
             serde_json::from_slice(&trim_input(br#"{"session_id":"s1","prompt":"hi"}"#, keys))
                 .unwrap();
         assert_eq!(out, serde_json::json!({"session_id": "s1"}));
+        // A mail fence: only its header line goes, never the body.
+        let input = json!({
+            "session_id": "s1",
+            "mail": "forged",
+            "prompt": "[c9watch mail msg_1 \u{b7} tok ab]\n[from terminal]\nsecret\n[end mail msg_1]",
+        });
+        let out: Value =
+            serde_json::from_slice(&trim_input(input.to_string().as_bytes(), keys)).unwrap();
+        assert_eq!(
+            out,
+            json!({"session_id": "s1", "mail": "[c9watch mail msg_1 \u{b7} tok ab]"})
+        );
+        let input = json!({"session_id": "s1", "mail": "forged", "prompt": "hi"});
+        let out: Value =
+            serde_json::from_slice(&trim_input(input.to_string().as_bytes(), keys)).unwrap();
+        assert_eq!(out, json!({"session_id": "s1"}));
         // Input that is not an object goes as it is.
         assert_eq!(trim_input(b"not json", keys), b"not json".to_vec());
     }

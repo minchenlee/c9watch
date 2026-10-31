@@ -2,7 +2,7 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 3;
+export const C9P_API_MINOR = 4;
 
 /**
  * `agent.create` params. C1a creates only free agents (A:794): no brief,
@@ -134,6 +134,11 @@ export interface C9pClientInfo {
 /** The `error` object of a failed response. */
 export interface C9pErrorBody {
   code: C9pErrorCode;
+  /**
+   * Facts about this error for the caller to act on, such as the
+   * `nearest` name for `unknown_address`. Absent for most errors.
+   */
+  data?: unknown;
   hint: string;
   msg: string;
   retryable: boolean;
@@ -213,6 +218,29 @@ export type C9pErrorCode =
    * until the next engine is up. Retry against the new engine.
    */
   | 'draining'
+  /**
+   * `msg.send`: no agent answers to `to`, its machine is not this one,
+   * or a name matches more than one agent. `data` has `nearest` or
+   * `candidates`.
+   */
+  | 'unknown_address'
+  /**
+   * `msg.send`: the engine does not drive the target's terminal (an
+   * observed session), or the target is retiring or gone. `data` has
+   * `state` and `control`.
+   */
+  | 'not_controlled'
+  /**
+   * `msg.send`: a managed worker takes mail only from its parent and
+   * the human, and sends only to its parent. `data` may have `parent`.
+   */
+  | 'not_owner'
+  /**
+   * `msg.send`: the `idem` key was used for another message, or the same
+   * body went to the same agent within 10 minutes. `data` has `msgId`
+   * and `at`.
+   */
+  | 'duplicate'
   /** An engine-side failure. */
   | 'internal';
 
@@ -314,6 +342,57 @@ export interface C9pHookResult {
    * `hookSpecificOutput.additionalContext`.
    */
   additionalContext?: string | null;
+}
+
+/** The agent a message went to. */
+export interface C9pMsgAddress {
+  /** `<machine>/<id>`. */
+  addr: string;
+  id: string;
+  name: string | null;
+}
+
+/**
+ * What a message asks of its reader (A:418). A caller sends `request` or
+ * `info`; `result` and `system` are written by the engine.
+ */
+export type C9pMsgKind = 'request' | 'info' | 'result' | 'system';
+
+/**
+ * `msg.send` params. The envelope's `idem` makes a resend safe: the same
+ * sender, key and request get the first message back.
+ */
+export interface C9pMsgSendParams {
+  /** UTF-8 text. No control characters other than `\n` and `\t`. */
+  body: string;
+  /** `request` or `info`. */
+  kind?: C9pMsgKind;
+  /** The id of the message this one answers. Stored, not checked. */
+  replyTo?: string | null;
+  /**
+   * An agent id (`agt_<ulid>`), a name, or `<machine>/<id>` with this
+   * machine's id.
+   */
+  to: string;
+}
+
+/** `msg.send` result. The response's `seq` is the same cursor. */
+export interface C9pMsgSendResult {
+  /**
+   * Cursor of the message's `msg.state` `queued` event. For a replay it
+   * is the first send's cursor, which may be past event retention.
+   */
+  cursor: string;
+  /** `msg_<ulid>`. */
+  msgId: string;
+  /**
+   * The same sender sent the same request with this `idem` before; no
+   * new message was written.
+   */
+  replayed: boolean;
+  /** The message's state now: `queued` for a new message. */
+  state: string;
+  to: C9pMsgAddress;
 }
 
 /**
@@ -471,6 +550,10 @@ export interface C9pMethods {
   'hook.user_prompt_submit': {
     params: C9pHookParams;
     result: C9pHookResult;
+  };
+  'msg.send': {
+    params: C9pMsgSendParams;
+    result: C9pMsgSendResult;
   };
   'session.list': {
     params: C9pSessionListParams;

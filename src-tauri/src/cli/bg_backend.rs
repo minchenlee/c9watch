@@ -51,7 +51,7 @@ use tokio::net::UnixStream;
 /// Send one request, read one reply, drop the connection.
 ///
 /// The daemon closes the connection after each one-shot reply, so this is
-/// the only safe pattern for `reply`/`kill`/`nudge`/`ping`. Do NOT use for
+/// the only safe pattern for `kill`/`nudge`/`ping`. Do NOT use for
 /// `subscribe` (subscribe takes over the connection — use [`subscribe`]).
 pub async fn rpc(sock: &Path, req: Request) -> Result<OneShotReply, String> {
     let wire = req.to_wire();
@@ -274,10 +274,10 @@ impl SettleDetector {
         // and `blocked` (awaiting user input). A third terminal shape exists for
         // open-ended assistant text that CC's classifier interprets as
         // "conversation continues but engine is quiescent": `state:"working"` +
-        // `tempo:"idle"`. Without this clause `wait_for_turn` hangs until
-        // timeout. The tempo qualifier prevents mid-turn `working+active`
-        // patches (none observed in 2.1.150, but defensive) from short-circuiting
-        // the wait.
+        // `tempo:"idle"`. Without this clause the settle watcher never
+        // reports the turn. The tempo qualifier prevents mid-turn `working+active`
+        // patches (none observed in 2.1.150, but defensive) from counting as
+        // settled.
         matches!(self.state.as_deref(), Some("done") | Some("blocked"))
             || (self.state.as_deref() == Some("working") && self.tempo.as_deref() == Some("idle"))
     }
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn statepatch_deserializes_from_top_level_record() {
-        // wait_for_turn's snapshot path must accept `record.state` / `record.tempo`
+        // The snapshot path must accept `record.state` / `record.tempo`
         // (the round-trip PoC shape), not just nested `record.currentState.*`.
         let raw = serde_json::json!({
             "state": "done",
@@ -566,7 +566,7 @@ mod tests {
         // CC 2.1.150 emits `state:"working", tempo:"idle"` for open-ended
         // assistant turns that the daemon's classifier interprets as
         // "conversation continues but engine is quiescent". Without this rule,
-        // `wait_for_turn` hangs until timeout. Reproduced empirically on
+        // the settle watcher never reports the turn. Reproduced empirically on
         // probe-01: `{"state":"working","detail":"Waiting.","tempo":"idle"}`.
         let mut det = SettleDetector::new();
         det.apply_patch(&StatePatch {

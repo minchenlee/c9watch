@@ -37,6 +37,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 4,
         sql: include_str!("migrations/0004_drain.sql"),
     },
+    Migration {
+        version: 5,
+        sql: include_str!("migrations/0005_messages.sql"),
+    },
 ];
 
 /// The schema version this engine writes.
@@ -214,6 +218,65 @@ mod tests {
             })
             .unwrap();
         assert_eq!((id.as_str(), key), ("agt_1", None));
+    }
+
+    #[test]
+    fn a_version_4_db_gains_the_mail_tables_with_a_backup() {
+        let t = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open(t.path().join("e.db")).unwrap();
+        migrate(&mut conn, &MIGRATIONS[..4], t.path()).unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, role, provider, source) \
+             VALUES ('agt_1', 'worker', 'claude', 'engine')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), [5]);
+        assert_eq!(user_version(&conn).unwrap(), 5);
+        let backup = Connection::open(t.path().join("pre-5.db")).unwrap();
+        assert_eq!(user_version(&backup).unwrap(), 4);
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema \
+                 WHERE name IN ('messages', 'message_status')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+        let id: String = conn
+            .query_row("SELECT id FROM agents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(id, "agt_1");
+    }
+
+    #[test]
+    fn idem_is_unique_per_sender_and_null_never_collides() {
+        let t = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open(t.path().join("e.db")).unwrap();
+        migrate(&mut conn, MIGRATIONS, t.path()).unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, role, provider, source) \
+             VALUES ('agt_1', 'worker', 'claude', 'engine')",
+            [],
+        )
+        .unwrap();
+        let put = |id: &str, from: &str, idem: Option<&str>| {
+            conn.execute(
+                "INSERT INTO messages (id, from_principal, to_agent, to_addr, \
+                 origin_kind, provenance, body, body_hash, req_hash, idem, state, \
+                 state_at, created_at) \
+                 VALUES (?1, ?2, 'agt_1', 'm/agt_1', 'local-unverified', 'p', 'b', \
+                 'h', 'r', ?3, 'queued', 0, 0)",
+                rusqlite::params![id, from, idem],
+            )
+        };
+        put("msg_1", "local-unverified", None).unwrap();
+        put("msg_2", "local-unverified", None).unwrap();
+        put("msg_3", "local-unverified", Some("k")).unwrap();
+        // Another sender may use the same key.
+        put("msg_4", "agent:agt_9", Some("k")).unwrap();
+        assert!(put("msg_5", "local-unverified", Some("k")).is_err());
     }
 
     #[test]

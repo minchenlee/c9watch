@@ -211,68 +211,6 @@ pub fn cmd_spawn(
     crate::cli::print_json(&response, pretty)
 }
 
-pub fn cmd_send(
-    session_id: String,
-    message: Option<String>,
-    stdin: bool,
-    file: Option<String>,
-    wait: bool,
-    timeout: u64,
-    pretty: bool,
-) -> Result<(), String> {
-    ensure_daemon()?;
-
-    // Resolve text from exactly one source
-    let text = if let Some(msg) = message {
-        if stdin || file.is_some() {
-            return Err("Specify exactly one of --message, --stdin, or --file".to_string());
-        }
-        msg
-    } else if stdin {
-        if file.is_some() {
-            return Err("Specify exactly one of --message, --stdin, or --file".to_string());
-        }
-        use std::io::Read;
-        let mut buf = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buf)
-            .map_err(|e| format!("Failed to read from stdin: {}", e))?;
-        buf
-    } else if let Some(path) = file {
-        std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read message file {:?}: {}", path, e))?
-    } else {
-        return Err("Specify one of --message, --stdin, or --file".to_string());
-    };
-
-    let request = RpcRequest::Send {
-        session_id,
-        text,
-        wait,
-        timeout_ms: timeout * 1000,
-    };
-
-    // RPC timeout: if waiting for completion, add 10s buffer; otherwise 10s
-    let rpc_timeout = if wait {
-        Duration::from_secs(timeout + 10)
-    } else {
-        Duration::from_secs(10)
-    };
-
-    let response = daemon_rpc(&request, rpc_timeout)?;
-    crate::cli::print_json(&response, pretty)?;
-
-    // Exit code 2 when --wait timed out: message was sent but the turn did not
-    // complete within the requested timeout.
-    if wait {
-        if let Some(false) = response.get("turnCompleted").and_then(|v| v.as_bool()) {
-            std::process::exit(2);
-        }
-    }
-
-    Ok(())
-}
-
 pub fn cmd_stop(session_id: String, pretty: bool) -> Result<(), String> {
     ensure_daemon()?;
     let request = RpcRequest::Stop { session_id };
