@@ -327,7 +327,7 @@ pub fn orphan_agent(
     let n = tx.execute(
         "UPDATE agents SET state = 'orphaned', state_reason = ?2, gone_at = NULL \
          WHERE id = ?1 AND source = 'engine' AND state IS NOT 'orphaned'",
-        params![agent_id, KILL_UNCONFIRMED],
+        params![agent_id, orphan_reason(left.len() > MAX_SURVIVORS)],
     )?;
     if n == 0 {
         return Ok(false);
@@ -431,6 +431,41 @@ pub fn store_survivors(
         params![agent_id, json],
     )?;
     Ok(dropped.then(|| format!("survivors: kept the first {} of {}", kept.len(), left.len())))
+}
+
+/// The `state_reason` of an `orphaned` agent: `survivors_overflow` once
+/// an unconfirmed kill left more than were recorded, else
+/// `kill_unconfirmed`.
+pub fn orphan_reason(overflow: bool) -> &'static str {
+    if overflow {
+        SURVIVORS_OVERFLOW
+    } else {
+        KILL_UNCONFIRMED
+    }
+}
+
+/// After a later unconfirmed kill of an `orphaned` agent: store what is
+/// `left` (`store_survivors`, keeping `overflow`) and set its reason to
+/// match (`orphan_reason`), with `agent.upsert` when the reason changed.
+/// Returns the note for the audit row.
+pub fn record_survivors(
+    tx: &mut Tx,
+    machine: &str,
+    agent_id: &str,
+    left: &[Survivor],
+    overflow: bool,
+) -> rusqlite::Result<Option<String>> {
+    let note = store_survivors(tx, agent_id, left, overflow)?;
+    let reason = orphan_reason(overflow || left.len() > MAX_SURVIVORS);
+    let changed = tx.execute(
+        "UPDATE agents SET state_reason = ?2 \
+         WHERE id = ?1 AND state = 'orphaned' AND state_reason IS NOT ?2",
+        params![agent_id, reason],
+    )?;
+    if changed > 0 {
+        emit_upsert(tx, machine, agent_id)?;
+    }
+    Ok(note)
 }
 
 /// `agent_state.survivors` as stored by `store_survivors`. NULL is none.

@@ -2165,8 +2165,9 @@ impl Spawner {
     }
 
     /// The audit row of a retire that left the agent `orphaned`, in one
-    /// transaction with what is still `left`, when the kill said, and
-    /// `survivors_overflow` as the reason with `overflow`. Returns the row.
+    /// transaction with what is still `left`, when the kill said, and the
+    /// reason that matches (`ops::record_survivors`; `overflow` is the
+    /// stored one). Returns the row.
     fn audit_orphan(
         &self,
         id: &str,
@@ -2176,19 +2177,14 @@ impl Spawner {
         overflow: bool,
     ) -> Result<AgentRow, ApiError> {
         let (id2, principal, mut why) = (id.to_string(), principal.to_string(), why.to_string());
+        let machine = self.db.machine_id().to_string();
         let row = self
             .db
             .write_blocking(move |tx| {
                 if let Some(left) = &left {
-                    if let Some(note) = ops::store_survivors(tx, &id2, left, overflow)? {
+                    if let Some(note) = ops::record_survivors(tx, &machine, &id2, left, overflow)? {
                         why = format!("{}; {}", why, note);
                     }
-                }
-                if overflow {
-                    tx.execute(
-                        "UPDATE agents SET state_reason = ?2 WHERE id = ?1",
-                        params![id2, ops::SURVIVORS_OVERFLOW],
-                    )?;
                 }
                 audit::append(
                     tx,
@@ -6475,6 +6471,7 @@ mod tests {
                 pgid: 1_000_000 + i,
             })
             .collect();
+        let before = upsert_reasons(&e.db, &r.id).len();
         let (m, id, left2) = (MACHINE.to_string(), r.id.clone(), left.clone());
         e.db.write_blocking(move |tx| {
             ops::orphan_agent(
@@ -6496,6 +6493,15 @@ mod tests {
         assert!(kept.overflow);
         let why = audit_reasons(&e.db, "engine.reconcile", ops::ORPHANED);
         assert!(why[0].contains("kept the first 64 of 70"), "{:?}", why);
+        // P2-2: the first overflow is the reason at once, in one upsert.
+        assert_eq!(
+            row(&e.db, &r.id).state_reason.as_deref(),
+            Some(ops::SURVIVORS_OVERFLOW)
+        );
+        assert_eq!(
+            upsert_reasons(&e.db, &r.id)[before..],
+            [Some(ops::SURVIVORS_OVERFLOW.to_string())]
+        );
     }
     /// P1-B: an unconfirmed kill that left more than 64 never ends by
     /// itself: with the recorded ones gone the row stays `orphaned` with
@@ -6507,12 +6513,18 @@ mod tests {
         let r = orphan_with_survivors(&e, r#"{"v":1,"overflow":true,"list":[]}"#).await;
         let l = Principal::LocalUnverified;
         let id = serde_json::json!({ "id": r.id });
+        let before = upsert_reasons(&e.db, &r.id).len();
         for _ in 0..2 {
             let got = e.sp.retire(&l, id.clone()).await.unwrap();
             assert_eq!(got.state.as_deref(), Some("orphaned"));
             assert_eq!(got.state_reason.as_deref(), Some(ops::SURVIVORS_OVERFLOW));
             assert_eq!(got.gone_at, None);
         }
+        // P2-1: the reason changed once, and subscribers saw it once.
+        assert_eq!(
+            upsert_reasons(&e.db, &r.id)[before..],
+            [Some(ops::SURVIVORS_OVERFLOW.to_string())]
+        );
         let why = audit_reasons(&e.db, "agent.retire", ops::ORPHANED);
         assert!(
             why.last().unwrap().contains(ops::SURVIVORS_OVERFLOW),
@@ -6591,6 +6603,62 @@ mod tests {
             ops::parse_survivors(None).unwrap(),
             ops::Survivors::default()
         );
+    }
+    /// The `stateReason` of every `agent.upsert` of `id`, in order.
+    fn upsert_reasons(db: &Db, id: &str) -> Vec<Option<String>> {
+        let conn = db.reader().unwrap();
+        let mut st = conn
+            .prepare(
+                "SELECT json_extract(payload, '$.stateReason') FROM events \
+                 WHERE topic = 'agent.upsert' AND subject = ?1 ORDER BY seq",
+            )
+            .unwrap();
+        let rows = st
+            .query_map([format!("{}/{}", MACHINE, id)], |r| r.get(0))
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// P2-2: a retry whose kill first leaves more than 64 sets
+    /// `survivors_overflow` at once, with one upsert; a retry that changes
+    /// nothing emits none.
+    #[tokio::test]
+    async fn a_retry_that_first_overflows_sets_the_reason_with_one_upsert() {
+        let e = setup(Script::Ready, None);
+        let r = orphan_with_survivors(&e, &survivor_json(ChildId { pid: 9, start: 9 })).await;
+        assert_eq!(
+            row(&e.db, &r.id).state_reason.as_deref(),
+            Some(ops::KILL_UNCONFIRMED)
+        );
+        e.sp.set_orphan_killer(Arc::new(|_, _| {
+            let left = (0..70)
+                .map(|i| Survivor {
+                    pid: 1_000_000 + i,
+                    start: 1,
+                    pgid: 1_000_000 + i,
+                })
+                .collect();
+            Err(io::Error::other(Unconfirmed::new(left, "test")))
+        }));
+        let l = Principal::LocalUnverified;
+        let before = upsert_reasons(&e.db, &r.id).len();
+        let got =
+            e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+                .await
+                .unwrap();
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        assert_eq!(got.state_reason.as_deref(), Some(ops::SURVIVORS_OVERFLOW));
+        assert_eq!(
+            upsert_reasons(&e.db, &r.id)[before..],
+            [Some(ops::SURVIVORS_OVERFLOW.to_string())]
+        );
+        let stored = ops::parse_survivors(survivors_json(&e.db, &r.id).as_deref()).unwrap();
+        assert!(stored.overflow);
+        assert_eq!(stored.list.len(), ops::MAX_SURVIVORS);
+        e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+            .await
+            .unwrap();
+        assert_eq!(upsert_reasons(&e.db, &r.id).len(), before + 1);
     }
 }
 
