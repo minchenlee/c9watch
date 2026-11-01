@@ -1,20 +1,20 @@
-//! Core's persistent token store. This module does not expose a network route.
-//! The caller performs native confirmation before issue or a widening update.
-//! Only hashes are persisted; no raw-token HMAC verifier can be built from them.
+//! Core's persistent gateway client store (D15). This module does not expose
+//! a network route. The caller performs native confirmation before issue or a
+//! widening update. Each client is its own Ed25519 public key; the db holds no
+//! secret a reader could replay. Handshake encodings live in `pubkey`.
 use super::policy::RemoteAccess;
+use super::pubkey::{self, AuthError, AuthRequest};
 use crate::engine::api::{blocking, internal};
 use crate::engine::authz::{self, Access};
 use crate::engine::db::audit::{self, AuditEntry};
 use crate::engine::db::Db;
 use crate::engine::principal::Principal;
 use crate::engine::proto::{ApiError, Ceiling, ErrorCode};
-use rand::RngCore;
+use ed25519_dalek::VerifyingKey;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use subtle::ConstantTimeEq;
 use tokio::sync::watch;
 
 /// A new gateway client id, `cli_<ulid>` in lowercase Crockford base32
@@ -79,9 +79,6 @@ impl Client {
 fn denied(reason: &str) -> ApiError {
     ApiError::new(ErrorCode::NotAllowed, reason)
 }
-fn hash(token: &str) -> [u8; 32] {
-    Sha256::digest(token.as_bytes()).into()
-}
 fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Client> {
     let scopes: String = row.get(4)?;
     let ceiling: String = row.get(5)?;
@@ -126,22 +123,23 @@ impl Store {
         mut spec: Spec,
         policy: &RemoteAccess,
         now: i64,
-    ) -> Result<(Client, String), ApiError> {
+        public_key: &VerifyingKey,
+    ) -> Result<Client, ApiError> {
         authz::subset(principal, &spec.scopes, spec.ceiling, policy)?;
         if spec.label.len() > 256
             || spec.expires_at <= now
             || spec.expires_at > now.saturating_add(ABSOLUTE_MS)
         {
-            return Err(denied("invalid token label or expiry"));
+            return Err(denied("invalid client label or expiry"));
+        }
+        if public_key.is_weak() {
+            return Err(denied("invalid client key"));
         }
         spec.origin = spec
             .origin
             .map(|v| super::security::canonical_origin(&v).ok_or_else(|| denied("invalid origin")))
             .transpose()?;
-        let mut bytes = [0; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let digest = hash(&token);
+        let key = *public_key.as_bytes();
         let client = Client {
             client_id: new_client_id(),
             label: spec.label.clone(),
@@ -158,12 +156,15 @@ impl Store {
         let payload_hash =
             crate::engine::mail::sha256_hex(&serde_json::to_vec(&spec).map_err(internal)?);
         self.db.write(move |tx| {
-            tx.execute("INSERT INTO gateway_tokens (client_id,sha256,label,origin,aud,scopes,ceiling,created_at,last_used_at,expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)",
-                params![c.client_id,digest.as_slice(),c.label,c.origin,c.aud,serde_json::to_string(&c.scopes).unwrap(),serde_json::to_value(c.ceiling).unwrap().as_str().unwrap(),now,c.expires_at])?;
+            tx.execute("INSERT INTO gateway_clients (client_id,public_key,label,origin,aud,scopes,ceiling,created_at,last_used_at,expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)",
+                params![c.client_id,key.as_slice(),c.label,c.origin,c.aud,serde_json::to_string(&c.scopes).unwrap(),serde_json::to_value(c.ceiling).unwrap().as_str().unwrap(),now,c.expires_at])?;
             audit::append(tx,now,&AuditEntry { principal:&who,method:"gateway.pair.register",target:Some(&c.client_id),decision:"allow",payload_hash:Some(&payload_hash),..Default::default() })?;
             Ok(())
-        }).await.map_err(internal)?;
-        Ok((client, token))
+        }).await.map_err(|e| {
+            // One key pairs once; a second pairing must bring a new key.
+            if e.to_string().contains("UNIQUE") { denied("client key already paired") } else { internal(e) }
+        })?;
+        Ok(client)
     }
     pub async fn list(&self) -> Result<Vec<Client>, ApiError> {
         let db = self.db.clone();
@@ -171,7 +172,7 @@ impl Store {
             let conn = db.reader().map_err(internal)?;
             let mut st = conn
                 .prepare(&format!(
-                    "SELECT {COLUMNS} FROM gateway_tokens ORDER BY created_at,client_id"
+                    "SELECT {COLUMNS} FROM gateway_clients ORDER BY created_at,client_id"
                 ))
                 .map_err(internal)?;
             let clients = st
@@ -183,7 +184,7 @@ impl Store {
         })
         .await
     }
-    /// Audience and expiry are checked before a protocol's MAC check can run.
+    /// Audience and expiry are checked before any signature check runs.
     /// A native client has no Origin and must match that same binding later.
     pub async fn lookup(
         &self,
@@ -200,7 +201,7 @@ impl Store {
             let conn = db.reader().map_err(internal)?;
             let c = conn
                 .query_row(
-                    &format!("SELECT {COLUMNS} FROM gateway_tokens WHERE client_id=?1"),
+                    &format!("SELECT {COLUMNS} FROM gateway_clients WHERE client_id=?1"),
                     [id],
                     row,
                 )
@@ -217,49 +218,60 @@ impl Store {
                 || now >= c.expires_at
                 || now.saturating_sub(c.last_used_at) >= IDLE_MS
             {
-                return Err(denied("expired token"));
+                return Err(denied("expired client"));
             }
             Ok(c)
         })
         .await
     }
-    /// Legacy /ws bearer check only. This is deliberately not a /c9p MAC check.
-    pub async fn verify_bearer(
+    /// Check a reconnect `auth` frame against the client's stored key. Every
+    /// failure, malformed or not, is `not_allowed` (close 4401). On success the
+    /// caller replies with `pubkey::sign_auth` over the returned client nonce.
+    pub async fn authenticate(
         &self,
-        id: &str,
-        token: &str,
+        server_nonce: &[u8; 32],
+        req: &AuthRequest,
         origin: Option<&str>,
         now: i64,
-    ) -> Result<Client, ApiError> {
-        let c = self.lookup(id, origin, now).await?;
+    ) -> Result<(Client, [u8; 32]), ApiError> {
+        if !pubkey::valid_client_id(&req.client_id) {
+            return Err(denied("malformed client id"));
+        }
+        let c = self.lookup(&req.client_id, origin, now).await?;
         let db = self.db.clone();
-        let id = id.to_string();
-        let candidate = hash(token);
-        let matched = blocking(move || {
+        let id = req.client_id.clone();
+        let saved: Option<Vec<u8>> = blocking(move || {
             let conn = db.reader().map_err(internal)?;
-            let saved: Option<Vec<u8>> = conn
-                .query_row(
-                    "SELECT sha256 FROM gateway_tokens WHERE client_id=?1",
-                    [id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(internal)?;
-            Ok(saved.is_some_and(|s| bool::from(s.as_slice().ct_eq(&candidate))))
+            conn.query_row(
+                "SELECT public_key FROM gateway_clients WHERE client_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(internal)
         })
         .await?;
-        if !matched {
-            return Err(denied("wrong token"));
-        }
+        let key = saved
+            .and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok())
+            .and_then(|k| pubkey::key_from_bytes(&k).ok())
+            .ok_or_else(|| denied("unknown client"))?;
+        let client_nonce =
+            pubkey::verify_auth(server_nonce, &c.aud, &key, req).map_err(|e| match e {
+                AuthError::Malformed => denied("malformed auth frame"),
+                AuthError::WeakKey | AuthError::BadSignature => denied("bad client signature"),
+            })?;
         let id = c.client_id.clone();
-        let (changed, _)=self.db.write(move |tx|tx.execute("UPDATE gateway_tokens SET last_used_at=?2 WHERE client_id=?1 AND expires_at>?2 AND last_used_at>?3",params![id,now,now.saturating_sub(IDLE_MS)])).await.map_err(internal)?;
+        let (changed, _)=self.db.write(move |tx|tx.execute("UPDATE gateway_clients SET last_used_at=?2 WHERE client_id=?1 AND expires_at>?2 AND last_used_at>?3",params![id,now,now.saturating_sub(IDLE_MS)])).await.map_err(internal)?;
         if changed != 1 {
-            return Err(denied("expired or revoked token"));
+            return Err(denied("expired or revoked client"));
         }
-        Ok(Client {
-            last_used_at: now,
-            ..c
-        })
+        Ok((
+            Client {
+                last_used_at: now,
+                ..c
+            },
+            client_nonce,
+        ))
     }
     pub async fn revoke(
         &self,
@@ -276,9 +288,9 @@ impl Store {
             .db
             .write(move |tx| {
                 let n = if let Some(id) = &id {
-                    tx.execute("DELETE FROM gateway_tokens WHERE client_id=?1", [id])?
+                    tx.execute("DELETE FROM gateway_clients WHERE client_id=?1", [id])?
                 } else {
-                    tx.execute("DELETE FROM gateway_tokens", [])?
+                    tx.execute("DELETE FROM gateway_clients", [])?
                 };
                 audit::append(
                     tx,
@@ -318,50 +330,92 @@ mod tests {
             expires_at: now + ABSOLUTE_MS,
         }
     }
+    fn client_key(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+    fn auth(
+        key: &ed25519_dalek::SigningKey,
+        server: &[u8; 32],
+        aud: &str,
+        id: &str,
+    ) -> AuthRequest {
+        use ed25519_dalek::Signer;
+        let nonce = [0xabu8; 32];
+        AuthRequest {
+            client_id: id.into(),
+            client_nonce: pubkey::to_hex(&nonce),
+            sig: pubkey::to_hex(
+                &key.sign(&pubkey::auth_client_message(server, &nonce, aud, id))
+                    .to_bytes(),
+            ),
+        }
+    }
     #[tokio::test]
     async fn persistence_origin_audience_expiry_and_revoke_fail_closed() {
         let t = tempfile::tempdir().unwrap();
         let home = t.path().join("engine");
-        let db = Arc::new(crate::engine::db::open(&home, "machine-a").unwrap());
+        let db = Arc::new(crate::engine::db::open(&home, &"ab".repeat(32)).unwrap());
         let store = Store::new(db.clone());
         let now = 1000;
-        let (c, token) = store
+        let key = client_key(9);
+        let c = store
             .issue(
                 &Principal::LocalUnverified,
                 spec(now),
                 &RemoteAccess::default(),
                 now,
+                &key.verifying_key(),
             )
             .await
             .unwrap();
         assert!(c.client_id.starts_with("cli_") && c.client_id.len() == 30);
+        let server = pubkey::new_nonce();
+        let good = auth(&key, &server, &c.aud, &c.client_id);
+        let (got, nonce) = store
+            .authenticate(&server, &good, Some("https://view.example:443"), now + 1)
+            .await
+            .unwrap();
         assert_eq!(
-            store
-                .verify_bearer(
-                    &c.client_id,
-                    &token,
-                    Some("https://view.example:443"),
-                    now + 1
-                )
-                .await
-                .unwrap()
-                .client_id,
-            c.client_id
+            (got.client_id.as_str(), got.last_used_at),
+            (c.client_id.as_str(), now + 1)
         );
+        assert_eq!(nonce, [0xabu8; 32]);
+        // Another key, another challenge, another audience: all refused.
+        for bad in [
+            auth(&client_key(10), &server, &c.aud, &c.client_id),
+            auth(&key, &pubkey::new_nonce(), &c.aud, &c.client_id),
+            auth(&key, &server, &"cd".repeat(32), &c.client_id),
+            AuthRequest {
+                client_nonce: "AB".repeat(32),
+                ..good.clone()
+            },
+            AuthRequest {
+                client_id: c.client_id.to_uppercase(),
+                ..good.clone()
+            },
+        ] {
+            assert_eq!(
+                store
+                    .authenticate(&server, &bad, Some("https://view.example"), now + 2)
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::NotAllowed
+            );
+        }
         assert!(store
-            .verify_bearer(&c.client_id, "wrong", Some("https://view.example"), now + 2)
+            .authenticate(&server, &good, Some("https://other.example"), now + 2)
             .await
             .is_err());
         assert!(store
-            .lookup(&c.client_id, Some("https://other.example"), now + 2)
+            .authenticate(&server, &good, None, now + 2)
             .await
             .is_err());
-        assert!(store.lookup(&c.client_id, None, now + 2).await.is_err());
         assert!(store
             .lookup(
                 &c.client_id,
                 Some("https://view.example"),
-                now + IDLE_MS + 1
+                now + 1 + IDLE_MS + 1
             )
             .await
             .is_err());
@@ -373,17 +427,30 @@ mod tests {
             )
             .await
             .is_err());
+        // Only the public key is stored.
         let raw: Vec<u8> = db
             .reader()
             .unwrap()
-            .query_row("SELECT sha256 FROM gateway_tokens", [], |r| r.get(0))
+            .query_row("SELECT public_key FROM gateway_clients", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(raw.len(), 32);
-        assert_ne!(raw, token.as_bytes());
+        assert_eq!(raw, key.verifying_key().as_bytes());
+        // One key pairs once.
+        assert!(store
+            .issue(
+                &Principal::LocalUnverified,
+                spec(now),
+                &RemoteAccess::default(),
+                now,
+                &key.verifying_key(),
+            )
+            .await
+            .unwrap_err()
+            .msg
+            .contains("already paired"));
         let id = c.client_id.clone();
         db.write(move |tx| {
             tx.execute(
-                "UPDATE gateway_tokens SET aud='machine-b' WHERE client_id=?1",
+                "UPDATE gateway_clients SET aud='machine-b' WHERE client_id=?1",
                 [id],
             )
         })
@@ -411,25 +478,52 @@ mod tests {
         assert!(store.list().await.unwrap().is_empty());
         drop(store);
         drop(db);
-        let db = Arc::new(crate::engine::db::open(&home, "machine-a").unwrap());
+        let db = Arc::new(crate::engine::db::open(&home, &"ab".repeat(32)).unwrap());
         let store = Store::new(db);
-        let (c, token) = store
+        let c = store
             .issue(
                 &Principal::LocalUnverified,
                 spec(now),
                 &RemoteAccess::default(),
                 now,
+                &key.verifying_key(),
             )
             .await
             .unwrap();
         drop(store);
         let store = Store::new(Arc::new(
-            crate::engine::db::open(&home, "machine-a").unwrap(),
+            crate::engine::db::open(&home, &"ab".repeat(32)).unwrap(),
         ));
+        let server = pubkey::new_nonce();
         assert!(store
-            .verify_bearer(&c.client_id, &token, Some("https://view.example"), now + 1)
+            .authenticate(
+                &server,
+                &auth(&key, &server, &c.aud, &c.client_id),
+                Some("https://view.example"),
+                now + 1
+            )
             .await
             .is_ok());
+    }
+    #[tokio::test]
+    async fn weak_client_key_is_never_stored() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::engine::db::open(&t.path().join("e"), "m").unwrap());
+        let store = Store::new(db);
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let weak = VerifyingKey::from_bytes(&identity).unwrap();
+        assert!(store
+            .issue(
+                &Principal::LocalUnverified,
+                spec(0),
+                &RemoteAccess::default(),
+                0,
+                &weak
+            )
+            .await
+            .is_err());
+        assert!(store.list().await.unwrap().is_empty());
     }
     #[test]
     fn client_ids_are_lowercase_prefixed_ulids() {

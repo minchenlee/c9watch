@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **c9p `SessionView` is its own wire type.** The engine converts the internal session record to `SessionView` at the API boundary, and the published schema is generated from `SessionView`. The wire bytes and `docs/api/c9p-1.json` do not change; a golden test and a leak test guard both.
 
 ### Security
+- **Gateway `/c9p` pairing uses client public keys (D15).** Each remote client makes its own Ed25519 key pair and proves it with a signature over lowercase hex nonces. Core stores only public keys (new `gateway_clients` table; the unused bearer-token table is dropped). The bearer-token and HMAC reconnect profile is removed from the spec, the SDK and the GUI adapter. The `/c9p` listener is not wired yet; legacy `/ws` mobile pairing is unchanged.
+
 These changes break old mobile clients, QR codes and bookmarks on purpose. See [docs/mobile-migration-c0h.md](docs/mobile-migration-c0h.md) before you upgrade.
 
 - **Port 9210 listens on this Mac only.** LAN access is a new opt-in in **Settings → Remote access**. With it on, traffic is plain `ws://`, and the settings page says so.

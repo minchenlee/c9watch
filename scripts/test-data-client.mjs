@@ -158,35 +158,52 @@ test('a mode/transport switch between pages cannot mix real and demo content', a
     assert.equal(result.messages.length,2); assert.deepEqual(offsets,[0,1]); assert.equal(choices,1);
 });
 
-test('gateway auth sends an audience-bound HMAC and verifies the pinned Ed25519 key', async () => {
-    const { webcrypto, createHmac } = await import('node:crypto');
-    const key = await webcrypto.subtle.generateKey('Ed25519',true,['sign','verify']);
-    const serverKey=Buffer.from(await webcrypto.subtle.exportKey('raw',key.publicKey)).toString('hex');
-    const token='a1'.repeat(32), serverNonce='b2'.repeat(32);
+test('gateway auth signs with the client key and verifies the pinned Ed25519 server key', async () => {
+    const { webcrypto, createPrivateKey, createPublicKey, sign, verify } = await import('node:crypto');
+    // Same seeds and bytes as src-tauri/src/gateway/pubkey.rs cross_language_vectors.
+    const seeded=seed=>createPrivateKey({key:Buffer.concat([Buffer.from('302e020100300506032b657004220420','hex'),Buffer.alloc(32,seed)]),format:'der',type:'pkcs8'});
+    const machine=seeded(7), client=seeded(9);
+    const serverKey=createPublicKey(machine).export({format:'der',type:'spki'}).subarray(-32).toString('hex');
+    const privateKey=await webcrypto.subtle.importKey('pkcs8',client.export({format:'der',type:'pkcs8'}),'Ed25519',false,['sign']);
+    const clientId='cli_01jbz3k6x8q2m9v4r7t5w0y1zc', serverNonce='b2'.repeat(32);
+    const msg=(label,clientNonce)=>Buffer.concat([Buffer.from(label),Buffer.from([0]),Buffer.from(serverNonce,'hex'),Buffer.from(clientNonce,'hex'),
+        Buffer.from([64]),Buffer.from(serverKey),Buffer.from([30]),Buffer.from(clientId)]);
+    assert.equal(sign(null,msg('c9p-gateway auth-client v1','c3'.repeat(32)),client).toString('hex'),
+        'c8434983a6da58624add2bdc334f4f3f1f306c5a4177da50e8d1df4352e033d587bb5d3a26027cc0690fe4bcdf66276bc41a9c0474111fd6f7f168424a73e901');
     const auth=load('../src/lib/data/ws-c9p-auth.ts',{}, {crypto:webcrypto,TextEncoder});
+    const pairing={clientId,privateKey,serverKey,machineId:serverKey};
     class Socket {
         listeners=new Map(); sent=[];
         addEventListener(name,fn) { this.listeners.set(name,fn); }
         removeEventListener(name,fn) { if(this.listeners.get(name)===fn)this.listeners.delete(name); }
         emit(value) { this.listeners.get('message')?.({data:JSON.stringify(value)}); }
         send(text) {
-            this.sent.push(text); assert(!text.includes(token));
+            this.sent.push(text);
             const {auth:request}=JSON.parse(text);
-            const payload=Buffer.concat([Buffer.from(serverNonce,'hex'),Buffer.from(request.clientNonce,'hex'),Buffer.from('machine-1')]);
-            assert.equal(request.mac,createHmac('sha256',Buffer.from(token,'hex')).update(payload).digest('hex'));
-            const nonces=payload.subarray(0,64);
-            void webcrypto.subtle.sign('Ed25519',key.privateKey,nonces).then(sig=>this.emit({sig:Buffer.from(sig).toString('hex')}));
+            assert.deepEqual(Object.keys(request).sort(),['clientId','clientNonce','sig']);
+            assert(verify(null,msg('c9p-gateway auth-client v1',request.clientNonce),createPublicKey(client),Buffer.from(request.sig,'hex')));
+            this.emit({sig:sign(null,msg('c9p-gateway auth-server v1',request.clientNonce),machine).toString('hex')});
         }
     }
     const socket=new Socket();
-    const done=auth.hexGatewayAuthenticator({clientId:'client-1',token,serverKey,machineId:'machine-1'})(socket);
+    const done=auth.hexGatewayAuthenticator(pairing)(socket);
+    await new Promise(r=>setTimeout(r,0));
     socket.emit({challenge:serverNonce}); await done;
     assert.equal(socket.sent.length,1);
     assert.equal(socket.listeners.size,0);
     const bad=new Socket(); bad.send=function(){this.emit({sig:'00'.repeat(64)});};
-    const rejected=auth.hexGatewayAuthenticator({clientId:'client-1',token,serverKey,machineId:'machine-1'})(bad);
+    const rejected=auth.hexGatewayAuthenticator(pairing)(bad);
+    await new Promise(r=>setTimeout(r,0));
     bad.emit({challenge:serverNonce});
     await assert.rejects(rejected,/does not match/);
+    for (const challenge of [serverNonce.toUpperCase(), serverNonce.slice(2), 'nonce']) {
+        const s=new Socket();
+        const p=auth.hexGatewayAuthenticator(pairing)(s);
+        await new Promise(r=>setTimeout(r,0));
+        s.emit({challenge}); await assert.rejects(p,/Invalid gateway challenge/);
+        assert.equal(s.sent.length,0);
+    }
+    await assert.rejects(auth.hexGatewayAuthenticator({...pairing,clientId:'client-1'})(new Socket()),/client id/);
 });
 
 test('native unsubscribe is idempotent and drops queued channel frames', async () => {

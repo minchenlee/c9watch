@@ -1,8 +1,11 @@
 import { object, type Transport } from './transport.js';
 
+/** A paired gateway client. `privateKey` is this client's own Ed25519 key;
+ * `pair()` creates it non-extractable. Keep the object (for example in
+ * IndexedDB); core stores only the public half. */
 export interface Credentials {
   clientId: string;
-  token: string;
+  privateKey: CryptoKey;
   /** Pinned raw Ed25519 public key (hex). */
   serverKey: string;
   machineId: string;
@@ -23,9 +26,24 @@ export interface WsOptions {
 }
 const utf8 = (s: string) => new TextEncoder().encode(s);
 const hex = (bytes: Uint8Array) => Array.from(bytes, (x) => x.toString(16).padStart(2, '0')).join('');
-function unhex(s: string): Uint8Array {
-  if (!/^(?:[0-9a-fA-F]{2})+$/.test(s)) throw new Error('Invalid hex authentication field');
+/** Exactly `length` bytes of lowercase hex; anything else is refused. */
+function unhex(s: unknown, length: number, what: string): Uint8Array {
+  if (typeof s !== 'string' || s.length !== length * 2 || !/^[0-9a-f]*$/.test(s)) throw new Error(`Invalid gateway ${what}`);
   return Uint8Array.from(s.match(/../g)!, (x) => parseInt(x, 16));
+}
+const CLIENT_ID = /^cli_[0-9a-hjkmnp-tv-z]{26}$/;
+/** `label || 0x00 || serverNonce || clientNonce || (len8 || field)*`; see gateway.md. */
+export function gatewayMessage(label: string, serverNonce: Uint8Array, clientNonce: Uint8Array, ...fields: (Uint8Array | string)[]): Uint8Array {
+  const parts = [utf8(label), new Uint8Array([0]), serverNonce, clientNonce];
+  for (const f of fields) {
+    const bytes = typeof f === 'string' ? utf8(f) : f;
+    if (bytes.byteLength > 255) throw new Error('Gateway field too long');
+    parts.push(new Uint8Array([bytes.byteLength]), bytes);
+  }
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.byteLength, 0));
+  let at = 0;
+  for (const p of parts) { out.set(p, at); at += p.byteLength; }
+  return out;
 }
 function cryptoApi(options: WsOptions): Crypto {
   const api = options.crypto ?? globalThis.crypto;
@@ -40,8 +58,17 @@ function socket(url: string, options: WsOptions): WebSocketLike {
   return options.webSocket ? options.webSocket(url) : new WebSocket(url);
 }
 
+async function verifyServer(api: Crypto, serverKey: string, sig: unknown, message: Uint8Array): Promise<boolean> {
+  const key = await api.subtle.importKey('raw', unhex(serverKey, 32, 'server key'), 'Ed25519', false, ['verify']);
+  return api.subtle.verify('Ed25519', key, unhex(sig, 64, 'signature'), message);
+}
+async function signClient(api: Crypto, key: CryptoKey, message: Uint8Array): Promise<string> {
+  return hex(new Uint8Array(await api.subtle.sign('Ed25519', key, message)));
+}
+
 /** Gateway /c9p. No c9p frame is sent until the pinned server proves its key.
- * Wire encoding: UTF-8 token/nonces/machineId, hex MAC/key/signature. Needs M-b.
+ * The client proves its own key; no shared secret crosses the wire or is stored
+ * by core. Wire encoding: lowercase hex nonces, keys and signatures. Needs M-b.
  */
 export class WsTransport implements Transport {
   private ws?: WebSocketLike;
@@ -52,10 +79,11 @@ export class WsTransport implements Transport {
     return new Promise((resolve, reject) => {
       const api = cryptoApi(this.options);
       const ws = this.ws = socket(this.url, this.options);
+      const { clientId, machineId, serverKey, privateKey } = this.credentials;
       let ended = false;
       let phase: 'challenge' | 'signature' | 'ready' = 'challenge';
-      let serverNonce = '';
-      const clientNonce = hex(api.getRandomValues(new Uint8Array(32)));
+      let serverNonce = new Uint8Array();
+      const clientNonce = api.getRandomValues(new Uint8Array(32));
       const timer = setTimeout(() => fail(new Error('Gateway authentication timed out')), this.options.timeoutMs ?? 5000);
       const fail = (e: Error) => {
         if (ended) return;
@@ -71,20 +99,16 @@ export class WsTransport implements Transport {
           if (size > (phase === 'ready' ? (this.options.maxFrame ?? 1 << 20) : 4096)) throw new Error('Gateway frame too large');
           const frame = object(JSON.parse(event.data));
           if (phase === 'challenge') {
-            if (typeof frame.challenge !== 'string' || !frame.challenge || frame.challenge.length > 1024) throw new Error('Missing gateway challenge');
-            serverNonce = frame.challenge;
-            const key = await api.subtle.importKey('raw', utf8(this.credentials.token), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-            const mac = hex(new Uint8Array(await api.subtle.sign('HMAC', key, utf8(serverNonce + clientNonce + this.credentials.machineId))));
+            serverNonce = unhex(frame.challenge, 32, 'challenge');
+            if (!CLIENT_ID.test(clientId)) throw new Error('Invalid gateway client id');
+            unhex(machineId, 32, 'machine id');
+            const sig = await signClient(api, privateKey, gatewayMessage('c9p-gateway auth-client v1', serverNonce, clientNonce, machineId, clientId));
             if (ended) return;
             phase = 'signature';
-            ws.send(JSON.stringify({ auth: { clientId: this.credentials.clientId, clientNonce, mac } }));
+            ws.send(JSON.stringify({ auth: { clientId, clientNonce: hex(clientNonce), sig } }));
           } else if (phase === 'signature') {
-            if (typeof frame.sig !== 'string') throw new Error('Missing gateway signature');
-            const keyBytes = unhex(this.credentials.serverKey);
-            if (keyBytes.length !== 32) throw new Error('Invalid pinned server key');
-            const key = await api.subtle.importKey('raw', keyBytes, 'Ed25519', false, ['verify']);
-            const verified = await api.subtle.verify('Ed25519', key, unhex(frame.sig), utf8(serverNonce + clientNonce));
-            if (!verified) throw new Error('Gateway identity does not match the pinned server key');
+            const message = gatewayMessage('c9p-gateway auth-server v1', serverNonce, clientNonce, machineId, clientId);
+            if (!await verifyServer(api, serverKey, frame.sig, message)) throw new Error('Gateway identity does not match the pinned server key');
             if (ended) return;
             phase = 'ready'; this.authenticated = true; clearTimeout(timer); resolve();
           } else onFrame(frame);
@@ -105,13 +129,16 @@ export class WsTransport implements Transport {
 }
 
 /** Redeem a code on /c9p, then reconnect with WsTransport. Needs M-b.
+ * Makes a fresh non-extractable Ed25519 key and registers its public half.
  * Pairing is trust on first use: verify the returned server key out of band.
- * Codes and tokens must never be placed in URLs, logs or source files.
+ * Codes must never be placed in URLs, logs or source files.
  */
 export function pair(url: string, code: string, options: WsOptions = {}): Promise<Credentials> {
   if (!code.trim()) return Promise.reject(new Error('Pairing code required'));
   return new Promise((resolve, reject) => {
-    const ws = socket(url, options);
+    let api: Crypto;
+    let ws: WebSocketLike;
+    try { api = cryptoApi(options); ws = socket(url, options); } catch (e) { reject(e); return; }
     let ended = false;
     let sent = false;
     const finish = (error?: Error, result?: Credentials) => {
@@ -120,20 +147,35 @@ export function pair(url: string, code: string, options: WsOptions = {}): Promis
       if (error) reject(error); else resolve(result!);
     };
     const timer = setTimeout(() => finish(new Error('Pairing timed out')), options.timeoutMs ?? 5000);
+    const clientNonce = api.getRandomValues(new Uint8Array(32));
+    let serverNonce = new Uint8Array();
+    let keys: CryptoKeyPair | undefined;
+    let publicKey = new Uint8Array();
+    let queue = Promise.resolve();
     ws.addEventListener('message', (event: { data: unknown }) => {
-      try {
+      queue = queue.then(async () => {
+        if (ended) return;
         if (typeof event.data !== 'string' || utf8(event.data).byteLength > 4096) throw new Error('Invalid pairing frame');
         const frame = object(JSON.parse(event.data));
         if (!sent) {
-          if (typeof frame.challenge !== 'string') throw new Error('Missing pairing challenge');
-          sent = true; ws.send(JSON.stringify({ pair: { code: code.trim() } })); return;
+          serverNonce = unhex(frame.challenge, 32, 'challenge');
+          keys = await api.subtle.generateKey('Ed25519', false, ['sign', 'verify']) as CryptoKeyPair;
+          publicKey = new Uint8Array(await api.subtle.exportKey('raw', keys.publicKey));
+          const sig = await signClient(api, keys.privateKey, gatewayMessage('c9p-gateway pair v1', serverNonce, clientNonce, publicKey));
+          if (ended) return;
+          sent = true;
+          ws.send(JSON.stringify({ pair: { code: code.trim(), publicKey: hex(publicKey), clientNonce: hex(clientNonce), sig } }));
+          return;
         }
-        for (const key of ['clientId', 'token', 'serverKey', 'machineId']) {
-          if (typeof frame[key] !== 'string' || !frame[key]) throw new Error('Pairing rejected or incomplete');
-        }
-        if (unhex(frame.serverKey as string).length !== 32) throw new Error('Invalid server key');
-        finish(undefined, frame as unknown as Credentials);
-      } catch (e) { finish(e instanceof Error ? e : new Error(String(e))); }
+        const paired = frame.paired === undefined ? undefined : object(frame.paired);
+        if (!paired) throw new Error('Pairing rejected or incomplete');
+        const { clientId, serverKey, machineId, sig } = paired;
+        if (typeof clientId !== 'string' || !CLIENT_ID.test(clientId)) throw new Error('Invalid gateway client id');
+        unhex(machineId, 32, 'machine id');
+        const message = gatewayMessage('c9p-gateway paired v1', serverNonce, clientNonce, publicKey, machineId as string, clientId);
+        if (!await verifyServer(api, serverKey as string, sig, message)) throw new Error('Pairing reply is not signed by the returned server key');
+        finish(undefined, { clientId, privateKey: keys!.privateKey, serverKey: serverKey as string, machineId: machineId as string });
+      }).catch((e: unknown) => finish(e instanceof Error ? e : new Error(String(e))));
     });
     ws.addEventListener('error', () => finish(new Error('Pairing connection failed')));
     ws.addEventListener('close', (event: { code?: number }) => finish(new Error(`Pairing closed (${event.code ?? 'unknown'})`)));

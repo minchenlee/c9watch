@@ -1,4 +1,4 @@
--- user_version 9
+-- user_version 10
 -- index agents_detected_key
 CREATE UNIQUE INDEX agents_detected_key ON agents (session_key) WHERE source = 'detected';
 -- index agents_legacy_sid
@@ -10,8 +10,8 @@ CREATE INDEX agents_provider_sid ON agents (provider, provider_sid);
 CREATE INDEX annotations_expiry ON annotations(expires_at) WHERE expires_at IS NOT NULL;
 -- index events_ts
 CREATE INDEX events_ts ON events (ts);
--- index gateway_tokens_expiry
-CREATE INDEX gateway_tokens_expiry ON gateway_tokens (expires_at);
+-- index gateway_clients_expiry
+CREATE INDEX gateway_clients_expiry ON gateway_clients (expires_at);
 -- index message_status_msg
 CREATE INDEX message_status_msg ON message_status (msg_id, seq);
 -- index messages_idem
@@ -115,10 +115,10 @@ CREATE TABLE events (
     payload TEXT,                                        -- JSON
     ts      INTEGER NOT NULL
 ) STRICT;
--- table gateway_tokens
-CREATE TABLE gateway_tokens (
-    client_id TEXT PRIMARY KEY,
-    sha256 BLOB NOT NULL UNIQUE CHECK (length(sha256) = 32),
+-- table gateway_clients
+CREATE TABLE gateway_clients (
+    client_id TEXT PRIMARY KEY CHECK (length(client_id) = 30 AND client_id GLOB 'cli_*'),
+    public_key BLOB NOT NULL UNIQUE CHECK (length(public_key) = 32),
     label TEXT NOT NULL,
     origin TEXT,
     aud TEXT NOT NULL,

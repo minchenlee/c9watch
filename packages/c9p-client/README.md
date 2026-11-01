@@ -49,6 +49,6 @@ const client = new C9pClient(() => new WsTransport(url, credentials));
 await client.connect();
 ```
 
-The pinned server key is verified before hello. Code, token and key encodings are explicit in [gateway.md](../../docs/api/gateway.md); they still need M-b alignment. Pairing is trust on first use. `/ws` legacy bearer auth is not supported. Use an allowed HTTP(S) origin; `file://` is unsupported. Node callers can provide the `webSocket` factory option when they need a WebSocket implementation that sends the paired Origin header. No credentials enter a URL. LAN WS remains unencrypted under the preview plan.
+The pinned server key is verified before hello. `pair()` creates the client's own non-extractable Ed25519 key; core stores only its public half, and no token exists. Keep the returned `Credentials` object (its `privateKey` is a `CryptoKey`, which IndexedDB can store). Nonce, key and signature encodings are in [gateway.md](../../docs/api/gateway.md#encoding). Pairing is trust on first use. `/ws` legacy bearer auth is not supported. Use an allowed HTTP(S) origin; `file://` is unsupported. Node callers can provide the `webSocket` factory option when they need a WebSocket implementation that sends the paired Origin header. No credentials enter a URL. LAN WS remains unencrypted under the preview plan.
 
 The SDK does not start or stop core. See [API overview](../../docs/api/README.md) for socket locations and limits. npm publication and preview wording approval belong to the owner.

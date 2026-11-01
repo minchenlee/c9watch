@@ -15,6 +15,7 @@ When preview ends, the GUI's legacy in-process fallback is removed. The GUI then
 
 ## 1.11 — upcoming
 
+- Breaking (preview), gateway handshake only; no c9p method or `rev` changes. `/c9p` authentication is Ed25519 public-key pairing. `pair` sends `{code,publicKey,clientNonce,sig}` and receives `{paired:{clientId,serverKey,machineId,sig}}`; `auth` sends `{clientId,clientNonce,sig}`. The bearer token and the HMAC reconnect proof are removed. Nonces, keys and signatures are lowercase hex of exact length; anything else fails closed. See [gateway.md](gateway.md#encoding). SDK `Credentials` replaces `token` with `privateKey` (a `CryptoKey`).
 - Responses on one connection may arrive out of order. Clients match them by `id`. Core handles requests on one connection concurrently, at most 32 in flight per connection.
 - `agent.create`, `agent.retire` and `session.stop` accept `idem`, as `msg.send` does. A repeated `idem` with the same params replays the original result; other params are `duplicate`. The key lives in core's memory for 24 hours.
 - Annotation namespaces use the lowercase form of the owner ID, so every valid agent and client ID gets a namespace (the 43-byte limit no longer rejects them). New gateway client IDs are `cli_` plus a lowercase ULID.

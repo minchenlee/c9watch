@@ -744,7 +744,7 @@ mod tests {
                 "audit",
                 "dedupe",
                 "events",
-                "gateway_tokens",
+                "gateway_clients",
                 "legacy_events",
                 "machines",
                 "mail_pause",

@@ -67,6 +67,11 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0009_kill_survivors.sql"),
         fk_off: false,
     },
+    Migration {
+        version: 10,
+        sql: include_str!("migrations/0010_gateway_pubkey.sql"),
+        fk_off: false,
+    },
 ];
 
 /// The schema version this engine writes.
@@ -282,7 +287,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             migrate(&mut conn, MIGRATIONS, t.path()).unwrap(),
-            [5, 6, 7, 8, 9]
+            [5, 6, 7, 8, 9, 10]
         );
         assert_eq!(user_version(&conn).unwrap(), latest_version());
         let backup = Connection::open(t.path().join("pre-5.db")).unwrap();
@@ -331,6 +336,39 @@ mod tests {
         assert!(put("msg_5", "local-unverified", Some("k")).is_err());
     }
 
+    /// D15: a version 9 db trades the bearer-token table for public-key
+    /// clients, after a `VACUUM INTO` backup of version 9.
+    #[test]
+    fn a_version_9_db_gains_public_key_gateway_clients() {
+        let t = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open(t.path().join("e.db")).unwrap();
+        migrate(&mut conn, &MIGRATIONS[..9], t.path()).unwrap();
+        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), [10]);
+        let backup = Connection::open(t.path().join("pre-10.db")).unwrap();
+        assert_eq!(user_version(&backup).unwrap(), 9);
+        let tables = |c: &Connection| -> Vec<String> {
+            c.prepare("SELECT name FROM sqlite_schema WHERE name LIKE 'gateway_%' ORDER BY name")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(tables(&conn), ["gateway_clients", "gateway_clients_expiry"]);
+        assert_eq!(tables(&backup), ["gateway_tokens", "gateway_tokens_expiry"]);
+        let insert = |id: &str, key: Vec<u8>| {
+            conn.execute(
+                "INSERT INTO gateway_clients (client_id,public_key,label,aud,scopes,ceiling,created_at,last_used_at,expires_at) \
+                 VALUES (?1,?2,'v','m','[]','metadata',1,1,2)",
+                rusqlite::params![id, key],
+            )
+        };
+        assert!(insert("cli_0123456789abcdefghjkmnpqrs", vec![1; 31]).is_err());
+        assert!(insert("agt_0123456789abcdefghjkmnpqrs", vec![1; 32]).is_err());
+        insert("cli_0123456789abcdefghjkmnpqrs", vec![1; 32]).unwrap();
+        assert!(insert("cli_0123456789abcdefghjkmnpqrt", vec![1; 32]).is_err());
+    }
+
     /// D2 (P1-3): a version 8 db gains `agent_state.survivors`, NULL on
     /// its rows, after a `VACUUM INTO` backup of version 8.
     #[test]
@@ -345,7 +383,7 @@ mod tests {
              VALUES ('agt_1', 1, 4242, 7);",
         )
         .unwrap();
-        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), [9]);
+        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), [9, 10]);
         assert_eq!(user_version(&conn).unwrap(), latest_version());
         let backup = Connection::open(t.path().join("pre-9.db")).unwrap();
         assert_eq!(user_version(&backup).unwrap(), 8);
