@@ -33,6 +33,13 @@
 //! same turn end. Publishing runs the change again instead of swapping in
 //! the copy, so a change made to the entry in between (the supervisor's
 //! `peek`) is kept.
+//!
+//! Each `with`, `peek` and `stage` takes the next revision of the table
+//! when the caller acts (a staged change keeps its stage-time revision for
+//! the replay). The attention flag is ordered by revision, never by the
+//! wall clock: a flag from a later revision is never replaced by an
+//! earlier one, and a turn start clears only a flag from an earlier
+//! revision. A clock that jumps back cannot pin a stale reason.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -142,7 +149,10 @@ pub struct TurnEnd {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attention {
     pub reason: String,
+    /// Wall-clock time, for events and display only; `rev` orders flags.
     pub at_ms: i64,
+    /// The merge revision that raised it (see the module doc).
+    rev: u64,
 }
 
 /// What a claim changed.
@@ -166,6 +176,10 @@ pub struct AgentMerge {
     /// The `tool_use_id` of the call a hook said is waiting for
     /// permission: only that call's PostToolUse means work goes on.
     blocked_call: Option<String>,
+    /// The revision of the table operation now running on this merge.
+    op_rev: Option<u64>,
+    /// A merge used outside a table numbers its own calls.
+    local_rev: u64,
 }
 
 impl AgentMerge {
@@ -173,10 +187,30 @@ impl AgentMerge {
         AgentMerge::default()
     }
 
+    /// The revision of the change being made now.
+    fn rev(&mut self) -> u64 {
+        match self.op_rev {
+            Some(r) => r,
+            None => {
+                self.local_rev += 1;
+                self.local_rev
+            }
+        }
+    }
+
+    /// Run `f` as table operation `rev`.
+    fn run<R>(&mut self, rev: u64, f: impl FnOnce(&mut AgentMerge) -> R) -> R {
+        self.op_rev = Some(rev);
+        let r = f(self);
+        self.op_rev = None;
+        r
+    }
+
     /// Take one claim. Only a source's newest claim counts; an older one is
     /// ignored.
     pub fn claim(&mut self, c: Claim) -> Change {
         let mut change = Change::default();
+        let rev = self.rev();
         if let Some(prev) = self.claims.get(&c.source) {
             if c.at_ms < prev.at_ms {
                 return change;
@@ -190,7 +224,7 @@ impl AgentMerge {
                 self.turn_open = true;
                 change.turn_start = true;
                 if self.last_turn_end.is_some()
-                    && self.attention.as_ref().is_some_and(|a| a.at_ms < c.at_ms)
+                    && self.attention.as_ref().is_some_and(|a| a.rev < rev)
                 {
                     self.attention = None;
                 }
@@ -217,16 +251,17 @@ impl AgentMerge {
     }
 
     /// Raise the attention flag (an auto-mode denial, a prompt). A flag
-    /// newer than `at_ms` stays: a staged change that publishes late (see
-    /// `MergeTable::stage`) must not replace a newer reason. An equal or
-    /// older flag is replaced.
+    /// from a later revision stays: a staged change that publishes late
+    /// (see `MergeTable::stage`) must not replace a newer reason.
     pub fn attention(&mut self, reason: &str, at_ms: i64) {
-        if self.attention.as_ref().is_some_and(|a| a.at_ms > at_ms) {
+        let rev = self.rev();
+        if self.attention.as_ref().is_some_and(|a| a.rev > rev) {
             return;
         }
         self.attention = Some(Attention {
             reason: reason.to_string(),
             at_ms,
+            rev,
         });
     }
 
@@ -305,6 +340,8 @@ type Agents = Arc<Mutex<HashMap<String, (i64, AgentMerge)>>>;
 #[derive(Debug, Default)]
 pub struct MergeTable {
     agents: Agents,
+    /// The last revision handed out; taken under the `agents` lock.
+    revs: std::sync::atomic::AtomicU64,
 }
 
 /// A merge change computed on a copy, not yet in the table (see the
@@ -315,6 +352,8 @@ pub struct MergeTable {
 pub struct Staged {
     agent_id: String,
     gen: i64,
+    /// The revision taken at stage time; the replay runs as it.
+    rev: u64,
     change: Box<dyn FnOnce(&mut AgentMerge) + Send>,
     /// From `stage_existing`: publish only while the agent is still at
     /// `gen`, never create it.
@@ -326,6 +365,7 @@ impl std::fmt::Debug for Staged {
         f.debug_struct("Staged")
             .field("agent_id", &self.agent_id)
             .field("gen", &self.gen)
+            .field("rev", &self.rev)
             .field("existing", &self.existing)
             .finish_non_exhaustive()
     }
@@ -346,7 +386,14 @@ impl MergeTable {
         if entry.0 != gen {
             *entry = (gen, AgentMerge::new());
         }
-        f(&mut entry.1)
+        let rev = self.next_rev();
+        entry.1.run(rev, f)
+    }
+
+    /// The next revision. Callers hold the `agents` lock, so revisions
+    /// follow the order in which operations take it.
+    fn next_rev(&self) -> u64 {
+        self.revs.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
     }
 
     /// Run `f` on the merge of `agent_id` only when it is at generation
@@ -359,7 +406,10 @@ impl MergeTable {
     ) -> Option<R> {
         let mut map = self.agents.lock().unwrap_or_else(|e| e.into_inner());
         match map.get_mut(agent_id) {
-            Some((g, m)) if *g == gen => Some(f(m)),
+            Some((g, m)) if *g == gen => {
+                let rev = self.next_rev();
+                Some(m.run(rev, f))
+            }
             _ => None,
         }
     }
@@ -380,15 +430,16 @@ impl MergeTable {
         gen: i64,
         f: impl Fn(&mut AgentMerge) -> R + Send + 'static,
     ) -> (R, Staged) {
-        let mut copy = {
+        let (mut copy, rev) = {
             let map = self.agents.lock().unwrap_or_else(|e| e.into_inner());
-            match map.get(agent_id) {
+            let copy = match map.get(agent_id) {
                 Some((g, m)) if *g == gen => m.clone(),
                 _ => AgentMerge::new(),
-            }
+            };
+            (copy, self.next_rev())
         };
-        let r = f(&mut copy);
-        (r, Staged::new(agent_id, gen, f, false))
+        let r = copy.run(rev, &f);
+        (r, Staged::new(agent_id, gen, rev, f, false))
     }
 
     /// `peek` on a copy: `None` unless `agent_id` is at generation `gen`.
@@ -398,15 +449,16 @@ impl MergeTable {
         gen: i64,
         f: impl Fn(&mut AgentMerge) -> R + Send + 'static,
     ) -> Option<(R, Staged)> {
-        let mut copy = {
+        let (mut copy, rev) = {
             let map = self.agents.lock().unwrap_or_else(|e| e.into_inner());
-            match map.get(agent_id) {
+            let copy = match map.get(agent_id) {
                 Some((g, m)) if *g == gen => m.clone(),
                 _ => return None,
-            }
+            };
+            (copy, self.next_rev())
         };
-        let r = f(&mut copy);
-        Some((r, Staged::new(agent_id, gen, f, true)))
+        let r = copy.run(rev, &f);
+        Some((r, Staged::new(agent_id, gen, rev, f, true)))
     }
 
     /// Run `staged`'s change on the live entry. A newer generation of the
@@ -428,12 +480,14 @@ impl Staged {
     fn new<R>(
         agent_id: &str,
         gen: i64,
+        rev: u64,
         f: impl Fn(&mut AgentMerge) -> R + Send + 'static,
         existing: bool,
     ) -> Staged {
         Staged {
             agent_id: agent_id.to_string(),
             gen,
+            rev,
             change: Box::new(move |m| {
                 f(m);
             }),
@@ -455,7 +509,7 @@ fn publish(agents: &Agents, staged: Staged) {
         }
     }
     if let Some((_, m)) = map.get_mut(&staged.agent_id) {
-        (staged.change)(m);
+        m.run(staged.rev, staged.change);
     }
 }
 
@@ -698,9 +752,9 @@ mod tests {
         assert_eq!(t.peek("a1", 2, |_| ()), None);
     }
 
-    /// Attention staged at t1, a newer flag raised at t2 before the
-    /// commit: the newer one survives the publish. The reverse: a staged
-    /// flag newer than the one raised in between wins.
+    /// Attention staged at t1, a flag raised by a later action (t2) before
+    /// the commit: the later one survives the publish. The reverse: a flag
+    /// raised before the stage loses to the staged one.
     #[test]
     fn a_late_publish_keeps_the_newer_attention() {
         let t = MergeTable::new();
@@ -712,31 +766,65 @@ mod tests {
         t.publish(staged);
         let flag = t.peek("a1", 1, |m| m.attention_flag().cloned()).flatten();
         assert_eq!(
-            flag,
-            Some(Attention {
-                reason: "mail_uncertain: m1".into(),
-                at_ms: 2_000
-            })
+            flag.map(|a| (a.reason, a.at_ms)),
+            Some(("mail_uncertain: m1".into(), 2_000))
         );
 
         let t = MergeTable::new();
         t.with("a1", 1, |_| ());
+        t.peek("a1", 1, |m| m.attention("mail_uncertain: m1", 1_000));
         let (_, staged) = t
             .stage_existing("a1", 1, |m| m.attention("mail_held: m2", 2_000))
             .unwrap();
-        t.peek("a1", 1, |m| m.attention("mail_uncertain: m1", 1_000));
         t.publish(staged);
         let flag = t.peek("a1", 1, |m| m.attention_flag().cloned()).flatten();
         assert_eq!(
             flag.map(|a| (a.reason, a.at_ms)),
             Some(("mail_held: m2".into(), 2_000))
         );
+    }
 
-        // An equal time is replaced (the latest call wins).
-        let mut m = AgentMerge::new();
-        m.attention("a", 5);
-        m.attention("b", 5);
-        assert_eq!(m.attention_flag().unwrap().reason, "b");
+    /// The clock jumps back: a later action stamped earlier still wins,
+    /// and a later turn start still clears the flag.
+    #[test]
+    fn attention_follows_the_revision_not_the_clock() {
+        let t = MergeTable::new();
+        t.with("a1", 1, |m| m.claim(c(Screen, Working, 0)));
+        t.peek("a1", 1, |m| m.attention("auto_mode_denied: x", 2_000));
+        // Rolled back: a later flag at 1_500 replaces the one at 2_000.
+        t.peek("a1", 1, |m| m.attention("mail_uncertain: m1", 1_500));
+        let flag = t.peek("a1", 1, |m| m.attention_flag().cloned()).flatten();
+        assert_eq!(
+            flag.map(|a| (a.reason, a.at_ms)),
+            Some(("mail_uncertain: m1".into(), 1_500))
+        );
+        // A staged flag taken before the rolled-back one loses to it, too.
+        let (_, staged) = t
+            .stage_existing("a1", 1, |m| m.attention("mail_held: m2", 3_000))
+            .unwrap();
+        t.peek("a1", 1, |m| m.attention("mail_uncertain: m3", 100));
+        t.publish(staged);
+        let reason = t.peek("a1", 1, |m| m.attention_flag().map(|a| a.reason.clone()));
+        assert_eq!(reason.flatten().as_deref(), Some("mail_uncertain: m3"));
+        // The clear path: the turn ends, then a new turn starts at a time
+        // before the flag's stamp; it is a later action, so it clears.
+        t.with("a1", 1, |m| m.claim(c(Hook, Ready, 4_000)));
+        t.peek("a1", 1, |m| m.attention("mail_uncertain: m4", 9_000));
+        let started = t.with("a1", 1, |m| m.claim(c(Screen, Working, 5_000)));
+        assert!(started.turn_start);
+        assert_eq!(
+            t.peek("a1", 1, |m| m.attention_flag().is_none()),
+            Some(true)
+        );
+        // A staged turn start from before the flag does not clear it on replay.
+        t.with("a1", 1, |m| m.claim(c(Hook, Ready, 6_000)));
+        let (_, staged) = t.stage("a1", 1, |m| m.claim(c(Hook, Working, 7_000)));
+        t.peek("a1", 1, |m| m.attention("mail_uncertain: m5", 1));
+        t.publish(staged);
+        t.peek("a1", 1, |m| {
+            assert!(m.turn_open());
+            assert_eq!(m.attention_flag().unwrap().reason, "mail_uncertain: m5");
+        });
     }
 
     /// A change made to the live entry between stage and publish (the
