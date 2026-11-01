@@ -74,10 +74,10 @@ The result is `{applied,target,source,values}`, where `values` contains the resu
 | Caller | Namespace |
 | --- | --- |
 | Local process | Explicit caller-chosen source/key namespace; prefixes `agent.`, `client.` and `c9watch` are reserved. Requires mutation-peer verification. |
-| Engine agent | `agent.<stamped-id>` only; source may be omitted on patch. |
-| Paired client | `client.<authenticated-id>` only; requires `annotation:write`. Source may be omitted on patch. |
+| Engine agent | `agent.<stamped-id>` only, with the ID in lowercase; source may be omitted on patch. |
+| Paired client | `client.<authenticated-id>` only, with the ID in lowercase; requires `annotation:write`. Source may be omitted on patch. |
 
-The current token store issues hyphenated UUID client IDs: `client.` plus that ID is 43 bytes, exceeding the 40-byte namespace cap. Writes for those IDs currently fail closed with `bad_request`; resolving the ID/namespace length contract is required before gateway writes can be enabled. IDs are never silently shortened.
+Engine agent IDs are `agt_` plus a 26-character Crockford base32 ULID in uppercase. Gateway client IDs are `cli_` plus a 26-character ULID in lowercase. Crockford base32 is case-insensitive, so the namespace uses the lowercase form of the ID: agent `agt_01JB8Z…` owns `agent.agt_01jb8z…`. Use that exact form in a key or `source`; another spelling is refused. Both forms fit the 40-byte namespace cap. An ID that does not fit the namespace rules fails closed with `bad_request`. IDs are never silently shortened.
 
 A supplied foreign namespace is refused with `not_allowed`. Local patches require `source`; the engine does not guess a local identity. Two allowed local processes can overwrite the same local namespace: `local-unverified` is not an identity boundary. Namespace and name use `[a-z0-9._-]`, at most 40 and 32 UTF-8 bytes respectively.
 

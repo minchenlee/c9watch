@@ -17,6 +17,13 @@ use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::sync::watch;
 
+/// A new gateway client id, `cli_<ulid>` in lowercase Crockford base32
+/// (30 bytes). It fits the `client.<id>` annotation namespace (40-byte cap)
+/// without shortening, and sorts by the ms it was made in.
+pub fn new_client_id() -> String {
+    let agent = crate::engine::db::new_agent_id();
+    format!("cli_{}", agent["agt_".len()..].to_ascii_lowercase())
+}
 pub const IDLE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 pub const ABSOLUTE_MS: i64 = 180 * 24 * 60 * 60 * 1000;
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,7 +143,7 @@ impl Store {
         let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let digest = hash(&token);
         let client = Client {
-            client_id: uuid::Uuid::new_v4().to_string(),
+            client_id: new_client_id(),
             label: spec.label.clone(),
             origin: spec.origin.clone(),
             aud: self.db.machine_id().into(),
@@ -327,6 +334,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(c.client_id.starts_with("cli_") && c.client_id.len() == 30);
         assert_eq!(
             store
                 .verify_bearer(
@@ -422,6 +430,20 @@ mod tests {
             .verify_bearer(&c.client_id, &token, Some("https://view.example"), now + 1)
             .await
             .is_ok());
+    }
+    #[test]
+    fn client_ids_are_lowercase_prefixed_ulids() {
+        let a = new_client_id();
+        let b = new_client_id();
+        assert_ne!(a, b);
+        for id in [&a, &b] {
+            assert_eq!(id.len(), 30, "{id}");
+            let body = id.strip_prefix("cli_").unwrap();
+            assert!(body
+                .bytes()
+                .all(|c| b"0123456789abcdefghjkmnpqrstvwxyz".contains(&c)));
+            assert!(format!("client.{id}").len() <= 40);
+        }
     }
     #[test]
     fn live_policy_never_widens_stored_scopes() {
