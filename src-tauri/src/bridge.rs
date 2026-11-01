@@ -964,15 +964,26 @@ mod tests {
         for i in 0..200 {
             tx.send(i.to_string()).unwrap();
         }
-        assert_eq!(recv_batch(&rx, Duration::from_secs(5), 128).unwrap().len(), 128);
-        assert_eq!(recv_batch(&rx, Duration::from_secs(5), 128).unwrap().len(), 72);
+        assert_eq!(
+            recv_batch(&rx, Duration::from_secs(5), 128).unwrap().len(),
+            128
+        );
+        assert_eq!(
+            recv_batch(&rx, Duration::from_secs(5), 128).unwrap().len(),
+            72
+        );
         let started = Instant::now();
-        assert!(recv_batch(&rx, Duration::from_millis(30), 128).unwrap().is_empty());
+        assert!(recv_batch(&rx, Duration::from_millis(30), 128)
+            .unwrap()
+            .is_empty());
         assert!(started.elapsed() >= Duration::from_millis(25));
 
         tx.send("last".into()).unwrap();
         drop(tx);
-        assert_eq!(recv_batch(&rx, Duration::from_secs(5), 128).unwrap(), vec!["last".to_string()]);
+        assert_eq!(
+            recv_batch(&rx, Duration::from_secs(5), 128).unwrap(),
+            vec!["last".to_string()]
+        );
         assert!(recv_batch(&rx, Duration::from_secs(5), 128).is_err());
     }
     #[test]
@@ -985,7 +996,10 @@ mod tests {
             let (mut socket, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(socket.try_clone().unwrap());
             let mut line = String::new();
-            while { line.clear(); reader.read_line(&mut line).unwrap_or(0) > 0 } {
+            while {
+                line.clear();
+                reader.read_line(&mut line).unwrap_or(0) > 0
+            } {
                 let req: Value = serde_json::from_str(&line).unwrap();
                 if req["method"] == "hello" {
                     writeln!(socket, "{}", json!({"v":1,"id":req["id"],"ok":true,"result":{
@@ -996,7 +1010,12 @@ mod tests {
                     for read in [10, 20] {
                         writeln!(socket, "{}", json!({"v":1,"type":"progress","id":req["id"],"bytesRead":read,"bytesTotal":20})).unwrap();
                     }
-                    writeln!(socket, "{}", json!({"v":1,"id":req["id"],"ok":true,"result":{"messages":[]}})).unwrap();
+                    writeln!(
+                        socket,
+                        "{}",
+                        json!({"v":1,"id":req["id"],"ok":true,"result":{"messages":[]}})
+                    )
+                    .unwrap();
                 }
             }
         });
