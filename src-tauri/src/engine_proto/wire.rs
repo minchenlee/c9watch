@@ -159,7 +159,8 @@ pub enum ErrorCode {
     NotOwner,
     /// `msg.send`: the `idem` key was used for another message, or the same
     /// body went to the same agent within 10 minutes. `data` has `msgId`
-    /// and `at`.
+    /// and `at`. `agent.create`, `agent.retire`, `session.stop`: the `idem`
+    /// key was used for a request with other params.
     Duplicate,
     /// `session.stop`: no live session has this key.
     UnknownSession,

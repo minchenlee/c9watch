@@ -15,8 +15,8 @@ When preview ends, the GUI's legacy in-process fallback is removed. The GUI then
 
 ## 1.11 — upcoming
 
-- Responses on one connection may arrive out of order. Clients match them by `id`. Core may handle requests on one connection concurrently.
-- `agent.create`, `agent.retire` and `session.stop` accept `idem`, as `msg.send` does today. A repeated `idem` replays the original result.
+- Responses on one connection may arrive out of order. Clients match them by `id`. Core handles requests on one connection concurrently, at most 32 in flight per connection.
+- `agent.create`, `agent.retire` and `session.stop` accept `idem`, as `msg.send` does. A repeated `idem` with the same params replays the original result; other params are `duplicate`. The key lives in core's memory for 24 hours.
 - Annotation namespaces use the lowercase form of the owner ID, so every valid agent and client ID gets a namespace (the 43-byte limit no longer rejects them). New gateway client IDs are `cli_` plus a lowercase ULID.
 - Add detector health. `snapshot.get` and `session.list` add optional `observedAt` (the last written detection pass) and `detectorHealth` (`DetectorHealth`: `state` ok/degraded/failed/starting, `reason`, `failedProviders`, `lastOkAt`, `lastAttemptAt`, `stale`, `staleAfterMs`). New preview topic `detect.health` carries `DetectorHealth` when the state, the failed providers or staleness change, and as a heartbeat every `staleAfterMs / 2` while passes are written. `observedAt` equals `detectorHealth.lastOkAt`. A failed detection no longer looks like a quiet machine. Additive; no method `rev` changes.
 - Hook and CC-socket state changes reach the in-memory merge only after their transaction commits. A failed write leaves the merge unchanged, so a retried event writes the same turn end.
@@ -24,6 +24,8 @@ When preview ends, the GUI's legacy in-process fallback is removed. The GUI then
 - Core writes `orphaned` (`stateReason` `kill_unconfirmed`) when no kill can confirm that an agent's process ended: after a retire, after an agent's own exit, after a failed create or resume, and in boot reconcile. Before SIGKILL, core confirms the process by pid and start time. An `orphaned` agent keeps `goneAt` `null`, counts as live for the cwd rules of `agent.create`, and is not resumable. `agent.retire` kills it again, together with the processes that the unconfirmed kill left (up to 64), and the row becomes `retired` only when every one is confirmed gone. If the kill left more than 64, the row stays `orphaned` with `stateReason` `survivors_overflow`. Add `agent.retire {force: true}` (local client only, as `agent.retire` is): it kills as usual, then writes the tombstone and a `forced` audit row. Before this change, boot reconcile marked such a row `interrupted` and resumed it.
 - Add preview `agent.resume {id}` (local client only). It resumes a `paused` or `interrupted` engine agent and answers when the agent is `ready`.
 - A failed resume no longer ends the agent as `failed`. The row goes back to `paused` or `interrupted` with `stateReason` `resume_failed`, keeps its mail queue, and does not emit `agent.failed`. Boot behavior change: a boot skips these rows; `agent.resume` retries them. `failed` with `resume_failed` now means only that there is no session to resume.
+- New principal `observed:<sessionKey>` for a process inside an observed session. It cannot create, retire or resume agents, stops only its own session, and sends mail that names its session. Before, such a process was `local-unverified`.
+- The authorization table now declares every admission check, including the Unix-peer gate and the mail sender check. `x-authz.admission` lists more checks; `x-authz.principals` may list `observed`.
 
 ## 1.10 — public error cleanup
 

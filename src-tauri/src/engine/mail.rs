@@ -33,7 +33,7 @@
 
 use super::db::outbox::{Cursor, NewEvent};
 use super::db::Tx;
-use super::principal::{self, LiveAgents, Principal};
+use super::principal::{self, LiveAgents, ObservedSessions, Principal};
 use crate::engine_proto::wire::{
     ApiError, ErrorCode, MsgAddress, MsgKind, MsgSendParams, MsgSendResult, MsgStateEvent,
 };
@@ -120,7 +120,9 @@ impl Sender {
     fn agent_id(&self) -> Option<&str> {
         match &self.principal {
             Principal::Agent { id, .. } => Some(id),
-            Principal::LocalUnverified | Principal::Client { .. } => None,
+            Principal::LocalUnverified | Principal::Observed { .. } | Principal::Client { .. } => {
+                None
+            }
         }
     }
 }
@@ -136,7 +138,7 @@ pub fn sender(conn: &Connection, principal: &Principal) -> rusqlite::Result<Send
             )
             .optional()?
             .unwrap_or((None, None)),
-        Principal::LocalUnverified => (None, None),
+        Principal::LocalUnverified | Principal::Observed { .. } => (None, None),
         Principal::Client { .. } => return Err(rusqlite::Error::InvalidQuery),
     };
     Ok(Sender {
@@ -304,22 +306,28 @@ fn levenshtein(a: &str, b: &str) -> usize {
 }
 
 /// May this connection send at all (§5.4). The terminal must pass
-/// `principal::check_mutating_peer`, as for `agent.create`; an agent must
-/// still be the generation the engine stamped. Blocking: the terminal check
+/// `principal::check_mutating_peer`, as for `agent.create`; so must a peer
+/// inside an observed session, which may sit under its own session only
+/// (D8). An agent must still be the generation the engine stamped. Blocking: the terminal check
 /// reads the peer's ancestry.
 pub fn check_sender(
     principal: &Principal,
     pid: libc::pid_t,
     peer_start: Option<u64>,
     live: &dyn LiveAgents,
+    observed: &dyn ObservedSessions,
 ) -> Result<(), ApiError> {
+    let own = match principal {
+        Principal::Observed { session_key } => Some(session_key.as_str()),
+        _ => None,
+    };
     match principal {
         Principal::Client { .. } => Err(ApiError::new(
             ErrorCode::NotAllowed,
             "gateway peers cannot send mail",
         )),
-        Principal::LocalUnverified => principal::check_mutating_peer(pid, peer_start, live)
-            .map_err(|why| {
+        Principal::LocalUnverified | Principal::Observed { .. } => {
+            principal::check_mutating_peer(pid, peer_start, live, observed, own).map_err(|why| {
                 ApiError::new(
                     ErrorCode::NotAllowed,
                     format!("msg.send refused for this peer: {}", why),
@@ -327,7 +335,8 @@ pub fn check_sender(
                 .with_hint(
                     "run `c9watch send` from your own terminal, outside any agent and sandbox",
                 )
-            }),
+            })
+        }
         Principal::Agent { id, gen } => match live.current_gen(id) {
             Some(now) if now == *gen => Ok(()),
             _ => Err(ApiError::new(
@@ -431,8 +440,13 @@ pub fn person() -> String {
 
 /// The provenance line above the body (A:327):
 /// `[from <addr> (<mode>) for <person>]`, or
-/// `[from terminal (local-unverified) for <person>]` for the terminal.
+/// `[from terminal (local-unverified) for <person>]` for the terminal, or
+/// `[from observed session <sessionKey> for <person>]` for a peer inside
+/// an observed session (D8).
 pub fn provenance(machine: &str, sender: &Sender, person: &str) -> String {
+    if let Principal::Observed { session_key } = &sender.principal {
+        return format!("[from observed session {} for {}]", session_key, person);
+    }
     match sender.agent_id() {
         Some(id) => format!(
             "[from {}/{} ({}) for {}]",
@@ -1467,7 +1481,7 @@ pub(super) fn visible(
 ) -> rusqlite::Result<bool> {
     match principal {
         Principal::LocalUnverified => Ok(true),
-        Principal::Client { .. } => Ok(false),
+        Principal::Observed { .. } | Principal::Client { .. } => Ok(false),
         Principal::Agent { id: agent, .. } => conn.query_row("SELECT count(*) > 0 FROM messages WHERE id = ?1 AND (from_agent = ?2 OR to_agent = ?2)", params![id, agent], |r| r.get(0)),
     }
 }
@@ -1526,6 +1540,12 @@ pub fn list(
         return Ok(Err(ApiError::new(
             ErrorCode::NotAllowed,
             "mail is local-only",
+        )));
+    }
+    if matches!(who, Principal::Observed { .. }) {
+        return Ok(Err(ApiError::new(
+            ErrorCode::NotAllowed,
+            "an observed session has no mailbox",
         )));
     }
     let agent = match p.agent.as_deref() {
@@ -2557,19 +2577,33 @@ mod tests {
     fn a_stale_generation_may_not_send() {
         let live = FakeAgents::one("agt_a", 4242, 7);
         let me = std::process::id() as libc::pid_t;
-        assert!(check_sender(&agent("agt_a"), me, None, &live).is_ok());
+        assert!(check_sender(
+            &agent("agt_a"),
+            me,
+            None,
+            &live,
+            &principal::NoObservedSessions
+        )
+        .is_ok());
         let stale = Principal::Agent {
             id: "agt_a".into(),
             gen: 0,
         };
-        let e = check_sender(&stale, me, None, &live).unwrap_err();
+        let e = check_sender(&stale, me, None, &live, &principal::NoObservedSessions).unwrap_err();
         assert_eq!(e.code, ErrorCode::NotAllowed);
         assert_eq!(
             e.hint.as_deref(),
             Some("stale generation; this agent was restarted")
         );
         // Not live at all.
-        assert!(check_sender(&agent("agt_b"), me, None, &live).is_err());
+        assert!(check_sender(
+            &agent("agt_b"),
+            me,
+            None,
+            &live,
+            &principal::NoObservedSessions
+        )
+        .is_err());
     }
 
     #[test]
@@ -2577,9 +2611,23 @@ mod tests {
         let me = std::process::id() as libc::pid_t;
         let start = crate::engine::peer::proc_info(me).map(|p| p.start);
         let none = crate::engine::principal::NoLiveAgents;
-        assert!(check_sender(&LocalUnverified, me, start, &none).is_ok());
+        assert!(check_sender(
+            &LocalUnverified,
+            me,
+            start,
+            &none,
+            &principal::NoObservedSessions
+        )
+        .is_ok());
         // Another process than the one stamped at accept.
-        let e = check_sender(&LocalUnverified, me, start.map(|s| s + 1), &none).unwrap_err();
+        let e = check_sender(
+            &LocalUnverified,
+            me,
+            start.map(|s| s + 1),
+            &none,
+            &principal::NoObservedSessions,
+        )
+        .unwrap_err();
         assert_eq!(e.code, ErrorCode::NotAllowed);
         assert!(e.hint.unwrap().contains("own terminal"));
     }

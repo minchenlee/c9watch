@@ -9,7 +9,12 @@
 //!    recorded it at spawn (C1a-33). The live set is the engine's table in
 //!    `engine::agents`, filled only from PTY children the engine spawned, so
 //!    an observed session is never an agent (A:186).
-//! 2. `local-unverified`: everything else (A:187).
+//! 2. `observed:<sessionKey>`: no live agent is in the chain, but a
+//!    process of a session detection observed (one the engine did not
+//!    create) is. Such a peer runs inside the user's own session, so it is
+//!    narrower than `local-unverified`: no `agent.create`/`agent.retire`, and
+//!    `session.stop` only for its own session (D8).
+//! 3. `local-unverified`: everything else (A:187).
 //!
 //! Unix stamping never returns `human` (that waits for the C1.5 code-signature check)
 //! and never stamps `client:<id>` on the engine socket: `kind=gateway` in
@@ -28,6 +33,10 @@ pub enum Principal {
         gen: i64,
     },
     LocalUnverified,
+    /// A process inside the observed session with this key (D8).
+    Observed {
+        session_key: String,
+    },
     /// Only constructed after gateway token authentication; never by stamp_peer.
     Client {
         id: String,
@@ -39,6 +48,7 @@ impl std::fmt::Display for Principal {
         match self {
             Principal::Agent { id, .. } => write!(f, "agent:{}", id),
             Principal::LocalUnverified => f.write_str("local-unverified"),
+            Principal::Observed { session_key } => write!(f, "observed:{}", session_key),
             Principal::Client { id } => write!(f, "client:{}", id),
         }
     }
@@ -73,6 +83,23 @@ pub trait LiveAgents: Send + Sync {
     fn current_gen(&self, agent_id: &str) -> Option<i64>;
 }
 
+/// Lookup of observed sessions by the pid of their process, as detection
+/// last saw them. A session the engine created matches too; `stamp` asks
+/// `LiveAgents` first, so its peers stay `agent:<id>`.
+pub trait ObservedSessions: Send + Sync {
+    /// The `sessionKey` of the observed session whose process has `pid`.
+    fn by_pid(&self, pid: libc::pid_t) -> Option<String>;
+}
+
+/// No session is observed.
+pub struct NoObservedSessions;
+
+impl ObservedSessions for NoObservedSessions {
+    fn by_pid(&self, _pid: libc::pid_t) -> Option<String> {
+        None
+    }
+}
+
 /// No agent is live. Every connection is `local-unverified`.
 pub struct NoLiveAgents;
 
@@ -101,6 +128,27 @@ pub fn stamp(chain: &[ProcInfo], agents: &dyn LiveAgents) -> Principal {
     Principal::LocalUnverified
 }
 
+/// `stamp`, then observed sessions: with no live agent in the chain, the
+/// first process that is an observed session's makes the peer
+/// `observed:<sessionKey>`. Detection has no process start time, so a
+/// reused pid can match; that only narrows the peer.
+pub fn stamp_observed(
+    chain: &[ProcInfo],
+    agents: &dyn LiveAgents,
+    observed: &dyn ObservedSessions,
+) -> Principal {
+    match stamp(chain, agents) {
+        Principal::LocalUnverified => chain
+            .iter()
+            .take(MAX_ANCESTRY)
+            .find_map(|p| observed.by_pid(p.pid))
+            .map_or(Principal::LocalUnverified, |session_key| {
+                Principal::Observed { session_key }
+            }),
+        p => p,
+    }
+}
+
 /// Stamp the principal of the peer with `pid`. `accepted` is the start-time
 /// token taken when the connection was accepted. A peer that started after
 /// it holds a reused pid, not the process that connected, and is
@@ -113,23 +161,27 @@ pub fn stamp_peer(
     pid: libc::pid_t,
     accepted: Option<u64>,
     agents: &dyn LiveAgents,
+    observed: &dyn ObservedSessions,
 ) -> (Principal, Option<u64>) {
     let chain = peer::ancestry(pid, MAX_ANCESTRY);
     let start = chain.first().map(|p| p.start);
     match (start, accepted) {
-        (Some(first), Some(at)) if first <= at => (stamp(&chain, agents), start),
+        (Some(first), Some(at)) if first <= at => (stamp_observed(&chain, agents, observed), start),
         _ => (Principal::LocalUnverified, start),
     }
 }
 
-/// The extra check before a `local-unverified` peer may call a mutating
-/// method (`agent.create`, `agent.retire`). The stamp walks at most
+/// The extra check before a `local-unverified` or `observed:` peer may call
+/// a mutating method (`agent.create`, `agent.retire`, `session.stop`). The stamp walks at most
 /// `MAX_ANCESTRY` levels and calls the rest `local-unverified`, which is
 /// fine for reads; a mutation fails closed instead (security review H1):
 /// - `chain` is the peer's whole ancestry up to init (`None`: the walk
 ///   stopped early, so an agent may be above the cut);
 /// - its first entry is the process stamped at accept (`peer_start`);
 /// - no process in it is a live agent's PTY child, at any depth;
+/// - no process in it is an observed session's, at any depth, except the
+///   session `own` (the key an `observed:` principal was stamped with): a
+///   `local-unverified` stamp only walks `MAX_ANCESTRY` levels;
 /// - the peer is not `confined`: an agent's Bash runs in the vendor
 ///   sandbox, and a process it moved under init stays there.
 pub fn check_mutation(
@@ -137,6 +189,8 @@ pub fn check_mutation(
     peer_start: Option<u64>,
     confined: Option<bool>,
     agents: &dyn LiveAgents,
+    observed: &dyn ObservedSessions,
+    own: Option<&str>,
 ) -> Result<(), String> {
     let chain = chain.ok_or("the peer's ancestry could not be read up to init")?;
     match (chain.first(), peer_start) {
@@ -148,6 +202,13 @@ pub fn check_mutation(
         .find_map(|p| agents.by_pty_child(p.pid, p.start))
     {
         return Err(format!("the peer runs under agent:{}", agent.id));
+    }
+    if let Some(key) = chain
+        .iter()
+        .filter_map(|p| observed.by_pid(p.pid))
+        .find(|k| Some(k.as_str()) != own)
+    {
+        return Err(format!("the peer runs under observed:{}", key));
     }
     match confined {
         Some(false) => Ok(()),
@@ -161,9 +222,18 @@ pub fn check_mutating_peer(
     pid: libc::pid_t,
     peer_start: Option<u64>,
     agents: &dyn LiveAgents,
+    observed: &dyn ObservedSessions,
+    own: Option<&str>,
 ) -> Result<(), String> {
     let chain = peer::full_ancestry(pid);
-    check_mutation(chain.as_deref(), peer_start, peer::confined(pid), agents)
+    check_mutation(
+        chain.as_deref(),
+        peer_start,
+        peer::confined(pid),
+        agents,
+        observed,
+        own,
+    )
 }
 
 #[cfg(test)]
@@ -198,6 +268,27 @@ pub(crate) mod tests {
 
         fn current_gen(&self, agent_id: &str) -> Option<i64> {
             self.0.values().find(|a| a.id == agent_id).map(|a| a.gen)
+        }
+    }
+
+    /// Observed sessions keyed by process pid.
+    pub(crate) struct FakeObserved(pub HashMap<libc::pid_t, String>);
+
+    impl FakeObserved {
+        pub(crate) fn one(key: &str, pid: libc::pid_t) -> Self {
+            Self(HashMap::from([(pid, key.to_string())]))
+        }
+    }
+
+    impl ObservedSessions for FakeObserved {
+        fn by_pid(&self, pid: libc::pid_t) -> Option<String> {
+            self.0.get(&pid).cloned()
+        }
+    }
+
+    fn observed(key: &str) -> Principal {
+        Principal::Observed {
+            session_key: key.into(),
         }
     }
 
@@ -271,13 +362,22 @@ pub(crate) mod tests {
         let pstart = peer::proc_info(parent).unwrap().start;
         let now = peer::start_token_now();
         let agents = FakeAgents::one("p", parent, pstart);
-        assert_eq!(stamp_peer(me, now, &agents).0, agent("p"));
         assert_eq!(
-            stamp_peer(me, now, &FakeAgents::one("p", parent, pstart + 1)).0,
+            stamp_peer(me, now, &agents, &NoObservedSessions).0,
+            agent("p")
+        );
+        assert_eq!(
+            stamp_peer(
+                me,
+                now,
+                &FakeAgents::one("p", parent, pstart + 1),
+                &NoObservedSessions
+            )
+            .0,
             Principal::LocalUnverified
         );
         assert_eq!(
-            stamp_peer(me, now, &NoLiveAgents).0,
+            stamp_peer(me, now, &NoLiveAgents, &NoObservedSessions).0,
             Principal::LocalUnverified
         );
     }
@@ -289,14 +389,23 @@ pub(crate) mod tests {
         let agents = FakeAgents::one("p", mine.ppid, peer::proc_info(mine.ppid).unwrap().start);
         // Accepted just before we started: our pid would be a reused one.
         assert_eq!(
-            stamp_peer(me, Some(mine.start - 1), &agents).0,
+            stamp_peer(me, Some(mine.start - 1), &agents, &NoObservedSessions).0,
             Principal::LocalUnverified
         );
-        assert_eq!(stamp_peer(me, None, &agents).0, Principal::LocalUnverified);
-        assert_eq!(stamp_peer(me, Some(mine.start), &agents).0, agent("p"));
+        assert_eq!(
+            stamp_peer(me, None, &agents, &NoObservedSessions).0,
+            Principal::LocalUnverified
+        );
+        assert_eq!(
+            stamp_peer(me, Some(mine.start), &agents, &NoObservedSessions).0,
+            agent("p")
+        );
         // The start time comes back from the same read, even when refused.
-        assert_eq!(stamp_peer(me, None, &agents).1, Some(mine.start));
-        assert_eq!(stamp_peer(-1, None, &agents).1, None);
+        assert_eq!(
+            stamp_peer(me, None, &agents, &NoObservedSessions).1,
+            Some(mine.start)
+        );
+        assert_eq!(stamp_peer(-1, None, &agents, &NoObservedSessions).1, None);
     }
 
     /// H1: a mutation fails closed where the stamp says
@@ -305,7 +414,7 @@ pub(crate) mod tests {
     fn a_mutation_needs_the_whole_chain_and_no_sandbox() {
         let chain = bash_tool_chain(100);
         let ok = |c: Option<&[ProcInfo]>, start, confined, agents: &dyn LiveAgents| {
-            check_mutation(c, start, confined, agents)
+            check_mutation(c, start, confined, agents, &NoObservedSessions, None)
         };
         assert_eq!(
             ok(Some(&chain), Some(300), Some(false), &NoLiveAgents),
@@ -329,14 +438,57 @@ pub(crate) mod tests {
         assert!(e.contains("agent:a1"), "{}", e);
     }
 
+    /// D8: a peer inside an observed session is `observed:<key>`, not the
+    /// broad `local-unverified` bucket; a live agent still wins.
+    #[test]
+    fn a_peer_inside_an_observed_session_is_observed() {
+        let chain = bash_tool_chain(100);
+        let seen = FakeObserved::one("claudeCode:s1", 10);
+        let p = stamp_observed(&chain, &NoLiveAgents, &seen);
+        assert_eq!(p, observed("claudeCode:s1"));
+        assert_eq!(p.to_string(), "observed:claudeCode:s1");
+        assert_eq!(
+            stamp_observed(&chain, &FakeAgents::one("a1", 10, 100), &seen),
+            agent("a1")
+        );
+        assert_eq!(
+            stamp_observed(&chain, &NoLiveAgents, &NoObservedSessions),
+            Principal::LocalUnverified
+        );
+    }
+
+    /// D8: a mutation refuses a peer under an observed session at any
+    /// depth, except the observed principal's own session.
+    #[test]
+    fn a_mutation_refuses_an_observed_session_other_than_its_own() {
+        let deep: Vec<ProcInfo> = (0..40).map(|i| pi(100 + i, 101 + i, 7)).collect();
+        let seen = FakeObserved::one("claudeCode:s1", 135);
+        let check =
+            |own| check_mutation(Some(&deep), Some(7), Some(false), &NoLiveAgents, &seen, own);
+        let e = check(None).unwrap_err();
+        assert!(e.contains("observed:claudeCode:s1"), "{}", e);
+        assert!(check(Some("claudeCode:s2")).is_err());
+        assert_eq!(check(Some("claudeCode:s1")), Ok(()));
+    }
+
     #[test]
     fn the_test_process_may_mutate() {
         let me = std::process::id() as libc::pid_t;
         let start = peer::proc_info(me).map(|p| p.start);
-        assert_eq!(check_mutating_peer(me, start, &NoLiveAgents), Ok(()));
+        assert_eq!(
+            check_mutating_peer(me, start, &NoLiveAgents, &NoObservedSessions, None),
+            Ok(())
+        );
         let parent = peer::proc_info(me).unwrap().ppid;
         let pstart = peer::proc_info(parent).unwrap().start;
-        assert!(check_mutating_peer(me, start, &FakeAgents::one("p", parent, pstart)).is_err());
+        assert!(check_mutating_peer(
+            me,
+            start,
+            &FakeAgents::one("p", parent, pstart),
+            &NoObservedSessions,
+            None
+        )
+        .is_err());
     }
 
     #[test]
@@ -346,6 +498,10 @@ pub(crate) mod tests {
             "local-unverified"
         );
         assert_eq!(serde_json::to_value(agent("x")).unwrap(), "agent:x");
+        assert_eq!(
+            serde_json::to_value(observed("claudeCode:s")).unwrap(),
+            "observed:claudeCode:s"
+        );
     }
     #[test]
     fn unix_stamp_never_constructs_a_client() {
@@ -353,6 +509,7 @@ pub(crate) mod tests {
             std::process::id() as libc::pid_t,
             peer::start_token_now(),
             &NoLiveAgents,
+            &NoObservedSessions,
         );
         assert!(matches!(principal, Principal::LocalUnverified));
         assert!(!matches!(

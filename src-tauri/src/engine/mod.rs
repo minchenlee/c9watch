@@ -28,6 +28,9 @@ pub mod principal;
 pub mod authz;
 
 #[cfg(unix)]
+pub mod idem;
+
+#[cfg(unix)]
 pub mod confirmation;
 
 #[cfg(unix)]

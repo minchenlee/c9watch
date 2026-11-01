@@ -131,7 +131,7 @@ mod tests {
     use super::*;
     use crate::engine::driver::{Driver, SpawnSpec};
     use crate::engine::peer;
-    use crate::engine::principal::{stamp_peer, Principal};
+    use crate::engine::principal::{stamp_peer, NoObservedSessions, Principal};
     use crate::engine::pty::NativePty;
     use std::time::{Duration, Instant};
 
@@ -174,7 +174,7 @@ mod tests {
     }
 
     fn stamp(pid: libc::pid_t, table: &LiveTable) -> Principal {
-        stamp_peer(pid, peer::start_token_now(), table).0
+        stamp_peer(pid, peer::start_token_now(), table, &NoObservedSessions).0
     }
 
     #[test]

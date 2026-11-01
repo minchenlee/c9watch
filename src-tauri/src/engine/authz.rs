@@ -1,6 +1,11 @@
 //! One deny-by-default authority table. The pipeline is frame limits →
 //! authentication → authorize → admission → handler → egress → audit.
 //! Discovery and self queries consult this table without executing admission.
+//!
+//! The table is the one answer to "may principal X call method Y": the
+//! principal kinds a method takes, and the admission checks (`Admission`)
+//! that `api::dispatch` runs, in order, before the handler. Handlers do not
+//! repeat them (D9).
 use super::principal::Principal;
 use super::proto::{
     ApiError, AuthCanResult, AuthNeeds, AuthRulesResult, Ceiling, ErrorCode, MethodInfo,
@@ -11,7 +16,40 @@ use std::collections::{BTreeMap, BTreeSet};
 const L: &str = "local-unverified";
 const A: &str = "agent";
 const C: &str = "client";
-const ALL: &[&str] = &[L, A, C];
+const O: &str = "observed";
+const ALL: &[&str] = &[L, A, C, O];
+
+/// A check `api::dispatch` runs after the principal kind passed and before
+/// the handler. Each needs connection facts (the peer, the params) that the
+/// kind alone does not carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Admission {
+    /// The peer is a Unix peer; a gateway peer is refused.
+    UnixPeer,
+    /// `local-unverified` and `observed:` pass
+    /// `principal::check_mutating_peer`: the whole ancestry, no live agent
+    /// and no other observed session in it, no sandbox. Any other
+    /// principal is refused.
+    MutatingPeer,
+    /// An `observed:` principal names only its own session in
+    /// `params.sessionKey`.
+    OwnSession,
+    /// `annotations::admit`: force or check the principal's namespace.
+    AnnotationNamespace,
+    /// `local-unverified` passes the mutating-peer check.
+    AnnotationPeer,
+    /// `local-unverified` passes the mutating-peer check; an agent reads
+    /// only its own mail.
+    MailPeer,
+    /// `mail::check_sender`.
+    MailSender,
+    /// The agent names itself and the peer runs the engine's
+    /// `c9watch-agent` copy.
+    AgentExe,
+}
+
+use Admission::*;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,14 +59,14 @@ pub struct Rule {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_ceiling: Option<Ceiling>,
     pub principals: &'static [&'static str],
-    pub admission: &'static [&'static str],
+    pub admission: &'static [Admission],
 }
 fn rule(
     resource: &'static str,
     verb: &'static str,
     principals: &'static [&'static str],
     min_ceiling: Option<Ceiling>,
-    admission: &'static [&'static str],
+    admission: &'static [Admission],
 ) -> Rule {
     Rule {
         resource,
@@ -53,35 +91,61 @@ pub fn method(name: &str) -> Option<Rule> {
             "write",
             ALL,
             None,
-            &["annotation_namespace", "annotation_peer"],
+            &[AnnotationNamespace, AnnotationPeer],
         ),
         "agent.list" => rule("agent", "read", ALL, None, &[]),
+        // P10 opens these to agents; until then only the terminal (D8).
         "agent.create" | "agent.retire" | "agent.resume" => {
-            rule("agent", "write", &[L], None, &["mutating_peer"])
+            rule("agent", "write", &[L], None, &[UnixPeer, MutatingPeer])
         }
-        "detect.recheck" => rule("detect", "write", &[L], None, &["mutating_peer"]),
-        "session.stop" => rule("session", "stop", &[L, C], None, &["mutating_peer"]),
-        "session.rename" => rule("session", "rename", &[L, C], None, &["mutating_peer"]),
+        "detect.recheck" => rule("detect", "write", &[L], None, &[UnixPeer, MutatingPeer]),
+        // An observed session may stop itself, never another (D8).
+        "session.stop" => rule(
+            "session",
+            "stop",
+            &[L, C, O],
+            None,
+            &[OwnSession, MutatingPeer],
+        ),
+        "session.rename" => rule("session", "rename", &[L, C], None, &[MutatingPeer]),
         // Existing diagnostic access for agents is deliberately retained.
-        "provider.opencode.status" => rule("provider", "read", &[L, A], None, &[]),
-        "provider.opencode.connect" => rule("provider", "write", &[L], None, &["mutating_peer"]),
+        "provider.opencode.status" => rule("provider", "read", &[L, A, O], None, &[]),
+        "provider.opencode.connect" => {
+            rule("provider", "write", &[L], None, &[UnixPeer, MutatingPeer])
+        }
         "conversation.get" | "subagent.transcript" | "session.tasks" => rule(
             "conversation",
             "read",
-            &[L, C],
+            &[L, C, O],
             Some(Ceiling::Conversation),
             &[],
         ),
-        "history.list" => rule("history", "read", &[L, C], Some(Ceiling::Conversation), &[]),
-        "history.search" => rule("history", "read", &[L], Some(Ceiling::Conversation), &[]),
-        "memory.list" => rule("memory", "read", &[L, C], Some(Ceiling::Conversation), &[]),
+        "history.list" => rule(
+            "history",
+            "read",
+            &[L, C, O],
+            Some(Ceiling::Conversation),
+            &[],
+        ),
+        "history.search" => rule("history", "read", &[L, O], Some(Ceiling::Conversation), &[]),
+        "memory.list" => rule(
+            "memory",
+            "read",
+            &[L, C, O],
+            Some(Ceiling::Conversation),
+            &[],
+        ),
         "cost.get" | "usage.subscriptions" | "subagent.list" => {
-            rule("cost", "read", &[L, C], None, &[])
+            rule("cost", "read", &[L, C, O], None, &[])
         }
-        "msg.list" | "msg.read" => rule("msg", "read", &[L, A], None, &["mail_peer"]),
-        "msg.cancel" => rule("msg", "cancel", &[L], None, &["mutating_peer"]),
-        "mail.pause" | "mail.resume" => rule("mail", "write", &[L], None, &["mutating_peer"]),
-        "msg.send" => rule("msg", "send", &[L, A], None, &["mail_sender"]),
+        // An observed session has no mailbox and controls none.
+        "msg.list" | "msg.read" => rule("msg", "read", &[L, A], None, &[UnixPeer, MailPeer]),
+        "msg.cancel" => rule("msg", "cancel", &[L], None, &[UnixPeer, MutatingPeer]),
+        "mail.pause" | "mail.resume" => {
+            rule("mail", "write", &[L], None, &[UnixPeer, MutatingPeer])
+        }
+        // The message names an observed sender as such (D8).
+        "msg.send" => rule("msg", "send", &[L, A, O], None, &[UnixPeer, MailSender]),
         "hook.session_start"
         | "hook.stop"
         | "hook.permission_request"
@@ -90,7 +154,7 @@ pub fn method(name: &str) -> Option<Rule> {
         | "hook.user_prompt_submit"
         | "hook.post_tool_use"
         | "task.done"
-        | "agent.handoff" => rule("hook", "write", &[A], None, &["agent_exe"]),
+        | "agent.handoff" => rule("hook", "write", &[A], None, &[UnixPeer, AgentExe]),
         _ => return None,
     })
 }
@@ -118,6 +182,7 @@ pub fn kind(principal: &Principal) -> &'static str {
         Principal::LocalUnverified => L,
         Principal::Agent { .. } => A,
         Principal::Client { .. } => C,
+        Principal::Observed { .. } => O,
     }
 }
 
@@ -185,7 +250,7 @@ pub fn authorize(
     // Discovery uses the agent-only declaration. Preserve the established
     // local hook refusal code; dispatch audits this denial exactly once.
     let code = if matches!(principal, Principal::LocalUnverified)
-        && method(name).is_some_and(|r| r.admission.contains(&"agent_exe"))
+        && method(name).is_some_and(|r| r.admission.contains(&AgentExe))
     {
         ErrorCode::PeerNotAuthorized
     } else {
@@ -374,6 +439,9 @@ mod tests {
                 gen: 1,
             },
             Principal::Client { id: "c".into() },
+            Principal::Observed {
+                session_key: "claudeCode:s".into(),
+            },
         ];
         let access = Access {
             scopes: ["session:read".into()].into(),
@@ -614,5 +682,80 @@ mod tests {
             assert!(review(Some(&r), &client, Some(&access)).allowed, "{name}");
             assert!(!review(Some(&r), &client, None).allowed, "{name}");
         }
+    }
+
+    /// D8: an observed session reads as the terminal does, sends mail and
+    /// stops (its own) session, and never creates, retires or controls.
+    #[test]
+    fn an_observed_session_is_narrower_than_the_terminal() {
+        let o = Principal::Observed {
+            session_key: "claudeCode:s".into(),
+        };
+        for name in [
+            "agent.create",
+            "agent.retire",
+            "detect.recheck",
+            "session.rename",
+            "provider.opencode.connect",
+            "msg.list",
+            "msg.read",
+            "msg.cancel",
+            "mail.pause",
+            "mail.resume",
+            "hook.stop",
+        ] {
+            let e = authorize(name, &o, None).unwrap_err();
+            assert_eq!(e.code, ErrorCode::NotAllowed, "{name}");
+        }
+        for name in [
+            "msg.send",
+            "session.stop",
+            "session.views",
+            "history.search",
+        ] {
+            assert!(can(name, &o, None).allowed, "{name}");
+        }
+        assert!(method("session.stop")
+            .unwrap()
+            .admission
+            .contains(&OwnSession));
+        assert!(!topics(&o, None).contains(&"msg.state".into()));
+        assert!(topics(&o, None).contains(&"session.view".into()));
+    }
+
+    /// D9: the checks that used to sit in handlers are table rows.
+    #[test]
+    fn the_table_declares_every_admission_check() {
+        let needs = |name: &str, a: Admission| method(name).unwrap().admission.contains(&a);
+        for name in super::super::api::METHODS {
+            let r = method(name).unwrap();
+            // Whatever mutates for the terminal checks the whole peer.
+            if r.principals == [L] && r.verb != "read" {
+                assert!(needs(name, MutatingPeer), "{name}");
+            }
+            if r.admission.contains(&MutatingPeer)
+                && !matches!(*name, "session.stop" | "session.rename")
+            {
+                assert!(needs(name, UnixPeer), "{name}");
+            }
+            if r.principals.contains(&O) && r.verb != "read" {
+                assert!(
+                    r.admission
+                        .iter()
+                        .any(|a| matches!(a, MutatingPeer | MailSender | AnnotationNamespace)),
+                    "{name}"
+                );
+            }
+        }
+        for name in ["msg.list", "msg.read"] {
+            assert!(needs(name, UnixPeer) && needs(name, MailPeer), "{name}");
+        }
+        assert!(needs("msg.send", UnixPeer) && needs("msg.send", MailSender));
+        for name in super::super::proto::HOOK_METHODS {
+            assert!(needs(name, UnixPeer) && needs(name, AgentExe), "{name}");
+        }
+        assert!(needs("task.done", AgentExe) && needs("agent.handoff", AgentExe));
+        assert_eq!(method("agent.create").unwrap().principals, &[L]);
+        assert_eq!(method("agent.retire").unwrap().principals, &[L]);
     }
 }
