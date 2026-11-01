@@ -9,7 +9,7 @@ import type { Session, Conversation } from '../../types';
 import { SessionStatus } from '../../types';
 import { isDemoMode } from '../../demo/mode';
 import { wsClient, useWebSocket, getStoredConnection, isTauri } from '../../ws';
-import { providerOf, providerSessionKey, resolveCodexHierarchy, sessionReturnKind, sessionKeyOf } from '../../provider';
+import { providerOf, resolveCodexHierarchy, sessionReturnKind, sessionKeyOf } from '../../provider';
 import { initConversationProgressListener } from './conversation-loader';
 
 /**
@@ -55,23 +55,6 @@ export function showInAppNotification(title: string, body: string) {
 		inAppNotifications.update((list) => list.filter((n) => n.id !== id));
 	}, 5000);
 }
-
-/**
- * Derived store: map of PM session ID → its managed worker sessions.
- * Populated from `session.workerOf` — no new Rust data needed.
- */
-export const workersByPm = derived(sessions, ($sessions) => {
-	const m = new Map<string, Session[]>();
-	for (const s of $sessions) {
-		if (s.workerOf) {
-			const ownerKey = providerSessionKey('claudeCode', s.workerOf);
-			const arr = m.get(ownerKey) ?? [];
-			arr.push(s);
-			m.set(ownerKey, arr);
-		}
-	}
-	return m;
-});
 
 export const codexHierarchy = derived(sessions, resolveCodexHierarchy);
 

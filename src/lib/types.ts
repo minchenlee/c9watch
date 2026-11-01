@@ -106,9 +106,6 @@ export interface Session {
   /** One-line, tag-free preview of the last assistant text. */
   lastAssistantMessage?: string;
 
-  /** Session ID of the PM that spawned this session (if it's a c9watch worker) */
-  workerOf?: string | null;
-
   /** Name set via `claude agents` Ctrl+T pin (CC ≥ 2.1.150). */
   officialName?: string | null;
 

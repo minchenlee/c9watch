@@ -72,26 +72,6 @@ export function getSubagentStatusLabel(status: SubagentInfo['status']): string {
 	return status === 'running' ? 'Running' : 'Completed';
 }
 
-export function getWorkerStatusColor(status: SessionStatus): string {
-	switch (status) {
-		case SessionStatus.Working: return 'var(--status-working)';
-		case SessionStatus.NeedsAttention: return 'var(--status-permission)';
-		case SessionStatus.WaitingForInput: return 'var(--status-input)';
-		case SessionStatus.Connecting: return 'var(--status-working)';
-		default: return 'var(--text-muted)';
-	}
-}
-
-export function getWorkerStatusLabel(status: SessionStatus): string {
-	switch (status) {
-		case SessionStatus.Working: return 'Working';
-		case SessionStatus.NeedsAttention: return 'Attention';
-		case SessionStatus.WaitingForInput: return 'Ready';
-		case SessionStatus.Connecting: return 'Connecting';
-		default: return 'Unknown';
-	}
-}
-
 /** The three dashboard groups a session status falls into. */
 export type StatusBucket = 'attention' | 'idle' | 'working';
 
