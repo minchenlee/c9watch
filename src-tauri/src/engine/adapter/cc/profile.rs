@@ -348,6 +348,37 @@ pub fn deny_write(p: &Profile) -> Vec<String> {
         .collect()
 }
 
+/// D16: the CC config paths under a managed worktree root that no agent
+/// may write, as layer-1 rules. Each agent's cwd is `<root>/<agent_id>`,
+/// so one static set of rules names the `.claude/` of every agent, the
+/// ones spawned later too, which `Profile::peers` cannot. The root's own
+/// `CLAUDE.md`, `.mcp.json` and `.claude/` are here as well: CC reads them
+/// from a parent of the cwd, so they would reach every agent. `root` must
+/// be a realpath free of `BAD_CWD_CHARS`. Not verified live yet:
+/// `tests/live/d16_root.sh` is the check.
+pub fn managed_root_deny_rules(root: &Path) -> Vec<String> {
+    let r = root.display();
+    vec![
+        format!("Edit(/{}/**/.claude/**)", r),
+        format!("Edit(/{}/.claude/**)", r),
+        format!("Edit(/{}/CLAUDE.md)", r),
+        format!("Edit(/{}/.mcp.json)", r),
+    ]
+}
+
+/// D16 layer 2, the same places for sandboxed Bash: `<root>/*/.claude` is
+/// a glob, which CC's macOS sandbox takes (its Linux sandbox takes only a
+/// trailing `/**`, so Linux keeps `Profile::peers`).
+pub fn managed_root_deny_write(root: &Path) -> Vec<String> {
+    let r = root.display();
+    vec![
+        format!("{}/*/.claude", r),
+        format!("{}/.claude", r),
+        format!("{}/CLAUDE.md", r),
+        format!("{}/.mcp.json", r),
+    ]
+}
+
 /// `sandbox.network.allowUnixSockets`: the socket as bound and, when it
 /// differs, as a realpath. A home below `/tmp` is `/private/tmp` on macOS
 /// (D24 補充); the agent connects through `C9_ENGINE_SOCK`, and the
@@ -389,6 +420,8 @@ pub fn settings(p: &Profile) -> Value {
         "filesystem": { "denyWrite": deny_write(p) },
     });
     s["remoteControlAtStartup"] = json!(false);
+    #[cfg(feature = "live-test")]
+    crate::engine::live_test::patch_settings(p, &mut s);
     s
 }
 
@@ -935,6 +968,29 @@ mod tests {
         let dir = format!("{}/{}", HOME, crate::engine::live_test::DIR);
         assert!(deny_write(&p).contains(&dir));
         assert!(deny_rules(&p).contains(&format!("Edit(/{}/**)", dir)));
+    }
+
+    #[test]
+    fn managed_root_rules_name_every_agent_claude_dir_and_the_root_config() {
+        let root = Path::new("/w/c9 home/worktrees");
+        assert_eq!(
+            managed_root_deny_rules(root),
+            [
+                "Edit(//w/c9 home/worktrees/**/.claude/**)",
+                "Edit(//w/c9 home/worktrees/.claude/**)",
+                "Edit(//w/c9 home/worktrees/CLAUDE.md)",
+                "Edit(//w/c9 home/worktrees/.mcp.json)",
+            ]
+        );
+        assert_eq!(
+            managed_root_deny_write(root),
+            [
+                "/w/c9 home/worktrees/*/.claude",
+                "/w/c9 home/worktrees/.claude",
+                "/w/c9 home/worktrees/CLAUDE.md",
+                "/w/c9 home/worktrees/.mcp.json",
+            ]
+        );
     }
 }
 
