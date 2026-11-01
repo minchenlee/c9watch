@@ -50,7 +50,7 @@ use super::db::{new_agent_id, now_ms, Db, Tx};
 use super::driver::ChildId;
 use super::generation::emit_upsert;
 use super::mail;
-use super::pty::{kill_orphan, Orphan};
+use super::pty::{kill_orphans, survivors, Orphan, Survivor};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -314,6 +314,7 @@ pub fn orphan_agent(
     agent_id: &str,
     gen: i64,
     child: ChildId,
+    left: &[Survivor],
     principal: &str,
     method: &str,
     error: &str,
@@ -332,6 +333,7 @@ pub fn orphan_agent(
          VALUES (?1, ?2, ?3, ?4)",
         params![agent_id, gen, child.pid as i64, child.start as i64],
     )?;
+    let note = store_survivors(tx, agent_id, left)?;
     let open: Vec<String> = {
         let mut st = tx.prepare(
             "SELECT id FROM ops WHERE kind IN (?1, ?2) AND done_at IS NULL \
@@ -350,10 +352,14 @@ pub fn orphan_agent(
         &format!("target orphaned: {}", KILL_UNCONFIRMED),
         now,
     )?;
-    let why = format!(
+    let mut why = format!(
         "{}: pid {} start {}: {}",
         KILL_UNCONFIRMED, child.pid, child.start, error
     );
+    if let Some(note) = note {
+        why.push_str("; ");
+        why.push_str(&note);
+    }
     audit::append(
         tx,
         now,
@@ -368,6 +374,39 @@ pub fn orphan_agent(
     )?;
     emit_upsert(tx, machine, agent_id)?;
     Ok(true)
+}
+
+/// Survivors kept per agent at most (`agent_state.survivors`).
+pub const MAX_SURVIVORS: usize = 64;
+
+/// Store what an unconfirmed kill left (`agent_state.survivors`, D2): the
+/// first `MAX_SURVIVORS`, as JSON; none is NULL. Returns a note for the
+/// audit row when some were dropped.
+pub fn store_survivors(
+    tx: &mut Tx,
+    agent_id: &str,
+    left: &[Survivor],
+) -> rusqlite::Result<Option<String>> {
+    let kept = &left[..left.len().min(MAX_SURVIVORS)];
+    let json = if kept.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(kept).expect("survivors serialize"))
+    };
+    tx.execute(
+        "UPDATE agent_state SET survivors = ?2 WHERE agent_id = ?1",
+        params![agent_id, json],
+    )?;
+    Ok((left.len() > kept.len())
+        .then(|| format!("survivors: kept the first {} of {}", kept.len(), left.len())))
+}
+
+/// `agent_state.survivors` as stored by `store_survivors`. NULL is none.
+pub fn parse_survivors(json: Option<&str>) -> Result<Vec<Survivor>, String> {
+    match json {
+        None => Ok(Vec::new()),
+        Some(j) => serde_json::from_str(j).map_err(|e| format!("survivors unreadable: {}", e)),
+    }
 }
 
 /// What `reconcile` did.
@@ -486,14 +525,19 @@ fn plan(db: &Db) -> Result<Vec<Fix>, String> {
     Ok(fixes)
 }
 
-/// How boot reconcile kills a recorded PTY child (`pty::kill_orphan`).
-pub type Killer = dyn Fn(ChildId) -> std::io::Result<Orphan> + Send + Sync;
+/// How a recorded PTY child is killed, with the processes an earlier
+/// unconfirmed kill left (`pty::kill_orphans`).
+pub type Killer = dyn Fn(ChildId, &[ChildId]) -> std::io::Result<Orphan> + Send + Sync;
 
 /// Kill `child` if it is still the recorded process. Returns the error of
-/// a kill that could not be confirmed.
-fn kill(child: Option<ChildId>, killer: &Killer, done: &mut Reconciled) -> Option<String> {
+/// a kill that could not be confirmed, and what it left.
+fn kill(
+    child: Option<ChildId>,
+    killer: &Killer,
+    done: &mut Reconciled,
+) -> Option<(String, Vec<Survivor>)> {
     let child = child?;
-    match killer(child) {
+    match killer(child, &[]) {
         Ok(Orphan::Killed) => {
             done.killed += 1;
             None
@@ -504,9 +548,10 @@ fn kill(child: Option<ChildId>, killer: &Killer, done: &mut Reconciled) -> Optio
         }
         Ok(Orphan::Gone) => None,
         Err(e) => {
+            let left = survivors(&e);
             let e = e.to_string();
             done.kill_errors.push(e.clone());
-            Some(e)
+            Some((e, left))
         }
     }
 }
@@ -515,7 +560,7 @@ fn kill(child: Option<ChildId>, killer: &Killer, done: &mut Reconciled) -> Optio
 /// Blocking. Run it once at boot, before the socket is bound. `home` is the
 /// engine home, for the per-spawn settings files of the agents that end.
 pub fn reconcile(db: &Db, home: &Path) -> Result<Reconciled, String> {
-    reconcile_with(db, home, &kill_orphan)
+    reconcile_with(db, home, &kill_orphans)
 }
 
 /// `reconcile` with the kill a test chooses.
@@ -532,10 +577,21 @@ pub fn reconcile_with(db: &Db, home: &Path, killer: &Killer) -> Result<Reconcile
                     KIND_CREATE
                 };
                 let (m, id) = (machine.clone(), p.agent_id.clone());
-                if let (Some(e), Some(child)) = (killed, p.child()) {
+                if let (Some((e, left)), Some(child)) = (killed, p.child()) {
                     let gen = p.generation;
                     db.write_blocking(move |tx| {
-                        orphan_agent(tx, &m, &id, gen, child, audit::SYSTEM, method, &e, now_ms())
+                        orphan_agent(
+                            tx,
+                            &m,
+                            &id,
+                            gen,
+                            child,
+                            &left,
+                            audit::SYSTEM,
+                            method,
+                            &e,
+                            now_ms(),
+                        )
                     })?;
                     done.orphaned.push(p.agent_id);
                     continue;
@@ -569,7 +625,7 @@ pub fn reconcile_with(db: &Db, home: &Path, killer: &Killer) -> Result<Reconcile
                 let killed = kill(child, killer, &mut done);
                 let m = machine.clone();
                 let id = agent_id.clone();
-                if let (Some(e), Some(child)) = (killed, child) {
+                if let (Some((e, left)), Some(child)) = (killed, child) {
                     db.write_blocking(move |tx| {
                         orphan_agent(
                             tx,
@@ -577,6 +633,7 @@ pub fn reconcile_with(db: &Db, home: &Path, killer: &Killer) -> Result<Reconcile
                             &id,
                             gen,
                             child,
+                            &left,
                             audit::SYSTEM,
                             "engine.reconcile",
                             &e,

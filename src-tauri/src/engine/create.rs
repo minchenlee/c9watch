@@ -127,7 +127,7 @@ use super::principal::Principal;
 use super::proto::{
     AgentCreateParams, AgentResumeParams, AgentRetireParams, AgentRow, ApiError, ErrorCode,
 };
-use super::pty::{kill_orphan, NativePty};
+use super::pty::{kill_orphans, NativePty};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -379,7 +379,7 @@ pub struct Spawner {
     socket_seen: Mutex<HashSet<(String, i64)>>,
     peer_tailers: Mutex<HashMap<(String, i64), super::peer_log::Tailer>>,
     /// How `agent.retire` kills an `orphaned` agent's recorded PTY child
-    /// (`pty::kill_orphan`; a test swaps it).
+    /// and survivors (`pty::kill_orphans`; a test swaps it).
     orphan_killer: Mutex<Arc<ops::Killer>>,
 }
 
@@ -409,7 +409,7 @@ impl Spawner {
             socket_jobs: Mutex::new(HashMap::new()),
             socket_seen: Mutex::new(HashSet::new()),
             peer_tailers: Mutex::new(HashMap::new()),
-            orphan_killer: Mutex::new(Arc::new(kill_orphan)),
+            orphan_killer: Mutex::new(Arc::new(kill_orphans)),
         }
     }
 
@@ -1997,6 +1997,7 @@ impl Spawner {
         let Err(e) = driver.kill() else {
             return true;
         };
+        let left = super::pty::survivors(&e);
         eprintln!(
             "[engine] Could not confirm the kill of {} (pid {}); marking it orphaned: {}",
             s.id, child.pid, e
@@ -2010,6 +2011,7 @@ impl Spawner {
                 &id,
                 gen,
                 child,
+                &left,
                 &principal,
                 method,
                 &e,
@@ -2064,22 +2066,25 @@ impl Spawner {
     }
 
     /// `agent.retire` of an `orphaned` agent: kill its recorded PTY child
-    /// again, by pid and start time. Confirmed gone (or the pid now runs
-    /// another process), the row becomes the tombstone. Otherwise it stays
-    /// `orphaned`, the attempt is audited, and the row is returned as it
-    /// is. Blocking.
+    /// and the survivors of the unconfirmed kill again, each only by pid
+    /// and start time (`pty::kill_orphans`). The row becomes the tombstone
+    /// only when every one is confirmed gone (or its pid runs another
+    /// process now). Otherwise it stays `orphaned` with what is still
+    /// left, and the attempt is audited. Unreadable survivors fail closed:
+    /// nothing is signalled and the row stays. Blocking.
     fn retire_orphan(&self, id: &str, principal: &str) -> Result<AgentRow, ApiError> {
-        let (child, row) = {
+        let (state, row) = {
             let conn = self.db.pooled_reader().map_err(internal)?;
-            let child = conn
+            let state = conn
                 .query_row(
-                    "SELECT gen, pty_child_pid, pty_child_start FROM agent_state                      WHERE agent_id = ?1",
+                    "SELECT pty_child_pid, pty_child_start, survivors FROM agent_state \
+                     WHERE agent_id = ?1",
                     [id],
                     |r| {
                         Ok((
-                            r.get::<_, i64>(0)?,
+                            r.get::<_, Option<i64>>(0)?,
                             r.get::<_, Option<i64>>(1)?,
-                            r.get::<_, Option<i64>>(2)?,
+                            r.get::<_, Option<String>>(2)?,
                         ))
                     },
                 )
@@ -2088,48 +2093,76 @@ impl Spawner {
             let row = engine_row(&conn, id)
                 .map_err(internal)?
                 .ok_or_else(|| unknown_agent(id))?;
-            (child, row)
+            (state, row)
         };
-        let child = child.and_then(|(_, pid, start)| {
-            Some(super::driver::ChildId {
-                pid: pid? as libc::pid_t,
-                start: start? as u64,
-            })
-        });
-        if let Some(child) = child {
+        let (pid, start, json) = state.unwrap_or((None, None, None));
+        let left = match ops::parse_survivors(json.as_deref()) {
+            Ok(left) => left,
+            Err(why) => {
+                self.audit_orphan(id, principal, &why, None)?;
+                return Ok(row);
+            }
+        };
+        let mut ids: Vec<super::driver::ChildId> = left.iter().map(|s| s.id()).collect();
+        if let (Some(pid), Some(start)) = (pid, start) {
+            ids.insert(
+                0,
+                super::driver::ChildId {
+                    pid: pid as libc::pid_t,
+                    start: start as u64,
+                },
+            );
+        }
+        if let Some((&child, others)) = ids.split_first() {
             let killer = lock(&self.orphan_killer).clone();
-            if let Err(e) = killer(child) {
-                let (id2, principal, why) = (
-                    id.to_string(),
-                    principal.to_string(),
-                    format!(
-                        "{}: pid {} start {}: {}",
-                        ops::KILL_UNCONFIRMED,
-                        child.pid,
-                        child.start,
-                        e
-                    ),
+            if let Err(e) = killer(child, others) {
+                let left = super::pty::survivors(&e);
+                let why = format!(
+                    "{}: pid {} start {}: {}",
+                    ops::KILL_UNCONFIRMED,
+                    child.pid,
+                    child.start,
+                    e
                 );
-                self.db
-                    .write_blocking(move |tx| {
-                        audit::append(
-                            tx,
-                            now_ms(),
-                            &AuditEntry {
-                                principal: &principal,
-                                method: "agent.retire",
-                                target: Some(&id2),
-                                decision: ops::ORPHANED,
-                                reason: Some(&why),
-                                ..Default::default()
-                            },
-                        )
-                    })
-                    .map_err(internal)?;
+                self.audit_orphan(id, principal, &why, Some(left))?;
                 return Ok(row);
             }
         }
         self.retire_row(id, row.generation, principal)
+    }
+
+    /// The audit row of a retire that left the agent `orphaned`, in one
+    /// transaction with what is still `left`, when the kill said.
+    fn audit_orphan(
+        &self,
+        id: &str,
+        principal: &str,
+        why: &str,
+        left: Option<Vec<super::pty::Survivor>>,
+    ) -> Result<(), ApiError> {
+        let (id, principal, mut why) = (id.to_string(), principal.to_string(), why.to_string());
+        self.db
+            .write_blocking(move |tx| {
+                if let Some(left) = &left {
+                    if let Some(note) = ops::store_survivors(tx, &id, left)? {
+                        why = format!("{}; {}", why, note);
+                    }
+                }
+                audit::append(
+                    tx,
+                    now_ms(),
+                    &AuditEntry {
+                        principal: &principal,
+                        method: "agent.retire",
+                        target: Some(&id),
+                        decision: ops::ORPHANED,
+                        reason: Some(&why),
+                        ..Default::default()
+                    },
+                )
+            })
+            .map_err(internal)?;
+        Ok(())
     }
 
     /// `agent.resume` (D4): resume a `paused` or `interrupted` agent now,
@@ -2970,7 +3003,7 @@ mod tests {
     use crate::engine::driver::{ChildId, KillReport, Output, ScreenSnapshot};
     use crate::engine::home::sock_path;
     use crate::engine::peer;
-    use crate::engine::pty::Orphan;
+    use crate::engine::pty::{Orphan, Survivor, Unconfirmed};
     use std::collections::VecDeque;
     use std::ffi::OsString;
     use std::os::unix::process::ExitStatusExt;
@@ -3181,7 +3214,15 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
             if self.kill_fails.load(Ordering::SeqCst) {
-                return Err(io::Error::other("still alive after SIGKILL"));
+                let left = vec![crate::engine::pty::Survivor {
+                    pid: self.child.pid,
+                    start: self.child.start,
+                    pgid: self.child.pid,
+                }];
+                return Err(io::Error::other(crate::engine::pty::Unconfirmed::new(
+                    left,
+                    "the fake child",
+                )));
             }
             if !self.exited {
                 self.kills.fetch_add(1, Ordering::SeqCst);
@@ -5751,7 +5792,7 @@ mod tests {
             start: 7,
         };
         let r = stopped_agent_with(&e, child).await;
-        let fails: &ops::Killer = &|_| Err(io::Error::other("still alive after SIGKILL"));
+        let fails: &ops::Killer = &|_, _| Err(io::Error::other("still alive after SIGKILL"));
         let done = ops::reconcile_with(&e.db, &e.home, fails).unwrap();
         assert_eq!(done.orphaned, std::slice::from_ref(&r.id));
         assert!(done.interrupted.is_empty());
@@ -5800,11 +5841,11 @@ mod tests {
         assert_eq!(audit_reasons(&e.db, "agent.retire", ops::ORPHANED).len(), 1);
         let err = e.sp.resume(&l, id.clone()).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::ActionFailed);
-        e.sp.set_orphan_killer(Arc::new(|_| Err(io::Error::other("still alive"))));
+        e.sp.set_orphan_killer(Arc::new(|_, _| Err(io::Error::other("still alive"))));
         let got = e.sp.retire(&l, id.clone()).await.unwrap();
         assert_eq!(got.state.as_deref(), Some("orphaned"));
         assert_eq!(audit_reasons(&e.db, "agent.retire", ops::ORPHANED).len(), 2);
-        e.sp.set_orphan_killer(Arc::new(|_| Ok(Orphan::Killed)));
+        e.sp.set_orphan_killer(Arc::new(|_, _| Ok(Orphan::Killed)));
         let got = e.sp.retire(&l, id).await.unwrap();
         assert_eq!(got.state.as_deref(), Some("retired"));
         assert!(got.gone_at.is_some());
@@ -6142,6 +6183,225 @@ mod tests {
         assert_eq!(e.sp.live_count(), 1);
         e.sp.release_live("agt_x", 5);
         assert_eq!(e.sp.live_count(), 0);
+    }
+    /// The stored survivors of `id`, as JSON.
+    fn survivors_json(db: &Db, id: &str) -> Option<String> {
+        db.reader()
+            .unwrap()
+            .query_row(
+                "SELECT survivors FROM agent_state WHERE agent_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// An `orphaned` agent whose recorded PTY child is gone (a pid no
+    /// process has) and whose stored survivors are `json`.
+    async fn orphan_with_survivors(e: &Env, json: &str) -> AgentRow {
+        let l = Principal::LocalUnverified;
+        let r = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        e.launcher.kill_fails.store(true, Ordering::SeqCst);
+        let got =
+            e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+                .await
+                .unwrap();
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        no_supervisors(&e.sp);
+        let (id, json) = (r.id.clone(), json.to_string());
+        e.db.write_blocking(move |tx| {
+            tx.execute(
+                "UPDATE agent_state SET pty_child_pid = 1999999999, pty_child_start = 7, \
+                 survivors = ?2 WHERE agent_id = ?1",
+                params![id, json],
+            )
+        })
+        .unwrap();
+        r
+    }
+
+    fn survivor_json(child: ChildId) -> String {
+        serde_json::to_string(&[Survivor {
+            pid: child.pid,
+            start: child.start,
+            pgid: child.pid,
+        }])
+        .unwrap()
+    }
+
+    /// P1-3: an unconfirmed kill stores what it left in the same
+    /// transaction as `orphaned`.
+    #[tokio::test]
+    async fn an_unconfirmed_kill_stores_its_survivors() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let r = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        e.launcher.kill_fails.store(true, Ordering::SeqCst);
+        e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+            .await
+            .unwrap();
+        let left = ops::parse_survivors(survivors_json(&e.db, &r.id).as_deref()).unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(left[0].pid >= 2_000_000_000, "{:?}", left);
+    }
+
+    /// P1-3: the recorded PTY child is gone but a survivor still runs: the
+    /// retire keeps the row `orphaned` and the cwd held. Once the survivor
+    /// has exited, the retire makes the tombstone.
+    #[tokio::test]
+    async fn a_live_survivor_keeps_the_row_orphaned_until_it_is_gone() {
+        let e = setup(Script::Ready, None);
+        let (mut proc, child) = test_process("trap '' TERM; echo ready; exec sleep 30");
+        let r = orphan_with_survivors(&e, &survivor_json(child)).await;
+        // A kill that cannot end anything: what still runs is left.
+        let asked: Arc<Mutex<Vec<Vec<ChildId>>>> = Arc::default();
+        let asked2 = asked.clone();
+        e.sp.set_orphan_killer(Arc::new(move |c: ChildId, others: &[ChildId]| {
+            let mut all = vec![c];
+            all.extend_from_slice(others);
+            lock(&asked2).push(all.clone());
+            let alive: Vec<Survivor> = all
+                .iter()
+                .filter(|c| {
+                    crate::engine::peer::proc_entry(c.pid)
+                        .is_some_and(|p| p.info.start == c.start && !p.zombie)
+                })
+                .map(|c| Survivor {
+                    pid: c.pid,
+                    start: c.start,
+                    pgid: c.pid,
+                })
+                .collect();
+            if alive.is_empty() {
+                Ok(Orphan::Gone)
+            } else {
+                Err(io::Error::other(Unconfirmed::new(alive, "test")))
+            }
+        }));
+        let l = Principal::LocalUnverified;
+        let id = serde_json::json!({ "id": r.id });
+        let got = e.sp.retire(&l, id.clone()).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        assert_eq!(got.gone_at, None);
+        assert_eq!(survivors_json(&e.db, &r.id), Some(survivor_json(child)));
+        assert_eq!(
+            lock(&asked)[0],
+            vec![
+                ChildId {
+                    pid: 1_999_999_999,
+                    start: 7
+                },
+                child
+            ]
+        );
+        let other = e.t.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let err = e.sp.create(&l, create_params(&other)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::CwdCollision);
+        proc.kill().unwrap();
+        proc.wait().unwrap();
+        let got = e.sp.retire(&l, id).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        assert_eq!(agent_state_rows(&e.db), 0);
+    }
+
+    /// P1-3: the default kill takes a stored survivor by pid and start
+    /// time, then tombstones; a survivor whose pid runs another process
+    /// now is never signalled.
+    #[tokio::test]
+    async fn retire_kills_stored_survivors_only_by_pid_and_start() {
+        let e = setup(Script::Ready, None);
+        let (mut proc, child) = test_process("echo ready; exec sleep 30");
+        let r = orphan_with_survivors(&e, &survivor_json(child)).await;
+        let l = Principal::LocalUnverified;
+        let got =
+            e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+                .await
+                .unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        assert_eq!(proc.wait().unwrap().signal(), Some(libc::SIGTERM));
+
+        let e = setup(Script::Ready, None);
+        let (mut proc, child) = test_process("echo ready; exec sleep 30");
+        let stale = ChildId {
+            start: child.start + 1,
+            ..child
+        };
+        let r = orphan_with_survivors(&e, &survivor_json(stale)).await;
+        let got =
+            e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+                .await
+                .unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(proc.try_wait().unwrap().is_none(), "a reused pid was hit");
+        proc.kill().unwrap();
+        proc.wait().unwrap();
+    }
+
+    /// P1-3: survivors that cannot be read fail closed: nothing is
+    /// signalled, the row stays `orphaned`, and the error is audited.
+    #[tokio::test]
+    async fn unreadable_survivors_keep_the_row_orphaned() {
+        let e = setup(Script::Ready, None);
+        let r = orphan_with_survivors(&e, "not json").await;
+        let called = Arc::new(AtomicUsize::new(0));
+        let called2 = called.clone();
+        e.sp.set_orphan_killer(Arc::new(move |_, _| {
+            called2.fetch_add(1, Ordering::SeqCst);
+            Ok(Orphan::Killed)
+        }));
+        let l = Principal::LocalUnverified;
+        let got =
+            e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+                .await
+                .unwrap();
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        assert_eq!(called.load(Ordering::SeqCst), 0);
+        let why = audit_reasons(&e.db, "agent.retire", ops::ORPHANED);
+        assert!(
+            why.last().unwrap().contains("survivors unreadable"),
+            "{:?}",
+            why
+        );
+        assert_eq!(survivors_json(&e.db, &r.id).as_deref(), Some("not json"));
+    }
+
+    /// P1-3: at most 64 survivors are kept, the first ones, and the audit
+    /// row says how many were dropped.
+    #[tokio::test]
+    async fn survivors_are_capped_at_64_with_an_audit_note() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let r = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        e.sp.shutdown();
+        let left: Vec<Survivor> = (0..70)
+            .map(|i| Survivor {
+                pid: 1_000_000 + i,
+                start: 1,
+                pgid: 1_000_000 + i,
+            })
+            .collect();
+        let (m, id, left2) = (MACHINE.to_string(), r.id.clone(), left.clone());
+        e.db.write_blocking(move |tx| {
+            ops::orphan_agent(
+                tx,
+                &m,
+                &id,
+                r.generation,
+                ChildId { pid: 9, start: 9 },
+                &left2,
+                audit::SYSTEM,
+                "engine.reconcile",
+                "test",
+                now_ms(),
+            )
+        })
+        .unwrap();
+        let kept = ops::parse_survivors(survivors_json(&e.db, &r.id).as_deref()).unwrap();
+        assert_eq!(kept, left[..ops::MAX_SURVIVORS]);
+        let why = audit_reasons(&e.db, "engine.reconcile", ops::ORPHANED);
+        assert!(why[0].contains("kept the first 64 of 70"), "{:?}", why);
     }
 }
 

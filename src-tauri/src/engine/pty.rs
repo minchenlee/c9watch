@@ -117,14 +117,16 @@ impl Descendants {
         self.0.iter().any(runs)
     }
 
-    /// The processes seen that still run, by pid and start time.
-    fn alive(&self) -> Vec<ChildId> {
+    /// The processes seen that still run, with their current group.
+    fn alive(&self) -> Vec<Survivor> {
         self.0
             .iter()
-            .filter(|e| runs(e))
-            .map(|e| ChildId {
+            .filter_map(now)
+            .filter(|e| !e.zombie)
+            .map(|e| Survivor {
                 pid: e.info.pid,
                 start: e.info.start,
+                pgid: e.pgid,
             })
             .collect()
     }
@@ -206,18 +208,54 @@ fn send(hits: &[Hit], sig: libc::c_int) {
     }
 }
 
+/// The PTY child as a survivor: it leads its own group.
+fn leader_survivor(id: ChildId) -> Survivor {
+    Survivor {
+        pid: id.pid,
+        start: id.start,
+        pgid: id.pid,
+    }
+}
+
 /// The engine's own process group.
 fn own_group() -> libc::pid_t {
     unsafe { libc::getpgrp() }
 }
 
+/// A process an unconfirmed kill left: pid and start time, and its group
+/// when it was seen (a later kill reads the group again).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Survivor {
+    pub pid: libc::pid_t,
+    pub start: u64,
+    pub pgid: libc::pid_t,
+}
+
+impl Survivor {
+    pub fn id(&self) -> ChildId {
+        ChildId {
+            pid: self.pid,
+            start: self.start,
+        }
+    }
+}
+
 /// A kill that could not confirm that every process ended (D2). `alive`
-/// holds what still ran at the end, by pid and start time, so a later
-/// kill (`kill_orphans`) can find them without the PTY child.
+/// holds what still ran at the end, so a later kill (`kill_orphans`) can
+/// find them without the PTY child.
 #[derive(Debug)]
 pub struct Unconfirmed {
-    pub alive: Vec<ChildId>,
+    pub alive: Vec<Survivor>,
     what: String,
+}
+
+impl Unconfirmed {
+    pub fn new(alive: Vec<Survivor>, what: impl Into<String>) -> Unconfirmed {
+        Unconfirmed {
+            alive,
+            what: what.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for Unconfirmed {
@@ -235,7 +273,7 @@ impl std::error::Error for Unconfirmed {}
 
 /// The processes an unconfirmed kill left (`Unconfirmed::alive`), or none
 /// when `e` is another error.
-pub fn survivors(e: &io::Error) -> Vec<ChildId> {
+pub fn survivors(e: &io::Error) -> Vec<Survivor> {
     e.get_ref()
         .and_then(|e| e.downcast_ref::<Unconfirmed>())
         .map(|u| u.alive.clone())
@@ -721,7 +759,7 @@ impl Driver for NativePty {
                 // for as long as this engine runs.
                 let mut alive = seen.alive();
                 if self.exit.is_none() {
-                    alive.insert(0, self.id);
+                    alive.insert(0, leader_survivor(self.id));
                 }
                 return Err(io::Error::other(Unconfirmed {
                     alive,
@@ -840,7 +878,7 @@ pub fn kill_orphans(id: ChildId, others: &[ChildId]) -> io::Result<Orphan> {
         if !gone(&mut seen, KILL_VERIFY, libc::SIGKILL) {
             let mut alive = seen.alive();
             if runs(&leader) {
-                alive.insert(0, id);
+                alive.insert(0, leader_survivor(id));
             }
             return Err(io::Error::other(Unconfirmed {
                 alive,
@@ -1448,11 +1486,12 @@ mod tests {
 
     #[test]
     fn an_unconfirmed_kill_error_carries_its_survivors() {
-        let alive = vec![ChildId { pid: 42, start: 9 }];
-        let e = io::Error::other(Unconfirmed {
-            alive: alive.clone(),
-            what: "process group 42".into(),
-        });
+        let alive = vec![Survivor {
+            pid: 42,
+            start: 9,
+            pgid: 42,
+        }];
+        let e = io::Error::other(Unconfirmed::new(alive.clone(), "process group 42"));
         assert_eq!(survivors(&e), alive);
         assert!(e.to_string().contains("(pids 42)"), "{}", e);
         assert!(survivors(&io::Error::other("other")).is_empty());
