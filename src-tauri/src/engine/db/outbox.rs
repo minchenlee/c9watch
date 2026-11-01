@@ -143,7 +143,7 @@ pub fn prune(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
 /// wall-clock time and can go back, and a hole in the middle would let a
 /// subscriber below it skip events without `cursor_expired`. The newest row
 /// always stays, so `seq` is never reused. Touches nothing but `events`
-/// (audit is never pruned).
+/// (audit has its own retention, `audit::prune`).
 pub fn prune_with(conn: &Connection, cutoff_ts: i64, keep: i64) -> rusqlite::Result<usize> {
     conn.execute(
         "DELETE FROM events WHERE seq < (SELECT max(seq) FROM events) \

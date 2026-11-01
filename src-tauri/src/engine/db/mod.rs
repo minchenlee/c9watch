@@ -11,7 +11,8 @@
 //! 3. Migrations, each after a `VACUUM INTO` backup (see `migrate`).
 //! 4. This machine's row in `machines` (`is_self`), keyed by the machine
 //!    key id. A new self row is audited.
-//! 5. Event retention runs once (see `outbox`).
+//! 5. Event retention runs once (see `outbox`), and audit retention (see
+//!    `audit::AuditRetention`).
 //! 6. The writable connection moves to the writer thread (see `writer`).
 //!
 //! State changes go through `Db::write`, which runs on the writer thread in
@@ -27,12 +28,12 @@ pub mod writer;
 
 use super::fsutil::ensure_private_dir;
 use super::proto::AgentRow;
-use audit::AuditEntry;
+use audit::{AuditEntry, AuditRetention};
 use migrate::{check_not_newer, latest_version, migrate, MIGRATIONS};
 use outbox::{Cursor, NewEvent, ReadError, Subscription};
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, Transaction};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
 use writer::Writer;
@@ -44,6 +45,9 @@ pub const BACKUPS_DIR: &str = "backups";
 
 /// How long a reader waits for a lock (only the WAL checkpoint takes one).
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Idle read-only connections `Db::pooled_reader` keeps for reuse.
+const READER_POOL_IDLE: usize = 8;
 
 /// `<home>/engine.db`
 pub fn db_path(home: &Path) -> PathBuf {
@@ -65,6 +69,47 @@ pub struct Db {
     /// The newest committed event `seq`, sent after each commit that emitted
     /// events. Subscribers wake on it and read the rows from SQLite.
     head: Arc<watch::Sender<i64>>,
+    /// Idle read-only connections for `pooled_reader`.
+    readers: Arc<Mutex<Vec<Connection>>>,
+    audit_retention: AuditRetention,
+}
+
+/// What `open_with` takes beyond the home and machine id.
+#[derive(Debug, Clone, Default)]
+pub struct OpenOptions {
+    pub audit_retention: AuditRetention,
+}
+
+/// A read-only connection borrowed from the `Db`'s pool. Derefs to
+/// `Connection`, so code written for `Db::reader` works on it unchanged
+/// (`&reader` coerces to `&Connection`). On drop it goes back to the pool,
+/// unless it is inside a transaction (a `BEGIN` without its `COMMIT`) or
+/// the pool already has `READER_POOL_IDLE` idle connections.
+pub struct PooledReader {
+    conn: Option<Connection>,
+    pool: Arc<Mutex<Vec<Connection>>>,
+}
+
+impl std::ops::Deref for PooledReader {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("pooled reader used after drop")
+    }
+}
+
+impl Drop for PooledReader {
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else {
+            return;
+        };
+        if !conn.is_autocommit() {
+            return; // An open read transaction: close it, never reuse it.
+        }
+        let mut idle = self.pool.lock().unwrap_or_else(|p| p.into_inner());
+        if idle.len() < READER_POOL_IDLE {
+            idle.push(conn);
+        }
+    }
 }
 
 /// A write transaction on the writer thread. Derefs to the connection, so
@@ -144,6 +189,17 @@ impl Db {
         Ok((r, seq.map(|s| self.cursor_at(s))))
     }
 
+    /// Run audit retention (see `audit::AuditRetention`) on the writer
+    /// thread. Returns how many audit rows went. The engine runs it at boot
+    /// (in `open`) and then every `audit::PRUNE_EVERY`.
+    pub async fn prune_audit(&self) -> Result<usize, String> {
+        let keep = self.audit_retention.clone();
+        self.writer
+            .call(move |c| audit::prune(c, now_ms(), &keep))
+            .await?
+            .map_err(|e| format!("Failed to prune the audit log: {}", e))
+    }
+
     /// Run event retention (24 h / 50k) and the dedupe window on the
     /// writer thread. Returns how many events went.
     pub async fn prune(&self) -> Result<usize, String> {
@@ -180,7 +236,7 @@ impl Db {
     /// Check that `since` belongs to this db and can be read on from
     /// without a gap. Returns its `seq`. Blocking (one short read).
     pub fn check_cursor(&self, since: &Cursor) -> Result<i64, ReadError> {
-        let conn = self.reader().map_err(ReadError::Db)?;
+        let conn = self.pooled_reader().map_err(ReadError::Db)?;
         outbox::check_cursor(&conn, since, &self.machine_id, &self.epoch)
     }
 
@@ -194,7 +250,7 @@ impl Db {
     /// The state for `snapshot.get` and the cursor it is consistent with,
     /// read in one read transaction. Blocking.
     pub fn snapshot(&self) -> Result<(Cursor, Vec<AgentRow>), String> {
-        let conn = self.reader()?;
+        let conn = self.pooled_reader()?;
         let fail = |e: rusqlite::Error| format!("Failed to read the snapshot: {}", e);
         conn.execute_batch("BEGIN").map_err(fail)?;
         let read = (|| {
@@ -209,11 +265,38 @@ impl Db {
 
     /// The `agents` rows that pass `filter`. Blocking (one short read).
     pub fn agents(&self, filter: AgentFilter) -> Result<Vec<AgentRow>, String> {
-        let conn = self.reader()?;
+        let conn = self.pooled_reader()?;
         agent_rows(&conn, filter).map_err(|e| format!("Failed to read agents: {}", e))
     }
 
-    /// A new read-only connection. WAL lets readers run beside the writer.
+    /// A read-only connection from a small pool: cheap to call often, for
+    /// example several times per tick. Opening a SQLite connection costs a
+    /// file open, a lock-file check and a schema parse; a pooled one only a
+    /// mutex. Use it for short reads and drop it soon after (see
+    /// `PooledReader`): it is the drop-in replacement for `reader()` where
+    /// the connection does not have to be owned (`db.reader()?` becomes
+    /// `db.pooled_reader()?`, with no other change at most call sites).
+    ///
+    /// A long-lived thread (an agent supervisor) may also keep one
+    /// `PooledReader` for its whole life instead of borrowing per read; it
+    /// stays valid after `close` (WAL readers do not need the writer). A
+    /// reader that sees an error is still fine to reuse: SQLite errors do
+    /// not poison a connection.
+    pub fn pooled_reader(&self) -> Result<PooledReader, String> {
+        let idle = self.readers.lock().unwrap_or_else(|p| p.into_inner()).pop();
+        let conn = match idle {
+            Some(c) => c,
+            None => self.reader()?,
+        };
+        Ok(PooledReader {
+            conn: Some(conn),
+            pool: self.readers.clone(),
+        })
+    }
+
+    /// A new read-only connection the caller owns. WAL lets readers run
+    /// beside the writer. Prefer `pooled_reader` on hot paths; use this when
+    /// the connection must be moved or kept (a `Subscription`).
     pub fn reader(&self) -> Result<Connection, String> {
         let conn = Connection::open_with_flags(
             &self.path,
@@ -229,6 +312,11 @@ impl Db {
 /// Open (or create) the store in `home` for the machine `machine_id` (the
 /// machine key id, see `engine::machine`).
 pub fn open(home: &Path, machine_id: &str) -> Result<Db, String> {
+    open_with(home, machine_id, OpenOptions::default())
+}
+
+/// `open` with explicit options (audit retention).
+pub fn open_with(home: &Path, machine_id: &str, opts: OpenOptions) -> Result<Db, String> {
     ensure_private_dir(home)?;
     let backups = backups_dir(home);
     ensure_private_dir(&backups)?;
@@ -248,9 +336,12 @@ pub fn open(home: &Path, machine_id: &str) -> Result<Db, String> {
         None => {
             let dest = backups.join(format!("corrupt-{}.db", now_ms()));
             move_aside(&path, &dest)?;
-            eprintln!(
-                "[engine] {:?} failed quick_check; moved to {:?}, starting a new epoch",
-                path, dest
+            crate::elog!(
+                Warn,
+                "db",
+                "{:?} failed quick_check; moved to {:?}, starting a new epoch",
+                path,
+                dest
             );
             moved_aside = Some(dest);
             open_checked(&path)?.ok_or_else(|| format!("New db {:?} failed quick_check", path))?
@@ -266,6 +357,8 @@ pub fn open(home: &Path, machine_id: &str) -> Result<Db, String> {
     register_self(&mut conn, machine_id)?;
     outbox::prune(&conn, now_ms()).map_err(|e| format!("Failed to prune events: {}", e))?;
     prune_dedupe(&conn, now_ms()).map_err(|e| format!("Failed to prune dedupe: {}", e))?;
+    audit::prune(&conn, now_ms(), &opts.audit_retention)
+        .map_err(|e| format!("Failed to prune the audit log: {}", e))?;
     let head = outbox::head(&conn).map_err(|e| format!("Failed to read the event head: {}", e))?;
     Ok(Db {
         path,
@@ -274,6 +367,8 @@ pub fn open(home: &Path, machine_id: &str) -> Result<Db, String> {
         moved_aside,
         writer: Writer::spawn(conn)?,
         head: Arc::new(watch::channel(head).0),
+        readers: Arc::new(Mutex::new(Vec::new())),
+        audit_retention: opts.audit_retention,
     })
 }
 
@@ -443,6 +538,9 @@ fn configure(conn: &Connection) -> Result<(), String> {
     // FULL, not NORMAL: in WAL mode NORMAL skips the fsync on commit, so a
     // power loss could drop events that were already broadcast, and the
     // next boot would hand their seqs to new events in the same epoch.
+    // Kept on purpose (D11): the engine writes little (state changes and
+    // their events, not every read), so the fsync per commit costs little
+    // and data safety comes first.
     conn.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;")
         .map_err(|e| format!("Failed to set db pragmas: {}", e))?;
     conn.busy_timeout(BUSY_TIMEOUT)
@@ -1004,5 +1102,124 @@ mod tests {
         let db = open(&h, M).unwrap();
         assert_eq!(db.head_cursor(), cur);
         assert_eq!(db.check_cursor(&cur), Ok(1));
+    }
+
+    /// The address of the `sqlite3` handle behind a connection, to tell
+    /// whether the pool handed back the same one.
+    fn handle(c: &Connection) -> usize {
+        unsafe { c.handle() as usize }
+    }
+
+    #[test]
+    fn pooled_readers_are_reused_and_see_new_writes() {
+        let (_t, h) = home();
+        let db = open(&h, M).unwrap();
+        let first = handle(&db.pooled_reader().unwrap());
+        let again = db.pooled_reader().unwrap();
+        assert_eq!(handle(&again), first, "an idle reader is reused");
+        // A second reader while one is out is a new connection.
+        let other = db.pooled_reader().unwrap();
+        assert_ne!(handle(&other), first);
+        drop(other);
+        // A reused reader sees writes committed after it was opened.
+        db.write_blocking(|tx| insert_agent(tx, "a1")).unwrap();
+        let n: i64 = again
+            .query_row("SELECT count(*) FROM agents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        // `&PooledReader` coerces to `&Connection`.
+        assert_eq!(agent_rows(&again, AgentFilter::All).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_reader_left_in_a_transaction_is_not_reused() {
+        let (_t, h) = home();
+        let db = open(&h, M).unwrap();
+        let r = db.pooled_reader().unwrap();
+        r.execute_batch("BEGIN").unwrap();
+        drop(r);
+        assert!(db.readers.lock().unwrap().is_empty(), "closed, not pooled");
+        let ok = db.pooled_reader().unwrap();
+        drop(ok);
+        assert_eq!(db.readers.lock().unwrap().len(), 1);
+        assert!(db.pooled_reader().unwrap().is_autocommit());
+    }
+
+    #[test]
+    fn the_pool_keeps_at_most_its_idle_limit_and_survives_close() {
+        let (_t, h) = home();
+        let db = open(&h, M).unwrap();
+        let many: Vec<_> = (0..READER_POOL_IDLE + 3)
+            .map(|_| db.pooled_reader().unwrap())
+            .collect();
+        drop(many);
+        assert_eq!(db.readers.lock().unwrap().len(), READER_POOL_IDLE);
+        db.close();
+        let r = db.pooled_reader().unwrap();
+        let n: i64 = r
+            .query_row("SELECT count(*) FROM machines", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn audit_retention_runs_at_boot_and_on_demand() {
+        let (_t, h) = home();
+        let db = open(&h, M).unwrap();
+        db.write_blocking(|tx| {
+            let old = AuditEntry {
+                principal: audit::SYSTEM,
+                method: "old",
+                target: Some("t"),
+                decision: "allow",
+                ..Default::default()
+            };
+            audit::append(tx, 1, &old)?;
+            audit::append(tx, 2, &old)?;
+            let fresh = AuditEntry {
+                method: "fresh",
+                ..old
+            };
+            audit::append(tx, now_ms(), &fresh)
+        })
+        .unwrap();
+        assert_eq!(audit_rows(&db).len(), 4);
+        drop(db);
+
+        // The default keeps a year: the two rows from 1970 go at boot.
+        let db = open(&h, M).unwrap();
+        let methods: Vec<String> = audit_rows(&db).into_iter().map(|r| r.1).collect();
+        assert_eq!(methods, ["machine.register", "fresh"]);
+        drop(db);
+
+        // A row cap, applied by `prune_audit` on the writer.
+        let opts = OpenOptions {
+            audit_retention: AuditRetention {
+                max_rows: 2,
+                ..Default::default()
+            },
+        };
+        let db = open_with(&h, M, opts).unwrap();
+        db.write_blocking(|tx| {
+            for m in ["a", "b", "c"] {
+                let e = AuditEntry {
+                    principal: audit::SYSTEM,
+                    method: m,
+                    target: Some("t"),
+                    decision: "allow",
+                    ..Default::default()
+                };
+                audit::append(tx, now_ms(), &e)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(rt.block_on(db.prune_audit()).unwrap(), 3);
+        let methods: Vec<String> = audit_rows(&db).into_iter().map(|r| r.1).collect();
+        assert_eq!(methods, ["b", "c"]);
     }
 }
