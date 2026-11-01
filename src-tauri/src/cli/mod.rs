@@ -1082,11 +1082,9 @@ fn spawn_command(f: SpawnFlags, mode: &SpawnModeArgs, pretty: bool) -> Result<()
 /// Legacy managed workers are unavailable.
 #[cfg(all(unix, feature = "engine"))]
 fn spawn_managed(_f: SpawnFlags, _pretty: bool) -> Result<(), String> {
-    Err(
-        "bad_args: --mode managed is unavailable; \
+    Err("bad_args: --mode managed is unavailable; \
          use --mode free for an engine agent"
-            .into(),
-    )
+        .into())
 }
 
 /// One read of the live sessions for `wait` (and the engine's `watch`):
