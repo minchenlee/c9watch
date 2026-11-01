@@ -636,7 +636,7 @@ impl NativePty {
 }
 
 /// The exit status of child `pid` if it has exited, without reaping it.
-fn peek_exit(pid: libc::pid_t) -> io::Result<Option<ExitStatus>> {
+pub(crate) fn peek_exit(pid: libc::pid_t) -> io::Result<Option<ExitStatus>> {
     use std::os::unix::process::ExitStatusExt;
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     loop {

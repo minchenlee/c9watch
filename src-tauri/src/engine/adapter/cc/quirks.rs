@@ -297,13 +297,19 @@ pub fn probe_version(claude: &Path) -> Result<String, String> {
 
 /// `timeout` covers both the exit and the output: a wrapper that exits
 /// but leaves a child holding stdout open is a timeout too. The probe runs
-/// in its own process group, and a timeout kills the whole group.
+/// in its own process group, and a timeout or a failed exit kills the
+/// whole group.
+///
+/// The child is reaped last, after the last group signal. Until then its
+/// unreaped pid keeps its group id from reuse, so `killpg` cannot reach
+/// an unrelated group (as `NativePty` does, D2). So the exit is only
+/// peeked (`waitid` with `WNOWAIT`), never waited for, before the signal.
 fn probe_version_within(claude: &Path, timeout: Duration) -> Result<String, String> {
+    use crate::engine::pty::peek_exit;
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::Instant;
-    use wait_timeout::ChildExt;
     let deadline = Instant::now() + timeout;
     let mut child = Command::new(claude)
         .arg("--version")
@@ -313,45 +319,45 @@ fn probe_version_within(claude: &Path, timeout: Duration) -> Result<String, Stri
         .process_group(0)
         .spawn()
         .map_err(|e| format!("{}: {}", claude.display(), e))?;
-    let group = child.id() as libc::pid_t;
-    let kill_group = || unsafe {
-        libc::killpg(group, libc::SIGKILL);
+    let pid = child.id() as libc::pid_t;
+    let stdout = child.stdout.take();
+    // Kill the group, then reap: the pid pins the group id until the reap.
+    let mut kill_and_reap = |why: String| {
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
+        let _ = child.wait();
+        Err(why)
     };
     let timed_out = || format!("--version did not answer in {} ms", timeout.as_millis());
-    let mut stdout = child.stdout.take().ok_or("no stdout")?;
+    let Some(mut stdout) = stdout else {
+        return kill_and_reap("no stdout".into());
+    };
     // The output is one short line: read it on a thread so a full pipe
-    // never blocks the wait, and the wait never blocks on the read.
+    // never blocks the exit, and the exit never blocks on the read.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut s = String::new();
         let _ = (&mut stdout).take(4096).read_to_string(&mut s);
         let _ = tx.send(s);
     });
-    match child.wait_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(Some(status)) if status.success() => {}
-        Ok(Some(status)) => {
-            kill_group();
-            return Err(format!("--version exited with {}", status));
+    // EOF comes once the child and everything it left close stdout.
+    let Ok(out) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
+        return kill_and_reap(timed_out());
+    };
+    let status = loop {
+        match peek_exit(pid) {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => return kill_and_reap(timed_out()),
+            Err(e) => return kill_and_reap(e.to_string()),
         }
-        Ok(None) => {
-            kill_group();
-            let _ = child.wait();
-            return Err(timed_out());
-        }
-        Err(e) => {
-            kill_group();
-            let _ = child.wait();
-            return Err(e.to_string());
-        }
+    };
+    if !status.success() {
+        return kill_and_reap(format!("--version exited with {}", status));
     }
-    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(s) => Ok(s),
-        // The child exited, but something it left holds stdout open.
-        Err(_) => {
-            kill_group();
-            Err(timed_out())
-        }
-    }
+    let _ = child.wait();
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -440,6 +446,28 @@ mod tests {
         assert!(gate(Err(e)).warning.unwrap().contains("cannot read"));
         // The timeout killed the child that held stdout.
         std::thread::sleep(Duration::from_millis(2500));
+        assert!(!mark.exists());
+    }
+
+    #[test]
+    fn a_failed_probe_kills_what_it_left_before_the_reap() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let fake = t.path().join("claude");
+        let mark = t.path().join("survivor");
+        // The wrapper fails at once; its child no longer holds stdout.
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n(sleep 1; touch '{}') >/dev/null &\nexit 3\n",
+                mark.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = probe_version_within(&fake, Duration::from_secs(5)).unwrap_err();
+        assert!(e.contains("exited with"), "{}", e);
+        std::thread::sleep(Duration::from_millis(1500));
         assert!(!mark.exists());
     }
 }
