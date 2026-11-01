@@ -5509,6 +5509,8 @@ mod tests {
             ("session.rename", json!({}), true),
             ("annotation.set", json!({}), true),
             ("agent.create", json!({}), true),
+            ("agent.retire", json!({"agentId": "a", "force": true}), true),
+            ("agent.resume", json!({"id": "a"}), true),
             ("events.subscribe", json!({}), true),
             (
                 "events.subscribe",
@@ -5713,6 +5715,8 @@ mod tests {
         for (i, (method, params)) in [
             ("agent.create", json!({"mode": "free", "cwd": "/tmp"})),
             ("agent.retire", json!({"agentId": "agt_x"})),
+            ("agent.retire", json!({"agentId": "agt_x", "force": true})),
+            ("agent.resume", json!({"id": "agt_x"})),
             ("session.stop", json!({"sessionKey": "claudeCode:s2"})),
             ("detect.recheck", json!({})),
         ]
@@ -5747,6 +5751,8 @@ mod tests {
             [
                 "agent.create",
                 "agent.retire",
+                "agent.retire",
+                "agent.resume",
                 "session.stop",
                 "detect.recheck",
                 "session.stop"
@@ -5828,6 +5834,45 @@ mod tests {
                 .unwrap();
             assert_eq!(reason, "idem replay", "{method}");
         }
+    }
+
+    /// `agent.retire {force: true}` replays under its own `idem`; the same
+    /// key without `force` is other params, so `duplicate`.
+    #[tokio::test]
+    async fn a_forced_retire_replays_its_idem() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let me = Principal::LocalUnverified;
+        let runs = AtomicUsize::new(0);
+        let req = |params: Value| Request {
+            params,
+            idem: Some("force-k".into()),
+            ..Default::default()
+        };
+        let write = |_req: Request| async {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"agent": {"id": "agt_f", "state": "retired"}}))
+        };
+        let forced = json!({"agentId": "agt_f", "force": true});
+        let first = idem_write("agent.retire", req(forced.clone()), &ctx, &me, write)
+            .await
+            .unwrap();
+        let again = idem_write("agent.retire", req(forced), &ctx, &me, write)
+            .await
+            .unwrap();
+        assert_eq!(first, again);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        let e = idem_write(
+            "agent.retire",
+            req(json!({"agentId": "agt_f"})),
+            &ctx,
+            &me,
+            write,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Duplicate);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
     /// D3: `session.stop` with a repeated `idem` replays the first answer;

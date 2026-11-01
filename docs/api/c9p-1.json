@@ -4877,6 +4877,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "mutating_peer"
         ],
         "principals": [
@@ -5922,7 +5923,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "session",
         "verb": "read"
