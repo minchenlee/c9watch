@@ -1,4 +1,4 @@
--- user_version 8
+-- user_version 9
 -- index agents_detected_key
 CREATE UNIQUE INDEX agents_detected_key ON agents (session_key) WHERE source = 'detected';
 -- index agents_legacy_sid
@@ -34,7 +34,7 @@ CREATE TABLE agent_state (
     gen             INTEGER NOT NULL,
     pty_child_pid   INTEGER,
     pty_child_start INTEGER
-) STRICT;
+, survivors TEXT) STRICT;
 -- table agents
 CREATE TABLE agents (
     id                       TEXT PRIMARY KEY,           -- agt_<ulid>

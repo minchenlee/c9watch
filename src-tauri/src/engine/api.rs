@@ -25,7 +25,7 @@
 //! answers with the standing orders (`engine::standing`, C1a-25), except
 //! while the engine drains (C1a-27, `engine::drain`).
 //!
-//! `agent.create` and `agent.retire` take only a local client
+//! `agent.create`, `agent.retire` and `agent.resume` take only a local client
 //! (`local-unverified`); an agent gets `not_allowed`, which is audited. The
 //! work is in `engine::create` (C1a-26).
 //!
@@ -59,11 +59,12 @@ use super::peer::{self, PeerCred};
 use super::principal::{self, LiveAgents, NoLiveAgents, Principal};
 use super::proto::{
     encode, encode_event, is_hook_class, read_frame, AgentCreateParams, AgentCreateResult,
-    AgentListParams, AgentListResult, AgentRetireParams, AgentRetireResult, ApiError, ErrorCode,
-    EventFrame, EventType, FrameError, HandoffParams, HandoffResult, HelloParams, HelloResult,
-    HookParams, HookResult, MsgSendParams, MsgSendResult, Request, Response, SessionListParams,
-    SessionListResult, SnapshotParams, SnapshotResult, SubscribeParams, SubscribeResult,
-    TaskDoneParams, TaskDoneResult, API_MAJOR, API_MINOR, HOOK_METHODS, MAX_FRAME,
+    AgentListParams, AgentListResult, AgentResumeParams, AgentResumeResult, AgentRetireParams,
+    AgentRetireResult, ApiError, ErrorCode, EventFrame, EventType, FrameError, HandoffParams,
+    HandoffResult, HelloParams, HelloResult, HookParams, HookResult, MsgSendParams, MsgSendResult,
+    Request, Response, SessionListParams, SessionListResult, SnapshotParams, SnapshotResult,
+    SubscribeParams, SubscribeResult, TaskDoneParams, TaskDoneResult, API_MAJOR, API_MINOR,
+    HOOK_METHODS, MAX_FRAME,
 };
 use super::proto::{
     AnnotationChangedEvent, AnnotationDeleteParams, AnnotationDeleteResult, AnnotationListParams,
@@ -586,6 +587,7 @@ pub const METHODS: &[&str] = &[
     "agent.list",
     "agent.create",
     "agent.retire",
+    "agent.resume",
     "hook.session_start",
     "hook.stop",
     "hook.permission_request",
@@ -687,6 +689,10 @@ pub fn schema() -> serde_json::Value {
         "agent.retire": {
             "params": de.subschema_for::<AgentRetireParams>(),
             "result": ser.subschema_for::<AgentRetireResult>(),
+        },
+        "agent.resume": {
+            "params": de.subschema_for::<AgentResumeParams>(),
+            "result": ser.subschema_for::<AgentResumeResult>(),
         },
         "task.done": {
             "params": de.subschema_for::<TaskDoneParams>(),
@@ -1030,7 +1036,13 @@ async fn dispatch(
     // Atomic mutation handlers already write exactly one audit row.
     let owned_audit = matches!(
         method,
-        "agent.create" | "agent.retire" | "msg.send" | "msg.cancel" | "mail.pause" | "mail.resume"
+        "agent.create"
+            | "agent.retire"
+            | "agent.resume"
+            | "msg.send"
+            | "msg.cancel"
+            | "mail.pause"
+            | "mail.resume"
     ) || is_hook_class(method)
         || annotations::is_write(method);
     if !owned_audit {
@@ -1096,6 +1108,9 @@ async fn execute(
             spawn_or_retire(method, req, ctx, peer, principal).await?,
         )),
         "agent.retire" => Ok(Served::result(
+            spawn_or_retire(method, req, ctx, peer, principal).await?,
+        )),
+        "agent.resume" => Ok(Served::result(
             spawn_or_retire(method, req, ctx, peer, principal).await?,
         )),
         "snapshot.get" => Ok(Served::result(snapshot_get(ctx).await?)),
@@ -1317,6 +1332,12 @@ async fn spawn_or_retire(
         Ok(
             serde_json::to_value(AgentCreateResult { agent })
                 .expect("AgentCreateResult serializes"),
+        )
+    } else if method == "agent.resume" {
+        let agent = spawner.resume(principal, req.params).await?;
+        Ok(
+            serde_json::to_value(AgentResumeResult { agent })
+                .expect("AgentResumeResult serializes"),
         )
     } else {
         let agent = spawner.retire(principal, req.params).await?;
@@ -2439,7 +2460,7 @@ mod tests {
             if is_hook_class(m) {
                 // Served, but only to an agent (C1a-21).
                 assert_eq!(r["error"]["code"], "peer_not_authorized", "{}: {}", m, r);
-            } else if *m == "agent.create" || *m == "agent.retire" {
+            } else if ["agent.create", "agent.retire", "agent.resume"].contains(m) {
                 // This test engine has no spawner.
                 assert_eq!(r["error"]["code"], "internal", "{}: {}", m, r);
             } else if [

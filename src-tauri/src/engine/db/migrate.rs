@@ -62,6 +62,11 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0008_annotations.sql"),
         fk_off: false,
     },
+    Migration {
+        version: 9,
+        sql: include_str!("migrations/0009_kill_survivors.sql"),
+        fk_off: false,
+    },
 ];
 
 /// The schema version this engine writes.
@@ -277,7 +282,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             migrate(&mut conn, MIGRATIONS, t.path()).unwrap(),
-            [5, 6, 7, 8]
+            [5, 6, 7, 8, 9]
         );
         assert_eq!(user_version(&conn).unwrap(), latest_version());
         let backup = Connection::open(t.path().join("pre-5.db")).unwrap();
@@ -324,6 +329,39 @@ mod tests {
         // Another sender may use the same key.
         put("msg_4", "agent:agt_9", Some("k")).unwrap();
         assert!(put("msg_5", "local-unverified", Some("k")).is_err());
+    }
+
+    /// D2 (P1-3): a version 8 db gains `agent_state.survivors`, NULL on
+    /// its rows, after a `VACUUM INTO` backup of version 8.
+    #[test]
+    fn a_version_8_db_gains_kill_survivors_with_a_backup() {
+        let t = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open(t.path().join("e.db")).unwrap();
+        migrate(&mut conn, &MIGRATIONS[..8], t.path()).unwrap();
+        conn.execute_batch(
+            "INSERT INTO agents (id, role, provider, source) \
+             VALUES ('agt_1', 'worker', 'claude', 'engine'); \
+             INSERT INTO agent_state (agent_id, gen, pty_child_pid, pty_child_start) \
+             VALUES ('agt_1', 1, 4242, 7);",
+        )
+        .unwrap();
+        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), [9]);
+        assert_eq!(user_version(&conn).unwrap(), latest_version());
+        let backup = Connection::open(t.path().join("pre-9.db")).unwrap();
+        assert_eq!(user_version(&backup).unwrap(), 8);
+        let row: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT pty_child_pid, survivors FROM agent_state WHERE agent_id = 'agt_1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (4242, None));
+        conn.execute(
+            "UPDATE agent_state SET survivors = '[]' WHERE agent_id = 'agt_1'",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]

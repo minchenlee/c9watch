@@ -56,7 +56,9 @@ pub fn method(name: &str) -> Option<Rule> {
             &["annotation_namespace", "annotation_peer"],
         ),
         "agent.list" => rule("agent", "read", ALL, None, &[]),
-        "agent.create" | "agent.retire" => rule("agent", "write", &[L], None, &["mutating_peer"]),
+        "agent.create" | "agent.retire" | "agent.resume" => {
+            rule("agent", "write", &[L], None, &["mutating_peer"])
+        }
         "detect.recheck" => rule("detect", "write", &[L], None, &["mutating_peer"]),
         "session.stop" => rule("session", "stop", &[L, C], None, &["mutating_peer"]),
         "session.rename" => rule("session", "rename", &[L, C], None, &["mutating_peer"]),

@@ -146,7 +146,9 @@ pub trait Driver: Send {
     /// has exited and its group is empty.
     fn signal(&mut self, sig: libc::c_int) -> io::Result<()>;
 
-    /// The PTY child's exit status once it has exited (reaps it).
+    /// The PTY child's exit status once it has exited. A native PTY does
+    /// not reap it here: `kill` does, last, so the group id stays ours
+    /// until the group is gone (D2).
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>>;
 
     /// SIGTERM to the group and to the groups of the child's descendants

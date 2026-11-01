@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
 /// Protocol minor version. Preview breaks also raise method revisions.
-pub const API_MINOR: u32 = 10;
+pub const API_MINOR: u32 = 11;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -130,8 +130,8 @@ pub enum ErrorCode {
     /// The engine's `c9watch-agent` copy no longer has the sha256 it had
     /// when the engine installed it.
     AgentBinMismatch,
-    /// The principal may not call this method (`agent.create` and
-    /// `agent.retire` take only a local client).
+    /// The principal may not call this method (`agent.create`,
+    /// `agent.retire` and `agent.resume` take only a local client).
     NotAllowed,
     /// A widening permission change needs a fresh native confirmation.
     ConfirmationRequired,
@@ -167,7 +167,9 @@ pub enum ErrorCode {
     NotCancellable,
     /// `session.stop` or `session.rename` was refused or failed on the
     /// session itself: it cannot be stopped, it runs as another process
-    /// now, or the write failed. `msg` says which.
+    /// now, or the write failed. `agent.resume`: the agent is not `paused`
+    /// or `interrupted`, already runs, or has nothing to resume. `msg`
+    /// says which.
     ActionFailed,
     /// The engine is at a limit that frees up soon: the connection cap, or
     /// a scan of the same kind that is still running. Retry shortly.
@@ -585,9 +587,10 @@ pub struct AgentRow {
     /// `blocked`, `paused`, `refreshing`, `interrupted`, `retiring`,
     /// `retired`, `failed`, `orphaned`); `null` for an observed agent.
     /// `refreshing` and `retiring` are reserved: the engine does not emit
-    /// them today, but clients must accept them. `orphaned` means a retire
-    /// could not confirm that the agent's process was killed; the agent is
-    /// not resumable.
+    /// them today, but clients must accept them. `orphaned` means no kill
+    /// (retire, exit cleanup or boot reconcile) could confirm that the
+    /// agent's process ended; the agent is not resumable, `goneAt` stays
+    /// `null`, and `agent.retire` tries the kill again.
     pub state: Option<String>,
     /// The detected session status: `working`, `needs_attention`,
     /// `waiting_for_input` or `connecting`.
@@ -607,9 +610,12 @@ pub struct AgentRow {
     /// that adopted it.
     pub parent_id: Option<String>,
     /// Why the agent is in its `state`: `drain` for a `paused` or
-    /// `interrupted` agent that an engine drain stopped; for a `failed`
-    /// agent the failure reason, such as `spawn_failed`, `resume_failed`,
-    /// `exited` or `create_interrupted`.
+    /// `interrupted` agent that an engine drain stopped; `resume_failed`
+    /// for a `paused` or `interrupted` agent whose last resume failed
+    /// (`agent.resume` tries again); for a `failed` agent the failure
+    /// reason, such as `spawn_failed`, `resume_failed` (nothing to
+    /// resume), `exited` or `create_interrupted`; `kill_unconfirmed` for
+    /// an `orphaned` agent.
     pub state_reason: Option<String>,
 }
 
@@ -1139,13 +1145,38 @@ pub struct AgentCreateResult {
 pub struct AgentRetireParams {
     /// The agent id (`agt_<ulid>`).
     pub id: String,
+    /// End an `orphaned` agent even when the kill cannot confirm that
+    /// every process is gone: core kills by pid and start time as
+    /// always, then writes the tombstone and an audit row that names the
+    /// forced retire. The local client only, as `agent.retire` is. No
+    /// effect on an agent that is not `orphaned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<bool>,
 }
 
 /// `agent.retire` result: the tombstone row. Retiring a retired or
-/// failed agent changes nothing and returns its row.
+/// failed agent changes nothing and returns its row. When the kill cannot
+/// be confirmed, the row is `orphaned` instead; retire it again to retry
+/// the kill.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct AgentRetireResult {
+    pub agent: AgentRow,
+}
+
+/// `agent.resume` params.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct AgentResumeParams {
+    /// The agent id (`agt_<ulid>`) of a `paused` or `interrupted` engine
+    /// agent.
+    pub id: String,
+}
+
+/// `agent.resume` result: the agent once it is `ready`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+pub struct AgentResumeResult {
     pub agent: AgentRow,
 }
 

@@ -33,6 +33,15 @@
 //! row kept (A:828). An agent that exits by itself after `ready` ends
 //! `failed` with `exited`.
 //!
+//! **Confirmed kills (D2).** Every kill before a row ends (retire, exit,
+//! a failed create or resume) must confirm that the process, its group
+//! and its descendants are gone (`Driver::kill`: SIGTERM, then SIGKILL,
+//! then a check). One that cannot makes the row `orphaned` instead
+//! (`ops::orphan_agent`): never resumed, its PTY child kept in
+//! `agent_state`. A retire of an `orphaned` agent kills that child again by
+//! pid and start time (`pty::kill_orphan`) and makes the tombstone only
+//! once it is gone.
+//!
 //! The supervisor owns the `Driver`. After `ready` it keeps following the
 //! screen and feeds its state into the merge as a screen claim
 //! (`hooks::screen_claim`), the fallback for the `UserPromptSubmit` and
@@ -65,16 +74,19 @@
 //!   `resume_count`; one after a crash does.
 //! - The supervisor then brings the agent up exactly as for a create. No
 //!   quota is checked first (D28 Q7). An exit before `ready`, a vendor
-//!   refusal or no `ready` within 30 s ends the row `failed` with
-//!   `resume_failed` and the vendor's text in the detail; it is never
-//!   tried again. `ready` clears `state_reason` and `resume_argv`; the
-//!   resume SessionStart takes the interrupted note (`engine::standing`).
+//!   refusal or no `ready` within 30 s puts the row back to `paused` or
+//!   `interrupted` with reason `resume_failed`, its `resume_argv` and its
+//!   mail kept, and audits the vendor's text (`ops::resume_failed`). A
+//!   boot never tries it again; `agent.resume` does (D4, `resume`).
+//!   `ready` clears `state_reason` and `resume_argv`; the resume
+//!   SessionStart takes the interrupted note (`engine::standing`).
 //! - A drain or stop of this engine while the resume comes up is not a
 //!   resume failure: the supervisor kills the agent and puts the row back
 //!   to `paused` or `interrupted` with reason `drain` and its
 //!   `resume_argv`, so the next boot resumes it again (reviews M2). Only a
 //!   kill that fails, or an engine that dies, leaves it to boot reconcile,
-//!   which fails it.
+//!   which marks it `resume_failed` (or `orphaned`, if its kill fails
+//!   too).
 //! - Events of the old generation are dropped as `stale_generation` and
 //!   audited (`engine::hooks`).
 //!
@@ -112,8 +124,10 @@ use super::mail::{self, MsgState};
 use super::merge::{Activity, MergeTable};
 use super::ops::{self, CreatePayload, Phase};
 use super::principal::Principal;
-use super::proto::{AgentCreateParams, AgentRetireParams, AgentRow, ApiError, ErrorCode};
-use super::pty::NativePty;
+use super::proto::{
+    AgentCreateParams, AgentResumeParams, AgentRetireParams, AgentRow, ApiError, ErrorCode,
+};
+use super::pty::{kill_orphans, NativePty};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -266,6 +280,9 @@ enum Delivery {
 struct Handle {
     cmds: Sender<Cmd>,
     thread: JoinHandle<()>,
+    /// The generation it supervises: its cleanup removes only its own
+    /// entry, never a newer supervisor's (P2).
+    gen: i64,
 }
 
 /// Whether a supervisor starts a new session or resumes one.
@@ -346,6 +363,12 @@ pub struct Spawner {
     starts: Mutex<HashSet<(String, i64)>>,
     /// The supervisor of every agent that runs in this engine.
     live: Mutex<HashMap<String, Handle>>,
+    /// One lifecycle step of an agent at a time (P1-4): `agent.create`
+    /// and a resume hold it until their supervisor is registered (a resume
+    /// that finds it taken fails at once), `agent.retire` for its whole
+    /// run. So a retire either finds the supervisor or no supervisor can
+    /// start until it is done.
+    steps: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     stopping: AtomicBool,
     /// The engine's drain switch (C1a-27).
     drain: Arc<DrainSwitch>,
@@ -355,6 +378,9 @@ pub struct Spawner {
     socket_jobs: Mutex<HashMap<String, std::sync::mpsc::Receiver<super::cc_inbox::SocketOutcome>>>,
     socket_seen: Mutex<HashSet<(String, i64)>>,
     peer_tailers: Mutex<HashMap<(String, i64), super::peer_log::Tailer>>,
+    /// How `agent.retire` kills an `orphaned` agent's recorded PTY child
+    /// and survivors (`pty::kill_orphans`; a test swaps it).
+    orphan_killer: Mutex<Arc<ops::Killer>>,
 }
 
 impl Spawner {
@@ -375,6 +401,7 @@ impl Spawner {
             clock: Arc::new(Instant::now),
             starts: Mutex::new(HashSet::new()),
             live: Mutex::new(HashMap::new()),
+            steps: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
             drain: Arc::new(DrainSwitch::new()),
             header_key: None,
@@ -382,6 +409,7 @@ impl Spawner {
             socket_jobs: Mutex::new(HashMap::new()),
             socket_seen: Mutex::new(HashSet::new()),
             peer_tailers: Mutex::new(HashMap::new()),
+            orphan_killer: Mutex::new(Arc::new(kill_orphans)),
         }
     }
 
@@ -450,6 +478,11 @@ impl Spawner {
         self
     }
 
+    #[cfg(test)]
+    fn set_orphan_killer(&self, killer: Arc<ops::Killer>) {
+        *lock(&self.orphan_killer) = killer;
+    }
+
     pub fn with_clock(mut self, clock: Clock) -> Spawner {
         self.clock = clock;
         self
@@ -499,6 +532,9 @@ impl Spawner {
             kind: Kind::Create,
             from: None,
         };
+        // Until the supervisor is registered: a retire of the new row waits
+        // and then finds it (P1-4).
+        let step = self.step(&start.id).lock_owned().await;
         let gen = self
             .write_row(&start, desc, principal, p.name.clone())
             .await?;
@@ -507,6 +543,7 @@ impl Spawner {
         let start = Start { gen, ..start };
         let (reply, answer) = oneshot::channel();
         self.supervise(start, reply)?;
+        drop(step);
         answer.await.unwrap_or_else(|_| {
             Err(ApiError::new(
                 ErrorCode::Internal,
@@ -632,8 +669,19 @@ impl Spawner {
             self.fail_create(&s, "the engine stopped before the spawn");
             return Err(stopping());
         }
+        if live.contains_key(&s.id) {
+            // The step lock keeps this from happening; never replace a
+            // supervisor that still runs (P2).
+            drop(live);
+            let why = "another supervisor of it runs in this engine";
+            self.fail_create(&s, why);
+            return Err(ApiError::new(
+                ErrorCode::ActionFailed,
+                format!("{}: {}", s.id, why),
+            ));
+        }
         let sp = self.clone();
-        let id = s.id.clone();
+        let (id, gen) = (s.id.clone(), s.gen);
         let spawned = std::thread::Builder::new()
             .name(format!("agent-{}", id))
             .spawn({
@@ -642,7 +690,7 @@ impl Spawner {
             });
         match spawned {
             Ok(thread) => {
-                live.insert(id, Handle { cmds, thread });
+                live.insert(id, Handle { cmds, thread, gen });
                 Ok(())
             }
             Err(e) => {
@@ -684,7 +732,31 @@ impl Spawner {
         self.agents.unregister(&s.id, s.gen);
         self.merge.remove(&s.id);
         lock(&self.starts).retain(|(id, _)| *id != s.id);
-        lock(&self.live).remove(&s.id);
+        self.release_live(&s.id, s.gen);
+    }
+
+    /// Remove the supervisor entry of `id` if it is generation `gen`'s.
+    fn release_live(&self, id: &str, gen: i64) {
+        let mut live = lock(&self.live);
+        if live.get(id).is_some_and(|h| h.gen == gen) {
+            live.remove(id);
+        }
+    }
+
+    /// The step lock of agent `id` (see `steps`).
+    fn step(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        lock(&self.steps).entry(id.to_string()).or_default().clone()
+    }
+
+    /// Forget the step lock of a retired agent, while `held` (its guard)
+    /// is still held and nobody else waits for it.
+    fn forget_step(&self, id: &str, held: &tokio::sync::OwnedMutexGuard<()>) {
+        let mut steps = lock(&self.steps);
+        // The map's copy and the guard's: nobody else holds or waits.
+        if steps.get(id).is_some_and(|a| Arc::strong_count(a) <= 2) {
+            steps.remove(id);
+        }
+        let _ = held;
     }
 
     /// Spawn once and follow the screen until `ready` or a failure.
@@ -696,11 +768,27 @@ impl Spawner {
                 format!("{}: {}", s.id, why),
             ))
         };
+        // A failure after the spawn: the agent goes first. A kill that
+        // cannot confirm it leaves the row `orphaned`, not failed (D2).
+        let kill_fail = |driver: &mut Box<dyn Driver>, why: String| {
+            if self.kill_confirmed(s, driver.as_mut(), audit::SYSTEM, s.kind.failure().0) {
+                fail(why)
+            } else {
+                Up::Failed(ApiError::new(
+                    ErrorCode::SpawnFailed,
+                    format!("{}: {}; {}", s.id, why, ORPHANED_TEXT),
+                ))
+            }
+        };
         // The other live agents' cwds: their `.claude/` is denied too
         // (C1a-32). A failed read spawns nothing rather than spawn without.
-        let peers = match self.db.reader().map_err(|e| e.to_string()).and_then(|c| {
-            peer_cwds(&c, &s.id).map_err(|e| format!("Failed to read the peer cwds: {}", e))
-        }) {
+        let peers = match self
+            .db
+            .pooled_reader()
+            .map_err(|e| e.to_string())
+            .and_then(|c| {
+                peer_cwds(&c, &s.id).map_err(|e| format!("Failed to read the peer cwds: {}", e))
+            }) {
             Ok(p) => p,
             Err(e) => return fail(e),
         };
@@ -753,19 +841,15 @@ impl Spawner {
         };
         let child = driver.child();
         if let Err(e) = self.agents.register(&s.id, s.gen, child) {
-            let _ = driver.kill();
-            return fail(e);
+            return kill_fail(&mut driver, e);
         }
         match self.write_pty(s, child) {
             Ok(true) => {
                 #[cfg(feature = "live-test")]
                 super::live_test::crash_after(Phase::Pty);
             }
-            Ok(false) => return retired_meanwhile(driver),
-            Err(e) => {
-                let _ = driver.kill();
-                return fail(e);
-            }
+            Ok(false) => return self.retired_meanwhile(s, driver),
+            Err(e) => return kill_fail(&mut driver, e),
         }
         // A drain that started during the spawn: the agent goes at once
         // (reviews L2). The PTY child is in `agent_state` by now, so a
@@ -777,8 +861,7 @@ impl Spawner {
         loop {
             match cmds.try_recv() {
                 Ok(Cmd::Retire { principal, reply }) => {
-                    let _ = driver.kill();
-                    let _ = reply.send(self.retire_row(&s.id, s.gen, &principal));
+                    let _ = reply.send(self.retire_killed(s, driver.as_mut(), &principal));
                     return Up::Retired;
                 }
                 Ok(Cmd::Shutdown | Cmd::Drain) | Err(TryRecvError::Disconnected) => {
@@ -793,8 +876,10 @@ impl Spawner {
                 screen.session_start();
             }
             if let Some(text) = vendor_refusal(&snap.text) {
-                let _ = driver.kill();
-                return fail(format!("the vendor refused before ready: {}", text));
+                return kill_fail(
+                    &mut driver,
+                    format!("the vendor refused before ready: {}", text),
+                );
             }
             let mut ready = false;
             for ev in screen.step(&snap.title, &snap.text, snap.quiet, (self.clock)()) {
@@ -804,8 +889,8 @@ impl Spawner {
                     }
                     ScreenEvent::Ready { first: true } => ready = true,
                     ScreenEvent::Failed(why) => {
-                        let _ = driver.kill();
-                        return fail(format!("{}: {}", failure_text(why), detail(&snap.text)));
+                        let why = format!("{}: {}", failure_text(why), detail(&snap.text));
+                        return kill_fail(&mut driver, why);
                     }
                     _ => {}
                 }
@@ -817,11 +902,8 @@ impl Spawner {
                         super::live_test::crash_after(Phase::Bound);
                         Up::Ready(driver, Box::new(row), Box::new(screen))
                     }
-                    Ok(None) => retired_meanwhile(driver),
-                    Err(e) => {
-                        let _ = driver.kill();
-                        fail(e)
-                    }
+                    Ok(None) => self.retired_meanwhile(s, driver),
+                    Err(e) => kill_fail(&mut driver, e),
                 };
             }
             let status = match driver.try_wait() {
@@ -832,12 +914,8 @@ impl Spawner {
             if let Some(status) = status {
                 // The last output is in the screen by now.
                 let text = driver.screen().text;
-                let _ = driver.kill();
-                return fail(format!(
-                    "exited before ready ({}): {}",
-                    status,
-                    detail(&text)
-                ));
+                let why = format!("exited before ready ({}): {}", status, detail(&text));
+                return kill_fail(&mut driver, why);
             }
         }
     }
@@ -886,8 +964,7 @@ impl Spawner {
             match cmds.recv_timeout(RUN_TICK) {
                 Ok(Cmd::Retire { principal, reply }) => {
                     self.stop_delivery(s, &delivery, "target retired", "target retired");
-                    let _ = driver.kill();
-                    let _ = reply.send(self.retire_row(&s.id, s.gen, &principal));
+                    let _ = reply.send(self.retire_killed(s, driver.as_mut(), &principal));
                     return;
                 }
                 Ok(Cmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
@@ -945,7 +1022,10 @@ impl Spawner {
             );
             if let Ok(Some(status)) = driver.try_wait() {
                 let text = driver.screen().text;
-                let _ = driver.kill();
+                // The rest of its group and descendants go too.
+                if !self.kill_confirmed(s, driver.as_mut(), audit::SYSTEM, ops::METHOD_EXIT) {
+                    return;
+                }
                 let why = format!("exited ({}): {}", status, detail(&text));
                 let (machine, id) = (self.db.machine_id().to_string(), s.id.clone());
                 let wrote = self.db.write_blocking(move |tx| {
@@ -980,14 +1060,14 @@ impl Spawner {
                     return Delivery::Idle;
                 }
                 // Adopt an in-flight socket delivery before considering the queue.
-                if let Ok(c) = self.db.reader() {
+                if let Ok(c) = self.db.pooled_reader() {
                     if let Ok(Some(id)) = mail::socket_inflight(&c, &s.id) {
                         return socket_awaiting(id, now);
                     }
                 }
                 let candidate = match self
                     .db
-                    .reader()
+                    .pooled_reader()
                     .ok()
                     .and_then(|c| mail::peek_next_id(&c, &s.id, now_ms()).ok())
                     .flatten()
@@ -1080,7 +1160,7 @@ impl Spawner {
                 Delivery::Pasted { id, at }
             }
             Delivery::Submitted { id, at } => {
-                let read = match self.db.reader() {
+                let read = match self.db.pooled_reader() {
                     Ok(c) => mail::state_of(&c, &id).map_err(|e| e.to_string()),
                     Err(e) => Err(e.to_string()),
                 };
@@ -1131,7 +1211,7 @@ impl Spawner {
                     // A receipt may have committed before the worker's result.
                     if self
                         .db
-                        .reader()
+                        .pooled_reader()
                         .ok()
                         .and_then(|c| mail::state_of(&c, &id).ok())
                         .flatten()
@@ -1170,7 +1250,7 @@ impl Spawner {
                 mut held,
                 mut receipt_seq,
             } => {
-                let Ok(c) = self.db.reader() else {
+                let Ok(c) = self.db.pooled_reader() else {
                     return Delivery::SocketAwaiting {
                         id,
                         since,
@@ -1276,7 +1356,7 @@ impl Spawner {
         if !cc_inbox::enabled() {
             return None;
         }
-        let c = match self.db.reader() {
+        let c = match self.db.pooled_reader() {
             Ok(c) => c,
             Err(e) => return Some(Gate::Unknown(e)),
         };
@@ -1339,7 +1419,7 @@ impl Spawner {
         }
     }
     fn transcript_path(&self, s: &Start) -> Option<PathBuf> {
-        self.db.reader().ok()?.query_row("SELECT transcript_path FROM session_alias WHERE agent_id = ?1 AND generation = ?2 AND transcript_path IS NOT NULL ORDER BY rowid DESC LIMIT 1", rusqlite::params![s.id, s.gen], |r| r.get::<_, String>(0)).optional().ok()?.map(PathBuf::from)
+        self.db.pooled_reader().ok()?.query_row("SELECT transcript_path FROM session_alias WHERE agent_id = ?1 AND generation = ?2 AND transcript_path IS NOT NULL ORDER BY rowid DESC LIMIT 1", rusqlite::params![s.id, s.gen], |r| r.get::<_, String>(0)).optional().ok()?.map(PathBuf::from)
     }
     fn start_socket(
         &self,
@@ -1358,7 +1438,7 @@ impl Spawner {
             }
             Gate::NoProtocol => unreachable!(),
         };
-        let c = match self.db.reader() {
+        let c = match self.db.pooled_reader() {
             Ok(c) => c,
             Err(_) => {
                 self.requeue_mail(s, &m.id, "store unavailable");
@@ -1506,11 +1586,11 @@ impl Spawner {
             mail::note(tx, &machine, &id, &detail, now_ms())
         });
     }
+    /// The agent needs attention (`<reason>: <id>`): `agent.attention`,
+    /// and the merge flag once that commits.
     fn mail_attention(&self, s: &Start, id: &str, reason: &str) {
-        self.merge.peek(&s.id, s.gen, |m| {
-            m.attention(&format!("{}: {}", reason, id), now_ms())
-        });
-        let (machine, agent, gen, id, reason) = (
+        let (merge, machine, agent, gen, id, reason) = (
+            self.merge.clone(),
             self.db.machine_id().to_string(),
             s.id.clone(),
             s.gen,
@@ -1518,6 +1598,12 @@ impl Spawner {
             reason.to_string(),
         );
         self.mail_write(s, move |tx| {
+            let (flag, now) = (format!("{}: {}", reason, id), now_ms());
+            if let Some(((), staged)) =
+                merge.stage_existing(&agent, gen, move |m| m.attention(&flag, now))
+            {
+                merge.publish_on_commit(tx, staged);
+            }
             tx.emit(&NewEvent {
                 topic: "agent.attention".into(),
                 subject: Some(format!("{}/{}", machine, agent)),
@@ -1529,7 +1615,7 @@ impl Spawner {
     }
     fn poll_peer_log(&self, s: &Start) {
         use super::transcript::MailFact;
-        let Ok(c) = self.db.reader() else {
+        let Ok(c) = self.db.pooled_reader() else {
             return;
         };
         let eligible: bool = c.query_row("SELECT count(*) > 0 FROM messages WHERE to_agent = ?1 AND via = 'socket' AND (state = 'delivering' OR (state = 'uncertain' AND state_at >= ?2))", rusqlite::params![s.id, now_ms() - mail::LATE_WINDOW_MS], |r| r.get(0)).unwrap_or(false);
@@ -1670,13 +1756,11 @@ impl Spawner {
     }
 
     /// `msg_id` may have reached the agent: `uncertain`, and the agent
-    /// needs attention (`mail_uncertain: <id>`), raised in the merge and
-    /// emitted as `agent.attention`.
+    /// needs attention (`mail_uncertain: <id>`), emitted as
+    /// `agent.attention` and raised in the merge once that commits.
     fn mail_uncertain(&self, s: &Start, msg_id: &str, why: &str) {
-        let now = now_ms();
-        let reason = format!("mail_uncertain: {}", msg_id);
-        self.merge.peek(&s.id, s.gen, |m| m.attention(&reason, now));
-        let (machine, agent, gen, id, why) = (
+        let (merge, machine, agent, gen, id, why) = (
+            self.merge.clone(),
             self.db.machine_id().to_string(),
             s.id.clone(),
             s.gen,
@@ -1684,7 +1768,15 @@ impl Spawner {
             why.to_string(),
         );
         self.mail_write(s, move |tx| {
+            let now = now_ms();
+            let reason = format!("mail_uncertain: {}", id);
             if mail::mark(tx, &machine, &id, MsgState::Uncertain, Some(&why), now)? {
+                let flag = reason.clone();
+                if let Some(((), staged)) =
+                    merge.stage_existing(&agent, gen, move |m| m.attention(&flag, now))
+                {
+                    merge.publish_on_commit(tx, staged);
+                }
                 tx.emit(&NewEvent {
                     topic: "agent.attention".into(),
                     subject: Some(format!("{}/{}", machine, agent)),
@@ -1714,7 +1806,7 @@ impl Spawner {
             eprintln!("[engine] Drain: {}", e);
             None
         });
-        if let Ok(c) = self.db.reader() {
+        if let Ok(c) = self.db.pooled_reader() {
             if let Ok(Some(id)) = mail::socket_inflight(&c, &s.id) {
                 before = Some("working".into());
                 self.mail_uncertain(s, &id, "drain");
@@ -1826,7 +1918,7 @@ impl Spawner {
 
     /// Whether the create op of `s` is still open: a retire closes it.
     fn op_open(&self, s: &Start) -> Result<bool, String> {
-        let conn = self.db.reader()?;
+        let conn = self.db.pooled_reader()?;
         conn.query_row(
             "SELECT 1 FROM ops WHERE id = ?1 AND done_at IS NULL",
             [&s.op_id],
@@ -1856,7 +1948,8 @@ impl Spawner {
     }
 
     /// The create or resume failed: close the op, fail the row with
-    /// `spawn_failed` or `resume_failed`. A failed write only logs; boot
+    /// `spawn_failed`, or put a resume's row back with `resume_failed`
+    /// (`ops::resume_failed`). A failed write only logs; boot
     /// reconcile finishes it.
     fn fail_create(&self, s: &Start, why: &str) {
         let (machine, s2, why2) = (self.db.machine_id().to_string(), s.clone(), why.to_string());
@@ -1864,6 +1957,10 @@ impl Spawner {
         let wrote = self.db.write_blocking(move |tx| {
             let now = now_ms();
             ops::finish(tx, &s2.op_id, reason, now)?;
+            // A failed resume can be tried again (D4).
+            if s2.kind == Kind::Resume {
+                return ops::resume_failed(tx, &machine, &s2.id, s2.from.as_deref(), &why2, now);
+            }
             ops::fail_agent(tx, &machine, &s2.id, method, reason, &why2, now)
         });
         if let Err(e) = wrote {
@@ -1898,13 +1995,327 @@ impl Spawner {
     /// the module doc). Run once at boot, after boot reconcile and the
     /// bind. Blocking: the supervisors bring the agents up on their own
     /// threads.
+    /// Kill the agent of `s` and confirm that it ended (D2). When no kill
+    /// can confirm it, the row becomes `orphaned` (`ops::orphan_agent`,
+    /// audited with `principal` and `method`) and this returns `false`.
+    fn kill_confirmed(
+        &self,
+        s: &Start,
+        driver: &mut dyn Driver,
+        principal: &str,
+        method: &'static str,
+    ) -> bool {
+        let child = driver.child();
+        let Err(e) = driver.kill() else {
+            return true;
+        };
+        let left = super::pty::survivors(&e);
+        eprintln!(
+            "[engine] Could not confirm the kill of {} (pid {}); marking it orphaned: {}",
+            s.id, child.pid, e
+        );
+        let (machine, id, gen) = (self.db.machine_id().to_string(), s.id.clone(), s.gen);
+        let (principal, e) = (principal.to_string(), e.to_string());
+        let wrote = self.db.write_blocking(move |tx| {
+            ops::orphan_agent(
+                tx,
+                &machine,
+                &id,
+                gen,
+                child,
+                &left,
+                &principal,
+                method,
+                &e,
+                now_ms(),
+            )
+        });
+        if let Err(e) = wrote {
+            eprintln!("[engine] Failed to mark {} orphaned: {}", s.id, e);
+        }
+        false
+    }
+
+    /// `agent.retire` of a running agent: the tombstone once the kill is
+    /// confirmed, else the `orphaned` row.
+    fn retire_killed(
+        &self,
+        s: &Start,
+        driver: &mut dyn Driver,
+        principal: &str,
+    ) -> Result<AgentRow, ApiError> {
+        if self.kill_confirmed(s, driver, principal, "agent.retire") {
+            return self.retire_row(&s.id, s.gen, principal, None);
+        }
+        let conn = self.db.pooled_reader().map_err(internal)?;
+        engine_row(&conn, &s.id)
+            .map_err(internal)?
+            .ok_or_else(|| unknown_agent(&s.id))
+    }
+
+    /// A retire made the row a tombstone while the agent came up: the PTY
+    /// goes. A kill that cannot confirm it turns the tombstone `orphaned`.
+    fn retired_meanwhile(&self, s: &Start, mut driver: Box<dyn Driver>) -> Up {
+        self.kill_confirmed(s, driver.as_mut(), audit::SYSTEM, "agent.retire");
+        Up::Retired
+    }
+
+    /// `agent.retire` with no supervisor: the tombstone, or for an
+    /// `orphaned` agent first a new kill (`retire_orphan`, D2). The state
+    /// is read here, after `retire_live`: a supervisor that could not
+    /// confirm its kill wrote `orphaned` before it left. Blocking.
+    fn retire_idle(
+        &self,
+        id: &str,
+        gen: i64,
+        principal: &str,
+        force: bool,
+    ) -> Result<AgentRow, ApiError> {
+        let state = {
+            let conn = self.db.pooled_reader().map_err(internal)?;
+            engine_row(&conn, id)
+                .map_err(internal)?
+                .and_then(|r| r.state)
+        };
+        if state.as_deref() == Some("orphaned") {
+            return self.retire_orphan(id, principal, force);
+        }
+        self.retire_row(id, gen, principal, None)
+    }
+
+    /// `agent.retire` of an `orphaned` agent: kill its recorded PTY child
+    /// and the survivors of the unconfirmed kill again, each only by pid
+    /// and start time (`pty::kill_orphans`). The row becomes the tombstone
+    /// only when every one is confirmed gone (or its pid runs another
+    /// process now) and none went unrecorded (overflow). Otherwise it
+    /// stays `orphaned` with what is still left (`survivors_overflow` for
+    /// an overflow), and the attempt is audited. Unreadable survivors fail
+    /// closed: nothing is signalled and the row stays.
+    ///
+    /// `force` (the local client only, P1-B): after the same kill, the
+    /// tombstone whatever is left, with an audit row that names the forced
+    /// retire and what it left. Blocking.
+    fn retire_orphan(&self, id: &str, principal: &str, force: bool) -> Result<AgentRow, ApiError> {
+        let (state, row) = {
+            let conn = self.db.pooled_reader().map_err(internal)?;
+            let state = conn
+                .query_row(
+                    "SELECT pty_child_pid, pty_child_start, survivors FROM agent_state \
+                     WHERE agent_id = ?1",
+                    [id],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<i64>>(0)?,
+                            r.get::<_, Option<i64>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(internal)?;
+            let row = engine_row(&conn, id)
+                .map_err(internal)?
+                .ok_or_else(|| unknown_agent(id))?;
+            (state, row)
+        };
+        let (pid, start, json) = state.unwrap_or((None, None, None));
+        let (stored, unreadable) = match ops::parse_survivors(json.as_deref()) {
+            Ok(s) => (s, None),
+            Err(why) if force => (ops::Survivors::default(), Some(why)),
+            Err(why) => return self.audit_orphan(id, principal, &why, None, false),
+        };
+        let mut ids: Vec<super::driver::ChildId> = stored.list.iter().map(|s| s.id()).collect();
+        if let (Some(pid), Some(start)) = (pid, start) {
+            ids.insert(
+                0,
+                super::driver::ChildId {
+                    pid: pid as libc::pid_t,
+                    start: start as u64,
+                },
+            );
+        }
+        let mut failed = None;
+        if let Some((&child, others)) = ids.split_first() {
+            let killer = lock(&self.orphan_killer).clone();
+            if let Err(e) = killer(child, others) {
+                let why = format!(
+                    "{}: pid {} start {}: {}",
+                    ops::KILL_UNCONFIRMED,
+                    child.pid,
+                    child.start,
+                    e
+                );
+                failed = Some((why, super::pty::survivors(&e)));
+            }
+        }
+        if force {
+            let mut why = vec!["forced retire".to_string()];
+            why.extend(unreadable);
+            if let Some((w, left)) = &failed {
+                why.push(format!("{} ({} left)", w, left.len()));
+            }
+            if stored.overflow {
+                why.push(format!(
+                    "{}: unrecorded processes may run",
+                    ops::SURVIVORS_OVERFLOW
+                ));
+            }
+            return self.retire_row(id, row.generation, principal, Some(why.join("; ")));
+        }
+        if let Some((why, left)) = failed {
+            return self.audit_orphan(id, principal, &why, Some(left), stored.overflow);
+        }
+        if stored.overflow {
+            let why = format!(
+                "{}: the recorded processes are gone, but more were never recorded; \
+                 retire with force to end it",
+                ops::SURVIVORS_OVERFLOW
+            );
+            return self.audit_orphan(id, principal, &why, Some(Vec::new()), true);
+        }
+        self.retire_row(id, row.generation, principal, None)
+    }
+
+    /// The audit row of a retire that left the agent `orphaned`, in one
+    /// transaction with what is still `left`, when the kill said, and the
+    /// reason that matches (`ops::record_survivors`; `overflow` is the
+    /// stored one). Returns the row.
+    fn audit_orphan(
+        &self,
+        id: &str,
+        principal: &str,
+        why: &str,
+        left: Option<Vec<super::pty::Survivor>>,
+        overflow: bool,
+    ) -> Result<AgentRow, ApiError> {
+        let (id2, principal, mut why) = (id.to_string(), principal.to_string(), why.to_string());
+        let machine = self.db.machine_id().to_string();
+        let row = self
+            .db
+            .write_blocking(move |tx| {
+                if let Some(left) = &left {
+                    if let Some(note) = ops::record_survivors(tx, &machine, &id2, left, overflow)? {
+                        why = format!("{}; {}", why, note);
+                    }
+                }
+                audit::append(
+                    tx,
+                    now_ms(),
+                    &AuditEntry {
+                        principal: &principal,
+                        method: "agent.retire",
+                        target: Some(&id2),
+                        decision: ops::ORPHANED,
+                        reason: Some(&why),
+                        ..Default::default()
+                    },
+                )?;
+                engine_row(tx, &id2)
+            })
+            .map_err(internal)?
+            .0;
+        row.ok_or_else(|| unknown_agent(id))
+    }
+
+    /// `agent.resume` (D4): resume a `paused` or `interrupted` agent now,
+    /// also one whose last resume failed (`resume_failed`). The same steps
+    /// as a boot resume; answers once the agent is `ready`, or with the
+    /// failure, which puts the row back with `resume_failed` so it can be
+    /// tried again. An agent with a supervisor or an open op is refused:
+    /// one session never runs twice.
+    pub async fn resume(
+        self: &Arc<Self>,
+        principal: &Principal,
+        params: serde_json::Value,
+    ) -> Result<AgentRow, ApiError> {
+        local_only(principal, "agent.resume")?;
+        let p: AgentResumeParams = parse(params, "agent.resume")?;
+        if self.drain.on() {
+            return Err(draining());
+        }
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(stopping());
+        }
+        let not_resumable = |why: String| {
+            ApiError::new(
+                ErrorCode::ActionFailed,
+                format!("{} cannot be resumed: {}", p.id, why),
+            )
+        };
+        // Until the supervisor is registered (P1-4, P2). Taken: another
+        // resume or a retire of it runs now.
+        let Ok(step) = self.step(&p.id).try_lock_owned() else {
+            return Err(not_resumable(
+                "a resume or retire of it is in progress".into(),
+            ));
+        };
+        if lock(&self.live).contains_key(&p.id) {
+            return Err(not_resumable("it runs in this engine".into()));
+        }
+        let (sp, id) = (self.clone(), p.id.clone());
+        let r = blocking(move || {
+            let conn = sp.db.pooled_reader().map_err(internal)?;
+            let row = engine_row(&conn, &id)
+                .map_err(internal)?
+                .ok_or_else(|| unknown_agent(&id))?;
+            let r = sp.resumables(Some(&id)).map_err(internal)?.pop();
+            Ok((row, r))
+        })
+        .await?;
+        let (row, r) = r;
+        let Some(r) = r else {
+            let state = row.state.as_deref().unwrap_or("none");
+            let why = match state {
+                "orphaned" => "it is orphaned: its process may still run".to_string(),
+                _ => format!("it is {}, not paused or interrupted", state),
+            };
+            return Err(not_resumable(why));
+        };
+        let sp = self.clone();
+        let r2 = r.clone();
+        let start = blocking(move || sp.resume_plan(&r2).map_err(not_resumable_plain)).await?;
+        let reason = if r.reason.as_deref() == Some(drain::REASON_DRAIN) {
+            GenReason::EngineRestart
+        } else {
+            GenReason::Resume
+        };
+        let (machine, s2, state, who) = (
+            self.db.machine_id().to_string(),
+            start.clone(),
+            r.state.clone(),
+            principal.to_string(),
+        );
+        let (gen, _) = self
+            .db
+            .write(move |tx| write_resume(tx, &machine, &s2, &state, reason, &who))
+            .await
+            .map_err(internal)?;
+        let Some(gen) = gen else {
+            return Err(not_resumable(
+                "its state changed, or a create or resume of it is open".into(),
+            ));
+        };
+        remove_settings(&self.config.home, &r.id, gen - 1);
+        let (reply, answer) = oneshot::channel();
+        self.supervise(Start { gen, ..start }, reply)?;
+        drop(step);
+        answer
+            .await
+            .map_err(|_| internal("the agent's supervisor ended without an answer"))?
+    }
+
     pub fn resume_on_boot(self: &Arc<Self>) -> Result<Resumed, String> {
         let mut done = Resumed::default();
-        for r in self.resumables()? {
+        for r in self.resumables(None)? {
             if self.drain.on() {
                 done.left.push(r.id);
                 continue;
             }
+            // A retire or `agent.resume` of it runs: leave it to them.
+            let Ok(_step) = self.step(&r.id).try_lock_owned() else {
+                done.left.push(r.id);
+                continue;
+            };
             let start = match self.resume_plan(&r) {
                 Ok(s) => s,
                 Err(why) => {
@@ -1942,9 +2353,9 @@ impl Spawner {
                 start.clone(),
                 r.state.clone(),
             );
-            let (gen, _) = self
-                .db
-                .write_blocking(move |tx| write_resume(tx, &machine, &s2, &state, reason))?;
+            let (gen, _) = self.db.write_blocking(move |tx| {
+                write_resume(tx, &machine, &s2, &state, reason, audit::SYSTEM)
+            })?;
             let Some(gen) = gen else {
                 continue;
             };
@@ -1962,30 +2373,39 @@ impl Spawner {
         Ok(done)
     }
 
-    /// The engine agents a boot resume picks up, by id.
-    fn resumables(&self) -> Result<Vec<Resumable>, String> {
-        let conn = self.db.reader()?;
+    /// The engine agents a boot resume picks up, by id: `paused(drain)`
+    /// and `interrupted`, except a failed resume's (D4: only `agent.resume`
+    /// tries it again). With `only`, that agent if it is `paused` or
+    /// `interrupted` for any reason (`agent.resume`).
+    fn resumables(&self, only: Option<&str>) -> Result<Vec<Resumable>, String> {
+        let conn = self.db.pooled_reader()?;
         let fail = |e: rusqlite::Error| format!("Failed to read the agents to resume: {}", e);
         let mut st = conn
             .prepare(
                 "SELECT id, state, state_reason, provider, provider_sid, cwd, resume_argv \
                  FROM agents WHERE source = 'engine' AND control = 'pty' AND gone_at IS NULL \
-                 AND ((state = 'paused' AND state_reason = ?1) OR state = 'interrupted') \
+                 AND CASE WHEN ?3 IS NULL \
+                 THEN (state = 'paused' AND state_reason = ?1) \
+                 OR (state = 'interrupted' AND state_reason IS NOT ?2) \
+                 ELSE id = ?3 AND state IN ('paused', 'interrupted') END \
                  ORDER BY id",
             )
             .map_err(fail)?;
         let rows = st
-            .query_map([drain::REASON_DRAIN], |r| {
-                Ok(Resumable {
-                    id: r.get(0)?,
-                    state: r.get(1)?,
-                    reason: r.get(2)?,
-                    provider: r.get(3)?,
-                    sid: r.get(4)?,
-                    cwd: r.get(5)?,
-                    argv: r.get(6)?,
-                })
-            })
+            .query_map(
+                params![drain::REASON_DRAIN, ops::RESUME_FAILED, only],
+                |r| {
+                    Ok(Resumable {
+                        id: r.get(0)?,
+                        state: r.get(1)?,
+                        reason: r.get(2)?,
+                        provider: r.get(3)?,
+                        sid: r.get(4)?,
+                        cwd: r.get(5)?,
+                        argv: r.get(6)?,
+                    })
+                },
+            )
             .map_err(fail)?;
         rows.collect::<rusqlite::Result<_>>().map_err(fail)
     }
@@ -2041,8 +2461,15 @@ impl Spawner {
         })
     }
 
-    /// The retire transaction. Blocking.
-    fn retire_row(&self, id: &str, gen: i64, principal: &str) -> Result<AgentRow, ApiError> {
+    /// The retire transaction, with the audit row of a forced retire
+    /// (`forced`: why) in it. Blocking.
+    fn retire_row(
+        &self,
+        id: &str,
+        gen: i64,
+        principal: &str,
+        forced: Option<String>,
+    ) -> Result<AgentRow, ApiError> {
         let (machine, id2, principal) = (
             self.db.machine_id().to_string(),
             id.to_string(),
@@ -2050,7 +2477,23 @@ impl Spawner {
         );
         let row = self
             .db
-            .write_blocking(move |tx| retire_tx(tx, &machine, &id2, &principal))
+            .write_blocking(move |tx| {
+                if let Some(why) = &forced {
+                    audit::append(
+                        tx,
+                        now_ms(),
+                        &AuditEntry {
+                            principal: &principal,
+                            method: "agent.retire",
+                            target: Some(&id2),
+                            decision: ops::FORCED,
+                            reason: Some(why),
+                            ..Default::default()
+                        },
+                    )?;
+                }
+                retire_tx(tx, &machine, &id2, &principal)
+            })
             .map_err(internal)?
             .0;
         remove_settings(&self.config.home, id, gen);
@@ -2064,12 +2507,28 @@ impl Spawner {
         principal: &Principal,
         params: serde_json::Value,
     ) -> Result<AgentRow, ApiError> {
+        // `force` ends what no kill can confirm: the local client only. The
+        // dispatch already refuses `agent.retire` to every other principal
+        // (`not_allowed`); this holds for a caller that skips it.
+        if params.get("force").and_then(|f| f.as_bool()) == Some(true)
+            && !matches!(principal, Principal::LocalUnverified)
+        {
+            return Err(ApiError::new(
+                ErrorCode::PeerNotAuthorized,
+                format!("{} may not force agent.retire", principal),
+            ));
+        }
         local_only(principal, "agent.retire")?;
         let p: AgentRetireParams = parse(params, "agent.retire")?;
+        let force = p.force == Some(true);
+        // For the whole retire (P1-4): a create or resume of it has
+        // registered its supervisor before this goes on, and none starts
+        // until the retire is done.
+        let step = self.step(&p.id).lock_owned().await;
         let row = {
             let (db, id) = (self.db.clone(), p.id.clone());
             blocking(move || {
-                let conn = db.reader().map_err(internal)?;
+                let conn = db.pooled_reader().map_err(internal)?;
                 engine_row(&conn, &id).map_err(internal)
             })
             .await?
@@ -2079,19 +2538,28 @@ impl Spawner {
             return Ok(row);
         }
         if let Some(r) = self.retire_live(&p.id, principal).await {
+            self.forget_retired(&p.id, &r, &step);
             return r;
         }
-        // No supervisor: the agent runs nowhere, or its create is between
-        // the row and `supervise`. The tombstone closes the create op, so
-        // that supervisor spawns nothing or kills what it spawned; one
-        // that registered meanwhile is told to kill it here.
+        // No supervisor: the agent runs nowhere in this engine, and none
+        // can start while the step is held.
         let sp = self.clone();
         let (id, principal_s) = (p.id.clone(), principal.to_string());
-        let r = blocking(move || sp.retire_row(&id, row.generation, &principal_s)).await;
-        if r.is_ok() {
-            self.retire_live(&p.id, principal).await;
-        }
+        let r = blocking(move || sp.retire_idle(&id, row.generation, &principal_s, force)).await;
+        self.forget_retired(&p.id, &r, &step);
         r
+    }
+
+    /// After a retire: forget the step lock of a tombstone.
+    fn forget_retired(
+        &self,
+        id: &str,
+        r: &Result<AgentRow, ApiError>,
+        step: &tokio::sync::OwnedMutexGuard<()>,
+    ) {
+        if matches!(r, Ok(row) if row.state.as_deref() == Some("retired")) {
+            self.forget_step(id, step);
+        }
     }
 
     /// Hand the retire of `id` to its supervisor, if it runs here. `None`
@@ -2132,12 +2600,6 @@ impl Spawner {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// A retire made the row a tombstone while the agent came up: the PTY goes.
-fn retired_meanwhile(mut driver: Box<dyn Driver>) -> Up {
-    let _ = driver.kill();
-    Up::Retired
 }
 
 /// Phase `pty` (see `Spawner::write_pty`). Writes nothing and returns
@@ -2208,16 +2670,29 @@ fn write_bound(tx: &mut Tx, machine: &str, s: &Start) -> rusqlite::Result<Option
 }
 
 /// Phase `row` of a resume: the next generation on the same session and
-/// transcript, the resume op, the audit row. `None` when the row is no
-/// longer `state` (a retire came first).
+/// transcript, the resume op, the audit row (by `principal`). `None` when
+/// the row is no longer `state` (a retire came first), or a create or
+/// resume op of the agent is still open.
 fn write_resume(
     tx: &mut Tx,
     machine: &str,
     s: &Start,
     state: &str,
     reason: GenReason,
+    principal: &str,
 ) -> rusqlite::Result<Option<i64>> {
     let now = now_ms();
+    // One create or resume of an agent at a time: two would run one
+    // session twice.
+    let open: i64 = tx.query_row(
+        "SELECT count(*) FROM ops WHERE kind IN (?1, ?2) AND done_at IS NULL \
+         AND json_extract(payload, '$.agentId') = ?3",
+        params![ops::KIND_CREATE, ops::KIND_RESUME, s.id],
+        |r| r.get(0),
+    )?;
+    if open > 0 {
+        return Ok(None);
+    }
     let old: Option<i64> = tx
         .query_row(
             "SELECT generation FROM agents WHERE id = ?1 AND source = 'engine' \
@@ -2261,7 +2736,7 @@ fn write_resume(
         tx,
         now,
         &AuditEntry {
-            principal: audit::SYSTEM,
+            principal,
             method: ops::KIND_RESUME,
             target: Some(&s.id),
             decision: "allow",
@@ -2585,6 +3060,16 @@ fn draining() -> ApiError {
     )
 }
 
+/// What a create or resume error adds when its kill was not confirmed.
+const ORPHANED_TEXT: &str = "the kill could not be confirmed; the agent is orphaned";
+
+fn not_resumable_plain(why: String) -> ApiError {
+    ApiError::new(
+        ErrorCode::ActionFailed,
+        format!("cannot be resumed: {}", why),
+    )
+}
+
 fn unknown_agent(id: &str) -> ApiError {
     ApiError::new(ErrorCode::UnknownAgent, format!("no engine agent {:?}", id))
 }
@@ -2605,6 +3090,7 @@ mod tests {
     use crate::engine::driver::{ChildId, KillReport, Output, ScreenSnapshot};
     use crate::engine::home::sock_path;
     use crate::engine::peer;
+    use crate::engine::pty::{Orphan, Survivor, Unconfirmed};
     use std::collections::VecDeque;
     use std::ffi::OsString;
     use std::os::unix::process::ExitStatusExt;
@@ -2815,7 +3301,15 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
             if self.kill_fails.load(Ordering::SeqCst) {
-                return Err(io::Error::other("still alive after SIGKILL"));
+                let left = vec![crate::engine::pty::Survivor {
+                    pid: self.child.pid,
+                    start: self.child.start,
+                    pgid: self.child.pid,
+                }];
+                return Err(io::Error::other(crate::engine::pty::Unconfirmed::new(
+                    left,
+                    "the fake child",
+                )));
             }
             if !self.exited {
                 self.kills.fetch_add(1, Ordering::SeqCst);
@@ -3470,13 +3964,15 @@ mod tests {
     async fn phase_writes_after_a_retire_write_nothing() {
         let e = setup(Script::Ready, None);
         let s = row_only(&e).await;
-        e.sp.retire_row(&s.id, s.gen, "local-unverified").unwrap();
+        e.sp.retire_row(&s.id, s.gen, "local-unverified", None)
+            .unwrap();
         let child = ChildId { pid: 7, start: 1 };
         assert_eq!(e.sp.write_pty(&s, child), Ok(false));
         assert_eq!(agent_state_rows(&e.db), 0);
         let s2 = row_only(&e).await;
         assert_eq!(e.sp.write_pty(&s2, child), Ok(true));
-        e.sp.retire_row(&s2.id, s2.gen, "local-unverified").unwrap();
+        e.sp.retire_row(&s2.id, s2.gen, "local-unverified", None)
+            .unwrap();
         assert_eq!(e.sp.write_bound(&s2), Ok(None));
         for id in [&s.id, &s2.id] {
             assert_eq!(row(&e.db, id).state.as_deref(), Some("retired"));
@@ -4144,31 +4640,31 @@ mod tests {
         sp2.shutdown();
     }
 
-    /// D28 Q7 on resume: a usage-limit screen before ready ends the row
-    /// `failed` with `resume_failed` and the vendor's text, after exactly
-    /// one attempt. No later boot tries it again.
+    /// D28 Q7 on resume: a usage-limit screen before ready puts the row
+    /// back to `paused` with `resume_failed` and audits the vendor's text,
+    /// after exactly one attempt. No later boot tries it again (D4: only
+    /// `agent.resume` does).
     #[tokio::test]
     async fn a_vendor_refusal_on_resume_is_resume_failed_with_one_attempt() {
         let e = setup(Script::Ready, None);
         let r = drained_agent(&e).await;
         let (_, l2, sp2) = next_engine(&e, Script::Refuse, None);
         assert_eq!(sp2.resume_on_boot().unwrap().started, [r.id.clone()]);
-        wait_for("failed", || {
-            row(&e.db, &r.id).state.as_deref() == Some("failed")
+        wait_for("resume_failed", || {
+            row(&e.db, &r.id).state_reason.as_deref() == Some(ops::RESUME_FAILED)
         });
         no_supervisors(&sp2);
         assert_eq!(l2.spawns.load(Ordering::SeqCst), 1);
         let got = row(&e.db, &r.id);
-        assert_eq!(got.state_reason.as_deref(), Some(ops::RESUME_FAILED));
-        assert!(got.gone_at.is_some());
+        assert_eq!(got.state.as_deref(), Some("paused"));
+        assert_eq!(got.gone_at, None);
         assert_eq!(gens(&e.db, &r.id).1, 0);
-        let failed = events(&e.db, "agent.failed");
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0]["reason"], ops::RESUME_FAILED);
-        assert!(failed[0]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("Claude usage limit reached"));
+        // The agent did not fail; its resume did. The reason is on the
+        // row, the vendor's text in the audit.
+        assert!(events(&e.db, "agent.failed").is_empty());
+        let why = audit_reasons(&e.db, ops::KIND_RESUME, "failed");
+        assert_eq!(why.len(), 1);
+        assert!(why[0].contains("Claude usage limit reached"), "{:?}", why);
         assert_eq!(
             ops_for(&e.db, &r.id)[1],
             (
@@ -4207,14 +4703,10 @@ mod tests {
             no_supervisors(&sp2);
             assert_eq!(l2.spawns.load(Ordering::SeqCst), 1, "{:?}", script);
             let got = row(&e.db, &r.id);
-            assert_eq!(got.state.as_deref(), Some("failed"), "{:?}", script);
+            assert_eq!(got.state.as_deref(), Some("paused"), "{:?}", script);
             assert_eq!(got.state_reason.as_deref(), Some(ops::RESUME_FAILED));
-            let failed = events(&e.db, "agent.failed");
-            assert!(
-                failed[0]["detail"].as_str().unwrap().contains(text),
-                "{:?}",
-                failed
-            );
+            let why = audit_reasons(&e.db, ops::KIND_RESUME, "failed");
+            assert!(why[0].contains(text), "{:?}", why);
         }
     }
 
@@ -4301,9 +4793,10 @@ mod tests {
     }
 
     /// A resume cut while the engine dies (no supervisor to undo it) is
-    /// failed by boot reconcile, and the next boot does not try again.
+    /// `resume_failed` by boot reconcile, and the next boot does not try
+    /// again.
     #[tokio::test]
-    async fn a_resume_cut_by_a_crash_is_failed_by_reconcile() {
+    async fn a_resume_cut_by_a_crash_is_resume_failed_by_reconcile() {
         let e = setup(Script::Ready, None);
         let r = drained_agent(&e).await;
         let (_, l2, sp2) = next_engine(&e, Script::Hang, None);
@@ -4316,10 +4809,13 @@ mod tests {
         l2.kill_fails.store(true, Ordering::SeqCst);
         sp2.shutdown();
         let done = ops::reconcile(&e.db, &e.home).unwrap();
-        assert_eq!(done.failed, std::slice::from_ref(&r.id));
+        assert_eq!(done.resume_failed, std::slice::from_ref(&r.id));
         let got = row(&e.db, &r.id);
-        assert_eq!(got.state.as_deref(), Some("failed"));
+        // It was `starting`: the engine stopped while it ran.
+        assert_eq!(got.state.as_deref(), Some("interrupted"));
         assert_eq!(got.state_reason.as_deref(), Some(ops::RESUME_FAILED));
+        assert_eq!(got.gone_at, None);
+        assert_eq!(agent_state_rows(&e.db), 0);
         let (_, l3, sp3) = next_engine(&e, Script::Ready, None);
         assert_eq!(sp3.resume_on_boot().unwrap(), Resumed::default());
         assert_eq!(l3.spawns.load(Ordering::SeqCst), 0);
@@ -5262,6 +5758,973 @@ mod tests {
         ));
         assert_eq!(mail_of(&e.db, &id).0, "delivering");
         assert!(sent(&e).is_empty());
+    }
+
+    /// The audit `reason` of every row with `method` and `decision`, in
+    /// order.
+    fn audit_reasons(db: &Db, method: &str, decision: &str) -> Vec<String> {
+        let conn = db.reader().unwrap();
+        let mut st = conn
+            .prepare(
+                "SELECT coalesce(reason, '') FROM audit WHERE method = ?1 AND decision = ?2 \
+                 ORDER BY rowid",
+            )
+            .unwrap();
+        let rows = st
+            .query_map(params![method, decision], |r| r.get::<_, String>(0))
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// A real test process in a new process group, as a PTY child is, and
+    /// its id once it printed `ready`. `script` must `echo ready`.
+    fn test_process(script: &str) -> (std::process::Child, ChildId) {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
+        let pid = child.id() as libc::pid_t;
+        let start = super::super::peer::proc_info(pid).unwrap().start;
+        (child, ChildId { pid, start })
+    }
+
+    /// A ready agent whose engine stopped, with `child` as its recorded
+    /// PTY child, as boot reconcile finds it.
+    async fn stopped_agent_with(e: &Env, child: ChildId) -> AgentRow {
+        let r =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap();
+        e.sp.shutdown();
+        let id = r.id.clone();
+        e.db.write_blocking(move |tx| {
+            tx.execute(
+                "UPDATE agent_state SET pty_child_pid = ?2, pty_child_start = ?3 \
+                 WHERE agent_id = ?1",
+                params![id, child.pid as i64, child.start as i64],
+            )
+        })
+        .unwrap();
+        r
+    }
+
+    /// D2: boot reconcile kills a recorded child that ends on SIGTERM and
+    /// confirms it before the row becomes `interrupted`.
+    #[tokio::test]
+    async fn reconcile_confirms_a_kill_before_it_marks_the_row() {
+        let e = setup(Script::Ready, None);
+        let (mut proc, child) = test_process("echo ready; exec sleep 30");
+        let r = stopped_agent_with(&e, child).await;
+        let done = ops::reconcile(&e.db, &e.home).unwrap();
+        assert_eq!(done.killed, 1);
+        assert_eq!(done.interrupted, std::slice::from_ref(&r.id));
+        assert!(proc.try_wait().unwrap().is_some(), "the process still runs");
+        assert_eq!(row(&e.db, &r.id).state.as_deref(), Some("interrupted"));
+    }
+
+    /// D2: a child that ignores SIGTERM gets SIGKILL once `KILL_GRACE`
+    /// passes; its exit is confirmed, and the row is `interrupted`.
+    #[tokio::test]
+    async fn reconcile_escalates_to_sigkill_and_confirms_the_exit() {
+        use std::os::unix::process::ExitStatusExt;
+        let e = setup(Script::Ready, None);
+        let (mut proc, child) =
+            test_process("trap '' TERM; echo ready; while :; do sleep 0.05; done");
+        let r = stopped_agent_with(&e, child).await;
+        let t0 = Instant::now();
+        let done = ops::reconcile(&e.db, &e.home).unwrap();
+        assert!(t0.elapsed() >= super::super::driver::KILL_GRACE);
+        assert_eq!(done.killed, 1);
+        assert!(done.kill_errors.is_empty(), "{:?}", done.kill_errors);
+        let status = proc.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert_eq!(row(&e.db, &r.id).state.as_deref(), Some("interrupted"));
+    }
+
+    /// D2: a recorded pid that now runs another process (another start
+    /// time) is never signalled; the row is reconciled as gone.
+    #[tokio::test]
+    async fn reconcile_never_signals_a_reused_pid() {
+        let e = setup(Script::Ready, None);
+        let (mut proc, child) = test_process("echo ready; exec sleep 30");
+        let stale = ChildId {
+            start: child.start + 1,
+            ..child
+        };
+        let r = stopped_agent_with(&e, stale).await;
+        let done = ops::reconcile(&e.db, &e.home).unwrap();
+        assert_eq!((done.killed, done.pid_reused), (0, 1));
+        assert_eq!(done.interrupted, std::slice::from_ref(&r.id));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(proc.try_wait().unwrap().is_none(), "a reused pid was hit");
+        proc.kill().unwrap();
+        proc.wait().unwrap();
+    }
+
+    /// D2: a kill boot reconcile cannot confirm leaves the row `orphaned`
+    /// with its PTY child and an audit row. It is never resumed, and
+    /// `agent.resume` refuses it.
+    #[tokio::test]
+    async fn an_unconfirmed_reconcile_kill_orphans_the_agent() {
+        let e = setup(Script::Ready, None);
+        let child = ChildId {
+            pid: 1_999_999_999,
+            start: 7,
+        };
+        let r = stopped_agent_with(&e, child).await;
+        let fails: &ops::Killer = &|_, _| Err(io::Error::other("still alive after SIGKILL"));
+        let done = ops::reconcile_with(&e.db, &e.home, fails).unwrap();
+        assert_eq!(done.orphaned, std::slice::from_ref(&r.id));
+        assert!(done.interrupted.is_empty());
+        let got = row(&e.db, &r.id);
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        assert_eq!(got.state_reason.as_deref(), Some(ops::KILL_UNCONFIRMED));
+        assert_eq!(got.gone_at, None);
+        assert_eq!(agent_state_rows(&e.db), 1);
+        let why = audit_reasons(&e.db, "engine.reconcile", ops::ORPHANED);
+        assert_eq!(why.len(), 1);
+        assert!(why[0].contains("pid 1999999999 start 7"), "{:?}", why);
+        // Not resumable: not by boot, not by reconcile, not by hand.
+        assert!(ops::reconcile_with(&e.db, &e.home, fails)
+            .unwrap()
+            .is_empty());
+        let (_, l2, sp2) = next_engine(&e, Script::Ready, None);
+        assert_eq!(sp2.resume_on_boot().unwrap(), Resumed::default());
+        let err = sp2
+            .resume(
+                &Principal::LocalUnverified,
+                serde_json::json!({ "id": r.id }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        assert!(err.msg.contains("orphaned"), "{}", err.msg);
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 0);
+    }
+
+    /// D2: a retire whose kill cannot be confirmed answers with the
+    /// `orphaned` row, not a tombstone. A second retire kills again by pid
+    /// and start time: still unconfirmed, it stays `orphaned` and is
+    /// audited; confirmed, the row is the tombstone.
+    #[tokio::test]
+    async fn a_retire_with_an_unconfirmed_kill_orphans_then_retires() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let r = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        e.launcher.kill_fails.store(true, Ordering::SeqCst);
+        let id = serde_json::json!({ "id": r.id });
+        let got = e.sp.retire(&l, id.clone()).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        assert_eq!(got.gone_at, None);
+        no_supervisors(&e.sp);
+        assert_eq!(agent_state_rows(&e.db), 1);
+        assert_eq!(audit_reasons(&e.db, "agent.retire", ops::ORPHANED).len(), 1);
+        let err = e.sp.resume(&l, id.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        e.sp.set_orphan_killer(Arc::new(|_, _| Err(io::Error::other("still alive"))));
+        let got = e.sp.retire(&l, id.clone()).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        assert_eq!(audit_reasons(&e.db, "agent.retire", ops::ORPHANED).len(), 2);
+        e.sp.set_orphan_killer(Arc::new(|_, _| Ok(Orphan::Killed)));
+        let got = e.sp.retire(&l, id).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        assert!(got.gone_at.is_some());
+        assert_eq!(agent_state_rows(&e.db), 0);
+    }
+
+    /// D2: a create that fails after the spawn and cannot confirm the kill
+    /// ends `orphaned`, not `failed`, and says so.
+    #[tokio::test]
+    async fn a_failed_create_with_an_unconfirmed_kill_is_orphaned() {
+        let e = setup(Script::Refuse, None);
+        e.launcher.kill_fails.store(true, Ordering::SeqCst);
+        let err =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::SpawnFailed);
+        assert!(err.msg.contains("orphaned"), "{}", err.msg);
+        let got = only_row(&e.db);
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        assert_eq!(ops_of(&e.db)[0].2.as_deref(), Some(ops::ORPHANED));
+    }
+
+    /// D4: a failed resume can be tried again with `agent.resume`, which
+    /// answers once the agent is ready and clears the reason.
+    #[tokio::test]
+    async fn agent_resume_succeeds_after_a_failed_resume() {
+        let e = setup(Script::Ready, None);
+        let r = drained_agent(&e).await;
+        let (_, _, sp2) = next_engine(&e, Script::Refuse, None);
+        sp2.resume_on_boot().unwrap();
+        no_supervisors(&sp2);
+        assert_eq!(
+            row(&e.db, &r.id).state_reason.as_deref(),
+            Some(ops::RESUME_FAILED)
+        );
+        let l = Principal::LocalUnverified;
+        let id = serde_json::json!({ "id": r.id });
+        // Still refused by the vendor: an error with its text, and the
+        // row is back as it was, ready for the next try.
+        let err = sp2.resume(&l, id.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::SpawnFailed);
+        assert!(err.msg.contains("usage limit"), "{}", err.msg);
+        no_supervisors(&sp2);
+        let got = row(&e.db, &r.id);
+        assert_eq!(got.state.as_deref(), Some("paused"));
+        assert_eq!(got.state_reason.as_deref(), Some(ops::RESUME_FAILED));
+        let (_, l3, sp3) = next_engine(&e, Script::Ready, None);
+        let got = sp3.resume(&l, id.clone()).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("ready"));
+        assert_eq!(got.state_reason, None);
+        assert_eq!(l3.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            audit_reasons(&e.db, ops::KIND_RESUME, "allow")
+                .last()
+                .map(String::as_str),
+            Some("resume from paused, generation 4")
+        );
+        // A running agent is not resumed again.
+        let err = sp3.resume(&l, id).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        assert_eq!(l3.spawns.load(Ordering::SeqCst), 1);
+        sp3.shutdown();
+    }
+
+    /// D4: `agent.resume` takes only a local client, in the authz table
+    /// and in the spawner.
+    #[tokio::test]
+    async fn agent_resume_is_refused_for_non_local_principals() {
+        let e = setup(Script::Ready, None);
+        let r = drained_agent(&e).await;
+        let a = Principal::Agent {
+            id: r.id.clone(),
+            gen: 1,
+        };
+        assert_eq!(
+            super::super::authz::authorize("agent.resume", &a, None)
+                .unwrap_err()
+                .code,
+            ErrorCode::NotAllowed
+        );
+        assert!(
+            super::super::authz::authorize("agent.resume", &Principal::LocalUnverified, None)
+                .is_ok()
+        );
+        let (_, l2, sp2) = next_engine(&e, Script::Ready, None);
+        let err = sp2
+            .resume(&a, serde_json::json!({ "id": r.id }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotAllowed);
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(row(&e.db, &r.id).state.as_deref(), Some("paused"));
+    }
+    /// D4: a boot never retries a failed resume. The row stays `paused`
+    /// with `resume_failed` until `agent.resume` or `agent.retire`.
+    #[tokio::test]
+    async fn boot_resume_skips_a_failed_resume() {
+        let e = setup(Script::Ready, None);
+        let r = drained_agent(&e).await;
+        let (_, _, sp2) = next_engine(&e, Script::Refuse, None);
+        sp2.resume_on_boot().unwrap();
+        no_supervisors(&sp2);
+        for _ in 0..2 {
+            let (_, l, sp) = next_engine(&e, Script::Ready, None);
+            assert_eq!(sp.resume_on_boot().unwrap(), Resumed::default());
+            assert_eq!(l.spawns.load(Ordering::SeqCst), 0);
+            let got = row(&e.db, &r.id);
+            assert_eq!(got.state.as_deref(), Some("paused"));
+            assert_eq!(got.state_reason.as_deref(), Some(ops::RESUME_FAILED));
+            assert_eq!(got.gone_at, None);
+        }
+    }
+
+    /// D2: an `orphaned` agent counts as live for the one-cwd rule. Only
+    /// `agent.retire` ends it: the kill goes to the recorded pid and start
+    /// time, here a test process, and is confirmed before the tombstone.
+    #[tokio::test]
+    async fn an_orphaned_agent_holds_its_cwd_until_retire_kills_it() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let r = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        e.launcher.kill_fails.store(true, Ordering::SeqCst);
+        let id = serde_json::json!({ "id": r.id });
+        let got = e.sp.retire(&l, id.clone()).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        no_supervisors(&e.sp);
+        let (mut proc, child) = test_process("echo ready; exec sleep 30");
+        let aid = r.id.clone();
+        e.db.write_blocking(move |tx| {
+            tx.execute(
+                "UPDATE agent_state SET pty_child_pid = ?2, pty_child_start = ?3 \
+                 WHERE agent_id = ?1",
+                params![aid, child.pid as i64, child.start as i64],
+            )
+        })
+        .unwrap();
+        let other = e.t.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let err = e.sp.create(&l, create_params(&other)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::CwdCollision);
+        assert!(err.msg.contains(&r.id), "{}", err.msg);
+        let err = e.sp.resume(&l, id.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        assert!(err.msg.contains("orphaned"), "{}", err.msg);
+        assert!(proc.try_wait().unwrap().is_none(), "resume signalled it");
+        // The default killer: pid and start time, SIGTERM, confirmed.
+        let got = e.sp.retire(&l, id).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        assert!(got.gone_at.is_some());
+        assert_eq!(proc.wait().unwrap().signal(), Some(libc::SIGTERM));
+        assert_eq!(agent_state_rows(&e.db), 0);
+        e.sp.create(&l, create_params(&other)).await.unwrap();
+    }
+
+    /// D2: the retire of an `orphaned` agent whose pid now runs another
+    /// process (another start time) never signals it.
+    #[tokio::test]
+    async fn retiring_an_orphan_never_signals_a_reused_pid() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let r = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        e.launcher.kill_fails.store(true, Ordering::SeqCst);
+        let id = serde_json::json!({ "id": r.id });
+        e.sp.retire(&l, id.clone()).await.unwrap();
+        no_supervisors(&e.sp);
+        let (mut proc, child) = test_process("echo ready; exec sleep 30");
+        let aid = r.id.clone();
+        e.db.write_blocking(move |tx| {
+            tx.execute(
+                "UPDATE agent_state SET pty_child_pid = ?2, pty_child_start = ?3 \
+                 WHERE agent_id = ?1",
+                params![aid, child.pid as i64, child.start as i64 + 1],
+            )
+        })
+        .unwrap();
+        let got = e.sp.retire(&l, id).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(proc.try_wait().unwrap().is_none(), "a reused pid was hit");
+        proc.kill().unwrap();
+        proc.wait().unwrap();
+    }
+
+    /// D4: a second `agent.resume` while the first is open fails with a
+    /// clear error, in the same engine (a supervisor) and in another one
+    /// (the row is no longer paused). One session never runs twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_agent_resume_while_one_is_open_is_refused() {
+        let e = setup(Script::Ready, None);
+        let r = drained_agent(&e).await;
+        let (_, l2, sp2) = next_engine(&e, Script::Hang, None);
+        let l = Principal::LocalUnverified;
+        let id = serde_json::json!({ "id": r.id });
+        let first = tokio::spawn({
+            let (sp2, id) = (sp2.clone(), id.clone());
+            async move { sp2.resume(&Principal::LocalUnverified, id).await }
+        });
+        let rid = r.id.clone();
+        let db = e.db.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("the resume spawned", || {
+                row(&db, &rid).state.as_deref() == Some("starting")
+            })
+        })
+        .await
+        .unwrap();
+        let err = sp2.resume(&l, id.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        assert!(err.msg.contains("runs in this engine"), "{}", err.msg);
+        let (_, l3, sp3) = next_engine(&e, Script::Ready, None);
+        let err = sp3.resume(&l, id.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        assert!(err.msg.contains("not paused or interrupted"), "{}", err.msg);
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(l3.spawns.load(Ordering::SeqCst), 0);
+        // A retire ends the first; it answers with an error.
+        sp2.retire(&l, id).await.unwrap();
+        assert!(first.await.unwrap().is_err());
+    }
+    /// P1-4: while a retire holds an agent's step, a resume of it fails at
+    /// once and a boot leaves it alone; nothing spawns.
+    #[tokio::test]
+    async fn a_resume_during_a_retire_of_the_agent_is_refused() {
+        let e = setup(Script::Ready, None);
+        let r = drained_agent(&e).await;
+        let (_, l2, sp2) = next_engine(&e, Script::Ready, None);
+        let held = sp2.step(&r.id).try_lock_owned().unwrap();
+        let l = Principal::LocalUnverified;
+        let id = serde_json::json!({ "id": r.id });
+        let err = sp2.resume(&l, id.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        assert!(err.msg.contains("in progress"), "{}", err.msg);
+        assert_eq!(sp2.resume_on_boot().unwrap().left, vec![r.id.clone()]);
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(row(&e.db, &r.id).state.as_deref(), Some("paused"));
+        drop(held);
+        let got = sp2.resume(&l, id).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("ready"));
+        sp2.shutdown();
+    }
+
+    /// P1-4: a retire waits while a resume holds the step (between its
+    /// checks and its supervisor), then finds the supervisor and answers
+    /// with the confirmed end: the tombstone, or the `orphaned` row when
+    /// the kill cannot be confirmed. The row is never tombstoned under a
+    /// running agent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retire_waits_for_a_resume_and_answers_with_the_confirmed_end() {
+        let e = setup(Script::Ready, None);
+        let r = drained_agent(&e).await;
+        let (_, l2, sp2) = next_engine(&e, Script::Hang, None);
+        let l = Principal::LocalUnverified;
+        let id = serde_json::json!({ "id": r.id });
+        let held = sp2.step(&r.id).try_lock_owned().unwrap();
+        let retire = tokio::spawn({
+            let (sp2, id) = (sp2.clone(), id.clone());
+            async move { sp2.retire(&Principal::LocalUnverified, id).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!retire.is_finished(), "the retire did not wait");
+        assert_eq!(row(&e.db, &r.id).state.as_deref(), Some("paused"));
+        drop(held);
+        let got = retire.await.unwrap().unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 0);
+
+        // A resume that registered: the retire goes through its
+        // supervisor, and an unconfirmed kill answers `orphaned`.
+        let e = setup(Script::Ready, None);
+        let r = drained_agent(&e).await;
+        let (_, l3, sp3) = next_engine(&e, Script::Hang, None);
+        let id = serde_json::json!({ "id": r.id });
+        let resume = tokio::spawn({
+            let (sp3, id) = (sp3.clone(), id.clone());
+            async move { sp3.resume(&Principal::LocalUnverified, id).await }
+        });
+        let (db, rid) = (e.db.clone(), r.id.clone());
+        tokio::task::spawn_blocking(move || {
+            wait_for("the resume spawned", || {
+                row(&db, &rid).state.as_deref() == Some("starting")
+            })
+        })
+        .await
+        .unwrap();
+        l3.kill_fails.store(true, Ordering::SeqCst);
+        let got = sp3.retire(&l, id).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        assert_eq!(got.gone_at, None);
+        assert_eq!(agent_state_rows(&e.db), 1);
+        assert!(resume.await.unwrap().is_err());
+    }
+
+    /// P2: two resumes at once spawn the agent once; the other fails with
+    /// a clear error. Repeated, as the race is timing-dependent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_resumes_spawn_once() {
+        for _ in 0..10 {
+            let e = setup(Script::Ready, None);
+            let r = drained_agent(&e).await;
+            let (_, l2, sp2) = next_engine(&e, Script::Ready, None);
+            let go = |sp: Arc<Spawner>, id: String| {
+                tokio::spawn(async move {
+                    sp.resume(&Principal::LocalUnverified, serde_json::json!({ "id": id }))
+                        .await
+                })
+            };
+            let (a, b) = (go(sp2.clone(), r.id.clone()), go(sp2.clone(), r.id.clone()));
+            let results = [a.await.unwrap(), b.await.unwrap()];
+            assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+            let err = results.into_iter().find_map(Result::err).unwrap();
+            assert_eq!(err.code, ErrorCode::ActionFailed, "{}", err.msg);
+            assert_eq!(l2.spawns.load(Ordering::SeqCst), 1);
+            assert_eq!(sp2.live_count(), 1);
+            sp2.shutdown();
+        }
+    }
+
+    /// P2: a supervisor's cleanup removes only its own generation's entry,
+    /// never a newer supervisor of the same agent.
+    #[test]
+    fn a_supervisor_cleanup_never_removes_a_newer_supervisor() {
+        let e = setup(Script::Ready, None);
+        let (cmds, _rx) = mpsc::channel();
+        let thread = std::thread::spawn(|| {});
+        lock(&e.sp.live).insert(
+            "agt_x".into(),
+            Handle {
+                cmds,
+                thread,
+                gen: 5,
+            },
+        );
+        e.sp.release_live("agt_x", 4);
+        assert_eq!(e.sp.live_count(), 1);
+        e.sp.release_live("agt_x", 5);
+        assert_eq!(e.sp.live_count(), 0);
+    }
+    /// The stored survivors of `id`, as JSON.
+    fn survivors_json(db: &Db, id: &str) -> Option<String> {
+        db.reader()
+            .unwrap()
+            .query_row(
+                "SELECT survivors FROM agent_state WHERE agent_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// An `orphaned` agent whose recorded PTY child is gone (a pid no
+    /// process has) and whose stored survivors are `json`.
+    async fn orphan_with_survivors(e: &Env, json: &str) -> AgentRow {
+        let l = Principal::LocalUnverified;
+        let r = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        e.launcher.kill_fails.store(true, Ordering::SeqCst);
+        let got =
+            e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+                .await
+                .unwrap();
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        no_supervisors(&e.sp);
+        let (id, json) = (r.id.clone(), json.to_string());
+        e.db.write_blocking(move |tx| {
+            tx.execute(
+                "UPDATE agent_state SET pty_child_pid = 1999999999, pty_child_start = 7, \
+                 survivors = ?2 WHERE agent_id = ?1",
+                params![id, json],
+            )
+        })
+        .unwrap();
+        r
+    }
+
+    fn survivor(child: ChildId) -> Survivor {
+        Survivor {
+            pid: child.pid,
+            start: child.start,
+            pgid: child.pid,
+        }
+    }
+
+    /// One survivor, in the stored form.
+    fn survivor_json(child: ChildId) -> String {
+        serde_json::json!({ "v": 1, "overflow": false, "list": [survivor(child)] }).to_string()
+    }
+
+    /// P1-3: an unconfirmed kill stores what it left in the same
+    /// transaction as `orphaned`.
+    #[tokio::test]
+    async fn an_unconfirmed_kill_stores_its_survivors() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let r = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        e.launcher.kill_fails.store(true, Ordering::SeqCst);
+        e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+            .await
+            .unwrap();
+        let stored = ops::parse_survivors(survivors_json(&e.db, &r.id).as_deref()).unwrap();
+        assert!(!stored.overflow);
+        let left = stored.list;
+        assert_eq!(left.len(), 1);
+        assert!(left[0].pid >= 2_000_000_000, "{:?}", left);
+    }
+
+    /// A kill that cannot end anything: what still runs is left. Each
+    /// call's processes go to `asked`.
+    fn killer_that_cannot_kill(asked: Arc<Mutex<Vec<Vec<ChildId>>>>) -> Arc<ops::Killer> {
+        Arc::new(move |c: ChildId, others: &[ChildId]| {
+            let mut all = vec![c];
+            all.extend_from_slice(others);
+            lock(&asked).push(all.clone());
+            let alive: Vec<Survivor> = all
+                .iter()
+                .filter(|c| {
+                    crate::engine::peer::proc_entry(c.pid)
+                        .is_some_and(|p| p.info.start == c.start && !p.zombie)
+                })
+                .map(|c| Survivor {
+                    pid: c.pid,
+                    start: c.start,
+                    pgid: c.pid,
+                })
+                .collect();
+            if alive.is_empty() {
+                Ok(Orphan::Gone)
+            } else {
+                Err(io::Error::other(Unconfirmed::new(alive, "test")))
+            }
+        })
+    }
+
+    /// P1-3: the recorded PTY child is gone but a survivor still runs: the
+    /// retire keeps the row `orphaned` and the cwd held. Once the survivor
+    /// has exited, the retire makes the tombstone.
+    #[tokio::test]
+    async fn a_live_survivor_keeps_the_row_orphaned_until_it_is_gone() {
+        let e = setup(Script::Ready, None);
+        let (mut proc, child) = test_process("trap '' TERM; echo ready; exec sleep 30");
+        let r = orphan_with_survivors(&e, &survivor_json(child)).await;
+        let asked: Arc<Mutex<Vec<Vec<ChildId>>>> = Arc::default();
+        e.sp.set_orphan_killer(killer_that_cannot_kill(asked.clone()));
+        let l = Principal::LocalUnverified;
+        let id = serde_json::json!({ "id": r.id });
+        let got = e.sp.retire(&l, id.clone()).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        assert_eq!(got.gone_at, None);
+        let stored = ops::parse_survivors(survivors_json(&e.db, &r.id).as_deref()).unwrap();
+        assert_eq!(stored.list, vec![survivor(child)]);
+        assert!(!stored.overflow);
+        assert_eq!(
+            lock(&asked)[0],
+            vec![
+                ChildId {
+                    pid: 1_999_999_999,
+                    start: 7
+                },
+                child
+            ]
+        );
+        let other = e.t.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let err = e.sp.create(&l, create_params(&other)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::CwdCollision);
+        proc.kill().unwrap();
+        proc.wait().unwrap();
+        let got = e.sp.retire(&l, id).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        assert_eq!(agent_state_rows(&e.db), 0);
+    }
+
+    /// P1-3: the default kill takes a stored survivor by pid and start
+    /// time, then tombstones; a survivor whose pid runs another process
+    /// now is never signalled.
+    #[tokio::test]
+    async fn retire_kills_stored_survivors_only_by_pid_and_start() {
+        let e = setup(Script::Ready, None);
+        let (mut proc, child) = test_process("echo ready; exec sleep 30");
+        let r = orphan_with_survivors(&e, &survivor_json(child)).await;
+        let l = Principal::LocalUnverified;
+        let got =
+            e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+                .await
+                .unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        assert_eq!(proc.wait().unwrap().signal(), Some(libc::SIGTERM));
+
+        let e = setup(Script::Ready, None);
+        let (mut proc, child) = test_process("echo ready; exec sleep 30");
+        let stale = ChildId {
+            start: child.start + 1,
+            ..child
+        };
+        let r = orphan_with_survivors(&e, &survivor_json(stale)).await;
+        let got =
+            e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+                .await
+                .unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(proc.try_wait().unwrap().is_none(), "a reused pid was hit");
+        proc.kill().unwrap();
+        proc.wait().unwrap();
+    }
+
+    /// P1-3: survivors that cannot be read fail closed: nothing is
+    /// signalled, the row stays `orphaned`, and the error is audited.
+    #[tokio::test]
+    async fn unreadable_survivors_keep_the_row_orphaned() {
+        let e = setup(Script::Ready, None);
+        let r = orphan_with_survivors(&e, "not json").await;
+        let called = Arc::new(AtomicUsize::new(0));
+        let called2 = called.clone();
+        e.sp.set_orphan_killer(Arc::new(move |_, _| {
+            called2.fetch_add(1, Ordering::SeqCst);
+            Ok(Orphan::Killed)
+        }));
+        let l = Principal::LocalUnverified;
+        let got =
+            e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+                .await
+                .unwrap();
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        assert_eq!(called.load(Ordering::SeqCst), 0);
+        let why = audit_reasons(&e.db, "agent.retire", ops::ORPHANED);
+        assert!(
+            why.last().unwrap().contains("survivors unreadable"),
+            "{:?}",
+            why
+        );
+        assert_eq!(survivors_json(&e.db, &r.id).as_deref(), Some("not json"));
+    }
+
+    /// P1-3: at most 64 survivors are kept, the first ones, and the audit
+    /// row says how many were dropped.
+    #[tokio::test]
+    async fn survivors_are_capped_at_64_with_an_audit_note() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let r = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        e.sp.shutdown();
+        let left: Vec<Survivor> = (0..70)
+            .map(|i| Survivor {
+                pid: 1_000_000 + i,
+                start: 1,
+                pgid: 1_000_000 + i,
+            })
+            .collect();
+        let before = upsert_reasons(&e.db, &r.id).len();
+        let (m, id, left2) = (MACHINE.to_string(), r.id.clone(), left.clone());
+        e.db.write_blocking(move |tx| {
+            ops::orphan_agent(
+                tx,
+                &m,
+                &id,
+                r.generation,
+                ChildId { pid: 9, start: 9 },
+                &left2,
+                audit::SYSTEM,
+                "engine.reconcile",
+                "test",
+                now_ms(),
+            )
+        })
+        .unwrap();
+        let kept = ops::parse_survivors(survivors_json(&e.db, &r.id).as_deref()).unwrap();
+        assert_eq!(kept.list, left[..ops::MAX_SURVIVORS]);
+        assert!(kept.overflow);
+        let why = audit_reasons(&e.db, "engine.reconcile", ops::ORPHANED);
+        assert!(why[0].contains("kept the first 64 of 70"), "{:?}", why);
+        // P2-2: the first overflow is the reason at once, in one upsert.
+        assert_eq!(
+            row(&e.db, &r.id).state_reason.as_deref(),
+            Some(ops::SURVIVORS_OVERFLOW)
+        );
+        assert_eq!(
+            upsert_reasons(&e.db, &r.id)[before..],
+            [Some(ops::SURVIVORS_OVERFLOW.to_string())]
+        );
+    }
+    /// P1-B: an unconfirmed kill that left more than 64 never ends by
+    /// itself: with the recorded ones gone the row stays `orphaned` with
+    /// `survivors_overflow`, retry after retry. `force` by the local
+    /// client ends it, with an audit row that names the forced retire.
+    #[tokio::test]
+    async fn an_overflow_keeps_the_row_orphaned_until_a_forced_retire() {
+        let e = setup(Script::Ready, None);
+        let r = orphan_with_survivors(&e, r#"{"v":1,"overflow":true,"list":[]}"#).await;
+        let l = Principal::LocalUnverified;
+        let id = serde_json::json!({ "id": r.id });
+        let before = upsert_reasons(&e.db, &r.id).len();
+        for _ in 0..2 {
+            let got = e.sp.retire(&l, id.clone()).await.unwrap();
+            assert_eq!(got.state.as_deref(), Some("orphaned"));
+            assert_eq!(got.state_reason.as_deref(), Some(ops::SURVIVORS_OVERFLOW));
+            assert_eq!(got.gone_at, None);
+        }
+        // P2-1: the reason changed once, and subscribers saw it once.
+        assert_eq!(
+            upsert_reasons(&e.db, &r.id)[before..],
+            [Some(ops::SURVIVORS_OVERFLOW.to_string())]
+        );
+        let why = audit_reasons(&e.db, "agent.retire", ops::ORPHANED);
+        assert!(
+            why.last().unwrap().contains(ops::SURVIVORS_OVERFLOW),
+            "{:?}",
+            why
+        );
+        let stored = ops::parse_survivors(survivors_json(&e.db, &r.id).as_deref()).unwrap();
+        assert!(stored.overflow, "the overflow is kept");
+        let got =
+            e.sp.retire(&l, serde_json::json!({ "id": r.id, "force": true }))
+                .await
+                .unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        assert_eq!(agent_state_rows(&e.db), 0);
+        let why = audit_reasons(&e.db, "agent.retire", ops::FORCED);
+        assert_eq!(why.len(), 1);
+        assert!(why[0].starts_with("forced retire"), "{:?}", why);
+        assert!(why[0].contains(ops::SURVIVORS_OVERFLOW), "{:?}", why);
+    }
+
+    /// P1-B: a forced retire still kills first, by pid and start time, and
+    /// ends the row even when a process is left; the audit row says so.
+    #[tokio::test]
+    async fn a_forced_retire_kills_first_and_names_what_it_left() {
+        let e = setup(Script::Ready, None);
+        let (mut proc, child) = test_process("trap '' TERM; echo ready; exec sleep 30");
+        let r = orphan_with_survivors(&e, &survivor_json(child)).await;
+        let asked: Arc<Mutex<Vec<Vec<ChildId>>>> = Arc::default();
+        e.sp.set_orphan_killer(killer_that_cannot_kill(asked.clone()));
+        let l = Principal::LocalUnverified;
+        let got =
+            e.sp.retire(&l, serde_json::json!({ "id": r.id, "force": true }))
+                .await
+                .unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        assert_eq!(lock(&asked).len(), 1, "the kill ran first");
+        let why = audit_reasons(&e.db, "agent.retire", ops::FORCED);
+        assert!(why[0].contains("1 left"), "{:?}", why);
+        proc.kill().unwrap();
+        proc.wait().unwrap();
+    }
+
+    /// P1-B: `force` is for the local client only: any other principal
+    /// gets `peer_not_authorized`, and nothing changes.
+    #[tokio::test]
+    async fn a_forced_retire_by_another_principal_is_refused() {
+        let e = setup(Script::Ready, None);
+        let r = orphan_with_survivors(&e, r#"{"v":1,"overflow":true,"list":[]}"#).await;
+        let a = Principal::Agent {
+            id: r.id.clone(),
+            gen: 1,
+        };
+        let err =
+            e.sp.retire(&a, serde_json::json!({ "id": r.id, "force": true }))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PeerNotAuthorized);
+        assert_eq!(row(&e.db, &r.id).state.as_deref(), Some("orphaned"));
+        assert!(audit_reasons(&e.db, "agent.retire", ops::FORCED).is_empty());
+    }
+
+    /// P1-B: the first stored form, a bare list, still reads, with no
+    /// overflow; a list in an unknown version does not.
+    #[test]
+    fn stored_survivors_read_both_forms() {
+        let s = Survivor {
+            pid: 5,
+            start: 6,
+            pgid: 5,
+        };
+        let bare = ops::parse_survivors(Some(r#"[{"pid":5,"start":6,"pgid":5}]"#)).unwrap();
+        assert_eq!(bare.list, vec![s]);
+        assert!(!bare.overflow);
+        assert!(ops::parse_survivors(Some(r#"{"v":2,"overflow":false,"list":[]}"#)).is_err());
+        assert_eq!(
+            ops::parse_survivors(None).unwrap(),
+            ops::Survivors::default()
+        );
+    }
+    /// The `stateReason` of every `agent.upsert` of `id`, in order.
+    fn upsert_reasons(db: &Db, id: &str) -> Vec<Option<String>> {
+        let conn = db.reader().unwrap();
+        let mut st = conn
+            .prepare(
+                "SELECT json_extract(payload, '$.stateReason') FROM events \
+                 WHERE topic = 'agent.upsert' AND subject = ?1 ORDER BY seq",
+            )
+            .unwrap();
+        let rows = st
+            .query_map([format!("{}/{}", MACHINE, id)], |r| r.get(0))
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// P2-2: a retry whose kill first leaves more than 64 sets
+    /// `survivors_overflow` at once, with one upsert; a retry that changes
+    /// nothing emits none.
+    #[tokio::test]
+    async fn a_retry_that_first_overflows_sets_the_reason_with_one_upsert() {
+        let e = setup(Script::Ready, None);
+        let r = orphan_with_survivors(&e, &survivor_json(ChildId { pid: 9, start: 9 })).await;
+        assert_eq!(
+            row(&e.db, &r.id).state_reason.as_deref(),
+            Some(ops::KILL_UNCONFIRMED)
+        );
+        e.sp.set_orphan_killer(Arc::new(|_, _| {
+            let left = (0..70)
+                .map(|i| Survivor {
+                    pid: 1_000_000 + i,
+                    start: 1,
+                    pgid: 1_000_000 + i,
+                })
+                .collect();
+            Err(io::Error::other(Unconfirmed::new(left, "test")))
+        }));
+        let l = Principal::LocalUnverified;
+        let before = upsert_reasons(&e.db, &r.id).len();
+        let got =
+            e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+                .await
+                .unwrap();
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        assert_eq!(got.state_reason.as_deref(), Some(ops::SURVIVORS_OVERFLOW));
+        assert_eq!(
+            upsert_reasons(&e.db, &r.id)[before..],
+            [Some(ops::SURVIVORS_OVERFLOW.to_string())]
+        );
+        let stored = ops::parse_survivors(survivors_json(&e.db, &r.id).as_deref()).unwrap();
+        assert!(stored.overflow);
+        assert_eq!(stored.list.len(), ops::MAX_SURVIVORS);
+        e.sp.retire(&l, serde_json::json!({ "id": r.id }))
+            .await
+            .unwrap();
+        assert_eq!(upsert_reasons(&e.db, &r.id).len(), before + 1);
+    }
+    /// The supervisor start of a live agent, for the mail steps.
+    fn start_of(e: &Env, r: &AgentRow) -> Start {
+        Start {
+            id: r.id.clone(),
+            gen: r.generation,
+            sid: String::new(),
+            op_id: String::new(),
+            cwd: e.cwd.clone(),
+            claude: PathBuf::new(),
+            kind: Kind::Create,
+            from: None,
+        }
+    }
+
+    fn attention_of(e: &Env, r: &AgentRow) -> Option<String> {
+        e.sp.merge
+            .peek(&r.id, r.generation, |m| {
+                m.attention_flag().map(|a| a.reason.clone())
+            })
+            .flatten()
+    }
+
+    /// #207: the mail steps raise the merge flag through the transaction
+    /// that emits `agent.attention` (staged, published on commit), so the
+    /// merge never shows an attention the store does not. A message that
+    /// cannot be marked `uncertain` raises nothing.
+    #[tokio::test]
+    async fn mail_attention_reaches_the_merge_with_its_commit() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let r = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let s = start_of(&e, &r);
+        // A step only flags an agent the merge has (`stage_existing`).
+        e.sp.merge.with(&r.id, r.generation, |_| ());
+        assert_eq!(attention_of(&e, &r), None);
+        e.sp.mail_uncertain(&s, "msg_unknown", "test");
+        assert_eq!(attention_of(&e, &r), None);
+        let id = queue(&e.db, &r.id, "x");
+        let id2 = id.clone();
+        e.db.write_blocking(move |tx| {
+            tx.execute(
+                "UPDATE messages SET state = 'delivering' WHERE id = ?1",
+                [&id2],
+            )
+        })
+        .unwrap();
+        e.sp.mail_uncertain(&s, &id, "test");
+        assert_eq!(
+            attention_of(&e, &r),
+            Some(format!("mail_uncertain: {}", id))
+        );
+        e.sp.mail_attention(&s, "msg_x", "mail_late");
+        assert_eq!(attention_of(&e, &r).as_deref(), Some("mail_late: msg_x"));
     }
 }
 
