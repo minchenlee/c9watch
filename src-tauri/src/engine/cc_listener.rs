@@ -10,6 +10,7 @@ use super::{
     merge::MergeTable,
     peer,
 };
+use crate::elog;
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -106,13 +107,13 @@ impl Sockets {
                     break;
                 };
                 let Ok(slot) = this.slots.clone().try_acquire_owned() else {
-                    eprintln!("[engine] CC inbound connection limit");
+                    elog!(Warn, "cc_listener", "CC inbound connection limit");
                     continue;
                 };
                 tokio::spawn(async move {
                     let _slot = slot;
                     if let Err(e) = this.receive(stream).await {
-                        eprintln!("[engine] CC inbound: {}", e);
+                        elog!(Warn, "cc_listener", "CC inbound: {}", e);
                     }
                 });
             }
@@ -248,7 +249,11 @@ pub fn apply(
         let wire = frame["orig_msg_id"].as_str().unwrap_or("");
         let msg: Option<(String, String, i64)> = tx.query_row("SELECT id, state, attempts FROM messages WHERE wire_id = ?1 AND to_agent = ?2 AND via = 'socket'", params![wire, agent], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
         let Some((id, state, attempts)) = msg else {
-            eprintln!("[engine] ignored CC receipt: unknown wire id or wrong target");
+            elog!(
+                Warn,
+                "cc_listener",
+                "ignored CC receipt: unknown wire id or wrong target"
+            );
             return Ok(());
         };
         let status = frame["status"].as_str().unwrap_or("");

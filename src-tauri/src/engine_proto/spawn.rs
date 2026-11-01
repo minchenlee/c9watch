@@ -666,8 +666,10 @@ fn restart_engine_with(
         // engine, so this is rare; the new engine then runs the other
         // client's binary and environment, not ours.
         if let Some(other) = engine_pid(&lock)?.filter(|p| *p != pid) {
-            eprintln!(
-                "[c9watch] Another client started engine pid {} before this restart; \
+            crate::elog!(
+                Warn,
+                "spawn",
+                "Another client started engine pid {} before this restart; \
                  it runs that client's binary and environment",
                 other
             );

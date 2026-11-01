@@ -6,7 +6,7 @@ use std::sync::{LazyLock, Mutex};
 
 const MAX_ENTRIES: usize = 500;
 
-/// When true, suppress all eprintln! output (used in CLI mode so agents
+/// When true, suppress all stderr output (used in CLI mode so agents
 /// don't get noise on stderr).
 static QUIET_MODE: AtomicBool = AtomicBool::new(false);
 
@@ -21,16 +21,6 @@ pub enum LogLevel {
     Info,
     Warn,
     Error,
-}
-
-impl LogLevel {
-    fn as_str(&self) -> &'static str {
-        match self {
-            LogLevel::Info => "info",
-            LogLevel::Warn => "warn",
-            LogLevel::Error => "error",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,7 +42,12 @@ pub fn debug_log(level: LogLevel, message: &str) {
     };
 
     if !QUIET_MODE.load(Ordering::Relaxed) {
-        eprintln!("[c9watch][{}] {}", entry.level.as_str(), message);
+        let level = match entry.level {
+            LogLevel::Info => crate::log_line::Level::Info,
+            LogLevel::Warn => crate::log_line::Level::Warn,
+            LogLevel::Error => crate::log_line::Level::Error,
+        };
+        crate::log_line::write(level, "c9watch", format_args!("{}", message));
     }
 
     let mut buffer = match LOG_BUFFER.lock() {

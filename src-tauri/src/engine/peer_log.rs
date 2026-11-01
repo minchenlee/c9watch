@@ -1,5 +1,6 @@
 //! Bounded, incremental JSONL mail tailer. No eligible mail means no open.
 use super::transcript::{mail_fact, MailFact};
+use crate::elog;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -60,7 +61,7 @@ impl Tailer {
                 if self.partial.len() == MAX_LINE {
                     self.partial.clear();
                     self.skipping = true;
-                    eprintln!("[engine] skipped oversized CC JSONL line");
+                    elog!(Warn, "peer_log", "skipped oversized CC JSONL line");
                 } else {
                     self.partial.push(b);
                 }

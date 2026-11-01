@@ -40,6 +40,7 @@ use super::db::Tx;
 use super::drain::{self, InjectionPath};
 use super::hooks::{self, DropReason, HookEvent, Outcome};
 use super::merge::MergeTable;
+use crate::elog;
 use rusqlite::params;
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -145,7 +146,13 @@ pub fn read(path: &Path) -> Option<String> {
     let mut buf = Vec::new();
     let read = opened.and_then(|f| f.take(MAX_ORDERS as u64 + 1).read_to_end(&mut buf));
     if let Err(e) = read {
-        eprintln!("[engine] No standing orders from {:?}: {}", path, e);
+        elog!(
+            Warn,
+            "standing",
+            "No standing orders from {:?}: {}",
+            path,
+            e
+        );
         return None;
     }
     let cut = buf.len() > MAX_ORDERS;
@@ -160,9 +167,12 @@ pub fn read(path: &Path) -> Option<String> {
     }
     let mut text = String::from_utf8_lossy(&buf).into_owned();
     if cut {
-        eprintln!(
-            "[engine] {:?} is longer than {} bytes; sending the first part",
-            path, MAX_ORDERS
+        elog!(
+            Warn,
+            "standing",
+            "{:?} is longer than {} bytes; sending the first part",
+            path,
+            MAX_ORDERS
         );
         text.push_str("\n[standing orders cut at the engine's size limit]\n");
     }

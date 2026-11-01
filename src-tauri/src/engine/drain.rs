@@ -55,6 +55,7 @@ use super::db::{now_ms, Db, Tx};
 use super::driver::{KILL_GRACE, KILL_VERIFY};
 use super::generation::emit_upsert;
 use super::ops;
+use crate::elog;
 use rusqlite::{params, OptionalExtension};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -348,7 +349,7 @@ pub fn run(sp: &Spawner, timing: Timing, start: Instant) -> Report {
             let (state, open) = match look(sp.db(), id) {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("[engine] Drain: {}", e);
+                    elog!(Warn, "drain", "Drain: {}", e);
                     waiting += 1;
                     continue;
                 }

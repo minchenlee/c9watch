@@ -111,6 +111,7 @@ use super::standing;
 use super::views;
 use super::views::conversation::{Progress, PROGRESS_CAPABILITY};
 use super::views::sessions as session_views;
+use crate::elog;
 use std::collections::HashMap;
 use std::future::Future;
 use std::os::unix::io::AsRawFd;
@@ -288,8 +289,10 @@ impl ServerCtx {
     /// what the table holds.
     pub(crate) async fn detected(&self) {
         if !self.first_tick.is_open() && !self.first_tick.wait(FIRST_TICK_WAIT).await {
-            eprintln!(
-                "[engine] detection's first pass took over {:?}; answering anyway",
+            elog!(
+                Warn,
+                "api",
+                "detection's first pass took over {:?}; answering anyway",
                 FIRST_TICK_WAIT
             );
         }
@@ -379,7 +382,7 @@ pub async fn serve_with_cap(listener: UnixListener, ctx: Arc<ServerCtx>, cap: us
                 }
             },
             Err(e) => {
-                eprintln!("[engine] Accept error: {}", e);
+                elog!(Warn, "api", "Accept error: {}", e);
                 // EMFILE and friends: back off instead of spinning.
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -465,7 +468,7 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
     let cred = match cred.and_then(|c| peer::check_peer_uid(&c, ctx.engine_uid).map(|_| c)) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[engine] Rejected connection: {}", e);
+            elog!(Warn, "api", "Rejected connection: {}", e);
             let _ = tx
                 .send(encode(&Response::err(
                     None,
@@ -2128,7 +2131,12 @@ async fn audit_refusal(
         })
         .await;
     if let Err(e) = wrote {
-        eprintln!("[engine] Failed to audit a refused hook-class call: {}", e);
+        elog!(
+            Error,
+            "api",
+            "Failed to audit a refused hook-class call: {}",
+            e
+        );
     }
 }
 
@@ -2487,9 +2495,15 @@ fn hello(
     // The client's claim about itself is logged as unverified and nothing
     // else: it never decides the principal (N1).
     if let Some(client) = &params.client {
-        eprintln!(
-            "[engine] hello pid={} principal={} unverified client claim kind={:?} name={:?} version={:?}",
-            peer.unix().map(|p| p.cred.pid).unwrap_or(0), principal, client.kind, client.name, client.version
+        elog!(
+            Info,
+            "api",
+            "hello pid={} principal={} unverified client claim kind={:?} name={:?} version={:?}",
+            peer.unix().map(|p| p.cred.pid).unwrap_or(0),
+            principal,
+            client.kind,
+            client.name,
+            client.version
         );
     }
     let result = HelloResult {
