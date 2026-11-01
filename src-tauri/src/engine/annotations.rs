@@ -35,6 +35,14 @@ fn component(s: &str, max: usize) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
 }
+/// The namespace a principal owns: `<prefix>.<id>` with the id in lowercase.
+/// Engine agent ids are `agt_` + uppercase Crockford ULID and gateway client
+/// ids are `cli_` + lowercase ULID. Crockford base32 is case-insensitive, so
+/// lowercase is the same id. The result is never shortened: an id that does
+/// not fit the namespace rules fails admission later.
+fn owned_namespace(prefix: &str, id: &str) -> String {
+    format!("{prefix}.{}", id.to_ascii_lowercase())
+}
 fn key(s: &str) -> Result<(&str, &str), ApiError> {
     let (ns, name) = s
         .split_once('/')
@@ -72,8 +80,8 @@ pub fn admit(method: &str, params: &mut Value, who: &Principal) -> Result<(), Ap
         )
     };
     let forced = match who {
-        Principal::Agent { id, .. } => Some(format!("agent.{id}")),
-        Principal::Client { id } => Some(format!("client.{id}")),
+        Principal::Agent { id, .. } => Some(owned_namespace("agent", id)),
+        Principal::Client { id } => Some(owned_namespace("client", id)),
         Principal::LocalUnverified => None,
     };
     let ns = if let Some(ref forced) = forced {
@@ -466,11 +474,11 @@ pub fn audit_request(
     } else {
         let forced = principal
             .strip_prefix("agent:")
-            .map(|id| format!("agent.{id}"))
+            .map(|id| owned_namespace("agent", id))
             .or_else(|| {
                 principal
                     .strip_prefix("client:")
-                    .map(|id| format!("client.{id}"))
+                    .map(|id| owned_namespace("client", id))
             });
         let ns = params["source"]
             .as_str()
@@ -657,20 +665,63 @@ mod tests {
                 ErrorCode::NotAllowed
             );
         }
-        // Current gateway token IDs are hyphenated UUIDs: 7 + 36 > 40.
-        // Keep the namespace cap fail closed until the owner settles that
-        // contract mismatch; never silently shorten an authenticated ID.
-        let long_client = Principal::Client {
-            id: "00000000-0000-4000-8000-000000000001".into(),
-        };
-        let mut p = request("ci", json!({"x":null}), None, None);
-        p.as_object_mut().unwrap().remove("source");
-        assert_eq!(
-            admit("annotation.patch", &mut p, &long_client)
-                .unwrap_err()
-                .code,
-            ErrorCode::BadRequest
-        );
+        // Real principal ids fit: an uppercase engine agent id and a gateway
+        // client id both map to their lowercase canonical namespace.
+        let agent_id = super::super::db::new_agent_id();
+        assert!(agent_id.bytes().skip(4).any(|b| b.is_ascii_uppercase()));
+        // Shape of `gateway::tokens::new_client_id()` (tested there).
+        let client_id = "cli_01jb8zq3x4v5w6y7z8a9b0c1d2".to_string();
+        for (who, own) in [
+            (
+                Principal::Agent {
+                    id: agent_id.clone(),
+                    gen: 1,
+                },
+                format!("agent.{}", agent_id.to_ascii_lowercase()),
+            ),
+            (
+                Principal::Client {
+                    id: client_id.clone(),
+                },
+                format!("client.{client_id}"),
+            ),
+        ] {
+            let mut p = request("ci", json!({"x":null}), None, None);
+            p.as_object_mut().unwrap().remove("source");
+            admit("annotation.patch", &mut p, &who).unwrap();
+            assert_eq!(p["source"], own.as_str());
+            // An explicit source in canonical form, or a key in it, is accepted.
+            admit("annotation.patch", &mut p, &who).unwrap();
+            let mut set = json!({"key":format!("{own}/x")});
+            admit("annotation.set", &mut set, &who).unwrap();
+            // Any other spelling is another namespace and is refused.
+            let mut set = json!({"key":format!("{}/x", own.to_ascii_uppercase())});
+            assert!(admit("annotation.set", &mut set, &who).is_err());
+        }
+        // Over-long and invalid ids still fail closed; ids are never shortened.
+        for id in [
+            "00000000-0000-4000-8000-000000000001",
+            "agt_0123456789abcdefghjkmnpqrstvwxyz0",
+            "a b",
+            "a/b",
+            "é",
+        ] {
+            for who in [
+                Principal::Client { id: id.into() },
+                Principal::Agent {
+                    id: id.into(),
+                    gen: 1,
+                },
+            ] {
+                let mut p = request("ci", json!({"x":null}), None, None);
+                p.as_object_mut().unwrap().remove("source");
+                assert_eq!(
+                    admit("annotation.patch", &mut p, &who).unwrap_err().code,
+                    ErrorCode::BadRequest,
+                    "{who}"
+                );
+            }
+        }
         let client = Principal::Client { id: "phone".into() };
         for method in ["annotation.set", "annotation.delete", "annotation.patch"] {
             assert!(!super::super::authz::can(method, &client, None).allowed);
@@ -1336,6 +1387,38 @@ mod tests {
             assert_eq!(keys, "[\"ci/note\"]");
             assert!(!format!("{hash}{keys}{reason}").contains("secret"));
         }
+    }
+    #[tokio::test]
+    async fn uppercase_agent_id_round_trips_through_its_lowercase_namespace() {
+        let (_t, db) = db();
+        let id = super::super::db::new_agent_id();
+        let ns = format!("agent.{}", id.to_ascii_lowercase());
+        let who = Principal::Agent {
+            id: id.clone(),
+            gen: 1,
+        };
+        let mut p = json!({"target":{"kind":"session","sessionKey":"claudeCode:s"},"values":{"done":{"type":"bool","v":true}}});
+        admit("annotation.patch", &mut p, &who).unwrap();
+        write(&db, "annotation.patch", p, &who).await.unwrap();
+        let r = list(&db, json!({"namespace": ns})).await.unwrap();
+        let rows = r["annotations"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["key"], format!("{ns}/done"));
+        // The stamped writer keeps the authenticated id exactly as issued.
+        assert_eq!(rows[0]["writer"], format!("agent:{id}"));
+        let keys: String = db
+            .reader()
+            .unwrap()
+            .query_row(
+                "SELECT annotation_keys FROM audit WHERE method='annotation.patch'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            keys,
+            serde_json::to_string(&[format!("{ns}/done")]).unwrap()
+        );
     }
     #[test]
     fn schema_redacts_string_values_but_keeps_numbers_in_results_and_source_maps() {
