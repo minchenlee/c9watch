@@ -50,38 +50,12 @@ use session_json::{
 };
 use session_ref::resolve_session_reference_lightweight;
 
-// PM/worker orchestration modules — opt-in only. Compiled out of default builds.
 pub mod watch;
-
-#[cfg(feature = "pm-orchestration")]
-pub mod adoption;
-#[cfg(feature = "pm-orchestration")]
-pub mod bg_backend;
-#[cfg(feature = "pm-orchestration")]
-pub mod bg_protocol;
-#[cfg(feature = "pm-orchestration")]
-pub mod pm;
-#[cfg(feature = "pm-orchestration")]
-pub mod pm_caller;
-#[cfg(feature = "pm-orchestration")]
-pub mod pm_daemon;
-#[cfg(feature = "pm-orchestration")]
-pub mod pm_fs;
-#[cfg(feature = "pm-orchestration")]
-pub mod pm_inbox;
-#[cfg(feature = "pm-orchestration")]
-pub mod pm_rpc;
-#[cfg(feature = "pm-orchestration")]
-pub mod pm_worker;
-#[cfg(feature = "pm-orchestration")]
-pub mod worker_backend;
 
 /// First arguments that make the app binary run the CLI instead of the GUI.
 ///
 /// Every subcommand must be listed, or the desktop binary launches the GUI
-/// for it (v0.8.1 shipped that bug for `inbox`/`cost`/`adopt`). PM command
-/// names are listed even when the `pm-orchestration` feature is off, so Clap
-/// reports an unknown command instead of launching the GUI. Engine command
+/// for it (v0.8.1 shipped that bug for `cost`). Engine command
 /// names are listed only in engine builds, except the offline `api schema`.
 pub const CLI_COMMANDS: &[&str] = &[
     "list",
@@ -108,20 +82,17 @@ pub const CLI_COMMANDS: &[&str] = &[
     "spawn",
     "send",
     "mail",
-    "workers",
-    "inbox",
-    "adopt",
-    "daemon",
     "cost",
     "usage-bridge",
     "hooks",
     "help",
 ];
 
-/// Engine command names in builds without the engine, and `task`, which
-/// moved to `c9watch-agent` (C1a-21). They stay out of `CLI_COMMANDS`, but
-/// `is_cli_invocation` still routes them to Clap, so the user gets an
-/// unknown-command error instead of the GUI.
+/// Engine command names in builds without the engine, `task`, which moved
+/// to `c9watch-agent` (C1a-21), and the removed PM orchestration commands.
+/// They stay out of `CLI_COMMANDS`, but `is_cli_invocation` still routes
+/// them to Clap, so the user gets an unknown-command error instead of the
+/// GUI.
 pub const RESERVED_ENGINE_COMMANDS: &[&str] = &[
     "task",
     "engine",
@@ -129,6 +100,10 @@ pub const RESERVED_ENGINE_COMMANDS: &[&str] = &[
     "integration",
     "auth",
     "annotate",
+    "workers",
+    "inbox",
+    "adopt",
+    "daemon",
 ];
 
 /// Whether `first` (the first argument) selects the CLI.
@@ -174,10 +149,10 @@ impl DetectArgs {
 }
 
 /// `spawn --mode` (C1a-38). An engine build adds the flag; in other builds
-/// this holds nothing, so the PM build's `spawn` is unchanged.
+/// this holds nothing.
 #[derive(clap::Args, Debug, Clone, Default)]
 pub struct SpawnModeArgs {
-    /// `managed` (default): a c9watch worker through the legacy daemon.
+    /// `managed` (default): unavailable legacy worker mode.
     /// `free`: an engine agent in --cwd (agent.create), with only --cwd and
     /// --name
     #[cfg(all(unix, feature = "engine"))]
@@ -327,18 +302,7 @@ pub enum Commands {
         detect: DetectArgs,
     },
 
-    /// Stop a session. Worker lookup wins over PID parsing: if the target
-    /// matches a live PM worker's session id (exact or unique prefix), the
-    /// worker is stopped. Otherwise, a numeric target is treated as a PID
-    /// and the corresponding Claude process is killed.
-    #[cfg(feature = "pm-orchestration")]
-    Stop {
-        /// Worker session id/prefix (preferred) or numeric PID for regular sessions
-        target: String,
-    },
-
     /// Stop a session by PID (kills the corresponding Claude process).
-    #[cfg(not(feature = "pm-orchestration"))]
     Stop {
         /// Numeric PID of the session's Claude process
         target: String,
@@ -414,8 +378,8 @@ pub enum Commands {
         session_id: String,
     },
 
-    /// Spawn a new worker session managed by c9watch
-    #[cfg(any(feature = "pm-orchestration", all(unix, feature = "engine")))]
+    /// Spawn an engine agent with --mode free
+    #[cfg(all(unix, feature = "engine"))]
     Spawn {
         #[arg(long)]
         cwd: Option<String>,
@@ -425,11 +389,7 @@ pub enum Commands {
         append_system_prompt: Option<String>,
         #[arg(long)]
         append_system_prompt_file: Option<String>,
-        #[cfg(not(all(unix, feature = "engine")))]
-        #[arg(long, default_value = "bypassPermissions")]
-        permission_mode: String,
-        /// Permission mode of a managed worker [default: bypassPermissions].
-        /// Not with `--mode free`: the engine sets a free agent's profile
+        /// Legacy managed-worker option (unavailable with --mode free)
         #[cfg(all(unix, feature = "engine"))]
         #[arg(long)]
         permission_mode: Option<String>,
@@ -437,8 +397,7 @@ pub enum Commands {
         model: Option<String>,
         #[arg(long)]
         add_dir: Vec<String>,
-        /// Initial prompt sent at spawn time. REQUIRED for bg backend (CC >= 2.1.150).
-        /// The only prompt a managed worker gets: `c9watch send` mails engine agents only.
+        /// Legacy managed-worker option (unavailable with --mode free)
         #[arg(long)]
         prompt: Option<String>,
 
@@ -454,38 +413,6 @@ pub enum Commands {
     Send(engine_send::SendArgs),
     #[cfg(all(unix, feature = "engine"))]
     Mail(engine_mail::MailArgs),
-
-    /// List workers spawned by c9watch
-    #[cfg(feature = "pm-orchestration")]
-    Workers {
-        /// Include workers owned by other PMs (adds a status column per entry)
-        #[arg(long)]
-        all: bool,
-    },
-
-    /// List callback events from workers owned by this PM session
-    #[cfg(feature = "pm-orchestration")]
-    Inbox {
-        /// Remove events after listing
-        #[arg(long)]
-        consume: bool,
-        /// Remove all events without printing them
-        #[arg(long)]
-        clear: bool,
-        /// Only touch this worker's inbox (must be owned by caller)
-        #[arg(long)]
-        worker: Option<String>,
-    },
-
-    /// Adopt an existing worker as owned by this PM session
-    #[cfg(feature = "pm-orchestration")]
-    Adopt {
-        /// Worker session id or unique prefix
-        session_id: String,
-        /// Force adoption even if worker is OWNED_BY_OTHER_PM
-        #[arg(long)]
-        force: bool,
-    },
 
     /// Run the c9 engine in the foreground, or control it
     #[cfg(all(unix, feature = "engine"))]
@@ -557,11 +484,6 @@ pub enum Commands {
         #[arg(long, conflicts_with_all = ["daily", "weekly", "project", "session"])]
         session_prefix: Option<String>,
     },
-
-    /// [hidden] Run the PM daemon
-    #[cfg(feature = "pm-orchestration")]
-    #[command(hide = true)]
-    Daemon,
 }
 
 #[cfg(all(unix, feature = "engine"))]
@@ -693,7 +615,7 @@ pub fn run(cli: Cli) {
         Commands::Auth { action } => engine_client::cmd_auth(&action, cli.pretty),
         #[cfg(all(unix, feature = "engine"))]
         Commands::Integration { action } => engine_client::cmd_integration(&action, cli.pretty),
-        #[cfg(any(feature = "pm-orchestration", all(unix, feature = "engine")))]
+        #[cfg(all(unix, feature = "engine"))]
         Commands::Spawn {
             cwd,
             name,
@@ -710,8 +632,6 @@ pub fn run(cli: Cli) {
                 name,
                 append_system_prompt,
                 append_system_prompt_file,
-                // `Some` when given; a build without the engine always has
-                // its default here.
                 permission_mode: permission_mode.into(),
                 model,
                 add_dir,
@@ -728,16 +648,6 @@ pub fn run(cli: Cli) {
             Ok(code) => process::exit(code),
             Err(e) => Err(e),
         },
-        #[cfg(feature = "pm-orchestration")]
-        Commands::Workers { all } => pm::cmd_workers(all, cli.pretty),
-        #[cfg(feature = "pm-orchestration")]
-        Commands::Inbox {
-            consume,
-            clear,
-            worker,
-        } => pm::cmd_inbox(consume, clear, worker, cli.pretty),
-        #[cfg(feature = "pm-orchestration")]
-        Commands::Adopt { session_id, force } => pm::cmd_adopt(session_id, force, cli.pretty),
         Commands::Cost {
             daily,
             weekly,
@@ -758,11 +668,6 @@ pub fn run(cli: Cli) {
             session_prefix.as_deref(),
             cli.pretty,
         ),
-        #[cfg(feature = "pm-orchestration")]
-        Commands::Daemon => match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt.block_on(pm_daemon::run_daemon()),
-            Err(e) => Err(format!("Failed to create tokio runtime: {}", e)),
-        },
     };
 
     if let Err(e) = result {
@@ -1043,16 +948,6 @@ fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
         return Err("stop target required (PID or worker session id/prefix)".to_string());
     }
 
-    // Worker-first dispatch: worker session UUIDs routinely begin with
-    // digits (e.g. `12345678-abcd-...`), so a prefix like `12345678` would
-    // previously parse as PID and SIGKILL an arbitrary OS process. Ask the
-    // daemon for a worker match first; only fall back to PID if no worker
-    // matches AND the target parses as u32.
-    #[cfg(feature = "pm-orchestration")]
-    if let Some(worker_id) = try_resolve_worker(target)? {
-        return pm::cmd_stop(worker_id, pretty);
-    }
-
     // If target parses as u32, treat as PID (regular Claude session stop).
     // Only a pid detection reports for a stoppable Claude Code session is
     // signalled, and only while it is still the process detection saw.
@@ -1074,68 +969,10 @@ fn cmd_stop(target: &str, pretty: bool) -> Result<(), String> {
         return print_json(&output, pretty);
     }
 
-    // Not numeric, no worker match — fall through to PM so it can surface
-    // WORKER_NOT_FOUND (after starting the daemon if needed).
-    #[cfg(feature = "pm-orchestration")]
-    return pm::cmd_stop(target.to_string(), pretty);
-
-    // Without PM orchestration a non-numeric target can't refer to anything.
-    #[cfg(not(feature = "pm-orchestration"))]
     Err(format!(
         "invalid stop target '{}': expected a numeric PID",
         target
     ))
-}
-
-/// If the PM daemon is already running and has exactly one worker whose
-/// session id matches `target` (exact or unique prefix), return that full
-/// session id. Returns `Ok(None)` if the daemon is unreachable, if there's
-/// no match, or if the match is ambiguous — leaving the caller free to fall
-/// back to PID-based stop.
-///
-/// Returns `Err` when the daemon socket fails the trust checks
-/// (`DAEMON_UNTRUSTED`): then the caller must stop, not fall back to PID.
-///
-/// This function never starts the daemon: if the daemon isn't running there
-/// can't be any workers to match against, so PID-based stop is safe.
-#[cfg(feature = "pm-orchestration")]
-fn try_resolve_worker(target: &str) -> Result<Option<String>, String> {
-    use std::time::Duration;
-    let sock_path = match pm_fs::daemon_sock_path() {
-        Ok(p) => p,
-        Err(_) => return Ok(None),
-    };
-    if std::fs::symlink_metadata(&sock_path).is_err() {
-        return Ok(None);
-    }
-    // An install from before the 0700 dir still has a 0755 dir. Narrow it
-    // first, as `ensure_daemon` does, so the trust check below accepts it.
-    pm_fs::ensure_private_dir(&pm_fs::c9watch_dir()?)
-        .map_err(|e| format!("{}: {}", pm_rpc::DAEMON_UNTRUSTED, e))?;
-    let request = pm_rpc::RpcRequest::List;
-    let response = match pm_rpc::rpc_call(&sock_path, &request, Duration::from_secs(2)) {
-        Ok(r) => r,
-        Err(e) if e.starts_with(pm_rpc::DAEMON_UNTRUSTED) => return Err(e),
-        Err(_) => return Ok(None),
-    };
-    let workers = match response.get("workers").and_then(|w| w.as_array()) {
-        Some(w) => w,
-        None => return Ok(None),
-    };
-    let ids: Vec<String> = workers
-        .iter()
-        .filter_map(|w| {
-            w.get("sessionId")
-                .and_then(|s| s.as_str())
-                .map(String::from)
-        })
-        .collect();
-
-    // Delegate matching to the shared helper in pm_daemon so exact/prefix/
-    // ambiguous rules stay in one place. An ambiguous prefix silently falls
-    // through to None: the caller will next try PID parsing, which fails for
-    // a uuid-shaped prefix, landing in the WORKER_NOT_FOUND path from PM.
-    Ok(pm_daemon::resolve_worker_id_from_keys(ids.iter().map(|s| s.as_str()), target).ok())
 }
 
 /// One poll of live sessions as `watch`/`wait` snapshots, keyed by the
@@ -1214,28 +1051,22 @@ fn cmd_watch(
 }
 
 /// The flags of `c9watch spawn`, as parsed.
-#[cfg(any(feature = "pm-orchestration", all(unix, feature = "engine")))]
+#[cfg(all(unix, feature = "engine"))]
 struct SpawnFlags {
     cwd: Option<String>,
     name: Option<String>,
     append_system_prompt: Option<String>,
     append_system_prompt_file: Option<String>,
-    /// `None`: not given, so a managed worker gets
-    /// `DEFAULT_PERMISSION_MODE`.
+    /// `None`: not given.
     permission_mode: Option<String>,
     model: Option<String>,
     add_dir: Vec<String>,
     prompt: Option<String>,
 }
 
-/// The `--permission-mode` of a managed worker that was not given one.
-#[cfg(feature = "pm-orchestration")]
-const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
-
-/// `c9watch spawn`: `--mode managed` (the default, and the only mode of a
-/// build without the engine) keeps the legacy worker path; in an engine
-/// build `--mode free` calls `agent.create` (C1a-38).
-#[cfg(any(feature = "pm-orchestration", all(unix, feature = "engine")))]
+/// `c9watch spawn --mode free` calls `agent.create` (C1a-38).
+/// The default `--mode managed` remains unavailable.
+#[cfg(all(unix, feature = "engine"))]
 fn spawn_command(f: SpawnFlags, mode: &SpawnModeArgs, pretty: bool) -> Result<(), String> {
     #[cfg(all(unix, feature = "engine"))]
     if mode.mode == engine_spawn::SpawnMode::Free {
@@ -1253,36 +1084,12 @@ fn spawn_command(f: SpawnFlags, mode: &SpawnModeArgs, pretty: bool) -> Result<()
     spawn_managed(f, pretty)
 }
 
-#[cfg(feature = "pm-orchestration")]
-fn spawn_managed(f: SpawnFlags, pretty: bool) -> Result<(), String> {
-    let resolved_cwd = match f.cwd {
-        Some(c) => c,
-        None => std::env::current_dir()
-            .map_err(|e| format!("Failed to get current directory: {}", e))?
-            .to_string_lossy()
-            .to_string(),
-    };
-    let args = pm_worker::SpawnArgs {
-        cwd: resolved_cwd,
-        name: f.name,
-        append_system_prompt: f.append_system_prompt,
-        permission_mode: f
-            .permission_mode
-            .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.to_string()),
-        model: f.model,
-        add_dirs: f.add_dir,
-    };
-    pm::cmd_spawn(args, f.append_system_prompt_file, f.prompt, pretty)
-}
-
-/// An engine build without `pm-orchestration` has no legacy workers.
-#[cfg(all(unix, feature = "engine", not(feature = "pm-orchestration")))]
+/// Legacy managed workers are unavailable.
+#[cfg(all(unix, feature = "engine"))]
 fn spawn_managed(_f: SpawnFlags, _pretty: bool) -> Result<(), String> {
-    Err(
-        "bad_args: --mode managed needs a build with the pm-orchestration feature; \
+    Err("bad_args: --mode managed is unavailable; \
          use --mode free for an engine agent"
-            .into(),
-    )
+        .into())
 }
 
 /// One read of the live sessions for `wait` (and the engine's `watch`):
@@ -1494,6 +1301,14 @@ mod dispatch_tests {
     }
 
     #[test]
+    fn removed_pm_commands_get_a_cli_error_not_the_gui() {
+        for name in ["workers", "inbox", "adopt", "daemon"] {
+            assert!(is_cli_invocation(name), "{}", name);
+            assert!(Cli::try_parse_from(["c9watch", name]).is_err(), "{}", name);
+        }
+    }
+
+    #[test]
     fn wait_parses_its_arguments() {
         let cli = Cli::try_parse_from([
             "c9watch",
@@ -1567,9 +1382,9 @@ mod dispatch_tests {
         assert!(parsed.is_err(), "wait --event parsed in a release CLI");
     }
 
-    /// `spawn --mode` exists only in engine builds (C1a-38), defaults to
-    /// `managed`, and a PM build without the engine rejects it.
-    #[cfg(any(feature = "pm-orchestration", all(unix, feature = "engine")))]
+    /// `spawn --mode` exists only in engine builds (C1a-38) and defaults to
+    /// `managed`.
+    #[cfg(all(unix, feature = "engine"))]
     #[test]
     fn spawn_mode_is_an_engine_build_flag() {
         let parsed = Cli::try_parse_from(["c9watch", "spawn", "--mode", "free", "--cwd", "/w"]);
@@ -1594,8 +1409,6 @@ mod dispatch_tests {
             assert_eq!(cwd.as_deref(), Some("/w"));
             assert!(Cli::try_parse_from(["c9watch", "spawn", "--mode", "orch"]).is_err());
         }
-        #[cfg(not(all(unix, feature = "engine")))]
-        assert!(parsed.is_err(), "spawn --mode parsed without the engine");
     }
 
     #[cfg(all(unix, feature = "engine"))]

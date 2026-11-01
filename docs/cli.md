@@ -194,30 +194,15 @@ c9watch tasks cursor:<session-id>       # Provider-scoped key
 
 ### `stop` — Stop a Session
 
-Accepts either a PID (for regular Claude sessions) or a session ID / prefix (for PM workers spawned via `c9watch spawn`). Numeric args are treated as PIDs and dispatched to the session-kill path; non-numeric args are sent to the PM daemon as a worker stop.
+Stops a detected Claude Code session by PID.
 
 ```bash
-c9watch stop <pid>                   # regular Claude session (by PID)
-c9watch stop <session-id-or-prefix>  # PM worker (via daemon RPC)
+c9watch stop <pid>
 ```
 
-### `spawn` — Start a Worker Session
+### `spawn --mode free` — Start an Engine Agent
 
-Spawn a new Claude Code session managed by c9watch. The worker is a real session that appears in `c9watch list`.
-
-```bash
-c9watch spawn --name researcher --cwd /path/to/project
-c9watch spawn --name writer --append-system-prompt "You are a technical writer."
-c9watch spawn --cwd . --permission-mode plan --model sonnet
-```
-
-```json
-{"ok":true,"sessionId":"abc-1234-...","pid":54321,"name":"researcher"}
-```
-
-Options: `--cwd`, `--name`, `--prompt` (the worker's only prompt; there is no later `send` to a worker), `--append-system-prompt`, `--append-system-prompt-file`, `--permission-mode` (default: bypassPermissions), `--model`, `--add-dir`
-
-**Engine builds only (`--features engine`, not released):** `--mode managed` (the default) is the worker above. `--mode free` creates an engine agent instead:
+**Engine builds only (`--features engine`, not released):** `--mode free` creates an engine agent:
 
 ```bash
 c9watch spawn --mode free --cwd /path/to/project --name researcher
@@ -230,7 +215,7 @@ c9watch spawn --mode free --cwd /path/to/project --name researcher
 
 ### `send` — Mail an Engine Agent
 
-**Engine builds only (`--features engine`, not released).** Sends one message to an engine agent (an agent the engine runs in a PTY, such as one from `spawn --mode free`) through the engine's `msg.send`. The engine queues the message. When the agent is ready and its input box is empty, the engine pastes the message into the box and submits it, so the agent reads it as its next prompt. The legacy worker `send` is removed: a `--mode managed` worker takes its only prompt from `spawn --prompt`.
+**Engine builds only (`--features engine`, not released).** Sends one message to an engine agent (an agent the engine runs in a PTY, such as one from `spawn --mode free`) through the engine's `msg.send`. The engine queues the message. When the agent is ready and its input box is empty, the engine pastes the message into the box and submits it, so the agent reads it as its next prompt.
 
 ```bash
 c9watch send researcher "Summarize findings in notes.md"     # by name
@@ -253,17 +238,6 @@ c9watch send researcher "Review PR 12" --wait --timeout 600
 A message sent while the engine drains (`engine restart`) is still taken and stays `queued`; the resumed agent gets it.
 
 **From inside an agent** (`C9_AGENT_ID` set), `send` connects only to `C9_ENGINE_SOCK` and never starts the engine. `--wait` is refused there: end the turn instead, and the answer arrives as a new message. Every agent's SessionStart context carries this rule.
-
-### `workers` — List Managed Workers
-
-```bash
-c9watch workers
-c9watch workers --all --pretty
-```
-
-```json
-{"ok":true,"workers":[{"sessionId":"...","pid":54321,"name":"researcher","cwd":"/path","spawnedAt":"...","alive":true}]}
-```
 
 ### `hooks` — Report Permission Prompts
 

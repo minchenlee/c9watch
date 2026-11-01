@@ -1,6 +1,6 @@
 //! Private directory creation that never follows a symlink.
 //!
-//! Ported from `cli/pm_fs.rs::ensure_private_dir`, which still runs
+//! Ported from the legacy PM directory helper, which ran
 //! `create_dir_all` on the parent and so follows a symlink anywhere above
 //! the leaf. Here every component is checked with `fstatat` (no follow) and
 //! opened with `openat(O_NOFOLLOW|O_DIRECTORY)` relative to the parent fd,

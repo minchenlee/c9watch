@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- Removed the unshipped pm-orchestration CLI feature.
+
 ### Security
 These changes break old mobile clients, QR codes and bookmarks on purpose. See [docs/mobile-migration-c0h.md](docs/mobile-migration-c0h.md) before you upgrade.
 

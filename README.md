@@ -166,26 +166,7 @@ c9watch cost --daily
 c9watch cost --session abc12345 --pretty
 c9watch cost --session codex:<session-id> --pretty
 c9watch cost --session-prefix abc
-
-# PM orchestration (opt-in — see note below): spawn and manage child workers
-c9watch spawn --name my-worker --cwd ../my-worktree --prompt "do this task"
-c9watch workers
-c9watch inbox --pretty
 ```
-
-> **PM orchestration is disabled by default.** Claude Code and Codex now
-> provide native agent spawning, so c9watch's own PM/worker orchestration is
-> opt-in. The `spawn`, `workers`, `inbox`, and `adopt` subcommands
-> (and their dashboard affordances) are hidden in normal builds. Build with
-> the Cargo feature to enable them:
->
-> ```bash
-> cargo build --release --no-default-features --features cli,pm-orchestration
-> ```
->
-> To also surface the WORKER/PM badges and Workers panel in the dashboard,
-> set `PM_ORCHESTRATION_ENABLED = true` in `src/lib/feature-flags.ts` before
-> building the GUI.
 
 Use `--pretty` on any command for human-readable JSON. The `watch` command streams newline-delimited JSON events (`started`, `status_changed`, `stopped`) for real-time monitoring.
 
@@ -218,7 +199,6 @@ See [SKILLS.md](SKILLS.md) for more install options.
 - **Subscription usage** -- Quota meters for Claude Code, Codex, and Cursor in the toolbar and tray, with an elapsed-time marker for each window
 - **Claude Code hook bridge** _(opt-in)_ -- `c9watch hooks --install` lets Claude Code report permission prompts directly; see [docs/claude-hooks.md](docs/claude-hooks.md)
 - **CLI for agents** -- `c9watch list`, `view`, `history`, `search`, `stop`, `watch`, `wait`, `cost` commands for scriptable session management and agent-to-agent monitoring
-- **PM orchestration** _(disabled by default)_ -- Spawn and manage child Claude Code "worker" sessions from a parent "PM" session via `c9watch spawn`, `workers`, `adopt`, `inbox`, `tasks`. A worker takes its one prompt at spawn. WORKER and PM badges on session cards and a Workers panel in the overlay. Now that Claude Code and Codex spawn agents natively, this is opt-in: build the CLI with `--features cli,pm-orchestration` and set `PM_ORCHESTRATION_ENABLED = true` in `src/lib/feature-flags.ts` for the dashboard. Workers run as `claude --bg` background-pinned sessions, billed against your Pro/Max chat quota (not the separate Agent SDK credit pool that took effect 2026-06-15), falling back to legacy `--print` mode on older CC.
 - **Subagent visibility** -- Detect and display Task-tool subagents spawned inside any session, with click-to-preview transcripts
 - **Entry animations** -- Staggered cascade transitions across tabs and overlay panels for fluid navigation
 - **Token distance visualizer** -- See your token usage as a rice stack towering past 22 real-world landmarks, with animated stacking, native share sheet, and Instagram-ready PNG export

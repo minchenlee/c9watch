@@ -1,11 +1,10 @@
 //! The engine socket, `<home>/engine-v1.sock`: a private bind, cleanup that
 //! only removes our own socket, and the shutdown signals.
 //!
-//! Ported from `cli/pm_fs.rs` (`bind_tmp_path`, `bind_private`) and the C0
+//! Ported from the legacy PM socket helpers and the C0
 //! spike `sock.rs`. Unlike the legacy daemon, the engine never deletes a
 //! socket it does not own (A:175): replacing the path needs the lifetime
-//! lock, and exit only unlinks the inode it bound. The legacy
-//! `shutdown_daemon` (it kills workers and cleans worker dirs) is not used.
+//! lock, and exit only unlinks the inode it bound.
 
 use super::home::check_sun_path;
 use super::lock::EngineLock;
