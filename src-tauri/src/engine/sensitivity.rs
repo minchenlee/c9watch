@@ -114,6 +114,10 @@ const BY_NAME: &[(&str, &str)] = &[
     ("completedAt", P),
     ("goneAt", P),
     ("lastSeen", P),
+    ("observedAt", P),
+    ("lastOkAt", P),
+    ("lastAttemptAt", P),
+    ("staleAfterMs", P),
     ("sinceMs", P),
     ("updatedAt", P),
     ("resetsAt", P),
@@ -290,6 +294,13 @@ const OVERRIDES: &[(&str, &str, &str)] = &[
     ("SessionListResult", "sessions", P),
     ("AgentListResult", "agents", P),
     ("SnapshotResult", "agents", P),
+    ("SnapshotResult", "detectorHealth", P),
+    ("SessionListResult", "detectorHealth", P),
+    ("DetectorHealth", "state", P),
+    ("DetectorHealth", "failedProviders", P),
+    ("DetectorHealth", "stale", P),
+    // A detection error can name a path or a command line.
+    ("DetectorHealth", "reason", M),
     ("SessionViewsResult", "sessions", P),
 ];
 

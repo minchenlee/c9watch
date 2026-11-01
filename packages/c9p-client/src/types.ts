@@ -418,6 +418,42 @@ export interface C9pDetectionDiagnostics {
   processesWithCwd: number;
 }
 
+/**
+ * How session detection is doing: the `detect.health` data, and the
+ * `detectorHealth` of `snapshot.get` and `session.list`. A failed
+ * detection writes nothing, so the rows keep what the last good pass saw;
+ * this says how old that is. While passes are written, `detect.health`
+ * repeats every `staleAfterMs / 2` with a newer `lastOkAt`.
+ */
+export interface C9pDetectorHealth {
+  /**
+   * Provider keys (`claudeCode`, `codex`, ...) that did not answer the
+   * last written pass.
+   */
+  failedProviders: string[];
+  /** Unix ms when the last pass finished, written or not. */
+  lastAttemptAt?: number | null;
+  /** Unix ms of the last pass that was written (`observedAt`). */
+  lastOkAt?: number | null;
+  /** Why the state is not `ok`. */
+  reason?: string | null;
+  /**
+   * No pass was written for `staleAfterMs`: every detected session row
+   * may be out of date. Rows whose provider is in `failedProviders` may
+   * be out of date even when this is false.
+   */
+  stale: boolean;
+  staleAfterMs: number;
+  /**
+   * `ok`: the last pass was written. `degraded`: it was written, but
+   * the providers in `failedProviders` did not answer, and their rows
+   * keep what an earlier pass saw. `failed`: the last pass wrote
+   * nothing. `starting`: no pass has finished yet. Clients must accept
+   * other values.
+   */
+  state: string;
+}
+
 /** `diag.detection` params. There are none yet. */
 export type C9pDiagDetectionParams = Record<string, unknown>;
 
@@ -1012,6 +1048,10 @@ export type C9pSessionListParams = Record<string, unknown>;
  * (`goneAt` is `null`), in creation order.
  */
 export interface C9pSessionListResult {
+  /** As in `snapshot.get`. */
+  detectorHealth?: C9pDetectorHealth | null;
+  /** As in `snapshot.get`. */
+  observedAt?: number | null;
   sessions: C9pAgentRow[];
 }
 
@@ -1173,7 +1213,19 @@ export type C9pSnapshotParams = Record<string, unknown>;
 export interface C9pSnapshotResult {
   agents: C9pAgentRow[];
   cursor: string;
+  /**
+   * How detection is doing (the `detect.health` data). Absent in an
+   * engine without detection.
+   */
+  detectorHealth?: C9pDetectorHealth | null;
   machineId: string;
+  /**
+   * Unix ms of the last detection pass that was written: the
+   * `lastOkAt` of `detectorHealth`, read before the rows, so the rows
+   * are never older than it. Absent in an engine without detection, or
+   * before its first good pass.
+   */
+  observedAt?: number | null;
 }
 
 /**
@@ -1532,6 +1584,9 @@ export interface C9pTopics {
   'annotation.removed': {
     data: C9pAnnotationRemovedEvent;
   };
+  'detect.health': {
+    data: C9pDetectorHealth;
+  };
   'diag.detection': {
     data: C9pDetectionDiagnostics;
   };
@@ -1555,4 +1610,4 @@ export interface C9pTopics {
 export type C9pTopic = keyof C9pTopics;
 
 export const C9P_PUBLIC_METHODS = ["agent.create","agent.list","agent.retire","annotation.delete","annotation.list","annotation.patch","annotation.set","auth.can","auth.rules","conversation.get","cost.get","detect.recheck","diag.detection","events.subscribe","events.unsubscribe","hello","history.list","history.search","mail.pause","mail.resume","memory.list","msg.cancel","msg.list","msg.read","msg.send","ping","provider.opencode.connect","provider.opencode.status","session.away","session.list","session.rename","session.stop","session.tasks","session.views","snapshot.get","subagent.list","subagent.transcript","usage.subscriptions"] as const;
-export const C9P_PUBLIC_TOPICS = ["agent.attention","agent.failed","agent.gone","agent.turn_end","agent.upsert","annotation.changed","annotation.removed","diag.detection","msg.state","notification.needs_attention","notification.waiting_for_input","session.gone","session.view"] as const;
+export const C9P_PUBLIC_TOPICS = ["agent.attention","agent.failed","agent.gone","agent.turn_end","agent.upsert","annotation.changed","annotation.removed","detect.health","diag.detection","msg.state","notification.needs_attention","notification.waiting_for_input","session.gone","session.view"] as const;

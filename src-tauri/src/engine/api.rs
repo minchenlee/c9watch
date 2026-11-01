@@ -814,6 +814,7 @@ pub fn schema() -> serde_json::Value {
         "notification.needs_attention": ser.subschema_for::<NotificationEvent>(),
         "notification.waiting_for_input": ser.subschema_for::<NotificationEvent>(),
         "diag.detection": ser.subschema_for::<crate::session::DetectionDiagnostics>(),
+        "detect.health": ser.subschema_for::<super::proto::DetectorHealth>(),
     });
     let mut topics = serde_json::Map::new();
     for (name, stability) in discovery::TOPICS {
@@ -1764,14 +1765,26 @@ where
     tokio::task::spawn_blocking(f).await.map_err(internal)?
 }
 
+/// The detector's health, read BEFORE the rows it describes: a pass that
+/// commits after this read makes the rows newer than `observedAt`, never
+/// older, so the reported freshness is conservative. `observedAt` is the
+/// same struct's `lastOkAt`.
+fn health_first(ctx: &ServerCtx) -> (Option<i64>, Option<super::proto::DetectorHealth>) {
+    let health = ctx.detection.as_ref().map(|d| d.health());
+    (health.as_ref().and_then(|h| h.last_ok_at), health)
+}
+
 async fn snapshot_get(ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
     ctx.detected().await;
+    let (observed_at, detector_health) = health_first(ctx);
     let db = ctx.db()?.clone();
     let (cursor, agents) = blocking(move || db.snapshot().map_err(internal)).await?;
     let result = SnapshotResult {
         cursor: cursor.to_string(),
         machine_id: ctx.machine_id.clone(),
         agents,
+        observed_at,
+        detector_health,
     };
     Ok(serde_json::to_value(result).expect("SnapshotResult serializes"))
 }
@@ -1779,9 +1792,15 @@ async fn snapshot_get(ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
 /// The agents whose session detection sees now (C1a-15).
 async fn session_list(ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
     ctx.detected().await;
+    let (observed_at, detector_health) = health_first(ctx);
     let db = ctx.db()?.clone();
     let sessions = blocking(move || db.agents(AgentFilter::Sessions).map_err(internal)).await?;
-    Ok(serde_json::to_value(SessionListResult { sessions }).expect("SessionListResult serializes"))
+    let result = SessionListResult {
+        sessions,
+        observed_at,
+        detector_health,
+    };
+    Ok(serde_json::to_value(result).expect("SessionListResult serializes"))
 }
 
 /// Live agents, or with `all` every row (N4).
@@ -2566,6 +2585,31 @@ mod tests {
             r["result"]["sessions"],
             serde_json::to_value(vec![a2]).unwrap()
         );
+    }
+
+    /// D6: `snapshot.get` and `session.list` carry the detector health, and
+    /// `observedAt` is its `lastOkAt` (both read before the rows). An engine
+    /// without detection sends neither.
+    #[tokio::test]
+    async fn snapshot_and_session_list_carry_the_detector_health() {
+        let script = Scripted::default();
+        script.set(vec![fixture("a", SessionStatus::Working)], vec![]);
+        let (_t, ctx, _db, _d) = ctx_detect(Arc::new(NoLiveAgents), &script);
+        let (mut c, _) = Client::new(ctx).await;
+        for (id, method) in [("1", "snapshot.get"), ("2", "session.list")] {
+            let r = c.call(id, method, json!({})).await;
+            assert_eq!(r["ok"], true, "{}", r);
+            let h = &r["result"]["detectorHealth"];
+            assert_eq!(h["state"], "ok", "{}", r);
+            assert_eq!(h["stale"], false);
+            assert!(r["result"]["observedAt"].is_i64(), "{}", r);
+            assert_eq!(r["result"]["observedAt"], h["lastOkAt"]);
+        }
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c.call("3", "snapshot.get", json!({})).await;
+        assert!(r["result"].get("detectorHealth").is_none(), "{}", r);
+        assert!(r["result"].get("observedAt").is_none(), "{}", r);
     }
 
     /// `session.away` answers `away::away_activity`, the reader of the

@@ -536,6 +536,16 @@ pub struct SnapshotResult {
     pub cursor: String,
     pub machine_id: String,
     pub agents: Vec<AgentRow>,
+    /// Unix ms of the last detection pass that was written: the
+    /// `lastOkAt` of `detectorHealth`, read before the rows, so the rows
+    /// are never older than it. Absent in an engine without detection, or
+    /// before its first good pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<i64>,
+    /// How detection is doing (the `detect.health` data). Absent in an
+    /// engine without detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector_health: Option<DetectorHealth>,
 }
 
 /// One row of the `agents` table, as `snapshot.get`,
@@ -613,8 +623,15 @@ pub struct SessionListParams {}
 /// (`goneAt` is `null`), in creation order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
 pub struct SessionListResult {
     pub sessions: Vec<AgentRow>,
+    /// As in `snapshot.get`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<i64>,
+    /// As in `snapshot.get`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector_health: Option<DetectorHealth>,
 }
 
 /// `session.views` params. There are none yet; the engine ignores any it
@@ -644,6 +661,41 @@ pub struct SessionGoneEvent {
     pub session_key: String,
     /// The provider session id.
     pub id: String,
+}
+
+/// How session detection is doing: the `detect.health` data, and the
+/// `detectorHealth` of `snapshot.get` and `session.list`. A failed
+/// detection writes nothing, so the rows keep what the last good pass saw;
+/// this says how old that is. While passes are written, `detect.health`
+/// repeats every `staleAfterMs / 2` with a newer `lastOkAt`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct DetectorHealth {
+    /// `ok`: the last pass was written. `degraded`: it was written, but
+    /// the providers in `failedProviders` did not answer, and their rows
+    /// keep what an earlier pass saw. `failed`: the last pass wrote
+    /// nothing. `starting`: no pass has finished yet. Clients must accept
+    /// other values.
+    pub state: String,
+    /// Why the state is not `ok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Provider keys (`claudeCode`, `codex`, ...) that did not answer the
+    /// last written pass.
+    #[serde(default)]
+    pub failed_providers: Vec<String>,
+    /// Unix ms of the last pass that was written (`observedAt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ok_at: Option<i64>,
+    /// Unix ms when the last pass finished, written or not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at: Option<i64>,
+    /// No pass was written for `staleAfterMs`: every detected session row
+    /// may be out of date. Rows whose provider is in `failedProviders` may
+    /// be out of date even when this is false.
+    pub stale: bool,
+    pub stale_after_ms: i64,
 }
 
 /// `agent.attention` data: an agent needs the user.

@@ -99,7 +99,8 @@ pub fn topic(name: &str) -> Option<Rule> {
         | "session.gone"
         | "notification.needs_attention"
         | "notification.waiting_for_input"
-        | "diag.detection" => rule("session", "read", ALL, None, &[]),
+        | "diag.detection"
+        | "detect.health" => rule("session", "read", ALL, None, &[]),
         "agent.upsert" | "agent.attention" | "agent.turn_end" | "agent.gone" | "agent.failed" => {
             rule("agent", "read", ALL, None, &[])
         }

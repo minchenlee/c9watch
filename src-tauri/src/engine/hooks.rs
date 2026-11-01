@@ -14,7 +14,8 @@
 //!    the live one, or no longer the row's, is dropped.
 //! 4. **Dedupe** by `agent_id + seq` in the `dedupe` table, for
 //!    `db::DEDUPE_WINDOW_MS`.
-//! 5. The event goes into the state merge (`engine::merge`), and the
+//! 5. The event goes into a copy of the state merge (`engine::merge`),
+//!    which is published only when the transaction commits (D5), and the
 //!    session binding for SessionStart (`engine::generation`). A
 //!    UserPromptSubmit whose prompt carries a mail fence marks that mail
 //!    `delivered` (`engine::mail::confirm_from_prompt`).
@@ -169,8 +170,12 @@ fn apply(
         _ => (None, None),
     };
     let from_subagent = p.input["agent_id"].as_str().is_some_and(|a| !a.is_empty());
-    let (change, row_state, attention) = merge.with(id, ev.gen, |m| {
-        let claim = match ev.method {
+    // The change runs on a copy now and again on the live entry at commit
+    // (`MergeTable::stage`), so it owns what it reads.
+    let method = ev.method.to_string();
+    let flag = attention.clone();
+    let ((change, row_state), staged) = merge.stage(id, ev.gen, move |m| {
+        let claim = match method.as_str() {
             "hook.post_tool_use" => claim.filter(|_| {
                 !from_subagent
                     && m.turn_open()
@@ -190,13 +195,14 @@ fn apply(
             _ => claim,
         };
         let change = claim.map(|c| m.claim(c)).unwrap_or_default();
-        if let Some(a) = &attention {
+        if let Some(a) = &flag {
             m.attention(a, now_ms);
         }
         let row_state = m.row_state(now_ms);
         m.written(row_state);
-        (change, row_state, attention)
+        (change, row_state)
     });
+    merge.publish_on_commit(tx, staged);
     write_change(tx, machine, id, ev.gen, state, &change, row_state)?;
     // C1b-M1 §4.5: a prompt that carries a mail fence is that mail,
     // delivered. `c9watch-agent` sends only the fence header lines
@@ -288,12 +294,13 @@ pub fn screen_claim(
     let Some((row_gen, state)) = row.filter(|(g, _)| *g == gen) else {
         return Ok(false);
     };
-    let (change, row_state) = merge.with(id, gen, |m| {
+    let ((change, row_state), staged) = merge.stage(id, gen, move |m| {
         let change = m.claim(Claim::new(Source::Screen, activity, now_ms));
         let row_state = m.row_state(now_ms);
         m.written(row_state);
         (change, row_state)
     });
+    merge.publish_on_commit(tx, staged);
     write_change(
         tx,
         machine,
@@ -328,12 +335,15 @@ pub fn expire_hold(
         )
         .optional()?;
     let row_state = merge
-        .peek(id, gen, |m| {
+        .stage_existing(id, gen, move |m| {
             let s = m.row_state(now_ms);
             m.written(s);
             s
         })
-        .flatten();
+        .and_then(|(s, staged)| {
+            merge.publish_on_commit(tx, staged);
+            s
+        });
     // No live row of this generation: noted as written above, so the
     // supervisor does not ask again every tick.
     let Some(state) = row else {
@@ -648,6 +658,77 @@ mod tests {
         let p = params("claude", "4", json!({}));
         send(&db, &merge, "hook.permission_request", 1, Some(1), p, 9_000);
         assert_eq!(state(&db), "paused");
+    }
+
+    /// D5: a write that fails after the merge ran leaves the merge as it
+    /// was, so the retried Stop ends the turn and writes its turn end.
+    #[test]
+    fn a_failed_write_leaves_the_merge_unchanged() {
+        let (_t, db, merge) = setup();
+        let p = params("claude", "1", json!({"prompt": "hi"}));
+        send(&db, &merge, "hook.user_prompt_submit", 1, Some(1), p, 1_000);
+        assert_eq!(merge.peek("a1", 1, |m| m.turn_open()), Some(true));
+        let m2 = merge.clone();
+        let failed = db.write_blocking(move |tx| {
+            let p = params("claude", "2", json!({}));
+            let ev = HookEvent {
+                method: "hook.stop",
+                principal: "agent:a1",
+                gen: 1,
+                live_gen: Some(1),
+                params: &p,
+            };
+            intake(tx, MACHINE, &m2, &ev, 2_000)?;
+            // A later statement of the same transaction fails.
+            tx.execute("INSERT INTO no_such_table VALUES (1)", [])
+        });
+        assert!(failed.is_err());
+        assert_eq!(merge.peek("a1", 1, |m| m.turn_open()), Some(true));
+        assert_eq!(merge.peek("a1", 1, |m| m.last_turn_end()), Some(None));
+        assert_eq!(state(&db), "working");
+        assert!(!topics(&db).contains(&"agent.turn_end".to_string()));
+        // The commit itself fails (a deferred foreign key): the same.
+        let m2 = merge.clone();
+        let failed = db.write_blocking(move |tx| {
+            let p = params("claude", "2", json!({}));
+            let ev = HookEvent {
+                method: "hook.stop",
+                principal: "agent:a1",
+                gen: 1,
+                live_gen: Some(1),
+                params: &p,
+            };
+            intake(tx, MACHINE, &m2, &ev, 2_000)?;
+            tx.execute_batch(
+                "PRAGMA defer_foreign_keys = ON; \
+                 INSERT INTO agent_state (agent_id, gen) VALUES ('nobody', 1);",
+            )
+        });
+        assert!(failed.unwrap_err().contains("FOREIGN KEY"));
+        assert_eq!(merge.peek("a1", 1, |m| m.turn_open()), Some(true));
+        assert_eq!(merge.peek("a1", 1, |m| m.last_turn_end()), Some(None));
+        assert_eq!(state(&db), "working");
+        // The retry (the dedupe row rolled back too) ends the turn.
+        let p = params("claude", "2", json!({}));
+        assert_eq!(
+            send(&db, &merge, "hook.stop", 1, Some(1), p, 2_100),
+            Outcome::Accepted
+        );
+        assert_eq!(merge.peek("a1", 1, |m| m.turn_open()), Some(false));
+        assert_eq!(state(&db), "ready");
+        assert!(topics(&db).contains(&"agent.turn_end".to_string()));
+        // A failed screen claim leaves it too.
+        let m2 = merge.clone();
+        let failed = db.write_blocking(move |tx| {
+            screen_claim(tx, MACHINE, &m2, "a1", 1, Activity::Working, 9_000)?;
+            tx.execute("INSERT INTO no_such_table VALUES (1)", [])
+        });
+        assert!(failed.is_err());
+        assert_eq!(merge.peek("a1", 1, |m| m.turn_open()), Some(false));
+        assert_eq!(
+            merge.peek("a1", 1, |m| m.row_state(9_000)),
+            Some(Some("ready"))
+        );
     }
 
     #[test]

@@ -119,6 +119,7 @@ pub struct Tx<'a> {
     tx: Transaction<'a>,
     epoch: String,
     last: Option<i64>,
+    after_commit: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 impl Tx<'_> {
@@ -134,6 +135,22 @@ impl Tx<'_> {
     /// transaction as its event.
     pub fn epoch(&self) -> &str {
         &self.epoch
+    }
+
+    /// Run `f` on the writer thread once the transaction commits, before
+    /// the next write starts. For memory that must not move ahead of the db
+    /// (`MergeTable::publish_on_commit`).
+    ///
+    /// - If `f` (the closure of `write`) fails or the commit fails, the
+    ///   hooks are dropped and never run.
+    /// - A hook holds up every write behind it: keep it short, and never
+    ///   call `Db` or the writer from it. A writer call from inside a job
+    ///   is a hard error.
+    /// - A hook that panics is logged and skipped. The hooks after it
+    ///   still run, the new head is still sent to subscribers, and the
+    ///   caller still gets its committed result.
+    pub fn after_commit(&mut self, f: impl FnOnce() + Send + 'static) {
+        self.after_commit.push(Box::new(f));
     }
 }
 
@@ -391,11 +408,22 @@ where
             tx: c.transaction().map_err(fail)?,
             epoch,
             last: None,
+            after_commit: Vec::new(),
         };
         // On error `tx` drops here, which rolls back.
         let r = f(&mut tx).map_err(fail)?;
         let last = tx.last;
+        let after_commit = std::mem::take(&mut tx.after_commit);
         tx.tx.commit().map_err(fail)?;
+        for f in after_commit {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+                crate::elog!(
+                    Warn,
+                    "db",
+                    "an after-commit hook panicked; the commit stands"
+                );
+            }
+        }
         if let Some(seq) = last {
             head.send_replace(seq);
         }
@@ -1006,6 +1034,71 @@ mod tests {
              VALUES (?1, 'observed', 'claude', 'detected')",
             [id],
         )
+    }
+
+    /// `Tx::after_commit`: hooks run after a commit, in order, and a
+    /// panicking one does not hide the commit; a failed closure or a failed
+    /// commit drops them unrun.
+    #[test]
+    fn after_commit_hooks_run_only_after_a_commit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_t, h) = home();
+        let db = open(&h, M).unwrap();
+        let ran = Arc::new(AtomicUsize::new(0));
+        fn hook(tx: &mut Tx, ran: &Arc<AtomicUsize>) {
+            let ran = ran.clone();
+            tx.after_commit(move || {
+                ran.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        // A statement fails: rolled back, the hook never runs.
+        let r = ran.clone();
+        let err = db.write_blocking(move |tx| {
+            hook(tx, &r);
+            tx.execute("INSERT INTO no_such_table VALUES (1)", [])
+        });
+        assert!(err.is_err());
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        // The commit fails (a deferred foreign key): the hook never runs.
+        let r = ran.clone();
+        let err = db.write_blocking(move |tx| {
+            hook(tx, &r);
+            tx.execute_batch(
+                "PRAGMA defer_foreign_keys = ON; \
+                 INSERT INTO agent_state (agent_id, gen) VALUES ('nobody', 1);",
+            )
+        });
+        assert!(err.unwrap_err().contains("FOREIGN KEY"));
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        let rows: i64 = db
+            .reader()
+            .unwrap()
+            .query_row("SELECT count(*) FROM agent_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        // A commit: the hooks run; one that panics is skipped, and the
+        // caller still gets its result.
+        let mut head = db.head.subscribe();
+        let r = ran.clone();
+        let (out, cur) = db
+            .write_blocking(move |tx| {
+                hook(tx, &r);
+                tx.after_commit(|| panic!("hook"));
+                hook(tx, &r);
+                insert_agent(tx, "a1")?;
+                tx.emit(&agent_event("a1"))?;
+                Ok(7)
+            })
+            .unwrap();
+        assert_eq!(out, 7);
+        assert_eq!(cur, Some(db.cursor_at(1)));
+        assert_eq!(ran.load(Ordering::SeqCst), 2);
+        // Subscribers still wake on the commit.
+        assert!(head.has_changed().unwrap());
+        assert_eq!(*head.borrow_and_update(), 1);
+        // The writer still works.
+        db.write_blocking(|tx| tx.execute("DELETE FROM agents WHERE id = 'zz'", []))
+            .unwrap();
     }
 
     #[test]

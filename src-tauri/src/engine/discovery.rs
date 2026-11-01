@@ -110,6 +110,7 @@ pub const TOPICS: &[(&str, &str)] = &[
     ("notification.needs_attention", PREVIEW),
     ("notification.waiting_for_input", PREVIEW),
     ("diag.detection", PREVIEW),
+    ("detect.health", PREVIEW),
     ("annotation.changed", PREVIEW),
     ("annotation.removed", PREVIEW),
 ];
