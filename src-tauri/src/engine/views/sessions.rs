@@ -56,6 +56,8 @@ pub struct SessionViews {
     state: Mutex<Option<Committed>>,
     /// The last detection diagnostics; `None` before the first tick.
     diagnostics: Mutex<Option<DetectionDiagnostics>>,
+    /// Woken on every commit, for `wait_ready`.
+    committed: tokio::sync::Notify,
 }
 
 /// What one tick changes, computed before its write and committed after.
@@ -171,6 +173,26 @@ impl SessionViews {
             sessions: change.sessions,
             by_key: change.by_key,
         });
+        self.committed.notify_waiters();
+    }
+
+    /// Wait up to `timeout` for the first commit: detection's first
+    /// successful tick. A failed tick commits nothing. Returns whether
+    /// views are committed.
+    pub async fn wait_ready(&self, timeout: std::time::Duration) -> bool {
+        let ready = async {
+            loop {
+                let woken = self.committed.notified();
+                tokio::pin!(woken);
+                woken.as_mut().enable();
+                let committed = self.lock().is_some();
+                if committed {
+                    return;
+                }
+                woken.await;
+            }
+        };
+        tokio::time::timeout(timeout, ready).await.is_ok()
     }
 
     pub fn diagnostics(&self) -> Option<DetectionDiagnostics> {

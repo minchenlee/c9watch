@@ -2,9 +2,11 @@
 //! connection, the `hello` handshake, and method dispatch.
 //!
 //! The first frame must be `hello` and must arrive within 5 s of the accept;
-//! blank lines do not extend that deadline. The peer is stamped after
-//! detection's first pass; if that pass takes longer than the 5 s, the
-//! connection gets `busy` and closes. A major version mismatch gets
+//! blank lines do not extend that deadline. `hello` never waits for session
+//! detection. A connection stamped before detection's first successful
+//! pass is provisional (`Stamp`): it is stamped again before its first
+//! request that the stamp could change, which waits up to 5 s for the
+//! views and otherwise gets `busy`. A major version mismatch gets
 //! `upgrade_required` and the connection closes. So do a missing or late
 //! `hello`, an oversized frame and a peer under another uid. After `hello`, a
 //! frame that is not valid JSON or lacks `v` gets `bad_request`, and the
@@ -16,8 +18,9 @@
 //! (D3). A connection runs at most `MAX_IN_FLIGHT` requests; past that the
 //! reader reads nothing more until one ends. `events.subscribe` and
 //! `events.unsubscribe` take the connection's streams in the order they
-//! were sent, so a subscribe response comes before its first event and no
-//! event of a stream follows its unsubscribe response. When the peer closes, the
+//! were sent, on one task per connection, so a subscribe response comes
+//! before its first event and no event of a stream follows its
+//! unsubscribe response; a slow one never holds up the other requests. When the peer closes, the
 //! requests in flight finish first. `agent.create`, `agent.retire` and
 //! `session.stop` replay a repeated `idem` (`engine::idem`).
 //!
@@ -292,6 +295,33 @@ impl ServerCtx {
         }
     }
 
+    /// Whether detection has committed views once. An engine without
+    /// detection, or with a test set, has none to wait for.
+    pub(crate) fn views_ready(&self) -> bool {
+        match (&self.observed, &self.detection) {
+            (None, Some(d)) => d.views.current().is_some(),
+            _ => true,
+        }
+    }
+
+    /// Wait up to `STAMP_WAIT` for detection's first views; past it,
+    /// `busy`. Who a peer is depends on them, so nothing the principal
+    /// decides runs before them.
+    pub(crate) async fn ensure_views(&self) -> Result<(), ApiError> {
+        let ready = match (&self.observed, &self.detection) {
+            (None, Some(d)) => d.views.wait_ready(STAMP_WAIT).await,
+            _ => true,
+        };
+        if ready {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            ErrorCode::Busy,
+            "session detection has not finished a pass yet",
+        )
+        .with_hint("the engine is starting; retry shortly"))
+    }
+
     /// The observed sessions now: detection's last views, or the test set.
     pub(crate) fn observed_sessions(&self) -> Arc<dyn ObservedSessions> {
         if let Some(o) = &self.observed {
@@ -451,49 +481,28 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
     // Stamp at accept, not at `hello`: the peer pid is then as fresh as it
     // gets, and a late `hello` cannot wait for the pid to be reused.
     // The peer's start time comes from the same read as the principal, so
-    // a later exe check reads the process the principal came from.
-    //
-    // The observed sessions come from detection, so wait for its first pass
-    // first: stamped before it, a process in an observed session would stay
-    // `local-unverified` for the life of the connection. The wait counts
-    // against the `hello` timeout. Past it the connection gets `busy` and
-    // closes, and the client connects again; it is never stamped from
-    // empty views. A peer that exits during the wait and whose pid is
-    // reused fails the start check against `accepted`.
-    if !ctx.first_tick.is_open()
-        && !ctx
-            .first_tick
-            .wait(hello_deadline.saturating_duration_since(tokio::time::Instant::now()))
-            .await
-    {
-        let _ = tx
-            .send(encode(&Response::err(
-                None,
-                ApiError::new(
-                    ErrorCode::Busy,
-                    "session detection has not finished its first pass",
-                )
-                .with_hint("the engine is starting; connect again shortly"),
-            )))
-            .await;
-        drop(tx);
-        let _ = writer.await;
-        return;
-    }
-    let (principal, start) = principal::stamp_peer(
-        cred.pid,
-        accepted,
-        ctx.agents.as_ref(),
-        ctx.observed_sessions().as_ref(),
-    );
-    let principal = Arc::new(principal);
-    let peer = Peer::Unix { cred, start };
+    // a later exe check reads the process the principal came from. Before
+    // detection's first views the stamp is provisional (`Stamp`).
+    let stamp = Arc::new(Stamp::at_accept(&ctx, cred, accepted));
 
     let mut reader = BufReader::new(read);
     let mut conn: Option<Conn> = None;
     let streams = Arc::new(tokio::sync::Mutex::new(Streams::default()));
     let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let mut calls = tokio::task::JoinSet::new();
+    // Stream controls run one at a time in the order sent, on their own
+    // task, so a slow subscribe holds up only the controls after it. The
+    // in-flight bound also bounds this queue.
+    let (controls, mut queued) = mpsc::channel::<Queued>(MAX_IN_FLIGHT);
+    {
+        let (ctx, stamp, streams, tx) = (ctx.clone(), stamp.clone(), streams.clone(), tx.clone());
+        calls.spawn(async move {
+            while let Some(q) = queued.recv().await {
+                let held = streams.clone().lock_owned().await;
+                serve_queued(q, &ctx, &stamp, Some(held), &tx).await;
+            }
+        });
+    }
     loop {
         while calls.try_join_next().is_some() {}
         let frame = if conn.is_none() {
@@ -533,6 +542,7 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
         if frame.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
+        let (principal, peer) = stamp.now();
         match check_frame(&frame, &ctx, peer, &principal, &mut conn) {
             Checked::Done(resp, next) => {
                 if tx.send(encode(&resp)).await.is_err() {
@@ -553,23 +563,24 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
                         tx: tx.clone(),
                         id: req.id.clone(),
                     });
-                // The reader takes the streams for a subscribe or unsubscribe
-                // before the next frame, so these run in the order sent: an
-                // unsubscribe pipelined after its subscribe cannot run first.
-                let held = match method.as_str() {
-                    "events.subscribe" | "events.unsubscribe" => {
-                        Some(streams.clone().lock_owned().await)
-                    }
-                    _ => None,
+                let q = Queued {
+                    req,
+                    method,
+                    progress,
+                    slot,
                 };
-                let (ctx, principal, tx) = (ctx.clone(), principal.clone(), tx.clone());
-                calls.spawn(async move {
-                    call(req, &method, &ctx, peer, &principal, held, progress, &tx).await;
-                    drop(slot);
-                });
+                if matches!(q.method.as_str(), "events.subscribe" | "events.unsubscribe") {
+                    if controls.send(q).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                let (ctx, stamp, tx) = (ctx.clone(), stamp.clone(), tx.clone());
+                calls.spawn(async move { serve_queued(q, &ctx, &stamp, None, &tx).await });
             }
         }
     }
+    drop(controls);
     // A write in flight runs to its end; only then do the streams stop.
     while calls.join_next().await.is_some() {}
     streams.lock().await.abort_all();
@@ -577,11 +588,184 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
     let _ = writer.await;
 }
 
+/// One request after the envelope checks, with its in-flight permit.
+struct Queued {
+    req: Request,
+    method: String,
+    progress: Option<Progress>,
+    slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Serve `q` under the connection's stamp for it, then free its permit.
+async fn serve_queued(
+    q: Queued,
+    ctx: &ServerCtx,
+    stamp: &Stamp,
+    held: Option<tokio::sync::OwnedMutexGuard<Streams>>,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let Queued {
+        req,
+        method,
+        progress,
+        slot,
+    } = q;
+    match stamp.for_request(ctx, &method, &req).await {
+        Ok((principal, peer)) => {
+            call(req, &method, ctx, peer, &principal, held, progress, tx).await
+        }
+        Err(e) => {
+            let _ = tx.send(encode(&Response::err(req.id, e))).await;
+        }
+    }
+    drop(slot);
+}
+
+/// How long a request on a provisional connection waits for detection's
+/// first views.
+const STAMP_WAIT: Duration = Duration::from_secs(5);
+
+/// The principal of one Unix connection (D8). It is stamped at accept.
+/// Before detection's first successful pass there are no views, so a
+/// process in an observed session would stamp `local-unverified`: that
+/// stamp is provisional. Once views exist, the connection is stamped again,
+/// once, and keeps that result. A request whose answer the stamp could
+/// change waits for the views first (`needs_stamp`); past `STAMP_WAIT` it
+/// gets `busy`, and the next such request waits again. Other reads run
+/// under the provisional stamp. `hello` never waits, so it may report
+/// `local-unverified` for a peer that later narrows to `observed:`.
+struct Stamp {
+    cred: peer::PeerCred,
+    accepted: Option<u64>,
+    first: (Arc<Principal>, Peer),
+    provisional: bool,
+    settled: tokio::sync::OnceCell<(Arc<Principal>, Peer)>,
+}
+
+impl Stamp {
+    fn at_accept(ctx: &ServerCtx, cred: peer::PeerCred, accepted: Option<u64>) -> Self {
+        let ready = ctx.views_ready();
+        let (principal, start) = principal::stamp_peer(
+            cred.pid,
+            accepted,
+            ctx.agents.as_ref(),
+            ctx.observed_sessions().as_ref(),
+        );
+        // Only `local-unverified` can narrow: an agent's stamp comes from
+        // the engine's own agent table, never from the views.
+        let provisional = !ready && principal == Principal::LocalUnverified;
+        Self {
+            cred,
+            accepted,
+            first: (Arc::new(principal), Peer::Unix { cred, start }),
+            provisional,
+            settled: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// The stamp as it stands, for `hello`.
+    fn now(&self) -> (Arc<Principal>, Peer) {
+        self.settled.get().unwrap_or(&self.first).clone()
+    }
+
+    /// The stamp to serve `method` under.
+    async fn for_request(
+        &self,
+        ctx: &ServerCtx,
+        method: &str,
+        req: &Request,
+    ) -> Result<(Arc<Principal>, Peer), ApiError> {
+        if !self.provisional {
+            return Ok(self.first.clone());
+        }
+        if let Some(s) = self.settled.get() {
+            return Ok(s.clone());
+        }
+        if !ctx.views_ready() {
+            if !needs_stamp(method, req) {
+                return Ok(self.first.clone());
+            }
+            ctx.ensure_views().await?;
+        }
+        Ok(self
+            .settled
+            .get_or_init(|| async { self.again(ctx) })
+            .await
+            .clone())
+    }
+
+    /// Stamp again from the views. A peer whose process is no longer the
+    /// one that connected (another start time) keeps its first stamp, and
+    /// the start check of any later mutation refuses it.
+    fn again(&self, ctx: &ServerCtx) -> (Arc<Principal>, Peer) {
+        let (principal, start) = principal::stamp_peer(
+            self.cred.pid,
+            self.accepted,
+            ctx.agents.as_ref(),
+            ctx.observed_sessions().as_ref(),
+        );
+        match self.first.1 {
+            Peer::Unix { start: first, .. } if first == start && start.is_some() => (
+                Arc::new(principal),
+                Peer::Unix {
+                    cred: self.cred,
+                    start,
+                },
+            ),
+            _ => self.first.clone(),
+        }
+    }
+}
+
+/// Whether the answer to `method` could differ between `local-unverified`
+/// and an observed session, so a provisional stamp may not serve it: the
+/// method is closed to one of them, or an admission check reads the
+/// principal. For `events.subscribe`, whether it may carry a topic that
+/// only one of them may read (`msg.state`, `legacy.inbox`).
+fn needs_stamp(method: &str, req: &Request) -> bool {
+    if method == "events.subscribe" {
+        let observed = Principal::Observed {
+            session_key: String::new(),
+        };
+        let (local, observed) = (
+            authz::topics(&Principal::LocalUnverified, None),
+            authz::topics(&observed, None),
+        );
+        let wanted: Option<Vec<String>> = req
+            .params
+            .get("topics")
+            .map(|t| serde_json::from_value(t.clone()).unwrap_or_default());
+        return local
+            .iter()
+            .filter(|t| !observed.contains(t))
+            .any(|t| match &wanted {
+                Some(w) if !w.is_empty() => topic_wanted(w, t),
+                _ => true,
+            });
+    }
+    // An unknown method is `unknown_method` for every principal.
+    authz::method(method).is_some_and(|r| {
+        !(r.principals.contains(&authz::L)
+            && r.principals.contains(&authz::O)
+            && r.admission.iter().all(|a| *a == Admission::UnixPeer))
+    })
+}
+
+/// Whether topic patterns `wanted` (`name` or `prefix.*`) match `topic`.
+fn topic_wanted(wanted: &[String], topic: &str) -> bool {
+    wanted.iter().any(|t| match t.strip_suffix(".*") {
+        Some(prefix) => topic
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('.')),
+        None => t == topic,
+    })
+}
+
 /// Serve one request and queue its response. A subscribe or unsubscribe
-/// gets the connection's streams in `held`, taken by the reader in frame
-/// order, and holds them throughout: a new stream starts only after its
-/// response is queued, so that response comes first, and the stream count
-/// cannot pass `MAX_STREAMS`.
+/// gets the connection's streams in `held`, taken in the order sent, and
+/// holds them throughout: a new stream starts only after its response is
+/// queued, so that response comes first, and the stream count cannot pass
+/// `MAX_STREAMS`.
 #[allow(clippy::too_many_arguments)]
 async fn call(
     req: Request,
@@ -1216,7 +1400,7 @@ async fn admit(
             Admission::MailPeer => check_mail_peer(ctx, peer, principal).await?,
             Admission::MailSender => {
                 let peer = peer.unix()?;
-                ctx.detected().await;
+                ctx.ensure_views().await?;
                 let (agents, observed, who) = (
                     ctx.agents.clone(),
                     ctx.observed_sessions(),
@@ -1483,7 +1667,7 @@ async fn check_mutating_peer(
         }
     };
     let peer = peer.unix()?;
-    ctx.detected().await;
+    ctx.ensure_views().await?;
     let (agents, observed) = (ctx.agents.clone(), ctx.observed_sessions());
     let checked = blocking(move || {
         Ok(principal::check_mutating_peer(
@@ -2115,14 +2299,7 @@ struct EventStream {
 
 impl EventStream {
     fn wants(&self, e: &Event) -> bool {
-        let topic_ok = self.topics.is_empty()
-            || self.topics.iter().any(|t| match t.strip_suffix(".*") {
-                Some(prefix) => e
-                    .topic
-                    .strip_prefix(prefix)
-                    .is_some_and(|rest| rest.starts_with('.')),
-                None => *t == e.topic,
-            });
+        let topic_ok = self.topics.is_empty() || topic_wanted(&self.topics, &e.topic);
         let subject_ok = self.subjects.is_empty()
             || e.subject
                 .as_ref()
@@ -5244,54 +5421,159 @@ mod tests {
         }
     }
 
-    /// Observed sessions that detection fills in on its first pass.
-    struct LateObserved(std::sync::Mutex<HashMap<libc::pid_t, String>>);
+    /// A detector whose ticks fail until `ok` is set; then it sees one
+    /// session, run by this test process's parent.
+    #[derive(Clone, Default)]
+    struct Flaky(Arc<std::sync::atomic::AtomicBool>);
 
-    impl ObservedSessions for LateObserved {
-        fn by_pid(&self, pid: libc::pid_t) -> Option<String> {
-            self.0.lock().unwrap().get(&pid).cloned()
+    impl Observe for Flaky {
+        fn observe(&mut self) -> Result<Observation, String> {
+            if !self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("not yet".into());
+            }
+            let me = std::process::id() as libc::pid_t;
+            let mut s = fixture("s1", SessionStatus::Working);
+            s.pid = peer::proc_info(me).unwrap().ppid as u32;
+            Ok(Observation {
+                sessions: vec![s],
+                failed: Vec::new(),
+                diagnostics: None,
+            })
         }
     }
 
-    /// A peer that connects before detection's first pass is stamped after
-    /// it, so a process in an observed session is `observed:<key>`, not
-    /// `local-unverified`.
-    #[tokio::test]
-    async fn a_peer_is_stamped_after_detections_first_pass() {
-        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
-        let me = std::process::id() as libc::pid_t;
-        let parent = peer::proc_info(me).unwrap().ppid;
-        let seen = Arc::new(LateObserved(Default::default()));
-        let first = Arc::new(FirstTick::pending());
-        let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
-        ctx.observed = Some(seen.clone());
-        ctx.first_tick = first.clone();
-        let pass = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            seen.0
-                .lock()
+    /// `ctx_db` with a `Flaky` detection whose first tick failed: no views.
+    fn ctx_flaky() -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Detection>, Flaky) {
+        let (t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let flaky = Flaky::default();
+        let detection = Detection::new(db);
+        detection.install(Detector::new(Box::new(flaky.clone()), MACHINE.into()));
+        assert!(detection.tick().is_err());
+        let ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .unwrap()
+            .with_detection(detection.clone());
+        (t, Arc::new(ctx), detection, flaky)
+    }
+
+    /// Which requests a provisional stamp may not serve.
+    #[test]
+    fn needs_stamp_covers_what_an_observed_session_reads_differently() {
+        let req = |method: &str, params: Value| -> Request {
+            serde_json::from_value(json!({"v": 1, "id": "1", "method": method, "params": params}))
                 .unwrap()
-                .insert(parent, "claudeCode:s1".into());
-            first.open();
+        };
+        for (method, params, needs) in [
+            ("ping", json!({}), false),
+            ("agent.list", json!({}), false),
+            ("session.views", json!({}), false),
+            ("no.such", json!({}), false),
+            ("msg.list", json!({}), true),
+            ("msg.read", json!({}), true),
+            ("msg.send", json!({}), true),
+            ("session.stop", json!({}), true),
+            ("session.rename", json!({}), true),
+            ("annotation.set", json!({}), true),
+            ("agent.create", json!({}), true),
+            ("events.subscribe", json!({}), true),
+            (
+                "events.subscribe",
+                json!({"topics": ["agent.*", "session.*"]}),
+                false,
+            ),
+            ("events.subscribe", json!({"topics": ["legacy.*"]}), true),
+            ("events.subscribe", json!({"topics": ["msg.state"]}), true),
+        ] {
+            assert_eq!(
+                needs_stamp(method, &req(method, params.clone())),
+                needs,
+                "{} {}",
+                method,
+                params
+            );
+        }
+    }
+
+    /// `hello` with a deadline: it never waits for detection.
+    async fn quick_hello(ctx: Arc<ServerCtx>) -> (Client, Value) {
+        tokio::time::timeout(Duration::from_secs(1), Client::new(ctx))
+            .await
+            .expect("hello within 1 s")
+    }
+
+    /// The first tick fails and a later one succeeds. `hello` answers at
+    /// once, provisionally `local-unverified`; the first restricted request
+    /// waits for the views, and the connection is `observed:` from then on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provisional_peer_is_stamped_again_before_a_restricted_request() {
+        let (_t, ctx, detection, flaky) = ctx_flaky();
+        let (mut c, hello) = quick_hello(ctx).await;
+        assert_eq!(hello["principal"], "local-unverified");
+        let pass = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            flaky.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::task::spawn_blocking(move || detection.tick().unwrap())
+                .await
+                .unwrap();
         });
-        let (_c, hello) = Client::new(Arc::new(ctx)).await;
-        assert_eq!(hello["principal"], "observed:claudeCode:s1");
+        // Closed to an observed session: refused for the stamp that
+        // detection's views give, not run as the provisional one.
+        let r = c.call("1", "msg.list", json!({})).await;
+        assert_eq!(r["error"]["code"], "not_allowed", "{}", r);
+        let r = c.call("2", "auth.rules", json!({})).await;
+        assert_eq!(r["result"]["principal"], "observed:claudeCode:s1", "{}", r);
         pass.await.unwrap();
     }
 
-    /// Past the `hello` timeout with no first pass, the connection gets
-    /// `busy` and closes; it is never stamped from empty views.
+    /// Detection never succeeds: a restricted request gets `busy` with its
+    /// own `id`, and plain reads still answer.
     #[tokio::test]
-    async fn a_peer_gets_busy_when_detection_has_not_run() {
-        let mut ctx = Arc::try_unwrap(ctx(Duration::from_millis(200)))
-            .ok()
+    async fn a_restricted_request_is_busy_until_detection_succeeds() {
+        let (_t, ctx, _d, _f) = ctx_flaky();
+        let (mut c, hello) = quick_hello(ctx).await;
+        assert_eq!(hello["principal"], "local-unverified");
+        let r = c.call("1", "agent.list", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        c.send("2", "msg.list", json!({})).await;
+        c.send("3", "ping", json!({})).await;
+        let r = c.next().await;
+        assert_eq!(r["id"], "3", "a read waits behind a restricted one: {}", r);
+        let r = c.next().await;
+        assert_eq!(r["id"], "2", "{}", r);
+        assert_eq!(r["error"]["code"], "busy", "{}", r);
+        let r = c.call("4", "ping", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+    }
+
+    /// A slow subscribe holds up only the stream controls after it: a ping
+    /// sent after `subscribe` and `unsubscribe` answers first, and the
+    /// unsubscribe still runs after its subscribe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_subscribe_does_not_hold_up_other_requests() {
+        let (_t, ctx, detection, flaky) = ctx_flaky();
+        let (mut c, _) = quick_hello(ctx).await;
+        // Unfiltered, it may carry `legacy.inbox`: it waits for the views.
+        c.send("s", "events.subscribe", json!({})).await;
+        c.send("u", "events.unsubscribe", json!({"sub": "s"})).await;
+        c.send("p", "ping", json!({})).await;
+        let r = c.next().await;
+        assert_eq!(r["id"], "p", "{}", r);
+        flaky.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::task::spawn_blocking(move || detection.tick().unwrap())
+            .await
             .unwrap();
-        ctx.first_tick = Arc::new(FirstTick::pending());
-        let mut c = connect(Arc::new(ctx));
-        send(&mut c, hello_req("1", json!({"apiMajor": 1}))).await;
-        let got = read_all(c).await;
-        assert_eq!(got.len(), 1, "{:?}", got);
-        assert_eq!(got[0]["error"]["code"], "busy", "{:?}", got);
+        let mut acked = false;
+        loop {
+            let f = c.next().await;
+            if f["id"] == "s" && f["type"] != "event" {
+                assert_eq!(f["ok"], true, "{}", f);
+                acked = true;
+            } else if f["id"] == "u" {
+                assert!(acked, "unsubscribe answered before its subscribe");
+                assert_eq!(f["result"]["ended"], true, "{}", f);
+                break;
+            }
+        }
     }
 
     fn observed_ctx(key: &str) -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Db>) {
@@ -5554,7 +5836,7 @@ async fn check_mail_peer(ctx: &ServerCtx, peer: Peer, who: &Principal) -> Result
     if !matches!(who, Principal::LocalUnverified) {
         return Ok(());
     }
-    ctx.detected().await;
+    ctx.ensure_views().await?;
     let (agents, observed) = (ctx.agents.clone(), ctx.observed_sessions());
     let who = who.clone();
     blocking(move || {

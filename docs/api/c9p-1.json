@@ -1770,7 +1770,7 @@
         },
         {
           "const": "busy",
-          "description": "The engine is at a limit that frees up soon: the connection cap, a\nscan of the same kind that is still running, every `idem` key in\nuse, or a connection made before session detection's first pass\nended. Retry shortly.",
+          "description": "The engine is at a limit that frees up soon: the connection cap, a\nscan of the same kind that is still running, every `idem` key in\nuse, or, while the engine starts, a request that needs the caller's\nidentity before session detection has finished a pass. The request\nhas its own `id`; the connection stays open. Retry shortly.",
           "type": "string"
         },
         {

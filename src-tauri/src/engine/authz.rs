@@ -13,10 +13,10 @@ use super::proto::{
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-const L: &str = "local-unverified";
+pub(crate) const L: &str = "local-unverified";
 const A: &str = "agent";
 const C: &str = "client";
-const O: &str = "observed";
+pub(crate) const O: &str = "observed";
 const ALL: &[&str] = &[L, A, C, O];
 
 /// A check `api::dispatch` runs after the principal kind passed and before

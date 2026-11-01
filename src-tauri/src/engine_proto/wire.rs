@@ -174,8 +174,9 @@ pub enum ErrorCode {
     ActionFailed,
     /// The engine is at a limit that frees up soon: the connection cap, a
     /// scan of the same kind that is still running, every `idem` key in
-    /// use, or a connection made before session detection's first pass
-    /// ended. Retry shortly.
+    /// use, or, while the engine starts, a request that needs the caller's
+    /// identity before session detection has finished a pass. The request
+    /// has its own `id`; the connection stays open. Retry shortly.
     Busy,
     /// An annotation count, size or write-rate limit was exceeded.
     LimitExceeded,
