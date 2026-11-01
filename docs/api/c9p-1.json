@@ -1685,7 +1685,7 @@
         },
         {
           "const": "peer_not_authorized",
-          "description": "A hook-class method (`hook.*`, `task.done`, `agent.handoff`) from a\ncaller that is not a live agent running the engine's own\n`c9watch-agent` copy, or that names another agent.",
+          "description": "A hook-class method (`hook.*`, `task.done`, `agent.handoff`) from a\ncaller that is not a live agent running the engine's own\n`c9watch-agent` copy, or that names another agent. Also a request\nthat needs the caller's identity on a connection whose process core\ncould not verify once session detection was ready (it exited, or its\nstart time is unreadable); connect again.",
           "type": "string"
         },
         {

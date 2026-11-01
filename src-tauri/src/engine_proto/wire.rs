@@ -118,7 +118,10 @@ pub enum ErrorCode {
     RateLimited,
     /// A hook-class method (`hook.*`, `task.done`, `agent.handoff`) from a
     /// caller that is not a live agent running the engine's own
-    /// `c9watch-agent` copy, or that names another agent.
+    /// `c9watch-agent` copy, or that names another agent. Also a request
+    /// that needs the caller's identity on a connection whose process core
+    /// could not verify once session detection was ready (it exited, or its
+    /// start time is unreadable); connect again.
     PeerNotAuthorized,
     /// `task.done` from an agent without a task (every free agent).
     NoTask,

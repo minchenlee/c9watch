@@ -96,8 +96,14 @@ pub struct EngineConn {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
     next_id: u64,
+    /// Requests whose response did not come in time. The engine may still
+    /// answer them; those late responses are skipped.
+    abandoned: Vec<String>,
     pub hello: HelloResult,
 }
+
+/// Abandoned request ids kept at most; the oldest goes first.
+const MAX_ABANDONED: usize = 64;
 
 /// Connect to `sock` and check that the server runs under our euid. A
 /// socket served by another uid is refused before anything is sent.
@@ -145,6 +151,7 @@ impl EngineConn {
             reader: BufReader::new(stream),
             writer,
             next_id: 1,
+            abandoned: Vec::new(),
             hello: placeholder_hello(),
         };
         let params = HelloParams {
@@ -235,10 +242,21 @@ impl EngineConn {
             .map_err(|e| format!("Failed to write to the engine: {}", e))?;
         loop {
             let mut buf = String::new();
-            let n = (&mut self.reader)
+            let n = match (&mut self.reader)
                 .take(super::wire::MAX_FRAME as u64 + 1)
                 .read_line(&mut buf)
-                .map_err(|e| format!("No response from the engine: {e}"))?;
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) {
+                        self.abandon(id);
+                    }
+                    return Err(format!("No response from the engine: {e}"));
+                }
+            };
             if n == 0 {
                 return Err("The engine closed the connection".into());
             }
@@ -247,11 +265,20 @@ impl EngineConn {
             }
             let frame: serde_json::Value = serde_json::from_str(buf.trim_end())
                 .map_err(|e| format!("Bad response from the engine: {e}"))?;
+            let other = frame["id"].as_str().filter(|f| *f != id);
+            if let Some(late) = other.filter(|f| self.abandoned.iter().any(|a| a == f)) {
+                // A late answer to a request that timed out: skip it.
+                if frame["type"] != "progress" {
+                    let late = late.to_string();
+                    self.abandoned.retain(|a| *a != late);
+                }
+                continue;
+            }
             if frame["type"] == "progress" {
                 progress(frame);
                 continue;
             }
-            if frame["id"].as_str() != Some(&id) {
+            if other.is_some() || frame["id"].as_str().is_none() {
                 return Err("Engine response id mismatch".into());
             }
             if !frame["ok"].is_boolean() {
@@ -259,6 +286,15 @@ impl EngineConn {
             }
             return Ok(frame);
         }
+    }
+}
+
+impl EngineConn {
+    fn abandon(&mut self, id: String) {
+        if self.abandoned.len() >= MAX_ABANDONED {
+            self.abandoned.remove(0);
+        }
+        self.abandoned.push(id);
     }
 }
 
@@ -783,5 +819,69 @@ mod tests {
         assert!(err.starts_with("upgrade_required"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(4));
         server.join().unwrap();
+    }
+
+    /// An engine that answers `n` requests, the first `late` after `delay`.
+    fn late_engine(
+        delay: Duration,
+        answers: Vec<serde_json::Value>,
+    ) -> (EngineConn, std::thread::JoinHandle<()>) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let conn = EngineConn {
+            reader: BufReader::new(ours.try_clone().unwrap()),
+            writer: ours,
+            next_id: 1,
+            abandoned: Vec::new(),
+            hello: placeholder_hello(),
+        };
+        let engine = std::thread::spawn(move || {
+            let mut lines = BufReader::new(theirs.try_clone().unwrap());
+            let mut out = theirs;
+            for (i, answer) in answers.into_iter().enumerate() {
+                let mut line = String::new();
+                lines.read_line(&mut line).unwrap();
+                if i == 0 {
+                    std::thread::sleep(delay);
+                }
+                let mut bytes = serde_json::to_vec(&answer).unwrap();
+                bytes.push(b'\n');
+                out.write_all(&bytes).unwrap();
+            }
+        });
+        (conn, engine)
+    }
+
+    /// A response that comes after the read timeout is skipped by the next
+    /// call on the connection, which reads its own response.
+    #[test]
+    fn a_late_response_to_an_abandoned_request_is_skipped() {
+        let (mut conn, engine) = late_engine(
+            Duration::from_millis(300),
+            vec![
+                serde_json::json!({"v": 1, "id": "1", "ok": true, "result": {"n": 1}}),
+                serde_json::json!({"v": 1, "id": "2", "ok": true, "result": {"n": 2}}),
+            ],
+        );
+        conn.set_read_timeout(Duration::from_millis(100));
+        let e = conn.call("ping", serde_json::json!({})).unwrap_err();
+        assert!(e.starts_with("No response"), "{e}");
+        conn.set_read_timeout(Duration::from_secs(5));
+        let r = conn.call("ping", serde_json::json!({})).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.id.as_deref(), Some("2"));
+        assert!(conn.abandoned.is_empty());
+        engine.join().unwrap();
+    }
+
+    /// An id that no request of this connection used is still a mismatch.
+    #[test]
+    fn an_unknown_response_id_is_still_a_mismatch() {
+        let (mut conn, engine) = late_engine(
+            Duration::ZERO,
+            vec![serde_json::json!({"v": 1, "id": "99", "ok": true, "result": {}})],
+        );
+        let e = conn.call("ping", serde_json::json!({})).unwrap_err();
+        assert_eq!(e, "Engine response id mismatch");
+        engine.join().unwrap();
     }
 }

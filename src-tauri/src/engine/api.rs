@@ -621,9 +621,10 @@ async fn serve_queued(
     drop(slot);
 }
 
-/// How long a request on a provisional connection waits for detection's
-/// first views.
-const STAMP_WAIT: Duration = Duration::from_secs(5);
+/// How long a request that needs the caller's identity waits for
+/// detection's first views. Shorter than the clients' 5 s read timeout
+/// (`engine_proto::spawn`), so the `busy` reaches them in time.
+const STAMP_WAIT: Duration = Duration::from_secs(3);
 
 /// The principal of one Unix connection (D8). It is stamped at accept.
 /// Before detection's first successful pass there are no views, so a
@@ -632,14 +633,19 @@ const STAMP_WAIT: Duration = Duration::from_secs(5);
 /// once, and keeps that result. A request whose answer the stamp could
 /// change waits for the views first (`needs_stamp`); past `STAMP_WAIT` it
 /// gets `busy`, and the next such request waits again. Other reads run
-/// under the provisional stamp. `hello` never waits, so it may report
+/// under the provisional stamp. If the second stamp cannot verify the
+/// process (it exited, or its start time changed or is unreadable), the
+/// connection is restricted: it keeps its provisional stamp for plain
+/// reads, and every request that needs its identity is refused. `hello`
+/// never waits, so it may report
 /// `local-unverified` for a peer that later narrows to `observed:`.
 struct Stamp {
     cred: peer::PeerCred,
     accepted: Option<u64>,
     first: (Arc<Principal>, Peer),
     provisional: bool,
-    settled: tokio::sync::OnceCell<(Arc<Principal>, Peer)>,
+    /// The second stamp; `None` inside when it could not verify the peer.
+    settled: tokio::sync::OnceCell<Option<(Arc<Principal>, Peer)>>,
 }
 
 impl Stamp {
@@ -665,7 +671,11 @@ impl Stamp {
 
     /// The stamp as it stands, for `hello`.
     fn now(&self) -> (Arc<Principal>, Peer) {
-        self.settled.get().unwrap_or(&self.first).clone()
+        self.settled
+            .get()
+            .and_then(Option::as_ref)
+            .unwrap_or(&self.first)
+            .clone()
     }
 
     /// The stamp to serve `method` under.
@@ -678,26 +688,34 @@ impl Stamp {
         if !self.provisional {
             return Ok(self.first.clone());
         }
-        if let Some(s) = self.settled.get() {
-            return Ok(s.clone());
-        }
-        if !ctx.views_ready() {
-            if !needs_stamp(method, req) {
-                return Ok(self.first.clone());
+        let needs = needs_stamp(method, req);
+        let settled = match self.settled.get() {
+            Some(s) => s,
+            None => {
+                if !ctx.views_ready() {
+                    if !needs {
+                        return Ok(self.first.clone());
+                    }
+                    ctx.ensure_views().await?;
+                }
+                self.settled.get_or_init(|| async { self.again(ctx) }).await
             }
-            ctx.ensure_views().await?;
+        };
+        match settled {
+            Some(s) => Ok(s.clone()),
+            None if needs => Err(ApiError::new(
+                ErrorCode::PeerNotAuthorized,
+                "core could not verify this connection's process once session detection was ready",
+            )
+            .with_hint("connect again from a running process")),
+            None => Ok(self.first.clone()),
         }
-        Ok(self
-            .settled
-            .get_or_init(|| async { self.again(ctx) })
-            .await
-            .clone())
     }
 
-    /// Stamp again from the views. A peer whose process is no longer the
-    /// one that connected (another start time) keeps its first stamp, and
-    /// the start check of any later mutation refuses it.
-    fn again(&self, ctx: &ServerCtx) -> (Arc<Principal>, Peer) {
+    /// Stamp again from the views. `None` when the process is not verified
+    /// to be the one that connected: it is gone, or its start time is
+    /// unreadable or another. It never falls back to the provisional stamp.
+    fn again(&self, ctx: &ServerCtx) -> Option<(Arc<Principal>, Peer)> {
         let (principal, start) = principal::stamp_peer(
             self.cred.pid,
             self.accepted,
@@ -705,14 +723,14 @@ impl Stamp {
             ctx.observed_sessions().as_ref(),
         );
         match self.first.1 {
-            Peer::Unix { start: first, .. } if first == start && start.is_some() => (
+            Peer::Unix { start: first, .. } if first == start && start.is_some() => Some((
                 Arc::new(principal),
                 Peer::Unix {
                     cred: self.cred,
                     start,
                 },
-            ),
-            _ => self.first.clone(),
+            )),
+            _ => None,
         }
     }
 }
@@ -724,24 +742,14 @@ impl Stamp {
 /// only one of them may read (`msg.state`, `legacy.inbox`).
 fn needs_stamp(method: &str, req: &Request) -> bool {
     if method == "events.subscribe" {
-        let observed = Principal::Observed {
-            session_key: String::new(),
-        };
-        let (local, observed) = (
-            authz::topics(&Principal::LocalUnverified, None),
-            authz::topics(&observed, None),
-        );
-        let wanted: Option<Vec<String>> = req
+        let wanted: Vec<String> = req
             .params
             .get("topics")
-            .map(|t| serde_json::from_value(t.clone()).unwrap_or_default());
-        return local
+            .map(|t| serde_json::from_value(t.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        return local_only_topics()
             .iter()
-            .filter(|t| !observed.contains(t))
-            .any(|t| match &wanted {
-                Some(w) if !w.is_empty() => topic_wanted(w, t),
-                _ => true,
-            });
+            .any(|t| wanted.is_empty() || topic_wanted(&wanted, t));
     }
     // An unknown method is `unknown_method` for every principal.
     authz::method(method).is_some_and(|r| {
@@ -749,6 +757,21 @@ fn needs_stamp(method: &str, req: &Request) -> bool {
             && r.principals.contains(&authz::O)
             && r.admission.iter().all(|a| *a == Admission::UnixPeer))
     })
+}
+
+/// The topics `local-unverified` may read and an observed session may not
+/// (`msg.state`, `legacy.inbox`).
+fn local_only_topics() -> Vec<String> {
+    let observed = authz::topics(
+        &Principal::Observed {
+            session_key: String::new(),
+        },
+        None,
+    );
+    authz::topics(&Principal::LocalUnverified, None)
+        .into_iter()
+        .filter(|t| !observed.contains(t))
+        .collect()
 }
 
 /// Whether topic patterns `wanted` (`name` or `prefix.*`) match `topic`.
@@ -1553,8 +1576,7 @@ async fn execute(
                     ),
                 ));
             }
-            let (result, mut stream) = events_subscribe(req, ctx, peer, principal).await?;
-            stream.allowed_topics = authz::topics(principal, None);
+            let (result, stream) = events_subscribe(req, ctx, peer, principal).await?;
             Ok(Served {
                 result,
                 stream: Some(stream),
@@ -2247,11 +2269,23 @@ async fn events_subscribe(
         None => None,
     };
     // A shallow local stamp is not proof of unrestricted mailbox access.
-    // Failed verification drops mail events while preserving other topics.
-    let mail_principal = check_mail_peer(ctx, peer, principal)
-        .await
-        .ok()
-        .map(|_| principal.clone());
+    // When verification fails, a subscribe that names a local-only topic
+    // fails with it; any other loses the local-only topics and mail events
+    // and keeps the rest.
+    let mut allowed_topics = authz::topics(principal, None);
+    let mail_principal = match check_mail_peer(ctx, peer, principal).await {
+        Ok(()) => Some(principal.clone()),
+        Err(e) => {
+            let local_only = local_only_topics();
+            if !params.topics.is_empty()
+                && local_only.iter().any(|t| topic_wanted(&params.topics, t))
+            {
+                return Err(e);
+            }
+            allowed_topics.retain(|t| !local_only.contains(t));
+            None
+        }
+    };
     let mail_db = db.clone();
     let (start, sub) = blocking(move || {
         let after = match since {
@@ -2274,7 +2308,7 @@ async fn events_subscribe(
         subjects: params.subjects,
         mail_principal,
         mail_db,
-        allowed_topics: authz::topics(principal, None),
+        allowed_topics,
     };
     Ok((
         serde_json::to_value(result).expect("SubscribeResult serializes"),
@@ -5492,6 +5526,89 @@ mod tests {
                 params
             );
         }
+    }
+
+    fn req_of(method: &str, params: Value) -> Request {
+        serde_json::from_value(json!({"v": 1, "id": "1", "method": method, "params": params}))
+            .unwrap()
+    }
+
+    /// A peer that exits before detection's views exist cannot be verified
+    /// by the second stamp: its connection is restricted, never settled as
+    /// `local-unverified`. A live peer is stamped `observed:` as before.
+    #[tokio::test]
+    async fn a_peer_that_exits_before_the_views_is_restricted() {
+        let (_t, ctx, detection, flaky) = ctx_flaky();
+        let uid = unsafe { libc::getuid() };
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let gone = PeerCred {
+            pid: child.id() as libc::pid_t,
+            uid,
+        };
+        let me = PeerCred {
+            pid: std::process::id() as libc::pid_t,
+            uid,
+        };
+        let accepted = peer::start_token_now();
+        let (gone, live) = (
+            Stamp::at_accept(&ctx, gone, accepted),
+            Stamp::at_accept(&ctx, me, accepted),
+        );
+        assert!(gone.provisional && live.provisional);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        flaky.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        detection.tick().unwrap();
+
+        let inbox = req_of("events.subscribe", json!({"topics": ["legacy.inbox"]}));
+        for (method, req) in [
+            ("msg.list", req_of("msg.list", json!({}))),
+            ("events.subscribe", inbox),
+        ] {
+            let e = gone.for_request(&ctx, method, &req).await.unwrap_err();
+            assert_eq!(e.code, ErrorCode::PeerNotAuthorized, "{}: {:?}", method, e);
+        }
+        // Plain reads still answer under the provisional stamp.
+        let (p, _) = gone
+            .for_request(&ctx, "agent.list", &req_of("agent.list", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(*p, Principal::LocalUnverified);
+        let (p, _) = live
+            .for_request(&ctx, "msg.list", &req_of("msg.list", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(p.to_string(), "observed:claudeCode:s1");
+    }
+
+    /// A local subscribe whose mailbox check fails: naming a local-only
+    /// topic fails with the check; without one it loses those topics.
+    #[tokio::test]
+    async fn a_failed_mail_check_refuses_or_filters_local_only_topics() {
+        let (_t, ctx, _db) = observed_ctx("claudeCode:s1");
+        let me = std::process::id() as libc::pid_t;
+        let peer = Peer::Unix {
+            cred: PeerCred {
+                pid: me,
+                uid: unsafe { libc::getuid() },
+            },
+            start: Some(peer::proc_info(me).unwrap().start),
+        };
+        let local = Principal::LocalUnverified;
+        let named = req_of("events.subscribe", json!({"topics": ["legacy.inbox"]}));
+        assert!(events_subscribe(named, &ctx, peer, &local).await.is_err());
+        let (_, stream) =
+            events_subscribe(req_of("events.subscribe", json!({})), &ctx, peer, &local)
+                .await
+                .unwrap();
+        assert!(stream.mail_principal.is_none());
+        for t in local_only_topics() {
+            assert!(!stream.allowed_topics.contains(&t), "{}", t);
+        }
+        assert!(stream.allowed_topics.contains(&"agent.upsert".to_string()));
     }
 
     /// `hello` with a deadline: it never waits for detection.
