@@ -280,6 +280,9 @@ enum Delivery {
 struct Handle {
     cmds: Sender<Cmd>,
     thread: JoinHandle<()>,
+    /// The generation it supervises: its cleanup removes only its own
+    /// entry, never a newer supervisor's (P2).
+    gen: i64,
 }
 
 /// Whether a supervisor starts a new session or resumes one.
@@ -360,6 +363,12 @@ pub struct Spawner {
     starts: Mutex<HashSet<(String, i64)>>,
     /// The supervisor of every agent that runs in this engine.
     live: Mutex<HashMap<String, Handle>>,
+    /// One lifecycle step of an agent at a time (P1-4): `agent.create`
+    /// and a resume hold it until their supervisor is registered (a resume
+    /// that finds it taken fails at once), `agent.retire` for its whole
+    /// run. So a retire either finds the supervisor or no supervisor can
+    /// start until it is done.
+    steps: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     stopping: AtomicBool,
     /// The engine's drain switch (C1a-27).
     drain: Arc<DrainSwitch>,
@@ -392,6 +401,7 @@ impl Spawner {
             clock: Arc::new(Instant::now),
             starts: Mutex::new(HashSet::new()),
             live: Mutex::new(HashMap::new()),
+            steps: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
             drain: Arc::new(DrainSwitch::new()),
             header_key: None,
@@ -522,6 +532,9 @@ impl Spawner {
             kind: Kind::Create,
             from: None,
         };
+        // Until the supervisor is registered: a retire of the new row waits
+        // and then finds it (P1-4).
+        let step = self.step(&start.id).lock_owned().await;
         let gen = self
             .write_row(&start, desc, principal, p.name.clone())
             .await?;
@@ -530,6 +543,7 @@ impl Spawner {
         let start = Start { gen, ..start };
         let (reply, answer) = oneshot::channel();
         self.supervise(start, reply)?;
+        drop(step);
         answer.await.unwrap_or_else(|_| {
             Err(ApiError::new(
                 ErrorCode::Internal,
@@ -655,8 +669,19 @@ impl Spawner {
             self.fail_create(&s, "the engine stopped before the spawn");
             return Err(stopping());
         }
+        if live.contains_key(&s.id) {
+            // The step lock keeps this from happening; never replace a
+            // supervisor that still runs (P2).
+            drop(live);
+            let why = "another supervisor of it runs in this engine";
+            self.fail_create(&s, why);
+            return Err(ApiError::new(
+                ErrorCode::ActionFailed,
+                format!("{}: {}", s.id, why),
+            ));
+        }
         let sp = self.clone();
-        let id = s.id.clone();
+        let (id, gen) = (s.id.clone(), s.gen);
         let spawned = std::thread::Builder::new()
             .name(format!("agent-{}", id))
             .spawn({
@@ -665,7 +690,7 @@ impl Spawner {
             });
         match spawned {
             Ok(thread) => {
-                live.insert(id, Handle { cmds, thread });
+                live.insert(id, Handle { cmds, thread, gen });
                 Ok(())
             }
             Err(e) => {
@@ -707,7 +732,31 @@ impl Spawner {
         self.agents.unregister(&s.id, s.gen);
         self.merge.remove(&s.id);
         lock(&self.starts).retain(|(id, _)| *id != s.id);
-        lock(&self.live).remove(&s.id);
+        self.release_live(&s.id, s.gen);
+    }
+
+    /// Remove the supervisor entry of `id` if it is generation `gen`'s.
+    fn release_live(&self, id: &str, gen: i64) {
+        let mut live = lock(&self.live);
+        if live.get(id).is_some_and(|h| h.gen == gen) {
+            live.remove(id);
+        }
+    }
+
+    /// The step lock of agent `id` (see `steps`).
+    fn step(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        lock(&self.steps).entry(id.to_string()).or_default().clone()
+    }
+
+    /// Forget the step lock of a retired agent, while `held` (its guard)
+    /// is still held and nobody else waits for it.
+    fn forget_step(&self, id: &str, held: &tokio::sync::OwnedMutexGuard<()>) {
+        let mut steps = lock(&self.steps);
+        // The map's copy and the guard's: nobody else holds or waits.
+        if steps.get(id).is_some_and(|a| Arc::strong_count(a) <= 2) {
+            steps.remove(id);
+        }
+        let _ = held;
     }
 
     /// Spawn once and follow the screen until `ready` or a failure.
@@ -2108,6 +2157,13 @@ impl Spawner {
                 format!("{} cannot be resumed: {}", p.id, why),
             )
         };
+        // Until the supervisor is registered (P1-4, P2). Taken: another
+        // resume or a retire of it runs now.
+        let Ok(step) = self.step(&p.id).try_lock_owned() else {
+            return Err(not_resumable(
+                "a resume or retire of it is in progress".into(),
+            ));
+        };
         if lock(&self.live).contains_key(&p.id) {
             return Err(not_resumable("it runs in this engine".into()));
         }
@@ -2157,6 +2213,7 @@ impl Spawner {
         remove_settings(&self.config.home, &r.id, gen - 1);
         let (reply, answer) = oneshot::channel();
         self.supervise(Start { gen, ..start }, reply)?;
+        drop(step);
         answer
             .await
             .map_err(|_| internal("the agent's supervisor ended without an answer"))?
@@ -2169,6 +2226,11 @@ impl Spawner {
                 done.left.push(r.id);
                 continue;
             }
+            // A retire or `agent.resume` of it runs: leave it to them.
+            let Ok(_step) = self.step(&r.id).try_lock_owned() else {
+                done.left.push(r.id);
+                continue;
+            };
             let start = match self.resume_plan(&r) {
                 Ok(s) => s,
                 Err(why) => {
@@ -2339,6 +2401,10 @@ impl Spawner {
     ) -> Result<AgentRow, ApiError> {
         local_only(principal, "agent.retire")?;
         let p: AgentRetireParams = parse(params, "agent.retire")?;
+        // For the whole retire (P1-4): a create or resume of it has
+        // registered its supervisor before this goes on, and none starts
+        // until the retire is done.
+        let step = self.step(&p.id).lock_owned().await;
         let row = {
             let (db, id) = (self.db.clone(), p.id.clone());
             blocking(move || {
@@ -2352,19 +2418,28 @@ impl Spawner {
             return Ok(row);
         }
         if let Some(r) = self.retire_live(&p.id, principal).await {
+            self.forget_retired(&p.id, &r, &step);
             return r;
         }
-        // No supervisor: the agent runs nowhere, or its create is between
-        // the row and `supervise`. The tombstone closes the create op, so
-        // that supervisor spawns nothing or kills what it spawned; one
-        // that registered meanwhile is told to kill it here.
+        // No supervisor: the agent runs nowhere in this engine, and none
+        // can start while the step is held.
         let sp = self.clone();
         let (id, principal_s) = (p.id.clone(), principal.to_string());
         let r = blocking(move || sp.retire_idle(&id, row.generation, &principal_s)).await;
-        if r.is_ok() {
-            self.retire_live(&p.id, principal).await;
-        }
+        self.forget_retired(&p.id, &r, &step);
         r
+    }
+
+    /// After a retire: forget the step lock of a tombstone.
+    fn forget_retired(
+        &self,
+        id: &str,
+        r: &Result<AgentRow, ApiError>,
+        step: &tokio::sync::OwnedMutexGuard<()>,
+    ) {
+        if matches!(r, Ok(row) if row.state.as_deref() == Some("retired")) {
+            self.forget_step(id, step);
+        }
     }
 
     /// Hand the retire of `id` to its supervisor, if it runs here. `None`
@@ -5949,6 +6024,124 @@ mod tests {
         // A retire ends the first; it answers with an error.
         sp2.retire(&l, id).await.unwrap();
         assert!(first.await.unwrap().is_err());
+    }
+    /// P1-4: while a retire holds an agent's step, a resume of it fails at
+    /// once and a boot leaves it alone; nothing spawns.
+    #[tokio::test]
+    async fn a_resume_during_a_retire_of_the_agent_is_refused() {
+        let e = setup(Script::Ready, None);
+        let r = drained_agent(&e).await;
+        let (_, l2, sp2) = next_engine(&e, Script::Ready, None);
+        let held = sp2.step(&r.id).try_lock_owned().unwrap();
+        let l = Principal::LocalUnverified;
+        let id = serde_json::json!({ "id": r.id });
+        let err = sp2.resume(&l, id.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        assert!(err.msg.contains("in progress"), "{}", err.msg);
+        assert_eq!(sp2.resume_on_boot().unwrap().left, vec![r.id.clone()]);
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(row(&e.db, &r.id).state.as_deref(), Some("paused"));
+        drop(held);
+        let got = sp2.resume(&l, id).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("ready"));
+        sp2.shutdown();
+    }
+
+    /// P1-4: a retire waits while a resume holds the step (between its
+    /// checks and its supervisor), then finds the supervisor and answers
+    /// with the confirmed end: the tombstone, or the `orphaned` row when
+    /// the kill cannot be confirmed. The row is never tombstoned under a
+    /// running agent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retire_waits_for_a_resume_and_answers_with_the_confirmed_end() {
+        let e = setup(Script::Ready, None);
+        let r = drained_agent(&e).await;
+        let (_, l2, sp2) = next_engine(&e, Script::Hang, None);
+        let l = Principal::LocalUnverified;
+        let id = serde_json::json!({ "id": r.id });
+        let held = sp2.step(&r.id).try_lock_owned().unwrap();
+        let retire = tokio::spawn({
+            let (sp2, id) = (sp2.clone(), id.clone());
+            async move { sp2.retire(&Principal::LocalUnverified, id).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!retire.is_finished(), "the retire did not wait");
+        assert_eq!(row(&e.db, &r.id).state.as_deref(), Some("paused"));
+        drop(held);
+        let got = retire.await.unwrap().unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 0);
+
+        // A resume that registered: the retire goes through its
+        // supervisor, and an unconfirmed kill answers `orphaned`.
+        let e = setup(Script::Ready, None);
+        let r = drained_agent(&e).await;
+        let (_, l3, sp3) = next_engine(&e, Script::Hang, None);
+        let id = serde_json::json!({ "id": r.id });
+        let resume = tokio::spawn({
+            let (sp3, id) = (sp3.clone(), id.clone());
+            async move { sp3.resume(&Principal::LocalUnverified, id).await }
+        });
+        let (db, rid) = (e.db.clone(), r.id.clone());
+        tokio::task::spawn_blocking(move || {
+            wait_for("the resume spawned", || {
+                row(&db, &rid).state.as_deref() == Some("starting")
+            })
+        })
+        .await
+        .unwrap();
+        l3.kill_fails.store(true, Ordering::SeqCst);
+        let got = sp3.retire(&l, id).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        assert_eq!(got.gone_at, None);
+        assert_eq!(agent_state_rows(&e.db), 1);
+        assert!(resume.await.unwrap().is_err());
+    }
+
+    /// P2: two resumes at once spawn the agent once; the other fails with
+    /// a clear error. Repeated, as the race is timing-dependent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_resumes_spawn_once() {
+        for _ in 0..10 {
+            let e = setup(Script::Ready, None);
+            let r = drained_agent(&e).await;
+            let (_, l2, sp2) = next_engine(&e, Script::Ready, None);
+            let go = |sp: Arc<Spawner>, id: String| {
+                tokio::spawn(async move {
+                    sp.resume(&Principal::LocalUnverified, serde_json::json!({ "id": id }))
+                        .await
+                })
+            };
+            let (a, b) = (go(sp2.clone(), r.id.clone()), go(sp2.clone(), r.id.clone()));
+            let results = [a.await.unwrap(), b.await.unwrap()];
+            assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+            let err = results.into_iter().find_map(Result::err).unwrap();
+            assert_eq!(err.code, ErrorCode::ActionFailed, "{}", err.msg);
+            assert_eq!(l2.spawns.load(Ordering::SeqCst), 1);
+            assert_eq!(sp2.live_count(), 1);
+            sp2.shutdown();
+        }
+    }
+
+    /// P2: a supervisor's cleanup removes only its own generation's entry,
+    /// never a newer supervisor of the same agent.
+    #[test]
+    fn a_supervisor_cleanup_never_removes_a_newer_supervisor() {
+        let e = setup(Script::Ready, None);
+        let (cmds, _rx) = mpsc::channel();
+        let thread = std::thread::spawn(|| {});
+        lock(&e.sp.live).insert(
+            "agt_x".into(),
+            Handle {
+                cmds,
+                thread,
+                gen: 5,
+            },
+        );
+        e.sp.release_live("agt_x", 4);
+        assert_eq!(e.sp.live_count(), 1);
+        e.sp.release_live("agt_x", 5);
+        assert_eq!(e.sp.live_count(), 0);
     }
 }
 
