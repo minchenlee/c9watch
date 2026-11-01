@@ -304,55 +304,6 @@ fn agent_callers_cannot_run_or_start_the_engine() {
     assert!(sb.pid().is_none());
 }
 
-/// The engine coexists with the legacy daemon: starting it leaves the
-/// daemon, its socket and its worker dirs alone (no RPC, no retire).
-#[cfg(feature = "pm-orchestration")]
-#[test]
-fn the_engine_leaves_the_legacy_daemon_alone() {
-    let sb = Sandbox::new();
-    let legacy = sb.home.join(".claude").join("c9watch");
-    let mut daemon = sb
-        .cmd(&["daemon"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let daemon_sock = legacy.join("daemon.sock");
-    assert!(wait_for(Duration::from_secs(10), || daemon_sock.exists()));
-
-    let mut sleeper = Command::new("sleep").arg("60").spawn().unwrap();
-    let worker = legacy.join("workers").join("fixture-1");
-    std::fs::create_dir_all(&worker).unwrap();
-    let meta = serde_json::json!({
-        "sessionId": "fixture-1",
-        "pid": sleeper.id(),
-        "name": "fixture",
-        "cwd": "/",
-        "spawnedAt": "2026-10-29T00:00:00Z",
-        "spawnedBy": "test",
-        "spawnArgs": {"permissionMode": "default", "addDirs": []},
-        "stoppedAt": null,
-    });
-    std::fs::write(worker.join("meta.json"), meta.to_string()).unwrap();
-
-    let out = sb.run(&["api", "hello"]);
-    assert!(out.status.success(), "{:?}", out);
-    assert!(sb.pid().is_some());
-    // Give a misbehaving engine time to act on the daemon.
-    std::thread::sleep(Duration::from_millis(500));
-
-    assert!(daemon.try_wait().unwrap().is_none(), "the daemon exited");
-    assert!(alive(daemon.id() as libc::pid_t));
-    assert!(daemon_sock.exists());
-    assert!(worker.join("meta.json").exists());
-    assert!(sleeper.try_wait().unwrap().is_none(), "the worker pid died");
-
-    let _ = daemon.kill();
-    let _ = daemon.wait();
-    let _ = sleeper.kill();
-    let _ = sleeper.wait();
-}
-
 #[test]
 fn a_db_from_a_newer_engine_fails_the_auto_start_with_its_code() {
     let sb = Sandbox::new();
@@ -1258,18 +1209,20 @@ fn spawn_free_refuses_agents_and_managed_flags_locally() {
     assert!(sb.pid().is_none());
 }
 
-/// An engine build without `pm-orchestration` has no legacy workers:
+/// An engine build has no legacy workers:
 /// `spawn` (managed by default) fails and names `--mode free`.
-#[cfg(not(feature = "pm-orchestration"))]
 #[test]
-fn spawn_managed_needs_the_pm_build() {
+fn spawn_managed_is_unavailable() {
     let sb = Sandbox::new();
     let fa = FreeAgents::new(&sb);
     for args in [&["spawn"][..], &["spawn", "--mode", "managed"]] {
         let out = fa.run(&sb, args);
         assert_eq!(out.status.code(), Some(1), "{args:?}: {:?}", out);
         let err = stderr_of(&out);
-        assert!(err.contains("pm-orchestration"), "{args:?}: {err}");
+        assert!(
+            err.contains("--mode managed is unavailable"),
+            "{args:?}: {err}"
+        );
         assert!(err.contains("--mode free"), "{args:?}: {err}");
     }
     assert!(!sb.engine.exists());

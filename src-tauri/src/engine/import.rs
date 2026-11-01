@@ -7,12 +7,11 @@
 //!   a symlink anywhere below the legacy root is skipped, never followed.
 //!   Only regular files are copied, each one at most `MAX_FILE_BYTES`, and
 //!   one import at most `MAX_FILES` files and `MAX_TOTAL_BYTES`.
-//! - The legacy tree is only read. In particular this never calls
-//!   `cli::adoption::read_filter`, which rewrites or deletes adoption files
-//!   while it reads them. C1a neither freezes nor changes the legacy dirs.
+//! - The legacy tree is only read. C1a neither freezes nor changes the
+//!   legacy dirs.
 //!
 //! What the copy becomes, in one transaction:
-//! - `WorkerMeta` (`cli/pm_fs.rs`): one `role=worker`, `control=none`,
+//! - Legacy worker metadata: one `role=worker`, `control=none`,
 //!   `source=legacy_import` row per worker session, with a `session_alias`
 //!   row. A re-import updates that row; a change emits `agent.upsert`.
 //! - Legacy rows are history, never live: `gone_at` is the worker's
@@ -20,16 +19,16 @@
 //!   writes one). A legacy worker that still runs is listed by detection
 //!   as its `source=detected` row, so the default `agent.list` shows it
 //!   once.
-//! - `AdoptionRecord` (`cli/adoption.rs`): the worker's `parent_id`. The
+//! - Legacy adoption records: the worker's `parent_id`. The
 //!   adopting PM gets a `role=orch` legacy row if it has none. A record that
 //!   names a worker with no row (a dangling adoption) is skipped.
-//! - `InboxEvent` (`cli/pm_inbox.rs`): one `legacy.inbox` event each, once
+//! - Legacy inbox events: one `legacy.inbox` event each, once
 //!   per `eventId`. `legacy_events` remembers the ids, so an event that
 //!   retention pruned is not imported again. Legacy inbox events are not
 //!   copied into the `messages` table (C1b-M1).
 //!
-//! The legacy types live behind `pm-orchestration`, so the copy is parsed
-//! into the minimal mirrors below, which ignore unknown fields.
+//! The copy is parsed into the minimal legacy format mirrors below, which
+//! ignore unknown fields.
 
 use super::db::outbox::NewEvent;
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
@@ -420,7 +419,7 @@ fn list_dir(dir: &OwnedFd) -> Result<Vec<OsString>, String> {
 
 // ── Parse (the copy only) ─────────────────────────────────────────────
 
-/// The fields of `cli::pm_fs::WorkerMeta` the import uses.
+/// The fields of legacy worker metadata the import uses.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LegacyWorker {
@@ -437,7 +436,7 @@ struct LegacyWorker {
     stopped_at: Option<String>,
 }
 
-/// `cli::adoption::AdoptionRecord`.
+/// A legacy adoption record.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LegacyAdoption {
@@ -447,7 +446,7 @@ struct LegacyAdoption {
     worker_ids: Vec<String>,
 }
 
-/// One `cli::pm_inbox::InboxEvent`, kept as it was written.
+/// One legacy inbox event, kept as it was written.
 #[derive(Debug, Clone)]
 struct LegacyEvent {
     event_id: String,
@@ -462,7 +461,7 @@ struct Legacy {
     events: Vec<LegacyEvent>,
 }
 
-/// The rule of `cli::pm_fs::validate_session_id`.
+/// The legacy session ID validation rule.
 fn valid_sid(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }

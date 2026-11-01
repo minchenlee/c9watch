@@ -1,14 +1,11 @@
 //! CLI side of the c9 engine: `c9watch engine`, `c9watch engine restart`,
 //! `c9watch api <method> '<json>'`, and auto-start.
 //!
-//! Auto-start follows `cli/pm.rs` (`ensure_daemon`): a client-side spawn
+//! Auto-start uses a client-side spawn
 //! lock (`engine.spawn.lock`) makes sure only one caller spawns, and the
 //! engine runs in its own session (`setsid`) with an allowlisted
 //! environment. The engine counts as up only when `hello` succeeds, which is
-//! stricter than the daemon's lock probe.
-//!
-//! Nothing here talks to the legacy `c9watch daemon`: no RPC, no
-//! `retire_legacy_daemon`, on every channel.
+//! stricter than the legacy daemon's lock probe.
 
 use crate::engine::home::{engine_home, sock_path};
 pub use crate::engine_proto::spawn::{

@@ -2,7 +2,7 @@
 //!
 //! The engine takes an exclusive flock on it at start and holds it until the
 //! process exits, so at most one engine runs per home. Ported from
-//! `cli/pm_fs.rs` (`acquire_daemon_lock`, `daemon_lock_held`), with two
+//! the legacy PM daemon's locking helpers, with two
 //! changes: the lock file is opened with `O_NOFOLLOW`, and the holder writes
 //! its pid at once (readiness is a successful `hello`, not a file mark).
 

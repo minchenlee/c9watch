@@ -39,10 +39,6 @@ gui = [
     "dep:tauri-nspanel",
 ]
 cli = ["dep:clap", "dep:regex", "dep:tokio"]
-# PM/worker orchestration (spawn/send/workers/inbox/adopt/daemon). Opt-in only —
-# Claude Code and Codex now provide native agent spawning, so this is excluded
-# from `default`. Build with `--features pm-orchestration` to expose it.
-pm-orchestration = ["cli"]
 # Agent engine (C1a): `c9watch engine` and `api`, plus the `c9watch-agent`
 # binary, unix only.
 engine = ["cli", "dep:ed25519-dalek", "dep:rand", "dep:schemars", "dep:sha2", "dep:axum", "dep:base64", "dep:subtle", "dep:mime_guess"]

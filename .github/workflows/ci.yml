@@ -77,17 +77,6 @@ jobs:
           cargo test --manifest-path src-tauri/Cargo.toml \
             --no-default-features --features engine
 
-      - name: PM orchestration tests
-        run: |
-          cargo test --manifest-path src-tauri/Cargo.toml \
-            --no-default-features --features pm-orchestration
-
-      - name: Engine and legacy daemon coexistence test
-        run: |
-          cargo test --manifest-path src-tauri/Cargo.toml \
-            --no-default-features --features engine,pm-orchestration \
-            --test engine_cli
-
   visual-classic:
     # Classic must stay pixel-identical (core-public plan, M-c0). Fixed
     # runner image and fixed WebKit: Playwright is pinned exactly in

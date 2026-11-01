@@ -1,9 +1,9 @@
 # Remote access after the C0h hardening
 
-This release locks down the WebSocket server on port 9210 and the PM daemon.
+This release locks down the WebSocket server on port 9210.
 The changes below break old mobile and browser clients on purpose. Read this
-page before you upgrade if you use c9watch from a phone, another browser, a
-script, or the PM orchestration CLI.
+page before you upgrade if you use c9watch from a phone, another browser,
+or a script.
 
 ## What you must do
 
@@ -16,9 +16,6 @@ script, or the PM orchestration CLI.
    To read conversations or to open a terminal from the device, turn on
    **Conversations over remote** and **Open terminal from remote** in the same
    section.
-4. **Stop the old PM daemon** if you use PM orchestration:
-   `pkill -f 'c9watch daemon'`. The new daemon also asks an old one to shut
-   down, but stopping it yourself is faster.
 
 ## What changed for users
 
@@ -55,15 +52,11 @@ script, or the PM orchestration CLI.
 8. **Stop is stricter.** c9watch stops only a Claude Code session that it
    detects, and only when the process start time still matches. A refused stop
    now shows the reason in a toast. `c9watch stop <pid>` refuses a pid that is
-   not a detected session. This includes PM worker pids: workers are SDK
-   sessions, which detection filters out. Stop a worker by its worker id.
+   not a detected session.
 9. **The terminal and the debug console no longer show the access URL** or
    print a QR code.
 10. **Remote images in Markdown do not load** in the desktop app or the web
     UI. The content security policy blocks them.
-11. **The PM daemon directory is private.** `~/.claude/c9watch` becomes `0700`
-    and the daemon's socket, pid, lock and log files become `0600`. A client
-    run by another user is refused.
 
 ## Reaching the desktop without LAN access
 
