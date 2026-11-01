@@ -2033,7 +2033,7 @@ impl Spawner {
         principal: &str,
     ) -> Result<AgentRow, ApiError> {
         if self.kill_confirmed(s, driver, principal, "agent.retire") {
-            return self.retire_row(&s.id, s.gen, principal);
+            return self.retire_row(&s.id, s.gen, principal, None);
         }
         let conn = self.db.pooled_reader().map_err(internal)?;
         engine_row(&conn, &s.id)
@@ -2052,7 +2052,13 @@ impl Spawner {
     /// `orphaned` agent first a new kill (`retire_orphan`, D2). The state
     /// is read here, after `retire_live`: a supervisor that could not
     /// confirm its kill wrote `orphaned` before it left. Blocking.
-    fn retire_idle(&self, id: &str, gen: i64, principal: &str) -> Result<AgentRow, ApiError> {
+    fn retire_idle(
+        &self,
+        id: &str,
+        gen: i64,
+        principal: &str,
+        force: bool,
+    ) -> Result<AgentRow, ApiError> {
         let state = {
             let conn = self.db.pooled_reader().map_err(internal)?;
             engine_row(&conn, id)
@@ -2060,19 +2066,24 @@ impl Spawner {
                 .and_then(|r| r.state)
         };
         if state.as_deref() == Some("orphaned") {
-            return self.retire_orphan(id, principal);
+            return self.retire_orphan(id, principal, force);
         }
-        self.retire_row(id, gen, principal)
+        self.retire_row(id, gen, principal, None)
     }
 
     /// `agent.retire` of an `orphaned` agent: kill its recorded PTY child
     /// and the survivors of the unconfirmed kill again, each only by pid
     /// and start time (`pty::kill_orphans`). The row becomes the tombstone
     /// only when every one is confirmed gone (or its pid runs another
-    /// process now). Otherwise it stays `orphaned` with what is still
-    /// left, and the attempt is audited. Unreadable survivors fail closed:
-    /// nothing is signalled and the row stays. Blocking.
-    fn retire_orphan(&self, id: &str, principal: &str) -> Result<AgentRow, ApiError> {
+    /// process now) and none went unrecorded (overflow). Otherwise it
+    /// stays `orphaned` with what is still left (`survivors_overflow` for
+    /// an overflow), and the attempt is audited. Unreadable survivors fail
+    /// closed: nothing is signalled and the row stays.
+    ///
+    /// `force` (the local client only, P1-B): after the same kill, the
+    /// tombstone whatever is left, with an audit row that names the forced
+    /// retire and what it left. Blocking.
+    fn retire_orphan(&self, id: &str, principal: &str, force: bool) -> Result<AgentRow, ApiError> {
         let (state, row) = {
             let conn = self.db.pooled_reader().map_err(internal)?;
             let state = conn
@@ -2096,14 +2107,12 @@ impl Spawner {
             (state, row)
         };
         let (pid, start, json) = state.unwrap_or((None, None, None));
-        let left = match ops::parse_survivors(json.as_deref()) {
-            Ok(left) => left,
-            Err(why) => {
-                self.audit_orphan(id, principal, &why, None)?;
-                return Ok(row);
-            }
+        let (stored, unreadable) = match ops::parse_survivors(json.as_deref()) {
+            Ok(s) => (s, None),
+            Err(why) if force => (ops::Survivors::default(), Some(why)),
+            Err(why) => return self.audit_orphan(id, principal, &why, None, false),
         };
-        let mut ids: Vec<super::driver::ChildId> = left.iter().map(|s| s.id()).collect();
+        let mut ids: Vec<super::driver::ChildId> = stored.list.iter().map(|s| s.id()).collect();
         if let (Some(pid), Some(start)) = (pid, start) {
             ids.insert(
                 0,
@@ -2113,10 +2122,10 @@ impl Spawner {
                 },
             );
         }
+        let mut failed = None;
         if let Some((&child, others)) = ids.split_first() {
             let killer = lock(&self.orphan_killer).clone();
             if let Err(e) = killer(child, others) {
-                let left = super::pty::survivors(&e);
                 let why = format!(
                     "{}: pid {} start {}: {}",
                     ops::KILL_UNCONFIRMED,
@@ -2124,29 +2133,62 @@ impl Spawner {
                     child.start,
                     e
                 );
-                self.audit_orphan(id, principal, &why, Some(left))?;
-                return Ok(row);
+                failed = Some((why, super::pty::survivors(&e)));
             }
         }
-        self.retire_row(id, row.generation, principal)
+        if force {
+            let mut why = vec!["forced retire".to_string()];
+            why.extend(unreadable);
+            if let Some((w, left)) = &failed {
+                why.push(format!("{} ({} left)", w, left.len()));
+            }
+            if stored.overflow {
+                why.push(format!(
+                    "{}: unrecorded processes may run",
+                    ops::SURVIVORS_OVERFLOW
+                ));
+            }
+            return self.retire_row(id, row.generation, principal, Some(why.join("; ")));
+        }
+        if let Some((why, left)) = failed {
+            return self.audit_orphan(id, principal, &why, Some(left), stored.overflow);
+        }
+        if stored.overflow {
+            let why = format!(
+                "{}: the recorded processes are gone, but more were never recorded; \
+                 retire with force to end it",
+                ops::SURVIVORS_OVERFLOW
+            );
+            return self.audit_orphan(id, principal, &why, Some(Vec::new()), true);
+        }
+        self.retire_row(id, row.generation, principal, None)
     }
 
     /// The audit row of a retire that left the agent `orphaned`, in one
-    /// transaction with what is still `left`, when the kill said.
+    /// transaction with what is still `left`, when the kill said, and
+    /// `survivors_overflow` as the reason with `overflow`. Returns the row.
     fn audit_orphan(
         &self,
         id: &str,
         principal: &str,
         why: &str,
         left: Option<Vec<super::pty::Survivor>>,
-    ) -> Result<(), ApiError> {
-        let (id, principal, mut why) = (id.to_string(), principal.to_string(), why.to_string());
-        self.db
+        overflow: bool,
+    ) -> Result<AgentRow, ApiError> {
+        let (id2, principal, mut why) = (id.to_string(), principal.to_string(), why.to_string());
+        let row = self
+            .db
             .write_blocking(move |tx| {
                 if let Some(left) = &left {
-                    if let Some(note) = ops::store_survivors(tx, &id, left)? {
+                    if let Some(note) = ops::store_survivors(tx, &id2, left, overflow)? {
                         why = format!("{}; {}", why, note);
                     }
+                }
+                if overflow {
+                    tx.execute(
+                        "UPDATE agents SET state_reason = ?2 WHERE id = ?1",
+                        params![id2, ops::SURVIVORS_OVERFLOW],
+                    )?;
                 }
                 audit::append(
                     tx,
@@ -2154,15 +2196,17 @@ impl Spawner {
                     &AuditEntry {
                         principal: &principal,
                         method: "agent.retire",
-                        target: Some(&id),
+                        target: Some(&id2),
                         decision: ops::ORPHANED,
                         reason: Some(&why),
                         ..Default::default()
                     },
-                )
+                )?;
+                engine_row(tx, &id2)
             })
-            .map_err(internal)?;
-        Ok(())
+            .map_err(internal)?
+            .0;
+        row.ok_or_else(|| unknown_agent(id))
     }
 
     /// `agent.resume` (D4): resume a `paused` or `interrupted` agent now,
@@ -2409,8 +2453,15 @@ impl Spawner {
         })
     }
 
-    /// The retire transaction. Blocking.
-    fn retire_row(&self, id: &str, gen: i64, principal: &str) -> Result<AgentRow, ApiError> {
+    /// The retire transaction, with the audit row of a forced retire
+    /// (`forced`: why) in it. Blocking.
+    fn retire_row(
+        &self,
+        id: &str,
+        gen: i64,
+        principal: &str,
+        forced: Option<String>,
+    ) -> Result<AgentRow, ApiError> {
         let (machine, id2, principal) = (
             self.db.machine_id().to_string(),
             id.to_string(),
@@ -2418,7 +2469,23 @@ impl Spawner {
         );
         let row = self
             .db
-            .write_blocking(move |tx| retire_tx(tx, &machine, &id2, &principal))
+            .write_blocking(move |tx| {
+                if let Some(why) = &forced {
+                    audit::append(
+                        tx,
+                        now_ms(),
+                        &AuditEntry {
+                            principal: &principal,
+                            method: "agent.retire",
+                            target: Some(&id2),
+                            decision: ops::FORCED,
+                            reason: Some(why),
+                            ..Default::default()
+                        },
+                    )?;
+                }
+                retire_tx(tx, &machine, &id2, &principal)
+            })
             .map_err(internal)?
             .0;
         remove_settings(&self.config.home, id, gen);
@@ -2432,8 +2499,20 @@ impl Spawner {
         principal: &Principal,
         params: serde_json::Value,
     ) -> Result<AgentRow, ApiError> {
+        // `force` ends what no kill can confirm: the local client only. The
+        // dispatch already refuses `agent.retire` to every other principal
+        // (`not_allowed`); this holds for a caller that skips it.
+        if params.get("force").and_then(|f| f.as_bool()) == Some(true)
+            && !matches!(principal, Principal::LocalUnverified)
+        {
+            return Err(ApiError::new(
+                ErrorCode::PeerNotAuthorized,
+                format!("{} may not force agent.retire", principal),
+            ));
+        }
         local_only(principal, "agent.retire")?;
         let p: AgentRetireParams = parse(params, "agent.retire")?;
+        let force = p.force == Some(true);
         // For the whole retire (P1-4): a create or resume of it has
         // registered its supervisor before this goes on, and none starts
         // until the retire is done.
@@ -2458,7 +2537,7 @@ impl Spawner {
         // can start while the step is held.
         let sp = self.clone();
         let (id, principal_s) = (p.id.clone(), principal.to_string());
-        let r = blocking(move || sp.retire_idle(&id, row.generation, &principal_s)).await;
+        let r = blocking(move || sp.retire_idle(&id, row.generation, &principal_s, force)).await;
         self.forget_retired(&p.id, &r, &step);
         r
     }
@@ -3877,13 +3956,15 @@ mod tests {
     async fn phase_writes_after_a_retire_write_nothing() {
         let e = setup(Script::Ready, None);
         let s = row_only(&e).await;
-        e.sp.retire_row(&s.id, s.gen, "local-unverified").unwrap();
+        e.sp.retire_row(&s.id, s.gen, "local-unverified", None)
+            .unwrap();
         let child = ChildId { pid: 7, start: 1 };
         assert_eq!(e.sp.write_pty(&s, child), Ok(false));
         assert_eq!(agent_state_rows(&e.db), 0);
         let s2 = row_only(&e).await;
         assert_eq!(e.sp.write_pty(&s2, child), Ok(true));
-        e.sp.retire_row(&s2.id, s2.gen, "local-unverified").unwrap();
+        e.sp.retire_row(&s2.id, s2.gen, "local-unverified", None)
+            .unwrap();
         assert_eq!(e.sp.write_bound(&s2), Ok(None));
         for id in [&s.id, &s2.id] {
             assert_eq!(row(&e.db, id).state.as_deref(), Some("retired"));
@@ -6220,13 +6301,17 @@ mod tests {
         r
     }
 
-    fn survivor_json(child: ChildId) -> String {
-        serde_json::to_string(&[Survivor {
+    fn survivor(child: ChildId) -> Survivor {
+        Survivor {
             pid: child.pid,
             start: child.start,
             pgid: child.pid,
-        }])
-        .unwrap()
+        }
+    }
+
+    /// One survivor, in the stored form.
+    fn survivor_json(child: ChildId) -> String {
+        serde_json::json!({ "v": 1, "overflow": false, "list": [survivor(child)] }).to_string()
     }
 
     /// P1-3: an unconfirmed kill stores what it left in the same
@@ -6240,26 +6325,20 @@ mod tests {
         e.sp.retire(&l, serde_json::json!({ "id": r.id }))
             .await
             .unwrap();
-        let left = ops::parse_survivors(survivors_json(&e.db, &r.id).as_deref()).unwrap();
+        let stored = ops::parse_survivors(survivors_json(&e.db, &r.id).as_deref()).unwrap();
+        assert!(!stored.overflow);
+        let left = stored.list;
         assert_eq!(left.len(), 1);
         assert!(left[0].pid >= 2_000_000_000, "{:?}", left);
     }
 
-    /// P1-3: the recorded PTY child is gone but a survivor still runs: the
-    /// retire keeps the row `orphaned` and the cwd held. Once the survivor
-    /// has exited, the retire makes the tombstone.
-    #[tokio::test]
-    async fn a_live_survivor_keeps_the_row_orphaned_until_it_is_gone() {
-        let e = setup(Script::Ready, None);
-        let (mut proc, child) = test_process("trap '' TERM; echo ready; exec sleep 30");
-        let r = orphan_with_survivors(&e, &survivor_json(child)).await;
-        // A kill that cannot end anything: what still runs is left.
-        let asked: Arc<Mutex<Vec<Vec<ChildId>>>> = Arc::default();
-        let asked2 = asked.clone();
-        e.sp.set_orphan_killer(Arc::new(move |c: ChildId, others: &[ChildId]| {
+    /// A kill that cannot end anything: what still runs is left. Each
+    /// call's processes go to `asked`.
+    fn killer_that_cannot_kill(asked: Arc<Mutex<Vec<Vec<ChildId>>>>) -> Arc<ops::Killer> {
+        Arc::new(move |c: ChildId, others: &[ChildId]| {
             let mut all = vec![c];
             all.extend_from_slice(others);
-            lock(&asked2).push(all.clone());
+            lock(&asked).push(all.clone());
             let alive: Vec<Survivor> = all
                 .iter()
                 .filter(|c| {
@@ -6277,13 +6356,27 @@ mod tests {
             } else {
                 Err(io::Error::other(Unconfirmed::new(alive, "test")))
             }
-        }));
+        })
+    }
+
+    /// P1-3: the recorded PTY child is gone but a survivor still runs: the
+    /// retire keeps the row `orphaned` and the cwd held. Once the survivor
+    /// has exited, the retire makes the tombstone.
+    #[tokio::test]
+    async fn a_live_survivor_keeps_the_row_orphaned_until_it_is_gone() {
+        let e = setup(Script::Ready, None);
+        let (mut proc, child) = test_process("trap '' TERM; echo ready; exec sleep 30");
+        let r = orphan_with_survivors(&e, &survivor_json(child)).await;
+        let asked: Arc<Mutex<Vec<Vec<ChildId>>>> = Arc::default();
+        e.sp.set_orphan_killer(killer_that_cannot_kill(asked.clone()));
         let l = Principal::LocalUnverified;
         let id = serde_json::json!({ "id": r.id });
         let got = e.sp.retire(&l, id.clone()).await.unwrap();
         assert_eq!(got.state.as_deref(), Some("orphaned"));
         assert_eq!(got.gone_at, None);
-        assert_eq!(survivors_json(&e.db, &r.id), Some(survivor_json(child)));
+        let stored = ops::parse_survivors(survivors_json(&e.db, &r.id).as_deref()).unwrap();
+        assert_eq!(stored.list, vec![survivor(child)]);
+        assert!(!stored.overflow);
         assert_eq!(
             lock(&asked)[0],
             vec![
@@ -6399,9 +6492,105 @@ mod tests {
         })
         .unwrap();
         let kept = ops::parse_survivors(survivors_json(&e.db, &r.id).as_deref()).unwrap();
-        assert_eq!(kept, left[..ops::MAX_SURVIVORS]);
+        assert_eq!(kept.list, left[..ops::MAX_SURVIVORS]);
+        assert!(kept.overflow);
         let why = audit_reasons(&e.db, "engine.reconcile", ops::ORPHANED);
         assert!(why[0].contains("kept the first 64 of 70"), "{:?}", why);
+    }
+    /// P1-B: an unconfirmed kill that left more than 64 never ends by
+    /// itself: with the recorded ones gone the row stays `orphaned` with
+    /// `survivors_overflow`, retry after retry. `force` by the local
+    /// client ends it, with an audit row that names the forced retire.
+    #[tokio::test]
+    async fn an_overflow_keeps_the_row_orphaned_until_a_forced_retire() {
+        let e = setup(Script::Ready, None);
+        let r = orphan_with_survivors(&e, r#"{"v":1,"overflow":true,"list":[]}"#).await;
+        let l = Principal::LocalUnverified;
+        let id = serde_json::json!({ "id": r.id });
+        for _ in 0..2 {
+            let got = e.sp.retire(&l, id.clone()).await.unwrap();
+            assert_eq!(got.state.as_deref(), Some("orphaned"));
+            assert_eq!(got.state_reason.as_deref(), Some(ops::SURVIVORS_OVERFLOW));
+            assert_eq!(got.gone_at, None);
+        }
+        let why = audit_reasons(&e.db, "agent.retire", ops::ORPHANED);
+        assert!(
+            why.last().unwrap().contains(ops::SURVIVORS_OVERFLOW),
+            "{:?}",
+            why
+        );
+        let stored = ops::parse_survivors(survivors_json(&e.db, &r.id).as_deref()).unwrap();
+        assert!(stored.overflow, "the overflow is kept");
+        let got =
+            e.sp.retire(&l, serde_json::json!({ "id": r.id, "force": true }))
+                .await
+                .unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        assert_eq!(agent_state_rows(&e.db), 0);
+        let why = audit_reasons(&e.db, "agent.retire", ops::FORCED);
+        assert_eq!(why.len(), 1);
+        assert!(why[0].starts_with("forced retire"), "{:?}", why);
+        assert!(why[0].contains(ops::SURVIVORS_OVERFLOW), "{:?}", why);
+    }
+
+    /// P1-B: a forced retire still kills first, by pid and start time, and
+    /// ends the row even when a process is left; the audit row says so.
+    #[tokio::test]
+    async fn a_forced_retire_kills_first_and_names_what_it_left() {
+        let e = setup(Script::Ready, None);
+        let (mut proc, child) = test_process("trap '' TERM; echo ready; exec sleep 30");
+        let r = orphan_with_survivors(&e, &survivor_json(child)).await;
+        let asked: Arc<Mutex<Vec<Vec<ChildId>>>> = Arc::default();
+        e.sp.set_orphan_killer(killer_that_cannot_kill(asked.clone()));
+        let l = Principal::LocalUnverified;
+        let got =
+            e.sp.retire(&l, serde_json::json!({ "id": r.id, "force": true }))
+                .await
+                .unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        assert_eq!(lock(&asked).len(), 1, "the kill ran first");
+        let why = audit_reasons(&e.db, "agent.retire", ops::FORCED);
+        assert!(why[0].contains("1 left"), "{:?}", why);
+        proc.kill().unwrap();
+        proc.wait().unwrap();
+    }
+
+    /// P1-B: `force` is for the local client only: any other principal
+    /// gets `peer_not_authorized`, and nothing changes.
+    #[tokio::test]
+    async fn a_forced_retire_by_another_principal_is_refused() {
+        let e = setup(Script::Ready, None);
+        let r = orphan_with_survivors(&e, r#"{"v":1,"overflow":true,"list":[]}"#).await;
+        let a = Principal::Agent {
+            id: r.id.clone(),
+            gen: 1,
+        };
+        let err =
+            e.sp.retire(&a, serde_json::json!({ "id": r.id, "force": true }))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PeerNotAuthorized);
+        assert_eq!(row(&e.db, &r.id).state.as_deref(), Some("orphaned"));
+        assert!(audit_reasons(&e.db, "agent.retire", ops::FORCED).is_empty());
+    }
+
+    /// P1-B: the first stored form, a bare list, still reads, with no
+    /// overflow; a list in an unknown version does not.
+    #[test]
+    fn stored_survivors_read_both_forms() {
+        let s = Survivor {
+            pid: 5,
+            start: 6,
+            pgid: 5,
+        };
+        let bare = ops::parse_survivors(Some(r#"[{"pid":5,"start":6,"pgid":5}]"#)).unwrap();
+        assert_eq!(bare.list, vec![s]);
+        assert!(!bare.overflow);
+        assert!(ops::parse_survivors(Some(r#"{"v":2,"overflow":false,"list":[]}"#)).is_err());
+        assert_eq!(
+            ops::parse_survivors(None).unwrap(),
+            ops::Survivors::default()
+        );
     }
 }
 

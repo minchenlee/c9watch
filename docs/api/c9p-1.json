@@ -198,6 +198,13 @@
     "AgentRetireParams": {
       "description": "`agent.retire` params.",
       "properties": {
+        "force": {
+          "description": "End an `orphaned` agent even when the kill cannot confirm that\nevery process is gone: core kills by pid and start time as\nalways, then writes the tombstone and an audit row that names the\nforced retire. The local client only, as `agent.retire` is. No\neffect on an agent that is not `orphaned`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "id": {
           "description": "The agent id (`agt_<ulid>`).",
           "type": "string"

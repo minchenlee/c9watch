@@ -1145,6 +1145,13 @@ pub struct AgentCreateResult {
 pub struct AgentRetireParams {
     /// The agent id (`agt_<ulid>`).
     pub id: String,
+    /// End an `orphaned` agent even when the kill cannot confirm that
+    /// every process is gone: core kills by pid and start time as
+    /// always, then writes the tombstone and an audit row that names the
+    /// forced retire. The local client only, as `agent.retire` is. No
+    /// effect on an agent that is not `orphaned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<bool>,
 }
 
 /// `agent.retire` result: the tombstone row. Retiring a retired or

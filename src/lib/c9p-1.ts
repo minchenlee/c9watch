@@ -83,6 +83,14 @@ export interface C9pAgentResumeResult {
 
 /** `agent.retire` params. */
 export interface C9pAgentRetireParams {
+  /**
+   * End an `orphaned` agent even when the kill cannot confirm that
+   * every process is gone: core kills by pid and start time as
+   * always, then writes the tombstone and an audit row that names the
+   * forced retire. The local client only, as `agent.retire` is. No
+   * effect on an agent that is not `orphaned`.
+   */
+  force?: boolean | null;
   /** The agent id (`agt_<ulid>`). */
   id: string;
 }

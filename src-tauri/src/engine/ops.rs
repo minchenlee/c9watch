@@ -78,6 +78,10 @@ pub const KILL_UNCONFIRMED: &str = "kill_unconfirmed";
 /// `ops.outcome` and audit decision of an unconfirmed kill.
 pub const ORPHANED: &str = "orphaned";
 
+/// Audit decision of `agent.retire` with `force` on an `orphaned` agent:
+/// the tombstone without a confirmed end (P1-B).
+pub const FORCED: &str = "forced";
+
 /// The phases of a free create.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -333,7 +337,7 @@ pub fn orphan_agent(
          VALUES (?1, ?2, ?3, ?4)",
         params![agent_id, gen, child.pid as i64, child.start as i64],
     )?;
-    let note = store_survivors(tx, agent_id, left)?;
+    let note = store_survivors(tx, agent_id, left, false)?;
     let open: Vec<String> = {
         let mut st = tx.prepare(
             "SELECT id FROM ops WHERE kind IN (?1, ?2) AND done_at IS NULL \
@@ -379,33 +383,78 @@ pub fn orphan_agent(
 /// Survivors kept per agent at most (`agent_state.survivors`).
 pub const MAX_SURVIVORS: usize = 64;
 
+/// Why an `orphaned` agent cannot be retired by itself: an unconfirmed
+/// kill left more than `MAX_SURVIVORS` processes, so not every one is
+/// recorded (D2). Only `agent.retire` with `force` ends it.
+pub const SURVIVORS_OVERFLOW: &str = "survivors_overflow";
+
+/// What an unconfirmed kill left (`agent_state.survivors`, D2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Survivors {
+    /// The first `MAX_SURVIVORS` of them.
+    pub list: Vec<Survivor>,
+    /// Some were not recorded. Kept once set: a process never recorded
+    /// is never confirmed gone.
+    pub overflow: bool,
+}
+
+/// The stored form: `{"v":1,"overflow":…,"list":[{pid,start,pgid}…]}`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Stored {
+    v: u32,
+    overflow: bool,
+    list: Vec<Survivor>,
+}
+
 /// Store what an unconfirmed kill left (`agent_state.survivors`, D2): the
-/// first `MAX_SURVIVORS`, as JSON; none is NULL. Returns a note for the
-/// audit row when some were dropped.
+/// first `MAX_SURVIVORS` of `left`, and `overflow` when there were more or
+/// `overflow` was set before. Nothing left and no overflow is NULL.
+/// Returns a note for the audit row when some were dropped now.
 pub fn store_survivors(
     tx: &mut Tx,
     agent_id: &str,
     left: &[Survivor],
+    overflow: bool,
 ) -> rusqlite::Result<Option<String>> {
     let kept = &left[..left.len().min(MAX_SURVIVORS)];
-    let json = if kept.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(kept).expect("survivors serialize"))
-    };
+    let dropped = left.len() > kept.len();
+    let json = (overflow || dropped || !kept.is_empty()).then(|| {
+        serde_json::to_string(&Stored {
+            v: 1,
+            overflow: overflow || dropped,
+            list: kept.to_vec(),
+        })
+        .expect("survivors serialize")
+    });
     tx.execute(
         "UPDATE agent_state SET survivors = ?2 WHERE agent_id = ?1",
         params![agent_id, json],
     )?;
-    Ok((left.len() > kept.len())
-        .then(|| format!("survivors: kept the first {} of {}", kept.len(), left.len())))
+    Ok(dropped.then(|| format!("survivors: kept the first {} of {}", kept.len(), left.len())))
 }
 
 /// `agent_state.survivors` as stored by `store_survivors`. NULL is none.
-pub fn parse_survivors(json: Option<&str>) -> Result<Vec<Survivor>, String> {
-    match json {
-        None => Ok(Vec::new()),
-        Some(j) => serde_json::from_str(j).map_err(|e| format!("survivors unreadable: {}", e)),
+/// A bare list (the first form) has no overflow.
+pub fn parse_survivors(json: Option<&str>) -> Result<Survivors, String> {
+    let Some(j) = json else {
+        return Ok(Survivors::default());
+    };
+    let unreadable = |e: serde_json::Error| format!("survivors unreadable: {}", e);
+    match serde_json::from_str::<serde_json::Value>(j).map_err(unreadable)? {
+        v @ serde_json::Value::Array(_) => Ok(Survivors {
+            list: serde_json::from_value(v).map_err(unreadable)?,
+            overflow: false,
+        }),
+        v => {
+            let s: Stored = serde_json::from_value(v).map_err(unreadable)?;
+            if s.v != 1 {
+                return Err(format!("survivors unreadable: version {}", s.v));
+            }
+            Ok(Survivors {
+                list: s.list,
+                overflow: s.overflow,
+            })
+        }
     }
 }
 
