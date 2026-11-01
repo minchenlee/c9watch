@@ -1685,7 +1685,7 @@
         },
         {
           "const": "peer_not_authorized",
-          "description": "A hook-class method (`hook.*`, `task.done`, `agent.handoff`) from a\ncaller that is not a live agent running the engine's own\n`c9watch-agent` copy, or that names another agent.",
+          "description": "A hook-class method (`hook.*`, `task.done`, `agent.handoff`) from a\ncaller that is not a live agent running the engine's own\n`c9watch-agent` copy, or that names another agent. Also a request\nthat needs the caller's identity on a connection whose process core\ncould not verify once session detection was ready (it exited, or its\nstart time is unreadable); connect again.",
           "type": "string"
         },
         {
@@ -1755,7 +1755,7 @@
         },
         {
           "const": "duplicate",
-          "description": "`msg.send`: the `idem` key was used for another message, or the same\nbody went to the same agent within 10 minutes. `data` has `msgId`\nand `at`.",
+          "description": "`msg.send`: the `idem` key was used for another message, or the same\nbody went to the same agent within 10 minutes. `data` has `msgId`\nand `at`. `agent.create`, `agent.retire`, `session.stop`: the `idem`\nkey was used for a request with other params.",
           "type": "string"
         },
         {
@@ -1770,7 +1770,7 @@
         },
         {
           "const": "busy",
-          "description": "The engine is at a limit that frees up soon: the connection cap, or\na scan of the same kind that is still running. Retry shortly.",
+          "description": "The engine is at a limit that frees up soon: the connection cap, a\nscan of the same kind that is still running, every `idem` key in\nuse, or, while the engine starts, a request that needs the caller's\nidentity before session detection has finished a pass. The request\nhas its own `id`; the connection stays open. Retry shortly.",
           "type": "string"
         },
         {
@@ -4816,6 +4816,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "mutating_peer"
         ],
         "principals": [
@@ -4835,6 +4836,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "agent_exe"
         ],
         "principals": [
@@ -4858,7 +4860,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "agent",
         "verb": "read"
@@ -4874,6 +4877,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "mutating_peer"
         ],
         "principals": [
@@ -4893,6 +4897,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "mutating_peer"
         ],
         "principals": [
@@ -4918,7 +4923,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "annotation",
         "verb": "write"
@@ -4937,7 +4943,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "annotation",
         "verb": "read"
@@ -4959,7 +4966,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "annotation",
         "verb": "write"
@@ -4981,7 +4989,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "annotation",
         "verb": "write"
@@ -5000,7 +5009,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "protocol",
         "verb": "read"
@@ -5019,7 +5029,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "protocol",
         "verb": "read"
@@ -5041,7 +5052,8 @@
         "minCeiling": "conversation",
         "principals": [
           "local-unverified",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "conversation",
         "verb": "read"
@@ -5059,7 +5071,8 @@
         "admission": [],
         "principals": [
           "local-unverified",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "cost",
         "verb": "read"
@@ -5075,6 +5088,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "mutating_peer"
         ],
         "principals": [
@@ -5097,7 +5111,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "session",
         "verb": "read"
@@ -5119,7 +5134,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "protocol",
         "verb": "read"
@@ -5138,7 +5154,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "protocol",
         "verb": "read"
@@ -5157,7 +5174,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "protocol",
         "verb": "read"
@@ -5176,7 +5194,8 @@
         "minCeiling": "conversation",
         "principals": [
           "local-unverified",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "history",
         "verb": "read"
@@ -5194,7 +5213,8 @@
         "admission": [],
         "minCeiling": "conversation",
         "principals": [
-          "local-unverified"
+          "local-unverified",
+          "observed"
         ],
         "resource": "history",
         "verb": "read"
@@ -5210,6 +5230,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "agent_exe"
         ],
         "principals": [
@@ -5230,6 +5251,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "agent_exe"
         ],
         "principals": [
@@ -5250,6 +5272,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "agent_exe"
         ],
         "principals": [
@@ -5270,6 +5293,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "agent_exe"
         ],
         "principals": [
@@ -5290,6 +5314,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "agent_exe"
         ],
         "principals": [
@@ -5310,6 +5335,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "agent_exe"
         ],
         "principals": [
@@ -5330,6 +5356,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "agent_exe"
         ],
         "principals": [
@@ -5350,6 +5377,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "mutating_peer"
         ],
         "principals": [
@@ -5369,6 +5397,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "mutating_peer"
         ],
         "principals": [
@@ -5391,7 +5420,8 @@
         "minCeiling": "conversation",
         "principals": [
           "local-unverified",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "memory",
         "verb": "read"
@@ -5407,6 +5437,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "mutating_peer"
         ],
         "principals": [
@@ -5426,6 +5457,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "mail_peer"
         ],
         "principals": [
@@ -5446,6 +5478,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "mail_peer"
         ],
         "principals": [
@@ -5466,11 +5499,13 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "mail_sender"
         ],
         "principals": [
           "local-unverified",
-          "agent"
+          "agent",
+          "observed"
         ],
         "resource": "msg",
         "verb": "send"
@@ -5489,7 +5524,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "protocol",
         "verb": "read"
@@ -5505,6 +5541,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "mutating_peer"
         ],
         "principals": [
@@ -5526,7 +5563,8 @@
         "admission": [],
         "principals": [
           "local-unverified",
-          "agent"
+          "agent",
+          "observed"
         ],
         "resource": "provider",
         "verb": "read"
@@ -5545,7 +5583,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "session",
         "verb": "read"
@@ -5564,7 +5603,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "session",
         "verb": "read"
@@ -5600,11 +5640,13 @@
       },
       "x-authz": {
         "admission": [
+          "own_session",
           "mutating_peer"
         ],
         "principals": [
           "local-unverified",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "session",
         "verb": "stop"
@@ -5623,7 +5665,8 @@
         "minCeiling": "conversation",
         "principals": [
           "local-unverified",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "conversation",
         "verb": "read"
@@ -5642,7 +5685,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "session",
         "verb": "read"
@@ -5661,7 +5705,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "session",
         "verb": "read"
@@ -5679,7 +5724,8 @@
         "admission": [],
         "principals": [
           "local-unverified",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "cost",
         "verb": "read"
@@ -5698,7 +5744,8 @@
         "minCeiling": "conversation",
         "principals": [
           "local-unverified",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "conversation",
         "verb": "read"
@@ -5714,6 +5761,7 @@
       },
       "x-authz": {
         "admission": [
+          "unix_peer",
           "agent_exe"
         ],
         "principals": [
@@ -5736,7 +5784,8 @@
         "admission": [],
         "principals": [
           "local-unverified",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "cost",
         "verb": "read"
@@ -5755,7 +5804,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "agent",
         "verb": "read"
@@ -5771,7 +5821,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "agent",
         "verb": "read"
@@ -5787,7 +5838,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "agent",
         "verb": "read"
@@ -5803,7 +5855,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "agent",
         "verb": "read"
@@ -5819,7 +5872,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "agent",
         "verb": "read"
@@ -5835,7 +5889,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "annotation",
         "verb": "read"
@@ -5851,7 +5906,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "annotation",
         "verb": "read"
@@ -5867,7 +5923,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "session",
         "verb": "read"
@@ -5883,7 +5940,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "session",
         "verb": "read"
@@ -5929,7 +5987,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "session",
         "verb": "read"
@@ -5945,7 +6004,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "session",
         "verb": "read"
@@ -5961,7 +6021,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "session",
         "verb": "read"
@@ -5978,7 +6039,8 @@
         "principals": [
           "local-unverified",
           "agent",
-          "client"
+          "client",
+          "observed"
         ],
         "resource": "session",
         "verb": "read"

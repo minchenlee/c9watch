@@ -82,6 +82,11 @@ pub fn admit(method: &str, params: &mut Value, who: &Principal) -> Result<(), Ap
     let forced = match who {
         Principal::Agent { id, .. } => Some(owned_namespace("agent", id)),
         Principal::Client { id } => Some(owned_namespace("client", id)),
+        // A session key is not a valid namespace component; its hash is.
+        Principal::Observed { session_key } => Some(format!(
+            "observed.{}",
+            &super::mail::sha256_hex(session_key.as_bytes())[..16]
+        )),
         Principal::LocalUnverified => None,
     };
     let ns = if let Some(ref forced) = forced {
@@ -94,7 +99,11 @@ pub fn admit(method: &str, params: &mut Value, who: &Principal) -> Result<(), Ap
         forced.as_str()
     } else {
         let ns = supplied.ok_or_else(|| bad("local patches require source"))?;
-        if ns.starts_with("agent.") || ns.starts_with("client.") || ns.starts_with("c9watch") {
+        if ns.starts_with("agent.")
+            || ns.starts_with("client.")
+            || ns.starts_with("observed.")
+            || ns.starts_with("c9watch")
+        {
             return Err(ApiError::new(
                 ErrorCode::NotAllowed,
                 "reserved annotation namespace",
@@ -629,6 +638,34 @@ mod tests {
         db.write_blocking(move |tx| apply(tx, &p, "local-unverified", "annotation.patch", now))
             .unwrap()
             .0
+    }
+    /// D8: a peer inside an observed session writes only under its own
+    /// hashed `observed.` namespace, which a local caller may not claim.
+    #[test]
+    fn an_observed_session_writes_under_its_own_namespace() {
+        let who = Principal::Observed {
+            session_key: "claudeCode:s1".into(),
+        };
+        let own = format!(
+            "observed.{}",
+            &super::super::mail::sha256_hex(b"claudeCode:s1")[..16]
+        );
+        let mut p = request("x", json!({"x":null}), None, None);
+        p.as_object_mut().unwrap().remove("source");
+        admit("annotation.patch", &mut p, &who).unwrap();
+        assert_eq!(p["source"], own.as_str());
+        let mut set = json!({"key":"observed.0000000000000000/x"});
+        assert_eq!(
+            admit("annotation.set", &mut set, &who).unwrap_err().code,
+            ErrorCode::NotAllowed
+        );
+        let mut set = json!({"key":format!("{own}/x")});
+        assert_eq!(
+            admit("annotation.set", &mut set, &Principal::LocalUnverified)
+                .unwrap_err()
+                .code,
+            ErrorCode::NotAllowed
+        );
     }
     #[test]
     fn namespaces_are_forced_and_reserved_ones_are_refused() {

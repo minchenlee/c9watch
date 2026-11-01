@@ -2,11 +2,31 @@
 //! connection, the `hello` handshake, and method dispatch.
 //!
 //! The first frame must be `hello` and must arrive within 5 s of the accept;
-//! blank lines do not extend that deadline. A major version mismatch gets
+//! blank lines do not extend that deadline. `hello` never waits for session
+//! detection. A connection stamped before detection's first successful
+//! pass is provisional (`Stamp`): it is stamped again before its first
+//! request that the stamp could change, which waits up to 5 s for the
+//! views and otherwise gets `busy`. A major version mismatch gets
 //! `upgrade_required` and the connection closes. So do a missing or late
 //! `hello`, an oversized frame and a peer under another uid. After `hello`, a
 //! frame that is not valid JSON or lacks `v` gets `bad_request`, and the
 //! connection stays open, because the line framing is still intact.
+//!
+//! After `hello`, the reader hands each request to its own task, so one
+//! connection runs requests concurrently and answers each when it is done:
+//! responses can come out of order, and a client matches them by `id`
+//! (D3). A connection runs at most `MAX_IN_FLIGHT` requests; past that the
+//! reader reads nothing more until one ends. `events.subscribe` and
+//! `events.unsubscribe` take the connection's streams in the order they
+//! were sent, on one task per connection, so a subscribe response comes
+//! before its first event and no event of a stream follows its
+//! unsubscribe response; a slow one never holds up the other requests. When the peer closes, the
+//! requests in flight finish first. `agent.create`, `agent.retire` and
+//! `session.stop` replay a repeated `idem` (`engine::idem`).
+//!
+//! Who may call what is the table in `engine::authz`: the principal kinds
+//! of each method and its admission checks, which `dispatch` runs before
+//! any handler (D9).
 //!
 //! `events.subscribe` starts a stream task on the connection. It reads the
 //! event log from SQLite at its own pace and writes event frames to the
@@ -25,16 +45,18 @@
 //! answers with the standing orders (`engine::standing`, C1a-25), except
 //! while the engine drains (C1a-27, `engine::drain`).
 //!
-//! `agent.create`, `agent.retire` and `agent.resume` take only a local client
-//! (`local-unverified`); an agent gets `not_allowed`, which is audited. The
-//! work is in `engine::create` (C1a-26).
+//! `agent.create`, `agent.retire` and `agent.resume` take only a local
+//! client (`local-unverified`); an agent or an observed session gets
+//! `not_allowed`, which is audited. The work is in `engine::create`
+//! (C1a-26).
 //!
 //! `session.views` and `session.away` serve the session views and the
 //! away-activity index that each detection tick keeps (`views::sessions`).
 //! Every principal may read them. `detect.recheck`, `session.stop` and
 //! `session.rename` take only a local client that passes the mutation
 //! check, as `agent.create` does; each runs one detection tick before it
-//! answers.
+//! answers. A peer inside an observed session (`observed:<sessionKey>`)
+//! may stop only that session (D8).
 //!
 //! `msg.send` (C1b-M1) takes the terminal and agents (`engine::mail`
 //! checks both), queues the message and nudges the target's supervisor,
@@ -43,7 +65,7 @@
 
 use super::agent_bin::AgentBin;
 use super::annotations;
-use super::authz;
+use super::authz::{self, Admission};
 use super::create::Spawner;
 use super::db::audit::{self, AuditEntry};
 use super::db::outbox::{Cursor, Event, ReadError, Subscription, READ_BATCH};
@@ -52,11 +74,12 @@ use super::detect::{Detection, FirstTick, FIRST_TICK_WAIT};
 use super::discovery;
 use super::drain::DrainSwitch;
 use super::hooks::{self, HookEvent, Outcome};
+use super::idem::IdemCache;
 use super::machine::HeaderKey;
 use super::mail;
 use super::merge::MergeTable;
 use super::peer::{self, PeerCred};
-use super::principal::{self, LiveAgents, NoLiveAgents, Principal};
+use super::principal::{self, LiveAgents, NoLiveAgents, ObservedSessions, Principal};
 use super::proto::{
     encode, encode_event, is_hook_class, read_frame, AgentCreateParams, AgentCreateResult,
     AgentListParams, AgentListResult, AgentResumeParams, AgentResumeResult, AgentRetireParams,
@@ -88,6 +111,8 @@ use super::standing;
 use super::views;
 use super::views::conversation::{Progress, PROGRESS_CAPABILITY};
 use super::views::sessions as session_views;
+use std::collections::HashMap;
+use std::future::Future;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -108,6 +133,10 @@ const WRITE_QUEUE: usize = 64;
 /// SQLite reader (and its file descriptors) until the connection closes, so
 /// without a cap one client could exhaust the engine's descriptors.
 pub const MAX_STREAMS: usize = 16;
+
+/// Requests one connection runs at once. Past it the reader waits for one
+/// to end before it reads the next frame.
+pub const MAX_IN_FLIGHT: usize = 32;
 
 /// Longest `seq` a hook-class call may carry. A ns clock has 19 digits.
 const MAX_SEQ: usize = 32;
@@ -156,6 +185,21 @@ pub struct ServerCtx {
     /// Where `usage.subscriptions` reads. `None` (only in tests) answers
     /// `internal`.
     pub usage: Option<views::usage::UsageSource>,
+    /// The `idem` record of `agent.create`, `agent.retire` and
+    /// `session.stop` (D3).
+    pub idem: Arc<IdemCache>,
+    /// Observed sessions, for `observed:<sessionKey>` stamping (D8).
+    /// `None` reads detection's views.
+    pub observed: Option<Arc<dyn ObservedSessions>>,
+}
+
+/// Observed sessions by process pid, as detection last saw them.
+struct ObservedNow(HashMap<libc::pid_t, String>);
+
+impl ObservedSessions for ObservedNow {
+    fn by_pid(&self, pid: libc::pid_t) -> Option<String> {
+        self.0.get(&pid).cloned()
+    }
 }
 
 impl ServerCtx {
@@ -179,6 +223,8 @@ impl ServerCtx {
             user_home: None,
             cost_cache: None,
             usage: None,
+            idem: Arc::new(IdemCache::new()),
+            observed: None,
         }
     }
 
@@ -247,6 +293,53 @@ impl ServerCtx {
                 FIRST_TICK_WAIT
             );
         }
+    }
+
+    /// Whether detection has committed views once. An engine without
+    /// detection, or with a test set, has none to wait for.
+    pub(crate) fn views_ready(&self) -> bool {
+        match (&self.observed, &self.detection) {
+            (None, Some(d)) => d.views.current().is_some(),
+            _ => true,
+        }
+    }
+
+    /// Wait up to `STAMP_WAIT` for detection's first views; past it,
+    /// `busy`. Who a peer is depends on them, so nothing the principal
+    /// decides runs before them.
+    pub(crate) async fn ensure_views(&self) -> Result<(), ApiError> {
+        let ready = match (&self.observed, &self.detection) {
+            (None, Some(d)) => d.views.wait_ready(STAMP_WAIT).await,
+            _ => true,
+        };
+        if ready {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            ErrorCode::Busy,
+            "session detection has not finished a pass yet",
+        )
+        .with_hint("the engine is starting; retry shortly"))
+    }
+
+    /// The observed sessions now: detection's last views, or the test set.
+    pub(crate) fn observed_sessions(&self) -> Arc<dyn ObservedSessions> {
+        if let Some(o) = &self.observed {
+            return o.clone();
+        }
+        let sessions = self
+            .detection
+            .as_ref()
+            .and_then(|d| d.views.current())
+            .map(|(_, s)| s)
+            .unwrap_or_default();
+        Arc::new(ObservedNow(
+            sessions
+                .into_iter()
+                .filter(|s| s.pid > 0 && !s.session_key.is_empty())
+                .filter_map(|s| Some((libc::pid_t::try_from(s.pid).ok()?, s.session_key)))
+                .collect(),
+        ))
     }
 
     pub(crate) fn db(&self) -> Result<&Arc<Db>, ApiError> {
@@ -336,17 +429,6 @@ impl Peer {
             )),
         }
     }
-    /// This second gate is independent of x-authz and its admission list.
-    fn mutation(self, method: &str) -> Result<(), ApiError> {
-        match self {
-            Self::Unix { .. } => Ok(()),
-            Self::Gateway { .. } if matches!(method, "session.stop" | "session.rename") => Ok(()),
-            Self::Gateway { .. } => Err(ApiError::new(
-                ErrorCode::NotAllowed,
-                "gateway peer cannot perform this mutation",
-            )),
-        }
-    }
 }
 
 /// The connection's state after `hello`.
@@ -356,7 +438,7 @@ struct Conn {
     capabilities: Vec<String>,
 }
 
-/// What the reader does after handling a frame.
+/// What the reader does after a frame it answered itself.
 enum Next {
     Continue,
     Close,
@@ -399,14 +481,30 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
     // Stamp at accept, not at `hello`: the peer pid is then as fresh as it
     // gets, and a late `hello` cannot wait for the pid to be reused.
     // The peer's start time comes from the same read as the principal, so
-    // a later exe check reads the process the principal came from.
-    let (principal, start) = principal::stamp_peer(cred.pid, accepted, ctx.agents.as_ref());
-    let peer = Peer::Unix { cred, start };
+    // a later exe check reads the process the principal came from. Before
+    // detection's first views the stamp is provisional (`Stamp`).
+    let stamp = Arc::new(Stamp::at_accept(&ctx, cred, accepted));
 
     let mut reader = BufReader::new(read);
     let mut conn: Option<Conn> = None;
-    let mut streams = Streams::default();
+    let streams = Arc::new(tokio::sync::Mutex::new(Streams::default()));
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+    let mut calls = tokio::task::JoinSet::new();
+    // Stream controls run one at a time in the order sent, on their own
+    // task, so a slow subscribe holds up only the controls after it. The
+    // in-flight bound also bounds this queue.
+    let (controls, mut queued) = mpsc::channel::<Queued>(MAX_IN_FLIGHT);
+    {
+        let (ctx, stamp, streams, tx) = (ctx.clone(), stamp.clone(), streams.clone(), tx.clone());
+        calls.spawn(async move {
+            while let Some(q) = queued.recv().await {
+                let held = streams.clone().lock_owned().await;
+                serve_queued(q, &ctx, &stamp, Some(held), &tx).await;
+            }
+        });
+    }
     loop {
+        while calls.try_join_next().is_some() {}
         let frame = if conn.is_none() {
             match tokio::time::timeout_at(hello_deadline, read_frame(&mut reader, MAX_FRAME)).await
             {
@@ -444,58 +542,288 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
         if frame.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        // A stream that ended (expired, or the store closed) frees its slot.
-        streams.reap();
-        let (resp, next, stream) =
-            handle_frame(&frame, &ctx, peer, &principal, &mut conn, &mut streams, &tx).await;
-        if tx.send(encode(&resp)).await.is_err() {
-            break;
-        }
-        // Start the stream only after its subscribe response is queued, so
-        // that response comes first.
-        if let Some(s) = stream {
-            streams.start(s, tx.clone());
-        }
-        if let Next::Close = next {
-            break;
+        let (principal, peer) = stamp.now();
+        match check_frame(&frame, &ctx, peer, &principal, &mut conn) {
+            Checked::Done(resp, next) => {
+                if tx.send(encode(&resp)).await.is_err() {
+                    break;
+                }
+                if let Next::Close = next {
+                    break;
+                }
+            }
+            Checked::Call(req, method) => {
+                let Ok(slot) = in_flight.clone().acquire_owned().await else {
+                    break;
+                };
+                let progress = conn
+                    .as_ref()
+                    .is_some_and(|c| c.capabilities.iter().any(|w| w == PROGRESS_CAPABILITY))
+                    .then(|| Progress {
+                        tx: tx.clone(),
+                        id: req.id.clone(),
+                    });
+                let q = Queued {
+                    req,
+                    method,
+                    progress,
+                    slot,
+                };
+                if matches!(q.method.as_str(), "events.subscribe" | "events.unsubscribe") {
+                    if controls.send(q).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                let (ctx, stamp, tx) = (ctx.clone(), stamp.clone(), tx.clone());
+                calls.spawn(async move { serve_queued(q, &ctx, &stamp, None, &tx).await });
+            }
         }
     }
-    streams.abort_all();
+    drop(controls);
+    // A write in flight runs to its end; only then do the streams stop.
+    while calls.join_next().await.is_some() {}
+    streams.lock().await.abort_all();
     drop(tx);
     let _ = writer.await;
 }
 
-/// Handle one frame and say whether the connection stays open, and which
-/// event stream to start after the response.
-async fn handle_frame(
-    frame: &[u8],
+/// One request after the envelope checks, with its in-flight permit.
+struct Queued {
+    req: Request,
+    method: String,
+    progress: Option<Progress>,
+    slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Serve `q` under the connection's stamp for it, then free its permit.
+async fn serve_queued(
+    q: Queued,
+    ctx: &ServerCtx,
+    stamp: &Stamp,
+    held: Option<tokio::sync::OwnedMutexGuard<Streams>>,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let Queued {
+        req,
+        method,
+        progress,
+        slot,
+    } = q;
+    match stamp.for_request(ctx, &method, &req).await {
+        Ok((principal, peer)) => {
+            call(req, &method, ctx, peer, &principal, held, progress, tx).await
+        }
+        Err(e) => {
+            let _ = tx.send(encode(&Response::err(req.id, e))).await;
+        }
+    }
+    drop(slot);
+}
+
+/// How long a request that needs the caller's identity waits for
+/// detection's first views. Shorter than the clients' 5 s read timeout
+/// (`engine_proto::spawn`), so the `busy` reaches them in time.
+const STAMP_WAIT: Duration = Duration::from_secs(3);
+
+/// The principal of one Unix connection (D8). It is stamped at accept.
+/// Before detection's first successful pass there are no views, so a
+/// process in an observed session would stamp `local-unverified`: that
+/// stamp is provisional. Once views exist, the connection is stamped again,
+/// once, and keeps that result. A request whose answer the stamp could
+/// change waits for the views first (`needs_stamp`); past `STAMP_WAIT` it
+/// gets `busy`, and the next such request waits again. Other reads run
+/// under the provisional stamp. If the second stamp cannot verify the
+/// process (it exited, or its start time changed or is unreadable), the
+/// connection is restricted: it keeps its provisional stamp for plain
+/// reads, and every request that needs its identity is refused. `hello`
+/// never waits, so it may report
+/// `local-unverified` for a peer that later narrows to `observed:`.
+struct Stamp {
+    cred: peer::PeerCred,
+    accepted: Option<u64>,
+    first: (Arc<Principal>, Peer),
+    provisional: bool,
+    /// The second stamp; `None` inside when it could not verify the peer.
+    settled: tokio::sync::OnceCell<Option<(Arc<Principal>, Peer)>>,
+}
+
+impl Stamp {
+    fn at_accept(ctx: &ServerCtx, cred: peer::PeerCred, accepted: Option<u64>) -> Self {
+        let ready = ctx.views_ready();
+        let (principal, start) = principal::stamp_peer(
+            cred.pid,
+            accepted,
+            ctx.agents.as_ref(),
+            ctx.observed_sessions().as_ref(),
+        );
+        // Only `local-unverified` can narrow: an agent's stamp comes from
+        // the engine's own agent table, never from the views.
+        let provisional = !ready && principal == Principal::LocalUnverified;
+        Self {
+            cred,
+            accepted,
+            first: (Arc::new(principal), Peer::Unix { cred, start }),
+            provisional,
+            settled: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// The stamp as it stands, for `hello`.
+    fn now(&self) -> (Arc<Principal>, Peer) {
+        self.settled
+            .get()
+            .and_then(Option::as_ref)
+            .unwrap_or(&self.first)
+            .clone()
+    }
+
+    /// The stamp to serve `method` under.
+    async fn for_request(
+        &self,
+        ctx: &ServerCtx,
+        method: &str,
+        req: &Request,
+    ) -> Result<(Arc<Principal>, Peer), ApiError> {
+        if !self.provisional {
+            return Ok(self.first.clone());
+        }
+        let needs = needs_stamp(method, req);
+        let settled = match self.settled.get() {
+            Some(s) => s,
+            None => {
+                if !ctx.views_ready() {
+                    if !needs {
+                        return Ok(self.first.clone());
+                    }
+                    ctx.ensure_views().await?;
+                }
+                self.settled.get_or_init(|| async { self.again(ctx) }).await
+            }
+        };
+        match settled {
+            Some(s) => Ok(s.clone()),
+            None if needs => Err(ApiError::new(
+                ErrorCode::PeerNotAuthorized,
+                "core could not verify this connection's process once session detection was ready",
+            )
+            .with_hint("connect again from a running process")),
+            None => Ok(self.first.clone()),
+        }
+    }
+
+    /// Stamp again from the views. `None` when the process is not verified
+    /// to be the one that connected: it is gone, or its start time is
+    /// unreadable or another. It never falls back to the provisional stamp.
+    fn again(&self, ctx: &ServerCtx) -> Option<(Arc<Principal>, Peer)> {
+        let (principal, start) = principal::stamp_peer(
+            self.cred.pid,
+            self.accepted,
+            ctx.agents.as_ref(),
+            ctx.observed_sessions().as_ref(),
+        );
+        match self.first.1 {
+            Peer::Unix { start: first, .. } if first == start && start.is_some() => Some((
+                Arc::new(principal),
+                Peer::Unix {
+                    cred: self.cred,
+                    start,
+                },
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the answer to `method` could differ between `local-unverified`
+/// and an observed session, so a provisional stamp may not serve it: the
+/// method is closed to one of them, or an admission check reads the
+/// principal. For `events.subscribe`, whether it may carry a topic that
+/// only one of them may read (`msg.state`, `legacy.inbox`).
+fn needs_stamp(method: &str, req: &Request) -> bool {
+    if method == "events.subscribe" {
+        let wanted: Vec<String> = req
+            .params
+            .get("topics")
+            .map(|t| serde_json::from_value(t.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        return local_only_topics()
+            .iter()
+            .any(|t| wanted.is_empty() || topic_wanted(&wanted, t));
+    }
+    // An unknown method is `unknown_method` for every principal.
+    authz::method(method).is_some_and(|r| {
+        !(r.principals.contains(&authz::L)
+            && r.principals.contains(&authz::O)
+            && r.admission.iter().all(|a| *a == Admission::UnixPeer))
+    })
+}
+
+/// The topics `local-unverified` may read and an observed session may not
+/// (`msg.state`, `legacy.inbox`).
+fn local_only_topics() -> Vec<String> {
+    let observed = authz::topics(
+        &Principal::Observed {
+            session_key: String::new(),
+        },
+        None,
+    );
+    authz::topics(&Principal::LocalUnverified, None)
+        .into_iter()
+        .filter(|t| !observed.contains(t))
+        .collect()
+}
+
+/// Whether topic patterns `wanted` (`name` or `prefix.*`) match `topic`.
+fn topic_wanted(wanted: &[String], topic: &str) -> bool {
+    wanted.iter().any(|t| match t.strip_suffix(".*") {
+        Some(prefix) => topic
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('.')),
+        None => t == topic,
+    })
+}
+
+/// Serve one request and queue its response. A subscribe or unsubscribe
+/// gets the connection's streams in `held`, taken in the order sent, and
+/// holds them throughout: a new stream starts only after its response is
+/// queued, so that response comes first, and the stream count cannot pass
+/// `MAX_STREAMS`.
+#[allow(clippy::too_many_arguments)]
+async fn call(
+    req: Request,
+    method: &str,
     ctx: &ServerCtx,
     peer: Peer,
     principal: &Principal,
-    conn: &mut Option<Conn>,
-    streams: &mut Streams,
+    mut held: Option<tokio::sync::OwnedMutexGuard<Streams>>,
+    progress: Option<Progress>,
     tx: &mpsc::Sender<Vec<u8>>,
-) -> (Response, Next, Option<EventStream>) {
-    match check_frame(frame, ctx, peer, principal, conn) {
-        Checked::Done(resp, next) => (resp, next, None),
-        Checked::Call(req, method) => {
-            let id = req.id.clone();
-            let progress = conn
-                .as_ref()
-                .is_some_and(|c| c.capabilities.iter().any(|w| w == PROGRESS_CAPABILITY))
-                .then(|| Progress {
-                    tx: tx.clone(),
-                    id: id.clone(),
-                });
-            match dispatch(&method, req, ctx, peer, principal, streams, progress).await {
-                Ok(served) => {
-                    let mut resp = Response::ok(id, served.result);
-                    resp.seq = served.seq;
-                    (resp, Next::Continue, served.stream)
-                }
-                Err(e) => (Response::err(id, e), Next::Continue, None),
-            }
+) {
+    let id = req.id.clone();
+    let (resp, stream) = match dispatch(
+        method,
+        req,
+        ctx,
+        peer,
+        principal,
+        held.as_deref_mut(),
+        progress,
+    )
+    .await
+    {
+        Ok(served) => {
+            let mut resp = Response::ok(id, served.result);
+            resp.seq = served.seq;
+            (resp, served.stream)
         }
+        Err(e) => (Response::err(id, e), None),
+    };
+    if tx.send(encode(&resp)).await.is_err() {
+        return;
+    }
+    if let (Some(s), Some(streams)) = (stream, held.as_mut()) {
+        streams.start(s, tx.clone());
     }
 }
 
@@ -978,23 +1306,22 @@ impl Served {
     }
 }
 
-/// Methods after `hello`, except the hook-class ones. Both C1a principals,
-/// L and A, may call every method here except `agent.create` and
-/// `agent.retire`, which take L only (§1.1). `streams` is how many event
-/// streams the connection holds.
+/// Every method after `hello`: authorize and admit by the `authz` table,
+/// run the handler, audit. `streams` are the connection's event streams,
+/// held only by `events.subscribe` and `events.unsubscribe`.
 async fn dispatch(
     method: &str,
     mut req: Request,
     ctx: &ServerCtx,
     peer: Peer,
     principal: &Principal,
-    streams: &mut Streams,
+    streams: Option<&mut Streams>,
     progress: Option<Progress>,
 ) -> Result<Served, ApiError> {
     if !METHODS.contains(&method) {
         return Err(ApiError::new(ErrorCode::UnknownMethod, "unknown method"));
     }
-    let target = ["sessionKey", "sessionId", "agentId"]
+    let target = ["sessionKey", "sessionId", "agentId", "to", "agent", "msgId"]
         .iter()
         .find_map(|k| req.params.get(*k).and_then(|v| v.as_str()))
         .unwrap_or_default()
@@ -1003,18 +1330,7 @@ async fn dispatch(
         mail::sha256_hex(&serde_json::to_vec(&req.params).expect("params serialize"));
     let admission = async {
         let rule = authz::authorize(method, principal, None)?;
-        if rule.admission.contains(&"annotation_namespace") {
-            annotations::admit(method, &mut req.params, principal)?;
-        }
-        if rule.admission.contains(&"annotation_peer")
-            && matches!(principal, Principal::LocalUnverified)
-        {
-            check_local_peer(method, ctx, peer, principal).await?;
-        }
-        if rule.admission.contains(&"mutating_peer") {
-            check_local_peer(method, ctx, peer, principal).await?;
-        }
-        Ok::<(), ApiError>(())
+        admit(&rule, method, &mut req.params, ctx, peer, principal).await
     }
     .await;
     if let Err(e) = admission {
@@ -1059,14 +1375,84 @@ async fn dispatch(
                 .await
             }
             authz::AuditLevel::Hash => {
-                audit_success(ctx, principal, method, &target, Some(&payload_hash)).await
+                audit_success(ctx, principal, method, &target, Some(&payload_hash), None).await
             }
             authz::AuditLevel::Metadata => {
-                audit_success(ctx, principal, method, &target, None).await
+                audit_success(ctx, principal, method, &target, None, None).await
             }
         }
     }
     result
+}
+
+/// Run the checks `rule` declares, in order (D9). Handlers do not repeat
+/// them.
+async fn admit(
+    rule: &authz::Rule,
+    method: &str,
+    params: &mut serde_json::Value,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+) -> Result<(), ApiError> {
+    for check in rule.admission {
+        match check {
+            Admission::UnixPeer => {
+                peer.unix()?;
+            }
+            Admission::MutatingPeer => check_mutating_peer(method, ctx, peer, principal).await?,
+            Admission::OwnSession => {
+                if let Principal::Observed { session_key } = principal {
+                    if params.get("sessionKey").and_then(|v| v.as_str())
+                        != Some(session_key.as_str())
+                    {
+                        return Err(ApiError::new(
+                            ErrorCode::NotAllowed,
+                            format!("{} may call {} only for its own session", principal, method),
+                        )
+                        .with_hint("run it from your own terminal, outside the session"));
+                    }
+                }
+            }
+            Admission::AnnotationNamespace => annotations::admit(method, params, principal)?,
+            Admission::AnnotationPeer => {
+                if matches!(principal, Principal::LocalUnverified) {
+                    check_mutating_peer(method, ctx, peer, principal).await?;
+                }
+            }
+            Admission::MailPeer => check_mail_peer(ctx, peer, principal).await?,
+            Admission::MailSender => {
+                let peer = peer.unix()?;
+                ctx.ensure_views().await?;
+                let (agents, observed, who) = (
+                    ctx.agents.clone(),
+                    ctx.observed_sessions(),
+                    principal.clone(),
+                );
+                blocking(move || {
+                    Ok(mail::check_sender(
+                        &who,
+                        peer.cred.pid,
+                        peer.start,
+                        agents.as_ref(),
+                        observed.as_ref(),
+                    ))
+                })
+                .await??;
+            }
+            Admission::AgentExe => {
+                let claimed = params
+                    .get("agentId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let (bin, who) = (ctx.agent_bin.clone(), principal.clone());
+                blocking(move || Ok(authorize_hook(bin.as_deref(), peer, &who, &claimed)))
+                    .await??;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn execute(
@@ -1075,17 +1461,16 @@ async fn execute(
     ctx: &ServerCtx,
     peer: Peer,
     principal: &Principal,
-    streams: &mut Streams,
+    streams: Option<&mut Streams>,
     progress: Option<Progress>,
 ) -> Result<Served, ApiError> {
-    if matches!(
-        method,
-        "msg.list" | "msg.read" | "msg.cancel" | "mail.pause" | "mail.resume"
-    ) {
-        peer.mutation(method)?;
+    // The table's transport gate again, at the handlers: a declaration that
+    // let a gateway principal in still reaches no Unix-only handler.
+    if authz::method(method).is_some_and(|r| r.admission.contains(&Admission::UnixPeer)) {
+        peer.unix()?;
     }
     if is_hook_class(method) {
-        return hook_class(method, req, ctx, peer, principal)
+        return hook_class(method, req, ctx, principal)
             .await
             .map(Served::result);
     }
@@ -1105,47 +1490,50 @@ async fn execute(
         // One arm per method: scripts/test-ipc-contract.mjs reads the
         // served methods off these arms.
         "agent.create" => Ok(Served::result(
-            spawn_or_retire(method, req, ctx, peer, principal).await?,
+            idem_write(method, req, ctx, principal, |req| {
+                spawn_or_retire(method, req, ctx, principal)
+            })
+            .await?,
         )),
         "agent.retire" => Ok(Served::result(
-            spawn_or_retire(method, req, ctx, peer, principal).await?,
+            idem_write(method, req, ctx, principal, |req| {
+                spawn_or_retire(method, req, ctx, principal)
+            })
+            .await?,
         )),
         "agent.resume" => Ok(Served::result(
-            spawn_or_retire(method, req, ctx, peer, principal).await?,
+            spawn_or_retire(method, req, ctx, principal).await?,
         )),
         "snapshot.get" => Ok(Served::result(snapshot_get(ctx).await?)),
         "session.list" => Ok(Served::result(session_list(ctx).await?)),
         "agent.list" => Ok(Served::result(agent_list(req, ctx).await?)),
-        "msg.send" => msg_send(req, ctx, peer, principal).await,
+        "msg.send" => msg_send(req, ctx, principal).await,
         "msg.list" => Ok(Served::result(
-            mail_query("msg.list", req, ctx, peer, principal).await?,
+            mail_query("msg.list", req, ctx, principal).await?,
         )),
         "msg.read" => Ok(Served::result(
-            mail_query("msg.read", req, ctx, peer, principal).await?,
+            mail_query("msg.read", req, ctx, principal).await?,
         )),
         "msg.cancel" => Ok(Served::result(
-            mail_control("msg.cancel", req, ctx, peer, principal).await?,
+            mail_control("msg.cancel", req, ctx, principal).await?,
         )),
         "mail.pause" => Ok(Served::result(
-            mail_control("mail.pause", req, ctx, peer, principal).await?,
+            mail_control("mail.pause", req, ctx, principal).await?,
         )),
         "mail.resume" => Ok(Served::result(
-            mail_control("mail.resume", req, ctx, peer, principal).await?,
+            mail_control("mail.resume", req, ctx, principal).await?,
         )),
         "session.views" => Ok(Served::result(session_views::session_views(ctx).await?)),
         "session.away" => Ok(Served::result(session_views::session_away(req, ctx).await?)),
-        "detect.recheck" => Ok(Served::result(
-            local_mutation(method, req, ctx, peer).await?,
-        )),
+        "detect.recheck" => Ok(Served::result(local_mutation(method, req, ctx).await?)),
         "session.stop" => Ok(Served::result(
-            local_mutation(method, req, ctx, peer).await?,
+            idem_write(method, req, ctx, principal, |req| {
+                local_mutation(method, req, ctx)
+            })
+            .await?,
         )),
-        "session.rename" => Ok(Served::result(
-            local_mutation(method, req, ctx, peer).await?,
-        )),
-        "provider.opencode.connect" => Ok(Served::result(
-            local_mutation(method, req, ctx, peer).await?,
-        )),
+        "session.rename" => Ok(Served::result(local_mutation(method, req, ctx).await?)),
+        "provider.opencode.connect" => Ok(Served::result(local_mutation(method, req, ctx).await?)),
         "diag.detection" => Ok(Served::result(
             session_views::diag_detection(req, ctx).await?,
         )),
@@ -1176,6 +1564,9 @@ async fn execute(
             views::usage::usage_subscriptions(req, ctx).await?,
         )),
         "events.subscribe" => {
+            let streams = streams.ok_or_else(|| internal("subscribe without the streams"))?;
+            // A stream that ended (expired, or the store closed) frees its slot.
+            streams.reap();
             if streams.len() >= MAX_STREAMS {
                 return Err(ApiError::new(
                     ErrorCode::RateLimited,
@@ -1185,8 +1576,7 @@ async fn execute(
                     ),
                 ));
             }
-            let (result, mut stream) = events_subscribe(req, ctx, peer, principal).await?;
-            stream.allowed_topics = authz::topics(principal, None);
+            let (result, stream) = events_subscribe(req, ctx, peer, principal).await?;
             Ok(Served {
                 result,
                 stream: Some(stream),
@@ -1195,6 +1585,7 @@ async fn execute(
         }
         "events.unsubscribe" => {
             let p: UnsubscribeParams = views::params(method, req)?;
+            let streams = streams.ok_or_else(|| internal("unsubscribe without the streams"))?;
             let ended = streams.end(&p.sub).await;
             Ok(Served::result(to_json(&UnsubscribeResult { ended })))
         }
@@ -1269,9 +1660,7 @@ async fn local_mutation(
     method: &str,
     req: Request,
     ctx: &ServerCtx,
-    peer: Peer,
 ) -> Result<serde_json::Value, ApiError> {
-    peer.mutation(method)?;
     match method {
         "detect.recheck" => session_views::detect_recheck(ctx).await,
         "session.stop" => session_views::session_stop(req, ctx).await,
@@ -1280,28 +1669,35 @@ async fn local_mutation(
     }
 }
 
-/// Who may call `agent.create` or `agent.retire`: never an agent, so its
-/// attempt is audited; and a `local-unverified` peer only after the
-/// mutation check.
-async fn check_local_peer(
+/// `Admission::MutatingPeer`: only the terminal and an observed session,
+/// and only after `principal::check_mutating_peer`. It waits for
+/// detection's first pass, so the observed sessions are known.
+async fn check_mutating_peer(
     method: &str,
     ctx: &ServerCtx,
     peer: Peer,
     principal: &Principal,
 ) -> Result<(), ApiError> {
-    if *principal != Principal::LocalUnverified {
-        return Err(ApiError::new(
-            ErrorCode::NotAllowed,
-            format!("{} may not call {} in C1a", principal, method),
-        ));
-    }
+    let own = match principal {
+        Principal::LocalUnverified => None,
+        Principal::Observed { session_key } => Some(session_key.clone()),
+        _ => {
+            return Err(ApiError::new(
+                ErrorCode::NotAllowed,
+                format!("{} may not call {} in C1a", principal, method),
+            ))
+        }
+    };
     let peer = peer.unix()?;
-    let agents = ctx.agents.clone();
+    ctx.ensure_views().await?;
+    let (agents, observed) = (ctx.agents.clone(), ctx.observed_sessions());
     let checked = blocking(move || {
         Ok(principal::check_mutating_peer(
             peer.cred.pid,
             peer.start,
             agents.as_ref(),
+            observed.as_ref(),
+            own.as_deref(),
         ))
     })
     .await?;
@@ -1313,14 +1709,42 @@ async fn check_local_peer(
     })
 }
 
+/// Run `write` once per `idem` key (D3), or replay its first result;
+/// without a key, just run it. The spawner audits `agent.create` and
+/// `agent.retire`, so their replay, which does not reach it, writes its own
+/// audit row.
+async fn idem_write<F, Fut>(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    principal: &Principal,
+    write: F,
+) -> Result<serde_json::Value, ApiError>
+where
+    F: FnOnce(Request) -> Fut,
+    Fut: Future<Output = Result<serde_json::Value, ApiError>>,
+{
+    let Some(key) = req.idem.clone() else {
+        return write(req).await;
+    };
+    let params = req.params.clone();
+    let (result, replayed) = ctx
+        .idem
+        .run(&principal.to_string(), method, &key, &params, || write(req))
+        .await?;
+    if replayed && matches!(method, "agent.create" | "agent.retire") {
+        let target = result["agent"]["id"].as_str().unwrap_or_default();
+        audit_success(ctx, principal, method, target, None, Some("idem replay")).await;
+    }
+    Ok(result)
+}
+
 async fn spawn_or_retire(
     method: &str,
     req: Request,
     ctx: &ServerCtx,
-    peer: Peer,
     principal: &Principal,
 ) -> Result<serde_json::Value, ApiError> {
-    peer.unix()?;
     let Some(spawner) = &ctx.spawner else {
         return Err(ApiError::new(
             ErrorCode::Internal,
@@ -1356,7 +1780,6 @@ async fn spawn_or_retire(
 async fn msg_send(
     req: Request,
     ctx: &ServerCtx,
-    peer: Peer,
     principal: &Principal,
 ) -> Result<Served, ApiError> {
     const METHOD: &str = "msg.send";
@@ -1366,34 +1789,19 @@ async fn msg_send(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let checked: Result<MsgSendParams, ApiError> = async {
-        let peer = peer.unix()?;
-        let params = serde_json::from_value::<MsgSendParams>(req.params).map_err(|e| {
+    // The sender passed `Admission::MailSender` already.
+    let checked = serde_json::from_value::<MsgSendParams>(req.params)
+        .map_err(|e| {
             ApiError::new(
                 ErrorCode::BadRequest,
                 format!("bad {} params: {}", METHOD, e),
             )
-        })?;
-        mail::validate(&params)?;
-        let (agents, who) = (ctx.agents.clone(), principal.clone());
-        blocking(move || {
-            Ok(mail::check_sender(
-                &who,
-                peer.cred.pid,
-                peer.start,
-                agents.as_ref(),
-            ))
         })
-        .await??;
-        Ok(params)
-    }
-    .await;
+        .and_then(|p| mail::validate(&p).map(|()| p));
     let params = match checked {
         Ok(p) => p,
         Err(e) => {
-            if e.code != ErrorCode::Internal {
-                audit_refusal(ctx, principal, METHOD, &claimed, &e).await;
-            }
+            audit_refusal(ctx, principal, METHOD, &claimed, &e).await;
             return Err(e);
         }
     };
@@ -1490,7 +1898,6 @@ async fn hook_class(
     method: &str,
     req: Request,
     ctx: &ServerCtx,
-    peer: Peer,
     principal: &Principal,
 ) -> Result<serde_json::Value, ApiError> {
     if method.starts_with("hook.") && !HOOK_METHODS.contains(&method) {
@@ -1505,16 +1912,7 @@ async fn hook_class(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let checked = {
-        let bin = ctx.agent_bin.clone();
-        let principal = principal.clone();
-        let claimed = claimed.clone();
-        blocking(move || Ok(authorize_hook(bin.as_deref(), peer, &principal, &claimed))).await?
-    };
-    if let Err(e) = checked {
-        audit_refusal(ctx, principal, method, &claimed, &e).await;
-        return Err(e);
-    }
+    // The caller passed `Admission::AgentExe` already.
     let bad = |e: serde_json::Error| {
         ApiError::new(
             ErrorCode::BadRequest,
@@ -1660,7 +2058,7 @@ async fn hook_intake(
     Ok(answer)
 }
 
-/// The two facts a hook-class call needs: the principal is the agent the
+/// `Admission::AgentExe`, the two facts a hook-class call needs: the principal is the agent the
 /// params name, and the peer runs the engine's `c9watch-agent` copy. The
 /// exe check reads the peer pid again, so it must still be the process that
 /// was stamped at accept. Blocking.
@@ -1740,9 +2138,11 @@ async fn audit_success(
     method: &str,
     target: &str,
     hash: Option<&str>,
+    reason: Option<&str>,
 ) {
     let Some(db) = ctx.db.clone() else { return };
     let payload_hash = hash.map(str::to_string);
+    let reason = reason.map(str::to_string);
     let (principal, method, target) = (
         principal.to_string(),
         method.to_string(),
@@ -1758,6 +2158,7 @@ async fn audit_success(
                     method: &method,
                     target: (!target.is_empty()).then_some(target.as_str()),
                     decision: "allow",
+                    reason: reason.as_deref(),
                     payload_hash: payload_hash.as_deref(),
                     ..Default::default()
                 },
@@ -1868,11 +2269,23 @@ async fn events_subscribe(
         None => None,
     };
     // A shallow local stamp is not proof of unrestricted mailbox access.
-    // Failed verification drops mail events while preserving other topics.
-    let mail_principal = check_mail_peer(ctx, peer, principal)
-        .await
-        .ok()
-        .map(|_| principal.clone());
+    // When verification fails, a subscribe that names a local-only topic
+    // fails with it; any other loses the local-only topics and mail events
+    // and keeps the rest.
+    let mut allowed_topics = authz::topics(principal, None);
+    let mail_principal = match check_mail_peer(ctx, peer, principal).await {
+        Ok(()) => Some(principal.clone()),
+        Err(e) => {
+            let local_only = local_only_topics();
+            if !params.topics.is_empty()
+                && local_only.iter().any(|t| topic_wanted(&params.topics, t))
+            {
+                return Err(e);
+            }
+            allowed_topics.retain(|t| !local_only.contains(t));
+            None
+        }
+    };
     let mail_db = db.clone();
     let (start, sub) = blocking(move || {
         let after = match since {
@@ -1895,7 +2308,7 @@ async fn events_subscribe(
         subjects: params.subjects,
         mail_principal,
         mail_db,
-        allowed_topics: authz::topics(principal, None),
+        allowed_topics,
     };
     Ok((
         serde_json::to_value(result).expect("SubscribeResult serializes"),
@@ -1920,14 +2333,7 @@ struct EventStream {
 
 impl EventStream {
     fn wants(&self, e: &Event) -> bool {
-        let topic_ok = self.topics.is_empty()
-            || self.topics.iter().any(|t| match t.strip_suffix(".*") {
-                Some(prefix) => e
-                    .topic
-                    .strip_prefix(prefix)
-                    .is_some_and(|rest| rest.starts_with('.')),
-                None => *t == e.topic,
-            });
+        let topic_ok = self.topics.is_empty() || topic_wanted(&self.topics, &e.topic);
         let subject_ok = self.subjects.is_empty()
             || e.subject
                 .as_ref()
@@ -2136,6 +2542,8 @@ mod tests {
             user_home: Some(PathBuf::from("/nonexistent/c9watch-test-home")),
             cost_cache: None,
             usage: None,
+            idem: Arc::new(IdemCache::new()),
+            observed: None,
         })
     }
 
@@ -2811,6 +3219,8 @@ mod tests {
             user_home: Some(t.path().join("home")),
             cost_cache: None,
             usage: None,
+            idem: Arc::new(IdemCache::new()),
+            observed: None,
         });
         (t, ctx, db)
     }
@@ -2839,9 +3249,12 @@ mod tests {
         }
 
         async fn send(&mut self, id: &str, method: &str, params: Value) {
-            let mut line =
-                serde_json::to_vec(&json!({"v": 1, "id": id, "method": method, "params": params}))
-                    .unwrap();
+            self.send_raw(json!({"v": 1, "id": id, "method": method, "params": params}))
+                .await;
+        }
+
+        async fn send_raw(&mut self, frame: Value) {
+            let mut line = serde_json::to_vec(&frame).unwrap();
             line.push(b'\n');
             self.write.write_all(&line).await.unwrap();
         }
@@ -3826,7 +4239,11 @@ mod tests {
             params: json!({"to": "agt_b1", "body": "hi"}),
             idem: None,
         };
-        let e = msg_send(req, &ctx, peer, &principal).await.err().unwrap();
+        // The sender check is `Admission::MailSender`, run by `dispatch`.
+        let e = dispatch("msg.send", req, &ctx, peer, &principal, None, None)
+            .await
+            .err()
+            .unwrap();
         assert_eq!(e.code, ErrorCode::NotAllowed);
         assert_eq!(message_count(&db), 0);
         assert_eq!(mail_audit(&db)[0].2, "deny");
@@ -4597,7 +5014,7 @@ mod tests {
                         start,
                     },
                     &Principal::LocalUnverified,
-                    &mut Streams::default(),
+                    None,
                     None,
                 )
                 .await;
@@ -4846,17 +5263,7 @@ mod tests {
                 params: json!({}),
                 ..Default::default()
             };
-            let err = match execute(
-                method,
-                req,
-                &ctx,
-                peer,
-                &principal,
-                &mut Streams::default(),
-                None,
-            )
-            .await
-            {
+            let err = match execute(method, req, &ctx, peer, &principal, None, None).await {
                 Err(e) => e,
                 Ok(_) => panic!("{method} bypassed the gateway type gate"),
             };
@@ -4917,6 +5324,636 @@ mod tests {
             assert!(!format!("{hash}{keys}{reason}").contains("secret payload"));
         }
     }
+
+    // ── Concurrency, idem and observed sessions (D3, D8, D9) ──────────
+
+    /// `ctx_db` whose `session.list` waits on `gate` until the test opens it.
+    /// A slow request: `session.stop` with `idem` key `k` waits while the
+    /// test holds that key's slot.
+    async fn hold_idem(
+        ctx: &ServerCtx,
+        k: &str,
+    ) -> tokio::sync::OwnedMutexGuard<Option<crate::engine::idem::Done>> {
+        let key = ("local-unverified".into(), "session.stop".into(), k.into());
+        ctx.idem.slot(key).unwrap().lock_owned().await
+    }
+
+    fn slow(k: &str) -> Value {
+        json!({"v": 1, "id": k, "method": "session.stop", "idem": k,
+            "params": {"sessionKey": "claudeCode:none"}})
+    }
+
+    /// D3: one connection runs requests concurrently; a fast one sent after
+    /// a slow one answers first, and each answer carries its own `id`.
+    #[tokio::test]
+    async fn responses_on_one_connection_come_out_of_order() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let held = hold_idem(&ctx, "slow").await;
+        let (mut c, _) = Client::new(ctx.clone()).await;
+        c.send_raw(slow("slow")).await;
+        c.send("fast", "ping", json!({})).await;
+        let first = c.next().await;
+        assert_eq!(first["id"], "fast", "{}", first);
+        assert_eq!(first["ok"], true, "{}", first);
+        drop(held);
+        let second = c.next().await;
+        assert_eq!(second["id"], "slow", "{}", second);
+    }
+
+    /// D3: past `MAX_IN_FLIGHT` requests the reader waits; nothing is lost
+    /// and every request is answered once one ends.
+    #[tokio::test]
+    async fn requests_in_flight_are_bounded() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let mut held = Vec::new();
+        for i in 0..MAX_IN_FLIGHT {
+            held.push(hold_idem(&ctx, &i.to_string()).await);
+        }
+        let (mut c, _) = Client::new(ctx.clone()).await;
+        for i in 0..MAX_IN_FLIGHT {
+            c.send_raw(slow(&i.to_string())).await;
+        }
+        c.send("last", "ping", json!({})).await;
+        let early = tokio::time::timeout(Duration::from_millis(300), c.lines.next_line()).await;
+        assert!(early.is_err(), "answered past the bound: {:?}", early);
+        drop(held);
+        let mut ids = std::collections::BTreeSet::new();
+        for _ in 0..=MAX_IN_FLIGHT {
+            let r = c.next().await;
+            ids.insert(r["id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(ids.len(), MAX_IN_FLIGHT + 1);
+        assert!(ids.contains("last"));
+    }
+
+    /// D3: a subscribe response still comes before the stream's first
+    /// event while other requests run beside it.
+    #[tokio::test]
+    async fn a_subscribe_answers_before_its_events_beside_other_calls() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        for i in 0..3 {
+            let e = event("agent.upsert", &format!("m/a{}", i), 0, 0);
+            db.write(move |tx| tx.emit(&e)).await.unwrap();
+        }
+        let (mut c, _) = Client::new(ctx).await;
+        let since = format!("{}:{}:0", MACHINE, db.epoch());
+        c.send("p1", "ping", json!({})).await;
+        c.send(
+            "s",
+            "events.subscribe",
+            json!({"since": since, "topics": ["agent.*"]}),
+        )
+        .await;
+        c.send("p2", "ping", json!({})).await;
+        let mut acked = false;
+        let mut events = 0;
+        while events < 3 {
+            let f = c.next().await;
+            if f["type"] == "event" {
+                assert!(acked, "event before the subscribe response: {}", f);
+                events += 1;
+            } else if f["id"] == "s" {
+                assert_eq!(f["ok"], true, "{}", f);
+                acked = true;
+            }
+        }
+    }
+
+    /// A subscribe and its unsubscribe sent back to back run in that order:
+    /// the unsubscribe ends the stream, and no event follows its response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pipelined_unsubscribe_runs_after_its_subscribe() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        for i in 0..50 {
+            let e = event("agent.upsert", &format!("m/a{}", i), 0, 0);
+            db.write(move |tx| tx.emit(&e)).await.unwrap();
+        }
+        let since = format!("{}:{}:0", MACHINE, db.epoch());
+        for _ in 0..200 {
+            let (mut c, _) = Client::new(ctx.clone()).await;
+            c.send(
+                "s",
+                "events.subscribe",
+                json!({"since": since, "topics": ["agent.*"]}),
+            )
+            .await;
+            c.send("u", "events.unsubscribe", json!({"sub": "s"})).await;
+            let mut acked = false;
+            loop {
+                let f = c.next().await;
+                if f["id"] == "s" {
+                    assert_eq!(f["ok"], true, "{}", f);
+                    acked = true;
+                } else if f["id"] == "u" {
+                    assert!(acked, "unsubscribe answered before its subscribe");
+                    assert_eq!(f["result"]["ended"], true, "{}", f);
+                    break;
+                }
+            }
+            let after = tokio::time::timeout(Duration::from_millis(20), c.next()).await;
+            assert!(after.is_err(), "a frame after the unsubscribe: {:?}", after);
+        }
+    }
+
+    /// A detector whose ticks fail until `ok` is set; then it sees one
+    /// session, run by this test process's parent.
+    #[derive(Clone, Default)]
+    struct Flaky(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Observe for Flaky {
+        fn observe(&mut self) -> Result<Observation, String> {
+            if !self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("not yet".into());
+            }
+            let me = std::process::id() as libc::pid_t;
+            let mut s = fixture("s1", SessionStatus::Working);
+            s.pid = peer::proc_info(me).unwrap().ppid as u32;
+            Ok(Observation {
+                sessions: vec![s],
+                failed: Vec::new(),
+                diagnostics: None,
+            })
+        }
+    }
+
+    /// `ctx_db` with a `Flaky` detection whose first tick failed: no views.
+    fn ctx_flaky() -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Detection>, Flaky) {
+        let (t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let flaky = Flaky::default();
+        let detection = Detection::new(db);
+        detection.install(Detector::new(Box::new(flaky.clone()), MACHINE.into()));
+        assert!(detection.tick().is_err());
+        let ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .unwrap()
+            .with_detection(detection.clone());
+        (t, Arc::new(ctx), detection, flaky)
+    }
+
+    /// Which requests a provisional stamp may not serve.
+    #[test]
+    fn needs_stamp_covers_what_an_observed_session_reads_differently() {
+        let req = |method: &str, params: Value| -> Request {
+            serde_json::from_value(json!({"v": 1, "id": "1", "method": method, "params": params}))
+                .unwrap()
+        };
+        for (method, params, needs) in [
+            ("ping", json!({}), false),
+            ("agent.list", json!({}), false),
+            ("session.views", json!({}), false),
+            ("no.such", json!({}), false),
+            ("msg.list", json!({}), true),
+            ("msg.read", json!({}), true),
+            ("msg.send", json!({}), true),
+            ("session.stop", json!({}), true),
+            ("session.rename", json!({}), true),
+            ("annotation.set", json!({}), true),
+            ("agent.create", json!({}), true),
+            ("agent.retire", json!({"agentId": "a", "force": true}), true),
+            ("agent.resume", json!({"id": "a"}), true),
+            ("events.subscribe", json!({}), true),
+            (
+                "events.subscribe",
+                json!({"topics": ["agent.*", "session.*"]}),
+                false,
+            ),
+            ("events.subscribe", json!({"topics": ["legacy.*"]}), true),
+            ("events.subscribe", json!({"topics": ["msg.state"]}), true),
+        ] {
+            assert_eq!(
+                needs_stamp(method, &req(method, params.clone())),
+                needs,
+                "{} {}",
+                method,
+                params
+            );
+        }
+    }
+
+    fn req_of(method: &str, params: Value) -> Request {
+        serde_json::from_value(json!({"v": 1, "id": "1", "method": method, "params": params}))
+            .unwrap()
+    }
+
+    /// A peer that exits before detection's views exist cannot be verified
+    /// by the second stamp: its connection is restricted, never settled as
+    /// `local-unverified`. A live peer is stamped `observed:` as before.
+    #[tokio::test]
+    async fn a_peer_that_exits_before_the_views_is_restricted() {
+        let (_t, ctx, detection, flaky) = ctx_flaky();
+        let uid = unsafe { libc::getuid() };
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let gone = PeerCred {
+            pid: child.id() as libc::pid_t,
+            uid,
+        };
+        let me = PeerCred {
+            pid: std::process::id() as libc::pid_t,
+            uid,
+        };
+        let accepted = peer::start_token_now();
+        let (gone, live) = (
+            Stamp::at_accept(&ctx, gone, accepted),
+            Stamp::at_accept(&ctx, me, accepted),
+        );
+        assert!(gone.provisional && live.provisional);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        flaky.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        detection.tick().unwrap();
+
+        let inbox = req_of("events.subscribe", json!({"topics": ["legacy.inbox"]}));
+        for (method, req) in [
+            ("msg.list", req_of("msg.list", json!({}))),
+            ("events.subscribe", inbox),
+        ] {
+            let e = gone.for_request(&ctx, method, &req).await.unwrap_err();
+            assert_eq!(e.code, ErrorCode::PeerNotAuthorized, "{}: {:?}", method, e);
+        }
+        // Plain reads still answer under the provisional stamp.
+        let (p, _) = gone
+            .for_request(&ctx, "agent.list", &req_of("agent.list", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(*p, Principal::LocalUnverified);
+        let (p, _) = live
+            .for_request(&ctx, "msg.list", &req_of("msg.list", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(p.to_string(), "observed:claudeCode:s1");
+    }
+
+    /// A local subscribe whose mailbox check fails: naming a local-only
+    /// topic fails with the check; without one it loses those topics.
+    #[tokio::test]
+    async fn a_failed_mail_check_refuses_or_filters_local_only_topics() {
+        let (_t, ctx, _db) = observed_ctx("claudeCode:s1");
+        let me = std::process::id() as libc::pid_t;
+        let peer = Peer::Unix {
+            cred: PeerCred {
+                pid: me,
+                uid: unsafe { libc::getuid() },
+            },
+            start: Some(peer::proc_info(me).unwrap().start),
+        };
+        let local = Principal::LocalUnverified;
+        let named = req_of("events.subscribe", json!({"topics": ["legacy.inbox"]}));
+        assert!(events_subscribe(named, &ctx, peer, &local).await.is_err());
+        let (_, stream) =
+            events_subscribe(req_of("events.subscribe", json!({})), &ctx, peer, &local)
+                .await
+                .unwrap();
+        assert!(stream.mail_principal.is_none());
+        for t in local_only_topics() {
+            assert!(!stream.allowed_topics.contains(&t), "{}", t);
+        }
+        assert!(stream.allowed_topics.contains(&"agent.upsert".to_string()));
+    }
+
+    /// `hello` with a deadline: it never waits for detection.
+    async fn quick_hello(ctx: Arc<ServerCtx>) -> (Client, Value) {
+        tokio::time::timeout(Duration::from_secs(1), Client::new(ctx))
+            .await
+            .expect("hello within 1 s")
+    }
+
+    /// The first tick fails and a later one succeeds. `hello` answers at
+    /// once, provisionally `local-unverified`; the first restricted request
+    /// waits for the views, and the connection is `observed:` from then on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provisional_peer_is_stamped_again_before_a_restricted_request() {
+        let (_t, ctx, detection, flaky) = ctx_flaky();
+        let (mut c, hello) = quick_hello(ctx).await;
+        assert_eq!(hello["principal"], "local-unverified");
+        let pass = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            flaky.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::task::spawn_blocking(move || detection.tick().unwrap())
+                .await
+                .unwrap();
+        });
+        // Closed to an observed session: refused for the stamp that
+        // detection's views give, not run as the provisional one.
+        let r = c.call("1", "msg.list", json!({})).await;
+        assert_eq!(r["error"]["code"], "not_allowed", "{}", r);
+        let r = c.call("2", "auth.rules", json!({})).await;
+        assert_eq!(r["result"]["principal"], "observed:claudeCode:s1", "{}", r);
+        pass.await.unwrap();
+    }
+
+    /// Detection never succeeds: a restricted request gets `busy` with its
+    /// own `id`, and plain reads still answer.
+    #[tokio::test]
+    async fn a_restricted_request_is_busy_until_detection_succeeds() {
+        let (_t, ctx, _d, _f) = ctx_flaky();
+        let (mut c, hello) = quick_hello(ctx).await;
+        assert_eq!(hello["principal"], "local-unverified");
+        let r = c.call("1", "agent.list", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        c.send("2", "msg.list", json!({})).await;
+        c.send("3", "ping", json!({})).await;
+        let r = c.next().await;
+        assert_eq!(r["id"], "3", "a read waits behind a restricted one: {}", r);
+        let r = c.next().await;
+        assert_eq!(r["id"], "2", "{}", r);
+        assert_eq!(r["error"]["code"], "busy", "{}", r);
+        let r = c.call("4", "ping", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+    }
+
+    /// A slow subscribe holds up only the stream controls after it: a ping
+    /// sent after `subscribe` and `unsubscribe` answers first, and the
+    /// unsubscribe still runs after its subscribe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_subscribe_does_not_hold_up_other_requests() {
+        let (_t, ctx, detection, flaky) = ctx_flaky();
+        let (mut c, _) = quick_hello(ctx).await;
+        // Unfiltered, it may carry `legacy.inbox`: it waits for the views.
+        c.send("s", "events.subscribe", json!({})).await;
+        c.send("u", "events.unsubscribe", json!({"sub": "s"})).await;
+        c.send("p", "ping", json!({})).await;
+        let r = c.next().await;
+        assert_eq!(r["id"], "p", "{}", r);
+        flaky.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::task::spawn_blocking(move || detection.tick().unwrap())
+            .await
+            .unwrap();
+        let mut acked = false;
+        loop {
+            let f = c.next().await;
+            if f["id"] == "s" && f["type"] != "event" {
+                assert_eq!(f["ok"], true, "{}", f);
+                acked = true;
+            } else if f["id"] == "u" {
+                assert!(acked, "unsubscribe answered before its subscribe");
+                assert_eq!(f["result"]["ended"], true, "{}", f);
+                break;
+            }
+        }
+    }
+
+    fn observed_ctx(key: &str) -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Db>) {
+        let (t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let me = std::process::id() as libc::pid_t;
+        let parent = peer::proc_info(me).unwrap().ppid;
+        let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+        ctx.observed = Some(Arc::new(principal::tests::FakeObserved::one(key, parent)));
+        (t, Arc::new(ctx), db)
+    }
+
+    /// D8: a peer inside an observed session is `observed:<sessionKey>`. It
+    /// may not create, retire or stop another session; each refusal is
+    /// audited under its own name.
+    #[tokio::test]
+    async fn an_observed_session_may_not_create_retire_or_stop_others() {
+        let (_t, ctx, db) = observed_ctx("claudeCode:s1");
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["principal"], "observed:claudeCode:s1");
+        for (i, (method, params)) in [
+            ("agent.create", json!({"mode": "free", "cwd": "/tmp"})),
+            ("agent.retire", json!({"agentId": "agt_x"})),
+            ("agent.retire", json!({"agentId": "agt_x", "force": true})),
+            ("agent.resume", json!({"id": "agt_x"})),
+            ("session.stop", json!({"sessionKey": "claudeCode:s2"})),
+            ("detect.recheck", json!({})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let r = c.call(&i.to_string(), method, params).await;
+            assert_eq!(r["error"]["code"], "not_allowed", "{}: {}", method, r);
+        }
+        // Its own session passes admission; this engine runs no detection.
+        let r = c
+            .call(
+                "own",
+                "session.stop",
+                json!({"sessionKey": "claudeCode:s1"}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "internal", "{}", r);
+        let denied: Vec<(String, String)> = db
+            .reader()
+            .unwrap()
+            .prepare("SELECT principal, method FROM audit WHERE decision = 'deny' ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let methods: Vec<&str> = denied.iter().map(|(_, m)| m.as_str()).collect();
+        // The last row is the own stop's failure, after admission.
+        assert_eq!(
+            methods,
+            [
+                "agent.create",
+                "agent.retire",
+                "agent.retire",
+                "agent.resume",
+                "session.stop",
+                "detect.recheck",
+                "session.stop"
+            ]
+        );
+        assert!(denied.iter().all(|(p, _)| p == "observed:claudeCode:s1"));
+    }
+
+    /// D8: an observed session may still send mail; the message names it
+    /// as its source.
+    #[tokio::test]
+    async fn an_observed_session_sends_mail_that_names_it() {
+        let (_t, ctx, db) = observed_ctx("claudeCode:s1");
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c
+            .call("1", "msg.send", json!({"to": "agt_b1", "body": "hi"}))
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let (from, provenance): (String, String) = db
+            .reader()
+            .unwrap()
+            .query_row("SELECT from_principal, provenance FROM messages", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(from, "observed:claudeCode:s1");
+        assert!(
+            provenance.starts_with("[from observed session claudeCode:s1 for "),
+            "{}",
+            provenance
+        );
+        // It has no mailbox to read.
+        let r = c.call("2", "msg.list", json!({})).await;
+        assert_eq!(r["error"]["code"], "not_allowed", "{}", r);
+    }
+
+    /// D3: `agent.create` and `agent.retire` replay a repeated `idem`
+    /// without reaching the spawner again, and audit the replay.
+    #[tokio::test]
+    async fn create_and_retire_replay_a_repeated_idem() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let me = Principal::LocalUnverified;
+        for method in ["agent.create", "agent.retire"] {
+            let runs = AtomicUsize::new(0);
+            let req = || Request {
+                params: json!({"agentId": "agt_a"}),
+                idem: Some(format!("{method}-k")),
+                ..Default::default()
+            };
+            let write = |_req: Request| async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"agent": {"id": "agt_a"}}))
+            };
+            let first = idem_write(method, req(), &ctx, &me, write).await.unwrap();
+            let again = idem_write(method, req(), &ctx, &me, write).await.unwrap();
+            assert_eq!(first, again);
+            assert_eq!(runs.load(Ordering::SeqCst), 1, "{method}");
+            let mut other = req();
+            other.params = json!({"agentId": "agt_b"});
+            let e = idem_write(method, other, &ctx, &me, write)
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, ErrorCode::Duplicate, "{method}");
+            // Without a key every request writes.
+            let mut plain = req();
+            plain.idem = None;
+            idem_write(method, plain, &ctx, &me, write).await.unwrap();
+            assert_eq!(runs.load(Ordering::SeqCst), 2, "{method}");
+            let reason: String = db
+                .reader()
+                .unwrap()
+                .query_row(
+                    "SELECT reason FROM audit WHERE method = ?1 AND target = 'agt_a'",
+                    [method],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(reason, "idem replay", "{method}");
+        }
+    }
+
+    /// `agent.retire {force: true}` replays under its own `idem`; the same
+    /// key without `force` is other params, so `duplicate`.
+    #[tokio::test]
+    async fn a_forced_retire_replays_its_idem() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let me = Principal::LocalUnverified;
+        let runs = AtomicUsize::new(0);
+        let req = |params: Value| Request {
+            params,
+            idem: Some("force-k".into()),
+            ..Default::default()
+        };
+        let write = |_req: Request| async {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"agent": {"id": "agt_f", "state": "retired"}}))
+        };
+        let forced = json!({"agentId": "agt_f", "force": true});
+        let first = idem_write("agent.retire", req(forced.clone()), &ctx, &me, write)
+            .await
+            .unwrap();
+        let again = idem_write("agent.retire", req(forced), &ctx, &me, write)
+            .await
+            .unwrap();
+        assert_eq!(first, again);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        let e = idem_write(
+            "agent.retire",
+            req(json!({"agentId": "agt_f"})),
+            &ctx,
+            &me,
+            write,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Duplicate);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// D3: `session.stop` with a repeated `idem` replays the first answer;
+    /// without the key, the second stop finds no session.
+    #[tokio::test]
+    async fn session_stop_replays_a_repeated_idem() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = crate::actions::process_start_secs(pid).expect("the sleep's start time");
+        let detected = DetectedSession {
+            process_start_secs: Some(start),
+            ..DetectedSession::with_legacy_defaults(
+                pid,
+                "/tmp".into(),
+                "/tmp/proj".into(),
+                Some("stop-idem".to_string()),
+                "proj".to_string(),
+            )
+        };
+        let mut live = fixture("stop-idem", SessionStatus::Working);
+        live.pid = pid;
+        let script = Scripted::default();
+        script.set(vec![live], vec![detected]);
+        let (_t, ctx, _db, _d) = ctx_detect(Arc::new(NoLiveAgents), &script);
+        let reaper = {
+            let script = script.clone();
+            std::thread::spawn(move || {
+                child.wait().unwrap();
+                script.set(vec![], vec![]);
+            })
+        };
+        let (mut c, _) = Client::new(ctx).await;
+        let stop = |id: &str, idem: Option<&str>| {
+            let mut v = json!({"v": 1, "id": id, "method": "session.stop",
+                "params": {"sessionKey": "claudeCode:stop-idem"}});
+            if let Some(k) = idem {
+                v["idem"] = k.into();
+            }
+            let mut line = serde_json::to_vec(&v).unwrap();
+            line.push(b'\n');
+            line
+        };
+        c.write.write_all(&stop("1", Some("k"))).await.unwrap();
+        let first = c.next().await;
+        assert_eq!(first["ok"], true, "{}", first);
+        reaper.join().unwrap();
+        c.write.write_all(&stop("2", Some("k"))).await.unwrap();
+        let again = c.next().await;
+        assert_eq!(again["ok"], true, "{}", again);
+        assert_eq!(again["result"], first["result"]);
+        c.write.write_all(&stop("3", None)).await.unwrap();
+        let plain = c.next().await;
+        assert_eq!(plain["error"]["code"], "unknown_session", "{}", plain);
+    }
+
+    /// D3: `msg.send` replays a repeated `idem` while requests on the same
+    /// connection run concurrently: one message, two equal answers.
+    #[tokio::test]
+    async fn concurrent_msg_sends_with_one_idem_write_once() {
+        let (_t, ctx, db) = ctx_db(as_agent("agt_a7"));
+        mail_agent(&db, "agt_a7", "me", "pty").await;
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let (mut c, _) = Client::new(ctx).await;
+        for i in 0..2 {
+            let mut line = serde_json::to_vec(&json!({
+                "v": 1, "id": i.to_string(), "method": "msg.send", "idem": "same",
+                "params": {"to": "agt_b1", "body": "hi"},
+            }))
+            .unwrap();
+            line.push(b'\n');
+            c.write.write_all(&line).await.unwrap();
+        }
+        let (a, b) = (c.next().await, c.next().await);
+        assert_eq!(a["ok"], true, "{}", a);
+        assert_eq!(b["ok"], true, "{}", b);
+        assert_eq!(a["result"]["msgId"], b["result"]["msgId"]);
+        assert_eq!(message_count(&db), 1);
+    }
 }
 
 // C1b-M2 mailbox APIs. Mutations require the same verified local ancestry
@@ -4925,11 +5962,10 @@ async fn mail_query(
     method: &str,
     req: Request,
     ctx: &ServerCtx,
-    peer: Peer,
     who: &Principal,
 ) -> Result<serde_json::Value, ApiError> {
     use crate::engine_proto::wire::{MsgIdParams, MsgListParams};
-    check_mail_peer(ctx, peer, who).await?;
+    // The caller passed `Admission::MailPeer` already.
     let db = ctx.db()?.clone();
     let machine = ctx.machine_id.clone();
     let who = who.clone();
@@ -4954,14 +5990,16 @@ async fn mail_query(
     })
     .await
 }
-/// Unrestricted mail reads need the same complete peer verification as
-/// mailbox controls. Agent reads remain restricted by message ownership.
+/// `Admission::MailPeer`: unrestricted mail reads need the same complete
+/// peer verification as mailbox controls. Agent reads remain restricted by
+/// message ownership.
 async fn check_mail_peer(ctx: &ServerCtx, peer: Peer, who: &Principal) -> Result<(), ApiError> {
     let peer = peer.unix()?;
     if !matches!(who, Principal::LocalUnverified) {
         return Ok(());
     }
-    let agents = ctx.agents.clone();
+    ctx.ensure_views().await?;
+    let (agents, observed) = (ctx.agents.clone(), ctx.observed_sessions());
     let who = who.clone();
     blocking(move || {
         Ok(mail::check_sender(
@@ -4969,6 +6007,7 @@ async fn check_mail_peer(ctx: &ServerCtx, peer: Peer, who: &Principal) -> Result
             peer.cred.pid,
             peer.start,
             agents.as_ref(),
+            observed.as_ref(),
         ))
     })
     .await?
@@ -4978,11 +6017,10 @@ async fn mail_control(
     method: &str,
     req: Request,
     ctx: &ServerCtx,
-    peer: Peer,
     who: &Principal,
 ) -> Result<serde_json::Value, ApiError> {
     use crate::engine_proto::wire::{MailAgentParams, MsgIdParams};
-    let peer = peer.unix()?;
+    // The caller passed `Admission::MutatingPeer` already.
     let method = method.to_string();
     let target = req
         .params
@@ -4991,28 +6029,6 @@ async fn mail_control(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let checked = if !matches!(who, Principal::LocalUnverified) {
-        Err(ApiError::new(
-            ErrorCode::NotAllowed,
-            "mail controls require a person",
-        ))
-    } else {
-        let agents = ctx.agents.clone();
-        let who = who.clone();
-        blocking(move || {
-            Ok(mail::check_sender(
-                &who,
-                peer.cred.pid,
-                peer.start,
-                agents.as_ref(),
-            ))
-        })
-        .await?
-    };
-    if let Err(e) = checked {
-        audit_refusal(ctx, who, &method, &target, &e).await;
-        return Err(e);
-    }
     let parsed = if method == "msg.cancel" {
         serde_json::from_value::<MsgIdParams>(req.params).map(|p| p.msg_id)
     } else {

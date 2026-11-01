@@ -118,7 +118,10 @@ pub enum ErrorCode {
     RateLimited,
     /// A hook-class method (`hook.*`, `task.done`, `agent.handoff`) from a
     /// caller that is not a live agent running the engine's own
-    /// `c9watch-agent` copy, or that names another agent.
+    /// `c9watch-agent` copy, or that names another agent. Also a request
+    /// that needs the caller's identity on a connection whose process core
+    /// could not verify once session detection was ready (it exited, or its
+    /// start time is unreadable); connect again.
     PeerNotAuthorized,
     /// `task.done` from an agent without a task (every free agent).
     NoTask,
@@ -159,7 +162,8 @@ pub enum ErrorCode {
     NotOwner,
     /// `msg.send`: the `idem` key was used for another message, or the same
     /// body went to the same agent within 10 minutes. `data` has `msgId`
-    /// and `at`.
+    /// and `at`. `agent.create`, `agent.retire`, `session.stop`: the `idem`
+    /// key was used for a request with other params.
     Duplicate,
     /// `session.stop`: no live session has this key.
     UnknownSession,
@@ -171,8 +175,11 @@ pub enum ErrorCode {
     /// or `interrupted`, already runs, or has nothing to resume. `msg`
     /// says which.
     ActionFailed,
-    /// The engine is at a limit that frees up soon: the connection cap, or
-    /// a scan of the same kind that is still running. Retry shortly.
+    /// The engine is at a limit that frees up soon: the connection cap, a
+    /// scan of the same kind that is still running, every `idem` key in
+    /// use, or, while the engine starts, a request that needs the caller's
+    /// identity before session detection has finished a pass. The request
+    /// has its own `id`; the connection stays open. Retry shortly.
     Busy,
     /// An annotation count, size or write-rate limit was exceeded.
     LimitExceeded,
