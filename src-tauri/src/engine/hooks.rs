@@ -683,6 +683,27 @@ mod tests {
         assert_eq!(merge.peek("a1", 1, |m| m.last_turn_end()), Some(None));
         assert_eq!(state(&db), "working");
         assert!(!topics(&db).contains(&"agent.turn_end".to_string()));
+        // The commit itself fails (a deferred foreign key): the same.
+        let m2 = merge.clone();
+        let failed = db.write_blocking(move |tx| {
+            let p = params("claude", "2", json!({}));
+            let ev = HookEvent {
+                method: "hook.stop",
+                principal: "agent:a1",
+                gen: 1,
+                live_gen: Some(1),
+                params: &p,
+            };
+            intake(tx, MACHINE, &m2, &ev, 2_000)?;
+            tx.execute_batch(
+                "PRAGMA defer_foreign_keys = ON; \
+                 INSERT INTO agent_state (agent_id, gen) VALUES ('nobody', 1);",
+            )
+        });
+        assert!(failed.unwrap_err().contains("FOREIGN KEY"));
+        assert_eq!(merge.peek("a1", 1, |m| m.turn_open()), Some(true));
+        assert_eq!(merge.peek("a1", 1, |m| m.last_turn_end()), Some(None));
+        assert_eq!(state(&db), "working");
         // The retry (the dedupe row rolled back too) ends the turn.
         let p = params("claude", "2", json!({}));
         assert_eq!(
