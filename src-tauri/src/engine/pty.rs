@@ -32,7 +32,9 @@
 //!   cannot leave its group, and its unreaped pid keeps the group id from
 //!   reuse), or a process seen by pid and start time is in the group now
 //!   (its pgid read now, not remembered). Without proof only the processes
-//!   seen are signalled, one by one. So `try_wait` only looks
+//!   seen are signalled, one by one. A round keeps the identities that
+//!   prove each target and proves it again just before its signal
+//!   (`send`, which also names the gap that is left). So `try_wait` only looks
 //!   (`waitid` with `WNOWAIT`), and `kill` reaps the child last, once the
 //!   group and every process seen are gone.
 
@@ -152,60 +154,168 @@ fn group_runs(all: &[peer::ProcEntry], pgid: libc::pid_t) -> bool {
     all.iter().any(|e| e.pgid == pgid && !e.zombie)
 }
 
-/// One target of a signal round.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One target of a signal round. It keeps the identities that prove it,
+/// so `send` proves it again just before the signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Hit {
-    Group(libc::pid_t),
-    Pid(libc::pid_t),
+    /// Group `pgid`. `held`: the unreaped native PTY child leads it, which
+    /// needs no new proof (only `kill` reaps it). Otherwise a process of
+    /// `by`, by pid and start time, must be in the group at the signal.
+    Group {
+        pgid: libc::pid_t,
+        held: bool,
+        by: Vec<ChildId>,
+    },
+    /// One process, by pid and start time.
+    Pid(ChildId),
 }
 
-/// What one signal round sends (D2). `target` is the PTY child's group;
-/// `pinned` is current proof that it is ours (see the module doc).
-/// `members` is the current state (`now`) of the processes seen, so each
-/// pgid is the one read now: a process that called `setsid` since it was
-/// seen proves its new group, not the old one. Each group once; never the
-/// engine's own group (`own`): a process seen in it gets its own signal.
+/// What `send` fires once a hit is proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shot {
+    Group(libc::pid_t),
+    Pid(ChildId),
+}
+
+fn child_id(e: &peer::ProcEntry) -> ChildId {
+    ChildId {
+        pid: e.info.pid,
+        start: e.info.start,
+    }
+}
+
+/// What one signal round sends (D2). `target` is the PTY child, whose
+/// group is hit only with proof (see the module doc): `held`, or the child
+/// itself in the group at the signal. `members` is the current state
+/// (`now`) of the processes seen, so each pgid is the one read now: a
+/// process that called `setsid` since it was seen proves its new group,
+/// not the old one. Each group once, with every process seen in it as its
+/// proof; never the engine's own group (`own`): a process seen in it gets
+/// its own signal.
 fn plan(
-    target: libc::pid_t,
-    pinned: bool,
+    target: Option<ChildId>,
+    held: bool,
     members: &[peer::ProcEntry],
     own: libc::pid_t,
 ) -> Vec<Hit> {
     let mut hits = Vec::new();
-    if pinned && target > 1 && target != own {
-        hits.push(Hit::Group(target));
+    if let Some(t) = target.filter(|t| t.pid > 1 && t.pid != own) {
+        hits.push(Hit::Group {
+            pgid: t.pid,
+            held,
+            by: vec![t],
+        });
     }
     for e in members {
-        let hit = if e.pgid > 1 && e.pgid != own {
-            Hit::Group(e.pgid)
-        } else if !e.zombie {
-            Hit::Pid(e.info.pid)
-        } else {
-            continue;
-        };
-        if !hits.contains(&hit) {
-            hits.push(hit);
+        if e.pgid > 1 && e.pgid != own {
+            let found = hits.iter_mut().find_map(|h| match h {
+                Hit::Group { pgid, by, .. } if *pgid == e.pgid => Some(by),
+                _ => None,
+            });
+            match found {
+                Some(by) if !by.contains(&child_id(e)) => by.push(child_id(e)),
+                Some(_) => {}
+                None => hits.push(Hit::Group {
+                    pgid: e.pgid,
+                    held: false,
+                    by: vec![child_id(e)],
+                }),
+            }
+        } else if !e.zombie && !hits.contains(&Hit::Pid(child_id(e))) {
+            hits.push(Hit::Pid(child_id(e)));
         }
     }
     hits
 }
 
-/// Send `sig` to every hit of `plan`. Each hit was proven just before;
-/// the gap to the signal is one system call.
+/// Send `sig` to every hit of `plan`, each proven again just before its
+/// signal (P1-A): a process by pid and start time, not a zombie; a group
+/// `held`, or with a process of `by` (same pid and start, a zombie
+/// counts) in it now. A group without proof gets none: each process of
+/// `by` that still proves itself gets its own signal instead.
+///
+/// What is left is the gap between the proof and the signal. On Linux a
+/// single process is signalled through a pidfd opened before its proof,
+/// so its pid cannot be reused in that gap. A group has no pidfd, and
+/// macOS has none at all: there the gap is the few microseconds between
+/// one `proc_pidinfo` and one `kill`, in which a group's last process
+/// would have to exit, be reaped by init and its id be taken by a new
+/// group.
 fn send(hits: &[Hit], sig: libc::c_int) {
+    dispatch(hits, &peer::proc_entry, &mut |shot| {
+        let _ = match shot {
+            Shot::Group(g) => signal_group(g, sig),
+            Shot::Pid(id) => signal_exact(id, sig),
+        };
+    });
+}
+
+/// The proving half of `send`: `look` reads a process now, `fire` signals.
+fn dispatch(
+    hits: &[Hit],
+    look: &dyn Fn(libc::pid_t) -> Option<peer::ProcEntry>,
+    fire: &mut dyn FnMut(Shot),
+) {
+    let is = |id: &ChildId| look(id.pid).filter(|e| e.info.start == id.start);
+    let runs = |id: &ChildId| id.pid > 1 && is(id).is_some_and(|e| !e.zombie);
     for hit in hits {
-        let _ = match *hit {
-            Hit::Group(g) => signal_group(g, sig),
-            Hit::Pid(p) if p > 1 => {
-                if unsafe { libc::kill(p, sig) } == -1 {
-                    Err(io::Error::last_os_error())
+        match hit {
+            Hit::Group { pgid, held, by } => {
+                if *held || by.iter().any(|id| is(id).is_some_and(|e| e.pgid == *pgid)) {
+                    fire(Shot::Group(*pgid));
                 } else {
-                    Ok(())
+                    for id in by.iter().filter(|id| runs(id)) {
+                        fire(Shot::Pid(*id));
+                    }
                 }
             }
-            Hit::Pid(_) => Ok(()),
-        };
+            Hit::Pid(id) => {
+                if runs(id) {
+                    fire(Shot::Pid(*id));
+                }
+            }
+        }
     }
+}
+
+/// Signal the process `id`, only while it is still that process.
+#[cfg(target_os = "linux")]
+fn signal_exact(id: ChildId, sig: libc::c_int) -> io::Result<()> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, id.pid, 0) };
+    if fd < 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ENOSYS) {
+            return signal_pid(id, sig);
+        }
+        return Err(e);
+    }
+    // The pidfd names one process for good: proven once it is open, the
+    // signal cannot reach another one that took the pid.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+    if !peer::proc_entry(id.pid).is_some_and(|e| e.info.start == id.start) {
+        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    let null = std::ptr::null::<libc::siginfo_t>();
+    if unsafe { libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd(), sig, null, 0) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn signal_exact(id: ChildId, sig: libc::c_int) -> io::Result<()> {
+    signal_pid(id, sig)
+}
+
+/// `kill(pid, sig)`; the caller proved `id` just before.
+fn signal_pid(id: ChildId, sig: libc::c_int) -> io::Result<()> {
+    if id.pid <= 1 {
+        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    if unsafe { libc::kill(id.pid, sig) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The PTY child as a survivor: it leads its own group.
@@ -487,7 +597,10 @@ impl NativePty {
     /// One signal round to the group (while pinned) and to every process
     /// seen, by its current group.
     fn signal_all(&self, members: &[peer::ProcEntry], sig: libc::c_int) {
-        send(&plan(self.id.pid, self.pinned(), members, own_group()), sig);
+        send(
+            &plan(Some(self.id), self.pinned(), members, own_group()),
+            sig,
+        );
     }
 
     /// Wait up to `limit` for the child to exit, its group to empty and
@@ -499,7 +612,7 @@ impl NativePty {
             let _ = self.peek();
             let all = peer::processes();
             let new: Vec<_> = self.sweep(&all, seen).iter().filter_map(now).collect();
-            send(&plan(self.id.pid, false, &new, own_group()), sig);
+            send(&plan(None, false, &new, own_group()), sig);
             if self.gone(&all, seen) {
                 return true;
             }
@@ -855,7 +968,7 @@ pub fn kill_orphans(id: ChildId, others: &[ChildId]) -> io::Result<Orphan> {
         loop {
             let all = peer::processes();
             let new: Vec<_> = sweep(seen, &all).iter().filter_map(now).collect();
-            send(&plan(id.pid, false, &new, own_group()), sig);
+            send(&plan(None, false, &new, own_group()), sig);
             let group_left = pinned() && group_runs(&all, id.pid);
             if !runs(&leader) && !seen.any_runs() && !group_left {
                 return true;
@@ -866,13 +979,15 @@ pub fn kill_orphans(id: ChildId, others: &[ChildId]) -> io::Result<Orphan> {
             std::thread::sleep(POLL);
         }
     };
+    // The group is proven again at each signal (`send`): the leader, by
+    // pid and start time, still in it.
     send(
-        &plan(id.pid, pinned(), &seen.current(), own_group()),
+        &plan(Some(id), false, &seen.current(), own_group()),
         libc::SIGTERM,
     );
     if !gone(&mut seen, KILL_GRACE, libc::SIGTERM) {
         send(
-            &plan(id.pid, pinned(), &seen.current(), own_group()),
+            &plan(Some(id), false, &seen.current(), own_group()),
             libc::SIGKILL,
         );
         if !gone(&mut seen, KILL_VERIFY, libc::SIGKILL) {
@@ -1408,42 +1523,96 @@ mod tests {
         assert!(gone_soon(m), "member {} survived its setsid", m);
     }
 
-    /// D2 (P1-2): a signal round uses each member's current group. The
-    /// group of the PTY child is hit only with proof: pinned, or a member
-    /// in it now. The engine's own group never; its members one by one.
-    #[test]
-    fn plan_signals_only_groups_proven_now() {
-        let e = |pid, pgid, zombie| peer::ProcEntry {
+    fn entry(pid: libc::pid_t, start: u64, pgid: libc::pid_t, zombie: bool) -> peer::ProcEntry {
+        peer::ProcEntry {
             info: peer::ProcInfo {
                 pid,
                 ppid: 1,
-                start: 1,
+                start,
             },
             pgid,
             zombie,
-        };
-        let (target, own) = (100, 7);
-        // Pinned: the group once, and a member's own group.
+        }
+    }
+
+    fn cid(pid: libc::pid_t) -> ChildId {
+        ChildId { pid, start: 1 }
+    }
+
+    /// What `dispatch` fires for `hits` when the processes are `now`.
+    fn shots(hits: &[Hit], now: &[peer::ProcEntry]) -> Vec<Shot> {
+        let now = now.to_vec();
+        let look = move |pid| now.iter().find(|e| e.info.pid == pid).cloned();
+        let mut fired = Vec::new();
+        dispatch(hits, &look, &mut |s| fired.push(s));
+        fired
+    }
+
+    /// D2 (P1-2): a signal round uses each member's current group. The
+    /// group of the PTY child is hit only with proof: held, or the child
+    /// or a member in it at the signal. The engine's own group never; its
+    /// members one by one.
+    #[test]
+    fn plan_signals_only_groups_proven_now() {
+        let e = |pid, pgid, zombie| entry(pid, 1, pgid, zombie);
+        let (t, own) = (Some(cid(100)), 7);
+        // Held: the group once, and a member's own group.
+        let m = [e(101, 100, false), e(102, 102, false)];
         assert_eq!(
-            plan(target, true, &[e(101, 100, false), e(102, 102, false)], own),
-            vec![Hit::Group(100), Hit::Group(102)]
+            shots(&plan(t, true, &m, own), &m),
+            vec![Shot::Group(100), Shot::Group(102)]
         );
-        // Not pinned, and the member seen in it has left: not the group.
-        assert_eq!(
-            plan(target, false, &[e(101, 101, false)], own),
-            vec![Hit::Group(101)]
-        );
-        // Not pinned, but a member is in it now: that proves it.
-        assert_eq!(
-            plan(target, false, &[e(101, 100, false)], own),
-            vec![Hit::Group(100)]
-        );
+        // Not held, the child gone and the member seen in it has left:
+        // not the group.
+        let m = [e(101, 101, false)];
+        assert_eq!(shots(&plan(t, false, &m, own), &m), vec![Shot::Group(101)]);
+        // Not held, but a member is in it now: that proves it.
+        let m = [e(101, 100, false)];
+        assert_eq!(shots(&plan(t, false, &m, own), &m), vec![Shot::Group(100)]);
         // In the engine's group: the process alone; a zombie not at all.
+        let m = [e(103, own, false), e(104, own, true)];
         assert_eq!(
-            plan(target, false, &[e(103, own, false), e(104, own, true)], own),
-            vec![Hit::Pid(103)]
+            shots(&plan(t, false, &m, own), &m),
+            vec![Shot::Pid(cid(103))]
         );
-        assert!(plan(target, false, &[], own).is_empty());
+        assert!(plan(None, false, &[], own).is_empty());
+    }
+
+    /// D2 (P1-A): each hit is proven again at the signal, not at the plan.
+    /// A process whose pid another one took since, or that left the group,
+    /// is no proof: the group is not signalled, and only what still proves
+    /// itself gets its own signal.
+    #[test]
+    fn a_target_that_changes_between_plan_and_send_is_not_signalled() {
+        let own = 7;
+        let seen = [
+            entry(101, 1, 200, false),
+            entry(102, 1, 200, false),
+            entry(103, 1, 7, false),
+        ];
+        let hits = plan(Some(cid(100)), false, &seen, own);
+        // As planned: both groups and the lone process.
+        let leader = entry(100, 1, 100, false);
+        let mut now = seen.to_vec();
+        now.push(leader.clone());
+        assert_eq!(
+            shots(&hits, &now),
+            vec![Shot::Group(100), Shot::Group(200), Shot::Pid(cid(103))]
+        );
+        // Meanwhile: the leader's pid runs a new process, 101's pid too,
+        // 102 left group 200 with setsid, and 103's pid was reused.
+        let now = [
+            entry(100, 2, 100, false),
+            entry(101, 2, 200, false),
+            entry(102, 1, 102, false),
+            entry(103, 2, 7, false),
+        ];
+        assert_eq!(shots(&hits, &now), vec![Shot::Pid(cid(102))]);
+        // Nothing runs any more: nothing at all.
+        assert!(shots(&hits, &[]).is_empty());
+        // A held group needs no new proof.
+        let hits = plan(Some(cid(100)), true, &[], own);
+        assert_eq!(shots(&hits, &[]), vec![Shot::Group(100)]);
     }
 
     /// D2 (P1-3): a later kill finds what an unconfirmed one left by pid
