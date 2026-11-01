@@ -568,35 +568,51 @@ impl Spawner {
         }
         let cwd = resolve_cwd(given).map_err(bad)?;
         check_collision(&self.config.home, &cwd)?;
-        let claude = match &self.config.claude {
-            Some(c) => c.clone(),
-            None => find_on_path("claude").ok_or_else(|| {
-                ApiError::new(
-                    ErrorCode::SpawnFailed,
-                    "claude is not on the engine's PATH; nothing was spawned",
-                )
-            })?,
-        };
-        self.gate_cc(&claude)
+        let claude = self
+            .cc_bin()
             .map_err(|e| ApiError::new(ErrorCode::SpawnFailed, e))?;
         Ok((cwd, claude))
     }
 
-    /// D7: the spawn path runs only a CC that a quirks profile covers.
-    /// Fails closed. Blocking.
-    fn gate_cc(&self, claude: &Path) -> Result<(), String> {
-        let out = self.launcher.cc_version(claude);
-        let version = out.as_deref().ok().and_then(quirks::parse_version);
-        let profile = quirks::gate(out, quirks::allow_untested())?;
-        if version.is_some_and(|v| !profile.covers(v)) {
-            eprintln!(
-                "[engine] Claude Code {:?} is untested; {}=1 runs it with the {} profile",
-                version.unwrap_or_default(),
-                quirks::ENV_ALLOW_UNTESTED,
-                profile.name
-            );
+    /// The `claude` to spawn, after the version check (D7). Only a missing
+    /// `claude` fails; that is the machine's fault, not the agent's, so a
+    /// resume it stops stays resumable (D4). Blocking.
+    fn cc_bin(&self) -> Result<PathBuf, String> {
+        let claude = match &self.config.claude {
+            Some(c) if c.is_file() => c.clone(),
+            Some(c) => return Err(format!("claude {:?} is missing; nothing was spawned", c)),
+            None => find_on_path("claude")
+                .ok_or("claude is not on the engine's PATH; nothing was spawned")?,
+        };
+        self.gate_cc(&claude);
+        Ok(claude)
+    }
+
+    /// D7: the version check of the spawn path. An untested or unreadable
+    /// CC version still runs, with the newest profile; the warning goes to
+    /// the log and the audit, with the version and the supported range.
+    /// Blocking.
+    fn gate_cc(&self, claude: &Path) {
+        let Some(warning) = quirks::gate(self.launcher.cc_version(claude)).warning else {
+            return;
+        };
+        crate::elog!(Warn, "spawn", "{}", warning);
+        let wrote = self.db.write_blocking(move |tx| {
+            audit::append(
+                tx,
+                now_ms(),
+                &AuditEntry {
+                    principal: audit::SYSTEM,
+                    method: quirks::AUDIT_METHOD,
+                    decision: quirks::AUDIT_UNTESTED,
+                    reason: Some(&warning),
+                    ..Default::default()
+                },
+            )
+        });
+        if let Err(e) = wrote {
+            crate::elog!(Warn, "spawn", "Failed to audit the CC version: {}", e);
         }
-        Ok(())
     }
 
     /// Phase `row`, in one transaction. Returns the new generation.
@@ -2310,10 +2326,13 @@ impl Spawner {
         };
         let sp = self.clone();
         let r2 = r.clone();
+        // A missing claude is `spawn_failed`, as for a create; the row
+        // stays as it was.
         let start = blocking(move || {
-            let start = sp.resume_plan(&r2).map_err(not_resumable_plain)?;
-            sp.gate_cc(&start.claude).map_err(not_resumable_plain)?;
-            Ok(start)
+            let claude = sp
+                .cc_bin()
+                .map_err(|e| ApiError::new(ErrorCode::SpawnFailed, e))?;
+            sp.resume_plan(&r2, claude).map_err(not_resumable_plain)
         })
         .await?;
         let reason = if r.reason.as_deref() == Some(drain::REASON_DRAIN) {
@@ -2349,7 +2368,7 @@ impl Spawner {
     pub fn resume_on_boot(self: &Arc<Self>) -> Result<Resumed, String> {
         let mut done = Resumed::default();
         // D7: one version gate for the whole boot, at the first resume.
-        let mut gated: Option<Result<(), String>> = None;
+        let mut gated: Option<Result<PathBuf, String>> = None;
         for r in self.resumables(None)? {
             if self.drain.on() {
                 done.left.push(r.id);
@@ -2360,31 +2379,31 @@ impl Spawner {
                 done.left.push(r.id);
                 continue;
             };
-            let start = match self.resume_plan(&r) {
-                Ok(s) => match gated.get_or_insert_with(|| self.gate_cc(&s.claude)).clone() {
-                    Ok(()) => s,
-                    // Not the agent's fault: it stays resumable (D4), so a
-                    // CC update never ends the agents of a drain.
-                    Err(why) => {
-                        let (machine, id, from) = (
-                            self.db.machine_id().to_string(),
-                            r.id.clone(),
-                            r.state.clone(),
-                        );
-                        let wrote = self.db.write_blocking(move |tx| {
-                            ops::resume_failed(tx, &machine, &id, Some(&from), &why, now_ms())
-                        });
-                        match wrote {
-                            Ok(_) => done.failed.push(r.id),
-                            Err(e) => {
-                                eprintln!("[engine] Failed to fail the resume of {}: {}", r.id, e);
-                                done.left.push(r.id);
-                            }
-                        }
-                        continue;
-                    }
-                },
+            let claude = gated.get_or_insert_with(|| self.cc_bin()).clone();
+            let start = match claude.map(|c| self.resume_plan(&r, c)) {
+                Ok(Ok(s)) => s,
+                // A missing claude is not the agent's fault: it stays
+                // resumable (D4), so a reinstall never ends the agents of a
+                // drain.
                 Err(why) => {
+                    let (machine, id, from) = (
+                        self.db.machine_id().to_string(),
+                        r.id.clone(),
+                        r.state.clone(),
+                    );
+                    let wrote = self.db.write_blocking(move |tx| {
+                        ops::resume_failed(tx, &machine, &id, Some(&from), &why, now_ms())
+                    });
+                    match wrote {
+                        Ok(_) => done.failed.push(r.id),
+                        Err(e) => {
+                            eprintln!("[engine] Failed to fail the resume of {}: {}", r.id, e);
+                            done.left.push(r.id);
+                        }
+                    }
+                    continue;
+                }
+                Ok(Err(why)) => {
                     let (machine, id) = (self.db.machine_id().to_string(), r.id.clone());
                     let wrote = self.db.write_blocking(move |tx| {
                         ops::fail_agent(
@@ -2478,7 +2497,7 @@ impl Spawner {
 
     /// The session, cwd and `claude` of a resume, or why there is none.
     /// Blocking.
-    fn resume_plan(&self, r: &Resumable) -> Result<Start, String> {
+    fn resume_plan(&self, r: &Resumable, claude: PathBuf) -> Result<Start, String> {
         // The drain understands more descriptors than this CC supervisor.
         // Never resume a different CLI with Claude's executable/settings.
         if adapter::descriptor_for_provider(&r.provider).is_none_or(|d| d.kind != "claude") {
@@ -2510,11 +2529,6 @@ impl Spawner {
         }
         check_collision(&self.config.home, &cwd).map_err(|e| e.msg)?;
         self.agent_bin.check(Rehash::Always).map_err(|e| e.msg)?;
-        let claude = match &self.config.claude {
-            Some(c) => c.clone(),
-            None => find_on_path("claude")
-                .ok_or("claude is not on the engine's PATH; nothing was spawned")?,
-        };
         Ok(Start {
             id: r.id.clone(),
             gen: 0,
@@ -3515,6 +3529,24 @@ mod tests {
         script: Script,
         clock: Option<Clock>,
     ) -> (Arc<LiveTable>, Arc<FakeLauncher>, Arc<Spawner>) {
+        engine_with(
+            dir,
+            home,
+            db,
+            script,
+            clock,
+            PathBuf::from("/usr/bin/false"),
+        )
+    }
+
+    fn engine_with(
+        dir: &Path,
+        home: &Path,
+        db: &Arc<Db>,
+        script: Script,
+        clock: Option<Clock>,
+        claude: PathBuf,
+    ) -> (Arc<LiveTable>, Arc<FakeLauncher>, Arc<Spawner>) {
         let bin = Arc::new(AgentBin::install(home, &dir.join("agent-src")));
         let agents = Arc::new(LiveTable::new());
         let launcher = Arc::new(FakeLauncher {
@@ -3541,7 +3573,7 @@ mod tests {
             SpawnerConfig {
                 home: home.to_path_buf(),
                 sock: sock_path(home),
-                claude: Some(PathBuf::from("/bin/false")),
+                claude: Some(claude),
             },
             db.clone(),
             agents.clone(),
@@ -3742,34 +3774,46 @@ mod tests {
         assert!(!settings_path_of(&e.home, &r.id, 1).exists());
     }
 
-    /// D7: a CC version that no quirks profile covers, or one that cannot
-    /// be read, is refused before anything is written or spawned.
+    /// The audit reasons of the CC version warnings.
+    fn cc_warnings(db: &Db) -> Vec<String> {
+        audit_reasons(db, quirks::AUDIT_METHOD, quirks::AUDIT_UNTESTED)
+    }
+
+    /// D7 (owner, 2026-11-01): an untested or unreadable CC version still
+    /// spawns, with a warning in the audit that names the version and the
+    /// supported range. A covered version warns nothing.
     #[tokio::test]
-    async fn an_unsupported_cc_version_is_refused_before_the_row() {
+    async fn an_untested_cc_version_spawns_with_a_warning() {
         let e = setup(Script::Ready, None);
-        for (out, text) in [
-            (Ok("2.2.0 (Claude Code)".to_string()), "is not supported"),
-            (Ok("2.1.311 (Claude Code)".to_string()), "is not supported"),
-            (Ok("nonsense".to_string()), "cannot read"),
-            (Err("timed out".to_string()), "cannot read"),
-        ] {
-            *lock(&e.launcher.version) = out;
-            let err =
-                e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
-                    .await
-                    .unwrap_err();
-            assert_eq!(err.code, ErrorCode::SpawnFailed);
-            assert!(err.msg.contains(text), "{}", err.msg);
-            assert!(err.msg.contains("nothing was spawned"), "{}", err.msg);
-        }
-        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 0);
-        assert!(e.db.agents(AgentFilter::All).unwrap().is_empty());
-        *lock(&e.launcher.version) = Ok("2.1.316 (Claude Code)".into());
         e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
             .await
             .unwrap();
-        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 1);
+        assert!(cc_warnings(&e.db).is_empty());
         e.sp.shutdown();
+        for (out, text) in [
+            (
+                Ok("2.2.0 (Claude Code)".to_string()),
+                "Claude Code 2.2.0 is untested",
+            ),
+            (
+                Err("timed out".to_string()),
+                "cannot read the Claude Code version",
+            ),
+        ] {
+            let e = setup(Script::Ready, None);
+            *lock(&e.launcher.version) = out;
+            let got =
+                e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                    .await
+                    .unwrap();
+            assert_eq!(got.state.as_deref(), Some("ready"));
+            assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 1);
+            let w = cc_warnings(&e.db);
+            assert_eq!(w.len(), 1, "{:?}", w);
+            assert!(w[0].contains(text), "{}", w[0]);
+            assert!(w[0].contains(">= 2.1.312, < 2.2.0"), "{}", w[0]);
+            e.sp.shutdown();
+        }
     }
 
     #[tokio::test]
@@ -4662,7 +4706,7 @@ mod tests {
         let sid = row(&e.db, last).provider_sid.unwrap();
         let settings = settings_path_of(&e.home, last, 2).display().to_string();
         let mut argv = vec![
-            "/bin/false".to_string(),
+            "/usr/bin/false".to_string(),
             "--resume".into(),
             sid,
             "--settings".into(),
@@ -4786,30 +4830,55 @@ mod tests {
         assert_eq!(l3.spawns.load(Ordering::SeqCst), 0);
     }
 
-    /// D7 on resume: an unsupported CC leaves the row `paused` with
-    /// `resume_failed` and nothing spawned; `agent.resume` may retry it.
+    /// D7 on resume: an untested CC resumes the agent, and the boot
+    /// probes and warns once for all of its resumes.
     #[tokio::test]
-    async fn an_unsupported_cc_version_on_resume_is_resume_failed_without_a_spawn() {
+    async fn an_untested_cc_version_on_resume_resumes_with_one_warning() {
         let e = setup(Script::Ready, None);
-        let r = drained_agent(&e).await;
+        let a = drained_agent(&e).await;
         let (_, l2, sp2) = next_engine(&e, Script::Ready, None);
         *lock(&l2.version) = Ok("2.2.0 (Claude Code)".into());
+        assert_eq!(sp2.resume_on_boot().unwrap().started, [a.id.clone()]);
+        wait_for("ready", || {
+            row(&e.db, &a.id).state.as_deref() == Some("ready")
+        });
+        let w = cc_warnings(&e.db);
+        assert_eq!(w.len(), 1, "{:?}", w);
+        assert!(w[0].contains("2.2.0"), "{}", w[0]);
+        sp2.shutdown();
+    }
+
+    /// A `claude` that is gone at boot is the machine's fault, not the
+    /// agent's: the row is `resume_failed` (paused), not `failed`, and
+    /// `agent.resume` brings it back once claude is installed again.
+    #[tokio::test]
+    async fn a_missing_claude_on_boot_is_resume_failed_and_resumable() {
+        let e = setup(Script::Ready, None);
+        let r = drained_agent(&e).await;
+        let claude = e.t.path().join("claude-bin");
+        let (_, l2, sp2) = engine_with(
+            e.t.path(),
+            &e.home,
+            &e.db,
+            Script::Ready,
+            None,
+            claude.clone(),
+        );
         assert_eq!(sp2.resume_on_boot().unwrap().failed, [r.id.clone()]);
         assert_eq!(l2.spawns.load(Ordering::SeqCst), 0);
         let got = row(&e.db, &r.id);
         assert_eq!(got.state.as_deref(), Some("paused"));
         assert_eq!(got.state_reason.as_deref(), Some(ops::RESUME_FAILED));
+        assert_eq!(got.gone_at, None);
+        assert!(events(&e.db, "agent.failed").is_empty());
         let why = audit_reasons(&e.db, ops::KIND_RESUME, "failed");
-        assert!(why[0].contains("is not supported"), "{:?}", why);
-        // `agent.resume` gates too, and leaves the row as it was.
+        assert!(why[0].contains("is missing"), "{:?}", why);
         let l = Principal::LocalUnverified;
         let id = serde_json::json!({ "id": r.id });
         let err = sp2.resume(&l, id.clone()).await.unwrap_err();
-        assert!(err.msg.contains("is not supported"), "{}", err.msg);
-        assert_eq!(l2.spawns.load(Ordering::SeqCst), 0);
-        assert_eq!(row(&e.db, &r.id).state.as_deref(), Some("paused"));
-        // A supported CC again: the same agent resumes.
-        *lock(&l2.version) = Ok("2.1.316 (Claude Code)".into());
+        assert_eq!(err.code, ErrorCode::SpawnFailed);
+        // Installed again.
+        std::fs::write(&claude, "").unwrap();
         let got = sp2.resume(&l, id).await.unwrap();
         assert_eq!(got.state.as_deref(), Some("ready"));
         assert_eq!(l2.spawns.load(Ordering::SeqCst), 1);
@@ -5003,7 +5072,7 @@ mod tests {
             };
             assert!(e
                 .sp
-                .resume_plan(&r)
+                .resume_plan(&r, PathBuf::from("/bin/false"))
                 .unwrap_err()
                 .contains("no spawn integration"));
         }

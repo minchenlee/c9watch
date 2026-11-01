@@ -25,8 +25,9 @@ fn the_current_profile_matches_its_golden() {
 
 #[test]
 fn recorded_version_output_passes_the_gate() {
-    let p = quirks::gate(Ok(VERSION_2_1_316.into()), false).unwrap();
-    assert_eq!(p.name, CURRENT.name);
+    let g = quirks::gate(Ok(VERSION_2_1_316.into()));
+    assert_eq!(g.profile.name, CURRENT.name);
+    assert_eq!(g.warning, None);
 }
 
 #[test]

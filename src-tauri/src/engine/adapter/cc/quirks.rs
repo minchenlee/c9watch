@@ -5,11 +5,11 @@
 //! - One profile per range of CC versions. Today there is one,
 //!   `CC_2_1`, recorded on CC 2.1.312 and 2.1.314 (the screens in
 //!   `tests/fixtures/cc_screens/`) and run live on 2.1.316.
-//! - The spawn path gates on it: `gate` reads `claude --version` before a
-//!   create or resume, and a version that no profile covers is refused.
-//!   It fails closed: a version that cannot be read is refused too.
-//!   `C9_CC_ALLOW_UNTESTED=1` lets an untested version run with the
-//!   newest profile, and says so in the refusal text it replaces.
+//! - The spawn path checks it: `gate` reads `claude --version` before a
+//!   create or resume. A version that no profile covers, or one that
+//!   cannot be read, still runs, with the newest profile and a warning
+//!   that names the version and the supported range (owner, 2026-11-01).
+//!   Only a missing `claude` stops a spawn.
 //! - The readers keep their logic: `cc_screen` (screen rules), `cc_inbox`
 //!   (peer inbox) and `create` (mail delivery) take their constants from
 //!   `CURRENT`. The peer-inbox frame fields (`cc_inbox`, `cc_listener`,
@@ -216,8 +216,10 @@ pub const PROFILES: &[&CcQuirksProfile] = &[&CC_2_1];
 /// `gate` matched to it.
 pub const CURRENT: &CcQuirksProfile = &CC_2_1;
 
-/// Lets an untested CC version run with the newest profile.
-pub const ENV_ALLOW_UNTESTED: &str = "C9_CC_ALLOW_UNTESTED";
+/// The audit row of a spawn on an untested or unreadable CC version:
+/// method, decision.
+pub const AUDIT_METHOD: &str = "cc.version";
+pub const AUDIT_UNTESTED: &str = "untested";
 
 /// How long `claude --version` may take.
 pub const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -239,87 +241,117 @@ pub fn parse_version(out: &str) -> Option<CcVersion> {
         })
 }
 
+/// What the version gate found: the profile to run with, and a warning
+/// when the version is untested or could not be read.
+#[derive(Debug)]
+pub struct Gated {
+    pub profile: &'static CcQuirksProfile,
+    pub warning: Option<String>,
+}
+
+fn supported() -> String {
+    PROFILES
+        .iter()
+        .map(|p| p.range())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// The version gate of the spawn path. `out` is the output of `claude
-/// --version`, or why it could not be run. Fails closed.
-pub fn gate(
-    out: Result<String, String>,
-    allow_untested: bool,
-) -> Result<&'static CcQuirksProfile, String> {
-    let out = out.map_err(|e| {
-        format!(
-            "cannot read the Claude Code version ({}); nothing was spawned",
-            e
-        )
-    })?;
+/// --version`, or why it could not be run. It never refuses: an untested
+/// or unreadable version runs with the newest profile and a warning.
+pub fn gate(out: Result<String, String>) -> Gated {
+    let newest = PROFILES[PROFILES.len() - 1];
+    let warn = |what: String| Gated {
+        profile: newest,
+        warning: Some(format!(
+            "{} (supported: {}); running it with the {} profile",
+            what,
+            supported(),
+            newest.name
+        )),
+    };
+    let out = match out {
+        Ok(out) => out,
+        Err(e) => return warn(format!("cannot read the Claude Code version: {}", e)),
+    };
     let Some(v) = parse_version(&out) else {
-        return Err(format!(
-            "cannot read the Claude Code version from {:?}; nothing was spawned",
+        return warn(format!(
+            "cannot read the Claude Code version from {:?}",
             out.trim()
         ));
     };
-    if let Some(p) = profile_for(v) {
-        return Ok(p);
+    match profile_for(v) {
+        Some(profile) => Gated {
+            profile,
+            warning: None,
+        },
+        None => warn(format!("Claude Code {}.{}.{} is untested", v.0, v.1, v.2)),
     }
-    let newest = PROFILES[PROFILES.len() - 1];
-    if allow_untested {
-        return Ok(newest);
-    }
-    Err(format!(
-        "Claude Code {}.{}.{} is not supported by this engine (supported: {}); \
-         nothing was spawned. Set {}=1 to run it with the {} profile anyway",
-        v.0,
-        v.1,
-        v.2,
-        PROFILES
-            .iter()
-            .map(|p| p.range())
-            .collect::<Vec<_>>()
-            .join("; "),
-        ENV_ALLOW_UNTESTED,
-        newest.name
-    ))
-}
-
-pub fn allow_untested() -> bool {
-    std::env::var(ENV_ALLOW_UNTESTED).as_deref() == Ok("1")
 }
 
 /// Run `<claude> --version` with a timeout. Blocking.
 pub fn probe_version(claude: &Path) -> Result<String, String> {
+    probe_version_within(claude, VERSION_TIMEOUT)
+}
+
+/// `timeout` covers both the exit and the output: a wrapper that exits
+/// but leaves a child holding stdout open is a timeout too. The probe runs
+/// in its own process group, and a timeout kills the whole group.
+fn probe_version_within(claude: &Path, timeout: Duration) -> Result<String, String> {
     use std::io::Read;
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    use std::time::Instant;
     use wait_timeout::ChildExt;
+    let deadline = Instant::now() + timeout;
     let mut child = Command::new(claude)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("{}: {}", claude.display(), e))?;
+    let group = child.id() as libc::pid_t;
+    let kill_group = || unsafe {
+        libc::killpg(group, libc::SIGKILL);
+    };
+    let timed_out = || format!("--version did not answer in {} ms", timeout.as_millis());
     let mut stdout = child.stdout.take().ok_or("no stdout")?;
     // The output is one short line: read it on a thread so a full pipe
-    // never blocks the wait.
-    let reader = std::thread::spawn(move || {
+    // never blocks the wait, and the wait never blocks on the read.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut s = String::new();
         let _ = (&mut stdout).take(4096).read_to_string(&mut s);
-        s
+        let _ = tx.send(s);
     });
-    match child.wait_timeout(VERSION_TIMEOUT) {
+    match child.wait_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(Some(status)) if status.success() => {}
-        Ok(Some(status)) => return Err(format!("--version exited with {}", status)),
-        Ok(None) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "--version did not answer in {} s",
-                VERSION_TIMEOUT.as_secs()
-            ));
+        Ok(Some(status)) => {
+            kill_group();
+            return Err(format!("--version exited with {}", status));
         }
-        Err(e) => return Err(e.to_string()),
+        Ok(None) => {
+            kill_group();
+            let _ = child.wait();
+            return Err(timed_out());
+        }
+        Err(e) => {
+            kill_group();
+            let _ = child.wait();
+            return Err(e.to_string());
+        }
     }
-    reader
-        .join()
-        .map_err(|_| "version reader panicked".to_string())
+    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(s) => Ok(s),
+        // The child exited, but something it left holds stdout open.
+        Err(_) => {
+            kill_group();
+            Err(timed_out())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -335,26 +367,30 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_covers_the_recorded_range_and_fails_closed() {
-        let ok = |s: &str| gate(Ok(s.into()), false).map(|p| p.name);
-        assert_eq!(ok("2.1.312 (Claude Code)"), Ok("cc-2.1"));
+    fn the_gate_covers_the_recorded_range_and_warns_outside_it() {
+        let ok = |s: &str| {
+            let g = gate(Ok(s.into()));
+            (g.profile.name, g.warning)
+        };
+        assert_eq!(ok("2.1.312 (Claude Code)"), ("cc-2.1", None));
         // The CC installed when the profile was recorded.
-        assert_eq!(ok("2.1.316 (Claude Code)"), Ok("cc-2.1"));
-        assert_eq!(ok("2.1.999 (Claude Code)"), Ok("cc-2.1"));
-        for bad in ["2.1.311 (Claude Code)", "2.2.0 (Claude Code)", "3.0.0"] {
-            let e = gate(Ok(bad.into()), false).unwrap_err();
-            assert!(e.contains("is not supported"), "{}", e);
-            assert!(e.contains(">= 2.1.312, < 2.2.0"), "{}", e);
-            assert!(e.contains(ENV_ALLOW_UNTESTED), "{}", e);
+        assert_eq!(ok("2.1.316 (Claude Code)"), ("cc-2.1", None));
+        assert_eq!(ok("2.1.999 (Claude Code)"), ("cc-2.1", None));
+        for (out, version) in [
+            ("2.1.311 (Claude Code)", "2.1.311"),
+            ("2.2.0 (Claude Code)", "2.2.0"),
+            ("3.0.0", "3.0.0"),
+            ("garbage", "garbage"),
+        ] {
+            let (name, warning) = ok(out);
+            assert_eq!(name, "cc-2.1");
+            let w = warning.unwrap();
+            assert!(w.contains(version), "{}", w);
+            assert!(w.contains(">= 2.1.312, < 2.2.0"), "{}", w);
         }
-        assert!(gate(Ok("garbage".into()), false)
-            .unwrap_err()
-            .contains("cannot read"));
-        assert!(gate(Err("no such file".into()), true)
-            .unwrap_err()
-            .contains("cannot read"));
-        // The override takes an untested version, never an unreadable one.
-        assert_eq!(gate(Ok("2.2.0".into()), true).map(|p| p.name), Ok("cc-2.1"));
+        let g = gate(Err("timed out".into()));
+        assert_eq!(g.profile.name, "cc-2.1");
+        assert!(g.warning.unwrap().contains("cannot read"));
     }
 
     #[test]
@@ -366,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_reads_a_fake_claude_and_fails_closed() {
+    fn probe_reads_a_fake_claude_and_reports_failures() {
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let fake = t.path().join("claude");
@@ -378,5 +414,32 @@ mod tests {
         );
         assert!(probe_version(&t.path().join("missing")).is_err());
         assert!(probe_version(Path::new("/usr/bin/false")).is_err());
+    }
+
+    #[test]
+    fn a_probe_whose_stdout_outlives_the_child_times_out_and_kills_the_group() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let fake = t.path().join("claude");
+        let mark = t.path().join("survivor");
+        // The wrapper prints and exits; its child keeps stdout open.
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n(sleep 2; touch '{}') &\necho '2.1.316 (Claude Code)'\n",
+                mark.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let start = std::time::Instant::now();
+        let e = probe_version_within(&fake, Duration::from_millis(500)).unwrap_err();
+        assert!(e.contains("did not answer"), "{}", e);
+        assert!(start.elapsed() < Duration::from_millis(1500));
+        // Unreadable: the gate warns and runs the newest profile.
+        assert!(gate(Err(e)).warning.unwrap().contains("cannot read"));
+        // The timeout killed the child that held stdout.
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(!mark.exists());
     }
 }
