@@ -2,7 +2,9 @@
 //! connection, the `hello` handshake, and method dispatch.
 //!
 //! The first frame must be `hello` and must arrive within 5 s of the accept;
-//! blank lines do not extend that deadline. A major version mismatch gets
+//! blank lines do not extend that deadline. The peer is stamped after
+//! detection's first pass; if that pass takes longer than the 5 s, the
+//! connection gets `busy` and closes. A major version mismatch gets
 //! `upgrade_required` and the connection closes. So do a missing or late
 //! `hello`, an oversized frame and a peer under another uid. After `hello`, a
 //! frame that is not valid JSON or lacks `v` gets `bad_request`, and the
@@ -13,9 +15,9 @@
 //! responses can come out of order, and a client matches them by `id`
 //! (D3). A connection runs at most `MAX_IN_FLIGHT` requests; past that the
 //! reader reads nothing more until one ends. `events.subscribe` and
-//! `events.unsubscribe` take the connection's streams in turn, so a
-//! subscribe response comes before its first event and no event of a
-//! stream follows its unsubscribe response. When the peer closes, the
+//! `events.unsubscribe` take the connection's streams in the order they
+//! were sent, so a subscribe response comes before its first event and no
+//! event of a stream follows its unsubscribe response. When the peer closes, the
 //! requests in flight finish first. `agent.create`, `agent.retire` and
 //! `session.stop` replay a repeated `idem` (`engine::idem`).
 //!
@@ -450,6 +452,34 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
     // gets, and a late `hello` cannot wait for the pid to be reused.
     // The peer's start time comes from the same read as the principal, so
     // a later exe check reads the process the principal came from.
+    //
+    // The observed sessions come from detection, so wait for its first pass
+    // first: stamped before it, a process in an observed session would stay
+    // `local-unverified` for the life of the connection. The wait counts
+    // against the `hello` timeout. Past it the connection gets `busy` and
+    // closes, and the client connects again; it is never stamped from
+    // empty views. A peer that exits during the wait and whose pid is
+    // reused fails the start check against `accepted`.
+    if !ctx.first_tick.is_open()
+        && !ctx
+            .first_tick
+            .wait(hello_deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await
+    {
+        let _ = tx
+            .send(encode(&Response::err(
+                None,
+                ApiError::new(
+                    ErrorCode::Busy,
+                    "session detection has not finished its first pass",
+                )
+                .with_hint("the engine is starting; connect again shortly"),
+            )))
+            .await;
+        drop(tx);
+        let _ = writer.await;
+        return;
+    }
     let (principal, start) = principal::stamp_peer(
         cred.pid,
         accepted,
@@ -523,13 +553,18 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
                         tx: tx.clone(),
                         id: req.id.clone(),
                     });
-                let (ctx, principal, streams, tx) =
-                    (ctx.clone(), principal.clone(), streams.clone(), tx.clone());
+                // The reader takes the streams for a subscribe or unsubscribe
+                // before the next frame, so these run in the order sent: an
+                // unsubscribe pipelined after its subscribe cannot run first.
+                let held = match method.as_str() {
+                    "events.subscribe" | "events.unsubscribe" => {
+                        Some(streams.clone().lock_owned().await)
+                    }
+                    _ => None,
+                };
+                let (ctx, principal, tx) = (ctx.clone(), principal.clone(), tx.clone());
                 calls.spawn(async move {
-                    call(
-                        req, &method, &ctx, peer, &principal, &streams, progress, &tx,
-                    )
-                    .await;
+                    call(req, &method, &ctx, peer, &principal, held, progress, &tx).await;
                     drop(slot);
                 });
             }
@@ -543,9 +578,10 @@ pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
 }
 
 /// Serve one request and queue its response. A subscribe or unsubscribe
-/// holds the connection's streams throughout: a new stream starts only
-/// after its response is queued, so that response comes first, and the
-/// stream count cannot pass `MAX_STREAMS`.
+/// gets the connection's streams in `held`, taken by the reader in frame
+/// order, and holds them throughout: a new stream starts only after its
+/// response is queued, so that response comes first, and the stream count
+/// cannot pass `MAX_STREAMS`.
 #[allow(clippy::too_many_arguments)]
 async fn call(
     req: Request,
@@ -553,15 +589,11 @@ async fn call(
     ctx: &ServerCtx,
     peer: Peer,
     principal: &Principal,
-    streams: &tokio::sync::Mutex<Streams>,
+    mut held: Option<tokio::sync::OwnedMutexGuard<Streams>>,
     progress: Option<Progress>,
     tx: &mpsc::Sender<Vec<u8>>,
 ) {
     let id = req.id.clone();
-    let mut held = match method {
-        "events.subscribe" | "events.unsubscribe" => Some(streams.lock().await),
-        _ => None,
-    };
     let (resp, stream) = match dispatch(
         method,
         req,
@@ -3006,9 +3038,12 @@ mod tests {
         }
 
         async fn send(&mut self, id: &str, method: &str, params: Value) {
-            let mut line =
-                serde_json::to_vec(&json!({"v": 1, "id": id, "method": method, "params": params}))
-                    .unwrap();
+            self.send_raw(json!({"v": 1, "id": id, "method": method, "params": params}))
+                .await;
+        }
+
+        async fn send_raw(&mut self, frame: Value) {
+            let mut line = serde_json::to_vec(&frame).unwrap();
             line.push(b'\n');
             self.write.write_all(&line).await.unwrap();
         }
@@ -5082,50 +5117,58 @@ mod tests {
     // ── Concurrency, idem and observed sessions (D3, D8, D9) ──────────
 
     /// `ctx_db` whose `session.list` waits on `gate` until the test opens it.
-    fn ctx_gated() -> (tempfile::TempDir, Arc<ServerCtx>, Arc<FirstTick>) {
-        let (t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
-        let gate = Arc::new(FirstTick::pending());
-        let ctx = ServerCtx {
-            first_tick: gate.clone(),
-            ..Arc::try_unwrap(ctx).ok().unwrap()
-        };
-        (t, Arc::new(ctx), gate)
+    /// A slow request: `session.stop` with `idem` key `k` waits while the
+    /// test holds that key's slot.
+    async fn hold_idem(
+        ctx: &ServerCtx,
+        k: &str,
+    ) -> tokio::sync::OwnedMutexGuard<Option<crate::engine::idem::Done>> {
+        let key = ("local-unverified".into(), "session.stop".into(), k.into());
+        ctx.idem.slot(key).unwrap().lock_owned().await
+    }
+
+    fn slow(k: &str) -> Value {
+        json!({"v": 1, "id": k, "method": "session.stop", "idem": k,
+            "params": {"sessionKey": "claudeCode:none"}})
     }
 
     /// D3: one connection runs requests concurrently; a fast one sent after
     /// a slow one answers first, and each answer carries its own `id`.
     #[tokio::test]
     async fn responses_on_one_connection_come_out_of_order() {
-        let (_t, ctx, gate) = ctx_gated();
-        let (mut c, _) = Client::new(ctx).await;
-        c.send("slow", "session.list", json!({})).await;
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let held = hold_idem(&ctx, "slow").await;
+        let (mut c, _) = Client::new(ctx.clone()).await;
+        c.send_raw(slow("slow")).await;
         c.send("fast", "ping", json!({})).await;
         let first = c.next().await;
         assert_eq!(first["id"], "fast", "{}", first);
         assert_eq!(first["ok"], true, "{}", first);
-        gate.open();
+        drop(held);
         let second = c.next().await;
         assert_eq!(second["id"], "slow", "{}", second);
-        assert_eq!(second["ok"], true, "{}", second);
     }
 
     /// D3: past `MAX_IN_FLIGHT` requests the reader waits; nothing is lost
     /// and every request is answered once one ends.
     #[tokio::test]
     async fn requests_in_flight_are_bounded() {
-        let (_t, ctx, gate) = ctx_gated();
-        let (mut c, _) = Client::new(ctx).await;
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let mut held = Vec::new();
         for i in 0..MAX_IN_FLIGHT {
-            c.send(&i.to_string(), "session.list", json!({})).await;
+            held.push(hold_idem(&ctx, &i.to_string()).await);
+        }
+        let (mut c, _) = Client::new(ctx.clone()).await;
+        for i in 0..MAX_IN_FLIGHT {
+            c.send_raw(slow(&i.to_string())).await;
         }
         c.send("last", "ping", json!({})).await;
         let early = tokio::time::timeout(Duration::from_millis(300), c.lines.next_line()).await;
         assert!(early.is_err(), "answered past the bound: {:?}", early);
-        gate.open();
+        drop(held);
         let mut ids = std::collections::BTreeSet::new();
         for _ in 0..=MAX_IN_FLIGHT {
             let r = c.next().await;
-            assert_eq!(r["ok"], true, "{}", r);
             ids.insert(r["id"].as_str().unwrap().to_string());
         }
         assert_eq!(ids.len(), MAX_IN_FLIGHT + 1);
@@ -5163,6 +5206,92 @@ mod tests {
                 acked = true;
             }
         }
+    }
+
+    /// A subscribe and its unsubscribe sent back to back run in that order:
+    /// the unsubscribe ends the stream, and no event follows its response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pipelined_unsubscribe_runs_after_its_subscribe() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        for i in 0..50 {
+            let e = event("agent.upsert", &format!("m/a{}", i), 0, 0);
+            db.write(move |tx| tx.emit(&e)).await.unwrap();
+        }
+        let since = format!("{}:{}:0", MACHINE, db.epoch());
+        for _ in 0..200 {
+            let (mut c, _) = Client::new(ctx.clone()).await;
+            c.send(
+                "s",
+                "events.subscribe",
+                json!({"since": since, "topics": ["agent.*"]}),
+            )
+            .await;
+            c.send("u", "events.unsubscribe", json!({"sub": "s"})).await;
+            let mut acked = false;
+            loop {
+                let f = c.next().await;
+                if f["id"] == "s" {
+                    assert_eq!(f["ok"], true, "{}", f);
+                    acked = true;
+                } else if f["id"] == "u" {
+                    assert!(acked, "unsubscribe answered before its subscribe");
+                    assert_eq!(f["result"]["ended"], true, "{}", f);
+                    break;
+                }
+            }
+            let after = tokio::time::timeout(Duration::from_millis(20), c.next()).await;
+            assert!(after.is_err(), "a frame after the unsubscribe: {:?}", after);
+        }
+    }
+
+    /// Observed sessions that detection fills in on its first pass.
+    struct LateObserved(std::sync::Mutex<HashMap<libc::pid_t, String>>);
+
+    impl ObservedSessions for LateObserved {
+        fn by_pid(&self, pid: libc::pid_t) -> Option<String> {
+            self.0.lock().unwrap().get(&pid).cloned()
+        }
+    }
+
+    /// A peer that connects before detection's first pass is stamped after
+    /// it, so a process in an observed session is `observed:<key>`, not
+    /// `local-unverified`.
+    #[tokio::test]
+    async fn a_peer_is_stamped_after_detections_first_pass() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let me = std::process::id() as libc::pid_t;
+        let parent = peer::proc_info(me).unwrap().ppid;
+        let seen = Arc::new(LateObserved(Default::default()));
+        let first = Arc::new(FirstTick::pending());
+        let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+        ctx.observed = Some(seen.clone());
+        ctx.first_tick = first.clone();
+        let pass = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            seen.0
+                .lock()
+                .unwrap()
+                .insert(parent, "claudeCode:s1".into());
+            first.open();
+        });
+        let (_c, hello) = Client::new(Arc::new(ctx)).await;
+        assert_eq!(hello["principal"], "observed:claudeCode:s1");
+        pass.await.unwrap();
+    }
+
+    /// Past the `hello` timeout with no first pass, the connection gets
+    /// `busy` and closes; it is never stamped from empty views.
+    #[tokio::test]
+    async fn a_peer_gets_busy_when_detection_has_not_run() {
+        let mut ctx = Arc::try_unwrap(ctx(Duration::from_millis(200)))
+            .ok()
+            .unwrap();
+        ctx.first_tick = Arc::new(FirstTick::pending());
+        let mut c = connect(Arc::new(ctx));
+        send(&mut c, hello_req("1", json!({"apiMajor": 1}))).await;
+        let got = read_all(c).await;
+        assert_eq!(got.len(), 1, "{:?}", got);
+        assert_eq!(got[0]["error"]["code"], "busy", "{:?}", got);
     }
 
     fn observed_ctx(key: &str) -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Db>) {

@@ -131,7 +131,9 @@ pub fn stamp(chain: &[ProcInfo], agents: &dyn LiveAgents) -> Principal {
 /// `stamp`, then observed sessions: with no live agent in the chain, the
 /// first process that is an observed session's makes the peer
 /// `observed:<sessionKey>`. Detection has no process start time, so a
-/// reused pid can match; that only narrows the peer.
+/// session's pid that exits and is reused can still match. That fails
+/// closed: the new process is stamped observed, which only narrows it
+/// (no create, retire or stop of other sessions), and never widens it.
 pub fn stamp_observed(
     chain: &[ProcInfo],
     agents: &dyn LiveAgents,

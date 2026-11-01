@@ -172,8 +172,10 @@ pub enum ErrorCode {
     /// or `interrupted`, already runs, or has nothing to resume. `msg`
     /// says which.
     ActionFailed,
-    /// The engine is at a limit that frees up soon: the connection cap, or
-    /// a scan of the same kind that is still running. Retry shortly.
+    /// The engine is at a limit that frees up soon: the connection cap, a
+    /// scan of the same kind that is still running, every `idem` key in
+    /// use, or a connection made before session detection's first pass
+    /// ended. Retry shortly.
     Busy,
     /// An annotation count, size or write-rate limit was exceeded.
     LimitExceeded,

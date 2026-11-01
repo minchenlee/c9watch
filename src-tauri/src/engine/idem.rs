@@ -9,7 +9,8 @@
 //! with one key never run at once; the second waits for the first.
 //!
 //! The record is in memory, so it ends with the engine process, and holds
-//! at most `CAP` keys for at most `TTL`.
+//! at most `CAP` keys for at most `TTL`. A key that a request still uses is
+//! never dropped; when all `CAP` keys are in use, a new key gets `busy`.
 
 use super::proto::{ApiError, ErrorCode};
 use std::collections::HashMap;
@@ -20,24 +21,25 @@ use std::time::{Duration, Instant};
 /// How long a key replays.
 pub const TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Keys kept at most. Past it, the oldest kept result goes first.
+/// Keys kept at most. Past it, the oldest kept result that no request uses
+/// goes first.
 pub const CAP: usize = 1024;
 
 /// Longest key, in bytes.
 pub const MAX_KEY: usize = 128;
 
 /// The first success for one key.
-struct Done {
+pub(crate) struct Done {
     hash: String,
     result: serde_json::Value,
     at: Instant,
 }
 
 /// One key's slot. Its lock is held while the write runs.
-type Slot = Arc<tokio::sync::Mutex<Option<Done>>>;
+pub(crate) type Slot = Arc<tokio::sync::Mutex<Option<Done>>>;
 
 /// (principal, method, key)
-type Key = (String, String, String);
+pub(crate) type Key = (String, String, String);
 
 #[derive(Default)]
 pub struct IdemCache {
@@ -75,7 +77,7 @@ impl IdemCache {
         let hash = super::mail::sha256_hex(
             &serde_json::to_vec(&(method, params)).expect("params serialize"),
         );
-        let slot = self.slot((principal.into(), method.into(), key.into()));
+        let slot = self.slot((principal.into(), method.into(), key.into()))?;
         let mut done = slot.lock().await;
         if let Some(d) = done.as_ref().filter(|d| d.at.elapsed() < TTL) {
             if d.hash != hash {
@@ -96,31 +98,44 @@ impl IdemCache {
         Ok((result, false))
     }
 
-    /// The slot for `key`, made if new. A new key first drops the slots that
-    /// are not in use and hold nothing or an expired result, then, at `CAP`,
-    /// the oldest result.
-    fn slot(&self, key: Key) -> Slot {
+    /// The slot for `key`, made if new. At `CAP`, a new key first drops the
+    /// unused slots that hold nothing or an expired result, then the unused
+    /// slot with the oldest result.
+    ///
+    /// A slot is in use while a caller holds its `Arc`: a caller clones it
+    /// under this lock and keeps it until its write ends, also before it
+    /// locks the slot. Dropping a slot in use would let a second request
+    /// with the key make another slot and run the write again, so only a
+    /// slot the map alone holds may go.
+    pub(crate) fn slot(&self, key: Key) -> Result<Slot, ApiError> {
         let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = slots.get(&key) {
-            return s.clone();
+            return Ok(s.clone());
         }
+        let unused = |s: &Slot| Arc::strong_count(s) == 1;
         if slots.len() >= CAP {
-            slots.retain(|_, s| match s.try_lock() {
-                Ok(d) => d.as_ref().is_some_and(|d| d.at.elapsed() < TTL),
-                Err(_) => true,
+            slots.retain(|_, s| {
+                !unused(s)
+                    || s.try_lock()
+                        .is_ok_and(|d| d.as_ref().is_some_and(|d| d.at.elapsed() < TTL))
             });
         }
         if slots.len() >= CAP {
             let oldest = slots
                 .iter()
+                .filter(|(_, s)| unused(s))
                 .filter_map(|(k, s)| Some((k.clone(), s.try_lock().ok()?.as_ref()?.at)))
                 .min_by_key(|(_, at)| *at)
                 .map(|(k, _)| k);
-            if let Some(k) = oldest {
-                slots.remove(&k);
-            }
+            let Some(k) = oldest else {
+                return Err(ApiError::new(
+                    ErrorCode::Busy,
+                    format!("all {} idem keys are in use", CAP),
+                ));
+            };
+            slots.remove(&k);
         }
-        slots.entry(key).or_default().clone()
+        Ok(slots.entry(key).or_default().clone())
     }
 
     #[cfg(test)]
@@ -216,5 +231,43 @@ mod tests {
             let e = count(&c, &runs, "l", bad, json!({})).await.unwrap_err();
             assert_eq!(e.code, ErrorCode::BadRequest);
         }
+    }
+
+    /// A key whose caller has its slot but has not locked it yet is in use:
+    /// keys that come after it at `CAP` may not drop it, so the key keeps
+    /// one slot and its write runs once.
+    #[tokio::test]
+    async fn a_key_in_use_is_never_dropped() {
+        let (c, runs) = (IdemCache::new(), AtomicUsize::new(0));
+        let a = c
+            .slot(("l".into(), "agent.create".into(), "a".into()))
+            .unwrap();
+        for k in 0..CAP + 10 {
+            count(&c, &runs, "l", &k.to_string(), json!({}))
+                .await
+                .unwrap();
+        }
+        let again = c
+            .slot(("l".into(), "agent.create".into(), "a".into()))
+            .unwrap();
+        assert!(Arc::ptr_eq(&a, &again), "the key kept its slot");
+        assert!(c.len() <= CAP);
+    }
+
+    #[tokio::test]
+    async fn a_new_key_is_busy_when_every_key_is_in_use() {
+        let (c, runs) = (IdemCache::new(), AtomicUsize::new(0));
+        let held: Vec<_> = (0..CAP)
+            .map(|k| {
+                c.slot(("l".into(), "agent.create".into(), k.to_string()))
+                    .unwrap()
+            })
+            .collect();
+        let e = count(&c, &runs, "l", "new", json!({})).await.unwrap_err();
+        assert_eq!(e.code, ErrorCode::Busy);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        drop(held);
+        let ok = count(&c, &runs, "l", "new", json!({})).await;
+        assert_eq!(ok.unwrap(), (json!({"n": 0}), false));
     }
 }

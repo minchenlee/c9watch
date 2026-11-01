@@ -1770,7 +1770,7 @@
         },
         {
           "const": "busy",
-          "description": "The engine is at a limit that frees up soon: the connection cap, or\na scan of the same kind that is still running. Retry shortly.",
+          "description": "The engine is at a limit that frees up soon: the connection cap, a\nscan of the same kind that is still running, every `idem` key in\nuse, or a connection made before session detection's first pass\nended. Retry shortly.",
           "type": "string"
         },
         {
