@@ -26,9 +26,10 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
 /// Combined session information
+///
+/// Internal: the c9p wire carries `engine_proto::wire::SessionView`, built
+/// from this at the API boundary, so this struct has no JSON Schema.
 #[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "engine", schemars(rename = "SessionView"))]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
     pub id: String,

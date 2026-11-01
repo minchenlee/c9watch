@@ -7,6 +7,7 @@
 pub mod client;
 pub mod home;
 pub mod peer;
+pub mod session_view;
 pub mod wire;
 
 /// The shadow diff exists only in dev channel builds (C1a-17).

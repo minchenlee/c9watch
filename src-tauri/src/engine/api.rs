@@ -104,7 +104,7 @@ use super::proto::{
 };
 use super::proto::{
     DetectRecheckParams, SessionAwayParams, SessionAwayResult, SessionRenameParams,
-    SessionStopParams, SessionViewsParams, SessionViewsResult, TickResult,
+    SessionStopParams, SessionView, SessionViewsParams, SessionViewsResult, TickResult,
 };
 use super::proto::{PingParams, PingResult, UnsubscribeParams, UnsubscribeResult};
 use super::standing;
@@ -1143,7 +1143,7 @@ pub fn schema() -> serde_json::Value {
         "agent.failed": ser.subschema_for::<AgentFailedEvent>(),
         "msg.state": ser.subschema_for::<MsgStateEvent>(),
         "legacy.inbox": ser.subschema_for::<LegacyInboxEvent>(),
-        "session.view": ser.subschema_for::<crate::session::Session>(),
+        "session.view": ser.subschema_for::<SessionView>(),
         "session.gone": ser.subschema_for::<SessionGoneEvent>(),
         "notification.needs_attention": ser.subschema_for::<NotificationEvent>(),
         "notification.waiting_for_input": ser.subschema_for::<NotificationEvent>(),

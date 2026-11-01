@@ -662,7 +662,7 @@ pub struct SessionViewsParams {}
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 pub struct SessionViewsResult {
     pub cursor: String,
-    pub sessions: Vec<crate::session::Session>,
+    pub sessions: Vec<SessionView>,
 }
 
 /// `session.gone` data.
@@ -1532,3 +1532,4 @@ pub struct MailControlResult {
 
 // L1 annotation types are shared with clients outside the engine feature.
 pub use super::annotations::*;
+pub use super::session_view::SessionView;

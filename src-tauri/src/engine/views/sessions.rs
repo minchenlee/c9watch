@@ -21,7 +21,7 @@ use crate::engine::db::outbox::NewEvent;
 use crate::engine::detect::{Detection, StopError};
 use crate::engine::proto::{
     ApiError, ErrorCode, Request, SessionAwayParams, SessionAwayResult, SessionGoneEvent,
-    SessionRenameParams, SessionStopParams, SessionViewsResult, TickResult,
+    SessionRenameParams, SessionStopParams, SessionView, SessionViewsResult, TickResult,
 };
 use crate::session::{DetectionDiagnostics, Session};
 use std::collections::HashMap;
@@ -46,7 +46,7 @@ struct Seen {
 
 struct Committed {
     cursor: String,
-    sessions: Vec<Session>,
+    sessions: Vec<SessionView>,
     by_key: HashMap<String, Seen>,
 }
 
@@ -62,7 +62,7 @@ pub struct SessionViews {
 
 /// What one tick changes, computed before its write and committed after.
 pub struct ViewChange {
-    sessions: Vec<Session>,
+    sessions: Vec<SessionView>,
     by_key: HashMap<String, Seen>,
     /// `(session key, view)` of new or changed sessions, in detection order.
     pub changed: Vec<(String, serde_json::Value)>,
@@ -111,19 +111,20 @@ impl SessionViews {
 
     /// Diff `sessions` against the last commit. A session key listed twice
     /// counts once, by its first entry; the views keep both, as the GUI
-    /// does.
+    /// does. The views are the wire `SessionView`s of `sessions`.
     pub fn diff(&self, sessions: &[Session]) -> ViewChange {
+        let sessions: Vec<SessionView> = sessions.iter().map(SessionView::from).collect();
         let state = self.lock();
         let empty = HashMap::new();
         let before = state.as_ref().map_or(&empty, |c| &c.by_key);
         let mut by_key = HashMap::new();
         let mut changed = Vec::new();
         let mut superseded = Vec::new();
-        for s in sessions {
+        for s in &sessions {
             if by_key.contains_key(&s.session_key) {
                 continue;
             }
-            let value = serde_json::to_value(s).expect("Session serializes");
+            let value = serde_json::to_value(s).expect("SessionView serializes");
             let json = value.to_string();
             let prev = before.get(&s.session_key);
             let view_seq = match prev {
@@ -157,7 +158,7 @@ impl SessionViews {
         gone.sort_by(|a, b| a.session_key.cmp(&b.session_key));
         superseded.sort_unstable();
         ViewChange {
-            sessions: sessions.to_vec(),
+            sessions,
             by_key,
             changed,
             gone,
@@ -207,7 +208,7 @@ impl SessionViews {
     }
 
     /// The current views and their cursor; `None` before the first commit.
-    pub fn current(&self) -> Option<(String, Vec<Session>)> {
+    pub fn current(&self) -> Option<(String, Vec<SessionView>)> {
         self.lock()
             .as_ref()
             .map(|c| (c.cursor.clone(), c.sessions.clone()))
