@@ -144,10 +144,11 @@ impl Tx<'_> {
     /// - If `f` (the closure of `write`) fails or the commit fails, the
     ///   hooks are dropped and never run.
     /// - A hook holds up every write behind it: keep it short, and never
-    ///   call `Db` or the writer from it (the writer cannot run a job from
-    ///   inside a job).
-    /// - A hook that panics is logged and skipped; the hooks after it
-    ///   still run, and the caller still gets its committed result.
+    ///   call `Db` or the writer from it. A writer call from inside a job
+    ///   is a hard error.
+    /// - A hook that panics is logged and skipped. The hooks after it
+    ///   still run, the new head is still sent to subscribers, and the
+    ///   caller still gets its committed result.
     pub fn after_commit(&mut self, f: impl FnOnce() + Send + 'static) {
         self.after_commit.push(Box::new(f));
     }
@@ -416,7 +417,11 @@ where
         tx.tx.commit().map_err(fail)?;
         for f in after_commit {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
-                eprintln!("[engine] an after-commit hook panicked; the commit stands");
+                crate::elog!(
+                    Warn,
+                    "db",
+                    "an after-commit hook panicked; the commit stands"
+                );
             }
         }
         if let Some(seq) = last {
@@ -1073,18 +1078,24 @@ mod tests {
         assert_eq!(rows, 0);
         // A commit: the hooks run; one that panics is skipped, and the
         // caller still gets its result.
+        let mut head = db.head.subscribe();
         let r = ran.clone();
-        let (out, _) = db
+        let (out, cur) = db
             .write_blocking(move |tx| {
                 hook(tx, &r);
                 tx.after_commit(|| panic!("hook"));
                 hook(tx, &r);
                 insert_agent(tx, "a1")?;
+                tx.emit(&agent_event("a1"))?;
                 Ok(7)
             })
             .unwrap();
         assert_eq!(out, 7);
+        assert_eq!(cur, Some(db.cursor_at(1)));
         assert_eq!(ran.load(Ordering::SeqCst), 2);
+        // Subscribers still wake on the commit.
+        assert!(head.has_changed().unwrap());
+        assert_eq!(*head.borrow_and_update(), 1);
         // The writer still works.
         db.write_blocking(|tx| tx.execute("DELETE FROM agents WHERE id = 'zz'", []))
             .unwrap();
