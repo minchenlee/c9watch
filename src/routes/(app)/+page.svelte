@@ -16,7 +16,6 @@
 	import { toolsLoadedFor, withConversationLoader } from '$lib/stores/conversation-loader';
 	import { get } from 'svelte/store';
 	import { isDemoMode, toggleDemoMode } from '$lib/demo';
-	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 	import { isTauri, wsClient } from '$lib/ws';
 	import StatusBar from '$lib/components/StatusBar.svelte';
 	import SessionCard from '$lib/components/SessionCard.svelte';
@@ -75,7 +74,6 @@
 
 	let viewMode = $state<'project' | 'all' | 'dense'>('project');
 	let isDense = $derived(viewMode === 'dense');
-	let sessionFilter = $state<'humans' | 'workers'>('humans');
 
 	let isCompact = $state(false);
 
@@ -116,13 +114,6 @@
 			const savedFontScale = Number(localStorage.getItem('denseFontScale'));
 			if (DENSE_FONT_SCALES.includes(savedFontScale)) {
 				denseFontScale = savedFontScale;
-			}
-			const savedFilter = localStorage.getItem('sessionFilter');
-			if (
-				PM_ORCHESTRATION_ENABLED &&
-				(savedFilter === 'humans' || savedFilter === 'workers')
-			) {
-				sessionFilter = savedFilter;
 			}
 		}
 
@@ -193,12 +184,6 @@
 	$effect(() => {
 		if (browser) {
 			localStorage.setItem('denseFontScale', String(denseFontScale));
-		}
-	});
-
-	$effect(() => {
-		if (browser) {
-			localStorage.setItem('sessionFilter', sessionFilter);
 		}
 	});
 
@@ -322,18 +307,11 @@
 		});
 	}
 
-	// With PM orchestration disabled, show every session — legacy `workerOf`
-	// records render as ordinary sessions and the HUMANS/WORKERS split is gone.
-	let filteredSessions = $derived.by(() => {
-		const providerSessions = sessions
+	let filteredSessions = $derived(
+		sessions
 			.filter((session) => $visibleTopLevelSessionIds.has(sessionKeyOf(session)))
-			.filter((session) => matchesProvider(session, $providerFilter));
-		return !PM_ORCHESTRATION_ENABLED
-			? providerSessions
-			: providerSessions.filter((session) =>
-					sessionFilter === 'workers' ? !!session.workerOf : !session.workerOf
-				);
-	});
+			.filter((session) => matchesProvider(session, $providerFilter))
+	);
 
 	let projectGroups = $derived(groupByProjectAndStatus(filteredSessions));
 	let allStatusGroups = $derived(groupSessionsByStatus(filteredSessions));
@@ -639,36 +617,6 @@
 						</button>
 					{/if}
 					<div class="header-spacer"></div>
-					{#if PM_ORCHESTRATION_ENABLED}
-					<div class="view-toggle">
-						<button
-							type="button"
-							class="toggle-btn"
-							class:active={sessionFilter === 'humans'}
-							onclick={() => sessionFilter = 'humans'}
-							title="Show human sessions"
-						>
-							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-								<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
-								<circle cx="12" cy="7" r="4" />
-							</svg>
-						</button>
-						<button
-							type="button"
-							class="toggle-btn"
-							class:active={sessionFilter === 'workers'}
-							onclick={() => sessionFilter = 'workers'}
-							title="Show PM workers"
-						>
-							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-								<rect x="4" y="6" width="16" height="12" rx="2" />
-								<circle cx="9" cy="12" r="1.5" />
-								<circle cx="15" cy="12" r="1.5" />
-								<path d="M12 2v4" />
-							</svg>
-						</button>
-					</div>
-					{/if}
 					<div class="view-toggle">
 						<button
 							class="toggle-btn"
@@ -768,33 +716,18 @@
 						</div>
 					</div>
 					<div class="empty-content">
-						{#if PM_ORCHESTRATION_ENABLED && sessionFilter === 'workers'}
-							<h2>No Workers Spawned</h2>
-							<p>Spawn a worker from a Claude Code session with <code>c9watch spawn</code></p>
-							<div class="empty-hint">
-								<span class="hint-icon">
-									<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-										<circle cx="12" cy="12" r="10" />
-										<path d="M12 16v-4" />
-										<path d="M12 8h.01" />
-									</svg>
-								</span>
-								Workers appear here once they're spawned by a PM session
-							</div>
-						{:else}
-							<h2>No {providerFilterLabel($providerFilter)} Sessions</h2>
-							<p>{ $providerFilter === 'all' ? 'Start a Claude Code, Codex, or Cursor Agent session' : `Start a ${providerFilterLabel($providerFilter)} session` }</p>
-							<div class="empty-hint">
-								<span class="hint-icon">
-									<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-										<circle cx="12" cy="12" r="10" />
-										<path d="M12 16v-4" />
-										<path d="M12 8h.01" />
-									</svg>
-								</span>
-								Sessions are detected automatically
-							</div>
-						{/if}
+						<h2>No {providerFilterLabel($providerFilter)} Sessions</h2>
+						<p>{ $providerFilter === 'all' ? 'Start a Claude Code, Codex, or Cursor Agent session' : `Start a ${providerFilterLabel($providerFilter)} session` }</p>
+						<div class="empty-hint">
+							<span class="hint-icon">
+								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+									<circle cx="12" cy="12" r="10" />
+									<path d="M12 16v-4" />
+									<path d="M12 8h.01" />
+								</svg>
+							</span>
+							Sessions are detected automatically
+						</div>
 					</div>
 				</div>
 			{:else}
@@ -839,7 +772,6 @@
 												<SessionCard
 													{session}
 													compact={isCompact}
-													workersView={sessionFilter === 'workers'}
 													onexpand={() => handleExpand(session)}
 													onstop={() => handleStop(session)}
 													onopen={() => handleOpen(session)}
@@ -873,7 +805,6 @@
 										<SessionCard
 											{session}
 											compact={isCompact}
-											workersView={sessionFilter === 'workers'}
 											onexpand={() => handleExpand(session)}
 											onstop={() => handleStop(session)}
 											onopen={() => handleOpen(session)}
@@ -1325,14 +1256,6 @@
 		color: var(--text-primary);
 		background: rgba(255, 255, 255, 0.1);
 		border-color: var(--border-default);
-	}
-
-	/* Workers-filter active state gets a pink tint to reinforce the
-	   agent visual language used by the WORKER/PM badges on cards. */
-	.toggle-btn.active[title="Show PM workers"] {
-		color: var(--accent-pink);
-		background: color-mix(in srgb, var(--accent-pink) 12%, transparent);
-		border-color: color-mix(in srgb, var(--accent-pink) 40%, transparent);
 	}
 
 	.all-sessions-grid {

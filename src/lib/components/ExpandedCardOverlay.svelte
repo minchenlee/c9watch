@@ -42,13 +42,12 @@
 	import TodoPanel from './TodoPanel.svelte';
 	import { createSlidingWindow, BATCH_SIZE } from '$lib/slidingWindow.svelte';
 	import { sessionCostMap, costMode } from '$lib/stores/cost';
-	import { currentConversation, workersByPm, expandedSessionId, codexSubagentsByParent, codexVisibleParentByChild } from '$lib/stores/sessions';
+	import { currentConversation, expandedSessionId, codexSubagentsByParent, codexVisibleParentByChild } from '$lib/stores/sessions';
 	import { visibleSubagentsBySession } from '$lib/stores/subagents';
-	import { PM_ORCHESTRATION_ENABLED } from '$lib/feature-flags';
 	import { formatCost, formatTokens, formatCostOrTokens, modelDisplayName } from '$lib/cost-utils';
 	import { isCostAvailable } from '$lib/cost-semantics';
 	import { formatTimeSince, formatDurationMs } from '$lib/time-utils';
-	import { getSessionStatusColor, getSessionStatusLabel, getSubagentStatusColor, getSubagentStatusLabel, getWorkerStatusColor, getWorkerStatusLabel } from '$lib/status-utils';
+	import { getSessionStatusColor, getSessionStatusLabel, getSubagentStatusColor, getSubagentStatusLabel } from '$lib/status-utils';
 	import { isTauri } from '$lib/ws';
 	import ProviderBadge from './ProviderBadge.svelte';
 	import { canSessionAction, providerFilterLabel, providerOf, providerSessionKey, sessionKeyOf } from '$lib/provider';
@@ -90,7 +89,6 @@
 	let tooltipY = $state(0);
 	let navCollapsed = $state(false);
 	let tasksCollapsed = $state(false);
-	let workersCollapsed = $state(false);
 	let overlayLayout = $state<HTMLDivElement>();
 	const SIDE_STORAGE_KEY = 'c9watch.overlaySideWidth';
 	const SIDE_MIN = 240;
@@ -294,22 +292,6 @@
 	let isWaitingInput = $derived(session.status === SessionStatus.WaitingForInput);
 	let isWorking = $derived(session.status === SessionStatus.Working);
 
-	// resolvedWorkers works for both PM (views own workers) and a worker
-	// (views siblings under the same PM). Highlights the current session in the list.
-	// When the session is a PM, workerOf is null, so we fall back to its
-	// provider-scoped key
-	// and resolvedWorkers IS myWorkers; the PM badge shows when length > 0 and
-	// workerOf is null (i.e. this session is itself the PM).
-	let resolvedWorkers = $derived(
-		$workersByPm.get(session.workerOf ? providerSessionKey('claudeCode', session.workerOf) : sessionKeyOf(session)) ?? []
-	);
-	let isPm = $derived(
-		PM_ORCHESTRATION_ENABLED && !session.workerOf && resolvedWorkers.length > 0
-	);
-	let showWorkersPanel = $derived(
-		PM_ORCHESTRATION_ENABLED && resolvedWorkers.length > 0
-	);
-
 	function subagentKey(subagent: SubagentInfo): string {
 		return providerSessionKey(subagent.provider, subagent.id);
 	}
@@ -417,10 +399,6 @@
 		previewStateBySession.delete(sid);
 	}
 
-	function openWorker(worker: Session) {
-		expandedSessionId.set(sessionKeyOf(worker));
-	}
-
 
 	async function handleClose() {
 		await sw.clearBeforeClose(conversation?.messages.length ?? 0);
@@ -475,24 +453,6 @@
 								onmouseleave={tipLeave}
 								onmousemove={tipMove}
 							>{sessionDisplayTitle(session) || 'New Session'}</h2>
-							{#if PM_ORCHESTRATION_ENABLED && session.workerOf}
-								<!-- svelte-ignore a11y_no_static_element_interactions -->
-								<span
-									class="worker-badge"
-									onmouseenter={() => tipEnter(`Worker of ${session.workerOf}`)}
-									onmouseleave={tipLeave}
-									onmousemove={tipMove}
-								>WORKER</span>
-							{/if}
-							{#if isPm}
-								<!-- svelte-ignore a11y_no_static_element_interactions -->
-								<span
-									class="pm-badge"
-									onmouseenter={() => tipEnter(`Managing ${resolvedWorkers.length} worker${resolvedWorkers.length === 1 ? '' : 's'}`)}
-									onmouseleave={tipLeave}
-									onmousemove={tipMove}
-								>PM · {resolvedWorkers.length}</span>
-							{/if}
 							<!-- svelte-ignore a11y_click_events_have_key_events -->
 							<!-- svelte-ignore a11y_no_static_element_interactions -->
 							<span
@@ -726,7 +686,7 @@
 			</button>
 		</div>
 
-		<!-- Desktop: right column (nav + workers stacked) -->
+		<!-- Desktop: right column (navigation, tasks, and subagents) -->
 		<div class="right-column nav-desktop">
 			<button
 				type="button"
@@ -769,44 +729,7 @@
 
 			/>
 
-			<!-- Workers panel (only when relevant) -->
-			{#if showWorkersPanel}
-				<div class="workers-side-panel" class:collapsed={workersCollapsed} in:flyInX|global={{ index: 2 }}>
-					<button
-						type="button"
-						class="panel-header"
-						onclick={() => workersCollapsed = !workersCollapsed}
-						aria-expanded={!workersCollapsed}
-					>
-						<span class="panel-chevron" class:rotated={workersCollapsed}>▾</span>
-						<span class="panel-title">Workers</span>
-						<span class="panel-count">{resolvedWorkers.length}</span>
-					</button>
-					{#if !workersCollapsed}
-						{#if session.workerOf}
-							<button class="back-to-pm" onclick={() => expandedSessionId.set(providerSessionKey('claudeCode', session.workerOf!))}>← Back to PM</button>
-						{/if}
-						<div class="workers-list">
-							{#each resolvedWorkers as w (sessionKeyOf(w))}
-								<button
-									type="button"
-									class="worker-row"
-									class:active={sessionKeyOf(w) === sessionKeyOf(session)}
-									onclick={() => openWorker(w)}
-								>
-								<span class="worker-name">{w.customTitle || w.codexTitle || w.cursorTitle || w.aiTitle || w.summary || w.sessionName}</span>
-									<span class="worker-status" style="color: {getWorkerStatusColor(w.status)}">
-										{getWorkerStatusLabel(w.status)}
-									</span>
-									<span class="worker-time">{formatTimeSince(w.modified)}</span>
-								</button>
-							{/each}
-						</div>
-					{/if}
-				</div>
-			{/if}
-
-			<!-- Subagents panel (CC internal Agent tool calls; separate from c9watch workers) -->
+			<!-- Subagents panel (native provider subagents) -->
 			{#if hasSubagents}
 				<div class="subagents-side-panel" class:collapsed={subagentsCollapsed}>
 					<button
@@ -902,7 +825,7 @@
 		pointer-events: auto; /* Enable clicks on the card */
 	}
 
-	/* Right column: nav + workers stacked */
+	/* Right column: navigation, tasks, and subagents */
 	.right-column.nav-desktop {
 		position: absolute;
 		top: 0;
@@ -954,10 +877,8 @@
 		background: var(--text-primary);
 	}
 
-	.workers-side-panel { border-top: 1px solid var(--border-default); }
-	/* Shared panel card style */
-	.nav-map-side,
-	.workers-side-panel {
+	/* Navigation panel card style */
+	.nav-map-side {
 		background: var(--bg-card);
 		border: 0;
 		display: flex;
@@ -1034,16 +955,8 @@
 
 	/* Collapsed panel: no bottom border on header since there's nothing below */
 	.nav-map-side.collapsed .panel-header,
-	.workers-side-panel.collapsed .panel-header,
 	.subagents-side-panel.collapsed .panel-header {
 		border-bottom: none;
-	}
-
-	.workers-side-panel .workers-list {
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-		padding: var(--space-sm) 0;
 	}
 
 	.back-to-pm {
@@ -1176,78 +1089,6 @@
 		font-family: var(--font-mono);
 		font-size: 12px;
 		color: var(--text-muted);
-		letter-spacing: 0.05em;
-	}
-
-	.worker-badge {
-		font-family: var(--font-pixel);
-		font-size: 10px;
-		font-weight: 500;
-		color: var(--accent-pink);
-		background: color-mix(in srgb, var(--accent-pink) 12%, transparent);
-		padding: 2px 6px;
-		border: 1px solid color-mix(in srgb, var(--accent-pink) 40%, transparent);
-		text-transform: uppercase;
-		letter-spacing: 0.1em;
-	}
-
-	.pm-badge {
-		font-family: var(--font-pixel);
-		font-size: 10px;
-		font-weight: 500;
-		color: var(--accent-pink);
-		background: color-mix(in srgb, var(--accent-pink) 12%, transparent);
-		padding: 2px 6px;
-		border: 1px solid color-mix(in srgb, var(--accent-pink) 40%, transparent);
-		text-transform: uppercase;
-		letter-spacing: 0.1em;
-		white-space: nowrap;
-	}
-
-	.worker-row {
-		display: grid;
-		grid-template-columns: 1fr auto auto;
-		align-items: center;
-		gap: var(--space-sm);
-		padding: 6px var(--space-md);
-		background: transparent;
-		border: none;
-		border-left: 2px solid transparent;
-		color: var(--text-primary);
-		text-align: left;
-		font-family: var(--font-mono);
-		font-size: 12px;
-		cursor: pointer;
-		transition: all 0.15s ease;
-		width: 100%;
-	}
-
-	.worker-row:hover {
-		background: color-mix(in srgb, var(--text-muted) 6%, transparent);
-		border-left-color: var(--border-muted);
-	}
-
-	.worker-row.active {
-		border-left-color: var(--accent-green);
-		background: color-mix(in srgb, var(--accent-green) 10%, transparent);
-	}
-
-	.worker-name {
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-		min-width: 0;
-	}
-
-	.worker-status {
-		text-transform: uppercase;
-		letter-spacing: 0.1em;
-		font-weight: 500;
-	}
-
-	.worker-time {
-		color: var(--text-muted);
-		text-transform: uppercase;
 		letter-spacing: 0.05em;
 	}
 
