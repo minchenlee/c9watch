@@ -5824,6 +5824,132 @@ mod tests {
         assert_eq!(l2.spawns.load(Ordering::SeqCst), 0);
         assert_eq!(row(&e.db, &r.id).state.as_deref(), Some("paused"));
     }
+    /// D4: a boot never retries a failed resume. The row stays `paused`
+    /// with `resume_failed` until `agent.resume` or `agent.retire`.
+    #[tokio::test]
+    async fn boot_resume_skips_a_failed_resume() {
+        let e = setup(Script::Ready, None);
+        let r = drained_agent(&e).await;
+        let (_, _, sp2) = next_engine(&e, Script::Refuse, None);
+        sp2.resume_on_boot().unwrap();
+        no_supervisors(&sp2);
+        for _ in 0..2 {
+            let (_, l, sp) = next_engine(&e, Script::Ready, None);
+            assert_eq!(sp.resume_on_boot().unwrap(), Resumed::default());
+            assert_eq!(l.spawns.load(Ordering::SeqCst), 0);
+            let got = row(&e.db, &r.id);
+            assert_eq!(got.state.as_deref(), Some("paused"));
+            assert_eq!(got.state_reason.as_deref(), Some(ops::RESUME_FAILED));
+            assert_eq!(got.gone_at, None);
+        }
+    }
+
+    /// D2: an `orphaned` agent counts as live for the one-cwd rule. Only
+    /// `agent.retire` ends it: the kill goes to the recorded pid and start
+    /// time, here a test process, and is confirmed before the tombstone.
+    #[tokio::test]
+    async fn an_orphaned_agent_holds_its_cwd_until_retire_kills_it() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let r = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        e.launcher.kill_fails.store(true, Ordering::SeqCst);
+        let id = serde_json::json!({ "id": r.id });
+        let got = e.sp.retire(&l, id.clone()).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("orphaned"));
+        no_supervisors(&e.sp);
+        let (mut proc, child) = test_process("echo ready; exec sleep 30");
+        let aid = r.id.clone();
+        e.db.write_blocking(move |tx| {
+            tx.execute(
+                "UPDATE agent_state SET pty_child_pid = ?2, pty_child_start = ?3 \
+                 WHERE agent_id = ?1",
+                params![aid, child.pid as i64, child.start as i64],
+            )
+        })
+        .unwrap();
+        let other = e.t.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let err = e.sp.create(&l, create_params(&other)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::CwdCollision);
+        assert!(err.msg.contains(&r.id), "{}", err.msg);
+        let err = e.sp.resume(&l, id.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        assert!(err.msg.contains("orphaned"), "{}", err.msg);
+        assert!(proc.try_wait().unwrap().is_none(), "resume signalled it");
+        // The default killer: pid and start time, SIGTERM, confirmed.
+        let got = e.sp.retire(&l, id).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        assert!(got.gone_at.is_some());
+        assert_eq!(proc.wait().unwrap().signal(), Some(libc::SIGTERM));
+        assert_eq!(agent_state_rows(&e.db), 0);
+        e.sp.create(&l, create_params(&other)).await.unwrap();
+    }
+
+    /// D2: the retire of an `orphaned` agent whose pid now runs another
+    /// process (another start time) never signals it.
+    #[tokio::test]
+    async fn retiring_an_orphan_never_signals_a_reused_pid() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let r = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        e.launcher.kill_fails.store(true, Ordering::SeqCst);
+        let id = serde_json::json!({ "id": r.id });
+        e.sp.retire(&l, id.clone()).await.unwrap();
+        no_supervisors(&e.sp);
+        let (mut proc, child) = test_process("echo ready; exec sleep 30");
+        let aid = r.id.clone();
+        e.db.write_blocking(move |tx| {
+            tx.execute(
+                "UPDATE agent_state SET pty_child_pid = ?2, pty_child_start = ?3 \
+                 WHERE agent_id = ?1",
+                params![aid, child.pid as i64, child.start as i64 + 1],
+            )
+        })
+        .unwrap();
+        let got = e.sp.retire(&l, id).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("retired"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(proc.try_wait().unwrap().is_none(), "a reused pid was hit");
+        proc.kill().unwrap();
+        proc.wait().unwrap();
+    }
+
+    /// D4: a second `agent.resume` while the first is open fails with a
+    /// clear error, in the same engine (a supervisor) and in another one
+    /// (the row is no longer paused). One session never runs twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_agent_resume_while_one_is_open_is_refused() {
+        let e = setup(Script::Ready, None);
+        let r = drained_agent(&e).await;
+        let (_, l2, sp2) = next_engine(&e, Script::Hang, None);
+        let l = Principal::LocalUnverified;
+        let id = serde_json::json!({ "id": r.id });
+        let first = tokio::spawn({
+            let (sp2, id) = (sp2.clone(), id.clone());
+            async move { sp2.resume(&Principal::LocalUnverified, id).await }
+        });
+        let rid = r.id.clone();
+        let db = e.db.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for("the resume spawned", || {
+                row(&db, &rid).state.as_deref() == Some("starting")
+            })
+        })
+        .await
+        .unwrap();
+        let err = sp2.resume(&l, id.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        assert!(err.msg.contains("runs in this engine"), "{}", err.msg);
+        let (_, l3, sp3) = next_engine(&e, Script::Ready, None);
+        let err = sp3.resume(&l, id.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::ActionFailed);
+        assert!(err.msg.contains("not paused or interrupted"), "{}", err.msg);
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(l3.spawns.load(Ordering::SeqCst), 0);
+        // A retire ends the first; it answers with an error.
+        sp2.retire(&l, id).await.unwrap();
+        assert!(first.await.unwrap().is_err());
+    }
 }
 
 fn socket_awaiting(id: String, now: Instant) -> Delivery {
