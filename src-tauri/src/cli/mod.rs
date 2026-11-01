@@ -88,10 +88,11 @@ pub const CLI_COMMANDS: &[&str] = &[
     "help",
 ];
 
-/// Engine command names in builds without the engine, and `task`, which
-/// moved to `c9watch-agent` (C1a-21). They stay out of `CLI_COMMANDS`, but
-/// `is_cli_invocation` still routes them to Clap, so the user gets an
-/// unknown-command error instead of the GUI.
+/// Engine command names in builds without the engine, `task`, which moved
+/// to `c9watch-agent` (C1a-21), and the removed PM orchestration commands.
+/// They stay out of `CLI_COMMANDS`, but `is_cli_invocation` still routes
+/// them to Clap, so the user gets an unknown-command error instead of the
+/// GUI.
 pub const RESERVED_ENGINE_COMMANDS: &[&str] = &[
     "task",
     "engine",
@@ -99,6 +100,10 @@ pub const RESERVED_ENGINE_COMMANDS: &[&str] = &[
     "integration",
     "auth",
     "annotate",
+    "workers",
+    "inbox",
+    "adopt",
+    "daemon",
 ];
 
 /// Whether `first` (the first argument) selects the CLI.
@@ -1293,6 +1298,14 @@ mod dispatch_tests {
         assert!(is_cli_invocation("--version"));
         assert!(!is_cli_invocation("--some-tauri-flag"));
         assert!(!is_cli_invocation(""));
+    }
+
+    #[test]
+    fn removed_pm_commands_get_a_cli_error_not_the_gui() {
+        for name in ["workers", "inbox", "adopt", "daemon"] {
+            assert!(is_cli_invocation(name), "{}", name);
+            assert!(Cli::try_parse_from(["c9watch", name]).is_err(), "{}", name);
+        }
     }
 
     #[test]
