@@ -1586,11 +1586,11 @@ impl Spawner {
             mail::note(tx, &machine, &id, &detail, now_ms())
         });
     }
+    /// The agent needs attention (`<reason>: <id>`): `agent.attention`,
+    /// and the merge flag once that commits.
     fn mail_attention(&self, s: &Start, id: &str, reason: &str) {
-        self.merge.peek(&s.id, s.gen, |m| {
-            m.attention(&format!("{}: {}", reason, id), now_ms())
-        });
-        let (machine, agent, gen, id, reason) = (
+        let (merge, machine, agent, gen, id, reason) = (
+            self.merge.clone(),
             self.db.machine_id().to_string(),
             s.id.clone(),
             s.gen,
@@ -1598,6 +1598,12 @@ impl Spawner {
             reason.to_string(),
         );
         self.mail_write(s, move |tx| {
+            let (flag, now) = (format!("{}: {}", reason, id), now_ms());
+            if let Some(((), staged)) =
+                merge.stage_existing(&agent, gen, move |m| m.attention(&flag, now))
+            {
+                merge.publish_on_commit(tx, staged);
+            }
             tx.emit(&NewEvent {
                 topic: "agent.attention".into(),
                 subject: Some(format!("{}/{}", machine, agent)),
@@ -1750,13 +1756,11 @@ impl Spawner {
     }
 
     /// `msg_id` may have reached the agent: `uncertain`, and the agent
-    /// needs attention (`mail_uncertain: <id>`), raised in the merge and
-    /// emitted as `agent.attention`.
+    /// needs attention (`mail_uncertain: <id>`), emitted as
+    /// `agent.attention` and raised in the merge once that commits.
     fn mail_uncertain(&self, s: &Start, msg_id: &str, why: &str) {
-        let now = now_ms();
-        let reason = format!("mail_uncertain: {}", msg_id);
-        self.merge.peek(&s.id, s.gen, |m| m.attention(&reason, now));
-        let (machine, agent, gen, id, why) = (
+        let (merge, machine, agent, gen, id, why) = (
+            self.merge.clone(),
             self.db.machine_id().to_string(),
             s.id.clone(),
             s.gen,
@@ -1764,7 +1768,15 @@ impl Spawner {
             why.to_string(),
         );
         self.mail_write(s, move |tx| {
+            let now = now_ms();
+            let reason = format!("mail_uncertain: {}", id);
             if mail::mark(tx, &machine, &id, MsgState::Uncertain, Some(&why), now)? {
+                let flag = reason.clone();
+                if let Some(((), staged)) =
+                    merge.stage_existing(&agent, gen, move |m| m.attention(&flag, now))
+                {
+                    merge.publish_on_commit(tx, staged);
+                }
                 tx.emit(&NewEvent {
                     topic: "agent.attention".into(),
                     subject: Some(format!("{}/{}", machine, agent)),
@@ -6659,6 +6671,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(upsert_reasons(&e.db, &r.id).len(), before + 1);
+    }
+    /// The supervisor start of a live agent, for the mail steps.
+    fn start_of(e: &Env, r: &AgentRow) -> Start {
+        Start {
+            id: r.id.clone(),
+            gen: r.generation,
+            sid: String::new(),
+            op_id: String::new(),
+            cwd: e.cwd.clone(),
+            claude: PathBuf::new(),
+            kind: Kind::Create,
+            from: None,
+        }
+    }
+
+    fn attention_of(e: &Env, r: &AgentRow) -> Option<String> {
+        e.sp.merge
+            .peek(&r.id, r.generation, |m| {
+                m.attention_flag().map(|a| a.reason.clone())
+            })
+            .flatten()
+    }
+
+    /// #207: the mail steps raise the merge flag through the transaction
+    /// that emits `agent.attention` (staged, published on commit), so the
+    /// merge never shows an attention the store does not. A message that
+    /// cannot be marked `uncertain` raises nothing.
+    #[tokio::test]
+    async fn mail_attention_reaches_the_merge_with_its_commit() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let r = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let s = start_of(&e, &r);
+        // A step only flags an agent the merge has (`stage_existing`).
+        e.sp.merge.with(&r.id, r.generation, |_| ());
+        assert_eq!(attention_of(&e, &r), None);
+        e.sp.mail_uncertain(&s, "msg_unknown", "test");
+        assert_eq!(attention_of(&e, &r), None);
+        let id = queue(&e.db, &r.id, "x");
+        let id2 = id.clone();
+        e.db.write_blocking(move |tx| {
+            tx.execute(
+                "UPDATE messages SET state = 'delivering' WHERE id = ?1",
+                [&id2],
+            )
+        })
+        .unwrap();
+        e.sp.mail_uncertain(&s, &id, "test");
+        assert_eq!(
+            attention_of(&e, &r),
+            Some(format!("mail_uncertain: {}", id))
+        );
+        e.sp.mail_attention(&s, "msg_x", "mail_late");
+        assert_eq!(attention_of(&e, &r).as_deref(), Some("mail_late: msg_x"));
     }
 }
 
