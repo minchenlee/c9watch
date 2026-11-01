@@ -160,6 +160,25 @@ impl Bridge {
         params: Value,
         app: Option<&AppHandle>,
     ) -> Result<Value, BridgeError> {
+        let session = (method == "conversation.get").then(|| {
+            let key = params["sessionKey"].as_str().unwrap_or("");
+            let id = key.split_once(':').map_or(key, |(_, id)| id).to_string();
+            (id, params["provider"].clone())
+        });
+        self.call_with_progress(method, params, &mut |frame| {
+            if let (Some(app), Some((id, provider))) = (app, session.as_ref()) {
+                let _ = app.emit("conversation-progress", json!({ "sessionId": id, "provider": provider, "bytesRead": frame["bytesRead"], "bytesTotal": frame["bytesTotal"] }));
+            }
+        })
+    }
+    /// Progress frames belong to this request only. They go to `progress`,
+    /// never to the webview event streams, which did not ask for them.
+    fn call_with_progress(
+        &self,
+        method: &str,
+        params: Value,
+        progress: &mut dyn FnMut(Value),
+    ) -> Result<Value, BridgeError> {
         if !self.active() {
             return Err(BridgeError::new(
                 "core_unavailable",
@@ -180,16 +199,10 @@ impl Bridge {
             conn.set_read_timeout(Duration::from_secs(120));
             *cached = Some(conn);
         }
-        let result = cached.as_mut().unwrap().call_raw_progress(method, params.clone(), None, &mut |frame| {
-            for stream in self.streams.lock().unwrap().values() { let _ = stream.channel.send(frame.clone()); }
-            if let Some(app) = app {
-                if method == "conversation.get" {
-                    let key = params["sessionKey"].as_str().unwrap_or("");
-                    let id = key.split_once(':').map_or(key, |(_, id)| id);
-                    let _ = app.emit("conversation-progress", json!({ "sessionId": id, "provider": params["provider"], "bytesRead": frame["bytesRead"], "bytesTotal": frame["bytesTotal"] }));
-                }
-            }
-        });
+        let result = cached
+            .as_mut()
+            .unwrap()
+            .call_raw_progress(method, params, None, progress);
         match result {
             Ok(mut response) if response["ok"] == true => Ok(response["result"].take()),
             Ok(mut response) => Err(BridgeError(response["error"].take())),
@@ -413,9 +426,15 @@ fn run_stream_worker(bridge: Arc<Bridge>, stopped: impl Fn() -> bool) {
                     }
                 }
             }
-            for _ in 0..128 {
-                match socket.lines.try_recv() {
-                    Ok(line) => {
+            let batch = if disconnected {
+                Ok(Vec::new())
+            } else {
+                recv_batch(&socket.lines, STREAM_POLL, STREAM_BATCH)
+            };
+            match batch {
+                Err(()) => disconnected = true,
+                Ok(batch) => {
+                    for line in batch {
                         let Ok(frame) = serde_json::from_str::<Value>(&line) else {
                             disconnected = true;
                             break;
@@ -450,20 +469,39 @@ fn run_stream_worker(bridge: Arc<Bridge>, stopped: impl Fn() -> bool) {
                             }
                         }
                     }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(_) => {
-                        disconnected = true;
-                        break;
-                    }
                 }
             }
         }
         if disconnected {
             frames = None;
             active.clear();
+            // Back off before reconnecting so a broken core is not a busy loop.
+            std::thread::sleep(STREAM_POLL);
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
+}
+/// The longest the multiplexer waits for a frame before it re-reads the
+/// subscription set; a new or removed subscription is seen within this time.
+const STREAM_POLL: Duration = Duration::from_millis(50);
+/// The most frames handled before the subscription set is read again.
+const STREAM_BATCH: usize = 128;
+/// Block until the first frame arrives (or `wait` ends), then take the frames
+/// already queued, up to `cap`. `Err` means the reader thread ended.
+fn recv_batch(
+    lines: &std::sync::mpsc::Receiver<String>,
+    wait: Duration,
+    cap: usize,
+) -> Result<Vec<String>, ()> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let first = match lines.recv_timeout(wait) {
+        Ok(line) => line,
+        Err(RecvTimeoutError::Timeout) => return Ok(Vec::new()),
+        Err(RecvTimeoutError::Disconnected) => return Err(()),
+    };
+    let mut batch = vec![first];
+    // A disconnect after queued frames is reported by the next call.
+    batch.extend(lines.try_iter().take(cap.saturating_sub(1)));
+    Ok(batch)
 }
 
 #[tauri::command]
@@ -900,6 +938,124 @@ mod tests {
         assert_eq!(error.0["extension"]["needs"], "scope");
         release.wait();
         assert!(slow.join().unwrap().is_ok());
+        drop(bridge);
+        server.join().unwrap();
+    }
+    #[test]
+    fn recv_batch_wakes_on_the_first_frame_and_caps_the_batch() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(256);
+        let sender = std::thread::spawn({
+            let tx = tx.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(20));
+                tx.send("first".into()).unwrap();
+            }
+        });
+        let started = Instant::now();
+        let batch = recv_batch(&rx, Duration::from_secs(5), 128).unwrap();
+        assert_eq!(batch, vec!["first".to_string()]);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "woke on the frame, not on the timeout: {:?}",
+            started.elapsed()
+        );
+        sender.join().unwrap();
+
+        for i in 0..200 {
+            tx.send(i.to_string()).unwrap();
+        }
+        assert_eq!(
+            recv_batch(&rx, Duration::from_secs(5), 128).unwrap().len(),
+            128
+        );
+        assert_eq!(
+            recv_batch(&rx, Duration::from_secs(5), 128).unwrap().len(),
+            72
+        );
+        let started = Instant::now();
+        assert!(recv_batch(&rx, Duration::from_millis(30), 128)
+            .unwrap()
+            .is_empty());
+        assert!(started.elapsed() >= Duration::from_millis(25));
+
+        tx.send("last".into()).unwrap();
+        drop(tx);
+        assert_eq!(
+            recv_batch(&rx, Duration::from_secs(5), 128).unwrap(),
+            vec!["last".to_string()]
+        );
+        assert!(recv_batch(&rx, Duration::from_secs(5), 128).is_err());
+    }
+    #[test]
+    fn progress_frames_go_to_the_caller_only_not_to_open_streams() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let temp = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(sock_path(temp.path())).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            while {
+                line.clear();
+                reader.read_line(&mut line).unwrap_or(0) > 0
+            } {
+                let req: Value = serde_json::from_str(&line).unwrap();
+                if req["method"] == "hello" {
+                    writeln!(socket, "{}", json!({"v":1,"id":req["id"],"ok":true,"result":{
+                        "apiMajor":1,"apiMinor":6,"engineVersion":"0.11.1","machineId":"test","principal":"local-unverified","capabilities":[],"cursor":null,
+                        "methods":GUI_METHODS.iter().map(|m| (m.to_string(), json!({"since":1,"rev":1,"stability":"preview"}))).collect::<serde_json::Map<String,Value>>()
+                    }})).unwrap();
+                } else {
+                    for read in [10, 20] {
+                        writeln!(socket, "{}", json!({"v":1,"type":"progress","id":req["id"],"bytesRead":read,"bytesTotal":20})).unwrap();
+                    }
+                    writeln!(
+                        socket,
+                        "{}",
+                        json!({"v":1,"id":req["id"],"ok":true,"result":{"messages":[]}})
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let bridge = Arc::new(Bridge::at_home(temp.path().into()));
+        bridge.healthy();
+        bridge.active.store(true, Ordering::Release);
+        let stream_frames = Arc::new(Mutex::new(Vec::<String>::new()));
+        let received = stream_frames.clone();
+        let channel = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(body) = body {
+                received.lock().unwrap().push(body);
+            }
+            Ok(())
+        });
+        bridge.streams.lock().unwrap().insert(
+            "popover-sessions".into(),
+            Stream {
+                owner: "popover".into(),
+                channel,
+                params: SubscribeParams {
+                    topics: vec!["session.*".into()],
+                    ..Default::default()
+                },
+                ready: None,
+            },
+        );
+        let mut progress = Vec::new();
+        let result = bridge
+            .call_with_progress(
+                "conversation.get",
+                json!({"sessionKey":"claudeCode:a"}),
+                &mut |frame| progress.push(frame["bytesRead"].as_i64().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(result, json!({"messages":[]}));
+        assert_eq!(progress, vec![10, 20]);
+        assert!(
+            stream_frames.lock().unwrap().is_empty(),
+            "a stream that did not make the request gets no progress frames"
+        );
         drop(bridge);
         server.join().unwrap();
     }
