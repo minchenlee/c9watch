@@ -20,45 +20,46 @@
 //!
 //! **Deviation from the design (A:1037, A:1065):** the design keeps screen
 //! rules in a data file per agent, read by a shared screen-rule engine. C1a
-//! has one agent, Claude Code, so its rules are hard-coded here. The data
-//! file comes with the second agent kind (C2).
+//! has one agent, Claude Code, so its rules are code here. Their glyphs,
+//! texts, keys and delays come from the CC quirks profile (D7,
+//! `adapter/cc/quirks.rs`); the data file comes with the second agent kind
+//! (C2).
 //!
 //! Everything here is pure: the caller passes the screen and the clock.
 
+use super::adapter::cc::quirks::{ScreenQuirks, CURRENT};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+const Q: &ScreenQuirks = &CURRENT.screen;
+
 /// U+2733, bytes e2 9c b3: CC's idle window-title glyph (D24.4).
-pub const IDLE_GLYPH: char = '\u{2733}';
+pub const IDLE_GLYPH: char = Q.idle_glyph;
 
 /// The selection cursor of CC's menus.
-const SELECT_GLYPH: char = '\u{276f}';
+const SELECT_GLYPH: char = Q.select_glyph;
 
 /// Screen text that means a dialog is open. Mail and briefs are never pasted
 /// while any of these shows (D24.4, D24.5).
-pub const DIALOG_MARKERS: &[&str] = &[
-    "Do you want to proceed?",
-    "Esc to cancel",
-    "trust this folder",
-];
+pub const DIALOG_MARKERS: &[&str] = Q.dialog_markers;
 
 /// Quiet time on the PTY before `ready` (D24.4).
-pub const QUIET: Duration = Duration::from_millis(300);
+pub const QUIET: Duration = CURRENT.timing.quiet;
 
 /// A spawn or resume that is not `ready` by then has failed (D24.4: the
 /// worst seen was 10.9 s). The spike had only a 240 s run timeout.
-pub const READY_TIMEOUT: Duration = Duration::from_secs(30);
+pub const READY_TIMEOUT: Duration = CURRENT.timing.ready_timeout;
 
 /// Quiet time after Down before the engine checks the trust highlight.
-const TRUST_SETTLE: Duration = Duration::from_millis(150);
+const TRUST_SETTLE: Duration = CURRENT.timing.trust_settle;
 
 /// How long the highlight may take to move to "Yes" after Down.
-pub const TRUST_SELECT_TIMEOUT: Duration = Duration::from_secs(3);
+pub const TRUST_SELECT_TIMEOUT: Duration = CURRENT.timing.trust_select_timeout;
 
 /// Cursor Down, as the keyboard sends it.
-pub const KEY_DOWN: &[u8] = b"\x1b[B";
+pub const KEY_DOWN: &[u8] = CURRENT.keys.down;
 
-pub const KEY_CR: &[u8] = b"\r";
+pub const KEY_CR: &[u8] = CURRENT.keys.cr;
 
 pub fn title_is_idle(title: &str) -> bool {
     title.starts_with(IDLE_GLYPH)
@@ -66,7 +67,7 @@ pub fn title_is_idle(title: &str) -> bool {
 
 /// D24.3: the workspace trust dialog.
 pub fn trust_dialog(screen: &str) -> bool {
-    screen.contains("trust this folder") || screen.contains("Accessing workspace:")
+    Q.trust_markers.iter().any(|m| screen.contains(m))
 }
 
 /// The highlighted trust option is "Yes, I trust this folder". The engine
@@ -74,12 +75,12 @@ pub fn trust_dialog(screen: &str) -> bool {
 pub fn trust_yes_selected(screen: &str) -> bool {
     screen
         .lines()
-        .any(|l| l.contains(SELECT_GLYPH) && l.contains("trust this folder") && l.contains("Yes"))
+        .any(|l| l.contains(SELECT_GLYPH) && l.contains(Q.trust_option) && l.contains(Q.trust_yes))
 }
 
 /// D24.5: a permission prompt is open.
 pub fn permission_prompt(screen: &str) -> bool {
-    screen.contains("Do you want to proceed?")
+    screen.contains(Q.permission_marker)
 }
 
 pub fn dialog_open(screen: &str) -> bool {
@@ -162,7 +163,7 @@ pub fn auto_deny_notice(screen: &str) -> Option<String> {
     screen
         .lines()
         .map(str::trim)
-        .find(|l| l.contains(" denied by auto mode"))
+        .find(|l| l.contains(Q.auto_deny_marker))
         .map(String::from)
 }
 
@@ -173,20 +174,10 @@ pub fn auto_deny_notice(screen: &str) -> Option<String> {
 /// such as "Approaching usage limit" leaves a usable session, and a match
 /// on it would kill an agent that could start (reviews), so a bare "usage
 /// limit" is not here and a line with `NOT_REFUSALS` never matches.
-pub const VENDOR_REFUSALS: &[&str] = &[
-    "usage limit reached",
-    "hit your limit",
-    "limit reached",
-    "credit balance is too low",
-    "please run /login",
-    "not logged in",
-    "invalid api key",
-    "oauth token has expired",
-    "select login method",
-];
+pub const VENDOR_REFUSALS: &[&str] = Q.vendor_refusals;
 
 /// Lower-case words of a line that warns but does not refuse.
-pub const NOT_REFUSALS: &[&str] = &["approaching"];
+pub const NOT_REFUSALS: &[&str] = Q.not_refusals;
 
 /// The lines of `screen` that show a vendor refusal, joined, or `None`.
 /// Only for the screen before the first ready: after it, the agent's own
@@ -225,17 +216,18 @@ pub fn answer_trust(screen: &str, after_first_ready: bool) -> bool {
 /// Bracketed-paste payload (D24.8). The body loses any `ESC[201~`, which
 /// would end the paste early. The CR is sent separately by the caller.
 pub fn paste_payload(body: &str) -> Vec<u8> {
-    let clean = body.replace("\x1b[201~", "");
-    let mut v = b"\x1b[200~".to_vec();
+    let end = CURRENT.keys.paste_end;
+    let clean = body.replace(end, "");
+    let mut v = CURRENT.keys.paste_start.to_vec();
     v.extend_from_slice(clean.as_bytes());
-    v.extend_from_slice(b"\x1b[201~");
+    v.extend_from_slice(end.as_bytes());
     v
 }
 
 /// A line drawn of `─` only: CC's full-width rule above a prompt.
 fn is_rule(line: &str) -> bool {
     let t = line.trim();
-    t.chars().count() >= 10 && t.chars().all(|c| c == '\u{2500}')
+    t.chars().count() >= Q.rule_min_len && t.chars().all(|c| c == Q.rule_glyph)
 }
 
 /// What CC's input box holds: the lines between the last two full-width
@@ -281,7 +273,10 @@ pub fn input_box(screen: &str) -> InputBox {
     let text = text.trim_matches(|c: char| c.is_whitespace());
     if text.is_empty() {
         InputBox::Empty
-    } else if !text.contains('\n') && text.starts_with("Try \"") && text.ends_with('"') {
+    } else if !text.contains('\n')
+        && text.starts_with(Q.placeholder_open)
+        && text.ends_with(Q.placeholder_close)
+    {
         InputBox::Placeholder
     } else {
         InputBox::Text(text.to_string())
@@ -299,7 +294,7 @@ pub fn box_is_free(b: &InputBox) -> bool {
 pub fn box_has_paste(b: &InputBox, msg_id: &str) -> bool {
     match b {
         InputBox::Text(t) => {
-            t.contains(&format!("[c9watch mail {}", msg_id)) || t.contains("[Pasted text #")
+            t.contains(&format!("[c9watch mail {}", msg_id)) || t.contains(Q.pasted_marker)
         }
         _ => false,
     }

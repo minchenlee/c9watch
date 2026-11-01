@@ -1,30 +1,34 @@
 //! CC's internal peer inbox protocol. Opt in with C9_MAIL_SOCKET=on.
 //! Unknown/transient failures never promote peer mail to user (PTY) authority.
+//! Paths, protocol version, tag and delays: the CC quirks profile (D7).
+//!
+//! D12: a send is a task on one shared runtime (`io_runtime`), not a new
+//! thread and runtime per message.
+use super::adapter::cc::quirks::{InboxQuirks, CURRENT};
 use super::peer;
 use serde_json::{json, Value};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const Q: &InboxQuirks = &CURRENT.inbox;
+
+pub const WRITE_TIMEOUT: Duration = CURRENT.timing.socket_write_timeout;
 pub fn enabled() -> bool {
     std::env::var("C9_MAIL_SOCKET").as_deref() == Ok("on")
 }
 pub fn sessions_dir() -> PathBuf {
     std::env::var_os("C9_CC_SESSIONS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".claude/sessions")
-        })
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(Q.sessions_dir))
 }
 pub fn default_socket_dir() -> PathBuf {
     std::env::var_os("C9_CC_SOCK_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/cc-socks"))
+        .unwrap_or_else(|| PathBuf::from(Q.socket_dir))
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
@@ -43,9 +47,8 @@ pub enum Gate {
 
 pub fn check_namespace(dir: &Path) -> Result<(), String> {
     let uid = peer::engine_uid();
-    let allowed = dir == Path::new("/tmp/cc-socks")
-        || dir == Path::new("/private/tmp/cc-socks")
-        || dir == Path::new(&format!("/tmp/cc-socks-{}", uid))
+    let allowed = Q.socket_namespaces.iter().any(|n| dir == Path::new(n))
+        || dir == Path::new(&format!("{}{}", Q.socket_uid_prefix, uid))
         || std::env::var_os("C9_CC_SOCK_DIR").is_some_and(|d| Path::new(&d) == dir);
     if !allowed {
         return Err("outside CC socket namespace".into());
@@ -107,7 +110,7 @@ pub fn gate(
         return Gate::Unknown("pid.json session mismatch".into());
     }
     let path = v["messagingSocketPath"].as_str().unwrap_or("");
-    if v["peerProtocol"].as_u64() != Some(1) || path.is_empty() {
+    if v["peerProtocol"].as_u64() != Some(Q.peer_protocol) || path.is_empty() {
         return if socket_seen {
             Gate::Unknown("protocol disappeared within generation".into())
         } else {
@@ -163,12 +166,12 @@ pub fn name(s: &str) -> String {
 pub fn escape(body: &str) -> String {
     let mut out = String::new();
     for (i, c) in body.char_indices() {
-        if "<＜﹤‹⟨〈".contains(c) {
+        if Q.lt_lookalikes.contains(c) {
             let tail = &body[i + c.len_utf8()..];
             let tail = tail.strip_prefix('/').unwrap_or(tail);
             if tail
-                .get(..21)
-                .is_some_and(|s| s.eq_ignore_ascii_case("cross-session-message"))
+                .get(..Q.wrapper_tag.len())
+                .is_some_and(|s| s.eq_ignore_ascii_case(Q.wrapper_tag))
             {
                 out.push(c);
                 out.push('\\');
@@ -198,11 +201,20 @@ pub fn wrapper(
             addr, id
         ));
     }
-    format!("<cross-session-message from=\"{}\" from-name=\"{}\" from-mode=\"{}\">\n{}\n</cross-session-message>", from, name(sender_name), mode, body)
+    let tag = Q.wrapper_tag;
+    format!(
+        "<{} from=\"{}\" from-name=\"{}\" from-mode=\"{}\">\n{}\n</{}>",
+        tag,
+        from,
+        name(sender_name),
+        mode,
+        body,
+        tag
+    )
 }
 pub fn frame(endpoint: &Endpoint, wire_id: &str, from: &str, content: &str) -> (String, String) {
     let uuid = uuid::Uuid::new_v4().to_string();
-    let v = json!({"type":"user", "session_id":endpoint.session_id, "msg_id":wire_id, "uuid":uuid, "priority":"next", "from":from, "message":{"role":"user", "content":content}});
+    let v = json!({"type":"user", "session_id":endpoint.session_id, "msg_id":wire_id, "uuid":uuid, "priority":Q.frame_priority, "from":from, "message":{"role":"user", "content":content}});
     (format!("{}\n", v), uuid)
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,41 +224,43 @@ pub enum SocketOutcome {
     MaybeSent(String),
     Blocked,
 }
-/// Runs on a short-lived helper thread. The async connect also bounds the
-/// connect phase; all remaining operations share the same five-second budget.
-pub fn write(endpoint: &Endpoint, line: &str) -> SocketOutcome {
-    write_guarded(endpoint, line, || false)
+/// The runtime every socket send runs on (D12): one for the process,
+/// built on first use, with one worker. A send is a few syscalls and
+/// timers, so one worker carries them all.
+pub fn io_runtime() -> Result<tokio::runtime::Handle, String> {
+    static RT: std::sync::LazyLock<Result<tokio::runtime::Runtime, String>> =
+        std::sync::LazyLock::new(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("c9-mail-io")
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+        });
+    RT.as_ref()
+        .map(|r| r.handle().clone())
+        .map_err(Clone::clone)
 }
-pub fn write_guarded(endpoint: &Endpoint, line: &str, blocked: impl Fn() -> bool) -> SocketOutcome {
+
+/// Connect, check the peer, write `line`, linger, close the write half and
+/// wait for CC to close. Connect and all later steps share one
+/// `WRITE_TIMEOUT` budget. `blocked` (the drain) is checked before the
+/// connect and again before the first byte.
+pub async fn send(endpoint: &Endpoint, line: &str, blocked: impl Fn() -> bool) -> SocketOutcome {
     if blocked() {
         return SocketOutcome::Blocked;
     }
     let deadline = Instant::now() + WRITE_TIMEOUT;
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(r) => r,
+    let connect = tokio::time::timeout(
+        WRITE_TIMEOUT,
+        tokio::net::UnixStream::connect(&endpoint.path),
+    )
+    .await;
+    let mut stream = match connect {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return SocketOutcome::NotSent(e.to_string()),
         Err(e) => return SocketOutcome::NotSent(e.to_string()),
     };
-    let stream = runtime.block_on(async {
-        tokio::time::timeout(
-            WRITE_TIMEOUT,
-            tokio::net::UnixStream::connect(&endpoint.path),
-        )
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?
-        .into_std()
-        .map_err(|e| e.to_string())
-    });
-    let mut stream = match stream {
-        Ok(s) => s,
-        Err(e) => return SocketOutcome::NotSent(e),
-    };
-    if let Err(e) = stream.set_nonblocking(false) {
-        return SocketOutcome::NotSent(e.to_string());
-    }
     let cred = peer::peer_cred(stream.as_raw_fd());
     if !cred.is_ok_and(|c| c.uid == peer::engine_uid() && c.pid == endpoint.pid)
         || peer::proc_info(endpoint.pid).is_none_or(|p| p.start != endpoint.start)
@@ -256,54 +270,51 @@ pub fn write_guarded(endpoint: &Endpoint, line: &str, blocked: impl Fn() -> bool
     if blocked() {
         return SocketOutcome::Blocked;
     }
+    let bytes = line.as_bytes();
     let mut sent = 0;
-    while sent < line.len() {
+    while sent < bytes.len() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return SocketOutcome::MaybeSent("close_timeout".into());
         }
-        let _ = stream.set_write_timeout(Some(remaining));
-        match stream.write(&line.as_bytes()[sent..]) {
-            Ok(0) => return SocketOutcome::MaybeSent("partial write".into()),
-            Ok(n) => sent += n,
-            Err(e) => {
-                return if sent == 0 {
-                    SocketOutcome::NotSent(e.to_string())
-                } else {
-                    SocketOutcome::MaybeSent(e.to_string())
-                }
+        let e = match tokio::time::timeout(remaining, stream.write(&bytes[sent..])).await {
+            Ok(Ok(0)) => return SocketOutcome::MaybeSent("partial write".into()),
+            Ok(Ok(n)) => {
+                sent += n;
+                continue;
             }
-        }
+            Ok(Err(e)) => e.to_string(),
+            Err(e) => e.to_string(),
+        };
+        return if sent == 0 {
+            SocketOutcome::NotSent(e)
+        } else {
+            SocketOutcome::MaybeSent(e)
+        };
     }
-    std::thread::sleep(Duration::from_millis(150));
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    wait_for_close(deadline, |remaining, b| {
-        let _ = stream.set_read_timeout(Some(remaining));
-        stream.read(b)
-    })
+    tokio::time::sleep(CURRENT.timing.socket_linger).await;
+    let _ = stream.shutdown().await;
+    wait_for_close(deadline, &mut stream).await
 }
 
-fn wait_for_close(
-    deadline: Instant,
-    mut read: impl FnMut(Duration, &mut [u8]) -> std::io::Result<usize>,
-) -> SocketOutcome {
+async fn wait_for_close(deadline: Instant, stream: &mut (impl AsyncRead + Unpin)) -> SocketOutcome {
     let mut b = [0u8; 1024];
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
-        let result = read(remaining, &mut b);
-        // A socket timeout is relative to the read, and the thread can be
-        // descheduled before or during it. EOF observed after our absolute
-        // deadline is still uncertain delivery, even if read returned Ok(0).
+        let result = tokio::time::timeout(remaining, stream.read(&mut b)).await;
+        // The task can be descheduled before or during the read. EOF
+        // observed after our absolute deadline is still uncertain
+        // delivery, even if read returned Ok(0).
         if Instant::now() >= deadline {
             break;
         }
         match result {
-            Ok(0) => return SocketOutcome::Sent,
-            Ok(_) => {}
-            Err(_) => break,
+            Ok(Ok(0)) => return SocketOutcome::Sent,
+            Ok(Ok(_)) => {}
+            _ => break,
         }
     }
     SocketOutcome::MaybeSent("close_timeout".into())
@@ -313,6 +324,14 @@ fn wait_for_close(
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+    fn write(endpoint: &Endpoint, line: &str) -> SocketOutcome {
+        write_guarded(endpoint, line, || false)
+    }
+    fn write_guarded(endpoint: &Endpoint, line: &str, blocked: impl Fn() -> bool) -> SocketOutcome {
+        io_runtime()
+            .unwrap()
+            .block_on(send(endpoint, line, blocked))
+    }
     fn endpoint(path: PathBuf) -> Endpoint {
         let pid = std::process::id() as i32;
         Endpoint {
@@ -485,18 +504,36 @@ mod tests {
     }
     #[test]
     fn eof_observed_after_the_deadline_is_possible_delivery() {
-        let (mut writer, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        /// Models the task being descheduled inside the read: the read
+        /// returns EOF at once, but only after the absolute deadline.
+        struct LateEof(Instant);
+        impl AsyncRead for LateEof {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                std::thread::sleep(self.0.saturating_duration_since(Instant::now()));
+                Poll::Ready(Ok(()))
+            }
+        }
         let deadline = Instant::now() + Duration::from_millis(50);
-        let outcome = wait_for_close(deadline, |remaining, b| {
-            writer.set_read_timeout(Some(remaining)).unwrap();
-            // Model the writer being descheduled between setting the socket's
-            // relative timeout and entering read. The peer closes only after
-            // the absolute deadline, so the next read returns EOF immediately.
-            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-            peer.shutdown(std::net::Shutdown::Write).unwrap();
-            writer.read(b)
-        });
+        let outcome = io_runtime()
+            .unwrap()
+            .block_on(wait_for_close(deadline, &mut LateEof(deadline)));
         assert_eq!(outcome, SocketOutcome::MaybeSent("close_timeout".into()));
+    }
+    #[test]
+    fn every_send_runs_on_the_one_shared_runtime() {
+        // D12: no thread and runtime per message.
+        let name = io_runtime().unwrap().block_on(async {
+            tokio::spawn(async { std::thread::current().name().map(String::from) })
+                .await
+                .unwrap()
+        });
+        assert_eq!(name.as_deref(), Some("c9-mail-io"));
     }
     #[test]
     fn unsafe_socket_nodes_and_directories_are_unreachable() {

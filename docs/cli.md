@@ -345,3 +345,10 @@ path; human mail always uses paste. Temporary socket failures never fall
 back to paste. A successful write is not delivery; `uncertain` mail is
 never resent automatically. Reply through the CLI, not SendMessage. Do
 not reply to system mail. See [mail semantics](engine-mail.md).
+
+Before it starts or resumes an agent, the engine reads `claude --version`.
+Its screen profile is recorded on Claude Code 2.1.312 up to (not including)
+2.2.0. Another version, or a version it cannot read, still starts: the
+engine uses the newest profile and writes a warning with the version and
+the supported range to its log and to the audit (method `cc.version`,
+decision `untested`). Only a missing `claude` fails the create or resume.
