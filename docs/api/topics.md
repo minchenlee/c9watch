@@ -11,6 +11,7 @@ This table covers every public topic in c9p 1.6. Type names refer to `$defs` in 
 | `session.view` | machine/session key | `SessionView`: newest session state | `session:read` |
 | `session.gone` | machine/session key | `SessionGoneEvent`: removed session id and key | `session:read` |
 | `diag.detection` | machine | `DetectionDiagnostics`: source diagnostics | `session:read` |
+| `detect.health` (1.11) | machine | `DetectorHealth`: detection is ok, degraded, failed or stale; see [c9p-1.md](c9p-1.md#detector-health-111) | `session:read` |
 | `notification.needs_attention` | machine/agent id | `NotificationEvent`: attention transition | `session:read` |
 | `notification.waiting_for_input` | machine/agent id | `NotificationEvent`: input transition | `session:read` |
 | `agent.upsert` | machine/agent id | `AgentRow`: newest engine agent state | `agent:read` |

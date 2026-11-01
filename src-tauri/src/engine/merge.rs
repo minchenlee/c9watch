@@ -24,9 +24,15 @@
 //! after a turn end.
 //!
 //! Pure apart from the `MergeTable` lock: the caller passes the clock.
+//!
+//! Commit first (D5): a caller that writes the merge's result to the db
+//! changes a copy (`MergeTable::stage`, `stage_existing`) and publishes it
+//! only once its transaction commits (`MergeTable::publish_on_commit`). A
+//! write that fails leaves the table as it was, so a retried event finds
+//! the same merge and writes the same turn end.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// How long a stronger claim holds against weaker claims made after it.
 pub const SETTLE_MS: i64 = 2_000;
@@ -283,11 +289,25 @@ impl AgentMerge {
     }
 }
 
+type Agents = Arc<Mutex<HashMap<String, (i64, AgentMerge)>>>;
+
 /// The merge state of every live agent, keyed by agent id. A new
 /// generation starts with a clean merge.
 #[derive(Debug, Default)]
 pub struct MergeTable {
-    agents: Mutex<HashMap<String, (i64, AgentMerge)>>,
+    agents: Agents,
+}
+
+/// A merge changed on a copy, not yet in the table (see the module doc).
+#[derive(Debug, Clone)]
+#[must_use = "a staged merge changes nothing until it is published"]
+pub struct Staged {
+    agent_id: String,
+    gen: i64,
+    merge: AgentMerge,
+    /// From `stage_existing`: publish only while the agent is still at
+    /// `gen`, never create it.
+    existing: bool,
 }
 
 impl MergeTable {
@@ -327,6 +347,82 @@ impl MergeTable {
     pub fn remove(&self, agent_id: &str) {
         let mut map = self.agents.lock().unwrap_or_else(|e| e.into_inner());
         map.remove(agent_id);
+    }
+
+    /// `with` on a copy: run `f` on the merge of `agent_id`'s generation
+    /// `gen` (a clean one for a new generation) and return the result with
+    /// the changed copy. The table does not change.
+    pub fn stage<R>(
+        &self,
+        agent_id: &str,
+        gen: i64,
+        f: impl FnOnce(&mut AgentMerge) -> R,
+    ) -> (R, Staged) {
+        let mut merge = {
+            let map = self.agents.lock().unwrap_or_else(|e| e.into_inner());
+            match map.get(agent_id) {
+                Some((g, m)) if *g == gen => m.clone(),
+                _ => AgentMerge::new(),
+            }
+        };
+        let r = f(&mut merge);
+        let staged = Staged {
+            agent_id: agent_id.to_string(),
+            gen,
+            merge,
+            existing: false,
+        };
+        (r, staged)
+    }
+
+    /// `peek` on a copy: `None` unless `agent_id` is at generation `gen`.
+    pub fn stage_existing<R>(
+        &self,
+        agent_id: &str,
+        gen: i64,
+        f: impl FnOnce(&mut AgentMerge) -> R,
+    ) -> Option<(R, Staged)> {
+        let mut merge = {
+            let map = self.agents.lock().unwrap_or_else(|e| e.into_inner());
+            match map.get(agent_id) {
+                Some((g, m)) if *g == gen => m.clone(),
+                _ => return None,
+            }
+        };
+        let r = f(&mut merge);
+        let staged = Staged {
+            agent_id: agent_id.to_string(),
+            gen,
+            merge,
+            existing: true,
+        };
+        Some((r, staged))
+    }
+
+    /// Put `staged` into the table. A newer generation of the agent wins
+    /// over it; a `stage_existing` copy of an agent that went is dropped.
+    pub fn publish(&self, staged: Staged) {
+        publish(&self.agents, staged);
+    }
+
+    /// Publish `staged` when `tx` commits; if it rolls back, the table
+    /// does not change.
+    pub fn publish_on_commit(&self, tx: &mut super::db::Tx, staged: Staged) {
+        let agents = self.agents.clone();
+        tx.after_commit(move || publish(&agents, staged));
+    }
+}
+
+fn publish(agents: &Agents, staged: Staged) {
+    let mut map = agents.lock().unwrap_or_else(|e| e.into_inner());
+    match map.get_mut(&staged.agent_id) {
+        Some(entry) if entry.0 > staged.gen => {}
+        Some(entry) if staged.existing && entry.0 != staged.gen => {}
+        Some(entry) => *entry = (staged.gen, staged.merge),
+        None if staged.existing => {}
+        None => {
+            map.insert(staged.agent_id, (staged.gen, staged.merge));
+        }
     }
 }
 
@@ -543,6 +639,30 @@ mod tests {
         assert_eq!(t.with("a1", 1, |m| m.row_state(10)), Some("blocked"));
         assert_eq!(t.with("a1", 2, |m| m.row_state(10)), None);
         t.remove("a1");
+    }
+
+    #[test]
+    fn a_staged_merge_changes_the_table_only_when_published() {
+        let t = MergeTable::new();
+        let (change, staged) = t.stage("a1", 1, |m| m.claim(c(Hook, Working, 0)));
+        assert!(change.turn_start);
+        assert_eq!(t.peek("a1", 1, |m| m.turn_open()), None);
+        t.publish(staged);
+        assert_eq!(t.peek("a1", 1, |m| m.turn_open()), Some(true));
+        // An unpublished copy is dropped with no trace.
+        let _ = t.stage("a1", 1, |m| m.claim(c(Hook, Ready, 1_000)));
+        assert_eq!(t.peek("a1", 1, |m| m.turn_open()), Some(true));
+        // A copy of an older generation does not replace a newer one, and
+        // a `stage_existing` copy does not bring back a removed agent.
+        let (_, old) = t.stage("a1", 1, |m| m.claim(c(Hook, Ready, 1_000)));
+        t.with("a1", 2, |_| ());
+        t.publish(old);
+        assert_eq!(t.peek("a1", 2, |m| m.turn_open()), Some(false));
+        assert!(t.stage_existing("a1", 1, |_| ()).is_none());
+        let (_, gone) = t.stage_existing("a1", 2, |m| m.attention("x", 5)).unwrap();
+        t.remove("a1");
+        t.publish(gone);
+        assert_eq!(t.peek("a1", 2, |_| ()), None);
     }
 
     #[test]

@@ -42,10 +42,18 @@
 //! keeps only those counts and the notifier: it reads the rows it compares
 //! against from the db. After `quick_check` starts a new epoch, the next
 //! tick rebuilds the observed rows from provider data (A:497).
+//!
+//! So a failed pass does not look like a quiet machine, `Detection` keeps
+//! the detector's health (D6): `ok`, `degraded` (some providers did not
+//! answer), `failed` (the pass wrote nothing) or `starting`, the time of
+//! the last written pass (`observedAt`), and `stale` once no pass was
+//! written for `STALE_AFTER`. `snapshot.get` and `session.list` carry it,
+//! and `detect.health` is emitted when its state, failed providers or
+//! staleness change.
 
 use super::db::outbox::{self, NewEvent};
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
-use super::proto::{AgentRow, TickResult};
+use super::proto::{AgentRow, DetectorHealth, TickResult};
 use super::views::sessions::SessionViews;
 use crate::session::enrichment::enrich_detected_sessions;
 use crate::session::transitions::notification_transitions;
@@ -62,6 +70,15 @@ use std::time::{Duration, Instant};
 /// Emitted when a tick's detection diagnostics differ from the last
 /// tick's, as the GUI's `diagnostic-update`. Subject: the machine id.
 pub const DIAG_TOPIC: &str = "diag.detection";
+
+/// Emitted when the detector's health changes (`DetectorHealth`).
+/// Subject: the machine id.
+pub const HEALTH_TOPIC: &str = "detect.health";
+
+/// With no pass written for this long, the detected rows count as stale.
+/// About eight failed ticks: longer than a provider's `HOLD_TICKS`, short
+/// enough that a client does not show a frozen list as live for long.
+pub const STALE_AFTER: Duration = Duration::from_secs(30);
 
 /// Time between ticks; the GUI polls at the same rate.
 pub const TICK: Duration = Duration::from_millis(3500);
@@ -217,6 +234,100 @@ pub struct Applied {
     pub notified: Vec<(String, String)>,
 }
 
+/// What detection's passes said, for `DetectorHealth`. The caller passes
+/// the clock.
+#[derive(Debug, Clone)]
+pub struct Health {
+    started_at: i64,
+    last_ok_at: Option<i64>,
+    last_attempt_at: Option<i64>,
+    /// Why the last pass wrote nothing.
+    failure: Option<String>,
+    failed_providers: Vec<String>,
+    /// The health last emitted on `detect.health`.
+    emitted: Option<DetectorHealth>,
+}
+
+impl Health {
+    pub fn new(now_ms: i64) -> Self {
+        Health {
+            started_at: now_ms,
+            last_ok_at: None,
+            last_attempt_at: None,
+            failure: None,
+            failed_providers: Vec::new(),
+            emitted: None,
+        }
+    }
+
+    /// A pass was written; the `failed` providers did not answer it.
+    pub fn ok(&mut self, now_ms: i64, failed: &[&str]) {
+        self.last_ok_at = Some(now_ms);
+        self.last_attempt_at = Some(now_ms);
+        self.failure = None;
+        self.failed_providers = failed.iter().map(|p| p.to_string()).collect();
+        self.failed_providers.sort();
+    }
+
+    /// A pass wrote nothing.
+    pub fn failed(&mut self, now_ms: i64, reason: &str) {
+        self.last_attempt_at = Some(now_ms);
+        self.failure = Some(reason.to_string());
+    }
+
+    /// When the last pass was written.
+    pub fn observed_at(&self) -> Option<i64> {
+        self.last_ok_at
+    }
+
+    /// The health at `now_ms`: staleness moves with the clock.
+    pub fn at(&self, now_ms: i64) -> DetectorHealth {
+        let since = self.last_ok_at.unwrap_or(self.started_at);
+        let stale_after_ms = STALE_AFTER.as_millis() as i64;
+        let (state, reason) = if let Some(why) = &self.failure {
+            ("failed", Some(why.clone()))
+        } else if self.last_attempt_at.is_none() {
+            ("starting", None)
+        } else if !self.failed_providers.is_empty() {
+            (
+                "degraded",
+                Some(format!(
+                    "no answer from {}",
+                    self.failed_providers.join(", ")
+                )),
+            )
+        } else {
+            ("ok", None)
+        };
+        DetectorHealth {
+            state: state.to_string(),
+            reason,
+            failed_providers: self.failed_providers.clone(),
+            last_ok_at: self.last_ok_at,
+            last_attempt_at: self.last_attempt_at,
+            stale: now_ms - since >= stale_after_ms,
+            stale_after_ms,
+        }
+    }
+
+    /// The `detect.health` data to emit at `now_ms`, when the state, the
+    /// failed providers or `stale` differ from what was last emitted. The
+    /// reason and the times alone do not emit, so a failing detector does
+    /// not emit every tick.
+    pub fn due(&self, now_ms: i64) -> Option<DetectorHealth> {
+        let h = self.at(now_ms);
+        let same = self.emitted.as_ref().is_some_and(|e| {
+            e.state == h.state && e.failed_providers == h.failed_providers && e.stale == h.stale
+        });
+        (!same).then_some(h)
+    }
+
+    /// Note that `h` was emitted.
+    pub fn emitted(&mut self, h: DetectorHealth) {
+        self.emitted = Some(h);
+    }
+}
+
 /// A notification a tick emits. `title` and `body` can carry conversation
 /// text (the first prompt, a session title); `redacted_title` does not.
 #[derive(Debug, Clone, PartialEq)]
@@ -313,6 +424,8 @@ pub struct Detector {
     notifier: Notifier,
     /// Failed passes in a row, per provider key.
     misses: HashMap<&'static str, u32>,
+    /// The providers that did not answer the last written pass.
+    failed: Vec<&'static str>,
     views: Arc<SessionViews>,
     /// Keep the away-activity index (a process-wide table) current. Off
     /// by default so unit tests do not touch it.
@@ -328,6 +441,7 @@ impl Detector {
             machine_id,
             notifier: Notifier::default(),
             misses: HashMap::new(),
+            failed: Vec::new(),
             views: Arc::new(SessionViews::default()),
             away: false,
             workers_dir: None,
@@ -368,6 +482,7 @@ impl Detector {
         if self.away {
             crate::session::away::refresh_index(&obs.sessions);
         }
+        let failed = obs.failed.clone();
         self.misses.retain(|p, _| obs.failed.contains(p));
         for p in &obs.failed {
             *self.misses.entry(p).or_insert(0) += 1;
@@ -419,6 +534,7 @@ impl Detector {
             outbox::compact_views(tx, &superseded)?;
             Ok((applied, view_seqs))
         })?;
+        self.failed = failed;
         change.written(&view_seqs);
         if let Some(d) = diag {
             self.views.set_diagnostics(d);
@@ -451,6 +567,7 @@ pub struct Detection {
     db: Arc<Db>,
     detector: Mutex<Option<Detector>>,
     pub views: Arc<SessionViews>,
+    health: Mutex<Health>,
 }
 
 impl Detection {
@@ -460,7 +577,47 @@ impl Detection {
             db,
             detector: Mutex::new(None),
             views: Arc::new(SessionViews::default()),
+            health: Mutex::new(Health::new(now_ms())),
         })
+    }
+
+    /// The detector's health now (D6).
+    pub fn health(&self) -> DetectorHealth {
+        self.health_lock().at(now_ms())
+    }
+
+    /// When the last pass was written.
+    pub fn observed_at(&self) -> Option<i64> {
+        self.health_lock().observed_at()
+    }
+
+    fn health_lock(&self) -> std::sync::MutexGuard<'_, Health> {
+        self.health.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Note a pass in the health, and emit `detect.health` when it changed.
+    /// A failed emit is tried again on the next pass.
+    fn record(&self, d: &Detector, pass: &Result<Applied, String>) {
+        let now = now_ms();
+        let due = {
+            let mut h = self.health_lock();
+            match pass {
+                Ok(_) => h.ok(now, &d.failed),
+                Err(e) => h.failed(now, e),
+            }
+            h.due(now)
+        };
+        let Some(data) = due else { return };
+        let event = NewEvent {
+            topic: HEALTH_TOPIC.into(),
+            subject: Some(self.db.machine_id().to_string()),
+            origin: None,
+            data: serde_json::to_value(&data).expect("DetectorHealth serializes"),
+        };
+        match self.db.write_blocking(move |tx| tx.emit(&event)) {
+            Ok(_) => self.health_lock().emitted(data),
+            Err(e) => eprintln!("[engine] detection health: {}", e),
+        }
     }
 
     /// Use `d`; its ticks commit to these views.
@@ -494,7 +651,9 @@ impl Detection {
     /// One tick. Blocking.
     pub fn tick(&self) -> Result<TickResult, String> {
         self.with(|d| {
-            d.tick(&self.db)?;
+            let pass = d.tick(&self.db);
+            self.record(d, &pass);
+            pass?;
             Ok(self.result(d))
         })
     }
@@ -503,7 +662,9 @@ impl Detection {
     pub fn recheck(&self) -> Result<TickResult, String> {
         self.with(|d| {
             d.observe.recheck();
-            d.tick(&self.db)?;
+            let pass = d.tick(&self.db);
+            self.record(d, &pass);
+            pass?;
             Ok(self.result(d))
         })
     }
@@ -1069,6 +1230,85 @@ mod tests {
         assert!(d.tick(&db).is_err());
         assert_eq!(rows(&db, AgentFilter::All), before);
         assert_eq!(rows(&db, AgentFilter::Sessions).len(), 1);
+    }
+
+    fn health_events(db: &Db) -> Vec<DetectorHealth> {
+        let conn = db.reader().unwrap();
+        let mut st = conn
+            .prepare("SELECT payload FROM events WHERE topic = ?1 ORDER BY seq")
+            .unwrap();
+        let rows = st
+            .query_map([HEALTH_TOPIC], |r| r.get::<_, String>(0))
+            .unwrap();
+        rows.map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+            .collect()
+    }
+
+    /// D6: a failed pass is `failed` on `detect.health`, not a quiet
+    /// machine; the next good pass is `ok` again. An unchanged health
+    /// emits nothing.
+    #[test]
+    fn the_health_topic_goes_failed_and_back_to_ok() {
+        let (_t, h) = home();
+        let db = Arc::new(db::open(&h, M).unwrap());
+        let script = Script::default();
+        let detection = Detection::new(db.clone());
+        detection.install(detector(&script));
+        assert_eq!(detection.health().state, "starting");
+        assert_eq!(detection.observed_at(), None);
+        script.set(vec![s("a", SessionStatus::Working)]);
+        detection.tick().unwrap();
+        let ok_at = detection.observed_at().unwrap();
+        assert_eq!(detection.health().state, "ok");
+        script.fail();
+        assert!(detection.tick().is_err());
+        assert!(detection.tick().is_err());
+        let failed = detection.health();
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.reason.as_deref(), Some("detect failed"));
+        assert_eq!(failed.last_ok_at, Some(ok_at));
+        assert!(!failed.stale);
+        // The rows stay; the health says they are what the last good pass saw.
+        assert_eq!(rows(&db, AgentFilter::Sessions).len(), 1);
+        script.partial(vec![s("a", SessionStatus::Working)], &["codex"]);
+        detection.tick().unwrap();
+        let degraded = detection.health();
+        assert_eq!(degraded.state, "degraded");
+        assert_eq!(degraded.failed_providers, vec!["codex".to_string()]);
+        script.set(vec![s("a", SessionStatus::Working)]);
+        detection.tick().unwrap();
+        detection.tick().unwrap();
+        let states: Vec<String> = health_events(&db).into_iter().map(|h| h.state).collect();
+        assert_eq!(states, ["ok", "failed", "degraded", "ok"]);
+    }
+
+    /// D6: with no written pass for `STALE_AFTER`, the health is stale.
+    #[test]
+    fn health_goes_stale_without_a_written_pass() {
+        let after = STALE_AFTER.as_millis() as i64;
+        let mut h = Health::new(0);
+        assert_eq!(h.at(0).state, "starting");
+        assert!(!h.at(after - 1).stale);
+        assert!(h.at(after).stale);
+        h.ok(1_000, &[]);
+        assert!(!h.at(1_000 + after - 1).stale);
+        assert_eq!(h.at(1_000).stale_after_ms, after);
+        // Failed passes keep the last good time; staleness moves with the clock.
+        h.failed(5_000, "claude timed out");
+        let fresh = h.at(5_000);
+        assert_eq!((fresh.state.as_str(), fresh.stale), ("failed", false));
+        h.emitted(fresh);
+        assert_eq!(h.due(6_000), None);
+        h.failed(1_000 + after, "claude timed out again");
+        let stale = h.due(1_000 + after).expect("stale is a change");
+        assert!(stale.stale);
+        assert_eq!(stale.last_ok_at, Some(1_000));
+        assert_eq!(stale.reason.as_deref(), Some("claude timed out again"));
+        h.emitted(stale);
+        // A good pass clears it.
+        h.ok(2_000 + after, &[]);
+        let back = h.due(2_000 + after).unwrap();
+        assert_eq!((back.state.as_str(), back.stale), ("ok", false));
     }
 
     fn codex(id: &str, status: SessionStatus) -> Session {

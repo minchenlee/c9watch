@@ -814,6 +814,7 @@ pub fn schema() -> serde_json::Value {
         "notification.needs_attention": ser.subschema_for::<NotificationEvent>(),
         "notification.waiting_for_input": ser.subschema_for::<NotificationEvent>(),
         "diag.detection": ser.subschema_for::<crate::session::DetectionDiagnostics>(),
+        "detect.health": ser.subschema_for::<super::proto::DetectorHealth>(),
     });
     let mut topics = serde_json::Map::new();
     for (name, stability) in discovery::TOPICS {
@@ -1772,6 +1773,8 @@ async fn snapshot_get(ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
         cursor: cursor.to_string(),
         machine_id: ctx.machine_id.clone(),
         agents,
+        observed_at: ctx.detection.as_ref().and_then(|d| d.observed_at()),
+        detector_health: ctx.detection.as_ref().map(|d| d.health()),
     };
     Ok(serde_json::to_value(result).expect("SnapshotResult serializes"))
 }
@@ -1781,7 +1784,12 @@ async fn session_list(ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
     ctx.detected().await;
     let db = ctx.db()?.clone();
     let sessions = blocking(move || db.agents(AgentFilter::Sessions).map_err(internal)).await?;
-    Ok(serde_json::to_value(SessionListResult { sessions }).expect("SessionListResult serializes"))
+    let result = SessionListResult {
+        sessions,
+        observed_at: ctx.detection.as_ref().and_then(|d| d.observed_at()),
+        detector_health: ctx.detection.as_ref().map(|d| d.health()),
+    };
+    Ok(serde_json::to_value(result).expect("SessionListResult serializes"))
 }
 
 /// Live agents, or with `all` every row (N4).

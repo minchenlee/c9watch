@@ -328,9 +328,11 @@ pub fn apply(
             }
         }
         if status == "held" && matches!(state.as_str(), "delivering" | "uncertain") {
-            merge.peek(agent, gen, |m| {
+            if let Some(((), staged)) = merge.stage_existing(agent, gen, |m| {
                 m.attention(&format!("mail_held: {}", id), now)
-            });
+            }) {
+                merge.publish_on_commit(tx, staged);
+            }
             tx.emit(&super::db::outbox::NewEvent { topic: "agent.attention".into(), subject: Some(format!("{}/{}", machine, agent)), origin: None, data: serde_json::json!({"id":agent,"generation":gen,"reason":"mail_held","msgId":id}) })?;
         }
     } else if frame["type"] == "user" {

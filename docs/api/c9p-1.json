@@ -1496,6 +1496,68 @@
       ],
       "type": "object"
     },
+    "DetectorHealth": {
+      "description": "How session detection is doing: the `detect.health` data, and the\n`detectorHealth` of `snapshot.get` and `session.list`. A failed\ndetection writes nothing, so the rows keep what the last good pass saw;\nthis says how old that is.",
+      "properties": {
+        "failedProviders": {
+          "default": [],
+          "description": "Provider keys (`claudeCode`, `codex`, ...) that did not answer the\nlast written pass.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-sensitivity": "public"
+        },
+        "lastAttemptAt": {
+          "description": "Unix ms when the last pass finished, written or not.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "lastOkAt": {
+          "description": "Unix ms of the last pass that was written (`observedAt`).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "reason": {
+          "description": "Why the state is not `ok`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        },
+        "stale": {
+          "description": "No pass was written for `staleAfterMs`: every detected session row\nmay be out of date. Rows whose provider is in `failedProviders` may\nbe out of date even when this is false.",
+          "type": "boolean",
+          "x-sensitivity": "public"
+        },
+        "staleAfterMs": {
+          "format": "int64",
+          "type": "integer",
+          "x-sensitivity": "public"
+        },
+        "state": {
+          "description": "`ok`: the last pass was written. `degraded`: it was written, but\nthe providers in `failedProviders` did not answer, and their rows\nkeep what an earlier pass saw. `failed`: the last pass wrote\nnothing. `starting`: no pass has finished yet. Clients must accept\nother values.",
+          "type": "string",
+          "x-sensitivity": "public"
+        }
+      },
+      "required": [
+        "state",
+        "failedProviders",
+        "stale",
+        "staleAfterMs"
+      ],
+      "type": "object"
+    },
     "DiagDetectionParams": {
       "description": "`diag.detection` params. There are none yet.",
       "type": "object"
@@ -3664,6 +3726,27 @@
     "SessionListResult": {
       "description": "`session.list` result: the agents whose session detection sees now\n(`goneAt` is `null`), in creation order.",
       "properties": {
+        "detectorHealth": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DetectorHealth"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "As in `snapshot.get`.",
+          "x-sensitivity": "public"
+        },
+        "observedAt": {
+          "description": "As in `snapshot.get`.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
         "sessions": {
           "items": {
             "$ref": "#/$defs/AgentRow"
@@ -4125,8 +4208,29 @@
           "type": "string",
           "x-sensitivity": "public"
         },
+        "detectorHealth": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DetectorHealth"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How detection is doing (the `detect.health` data). Absent in an\nengine without detection.",
+          "x-sensitivity": "public"
+        },
         "machineId": {
           "type": "string",
+          "x-sensitivity": "public"
+        },
+        "observedAt": {
+          "description": "Unix ms of the last detection pass that was written. Absent in an\nengine without detection, or before its first good pass.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ],
           "x-sensitivity": "public"
         }
       },
@@ -5698,6 +5802,22 @@
           "client"
         ],
         "resource": "annotation",
+        "verb": "read"
+      },
+      "x-stability": "preview"
+    },
+    "detect.health": {
+      "data": {
+        "$ref": "#/$defs/DetectorHealth"
+      },
+      "x-authz": {
+        "admission": [],
+        "principals": [
+          "local-unverified",
+          "agent",
+          "client"
+        ],
+        "resource": "session",
         "verb": "read"
       },
       "x-stability": "preview"

@@ -119,6 +119,7 @@ pub struct Tx<'a> {
     tx: Transaction<'a>,
     epoch: String,
     last: Option<i64>,
+    after_commit: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 impl Tx<'_> {
@@ -134,6 +135,13 @@ impl Tx<'_> {
     /// transaction as its event.
     pub fn epoch(&self) -> &str {
         &self.epoch
+    }
+
+    /// Run `f` on the writer thread once the transaction commits, before
+    /// the next write starts; never if it rolls back. For memory that must
+    /// not move ahead of the db (`MergeTable::publish_on_commit`).
+    pub fn after_commit(&mut self, f: impl FnOnce() + Send + 'static) {
+        self.after_commit.push(Box::new(f));
     }
 }
 
@@ -391,11 +399,16 @@ where
             tx: c.transaction().map_err(fail)?,
             epoch,
             last: None,
+            after_commit: Vec::new(),
         };
         // On error `tx` drops here, which rolls back.
         let r = f(&mut tx).map_err(fail)?;
         let last = tx.last;
+        let after_commit = std::mem::take(&mut tx.after_commit);
         tx.tx.commit().map_err(fail)?;
+        for f in after_commit {
+            f();
+        }
         if let Some(seq) = last {
             head.send_replace(seq);
         }

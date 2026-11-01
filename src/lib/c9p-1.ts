@@ -427,6 +427,41 @@ export interface C9pDetectionDiagnostics {
   processesWithCwd: number;
 }
 
+/**
+ * How session detection is doing: the `detect.health` data, and the
+ * `detectorHealth` of `snapshot.get` and `session.list`. A failed
+ * detection writes nothing, so the rows keep what the last good pass saw;
+ * this says how old that is.
+ */
+export interface C9pDetectorHealth {
+  /**
+   * Provider keys (`claudeCode`, `codex`, ...) that did not answer the
+   * last written pass.
+   */
+  failedProviders: string[];
+  /** Unix ms when the last pass finished, written or not. */
+  lastAttemptAt?: number | null;
+  /** Unix ms of the last pass that was written (`observedAt`). */
+  lastOkAt?: number | null;
+  /** Why the state is not `ok`. */
+  reason?: string | null;
+  /**
+   * No pass was written for `staleAfterMs`: every detected session row
+   * may be out of date. Rows whose provider is in `failedProviders` may
+   * be out of date even when this is false.
+   */
+  stale: boolean;
+  staleAfterMs: number;
+  /**
+   * `ok`: the last pass was written. `degraded`: it was written, but
+   * the providers in `failedProviders` did not answer, and their rows
+   * keep what an earlier pass saw. `failed`: the last pass wrote
+   * nothing. `starting`: no pass has finished yet. Clients must accept
+   * other values.
+   */
+  state: string;
+}
+
 /** `diag.detection` params. There are none yet. */
 export type C9pDiagDetectionParams = Record<string, unknown>;
 
@@ -1085,6 +1120,10 @@ export type C9pSessionListParams = Record<string, unknown>;
  * (`goneAt` is `null`), in creation order.
  */
 export interface C9pSessionListResult {
+  /** As in `snapshot.get`. */
+  detectorHealth?: C9pDetectorHealth | null;
+  /** As in `snapshot.get`. */
+  observedAt?: number | null;
   sessions: C9pAgentRow[];
 }
 
@@ -1246,7 +1285,17 @@ export type C9pSnapshotParams = Record<string, unknown>;
 export interface C9pSnapshotResult {
   agents: C9pAgentRow[];
   cursor: string;
+  /**
+   * How detection is doing (the `detect.health` data). Absent in an
+   * engine without detection.
+   */
+  detectorHealth?: C9pDetectorHealth | null;
   machineId: string;
+  /**
+   * Unix ms of the last detection pass that was written. Absent in an
+   * engine without detection, or before its first good pass.
+   */
+  observedAt?: number | null;
 }
 
 /**
@@ -1657,6 +1706,9 @@ export interface C9pTopics {
   };
   'annotation.removed': {
     data: C9pAnnotationRemovedEvent;
+  };
+  'detect.health': {
+    data: C9pDetectorHealth;
   };
   'diag.detection': {
     data: C9pDetectionDiagnostics;
