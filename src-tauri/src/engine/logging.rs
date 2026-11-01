@@ -18,10 +18,11 @@
 //!
 //! Rotation is by size: `rotate_stderr_log` moves `engine.log` to
 //! `engine.log.1` (and `.1` to `.2`, up to `LOG_KEEP`) once it passes
-//! `LOG_MAX_BYTES`, opens a new `engine.log` (0600, no symlink) and points
-//! fds 1 and 2 at it. It does that only when fd 2 is that very file (same
-//! device and inode), so an engine run in a terminal or a test is never
-//! redirected. The engine checks after the socket is bound (a client that
+//! `LOG_MAX_BYTES`, puts a new `engine.log` (0600, no symlink, created
+//! before anything is renamed) in its place and points fd 2 at it, and fd 1
+//! too when fd 1 wrote to the same file. It does that only when fd 2 is
+//! that very file (same device and inode), so an engine run in a terminal
+//! or a test is never redirected. The engine checks after the socket is bound (a client that
 //! is waiting for hello reads boot errors at an offset in the old file)
 //! and then every minute.
 
@@ -100,16 +101,24 @@ macro_rules! elog {
 }
 
 /// Rotate `<home>/engine.log` if the engine's stderr writes to it and it
-/// is over `LOG_MAX_BYTES`. Returns whether it rotated.
+/// is over `LOG_MAX_BYTES`. Returns whether it rotated. Stderr (fd 2) is
+/// the gate; stdout (fd 1) moves too only when it writes to the same file.
 pub fn rotate_stderr_log(home: &Path) -> Result<bool, String> {
     let path = crate::engine_proto::spawn::log_path(home);
-    rotate_fds(&path, &[1, 2], LOG_MAX_BYTES, LOG_KEEP)
+    rotate_fds(&path, 2, &[1], LOG_MAX_BYTES, LOG_KEEP)
 }
 
 /// `path` with `.n` appended.
 fn numbered(path: &Path, n: u32) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(format!(".{}", n));
+    PathBuf::from(s)
+}
+
+/// `path` with `.new` appended: the next log, before it takes the name.
+fn staged(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".new");
     PathBuf::from(s)
 }
 
@@ -125,15 +134,26 @@ fn fd_file_id(fd: RawFd) -> Option<(u64, u64)> {
     Some((st.st_dev as u64, st.st_ino as u64))
 }
 
-/// The rotation behind `rotate_stderr_log`: when the first of `fds` writes
-/// to `path` and `path` is larger than `max`, shift the numbered files,
-/// move `path` to `path.1`, create a new `path` and `dup2` it onto every fd
-/// in `fds` that wrote to the old file. Returns whether it rotated.
-pub fn rotate_fds(path: &Path, fds: &[RawFd], max: u64, keep: u32) -> Result<bool, String> {
-    let Some(&first) = fds.first() else {
-        return Ok(false);
-    };
-    let Some(ours) = fd_file_id(first) else {
+/// The rotation behind `rotate_stderr_log`. It runs only when `gate`
+/// writes to `path` (same device and inode) and `path` is larger than
+/// `max`. Then:
+///
+/// 1. Create the next log at `path.new` (0600, no symlink). A failure here
+///    changes nothing.
+/// 2. Shift the numbered files and move `path` to `path.1`.
+/// 3. Move `path.new` to `path`; if that fails, move `path.1` back.
+/// 4. `dup2` the new file onto `gate`, and onto each fd in `also` that
+///    wrote to the same old file. Other fds are left alone.
+///
+/// Returns whether it rotated.
+pub fn rotate_fds(
+    path: &Path,
+    gate: RawFd,
+    also: &[RawFd],
+    max: u64,
+    keep: u32,
+) -> Result<bool, String> {
+    let Some(ours) = fd_file_id(gate) else {
         return Ok(false);
     };
     // Not following a symlink: a planted link is never rotated through.
@@ -145,24 +165,45 @@ pub fn rotate_fds(path: &Path, fds: &[RawFd], max: u64, keep: u32) -> Result<boo
     if !meta.file_type().is_file() || (meta.dev(), meta.ino()) != ours || meta.len() <= max {
         return Ok(false);
     }
+
+    let next = staged(path);
+    // A file or link left by a rotation that failed midway; a directory
+    // there is not ours to remove, and the create below then fails.
+    if let Ok(m) = std::fs::symlink_metadata(&next) {
+        if !m.is_dir() {
+            let _ = std::fs::remove_file(&next);
+        }
+    }
+    let new = OpenOptions::new()
+        .create_new(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&next)
+        .map_err(|e| format!("Failed to create the next log {:?}: {}", next, e))?;
+
     let keep = keep.max(1);
     for n in (1..keep).rev() {
         match std::fs::rename(numbered(path, n), numbered(path, n + 1)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("Failed to rotate {:?}: {}", path, e)),
+            Err(e) => {
+                let _ = std::fs::remove_file(&next);
+                return Err(format!("Failed to rotate {:?}: {}", path, e));
+            }
         }
     }
-    std::fs::rename(path, numbered(path, 1))
-        .map_err(|e| format!("Failed to rotate {:?}: {}", path, e))?;
-    let new = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|e| format!("Failed to open a new {:?}: {}", path, e))?;
-    for &fd in fds {
+    let first = numbered(path, 1);
+    if let Err(e) = std::fs::rename(path, &first) {
+        let _ = std::fs::remove_file(&next);
+        return Err(format!("Failed to rotate {:?}: {}", path, e));
+    }
+    if let Err(e) = std::fs::rename(&next, path) {
+        let _ = std::fs::rename(&first, path);
+        let _ = std::fs::remove_file(&next);
+        return Err(format!("Failed to rotate {:?}: {}", path, e));
+    }
+    for &fd in std::iter::once(&gate).chain(also) {
         if fd_file_id(fd) == Some(ours) && unsafe { libc::dup2(new.as_raw_fd(), fd) } == -1 {
             return Err(format!(
                 "Failed to point fd {} at {:?}: {}",
@@ -209,9 +250,9 @@ mod tests {
         f.write_all(b"0123456789").unwrap();
         let fd = f.as_raw_fd();
         // At the cap: nothing happens.
-        assert!(!rotate_fds(&path, &[fd], 10, 2).unwrap());
+        assert!(!rotate_fds(&path, fd, &[], 10, 2).unwrap());
         f.write_all(b"x").unwrap();
-        assert!(rotate_fds(&path, &[fd], 10, 2).unwrap());
+        assert!(rotate_fds(&path, fd, &[], 10, 2).unwrap());
         assert_eq!(std::fs::read(numbered(&path, 1)).unwrap(), b"0123456789x");
         // The fd now writes to the new, private file.
         f.write_all(b"new").unwrap();
@@ -221,9 +262,9 @@ mod tests {
 
         // Two more rotations with keep = 2: .1 shifts to .2, the oldest goes.
         f.write_all(b"-second-file").unwrap();
-        assert!(rotate_fds(&path, &[fd], 10, 2).unwrap());
+        assert!(rotate_fds(&path, fd, &[], 10, 2).unwrap());
         f.write_all(b"third-file!").unwrap();
-        assert!(rotate_fds(&path, &[fd], 10, 2).unwrap());
+        assert!(rotate_fds(&path, fd, &[], 10, 2).unwrap());
         assert_eq!(std::fs::read(numbered(&path, 1)).unwrap(), b"third-file!");
         assert_eq!(
             std::fs::read(numbered(&path, 2)).unwrap(),
@@ -238,12 +279,12 @@ mod tests {
         let path = t.path().join("engine.log");
         std::fs::write(&path, vec![b'a'; 100]).unwrap();
         let other = open_append(&t.path().join("other.log"));
-        assert!(!rotate_fds(&path, &[other.as_raw_fd()], 10, 2).unwrap());
+        assert!(!rotate_fds(&path, other.as_raw_fd(), &[], 10, 2).unwrap());
         assert!(!numbered(&path, 1).exists());
         // A pipe (a terminal or test harness) is never rotated either.
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        assert!(!rotate_fds(&path, &[fds[1]], 10, 2).unwrap());
+        assert!(!rotate_fds(&path, fds[1], &[], 10, 2).unwrap());
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);
@@ -258,7 +299,61 @@ mod tests {
         std::fs::write(&real, vec![b'a'; 100]).unwrap();
         let link = t.path().join("engine.log");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(!rotate_fds(&link, &[f.as_raw_fd()], 10, 2).unwrap());
+        assert!(!rotate_fds(&link, f.as_raw_fd(), &[], 10, 2).unwrap());
         assert!(real.exists());
+    }
+
+    #[test]
+    fn a_failed_create_of_the_next_log_changes_nothing() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("engine.log");
+        let mut f = open_append(&path);
+        f.write_all(&[b'a'; 20]).unwrap();
+        // A directory where the next log goes: the create fails.
+        std::fs::create_dir(staged(&path)).unwrap();
+        assert!(rotate_fds(&path, f.as_raw_fd(), &[], 10, 2).is_err());
+        assert!(!numbered(&path, 1).exists());
+        f.write_all(b"b").unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap().len(),
+            21,
+            "still the live log"
+        );
+        // Once the path is free, rotation works again.
+        std::fs::remove_dir(staged(&path)).unwrap();
+        assert!(rotate_fds(&path, f.as_raw_fd(), &[], 10, 2).unwrap());
+        assert_eq!(std::fs::read(numbered(&path, 1)).unwrap().len(), 21);
+        assert!(!staged(&path).exists());
+    }
+
+    #[test]
+    fn a_stale_next_log_file_is_replaced() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("engine.log");
+        let mut f = open_append(&path);
+        f.write_all(&[b'a'; 20]).unwrap();
+        std::fs::write(staged(&path), b"stale").unwrap();
+        assert!(rotate_fds(&path, f.as_raw_fd(), &[], 10, 2).unwrap());
+        f.write_all(b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert!(!staged(&path).exists());
+    }
+
+    #[test]
+    fn the_gate_fd_decides_and_only_fds_on_the_same_file_move() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("engine.log");
+        let mut log_fd = open_append(&path);
+        log_fd.write_all(&[b'a'; 20]).unwrap();
+        let mut other = open_append(&t.path().join("other.log"));
+        // The gate is not the log: no rotation, even though `also` is.
+        assert!(!rotate_fds(&path, other.as_raw_fd(), &[log_fd.as_raw_fd()], 10, 2).unwrap());
+        assert!(!numbered(&path, 1).exists());
+        // The gate is the log: it moves; an `also` fd on another file does not.
+        assert!(rotate_fds(&path, log_fd.as_raw_fd(), &[other.as_raw_fd()], 10, 2).unwrap());
+        log_fd.write_all(b"new").unwrap();
+        other.write_all(b"x").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(std::fs::read(t.path().join("other.log")).unwrap(), b"x");
     }
 }

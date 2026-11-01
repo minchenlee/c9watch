@@ -97,12 +97,16 @@ impl Writer {
     }
 
     /// Queue `job`, sleeping (not blocking the runtime) while the queue is
-    /// full.
+    /// full. No sender is held across the sleep: the writer thread ends
+    /// only when every sender is gone, and `close` joins it, so a sleeping
+    /// task that held one would deadlock `close` on a current-thread
+    /// runtime (the task could never run again to drop it). Each try takes
+    /// a fresh sender, so a try after `close` fails with `WRITER_STOPPED`.
     async fn send_async(&self, mut job: Job) -> Result<(), String> {
-        let tx = self.sender()?;
         let mut backoff = Duration::from_millis(1);
         loop {
-            match tx.try_send(job) {
+            let tried = self.sender()?.try_send(job);
+            match tried {
                 Ok(()) => return Ok(()),
                 Err(mpsc::TrySendError::Disconnected(_)) => return Err(WRITER_STOPPED.to_string()),
                 Err(mpsc::TrySendError::Full(j)) => {
@@ -289,6 +293,35 @@ mod tests {
         assert!(!call.is_finished());
         release.send(()).unwrap();
         assert_eq!(call.await.unwrap().unwrap(), 5);
+    }
+
+    #[test]
+    fn close_returns_while_an_async_producer_sleeps_on_a_full_queue() {
+        let (done_tx, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let r = rt.block_on(async {
+                let (w, release) = stuck_writer();
+                let w2 = w.clone();
+                let call = tokio::spawn(async move { w2.call(|_| ()).await });
+                // Let the producer find the queue full and go to sleep.
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                assert!(!call.is_finished());
+                release.send(()).unwrap();
+                // Blocks the only runtime thread: the sleeping producer
+                // cannot run until `close` returns.
+                w.close();
+                call.await.unwrap()
+            });
+            done_tx.send(r).unwrap();
+        });
+        let r = done
+            .recv_timeout(Duration::from_secs(10))
+            .expect("close deadlocked with a producer sleeping on a full queue");
+        assert_eq!(r.unwrap_err(), WRITER_STOPPED);
     }
 
     #[test]
