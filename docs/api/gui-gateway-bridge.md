@@ -42,18 +42,19 @@ and one native dialog implementation:
   stays in Rust/Classic and never goes over c9p. Default is the `viewer`
   expanded scopes `session:read cost:read annotation:read`, ceiling `metadata`.
 - `gateway.info` returns the existing `ServerInfo` shape.
-- The browser's `hexGatewayAuthenticator` uses 32-byte hex server/client
-  nonces, a 32-byte hex token as the HMAC key, a hex pinned Ed25519 public
-  key and a hex signature. The HMAC input is decoded nonce bytes followed
-  by UTF-8 machineId; the signed input is the decoded nonce pair. The
-  generic transport also accepts a reviewed authenticator for other
-  encodings; it never sends hello until authentication has completed.
+- The browser's `hexGatewayAuthenticator` takes the client's own Ed25519
+  private key (a WebCrypto `CryptoKey`), the pinned server key, `clientId`
+  and `machineId`. It signs the `auth` message and verifies the server's
+  reply, both in the encoding of [gateway.md](gateway.md#encoding): lowercase
+  hex nonces, keys and signatures. The generic transport also accepts a
+  reviewed authenticator for other encodings; it never sends hello until
+  authentication has completed.
 
-M-b's report also records an unresolved protocol/storage contradiction:
-a server storing only SHA-256(token) cannot verify HMAC keyed by the raw token.
-The browser adapter follows the current plan's raw-token HMAC; Classic never
-selects it automatically. The owner must resolve that contract, then the
-integrator must align and test both ends before enabling /c9p pairing.
+D15 resolved the earlier storage contradiction (hash-only token storage
+against an HMAC keyed by the raw token). There is no token: core stores the
+client's public key in `gateway_clients` and verifies signatures with it.
+Classic never selects the `/c9p` adapter automatically; the integrator must
+test both ends before enabling `/c9p` pairing.
 
 M-b currently exposes no gateway attachment/write endpoints. Handover remains
 disabled unless all advertised capabilities and lease steps succeed. Public-key

@@ -21,7 +21,7 @@ This table covers every public topic in c9p 1.6. Type names refer to `$defs` in 
 | `agent.failed` | machine/agent id | `AgentFailedEvent`: agent failure | `agent:read` |
 | `msg.state` | machine/recipient agent id | `MsgStateEvent`: mail delivery state | Not available to gateway clients in preview |
 
-Socket topic discovery in 1.6 lists all topics. M-b derives the allowed set for each principal and gateway token from `x-authz`. Agent principals will receive the permitted session and agent topics. Conversation and mail access remain restricted. Gateway fields are also redacted by ceiling. The table's scopes describe that M-b contract; they are not present as grants in today's socket API.
+Socket topic discovery in 1.6 lists all topics. M-b derives the allowed set for each principal and paired gateway client from `x-authz`. Agent principals will receive the permitted session and agent topics. Conversation and mail access remain restricted. Gateway fields are also redacted by ceiling. The table's scopes describe that M-b contract; they are not present as grants in today's socket API.
 
 `legacy.inbox` is private migration data. It is absent from public schema, SDK types and event exports. Do not subscribe to it in a public client.
 

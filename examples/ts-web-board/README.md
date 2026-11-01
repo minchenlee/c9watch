@@ -12,7 +12,7 @@ npx vite examples/ts-web-board --host 127.0.0.1 --port 5174 --strictPort
 
 Open `http://localhost:5174`. Add that full origin to core's `allowedOrigins` using the GUI's native confirmation. Enable the gateway and obtain a fresh pairing code through the GUI. Use `ws://localhost:9210/c9p` on macOS, or the configured gateway port on Linux. `file://` is unsupported. A page served on a remote host must use HTTPS for WebCrypto. Browsers can also block insecure WS from an HTTPS page; use a secured gateway channel where required.
 
-The SDK's provisional integration profile is documented in [gateway.md](../../docs/api/gateway.md). There is no fallback to bearer auth. Initial pairing is trust on first use; compare the returned key through a trusted local path before relying on it. LAN plain WS does not encrypt session data.
+The SDK's public-key pairing profile is documented in [gateway.md](../../docs/api/gateway.md). There is no bearer token and no fallback to bearer auth. Initial pairing is trust on first use; compare the returned key through a trusted local path before relying on it. LAN plain WS does not encrypt session data.
 
 The page displays disconnect or stream errors. Pair again to reconnect with a fresh snapshot. The SDK separately provides cursor resume for clients that retain state. This page deliberately keeps its lifecycle small.
 

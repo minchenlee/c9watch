@@ -3,6 +3,7 @@ pub mod assets;
 pub mod auth;
 pub mod limits;
 pub mod policy;
+pub mod pubkey;
 pub mod security;
 
 pub mod redaction;

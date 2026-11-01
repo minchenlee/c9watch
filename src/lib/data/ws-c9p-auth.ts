@@ -1,13 +1,19 @@
-/** M-b challenge-response adapter. All wire byte strings use lowercase
- * hex; see docs/api/gui-gateway-bridge.md before integrating another codec.
- * The bearer secret never crosses the WebSocket after pairing. */
-export interface GatewayPairing { clientId: string; token: string; serverKey: string; machineId: string }
-function bytes(hex: string, length: number): Uint8Array {
-    if (hex.length !== length * 2 || !/^[a-f\d]+$/i.test(hex)) throw new Error('Invalid gateway key or nonce');
+/** M-b public-key challenge-response adapter (D15). All wire byte strings
+ * use lowercase hex; see docs/api/gateway.md before integrating another codec.
+ * The client proves its own Ed25519 key; no shared secret crosses the
+ * WebSocket or is stored by core. */
+export interface GatewayPairing { clientId: string; privateKey: CryptoKey; serverKey: string; machineId: string }
+function bytes(hex: unknown, length: number, what: string): Uint8Array {
+    if (typeof hex !== 'string' || hex.length !== length * 2 || !/^[0-9a-f]*$/.test(hex)) throw new Error(`Invalid gateway ${what}`);
     return Uint8Array.from(hex.match(/../g)!, pair => parseInt(pair, 16));
 }
 const hex = (bytes: Uint8Array) => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-function join(...parts: Uint8Array[]): Uint8Array {
+const CLIENT_ID = /^cli_[0-9a-hjkmnp-tv-z]{26}$/;
+/** `label || 0x00 || serverNonce || clientNonce || (len8 || UTF-8 field)*`. */
+function message(label: string, serverNonce: Uint8Array, clientNonce: Uint8Array, ...fields: string[]): Uint8Array {
+    const utf8 = (s: string) => new TextEncoder().encode(s);
+    const parts = [utf8(label), new Uint8Array([0]), serverNonce, clientNonce];
+    for (const f of fields.map(utf8)) parts.push(new Uint8Array([f.byteLength]), f);
     const result = new Uint8Array(parts.reduce((n, p) => n + p.byteLength, 0));
     let offset = 0;
     for (const part of parts) { result.set(part, offset); offset += part.byteLength; }
@@ -31,18 +37,19 @@ function authFrame(socket: WebSocket): Promise<any> {
 export function hexGatewayAuthenticator(pairing: GatewayPairing) {
     const pin = { ...pairing };
     return async (socket: WebSocket): Promise<void> => {
+        if (!CLIENT_ID.test(pin.clientId)) throw new Error('Invalid gateway client id');
+        const serverKey = bytes(pin.serverKey, 32, 'server key');
+        bytes(pin.machineId, 32, 'machine id');
         const challenge = await authFrame(socket);
-        if (typeof challenge.challenge !== 'string') throw new Error('Gateway sent no challenge');
-        const serverNonce = bytes(challenge.challenge, 32);
+        const serverNonce = bytes(challenge?.challenge, 32, 'challenge');
         const clientNonce = crypto.getRandomValues(new Uint8Array(32));
-        const key = await crypto.subtle.importKey('raw', bytes(pin.token, 32), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-        const mac = await crypto.subtle.sign('HMAC', key, join(serverNonce, clientNonce, new TextEncoder().encode(pin.machineId)));
+        const sig = await crypto.subtle.sign('Ed25519', pin.privateKey, message('c9p-gateway auth-client v1', serverNonce, clientNonce, pin.machineId, pin.clientId));
         // Install the receiver before sending, including for immediate acks.
-        const signature = authFrame(socket);
-        socket.send(JSON.stringify({ auth: { clientId: pin.clientId, clientNonce: hex(clientNonce), mac: hex(new Uint8Array(mac)) } }));
-        const proof = await signature;
-        if (typeof proof.sig !== 'string') throw new Error('Gateway sent no server proof');
-        const publicKey = await crypto.subtle.importKey('raw', bytes(pin.serverKey, 32), 'Ed25519', false, ['verify']);
-        if (!await crypto.subtle.verify('Ed25519', publicKey, bytes(proof.sig, 64), join(serverNonce, clientNonce))) throw new Error('Gateway server proof does not match the paired key');
+        const proof = authFrame(socket);
+        socket.send(JSON.stringify({ auth: { clientId: pin.clientId, clientNonce: hex(clientNonce), sig: hex(new Uint8Array(sig)) } }));
+        const reply = await proof;
+        const signature = bytes(reply?.sig, 64, 'server proof');
+        const publicKey = await crypto.subtle.importKey('raw', serverKey, 'Ed25519', false, ['verify']);
+        if (!await crypto.subtle.verify('Ed25519', publicKey, signature, message('c9p-gateway auth-server v1', serverNonce, clientNonce, pin.machineId, pin.clientId))) throw new Error('Gateway server proof does not match the paired key');
     };
 }
