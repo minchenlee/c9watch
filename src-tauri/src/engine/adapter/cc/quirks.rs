@@ -295,16 +295,48 @@ pub fn probe_version(claude: &Path) -> Result<String, String> {
     probe_version_within(claude, VERSION_TIMEOUT)
 }
 
+/// How long the cleanup after a failed probe waits for the reap.
+const PROBE_REAP_LIMIT: Duration = Duration::from_secs(2);
+
+/// What a cleanup signal goes to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Target {
+    /// The probe's process group, by the unreaped child's pid.
+    Group(libc::pid_t),
+    /// The unreaped child itself, in case it left the group.
+    Child(libc::pid_t),
+}
+
+fn sigkill(t: Target) -> std::io::Result<()> {
+    let r = match t {
+        Target::Group(pid) => unsafe { libc::killpg(pid, libc::SIGKILL) },
+        Target::Child(pid) => unsafe { libc::kill(pid, libc::SIGKILL) },
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// `timeout` covers both the exit and the output: a wrapper that exits
 /// but leaves a child holding stdout open is a timeout too. The probe runs
 /// in its own process group, and a timeout or a failed exit kills the
 /// whole group.
 ///
-/// The child is reaped last, after the last group signal. Until then its
+/// The child is reaped last, after the last signal. Until then its
 /// unreaped pid keeps its group id from reuse, so `killpg` cannot reach
 /// an unrelated group (as `NativePty` does, D2). So the exit is only
 /// peeked (`waitid` with `WNOWAIT`), never waited for, before the signal.
 fn probe_version_within(claude: &Path, timeout: Duration) -> Result<String, String> {
+    probe_version_with(claude, timeout, &sigkill)
+}
+
+fn probe_version_with(
+    claude: &Path,
+    timeout: Duration,
+    signal: &dyn Fn(Target) -> std::io::Result<()>,
+) -> Result<String, String> {
     use crate::engine::pty::peek_exit;
     use std::io::Read;
     use std::os::unix::process::CommandExt;
@@ -320,18 +352,9 @@ fn probe_version_within(claude: &Path, timeout: Duration) -> Result<String, Stri
         .spawn()
         .map_err(|e| format!("{}: {}", claude.display(), e))?;
     let pid = child.id() as libc::pid_t;
-    let stdout = child.stdout.take();
-    // Kill the group, then reap: the pid pins the group id until the reap.
-    let mut kill_and_reap = |why: String| {
-        unsafe {
-            libc::killpg(pid, libc::SIGKILL);
-        }
-        let _ = child.wait();
-        Err(why)
-    };
     let timed_out = || format!("--version did not answer in {} ms", timeout.as_millis());
-    let Some(mut stdout) = stdout else {
-        return kill_and_reap("no stdout".into());
+    let Some(mut stdout) = child.stdout.take() else {
+        return Err(kill_and_reap(child, signal, "no stdout".into()));
     };
     // The output is one short line: read it on a thread so a full pipe
     // never blocks the exit, and the exit never blocks on the read.
@@ -343,21 +366,61 @@ fn probe_version_within(claude: &Path, timeout: Duration) -> Result<String, Stri
     });
     // EOF comes once the child and everything it left close stdout.
     let Ok(out) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
-        return kill_and_reap(timed_out());
+        return Err(kill_and_reap(child, signal, timed_out()));
     };
     let status = loop {
         match peek_exit(pid) {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => return kill_and_reap(timed_out()),
-            Err(e) => return kill_and_reap(e.to_string()),
+            Ok(None) => return Err(kill_and_reap(child, signal, timed_out())),
+            Err(e) => return Err(kill_and_reap(child, signal, e.to_string())),
         }
     };
     if !status.success() {
-        return kill_and_reap(format!("--version exited with {}", status));
+        let why = format!("--version exited with {}", status);
+        return Err(kill_and_reap(child, signal, why));
     }
     let _ = child.wait();
     Ok(out)
+}
+
+/// Kill the probe's group and the child itself (it may have left the
+/// group, so `killpg` alone can miss it), then reap the child. Both
+/// signals go while the child is unreaped. The reap waits at most
+/// `PROBE_REAP_LIMIT`; a child still there after that is reaped on a
+/// thread of its own, so no path waits without end. Returns `why` with
+/// any cleanup failure added.
+fn kill_and_reap(
+    mut child: std::process::Child,
+    signal: &dyn Fn(Target) -> std::io::Result<()>,
+    mut why: String,
+) -> String {
+    use std::time::Instant;
+    let pid = child.id() as libc::pid_t;
+    for t in [Target::Group(pid), Target::Child(pid)] {
+        match signal(t) {
+            // Nothing left to kill there.
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(e) => why.push_str(&format!("; cannot kill {:?}: {}", t, e)),
+            Ok(()) => {}
+        }
+    }
+    let limit = Instant::now() + PROBE_REAP_LIMIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return why,
+            Ok(None) if Instant::now() < limit => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                why.push_str("; the probe outlived SIGKILL");
+                std::thread::spawn(move || child.wait());
+                return why;
+            }
+            Err(e) => {
+                why.push_str(&format!("; cannot reap the probe: {}", e));
+                return why;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -449,25 +512,101 @@ mod tests {
         assert!(!mark.exists());
     }
 
-    #[test]
-    fn a_failed_probe_kills_what_it_left_before_the_reap() {
+    /// A fake `claude` from a script, and a cleanup signal that records
+    /// each target and, at that moment, whether the child is unreaped.
+    fn fake_claude(t: &tempfile::TempDir, script: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let t = tempfile::tempdir().unwrap();
         let fake = t.path().join("claude");
-        let mark = t.path().join("survivor");
-        // The wrapper fails at once; its child no longer holds stdout.
-        std::fs::write(
-            &fake,
-            format!(
-                "#!/bin/sh\n(sleep 1; touch '{}') >/dev/null &\nexit 3\n",
-                mark.display()
-            ),
-        )
-        .unwrap();
+        std::fs::write(&fake, script).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let e = probe_version_within(&fake, Duration::from_secs(5)).unwrap_err();
+        fake
+    }
+
+    type Seen = std::sync::Mutex<Vec<(Target, bool)>>;
+
+    fn recording(seen: &Seen) -> impl Fn(Target) -> std::io::Result<()> + '_ {
+        move |t| {
+            let pid = match t {
+                Target::Group(p) | Target::Child(p) => p,
+            };
+            // `waitid` fails with ECHILD once the child is reaped.
+            let unreaped = crate::engine::pty::peek_exit(pid).is_ok();
+            seen.lock().unwrap().push((t, unreaped));
+            sigkill(t)
+        }
+    }
+
+    /// Wait, up to 10 s, until `pid` is gone. Its parent is gone, so init
+    /// reaps it.
+    fn gone(pid: libc::pid_t) -> bool {
+        let limit = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < limit {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn a_failed_probe_signals_before_the_reap() {
+        let t = tempfile::tempdir().unwrap();
+        let left = t.path().join("left");
+        // The wrapper starts a long child without stdout, records its pid
+        // and only then fails, so the child is there before the cleanup.
+        let fake = fake_claude(
+            &t,
+            &format!(
+                "#!/bin/sh\nsleep 30 >/dev/null &\necho $! > '{}'\nexit 3\n",
+                left.display()
+            ),
+        );
+        let seen = Seen::default();
+        let e = probe_version_with(&fake, Duration::from_secs(5), &recording(&seen)).unwrap_err();
         assert!(e.contains("exited with"), "{}", e);
-        std::thread::sleep(Duration::from_millis(1500));
-        assert!(!mark.exists());
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(seen.len(), 2, "{:?}", seen);
+        assert!(matches!(seen[0].0, Target::Group(_)), "{:?}", seen);
+        assert!(matches!(seen[1].0, Target::Child(_)), "{:?}", seen);
+        // The wrapper was not reaped when its group got the signal.
+        assert!(seen.iter().all(|(_, unreaped)| *unreaped), "{:?}", seen);
+        let pid: libc::pid_t = std::fs::read_to_string(&left)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(gone(pid), "the group signal missed {}", pid);
+    }
+
+    #[test]
+    fn a_probe_that_leaves_its_group_is_killed_and_reaped_in_time() {
+        // The wrapper moves itself into a new group of its child, so
+        // `killpg` on its own pid finds nothing. It keeps stdout open, so
+        // the probe times out.
+        if !Path::new("/usr/bin/perl").exists() {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let fake = fake_claude(
+            &t,
+            "#!/usr/bin/perl\n\
+             pipe(my $r, my $w) or die;\n\
+             my $kid = fork();\n\
+             if ($kid == 0) { close STDOUT; setpgrp(0, 0); syswrite($w, 'x'); sleep 3; exit 0; }\n\
+             sysread($r, my $b, 1);\n\
+             setpgrp(0, $kid) or die;\n\
+             $| = 1; print \"2.1.316 (Claude Code)\\n\";\n\
+             sleep 30;\n",
+        );
+        let seen = Seen::default();
+        let start = std::time::Instant::now();
+        let e =
+            probe_version_with(&fake, Duration::from_millis(500), &recording(&seen)).unwrap_err();
+        assert!(e.contains("did not answer"), "{}", e);
+        assert!(!e.contains("outlived"), "{}", e);
+        assert!(start.elapsed() < Duration::from_millis(500) + PROBE_REAP_LIMIT);
+        let seen = seen.into_inner().unwrap();
+        assert!(seen.iter().all(|(_, unreaped)| *unreaped), "{:?}", seen);
     }
 }
