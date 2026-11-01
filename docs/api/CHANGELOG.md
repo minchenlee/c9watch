@@ -2,6 +2,23 @@
 
 # c9p/1 changelog
 
+## Leaving preview
+
+c9p 1 leaves preview when both conditions are true:
+
+1. Gateway public-key pairing ships.
+2. Two weeks pass after that with no breaking change.
+
+After that, major 1 accepts additive changes only. A breaking change needs major 2.
+
+When preview ends, the GUI's legacy in-process fallback is removed. The GUI then reads only through core.
+
+## 1.11 — upcoming
+
+- Responses on one connection may arrive out of order. Clients match them by `id`. Core may handle requests on one connection concurrently.
+- `agent.create`, `agent.retire` and `session.stop` accept `idem`, as `msg.send` does today. A repeated `idem` replays the original result.
+- Docs: `refreshing` and `retiring` are reserved states that core does not emit yet. `orphaned` means a retire could not confirm the kill; the agent is not resumable. `seq` can have gaps after view compaction; a gap is not a lost event.
+
 ## 1.10 — public error cleanup
 
 - **breaking (preview):** rename the unsupported-operation error to `unsupported` in the engine, CLI and generated contracts. `agent.create` is now revision 2; clients built against minors 3–9 see it in `hello.breakingSince`. Internal `agent.handoff` also advances to revision 2.

@@ -574,6 +574,10 @@ pub struct AgentRow {
     /// Engine lifecycle state (`creating`, `starting`, `ready`, `working`,
     /// `blocked`, `paused`, `refreshing`, `interrupted`, `retiring`,
     /// `retired`, `failed`, `orphaned`); `null` for an observed agent.
+    /// `refreshing` and `retiring` are reserved: the engine does not emit
+    /// them today, but clients must accept them. `orphaned` means a retire
+    /// could not confirm that the agent's process was killed; the agent is
+    /// not resumable.
     pub state: Option<String>,
     /// The detected session status: `working`, `needs_attention`,
     /// `waiting_for_input` or `connecting`.

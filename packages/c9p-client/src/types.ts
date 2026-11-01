@@ -135,6 +135,10 @@ export interface C9pAgentRow {
    * Engine lifecycle state (`creating`, `starting`, `ready`, `working`,
    * `blocked`, `paused`, `refreshing`, `interrupted`, `retiring`,
    * `retired`, `failed`, `orphaned`); `null` for an observed agent.
+   * `refreshing` and `retiring` are reserved: the engine does not emit
+   * them today, but clients must accept them. `orphaned` means a retire
+   * could not confirm that the agent's process was killed; the agent is
+   * not resumable.
    */
   state: 'creating' | 'starting' | 'ready' | 'working' | 'blocked' | 'paused' | 'refreshing' | 'interrupted' | 'retiring' | 'retired' | 'failed' | 'orphaned' | null | string;
   /**
