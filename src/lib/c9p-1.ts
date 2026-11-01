@@ -431,7 +431,8 @@ export interface C9pDetectionDiagnostics {
  * How session detection is doing: the `detect.health` data, and the
  * `detectorHealth` of `snapshot.get` and `session.list`. A failed
  * detection writes nothing, so the rows keep what the last good pass saw;
- * this says how old that is.
+ * this says how old that is. While passes are written, `detect.health`
+ * repeats every `staleAfterMs / 2` with a newer `lastOkAt`.
  */
 export interface C9pDetectorHealth {
   /**
@@ -1292,8 +1293,10 @@ export interface C9pSnapshotResult {
   detectorHealth?: C9pDetectorHealth | null;
   machineId: string;
   /**
-   * Unix ms of the last detection pass that was written. Absent in an
-   * engine without detection, or before its first good pass.
+   * Unix ms of the last detection pass that was written: the
+   * `lastOkAt` of `detectorHealth`, read before the rows, so the rows
+   * are never older than it. Absent in an engine without detection, or
+   * before its first good pass.
    */
   observedAt?: number | null;
 }

@@ -49,7 +49,7 @@
 //! the last written pass (`observedAt`), and `stale` once no pass was
 //! written for `STALE_AFTER`. `snapshot.get` and `session.list` carry it,
 //! and `detect.health` is emitted when its state, failed providers or
-//! staleness change.
+//! staleness change, and every `HEARTBEAT` while passes are written.
 
 use super::db::outbox::{self, NewEvent};
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
@@ -79,6 +79,11 @@ pub const HEALTH_TOPIC: &str = "detect.health";
 /// About eight failed ticks: longer than a provider's `HOLD_TICKS`, short
 /// enough that a client does not show a frozen list as live for long.
 pub const STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// A healthy detector repeats `detect.health` this often, with a newer
+/// `lastOkAt`: half of `STALE_AFTER`, so a client's own clock never ages a
+/// healthy `lastOkAt` past it.
+pub const HEARTBEAT: Duration = Duration::from_secs(STALE_AFTER.as_secs() / 2);
 
 /// Time between ticks; the GUI polls at the same rate.
 pub const TICK: Duration = Duration::from_millis(3500);
@@ -244,8 +249,8 @@ pub struct Health {
     /// Why the last pass wrote nothing.
     failure: Option<String>,
     failed_providers: Vec<String>,
-    /// The health last emitted on `detect.health`.
-    emitted: Option<DetectorHealth>,
+    /// The health last emitted on `detect.health`, and when.
+    emitted: Option<(DetectorHealth, i64)>,
 }
 
 impl Health {
@@ -273,11 +278,6 @@ impl Health {
     pub fn failed(&mut self, now_ms: i64, reason: &str) {
         self.last_attempt_at = Some(now_ms);
         self.failure = Some(reason.to_string());
-    }
-
-    /// When the last pass was written.
-    pub fn observed_at(&self) -> Option<i64> {
-        self.last_ok_at
     }
 
     /// The health at `now_ms`: staleness moves with the clock.
@@ -310,21 +310,31 @@ impl Health {
         }
     }
 
-    /// The `detect.health` data to emit at `now_ms`, when the state, the
-    /// failed providers or `stale` differ from what was last emitted. The
-    /// reason and the times alone do not emit, so a failing detector does
-    /// not emit every tick.
+    /// The `detect.health` data to emit at `now_ms`:
+    /// - when the state, the failed providers or `stale` differ from what
+    ///   was last emitted;
+    /// - as a heartbeat, when a newer pass was written and the last emit
+    ///   is `HEARTBEAT` old, so a client that ages `lastOkAt` by its own
+    ///   clock does not mark a healthy detector stale. At most one per
+    ///   `HEARTBEAT`; a failing detector sends none (its `lastOkAt` does
+    ///   not move, and `stale` turning true emits).
+    ///
+    /// The reason alone does not emit, so a failing detector does not emit
+    /// every tick.
     pub fn due(&self, now_ms: i64) -> Option<DetectorHealth> {
         let h = self.at(now_ms);
-        let same = self.emitted.as_ref().is_some_and(|e| {
-            e.state == h.state && e.failed_providers == h.failed_providers && e.stale == h.stale
-        });
-        (!same).then_some(h)
+        let Some((e, at)) = &self.emitted else {
+            return Some(h);
+        };
+        let same =
+            e.state == h.state && e.failed_providers == h.failed_providers && e.stale == h.stale;
+        let heartbeat = h.last_ok_at > e.last_ok_at && now_ms - at >= HEARTBEAT.as_millis() as i64;
+        (!same || heartbeat).then_some(h)
     }
 
-    /// Note that `h` was emitted.
-    pub fn emitted(&mut self, h: DetectorHealth) {
-        self.emitted = Some(h);
+    /// Note that `h` was emitted at `now_ms`.
+    pub fn emitted(&mut self, h: DetectorHealth, now_ms: i64) {
+        self.emitted = Some((h, now_ms));
     }
 }
 
@@ -586,11 +596,6 @@ impl Detection {
         self.health_lock().at(now_ms())
     }
 
-    /// When the last pass was written.
-    pub fn observed_at(&self) -> Option<i64> {
-        self.health_lock().observed_at()
-    }
-
     fn health_lock(&self) -> std::sync::MutexGuard<'_, Health> {
         self.health.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -615,7 +620,7 @@ impl Detection {
             data: serde_json::to_value(&data).expect("DetectorHealth serializes"),
         };
         match self.db.write_blocking(move |tx| tx.emit(&event)) {
-            Ok(_) => self.health_lock().emitted(data),
+            Ok(_) => self.health_lock().emitted(data, now),
             Err(e) => eprintln!("[engine] detection health: {}", e),
         }
     }
@@ -1255,10 +1260,10 @@ mod tests {
         let detection = Detection::new(db.clone());
         detection.install(detector(&script));
         assert_eq!(detection.health().state, "starting");
-        assert_eq!(detection.observed_at(), None);
+        assert_eq!(detection.health().last_ok_at, None);
         script.set(vec![s("a", SessionStatus::Working)]);
         detection.tick().unwrap();
-        let ok_at = detection.observed_at().unwrap();
+        let ok_at = detection.health().last_ok_at.unwrap();
         assert_eq!(detection.health().state, "ok");
         script.fail();
         assert!(detection.tick().is_err());
@@ -1297,18 +1302,47 @@ mod tests {
         h.failed(5_000, "claude timed out");
         let fresh = h.at(5_000);
         assert_eq!((fresh.state.as_str(), fresh.stale), ("failed", false));
-        h.emitted(fresh);
+        h.emitted(fresh, 5_000);
         assert_eq!(h.due(6_000), None);
         h.failed(1_000 + after, "claude timed out again");
         let stale = h.due(1_000 + after).expect("stale is a change");
         assert!(stale.stale);
         assert_eq!(stale.last_ok_at, Some(1_000));
         assert_eq!(stale.reason.as_deref(), Some("claude timed out again"));
-        h.emitted(stale);
+        h.emitted(stale, 1_000 + after);
         // A good pass clears it.
         h.ok(2_000 + after, &[]);
         let back = h.due(2_000 + after).unwrap();
         assert_eq!((back.state.as_str(), back.stale), ("ok", false));
+    }
+
+    /// A healthy detector repeats `detect.health` every `HEARTBEAT` with a
+    /// newer `lastOkAt`, and no more often; a failing one does not.
+    #[test]
+    fn a_healthy_detector_sends_a_bounded_heartbeat() {
+        let beat = HEARTBEAT.as_millis() as i64;
+        assert_eq!(beat * 2, STALE_AFTER.as_millis() as i64);
+        let mut h = Health::new(0);
+        h.ok(0, &[]);
+        let first = h.due(0).unwrap();
+        h.emitted(first, 0);
+        // Passes keep coming: nothing until the heartbeat is due.
+        h.ok(3_500, &[]);
+        assert_eq!(h.due(3_500), None);
+        h.ok(beat - 1, &[]);
+        assert_eq!(h.due(beat - 1), None);
+        h.ok(beat, &[]);
+        let hb = h.due(beat).expect("heartbeat");
+        assert_eq!((hb.state.as_str(), hb.last_ok_at), ("ok", Some(beat)));
+        h.emitted(hb, beat);
+        h.ok(beat + 3_500, &[]);
+        assert_eq!(h.due(beat + 3_500), None);
+        // Failing: `lastOkAt` does not move, so no heartbeat; only the
+        // state change and later `stale` emit.
+        h.failed(beat + 7_000, "x");
+        let failed = h.due(beat + 7_000).unwrap();
+        h.emitted(failed, beat + 7_000);
+        assert_eq!(h.due(beat * 3), None);
     }
 
     fn codex(id: &str, status: SessionStatus) -> Session {

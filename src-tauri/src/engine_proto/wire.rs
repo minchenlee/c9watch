@@ -536,8 +536,10 @@ pub struct SnapshotResult {
     pub cursor: String,
     pub machine_id: String,
     pub agents: Vec<AgentRow>,
-    /// Unix ms of the last detection pass that was written. Absent in an
-    /// engine without detection, or before its first good pass.
+    /// Unix ms of the last detection pass that was written: the
+    /// `lastOkAt` of `detectorHealth`, read before the rows, so the rows
+    /// are never older than it. Absent in an engine without detection, or
+    /// before its first good pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<i64>,
     /// How detection is doing (the `detect.health` data). Absent in an
@@ -664,7 +666,8 @@ pub struct SessionGoneEvent {
 /// How session detection is doing: the `detect.health` data, and the
 /// `detectorHealth` of `snapshot.get` and `session.list`. A failed
 /// detection writes nothing, so the rows keep what the last good pass saw;
-/// this says how old that is.
+/// this says how old that is. While passes are written, `detect.health`
+/// repeats every `staleAfterMs / 2` with a newer `lastOkAt`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]

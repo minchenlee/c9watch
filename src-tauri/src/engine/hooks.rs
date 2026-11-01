@@ -170,8 +170,12 @@ fn apply(
         _ => (None, None),
     };
     let from_subagent = p.input["agent_id"].as_str().is_some_and(|a| !a.is_empty());
-    let ((change, row_state, attention), staged) = merge.stage(id, ev.gen, |m| {
-        let claim = match ev.method {
+    // The change runs on a copy now and again on the live entry at commit
+    // (`MergeTable::stage`), so it owns what it reads.
+    let method = ev.method.to_string();
+    let flag = attention.clone();
+    let ((change, row_state), staged) = merge.stage(id, ev.gen, move |m| {
+        let claim = match method.as_str() {
             "hook.post_tool_use" => claim.filter(|_| {
                 !from_subagent
                     && m.turn_open()
@@ -191,12 +195,12 @@ fn apply(
             _ => claim,
         };
         let change = claim.map(|c| m.claim(c)).unwrap_or_default();
-        if let Some(a) = &attention {
+        if let Some(a) = &flag {
             m.attention(a, now_ms);
         }
         let row_state = m.row_state(now_ms);
         m.written(row_state);
-        (change, row_state, attention)
+        (change, row_state)
     });
     merge.publish_on_commit(tx, staged);
     write_change(tx, machine, id, ev.gen, state, &change, row_state)?;
@@ -290,7 +294,7 @@ pub fn screen_claim(
     let Some((row_gen, state)) = row.filter(|(g, _)| *g == gen) else {
         return Ok(false);
     };
-    let ((change, row_state), staged) = merge.stage(id, gen, |m| {
+    let ((change, row_state), staged) = merge.stage(id, gen, move |m| {
         let change = m.claim(Claim::new(Source::Screen, activity, now_ms));
         let row_state = m.row_state(now_ms);
         m.written(row_state);
@@ -331,7 +335,7 @@ pub fn expire_hold(
         )
         .optional()?;
     let row_state = merge
-        .stage_existing(id, gen, |m| {
+        .stage_existing(id, gen, move |m| {
             let s = m.row_state(now_ms);
             m.written(s);
             s

@@ -1497,7 +1497,7 @@
       "type": "object"
     },
     "DetectorHealth": {
-      "description": "How session detection is doing: the `detect.health` data, and the\n`detectorHealth` of `snapshot.get` and `session.list`. A failed\ndetection writes nothing, so the rows keep what the last good pass saw;\nthis says how old that is.",
+      "description": "How session detection is doing: the `detect.health` data, and the\n`detectorHealth` of `snapshot.get` and `session.list`. A failed\ndetection writes nothing, so the rows keep what the last good pass saw;\nthis says how old that is. While passes are written, `detect.health`\nrepeats every `staleAfterMs / 2` with a newer `lastOkAt`.",
       "properties": {
         "failedProviders": {
           "default": [],
@@ -4225,7 +4225,7 @@
           "x-sensitivity": "public"
         },
         "observedAt": {
-          "description": "Unix ms of the last detection pass that was written. Absent in an\nengine without detection, or before its first good pass.",
+          "description": "Unix ms of the last detection pass that was written: the\n`lastOkAt` of `detectorHealth`, read before the rows, so the rows\nare never older than it. Absent in an engine without detection, or\nbefore its first good pass.",
           "format": "int64",
           "type": [
             "integer",
