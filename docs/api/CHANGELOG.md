@@ -17,6 +17,7 @@ When preview ends, the GUI's legacy in-process fallback is removed. The GUI then
 
 - Responses on one connection may arrive out of order. Clients match them by `id`. Core may handle requests on one connection concurrently.
 - `agent.create`, `agent.retire` and `session.stop` accept `idem`, as `msg.send` does today. A repeated `idem` replays the original result.
+- Annotation namespaces use the lowercase form of the owner ID, so every valid agent and client ID gets a namespace (the 43-byte limit no longer rejects them). New gateway client IDs are `cli_` plus a lowercase ULID.
 - Docs: `refreshing` and `retiring` are reserved states that core does not emit yet. `orphaned` means a retire could not confirm the kill; the agent is not resumable. `seq` can have gaps after view compaction; a gap is not a lost event.
 
 ## 1.10 — public error cleanup
