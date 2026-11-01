@@ -216,8 +216,14 @@ impl AgentMerge {
         change
     }
 
-    /// Raise the attention flag (an auto-mode denial, a prompt).
+    /// Raise the attention flag (an auto-mode denial, a prompt). A flag
+    /// newer than `at_ms` stays: a staged change that publishes late (see
+    /// `MergeTable::stage`) must not replace a newer reason. An equal or
+    /// older flag is replaced.
     pub fn attention(&mut self, reason: &str, at_ms: i64) {
+        if self.attention.as_ref().is_some_and(|a| a.at_ms > at_ms) {
+            return;
+        }
         self.attention = Some(Attention {
             reason: reason.to_string(),
             at_ms,
@@ -690,6 +696,47 @@ mod tests {
         t.remove("a1");
         t.publish(gone);
         assert_eq!(t.peek("a1", 2, |_| ()), None);
+    }
+
+    /// Attention staged at t1, a newer flag raised at t2 before the
+    /// commit: the newer one survives the publish. The reverse: a staged
+    /// flag newer than the one raised in between wins.
+    #[test]
+    fn a_late_publish_keeps_the_newer_attention() {
+        let t = MergeTable::new();
+        t.with("a1", 1, |_| ());
+        let (_, staged) = t
+            .stage_existing("a1", 1, |m| m.attention("auto_mode_denied: x", 1_000))
+            .unwrap();
+        t.peek("a1", 1, |m| m.attention("mail_uncertain: m1", 2_000));
+        t.publish(staged);
+        let flag = t.peek("a1", 1, |m| m.attention_flag().cloned()).flatten();
+        assert_eq!(
+            flag,
+            Some(Attention {
+                reason: "mail_uncertain: m1".into(),
+                at_ms: 2_000
+            })
+        );
+
+        let t = MergeTable::new();
+        t.with("a1", 1, |_| ());
+        let (_, staged) = t
+            .stage_existing("a1", 1, |m| m.attention("mail_held: m2", 2_000))
+            .unwrap();
+        t.peek("a1", 1, |m| m.attention("mail_uncertain: m1", 1_000));
+        t.publish(staged);
+        let flag = t.peek("a1", 1, |m| m.attention_flag().cloned()).flatten();
+        assert_eq!(
+            flag.map(|a| (a.reason, a.at_ms)),
+            Some(("mail_held: m2".into(), 2_000))
+        );
+
+        // An equal time is replaced (the latest call wins).
+        let mut m = AgentMerge::new();
+        m.attention("a", 5);
+        m.attention("b", 5);
+        assert_eq!(m.attention_flag().unwrap().reason, "b");
     }
 
     /// A change made to the live entry between stage and publish (the
