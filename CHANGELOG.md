@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - Removed the unshipped pm-orchestration CLI feature and its hidden UI.
 
+### Changed
+- **c9p `SessionView` is its own wire type.** The engine converts the internal session record to `SessionView` at the API boundary, and the published schema is generated from `SessionView`. The wire bytes and `docs/api/c9p-1.json` do not change; a golden test and a leak test guard both.
+
 ### Security
 These changes break old mobile clients, QR codes and bookmarks on purpose. See [docs/mobile-migration-c0h.md](docs/mobile-migration-c0h.md) before you upgrade.
 
