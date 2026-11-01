@@ -18,9 +18,11 @@
 
 use std::path::Path;
 
-/// Claude Code runtime pieces: the spawn profile (`adapter/cc/profile.rs`).
+/// Claude Code runtime pieces: the spawn profile (`adapter/cc/profile.rs`)
+/// and the TUI quirks profile (`adapter/cc/quirks.rs`, D7).
 pub mod cc {
     pub mod profile;
+    pub mod quirks;
 }
 
 /// `full` | `basic` | `later` (A:1022).

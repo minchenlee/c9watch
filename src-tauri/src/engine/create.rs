@@ -104,6 +104,7 @@
 use super::adapter::cc::profile::{
     resolve_cwd, settings_path_of, spawn_spec, write_settings, Profile,
 };
+use super::adapter::cc::quirks::{self, CURRENT as CC};
 use super::adapter::{self, Descriptor};
 use super::agent_bin::{AgentBin, Rehash};
 use super::agents::LiveTable;
@@ -153,15 +154,15 @@ const POLL: Duration = Duration::from_millis(100);
 const RUN_TICK: Duration = Duration::from_millis(250);
 
 /// Mail (C1b-M1 §4.5): how long a paste settles before the supervisor
-/// looks for it in the input box.
-const PASTE_SETTLE: Duration = Duration::from_millis(600);
+/// looks for it in the input box. The mail delays are CC's (D7).
+const PASTE_SETTLE: Duration = CC.timing.paste_settle;
 
 /// How long a paste may take to show in the input box, and a CR to get
 /// into a full write queue. After it the message is `uncertain`.
-const PASTE_TIMEOUT: Duration = Duration::from_secs(5);
+const PASTE_TIMEOUT: Duration = CC.timing.paste_timeout;
 
 /// How long after the CR the prompt hook may take to confirm a message.
-const SUBMIT_CONFIRM: Duration = Duration::from_secs(10);
+const SUBMIT_CONFIRM: Duration = CC.timing.submit_confirm;
 
 /// Pastes of one message that found the PTY write queue full before it
 /// fails.
@@ -183,6 +184,12 @@ pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 /// fake driver.
 pub trait Launcher: Send + Sync {
     fn spawn(&self, spec: &SpawnSpec) -> io::Result<Box<dyn Driver>>;
+
+    /// The output of `<claude> --version`, for the version gate (D7).
+    /// Blocking.
+    fn cc_version(&self, claude: &Path) -> Result<String, String> {
+        quirks::probe_version(claude)
+    }
 }
 
 /// The native PTY (`engine::pty`).
@@ -570,7 +577,26 @@ impl Spawner {
                 )
             })?,
         };
+        self.gate_cc(&claude)
+            .map_err(|e| ApiError::new(ErrorCode::SpawnFailed, e))?;
         Ok((cwd, claude))
+    }
+
+    /// D7: the spawn path runs only a CC that a quirks profile covers.
+    /// Fails closed. Blocking.
+    fn gate_cc(&self, claude: &Path) -> Result<(), String> {
+        let out = self.launcher.cc_version(claude);
+        let version = out.as_deref().ok().and_then(quirks::parse_version);
+        let profile = quirks::gate(out, quirks::allow_untested())?;
+        if version.is_some_and(|v| !profile.covers(v)) {
+            eprintln!(
+                "[engine] Claude Code {:?} is untested; {}=1 runs it with the {} profile",
+                version.unwrap_or_default(),
+                quirks::ENV_ALLOW_UNTESTED,
+                profile.name
+            );
+        }
+        Ok(())
     }
 
     /// Phase `row`, in one transaction. Returns the new generation.
@@ -1311,15 +1337,15 @@ impl Spawner {
                 } else if held.is_some() {
                     None
                 } else if enqueued.is_none()
-                    && now.saturating_duration_since(since) >= Duration::from_secs(30)
+                    && now.saturating_duration_since(since) >= CC.timing.socket_queue_timeout
                 {
                     Some(format!(
                         "no queue-operation after {} ms",
                         now.saturating_duration_since(since).as_millis()
                     ))
-                } else if turn_ended
-                    .is_some_and(|at| now.saturating_duration_since(at) >= Duration::from_secs(15))
-                {
+                } else if turn_ended.is_some_and(|at| {
+                    now.saturating_duration_since(at) >= CC.timing.socket_after_turn_end
+                }) {
                     Some("queued in CC, not seen after turn end".into())
                 } else {
                     None
@@ -1520,21 +1546,32 @@ impl Spawner {
         }
     }
     /// All outgoing socket injection goes through this drain gate. A second
-    /// check on the helper closes the scheduling gap before connect/write.
+    /// check in the send closes the scheduling gap before connect/write.
+    /// The send is a task on the shared mail runtime (D12).
     fn socket_write(
         &self,
         agent: &str,
         endpoint: super::cc_inbox::Endpoint,
         line: String,
     ) -> std::sync::mpsc::Receiver<super::cc_inbox::SocketOutcome> {
+        use super::cc_inbox::{self, SocketOutcome};
         let (tx, rx) = std::sync::mpsc::channel();
+        let rt = match cc_inbox::io_runtime() {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(SocketOutcome::NotSent(e));
+                return rx;
+            }
+        };
         let (db, drain, agent) = (self.db.clone(), self.drain.clone(), agent.to_string());
-        std::thread::spawn(move || {
-            let outcome = super::cc_inbox::write_guarded(&endpoint, &line, || drain.on());
-            if outcome == super::cc_inbox::SocketOutcome::Blocked {
-                let _ = db.write_blocking(move |tx| {
-                    drain::audit_blocked(tx, "engine", &agent, InjectionPath::Socket, now_ms())
-                });
+        rt.spawn(async move {
+            let outcome = cc_inbox::send(&endpoint, &line, || drain.on()).await;
+            if outcome == SocketOutcome::Blocked {
+                let _ = db
+                    .write(move |tx| {
+                        drain::audit_blocked(tx, "engine", &agent, InjectionPath::Socket, now_ms())
+                    })
+                    .await;
             }
             let _ = tx.send(outcome);
         });
@@ -2273,7 +2310,12 @@ impl Spawner {
         };
         let sp = self.clone();
         let r2 = r.clone();
-        let start = blocking(move || sp.resume_plan(&r2).map_err(not_resumable_plain)).await?;
+        let start = blocking(move || {
+            let start = sp.resume_plan(&r2).map_err(not_resumable_plain)?;
+            sp.gate_cc(&start.claude).map_err(not_resumable_plain)?;
+            Ok(start)
+        })
+        .await?;
         let reason = if r.reason.as_deref() == Some(drain::REASON_DRAIN) {
             GenReason::EngineRestart
         } else {
@@ -2306,6 +2348,8 @@ impl Spawner {
 
     pub fn resume_on_boot(self: &Arc<Self>) -> Result<Resumed, String> {
         let mut done = Resumed::default();
+        // D7: one version gate for the whole boot, at the first resume.
+        let mut gated: Option<Result<(), String>> = None;
         for r in self.resumables(None)? {
             if self.drain.on() {
                 done.left.push(r.id);
@@ -2317,7 +2361,29 @@ impl Spawner {
                 continue;
             };
             let start = match self.resume_plan(&r) {
-                Ok(s) => s,
+                Ok(s) => match gated.get_or_insert_with(|| self.gate_cc(&s.claude)).clone() {
+                    Ok(()) => s,
+                    // Not the agent's fault: it stays resumable (D4), so a
+                    // CC update never ends the agents of a drain.
+                    Err(why) => {
+                        let (machine, id, from) = (
+                            self.db.machine_id().to_string(),
+                            r.id.clone(),
+                            r.state.clone(),
+                        );
+                        let wrote = self.db.write_blocking(move |tx| {
+                            ops::resume_failed(tx, &machine, &id, Some(&from), &why, now_ms())
+                        });
+                        match wrote {
+                            Ok(_) => done.failed.push(r.id),
+                            Err(e) => {
+                                eprintln!("[engine] Failed to fail the resume of {}: {}", r.id, e);
+                                done.left.push(r.id);
+                            }
+                        }
+                        continue;
+                    }
+                },
                 Err(why) => {
                     let (machine, id) = (self.db.machine_id().to_string(), r.id.clone());
                     let wrote = self.db.write_blocking(move |tx| {
@@ -3341,6 +3407,8 @@ mod tests {
         /// The argv of the last spawn.
         argv: Mutex<Vec<OsString>>,
         spawner: OnceLock<Weak<Spawner>>,
+        /// What `claude --version` prints.
+        version: Mutex<Result<String, String>>,
     }
 
     fn env_of(spec: &SpawnSpec, key: &str) -> Option<String> {
@@ -3394,6 +3462,10 @@ mod tests {
                 kill_fails: self.kill_fails.clone(),
                 drain_on_screen,
             }))
+        }
+
+        fn cc_version(&self, _: &Path) -> Result<String, String> {
+            lock(&self.version).clone()
         }
     }
 
@@ -3463,6 +3535,7 @@ mod tests {
             env: Mutex::new(Vec::new()),
             argv: Mutex::new(Vec::new()),
             spawner: OnceLock::new(),
+            version: Mutex::new(Ok("2.1.316 (Claude Code)".into())),
         });
         let mut sp = Spawner::new(
             SpawnerConfig {
@@ -3667,6 +3740,36 @@ mod tests {
             .contains("Claude usage limit reached"));
         assert!(e.agents.is_empty());
         assert!(!settings_path_of(&e.home, &r.id, 1).exists());
+    }
+
+    /// D7: a CC version that no quirks profile covers, or one that cannot
+    /// be read, is refused before anything is written or spawned.
+    #[tokio::test]
+    async fn an_unsupported_cc_version_is_refused_before_the_row() {
+        let e = setup(Script::Ready, None);
+        for (out, text) in [
+            (Ok("2.2.0 (Claude Code)".to_string()), "is not supported"),
+            (Ok("2.1.311 (Claude Code)".to_string()), "is not supported"),
+            (Ok("nonsense".to_string()), "cannot read"),
+            (Err("timed out".to_string()), "cannot read"),
+        ] {
+            *lock(&e.launcher.version) = out;
+            let err =
+                e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                    .await
+                    .unwrap_err();
+            assert_eq!(err.code, ErrorCode::SpawnFailed);
+            assert!(err.msg.contains(text), "{}", err.msg);
+            assert!(err.msg.contains("nothing was spawned"), "{}", err.msg);
+        }
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 0);
+        assert!(e.db.agents(AgentFilter::All).unwrap().is_empty());
+        *lock(&e.launcher.version) = Ok("2.1.316 (Claude Code)".into());
+        e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+            .await
+            .unwrap();
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 1);
+        e.sp.shutdown();
     }
 
     #[tokio::test]
@@ -4681,6 +4784,36 @@ mod tests {
         let (_, l3, sp3) = next_engine(&e, Script::Ready, None);
         assert_eq!(sp3.resume_on_boot().unwrap(), Resumed::default());
         assert_eq!(l3.spawns.load(Ordering::SeqCst), 0);
+    }
+
+    /// D7 on resume: an unsupported CC leaves the row `paused` with
+    /// `resume_failed` and nothing spawned; `agent.resume` may retry it.
+    #[tokio::test]
+    async fn an_unsupported_cc_version_on_resume_is_resume_failed_without_a_spawn() {
+        let e = setup(Script::Ready, None);
+        let r = drained_agent(&e).await;
+        let (_, l2, sp2) = next_engine(&e, Script::Ready, None);
+        *lock(&l2.version) = Ok("2.2.0 (Claude Code)".into());
+        assert_eq!(sp2.resume_on_boot().unwrap().failed, [r.id.clone()]);
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 0);
+        let got = row(&e.db, &r.id);
+        assert_eq!(got.state.as_deref(), Some("paused"));
+        assert_eq!(got.state_reason.as_deref(), Some(ops::RESUME_FAILED));
+        let why = audit_reasons(&e.db, ops::KIND_RESUME, "failed");
+        assert!(why[0].contains("is not supported"), "{:?}", why);
+        // `agent.resume` gates too, and leaves the row as it was.
+        let l = Principal::LocalUnverified;
+        let id = serde_json::json!({ "id": r.id });
+        let err = sp2.resume(&l, id.clone()).await.unwrap_err();
+        assert!(err.msg.contains("is not supported"), "{}", err.msg);
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(row(&e.db, &r.id).state.as_deref(), Some("paused"));
+        // A supported CC again: the same agent resumes.
+        *lock(&l2.version) = Ok("2.1.316 (Claude Code)".into());
+        let got = sp2.resume(&l, id).await.unwrap();
+        assert_eq!(got.state.as_deref(), Some("ready"));
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 1);
+        sp2.shutdown();
     }
 
     /// An exit before ready, and no ready within 30 s, are `resume_failed`
