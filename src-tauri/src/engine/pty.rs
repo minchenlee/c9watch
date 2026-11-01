@@ -999,10 +999,15 @@ mod tests {
     /// (and the hangup the leader's exit sends).
     /// The group signal still goes out with SIGKILL, because that member,
     /// seen by pid and start time, still holds the group id.
+    ///
+    /// The member prints its own pid after its trap is set (`exec sh`
+    /// keeps an ignored signal ignored). A pid the leader prints from `$!`
+    /// comes right after the fork, before the trap: on a loaded machine
+    /// SIGTERM then got there first and the kill ended early.
     #[test]
     fn an_orphan_group_member_that_ignores_sigterm_gets_sigkill() {
         let mut pty = NativePty::spawn(&sh(
-            "(trap '' TERM HUP; exec sleep 300) & echo \"$! bg\"; wait",
+            "(trap '' TERM HUP; exec sh -c 'echo \"$$ bg\"; exec sleep 300') & wait",
         ))
         .unwrap();
         let bg = read_pid(&mut pty, " bg");
