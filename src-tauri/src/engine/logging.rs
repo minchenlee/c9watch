@@ -5,7 +5,7 @@
 //! (`engine_proto::spawn::log_path`, opened append-only). The engine never
 //! opens the log for its own writes; it writes to stderr.
 //!
-//! Line format: `elog!` writes one line per record,
+//! Line format: `elog!` (`crate::log_line`) writes one line per record,
 //!
 //! ```text
 //! 2026-11-01T08:15:02.123Z INFO run: Listening on "/…/engine.sock"
@@ -13,8 +13,9 @@
 //!
 //! that is an RFC 3339 UTC timestamp with milliseconds, the level, the
 //! target (the module that logs) and the message, with newlines in the
-//! message escaped, so one record is always one line. Lines from code that
-//! still uses `eprintln!` stay plain text in the same file.
+//! message escaped, so one record is always one line. Lines that something
+//! other than `elog!` writes to stderr (a panic message, a child's output)
+//! stay plain text in the same file.
 //!
 //! Rotation is by size: `rotate_stderr_log` moves `engine.log` to
 //! `engine.log.1` (and `.1` to `.2`, up to `LOG_KEEP`) once it passes
@@ -26,7 +27,6 @@
 //! is waiting for hello reads boot errors at an offset in the old file)
 //! and then every minute.
 
-use std::fmt;
 use std::fs::OpenOptions;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -38,67 +38,7 @@ pub const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// at most about `(LOG_KEEP + 1) * LOG_MAX_BYTES` on disk.
 pub const LOG_KEEP: u32 = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Level {
-    Error,
-    Warn,
-    Info,
-    Debug,
-}
-
-impl Level {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Level::Error => "ERROR",
-            Level::Warn => "WARN",
-            Level::Info => "INFO",
-            Level::Debug => "DEBUG",
-        }
-    }
-}
-
-/// One log line, without the trailing newline.
-pub fn format_line(
-    ts: chrono::DateTime<chrono::Utc>,
-    level: Level,
-    target: &str,
-    msg: fmt::Arguments,
-) -> String {
-    let msg = msg.to_string();
-    let mut escaped = String::with_capacity(msg.len());
-    for c in msg.chars() {
-        match c {
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            c => escaped.push(c),
-        }
-    }
-    format!(
-        "{} {} {}: {}",
-        ts.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
-        level.as_str(),
-        target,
-        escaped
-    )
-}
-
-/// Write one record to stderr. Use `elog!`.
-pub fn write(level: Level, target: &str, msg: fmt::Arguments) {
-    eprintln!("{}", format_line(chrono::Utc::now(), level, target, msg));
-}
-
-/// `elog!(Info, "run", "Listening on {:?}", path)`: one structured line on
-/// stderr (see the module doc).
-#[macro_export]
-macro_rules! elog {
-    ($level:ident, $target:expr, $($arg:tt)*) => {
-        $crate::engine::logging::write(
-            $crate::engine::logging::Level::$level,
-            $target,
-            format_args!($($arg)*),
-        )
-    };
-}
+pub use crate::log_line::{format_line, write, Level};
 
 /// Rotate `<home>/engine.log` if the engine's stderr writes to it and it
 /// is over `LOG_MAX_BYTES`. Returns whether it rotated. Stderr (fd 2) is

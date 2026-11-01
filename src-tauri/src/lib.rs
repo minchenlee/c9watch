@@ -8,6 +8,7 @@ pub mod claude_hooks;
 pub mod claude_path;
 pub mod claude_usage;
 pub mod debug_log;
+pub mod log_line;
 pub mod session;
 
 #[cfg(any(feature = "gui", all(unix, feature = "engine")))]

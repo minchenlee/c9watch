@@ -55,6 +55,7 @@ use super::db::outbox::{self, NewEvent};
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
 use super::proto::{AgentRow, DetectorHealth, TickResult};
 use super::views::sessions::SessionViews;
+use crate::elog;
 use crate::session::enrichment::enrich_detected_sessions;
 use crate::session::transitions::notification_transitions;
 use crate::session::{
@@ -621,7 +622,7 @@ impl Detection {
         };
         match self.db.write_blocking(move |tx| tx.emit(&event)) {
             Ok(_) => self.health_lock().emitted(data, now),
-            Err(e) => eprintln!("[engine] detection health: {}", e),
+            Err(e) => elog!(Error, "detect", "detection health: {}", e),
         }
     }
 
@@ -793,7 +794,7 @@ pub fn spawn(detection: Arc<Detection>, first: Arc<FirstTick>) -> Result<mpsc::S
             detection.install(Detector::live(Box::new(Live::new()), machine));
             loop {
                 if let Err(e) = detection.tick() {
-                    eprintln!("[engine] detection: {}", e);
+                    elog!(Error, "detect", "detection: {}", e);
                 }
                 first.open();
                 match stopped.recv_timeout(TICK) {

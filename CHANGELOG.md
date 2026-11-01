@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed the unshipped pm-orchestration CLI feature and its hidden UI.
 
 ### Changed
+- **The engine keeps audit rows for 90 days by default (was 365).** The 500 000-row size cap stays, and both limits stay configurable (`EngineConfig::audit_retention`).
+- **Engine and client log lines are structured.** Diagnostics that were plain `eprintln!` lines now use the `elog!` format (`<UTC time> <LEVEL> <target>: <message>`, one record per line). CLI output to the user does not change.
 - **c9p `SessionView` is its own wire type.** The engine converts the internal session record to `SessionView` at the API boundary, and the published schema is generated from `SessionView`. The wire bytes and `docs/api/c9p-1.json` do not change; a golden test and a leak test guard both.
 
 ### Security

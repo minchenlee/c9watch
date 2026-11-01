@@ -34,6 +34,7 @@ use super::db::outbox::NewEvent;
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
 use super::fsutil::ensure_private_dir;
 use super::proto::AgentRow;
+use crate::elog;
 use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -127,7 +128,7 @@ pub fn import(db: &Db, home: &Path, source: &Path) -> Result<Report, String> {
     if let Err(e) = copy_and_apply(db, &root, &snap, &mut report) {
         // Each failed boot would otherwise leave one more copy behind.
         if let Err(rm) = std::fs::remove_dir_all(&snap) {
-            eprintln!("[engine] Failed to remove import {:?}: {}", snap, rm);
+            elog!(Warn, "import", "Failed to remove import {:?}: {}", snap, rm);
         }
         return Err(e);
     }
@@ -337,7 +338,13 @@ fn prune_snapshots(base: &Path, keep: &Path) {
     for (_, dir) in snaps.into_iter().take(old) {
         if dir != keep {
             if let Err(e) = std::fs::remove_dir_all(&dir) {
-                eprintln!("[engine] Failed to remove old import {:?}: {}", dir, e);
+                elog!(
+                    Warn,
+                    "import",
+                    "Failed to remove old import {:?}: {}",
+                    dir,
+                    e
+                );
             }
         }
     }

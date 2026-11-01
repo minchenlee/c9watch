@@ -19,7 +19,7 @@ pub const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
 /// How long, and how many, audit rows are kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditRetention {
-    /// Rows older than this go. Default 365 days.
+    /// Rows older than this go. Default 90 days.
     pub max_age: Duration,
     /// All but the newest `max_rows` go: the size cap. Default 500 000
     /// (a row is a few hundred bytes, so about 100-250 MB at most).
@@ -29,7 +29,7 @@ pub struct AuditRetention {
 impl Default for AuditRetention {
     fn default() -> Self {
         AuditRetention {
-            max_age: Duration::from_secs(365 * 24 * 60 * 60),
+            max_age: Duration::from_secs(90 * 24 * 60 * 60),
             max_rows: 500_000,
         }
     }
@@ -127,16 +127,16 @@ mod tests {
     const DAY: i64 = 24 * 60 * 60 * 1000;
 
     #[test]
-    fn default_keeps_a_year_and_half_a_million_rows() {
+    fn default_keeps_90_days_and_half_a_million_rows() {
         let d = AuditRetention::default();
-        assert_eq!(d.max_age, Duration::from_secs(365 * 86_400));
+        assert_eq!(d.max_age, Duration::from_secs(90 * 86_400));
         assert_eq!(d.max_rows, 500_000);
     }
 
     #[test]
     fn rows_older_than_max_age_go() {
         let now = 1000 * DAY;
-        let c = conn_with(&[now - 400 * DAY, now - 366 * DAY, now - 364 * DAY, now]);
+        let c = conn_with(&[now - 400 * DAY, now - 91 * DAY, now - 89 * DAY, now]);
         let n = prune(&c, now, &AuditRetention::default()).unwrap();
         assert_eq!(n, 2);
         assert_eq!(seqs(&c), vec![3, 4]);

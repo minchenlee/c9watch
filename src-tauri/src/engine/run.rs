@@ -85,7 +85,7 @@ pub struct EngineConfig {
     /// The `claude` binary for free agents. `None` looks it up on `PATH`
     /// at each create; tests set a script here.
     pub claude: Option<PathBuf>,
-    /// How long and how many audit rows are kept (D10). Default 365 days
+    /// How long and how many audit rows are kept (D10). Default 90 days
     /// and 500 000 rows.
     pub audit_retention: db::audit::AuditRetention,
 }
