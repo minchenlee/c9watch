@@ -2,7 +2,7 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 10;
+export const C9P_API_MINOR = 11;
 
 /** `agent.attention` data: an agent needs the user. */
 export interface C9pAgentAttentionEvent {
@@ -67,6 +67,20 @@ export interface C9pAgentListResult {
   agents: C9pAgentRow[];
 }
 
+/** `agent.resume` params. */
+export interface C9pAgentResumeParams {
+  /**
+   * The agent id (`agt_<ulid>`) of a `paused` or `interrupted` engine
+   * agent.
+   */
+  id: string;
+}
+
+/** `agent.resume` result: the agent once it is `ready`. */
+export interface C9pAgentResumeResult {
+  agent: C9pAgentRow;
+}
+
 /** `agent.retire` params. */
 export interface C9pAgentRetireParams {
   /** The agent id (`agt_<ulid>`). */
@@ -75,7 +89,9 @@ export interface C9pAgentRetireParams {
 
 /**
  * `agent.retire` result: the tombstone row. Retiring a retired or
- * failed agent changes nothing and returns its row.
+ * failed agent changes nothing and returns its row. When the kill cannot
+ * be confirmed, the row is `orphaned` instead; retire it again to retry
+ * the kill.
  */
 export interface C9pAgentRetireResult {
   agent: C9pAgentRow;
@@ -138,16 +154,20 @@ export interface C9pAgentRow {
    * `blocked`, `paused`, `refreshing`, `interrupted`, `retiring`,
    * `retired`, `failed`, `orphaned`); `null` for an observed agent.
    * `refreshing` and `retiring` are reserved: the engine does not emit
-   * them today, but clients must accept them. `orphaned` means a retire
-   * could not confirm that the agent's process was killed; the agent is
-   * not resumable.
+   * them today, but clients must accept them. `orphaned` means no kill
+   * (retire, exit cleanup or boot reconcile) could confirm that the
+   * agent's process ended; the agent is not resumable, `goneAt` stays
+   * `null`, and `agent.retire` tries the kill again.
    */
   state: 'creating' | 'starting' | 'ready' | 'working' | 'blocked' | 'paused' | 'refreshing' | 'interrupted' | 'retiring' | 'retired' | 'failed' | 'orphaned' | null | string;
   /**
    * Why the agent is in its `state`: `drain` for a `paused` or
-   * `interrupted` agent that an engine drain stopped; for a `failed`
-   * agent the failure reason, such as `spawn_failed`, `resume_failed`,
-   * `exited` or `create_interrupted`.
+   * `interrupted` agent that an engine drain stopped; `resume_failed`
+   * for a `paused` or `interrupted` agent whose last resume failed
+   * (`agent.resume` tries again); for a `failed` agent the failure
+   * reason, such as `spawn_failed`, `resume_failed` (nothing to
+   * resume), `exited` or `create_interrupted`; `kill_unconfirmed` for
+   * an `orphaned` agent.
    */
   stateReason: string | null;
   /**
@@ -1504,6 +1524,10 @@ export interface C9pMethods {
   'agent.list': {
     params: C9pAgentListParams;
     result: C9pAgentListResult;
+  };
+  'agent.resume': {
+    params: C9pAgentResumeParams;
+    result: C9pAgentResumeResult;
   };
   'agent.retire': {
     params: C9pAgentRetireParams;

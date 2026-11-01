@@ -48,6 +48,7 @@ pub const METHOD_INFO: &[Method] = &[
         ..m("agent.create", 3, PREVIEW)
     },
     m("agent.retire", 3, PREVIEW),
+    m("agent.resume", 11, PREVIEW),
     m("hook.session_start", 2, INTERNAL),
     m("hook.stop", 2, INTERNAL),
     m("hook.permission_request", 2, INTERNAL),

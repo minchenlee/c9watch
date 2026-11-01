@@ -169,6 +169,32 @@
       ],
       "type": "object"
     },
+    "AgentResumeParams": {
+      "description": "`agent.resume` params.",
+      "properties": {
+        "id": {
+          "description": "The agent id (`agt_<ulid>`) of a `paused` or `interrupted` engine\nagent.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "AgentResumeResult": {
+      "description": "`agent.resume` result: the agent once it is `ready`.",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/AgentRow",
+          "x-sensitivity": "conversation"
+        }
+      },
+      "required": [
+        "agent"
+      ],
+      "type": "object"
+    },
     "AgentRetireParams": {
       "description": "`agent.retire` params.",
       "properties": {
@@ -183,7 +209,7 @@
       "type": "object"
     },
     "AgentRetireResult": {
-      "description": "`agent.retire` result: the tombstone row. Retiring a retired or\nfailed agent changes nothing and returns its row.",
+      "description": "`agent.retire` result: the tombstone row. Retiring a retired or\nfailed agent changes nothing and returns its row. When the kill cannot\nbe confirmed, the row is `orphaned` instead; retire it again to retry\nthe kill.",
       "properties": {
         "agent": {
           "$ref": "#/$defs/AgentRow",
@@ -372,7 +398,7 @@
           "x-sensitivity": "public"
         },
         "state": {
-          "description": "Engine lifecycle state (`creating`, `starting`, `ready`, `working`,\n`blocked`, `paused`, `refreshing`, `interrupted`, `retiring`,\n`retired`, `failed`, `orphaned`); `null` for an observed agent.\n`refreshing` and `retiring` are reserved: the engine does not emit\nthem today, but clients must accept them. `orphaned` means a retire\ncould not confirm that the agent's process was killed; the agent is\nnot resumable.",
+          "description": "Engine lifecycle state (`creating`, `starting`, `ready`, `working`,\n`blocked`, `paused`, `refreshing`, `interrupted`, `retiring`,\n`retired`, `failed`, `orphaned`); `null` for an observed agent.\n`refreshing` and `retiring` are reserved: the engine does not emit\nthem today, but clients must accept them. `orphaned` means no kill\n(retire, exit cleanup or boot reconcile) could confirm that the\nagent's process ended; the agent is not resumable, `goneAt` stays\n`null`, and `agent.retire` tries the kill again.",
           "enum": [
             "creating",
             "starting",
@@ -396,7 +422,7 @@
           "x-sensitivity": "public"
         },
         "stateReason": {
-          "description": "Why the agent is in its `state`: `drain` for a `paused` or\n`interrupted` agent that an engine drain stopped; for a `failed`\nagent the failure reason, such as `spawn_failed`, `resume_failed`,\n`exited` or `create_interrupted`.",
+          "description": "Why the agent is in its `state`: `drain` for a `paused` or\n`interrupted` agent that an engine drain stopped; `resume_failed`\nfor a `paused` or `interrupted` agent whose last resume failed\n(`agent.resume` tries again); for a `failed` agent the failure\nreason, such as `spawn_failed`, `resume_failed` (nothing to\nresume), `exited` or `create_interrupted`; `kill_unconfirmed` for\nan `orphaned` agent.",
           "type": [
             "string",
             "null"
@@ -1677,7 +1703,7 @@
         },
         {
           "const": "not_allowed",
-          "description": "The principal may not call this method (`agent.create` and\n`agent.retire` take only a local client).",
+          "description": "The principal may not call this method (`agent.create`,\n`agent.retire` and `agent.resume` take only a local client).",
           "type": "string"
         },
         {
@@ -1732,7 +1758,7 @@
         },
         {
           "const": "action_failed",
-          "description": "`session.stop` or `session.rename` was refused or failed on the\nsession itself: it cannot be stopped, it runs as another process\nnow, or the write failed. `msg` says which.",
+          "description": "`session.stop` or `session.rename` was refused or failed on the\nsession itself: it cannot be stopped, it runs as another process\nnow, or the write failed. `agent.resume`: the agent is not `paused`\nor `interrupted`, already runs, or has nothing to resume. `msg`\nsays which.",
           "type": "string"
         },
         {
@@ -4757,7 +4783,7 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
-  "apiMinor": 10,
+  "apiMinor": 11,
   "description": "Preview: the c9watch engine protocol. One JSON object per line over the engine socket. A preview minor may break a method; check breakingSince.",
   "frames": {
     "event": {
@@ -4829,6 +4855,25 @@
         ],
         "resource": "agent",
         "verb": "read"
+      },
+      "x-stability": "preview"
+    },
+    "agent.resume": {
+      "params": {
+        "$ref": "#/$defs/AgentResumeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AgentResumeResult"
+      },
+      "x-authz": {
+        "admission": [
+          "mutating_peer"
+        ],
+        "principals": [
+          "local-unverified"
+        ],
+        "resource": "agent",
+        "verb": "write"
       },
       "x-stability": "preview"
     },

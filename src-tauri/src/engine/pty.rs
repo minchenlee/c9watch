@@ -104,6 +104,12 @@ impl Descendants {
     fn any_runs(&self) -> bool {
         self.0.iter().any(runs)
     }
+
+    /// Whether a descendant seen in group `pgid` still runs (same pid and
+    /// start time): then the group id is still the one it had.
+    fn holds_group(&self, pgid: libc::pid_t) -> bool {
+        self.0.iter().any(|e| e.pgid == pgid && runs(e))
+    }
 }
 
 /// Whether the process `e` names (same pid and start time) still runs. A
@@ -571,9 +577,11 @@ pub fn kill_orphan(id: ChildId) -> io::Result<Orphan> {
     let mut seen = Descendants::default();
     seen.sweep(id);
     // While the leader runs, its pid is also its group id (it called
-    // `setsid`), so the group signal reaches the right processes.
+    // `setsid`), so the group signal reaches the right processes. After it
+    // exits, the group id stays ours only while a member seen by pid and
+    // start time still runs; otherwise it may be another process's now.
     let signal = |seen: &Descendants, sig| {
-        if runs(&leader) {
+        if runs(&leader) || seen.holds_group(id.pid) {
             let _ = signal_group(id.pid, sig);
         }
         Descendants::signal(&seen.0, id.pid, sig);
@@ -985,6 +993,25 @@ mod tests {
     /// Whether `pid` runs something (a zombie does not).
     fn runs_pid(pid: libc::pid_t) -> bool {
         peer::proc_entry(pid).is_some_and(|e| !e.zombie)
+    }
+
+    /// D2: the leader dies on SIGTERM, a member of its group ignores it
+    /// (and the hangup the leader's exit sends).
+    /// The group signal still goes out with SIGKILL, because that member,
+    /// seen by pid and start time, still holds the group id.
+    #[test]
+    fn an_orphan_group_member_that_ignores_sigterm_gets_sigkill() {
+        let mut pty = NativePty::spawn(&sh(
+            "(trap '' TERM HUP; exec sleep 300) & echo \"$! bg\"; wait",
+        ))
+        .unwrap();
+        let bg = read_pid(&mut pty, " bg");
+        let id = pty.child();
+        assert_eq!(unsafe { libc::getpgid(bg) }, id.pid);
+        let started = Instant::now();
+        assert_eq!(kill_orphan(id).unwrap(), Orphan::Killed);
+        assert!(started.elapsed() >= KILL_GRACE);
+        assert!(gone_soon(bg), "group member {} survived", bg);
     }
 
     #[test]
