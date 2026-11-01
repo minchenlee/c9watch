@@ -40,6 +40,9 @@ pub mod agent_bin;
 pub mod db;
 
 #[cfg(unix)]
+pub mod logging;
+
+#[cfg(unix)]
 pub mod machine;
 
 #[cfg(unix)]

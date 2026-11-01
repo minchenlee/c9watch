@@ -1,0 +1,264 @@
+//! Engine log lines and `engine.log` rotation (D10).
+//!
+//! Where the log goes: a client that auto-starts the engine points the
+//! engine's stdout and stderr at `<home>/engine.log`
+//! (`engine_proto::spawn::log_path`, opened append-only). The engine never
+//! opens the log for its own writes; it writes to stderr.
+//!
+//! Line format: `elog!` writes one line per record,
+//!
+//! ```text
+//! 2026-11-01T08:15:02.123Z INFO run: Listening on "/…/engine.sock"
+//! ```
+//!
+//! that is an RFC 3339 UTC timestamp with milliseconds, the level, the
+//! target (the module that logs) and the message, with newlines in the
+//! message escaped, so one record is always one line. Lines from code that
+//! still uses `eprintln!` stay plain text in the same file.
+//!
+//! Rotation is by size: `rotate_stderr_log` moves `engine.log` to
+//! `engine.log.1` (and `.1` to `.2`, up to `LOG_KEEP`) once it passes
+//! `LOG_MAX_BYTES`, opens a new `engine.log` (0600, no symlink) and points
+//! fds 1 and 2 at it. It does that only when fd 2 is that very file (same
+//! device and inode), so an engine run in a terminal or a test is never
+//! redirected. The engine checks after the socket is bound (a client that
+//! is waiting for hello reads boot errors at an offset in the old file)
+//! and then every minute.
+
+use std::fmt;
+use std::fs::OpenOptions;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+
+/// `engine.log` is rotated once it is larger than this.
+pub const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// Rotated files kept (`engine.log.1` … `engine.log.N`), so the log takes
+/// at most about `(LOG_KEEP + 1) * LOG_MAX_BYTES` on disk.
+pub const LOG_KEEP: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
+
+impl Level {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Level::Error => "ERROR",
+            Level::Warn => "WARN",
+            Level::Info => "INFO",
+            Level::Debug => "DEBUG",
+        }
+    }
+}
+
+/// One log line, without the trailing newline.
+pub fn format_line(
+    ts: chrono::DateTime<chrono::Utc>,
+    level: Level,
+    target: &str,
+    msg: fmt::Arguments,
+) -> String {
+    let msg = msg.to_string();
+    let mut escaped = String::with_capacity(msg.len());
+    for c in msg.chars() {
+        match c {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            c => escaped.push(c),
+        }
+    }
+    format!(
+        "{} {} {}: {}",
+        ts.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+        level.as_str(),
+        target,
+        escaped
+    )
+}
+
+/// Write one record to stderr. Use `elog!`.
+pub fn write(level: Level, target: &str, msg: fmt::Arguments) {
+    eprintln!("{}", format_line(chrono::Utc::now(), level, target, msg));
+}
+
+/// `elog!(Info, "run", "Listening on {:?}", path)`: one structured line on
+/// stderr (see the module doc).
+#[macro_export]
+macro_rules! elog {
+    ($level:ident, $target:expr, $($arg:tt)*) => {
+        $crate::engine::logging::write(
+            $crate::engine::logging::Level::$level,
+            $target,
+            format_args!($($arg)*),
+        )
+    };
+}
+
+/// Rotate `<home>/engine.log` if the engine's stderr writes to it and it
+/// is over `LOG_MAX_BYTES`. Returns whether it rotated.
+pub fn rotate_stderr_log(home: &Path) -> Result<bool, String> {
+    let path = crate::engine_proto::spawn::log_path(home);
+    rotate_fds(&path, &[1, 2], LOG_MAX_BYTES, LOG_KEEP)
+}
+
+/// `path` with `.n` appended.
+fn numbered(path: &Path, n: u32) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(format!(".{}", n));
+    PathBuf::from(s)
+}
+
+/// (device, inode) of an open fd, when it is a regular file.
+fn fd_file_id(fd: RawFd) -> Option<(u64, u64)> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return None;
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return None;
+    }
+    Some((st.st_dev as u64, st.st_ino as u64))
+}
+
+/// The rotation behind `rotate_stderr_log`: when the first of `fds` writes
+/// to `path` and `path` is larger than `max`, shift the numbered files,
+/// move `path` to `path.1`, create a new `path` and `dup2` it onto every fd
+/// in `fds` that wrote to the old file. Returns whether it rotated.
+pub fn rotate_fds(path: &Path, fds: &[RawFd], max: u64, keep: u32) -> Result<bool, String> {
+    let Some(&first) = fds.first() else {
+        return Ok(false);
+    };
+    let Some(ours) = fd_file_id(first) else {
+        return Ok(false);
+    };
+    // Not following a symlink: a planted link is never rotated through.
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("Failed to stat {:?}: {}", path, e)),
+    };
+    if !meta.file_type().is_file() || (meta.dev(), meta.ino()) != ours || meta.len() <= max {
+        return Ok(false);
+    }
+    let keep = keep.max(1);
+    for n in (1..keep).rev() {
+        match std::fs::rename(numbered(path, n), numbered(path, n + 1)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Failed to rotate {:?}: {}", path, e)),
+        }
+    }
+    std::fs::rename(path, numbered(path, 1))
+        .map_err(|e| format!("Failed to rotate {:?}: {}", path, e))?;
+    let new = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("Failed to open a new {:?}: {}", path, e))?;
+    for &fd in fds {
+        if fd_file_id(fd) == Some(ours) && unsafe { libc::dup2(new.as_raw_fd(), fd) } == -1 {
+            return Err(format!(
+                "Failed to point fd {} at {:?}: {}",
+                fd,
+                path,
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_line_has_timestamp_level_target_and_one_line_message() {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-11-01T08:15:02.123Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let line = format_line(ts, Level::Warn, "db", format_args!("a\nb {}", 7));
+        assert_eq!(line, "2026-11-01T08:15:02.123Z WARN db: a\\nb 7");
+    }
+
+    /// An fd for `path` opened like the spawner does (append), as a stand-in
+    /// for the engine's stderr.
+    fn open_append(path: &Path) -> std::fs::File {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+    }
+
+    #[test]
+    fn rotates_past_the_cap_and_moves_the_fd_to_the_new_file() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("engine.log");
+        let mut f = open_append(&path);
+        f.write_all(b"0123456789").unwrap();
+        let fd = f.as_raw_fd();
+        // At the cap: nothing happens.
+        assert!(!rotate_fds(&path, &[fd], 10, 2).unwrap());
+        f.write_all(b"x").unwrap();
+        assert!(rotate_fds(&path, &[fd], 10, 2).unwrap());
+        assert_eq!(std::fs::read(numbered(&path, 1)).unwrap(), b"0123456789x");
+        // The fd now writes to the new, private file.
+        f.write_all(b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // Two more rotations with keep = 2: .1 shifts to .2, the oldest goes.
+        f.write_all(b"-second-file").unwrap();
+        assert!(rotate_fds(&path, &[fd], 10, 2).unwrap());
+        f.write_all(b"third-file!").unwrap();
+        assert!(rotate_fds(&path, &[fd], 10, 2).unwrap());
+        assert_eq!(std::fs::read(numbered(&path, 1)).unwrap(), b"third-file!");
+        assert_eq!(
+            std::fs::read(numbered(&path, 2)).unwrap(),
+            b"new-second-file"
+        );
+        assert!(!numbered(&path, 3).exists());
+    }
+
+    #[test]
+    fn an_fd_that_is_not_the_log_is_left_alone() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("engine.log");
+        std::fs::write(&path, vec![b'a'; 100]).unwrap();
+        let other = open_append(&t.path().join("other.log"));
+        assert!(!rotate_fds(&path, &[other.as_raw_fd()], 10, 2).unwrap());
+        assert!(!numbered(&path, 1).exists());
+        // A pipe (a terminal or test harness) is never rotated either.
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert!(!rotate_fds(&path, &[fds[1]], 10, 2).unwrap());
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn a_symlinked_log_is_not_rotated() {
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().join("real.log");
+        let f = open_append(&real);
+        std::fs::write(&real, vec![b'a'; 100]).unwrap();
+        let link = t.path().join("engine.log");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(!rotate_fds(&link, &[f.as_raw_fd()], 10, 2).unwrap());
+        assert!(real.exists());
+    }
+}

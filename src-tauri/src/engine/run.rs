@@ -37,6 +37,11 @@
 //! new generation and comes up on `claude --resume` on its supervisor's
 //! thread. While the engine drains the rows stay as they are. A failed read
 //! or write logs and the engine runs on.
+//!
+//! Upkeep (`upkeep_loop`): event retention every minute, audit retention
+//! every hour (both also run at boot, in `db::open_with`), and an
+//! `engine.log` size check every minute, first right after the bind
+//! (`engine::logging`).
 
 use super::agent_bin::{self, AgentBin};
 use super::agents::LiveTable;
@@ -54,12 +59,14 @@ use super::mail;
 use super::ops;
 use super::sock::{bind_private, ShutdownSignal, ShutdownSignals};
 use super::standing;
+use crate::elog;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixListener;
 
-/// How often event retention runs (it also runs at boot).
+/// How often event retention and the log size check run (retention also
+/// runs at boot).
 const PRUNE_EVERY: Duration = Duration::from_secs(60);
 
 /// What one engine runs with.
@@ -78,6 +85,9 @@ pub struct EngineConfig {
     /// The `claude` binary for free agents. `None` looks it up on `PATH`
     /// at each create; tests set a script here.
     pub claude: Option<PathBuf>,
+    /// How long and how many audit rows are kept (D10). Default 365 days
+    /// and 500 000 rows.
+    pub audit_retention: db::audit::AuditRetention,
 }
 
 impl EngineConfig {
@@ -88,6 +98,7 @@ impl EngineConfig {
             agents: Arc::new(LiveTable::new()),
             detection: true,
             claude: None,
+            audit_retention: Default::default(),
         })
     }
 }
@@ -112,25 +123,39 @@ pub async fn run_until(
     let lock = acquire_engine_lock(&lock_path(home))?;
     let key = machine::load_or_create(home)?;
     let header_key = key.header_key();
-    let db = Arc::new(db::open(home, key.id())?);
+    let db = Arc::new(db::open_with(
+        home,
+        key.id(),
+        db::OpenOptions {
+            audit_retention: config.audit_retention.clone(),
+        },
+    )?);
     let agent_bin = Arc::new(AgentBin::install(home, &config.agent_source));
     match (agent_bin.sha256_hex(), agent_bin.missing_reason()) {
-        (Some(sha), _) => eprintln!("[engine] Installed {:?} (sha256 {})", agent_bin.path(), sha),
-        (None, why) => eprintln!(
-            "[engine] No agent binary, agents cannot start: {}",
+        (Some(sha), _) => elog!(
+            Info,
+            "run",
+            "Installed {:?} (sha256 {})",
+            agent_bin.path(),
+            sha
+        ),
+        (None, why) => elog!(
+            Warn,
+            "run",
+            "No agent binary, agents cannot start: {}",
             why.unwrap_or_default()
         ),
     }
     match standing::ensure(home) {
-        Ok(true) => eprintln!("[engine] Wrote the default {:?}", standing::path(home)),
+        Ok(true) => elog!(Info, "run", "Wrote the default {:?}", standing::path(home)),
         Ok(false) => {}
-        Err(e) => eprintln!("[engine] {}", e),
+        Err(e) => elog!(Warn, "run", "{}", e),
     }
     let mail_merge = Arc::new(super::merge::MergeTable::new());
     let mail_sockets = if super::cc_inbox::enabled() {
         let sockets = super::cc_listener::Sockets::new(db.clone(), mail_merge.clone());
         if let Err(e) = sockets.bind(&super::cc_inbox::default_socket_dir()) {
-            eprintln!("[engine] CC return socket unavailable: {}", e);
+            elog!(Warn, "run", "CC return socket unavailable: {}", e);
         }
         Some(sockets)
     } else {
@@ -141,7 +166,7 @@ pub async fn run_until(
         .map(|s| super::cc_listener::SocketCleanup(s.clone()));
     let reconciled = ops::reconcile(&db, home)?;
     if !reconciled.is_empty() {
-        eprintln!("[engine] Boot reconcile: {:?}", reconciled);
+        elog!(Info, "run", "Boot reconcile: {:?}", reconciled);
     }
     // No supervisor holds mail now (C1b-M1 §4.9): after `ops::reconcile`,
     // which fails the agents that did not survive.
@@ -150,7 +175,7 @@ pub async fn run_until(
         .write_blocking(move |tx| mail::reconcile_on_boot(tx, &machine_id, db::now_ms()))
         .map_err(|e| format!("Failed to reconcile the mail: {}", e))?;
     if mail != mail::Ended::default() {
-        eprintln!("[engine] Mail reconcile: {:?}", mail);
+        elog!(Info, "run", "Mail reconcile: {:?}", mail);
     }
     let (std_listener, socket) = bind_private(&sock, &lock)?;
     std_listener
@@ -203,8 +228,10 @@ pub async fn run_until(
     let ctx = Arc::new(ctx.with_spawner(spawner.clone()));
     match spawner.resume_on_boot() {
         Ok(r) if r == Default::default() => {}
-        Ok(r) => eprintln!(
-            "[engine] Boot resume: started {:?}, failed {:?}, left {:?}{}",
+        Ok(r) => elog!(
+            Info,
+            "run",
+            "Boot resume: started {:?}, failed {:?}, left {:?}{}",
             r.started,
             r.failed,
             r.left,
@@ -214,9 +241,12 @@ pub async fn run_until(
                 " (the engine drains, or a write failed)"
             }
         ),
-        Err(e) => eprintln!("[engine] Boot resume: {}", e),
+        Err(e) => elog!(Warn, "run", "Boot resume: {}", e),
     }
-    let pruner = tokio::spawn(prune_loop(db.clone()));
+    // After the bind: a client waiting for hello reads boot errors at an
+    // offset in the old `engine.log`.
+    rotate_log(home);
+    let pruner = tokio::spawn(upkeep_loop(db.clone(), home.to_path_buf()));
     let detection = if config.detection {
         let d = detect::spawn(detection, first_tick)?;
         spawn_import(db.clone(), home.to_path_buf());
@@ -224,8 +254,10 @@ pub async fn run_until(
     } else {
         None
     };
-    eprintln!(
-        "[engine] Listening on {:?}, pid={}, machine={}, epoch={}",
+    elog!(
+        Info,
+        "run",
+        "Listening on {:?}, pid={}, machine={}, epoch={}",
         socket.path(),
         std::process::id(),
         key.id(),
@@ -251,23 +283,23 @@ pub async fn run_until(
         loop {
             tokio::select! {
                 _ = &mut serving => {
-                    eprintln!("[engine] The listener failed during the drain");
+                    elog!(Warn, "run","The listener failed during the drain");
                     break;
                 }
                 _ = &mut drain => break,
                 sig = signals.recv() => {
                     if sig == ShutdownSignal::Term {
-                        eprintln!("[engine] SIGTERM again: still draining");
+                        elog!(Info, "run","SIGTERM again: still draining");
                         continue;
                     }
-                    eprintln!("[engine] {:?} during the drain", sig);
+                    elog!(Info, "run","{:?} during the drain", sig);
                     break;
                 }
                 _ = &mut stop => break,
             }
         }
     }
-    eprintln!("[engine] Shutting down ({:?})", sig);
+    elog!(Info, "run", "Shutting down ({:?})", sig);
     pruner.abort();
     // The agents go before the db closes, so their supervisors can still
     // write; what they leave is reconciled at the next boot. After a drain
@@ -276,8 +308,10 @@ pub async fn run_until(
     let shut = tokio::task::spawn_blocking(move || spawner.shutdown());
     if sig == Some(ShutdownSignal::Term) {
         if tokio::time::timeout_at(deadline, shut).await.is_err() {
-            eprintln!(
-                "[engine] Hard deadline of {} s: exiting with agents still stopping",
+            elog!(
+                Warn,
+                "run",
+                "Hard deadline of {} s: exiting with agents still stopping",
                 drain::HARD_DEADLINE.as_secs()
             );
         }
@@ -304,8 +338,10 @@ pub async fn run_until(
 async fn run_drain(spawner: &Arc<Spawner>) {
     spawner.drain_switch().start();
     let start = spawner.now();
-    eprintln!(
-        "[engine] SIGTERM: draining {} agent(s), up to {} s",
+    elog!(
+        Info,
+        "run",
+        "SIGTERM: draining {} agent(s), up to {} s",
         spawner.live_count(),
         drain::HARD_DEADLINE.as_secs()
     );
@@ -313,8 +349,10 @@ async fn run_drain(spawner: &Arc<Spawner>) {
     match tokio::task::spawn_blocking(move || drain::run(&sp, drain::Timing::default(), start))
         .await
     {
-        Ok(r) => eprintln!(
-            "[engine] Drained: paused {:?}, interrupted {:?}, left to boot reconcile {:?}, \
+        Ok(r) => elog!(
+            Info,
+            "run",
+            "Drained: paused {:?}, interrupted {:?}, left to boot reconcile {:?}, \
              unsettled {:?}{}",
             r.paused,
             r.interrupted,
@@ -326,7 +364,7 @@ async fn run_drain(spawner: &Arc<Spawner>) {
                 ""
             }
         ),
-        Err(e) => eprintln!("[engine] The drain failed: {}", e),
+        Err(e) => elog!(Warn, "run", "The drain failed: {}", e),
     }
 }
 
@@ -338,7 +376,7 @@ fn spawn_import(db: Arc<db::Db>, home: PathBuf) {
         .name("engine-import".into())
         .spawn(move || import_legacy(&db, &home));
     if let Err(e) = spawned {
-        eprintln!("[engine] Failed to start the legacy import: {}", e);
+        elog!(Warn, "run", "Failed to start the legacy import: {}", e);
     }
 }
 
@@ -348,8 +386,10 @@ fn import_legacy(db: &db::Db, home: &Path) {
         return;
     };
     match import::import(db, home, &source) {
-        Ok(r) if !r.is_empty() => eprintln!(
-            "[engine] Imported legacy files: {} copied, {} new rows, {} changed, {} events, \
+        Ok(r) if !r.is_empty() => elog!(
+            Info,
+            "run",
+            "Imported legacy files: {} copied, {} new rows, {} changed, {} events, \
              {} symlinks and {} other files skipped, {} unreadable",
             r.copied,
             r.created.len(),
@@ -360,18 +400,38 @@ fn import_legacy(db: &db::Db, home: &Path) {
             r.bad
         ),
         Ok(_) => {}
-        Err(e) => eprintln!("[engine] Legacy import failed: {}", e),
+        Err(e) => elog!(Warn, "run", "Legacy import failed: {}", e),
     }
 }
 
-async fn prune_loop(db: Arc<db::Db>) {
+/// Rotate `engine.log` when it is too large; a failure only logs.
+fn rotate_log(home: &Path) {
+    match super::logging::rotate_stderr_log(home) {
+        Ok(true) => elog!(Info, "run", "Rotated engine.log"),
+        Ok(false) => {}
+        Err(e) => elog!(Warn, "run", "{}", e),
+    }
+}
+
+async fn upkeep_loop(db: Arc<db::Db>, home: PathBuf) {
     let mut every = tokio::time::interval(PRUNE_EVERY);
-    // The first tick is immediate; boot already pruned.
+    // The first tick is immediate; boot already pruned and checked the log.
     every.tick().await;
+    let audit_every = (db::audit::PRUNE_EVERY.as_secs() / PRUNE_EVERY.as_secs()).max(1);
+    let mut ticks: u64 = 0;
     loop {
         every.tick().await;
+        ticks += 1;
         if let Err(e) = db.prune().await {
-            eprintln!("[engine] {}", e);
+            elog!(Warn, "run", "{}", e);
         }
+        if ticks.is_multiple_of(audit_every) {
+            match db.prune_audit().await {
+                Ok(0) => {}
+                Ok(n) => elog!(Info, "run", "Audit retention removed {} row(s)", n),
+                Err(e) => elog!(Warn, "run", "{}", e),
+            }
+        }
+        rotate_log(&home);
     }
 }

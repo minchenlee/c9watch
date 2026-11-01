@@ -52,6 +52,7 @@ impl Engine {
             agents: agents.clone(),
             detection: false,
             claude: None,
+            audit_retention: Default::default(),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let thread = std::thread::spawn(move || {
