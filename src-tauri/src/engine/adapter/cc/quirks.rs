@@ -522,17 +522,36 @@ mod tests {
         fake
     }
 
-    type Seen = std::sync::Mutex<Vec<(Target, bool)>>;
+    /// One cleanup signal, as the recording signal saw it when it was sent.
+    #[derive(Debug)]
+    struct Sent {
+        target: Target,
+        /// The child was not reaped yet.
+        unreaped: bool,
+        /// The child's group id at that moment.
+        pgid: libc::pid_t,
+        /// The signal's errno, if it failed.
+        errno: Option<i32>,
+    }
+
+    type Seen = std::sync::Mutex<Vec<Sent>>;
 
     fn recording(seen: &Seen) -> impl Fn(Target) -> std::io::Result<()> + '_ {
-        move |t| {
-            let pid = match t {
+        move |target| {
+            let pid = match target {
                 Target::Group(p) | Target::Child(p) => p,
             };
             // `waitid` fails with ECHILD once the child is reaped.
             let unreaped = crate::engine::pty::peek_exit(pid).is_ok();
-            seen.lock().unwrap().push((t, unreaped));
-            sigkill(t)
+            let pgid = unsafe { libc::getpgid(pid) };
+            let r = sigkill(target);
+            seen.lock().unwrap().push(Sent {
+                target,
+                unreaped,
+                pgid,
+                errno: r.as_ref().err().and_then(|e| e.raw_os_error()),
+            });
+            r
         }
     }
 
@@ -567,10 +586,10 @@ mod tests {
         assert!(e.contains("exited with"), "{}", e);
         let seen = seen.into_inner().unwrap();
         assert_eq!(seen.len(), 2, "{:?}", seen);
-        assert!(matches!(seen[0].0, Target::Group(_)), "{:?}", seen);
-        assert!(matches!(seen[1].0, Target::Child(_)), "{:?}", seen);
+        assert!(matches!(seen[0].target, Target::Group(_)), "{:?}", seen);
+        assert!(matches!(seen[1].target, Target::Child(_)), "{:?}", seen);
         // The wrapper was not reaped when its group got the signal.
-        assert!(seen.iter().all(|(_, unreaped)| *unreaped), "{:?}", seen);
+        assert!(seen.iter().all(|s| s.unreaped), "{:?}", seen);
         let pid: libc::pid_t = std::fs::read_to_string(&left)
             .unwrap()
             .trim()
@@ -588,25 +607,41 @@ mod tests {
             return;
         }
         let t = tempfile::tempdir().unwrap();
+        let ready = t.path().join("ready");
+        // `ready` appears only once the wrapper is in the new group.
         let fake = fake_claude(
             &t,
-            "#!/usr/bin/perl\n\
-             pipe(my $r, my $w) or die;\n\
-             my $kid = fork();\n\
-             if ($kid == 0) { close STDOUT; setpgrp(0, 0); syswrite($w, 'x'); sleep 3; exit 0; }\n\
-             sysread($r, my $b, 1);\n\
-             setpgrp(0, $kid) or die;\n\
-             $| = 1; print \"2.1.316 (Claude Code)\\n\";\n\
-             sleep 30;\n",
+            &format!(
+                "#!/usr/bin/perl\n\
+                 pipe(my $r, my $w) or die;\n\
+                 my $kid = fork();\n\
+                 if ($kid == 0) {{ close STDOUT; setpgrp(0, 0); syswrite($w, 'x'); sleep 3; exit 0; }}\n\
+                 sysread($r, my $b, 1);\n\
+                 setpgrp(0, $kid) or die;\n\
+                 open(my $f, '>', '{}') or die; close($f);\n\
+                 $| = 1; print \"2.1.316 (Claude Code)\\n\";\n\
+                 sleep 30;\n",
+                ready.display()
+            ),
         );
         let seen = Seen::default();
+        let timeout = Duration::from_secs(2);
         let start = std::time::Instant::now();
-        let e =
-            probe_version_with(&fake, Duration::from_millis(500), &recording(&seen)).unwrap_err();
+        let e = probe_version_with(&fake, timeout, &recording(&seen)).unwrap_err();
         assert!(e.contains("did not answer"), "{}", e);
         assert!(!e.contains("outlived"), "{}", e);
-        assert!(start.elapsed() < Duration::from_millis(500) + PROBE_REAP_LIMIT);
+        assert!(start.elapsed() < timeout + PROBE_REAP_LIMIT);
+        // The wrapper had left its group before the cleanup, so only the
+        // signal to the child can have killed it.
+        assert!(ready.exists(), "the wrapper never left its group");
         let seen = seen.into_inner().unwrap();
-        assert!(seen.iter().all(|(_, unreaped)| *unreaped), "{:?}", seen);
+        assert_eq!(seen.len(), 2, "{:?}", seen);
+        assert!(seen.iter().all(|s| s.unreaped), "{:?}", seen);
+        assert_eq!(seen[0].errno, Some(libc::ESRCH), "{:?}", seen);
+        let Target::Child(pid) = seen[1].target else {
+            panic!("{:?}", seen)
+        };
+        assert_ne!(seen[1].pgid, pid, "{:?}", seen);
+        assert_eq!(seen[1].errno, None, "{:?}", seen);
     }
 }
