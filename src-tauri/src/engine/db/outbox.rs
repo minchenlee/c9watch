@@ -1,9 +1,9 @@
 //! The event log and its cursor (D3, A:214-220).
 //!
 //! - **Cursor.** `machine:epoch:seq`. `seq` is the `events` rowid: global
-//!   and gap-free within an epoch, since a rolled-back insert takes no
-//!   rowid and retention never deletes the newest row (so `max(seq)` never
-//!   goes back and SQLite never reuses a rowid).
+//!   and increasing within an epoch, but not gap-free: view compaction
+//!   deletes middle `session.view` rows. Retention never deletes the newest
+//!   row, so `max(seq)` never goes back and SQLite never reuses a rowid.
 //! - **Outbox.** An event row is inserted in the same transaction as the
 //!   state change it reports (`Db::write`). After the commit only the new
 //!   head `seq` is broadcast, on a `watch` channel: it never blocks and

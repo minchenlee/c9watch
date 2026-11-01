@@ -372,7 +372,7 @@
           "x-sensitivity": "public"
         },
         "state": {
-          "description": "Engine lifecycle state (`creating`, `starting`, `ready`, `working`,\n`blocked`, `paused`, `refreshing`, `interrupted`, `retiring`,\n`retired`, `failed`, `orphaned`); `null` for an observed agent.",
+          "description": "Engine lifecycle state (`creating`, `starting`, `ready`, `working`,\n`blocked`, `paused`, `refreshing`, `interrupted`, `retiring`,\n`retired`, `failed`, `orphaned`); `null` for an observed agent.\n`refreshing` and `retiring` are reserved: the engine does not emit\nthem today, but clients must accept them. `orphaned` means a retire\ncould not confirm that the agent's process was killed; the agent is\nnot resumable.",
           "enum": [
             "creating",
             "starting",
