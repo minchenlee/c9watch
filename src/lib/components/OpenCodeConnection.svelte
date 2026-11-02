@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { invoke } from '$lib/data/commands';
+	import { connectOpenCode, getOpenCodeStatus } from '$lib/data/api';
 	type ConnectionStatus = { url: string; connected: boolean; error: string | null; sessionCount: number };
 	let url = $state('http://127.0.0.1:4096');
 	let username = $state('opencode');
@@ -17,7 +17,7 @@
 			const requestGeneration = generation;
 			try {
 				if (busy) return;
-				const next = await invoke<ConnectionStatus>('opencode_connection_status');
+				const next = await getOpenCodeStatus<ConnectionStatus>();
 				if (disposed || requestGeneration !== generation) return;
 				status = next;
 				if (first && next.url) url = next.url;
@@ -34,9 +34,9 @@
 		busy = true;
 		error = '';
 		try {
-			await invoke('opencode_connect', { url: disconnect ? '' : url, username, password: password || null });
+			await connectOpenCode(disconnect ? '' : url, username, password || null);
 			password = '';
-			const next = await invoke<ConnectionStatus>('opencode_connection_status');
+			const next = await getOpenCodeStatus<ConnectionStatus>();
 			if (requestGeneration === generation) status = next;
 		} catch (e) { if (requestGeneration === generation) error = String(e); }
 		finally { if (requestGeneration === generation) busy = false; }

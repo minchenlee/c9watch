@@ -3,18 +3,25 @@
  * into a local filesystem read. The in-process fallback stays until v1. */
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { Transport, StreamFrame } from './transport';
+import type { Transport, StreamFrame, RequestOptions } from './transport';
+import type { C9pProgressFrame } from '../c9p-1';
 import type { C9pMethod, C9pMethods } from '../c9p-1';
 import { C9pError } from './transport';
 
-async function fallback(method: C9pMethod, p: any): Promise<any> {
+async function fallback(method: C9pMethod, p: any, options?: RequestOptions): Promise<any> {
     switch (method) {
         case 'session.views': return { sessions: await invoke('get_sessions'), cursor: null };
         case 'diag.detection': return invoke('get_detection_diagnostics');
         case 'conversation.get': {
             const sessionId = p.sessionKey.replace(/^(claudeCode|codex|cursor|pi|opencode):/, '');
-            const c: any = await invoke('get_conversation', { sessionId, provider: p.provider, includeTools: p.includeTools });
-            return { ...c, total: c.messages.length, offset: 0, nextOffset: null };
+            const onProgress = options?.onProgress;
+            const unlisten = onProgress && await listen<any>('conversation-progress', e => {
+                if (e.payload?.sessionId === sessionId) onProgress({ v: 1, type: 'progress', id: null, bytesRead: e.payload.bytesRead, bytesTotal: e.payload.bytesTotal });
+            });
+            try {
+                const c: any = await invoke('get_conversation', { sessionId, provider: p.provider, includeTools: p.includeTools });
+                return { ...c, total: c.messages.length, offset: 0, nextOffset: null };
+            } finally { unlisten?.(); }
         }
         case 'session.away': return { activity: await invoke('get_away_activity', { requests: p.requests }) };
         case 'session.stop': return invoke('stop_session', { sessionKey: p.sessionKey, pid: p.pid });
@@ -34,10 +41,13 @@ async function fallback(method: C9pMethod, p: any): Promise<any> {
     }
 }
 export const tauriTransport: Transport = {
-    async request<M extends C9pMethod>(method: M, params: C9pMethods[M]['params']) {
-        try { return await invoke<C9pMethods[M]['result']>('c9p_request', { method, params }); }
+    async request<M extends C9pMethod>(method: M, params: C9pMethods[M]['params'], options?: RequestOptions) {
+        // Only a conversation read sends progress frames on this channel.
+        const progress = new Channel<C9pProgressFrame>();
+        if (options?.onProgress) progress.onmessage = options.onProgress;
+        try { return await invoke<C9pMethods[M]['result']>('c9p_request', { method, params, progress }); }
         catch (error: any) {
-            if (error?.code === 'core_unavailable') return fallback(method, params);
+            if (error?.code === 'core_unavailable') return fallback(method, params, options);
             if (error && typeof error.code === 'string') {
                 throw Object.assign(new C9pError(error.code, error.msg ?? 'Core request failed', error.retryable), error);
             }
@@ -55,8 +65,7 @@ export const tauriTransport: Transport = {
     }
 };
 
-/** Fallback and core both publish the same complete snapshot events from Rust.
- * Webview stream consumers may also subscribe directly to raw c9p frames. */
+/** Only the in-process fallback publishes these snapshot events; with core,
+ * the webview reads c9p event streams (`live.ts`). */
 export const listenSessions = (cb: (payload: any) => void) => listen('sessions-updated', e => cb(e.payload));
 export const listenDiagnostics = (cb: (payload: any) => void) => listen('diagnostic-update', e => cb(e.payload));
-export const listenProgress = (cb: (payload: any) => void) => listen('conversation-progress', e => cb(e.payload));

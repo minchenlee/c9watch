@@ -1,6 +1,5 @@
 import { get, writable, type Writable } from 'svelte/store';
-import { listen } from '$lib/data/platform';
-import { getConversation, CapabilityDisabledError } from '$lib/api';
+import { getConversation, onConversationProgress, CapabilityDisabledError } from '$lib/api';
 import { isTauri, useWebSocket, wsClient } from '$lib/ws';
 import { providerSessionKey } from '$lib/provider';
 import type { Conversation, SessionProvider } from '$lib/types';
@@ -85,11 +84,7 @@ export async function initConversationProgressListener() {
 		wsClient.on('conversationProgress', applyProgress);
 		return;
 	}
-	if (isTauri()) {
-		await listen<ConversationProgressEvent>('conversation-progress', (event) => {
-			applyProgress(event.payload);
-		});
-	}
+	if (isTauri()) onConversationProgress(applyProgress);
 }
 
 export async function withConversationLoader<T>(

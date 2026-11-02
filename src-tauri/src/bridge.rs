@@ -18,7 +18,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tauri::{ipc::Channel, AppHandle, Emitter, Manager, WebviewWindow};
+use tauri::{ipc::Channel, AppHandle, Manager, WebviewWindow};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
@@ -151,23 +151,41 @@ impl Bridge {
         self.last_health
             .store(chrono::Utc::now().timestamp_millis(), Ordering::Release);
     }
+    /// The in-process fallback takes over. Webview streams end with
+    /// `core_unavailable`, so the webview applies the fallback's events
+    /// until a new subscription succeeds; a stream would otherwise wait
+    /// silently for a core that is gone.
+    fn fall_back(&self) {
+        self.active.store(false, Ordering::Release);
+        let streams = std::mem::take(&mut *self.streams.lock().unwrap());
+        for (id, stream) in streams {
+            let error = json!({ "code": "core_unavailable", "msg": "The GUI is using its in-process fallback", "retryable": true });
+            match stream.ready {
+                Some(ready) => {
+                    let _ = ready.send(Err(BridgeError(error)));
+                }
+                None => {
+                    let _ = stream
+                        .channel
+                        .send(json!({ "v": 1, "id": id, "ok": false, "error": error }));
+                }
+            }
+        }
+        self.stream_wake.notify_one();
+    }
     pub fn handed_over(&self) -> bool {
         self.lease.lock().unwrap().is_some()
     }
+    /// `progress` gets this request's c9p `progress` frames unchanged.
     pub fn call(
         &self,
         method: &str,
         params: Value,
-        app: Option<&AppHandle>,
+        progress: Option<&Channel<Value>>,
     ) -> Result<Value, BridgeError> {
-        let session = (method == "conversation.get").then(|| {
-            let key = params["sessionKey"].as_str().unwrap_or("");
-            let id = key.split_once(':').map_or(key, |(_, id)| id).to_string();
-            (id, params["provider"].clone())
-        });
         self.call_with_progress(method, params, &mut |frame| {
-            if let (Some(app), Some((id, provider))) = (app, session.as_ref()) {
-                let _ = app.emit("conversation-progress", json!({ "sessionId": id, "provider": provider, "bytesRead": frame["bytesRead"], "bytesTotal": frame["bytesTotal"] }));
+            if let Some(progress) = progress {
+                let _ = progress.send(frame);
             }
         })
     }
@@ -249,10 +267,10 @@ fn result(conn: &mut EngineConn, method: &str, params: Value) -> Result<Value, S
 #[tauri::command]
 pub async fn c9p_request(
     window: WebviewWindow,
-    app: AppHandle,
     bridge: tauri::State<'_, Arc<Bridge>>,
     method: String,
     params: Value,
+    progress: Channel<Value>,
 ) -> Result<Value, BridgeError> {
     if !allowed(&method, window.label() == "popover")
         || !matches!(window.label(), "main" | "popover")
@@ -263,7 +281,7 @@ pub async fn c9p_request(
         ));
     }
     let bridge = bridge.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || bridge.call(&method, params, Some(&app)))
+    tauri::async_runtime::spawn_blocking(move || bridge.call(&method, params, Some(&progress)))
         .await
         .map_err(|e| BridgeError::new("transport", e.to_string()))?
 }
@@ -576,7 +594,7 @@ pub fn start(app: AppHandle, bridge: Arc<Bridge>, server: Arc<crate::web_server:
                 match core_action(&hello, env!("CARGO_PKG_VERSION"), controlled) {
                     CoreAction::Use => {}
                     CoreAction::Restart if !restarted && cfg!(feature = "engine") => {
-                        bridge.active.store(false, Ordering::Release);
+                        bridge.fall_back();
                         restarted = true;
                         restart_engine(&home, &exe)?;
                         conn = connect(&home)?;
@@ -586,7 +604,7 @@ pub fn start(app: AppHandle, bridge: Arc<Bridge>, server: Arc<crate::web_server:
                         cursor = None;
                     }
                     _ => {
-                        bridge.active.store(false, Ordering::Release);
+                        bridge.fall_back();
                         wait_agents = controlled == Some(true);
                         return Err("Core incompatible; keeping in-process fallback".into());
                     }
@@ -644,11 +662,7 @@ pub fn start(app: AppHandle, bridge: Arc<Bridge>, server: Arc<crate::web_server:
                 bridge.healthy();
                 bridge.active.store(true, Ordering::Release);
                 recovering = None;
-                publish(&app, &bridge, &server, &snapshot);
-                // Diagnostics are not an outbox topic on older cores.
-                if let Ok(diag) = result(&mut conn, "diag.detection", json!({})) {
-                    let _ = app.emit("diagnostic-update", diag);
-                }
+                publish(&bridge, &server, &snapshot);
                 let mut diag_at = Instant::now();
                 loop {
                     let mut batch = Vec::new();
@@ -674,7 +688,7 @@ pub fn start(app: AppHandle, bridge: Arc<Bridge>, server: Arc<crate::web_server:
                         }
                     }
                     if changed {
-                        publish(&app, &bridge, &server, &snapshot);
+                        publish(&bridge, &server, &snapshot);
                     }
                     for line in notifications.lines.try_iter() {
                         if let Ok(event) = serde_json::from_str::<EventFrame>(&line) {
@@ -688,10 +702,10 @@ pub fn start(app: AppHandle, bridge: Arc<Bridge>, server: Arc<crate::web_server:
                             }
                         }
                     }
+                    // A health probe; the webview reads `diag.detection` events.
                     if diag_at.elapsed() >= Duration::from_secs(4) {
-                        let diag = result(&mut conn, "diag.detection", json!({}))?;
+                        result(&mut conn, "diag.detection", json!({}))?;
                         bridge.healthy();
-                        let _ = app.emit("diagnostic-update", diag);
                         diag_at = Instant::now();
                     }
                 }
@@ -703,7 +717,7 @@ pub fn start(app: AppHandle, bridge: Arc<Bridge>, server: Arc<crate::web_server:
             // Incompatibility/spawn failure starts in fallback immediately.
             let since = recovering.get_or_insert_with(Instant::now);
             if !bridge.active() || since.elapsed() >= Duration::from_secs(15) {
-                bridge.active.store(false, Ordering::Release);
+                bridge.fall_back();
                 if !bound {
                     bridge.lease.lock().unwrap().take();
                     bind_gui(&server);
@@ -737,15 +751,11 @@ fn bind_gui(server: &Arc<crate::web_server::WsServer>) {
         }
     });
 }
-fn publish(
-    app: &AppHandle,
-    bridge: &Bridge,
-    server: &crate::web_server::WsServer,
-    snapshot: &[Value],
-) {
+/// For the legacy `/ws` server and its pages; the webview has its own
+/// c9p event stream.
+fn publish(bridge: &Bridge, server: &crate::web_server::WsServer, snapshot: &[Value]) {
     let data = json!(snapshot);
     *bridge.snapshot.lock().unwrap() = data.clone();
-    let _ = app.emit("sessions-updated", &data);
     let _ = server.state().sessions_tx.send(data.to_string());
 }
 pub fn apply_session_event(snapshot: &mut Vec<Value>, event: &EventFrame) -> bool {
@@ -775,6 +785,47 @@ pub fn apply_session_event(snapshot: &mut Vec<Value>, event: &EventFrame) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fall_back_ends_every_webview_stream_with_core_unavailable() {
+        let bridge = Bridge::at_home(PathBuf::new());
+        bridge.active.store(true, Ordering::Release);
+        let frames = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let seen = frames.clone();
+        let channel = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(body) = body {
+                seen.lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&body).unwrap());
+            }
+            Ok(())
+        });
+        let (ready, pending) = tokio::sync::oneshot::channel();
+        {
+            let mut streams = bridge.streams.lock().unwrap();
+            let stream = |ready| Stream {
+                owner: "main".into(),
+                channel: channel.clone(),
+                params: SubscribeParams::default(),
+                ready,
+            };
+            streams.insert("live".into(), stream(None));
+            streams.insert("pending".into(), stream(Some(ready)));
+        }
+        bridge.fall_back();
+        assert!(!bridge.active.load(Ordering::Acquire));
+        assert!(bridge.streams.lock().unwrap().is_empty());
+        let error = pending.blocking_recv().unwrap().unwrap_err();
+        assert_eq!(error.0["code"], "core_unavailable");
+        let frames = frames.lock().unwrap();
+        assert_eq!(
+            frames.len(),
+            1,
+            "a pending subscribe is rejected, not sent a frame"
+        );
+        assert_eq!(frames[0]["id"], "live");
+        assert_eq!(frames[0]["ok"], false);
+        assert_eq!(frames[0]["error"]["code"], "core_unavailable");
+    }
     #[test]
     fn webview_is_not_a_universal_pipe() {
         for m in [

@@ -16,7 +16,11 @@ function harness() {
     exports, $state: value => value,
     require(name) {
       if (name === 'svelte') return { onMount(fn) { mount = fn; } };
-      if (name === '$lib/data/commands') return { invoke: (command, args) => new Promise((resolve, reject) => requests.push({ command, args, resolve, reject })) };
+      const call = (command, args) => new Promise((resolve, reject) => requests.push({ command, args, resolve, reject }));
+      if (name === '$lib/data/api') return {
+        getOpenCodeStatus: () => call('provider.opencode.status'),
+        connectOpenCode: (url, username, password) => call('provider.opencode.connect', { url, username, password })
+      };
       throw Error(name);
     },
     setTimeout(fn) { timers.set(++timerId, fn); return timerId; },

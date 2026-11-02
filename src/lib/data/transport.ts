@@ -1,8 +1,11 @@
 import type { C9pMethods, C9pMethod, C9pFrames, C9pSubscribeParams } from '../c9p-1';
 export type StreamFrame = C9pFrames['event'] | C9pFrames['progress'] | C9pFrames['response'];
 export type Unsubscribe = () => void;
+/** `onProgress` gets this request's `progress` frames, where the transport
+ * has them (the `conversation.progress` capability). */
+export interface RequestOptions { onProgress?: (frame: C9pFrames['progress']) => void }
 export interface Transport {
-    request<M extends C9pMethod>(method: M, params: C9pMethods[M]['params']): Promise<C9pMethods[M]['result']>;
+    request<M extends C9pMethod>(method: M, params: C9pMethods[M]['params'], options?: RequestOptions): Promise<C9pMethods[M]['result']>;
     subscribe(params: C9pSubscribeParams, onFrame: (frame: StreamFrame) => void): Promise<Unsubscribe>;
 }
 export class C9pError extends Error {
