@@ -119,7 +119,7 @@ use super::drain::{self, DrainSwitch, InjectionPath};
 use super::driver::{Driver, SpawnSpec};
 use super::generation;
 use super::generation::{begin_generation, emit_upsert, GenReason};
-use super::guard::Fence;
+use super::guard::{self, Fence};
 use super::hooks;
 use super::machine::HeaderKey;
 use super::mail::{self, MsgState};
@@ -541,7 +541,14 @@ impl Spawner {
             blocking(move || sp.prepare(&cwd)).await?
         };
         let caps = quirks::capabilities(cc);
-        if let Some(missing) = p.require.iter().find(|r| !caps.contains(r)) {
+        // A fence needs the blocking hook, asked for or not.
+        let fence_cap = p.guard.as_ref().map(|_| guard::REQUIRED_CAP.to_string());
+        if let Some(missing) = p
+            .require
+            .iter()
+            .chain(fence_cap.as_ref())
+            .find(|r| !caps.contains(r))
+        {
             return Err(ApiError::new(
                 ErrorCode::Unsupported,
                 format!(
@@ -900,6 +907,21 @@ impl Spawner {
                 Ok(p) => p,
                 Err(e) => return fail(e),
             };
+        // A resumed fence needs the blocking hook from the CC found now; the
+        // create checked it already. A CC that lost it stays resumable.
+        if guarded && s.kind == Kind::Resume {
+            let cc = quirks::gate(self.launcher.cc_version(&s.claude)).version;
+            if !quirks::capabilities(cc)
+                .iter()
+                .any(|c| c == guard::REQUIRED_CAP)
+            {
+                return fail(format!(
+                    "the Claude Code here ({}) lacks {:?}, which the agent's write fence needs",
+                    cc.map_or("version unknown".into(), quirks::version_string),
+                    guard::REQUIRED_CAP
+                ));
+            }
+        }
         let profile = match Profile::new(
             self.agent_bin.path(),
             &self.config.sock,
@@ -4145,6 +4167,15 @@ mod tests {
                 .unwrap_err();
         assert_eq!(err.code, ErrorCode::Unsupported);
         assert!(err.msg.contains("hook.pre_tool_use.block"), "{}", err.msg);
+        // Codex P1: a guard alone requires the blocking hook too.
+        let no_require = serde_json::json!({
+            "mode": "free", "cwd": cwd,
+            "guard": {"denyWriteUnder": [root.join("elsewhere")]},
+        });
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        let err = e.sp.create(&l, no_require).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unsupported);
+        assert!(err.msg.contains("hook.pre_tool_use.block"), "{}", err.msg);
         *lock(&e.launcher.version) = Ok("2.1.316 (Claude Code)".into());
         // A fence that denies the agent's own cwd is refused.
         let own = serde_json::json!({
@@ -4155,6 +4186,29 @@ mod tests {
         assert_eq!(err.code, ErrorCode::BadRequest);
         assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 0);
         assert!(e.db.agents(AgentFilter::All).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fenced_resume_on_a_cc_without_the_blocking_hook_is_resume_failed() {
+        let e = setup(Script::Ready, None);
+        let root = e.t.path().canonicalize().unwrap().join("root");
+        let a = root.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let r =
+            e.sp.create(&Principal::LocalUnverified, fenced_params(&root, &a))
+                .await
+                .unwrap();
+        e.sp.shutdown();
+        ops::reconcile(&e.db, &e.home).unwrap();
+        let (_, l2, sp2) = next_engine(&e, Script::Ready, None);
+        *lock(&l2.version) = Ok("2.1.200 (Claude Code)".into());
+        sp2.resume_on_boot().unwrap();
+        no_supervisors(&sp2);
+        assert_eq!(l2.spawns.load(Ordering::SeqCst), 0);
+        let got = row(&e.db, &r.id);
+        assert_eq!(got.state_reason.as_deref(), Some(ops::RESUME_FAILED));
+        let why = audit_reasons(&e.db, ops::KIND_RESUME, "failed");
+        assert!(why[0].contains("hook.pre_tool_use.block"), "{:?}", why);
     }
 
     #[tokio::test]
