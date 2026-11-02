@@ -390,3 +390,24 @@ test('a native event during the fallback snapshot read applies after it, never u
     assert.deepEqual(applied, ['A-snapshot', 'B-newer', 'C']);
     stop();
 });
+
+test('a fallback snapshot read that never settles times out and releases native events', async () => {
+    const clock = fakeTimers();
+    const live = load('../src/lib/data/live.ts', { './session-feed': sessionFeedModule(clock) }, clock);
+    let report, emit, finishRead; const applied = [];
+    const stop = live.withNativeFallback(
+        (apply, failed) => { report = { apply, failed }; return () => {}; },
+        async listener => { emit = listener; return () => {}; },
+        v => applied.push(v),
+        () => new Promise(resolve => { finishRead = resolve; }));
+    report.failed({ code: 'core_unavailable' }); await settle();
+    emit('B'); emit('C'); await settle();
+    assert.deepEqual(applied, []);
+    assert.deepEqual([...clock.timers.values()].map(t => t.ms), [3000]);
+    clock.run(); await settle();
+    assert.deepEqual(applied, ['B', 'C']);
+    emit('D'); await settle();
+    finishRead('stale-snapshot'); await settle();
+    assert.deepEqual(applied, ['B', 'C', 'D'], 'a late snapshot is ignored');
+    stop();
+});

@@ -7,6 +7,7 @@ import { sessionFeed, isUnavailable } from './session-feed';
 
 type Feed<T> = (apply: (value: T) => void, failed: (error: unknown | null) => void) => Unsubscribe;
 type Native<T> = (apply: (value: T) => void) => Promise<() => void>;
+const SNAPSHOT_TIMEOUT_MS = 3000;
 
 /** `snapshot`, when given, is read once the native listener is in place: a
  * fallback that saw no change since core took over emits nothing. Native
@@ -27,9 +28,19 @@ export function withNativeFallback<T>(feed: Feed<T>, native: Native<T>, apply: (
                 let buffered: T[] | null = snapshot ? [] : null;
                 const deliver = (value: T) => { if (fallback && !stopped && unlisten === mine) apply(value); };
                 const mine = unlisten = native(value => { if (buffered) buffered.push(value); else deliver(value); });
-                if (snapshot) void mine.then(snapshot)
-                    .then(value => { if (value) deliver(value); }, () => {})
-                    .finally(() => { const queued = buffered ?? []; buffered = null; queued.forEach(deliver); });
+                if (snapshot) {
+                    // A read that never settles must not hold native events
+                    // back: on timeout the buffer flushes and a late result is ignored.
+                    let timer: ReturnType<typeof setTimeout> | null = null;
+                    const flush = (value?: T | null) => {
+                        if (!buffered) return;
+                        if (timer) clearTimeout(timer);
+                        if (value) deliver(value);
+                        const queued = buffered; buffered = null; queued.forEach(deliver);
+                    };
+                    void mine.then(() => { timer = setTimeout(() => flush(), SNAPSHOT_TIMEOUT_MS); return snapshot(); })
+                        .then(value => flush(value), () => flush());
+                }
             }
         } else if (error === null) { fallback = false; drop(); }
     });
