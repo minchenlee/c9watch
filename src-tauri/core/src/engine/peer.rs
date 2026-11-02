@@ -462,10 +462,65 @@ pub fn peer_exe_path(_pid: libc::pid_t) -> Result<PathBuf, String> {
     Err("peer exe path is only supported on macOS and Linux".to_string())
 }
 
+/// The pids in `chain` whose argv is an agent-team teammate's
+/// (`session::teammates::parse_argv`), read now. A process whose argv can't
+/// be read (another user's, or gone) is not counted; a teammate runs as the
+/// user, so its own argv is readable.
+pub fn teammate_pids(chain: &[ProcInfo]) -> std::collections::HashSet<libc::pid_t> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let pids: Vec<Pid> = chain
+        .iter()
+        .filter_map(|p| u32::try_from(p.pid).ok().map(Pid::from_u32))
+        .collect();
+    if pids.is_empty() {
+        return Default::default();
+    }
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&pids),
+        false,
+        ProcessRefreshKind::new().with_cmd(UpdateKind::Always),
+    );
+    pids.iter()
+        .filter(|pid| {
+            system
+                .process(**pid)
+                .is_some_and(|p| crate::session::teammates::parse_argv(p.cmd()).is_some())
+        })
+        .filter_map(|pid| libc::pid_t::try_from(pid.as_u32()).ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::io::AsRawFd;
+
+    /// A child started with a teammate's argv is found by its argv alone.
+    #[test]
+    fn a_teammate_argv_is_read_from_the_live_process() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "sleep 5",
+                "sh",
+                "--agent-id",
+                "mate@session-52d94f40",
+                "--team-name",
+                "session-52d94f40",
+                "--parent-session-id",
+                "52d94f40-632b-43c7-a783-f31783dfe57f",
+            ])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let me = std::process::id() as libc::pid_t;
+        let chain = [proc_info(pid).unwrap(), proc_info(me).unwrap()];
+        let found = teammate_pids(&chain);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(found, [pid].into_iter().collect());
+    }
     use std::os::unix::net::UnixStream;
 
     fn my_pid() -> libc::pid_t {

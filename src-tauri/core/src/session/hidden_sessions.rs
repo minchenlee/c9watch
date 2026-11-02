@@ -94,14 +94,20 @@ pub(crate) fn pids_without_registry_entry<S: AsRef<str>>(file_names: &[S]) -> Ve
     keyed.difference(&registered).copied().collect()
 }
 
-/// Whether the process is the real Claude Code binary, not a script that
-/// happens to be named `claude`.
-pub(crate) fn is_claude_code(facts: &ProcessFacts, home: &Path) -> bool {
+/// Whether the process's executable is an installed Claude Code version.
+/// Unlike argv, a process cannot claim this.
+fn runs_claude_code_binary(facts: &ProcessFacts, home: &Path) -> bool {
     let versions = home.join(".local/share/claude/versions");
-    let exe_is_claude = facts
+    facts
         .exe
         .as_deref()
-        .is_some_and(|exe| exe.starts_with(&versions));
+        .is_some_and(|exe| exe.starts_with(&versions))
+}
+
+/// Whether the process is the real Claude Code binary, not a script that
+/// happens to be named `claude`.
+fn is_claude_code(facts: &ProcessFacts, home: &Path) -> bool {
+    let exe_is_claude = runs_claude_code_binary(facts, home);
     let argv0_is_claude = facts
         .argv0
         .as_deref()
@@ -200,15 +206,20 @@ impl HiddenSessionScanner {
 
     /// Agent-team teammates among the pids the last `scan` read: each pid
     /// with its start time and facts. A teammate also has a `.key` file and
-    /// no `.json`, so `scan` already holds its argv.
+    /// no `.json`, so `scan` already holds its argv. Only processes running
+    /// an installed Claude Code executable count.
     pub(crate) fn teammates(&self, home: &Path) -> Vec<(u32, u64, ProcessFacts)> {
         let mut found: Vec<_> = self
             .cache
             .iter()
             .filter_map(|(pid, (start, facts))| {
                 let facts = facts.as_ref()?;
-                (facts.same_user && facts.teammate.is_some() && is_claude_code(facts, home))
-                    .then(|| (*pid, *start, facts.clone()))
+                // A teammate's link and card need the verified executable,
+                // not argv0, which any process can set.
+                (facts.same_user
+                    && facts.teammate.is_some()
+                    && runs_claude_code_binary(facts, home))
+                .then(|| (*pid, *start, facts.clone()))
             })
             .collect();
         found.sort_by_key(|(pid, _, _)| *pid);

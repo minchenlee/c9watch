@@ -112,7 +112,7 @@ use super::views;
 use super::views::conversation::{Progress, PROGRESS_CAPABILITY};
 use super::views::sessions as session_views;
 use crate::elog;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -192,14 +192,30 @@ pub struct ServerCtx {
     /// Observed sessions, for `observed:<sessionKey>` stamping (D8).
     /// `None` reads detection's views.
     pub observed: Option<Arc<dyn ObservedSessions>>,
+    /// The pids of an ancestry chain whose argv is a teammate's (D8).
+    /// `peer::teammate_pids`, read at admission; unit tests run with none,
+    /// as they may run inside a teammate's pane themselves.
+    pub teammates: fn(&[peer::ProcInfo]) -> HashSet<libc::pid_t>,
 }
 
-/// Observed sessions by process pid, as detection last saw them.
-struct ObservedNow(HashMap<libc::pid_t, String>);
+fn no_teammates(_chain: &[peer::ProcInfo]) -> HashSet<libc::pid_t> {
+    HashSet::new()
+}
+
+/// Observed sessions by process pid, as detection last saw them, and the
+/// teammate lookup.
+struct ObservedNow(
+    HashMap<libc::pid_t, String>,
+    fn(&[peer::ProcInfo]) -> HashSet<libc::pid_t>,
+);
 
 impl ObservedSessions for ObservedNow {
     fn by_pid(&self, pid: libc::pid_t) -> Option<String> {
         self.0.get(&pid).cloned()
+    }
+
+    fn teammates(&self, chain: &[peer::ProcInfo]) -> HashSet<libc::pid_t> {
+        (self.1)(chain)
     }
 }
 
@@ -226,6 +242,11 @@ impl ServerCtx {
             usage: None,
             idem: Arc::new(IdemCache::new()),
             observed: None,
+            teammates: if cfg!(test) {
+                no_teammates
+            } else {
+                peer::teammate_pids
+            },
         }
     }
 
@@ -342,6 +363,7 @@ impl ServerCtx {
                 .filter(|s| s.pid > 0 && !s.session_key.is_empty())
                 .filter_map(|s| Some((libc::pid_t::try_from(s.pid).ok()?, s.session_key)))
                 .collect(),
+            self.teammates,
         ))
     }
 
@@ -660,9 +682,17 @@ impl Stamp {
             ctx.agents.as_ref(),
             ctx.observed_sessions().as_ref(),
         );
-        // Only `local-unverified` can narrow: an agent's stamp comes from
-        // the engine's own agent table, never from the views.
-        let provisional = !ready && principal == Principal::LocalUnverified;
+        // Only `local-unverified` and an unlisted teammate can change: an
+        // agent's stamp comes from the engine's own agent table, never from
+        // the views.
+        let provisional = !ready
+            && match &principal {
+                Principal::LocalUnverified => true,
+                Principal::Observed { session_key } => {
+                    session_key.starts_with(principal::UNLISTED_TEAMMATE)
+                }
+                _ => false,
+            };
         Self {
             cred,
             accepted,
@@ -2622,6 +2652,7 @@ mod tests {
             usage: None,
             idem: Arc::new(IdemCache::new()),
             observed: None,
+            teammates: no_teammates,
         })
     }
 
@@ -3300,6 +3331,7 @@ mod tests {
             usage: None,
             idem: Arc::new(IdemCache::new()),
             observed: None,
+            teammates: no_teammates,
         });
         (t, ctx, db)
     }
@@ -5845,6 +5877,35 @@ mod tests {
         let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
         ctx.observed = Some(Arc::new(principal::tests::FakeObserved::one(key, parent)));
         (t, Arc::new(ctx), db)
+    }
+
+    /// D8: a peer whose parent is a teammate detection has not listed is
+    /// `observed:unlisted-teammate:<pid>`, never `local-unverified`, and may
+    /// not create an agent, stop a session or send mail.
+    #[tokio::test]
+    async fn a_peer_under_an_unlisted_teammate_may_not_mutate() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let me = std::process::id() as libc::pid_t;
+        let parent = peer::proc_info(me).unwrap().ppid;
+        let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+        ctx.observed = Some(Arc::new(principal::tests::FakeTeam {
+            observed: principal::tests::FakeObserved(HashMap::new()),
+            teammates: HashSet::from([parent]),
+        }));
+        let (mut c, hello) = Client::new(Arc::new(ctx)).await;
+        let key = format!("unlisted-teammate:{parent}");
+        assert_eq!(hello["principal"], format!("observed:{key}"));
+        for (i, (method, params)) in [
+            ("agent.create", json!({"mode": "free", "cwd": "/tmp"})),
+            ("session.stop", json!({"sessionKey": key})),
+            ("msg.send", json!({"to": "agt_x", "body": "hi"})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let r = c.call(&i.to_string(), method, params).await;
+            assert_eq!(r["error"]["code"], "not_allowed", "{}: {}", method, r);
+        }
     }
 
     /// D8: a peer inside an observed session is `observed:<sessionKey>`. It

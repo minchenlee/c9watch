@@ -17,7 +17,7 @@
 //! teammate gets no transcript at all rather than a wrong one.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -151,23 +151,22 @@ fn team_member(home: &Path, args: &TeammateArgs) -> Option<Member> {
 
 /// The link, the agent type filled from the team config when argv has none,
 /// and the cwds to look for the transcript under (the process cwd first).
+/// `None` unless the team config lists this agent under the same lead: argv
+/// alone is a claim any process can make.
 pub(crate) fn link_for(
     home: &Path,
     args: &TeammateArgs,
     process_cwd: Option<&Path>,
-) -> (TeammateLink, Vec<PathBuf>) {
-    let member = team_member(home, args);
+) -> Option<(TeammateLink, Vec<PathBuf>)> {
+    let member = team_member(home, args)?;
     let mut cwds: Vec<PathBuf> = process_cwd.map(Path::to_path_buf).into_iter().collect();
-    if let Some(cwd) = member.as_ref().and_then(|m| m.cwd.clone()) {
+    if let Some(cwd) = member.cwd {
         if !cwds.contains(&cwd) {
             cwds.push(cwd);
         }
     }
-    let agent_type = args
-        .agent_type
-        .clone()
-        .or_else(|| member.and_then(|m| m.agent_type));
-    (
+    let agent_type = args.agent_type.clone().or(member.agent_type);
+    Some((
         TeammateLink {
             agent_name: args.agent_name.clone(),
             team_name: args.team_name.clone(),
@@ -175,7 +174,7 @@ pub(crate) fn link_for(
             agent_type,
         },
         cwds,
-    )
+    ))
 }
 
 /// What the start of a transcript says about who wrote it.
@@ -188,10 +187,25 @@ pub(crate) struct Header {
     started_ms: i64,
 }
 
+/// Opens `path` only if it is a regular file, not a symlink: opening does
+/// not follow a symlink or block on a FIFO, and the opened file is checked.
+fn open_regular(path: &Path) -> Option<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
 /// The first timestamped entry of a transcript, or `None` when there is none
-/// yet (or it doesn't fit in `HEADER_LIMIT`).
+/// yet (or it doesn't fit in `HEADER_LIMIT`, or the path is not a regular
+/// file).
 pub(crate) fn read_header(path: &Path) -> Option<Header> {
-    let file = std::fs::File::open(path).ok()?;
+    let file = open_regular(path)?;
     let reader = BufReader::new(file.take(HEADER_LIMIT));
     for line in reader.split(b'\n') {
         let line = line.ok()?;
@@ -230,32 +244,49 @@ impl HeaderCache {
         Some(header)
     }
 
-    /// Drops the entries of `dir`'s files that its last pass didn't see.
-    /// Entries of other directories are kept.
-    fn retain(&mut self, dir: &Path, seen: &[PathBuf]) {
-        self.0
-            .retain(|path, _| path.parent() != Some(dir) || seen.contains(path));
+    /// Drops the entries of files no lookup of the last pass saw.
+    pub(crate) fn retain(&mut self, seen: &HashSet<PathBuf>) {
+        self.0.retain(|path, _| seen.contains(path));
     }
+}
+
+/// `project_dir` resolved, when it is a real directory under `projects`
+/// (`~/.claude/projects`), not reached through a symlink out of it.
+fn confined_dir(project_dir: &Path, projects: &Path) -> Option<PathBuf> {
+    if !std::fs::symlink_metadata(project_dir).ok()?.is_dir() {
+        return None;
+    }
+    let dir = project_dir.canonicalize().ok()?;
+    dir.starts_with(projects.canonicalize().ok()?)
+        .then_some(dir)
 }
 
 /// The session ID of the transcript `args` writes in `project_dir`: the
 /// transcript whose first entry names this agent and team and was written no
 /// earlier than the process started. Of several, the one that started last
 /// (a `/clear` starts a new transcript in the same process). `None` when no
-/// transcript matches, or the latest start is shared.
+/// transcript matches, or the latest start is shared. `project_dir` must be
+/// under `projects`, and only regular files are read. Each file looked at is
+/// added to `seen`, for `HeaderCache::retain` after the pass.
 pub(crate) fn find_transcript(
     project_dir: &Path,
+    projects: &Path,
     args: &TeammateArgs,
     process_start_secs: u64,
     cache: &mut HeaderCache,
+    seen: &mut HashSet<PathBuf>,
 ) -> Option<String> {
+    let project_dir = confined_dir(project_dir, projects)?;
     let earliest_ms = (process_start_secs as i64 - START_SLACK_SECS) * 1000;
     let not_before = SystemTime::UNIX_EPOCH
         + Duration::from_secs(process_start_secs.saturating_sub(START_SLACK_SECS as u64));
-    let mut seen = Vec::new();
     let mut best: Option<(i64, String)> = None;
     let mut tied = false;
-    for entry in std::fs::read_dir(project_dir).ok()?.flatten() {
+    for entry in std::fs::read_dir(&project_dir).ok()?.flatten() {
+        // `file_type` does not follow a symlink.
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
         let path = entry.path();
         let Some(stem) = path
             .file_name()
@@ -270,7 +301,7 @@ pub(crate) fn find_transcript(
         if modified.is_none_or(|m| m < not_before) {
             continue;
         }
-        seen.push(path.clone());
+        seen.insert(path.clone());
         let Some(header) = cache.get(&path) else {
             continue;
         };
@@ -290,7 +321,6 @@ pub(crate) fn find_transcript(
             }
         }
     }
-    cache.retain(project_dir, &seen);
     if tied {
         return None;
     }
@@ -424,7 +454,7 @@ mod tests {
     fn the_team_config_fills_the_agent_type_and_cwd() {
         let home = tempfile::tempdir().unwrap();
         write_team_config(home.path(), LEAD);
-        let (link, cwds) = link_for(home.path(), &args(), Some(Path::new("/repo")));
+        let (link, cwds) = link_for(home.path(), &args(), Some(Path::new("/repo"))).unwrap();
         assert_eq!(
             link,
             TeammateLink {
@@ -441,13 +471,18 @@ mod tests {
     }
 
     #[test]
-    fn a_team_config_for_another_lead_is_ignored() {
+    fn no_link_without_a_team_config_that_lists_the_agent_under_its_lead() {
         let home = tempfile::tempdir().unwrap();
         write_team_config(home.path(), "00000000-0000-0000-0000-000000000000");
-        let (link, cwds) = link_for(home.path(), &args(), Some(Path::new("/repo")));
-        assert_eq!(link.lead_session_id, LEAD, "argv decides the lead");
-        assert_eq!(link.agent_type, None);
-        assert_eq!(cwds, vec![PathBuf::from("/repo")]);
+        assert!(link_for(home.path(), &args(), Some(Path::new("/repo"))).is_none());
+        // No team config at all.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(link_for(empty.path(), &args(), None).is_none());
+        // The config lists other members only.
+        write_team_config(home.path(), LEAD);
+        let mut stranger = args();
+        stranger.agent_name = "stranger".into();
+        assert!(link_for(home.path(), &stranger, None).is_none());
     }
 
     /// Writes `<id>.jsonl` whose first timestamped entry is at `secs`.
@@ -471,6 +506,16 @@ mod tests {
     }
 
     const START: u64 = 1_793_000_000;
+
+    /// `find_transcript` for `args()` in `dir`, as its own projects root.
+    fn find(dir: &Path, cache: &mut HeaderCache) -> Option<String> {
+        let root = if dir.exists() {
+            dir
+        } else {
+            dir.parent().unwrap()
+        };
+        find_transcript(dir, root, &args(), START, cache, &mut HashSet::new())
+    }
 
     fn id(n: u8) -> String {
         format!("{n:08}-0000-0000-0000-000000000000")
@@ -513,7 +558,7 @@ mod tests {
             "session-99999999",
             start + 5,
         );
-        let found = find_transcript(dir.path(), &args(), START, &mut HeaderCache::default());
+        let found = find(dir.path(), &mut HeaderCache::default());
         assert_eq!(found, Some(id(1)));
     }
 
@@ -535,7 +580,7 @@ mod tests {
             "session-52d94f40",
             start + 900,
         );
-        let found = find_transcript(dir.path(), &args(), START, &mut HeaderCache::default());
+        let found = find(dir.path(), &mut HeaderCache::default());
         assert_eq!(found, Some(id(6)));
     }
 
@@ -551,10 +596,7 @@ mod tests {
             "session-52d94f40",
             start - 60,
         );
-        assert_eq!(
-            find_transcript(dir.path(), &args(), START, &mut HeaderCache::default()),
-            None
-        );
+        assert_eq!(find(dir.path(), &mut HeaderCache::default()), None);
         // Two transcripts that both claim the same start.
         transcript(
             dir.path(),
@@ -570,16 +612,10 @@ mod tests {
             "session-52d94f40",
             start + 5,
         );
-        assert_eq!(
-            find_transcript(dir.path(), &args(), START, &mut HeaderCache::default()),
-            None
-        );
+        assert_eq!(find(dir.path(), &mut HeaderCache::default()), None);
         // A missing project dir.
         let gone = dir.path().join("missing");
-        assert_eq!(
-            find_transcript(&gone, &args(), START, &mut HeaderCache::default()),
-            None
-        );
+        assert_eq!(find(&gone, &mut HeaderCache::default()), None);
     }
 
     #[test]
@@ -597,10 +633,7 @@ mod tests {
             dir.path().join(format!("{}.jsonl", id(9))),
         )
         .unwrap();
-        assert_eq!(
-            find_transcript(dir.path(), &args(), START, &mut HeaderCache::default()),
-            None
-        );
+        assert_eq!(find(dir.path(), &mut HeaderCache::default()), None);
     }
 
     #[test]
@@ -609,10 +642,7 @@ mod tests {
         let path = dir.path().join(format!("{}.jsonl", id(1)));
         std::fs::write(&path, "{\"type\":\"mode\",\"mode\":\"normal\"}\n").unwrap();
         let mut cache = HeaderCache::default();
-        assert_eq!(
-            find_transcript(dir.path(), &args(), START, &mut cache),
-            None
-        );
+        assert_eq!(find(dir.path(), &mut cache), None);
         transcript(
             dir.path(),
             &id(1),
@@ -620,9 +650,102 @@ mod tests {
             "session-52d94f40",
             START as i64 + 5,
         );
-        assert_eq!(
-            find_transcript(dir.path(), &args(), START, &mut cache),
-            Some(id(1))
+        assert_eq!(find(dir.path(), &mut cache), Some(id(1)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_regular_files_under_the_projects_root_are_read() {
+        let root = tempfile::tempdir().unwrap();
+        let projects = root.path().join("projects");
+        let dir = projects.join("-repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let start = START as i64 + 5;
+        transcript(
+            &outside,
+            &id(1),
+            Some("p10-multi-cwd"),
+            "session-52d94f40",
+            start,
         );
+        // A symlink to a matching transcript elsewhere.
+        std::os::unix::fs::symlink(
+            outside.join(format!("{}.jsonl", id(1))),
+            dir.join(format!("{}.jsonl", id(1))),
+        )
+        .unwrap();
+        // A FIFO with a transcript's name: opening it must not block.
+        let fifo = dir.join(format!("{}.jsonl", id(2)));
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_header(&fifo), None);
+        let lookup = |project_dir: &Path| {
+            find_transcript(
+                project_dir,
+                &projects,
+                &args(),
+                START,
+                &mut HeaderCache::default(),
+                &mut HashSet::new(),
+            )
+        };
+        assert_eq!(lookup(&dir), None);
+        // A project dir that is a symlink out of the projects root.
+        let escape = projects.join("-escape");
+        std::os::unix::fs::symlink(&outside, &escape).unwrap();
+        assert_eq!(lookup(&escape), None);
+        // A project dir outside the root.
+        assert_eq!(lookup(&outside), None);
+        // The same transcript as a regular file in the project dir is found.
+        std::fs::remove_file(dir.join(format!("{}.jsonl", id(1)))).unwrap();
+        transcript(
+            &dir,
+            &id(1),
+            Some("p10-multi-cwd"),
+            "session-52d94f40",
+            start,
+        );
+        assert_eq!(lookup(&dir), Some(id(1)));
+    }
+
+    #[test]
+    fn the_cache_keeps_what_any_lookup_of_the_pass_saw() {
+        let dir = tempfile::tempdir().unwrap();
+        transcript(
+            dir.path(),
+            &id(1),
+            Some("p10-multi-cwd"),
+            "session-52d94f40",
+            START as i64 + 5,
+        );
+        let mut cache = HeaderCache::default();
+        let mut seen = HashSet::new();
+        let found = find_transcript(
+            dir.path(),
+            dir.path(),
+            &args(),
+            START,
+            &mut cache,
+            &mut seen,
+        );
+        assert_eq!(found, Some(id(1)));
+        // A later process's lookup skips the file by mtime; the pass still
+        // saw it, so its header stays.
+        let later = START + 3600 * 24 * 365 * 10;
+        find_transcript(
+            dir.path(),
+            dir.path(),
+            &args(),
+            later,
+            &mut cache,
+            &mut seen,
+        );
+        cache.retain(&seen);
+        assert_eq!(cache.0.len(), 1);
+        cache.retain(&HashSet::new());
+        assert!(cache.0.is_empty());
     }
 }

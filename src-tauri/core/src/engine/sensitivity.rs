@@ -188,10 +188,11 @@ const BY_NAME: &[(&str, &str)] = &[
     ("from", M),
     ("createdBy", M),
     ("workerOf", M),
-    // Agent-team teammate link: names a lead chose.
+    // Agent-team teammate link. The names are a lead's free text, so they
+    // are conversation, like `agentNickname`.
     ("teammate", M),
-    ("agentName", M),
-    ("teamName", M),
+    ("agentName", C),
+    ("teamName", C),
     ("agentType", M),
     ("agentRole", M),
     ("pendingTool", M),

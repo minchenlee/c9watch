@@ -14,6 +14,10 @@
 //!    create) is. Such a peer runs inside the user's own session, so it is
 //!    narrower than `local-unverified`: no `agent.create`/`agent.retire`, and
 //!    `session.stop` only for its own session (D8).
+//!    A process of an agent-team teammate that detection has not listed
+//!    (no transcript matched yet, or its argv is forged) counts too, with
+//!    an `unlisted-teammate:<pid>` key that names no session: a teammate's
+//!    descendants are never `local-unverified`.
 //! 3. `local-unverified`: everything else (A:187).
 //!
 //! Unix stamping never returns `human` (that waits for the C1.5 code-signature check)
@@ -22,6 +26,12 @@
 
 use super::peer::{self, ProcInfo, MAX_ANCESTRY};
 use serde::{Serialize, Serializer};
+use std::collections::HashSet;
+
+/// The session key prefix of an `observed:` principal stamped for a
+/// teammate detection has not listed. No session has such a key, so it
+/// passes no own-session check.
+pub const UNLISTED_TEAMMATE: &str = "unlisted-teammate:";
 
 /// Who a connection is, as the engine stamped it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +99,13 @@ pub trait LiveAgents: Send + Sync {
 pub trait ObservedSessions: Send + Sync {
     /// The `sessionKey` of the observed session whose process has `pid`.
     fn by_pid(&self, pid: libc::pid_t) -> Option<String>;
+
+    /// The pids in `chain` whose argv is an agent-team teammate's, read
+    /// now, whether or not detection lists them. Only argv decides: a
+    /// forged teammate narrows its descendants, which fails closed.
+    fn teammates(&self, _chain: &[ProcInfo]) -> HashSet<libc::pid_t> {
+        HashSet::new()
+    }
 }
 
 /// No session is observed.
@@ -130,23 +147,34 @@ pub fn stamp(chain: &[ProcInfo], agents: &dyn LiveAgents) -> Principal {
 
 /// `stamp`, then observed sessions: with no live agent in the chain, the
 /// first process that is an observed session's makes the peer
-/// `observed:<sessionKey>`. Detection has no process start time, so a
-/// session's pid that exits and is reused can still match. That fails
-/// closed: the new process is stamped observed, which only narrows it
-/// (no create, retire or stop of other sessions), and never widens it.
+/// `observed:<sessionKey>`, and the first that is a teammate detection has
+/// not listed makes it `observed:unlisted-teammate:<pid>`. Detection has no
+/// process start time, so a session's pid that exits and is reused can
+/// still match. That fails closed: the new process is stamped observed,
+/// which only narrows it (no create, retire or stop of other sessions),
+/// and never widens it.
 pub fn stamp_observed(
     chain: &[ProcInfo],
     agents: &dyn LiveAgents,
     observed: &dyn ObservedSessions,
 ) -> Principal {
     match stamp(chain, agents) {
-        Principal::LocalUnverified => chain
-            .iter()
-            .take(MAX_ANCESTRY)
-            .find_map(|p| observed.by_pid(p.pid))
-            .map_or(Principal::LocalUnverified, |session_key| {
-                Principal::Observed { session_key }
-            }),
+        Principal::LocalUnverified => {
+            let chain = &chain[..chain.len().min(MAX_ANCESTRY)];
+            let teammates = observed.teammates(chain);
+            chain
+                .iter()
+                .find_map(|p| {
+                    observed.by_pid(p.pid).or_else(|| {
+                        teammates
+                            .contains(&p.pid)
+                            .then(|| format!("{UNLISTED_TEAMMATE}{}", p.pid))
+                    })
+                })
+                .map_or(Principal::LocalUnverified, |session_key| {
+                    Principal::Observed { session_key }
+                })
+        }
         p => p,
     }
 }
@@ -184,6 +212,9 @@ pub fn stamp_peer(
 /// - no process in it is an observed session's, at any depth, except the
 ///   session `own` (the key an `observed:` principal was stamped with): a
 ///   `local-unverified` stamp only walks `MAX_ANCESTRY` levels;
+/// - every teammate in it (by argv, read now) is that observed session
+///   `own`: one detection has not listed fails closed, whether its
+///   transcript is missing, ambiguous or not found yet;
 /// - the peer is not `confined`: an agent's Bash runs in the vendor
 ///   sandbox, and a process it moved under init stays there.
 pub fn check_mutation(
@@ -211,6 +242,16 @@ pub fn check_mutation(
         .find(|k| Some(k.as_str()) != own)
     {
         return Err(format!("the peer runs under observed:{}", key));
+    }
+    let teammates = observed.teammates(chain);
+    if let Some(p) = chain
+        .iter()
+        .find(|p| teammates.contains(&p.pid) && observed.by_pid(p.pid).is_none())
+    {
+        return Err(format!(
+            "the peer runs under agent-team teammate pid {}, which session detection has not listed",
+            p.pid
+        ));
     }
     match confined {
         Some(false) => Ok(()),
@@ -294,6 +335,26 @@ pub(crate) mod tests {
     impl ObservedSessions for FakeObserved {
         fn by_pid(&self, pid: libc::pid_t) -> Option<String> {
             self.0.get(&pid).cloned()
+        }
+    }
+
+    /// Observed sessions plus the pids whose argv is a teammate's.
+    pub(crate) struct FakeTeam {
+        pub observed: FakeObserved,
+        pub teammates: HashSet<libc::pid_t>,
+    }
+
+    impl ObservedSessions for FakeTeam {
+        fn by_pid(&self, pid: libc::pid_t) -> Option<String> {
+            self.observed.by_pid(pid)
+        }
+
+        fn teammates(&self, chain: &[ProcInfo]) -> HashSet<libc::pid_t> {
+            chain
+                .iter()
+                .map(|p| p.pid)
+                .filter(|pid| self.teammates.contains(pid))
+                .collect()
         }
     }
 
@@ -495,6 +556,70 @@ pub(crate) mod tests {
             stamp_observed(&chain, &NoLiveAgents, &lead_only),
             Principal::LocalUnverified
         );
+    }
+
+    /// D8 fails closed for a teammate detection does not list: its
+    /// transcript is missing, two candidates tie, or the next detection tick
+    /// hasn't run yet. Detection lists nothing in each case, so they are
+    /// one case here. Its descendants are stamped `observed:` with a key no
+    /// session has, and every mutation is refused, by argv alone.
+    #[test]
+    fn a_peer_under_an_unlisted_teammate_is_never_local_unverified() {
+        // bash tool (30) -> shell (20) -> teammate claude (88) -> tmux (70).
+        let chain = vec![
+            pi(30, 20, 300),
+            pi(20, 88, 200),
+            pi(88, 70, 150),
+            pi(70, 1, 50),
+        ];
+        let unlisted = FakeTeam {
+            observed: FakeObserved::one("claudeCode:lead", 16405),
+            teammates: HashSet::from([88]),
+        };
+        let p = stamp_observed(&chain, &NoLiveAgents, &unlisted);
+        assert_eq!(p, observed("unlisted-teammate:88"));
+        let check = |own, team: &FakeTeam| {
+            check_mutation(
+                Some(&chain),
+                Some(300),
+                Some(false),
+                &NoLiveAgents,
+                team,
+                own,
+            )
+        };
+        for own in [None, Some("unlisted-teammate:88"), Some("claudeCode:lead")] {
+            let e = check(own, &unlisted).unwrap_err();
+            assert!(e.contains("teammate pid 88"), "{}", e);
+        }
+        // Past `MAX_ANCESTRY` the stamp can't see it; the mutation still can.
+        let mut deep: Vec<ProcInfo> = (0..40).map(|i| pi(100 + i, 101 + i, 7)).collect();
+        deep.push(pi(140, 1, 7));
+        let far = FakeTeam {
+            observed: FakeObserved(HashMap::new()),
+            teammates: HashSet::from([135]),
+        };
+        assert_eq!(
+            stamp_observed(&deep, &NoLiveAgents, &far),
+            Principal::LocalUnverified
+        );
+        assert!(
+            check_mutation(Some(&deep), Some(7), Some(false), &NoLiveAgents, &far, None)
+                .unwrap_err()
+                .contains("teammate pid 135")
+        );
+        // Once detection lists it, the teammate's own session may mutate
+        // what an observed session may, and nothing else.
+        let listed = FakeTeam {
+            observed: FakeObserved::one("claudeCode:mate", 88),
+            teammates: HashSet::from([88]),
+        };
+        assert_eq!(
+            stamp_observed(&chain, &NoLiveAgents, &listed),
+            observed("claudeCode:mate")
+        );
+        assert_eq!(check(Some("claudeCode:mate"), &listed), Ok(()));
+        assert!(check(None, &listed).is_err());
     }
 
     /// D8: a mutation refuses a peer under an observed session at any
