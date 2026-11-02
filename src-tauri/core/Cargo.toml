@@ -12,7 +12,7 @@ name = "c9watch_core"
 # The parts that the GUI shell calls. No tauri: CI fails if a `tauri*`
 # crate enters this crate's dependency tree (D32).
 gui = ["dep:tokio", "dep:ed25519-dalek", "dep:rand", "dep:base64", "dep:sha2", "dep:subtle"]
-cli = ["dep:clap", "dep:regex", "dep:tokio"]
+cli = ["dep:clap", "dep:tokio"]
 # Agent engine (C1a): `c9watch engine` and `api`, unix only.
 engine = ["cli", "dep:ed25519-dalek", "dep:rand", "dep:schemars", "dep:sha2", "dep:base64", "dep:subtle"]
 gateway-assets = ["dep:rust-embed"]
@@ -37,6 +37,8 @@ libc = "0.2.180"
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 wait-timeout = "0.2"
+# `session::sanitize` is always built.
+regex = "1"
 
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "process", "signal", "fs", "time", "macros"], optional = true }
 rand = { version = "0.8", optional = true }
@@ -45,7 +47,6 @@ base64 = { version = "0.22", optional = true }
 sha2 = { version = "0.10", optional = true }
 subtle = { version = "2.6", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
-regex = { version = "1", optional = true }
 ed25519-dalek = { version = "2", optional = true }
 # c9p/1 JSON Schema (`docs/api/c9p-1.json`) from the serde wire types.
 schemars = { version = "1", optional = true }
