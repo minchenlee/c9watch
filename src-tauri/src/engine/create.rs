@@ -754,7 +754,7 @@ impl Spawner {
             }
             Up::Failed(e) => {
                 if s.kind == Kind::Resume {
-                    eprintln!("[engine] The resume of {} failed: {}", s.id, e.msg);
+                    crate::elog!(Warn, "create", "The resume of {} failed: {}", s.id, e.msg);
                 }
                 let _ = reply.send(Err(e));
             }
@@ -971,9 +971,12 @@ impl Spawner {
         match killed {
             Ok(_) if s.kind == Kind::Resume => self.drop_resume(s),
             Ok(_) => {}
-            Err(e) => eprintln!(
-                "[engine] Failed to kill {} while it came up; left to boot reconcile: {}",
-                s.id, e
+            Err(e) => crate::elog!(
+                Warn,
+                "create",
+                "Failed to kill {} while it came up; left to boot reconcile: {}",
+                s.id,
+                e
             ),
         }
         if self.drain.on() {
@@ -1074,7 +1077,13 @@ impl Spawner {
                     ops::fail_agent(tx, &machine, &id, ops::METHOD_EXIT, EXITED, &why, now_ms())
                 });
                 if let Err(e) = wrote {
-                    eprintln!("[engine] Failed to record the exit of {}: {}", s.id, e);
+                    crate::elog!(
+                        Error,
+                        "create",
+                        "Failed to record the exit of {}: {}",
+                        s.id,
+                        e
+                    );
                 }
                 remove_settings(&self.config.home, &s.id, s.gen);
                 return;
@@ -1210,7 +1219,7 @@ impl Spawner {
                 let state = match read {
                     Ok(state) => state,
                     Err(e) => {
-                        eprintln!("[engine] Failed to read mail {}: {}", id, e);
+                        crate::elog!(Error, "create", "Failed to read mail {}: {}", id, e);
                         return Delivery::Submitted { id, at };
                     }
                 };
@@ -1780,7 +1789,7 @@ impl Spawner {
         match self.db.write_blocking(f) {
             Ok((r, _)) => Some(r),
             Err(e) => {
-                eprintln!("[engine] Failed to record mail to {}: {}", s.id, e);
+                crate::elog!(Error, "create", "Failed to record mail to {}: {}", s.id, e);
                 None
             }
         }
@@ -1856,7 +1865,7 @@ impl Spawner {
     /// time before anything resumes it (reviews M1).
     fn drain_now(&self, s: &Start, mut driver: Box<dyn Driver>) {
         let mut before = drain::state_of(&self.db, &s.id).unwrap_or_else(|e| {
-            eprintln!("[engine] Drain: {}", e);
+            crate::elog!(Warn, "create", "Drain: {}", e);
             None
         });
         if let Ok(c) = self.db.pooled_reader() {
@@ -1868,17 +1877,23 @@ impl Spawner {
         let (machine, id) = (self.db.machine_id().to_string(), s.id.clone());
         if let Err(e) = driver.kill() {
             let why = e.to_string();
-            eprintln!(
-                "[engine] Drain: failed to kill {}; left to boot reconcile: {}",
-                s.id, why
+            crate::elog!(
+                Warn,
+                "create",
+                "Drain: failed to kill {}; left to boot reconcile: {}",
+                s.id,
+                why
             );
             let wrote = self
                 .db
                 .write_blocking(move |tx| drain::audit_kill_failed(tx, &id, &why));
             if let Err(e) = wrote {
-                eprintln!(
-                    "[engine] Failed to audit the failed kill of {}: {}",
-                    s.id, e
+                crate::elog!(
+                    Error,
+                    "create",
+                    "Failed to audit the failed kill of {}: {}",
+                    s.id,
+                    e
                 );
             }
             return;
@@ -1887,7 +1902,13 @@ impl Spawner {
             .db
             .write_blocking(move |tx| drain::settle(tx, &machine, &id, before.as_deref()));
         if let Err(e) = wrote {
-            eprintln!("[engine] Failed to record the drain of {}: {}", s.id, e);
+            crate::elog!(
+                Error,
+                "create",
+                "Failed to record the drain of {}: {}",
+                s.id,
+                e
+            );
         }
         remove_settings(&self.config.home, &s.id, s.gen);
     }
@@ -1912,7 +1933,13 @@ impl Spawner {
             hooks::screen_claim(tx, &machine, &merge, &id, gen, activity, now_ms())
         });
         if let Err(e) = wrote {
-            eprintln!("[engine] Failed to record the screen of {}: {}", s.id, e);
+            crate::elog!(
+                Error,
+                "create",
+                "Failed to record the screen of {}: {}",
+                s.id,
+                e
+            );
         }
     }
 
@@ -1938,7 +1965,13 @@ impl Spawner {
             .db
             .write_blocking(move |tx| hooks::expire_hold(tx, &machine, &merge, &id, gen, now));
         if let Err(e) = wrote {
-            eprintln!("[engine] Failed to settle the state of {}: {}", s.id, e);
+            crate::elog!(
+                Error,
+                "create",
+                "Failed to settle the state of {}: {}",
+                s.id,
+                e
+            );
         }
     }
 
@@ -1961,9 +1994,12 @@ impl Spawner {
             drain::audit_blocked(tx, audit::SYSTEM, &id2, InjectionPath::Pty, now_ms())
         });
         if let Err(e) = wrote {
-            eprintln!(
-                "[engine] Failed to audit a blocked PTY write to {}: {}",
-                id, e
+            crate::elog!(
+                Error,
+                "create",
+                "Failed to audit a blocked PTY write to {}: {}",
+                id,
+                e
             );
         }
         Err(PtyWriteError::Blocked)
@@ -2017,9 +2053,12 @@ impl Spawner {
             ops::fail_agent(tx, &machine, &s2.id, method, reason, &why2, now)
         });
         if let Err(e) = wrote {
-            eprintln!(
-                "[engine] Failed to record the failed create of {}: {}",
-                s.id, e
+            crate::elog!(
+                Error,
+                "create",
+                "Failed to record the failed create of {}: {}",
+                s.id,
+                e
             );
         }
         remove_settings(&self.config.home, &s.id, s.gen);
@@ -2039,7 +2078,13 @@ impl Spawner {
             .db
             .write_blocking(move |tx| undo_resume(tx, &machine, &s2, outcome));
         if let Err(e) = wrote {
-            eprintln!("[engine] Failed to close the resume op of {}: {}", s.id, e);
+            crate::elog!(
+                Error,
+                "create",
+                "Failed to close the resume op of {}: {}",
+                s.id,
+                e
+            );
         }
         remove_settings(&self.config.home, &s.id, s.gen);
     }
@@ -2063,9 +2108,13 @@ impl Spawner {
             return true;
         };
         let left = super::pty::survivors(&e);
-        eprintln!(
-            "[engine] Could not confirm the kill of {} (pid {}); marking it orphaned: {}",
-            s.id, child.pid, e
+        crate::elog!(
+            Warn,
+            "create",
+            "Could not confirm the kill of {} (pid {}); marking it orphaned: {}",
+            s.id,
+            child.pid,
+            e
         );
         let (machine, id, gen) = (self.db.machine_id().to_string(), s.id.clone(), s.gen);
         let (principal, e) = (principal.to_string(), e.to_string());
@@ -2084,7 +2133,7 @@ impl Spawner {
             )
         });
         if let Err(e) = wrote {
-            eprintln!("[engine] Failed to mark {} orphaned: {}", s.id, e);
+            crate::elog!(Error, "create", "Failed to mark {} orphaned: {}", s.id, e);
         }
         false
     }
@@ -2397,7 +2446,13 @@ impl Spawner {
                     match wrote {
                         Ok(_) => done.failed.push(r.id),
                         Err(e) => {
-                            eprintln!("[engine] Failed to fail the resume of {}: {}", r.id, e);
+                            crate::elog!(
+                                Error,
+                                "create",
+                                "Failed to fail the resume of {}: {}",
+                                r.id,
+                                e
+                            );
                             done.left.push(r.id);
                         }
                     }
@@ -2421,7 +2476,13 @@ impl Spawner {
                     match wrote {
                         Ok(_) => done.failed.push(r.id),
                         Err(e) => {
-                            eprintln!("[engine] Failed to fail the resume of {}: {}", r.id, e);
+                            crate::elog!(
+                                Error,
+                                "create",
+                                "Failed to fail the resume of {}: {}",
+                                r.id,
+                                e
+                            );
                             done.left.push(r.id);
                         }
                     }
