@@ -6,7 +6,8 @@
 //!   `SO_PEERCRED` on Linux.
 //! - Process info (ppid, group and start time; the process list):
 //!   `proc_listallpids` and `proc_pidinfo(PROC_PIDTBSDINFO)` on
-//!   macOS, `/proc/<pid>/stat` on Linux. Never `ps`.
+//!   macOS (`proc_info` falls back to `sysctl(KERN_PROC_PID)` for
+//!   another user's process), `/proc/<pid>/stat` on Linux. Never `ps`.
 //! - Executable: `proc_pidpath` on macOS, `/proc/<pid>/exe` on Linux.
 //!
 //! The macOS part is ported from the C0 spike `peer.rs`, on top of the libc
@@ -76,6 +77,66 @@ pub fn proc_entry(pid: libc::pid_t) -> Option<ProcEntry> {
     })
 }
 
+/// `proc_entry` through `sysctl(KERN_PROC_PID)`, which reads processes of
+/// any user. The start token is the same as from `proc_pidinfo`.
+///
+/// The libc crate has no macOS `kinfo_proc`, so the fields are read at
+/// their offsets in the 64-bit layout (648 bytes). Source: xnu
+/// `bsd/sys/sysctl.h` (`struct kinfo_proc { struct extern_proc kp_proc;
+/// struct eproc kp_eproc; }`) and `bsd/sys/proc.h` (`struct extern_proc`,
+/// 296 bytes):
+/// - `kp_proc.p_un.__p_starttime` (`struct timeval`): tv_sec at 0, tv_usec at 8;
+/// - `kp_proc.p_stat` (char) at 36, `kp_proc.p_pid` at 40;
+/// - `kp_eproc` at 296, after `e_paddr`, `e_sess`, `e_pcred` (104),
+///   `e_ucred` (76) and `e_vm` (64): `e_ppid` at 560, `e_pgid` at 564.
+///
+/// Checked against `ps` and `proc_pidinfo` (test
+/// `sysctl_reads_a_process_as_proc_pidinfo_does`). Fail-closed: a size
+/// other than 648, a `p_pid` other than `pid`, or a start time out of
+/// range reads as `None`, so wrong offsets refuse instead of allowing.
+#[cfg(target_os = "macos")]
+fn kinfo_entry(pid: libc::pid_t) -> Option<ProcEntry> {
+    if pid <= 0 {
+        return None;
+    }
+    const SIZE: usize = 648;
+    let mut buf = [0u8; SIZE];
+    let mut len = SIZE;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let r = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if r != 0 || len != SIZE {
+        return None;
+    }
+    let i32_at = |o: usize| i32::from_ne_bytes(buf[o..o + 4].try_into().unwrap());
+    let i64_at = |o: usize| i64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
+    // Sanity check on the offsets: the record must name the pid asked for.
+    if i32_at(40) != pid {
+        return None;
+    }
+    let (sec, usec) = (i64_at(0), i32_at(8));
+    if sec <= 0 || !(0..1_000_000).contains(&usec) {
+        return None;
+    }
+    Some(ProcEntry {
+        info: ProcInfo {
+            pid,
+            ppid: i32_at(560),
+            start: sec as u64 * 1_000_000 + usec as u64,
+        },
+        pgid: i32_at(564),
+        zombie: buf[36] as libc::c_int == libc::SZOMB as libc::c_int,
+    })
+}
+
 /// Ppid, group, start time and state of `pid`, or `None` when it is gone
 /// or unreadable.
 #[cfg(target_os = "linux")]
@@ -102,8 +163,17 @@ pub fn proc_entry(_pid: libc::pid_t) -> Option<ProcEntry> {
 }
 
 /// Ppid and start time of `pid`, or `None` when it is gone or unreadable.
+///
+/// On macOS `proc_pidinfo` refuses another user's process (EPERM), such as
+/// the root-owned `/usr/bin/login` that Terminal, Ghostty and iTerm start
+/// each shell under, so this falls back to sysctl. `proc_entry` and
+/// `processes` keep to `proc_pidinfo`: the pty kill walk only follows
+/// processes it can signal.
 pub fn proc_info(pid: libc::pid_t) -> Option<ProcInfo> {
-    proc_entry(pid).map(|e| e.info)
+    let entry = proc_entry(pid);
+    #[cfg(target_os = "macos")]
+    let entry = entry.or_else(|| kinfo_entry(pid));
+    entry.map(|e| e.info)
 }
 
 /// Every process this module can read, zombies included.
@@ -400,6 +470,54 @@ mod tests {
         assert_eq!(chain[0].pid, my_pid());
         assert!(chain.last().unwrap().ppid <= 1, "{:?}", chain);
         assert!(full_ancestry(-1).is_none());
+    }
+
+    /// The sysctl fallback reads the fields at the right offsets: it agrees
+    /// with `proc_pidinfo` on processes both can read.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sysctl_reads_a_process_as_proc_pidinfo_does() {
+        let me = my_pid();
+        for pid in [me, unsafe { libc::getppid() }] {
+            assert_eq!(kinfo_entry(pid), proc_entry(pid), "pid {}", pid);
+        }
+        assert!(kinfo_entry(-1).is_none());
+        assert!(kinfo_entry(0).is_none());
+        assert!(kinfo_entry(libc::pid_t::MAX).is_none());
+    }
+
+    /// A root-owned process (`proc_pidinfo` gives EPERM) is still read, and
+    /// a chain through it reaches init: a shell that Terminal, Ghostty or
+    /// iTerm started under the setuid `/usr/bin/login`, when one runs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_chain_through_a_root_process_reaches_init() {
+        let all: Vec<libc::pid_t> = {
+            let mut pids = vec![0 as libc::pid_t; 8192];
+            let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+            let n =
+                unsafe { libc::proc_listallpids(pids.as_mut_ptr() as *mut libc::c_void, bytes) };
+            pids.truncate(n.max(0) as usize);
+            pids
+        };
+        let root: Vec<ProcInfo> = all
+            .iter()
+            .filter(|&&p| p > 1 && proc_entry(p).is_none())
+            .filter_map(|&p| proc_info(p))
+            .collect();
+        assert!(!root.is_empty(), "no process that only sysctl can read");
+        let under_root = all.iter().copied().find(|&p| {
+            proc_entry(p)
+                .is_some_and(|e| e.info.ppid > 1 && root.iter().any(|r| r.pid == e.info.ppid))
+        });
+        let start = under_root.unwrap_or(root[0].pid);
+        let chain = full_ancestry(start).expect("a complete chain");
+        assert!(chain.last().unwrap().ppid <= 1, "{:?}", chain);
+        if under_root.is_some() {
+            assert!(root.iter().any(|r| r.pid == chain[1].pid), "{:?}", chain);
+        } else {
+            eprintln!("no user process under a root parent; walked {}", start);
+        }
     }
 
     #[test]
