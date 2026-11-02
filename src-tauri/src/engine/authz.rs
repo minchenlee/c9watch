@@ -153,6 +153,7 @@ pub fn method(name: &str) -> Option<Rule> {
         | "hook.notification"
         | "hook.user_prompt_submit"
         | "hook.post_tool_use"
+        | "hook.pre_tool_use"
         | "task.done"
         | "agent.handoff" => rule("hook", "write", &[A], None, &[UnixPeer, AgentExe]),
         _ => return None,

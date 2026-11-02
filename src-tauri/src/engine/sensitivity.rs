@@ -163,8 +163,14 @@ const BY_NAME: &[(&str, &str)] = &[
     ("maxConnections", P),
     ("retentionHours", P),
     ("retentionEvents", P),
+    ("ccVersion", P),
+    ("decision", P),
     // Paths, places and tools.
     ("cwd", M),
+    // D30 write fence.
+    ("guard", M),
+    ("denyWriteUnder", M),
+    ("allowWrite", M),
     ("project", M),
     ("projectPath", M),
     ("projectName", M),
@@ -301,6 +307,8 @@ const OVERRIDES: &[(&str, &str, &str)] = &[
     ("DetectorHealth", "stale", P),
     // A detection error can name a path or a command line.
     ("DetectorHealth", "reason", M),
+    // Names the refused path.
+    ("PreToolUseResult", "reason", M),
     ("SessionViewsResult", "sessions", P),
 ];
 

@@ -460,7 +460,21 @@ impl AgentFilter {
 pub const AGENT_COLUMNS: &str = "id, generation, mode, role, control, provider, provider_sid, \
      source, created_by, gone_at, resume_count, interrupted_note_pending, session_key, \
      machine_id, state, status, cwd, name, pid, started_at, created_at, last_seen, parent_id, \
-     state_reason";
+     state_reason, guard, cc_version, capabilities";
+
+/// A JSON column as `T`, `None` when it is null.
+fn json_col<T: serde::de::DeserializeOwned>(
+    r: &rusqlite::Row,
+    i: usize,
+) -> rusqlite::Result<Option<T>> {
+    r.get::<_, Option<String>>(i)?
+        .map(|s| {
+            serde_json::from_str(&s).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, e.into())
+            })
+        })
+        .transpose()
+}
 
 /// Read one row selected with `AGENT_COLUMNS`.
 pub fn agent_row(r: &rusqlite::Row) -> rusqlite::Result<AgentRow> {
@@ -489,6 +503,9 @@ pub fn agent_row(r: &rusqlite::Row) -> rusqlite::Result<AgentRow> {
         last_seen: r.get(21)?,
         parent_id: r.get(22)?,
         state_reason: r.get(23)?,
+        guard: json_col(r, 24)?,
+        cc_version: r.get(25)?,
+        capabilities: json_col(r, 26)?,
     })
 }
 
@@ -789,7 +806,10 @@ mod tests {
                 "last_seen",
                 "parent_id",
                 "state_reason",
-                "resume_argv"
+                "resume_argv",
+                "guard",
+                "cc_version",
+                "capabilities"
             ]
         );
     }
@@ -1185,6 +1205,9 @@ mod tests {
                 last_seen: None,
                 parent_id: None,
                 state_reason: None,
+                guard: None,
+                cc_version: None,
+                capabilities: None,
             }
         );
         assert_eq!(db.check_cursor(&cur), Ok(1));

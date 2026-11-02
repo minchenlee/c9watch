@@ -114,6 +114,9 @@ pub struct Profile {
     /// Realpath cwds of the other live engine agents at spawn time. Their
     /// `.claude/` gets the same deny rules as this agent's own (C1a-32).
     pub peers: Vec<PathBuf>,
+    /// The agent has a write fence (D30): its settings get the blocking
+    /// `PreToolUse` hook, which asks the engine on every file tool call.
+    pub guarded: bool,
 }
 
 impl Profile {
@@ -143,6 +146,7 @@ impl Profile {
             session_id: session_id.into(),
             resume: false,
             peers: Vec::new(),
+            guarded: false,
         })
     }
 
@@ -168,6 +172,12 @@ impl Profile {
     }
 
     /// The same spawn, resuming `session_id` (C1a-28).
+    /// Give the settings the guard hook (`Profile::guarded`).
+    pub fn with_guard(mut self, guarded: bool) -> Profile {
+        self.guarded = guarded;
+        self
+    }
+
     pub fn resuming(mut self) -> Profile {
         self.resume = true;
         self
@@ -389,6 +399,12 @@ pub fn settings(p: &Profile) -> Value {
         "filesystem": { "denyWrite": deny_write(p) },
     });
     s["remoteControlAtStartup"] = json!(false);
+    if p.guarded {
+        let (event, _) = crate::engine::adapter::CC_GUARD_HOOK;
+        s["hooks"][event] = crate::engine::adapter::claude_guard_hook(&p.agent_bin);
+    }
+    #[cfg(feature = "live-test")]
+    crate::engine::live_test::patch_settings(p, &mut s);
     s
 }
 
@@ -606,6 +622,29 @@ mod tests {
                 );
                 assert!(!k.contains("TOKEN") && !k.contains("SECRET"), "{}", k);
             }
+        });
+    }
+
+    #[test]
+    fn only_a_fenced_agent_gets_the_blocking_pre_tool_use_hook() {
+        with_cwd(|_, p| {
+            assert!(settings(&p)["hooks"].get("PreToolUse").is_none());
+            let s = settings(&p.with_guard(true));
+            let e = &s["hooks"]["PreToolUse"][0];
+            assert_eq!(e["matcher"], "Write|Edit|MultiEdit|NotebookEdit");
+            let h = &e["hooks"][0];
+            assert_eq!(h["onFailure"], "block");
+            assert!(h.get("async").is_none(), "CC must wait for it");
+            assert_eq!(
+                h["command"],
+                format!("'{}' hook pre-tool-use --kind claude", BIN)
+            );
+            assert_eq!(s["hooks"].as_object().unwrap().len(), CC_HOOKS.len() + 1);
+            // The client gives up before CC does: a slow engine blocks.
+            assert!(
+                crate::cli::task::hook_timeout("pre-tool-use")
+                    < std::time::Duration::from_secs(crate::engine::adapter::CC_HOOK_TIMEOUT_S)
+            );
         });
     }
 

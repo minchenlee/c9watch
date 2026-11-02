@@ -30,6 +30,9 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>;
 }
 
+/** The first core minor that applies `agent.create` `guard` and `require`. */
+export const C9P_GUARD_MINOR = 12;
+
 /** One multiplexed connection. Reconnect explicitly; mutations are never retried. */
 export class C9pClient {
   hello?: C9pHelloResult;
@@ -86,7 +89,7 @@ export class C9pClient {
   }
 
   request<M extends C9pMethod>(method: M, params: C9pMethods[M]['params']): Promise<C9pMethods[M]['result']> {
-    try { this.checkMethod(method); }
+    try { this.checkMethod(method); this.checkParams(method, params); }
     catch (e) { return Promise.reject(e); }
     return this.raw(method, params) as Promise<C9pMethods[M]['result']>;
   }
@@ -128,6 +131,15 @@ export class C9pClient {
     if (!this.hello) throw new Error('Call connect() first');
     if (this.hello.breakingSince.includes(method)) throw new C9pError('breaking_preview', `${method} changed; update the SDK`);
     if (!Object.hasOwn(this.hello.methods, method)) throw new C9pError('unsupported', `${method} is not advertised by core`);
+  }
+  /** An older core ignores params it does not know; a fence it drops would spawn an unfenced agent. */
+  private checkParams(method: string, params: unknown): void {
+    if (method !== 'agent.create' || !params || typeof params !== 'object') return;
+    const p = params as { guard?: unknown; require?: unknown[] };
+    const fenced = (p.guard !== undefined && p.guard !== null) || (Array.isArray(p.require) && p.require.length > 0);
+    if (fenced && this.hello!.apiMinor < C9P_GUARD_MINOR) {
+      throw new C9pError('unsupported', `agent.create guard/require need core API minor ${C9P_GUARD_MINOR}; this core is 1.${this.hello!.apiMinor}`);
+    }
   }
   private async attach(s: LiveSubscription): Promise<void> {
     this.checkMethod('events.subscribe');

@@ -91,6 +91,9 @@ pub mod generation;
 pub mod hooks;
 
 #[cfg(unix)]
+pub mod guard;
+
+#[cfg(unix)]
 pub mod standing;
 
 #[cfg(unix)]

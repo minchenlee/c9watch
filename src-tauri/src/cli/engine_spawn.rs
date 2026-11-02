@@ -101,6 +101,8 @@ pub fn create_params(cwd: &Path, name: Option<&str>) -> serde_json::Value {
         mode: "free".into(),
         cwd: cwd.to_string_lossy().into_owned(),
         name: name.map(str::to_string),
+        guard: None,
+        require: Vec::new(),
     })
     .expect("AgentCreateParams serializes")
 }

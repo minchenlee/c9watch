@@ -2,7 +2,7 @@
 // The engine (src-tauri/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 11;
+export const C9P_API_MINOR = 12;
 
 /** `agent.attention` data: an agent needs the user. */
 export interface C9pAgentAttentionEvent {
@@ -23,6 +23,14 @@ export interface C9pAgentAttentionEvent {
 export interface C9pAgentCreateParams {
   /** An absolute directory. The engine uses its realpath. */
   cwd: string;
+  /**
+   * A write fence for the agent's file tools (`Write`, `Edit`,
+   * `MultiEdit`, `NotebookEdit`), checked by the engine on every call
+   * through a blocking `PreToolUse` hook. With a fence, the agent may
+   * run while live agents use other cwds, if each such pair fences the
+   * other's cwd off. Without one, nothing changes.
+   */
+  guard?: C9pAgentGuard | null;
   /** The adapter kind. Only `claude` is supported. */
   kind?: string;
   /** `free`. `managed` is not supported and answers `unsupported`. */
@@ -32,6 +40,12 @@ export interface C9pAgentCreateParams {
    * the live engine agents.
    */
   name?: string | null;
+  /**
+   * Capability tokens the spawned Claude Code must have (see
+   * `AgentRow.capabilities`). A missing one answers `unsupported` and
+   * spawns nothing. Without it, an untested version only warns.
+   */
+  require?: string[];
 }
 
 /** `agent.create` result: the agent once it is `ready`. */
@@ -52,6 +66,21 @@ export interface C9pAgentGoneEvent {
   goneAt: number;
   id: string;
   sessionKey: string;
+}
+
+/**
+ * A write fence for an agent's file tools: writes under any
+ * `denyWriteUnder` directory are refused, except under an `allowWrite`
+ * subtree. Bash is not fenced here; the CC sandbox keeps it in the cwd.
+ */
+export interface C9pAgentGuard {
+  /**
+   * Absolute existing subtrees exempt from `denyWriteUnder`. The
+   * agent's cwd must be writable. At most 64.
+   */
+  allowWrite?: string[];
+  /** Absolute existing directories, not `/`. At most 64. */
+  denyWriteUnder: string[];
 }
 
 export type C9pAgentKind = 'root' | 'subagent' | 'internal' | string;
@@ -110,6 +139,17 @@ export interface C9pAgentRetireResult {
  * `session.list` and `agent.list` send it.
  */
 export interface C9pAgentRow {
+  /**
+   * What that version can do, as capability tokens (such as
+   * `hook.pre_tool_use.block`); `null` for an agent the engine did not
+   * spawn.
+   */
+  capabilities?: string[] | null;
+  /**
+   * The Claude Code version the agent was spawned with, as `claude
+   * --version` printed it (`2.1.314`); `null` when unread.
+   */
+  ccVersion?: string | null;
   /** `pty` or `none`. */
   control: 'pty' | 'none' | string;
   /** Unix ms. */
@@ -122,6 +162,11 @@ export interface C9pAgentRow {
   generation: number;
   /** Unix ms; `null` while the agent is alive. */
   goneAt: number | null;
+  /**
+   * The write fence the agent was created with (`agent.create`
+   * `guard`), as realpaths; `null` for an agent without one.
+   */
+  guard?: C9pAgentGuard | null;
   /** `agt_<ulid>`. */
   id: string;
   /**

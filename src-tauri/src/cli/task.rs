@@ -9,14 +9,16 @@
 //!
 //! A hook never fails the vendor's hook: it exits 0, prints nothing but
 //! the `additionalContext` of `SessionStart`, and gives up after
-//! `HOOK_TIMEOUT` (A:1054). Only the engine writes logs (A:1167).
+//! `HOOK_TIMEOUT` (A:1054). Only the engine writes logs (A:1167). The
+//! one exception is `hook pre-tool-use` of a fenced agent (D30): it blocks
+//! the call (exit 2) unless the engine answers `allow`.
 //!
 //! Library code: everything here except the `cmd_*` wrappers is free of
 //! stdin/stdout side effects.
 
 use crate::engine_proto::client::{ClientError, Conn};
 use crate::engine_proto::wire::{
-    HandoffParams, HookParams, HookResult, TaskDoneParams, TaskDoneResult,
+    HandoffParams, HookParams, HookResult, PreToolUseResult, TaskDoneParams, TaskDoneResult,
 };
 use serde_json::Value;
 use std::io::Read;
@@ -34,6 +36,10 @@ pub const HOOK_TIMEOUT: Duration = Duration::from_millis(500);
 /// to a busy engine would lose the note. It runs once per generation, and
 /// stays under CC's own hook timeout (`engine::adapter::CC_HOOK_TIMEOUT_S`).
 pub const SESSION_START_TIMEOUT: Duration = Duration::from_secs(4);
+/// How long `hook pre-tool-use` waits. No answer blocks the call, so a
+/// busy engine costs a refused write; it stays under CC's own hook
+/// timeout (`engine::adapter::CC_HOOK_TIMEOUT_S`).
+pub const PRE_TOOL_USE_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long `task done` and `handoff` wait for each read and write.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// The largest hook stdin a hook forwards. A larger one goes as `null`
@@ -273,10 +279,10 @@ pub fn hook_method(event: &str) -> Option<&'static str> {
 
 /// How long `hook <event>` waits for the engine, all in.
 pub fn hook_timeout(event: &str) -> Duration {
-    if event == "session-start" {
-        SESSION_START_TIMEOUT
-    } else {
-        HOOK_TIMEOUT
+    match event {
+        "session-start" => SESSION_START_TIMEOUT,
+        PRE_TOOL_USE => PRE_TOOL_USE_TIMEOUT,
+        _ => HOOK_TIMEOUT,
     }
 }
 
@@ -371,6 +377,83 @@ pub fn run_hook(
             );
             None
         }
+    }
+}
+
+/// The blocking hook event of a fenced agent, sent as `hook.pre_tool_use`.
+pub const PRE_TOOL_USE: &str = "pre-tool-use";
+
+/// What `hook pre-tool-use` forwards of the hook input: the tool name, the
+/// ids and the path keys of `tool_input`. File content stays out of the
+/// socket.
+pub fn pre_tool_use_input(input: &[u8]) -> Value {
+    let Ok(v) = serde_json::from_slice::<Value>(input) else {
+        return Value::Null;
+    };
+    let mut tool_input = serde_json::Map::new();
+    for k in ["file_path", "notebook_path"] {
+        if let Some(p) = v["tool_input"].get(k) {
+            tool_input.insert(k.into(), p.clone());
+        }
+    }
+    let mut out = serde_json::Map::new();
+    for k in ["session_id", "agent_id", "tool_name", "tool_use_id"] {
+        if let Some(x) = v.get(k) {
+            out.insert(k.into(), x.clone());
+        }
+    }
+    out.insert("tool_input".into(), tool_input.into());
+    out.into()
+}
+
+/// Run `hook pre-tool-use`: `Ok` only when the engine answers `allow`.
+/// `Err` holds the reason the hook prints on stderr when it exits 2, which
+/// blocks the call: a deny, no env, a missing or slow engine, a refusal.
+pub fn run_pre_tool_use(
+    kind: &str,
+    stdin: impl Read + Send + 'static,
+    get: impl Fn(&str) -> Option<String>,
+    timeout: Duration,
+) -> Result<(), String> {
+    const NO_ANSWER: &str = "c9watch guard: no answer from the c9 engine, so the write is blocked";
+    let deadline = Instant::now() + timeout;
+    let env = engine_env(get).map_err(|e| format!("{} ({})", NO_ANSWER, e))?;
+    let kind = kind.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("hook".into())
+        .spawn(move || {
+            let mut input = Vec::new();
+            let _ = stdin
+                .take(MAX_TRIMMED_INPUT as u64 + 1)
+                .read_to_end(&mut input);
+            let params = HookParams {
+                agent_id: env.agent_id.clone(),
+                kind,
+                seq: seq_now(),
+                input: pre_tool_use_input(&input),
+                truncated: false,
+            };
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            let sent = serde_json::to_value(params)
+                .map_err(|e| e.to_string())
+                .and_then(|p| call(&env, "hook.pre_tool_use", p, left))
+                .and_then(|r| {
+                    serde_json::from_value::<PreToolUseResult>(r).map_err(|e| e.to_string())
+                });
+            let _ = tx.send(sent);
+        })
+        .map_err(|e| format!("{} ({})", NO_ANSWER, e))?;
+    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(r)) if r.decision == "allow" => Ok(()),
+        Ok(Ok(r)) => Err(r
+            .reason
+            .unwrap_or_else(|| "c9watch guard: the c9 engine denied the write".into())),
+        Ok(Err(e)) => Err(format!("{} ({})", NO_ANSWER, e)),
+        Err(_) => Err(format!("{} within {:?}", NO_ANSWER, timeout)),
     }
 }
 
@@ -532,8 +615,11 @@ mod tests {
         for (_, m) in HOOK_EVENTS {
             assert!(crate::engine_proto::wire::HOOK_METHODS.contains(m), "{m}");
         }
+        // `pre-tool-use` blocks, so it runs apart from `run_hook`.
+        assert!(crate::engine_proto::wire::HOOK_METHODS.contains(&"hook.pre_tool_use"));
+        assert_eq!(hook_method(PRE_TOOL_USE), None);
         assert_eq!(
-            HOOK_EVENTS.len(),
+            HOOK_EVENTS.len() + 1,
             crate::engine_proto::wire::HOOK_METHODS.len()
         );
     }
@@ -725,5 +811,99 @@ mod tests {
         assert_eq!(out, json!({"session_id": "s1"}));
         // Input that is not an object goes as it is.
         assert_eq!(trim_input(b"not json", keys), b"not json".to_vec());
+    }
+
+    #[test]
+    fn pre_tool_use_forwards_only_the_paths_and_ids() {
+        let input = br#"{"session_id":"s1","tool_name":"Write","tool_use_id":"t1",
+            "tool_input":{"file_path":"/a/b","content":"secret"},"cwd":"/a"}"#;
+        assert_eq!(
+            pre_tool_use_input(input),
+            json!({"session_id":"s1","tool_name":"Write","tool_use_id":"t1",
+                   "tool_input":{"file_path":"/a/b"}})
+        );
+        let nb = br#"{"tool_name":"NotebookEdit","tool_input":{"notebook_path":"/n.ipynb","new_source":"x"}}"#;
+        assert_eq!(
+            pre_tool_use_input(nb)["tool_input"],
+            json!({"notebook_path":"/n.ipynb"})
+        );
+        assert_eq!(pre_tool_use_input(b"not json"), Value::Null);
+    }
+
+    #[test]
+    fn pre_tool_use_passes_only_on_allow() {
+        let stdin = || {
+            std::io::Cursor::new(
+                br#"{"tool_name":"Write","tool_input":{"file_path":"/x"}}"#.to_vec(),
+            )
+        };
+        for (reply, want) in [
+            (json!({"decision": "allow"}), Ok(())),
+            (
+                json!({"decision": "deny", "reason": "c9watch guard: no"}),
+                Err("c9watch guard: no".to_string()),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("e.sock");
+            let h = serve_one(&path, move |_| Ok(reply.clone()));
+            let sock = path.to_str().unwrap().to_string();
+            let env = [("C9_ENGINE_SOCK", sock.as_str()), ("C9_AGENT_ID", "agt_x")];
+            let got = run_pre_tool_use("claude", stdin(), env_of(&env), PRE_TOOL_USE_TIMEOUT);
+            assert_eq!(got, want);
+            let req = h.join().unwrap();
+            assert_eq!(req.method.as_deref(), Some("hook.pre_tool_use"));
+            assert_eq!(req.params["input"]["tool_input"]["file_path"], "/x");
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_blocks_without_an_answer() {
+        let none = || std::io::Cursor::new(Vec::new());
+        let blocked = |r: Result<(), String>| {
+            let e = r.unwrap_err();
+            assert!(e.starts_with("c9watch guard:"), "{e}");
+        };
+        // No env, no socket, a refusal, an engine that never answers.
+        blocked(run_pre_tool_use(
+            "claude",
+            none(),
+            env_of(&[]),
+            PRE_TOOL_USE_TIMEOUT,
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.sock");
+        let sock = path.to_str().unwrap().to_string();
+        let env = [("C9_ENGINE_SOCK", sock.as_str()), ("C9_AGENT_ID", "a")];
+        blocked(run_pre_tool_use(
+            "claude",
+            none(),
+            env_of(&env),
+            PRE_TOOL_USE_TIMEOUT,
+        ));
+        let h = serve_one(&path, |_| Err(("peer_not_authorized", "no")));
+        blocked(run_pre_tool_use(
+            "claude",
+            none(),
+            env_of(&env),
+            PRE_TOOL_USE_TIMEOUT,
+        ));
+        h.join().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let l = UnixListener::bind(&path).unwrap();
+        let held = std::thread::spawn(move || {
+            let c = l.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+            drop(c);
+        });
+        let t = Instant::now();
+        let short = Duration::from_millis(300);
+        blocked(run_pre_tool_use("claude", none(), env_of(&env), short));
+        assert!(
+            t.elapsed() < short + Duration::from_millis(200),
+            "{:?}",
+            t.elapsed()
+        );
+        held.join().unwrap();
     }
 }

@@ -340,6 +340,50 @@ pub fn full_ancestry(pid: libc::pid_t) -> Option<Vec<ProcInfo>> {
     }
 }
 
+/// Where and why `full_ancestry(pid)` stops short of init, as read now,
+/// for an error message only: it decides nothing. The same walk as
+/// `ancestry`, naming the step that ended it.
+pub fn ancestry_gap(pid: libc::pid_t) -> String {
+    let unreadable = |p: libc::pid_t| {
+        format!(
+            "pid {} is unreadable ({})",
+            p,
+            std::io::Error::last_os_error()
+        )
+    };
+    let Some(mut cur) = proc_info(pid) else {
+        return unreadable(pid);
+    };
+    let mut levels = 1;
+    while cur.ppid > 1 {
+        if levels >= MAX_FULL_ANCESTRY {
+            return format!("more than {} levels", MAX_FULL_ANCESTRY);
+        }
+        let Some(parent) = proc_info(cur.ppid) else {
+            return format!("{}, the parent of pid {}", unreadable(cur.ppid), cur.pid);
+        };
+        match proc_info(cur.pid) {
+            Some(again) if again.start == cur.start && again.ppid == cur.ppid => {}
+            Some(again) => {
+                return format!(
+                    "pid {} changed during the walk (ppid {} -> {}, start {} -> {})",
+                    cur.pid, cur.ppid, again.ppid, cur.start, again.start
+                )
+            }
+            None => return format!("{} after its parent was read", unreadable(cur.pid)),
+        }
+        if parent.start > cur.start {
+            return format!(
+                "parent pid {} started after its child pid {} ({} > {})",
+                parent.pid, cur.pid, parent.start, cur.start
+            );
+        }
+        cur = parent;
+        levels += 1;
+    }
+    format!("the walk reaches init now ({} levels)", levels)
+}
+
 /// Whether `pid` runs confined in a way the engine does not: a CC agent's
 /// Bash runs under the vendor sandbox, and so does everything it starts,
 /// even a process that `setsid`/`nohup` moved under init. `None` when it
@@ -465,6 +509,29 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "diagnostic: C9_WALK_PIDS=<pid,...> cargo test ... -- --ignored --nocapture"]
+    fn walk_given_pids() {
+        for pid in std::env::var("C9_WALK_PIDS").unwrap_or_default().split(',') {
+            let Ok(pid) = pid.trim().parse::<libc::pid_t>() else {
+                continue;
+            };
+            println!(
+                "pid {} ancestry {:?}",
+                pid,
+                ancestry(pid, MAX_FULL_ANCESTRY)
+            );
+            println!("pid {} full {:?}", pid, full_ancestry(pid).map(|c| c.len()));
+            println!("pid {} gap {}", pid, ancestry_gap(pid));
+        }
+    }
+
+    #[test]
+    fn ancestry_gap_names_where_the_walk_stops() {
+        assert!(ancestry_gap(my_pid()).starts_with("the walk reaches init now"));
+        assert!(ancestry_gap(-1).starts_with("pid -1 is unreadable"));
+    }
+
+    #[test]
     fn full_ancestry_of_the_test_process_reaches_init() {
         let chain = full_ancestry(my_pid()).expect("a complete chain");
         assert_eq!(chain[0].pid, my_pid());
@@ -506,18 +573,46 @@ mod tests {
             .filter_map(|&p| proc_info(p))
             .collect();
         assert!(!root.is_empty(), "no process that only sysctl can read");
-        let under_root = all.iter().copied().find(|&p| {
-            proc_entry(p)
-                .is_some_and(|e| e.info.ppid > 1 && root.iter().any(|r| r.pid == e.info.ppid))
-        });
-        let start = under_root.unwrap_or(root[0].pid);
-        let chain = full_ancestry(start).expect("a complete chain");
-        assert!(chain.last().unwrap().ppid <= 1, "{:?}", chain);
-        if under_root.is_some() {
-            assert!(root.iter().any(|r| r.pid == chain[1].pid), "{:?}", chain);
-        } else {
-            eprintln!("no user process under a root parent; walked {}", start);
+        // Candidates: user processes whose parent only sysctl can read,
+        // then those parents. Any of them, or an ancestor, may exit while
+        // it is walked (seen on the GitHub macOS runner): such a candidate
+        // is skipped, and the check fails only when none gives a chain.
+        let under_root: Vec<libc::pid_t> = all
+            .iter()
+            .copied()
+            .filter(|&p| {
+                proc_entry(p)
+                    .is_some_and(|e| e.info.ppid > 1 && root.iter().any(|r| r.pid == e.info.ppid))
+            })
+            .take(16)
+            .collect();
+        let candidates = under_root
+            .iter()
+            .map(|&p| (p, true))
+            .chain(root.iter().take(16).map(|r| (r.pid, false)));
+        let mut tried = Vec::new();
+        for (start, user) in candidates {
+            let Some(chain) = full_ancestry(start) else {
+                tried.push(start);
+                continue;
+            };
+            assert!(chain.last().unwrap().ppid <= 1, "{:?}", chain);
+            if user {
+                // The walk went through the root parent, not around it. A
+                // parent that exited meanwhile leaves the child under init.
+                if chain.len() < 2 || !root.iter().any(|r| r.pid == chain[1].pid) {
+                    tried.push(start);
+                    continue;
+                }
+            } else {
+                eprintln!(
+                    "no user process under a root parent gave a chain; walked {}",
+                    start
+                );
+            }
+            return;
         }
+        panic!("no candidate gave a complete chain; tried {:?}", tried);
     }
 
     #[test]

@@ -85,9 +85,9 @@ use super::proto::{
     AgentListParams, AgentListResult, AgentResumeParams, AgentResumeResult, AgentRetireParams,
     AgentRetireResult, ApiError, ErrorCode, EventFrame, EventType, FrameError, HandoffParams,
     HandoffResult, HelloParams, HelloResult, HookParams, HookResult, MsgSendParams, MsgSendResult,
-    Request, Response, SessionListParams, SessionListResult, SnapshotParams, SnapshotResult,
-    SubscribeParams, SubscribeResult, TaskDoneParams, TaskDoneResult, API_MAJOR, API_MINOR,
-    HOOK_METHODS, MAX_FRAME,
+    PreToolUseResult, Request, Response, SessionListParams, SessionListResult, SnapshotParams,
+    SnapshotResult, SubscribeParams, SubscribeResult, TaskDoneParams, TaskDoneResult, API_MAJOR,
+    API_MINOR, HOOK_METHODS, MAX_FRAME,
 };
 use super::proto::{
     AnnotationChangedEvent, AnnotationDeleteParams, AnnotationDeleteResult, AnnotationListParams,
@@ -926,6 +926,7 @@ pub const METHODS: &[&str] = &[
     "hook.notification",
     "hook.user_prompt_submit",
     "hook.post_tool_use",
+    "hook.pre_tool_use",
     "task.done",
     "agent.handoff",
     "msg.send",
@@ -1132,6 +1133,8 @@ pub fn schema() -> serde_json::Value {
             "result": ser.subschema_for::<HookResult>(),
         });
     }
+    methods["hook.pre_tool_use"]["result"] =
+        serde_json::json!(ser.subschema_for::<PreToolUseResult>());
     use super::proto::{
         AgentAttentionEvent, AgentFailedEvent, AgentGoneEvent, AgentRow, AgentTurnEndEvent,
         LegacyInboxEvent, MsgStateEvent, NotificationEvent, SessionGoneEvent,
@@ -1938,6 +1941,10 @@ async fn hook_class(
                 "agent.handoff comes with refresh in C1b",
             ))
         }
+        "hook.pre_tool_use" => {
+            let params = serde_json::from_value::<HookParams>(req.params).map_err(bad)?;
+            pre_tool_use(ctx, principal, params).await
+        }
         _ => {
             let params = serde_json::from_value::<HookParams>(req.params).map_err(bad)?;
             // A sender's `seq` is a clock in ns; a long one only fills dedupe.
@@ -1963,6 +1970,63 @@ async fn hook_class(
             Ok(serde_json::to_value(result).expect("HookResult serializes"))
         }
     }
+}
+
+/// Answer a file tool call of a fenced agent from the guard on its row
+/// (D30). No guard on the row allows it. Each deny is audited; the hook
+/// blocks the call on a deny and on no answer.
+async fn pre_tool_use(
+    ctx: &ServerCtx,
+    principal: &Principal,
+    params: HookParams,
+) -> Result<serde_json::Value, ApiError> {
+    let db = ctx.db()?.clone();
+    let id = params.agent_id.clone();
+    let input = params.input;
+    let reason = blocking(move || {
+        let conn = db.pooled_reader().map_err(internal)?;
+        let guard = super::create::row_guard(&conn, &id).map_err(internal)?;
+        Ok(guard.and_then(|g| super::guard::decide(&super::guard::Fence::from_wire(&g), &input)))
+    })
+    .await?;
+    let Some(reason) = reason else {
+        let allow = PreToolUseResult {
+            decision: "allow".into(),
+            reason: None,
+        };
+        return Ok(serde_json::to_value(allow).expect("PreToolUseResult serializes"));
+    };
+    let (who, target, why) = (
+        principal.to_string(),
+        params.agent_id.clone(),
+        reason.clone(),
+    );
+    let wrote = ctx
+        .db()?
+        .write(move |tx| {
+            audit::append(
+                tx,
+                now_ms(),
+                &AuditEntry {
+                    principal: &who,
+                    method: "hook.pre_tool_use",
+                    target: Some(&target),
+                    decision: "deny",
+                    reason: Some(&why),
+                    ..Default::default()
+                },
+            )
+        })
+        .await;
+    if let Err(e) = wrote {
+        // The deny stands without its audit row.
+        elog!(Error, "api", "Failed to audit a guard deny: {}", e);
+    }
+    let deny = PreToolUseResult {
+        decision: "deny".into(),
+        reason: Some(reason),
+    };
+    Ok(serde_json::to_value(deny).expect("PreToolUseResult serializes"))
 }
 
 /// Run an authorized `hook.*` event through the intake. Returns the
@@ -3594,6 +3658,7 @@ mod tests {
         "hook.notification",
         "hook.user_prompt_submit",
         "hook.post_tool_use",
+        "hook.pre_tool_use",
         "task.done",
         "agent.handoff",
     ];
@@ -3732,10 +3797,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_tool_use_answers_from_the_row_guard_and_audits_each_deny() {
+        // The handler as `hook_class` runs it after admission: the test
+        // binary is not the engine's agent copy, so it cannot pass AgentExe.
+        let (t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let root = t.path().canonicalize().unwrap().join("root");
+        let (own, other) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let me = Principal::Agent {
+            id: "a7".into(),
+            gen: 1,
+        };
+        let call = |path: &std::path::Path| {
+            let mut p = hook_params("a7");
+            p["input"] = json!({"tool_name": "Write", "tool_input": {"file_path": path}});
+            serde_json::from_value::<HookParams>(p).unwrap()
+        };
+        // No row, or a row without a guard: allow.
+        let r = pre_tool_use(&ctx, &me, call(&other.join("x")))
+            .await
+            .unwrap();
+        assert_eq!(r, json!({"decision": "allow"}));
+        let guard = json!({"denyWriteUnder": [root], "allowWrite": [own]}).to_string();
+        db.write(move |tx| {
+            tx.execute(
+                "INSERT INTO agents (id, role, provider, source, state, guard) \
+                 VALUES ('a7', 'worker', 'claudeCode', 'engine', 'ready', ?1)",
+                [guard],
+            )
+        })
+        .await
+        .unwrap();
+        let r = pre_tool_use(&ctx, &me, call(&own.join("x"))).await.unwrap();
+        assert_eq!(r["decision"], "allow", "{r}");
+        assert!(audit_rows(&db).is_empty());
+        let r = pre_tool_use(&ctx, &me, call(&own.join("../b/x")))
+            .await
+            .unwrap();
+        assert_eq!(r["decision"], "deny", "{r}");
+        let reason = r["reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with(super::super::guard::DENY_PREFIX),
+            "{reason}"
+        );
+        let rows = audit_rows(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "agent:a7");
+        assert_eq!(rows[0].1, "hook.pre_tool_use");
+        assert_eq!(rows[0].3, reason);
+        // The answer is fast: the hook gives up after 3 s.
+        let t0 = std::time::Instant::now();
+        for _ in 0..50 {
+            pre_tool_use(&ctx, &me, call(&own.join("x"))).await.unwrap();
+        }
+        let per_call = t0.elapsed() / 50;
+        assert!(
+            per_call < std::time::Duration::from_millis(50),
+            "{per_call:?}"
+        );
+        eprintln!("pre_tool_use engine answer: {per_call:?} per allow");
+    }
+
+    #[tokio::test]
     async fn an_unknown_hook_method_is_unknown() {
         let (_t, ctx, db) = ctx_with_bin(as_agent("a7"));
         let (mut c, _) = Client::new(ctx).await;
-        let r = c.call("1", "hook.pre_tool_use", hook_params("a7")).await;
+        let r = c.call("1", "hook.no_such_event", hook_params("a7")).await;
         assert_eq!(r["error"]["code"], "unknown_method");
         assert!(audit_rows(&db).is_empty());
     }

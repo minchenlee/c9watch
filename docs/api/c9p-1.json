@@ -44,6 +44,17 @@
           "description": "An absolute directory. The engine uses its realpath.",
           "type": "string"
         },
+        "guard": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentGuard"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A write fence for the agent's file tools (`Write`, `Edit`,\n`MultiEdit`, `NotebookEdit`), checked by the engine on every call\nthrough a blocking `PreToolUse` hook. With a fence, the agent may\nrun while live agents use other cwds, if each such pair fences the\nother's cwd off. Without one, nothing changes."
+        },
         "kind": {
           "default": "claude",
           "description": "The adapter kind. Only `claude` is supported.",
@@ -64,6 +75,13 @@
             "string",
             "null"
           ]
+        },
+        "require": {
+          "description": "Capability tokens the spawned Claude Code must have (see\n`AgentRow.capabilities`). A missing one answers `unsupported` and\nspawns nothing. Without it, an untested version only warns.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -130,6 +148,31 @@
         "id",
         "sessionKey",
         "goneAt"
+      ],
+      "type": "object"
+    },
+    "AgentGuard": {
+      "description": "A write fence for an agent's file tools: writes under any\n`denyWriteUnder` directory are refused, except under an `allowWrite`\nsubtree. Bash is not fenced here; the CC sandbox keeps it in the cwd.",
+      "properties": {
+        "allowWrite": {
+          "description": "Absolute existing subtrees exempt from `denyWriteUnder`. The\nagent's cwd must be writable. At most 64.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-sensitivity": "metadata"
+        },
+        "denyWriteUnder": {
+          "description": "Absolute existing directories, not `/`. At most 64.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-sensitivity": "metadata"
+        }
+      },
+      "required": [
+        "denyWriteUnder"
       ],
       "type": "object"
     },
@@ -231,6 +274,25 @@
     "AgentRow": {
       "description": "One row of the `agents` table, as `snapshot.get`,\n`session.list` and `agent.list` send it.",
       "properties": {
+        "capabilities": {
+          "description": "What that version can do, as capability tokens (such as\n`hook.pre_tool_use.block`); `null` for an agent the engine did not\nspawn.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
+        "ccVersion": {
+          "description": "The Claude Code version the agent was spawned with, as `claude\n--version` printed it (`2.1.314`); `null` when unread.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "public"
+        },
         "control": {
           "description": "`pty` or `none`.",
           "enum": [
@@ -280,6 +342,18 @@
             "null"
           ],
           "x-sensitivity": "public"
+        },
+        "guard": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentGuard"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The write fence the agent was created with (`agent.create`\n`guard`), as realpaths; `null` for an agent without one.",
+          "x-sensitivity": "metadata"
         },
         "id": {
           "description": "`agt_<ulid>`.",
@@ -3372,6 +3446,28 @@
       ],
       "type": "object"
     },
+    "PreToolUseResult": {
+      "description": "`hook.pre_tool_use` result: whether a fenced agent's file tool call\nmay run. The hook blocks the call (exit 2) on `deny` and on no answer.",
+      "properties": {
+        "decision": {
+          "description": "`allow` or `deny`.",
+          "type": "string",
+          "x-sensitivity": "public"
+        },
+        "reason": {
+          "description": "Why a call is denied; shown to the model.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-sensitivity": "metadata"
+        }
+      },
+      "required": [
+        "decision"
+      ],
+      "type": "object"
+    },
     "ProgressFrame": {
       "description": "A `progress` frame: how far a read for request `id` has got. Sent only\nto a connection that asked for the `conversation.progress` capability,\nbefore that request's response. Never stored; a slow client may miss\nsome.",
       "properties": {
@@ -4790,7 +4886,7 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "apiMajor": 1,
-  "apiMinor": 11,
+  "apiMinor": 12,
   "description": "Preview: the c9watch engine protocol. One JSON object per line over the engine socket. A preview minor may break a method; check breakingSince.",
   "frames": {
     "event": {
@@ -5290,6 +5386,27 @@
       },
       "result": {
         "$ref": "#/$defs/HookResult"
+      },
+      "x-authz": {
+        "admission": [
+          "unix_peer",
+          "agent_exe"
+        ],
+        "principals": [
+          "agent"
+        ],
+        "resource": "hook",
+        "verb": "write"
+      },
+      "x-stability": "internal",
+      "x-visibility": "internal"
+    },
+    "hook.pre_tool_use": {
+      "params": {
+        "$ref": "#/$defs/HookParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PreToolUseResult"
       },
       "x-authz": {
         "admission": [

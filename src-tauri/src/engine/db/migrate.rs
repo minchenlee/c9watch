@@ -72,6 +72,11 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0010_gateway_pubkey.sql"),
         fk_off: false,
     },
+    Migration {
+        version: 11,
+        sql: include_str!("migrations/0011_agent_guard.sql"),
+        fk_off: false,
+    },
 ];
 
 /// The schema version this engine writes.
@@ -287,7 +292,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             migrate(&mut conn, MIGRATIONS, t.path()).unwrap(),
-            [5, 6, 7, 8, 9, 10]
+            [5, 6, 7, 8, 9, 10, 11]
         );
         assert_eq!(user_version(&conn).unwrap(), latest_version());
         let backup = Connection::open(t.path().join("pre-5.db")).unwrap();
@@ -343,7 +348,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let mut conn = Connection::open(t.path().join("e.db")).unwrap();
         migrate(&mut conn, &MIGRATIONS[..9], t.path()).unwrap();
-        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), [10]);
+        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), [10, 11]);
         let backup = Connection::open(t.path().join("pre-10.db")).unwrap();
         assert_eq!(user_version(&backup).unwrap(), 9);
         let tables = |c: &Connection| -> Vec<String> {
@@ -383,7 +388,10 @@ mod tests {
              VALUES ('agt_1', 1, 4242, 7);",
         )
         .unwrap();
-        assert_eq!(migrate(&mut conn, MIGRATIONS, t.path()).unwrap(), [9, 10]);
+        assert_eq!(
+            migrate(&mut conn, MIGRATIONS, t.path()).unwrap(),
+            [9, 10, 11]
+        );
         assert_eq!(user_version(&conn).unwrap(), latest_version());
         let backup = Connection::open(t.path().join("pre-9.db")).unwrap();
         assert_eq!(user_version(&backup).unwrap(), 8);

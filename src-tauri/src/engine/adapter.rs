@@ -357,6 +357,30 @@ pub const CC_HOOKS: &[(&str, &str)] = &[
     ("PostToolUse", "post-tool-use"),
 ];
 
+/// D30 (E2): the blocking `PreToolUse` hook of an agent created with a
+/// write fence (`agent.create` `guard`). Only such an agent gets it, so a
+/// bare create pays no round trip per file tool call. CC waits for it, and
+/// with `onFailure: "block"` a hook that fails or times out blocks the
+/// call; on a deny it exits 2.
+pub const CC_GUARD_HOOK: (&str, &str) = ("PreToolUse", "pre-tool-use");
+
+/// The file tools the guard hook runs for (CC matcher syntax).
+pub const CC_GUARD_MATCHER: &str = "Write|Edit|MultiEdit|NotebookEdit";
+
+/// The `hooks.PreToolUse` entry of a fenced agent's settings.
+pub fn claude_guard_hook(agent_bin: &Path) -> serde_json::Value {
+    let bin = sh_quote(&agent_bin.to_string_lossy());
+    serde_json::json!([{
+        "matcher": CC_GUARD_MATCHER,
+        "hooks": [{
+            "type": "command",
+            "command": format!("{} hook {} --kind {}", bin, CC_GUARD_HOOK.1, CLAUDE.kind),
+            "timeout": CC_HOOK_TIMEOUT_S,
+            "onFailure": "block",
+        }],
+    }])
+}
+
 /// CC hooks that run `async`: CC does not wait for them. PostToolUse runs
 /// once per tool call, and nothing in its answer goes back to CC.
 pub const CC_ASYNC_HOOKS: &[&str] = &["PostToolUse"];
