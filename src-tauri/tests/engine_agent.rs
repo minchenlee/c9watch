@@ -30,16 +30,37 @@ use std::time::{Duration, Instant};
 
 const MAIN: &str = env!("CARGO_BIN_EXE_c9watch");
 /// `c9watch-agent` is its own package (D32), so cargo gives this package no
-/// `CARGO_BIN_EXE_c9watch-agent`. It sits next to `c9watch` in the target
-/// dir: `cargo test` from `src-tauri` builds it (the agent package has an
-/// integration test, and all three packages are default members).
+/// `CARGO_BIN_EXE_c9watch-agent`. The first use builds it next to `c9watch`
+/// with the cargo that runs this test: one command, the same target dir
+/// and profile. A missing binary gets built and a stale one rebuilt, also
+/// for `cargo test --test engine_agent` on a clean target dir.
 static AGENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let path = Path::new(MAIN).with_file_name("c9watch-agent");
+    let profile_dir = Path::new(MAIN).parent().unwrap();
+    let mut cargo = Command::new(env!("CARGO"));
+    cargo
+        .args([
+            "build",
+            "--quiet",
+            "-p",
+            "c9watch-agent",
+            "--features",
+            "engine",
+        ])
+        .arg("--manifest-path")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(profile_dir.parent().unwrap());
+    if !cfg!(debug_assertions) {
+        cargo.arg("--release");
+    }
+    let out = cargo.output().unwrap();
     assert!(
-        path.is_file(),
-        "{:?} is missing: build it with `cargo build --features engine --bin c9watch-agent`",
-        path
+        out.status.success(),
+        "building c9watch-agent failed: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    let path = profile_dir.join("c9watch-agent");
+    assert!(path.is_file(), "{:?} is missing after the build", path);
     path.to_string_lossy().into_owned()
 });
 const AGENT_ID: &str = "agt_t";

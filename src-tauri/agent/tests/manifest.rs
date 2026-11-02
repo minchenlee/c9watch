@@ -1,7 +1,4 @@
 //! The package layout the CI jobs and release scripts rely on (D32).
-//!
-//! This test also makes `cargo test` build the plain `c9watch-agent`
-//! binary, which `tests/engine_agent.rs` in the GUI package runs.
 
 #![cfg(feature = "engine")]
 
