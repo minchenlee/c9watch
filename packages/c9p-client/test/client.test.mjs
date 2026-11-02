@@ -46,6 +46,20 @@ test('hello sends build minor; unknown and breaking methods never reach transpor
   await assert.rejects(c.request('cost.get', {}), /unsupported/);
   assert.equal(t.sent.length, 1); c.close();
 });
+test('a fenced agent.create needs a core that applies the fence', async () => {
+  const t = new Fake(); t.hello = hello({ apiMinor: 11 });
+  const c = new C9pClient(() => t); await c.connect();
+  const fenced = { mode: 'free', cwd: '/w/a', guard: { denyWriteUnder: ['/w'], allowWrite: ['/w/a'] } };
+  await assert.rejects(c.request('agent.create', fenced), /unsupported.*minor 12/);
+  await assert.rejects(c.request('agent.create', { mode: 'free', cwd: '/w/a', require: ['hook.pre_tool_use.block'] }), /unsupported/);
+  assert.equal(t.sent.filter((f) => f.method === 'agent.create').length, 0);
+  c.close();
+  const t2 = new Fake(); t2.hello = hello({ apiMinor: 12 });
+  const c2 = new C9pClient(() => t2); await c2.connect();
+  void c2.request('agent.create', fenced).catch(() => {});
+  assert.equal(t2.sent.filter((f) => f.method === 'agent.create').length, 1);
+  c2.close();
+});
 test('multiplexes responses, rejects pending calls on close, never retries writes', async () => {
   const t = new Fake(); const c = new C9pClient(() => t); await c.connect();
   const a = c.request('agent.retire', { agentId: 'a' });
