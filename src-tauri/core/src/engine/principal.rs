@@ -53,6 +53,14 @@ pub enum Principal {
     },
 }
 
+impl Principal {
+    /// An `observed:` stamp for a teammate detection has not listed (or a
+    /// chain process that could not be read). It may only read.
+    pub fn is_unlisted_teammate(&self) -> bool {
+        matches!(self, Principal::Observed { session_key } if session_key.starts_with(UNLISTED_TEAMMATE))
+    }
+}
+
 impl std::fmt::Display for Principal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -103,8 +111,10 @@ pub trait ObservedSessions: Send + Sync {
     /// The pids in `chain` whose argv is an agent-team teammate's, read
     /// now, whether or not detection lists them. Only argv decides: a
     /// forged teammate narrows its descendants, which fails closed.
-    fn teammates(&self, _chain: &[ProcInfo]) -> HashSet<libc::pid_t> {
-        HashSet::new()
+    /// `Err(pid)` when a process of the chain can't be told apart from a
+    /// teammate (`peer::teammate_pids`); callers fail closed on it.
+    fn teammates(&self, _chain: &[ProcInfo]) -> Result<HashSet<libc::pid_t>, libc::pid_t> {
+        Ok(HashSet::new())
     }
 }
 
@@ -161,7 +171,15 @@ pub fn stamp_observed(
     match stamp(chain, agents) {
         Principal::LocalUnverified => {
             let chain = &chain[..chain.len().min(MAX_ANCESTRY)];
-            let teammates = observed.teammates(chain);
+            let teammates = match observed.teammates(chain) {
+                Ok(t) => t,
+                // A process that can't be read may be a teammate.
+                Err(pid) => {
+                    return Principal::Observed {
+                        session_key: format!("{UNLISTED_TEAMMATE}{pid}"),
+                    }
+                }
+            };
             chain
                 .iter()
                 .find_map(|p| {
@@ -214,7 +232,8 @@ pub fn stamp_peer(
 ///   `local-unverified` stamp only walks `MAX_ANCESTRY` levels;
 /// - every teammate in it (by argv, read now) is that observed session
 ///   `own`: one detection has not listed fails closed, whether its
-///   transcript is missing, ambiguous or not found yet;
+///   transcript is missing, ambiguous or not found yet; so does a process
+///   of the chain whose argv can't be read;
 /// - the peer is not `confined`: an agent's Bash runs in the vendor
 ///   sandbox, and a process it moved under init stays there.
 pub fn check_mutation(
@@ -243,7 +262,12 @@ pub fn check_mutation(
     {
         return Err(format!("the peer runs under observed:{}", key));
     }
-    let teammates = observed.teammates(chain);
+    let teammates = observed.teammates(chain).map_err(|pid| {
+        format!(
+            "pid {} in the peer's ancestry could not be read (gone, unreadable or reused), so it may be an agent-team teammate",
+            pid
+        )
+    })?;
     if let Some(p) = chain
         .iter()
         .find(|p| teammates.contains(&p.pid) && observed.by_pid(p.pid).is_none())
@@ -342,6 +366,8 @@ pub(crate) mod tests {
     pub(crate) struct FakeTeam {
         pub observed: FakeObserved,
         pub teammates: HashSet<libc::pid_t>,
+        /// A pid whose argv can't be read.
+        pub unreadable: Option<libc::pid_t>,
     }
 
     impl ObservedSessions for FakeTeam {
@@ -349,12 +375,18 @@ pub(crate) mod tests {
             self.observed.by_pid(pid)
         }
 
-        fn teammates(&self, chain: &[ProcInfo]) -> HashSet<libc::pid_t> {
-            chain
+        fn teammates(&self, chain: &[ProcInfo]) -> Result<HashSet<libc::pid_t>, libc::pid_t> {
+            if let Some(pid) = self
+                .unreadable
+                .filter(|u| chain.iter().any(|p| p.pid == *u))
+            {
+                return Err(pid);
+            }
+            Ok(chain
                 .iter()
                 .map(|p| p.pid)
                 .filter(|pid| self.teammates.contains(pid))
-                .collect()
+                .collect())
         }
     }
 
@@ -575,6 +607,7 @@ pub(crate) mod tests {
         let unlisted = FakeTeam {
             observed: FakeObserved::one("claudeCode:lead", 16405),
             teammates: HashSet::from([88]),
+            unreadable: None,
         };
         let p = stamp_observed(&chain, &NoLiveAgents, &unlisted);
         assert_eq!(p, observed("unlisted-teammate:88"));
@@ -598,6 +631,7 @@ pub(crate) mod tests {
         let far = FakeTeam {
             observed: FakeObserved(HashMap::new()),
             teammates: HashSet::from([135]),
+            unreadable: None,
         };
         assert_eq!(
             stamp_observed(&deep, &NoLiveAgents, &far),
@@ -613,6 +647,7 @@ pub(crate) mod tests {
         let listed = FakeTeam {
             observed: FakeObserved::one("claudeCode:mate", 88),
             teammates: HashSet::from([88]),
+            unreadable: None,
         };
         assert_eq!(
             stamp_observed(&chain, &NoLiveAgents, &listed),
@@ -620,6 +655,39 @@ pub(crate) mod tests {
         );
         assert_eq!(check(Some("claudeCode:mate"), &listed), Ok(()));
         assert!(check(None, &listed).is_err());
+    }
+
+    /// A chain process whose argv can't be read at admission (it exited
+    /// after the ancestry walk, or its pid was reused) may have been a
+    /// teammate: the mutation is refused, even past `MAX_ANCESTRY`, and the
+    /// stamp is narrowed.
+    #[test]
+    fn an_unreadable_chain_process_fails_closed() {
+        let mut deep: Vec<ProcInfo> = (0..40).map(|i| pi(100 + i, 101 + i, 7)).collect();
+        deep.push(pi(140, 1, 7));
+        let gone = FakeTeam {
+            observed: FakeObserved(HashMap::new()),
+            teammates: HashSet::new(),
+            unreadable: Some(135),
+        };
+        let e = check_mutation(
+            Some(&deep),
+            Some(7),
+            Some(false),
+            &NoLiveAgents,
+            &gone,
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("pid 135"), "{}", e);
+        let near = FakeTeam {
+            unreadable: Some(103),
+            ..gone
+        };
+        let p = stamp_observed(&deep, &NoLiveAgents, &near);
+        assert_eq!(p, observed("unlisted-teammate:103"));
+        assert!(p.is_unlisted_teammate());
+        assert!(!observed("claudeCode:s1").is_unlisted_teammate());
     }
 
     /// D8: a mutation refuses a peer under an observed session at any

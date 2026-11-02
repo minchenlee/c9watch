@@ -15,7 +15,7 @@ When preview ends, the GUI's legacy in-process fallback is removed. The GUI then
 
 ## 1.13 — upcoming
 
-- Add agent-team teammates. `session.views` and `session.view` list live Claude Code teammates, which `claude agents --json` omits. `SessionView` adds optional `teammate` (`TeammateLink`: `agentName`, `teamName`, `leadSessionId`, optional `agentType`). A teammate's transcript is attached only when its first entry names the same agent and team and starts after the process; otherwise the teammate is not listed. Teammates have `canOpen`, `canStop` and `canRename` `false`. A process inside a teammate is `observed:<sessionKey>` (D8); inside a teammate core has not listed, it is `observed:unlisted-teammate:<pid>` and every mutation is refused. `agentName` and `teamName` are conversation sensitivity. See [c9p-1.md](c9p-1.md#agent-team-teammates-113). Additive; no method `rev` changes.
+- Add agent-team teammates. `session.views` and `session.view` list live Claude Code teammates, which `claude agents --json` omits. `SessionView` adds optional `teammate` (`TeammateLink`: `agentName`, `teamName`, `leadSessionId`, optional `agentType`). A teammate's transcript is attached only when its first entry names the same agent and team and starts after the process; otherwise the teammate is not listed. Teammates have `canOpen`, `canStop` and `canRename` `false`. A process inside a teammate is `observed:<sessionKey>` (D8); inside a teammate core has not listed, it is `observed:unlisted-teammate:<pid>` and may call only read methods; an ancestor whose arguments core cannot read fails closed the same way. `agentName` and `teamName` are conversation sensitivity. See [c9p-1.md](c9p-1.md#agent-team-teammates-113). Additive; no method `rev` changes.
 
 ## 1.12 — upcoming
 

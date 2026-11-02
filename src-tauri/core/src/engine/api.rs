@@ -195,18 +195,18 @@ pub struct ServerCtx {
     /// The pids of an ancestry chain whose argv is a teammate's (D8).
     /// `peer::teammate_pids`, read at admission; unit tests run with none,
     /// as they may run inside a teammate's pane themselves.
-    pub teammates: fn(&[peer::ProcInfo]) -> HashSet<libc::pid_t>,
+    pub teammates: fn(&[peer::ProcInfo]) -> Result<HashSet<libc::pid_t>, libc::pid_t>,
 }
 
-fn no_teammates(_chain: &[peer::ProcInfo]) -> HashSet<libc::pid_t> {
-    HashSet::new()
+fn no_teammates(_chain: &[peer::ProcInfo]) -> Result<HashSet<libc::pid_t>, libc::pid_t> {
+    Ok(HashSet::new())
 }
 
 /// Observed sessions by process pid, as detection last saw them, and the
 /// teammate lookup.
 struct ObservedNow(
     HashMap<libc::pid_t, String>,
-    fn(&[peer::ProcInfo]) -> HashSet<libc::pid_t>,
+    fn(&[peer::ProcInfo]) -> Result<HashSet<libc::pid_t>, libc::pid_t>,
 );
 
 impl ObservedSessions for ObservedNow {
@@ -214,7 +214,7 @@ impl ObservedSessions for ObservedNow {
         self.0.get(&pid).cloned()
     }
 
-    fn teammates(&self, chain: &[peer::ProcInfo]) -> HashSet<libc::pid_t> {
+    fn teammates(&self, chain: &[peer::ProcInfo]) -> Result<HashSet<libc::pid_t>, libc::pid_t> {
         (self.1)(chain)
     }
 }
@@ -685,14 +685,8 @@ impl Stamp {
         // Only `local-unverified` and an unlisted teammate can change: an
         // agent's stamp comes from the engine's own agent table, never from
         // the views.
-        let provisional = !ready
-            && match &principal {
-                Principal::LocalUnverified => true,
-                Principal::Observed { session_key } => {
-                    session_key.starts_with(principal::UNLISTED_TEAMMATE)
-                }
-                _ => false,
-            };
+        let provisional =
+            !ready && (principal == Principal::LocalUnverified || principal.is_unlisted_teammate());
         Self {
             cred,
             accepted,
@@ -5881,7 +5875,7 @@ mod tests {
 
     /// D8: a peer whose parent is a teammate detection has not listed is
     /// `observed:unlisted-teammate:<pid>`, never `local-unverified`, and may
-    /// not create an agent, stop a session or send mail.
+    /// not create an agent, stop a session, send mail or write annotations.
     #[tokio::test]
     async fn a_peer_under_an_unlisted_teammate_may_not_mutate() {
         let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
@@ -5891,6 +5885,7 @@ mod tests {
         ctx.observed = Some(Arc::new(principal::tests::FakeTeam {
             observed: principal::tests::FakeObserved(HashMap::new()),
             teammates: HashSet::from([parent]),
+            unreadable: None,
         }));
         let (mut c, hello) = Client::new(Arc::new(ctx)).await;
         let key = format!("unlisted-teammate:{parent}");
@@ -5899,6 +5894,16 @@ mod tests {
             ("agent.create", json!({"mode": "free", "cwd": "/tmp"})),
             ("session.stop", json!({"sessionKey": key})),
             ("msg.send", json!({"to": "agt_x", "body": "hi"})),
+            // `source` omitted: an observed peer would get its own namespace.
+            (
+                "annotation.patch",
+                json!({"target": {"kind": "session", "sessionKey": "claudeCode:s1"}, "values": {"k": 1}}),
+            ),
+            (
+                "annotation.set",
+                json!({"target": {"kind": "session", "sessionKey": "claudeCode:s1"}, "key": "k", "value": 1}),
+            ),
+            ("annotation.delete", json!({"target": {"kind": "session", "sessionKey": "claudeCode:s1"}, "key": "k"})),
         ]
         .into_iter()
         .enumerate()
@@ -5906,6 +5911,9 @@ mod tests {
             let r = c.call(&i.to_string(), method, params).await;
             assert_eq!(r["error"]["code"], "not_allowed", "{}: {}", method, r);
         }
+        // Reads still answer.
+        let r = c.call("v", "session.views", json!({})).await;
+        assert!(r["error"].is_null(), "{}", r);
     }
 
     /// D8: a peer inside an observed session is `observed:<sessionKey>`. It

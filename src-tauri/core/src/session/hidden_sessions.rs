@@ -94,14 +94,44 @@ pub(crate) fn pids_without_registry_entry<S: AsRef<str>>(file_names: &[S]) -> Ve
     keyed.difference(&registered).copied().collect()
 }
 
-/// Whether the process's executable is an installed Claude Code version.
-/// Unlike argv, a process cannot claim this.
+/// Homebrew prefixes: Apple silicon, Intel macOS, Linux.
+const BREW_PREFIXES: &[&str] = &["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"];
+
+/// Whether the process's executable is an installed Claude Code binary.
+/// Unlike argv, a process cannot claim this. The layouts:
+/// - the native installer: `~/.local/share/claude/versions/<version>`;
+/// - the Homebrew cask: `<brew prefix>/Caskroom/claude-code/<version>/claude`;
+/// - npm: a binary inside `node_modules/@anthropic-ai/claude-code/`.
+///
+/// A Node process running the npm package's `cli.js` has `node` as its
+/// executable, so it does not count: only its argv names Claude Code.
 fn runs_claude_code_binary(facts: &ProcessFacts, home: &Path) -> bool {
-    let versions = home.join(".local/share/claude/versions");
     facts
         .exe
         .as_deref()
-        .is_some_and(|exe| exe.starts_with(&versions))
+        .is_some_and(|exe| is_claude_code_binary(exe, home))
+}
+
+fn is_claude_code_binary(exe: &Path, home: &Path) -> bool {
+    if exe.starts_with(home.join(".local/share/claude/versions")) {
+        return true;
+    }
+    if BREW_PREFIXES
+        .iter()
+        .any(|prefix| exe.starts_with(Path::new(prefix).join("Caskroom/claude-code")))
+    {
+        return true;
+    }
+    let parts: Vec<_> = exe.components().collect();
+    let package = [
+        std::path::Component::Normal("node_modules".as_ref()),
+        std::path::Component::Normal("@anthropic-ai".as_ref()),
+        std::path::Component::Normal("claude-code".as_ref()),
+    ];
+    // The package dir itself is not a binary: something must follow it.
+    parts
+        .windows(package.len() + 1)
+        .any(|w| w[..package.len()] == package)
 }
 
 /// Whether the process is the real Claude Code binary, not a script that
@@ -367,6 +397,31 @@ mod tests {
         let procs = HashMap::from([(500, fake.clone()), (501, fake)]);
         assert!(hidden_sessions(&names(&[]), &procs, Path::new(HOME)).is_empty());
         assert!(hidden_sessions(&names(&["501.zz.key"]), &procs, Path::new(HOME)).is_empty());
+    }
+
+    #[test]
+    fn claude_code_binaries_of_each_install_layout_count() {
+        let home = Path::new("/Users/me");
+        for exe in [
+            "/Users/me/.local/share/claude/versions/2.1.314",
+            "/opt/homebrew/Caskroom/claude-code/2.1.314/claude",
+            "/usr/local/Caskroom/claude-code/2.1.314/claude",
+            "/home/linuxbrew/.linuxbrew/Caskroom/claude-code/2.1.314/claude",
+            "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/bin/claude",
+            "/Users/me/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/claude",
+        ] {
+            assert!(is_claude_code_binary(Path::new(exe), home), "{exe}");
+        }
+        for exe in [
+            "/opt/homebrew/bin/node",
+            "/opt/homebrew/Caskroom/other/1/claude",
+            "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code",
+            "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code-other/claude",
+            "/tmp/claude",
+            "/Users/other/.local/share/claude/versions/2.1.314",
+        ] {
+            assert!(!is_claude_code_binary(Path::new(exe), home), "{exe}");
+        }
     }
 
     #[test]
