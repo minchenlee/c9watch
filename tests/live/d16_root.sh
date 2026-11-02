@@ -91,6 +91,27 @@ check_work "$WORK"
 [ -x "$BUILD/c9watch" ] && [ -x "$BUILD/c9watch-agent" ] || refuse "no c9watch and c9watch-agent in $BUILD"
 command -v claude >/dev/null || refuse "no claude on PATH"
 command -v sqlite3 >/dev/null || refuse "no sqlite3 on PATH"
+
+# D8: the engine refuses agent.create from any process under a session it
+# observes (Claude Code, Codex, ...), so a run started from inside one
+# only ends INCONCLUSIVE. Run it from a plain terminal instead.
+under_agent_session() {
+    local p=$$ comm
+    while [ "${p:-1}" -gt 1 ]; do
+        comm=$(ps -o comm= -p "$p" 2>/dev/null)
+        case "$comm" in
+        */claude/versions/* | claude | */claude | codex | */codex | opencode | */opencode)
+            echo "$p $comm"
+            return 0
+            ;;
+        esac
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    done
+    return 1
+}
+if s=$(under_agent_session); then
+    refuse "this shell runs under an agent session ($s); the engine refuses agent.create from there (D8). Run it from a plain terminal."
+fi
 mkdir -p "$WORK" && WORK=$(cd "$WORK" && pwd -P) || exit 2
 check_work "$WORK"
 : >"$WORK/$MARK"
@@ -174,7 +195,8 @@ create() { # cwd name -> agent id
         sleep 1
         t=$((t + 1))
     done
-    [ $t -gt 0 ] && log "create $2: engine was busy for ${t}s"
+    # stderr: stdout is the agent id the caller captures.
+    [ $t -gt 0 ] && log "create $2: engine was busy for ${t}s" >&2
     echo "$out" >"$EV/create-$2.json"
     echo "$out" | python3 -I -c 'import json,sys; r=json.load(sys.stdin); print(r["result"]["agent"]["id"] if r.get("ok") else "")' 2>/dev/null
 }
