@@ -13,6 +13,10 @@ After that, major 1 accepts additive changes only. A breaking change needs major
 
 When preview ends, the GUI's legacy in-process fallback is removed. The GUI then reads only through core.
 
+## 1.12 — upcoming
+
+- Add an agent write fence (D30). `agent.create` accepts optional `guard {denyWriteUnder, allowWrite}` and `require` (capability names; a missing one is `unsupported`). `AgentRow` adds optional `guard`, `ccVersion` and `capabilities`. A fenced agent gets a blocking Claude Code PreToolUse hook for `Write|Edit|MultiEdit|NotebookEdit`, and core answers it through the new internal `hook.pre_tool_use` (result `{decision, reason}`). Each deny is audited. With a fence on both sides, agents may run in sibling cwds. See [c9p-1.md](c9p-1.md#write-fence-and-required-capabilities-112). Additive; no method `rev` changes.
+
 ## 1.11 — upcoming
 
 - Breaking (preview), gateway handshake only; no c9p method or `rev` changes. `/c9p` authentication is Ed25519 public-key pairing. `pair` sends `{code,publicKey,clientNonce,sig}` and receives `{paired:{clientId,serverKey,machineId,sig}}`; `auth` sends `{clientId,clientNonce,sig}`. The bearer token and the HMAC reconnect proof are removed. Nonces, keys and signatures are lowercase hex of exact length; anything else fails closed. See [gateway.md](gateway.md#encoding). SDK `Credentials` replaces `token` with `privateKey` (a `CryptoKey`).

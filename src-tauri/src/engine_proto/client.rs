@@ -248,6 +248,9 @@ pub(crate) mod tests {
             last_seen: None,
             parent_id: None,
             state_reason: None,
+            guard: None,
+            cc_version: None,
+            capabilities: None,
         }
     }
 

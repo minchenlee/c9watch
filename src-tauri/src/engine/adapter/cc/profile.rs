@@ -114,6 +114,9 @@ pub struct Profile {
     /// Realpath cwds of the other live engine agents at spawn time. Their
     /// `.claude/` gets the same deny rules as this agent's own (C1a-32).
     pub peers: Vec<PathBuf>,
+    /// The agent has a write fence (D30): its settings get the blocking
+    /// `PreToolUse` hook, which asks the engine on every file tool call.
+    pub guarded: bool,
 }
 
 impl Profile {
@@ -143,6 +146,7 @@ impl Profile {
             session_id: session_id.into(),
             resume: false,
             peers: Vec::new(),
+            guarded: false,
         })
     }
 
@@ -168,6 +172,12 @@ impl Profile {
     }
 
     /// The same spawn, resuming `session_id` (C1a-28).
+    /// Give the settings the guard hook (`Profile::guarded`).
+    pub fn with_guard(mut self, guarded: bool) -> Profile {
+        self.guarded = guarded;
+        self
+    }
+
     pub fn resuming(mut self) -> Profile {
         self.resume = true;
         self
@@ -348,37 +358,6 @@ pub fn deny_write(p: &Profile) -> Vec<String> {
         .collect()
 }
 
-/// D16: the CC config paths under a managed worktree root that no agent
-/// may write, as layer-1 rules. Each agent's cwd is `<root>/<agent_id>`,
-/// so one static set of rules names the `.claude/` of every agent, the
-/// ones spawned later too, which `Profile::peers` cannot. The root's own
-/// `CLAUDE.md`, `.mcp.json` and `.claude/` are here as well: CC reads them
-/// from a parent of the cwd, so they would reach every agent. `root` must
-/// be a realpath free of `BAD_CWD_CHARS`. Not verified live yet:
-/// `tests/live/d16_root.sh` is the check.
-pub fn managed_root_deny_rules(root: &Path) -> Vec<String> {
-    let r = root.display();
-    vec![
-        format!("Edit(/{}/**/.claude/**)", r),
-        format!("Edit(/{}/.claude/**)", r),
-        format!("Edit(/{}/CLAUDE.md)", r),
-        format!("Edit(/{}/.mcp.json)", r),
-    ]
-}
-
-/// D16 layer 2, the same places for sandboxed Bash: `<root>/*/.claude` is
-/// a glob, which CC's macOS sandbox takes (its Linux sandbox takes only a
-/// trailing `/**`, so Linux keeps `Profile::peers`).
-pub fn managed_root_deny_write(root: &Path) -> Vec<String> {
-    let r = root.display();
-    vec![
-        format!("{}/*/.claude", r),
-        format!("{}/.claude", r),
-        format!("{}/CLAUDE.md", r),
-        format!("{}/.mcp.json", r),
-    ]
-}
-
 /// `sandbox.network.allowUnixSockets`: the socket as bound and, when it
 /// differs, as a realpath. A home below `/tmp` is `/private/tmp` on macOS
 /// (D24 補充); the agent connects through `C9_ENGINE_SOCK`, and the
@@ -420,6 +399,10 @@ pub fn settings(p: &Profile) -> Value {
         "filesystem": { "denyWrite": deny_write(p) },
     });
     s["remoteControlAtStartup"] = json!(false);
+    if p.guarded {
+        let (event, _) = crate::engine::adapter::CC_GUARD_HOOK;
+        s["hooks"][event] = crate::engine::adapter::claude_guard_hook(&p.agent_bin);
+    }
     #[cfg(feature = "live-test")]
     crate::engine::live_test::patch_settings(p, &mut s);
     s
@@ -639,6 +622,29 @@ mod tests {
                 );
                 assert!(!k.contains("TOKEN") && !k.contains("SECRET"), "{}", k);
             }
+        });
+    }
+
+    #[test]
+    fn only_a_fenced_agent_gets_the_blocking_pre_tool_use_hook() {
+        with_cwd(|_, p| {
+            assert!(settings(&p)["hooks"].get("PreToolUse").is_none());
+            let s = settings(&p.with_guard(true));
+            let e = &s["hooks"]["PreToolUse"][0];
+            assert_eq!(e["matcher"], "Write|Edit|MultiEdit|NotebookEdit");
+            let h = &e["hooks"][0];
+            assert_eq!(h["onFailure"], "block");
+            assert!(h.get("async").is_none(), "CC must wait for it");
+            assert_eq!(
+                h["command"],
+                format!("'{}' hook pre-tool-use --kind claude", BIN)
+            );
+            assert_eq!(s["hooks"].as_object().unwrap().len(), CC_HOOKS.len() + 1);
+            // The client gives up before CC does: a slow engine blocks.
+            assert!(
+                crate::cli::task::hook_timeout("pre-tool-use")
+                    < std::time::Duration::from_secs(crate::engine::adapter::CC_HOOK_TIMEOUT_S)
+            );
         });
     }
 
@@ -968,29 +974,6 @@ mod tests {
         let dir = format!("{}/{}", HOME, crate::engine::live_test::DIR);
         assert!(deny_write(&p).contains(&dir));
         assert!(deny_rules(&p).contains(&format!("Edit(/{}/**)", dir)));
-    }
-
-    #[test]
-    fn managed_root_rules_name_every_agent_claude_dir_and_the_root_config() {
-        let root = Path::new("/w/c9 home/worktrees");
-        assert_eq!(
-            managed_root_deny_rules(root),
-            [
-                "Edit(//w/c9 home/worktrees/**/.claude/**)",
-                "Edit(//w/c9 home/worktrees/.claude/**)",
-                "Edit(//w/c9 home/worktrees/CLAUDE.md)",
-                "Edit(//w/c9 home/worktrees/.mcp.json)",
-            ]
-        );
-        assert_eq!(
-            managed_root_deny_write(root),
-            [
-                "/w/c9 home/worktrees/*/.claude",
-                "/w/c9 home/worktrees/.claude",
-                "/w/c9 home/worktrees/CLAUDE.md",
-                "/w/c9 home/worktrees/.mcp.json",
-            ]
-        );
     }
 }
 

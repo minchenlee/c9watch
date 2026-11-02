@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
 /// Protocol minor version. Preview breaks also raise method revisions.
-pub const API_MINOR: u32 = 11;
+pub const API_MINOR: u32 = 12;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -624,6 +624,34 @@ pub struct AgentRow {
     /// resume), `exited` or `create_interrupted`; `kill_unconfirmed` for
     /// an `orphaned` agent.
     pub state_reason: Option<String>,
+    /// The write fence the agent was created with (`agent.create`
+    /// `guard`), as realpaths; `null` for an agent without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<AgentGuard>,
+    /// The Claude Code version the agent was spawned with, as `claude
+    /// --version` printed it (`2.1.314`); `null` when unread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cc_version: Option<String>,
+    /// What that version can do, as capability tokens (such as
+    /// `hook.pre_tool_use.block`); `null` for an agent the engine did not
+    /// spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
+}
+
+/// A write fence for an agent's file tools: writes under any
+/// `denyWriteUnder` directory are refused, except under an `allowWrite`
+/// subtree. Bash is not fenced here; the CC sandbox keeps it in the cwd.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AgentGuard {
+    /// Absolute existing directories, not `/`. At most 64.
+    pub deny_write_under: Vec<String>,
+    /// Absolute existing subtrees exempt from `denyWriteUnder`. The
+    /// agent's cwd must be writable. At most 64.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_write: Vec<String>,
 }
 
 /// `session.list` params. There are none yet; the engine ignores any it
@@ -1133,6 +1161,18 @@ pub struct AgentCreateParams {
     /// the live engine agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// A write fence for the agent's file tools (`Write`, `Edit`,
+    /// `MultiEdit`, `NotebookEdit`), checked by the engine on every call
+    /// through a blocking `PreToolUse` hook. With a fence, the agent may
+    /// run while live agents use other cwds, if each such pair fences the
+    /// other's cwd off. Without one, nothing changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<AgentGuard>,
+    /// Capability tokens the spawned Claude Code must have (see
+    /// `AgentRow.capabilities`). A missing one answers `unsupported` and
+    /// spawns nothing. Without it, an untested version only warns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub require: Vec<String>,
 }
 
 fn default_kind() -> String {
@@ -1365,6 +1405,7 @@ pub const HOOK_METHODS: &[&str] = &[
     "hook.notification",
     "hook.user_prompt_submit",
     "hook.post_tool_use",
+    "hook.pre_tool_use",
 ];
 
 /// Whether `method` is hook-class: a `hook.*` method, `task.done` or
@@ -1407,6 +1448,19 @@ pub struct HookResult {
     /// `hookSpecificOutput.additionalContext`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_context: Option<String>,
+}
+
+/// `hook.pre_tool_use` result: whether a fenced agent's file tool call
+/// may run. The hook blocks the call (exit 2) on `deny` and on no answer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "engine", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PreToolUseResult {
+    /// `allow` or `deny`.
+    pub decision: String,
+    /// Why a call is denied; shown to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// `task.done` params (`c9watch-agent task done --report`).

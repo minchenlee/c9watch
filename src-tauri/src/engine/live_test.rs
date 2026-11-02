@@ -26,7 +26,8 @@
 //! - D16 settings (`tests/live/d16_root.sh`): when `<home>/live-test/
 //!   d16-root` names a directory that is the parent of the agent's cwd,
 //!   the spawn settings take the D16 managed-root rules
-//!   (`profile::managed_root_deny_rules`, `managed_root_deny_write`) in
+//!   (`managed_root_deny_rules`, `managed_root_deny_write`, test-only:
+//!   the core has no root vocabulary, D30) in
 //!   place of the rules that name the cwd's own `.claude/`, so only the
 //!   root rules can stop a write there. `<home>/live-test/extra-deny.json`
 //!   (a JSON array of strings) is appended to `permissions.deny` as it is,
@@ -83,7 +84,6 @@ pub const EXTRA_DENY_WRITE: &str = "extra-deny-write.json";
 /// Apply the D16 test settings to the `--settings` value `s` of `p` (see
 /// the module doc). Nothing changes without the files.
 pub fn patch_settings(p: &crate::engine::adapter::cc::profile::Profile, s: &mut serde_json::Value) {
-    use crate::engine::adapter::cc::profile::{managed_root_deny_rules, managed_root_deny_write};
     let Some(home) = p.agent_bin.parent().and_then(Path::parent) else {
         return;
     };
@@ -117,6 +117,37 @@ pub fn patch_settings(p: &crate::engine::adapter::cc::profile::Profile, s: &mut 
     if let Some(dw) = s["sandbox"]["filesystem"]["denyWrite"].as_array_mut() {
         dw.extend(extra(EXTRA_DENY_WRITE).into_iter().map(Into::into));
     }
+}
+
+/// D16 (live test only): the CC config paths under a managed worktree root that no agent
+/// may write, as layer-1 rules. Each agent's cwd is `<root>/<agent_id>`,
+/// so one static set of rules names the `.claude/` of every agent, the
+/// ones spawned later too, which `Profile::peers` cannot. The root's own
+/// `CLAUDE.md`, `.mcp.json` and `.claude/` are here as well: CC reads them
+/// from a parent of the cwd, so they would reach every agent. `root` must
+/// be a realpath free of `BAD_CWD_CHARS`. Not verified live yet:
+/// `tests/live/d16_root.sh` is the check.
+pub fn managed_root_deny_rules(root: &Path) -> Vec<String> {
+    let r = root.display();
+    vec![
+        format!("Edit(/{}/**/.claude/**)", r),
+        format!("Edit(/{}/.claude/**)", r),
+        format!("Edit(/{}/CLAUDE.md)", r),
+        format!("Edit(/{}/.mcp.json)", r),
+    ]
+}
+
+/// D16 layer 2, the same places for sandboxed Bash: `<root>/*/.claude` is
+/// a glob, which CC's macOS sandbox takes (its Linux sandbox takes only a
+/// trailing `/**`, so Linux keeps `Profile::peers`).
+pub fn managed_root_deny_write(root: &Path) -> Vec<String> {
+    let r = root.display();
+    vec![
+        format!("{}/*/.claude", r),
+        format!("{}/.claude", r),
+        format!("{}/CLAUDE.md", r),
+        format!("{}/.mcp.json", r),
+    ]
 }
 
 /// Write `text` as the screen of `agent_id` when it differs from `last`.
@@ -212,6 +243,29 @@ mod tests {
             .contains(&format!("Edit(/{}/.claude/**)", other.display())));
         assert!(
             !strs(&s["sandbox"]["filesystem"]["denyWrite"]).contains(&format!("{}/*/.claude", r))
+        );
+    }
+
+    #[test]
+    fn managed_root_rules_name_every_agent_claude_dir_and_the_root_config() {
+        let root = Path::new("/w/c9 home/worktrees");
+        assert_eq!(
+            managed_root_deny_rules(root),
+            [
+                "Edit(//w/c9 home/worktrees/**/.claude/**)",
+                "Edit(//w/c9 home/worktrees/.claude/**)",
+                "Edit(//w/c9 home/worktrees/CLAUDE.md)",
+                "Edit(//w/c9 home/worktrees/.mcp.json)",
+            ]
+        );
+        assert_eq!(
+            managed_root_deny_write(root),
+            [
+                "/w/c9 home/worktrees/*/.claude",
+                "/w/c9 home/worktrees/.claude",
+                "/w/c9 home/worktrees/CLAUDE.md",
+                "/w/c9 home/worktrees/.mcp.json",
+            ]
         );
     }
 

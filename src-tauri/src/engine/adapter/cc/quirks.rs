@@ -247,6 +247,35 @@ pub fn parse_version(out: &str) -> Option<CcVersion> {
 pub struct Gated {
     pub profile: &'static CcQuirksProfile,
     pub warning: Option<String>,
+    /// The version read, when it could be read.
+    pub version: Option<CcVersion>,
+}
+
+/// D30 (E3): what a Claude Code version can do, as capability tokens, and
+/// the first version that has each. A caller asks for them with
+/// `agent.create` `require`.
+pub const CAPABILITIES: &[(&str, CcVersion)] = &[
+    // A sync `PreToolUse` hook with `onFailure: "block"`: a hook that
+    // fails or times out blocks the call. CC 2.1.314 applies it to every
+    // event except Stop, SubagentStop, TaskCompleted and TeammateIdle.
+    ("hook.pre_tool_use.block", (2, 1, 295)),
+];
+
+/// The capability tokens of `version`; none when it could not be read.
+pub fn capabilities(version: Option<CcVersion>) -> Vec<String> {
+    let Some(v) = version else {
+        return Vec::new();
+    };
+    CAPABILITIES
+        .iter()
+        .filter(|(_, since)| *since <= v)
+        .map(|(c, _)| c.to_string())
+        .collect()
+}
+
+/// `2.1.314`.
+pub fn version_string(v: CcVersion) -> String {
+    format!("{}.{}.{}", v.0, v.1, v.2)
 }
 
 fn supported() -> String {
@@ -262,8 +291,9 @@ fn supported() -> String {
 /// or unreadable version runs with the newest profile and a warning.
 pub fn gate(out: Result<String, String>) -> Gated {
     let newest = PROFILES[PROFILES.len() - 1];
-    let warn = |what: String| Gated {
+    let warn = |what: String, version: Option<CcVersion>| Gated {
         profile: newest,
+        version,
         warning: Some(format!(
             "{} (supported: {}); running it with the {} profile",
             what,
@@ -273,20 +303,24 @@ pub fn gate(out: Result<String, String>) -> Gated {
     };
     let out = match out {
         Ok(out) => out,
-        Err(e) => return warn(format!("cannot read the Claude Code version: {}", e)),
+        Err(e) => return warn(format!("cannot read the Claude Code version: {}", e), None),
     };
     let Some(v) = parse_version(&out) else {
-        return warn(format!(
-            "cannot read the Claude Code version from {:?}",
-            out.trim()
-        ));
+        return warn(
+            format!("cannot read the Claude Code version from {:?}", out.trim()),
+            None,
+        );
     };
     match profile_for(v) {
         Some(profile) => Gated {
             profile,
             warning: None,
+            version: Some(v),
         },
-        None => warn(format!("Claude Code {}.{}.{} is untested", v.0, v.1, v.2)),
+        None => warn(
+            format!("Claude Code {}.{}.{} is untested", v.0, v.1, v.2),
+            Some(v),
+        ),
     }
 }
 
@@ -426,6 +460,24 @@ fn kill_and_reap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_follow_the_version_read() {
+        assert!(capabilities(None).is_empty());
+        assert!(capabilities(Some((2, 1, 294))).is_empty());
+        assert_eq!(capabilities(Some((2, 1, 295))), ["hook.pre_tool_use.block"]);
+        assert_eq!(capabilities(Some((2, 1, 314))), ["hook.pre_tool_use.block"]);
+        assert_eq!(
+            gate(Ok("2.1.314 (Claude Code)".into())).version,
+            Some((2, 1, 314))
+        );
+        assert_eq!(gate(Err("gone".into())).version, None);
+        // Every tested profile has every capability.
+        for p in PROFILES {
+            assert_eq!(capabilities(Some(p.min_version)).len(), CAPABILITIES.len());
+        }
+        assert_eq!(version_string((2, 1, 314)), "2.1.314");
+    }
 
     #[test]
     fn parses_claude_version_output() {

@@ -23,10 +23,11 @@ struct Cli {
 #[cfg(unix)]
 #[derive(Subcommand)]
 enum Command {
-    /// Send one hook event to the engine. Always exits 0.
+    /// Send one hook event to the engine. Exits 0, except pre-tool-use,
+    /// which exits 2 (blocks the call) unless the engine allows it.
     Hook {
         /// session-start, stop, permission-request, permission-denied,
-        /// notification, prompt-submit or post-tool-use
+        /// notification, prompt-submit, post-tool-use or pre-tool-use
         event: String,
         /// The adapter kind of the hook
         #[arg(long, default_value = c9watch_lib::cli::task::DEFAULT_HOOK_KIND)]
@@ -62,8 +63,15 @@ fn main() {
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
-            // A hook never fails the vendor's hook, not even on bad args.
-            if std::env::args().nth(1).as_deref() == Some("hook")
+            // A hook never fails the vendor's hook, not even on bad args;
+            // pre-tool-use fails closed.
+            let mut args = std::env::args().skip(1);
+            let hook = args.next().as_deref() == Some("hook");
+            if hook && args.next().as_deref() == Some(task::PRE_TOOL_USE) {
+                eprintln!("c9watch guard: bad hook args, so the write is blocked");
+                std::process::exit(2);
+            }
+            if hook
                 && !matches!(
                     e.kind(),
                     clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
@@ -75,6 +83,22 @@ fn main() {
         }
     };
     let result = match cli.command {
+        Command::Hook { event, kind } if event == task::PRE_TOOL_USE => {
+            let code = match task::run_pre_tool_use(
+                &kind,
+                std::io::stdin(),
+                |k| std::env::var(k).ok(),
+                task::PRE_TOOL_USE_TIMEOUT,
+            ) {
+                Ok(()) => 0,
+                Err(reason) => {
+                    eprintln!("{}", reason);
+                    2
+                }
+            };
+            // Leaves a call stuck past the deadline behind.
+            std::process::exit(code);
+        }
         Command::Hook { event, kind } => {
             if let Some(out) = task::run_hook(
                 &event,

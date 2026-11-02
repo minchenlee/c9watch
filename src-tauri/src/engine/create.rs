@@ -104,7 +104,7 @@
 use super::adapter::cc::profile::{
     resolve_cwd, settings_path_of, spawn_spec, write_settings, Profile,
 };
-use super::adapter::cc::quirks::{self, CURRENT as CC};
+use super::adapter::cc::quirks::{self, CcVersion, CURRENT as CC};
 use super::adapter::{self, Descriptor};
 use super::agent_bin::{AgentBin, Rehash};
 use super::agents::LiveTable;
@@ -119,6 +119,7 @@ use super::drain::{self, DrainSwitch, InjectionPath};
 use super::driver::{Driver, SpawnSpec};
 use super::generation;
 use super::generation::{begin_generation, emit_upsert, GenReason};
+use super::guard::Fence;
 use super::hooks;
 use super::machine::HeaderKey;
 use super::mail::{self, MsgState};
@@ -126,7 +127,8 @@ use super::merge::{Activity, MergeTable};
 use super::ops::{self, CreatePayload, Phase};
 use super::principal::Principal;
 use super::proto::{
-    AgentCreateParams, AgentResumeParams, AgentRetireParams, AgentRow, ApiError, ErrorCode,
+    AgentCreateParams, AgentGuard, AgentResumeParams, AgentRetireParams, AgentRow, ApiError,
+    ErrorCode,
 };
 use super::pty::{kill_orphans, NativePty};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -307,6 +309,15 @@ impl Kind {
             Kind::Resume => (ops::KIND_RESUME, ops::RESUME_FAILED),
         }
     }
+}
+
+/// What `agent.create` found before the row: the caller's write fence,
+/// and the Claude Code version and its capabilities (D30).
+#[derive(Default)]
+struct Spawned {
+    fence: Option<Fence>,
+    cc: Option<CcVersion>,
+    caps: Vec<String>,
 }
 
 /// One create or resume, as the supervisor gets it.
@@ -524,11 +535,32 @@ impl Spawner {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(stopping());
         }
-        let (cwd, claude) = {
+        let (cwd, claude, cc) = {
             let sp = self.clone();
             let cwd = p.cwd.clone();
             blocking(move || sp.prepare(&cwd)).await?
         };
+        let caps = quirks::capabilities(cc);
+        if let Some(missing) = p.require.iter().find(|r| !caps.contains(r)) {
+            return Err(ApiError::new(
+                ErrorCode::Unsupported,
+                format!(
+                    "the Claude Code here ({}) lacks the required capability {:?} \
+                     (it has {:?}); nothing was spawned",
+                    cc.map_or("version unknown".into(), quirks::version_string),
+                    missing,
+                    caps
+                ),
+            ));
+        }
+        let fence = match &p.guard {
+            Some(g) => {
+                let (g, cwd, home) = (g.clone(), cwd.clone(), self.config.home.clone());
+                Some(blocking(move || Fence::new(&g, &cwd, &home).map_err(bad)).await?)
+            }
+            None => None,
+        };
+        let spawned = Spawned { fence, cc, caps };
         let start = Start {
             id: new_agent_id(),
             gen: 0,
@@ -543,7 +575,7 @@ impl Spawner {
         // and then finds it (P1-4).
         let step = self.step(&start.id).lock_owned().await;
         let gen = self
-            .write_row(&start, desc, principal, p.name.clone())
+            .write_row(&start, desc, principal, p.name.clone(), spawned)
             .await?;
         #[cfg(feature = "live-test")]
         super::live_test::crash_after(Phase::Row);
@@ -560,7 +592,7 @@ impl Spawner {
     }
 
     /// Check the agent binary, the cwd and `claude`. Blocking.
-    fn prepare(&self, cwd: &str) -> Result<(PathBuf, PathBuf), ApiError> {
+    fn prepare(&self, cwd: &str) -> Result<(PathBuf, PathBuf, Option<CcVersion>), ApiError> {
         self.agent_bin.check(Rehash::Always)?;
         let given = Path::new(cwd);
         if !given.is_absolute() {
@@ -568,33 +600,39 @@ impl Spawner {
         }
         let cwd = resolve_cwd(given).map_err(bad)?;
         check_collision(&self.config.home, &cwd)?;
-        let claude = self
-            .cc_bin()
+        let (claude, cc) = self
+            .cc_bin_versioned()
             .map_err(|e| ApiError::new(ErrorCode::SpawnFailed, e))?;
-        Ok((cwd, claude))
+        Ok((cwd, claude, cc))
     }
 
     /// The `claude` to spawn, after the version check (D7). Only a missing
     /// `claude` fails; that is the machine's fault, not the agent's, so a
     /// resume it stops stays resumable (D4). Blocking.
     fn cc_bin(&self) -> Result<PathBuf, String> {
+        self.cc_bin_versioned().map(|(c, _)| c)
+    }
+
+    /// `cc_bin`, and the version the check read.
+    fn cc_bin_versioned(&self) -> Result<(PathBuf, Option<CcVersion>), String> {
         let claude = match &self.config.claude {
             Some(c) if c.is_file() => c.clone(),
             Some(c) => return Err(format!("claude {:?} is missing; nothing was spawned", c)),
             None => find_on_path("claude")
                 .ok_or("claude is not on the engine's PATH; nothing was spawned")?,
         };
-        self.gate_cc(&claude);
-        Ok(claude)
+        let cc = self.gate_cc(&claude);
+        Ok((claude, cc))
     }
 
     /// D7: the version check of the spawn path. An untested or unreadable
     /// CC version still runs, with the newest profile; the warning goes to
     /// the log and the audit, with the version and the supported range.
     /// Blocking.
-    fn gate_cc(&self, claude: &Path) {
-        let Some(warning) = quirks::gate(self.launcher.cc_version(claude)).warning else {
-            return;
+    fn gate_cc(&self, claude: &Path) -> Option<CcVersion> {
+        let gated = quirks::gate(self.launcher.cc_version(claude));
+        let Some(warning) = gated.warning else {
+            return gated.version;
         };
         crate::elog!(Warn, "spawn", "{}", warning);
         let wrote = self.db.write_blocking(move |tx| {
@@ -613,6 +651,7 @@ impl Spawner {
         if let Err(e) = wrote {
             crate::elog!(Warn, "spawn", "Failed to audit the CC version: {}", e);
         }
+        gated.version
     }
 
     /// Phase `row`, in one transaction. Returns the new generation.
@@ -622,6 +661,7 @@ impl Spawner {
         desc: &'static Descriptor,
         principal: &Principal,
         name: Option<String>,
+        spawned: Spawned,
     ) -> Result<i64, ApiError> {
         let s = s.clone();
         let machine = self.db.machine_id().to_string();
@@ -644,7 +684,11 @@ impl Spawner {
                         ),
                     )));
                 }
-                if let Some(other) = other_live_cwd(tx, &s.cwd)? {
+                let other = match &spawned.fence {
+                    None => other_live_cwd(tx, &s.cwd)?,
+                    Some(fence) => unfenced_live_cwd(tx, &s.cwd, fence)?,
+                };
+                if let Some(other) = other {
                     return Ok(Err(ApiError::new(
                         ErrorCode::CwdCollision,
                         format!(
@@ -657,12 +701,28 @@ impl Spawner {
                     )));
                 }
                 let cwd = s.cwd.display().to_string();
+                let guard = spawned
+                    .fence
+                    .as_ref()
+                    .map(|f| serde_json::to_string(&f.to_wire()).expect("guard serializes"));
+                let caps = serde_json::to_string(&spawned.caps).expect("caps serialize");
                 tx.execute(
                     "INSERT INTO agents (id, mode, role, control, provider, source, created_by, \
-                     state, cwd, name, machine_id, created_at) \
+                     state, cwd, name, machine_id, created_at, guard, cc_version, capabilities) \
                      VALUES (?1, 'free', 'worker', 'pty', ?2, 'engine', ?3, 'creating', ?4, ?5, \
-                     ?6, ?7)",
-                    params![s.id, desc.provider, principal, cwd, name, machine, now],
+                     ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        s.id,
+                        desc.provider,
+                        principal,
+                        cwd,
+                        name,
+                        machine,
+                        now,
+                        guard,
+                        spawned.cc.map(quirks::version_string),
+                        caps
+                    ],
                 )?;
                 let gen =
                     begin_generation(tx, &machine, &s.id, GenReason::Spawn, &s.sid, None, now)?;
@@ -824,16 +884,22 @@ impl Spawner {
         };
         // The other live agents' cwds: their `.claude/` is denied too
         // (C1a-32). A failed read spawns nothing rather than spawn without.
-        let peers = match self
-            .db
-            .pooled_reader()
-            .map_err(|e| e.to_string())
-            .and_then(|c| {
-                peer_cwds(&c, &s.id).map_err(|e| format!("Failed to read the peer cwds: {}", e))
-            }) {
-            Ok(p) => p,
-            Err(e) => return fail(e),
-        };
+        // The row's write fence (D30): a resume keeps it.
+        let (peers, guarded) =
+            match self
+                .db
+                .pooled_reader()
+                .map_err(|e| e.to_string())
+                .and_then(|c| {
+                    let peers = peer_cwds(&c, &s.id)
+                        .map_err(|e| format!("Failed to read the peer cwds: {}", e))?;
+                    let guard = row_guard(&c, &s.id)
+                        .map_err(|e| format!("Failed to read the write fence: {}", e))?;
+                    Ok((peers, guard.is_some()))
+                }) {
+                Ok(p) => p,
+                Err(e) => return fail(e),
+            };
         let profile = match Profile::new(
             self.agent_bin.path(),
             &self.config.sock,
@@ -842,8 +908,8 @@ impl Spawner {
             s.gen,
             &s.sid,
         ) {
-            Ok(p) if s.kind == Kind::Resume => p.resuming().with_peers(peers),
-            Ok(p) => p.with_peers(peers),
+            Ok(p) if s.kind == Kind::Resume => p.resuming().with_peers(peers).with_guard(guarded),
+            Ok(p) => p.with_peers(peers).with_guard(guarded),
             Err(e) => return fail(e),
         };
         // The realpath again: a path part swapped for a symlink since the
@@ -3032,6 +3098,54 @@ fn other_live_cwd(conn: &Connection, cwd: &Path) -> rusqlite::Result<Option<(Str
     .optional()
 }
 
+/// D30 (Q9): for a create with a write fence, the first live engine agent
+/// in another cwd that the two fences do not keep apart, as `(id, cwd)`.
+/// Each side's fence must deny writes in the other's cwd; an agent with
+/// no fence keeps the one-cwd-at-a-time rule (`other_live_cwd`). In the
+/// create transaction, as `other_live_cwd` is.
+fn unfenced_live_cwd(
+    conn: &Connection,
+    cwd: &Path,
+    fence: &Fence,
+) -> rusqlite::Result<Option<(String, PathBuf)>> {
+    let mut st = conn.prepare(
+        "SELECT id, cwd, guard FROM agents WHERE source = 'engine' AND gone_at IS NULL \
+         AND cwd IS NOT NULL AND cwd != ?1 ORDER BY created_at, id",
+    )?;
+    let rows = st.query_map([cwd.display().to_string()], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            PathBuf::from(r.get::<_, String>(1)?),
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, other, guard) = row?;
+        let theirs = guard
+            .and_then(|g| serde_json::from_str::<AgentGuard>(&g).ok())
+            .map(|g| Fence::from_wire(&g));
+        let apart = fence.denies(&other) && theirs.is_some_and(|t| t.denies(cwd));
+        if !apart {
+            return Ok(Some((id, other)));
+        }
+    }
+    Ok(None)
+}
+
+/// The write fence on the row of `id`, if it has one.
+pub(crate) fn row_guard(conn: &Connection, id: &str) -> rusqlite::Result<Option<AgentGuard>> {
+    let g: Option<String> = conn
+        .query_row("SELECT guard FROM agents WHERE id = ?1", [id], |r| r.get(0))
+        .optional()?
+        .flatten();
+    g.map(|g| {
+        serde_json::from_str(&g).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
+        })
+    })
+    .transpose()
+}
+
 fn name_taken(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
     Ok(conn
         .query_row(
@@ -3957,6 +4071,113 @@ mod tests {
         );
     }
 
+    /// `agent.create` with a write fence under `root` for `cwd`.
+    fn fenced_params(root: &Path, cwd: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "mode": "free", "cwd": cwd,
+            "guard": {"denyWriteUnder": [root], "allowWrite": [cwd]},
+            "require": ["hook.pre_tool_use.block"],
+        })
+    }
+
+    fn pre_tool_use_hook(home: &Path, id: &str, gen: i64) -> Option<serde_json::Value> {
+        let s = std::fs::read(settings_path_of(home, id, gen)).unwrap();
+        let s: serde_json::Value = serde_json::from_slice(&s).unwrap();
+        s["hooks"].get("PreToolUse").cloned()
+    }
+
+    #[tokio::test]
+    async fn a_fenced_create_keeps_its_guard_and_gets_the_blocking_hook() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let root = e.t.path().canonicalize().unwrap().join("root");
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        // A bare create has no guard and no PreToolUse hook.
+        let bare = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let r = row(&e.db, &bare.id);
+        assert_eq!(r.guard, None);
+        assert_eq!(r.cc_version.as_deref(), Some("2.1.316"));
+        assert!(r
+            .capabilities
+            .unwrap()
+            .contains(&"hook.pre_tool_use.block".into()));
+        assert_eq!(pre_tool_use_hook(&e.home, &bare.id, 1), None);
+        e.sp.retire(&l, serde_json::json!({ "id": bare.id }))
+            .await
+            .unwrap();
+
+        let ra = e.sp.create(&l, fenced_params(&root, &a)).await.unwrap();
+        let g = row(&e.db, &ra.id).guard.unwrap();
+        assert_eq!(g.deny_write_under, [root.display().to_string()]);
+        assert_eq!(g.allow_write, [a.display().to_string()]);
+        let hook = pre_tool_use_hook(&e.home, &ra.id, 1).unwrap();
+        assert_eq!(hook[0]["hooks"][0]["onFailure"], "block");
+        // Q9: two fences that keep each other out may run side by side.
+        e.sp.create(&l, fenced_params(&root, &b)).await.unwrap();
+        // A bare create next to them still collides.
+        let other = e.t.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let err = e.sp.create(&l, create_params(&other)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::CwdCollision);
+        // A fence that does not deny a live agent's cwd collides too.
+        let wide = serde_json::json!({
+            "mode": "free", "cwd": other,
+            "guard": {"denyWriteUnder": [a], "allowWrite": []},
+        });
+        let err = e.sp.create(&l, wide).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::CwdCollision);
+        assert!(err.msg.contains(&ra.id), "{}", err.msg);
+        e.sp.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_missing_required_capability_or_a_bad_fence_spawns_nothing() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        *lock(&e.launcher.version) = Ok("2.1.200 (Claude Code)".into());
+        let root = e.t.path().canonicalize().unwrap();
+        let cwd = e.cwd.canonicalize().unwrap();
+        let err =
+            e.sp.create(&l, fenced_params(&root, &cwd))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unsupported);
+        assert!(err.msg.contains("hook.pre_tool_use.block"), "{}", err.msg);
+        *lock(&e.launcher.version) = Ok("2.1.316 (Claude Code)".into());
+        // A fence that denies the agent's own cwd is refused.
+        let own = serde_json::json!({
+            "mode": "free", "cwd": cwd,
+            "guard": {"denyWriteUnder": [root]},
+        });
+        let err = e.sp.create(&l, own).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 0);
+        assert!(e.db.agents(AgentFilter::All).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resumed_fenced_agent_keeps_the_blocking_hook() {
+        let e = setup(Script::Ready, None);
+        let root = e.t.path().canonicalize().unwrap().join("root");
+        let a = root.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let r =
+            e.sp.create(&Principal::LocalUnverified, fenced_params(&root, &a))
+                .await
+                .unwrap();
+        e.sp.shutdown();
+        ops::reconcile(&e.db, &e.home).unwrap();
+        let (_, _, sp2) = next_engine(&e, Script::Ready, None);
+        assert_eq!(sp2.resume_on_boot().unwrap().started, [r.id.clone()]);
+        wait_for("ready", || {
+            row(&e.db, &r.id).state.as_deref() == Some("ready")
+        });
+        assert!(pre_tool_use_hook(&e.home, &r.id, 2).is_some());
+        sp2.shutdown();
+    }
+
     #[tokio::test]
     async fn create_walks_the_phases_and_retire_keeps_a_tombstone() {
         let e = setup(Script::Ready, None);
@@ -4130,9 +4351,15 @@ mod tests {
             from: None,
         };
         let gen =
-            e.sp.write_row(&s, &CLAUDE, &Principal::LocalUnverified, None)
-                .await
-                .unwrap();
+            e.sp.write_row(
+                &s,
+                &CLAUDE,
+                &Principal::LocalUnverified,
+                None,
+                Spawned::default(),
+            )
+            .await
+            .unwrap();
         Start { gen, ..s }
     }
 
@@ -4209,9 +4436,15 @@ mod tests {
             from: None,
         };
         let gen =
-            e.sp.write_row(&s, &CLAUDE, &Principal::LocalUnverified, None)
-                .await
-                .unwrap();
+            e.sp.write_row(
+                &s,
+                &CLAUDE,
+                &Principal::LocalUnverified,
+                None,
+                Spawned::default(),
+            )
+            .await
+            .unwrap();
         let s = Start { gen, ..s };
         let mut pty = None;
         if phase != Phase::Row {

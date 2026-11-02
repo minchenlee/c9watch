@@ -56,6 +56,7 @@ pub const METHOD_INFO: &[Method] = &[
     m("hook.notification", 2, INTERNAL),
     m("hook.user_prompt_submit", 4, INTERNAL),
     m("hook.post_tool_use", 4, INTERNAL),
+    m("hook.pre_tool_use", 12, INTERNAL),
     m("task.done", 2, INTERNAL),
     Method {
         rev: 2,
