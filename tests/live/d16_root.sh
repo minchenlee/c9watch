@@ -154,9 +154,27 @@ stop_engine() {
 }
 trap stop_engine EXIT
 
+busy() { # rpc reply -> 0 when it is a retryable `busy`
+    printf '%s' "$1" | python3 -I -c '
+import json, sys
+try:
+    e = json.load(sys.stdin).get("error") or {}
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if e.get("code") == "busy" and e.get("retryable") else 1)'
+}
+
+# A fresh engine answers `busy` (retryable) until session detection has
+# finished its first pass; retry that once a second for up to 60 s.
 create() { # cwd name -> agent id
-    local out
-    out=$(rpc agent.create "{\"mode\":\"free\",\"cwd\":\"$1\",\"name\":\"$2\"}" 120)
+    local out t=0
+    while :; do
+        out=$(rpc agent.create "{\"mode\":\"free\",\"cwd\":\"$1\",\"name\":\"$2\"}" 120)
+        busy "$out" && [ $t -lt 60 ] || break
+        sleep 1
+        t=$((t + 1))
+    done
+    [ $t -gt 0 ] && log "create $2: engine was busy for ${t}s"
     echo "$out" >"$EV/create-$2.json"
     echo "$out" | python3 -I -c 'import json,sys; r=json.load(sys.stdin); print(r["result"]["agent"]["id"] if r.get("ok") else "")' 2>/dev/null
 }
