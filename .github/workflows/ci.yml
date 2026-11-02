@@ -181,21 +181,40 @@ jobs:
         # tauri, with any feature, on any target. Package names only: the
         # path `src-tauri/core` itself contains "tauri".
         run: |
-          set -o pipefail
+          set -euo pipefail
+          # Fails the step when cargo fails; never an empty listing.
           names() {
-            cargo tree --manifest-path src-tauri/Cargo.toml -p "$1" -e normal,build \
-              --all-features --target all --prefix none --format '{p}' \
-              | awk '{print $1}' | sort -u
+            local out
+            out=$(cargo tree --manifest-path src-tauri/Cargo.toml -p "$1" -e normal,build \
+              --all-features --target all --prefix none --format '{p}')
+            awk '{print $1}' <<<"$out" | sort -u
           }
-          # The check sees tauri where it is: in the GUI shell.
-          names c9watch | grep -qx tauri
+          # The listing sees tauri where it is: in the GUI shell.
+          gui=$(names c9watch)
+          grep -qx c9watch <<<"$gui"
+          grep -qx tauri <<<"$gui"
           for p in c9watch-core c9watch-agent; do
-            if names "$p" | grep -i '^tauri'; then
+            list=$(names "$p")
+            grep -qx "$p" <<<"$list"
+            if grep -i '^tauri' <<<"$list"; then
               echo "::error::$p depends on tauri"
               exit 1
             fi
-            echo "$p: no tauri crate in $(names "$p" | wc -l) packages"
+            echo "$p: no tauri crate in $(wc -l <<<"$list") packages"
           done
+
+      - name: Core and agent build on their own (D32)
+        # Workspace commands unify features across the three packages, so
+        # they can hide a dependency that only another package turns on.
+        run: |
+          set -euo pipefail
+          m=src-tauri/Cargo.toml
+          for f in "" gui cli engine gateway-assets; do
+            echo "c9watch-core features: ${f:-none}"
+            cargo check --manifest-path "$m" -p c9watch-core --features "$f"
+          done
+          cargo check --manifest-path "$m" -p c9watch-core --all-features
+          cargo check --manifest-path "$m" -p c9watch-agent --features engine
 
       - name: Prod channel build check
         # CI builds are dev channel by default. Check the prod cfg path too.
