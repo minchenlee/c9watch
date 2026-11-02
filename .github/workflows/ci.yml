@@ -176,6 +176,27 @@ jobs:
       - name: Rust format check
         run: cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
 
+      - name: Core has no tauri (D32)
+        # The core crate (engine, CLI) and c9watch-agent never depend on
+        # tauri, with any feature, on any target. Package names only: the
+        # path `src-tauri/core` itself contains "tauri".
+        run: |
+          set -o pipefail
+          names() {
+            cargo tree --manifest-path src-tauri/Cargo.toml -p "$1" -e normal,build \
+              --all-features --target all --prefix none --format '{p}' \
+              | awk '{print $1}' | sort -u
+          }
+          # The check sees tauri where it is: in the GUI shell.
+          names c9watch | grep -qx tauri
+          for p in c9watch-core c9watch-agent; do
+            if names "$p" | grep -i '^tauri'; then
+              echo "::error::$p depends on tauri"
+              exit 1
+            fi
+            echo "$p: no tauri crate in $(names "$p" | wc -l) packages"
+          done
+
       - name: Prod channel build check
         # CI builds are dev channel by default. Check the prod cfg path too.
         env:
