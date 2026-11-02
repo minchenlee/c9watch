@@ -160,7 +160,7 @@ test('a mode/transport switch between pages cannot mix real and demo content', a
 
 test('gateway auth signs with the client key and verifies the pinned Ed25519 server key', async () => {
     const { webcrypto, createPrivateKey, createPublicKey, sign, verify } = await import('node:crypto');
-    // Same seeds and bytes as src-tauri/src/gateway/pubkey.rs cross_language_vectors.
+    // Same seeds and bytes as src-tauri/core/src/gateway/pubkey.rs cross_language_vectors.
     const seeded=seed=>createPrivateKey({key:Buffer.concat([Buffer.from('302e020100300506032b657004220420','hex'),Buffer.alloc(32,seed)]),format:'der',type:'pkcs8'});
     const machine=seeded(7), client=seeded(9);
     const serverKey=createPublicKey(machine).export({format:'der',type:'spki'}).subarray(-32).toString('hex');

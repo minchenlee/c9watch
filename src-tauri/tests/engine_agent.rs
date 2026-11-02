@@ -28,8 +28,20 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const AGENT: &str = env!("CARGO_BIN_EXE_c9watch-agent");
 const MAIN: &str = env!("CARGO_BIN_EXE_c9watch");
+/// `c9watch-agent` is its own package (D32), so cargo gives this package no
+/// `CARGO_BIN_EXE_c9watch-agent`. It sits next to `c9watch` in the target
+/// dir: `cargo test` from `src-tauri` builds it (the agent package has an
+/// integration test, and all three packages are default members).
+static AGENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let path = Path::new(MAIN).with_file_name("c9watch-agent");
+    assert!(
+        path.is_file(),
+        "{:?} is missing: build it with `cargo build --features engine --bin c9watch-agent`",
+        path
+    );
+    path.to_string_lossy().into_owned()
+});
 const AGENT_ID: &str = "agt_t";
 
 /// An engine running on its own thread. Dropping it stops the engine.
@@ -48,7 +60,7 @@ impl Engine {
         let agents = Arc::new(LiveTable::new());
         let config = EngineConfig {
             home: home.clone(),
-            agent_source: PathBuf::from(AGENT),
+            agent_source: PathBuf::from(&*AGENT),
             agents: agents.clone(),
             detection: false,
             claude: None,
@@ -156,11 +168,11 @@ fn the_engine_installs_its_own_copy_0555_with_the_source_sha() {
     assert_eq!(meta.permissions().mode() & 0o7777, 0o555);
     assert_eq!(
         Sha256::digest(std::fs::read(&copy).unwrap()),
-        Sha256::digest(std::fs::read(AGENT).unwrap())
+        Sha256::digest(std::fs::read(&*AGENT).unwrap())
     );
     assert_ne!(
         meta.ino(),
-        std::fs::metadata(AGENT).unwrap().ino(),
+        std::fs::metadata(&*AGENT).unwrap().ino(),
         "a copy, not a link"
     );
 }
@@ -382,7 +394,7 @@ fn an_agent_running_another_binary_is_refused() {
     // The source next to the main binary: same bytes, not the engine's copy.
     let (out, rc) = as_agent(
         &engine,
-        &format!("{} task done --report r", q(Path::new(AGENT))),
+        &format!("{} task done --report r", q(Path::new(&*AGENT))),
         true,
     );
     assert_eq!(rc, 1, "{}", out);
@@ -501,7 +513,7 @@ fn a_changed_copy_is_refused() {
 /// Run the agent binary once, untimed: the first exec of a freshly linked
 /// binary can wait on the OS's malware scan, which is not the hook's cost.
 fn warm_up_agent() {
-    let out = Command::new(AGENT).arg("--version").output().unwrap();
+    let out = Command::new(&*AGENT).arg("--version").output().unwrap();
     assert!(out.status.success(), "{:?}", out);
 }
 
@@ -511,7 +523,7 @@ fn a_hook_exits_0_without_an_engine_or_with_bad_args() {
     let dir = tempfile::tempdir().unwrap();
     let hook = |args: &[&str]| {
         let t = Instant::now();
-        let out = Command::new(AGENT)
+        let out = Command::new(&*AGENT)
             .args(args)
             .env("C9_ENGINE_SOCK", dir.path().join("none.sock"))
             .env("C9_AGENT_ID", AGENT_ID)
@@ -555,7 +567,7 @@ fn a_hook_against_a_silent_engine_exits_0_in_time() {
         drop(c);
     });
     let t = Instant::now();
-    let out = Command::new(AGENT)
+    let out = Command::new(&*AGENT)
         .args(["hook", "stop"])
         .env("C9_ENGINE_SOCK", &path)
         .env("C9_AGENT_ID", AGENT_ID)
@@ -568,16 +580,4 @@ fn a_hook_against_a_silent_engine_exits_0_in_time() {
     // Well under the 3 s the engine holds the connection.
     assert!(took < Duration::from_millis(2500), "took {:?}", took);
     held.join().unwrap();
-}
-
-/// `cargo run` picks the main binary (`default-run`), and the agent binary
-/// exists only with the engine (`required-features`). The Linux CI job also
-/// runs `cargo run ... -- --version` and builds `c9watch-agent` by name.
-#[test]
-fn the_manifest_keeps_c9watch_the_default_binary() {
-    let manifest = include_str!("../Cargo.toml");
-    assert!(manifest.contains("\ndefault-run = \"c9watch\"\n"));
-    let bin = manifest.split("[[bin]]").nth(1).unwrap();
-    assert!(bin.contains("name = \"c9watch-agent\""));
-    assert!(bin.contains("required-features = [\"engine\"]"));
 }

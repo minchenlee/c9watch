@@ -21,7 +21,9 @@ function files(dir, exts) {
   return out;
 }
 
-const sources = files(join(root, 'src-tauri/src'), ['.rs']).map((path) => ({
+// The GUI shell, the core crate and c9watch-agent (D32 workspace).
+const rustDirs = ['src-tauri/src', 'src-tauri/core/src', 'src-tauri/agent/src'];
+const sources = rustDirs.flatMap((dir) => files(join(root, dir), ['.rs'])).map((path) => ({
   path: relative(root, path),
   text: readFileSync(path, 'utf8'),
 }));

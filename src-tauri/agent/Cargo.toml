@@ -1,0 +1,19 @@
+[package]
+name = "c9watch-agent"
+version.workspace = true
+description = "Agent side of the c9 engine: hook, task done, handoff"
+authors.workspace = true
+edition.workspace = true
+
+[features]
+engine = ["c9watch-core/engine"]
+
+# Built only with the engine, so GUI and release CLI builds do not change.
+[[bin]]
+name = "c9watch-agent"
+path = "src/main.rs"
+required-features = ["engine"]
+
+[dependencies]
+c9watch-core = { path = "../core" }
+clap = { version = "4", features = ["derive"] }

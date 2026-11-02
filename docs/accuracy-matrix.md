@@ -5,7 +5,7 @@ test proves it today. ❌ means a known gap: the cell's test exists but is
 `#[ignore]`d until the gap is fixed.
 
 The table is generated from `MATRIX` in
-`src-tauri/src/session/accuracy_matrix.rs`; the test `docs_table_matches_matrix`
+`src-tauri/core/src/session/accuracy_matrix.rs`; the test `docs_table_matches_matrix`
 fails when this page and the tests disagree. Each cell is one test named
 `<source>_<scenario>` in that module (for example `claude_cli_pid_reuse`).
 Run them with:

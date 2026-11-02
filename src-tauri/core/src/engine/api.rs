@@ -1,0 +1,6259 @@
+//! c9p/1 connection handling: one reader and one writer task per
+//! connection, the `hello` handshake, and method dispatch.
+//!
+//! The first frame must be `hello` and must arrive within 5 s of the accept;
+//! blank lines do not extend that deadline. `hello` never waits for session
+//! detection. A connection stamped before detection's first successful
+//! pass is provisional (`Stamp`): it is stamped again before its first
+//! request that the stamp could change, which waits up to 5 s for the
+//! views and otherwise gets `busy`. A major version mismatch gets
+//! `upgrade_required` and the connection closes. So do a missing or late
+//! `hello`, an oversized frame and a peer under another uid. After `hello`, a
+//! frame that is not valid JSON or lacks `v` gets `bad_request`, and the
+//! connection stays open, because the line framing is still intact.
+//!
+//! After `hello`, the reader hands each request to its own task, so one
+//! connection runs requests concurrently and answers each when it is done:
+//! responses can come out of order, and a client matches them by `id`
+//! (D3). A connection runs at most `MAX_IN_FLIGHT` requests; past that the
+//! reader reads nothing more until one ends. `events.subscribe` and
+//! `events.unsubscribe` take the connection's streams in the order they
+//! were sent, on one task per connection, so a subscribe response comes
+//! before its first event and no event of a stream follows its
+//! unsubscribe response; a slow one never holds up the other requests. When the peer closes, the
+//! requests in flight finish first. `agent.create`, `agent.retire` and
+//! `session.stop` replay a repeated `idem` (`engine::idem`).
+//!
+//! Who may call what is the table in `engine::authz`: the principal kinds
+//! of each method and its admission checks, which `dispatch` runs before
+//! any handler (D9).
+//!
+//! `events.subscribe` starts a stream task on the connection. It reads the
+//! event log from SQLite at its own pace and writes event frames to the
+//! same write queue as responses, so a slow client only slows its own
+//! stream, never the db writer. A connection holds at most `MAX_STREAMS`
+//! live streams; one more gets `rate_limited`.
+//!
+//! Hook-class methods (`hook.*`, `task.done`, `agent.handoff`) need two
+//! facts (C1a-21): the principal is `agent:<id>` for the agent the params
+//! name, and the peer's exe realpath is the engine's `c9watch-agent` copy
+//! with the sha256 the engine recorded. Anything else is
+//! `peer_not_authorized`, and the refusal goes to the audit log. The main
+//! binary's `c9watch api` can therefore never send one. An authorized
+//! `hook.*` event then goes through `engine::hooks::intake` (kind,
+//! generation, dedupe, state merge; C1a-22). `hook.session_start` also
+//! answers with the standing orders (`engine::standing`, C1a-25), except
+//! while the engine drains (C1a-27, `engine::drain`).
+//!
+//! `agent.create`, `agent.retire` and `agent.resume` take only a local
+//! client (`local-unverified`); an agent or an observed session gets
+//! `not_allowed`, which is audited. The work is in `engine::create`
+//! (C1a-26).
+//!
+//! `session.views` and `session.away` serve the session views and the
+//! away-activity index that each detection tick keeps (`views::sessions`).
+//! Every principal may read them. `detect.recheck`, `session.stop` and
+//! `session.rename` take only a local client that passes the mutation
+//! check, as `agent.create` does; each runs one detection tick before it
+//! answers. A peer inside an observed session (`observed:<sessionKey>`)
+//! may stop only that session (D8).
+//!
+//! `msg.send` (C1b-M1) takes the terminal and agents (`engine::mail`
+//! checks both), queues the message and nudges the target's supervisor,
+//! which delivers it. Its response carries the cursor of the message's
+//! `queued` event in `seq`. Every send and every refusal is audited.
+
+use super::agent_bin::AgentBin;
+use super::annotations;
+use super::authz::{self, Admission};
+use super::create::Spawner;
+use super::db::audit::{self, AuditEntry};
+use super::db::outbox::{Cursor, Event, ReadError, Subscription, READ_BATCH};
+use super::db::{now_ms, AgentFilter, Db};
+use super::detect::{Detection, FirstTick, FIRST_TICK_WAIT};
+use super::discovery;
+use super::drain::DrainSwitch;
+use super::hooks::{self, HookEvent, Outcome};
+use super::idem::IdemCache;
+use super::machine::HeaderKey;
+use super::mail;
+use super::merge::MergeTable;
+use super::peer::{self, PeerCred};
+use super::principal::{self, LiveAgents, NoLiveAgents, ObservedSessions, Principal};
+use super::proto::{
+    encode, encode_event, is_hook_class, read_frame, AgentCreateParams, AgentCreateResult,
+    AgentListParams, AgentListResult, AgentResumeParams, AgentResumeResult, AgentRetireParams,
+    AgentRetireResult, ApiError, ErrorCode, EventFrame, EventType, FrameError, HandoffParams,
+    HandoffResult, HelloParams, HelloResult, HookParams, HookResult, MsgSendParams, MsgSendResult,
+    PreToolUseResult, Request, Response, SessionListParams, SessionListResult, SnapshotParams,
+    SnapshotResult, SubscribeParams, SubscribeResult, TaskDoneParams, TaskDoneResult, API_MAJOR,
+    API_MINOR, HOOK_METHODS, MAX_FRAME,
+};
+use super::proto::{
+    AnnotationChangedEvent, AnnotationDeleteParams, AnnotationDeleteResult, AnnotationListParams,
+    AnnotationListResult, AnnotationPatchParams, AnnotationPatchResult, AnnotationRemovedEvent,
+    AnnotationSetParams, AnnotationSetResult,
+};
+use super::proto::{AuthCanParams, AuthCanResult, AuthRulesResult, Ceiling};
+use super::proto::{
+    ConversationGetParams, ConversationGetResult, CostGetParams, DiagDetectionParams,
+    HistoryListParams, HistoryListResult, HistorySearchParams, HistorySearchResult,
+    MemoryListParams, MemoryListResult, OpencodeConnectParams, OpencodeStatusParams, ProgressFrame,
+    SessionTasksParams, SessionTasksResult, SubagentListParams, SubagentListResult,
+    SubagentTranscriptParams, UsageSubscriptionsParams, UsageSubscriptionsResult,
+};
+use super::proto::{
+    DetectRecheckParams, SessionAwayParams, SessionAwayResult, SessionRenameParams,
+    SessionStopParams, SessionView, SessionViewsParams, SessionViewsResult, TickResult,
+};
+use super::proto::{PingParams, PingResult, UnsubscribeParams, UnsubscribeResult};
+use super::standing;
+use super::views;
+use super::views::conversation::{Progress, PROGRESS_CAPABILITY};
+use super::views::sessions as session_views;
+use crate::elog;
+use std::collections::HashMap;
+use std::future::Future;
+use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+/// How long a new connection has to send `hello`.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Encoded frames (responses and events) queued for one connection's
+/// writer task.
+const WRITE_QUEUE: usize = 64;
+
+/// Live `events.subscribe` streams one connection may hold. Each holds a
+/// SQLite reader (and its file descriptors) until the connection closes, so
+/// without a cap one client could exhaust the engine's descriptors.
+pub const MAX_STREAMS: usize = 16;
+
+/// Requests one connection runs at once. Past it the reader waits for one
+/// to end before it reads the next frame.
+pub const MAX_IN_FLIGHT: usize = 32;
+
+/// Longest `seq` a hook-class call may carry. A ns clock has 19 digits.
+const MAX_SEQ: usize = 32;
+
+/// Engine-wide facts every connection needs.
+pub struct ServerCtx {
+    pub engine_version: String,
+    /// The machine key id (`engine::machine`).
+    pub machine_id: String,
+    pub hello_timeout: Duration,
+    /// Live agents, for `agent:<id>` stamping.
+    pub agents: Arc<dyn LiveAgents>,
+    /// The only uid a peer may have: the engine's own euid.
+    pub engine_uid: libc::uid_t,
+    /// The engine's `c9watch-agent` copy. Without one, every hook-class
+    /// call is `peer_not_authorized`.
+    pub agent_bin: Option<Arc<AgentBin>>,
+    /// The store. `None` only in tests of the connection layer.
+    pub db: Option<Arc<Db>>,
+    /// The state merge of every live agent (C1a-22).
+    pub merge: Arc<MergeTable>,
+    /// `<home>/standing-orders.md`, sent on `hook.session_start`. `None`
+    /// sends no orders.
+    pub standing_orders: Option<PathBuf>,
+    /// Free-agent create and retire (C1a-26). `None` (only in tests)
+    /// answers `internal` to both.
+    pub spawner: Option<Arc<Spawner>>,
+    /// On while the engine drains (C1a-27): `hook.session_start` then
+    /// injects nothing.
+    pub drain: Arc<DrainSwitch>,
+    /// Detection's first pass: `session.list` and `snapshot.get` wait for
+    /// it (`detect::FirstTick`).
+    pub first_tick: Arc<FirstTick>,
+    /// The mail header key (`MachineKey::header_key`): each agent's token
+    /// goes out in its `hook.session_start` context. `None` only in tests.
+    pub header_key: Option<HeaderKey>,
+    /// Session detection and its views. `None` in an engine without
+    /// detection, and in tests.
+    pub detection: Option<Arc<Detection>>,
+    /// The user home the data readers look under (`views::user_home`).
+    /// `None` is the engine user's home; tests point it at a fixture.
+    pub user_home: Option<PathBuf>,
+    /// The engine's own cost cache (`<home>/cost-cache.json`). `None` (only
+    /// in tests) answers `cost.get` with `internal`.
+    pub cost_cache: Option<PathBuf>,
+    /// Where `usage.subscriptions` reads. `None` (only in tests) answers
+    /// `internal`.
+    pub usage: Option<views::usage::UsageSource>,
+    /// The `idem` record of `agent.create`, `agent.retire` and
+    /// `session.stop` (D3).
+    pub idem: Arc<IdemCache>,
+    /// Observed sessions, for `observed:<sessionKey>` stamping (D8).
+    /// `None` reads detection's views.
+    pub observed: Option<Arc<dyn ObservedSessions>>,
+}
+
+/// Observed sessions by process pid, as detection last saw them.
+struct ObservedNow(HashMap<libc::pid_t, String>);
+
+impl ObservedSessions for ObservedNow {
+    fn by_pid(&self, pid: libc::pid_t) -> Option<String> {
+        self.0.get(&pid).cloned()
+    }
+}
+
+impl ServerCtx {
+    pub fn new(machine_id: String) -> Self {
+        Self {
+            engine_version: env!("CARGO_PKG_VERSION").to_string(),
+            machine_id,
+            hello_timeout: HELLO_TIMEOUT,
+            // `run` sets the engine's live table (`with_agents`).
+            agents: Arc::new(NoLiveAgents),
+            engine_uid: peer::engine_uid(),
+            agent_bin: None,
+            db: None,
+            merge: Arc::new(MergeTable::new()),
+            standing_orders: None,
+            spawner: None,
+            drain: Arc::new(DrainSwitch::new()),
+            first_tick: Arc::new(FirstTick::open_now()),
+            header_key: None,
+            detection: None,
+            user_home: None,
+            cost_cache: None,
+            usage: None,
+            idem: Arc::new(IdemCache::new()),
+            observed: None,
+        }
+    }
+
+    /// Stamp `agent:<id>` from the engine's live-agent table (C1a-33).
+    pub fn with_agents(mut self, agents: Arc<dyn LiveAgents>) -> Self {
+        self.agents = agents;
+        self
+    }
+
+    pub fn with_agent_bin(mut self, bin: Arc<AgentBin>) -> Self {
+        self.agent_bin = Some(bin);
+        self
+    }
+
+    pub fn with_db(mut self, db: Arc<Db>) -> Self {
+        self.db = Some(db);
+        self
+    }
+
+    pub fn with_standing_orders(mut self, path: PathBuf) -> Self {
+        self.standing_orders = Some(path);
+        self
+    }
+
+    pub fn with_spawner(mut self, spawner: Arc<Spawner>) -> Self {
+        self.spawner = Some(spawner);
+        self
+    }
+
+    pub fn with_drain(mut self, drain: Arc<DrainSwitch>) -> Self {
+        self.drain = drain;
+        self
+    }
+
+    pub fn with_first_tick(mut self, first_tick: Arc<FirstTick>) -> Self {
+        self.first_tick = first_tick;
+        self
+    }
+
+    pub fn with_header_key(mut self, key: HeaderKey) -> Self {
+        self.header_key = Some(key);
+        self
+    }
+
+    pub fn with_detection(mut self, detection: Arc<Detection>) -> Self {
+        self.detection = Some(detection);
+        self
+    }
+
+    pub fn with_cost_cache(mut self, path: PathBuf) -> Self {
+        self.cost_cache = Some(path);
+        self
+    }
+
+    pub fn with_usage(mut self, usage: views::usage::UsageSource) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// Wait for detection's first pass; past `FIRST_TICK_WAIT` answer with
+    /// what the table holds.
+    pub(crate) async fn detected(&self) {
+        if !self.first_tick.is_open() && !self.first_tick.wait(FIRST_TICK_WAIT).await {
+            elog!(
+                Warn,
+                "api",
+                "detection's first pass took over {:?}; answering anyway",
+                FIRST_TICK_WAIT
+            );
+        }
+    }
+
+    /// Whether detection has committed views once. An engine without
+    /// detection, or with a test set, has none to wait for.
+    pub(crate) fn views_ready(&self) -> bool {
+        match (&self.observed, &self.detection) {
+            (None, Some(d)) => d.views.current().is_some(),
+            _ => true,
+        }
+    }
+
+    /// Wait up to `STAMP_WAIT` for detection's first views; past it,
+    /// `busy`. Who a peer is depends on them, so nothing the principal
+    /// decides runs before them.
+    pub(crate) async fn ensure_views(&self) -> Result<(), ApiError> {
+        let ready = match (&self.observed, &self.detection) {
+            (None, Some(d)) => d.views.wait_ready(STAMP_WAIT).await,
+            _ => true,
+        };
+        if ready {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            ErrorCode::Busy,
+            "session detection has not finished a pass yet",
+        )
+        .with_hint("the engine is starting; retry shortly"))
+    }
+
+    /// The observed sessions now: detection's last views, or the test set.
+    pub(crate) fn observed_sessions(&self) -> Arc<dyn ObservedSessions> {
+        if let Some(o) = &self.observed {
+            return o.clone();
+        }
+        let sessions = self
+            .detection
+            .as_ref()
+            .and_then(|d| d.views.current())
+            .map(|(_, s)| s)
+            .unwrap_or_default();
+        Arc::new(ObservedNow(
+            sessions
+                .into_iter()
+                .filter(|s| s.pid > 0 && !s.session_key.is_empty())
+                .filter_map(|s| Some((libc::pid_t::try_from(s.pid).ok()?, s.session_key)))
+                .collect(),
+        ))
+    }
+
+    pub(crate) fn db(&self) -> Result<&Arc<Db>, ApiError> {
+        self.db
+            .as_ref()
+            .ok_or_else(|| ApiError::new(ErrorCode::Internal, "the engine has no store"))
+    }
+}
+
+/// Connections the socket serves at once. One more is answered `busy` and
+/// closed: each connection holds a task, a write queue and up to
+/// `MAX_STREAMS` SQLite readers.
+pub const MAX_CONNECTIONS: usize = 64;
+
+/// Accept connections until the listener fails. Each connection runs in its
+/// own task. The caller stops the engine by dropping this future (for
+/// example in a `select!` with `ShutdownSignals::recv`).
+pub async fn serve(listener: UnixListener, ctx: Arc<ServerCtx>) {
+    serve_with_cap(listener, ctx, MAX_CONNECTIONS).await
+}
+
+/// `serve` with at most `cap` connections at once.
+pub async fn serve_with_cap(listener: UnixListener, ctx: Arc<ServerCtx>, cap: usize) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(cap));
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => match slots.clone().try_acquire_owned() {
+                Ok(slot) => {
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        serve_conn(stream, ctx).await;
+                        drop(slot);
+                    });
+                }
+                Err(_) => {
+                    tokio::spawn(refuse_busy(stream, cap));
+                }
+            },
+            Err(e) => {
+                elog!(Warn, "api", "Accept error: {}", e);
+                // EMFILE and friends: back off instead of spinning.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// Answer a connection past the cap with `busy` and close it.
+async fn refuse_busy(mut stream: UnixStream, cap: usize) {
+    let resp = Response::err(
+        None,
+        ApiError::new(
+            ErrorCode::Busy,
+            format!("the engine already serves {} connections", cap),
+        ),
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(1), stream.write_all(&encode(&resp))).await;
+    let _ = stream.shutdown().await;
+}
+
+/// Transport identity. Gateway calls never borrow core's own Unix pid.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Peer {
+    Unix {
+        cred: PeerCred,
+        start: Option<u64>,
+    },
+    Gateway {
+        client_id: uuid::Uuid,
+        remote_addr: std::net::SocketAddr,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UnixPeer {
+    cred: PeerCred,
+    start: Option<u64>,
+}
+
+impl Peer {
+    fn unix(self) -> Result<UnixPeer, ApiError> {
+        match self {
+            Self::Unix { cred, start } => Ok(UnixPeer { cred, start }),
+            Self::Gateway { .. } => Err(ApiError::new(
+                ErrorCode::NotAllowed,
+                "this operation requires a Unix peer",
+            )),
+        }
+    }
+}
+
+/// The connection's state after `hello`.
+struct Conn {
+    principal: Principal,
+    /// The capabilities `hello` granted.
+    capabilities: Vec<String>,
+}
+
+/// What the reader does after a frame it answered itself.
+enum Next {
+    Continue,
+    Close,
+}
+
+/// Serve one connection until the peer closes it or a fatal error.
+pub async fn serve_conn(stream: UnixStream, ctx: Arc<ServerCtx>) {
+    let hello_deadline = tokio::time::Instant::now() + ctx.hello_timeout;
+    // Read the clock before the peer facts: a peer that started after this
+    // reused the pid of the process that connected.
+    let accepted = peer::start_token_now();
+    let cred = peer::peer_cred(stream.as_raw_fd());
+    let (read, mut write) = stream.into_split();
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(WRITE_QUEUE);
+    let writer = tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            if write.write_all(&line).await.is_err() {
+                break;
+            }
+        }
+        let _ = write.shutdown().await;
+    });
+
+    let cred = match cred.and_then(|c| peer::check_peer_uid(&c, ctx.engine_uid).map(|_| c)) {
+        Ok(c) => c,
+        Err(e) => {
+            elog!(Warn, "api", "Rejected connection: {}", e);
+            let _ = tx
+                .send(encode(&Response::err(
+                    None,
+                    ApiError::new(ErrorCode::PeerUidMismatch, e),
+                )))
+                .await;
+            drop(tx);
+            let _ = writer.await;
+            return;
+        }
+    };
+
+    // Stamp at accept, not at `hello`: the peer pid is then as fresh as it
+    // gets, and a late `hello` cannot wait for the pid to be reused.
+    // The peer's start time comes from the same read as the principal, so
+    // a later exe check reads the process the principal came from. Before
+    // detection's first views the stamp is provisional (`Stamp`).
+    let stamp = Arc::new(Stamp::at_accept(&ctx, cred, accepted));
+
+    let mut reader = BufReader::new(read);
+    let mut conn: Option<Conn> = None;
+    let streams = Arc::new(tokio::sync::Mutex::new(Streams::default()));
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+    let mut calls = tokio::task::JoinSet::new();
+    // Stream controls run one at a time in the order sent, on their own
+    // task, so a slow subscribe holds up only the controls after it. The
+    // in-flight bound also bounds this queue.
+    let (controls, mut queued) = mpsc::channel::<Queued>(MAX_IN_FLIGHT);
+    {
+        let (ctx, stamp, streams, tx) = (ctx.clone(), stamp.clone(), streams.clone(), tx.clone());
+        calls.spawn(async move {
+            while let Some(q) = queued.recv().await {
+                let held = streams.clone().lock_owned().await;
+                serve_queued(q, &ctx, &stamp, Some(held), &tx).await;
+            }
+        });
+    }
+    loop {
+        while calls.try_join_next().is_some() {}
+        let frame = if conn.is_none() {
+            match tokio::time::timeout_at(hello_deadline, read_frame(&mut reader, MAX_FRAME)).await
+            {
+                Ok(f) => f,
+                Err(_) => {
+                    let _ = tx
+                        .send(encode(&Response::err(
+                            None,
+                            ApiError::new(ErrorCode::HelloTimeout, "no hello within the timeout"),
+                        )))
+                        .await;
+                    break;
+                }
+            }
+        } else {
+            read_frame(&mut reader, MAX_FRAME).await
+        };
+        let frame = match frame {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(FrameError::TooLarge) => {
+                let _ = tx
+                    .send(encode(&Response::err(
+                        None,
+                        ApiError::new(
+                            ErrorCode::FrameTooLarge,
+                            format!("frame exceeds {} bytes", MAX_FRAME),
+                        ),
+                    )))
+                    .await;
+                break;
+            }
+            Err(FrameError::Io(_)) => break,
+        };
+        if frame.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let (principal, peer) = stamp.now();
+        match check_frame(&frame, &ctx, peer, &principal, &mut conn) {
+            Checked::Done(resp, next) => {
+                if tx.send(encode(&resp)).await.is_err() {
+                    break;
+                }
+                if let Next::Close = next {
+                    break;
+                }
+            }
+            Checked::Call(req, method) => {
+                let Ok(slot) = in_flight.clone().acquire_owned().await else {
+                    break;
+                };
+                let progress = conn
+                    .as_ref()
+                    .is_some_and(|c| c.capabilities.iter().any(|w| w == PROGRESS_CAPABILITY))
+                    .then(|| Progress {
+                        tx: tx.clone(),
+                        id: req.id.clone(),
+                    });
+                let q = Queued {
+                    req,
+                    method,
+                    progress,
+                    slot,
+                };
+                if matches!(q.method.as_str(), "events.subscribe" | "events.unsubscribe") {
+                    if controls.send(q).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                let (ctx, stamp, tx) = (ctx.clone(), stamp.clone(), tx.clone());
+                calls.spawn(async move { serve_queued(q, &ctx, &stamp, None, &tx).await });
+            }
+        }
+    }
+    drop(controls);
+    // A write in flight runs to its end; only then do the streams stop.
+    while calls.join_next().await.is_some() {}
+    streams.lock().await.abort_all();
+    drop(tx);
+    let _ = writer.await;
+}
+
+/// One request after the envelope checks, with its in-flight permit.
+struct Queued {
+    req: Request,
+    method: String,
+    progress: Option<Progress>,
+    slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Serve `q` under the connection's stamp for it, then free its permit.
+async fn serve_queued(
+    q: Queued,
+    ctx: &ServerCtx,
+    stamp: &Stamp,
+    held: Option<tokio::sync::OwnedMutexGuard<Streams>>,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let Queued {
+        req,
+        method,
+        progress,
+        slot,
+    } = q;
+    match stamp.for_request(ctx, &method, &req).await {
+        Ok((principal, peer)) => {
+            call(req, &method, ctx, peer, &principal, held, progress, tx).await
+        }
+        Err(e) => {
+            let _ = tx.send(encode(&Response::err(req.id, e))).await;
+        }
+    }
+    drop(slot);
+}
+
+/// How long a request that needs the caller's identity waits for
+/// detection's first views. Shorter than the clients' 5 s read timeout
+/// (`engine_proto::spawn`), so the `busy` reaches them in time.
+const STAMP_WAIT: Duration = Duration::from_secs(3);
+
+/// The principal of one Unix connection (D8). It is stamped at accept.
+/// Before detection's first successful pass there are no views, so a
+/// process in an observed session would stamp `local-unverified`: that
+/// stamp is provisional. Once views exist, the connection is stamped again,
+/// once, and keeps that result. A request whose answer the stamp could
+/// change waits for the views first (`needs_stamp`); past `STAMP_WAIT` it
+/// gets `busy`, and the next such request waits again. Other reads run
+/// under the provisional stamp. If the second stamp cannot verify the
+/// process (it exited, or its start time changed or is unreadable), the
+/// connection is restricted: it keeps its provisional stamp for plain
+/// reads, and every request that needs its identity is refused. `hello`
+/// never waits, so it may report
+/// `local-unverified` for a peer that later narrows to `observed:`.
+struct Stamp {
+    cred: peer::PeerCred,
+    accepted: Option<u64>,
+    first: (Arc<Principal>, Peer),
+    provisional: bool,
+    /// The second stamp; `None` inside when it could not verify the peer.
+    settled: tokio::sync::OnceCell<Option<(Arc<Principal>, Peer)>>,
+}
+
+impl Stamp {
+    fn at_accept(ctx: &ServerCtx, cred: peer::PeerCred, accepted: Option<u64>) -> Self {
+        let ready = ctx.views_ready();
+        let (principal, start) = principal::stamp_peer(
+            cred.pid,
+            accepted,
+            ctx.agents.as_ref(),
+            ctx.observed_sessions().as_ref(),
+        );
+        // Only `local-unverified` can narrow: an agent's stamp comes from
+        // the engine's own agent table, never from the views.
+        let provisional = !ready && principal == Principal::LocalUnverified;
+        Self {
+            cred,
+            accepted,
+            first: (Arc::new(principal), Peer::Unix { cred, start }),
+            provisional,
+            settled: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// The stamp as it stands, for `hello`.
+    fn now(&self) -> (Arc<Principal>, Peer) {
+        self.settled
+            .get()
+            .and_then(Option::as_ref)
+            .unwrap_or(&self.first)
+            .clone()
+    }
+
+    /// The stamp to serve `method` under.
+    async fn for_request(
+        &self,
+        ctx: &ServerCtx,
+        method: &str,
+        req: &Request,
+    ) -> Result<(Arc<Principal>, Peer), ApiError> {
+        if !self.provisional {
+            return Ok(self.first.clone());
+        }
+        let needs = needs_stamp(method, req);
+        let settled = match self.settled.get() {
+            Some(s) => s,
+            None => {
+                if !ctx.views_ready() {
+                    if !needs {
+                        return Ok(self.first.clone());
+                    }
+                    ctx.ensure_views().await?;
+                }
+                self.settled.get_or_init(|| async { self.again(ctx) }).await
+            }
+        };
+        match settled {
+            Some(s) => Ok(s.clone()),
+            None if needs => Err(ApiError::new(
+                ErrorCode::PeerNotAuthorized,
+                "core could not verify this connection's process once session detection was ready",
+            )
+            .with_hint("connect again from a running process")),
+            None => Ok(self.first.clone()),
+        }
+    }
+
+    /// Stamp again from the views. `None` when the process is not verified
+    /// to be the one that connected: it is gone, or its start time is
+    /// unreadable or another. It never falls back to the provisional stamp.
+    fn again(&self, ctx: &ServerCtx) -> Option<(Arc<Principal>, Peer)> {
+        let (principal, start) = principal::stamp_peer(
+            self.cred.pid,
+            self.accepted,
+            ctx.agents.as_ref(),
+            ctx.observed_sessions().as_ref(),
+        );
+        match self.first.1 {
+            Peer::Unix { start: first, .. } if first == start && start.is_some() => Some((
+                Arc::new(principal),
+                Peer::Unix {
+                    cred: self.cred,
+                    start,
+                },
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the answer to `method` could differ between `local-unverified`
+/// and an observed session, so a provisional stamp may not serve it: the
+/// method is closed to one of them, or an admission check reads the
+/// principal. For `events.subscribe`, whether it may carry a topic that
+/// only one of them may read (`msg.state`, `legacy.inbox`).
+fn needs_stamp(method: &str, req: &Request) -> bool {
+    if method == "events.subscribe" {
+        let wanted: Vec<String> = req
+            .params
+            .get("topics")
+            .map(|t| serde_json::from_value(t.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        return local_only_topics()
+            .iter()
+            .any(|t| wanted.is_empty() || topic_wanted(&wanted, t));
+    }
+    // An unknown method is `unknown_method` for every principal.
+    authz::method(method).is_some_and(|r| {
+        !(r.principals.contains(&authz::L)
+            && r.principals.contains(&authz::O)
+            && r.admission.iter().all(|a| *a == Admission::UnixPeer))
+    })
+}
+
+/// The topics `local-unverified` may read and an observed session may not
+/// (`msg.state`, `legacy.inbox`).
+fn local_only_topics() -> Vec<String> {
+    let observed = authz::topics(
+        &Principal::Observed {
+            session_key: String::new(),
+        },
+        None,
+    );
+    authz::topics(&Principal::LocalUnverified, None)
+        .into_iter()
+        .filter(|t| !observed.contains(t))
+        .collect()
+}
+
+/// Whether topic patterns `wanted` (`name` or `prefix.*`) match `topic`.
+fn topic_wanted(wanted: &[String], topic: &str) -> bool {
+    wanted.iter().any(|t| match t.strip_suffix(".*") {
+        Some(prefix) => topic
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('.')),
+        None => t == topic,
+    })
+}
+
+/// Serve one request and queue its response. A subscribe or unsubscribe
+/// gets the connection's streams in `held`, taken in the order sent, and
+/// holds them throughout: a new stream starts only after its response is
+/// queued, so that response comes first, and the stream count cannot pass
+/// `MAX_STREAMS`.
+#[allow(clippy::too_many_arguments)]
+async fn call(
+    req: Request,
+    method: &str,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+    mut held: Option<tokio::sync::OwnedMutexGuard<Streams>>,
+    progress: Option<Progress>,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let id = req.id.clone();
+    let (resp, stream) = match dispatch(
+        method,
+        req,
+        ctx,
+        peer,
+        principal,
+        held.as_deref_mut(),
+        progress,
+    )
+    .await
+    {
+        Ok(served) => {
+            let mut resp = Response::ok(id, served.result);
+            resp.seq = served.seq;
+            (resp, served.stream)
+        }
+        Err(e) => (Response::err(id, e), None),
+    };
+    if tx.send(encode(&resp)).await.is_err() {
+        return;
+    }
+    if let (Some(s), Some(streams)) = (stream, held.as_mut()) {
+        streams.start(s, tx.clone());
+    }
+}
+
+/// A frame after the envelope checks.
+enum Checked {
+    /// Answered already (an error or `hello`).
+    Done(Response, Next),
+    /// A method call after `hello`.
+    Call(Request, String),
+}
+
+/// Envelope checks and `hello`. Never touches the store.
+fn check_frame(
+    frame: &[u8],
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+    conn: &mut Option<Conn>,
+) -> Checked {
+    // A bad frame before `hello` closes; after it the connection stays.
+    let soft = if conn.is_some() {
+        Next::Continue
+    } else {
+        Next::Close
+    };
+    let req: Request = match serde_json::from_slice(frame) {
+        Ok(r) => r,
+        Err(e) => {
+            return Checked::Done(
+                Response::err(
+                    None,
+                    ApiError::new(ErrorCode::BadRequest, format!("invalid JSON: {}", e)),
+                ),
+                soft,
+            );
+        }
+    };
+    let id = req.id.clone();
+    let Some(v) = req.v else {
+        return Checked::Done(
+            Response::err(id, ApiError::new(ErrorCode::BadRequest, "missing v")),
+            soft,
+        );
+    };
+    if v != API_MAJOR {
+        return Checked::Done(
+            Response::err(
+                id,
+                ApiError::new(
+                    ErrorCode::UpgradeRequired,
+                    format!("envelope v={}, this engine speaks c9p/{}", v, API_MAJOR),
+                ),
+            ),
+            Next::Close,
+        );
+    }
+    let Some(method) = req.method.clone() else {
+        return Checked::Done(
+            Response::err(id, ApiError::new(ErrorCode::BadRequest, "missing method")),
+            soft,
+        );
+    };
+    if method == "hello" {
+        let (resp, next) = hello(req, ctx, peer, principal, conn);
+        return Checked::Done(resp, next);
+    }
+    if conn.is_none() {
+        return Checked::Done(
+            Response::err(
+                id,
+                ApiError::new(
+                    ErrorCode::HelloRequired,
+                    format!("got {:?} before hello", method),
+                ),
+            ),
+            Next::Close,
+        );
+    }
+    Checked::Call(req, method)
+}
+
+/// Every c9p/1 method, as in `docs/api/c9p-1.json`. `hello` is handled
+/// before dispatch; `dispatch` serves the rest.
+pub const METHODS: &[&str] = &[
+    "hello",
+    "snapshot.get",
+    "events.subscribe",
+    "session.list",
+    "agent.list",
+    "agent.create",
+    "agent.retire",
+    "agent.resume",
+    "hook.session_start",
+    "hook.stop",
+    "hook.permission_request",
+    "hook.permission_denied",
+    "hook.notification",
+    "hook.user_prompt_submit",
+    "hook.post_tool_use",
+    "hook.pre_tool_use",
+    "task.done",
+    "agent.handoff",
+    "msg.send",
+    "msg.list",
+    "msg.read",
+    "msg.cancel",
+    "mail.pause",
+    "mail.resume",
+    "session.views",
+    "session.away",
+    "detect.recheck",
+    "session.stop",
+    "session.rename",
+    "diag.detection",
+    "conversation.get",
+    "history.list",
+    "history.search",
+    "cost.get",
+    "memory.list",
+    "subagent.list",
+    "subagent.transcript",
+    "session.tasks",
+    "usage.subscriptions",
+    "provider.opencode.status",
+    "provider.opencode.connect",
+    "events.unsubscribe",
+    "ping",
+    "auth.can",
+    "auth.rules",
+    "annotation.set",
+    "annotation.delete",
+    "annotation.patch",
+    "annotation.list",
+];
+
+/// The c9p/1 JSON Schema (A:245): the frame types, a `methods` table with
+/// each method's params and result, and every wire type under `$defs`.
+/// `docs/api/c9p-1.json` is this value, and `src/lib/c9p-1.ts` is generated
+/// from that file by `scripts/gen-c9p-types.mjs`.
+pub fn schema() -> serde_json::Value {
+    use schemars::generate::SchemaSettings;
+    // Params and the request frame are what the engine reads; results and
+    // the other frames are what it writes. Each side gets its own contract,
+    // so an `Option` param may be left out while an `Option` result field
+    // is always sent.
+    let mut de = SchemaSettings::draft2020_12()
+        .for_deserialize()
+        .into_generator();
+    let mut ser = SchemaSettings::draft2020_12()
+        .for_serialize()
+        .into_generator();
+    let frames = serde_json::json!({
+        "request": de.subschema_for::<Request>(),
+        "response": ser.subschema_for::<Response>(),
+        "event": ser.subschema_for::<EventFrame>(),
+        "progress": ser.subschema_for::<ProgressFrame>(),
+    });
+    let methods = serde_json::json!({
+        "auth.can": {
+            "params": de.subschema_for::<AuthCanParams>(),
+            "result": ser.subschema_for::<AuthCanResult>(),
+        },
+        "auth.rules": {
+            "params": de.subschema_for::<PingParams>(),
+            "result": ser.subschema_for::<AuthRulesResult>(),
+        },
+        "hello": {
+            "params": de.subschema_for::<HelloParams>(),
+            "result": ser.subschema_for::<HelloResult>(),
+        },
+        "snapshot.get": {
+            "params": de.subschema_for::<SnapshotParams>(),
+            "result": ser.subschema_for::<SnapshotResult>(),
+        },
+        "events.subscribe": {
+            "params": de.subschema_for::<SubscribeParams>(),
+            "result": ser.subschema_for::<SubscribeResult>(),
+            "events": ser.subschema_for::<EventFrame>(),
+        },
+        "session.list": {
+            "params": de.subschema_for::<SessionListParams>(),
+            "result": ser.subschema_for::<SessionListResult>(),
+        },
+        "agent.list": {
+            "params": de.subschema_for::<AgentListParams>(),
+            "result": ser.subschema_for::<AgentListResult>(),
+        },
+        "agent.create": {
+            "params": de.subschema_for::<AgentCreateParams>(),
+            "result": ser.subschema_for::<AgentCreateResult>(),
+        },
+        "agent.retire": {
+            "params": de.subschema_for::<AgentRetireParams>(),
+            "result": ser.subschema_for::<AgentRetireResult>(),
+        },
+        "agent.resume": {
+            "params": de.subschema_for::<AgentResumeParams>(),
+            "result": ser.subschema_for::<AgentResumeResult>(),
+        },
+        "task.done": {
+            "params": de.subschema_for::<TaskDoneParams>(),
+            "result": ser.subschema_for::<TaskDoneResult>(),
+        },
+        "agent.handoff": {
+            "params": de.subschema_for::<HandoffParams>(),
+            "result": ser.subschema_for::<HandoffResult>(),
+        },
+        "msg.list": { "params": de.subschema_for::<crate::engine_proto::wire::MsgListParams>(), "result": ser.subschema_for::<crate::engine_proto::wire::MsgListResult>() },
+        "msg.read": { "params": de.subschema_for::<crate::engine_proto::wire::MsgIdParams>(), "result": ser.subschema_for::<crate::engine_proto::wire::MsgReadResult>() },
+        "msg.cancel": { "params": de.subschema_for::<crate::engine_proto::wire::MsgIdParams>(), "result": ser.subschema_for::<crate::engine_proto::wire::MailControlResult>() },
+        "mail.pause": { "params": de.subschema_for::<crate::engine_proto::wire::MailAgentParams>(), "result": ser.subschema_for::<crate::engine_proto::wire::MailControlResult>() },
+        "mail.resume": { "params": de.subschema_for::<crate::engine_proto::wire::MailAgentParams>(), "result": ser.subschema_for::<crate::engine_proto::wire::MailControlResult>() },
+        "msg.send": {
+            "params": de.subschema_for::<MsgSendParams>(),
+            "result": ser.subschema_for::<MsgSendResult>(),
+        },
+        "session.views": {
+            "params": de.subschema_for::<SessionViewsParams>(),
+            "result": ser.subschema_for::<SessionViewsResult>(),
+        },
+        "session.away": {
+            "params": de.subschema_for::<SessionAwayParams>(),
+            "result": ser.subschema_for::<SessionAwayResult>(),
+        },
+        "detect.recheck": {
+            "params": de.subschema_for::<DetectRecheckParams>(),
+            "result": ser.subschema_for::<TickResult>(),
+        },
+        "session.stop": {
+            "params": de.subschema_for::<SessionStopParams>(),
+            "result": ser.subschema_for::<TickResult>(),
+        },
+        "session.rename": {
+            "params": de.subschema_for::<SessionRenameParams>(),
+            "result": ser.subschema_for::<TickResult>(),
+        },
+        "diag.detection": {
+            "params": de.subschema_for::<DiagDetectionParams>(),
+            "result": ser.subschema_for::<crate::session::DetectionDiagnostics>(),
+        },
+        "conversation.get": {
+            "params": de.subschema_for::<ConversationGetParams>(),
+            "result": ser.subschema_for::<ConversationGetResult>(),
+            "progress": ser.subschema_for::<ProgressFrame>(),
+        },
+        "history.list": {
+            "params": de.subschema_for::<HistoryListParams>(),
+            "result": ser.subschema_for::<HistoryListResult>(),
+        },
+        "history.search": {
+            "params": de.subschema_for::<HistorySearchParams>(),
+            "result": ser.subschema_for::<HistorySearchResult>(),
+        },
+        "cost.get": {
+            "params": de.subschema_for::<CostGetParams>(),
+            "result": ser.subschema_for::<crate::session::CostData>(),
+        },
+        "memory.list": {
+            "params": de.subschema_for::<MemoryListParams>(),
+            "result": ser.subschema_for::<MemoryListResult>(),
+        },
+        "subagent.list": {
+            "params": de.subschema_for::<SubagentListParams>(),
+            "result": ser.subschema_for::<SubagentListResult>(),
+        },
+        "subagent.transcript": {
+            "params": de.subschema_for::<SubagentTranscriptParams>(),
+            "result": ser.subschema_for::<crate::session::subagents::SubagentTranscript>(),
+        },
+        "session.tasks": {
+            "params": de.subschema_for::<SessionTasksParams>(),
+            "result": ser.subschema_for::<SessionTasksResult>(),
+        },
+        "usage.subscriptions": {
+            "params": de.subschema_for::<UsageSubscriptionsParams>(),
+            "result": ser.subschema_for::<UsageSubscriptionsResult>(),
+        },
+        "provider.opencode.status": {
+            "params": de.subschema_for::<OpencodeStatusParams>(),
+            "result": ser.subschema_for::<crate::session::opencode::ConnectionStatus>(),
+        },
+        "provider.opencode.connect": {
+            "params": de.subschema_for::<OpencodeConnectParams>(),
+            "result": ser.subschema_for::<crate::session::opencode::ConnectionStatus>(),
+        },
+        "events.unsubscribe": {
+            "params": de.subschema_for::<UnsubscribeParams>(),
+            "result": ser.subschema_for::<UnsubscribeResult>(),
+        },
+        "ping": {
+            "params": de.subschema_for::<PingParams>(),
+            "result": ser.subschema_for::<PingResult>(),
+        },
+    });
+    let mut methods = methods;
+    methods["annotation.set"] = serde_json::json!({"params": de.subschema_for::<AnnotationSetParams>(), "result": ser.subschema_for::<AnnotationSetResult>()});
+    methods["annotation.delete"] = serde_json::json!({"params": de.subschema_for::<AnnotationDeleteParams>(), "result": ser.subschema_for::<AnnotationDeleteResult>()});
+    methods["annotation.patch"] = serde_json::json!({"params": de.subschema_for::<AnnotationPatchParams>(), "result": ser.subschema_for::<AnnotationPatchResult>()});
+    methods["annotation.list"] = serde_json::json!({"params": de.subschema_for::<AnnotationListParams>(), "result": ser.subschema_for::<AnnotationListResult>()});
+
+    for m in HOOK_METHODS {
+        methods[*m] = serde_json::json!({
+            "params": de.subschema_for::<HookParams>(),
+            "result": ser.subschema_for::<HookResult>(),
+        });
+    }
+    methods["hook.pre_tool_use"]["result"] =
+        serde_json::json!(ser.subschema_for::<PreToolUseResult>());
+    use super::proto::{
+        AgentAttentionEvent, AgentFailedEvent, AgentGoneEvent, AgentRow, AgentTurnEndEvent,
+        LegacyInboxEvent, MsgStateEvent, NotificationEvent, SessionGoneEvent,
+    };
+    let data = serde_json::json!({
+        "annotation.changed": ser.subschema_for::<AnnotationChangedEvent>(),
+        "annotation.removed": ser.subschema_for::<AnnotationRemovedEvent>(),
+        "agent.upsert": ser.subschema_for::<AgentRow>(),
+        "agent.attention": ser.subschema_for::<AgentAttentionEvent>(),
+        "agent.turn_end": ser.subschema_for::<AgentTurnEndEvent>(),
+        "agent.gone": ser.subschema_for::<AgentGoneEvent>(),
+        "agent.failed": ser.subschema_for::<AgentFailedEvent>(),
+        "msg.state": ser.subschema_for::<MsgStateEvent>(),
+        "legacy.inbox": ser.subschema_for::<LegacyInboxEvent>(),
+        "session.view": ser.subschema_for::<SessionView>(),
+        "session.gone": ser.subschema_for::<SessionGoneEvent>(),
+        "notification.needs_attention": ser.subschema_for::<NotificationEvent>(),
+        "notification.waiting_for_input": ser.subschema_for::<NotificationEvent>(),
+        "diag.detection": ser.subschema_for::<crate::session::DetectionDiagnostics>(),
+        "detect.health": ser.subschema_for::<super::proto::DetectorHealth>(),
+    });
+    let mut topics = serde_json::Map::new();
+    for (name, stability) in discovery::TOPICS {
+        let d = data
+            .get(*name)
+            .unwrap_or_else(|| panic!("topic {} has no data type", name));
+        let mut t = serde_json::json!({"data": d, "x-stability": stability});
+        if let Some(text) = discovery::topic_description(name) {
+            t["description"] = text.into();
+        }
+        t["x-authz"] = to_json(&authz::topic(name).expect("every topic has authority"));
+        topics.insert(name.to_string(), t);
+    }
+    for (name, entry) in methods.as_object_mut().expect("methods is an object") {
+        let stability = discovery::stability(name).expect("every method has a stability");
+        entry["x-stability"] = stability.into();
+        if stability == "internal" {
+            entry["x-visibility"] = "internal".into();
+        }
+        entry["x-authz"] = to_json(&authz::method(name).expect("every method has authority"));
+    }
+    let mut defs = de.take_definitions(true);
+    for (name, def) in ser.take_definitions(true) {
+        match defs.get(&name) {
+            // A type on both sides (ErrorCode) must read the same way.
+            Some(other) => assert_eq!(other, &def, "{} differs between contracts", name),
+            None => {
+                defs.insert(name, def);
+            }
+        }
+    }
+    let mut out = serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "c9p/1",
+        "description": "Preview: the c9watch engine protocol. One JSON object per line over \
+            the engine socket. A preview minor may break a method; check breakingSince.",
+        "apiMajor": API_MAJOR,
+        "apiMinor": API_MINOR,
+        "frames": frames,
+        "methods": methods,
+        "topics": topics,
+        "$defs": defs,
+    });
+    super::sensitivity::mark(&mut out);
+    // Known strings are discoverable, but clients must accept new values.
+    let mail_states = ["queued", "delivering", "delivered", "failed", "uncertain"];
+    let enum_fields: &[(&str, &str, &[&str])] = &[
+        ("AgentCreateParams", "mode", &["free", "managed"]),
+        ("AgentRow", "mode", &["managed", "free"]),
+        ("AgentRow", "role", &["human", "orch", "worker", "observed"]),
+        ("AgentRow", "control", &["pty", "none"]),
+        (
+            "AgentRow",
+            "source",
+            &["detected", "engine", "legacy_import"],
+        ),
+        (
+            "AgentRow",
+            "state",
+            &[
+                "creating",
+                "starting",
+                "ready",
+                "working",
+                "blocked",
+                "paused",
+                "refreshing",
+                "interrupted",
+                "retiring",
+                "retired",
+                "failed",
+                "orphaned",
+            ],
+        ),
+        (
+            "AgentRow",
+            "status",
+            &[
+                "working",
+                "needs_attention",
+                "waiting_for_input",
+                "connecting",
+            ],
+        ),
+        ("MsgSendResult", "state", &mail_states),
+        ("MsgStateEvent", "state", &mail_states),
+        (
+            "NotificationEvent",
+            "status",
+            &["needs_attention", "waiting_for_input"],
+        ),
+    ];
+    for (name, field, known) in enum_fields {
+        let property = &mut out["$defs"][*name]["properties"][*field];
+        let mut values: Vec<serde_json::Value> = known.iter().map(|v| (*v).into()).collect();
+        if property["type"]
+            .as_array()
+            .is_some_and(|types| types.iter().any(|t| t == "null"))
+        {
+            values.push(serde_json::Value::Null);
+        }
+        property["enum"] = values.into();
+        property["x-open-enum"] = true.into();
+    }
+    fn open_enums(value: &mut serde_json::Value) {
+        if let Some(o) = value.as_object_mut() {
+            let string_enum = o
+                .get("enum")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|a| !a.is_empty() && a.iter().all(serde_json::Value::is_string));
+            let string_variants = o
+                .get("oneOf")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|a| !a.is_empty() && a.iter().all(|v| v["const"].is_string()));
+            if string_enum || string_variants {
+                o.insert("x-open-enum".into(), true.into());
+            }
+            for child in o.values_mut() {
+                open_enums(child);
+            }
+        } else if let Some(a) = value.as_array_mut() {
+            for child in a {
+                open_enums(child);
+            }
+        }
+    }
+    open_enums(&mut out);
+    for field in ["resumeCount", "interruptedNotePending", "stateReason"] {
+        out["$defs"]["AgentRow"]["properties"][field]["x-visibility"] = "internal".into();
+    }
+    for entry in out["topics"].as_object_mut().unwrap().values_mut() {
+        if entry["x-stability"] == "internal" {
+            entry["x-visibility"] = "internal".into();
+        }
+    }
+    out
+}
+
+/// What `dispatch` answers: the result, the event stream to start after
+/// the response, and the cursor of the event the call wrote, for
+/// `Response.seq` (only `msg.send` sets it in M1).
+struct Served {
+    result: serde_json::Value,
+    stream: Option<EventStream>,
+    seq: Option<String>,
+}
+
+impl Served {
+    fn result(result: serde_json::Value) -> Self {
+        Served {
+            result,
+            stream: None,
+            seq: None,
+        }
+    }
+}
+
+/// Every method after `hello`: authorize and admit by the `authz` table,
+/// run the handler, audit. `streams` are the connection's event streams,
+/// held only by `events.subscribe` and `events.unsubscribe`.
+async fn dispatch(
+    method: &str,
+    mut req: Request,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+    streams: Option<&mut Streams>,
+    progress: Option<Progress>,
+) -> Result<Served, ApiError> {
+    if !METHODS.contains(&method) {
+        return Err(ApiError::new(ErrorCode::UnknownMethod, "unknown method"));
+    }
+    let target = ["sessionKey", "sessionId", "agentId", "to", "agent", "msgId"]
+        .iter()
+        .find_map(|k| req.params.get(*k).and_then(|v| v.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    let payload_hash =
+        mail::sha256_hex(&serde_json::to_vec(&req.params).expect("params serialize"));
+    let admission = async {
+        let rule = authz::authorize(method, principal, None)?;
+        admit(&rule, method, &mut req.params, ctx, peer, principal).await
+    }
+    .await;
+    if let Err(e) = admission {
+        if method.starts_with("annotation.") {
+            audit_annotation_refusal(ctx, principal, method, req.params, &e).await?;
+        } else {
+            audit_refusal(ctx, principal, method, &target, &e).await;
+        }
+        return Err(e);
+    }
+    let annotation_params = method
+        .starts_with("annotation.")
+        .then(|| req.params.clone());
+    let result = execute(method, req, ctx, peer, principal, streams, progress).await;
+    if let (Some(params), Err(e)) = (annotation_params, &result) {
+        audit_annotation_refusal(ctx, principal, method, params, e).await?;
+        return result;
+    }
+    // Atomic mutation handlers already write exactly one audit row.
+    let owned_audit = matches!(
+        method,
+        "agent.create"
+            | "agent.retire"
+            | "agent.resume"
+            | "msg.send"
+            | "msg.cancel"
+            | "mail.pause"
+            | "mail.resume"
+    ) || is_hook_class(method)
+        || annotations::is_write(method);
+    if !owned_audit {
+        match authz::audit_level(method, principal, result.is_ok(), Ceiling::Conversation) {
+            authz::AuditLevel::None => {}
+            _ if result.is_err() => {
+                audit_refusal(
+                    ctx,
+                    principal,
+                    method,
+                    &target,
+                    result.as_ref().err().unwrap(),
+                )
+                .await
+            }
+            authz::AuditLevel::Hash => {
+                audit_success(ctx, principal, method, &target, Some(&payload_hash), None).await
+            }
+            authz::AuditLevel::Metadata => {
+                audit_success(ctx, principal, method, &target, None, None).await
+            }
+        }
+    }
+    result
+}
+
+/// Run the checks `rule` declares, in order (D9). Handlers do not repeat
+/// them.
+async fn admit(
+    rule: &authz::Rule,
+    method: &str,
+    params: &mut serde_json::Value,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+) -> Result<(), ApiError> {
+    for check in rule.admission {
+        match check {
+            Admission::UnixPeer => {
+                peer.unix()?;
+            }
+            Admission::MutatingPeer => check_mutating_peer(method, ctx, peer, principal).await?,
+            Admission::OwnSession => {
+                if let Principal::Observed { session_key } = principal {
+                    if params.get("sessionKey").and_then(|v| v.as_str())
+                        != Some(session_key.as_str())
+                    {
+                        return Err(ApiError::new(
+                            ErrorCode::NotAllowed,
+                            format!("{} may call {} only for its own session", principal, method),
+                        )
+                        .with_hint("run it from your own terminal, outside the session"));
+                    }
+                }
+            }
+            Admission::AnnotationNamespace => annotations::admit(method, params, principal)?,
+            Admission::AnnotationPeer => {
+                if matches!(principal, Principal::LocalUnverified) {
+                    check_mutating_peer(method, ctx, peer, principal).await?;
+                }
+            }
+            Admission::MailPeer => check_mail_peer(ctx, peer, principal).await?,
+            Admission::MailSender => {
+                let peer = peer.unix()?;
+                ctx.ensure_views().await?;
+                let (agents, observed, who) = (
+                    ctx.agents.clone(),
+                    ctx.observed_sessions(),
+                    principal.clone(),
+                );
+                blocking(move || {
+                    Ok(mail::check_sender(
+                        &who,
+                        peer.cred.pid,
+                        peer.start,
+                        agents.as_ref(),
+                        observed.as_ref(),
+                    ))
+                })
+                .await??;
+            }
+            Admission::AgentExe => {
+                let claimed = params
+                    .get("agentId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let (bin, who) = (ctx.agent_bin.clone(), principal.clone());
+                blocking(move || Ok(authorize_hook(bin.as_deref(), peer, &who, &claimed)))
+                    .await??;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn execute(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+    streams: Option<&mut Streams>,
+    progress: Option<Progress>,
+) -> Result<Served, ApiError> {
+    // The table's transport gate again, at the handlers: a declaration that
+    // let a gateway principal in still reaches no Unix-only handler.
+    if authz::method(method).is_some_and(|r| r.admission.contains(&Admission::UnixPeer)) {
+        peer.unix()?;
+    }
+    if is_hook_class(method) {
+        return hook_class(method, req, ctx, principal)
+            .await
+            .map(Served::result);
+    }
+    match method {
+        "annotation.set" => Ok(Served::result(
+            annotations::write(ctx.db()?, method, req.params, principal).await?,
+        )),
+        "annotation.delete" => Ok(Served::result(
+            annotations::write(ctx.db()?, method, req.params, principal).await?,
+        )),
+        "annotation.patch" => Ok(Served::result(
+            annotations::write(ctx.db()?, method, req.params, principal).await?,
+        )),
+        "annotation.list" => Ok(Served::result(
+            annotations::list(ctx.db()?, req.params).await?,
+        )),
+        // One arm per method: scripts/test-ipc-contract.mjs reads the
+        // served methods off these arms.
+        "agent.create" => Ok(Served::result(
+            idem_write(method, req, ctx, principal, |req| {
+                spawn_or_retire(method, req, ctx, principal)
+            })
+            .await?,
+        )),
+        "agent.retire" => Ok(Served::result(
+            idem_write(method, req, ctx, principal, |req| {
+                spawn_or_retire(method, req, ctx, principal)
+            })
+            .await?,
+        )),
+        "agent.resume" => Ok(Served::result(
+            spawn_or_retire(method, req, ctx, principal).await?,
+        )),
+        "snapshot.get" => Ok(Served::result(snapshot_get(ctx).await?)),
+        "session.list" => Ok(Served::result(session_list(ctx).await?)),
+        "agent.list" => Ok(Served::result(agent_list(req, ctx).await?)),
+        "msg.send" => msg_send(req, ctx, principal).await,
+        "msg.list" => Ok(Served::result(
+            mail_query("msg.list", req, ctx, principal).await?,
+        )),
+        "msg.read" => Ok(Served::result(
+            mail_query("msg.read", req, ctx, principal).await?,
+        )),
+        "msg.cancel" => Ok(Served::result(
+            mail_control("msg.cancel", req, ctx, principal).await?,
+        )),
+        "mail.pause" => Ok(Served::result(
+            mail_control("mail.pause", req, ctx, principal).await?,
+        )),
+        "mail.resume" => Ok(Served::result(
+            mail_control("mail.resume", req, ctx, principal).await?,
+        )),
+        "session.views" => Ok(Served::result(session_views::session_views(ctx).await?)),
+        "session.away" => Ok(Served::result(session_views::session_away(req, ctx).await?)),
+        "detect.recheck" => Ok(Served::result(local_mutation(method, req, ctx).await?)),
+        "session.stop" => Ok(Served::result(
+            idem_write(method, req, ctx, principal, |req| {
+                local_mutation(method, req, ctx)
+            })
+            .await?,
+        )),
+        "session.rename" => Ok(Served::result(local_mutation(method, req, ctx).await?)),
+        "provider.opencode.connect" => Ok(Served::result(local_mutation(method, req, ctx).await?)),
+        "diag.detection" => Ok(Served::result(
+            session_views::diag_detection(req, ctx).await?,
+        )),
+        "provider.opencode.status" => Ok(Served::result(
+            views::opencode::opencode_status(req, ctx).await?,
+        )),
+        "conversation.get" => Ok(Served::result(
+            views::conversation::conversation_get(req, ctx, progress).await?,
+        )),
+        "history.list" => Ok(Served::result(
+            views::history::history_list(req, ctx).await?,
+        )),
+        "history.search" => Ok(Served::result(
+            views::history::history_search(req, ctx).await?,
+        )),
+        "cost.get" => Ok(Served::result(views::cost::cost_get(req, ctx).await?)),
+        "memory.list" => Ok(Served::result(views::memory::memory_list(req, ctx).await?)),
+        "subagent.list" => Ok(Served::result(
+            views::subagents::subagent_list(req, ctx).await?,
+        )),
+        "subagent.transcript" => Ok(Served::result(
+            views::subagents::subagent_transcript(req, ctx).await?,
+        )),
+        "session.tasks" => Ok(Served::result(
+            views::subagents::session_tasks(req, ctx).await?,
+        )),
+        "usage.subscriptions" => Ok(Served::result(
+            views::usage::usage_subscriptions(req, ctx).await?,
+        )),
+        "events.subscribe" => {
+            let streams = streams.ok_or_else(|| internal("subscribe without the streams"))?;
+            // A stream that ended (expired, or the store closed) frees its slot.
+            streams.reap();
+            if streams.len() >= MAX_STREAMS {
+                return Err(ApiError::new(
+                    ErrorCode::RateLimited,
+                    format!(
+                        "this connection already holds {} event streams",
+                        streams.len()
+                    ),
+                ));
+            }
+            let (result, stream) = events_subscribe(req, ctx, peer, principal).await?;
+            Ok(Served {
+                result,
+                stream: Some(stream),
+                seq: None,
+            })
+        }
+        "events.unsubscribe" => {
+            let p: UnsubscribeParams = views::params(method, req)?;
+            let streams = streams.ok_or_else(|| internal("unsubscribe without the streams"))?;
+            let ended = streams.end(&p.sub).await;
+            Ok(Served::result(to_json(&UnsubscribeResult { ended })))
+        }
+        "auth.can" => {
+            let p: AuthCanParams = views::params(method, req)?;
+            Ok(Served::result(to_json(&authz::can(
+                &p.method, principal, None,
+            ))))
+        }
+        "auth.rules" => {
+            let _: PingParams = views::params(method, req)?;
+            Ok(Served::result(to_json(&authz::rules(principal, None))))
+        }
+        "ping" => {
+            let _: PingParams = views::params(method, req)?;
+            Ok(Served::result(to_json(&PingResult { ts: now_ms() })))
+        }
+        _ => Err(ApiError::new(
+            ErrorCode::UnknownMethod,
+            format!("unknown method {:?}", method),
+        )),
+    }
+}
+
+/// The event streams of one connection, with the `id` of the subscribe
+/// request that started each.
+#[derive(Default)]
+struct Streams(Vec<(Option<String>, JoinHandle<()>)>);
+
+impl Streams {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Forget the streams that ended (expired, or the store closed).
+    fn reap(&mut self) {
+        self.0.retain(|(_, h)| !h.is_finished());
+    }
+
+    fn start(&mut self, s: EventStream, tx: mpsc::Sender<Vec<u8>>) {
+        let id = s.id.clone();
+        self.0.push((id, tokio::spawn(s.run(tx))));
+    }
+
+    /// End every stream started by subscribe request `sub`, and wait until
+    /// each has stopped, so no frame of it follows the caller's response.
+    async fn end(&mut self, sub: &str) -> bool {
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.0)
+            .into_iter()
+            .partition(|(id, _)| id.as_deref() == Some(sub));
+        self.0 = kept;
+        let ended = !gone.is_empty();
+        for (_, h) in gone {
+            h.abort();
+            let _ = h.await;
+        }
+        ended
+    }
+
+    fn abort_all(&self) {
+        for (_, h) in &self.0 {
+            h.abort();
+        }
+    }
+}
+
+fn to_json<T: serde::Serialize>(v: &T) -> serde_json::Value {
+    serde_json::to_value(v).expect("a wire type serializes")
+}
+
+async fn local_mutation(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+) -> Result<serde_json::Value, ApiError> {
+    match method {
+        "detect.recheck" => session_views::detect_recheck(ctx).await,
+        "session.stop" => session_views::session_stop(req, ctx).await,
+        "provider.opencode.connect" => views::opencode::opencode_connect(req, ctx).await,
+        _ => session_views::session_rename(req, ctx).await,
+    }
+}
+
+/// `Admission::MutatingPeer`: only the terminal and an observed session,
+/// and only after `principal::check_mutating_peer`. It waits for
+/// detection's first pass, so the observed sessions are known.
+async fn check_mutating_peer(
+    method: &str,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+) -> Result<(), ApiError> {
+    let own = match principal {
+        Principal::LocalUnverified => None,
+        Principal::Observed { session_key } => Some(session_key.clone()),
+        _ => {
+            return Err(ApiError::new(
+                ErrorCode::NotAllowed,
+                format!("{} may not call {} in C1a", principal, method),
+            ))
+        }
+    };
+    let peer = peer.unix()?;
+    ctx.ensure_views().await?;
+    let (agents, observed) = (ctx.agents.clone(), ctx.observed_sessions());
+    let checked = blocking(move || {
+        Ok(principal::check_mutating_peer(
+            peer.cred.pid,
+            peer.start,
+            agents.as_ref(),
+            observed.as_ref(),
+            own.as_deref(),
+        ))
+    })
+    .await?;
+    checked.map_err(|why| {
+        ApiError::new(
+            ErrorCode::NotAllowed,
+            format!("{} refused for this peer: {}", method, why),
+        )
+    })
+}
+
+/// Run `write` once per `idem` key (D3), or replay its first result;
+/// without a key, just run it. The spawner audits `agent.create` and
+/// `agent.retire`, so their replay, which does not reach it, writes its own
+/// audit row.
+async fn idem_write<F, Fut>(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    principal: &Principal,
+    write: F,
+) -> Result<serde_json::Value, ApiError>
+where
+    F: FnOnce(Request) -> Fut,
+    Fut: Future<Output = Result<serde_json::Value, ApiError>>,
+{
+    let Some(key) = req.idem.clone() else {
+        return write(req).await;
+    };
+    let params = req.params.clone();
+    let (result, replayed) = ctx
+        .idem
+        .run(&principal.to_string(), method, &key, &params, || write(req))
+        .await?;
+    if replayed && matches!(method, "agent.create" | "agent.retire") {
+        let target = result["agent"]["id"].as_str().unwrap_or_default();
+        audit_success(ctx, principal, method, target, None, Some("idem replay")).await;
+    }
+    Ok(result)
+}
+
+async fn spawn_or_retire(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    principal: &Principal,
+) -> Result<serde_json::Value, ApiError> {
+    let Some(spawner) = &ctx.spawner else {
+        return Err(ApiError::new(
+            ErrorCode::Internal,
+            "this engine runs no agents",
+        ));
+    };
+    if method == "agent.create" {
+        let agent = spawner.create(principal, req.params).await?;
+        Ok(
+            serde_json::to_value(AgentCreateResult { agent })
+                .expect("AgentCreateResult serializes"),
+        )
+    } else if method == "agent.resume" {
+        let agent = spawner.resume(principal, req.params).await?;
+        Ok(
+            serde_json::to_value(AgentResumeResult { agent })
+                .expect("AgentResumeResult serializes"),
+        )
+    } else {
+        let agent = spawner.retire(principal, req.params).await?;
+        Ok(
+            serde_json::to_value(AgentRetireResult { agent })
+                .expect("AgentRetireResult serializes"),
+        )
+    }
+}
+
+/// `msg.send` (C1b-M1 §5.4): check the sender, then resolve, check the
+/// target and queue the message in one transaction with its audit row. A
+/// refusal writes no message, only a `deny` audit row. After the commit
+/// the target's supervisor is nudged, except while the engine drains: the
+/// message then stays `queued` (Q1).
+async fn msg_send(
+    req: Request,
+    ctx: &ServerCtx,
+    principal: &Principal,
+) -> Result<Served, ApiError> {
+    const METHOD: &str = "msg.send";
+    let claimed = req
+        .params
+        .get("to")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    // The sender passed `Admission::MailSender` already.
+    let checked = serde_json::from_value::<MsgSendParams>(req.params)
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::BadRequest,
+                format!("bad {} params: {}", METHOD, e),
+            )
+        })
+        .and_then(|p| mail::validate(&p).map(|()| p));
+    let params = match checked {
+        Ok(p) => p,
+        Err(e) => {
+            audit_refusal(ctx, principal, METHOD, &claimed, &e).await;
+            return Err(e);
+        }
+    };
+    let sent = queue_mail(ctx, principal, params, req.idem).await?;
+    // A replay answers the first send's cursor, as its result does.
+    let seq = (!sent.cursor.is_empty()).then(|| sent.cursor.clone());
+    Ok(Served {
+        result: serde_json::to_value(&sent).expect("MsgSendResult serializes"),
+        stream: None,
+        seq,
+    })
+}
+
+/// The store half of `msg.send`, after the sender checks: resolve, check
+/// the target, queue, and audit in one transaction; then nudge.
+async fn queue_mail(
+    ctx: &ServerCtx,
+    principal: &Principal,
+    params: MsgSendParams,
+    idem: Option<String>,
+) -> Result<MsgSendResult, ApiError> {
+    const METHOD: &str = "msg.send";
+    let db = ctx.db()?.clone();
+    let machine = ctx.machine_id.clone();
+    let who = principal.clone();
+    let person = mail::person();
+    let (sent, _) = db
+        .write(move |tx| {
+            let principal = who.to_string();
+            let body_hash = mail::sha256_hex(params.body.as_bytes());
+            let sender = mail::sender(tx, &who)?;
+            // A resend of a known idem replays before the target is
+            // checked again: it may have ended or lost its name since.
+            let replay = match idem.as_deref() {
+                Some(key) => mail::replay(tx, &machine, &sender, &params, key)?,
+                None => None,
+            };
+            let sent = match replay {
+                Some(r) => r,
+                None => match mail::resolve(tx, &machine, &params.to)? {
+                    Ok(target) => match mail::check_target(&sender, &target) {
+                        Ok(()) => mail::enqueue(
+                            tx,
+                            &machine,
+                            &sender,
+                            &target,
+                            &params,
+                            idem.as_deref(),
+                            &person,
+                            now_ms(),
+                        )?,
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                },
+            };
+            let (target, decision, reason) = match &sent {
+                Ok(r) if r.replayed => (
+                    r.to.addr.clone(),
+                    "allow",
+                    format!("replay of {}", r.msg_id),
+                ),
+                Ok(r) => (r.to.addr.clone(), "allow", r.msg_id.clone()),
+                Err(e) => (params.to.clone(), "deny", format!("{}: {}", e.code, e.msg)),
+            };
+            audit::append(
+                tx,
+                now_ms(),
+                &AuditEntry {
+                    principal: &principal,
+                    method: METHOD,
+                    target: Some(&target),
+                    decision,
+                    reason: Some(&reason),
+                    payload_hash: Some(&body_hash),
+                    ..Default::default()
+                },
+            )?;
+            Ok(sent)
+        })
+        .await
+        .map_err(internal)?;
+    let sent = sent?;
+    if !sent.replayed && !ctx.drain.on() {
+        if let Some(spawner) = &ctx.spawner {
+            spawner.nudge_mail(&sent.to.id);
+        }
+    }
+    Ok(sent)
+}
+
+/// Hook-class methods (§1.1): `hook.*`, `task.done` and `agent.handoff`.
+async fn hook_class(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    principal: &Principal,
+) -> Result<serde_json::Value, ApiError> {
+    if method.starts_with("hook.") && !HOOK_METHODS.contains(&method) {
+        return Err(ApiError::new(
+            ErrorCode::UnknownMethod,
+            format!("unknown method {:?}", method),
+        ));
+    }
+    let claimed = req
+        .params
+        .get("agentId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    // The caller passed `Admission::AgentExe` already.
+    let bad = |e: serde_json::Error| {
+        ApiError::new(
+            ErrorCode::BadRequest,
+            format!("bad {} params: {}", method, e),
+        )
+    };
+    match method {
+        "task.done" => {
+            serde_json::from_value::<TaskDoneParams>(req.params).map_err(bad)?;
+            // Every C1a agent is free, and free agents have no task.
+            Err(ApiError::new(
+                ErrorCode::NoTask,
+                format!("{} is a free agent and has no task", claimed),
+            ))
+        }
+        "agent.handoff" => {
+            serde_json::from_value::<HandoffParams>(req.params).map_err(bad)?;
+            Err(ApiError::new(
+                ErrorCode::Unsupported,
+                "agent.handoff comes with refresh in C1b",
+            ))
+        }
+        "hook.pre_tool_use" => {
+            let params = serde_json::from_value::<HookParams>(req.params).map_err(bad)?;
+            pre_tool_use(ctx, principal, params).await
+        }
+        _ => {
+            let params = serde_json::from_value::<HookParams>(req.params).map_err(bad)?;
+            // A sender's `seq` is a clock in ns; a long one only fills dedupe.
+            if params.seq.len() > MAX_SEQ {
+                return Err(ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!("bad {} params: seq is longer than {}", method, MAX_SEQ),
+                ));
+            }
+            let Principal::Agent { gen, .. } = principal else {
+                // `authorize` lets only an agent through.
+                return Err(ApiError::new(
+                    ErrorCode::PeerNotAuthorized,
+                    format!("{} is not an agent", principal),
+                ));
+            };
+            let (outcome, additional_context) =
+                hook_intake(ctx, method, principal, *gen, params).await?;
+            let result = HookResult {
+                accepted: outcome == Outcome::Accepted,
+                additional_context,
+            };
+            Ok(serde_json::to_value(result).expect("HookResult serializes"))
+        }
+    }
+}
+
+/// Answer a file tool call of a fenced agent from the guard on its row
+/// (D30). No guard on the row allows it. Each deny is audited; the hook
+/// blocks the call on a deny and on no answer.
+async fn pre_tool_use(
+    ctx: &ServerCtx,
+    principal: &Principal,
+    params: HookParams,
+) -> Result<serde_json::Value, ApiError> {
+    let db = ctx.db()?.clone();
+    let id = params.agent_id.clone();
+    let input = params.input;
+    let reason = blocking(move || {
+        let conn = db.pooled_reader().map_err(internal)?;
+        let guard = super::create::row_guard(&conn, &id).map_err(internal)?;
+        Ok(guard.and_then(|g| super::guard::decide(&super::guard::Fence::from_wire(&g), &input)))
+    })
+    .await?;
+    let Some(reason) = reason else {
+        let allow = PreToolUseResult {
+            decision: "allow".into(),
+            reason: None,
+        };
+        return Ok(serde_json::to_value(allow).expect("PreToolUseResult serializes"));
+    };
+    let (who, target, why) = (
+        principal.to_string(),
+        params.agent_id.clone(),
+        reason.clone(),
+    );
+    let wrote = ctx
+        .db()?
+        .write(move |tx| {
+            audit::append(
+                tx,
+                now_ms(),
+                &AuditEntry {
+                    principal: &who,
+                    method: "hook.pre_tool_use",
+                    target: Some(&target),
+                    decision: "deny",
+                    reason: Some(&why),
+                    ..Default::default()
+                },
+            )
+        })
+        .await;
+    if let Err(e) = wrote {
+        // The deny stands without its audit row.
+        elog!(Error, "api", "Failed to audit a guard deny: {}", e);
+    }
+    let deny = PreToolUseResult {
+        decision: "deny".into(),
+        reason: Some(reason),
+    };
+    Ok(serde_json::to_value(deny).expect("PreToolUseResult serializes"))
+}
+
+/// Run an authorized `hook.*` event through the intake. Returns the
+/// outcome, and for `hook.session_start` the context to send; a dropped
+/// event is not an error (the hook must not fail).
+async fn hook_intake(
+    ctx: &ServerCtx,
+    method: &str,
+    principal: &Principal,
+    gen: i64,
+    mut params: HookParams,
+) -> Result<(Outcome, Option<String>), ApiError> {
+    let db = ctx.db()?.clone();
+    let machine = ctx.machine_id.clone();
+    let merge = ctx.merge.clone();
+    // The file is read before the write: no I/O inside the transaction.
+    let orders = match (&ctx.standing_orders, method) {
+        (Some(path), "hook.session_start") => {
+            let path = path.clone();
+            blocking(move || Ok(standing::read(&path))).await?
+        }
+        _ => None,
+    };
+    let token = match (&ctx.header_key, method) {
+        (Some(key), "hook.session_start") => Some(key.token(&params.agent_id)),
+        _ => None,
+    };
+    // Read now, not at accept: a resume since then makes the event stale.
+    let live_gen = ctx.agents.current_gen(&params.agent_id);
+    let agent_id = params.agent_id.clone();
+    let is_start = method == "hook.session_start";
+    let drain = ctx.drain.clone();
+    let header_key = ctx.header_key.clone();
+    let (method, principal) = (method.to_string(), principal.to_string());
+    let (answer, _) = db
+        .write(move |tx| {
+            // Read in the transaction: the writer is serial, so a start
+            // that commits after the drain began gets no context (reviews
+            // L1).
+            let draining = drain.on();
+            let signed_headers = if method == "hook.user_prompt_submit" {
+                params.input["mail"].as_str().map(str::to_string)
+            } else {
+                None
+            };
+            // With a production key, only signed evidence is accepted. Keep the
+            // intake responsible for hook ordering/dedupe, then confirm below.
+            if header_key.is_some() && signed_headers.is_some() {
+                params.input["mail"] = serde_json::Value::Null;
+            }
+            let ev = HookEvent {
+                method: &method,
+                principal: &principal,
+                gen,
+                live_gen,
+                params: &params,
+            };
+            if method == "hook.session_start" {
+                standing::session_start(
+                    tx,
+                    &machine,
+                    &merge,
+                    &ev,
+                    orders.as_deref(),
+                    token.as_deref(),
+                    draining,
+                    now_ms(),
+                )
+            } else {
+                let out = hooks::intake(tx, &machine, &merge, &ev, now_ms())?;
+                if out == Outcome::Accepted {
+                    if let (Some(key), Some(headers)) = (&header_key, &signed_headers) {
+                        mail::confirm_signed(
+                            tx,
+                            &machine,
+                            &params.agent_id,
+                            headers,
+                            key,
+                            now_ms(),
+                        )?;
+                    }
+                }
+                Ok((out, None))
+            }
+        })
+        .await
+        .map_err(internal)?;
+    // A duplicate is the hook's retry: the start still happened.
+    let started = matches!(
+        answer.0,
+        Outcome::Accepted | Outcome::Dropped(hooks::DropReason::Duplicate)
+    );
+    if let (true, true, Some(spawner)) = (is_start, started, &ctx.spawner) {
+        spawner.session_started(&agent_id, gen);
+    }
+    Ok(answer)
+}
+
+/// `Admission::AgentExe`, the two facts a hook-class call needs: the principal is the agent the
+/// params name, and the peer runs the engine's `c9watch-agent` copy. The
+/// exe check reads the peer pid again, so it must still be the process that
+/// was stamped at accept. Blocking.
+fn authorize_hook(
+    bin: Option<&AgentBin>,
+    peer: Peer,
+    principal: &Principal,
+    claimed: &str,
+) -> Result<(), ApiError> {
+    let peer = peer.unix()?;
+    let denied = |m: String| ApiError::new(ErrorCode::PeerNotAuthorized, m);
+    let Principal::Agent { id, .. } = principal else {
+        return Err(denied(format!("{} is not an agent", principal)));
+    };
+    if claimed != id {
+        return Err(denied(format!(
+            "the call names agent {:?}, the caller is {}",
+            claimed, principal
+        )));
+    }
+    let Some(bin) = bin else {
+        return Err(denied("the engine has no c9watch-agent copy".into()));
+    };
+    let exe = peer::peer_exe_path(peer.cred.pid).map_err(denied)?;
+    let start = peer::proc_info(peer.cred.pid).map(|p| p.start);
+    if start.is_none() || start != peer.start {
+        return Err(denied(format!(
+            "pid {} is no longer the process that connected",
+            peer.cred.pid
+        )));
+    }
+    bin.check_peer_exe(&exe)
+}
+
+/// Record a refused call (hook-class, `agent.*`, `msg.send`). A failed
+/// write only logs.
+async fn audit_refusal(
+    ctx: &ServerCtx,
+    principal: &Principal,
+    method: &str,
+    claimed: &str,
+    e: &ApiError,
+) {
+    let Some(db) = ctx.db.clone() else {
+        return;
+    };
+    let (principal, method, claimed) = (
+        principal.to_string(),
+        method.to_string(),
+        claimed.to_string(),
+    );
+    let reason = e.code.to_string();
+    let wrote = db
+        .write(move |tx| {
+            audit::append(
+                tx,
+                now_ms(),
+                &AuditEntry {
+                    principal: &principal,
+                    method: &method,
+                    target: (!claimed.is_empty()).then_some(claimed.as_str()),
+                    decision: "deny",
+                    reason: Some(&reason),
+                    ..Default::default()
+                },
+            )
+        })
+        .await;
+    if let Err(e) = wrote {
+        elog!(
+            Error,
+            "api",
+            "Failed to audit a refused hook-class call: {}",
+            e
+        );
+    }
+}
+
+async fn audit_success(
+    ctx: &ServerCtx,
+    principal: &Principal,
+    method: &str,
+    target: &str,
+    hash: Option<&str>,
+    reason: Option<&str>,
+) {
+    let Some(db) = ctx.db.clone() else { return };
+    let payload_hash = hash.map(str::to_string);
+    let reason = reason.map(str::to_string);
+    let (principal, method, target) = (
+        principal.to_string(),
+        method.to_string(),
+        target.to_string(),
+    );
+    let _ = db
+        .write(move |tx| {
+            audit::append(
+                tx,
+                now_ms(),
+                &AuditEntry {
+                    principal: &principal,
+                    method: &method,
+                    target: (!target.is_empty()).then_some(target.as_str()),
+                    decision: "allow",
+                    reason: reason.as_deref(),
+                    payload_hash: payload_hash.as_deref(),
+                    ..Default::default()
+                },
+            )
+        })
+        .await;
+}
+
+pub(crate) fn internal(e: impl std::fmt::Display) -> ApiError {
+    ApiError::new(ErrorCode::Internal, e.to_string())
+}
+
+fn read_error(e: ReadError) -> ApiError {
+    match e {
+        ReadError::Expired(m) => ApiError::new(ErrorCode::CursorExpired, m),
+        ReadError::Db(m) => internal(m),
+    }
+}
+
+/// Run blocking store work off the async workers.
+pub(crate) async fn blocking<R, F>(f: F) -> Result<R, ApiError>
+where
+    F: FnOnce() -> Result<R, ApiError> + Send + 'static,
+    R: Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.map_err(internal)?
+}
+
+/// The detector's health, read BEFORE the rows it describes: a pass that
+/// commits after this read makes the rows newer than `observedAt`, never
+/// older, so the reported freshness is conservative. `observedAt` is the
+/// same struct's `lastOkAt`.
+fn health_first(ctx: &ServerCtx) -> (Option<i64>, Option<super::proto::DetectorHealth>) {
+    let health = ctx.detection.as_ref().map(|d| d.health());
+    (health.as_ref().and_then(|h| h.last_ok_at), health)
+}
+
+async fn snapshot_get(ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
+    ctx.detected().await;
+    let (observed_at, detector_health) = health_first(ctx);
+    let db = ctx.db()?.clone();
+    let (cursor, agents) = blocking(move || db.snapshot().map_err(internal)).await?;
+    let result = SnapshotResult {
+        cursor: cursor.to_string(),
+        machine_id: ctx.machine_id.clone(),
+        agents,
+        observed_at,
+        detector_health,
+    };
+    Ok(serde_json::to_value(result).expect("SnapshotResult serializes"))
+}
+
+/// The agents whose session detection sees now (C1a-15).
+async fn session_list(ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
+    ctx.detected().await;
+    let (observed_at, detector_health) = health_first(ctx);
+    let db = ctx.db()?.clone();
+    let sessions = blocking(move || db.agents(AgentFilter::Sessions).map_err(internal)).await?;
+    let result = SessionListResult {
+        sessions,
+        observed_at,
+        detector_health,
+    };
+    Ok(serde_json::to_value(result).expect("SessionListResult serializes"))
+}
+
+/// Live agents, or with `all` every row (N4).
+async fn agent_list(req: Request, ctx: &ServerCtx) -> Result<serde_json::Value, ApiError> {
+    let params: AgentListParams = if req.params.is_null() {
+        AgentListParams::default()
+    } else {
+        serde_json::from_value(req.params).map_err(|e| {
+            ApiError::new(
+                ErrorCode::BadRequest,
+                format!("bad agent.list params: {}", e),
+            )
+        })?
+    };
+    let filter = if params.all {
+        AgentFilter::All
+    } else {
+        AgentFilter::Live
+    };
+    let db = ctx.db()?.clone();
+    let agents = blocking(move || db.agents(filter).map_err(internal)).await?;
+    Ok(serde_json::to_value(AgentListResult { agents }).expect("AgentListResult serializes"))
+}
+
+async fn events_subscribe(
+    req: Request,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+) -> Result<(serde_json::Value, EventStream), ApiError> {
+    let params: SubscribeParams = if req.params.is_null() {
+        SubscribeParams::default()
+    } else {
+        serde_json::from_value(req.params).map_err(|e| {
+            ApiError::new(
+                ErrorCode::BadRequest,
+                format!("bad events.subscribe params: {}", e),
+            )
+        })?
+    };
+    let db = ctx.db()?.clone();
+    let since = match &params.since {
+        Some(s) => Some(Cursor::parse(s).map_err(|e| ApiError::new(ErrorCode::BadRequest, e))?),
+        None => None,
+    };
+    // A shallow local stamp is not proof of unrestricted mailbox access.
+    // When verification fails, a subscribe that names a local-only topic
+    // fails with it; any other loses the local-only topics and mail events
+    // and keeps the rest.
+    let mut allowed_topics = authz::topics(principal, None);
+    let mail_principal = match check_mail_peer(ctx, peer, principal).await {
+        Ok(()) => Some(principal.clone()),
+        Err(e) => {
+            let local_only = local_only_topics();
+            if !params.topics.is_empty()
+                && local_only.iter().any(|t| topic_wanted(&params.topics, t))
+            {
+                return Err(e);
+            }
+            allowed_topics.retain(|t| !local_only.contains(t));
+            None
+        }
+    };
+    let mail_db = db.clone();
+    let (start, sub) = blocking(move || {
+        let after = match since {
+            Some(c) => db.check_cursor(&c).map_err(read_error)?,
+            None => db.head_cursor().seq,
+        };
+        let sub = db.subscribe(after, READ_BATCH).map_err(internal)?;
+        Ok((db.cursor_at(after), sub))
+    })
+    .await?;
+    let result = SubscribeResult {
+        cursor: start.to_string(),
+    };
+    let stream = EventStream {
+        sub,
+        id: req.id,
+        machine: start.machine,
+        epoch: start.epoch,
+        topics: params.topics,
+        subjects: params.subjects,
+        mail_principal,
+        mail_db,
+        allowed_topics,
+    };
+    Ok((
+        serde_json::to_value(result).expect("SubscribeResult serializes"),
+        stream,
+    ))
+}
+
+/// One `events.subscribe` on a connection.
+struct EventStream {
+    sub: Subscription,
+    /// The subscribe request's `id`, set on every frame of the stream.
+    id: Option<String>,
+    machine: String,
+    epoch: String,
+    topics: Vec<String>,
+    subjects: Vec<String>,
+    /// None means local ancestry verification failed: no mail may leave.
+    mail_principal: Option<Principal>,
+    mail_db: Arc<Db>,
+    allowed_topics: Vec<String>,
+}
+
+impl EventStream {
+    fn wants(&self, e: &Event) -> bool {
+        let topic_ok = self.topics.is_empty() || topic_wanted(&self.topics, &e.topic);
+        let subject_ok = self.subjects.is_empty()
+            || e.subject
+                .as_ref()
+                .is_some_and(|s| self.subjects.contains(s));
+        self.allowed_topics.contains(&e.topic) && topic_ok && subject_ok
+    }
+
+    /// Apply ownership to every batch, including replay and catch-up. Use
+    /// the stored message, not client filters or optional event metadata.
+    async fn filter_mail(&self, mut batch: Vec<Event>) -> Vec<Event> {
+        match &self.mail_principal {
+            Some(Principal::LocalUnverified) => batch,
+            None => {
+                batch.retain(|e| e.topic != mail::TOPIC);
+                batch
+            }
+            Some(who) => {
+                if !batch.iter().any(|e| e.topic == mail::TOPIC) {
+                    return batch;
+                }
+                let who = who.clone();
+                let db = self.mail_db.clone();
+                blocking(move || {
+                    let conn = db.reader().ok();
+                    batch.retain(|e| {
+                        if e.topic != mail::TOPIC {
+                            return true;
+                        }
+                        match (conn.as_ref(), e.data.get("msgId").and_then(|v| v.as_str())) {
+                            (Some(c), Some(id)) => mail::visible(c, &who, id).unwrap_or(false),
+                            _ => false,
+                        }
+                    });
+                    Ok(batch)
+                })
+                .await
+                .unwrap_or_default()
+            }
+        }
+    }
+
+    fn frame(&self, e: Event) -> EventFrame {
+        EventFrame {
+            v: API_MAJOR,
+            kind: EventType::Event,
+            sub: self.id.clone(),
+            cursor: format!("{}:{}:{}", self.machine, self.epoch, e.seq),
+            topic: e.topic,
+            subject: e.subject,
+            ts: e.ts,
+            origin: e.origin,
+            data: e.data,
+        }
+    }
+
+    /// Send events until the connection closes or the subscription fails.
+    /// A full write queue only parks this task.
+    async fn run(mut self, tx: mpsc::Sender<Vec<u8>>) {
+        loop {
+            let batch = match self.sub.next().await {
+                Ok(Some(batch)) => batch,
+                Ok(None) => return,
+                Err(e) => {
+                    let _ = tx
+                        .send(encode(&Response::err(self.id.clone(), read_error(e))))
+                        .await;
+                    return;
+                }
+            };
+            for e in self.filter_mail(batch).await {
+                if !self.wants(&e) {
+                    continue;
+                }
+                if tx.send(encode_event(&self.frame(e))).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Capabilities this engine offers; a client gets the ones it `want`s.
+const CAPABILITIES: &[&str] = &[PROGRESS_CAPABILITY, "annotations"];
+
+fn hello(
+    req: Request,
+    ctx: &ServerCtx,
+    peer: Peer,
+    principal: &Principal,
+    conn: &mut Option<Conn>,
+) -> (Response, Next) {
+    let id = req.id.clone();
+    if let Err(e) = authz::authorize("hello", principal, None) {
+        return (Response::err(id, e), Next::Close);
+    }
+    let params: HelloParams = if req.params.is_null() {
+        HelloParams::default()
+    } else {
+        match serde_json::from_value(req.params) {
+            Ok(p) => p,
+            Err(e) => {
+                let next = if conn.is_some() {
+                    Next::Continue
+                } else {
+                    Next::Close
+                };
+                return (
+                    Response::err(
+                        id,
+                        ApiError::new(ErrorCode::BadRequest, format!("bad hello params: {}", e)),
+                    ),
+                    next,
+                );
+            }
+        }
+    };
+    if let Some(major) = params.api_major.filter(|m| *m != API_MAJOR) {
+        return (
+            Response::err(
+                id,
+                ApiError::new(
+                    ErrorCode::UpgradeRequired,
+                    format!(
+                        "client speaks c9p/{}, this engine speaks c9p/{}",
+                        major, API_MAJOR
+                    ),
+                ),
+            ),
+            Next::Close,
+        );
+    }
+    let capabilities: Vec<String> = params
+        .want
+        .iter()
+        .filter(|w| CAPABILITIES.contains(&w.as_str()))
+        .cloned()
+        .collect();
+    let principal = match conn {
+        Some(c) => {
+            c.capabilities = capabilities.clone();
+            c.principal.clone()
+        }
+        None => {
+            *conn = Some(Conn {
+                principal: principal.clone(),
+                capabilities: capabilities.clone(),
+            });
+            principal.clone()
+        }
+    };
+    // The client's claim about itself is logged as unverified and nothing
+    // else: it never decides the principal (N1).
+    if let Some(client) = &params.client {
+        elog!(
+            Info,
+            "api",
+            "hello pid={} principal={} unverified client claim kind={:?} name={:?} version={:?}",
+            peer.unix().map(|p| p.cred.pid).unwrap_or(0),
+            principal,
+            client.kind,
+            client.name,
+            client.version
+        );
+    }
+    let result = HelloResult {
+        api_major: API_MAJOR,
+        api_minor: API_MINOR,
+        engine_version: ctx.engine_version.clone(),
+        machine_id: ctx.machine_id.clone(),
+        principal: principal.to_string(),
+        capabilities,
+        cursor: ctx.db.as_ref().map(|db| db.head_cursor().to_string()),
+        methods: authz::methods(&principal, None),
+        breaking_since: discovery::breaking_since(
+            discovery::METHOD_INFO,
+            params.api_minor.unwrap_or(0),
+        ),
+        stability: discovery::PREVIEW.into(),
+        topics: authz::topics(&principal, None),
+        limits: discovery::limits(),
+    };
+    let result = serde_json::to_value(result).expect("HelloResult serializes");
+    (Response::ok(id, result), Next::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+    fn ctx(hello_timeout: Duration) -> Arc<ServerCtx> {
+        ctx_with(hello_timeout, Arc::new(NoLiveAgents))
+    }
+
+    fn ctx_with(hello_timeout: Duration, agents: Arc<dyn LiveAgents>) -> Arc<ServerCtx> {
+        Arc::new(ServerCtx {
+            engine_version: "9.9.9".into(),
+            machine_id: "m-test".into(),
+            hello_timeout,
+            agents,
+            engine_uid: peer::engine_uid(),
+            agent_bin: None,
+            db: None,
+            merge: Arc::new(MergeTable::new()),
+            standing_orders: None,
+            spawner: None,
+            drain: Arc::new(DrainSwitch::new()),
+            first_tick: Arc::new(FirstTick::open_now()),
+            header_key: None,
+            detection: None,
+            user_home: Some(PathBuf::from("/nonexistent/c9watch-test-home")),
+            cost_cache: None,
+            usage: None,
+            idem: Arc::new(IdemCache::new()),
+            observed: None,
+        })
+    }
+
+    /// A connected client stream, served by `serve_conn` on the other end.
+    fn connect(ctx: Arc<ServerCtx>) -> UnixStream {
+        let (client, server) = UnixStream::pair().unwrap();
+        tokio::spawn(serve_conn(server, ctx));
+        client
+    }
+
+    async fn send(c: &mut UnixStream, v: Value) {
+        let mut line = serde_json::to_vec(&v).unwrap();
+        line.push(b'\n');
+        c.write_all(&line).await.unwrap();
+    }
+
+    /// Read every response until the engine closes the connection.
+    async fn read_all(c: UnixStream) -> Vec<Value> {
+        let mut out = Vec::new();
+        let mut lines = BufReader::new(c).lines();
+        while let Some(l) = lines.next_line().await.unwrap() {
+            out.push(serde_json::from_str(&l).unwrap());
+        }
+        out
+    }
+
+    async fn read_one(c: &mut UnixStream) -> Value {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            c.read_exact(&mut byte).await.unwrap();
+            if byte[0] == b'\n' {
+                return serde_json::from_slice(&buf).unwrap();
+            }
+            buf.push(byte[0]);
+        }
+    }
+
+    fn hello_req(id: &str, params: Value) -> Value {
+        json!({"v": 1, "id": id, "method": "hello", "params": params})
+    }
+
+    #[tokio::test]
+    async fn hello_returns_the_engine_facts() {
+        let mut c = connect(ctx(HELLO_TIMEOUT));
+        send(
+            &mut c,
+            hello_req("1", json!({"apiMajor": 1, "want": ["nope"]})),
+        )
+        .await;
+        let r = read_one(&mut c).await;
+        assert_eq!(r["id"], "1");
+        assert_eq!(r["ok"], true, "{}", r);
+        let res = &r["result"];
+        assert_eq!(res["apiMajor"], 1);
+        assert_eq!(res["apiMinor"], API_MINOR);
+        assert_eq!(res["engineVersion"], "9.9.9");
+        assert_eq!(res["machineId"], "m-test");
+        assert_eq!(res["principal"], "local-unverified");
+        assert_eq!(res["capabilities"], json!([]));
+        assert!(res["cursor"].is_null());
+
+        // After hello the connection stays open for more frames.
+        send(&mut c, json!({"v": 1, "id": "2", "method": "no.such"})).await;
+        let r = read_one(&mut c).await;
+        assert_eq!(r["id"], "2");
+        assert_eq!(r["error"]["code"], "unknown_method");
+    }
+
+    #[tokio::test]
+    async fn major_mismatch_is_upgrade_required() {
+        let mut c = connect(ctx(HELLO_TIMEOUT));
+        send(&mut c, hello_req("1", json!({"apiMajor": 2}))).await;
+        let got = read_all(c).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["error"]["code"], "upgrade_required");
+
+        // A v2 envelope is a mismatch too.
+        let mut c = connect(ctx(HELLO_TIMEOUT));
+        send(
+            &mut c,
+            json!({"v": 2, "id": "1", "method": "hello", "params": {}}),
+        )
+        .await;
+        let got = read_all(c).await;
+        assert_eq!(got[0]["error"]["code"], "upgrade_required");
+        assert_eq!(got[0]["id"], "1");
+    }
+
+    #[tokio::test]
+    async fn no_hello_in_time_closes_the_connection() {
+        let c = connect(ctx(Duration::from_millis(100)));
+        let got = tokio::time::timeout(Duration::from_secs(5), read_all(c))
+            .await
+            .expect("engine closes the connection");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["error"]["code"], "hello_timeout");
+        assert_eq!(got[0]["error"]["retryable"], true);
+    }
+
+    #[tokio::test]
+    async fn blank_lines_do_not_extend_the_hello_deadline() {
+        let c = connect(ctx(Duration::from_millis(200)));
+        let (read, mut write) = c.into_split();
+        let ticker = tokio::spawn(async move {
+            // Ends once the engine closes and the write fails.
+            while write.write_all(b"\n").await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let mut lines = BufReader::new(read).lines();
+        let first = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("engine answers within the hello deadline")
+            .unwrap()
+            .expect("one error frame");
+        let v: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(v["error"]["code"], "hello_timeout");
+        ticker.abort();
+    }
+
+    #[tokio::test]
+    async fn a_peer_under_another_uid_is_rejected() {
+        let mut ctx = ServerCtx::new("m".into());
+        ctx.engine_uid = peer::engine_uid().wrapping_add(1);
+        // The engine answers before any frame, then closes.
+        let c = connect(Arc::new(ctx));
+        let got = read_all(c).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["error"]["code"], "peer_uid_mismatch");
+    }
+
+    #[tokio::test]
+    async fn missing_v_after_hello_is_a_bad_request() {
+        let mut c = connect(ctx(HELLO_TIMEOUT));
+        send(&mut c, hello_req("1", json!({}))).await;
+        assert_eq!(read_one(&mut c).await["ok"], true);
+        send(&mut c, json!({"id": "2", "method": "x"})).await;
+        let r = read_one(&mut c).await;
+        assert_eq!(r["id"], "2");
+        assert_eq!(r["error"]["code"], "bad_request");
+        // Still open; an explicit v2 then closes it.
+        send(&mut c, json!({"v": 2, "id": "3", "method": "x"})).await;
+        let got = read_all(c).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["error"]["code"], "upgrade_required");
+    }
+
+    #[tokio::test]
+    async fn first_frame_must_be_hello() {
+        let mut c = connect(ctx(HELLO_TIMEOUT));
+        send(&mut c, json!({"v": 1, "id": "1", "method": "session.list"})).await;
+        let got = read_all(c).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["error"]["code"], "hello_required");
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_closes_the_connection() {
+        let mut c = connect(ctx(HELLO_TIMEOUT));
+        send(&mut c, hello_req("1", json!({}))).await;
+        assert_eq!(read_one(&mut c).await["ok"], true);
+        let big = format!(
+            "{{\"v\":1,\"id\":\"2\",\"method\":\"x\",\"params\":\"{}\"}}\n",
+            "a".repeat(MAX_FRAME)
+        );
+        // The engine may close while we still write; ignore that error.
+        let _ = c.write_all(big.as_bytes()).await;
+        let got = read_all(c).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["error"]["code"], "frame_too_large");
+    }
+
+    #[tokio::test]
+    async fn unknown_fields_and_bad_json_after_hello() {
+        let mut c = connect(ctx(HELLO_TIMEOUT));
+        send(
+            &mut c,
+            json!({"v": 1, "id": "1", "method": "hello", "later": [1, 2],
+                   "params": {"client": {"kind": "cli", "name": "c9watch", "new": 1}, "x": {}}}),
+        )
+        .await;
+        assert_eq!(read_one(&mut c).await["ok"], true);
+        c.write_all(b"{not json\n").await.unwrap();
+        assert_eq!(read_one(&mut c).await["error"]["code"], "bad_request");
+        // Still open: a second hello answers again with the same principal.
+        send(&mut c, hello_req("3", json!({}))).await;
+        let r = read_one(&mut c).await;
+        assert_eq!(r["id"], "3");
+        assert_eq!(r["result"]["principal"], "local-unverified");
+    }
+
+    #[tokio::test]
+    async fn serve_accepts_on_a_real_socket() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("e.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(serve(listener, ctx(HELLO_TIMEOUT)));
+        let mut c = UnixStream::connect(&path).await.unwrap();
+        send(&mut c, hello_req("1", json!({"apiMajor": 1}))).await;
+        assert_eq!(read_one(&mut c).await["result"]["apiMajor"], 1);
+        server.abort();
+    }
+
+    /// Hello with `params` from the test process, and the stamped principal.
+    async fn principal_for(agents: Arc<dyn LiveAgents>, params: Value) -> Value {
+        let mut c = connect(ctx_with(HELLO_TIMEOUT, agents));
+        send(&mut c, hello_req("1", params)).await;
+        let r = read_one(&mut c).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        r
+    }
+
+    #[tokio::test]
+    async fn cli_and_gui_connections_are_local_unverified() {
+        for kind in ["cli", "gui"] {
+            let r = principal_for(
+                Arc::new(NoLiveAgents),
+                json!({"client": {"kind": kind, "name": "c9watch"}}),
+            )
+            .await;
+            assert_eq!(r["result"]["principal"], "local-unverified", "{}", kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_claim_is_local_unverified() {
+        let r = principal_for(
+            Arc::new(NoLiveAgents),
+            json!({"client": {"kind": "gateway", "name": "x"}, "clientId": "x"}),
+        )
+        .await;
+        assert_eq!(r["result"]["principal"], "local-unverified");
+        assert!(!r.to_string().contains("client:"), "{}", r);
+    }
+
+    #[tokio::test]
+    async fn descendant_of_a_live_pty_child_is_the_agent() {
+        // The peer is this test process; pretend its parent is the PTY child.
+        let me = std::process::id() as libc::pid_t;
+        let parent = peer::proc_info(me).unwrap().ppid;
+        let start = peer::proc_info(parent).unwrap().start;
+        let agents = principal::tests::FakeAgents::one("a7", parent, start);
+        let r = principal_for(Arc::new(agents), json!({"client": {"kind": "cli"}})).await;
+        assert_eq!(r["result"]["principal"], "agent:a7");
+
+        // Same pid, other start time: a reused pid is not the agent.
+        let agents = principal::tests::FakeAgents::one("a7", parent, start + 1);
+        let r = principal_for(Arc::new(agents), json!({})).await;
+        assert_eq!(r["result"]["principal"], "local-unverified");
+    }
+
+    // ── Store-backed methods (C1a-13) ──────────────────────────────────
+
+    use crate::engine::db::outbox::{self, NewEvent};
+    use tokio::io::Lines;
+    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+
+    const MACHINE: &str = "m-test";
+
+    /// `docs/api/c9p-1.json` must equal `schema()`. With
+    /// `C9P_SCHEMA_WRITE=1` the test rewrites the file instead.
+    #[test]
+    fn schema_file_is_current() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/api/c9p-1.json");
+        let want = serde_json::to_string_pretty(&schema()).unwrap() + "\n";
+        if std::env::var_os("C9P_SCHEMA_WRITE").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, want).unwrap();
+            return;
+        }
+        let have = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            have == want,
+            "docs/api/c9p-1.json is stale. Run `C9P_SCHEMA_WRITE=1 cargo test --no-default-features \
+             --features engine schema_file_is_current`, then `node scripts/gen-c9p-types.mjs`."
+        );
+    }
+
+    #[test]
+    fn schema_has_no_internal_design_codes() {
+        let text = serde_json::to_string(&schema()).unwrap();
+        let codes = regex::Regex::new(r"A:[0-9]+|C1a-[0-9]+|§|\b[DQN][0-9]+\b").unwrap();
+        assert!(
+            !codes.is_match(&text),
+            "internal design code in schema: {:?}",
+            codes.find(&text)
+        );
+    }
+
+    #[test]
+    fn schema_lists_every_method_and_resolves_every_ref() {
+        let s = schema();
+        let methods: Vec<&str> = s["methods"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut want = METHODS.to_vec();
+        want.sort();
+        assert_eq!(methods, want);
+        let text = s.to_string();
+        let defs = s["$defs"].as_object().unwrap();
+        for r in text.split("\"$ref\":\"#/$defs/").skip(1) {
+            let name = &r[..r.find('"').unwrap()];
+            assert!(defs.contains_key(name), "dangling $ref {}", name);
+        }
+        let codes = serde_json::to_string(&s["$defs"]["ErrorCode"]).unwrap();
+        for code in ["upgrade_required", "cursor_expired", "internal"] {
+            assert!(codes.contains(code), "ErrorCode lacks {}", code);
+        }
+    }
+
+    /// Every method in the schema is served: none answers `unknown_method`.
+    #[tokio::test]
+    async fn every_schema_method_is_served() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        for (i, m) in METHODS.iter().enumerate() {
+            let r = c.call_past_busy(&i.to_string(), m, json!({})).await;
+            if is_hook_class(m) {
+                // Served, but only to an agent (C1a-21).
+                assert_eq!(r["error"]["code"], "peer_not_authorized", "{}: {}", m, r);
+            } else if ["agent.create", "agent.retire", "agent.resume"].contains(m) {
+                // This test engine has no spawner.
+                assert_eq!(r["error"]["code"], "internal", "{}: {}", m, r);
+            } else if [
+                "msg.send",
+                "msg.read",
+                "msg.cancel",
+                "mail.pause",
+                "mail.resume",
+                "session.stop",
+                "session.rename",
+                "conversation.get",
+                "history.search",
+                "subagent.transcript",
+                "session.tasks",
+                "provider.opencode.connect",
+                "events.unsubscribe",
+                "auth.can",
+                "annotation.set",
+                "annotation.delete",
+                "annotation.patch",
+            ]
+            .contains(m)
+            {
+                // Each needs a param `{}` lacks (`to`, `sessionKey`, `query`, …).
+                assert_eq!(r["error"]["code"], "bad_request", "{}: {}", m, r);
+            } else if ["detect.recheck", "cost.get", "usage.subscriptions"].contains(m) {
+                // This test engine runs no detection, keeps no cost cache and
+                // reads no subscription usage.
+                assert_eq!(r["error"]["code"], "internal", "{}: {}", m, r);
+            } else {
+                assert_eq!(r["ok"], true, "{}: {}", m, r);
+            }
+        }
+        let r = c.call("x", "no.such", json!({})).await;
+        assert_eq!(r["error"]["code"], "unknown_method");
+    }
+
+    // ── Session views (core-public M-a1) ──────────────────────────────
+
+    use crate::engine::detect::{Detector, Observation, Observe};
+    use crate::session::{DetectedSession, Session, SessionStatus};
+
+    /// What the next tick sees, set by the test.
+    #[derive(Clone, Default)]
+    struct Scripted(Arc<std::sync::Mutex<(Vec<Session>, Vec<DetectedSession>, u32)>>);
+
+    impl Scripted {
+        fn set(&self, sessions: Vec<Session>, detected: Vec<DetectedSession>) {
+            let mut g = self.0.lock().unwrap();
+            g.0 = sessions;
+            g.1 = detected;
+        }
+        fn rechecks(&self) -> u32 {
+            self.0.lock().unwrap().2
+        }
+    }
+
+    impl Observe for Scripted {
+        fn observe(&mut self) -> Result<Observation, String> {
+            Ok(Observation {
+                sessions: self.0.lock().unwrap().0.clone(),
+                failed: Vec::new(),
+                diagnostics: None,
+            })
+        }
+        fn detected(&mut self) -> Result<Vec<DetectedSession>, String> {
+            Ok(self.0.lock().unwrap().1.clone())
+        }
+        fn recheck(&mut self) {
+            self.0.lock().unwrap().2 += 1;
+        }
+        fn backend_name(&self) -> &'static str {
+            "script"
+        }
+    }
+
+    /// `ctx_db` with a detection that runs `script`, after one tick.
+    fn ctx_detect(
+        agents: Arc<dyn LiveAgents>,
+        script: &Scripted,
+    ) -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Db>, Arc<Detection>) {
+        let (t, ctx, db) = ctx_db(agents);
+        let detection = Detection::new(db.clone());
+        detection.install(Detector::new(Box::new(script.clone()), MACHINE.into()));
+        detection.tick().unwrap();
+        let ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .unwrap()
+            .with_detection(detection.clone());
+        (t, Arc::new(ctx), db, detection)
+    }
+
+    fn fixture(id: &str, status: SessionStatus) -> Session {
+        Session::fixture(id, status)
+    }
+
+    /// Parity: `session.views` answers the sessions of the last tick as the
+    /// GUI's JSON, and a subscriber from its cursor sees `session.view` and
+    /// `session.gone` for what `detect.recheck`'s tick changed.
+    #[tokio::test]
+    async fn session_views_answer_the_gui_json_and_stream_changes() {
+        let script = Scripted::default();
+        let a = fixture("a", SessionStatus::Working);
+        let b = fixture("b", SessionStatus::Working);
+        script.set(vec![a.clone(), b.clone()], vec![]);
+        let (_t, ctx, _db, _d) = ctx_detect(Arc::new(NoLiveAgents), &script);
+        let (mut c, _) = Client::new(ctx.clone()).await;
+        let r = c.call("1", "session.views", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        assert_eq!(
+            r["result"]["sessions"],
+            serde_json::to_value(vec![a.clone(), b.clone()]).unwrap()
+        );
+        let cursor = r["result"]["cursor"].as_str().unwrap().to_string();
+
+        let (mut sub, _) = Client::new(ctx.clone()).await;
+        let r = sub
+            .call(
+                "s",
+                "events.subscribe",
+                json!({"since": cursor, "topics": ["session.*"]}),
+            )
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+
+        let a2 = fixture("a", SessionStatus::WaitingForInput);
+        script.set(vec![a2.clone()], vec![]);
+        let r = c.call("2", "detect.recheck", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        assert_eq!(r["result"]["backend"], "script");
+        assert_eq!(script.rechecks(), 1);
+        let view = sub.next().await;
+        assert_eq!(view["topic"], "session.view", "{}", view);
+        assert_eq!(view["subject"], format!("{}/claudeCode:a", MACHINE));
+        assert_eq!(view["data"], serde_json::to_value(&a2).unwrap());
+        let gone = sub.next().await;
+        assert_eq!(gone["topic"], "session.gone", "{}", gone);
+        assert_eq!(gone["data"]["sessionKey"], "claudeCode:b");
+        // The answer's cursor is at or after both events.
+        assert!(seq_of(&r["result"]) >= seq_of(&gone));
+        let r = c.call("3", "session.views", json!({})).await;
+        assert_eq!(
+            r["result"]["sessions"],
+            serde_json::to_value(vec![a2]).unwrap()
+        );
+    }
+
+    /// D6: `snapshot.get` and `session.list` carry the detector health, and
+    /// `observedAt` is its `lastOkAt` (both read before the rows). An engine
+    /// without detection sends neither.
+    #[tokio::test]
+    async fn snapshot_and_session_list_carry_the_detector_health() {
+        let script = Scripted::default();
+        script.set(vec![fixture("a", SessionStatus::Working)], vec![]);
+        let (_t, ctx, _db, _d) = ctx_detect(Arc::new(NoLiveAgents), &script);
+        let (mut c, _) = Client::new(ctx).await;
+        for (id, method) in [("1", "snapshot.get"), ("2", "session.list")] {
+            let r = c.call(id, method, json!({})).await;
+            assert_eq!(r["ok"], true, "{}", r);
+            let h = &r["result"]["detectorHealth"];
+            assert_eq!(h["state"], "ok", "{}", r);
+            assert_eq!(h["stale"], false);
+            assert!(r["result"]["observedAt"].is_i64(), "{}", r);
+            assert_eq!(r["result"]["observedAt"], h["lastOkAt"]);
+        }
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c.call("3", "snapshot.get", json!({})).await;
+        assert!(r["result"].get("detectorHealth").is_none(), "{}", r);
+        assert!(r["result"].get("observedAt").is_none(), "{}", r);
+    }
+
+    /// `session.away` answers `away::away_activity`, the reader of the
+    /// GUI's `get_away_activity`; an unknown session is absent.
+    #[tokio::test]
+    async fn session_away_reads_the_away_index() {
+        let script = Scripted::default();
+        let (_t, ctx, _db, _d) = ctx_detect(Arc::new(NoLiveAgents), &script);
+        let (mut c, _) = Client::new(ctx).await;
+        let requests = json!([{"sessionKey": "claudeCode:nobody-away-api", "sinceMs": 0}]);
+        let r = c
+            .call("1", "session.away", json!({"requests": requests}))
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let reqs: Vec<crate::session::away::AwayRequest> =
+            serde_json::from_value(requests).unwrap();
+        assert_eq!(
+            r["result"]["activity"],
+            serde_json::to_value(crate::session::away::away_activity(&reqs)).unwrap()
+        );
+        assert_eq!(r["result"]["activity"], json!({}));
+        let r = c.call("2", "session.away", json!({"requests": 3})).await;
+        assert_eq!(r["error"]["code"], "bad_request", "{}", r);
+    }
+
+    /// `session.stop` signals the detected pid, and its tick writes
+    /// `session.gone` before the answer.
+    #[tokio::test]
+    async fn session_stop_writes_session_gone_before_it_answers() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = crate::actions::process_start_secs(pid).expect("the sleep's start time");
+        let detected = DetectedSession {
+            process_start_secs: Some(start),
+            ..DetectedSession::with_legacy_defaults(
+                pid,
+                "/tmp".into(),
+                "/tmp/proj".into(),
+                Some("stop-api".to_string()),
+                "proj".to_string(),
+            )
+        };
+        let mut live = fixture("stop-api", SessionStatus::Working);
+        live.pid = pid;
+        let script = Scripted::default();
+        script.set(vec![live], vec![detected]);
+        let (_t, ctx, db, _d) = ctx_detect(Arc::new(NoLiveAgents), &script);
+        // Reap the sleep once the signal lands; detection then sees it gone.
+        let reaper = {
+            let script = script.clone();
+            std::thread::spawn(move || {
+                child.wait().unwrap();
+                script.set(vec![], vec![]);
+            })
+        };
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c
+            .call(
+                "1",
+                "session.stop",
+                json!({"sessionKey": "claudeCode:nope"}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "unknown_session", "{}", r);
+        let r = c
+            .call(
+                "2",
+                "session.stop",
+                json!({"sessionKey": "claudeCode:stop-api", "pid": pid + 1}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "action_failed", "{}", r);
+        let r = c
+            .call(
+                "3",
+                "session.stop",
+                json!({"sessionKey": "claudeCode:stop-api"}),
+            )
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let answered = seq_of(&r["result"]);
+        let gone: i64 = db
+            .reader()
+            .unwrap()
+            .query_row(
+                "SELECT seq FROM events WHERE topic = 'session.gone' \
+                 AND json_extract(payload, '$.sessionKey') = 'claudeCode:stop-api'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            gone <= answered,
+            "gone {} after the answer {}",
+            gone,
+            answered
+        );
+        reaper.join().unwrap();
+    }
+
+    /// `session.rename` validates like the GUI: a provider other than
+    /// Claude Code is refused before anything is written.
+    #[tokio::test]
+    async fn session_rename_refuses_other_providers() {
+        let script = Scripted::default();
+        let (_t, ctx, _db, _d) = ctx_detect(Arc::new(NoLiveAgents), &script);
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c
+            .call(
+                "1",
+                "session.rename",
+                json!({"sessionId": "x", "newName": "n", "provider": "codex"}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "bad_request", "{}", r);
+    }
+
+    /// Principal table: an agent reads the views and the away index, and
+    /// may not recheck, stop or rename; each refusal is audited.
+    #[tokio::test]
+    async fn an_agent_reads_session_views_but_may_not_act_on_sessions() {
+        let script = Scripted::default();
+        script.set(vec![fixture("a", SessionStatus::Working)], vec![]);
+        let (_t, ctx, db, _d) = ctx_detect(as_agent("a7"), &script);
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["principal"], "agent:a7");
+        let r = c.call("1", "session.views", json!({})).await;
+        assert_eq!(
+            r["result"]["sessions"].as_array().unwrap().len(),
+            1,
+            "{}",
+            r
+        );
+        let r = c.call("2", "session.away", json!({"requests": []})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        for (i, (m, p)) in [
+            ("detect.recheck", json!({})),
+            ("session.stop", json!({"sessionKey": "claudeCode:a"})),
+            ("session.rename", json!({"sessionId": "a", "newName": "n"})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let r = c.call(&format!("m{}", i), m, p).await;
+            assert_eq!(r["error"]["code"], "not_allowed", "{}: {}", m, r);
+        }
+        assert_eq!(script.rechecks(), 0);
+        let denied: Vec<String> = audit_rows(&db)
+            .into_iter()
+            .filter(|r| r.2 == "deny")
+            .map(|r| r.1)
+            .collect();
+        assert_eq!(denied, ["detect.recheck", "session.stop", "session.rename"]);
+    }
+
+    /// A server context with a fresh store, and the store.
+    fn ctx_db(agents: Arc<dyn LiveAgents>) -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Db>) {
+        let t = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::engine::db::open(&t.path().join("engine"), MACHINE).unwrap());
+        let ctx = Arc::new(ServerCtx {
+            engine_version: "9.9.9".into(),
+            machine_id: MACHINE.into(),
+            hello_timeout: HELLO_TIMEOUT,
+            agents,
+            engine_uid: peer::engine_uid(),
+            agent_bin: None,
+            db: Some(db.clone()),
+            merge: Arc::new(MergeTable::new()),
+            standing_orders: None,
+            spawner: None,
+            drain: Arc::new(DrainSwitch::new()),
+            first_tick: Arc::new(FirstTick::open_now()),
+            header_key: None,
+            detection: None,
+            user_home: Some(t.path().join("home")),
+            cost_cache: None,
+            usage: None,
+            idem: Arc::new(IdemCache::new()),
+            observed: None,
+        });
+        (t, ctx, db)
+    }
+
+    struct Client {
+        lines: Lines<BufReader<OwnedReadHalf>>,
+        write: OwnedWriteHalf,
+    }
+
+    impl Client {
+        /// Connect and say `hello`; returns the hello result too.
+        async fn new(ctx: Arc<ServerCtx>) -> (Client, Value) {
+            Client::hello(ctx, json!({})).await
+        }
+
+        /// Connect and say `hello` with `params`.
+        async fn hello(ctx: Arc<ServerCtx>, params: Value) -> (Client, Value) {
+            let (read, write) = connect(ctx).into_split();
+            let mut c = Client {
+                lines: BufReader::new(read).lines(),
+                write,
+            };
+            let r = c.call("h", "hello", params).await;
+            assert_eq!(r["ok"], true, "{}", r);
+            (c, r["result"].clone())
+        }
+
+        async fn send(&mut self, id: &str, method: &str, params: Value) {
+            self.send_raw(json!({"v": 1, "id": id, "method": method, "params": params}))
+                .await;
+        }
+
+        async fn send_raw(&mut self, frame: Value) {
+            let mut line = serde_json::to_vec(&frame).unwrap();
+            line.push(b'\n');
+            self.write.write_all(&line).await.unwrap();
+        }
+
+        async fn next(&mut self) -> Value {
+            let line = tokio::time::timeout(Duration::from_secs(10), self.lines.next_line())
+                .await
+                .expect("a frame within 10 s")
+                .unwrap()
+                .expect("connection open");
+            serde_json::from_str(&line).unwrap()
+        }
+
+        async fn call(&mut self, id: &str, method: &str, params: Value) -> Value {
+            self.send(id, method, params).await;
+            self.next().await
+        }
+
+        /// `call`, again while it answers `busy`: the subagent reads share
+        /// one process-wide scan gate with the tests running beside this one.
+        async fn call_past_busy(&mut self, id: &str, method: &str, params: Value) -> Value {
+            for _ in 0..100 {
+                let r = self.call(id, method, params.clone()).await;
+                if r["error"]["code"] != "busy" {
+                    return r;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("{} stayed busy", method)
+        }
+    }
+
+    fn event(topic: &str, subject: &str, n: usize, pad: usize) -> NewEvent {
+        NewEvent {
+            topic: topic.into(),
+            subject: Some(subject.into()),
+            origin: Some(json!({"kind": "system"})),
+            data: json!({"n": n, "pad": "x".repeat(pad)}),
+        }
+    }
+
+    /// Emit `n` events, one write transaction each.
+    async fn emit(db: &Db, n: usize, pad: usize) {
+        for i in 0..n {
+            let e = event("agent.upsert", "m-test/a1", i, pad);
+            db.write(move |tx| tx.emit(&e)).await.unwrap();
+        }
+    }
+
+    fn seq_of(frame: &Value) -> i64 {
+        Cursor::parse(frame["cursor"].as_str().unwrap())
+            .unwrap()
+            .seq
+    }
+
+    #[tokio::test]
+    async fn hello_and_snapshot_return_the_head_cursor() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        emit(&db, 3, 0).await;
+        let head = format!("{}:{}:3", MACHINE, db.epoch());
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["cursor"], head);
+        let r = c.call("1", "snapshot.get", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        assert_eq!(r["result"]["cursor"], head);
+        assert_eq!(r["result"]["machineId"], MACHINE);
+        assert_eq!(r["result"]["agents"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn snapshot_agents_are_typed_camel_case_rows() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        db.write(|tx| {
+            tx.execute(
+                "INSERT INTO agents (id, role, provider, provider_sid, source, \
+                 interrupted_note_pending) \
+                 VALUES ('a1', 'observed', 'claude', 'sid-1', 'detected', 1)",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c.call("1", "snapshot.get", json!({})).await;
+        assert_eq!(
+            r["result"]["agents"],
+            json!([{
+                "id": "a1",
+                "generation": 0,
+                "mode": null,
+                "role": "observed",
+                "control": "none",
+                "provider": "claude",
+                "providerSid": "sid-1",
+                "source": "detected",
+                "createdBy": null,
+                "goneAt": null,
+                "resumeCount": 0,
+                "interruptedNotePending": true,
+                "sessionKey": null,
+                "machineId": null,
+                "state": null,
+                "status": null,
+                "cwd": null,
+                "name": null,
+                "pid": null,
+                "startedAt": null,
+                "createdAt": null,
+                "lastSeen": null,
+                "parentId": null,
+                "stateReason": null
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_does_not_block_the_writer_and_catches_up_without_gaps() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c.call("s", "events.subscribe", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        assert_eq!(seq_of(&r["result"]), 0);
+
+        // The client reads nothing while ~6 MB of events are written: far
+        // more than the socket buffer and the write queue hold.
+        const N: usize = 3000;
+        tokio::time::timeout(Duration::from_secs(30), emit(&db, N, 2000))
+            .await
+            .expect("the writer is not blocked by the slow subscriber");
+
+        let mut seqs = Vec::with_capacity(N);
+        while seqs.len() < N {
+            let f = c.next().await;
+            assert_eq!(f["type"], "event", "{}", f);
+            assert_eq!(f["sub"], "s");
+            assert_eq!(f["data"]["n"], seqs.len());
+            seqs.push(seq_of(&f));
+        }
+        assert_eq!(seqs, (1..=N as i64).collect::<Vec<_>>());
+
+        // Caught up, the stream is live again.
+        emit(&db, 1, 0).await;
+        assert_eq!(seq_of(&c.next().await), N as i64 + 1);
+    }
+
+    #[tokio::test]
+    async fn expired_cursor_errors_and_the_snapshot_cursor_resumes() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        emit(&db, 5, 0).await;
+        db.writer()
+            .call(|c| outbox::prune_with(c, 0, 2))
+            .await
+            .unwrap()
+            .unwrap();
+        let (mut c, _) = Client::new(ctx).await;
+        let epoch = db.epoch().to_string();
+
+        // Events 2 and 3 are gone.
+        let r = c
+            .call(
+                "1",
+                "events.subscribe",
+                json!({"since": format!("{}:{}:1", MACHINE, epoch)}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "cursor_expired", "{}", r);
+        assert!(r["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("snapshot.get"));
+        // An old epoch.
+        let r = c
+            .call(
+                "2",
+                "events.subscribe",
+                json!({"since": format!("{}:old:5", MACHINE)}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "cursor_expired", "{}", r);
+        // Not a cursor.
+        let r = c
+            .call("3", "events.subscribe", json!({"since": "nope"}))
+            .await;
+        assert_eq!(r["error"]["code"], "bad_request", "{}", r);
+
+        let snap = c.call("4", "snapshot.get", json!({})).await;
+        let cursor = snap["result"]["cursor"].as_str().unwrap().to_string();
+        let r = c
+            .call("5", "events.subscribe", json!({"since": cursor}))
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        assert_eq!(r["result"]["cursor"], cursor);
+        emit(&db, 1, 0).await;
+        let f = c.next().await;
+        assert_eq!(f["sub"], "5");
+        assert_eq!(f["cursor"], format!("{}:{}:6", MACHINE, epoch));
+        assert_eq!(f["topic"], "agent.upsert");
+        assert_eq!(f["subject"], "m-test/a1");
+        assert_eq!(f["origin"]["kind"], "system");
+    }
+
+    #[tokio::test]
+    async fn subscribe_replays_from_since_and_filters() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        for (topic, subject) in [
+            ("agent.upsert", "m/a1"),
+            ("session.seen", "m/a1"),
+            ("agent.gone", "m/a2"),
+            ("agentx.y", "m/a2"),
+        ] {
+            let e = event(topic, subject, 0, 0);
+            db.write(move |tx| tx.emit(&e)).await.unwrap();
+        }
+        let since = format!("{}:{}:0", MACHINE, db.epoch());
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c
+            .call(
+                "t",
+                "events.subscribe",
+                json!({"since": since, "topics": ["agent.*"]}),
+            )
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        // Events of "t" may arrive before the response to "s".
+        c.send(
+            "s",
+            "events.subscribe",
+            json!({"since": since, "subjects": ["m/a2"]}),
+        )
+        .await;
+        let mut got = Vec::new();
+        while got.len() < 3 {
+            let f = c.next().await;
+            if f["type"] == "event" {
+                got.push((f["sub"].as_str().unwrap().to_string(), seq_of(&f)));
+            } else {
+                assert_eq!((&f["id"], &f["ok"]), (&json!("s"), &json!(true)), "{}", f);
+            }
+        }
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("s".to_string(), 3),
+                ("t".to_string(), 1),
+                ("t".to_string(), 3)
+            ]
+        );
+        // Unclassified topics (session.seen and agentx.y) must not pass,
+        // even on an otherwise unrestricted local subscription. A subsequent
+        // classified event proves both streams advanced beyond the hidden rows.
+        let e = event("agent.upsert", "m/a2", 1, 0);
+        db.write(move |tx| tx.emit(&e)).await.unwrap();
+        let mut subs = Vec::new();
+        for _ in 0..2 {
+            let f = c.next().await;
+            assert_eq!(seq_of(&f), 5, "unclassified topic leaked: {f}");
+            subs.push(f["sub"].as_str().unwrap().to_string());
+        }
+        subs.sort();
+        assert_eq!(subs, ["s", "t"]);
+    }
+
+    #[tokio::test]
+    async fn an_agent_principal_may_read_the_store() {
+        let me = std::process::id() as libc::pid_t;
+        let parent = peer::proc_info(me).unwrap().ppid;
+        let start = peer::proc_info(parent).unwrap().start;
+        let agents = principal::tests::FakeAgents::one("a7", parent, start);
+        let (_t, ctx, _db) = ctx_db(Arc::new(agents));
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["principal"], "agent:a7");
+        assert_eq!(c.call("1", "snapshot.get", json!({})).await["ok"], true);
+        assert_eq!(c.call("2", "events.subscribe", json!({})).await["ok"], true);
+        assert_eq!(c.call("3", "session.list", json!({})).await["ok"], true);
+        assert_eq!(c.call("4", "agent.list", json!({})).await["ok"], true);
+    }
+
+    /// A detected session's row never makes its processes an agent: only
+    /// the engine's live table does (C1a-33, A:186).
+    #[tokio::test]
+    async fn an_observed_row_is_never_the_agent() {
+        use crate::engine::agents::LiveTable;
+        use crate::engine::driver::ChildId;
+        let me = std::process::id() as libc::pid_t;
+        let parent = peer::proc_info(me).unwrap();
+        let parent = peer::proc_info(parent.ppid).unwrap();
+        let table = Arc::new(LiveTable::new());
+        let (_t, ctx, db) = ctx_db(table.clone());
+        db.write(move |tx| {
+            tx.execute(
+                "INSERT INTO agents (id, role, provider, source, control, pid, started_at) \
+                 VALUES ('obs', 'observed', 'claude', 'detected', 'none', ?1, 1)",
+                [parent.pid],
+            )
+        })
+        .await
+        .unwrap();
+        let (_c, hello) = Client::new(ctx.clone()).await;
+        assert_eq!(hello["principal"], "local-unverified");
+        // The same parent as the PTY child of a live engine agent.
+        table
+            .register(
+                "a7",
+                2,
+                ChildId {
+                    pid: parent.pid,
+                    start: parent.start,
+                },
+            )
+            .unwrap();
+        let (_c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["principal"], "agent:a7");
+    }
+
+    // ── Hook-class methods (C1a-21) ────────────────────────────────────
+
+    const HOOK_CLASS: &[&str] = &[
+        "hook.session_start",
+        "hook.stop",
+        "hook.permission_request",
+        "hook.permission_denied",
+        "hook.notification",
+        "hook.user_prompt_submit",
+        "hook.post_tool_use",
+        "hook.pre_tool_use",
+        "task.done",
+        "agent.handoff",
+    ];
+
+    fn hook_params(agent: &str) -> Value {
+        json!({"agentId": agent, "kind": "claude", "seq": "1", "report": "r", "note": "n",
+               "input": {}})
+    }
+
+    fn audit_rows(db: &Db) -> Vec<(String, String, String, String)> {
+        let conn = db.reader().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT principal, method, decision, reason FROM audit \
+                 WHERE decision = 'deny' ORDER BY seq",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// The test process as the descendant of a live agent's PTY child.
+    fn as_agent(id: &str) -> Arc<dyn LiveAgents> {
+        let me = std::process::id() as libc::pid_t;
+        let parent = peer::proc_info(me).unwrap().ppid;
+        let start = peer::proc_info(parent).unwrap().start;
+        Arc::new(principal::tests::FakeAgents::one(id, parent, start))
+    }
+
+    /// A store-backed context whose agent copy is a fake file: no test
+    /// process runs it.
+    fn ctx_with_bin(agents: Arc<dyn LiveAgents>) -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Db>) {
+        let (t, ctx, db) = ctx_db(agents);
+        let source = t.path().join("c9watch-agent");
+        std::fs::write(&source, b"fake agent").unwrap();
+        let bin = Arc::new(AgentBin::install(&t.path().join("engine"), &source));
+        let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+        ctx.agent_bin = Some(bin);
+        (t, Arc::new(ctx), db)
+    }
+
+    #[tokio::test]
+    async fn hook_class_calls_from_a_local_peer_are_refused_and_audited() {
+        let (_t, ctx, db) = ctx_with_bin(Arc::new(NoLiveAgents));
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["principal"], "local-unverified");
+        let rules = c.call("rules", "auth.rules", json!({})).await;
+        assert_eq!(rules["result"]["methods"], hello["methods"]);
+        for m in HOOK_CLASS {
+            assert!(hello["methods"].get(*m).is_none(), "{m}");
+            let review = c.call("can", "auth.can", json!({"method": m})).await;
+            assert_eq!(review["result"]["allowed"], false, "{m}: {review}");
+        }
+        assert!(audit_rows(&db).is_empty(), "discovery must not audit");
+        for (i, m) in HOOK_CLASS.iter().enumerate() {
+            let r = c.call(&i.to_string(), m, hook_params("a7")).await;
+            assert_eq!(r["error"]["code"], "peer_not_authorized", "{}: {}", m, r);
+        }
+        let rows = audit_rows(&db);
+        assert_eq!(rows.len(), HOOK_CLASS.len());
+        for (row, m) in rows.iter().zip(HOOK_CLASS) {
+            assert_eq!(row.0, "local-unverified");
+            assert_eq!(row.1, *m);
+            assert_eq!(row.2, "deny");
+            assert!(row.3.starts_with("peer_not_authorized"), "{:?}", row);
+        }
+    }
+
+    /// An agent's process that is not the engine's `c9watch-agent` copy
+    /// (here the test binary; in life, the main binary's `c9watch api`)
+    /// is refused.
+    #[tokio::test]
+    async fn an_agent_running_another_binary_is_refused() {
+        let (_t, ctx, db) = ctx_with_bin(as_agent("a7"));
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["principal"], "agent:a7");
+        for (i, m) in HOOK_CLASS.iter().enumerate() {
+            let r = c.call(&i.to_string(), m, hook_params("a7")).await;
+            assert_eq!(r["error"]["code"], "peer_not_authorized", "{}: {}", m, r);
+            assert!(
+                r["error"]["msg"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not the engine's"),
+                "{}",
+                r
+            );
+        }
+        assert_eq!(audit_rows(&db)[0].0, "agent:a7");
+        // Without any copy, the refusal says so.
+        let (_t, ctx, _db) = ctx_db(as_agent("a7"));
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c.call("1", "hook.stop", hook_params("a7")).await;
+        assert_eq!(r["error"]["code"], "peer_not_authorized");
+        assert!(r["error"]["msg"]
+            .as_str()
+            .unwrap()
+            .contains("no c9watch-agent"));
+    }
+
+    /// Reviews: an agent's create or retire is `not_allowed` and audited,
+    /// also on an engine with no spawner.
+    #[tokio::test]
+    async fn an_agent_may_not_create_or_retire_even_without_a_spawner() {
+        let (_t, ctx, db) = ctx_db(as_agent("a7"));
+        let (mut c, _) = Client::new(ctx).await;
+        for (i, m) in ["agent.create", "agent.retire"].iter().enumerate() {
+            let r = c.call(&i.to_string(), m, json!({})).await;
+            assert_eq!(r["error"]["code"], "not_allowed", "{}: {}", m, r);
+        }
+        let rows: Vec<(String, String)> = audit_rows(&db)
+            .into_iter()
+            .map(|(p, m, _, _)| (p, m))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("agent:a7".to_string(), "agent.create".to_string()),
+                ("agent:a7".to_string(), "agent.retire".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_naming_another_agent_is_refused() {
+        let (_t, ctx, db) = ctx_with_bin(as_agent("a7"));
+        let (mut c, _) = Client::new(ctx).await;
+        for params in [hook_params("a8"), json!({})] {
+            let r = c.call("1", "task.done", params).await;
+            assert_eq!(r["error"]["code"], "peer_not_authorized", "{}", r);
+            assert!(r["error"]["msg"].as_str().unwrap().contains("names agent"));
+        }
+        assert_eq!(audit_rows(&db).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_answers_from_the_row_guard_and_audits_each_deny() {
+        // The handler as `hook_class` runs it after admission: the test
+        // binary is not the engine's agent copy, so it cannot pass AgentExe.
+        let (t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let root = t.path().canonicalize().unwrap().join("root");
+        let (own, other) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let me = Principal::Agent {
+            id: "a7".into(),
+            gen: 1,
+        };
+        let call = |path: &std::path::Path| {
+            let mut p = hook_params("a7");
+            p["input"] = json!({"tool_name": "Write", "tool_input": {"file_path": path}});
+            serde_json::from_value::<HookParams>(p).unwrap()
+        };
+        // No row, or a row without a guard: allow.
+        let r = pre_tool_use(&ctx, &me, call(&other.join("x")))
+            .await
+            .unwrap();
+        assert_eq!(r, json!({"decision": "allow"}));
+        let guard = json!({"denyWriteUnder": [root], "allowWrite": [own]}).to_string();
+        db.write(move |tx| {
+            tx.execute(
+                "INSERT INTO agents (id, role, provider, source, state, guard) \
+                 VALUES ('a7', 'worker', 'claudeCode', 'engine', 'ready', ?1)",
+                [guard],
+            )
+        })
+        .await
+        .unwrap();
+        let r = pre_tool_use(&ctx, &me, call(&own.join("x"))).await.unwrap();
+        assert_eq!(r["decision"], "allow", "{r}");
+        assert!(audit_rows(&db).is_empty());
+        let r = pre_tool_use(&ctx, &me, call(&own.join("../b/x")))
+            .await
+            .unwrap();
+        assert_eq!(r["decision"], "deny", "{r}");
+        let reason = r["reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with(super::super::guard::DENY_PREFIX),
+            "{reason}"
+        );
+        let rows = audit_rows(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "agent:a7");
+        assert_eq!(rows[0].1, "hook.pre_tool_use");
+        assert_eq!(rows[0].3, reason);
+        // The answer is fast: the hook gives up after 3 s.
+        let t0 = std::time::Instant::now();
+        for _ in 0..50 {
+            pre_tool_use(&ctx, &me, call(&own.join("x"))).await.unwrap();
+        }
+        let per_call = t0.elapsed() / 50;
+        assert!(
+            per_call < std::time::Duration::from_millis(50),
+            "{per_call:?}"
+        );
+        eprintln!("pre_tool_use engine answer: {per_call:?} per allow");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_hook_method_is_unknown() {
+        let (_t, ctx, db) = ctx_with_bin(as_agent("a7"));
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c.call("1", "hook.no_such_event", hook_params("a7")).await;
+        assert_eq!(r["error"]["code"], "unknown_method");
+        assert!(audit_rows(&db).is_empty());
+    }
+
+    // ── Detection-backed lists (C1a-15) ────────────────────────────────
+
+    fn ids(rows: &Value) -> Vec<String> {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Until detection's first pass is written, `session.list` and
+    /// `snapshot.get` wait (reviews H1).
+    #[tokio::test]
+    async fn session_list_and_snapshot_wait_for_the_first_detection_pass() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let gate = Arc::new(FirstTick::pending());
+        let ctx = ServerCtx {
+            first_tick: gate.clone(),
+            ..Arc::try_unwrap(ctx).ok().unwrap()
+        };
+        let short = Duration::from_millis(200);
+        assert!(tokio::time::timeout(short, session_list(&ctx))
+            .await
+            .is_err());
+        assert!(tokio::time::timeout(short, snapshot_get(&ctx))
+            .await
+            .is_err());
+        let waiting = tokio::time::timeout(Duration::from_secs(5), session_list(&ctx));
+        let open = async {
+            tokio::time::sleep(short).await;
+            gate.open();
+        };
+        let (listed, ()) = tokio::join!(waiting, open);
+        assert!(listed.unwrap().is_ok());
+        assert!(snapshot_get(&ctx).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_list_and_agent_list_read_the_agents_table() {
+        use crate::engine::detect::{apply, Observed};
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let seen = |sid: &str| Observed {
+            key: format!("claudeCode:{}", sid),
+            provider: "claudeCode".into(),
+            sid: sid.into(),
+            status: "working",
+            cwd: "/p".into(),
+            name: sid.into(),
+            pid: 1,
+            started_at: None,
+        };
+        let (a, b) = (seen("a"), seen("b"));
+        let both = vec![a.clone(), b];
+        db.write(move |tx| apply(tx, MACHINE, &both, 1, &Default::default()))
+            .await
+            .unwrap();
+        db.write(move |tx| {
+            apply(tx, MACHINE, &[a], 2, &Default::default())?;
+            tx.execute(
+                "INSERT INTO agents (id, role, provider, source, state) \
+                 VALUES ('agt_zretired', 'worker', 'claudeCode', 'engine', 'retired')",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+        let rows = db.agents(AgentFilter::All).unwrap();
+        let id_of = |sid: &str| {
+            rows.iter()
+                .find(|r| r.provider_sid.as_deref() == Some(sid))
+                .unwrap()
+                .id
+                .clone()
+        };
+
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c.call("1", "session.list", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let sessions = &r["result"]["sessions"];
+        assert_eq!(ids(sessions), [id_of("a")]);
+        assert_eq!(sessions[0]["sessionKey"], "claudeCode:a");
+        assert_eq!(sessions[0]["status"], "working");
+        assert_eq!(sessions[0]["machineId"], MACHINE);
+
+        let r = c.call("2", "agent.list", Value::Null).await;
+        assert_eq!(ids(&r["result"]["agents"]), [id_of("a")]);
+        let r = c.call("3", "agent.list", json!({"all": false})).await;
+        assert_eq!(ids(&r["result"]["agents"]), [id_of("a")]);
+        let r = c.call("4", "agent.list", json!({"all": true})).await;
+        let mut want = vec![id_of("a"), id_of("b"), "agt_zretired".to_string()];
+        want.sort();
+        assert_eq!(ids(&r["result"]["agents"]), want);
+        let gone = &r["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id_of("b"))
+            .unwrap()["goneAt"];
+        assert_eq!(gone, 2);
+
+        let r = c.call("5", "agent.list", json!({"all": "yes"})).await;
+        assert_eq!(r["error"]["code"], "bad_request", "{}", r);
+    }
+
+    #[tokio::test]
+    async fn a_connection_holds_at_most_max_streams() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        for i in 0..MAX_STREAMS {
+            let r = c.call(&i.to_string(), "events.subscribe", json!({})).await;
+            assert_eq!(r["ok"], true, "{}", r);
+        }
+        let r = c.call("over", "events.subscribe", json!({})).await;
+        assert_eq!(r["error"]["code"], "rate_limited", "{}", r);
+        // The connection and its streams keep working.
+        assert_eq!(c.call("snap", "snapshot.get", json!({})).await["ok"], true);
+        emit(&db, 1, 0).await;
+        let f = c.next().await;
+        assert_eq!(f["type"], "event", "{}", f);
+    }
+
+    #[tokio::test]
+    async fn store_methods_need_hello_first() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let mut c = connect(ctx);
+        send(&mut c, json!({"v": 1, "id": "1", "method": "snapshot.get"})).await;
+        let got = read_all(c).await;
+        assert_eq!(got[0]["error"]["code"], "hello_required");
+    }
+
+    /// Reviews L4: the drain switch reaches `hook.session_start` through
+    /// `hook_intake`. The start is taken, gets no context, keeps the
+    /// interrupted note and is audited as a blocked hook injection; once
+    /// the engine no longer drains, the same intake answers with context.
+    #[tokio::test]
+    async fn hook_intake_obeys_the_drain_switch() {
+        use crate::engine::agents::LiveTable;
+        use crate::engine::driver::ChildId;
+        use crate::engine::generation::tests::{db_with_agent, MACHINE};
+        use crate::engine::generation::{begin_generation, GenReason};
+        let (t, db) = db_with_agent("a1");
+        db.write_blocking(|tx| {
+            begin_generation(tx, MACHINE, "a1", GenReason::Spawn, "s1", None, 1)?;
+            tx.execute(
+                "UPDATE agents SET state = 'ready', interrupted_note_pending = 1 \
+                 WHERE id = 'a1'",
+                [],
+            )
+        })
+        .unwrap();
+        let db = Arc::new(db);
+        let agents = Arc::new(LiveTable::new());
+        agents
+            .register("a1", 1, ChildId { pid: 1, start: 1 })
+            .unwrap();
+        let orders = t.path().join("standing-orders.md");
+        std::fs::write(&orders, "Be {{agent_id}}.\n").unwrap();
+        let drain = Arc::new(DrainSwitch::new());
+        let ctx = ServerCtx::new(MACHINE.into())
+            .with_agents(agents)
+            .with_db(db.clone())
+            .with_standing_orders(orders)
+            .with_drain(drain.clone());
+        let key = crate::engine::machine::load_or_create(t.path())
+            .unwrap()
+            .header_key();
+        let token = key.token("a1");
+        let ctx = ctx.with_header_key(key);
+        let principal = Principal::Agent {
+            id: "a1".into(),
+            gen: 1,
+        };
+        let start = |seq: &str| HookParams {
+            agent_id: "a1".into(),
+            kind: "claude".into(),
+            seq: seq.into(),
+            input: json!({"session_id": "s1", "source": "resume"}),
+            truncated: false,
+        };
+        let note = || -> i64 {
+            db.reader()
+                .unwrap()
+                .query_row(
+                    "SELECT interrupted_note_pending FROM agents WHERE id = 'a1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        drain.start();
+        let (out, context) = hook_intake(&ctx, "hook.session_start", &principal, 1, start("1"))
+            .await
+            .unwrap();
+        assert_eq!(out, Outcome::Accepted);
+        assert_eq!(context, None);
+        assert_eq!(note(), 1);
+        let blocked: Vec<(String, String)> = {
+            let conn = db.reader().unwrap();
+            let mut st = conn
+                .prepare("SELECT principal, reason FROM audit WHERE method = ?1")
+                .unwrap();
+            let rows = st
+                .query_map([crate::engine::drain::BLOCKED_INJECTION], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert_eq!(blocked, [("agent:a1".to_string(), "path=hook".to_string())]);
+
+        // The same intake without the drain: context, and the note taken.
+        let ctx = ServerCtx {
+            drain: Arc::new(DrainSwitch::new()),
+            ..ctx
+        };
+        let (_, context) = hook_intake(&ctx, "hook.session_start", &principal, 1, start("2"))
+            .await
+            .unwrap();
+        let context = context.unwrap();
+        assert!(context.starts_with(&standing::header(1)), "{}", context);
+        // The agent's header token goes out with it (C1b-M1-7).
+        assert!(
+            context.contains(&standing::mail_rules(Some(&token))),
+            "{}",
+            context
+        );
+        assert_eq!(note(), 0);
+    }
+
+    // ── msg.send (C1b-M1-8) ────────────────────────────────────────────
+
+    /// An agent row: `pty` rows are engine agents, others observed.
+    async fn mail_agent(db: &Db, id: &str, name: &str, control: &str) {
+        let (id, name, control) = (id.to_string(), name.to_string(), control.to_string());
+        db.write(move |tx| {
+            let (role, source) = if control == "pty" {
+                ("worker", "engine")
+            } else {
+                ("observed", "detected")
+            };
+            tx.execute(
+                "INSERT INTO agents (id, role, control, provider, source, state, machine_id, name) \
+                 VALUES (?1, ?2, ?3, 'claudeCode', ?4, 'ready', ?5, ?6)",
+                rusqlite::params![id, role, control, source, MACHINE, name],
+            )
+        })
+        .await
+        .unwrap();
+    }
+
+    /// `msg.send` audit rows: (principal, target, decision, reason,
+    /// payload_hash).
+    fn mail_audit(db: &Db) -> Vec<(String, String, String, String, Option<String>)> {
+        let conn = db.reader().unwrap();
+        let mut st = conn
+            .prepare(
+                "SELECT principal, coalesce(target, ''), decision, reason, payload_hash \
+                 FROM audit WHERE method = 'msg.send' ORDER BY seq",
+            )
+            .unwrap();
+        let rows = st
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    fn message_count(db: &Db) -> i64 {
+        db.reader()
+            .unwrap()
+            .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// E2: an agent's send is queued, and the response's `seq` is the
+    /// result's cursor, which is the message's `queued` event. Other
+    /// methods still answer no `seq`.
+    #[tokio::test]
+    async fn an_agent_send_answers_its_cursor_as_seq() {
+        let (_t, ctx, db) = ctx_db(as_agent("agt_a7"));
+        mail_agent(&db, "agt_a7", "me", "pty").await;
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["principal"], "agent:agt_a7");
+        let r = c
+            .call("1", "msg.send", json!({"to": "bob", "body": "hi\nthere"}))
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let res = &r["result"];
+        assert_eq!(res["state"], "queued");
+        assert_eq!(res["replayed"], false);
+        assert_eq!(res["to"]["id"], "agt_b1");
+        assert_eq!(res["to"]["addr"], format!("{}/agt_b1", MACHINE));
+        assert_eq!(r["seq"], res["cursor"]);
+        let seq: i64 = res["cursor"]
+            .as_str()
+            .unwrap()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (topic, data): (String, String) = db
+            .reader()
+            .unwrap()
+            .query_row(
+                "SELECT topic, payload FROM events WHERE seq = ?1",
+                [seq],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(topic, "msg.state");
+        let data: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data["msgId"], res["msgId"]);
+        assert_eq!(data["state"], "queued");
+        assert_eq!(data["from"], "agent:agt_a7");
+        let audit = mail_audit(&db);
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].0, "agent:agt_a7");
+        assert_eq!(audit[0].1, format!("{}/agt_b1", MACHINE));
+        assert_eq!(audit[0].2, "allow");
+        assert_eq!(audit[0].3, res["msgId"].as_str().unwrap());
+        assert_eq!(
+            audit[0].4.as_deref(),
+            Some(mail::sha256_hex(b"hi\nthere").as_str())
+        );
+        // Other methods: no seq.
+        let r = c.call("2", "snapshot.get", json!({})).await;
+        assert_eq!(r["ok"], true);
+        assert!(r.get("seq").is_none(), "{}", r);
+        let r = c.call("3", "agent.list", json!({})).await;
+        assert!(r.get("seq").is_none(), "{}", r);
+    }
+
+    /// The same `idem` again replays the first message, with its cursor
+    /// as `seq`; no second message is written.
+    #[tokio::test]
+    async fn a_resend_with_the_same_idem_replays() {
+        let (_t, ctx, db) = ctx_db(as_agent("agt_a7"));
+        mail_agent(&db, "agt_a7", "me", "pty").await;
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let (mut c, _) = Client::new(ctx).await;
+        let mut first = Value::Null;
+        for i in 0..2 {
+            let mut line = serde_json::to_vec(&json!({
+                "v": 1, "id": i.to_string(), "method": "msg.send", "idem": "k1",
+                "params": {"to": "agt_b1", "body": "hi"},
+            }))
+            .unwrap();
+            line.push(b'\n');
+            c.write.write_all(&line).await.unwrap();
+            let r = c.next().await;
+            assert_eq!(r["ok"], true, "{}", r);
+            assert_eq!(r["seq"], r["result"]["cursor"]);
+            if i == 0 {
+                first = r["result"].clone();
+            } else {
+                assert_eq!(r["result"]["replayed"], true);
+                assert_eq!(r["result"]["msgId"], first["msgId"]);
+                assert_eq!(r["result"]["cursor"], first["cursor"]);
+            }
+        }
+        assert_eq!(message_count(&db), 1);
+        let audit = mail_audit(&db);
+        assert_eq!(
+            audit[1].3,
+            format!("replay of {}", first["msgId"].as_str().unwrap())
+        );
+    }
+
+    /// The terminal's send (after `check_sender`, which reads the real
+    /// process tree and is tested in `mail`): queued as
+    /// `local-unverified`.
+    #[tokio::test]
+    async fn a_terminal_send_is_queued() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let params = MsgSendParams {
+            to: format!("{}/agt_b1", MACHINE),
+            body: "hi".into(),
+            ..Default::default()
+        };
+        let sent = queue_mail(&ctx, &Principal::LocalUnverified, params, None)
+            .await
+            .unwrap();
+        assert_eq!(sent.state, "queued");
+        let from: String = db
+            .reader()
+            .unwrap()
+            .query_row("SELECT from_principal FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(from, "local-unverified");
+        assert_eq!(mail_audit(&db)[0].2, "allow");
+    }
+
+    /// A resend with the same `idem` replays even after the target ended
+    /// and its name became ambiguous; another body is still `duplicate`.
+    #[tokio::test]
+    async fn an_idem_replays_after_the_target_ended() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let send = |to: &str, body: &str| MsgSendParams {
+            to: to.into(),
+            body: body.into(),
+            ..Default::default()
+        };
+        let l = Principal::LocalUnverified;
+        let first = queue_mail(&ctx, &l, send("bob", "hi"), Some("ci-42".into()))
+            .await
+            .unwrap();
+        db.write(|tx| {
+            tx.execute(
+                "UPDATE agents SET state = 'retired' WHERE id = 'agt_b1'",
+                [],
+            )?;
+            tx.execute("UPDATE messages SET state = 'failed'", [])
+        })
+        .await
+        .unwrap();
+        mail_agent(&db, "agt_b2", "bob", "pty").await;
+        mail_agent(&db, "agt_b3", "bob", "pty").await;
+        for to in ["agt_b1", "bob", &format!("{}/agt_b1", MACHINE)] {
+            let again = queue_mail(&ctx, &l, send(to, "hi"), Some("ci-42".into()))
+                .await
+                .unwrap();
+            assert!(again.replayed, "{}", to);
+            assert_eq!(again.msg_id, first.msg_id);
+            assert_eq!(again.state, "failed");
+            assert_eq!(again.to.id, "agt_b1");
+        }
+        for (to, body) in [("agt_b1", "other"), ("agt_b2", "hi")] {
+            let e = queue_mail(&ctx, &l, send(to, body), Some("ci-42".into()))
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, ErrorCode::Duplicate, "{} {}", to, body);
+        }
+        assert_eq!(message_count(&db), 1);
+    }
+
+    /// E5: every refusal answers its code, `data` and hint, writes a
+    /// `deny` audit row and no message.
+    #[tokio::test]
+    async fn every_refused_send_is_audited_and_writes_no_message() {
+        let (_t, ctx, db) = ctx_db(as_agent("agt_a7"));
+        mail_agent(&db, "agt_a7", "me", "pty").await;
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        mail_agent(&db, "agt_o1", "obs", "none").await;
+        let (mut c, _) = Client::new(ctx).await;
+        let cases = [
+            (json!({}), "bad_request"),
+            (json!({"to": "bob", "body": "a\r\nb"}), "bad_request"),
+            (json!({"to": "bobb", "body": "hi"}), "unknown_address"),
+            (json!({"to": "agt_o1", "body": "hi"}), "not_controlled"),
+            (json!({"to": "agt_a7", "body": "hi"}), "not_allowed"),
+            (
+                json!({"to": "other/agt_b1", "body": "hi"}),
+                "unknown_address",
+            ),
+        ];
+        for (i, (params, code)) in cases.iter().enumerate() {
+            let r = c.call(&i.to_string(), "msg.send", params.clone()).await;
+            assert_eq!(r["error"]["code"], *code, "{}: {}", params, r);
+            assert!(r.get("seq").is_none(), "{}", r);
+        }
+        let r = c
+            .call("n", "msg.send", json!({"to": "bobb", "body": "hi"}))
+            .await;
+        assert_eq!(r["error"]["data"]["nearest"], "bob", "{}", r);
+        assert_eq!(r["error"]["hint"], "did you mean bob?", "{}", r);
+        let r = c
+            .call("s", "msg.send", json!({"to": "agt_a7", "body": "hi"}))
+            .await;
+        assert_eq!(r["error"]["hint"], "cannot mail yourself", "{}", r);
+        assert_eq!(message_count(&db), 0);
+        let audit = mail_audit(&db);
+        assert_eq!(audit.len(), cases.len() + 2);
+        for (row, (params, code)) in audit.iter().zip(cases.iter()) {
+            assert_eq!(row.0, "agent:agt_a7");
+            assert_eq!(row.1, params["to"].as_str().unwrap_or_default());
+            assert_eq!(row.2, "deny");
+            assert!(row.3.starts_with(code), "{:?}", row);
+        }
+        // A refused send that got past parsing carries the body hash.
+        assert_eq!(
+            audit[2].4.as_deref(),
+            Some(mail::sha256_hex(b"hi").as_str())
+        );
+    }
+
+    /// An agent whose generation is no longer live may not send.
+    #[tokio::test]
+    async fn a_stale_generation_may_not_send() {
+        let (_t, ctx, db) = ctx_db(as_agent("agt_a7"));
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let principal = Principal::Agent {
+            id: "agt_a7".into(),
+            gen: 2,
+        };
+        let peer = Peer::Unix {
+            cred: PeerCred {
+                pid: std::process::id() as libc::pid_t,
+                uid: peer::engine_uid(),
+            },
+            start: None,
+        };
+        let req = Request {
+            v: Some(1),
+            id: Some("1".into()),
+            method: Some("msg.send".into()),
+            params: json!({"to": "agt_b1", "body": "hi"}),
+            idem: None,
+        };
+        // The sender check is `Admission::MailSender`, run by `dispatch`.
+        let e = dispatch("msg.send", req, &ctx, peer, &principal, None, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(e.code, ErrorCode::NotAllowed);
+        assert_eq!(message_count(&db), 0);
+        assert_eq!(mail_audit(&db)[0].2, "deny");
+    }
+
+    /// Q1: a send while the engine drains is taken and stays `queued`.
+    #[tokio::test]
+    async fn a_send_while_draining_is_queued() {
+        let (_t, ctx, db) = ctx_db(as_agent("agt_a7"));
+        mail_agent(&db, "agt_a7", "me", "pty").await;
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        ctx.drain.start();
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c
+            .call("1", "msg.send", json!({"to": "bob", "body": "hi"}))
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        assert_eq!(r["result"]["state"], "queued");
+        let state: String = db
+            .reader()
+            .unwrap()
+            .query_row("SELECT state FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "queued");
+    }
+
+    // ── Data views (core-public M-a2) ─────────────────────────────────
+
+    const PROJECT: &str = "/p/demo";
+
+    /// A user home with one Claude Code session `sess-1` (history entry and
+    /// transcript), one memory file and a task list for `sess-1`.
+    fn data_home(home: &std::path::Path) {
+        let claude = home.join(".claude");
+        let project = claude
+            .join("projects")
+            .join(crate::session::detector::encode_path_for_matching(PROJECT));
+        std::fs::create_dir_all(project.join("memory")).unwrap();
+        std::fs::write(
+            claude.join("history.jsonl"),
+            format!(
+                "{}\n",
+                json!({"display": "fix the bug", "timestamp": 1000, "project": PROJECT, "sessionId": "sess-1"})
+            ),
+        )
+        .unwrap();
+        let mut transcript = String::new();
+        for i in 0..5 {
+            let (kind, content) = ("user", json!(format!("question {}", i)));
+            transcript.push_str(&format!(
+                "{}\n",
+                json!({
+                    "type": kind,
+                    "uuid": format!("u{}", i),
+                    "sessionId": "sess-1",
+                    "cwd": PROJECT,
+                    "timestamp": format!("2026-10-31T00:00:0{}Z", i),
+                    "message": {"role": kind, "content": content},
+                })
+            ));
+        }
+        std::fs::write(project.join("sess-1.jsonl"), transcript).unwrap();
+        std::fs::write(project.join("memory").join("MEMORY.md"), "# notes\n").unwrap();
+        let tasks = claude.join("tasks").join("sess-1");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            tasks.join("1.json"),
+            json!({"id": "1", "subject": "write tests", "status": "pending"}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn ctx_home(agents: Arc<dyn LiveAgents>) -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Db>) {
+        let (t, ctx, db) = ctx_db(agents);
+        data_home(&t.path().join("home"));
+        (t, ctx, db)
+    }
+
+    /// Parity (§3.1): each data method answers what the GUI command's
+    /// reader returns for the same home.
+    #[tokio::test]
+    async fn data_methods_answer_what_the_gui_readers_return() {
+        let (t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let home = t.path().join("home");
+        let (mut c, _) = Client::new(ctx).await;
+
+        let r = c.call("1", "history.list", json!({})).await;
+        let gui = crate::session::history::get_history_in(&home).unwrap();
+        assert_eq!(gui.len(), 1);
+        assert_eq!(
+            r["result"]["entries"],
+            serde_json::to_value(&gui).unwrap(),
+            "{}",
+            r
+        );
+
+        let r = c
+            .call("2", "history.search", json!({"query": "question 3"}))
+            .await;
+        let gui =
+            crate::session::history::deep_search_under(&home, "question 3", false, false).unwrap();
+        assert!(!gui.is_empty());
+        assert_eq!(
+            r["result"]["hits"],
+            serde_json::to_value(&gui).unwrap(),
+            "{}",
+            r
+        );
+        let r = c.call("3", "history.search", json!({"query": "  "})).await;
+        assert_eq!(r["result"]["hits"], json!([]), "{}", r);
+
+        let r = c.call("4", "memory.list", json!({})).await;
+        let gui = crate::session::memory::get_memory_files_from_home(&home).unwrap();
+        assert_eq!(gui.len(), 1);
+        assert_eq!(
+            r["result"]["projects"],
+            serde_json::to_value(&gui).unwrap(),
+            "{}",
+            r
+        );
+
+        let r = c
+            .call("5", "session.tasks", json!({"sessionId": "sess-1"}))
+            .await;
+        let gui = crate::session::tasks::read_session_tasks_in(&home, "sess-1").unwrap();
+        assert_eq!(gui.len(), 1);
+        assert_eq!(
+            r["result"]["tasks"],
+            serde_json::to_value(&gui).unwrap(),
+            "{}",
+            r
+        );
+        let r = c
+            .call("6", "session.tasks", json!({"sessionId": "../sess-1"}))
+            .await;
+        assert_eq!(r["error"]["code"], "bad_request", "{}", r);
+
+        let r = c
+            .call(
+                "7",
+                "conversation.get",
+                json!({"sessionKey": "claudeCode:sess-1"}),
+            )
+            .await;
+        let gui = crate::session::conversation::get_conversation_data_in(
+            &home,
+            "sess-1",
+            Some(crate::session::SessionProvider::ClaudeCode),
+            false,
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(gui.messages.len(), 5);
+        assert_eq!(
+            r["result"]["messages"],
+            serde_json::to_value(&gui.messages).unwrap(),
+            "{}",
+            r
+        );
+        assert_eq!(r["result"]["total"], 5);
+        assert_eq!(r["result"]["nextOffset"], Value::Null, "{}", r);
+        let r = c
+            .call(
+                "8",
+                "conversation.get",
+                json!({"sessionKey": "claudeCode:nope"}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "unknown_session", "{}", r);
+
+        let r = c
+            .call_past_busy("9", "subagent.list", json!({"sessionIds": ["sess-1"]}))
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let r = c
+            .call_past_busy(
+                "10",
+                "subagent.transcript",
+                json!({"parentSessionId": "sess-1", "subagentId": "nope"}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "unknown_session", "{}", r);
+    }
+
+    /// `cost.get` answers what the GUI's reader computes for the same home,
+    /// and keeps its cache in the engine's own file.
+    #[tokio::test]
+    async fn cost_get_answers_what_the_gui_reader_returns() {
+        let (t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let home = t.path().join("home");
+        let project = home
+            .join(".claude")
+            .join("projects")
+            .join(crate::session::detector::encode_path_for_matching(PROJECT));
+        let line = json!({
+            "type": "assistant",
+            "uuid": "c1",
+            "sessionId": "sess-2",
+            "cwd": PROJECT,
+            "timestamp": "2026-10-31T00:00:00Z",
+            "message": {
+                "id": "msg_1", "role": "assistant", "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 1000, "output_tokens": 500},
+            },
+        });
+        std::fs::write(project.join("sess-2.jsonl"), format!("{}\n", line)).unwrap();
+        let cache = t.path().join("engine-cost-cache.json");
+        let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+        ctx.cost_cache = Some(cache.clone());
+        let (mut c, _) = Client::new(Arc::new(ctx)).await;
+        let r = c.call("1", "cost.get", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let gui_cache = t.path().join("gui-cost-cache.json");
+        let gui = crate::session::cost::get_cost_data_in(&home, &gui_cache).unwrap();
+        assert!(gui.total_tokens > 0, "{:?}", gui.total_tokens);
+        assert_eq!(r["result"], serde_json::to_value(&gui).unwrap());
+        assert!(cache.exists(), "the engine writes its own cache");
+        assert!(!home.join(".claude").join("cost-cache.json").exists());
+    }
+
+    /// `conversation.get` pages: `nextOffset` walks the whole transcript.
+    #[tokio::test]
+    async fn conversation_get_pages_through_the_transcript() {
+        let (_t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        let mut offset = Some(0u64);
+        let mut seen = Vec::new();
+        let mut i = 0;
+        while let Some(o) = offset {
+            i += 1;
+            let r = c
+                .call(
+                    &i.to_string(),
+                    "conversation.get",
+                    json!({"sessionKey": "claudeCode:sess-1", "page": {"offset": o, "limit": 2}}),
+                )
+                .await;
+            assert_eq!(r["result"]["offset"], o, "{}", r);
+            assert_eq!(r["result"]["total"], 5, "{}", r);
+            for m in r["result"]["messages"].as_array().unwrap() {
+                seen.push(m["content"].clone());
+            }
+            offset = r["result"]["nextOffset"].as_u64();
+        }
+        assert_eq!(i, 3);
+        assert_eq!(seen.len(), 5);
+        // An offset past the end is an empty last page.
+        let r = c
+            .call(
+                "x",
+                "conversation.get",
+                json!({"sessionKey": "claudeCode:sess-1", "page": {"offset": 99}}),
+            )
+            .await;
+        assert_eq!(r["result"]["messages"], json!([]), "{}", r);
+        assert_eq!(r["result"]["offset"], 5, "{}", r);
+    }
+
+    /// A session key whose id is a path is `bad_request`, even where the
+    /// file it names exists; OpenCode's `?directory=` scope still passes
+    /// the id check.
+    #[tokio::test]
+    async fn conversation_get_refuses_path_ids() {
+        let (t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let home = t.path().join("home");
+        let project = home
+            .join(".claude")
+            .join("projects")
+            .join(crate::session::detector::encode_path_for_matching(PROJECT));
+        let stolen = std::fs::read(project.join("sess-1.jsonl")).unwrap();
+        std::fs::write(home.join("x.jsonl"), &stolen).unwrap();
+        let (mut c, _) = Client::new(ctx).await;
+        let abs = format!("claudeCode:{}", home.join("x").display());
+        for key in [
+            abs.as_str(),
+            "claudeCode:../../../x",
+            "../../../x",
+            "codex:../x",
+            "opencode:../x?directory=%2Ftmp",
+        ] {
+            let r = c
+                .call_past_busy("1", "conversation.get", json!({"sessionKey": key}))
+                .await;
+            assert_eq!(r["error"]["code"], "bad_request", "{}: {}", key, r);
+        }
+        let r = c
+            .call_past_busy(
+                "2",
+                "conversation.get",
+                json!({"sessionKey": "opencode:ses_abc?directory=%2Ftmp%2Fp"}),
+            )
+            .await;
+        assert_ne!(r["error"]["code"], "bad_request", "{}", r);
+        let r = c
+            .call_past_busy(
+                "3",
+                "conversation.get",
+                json!({"sessionKey": "claudeCode:sess-1"}),
+            )
+            .await;
+        assert_eq!(r["result"]["total"], 5, "{}", r);
+    }
+
+    /// `page.limit: 0` is `bad_request` on every paged method.
+    #[tokio::test]
+    async fn a_zero_page_limit_is_a_bad_request() {
+        let (_t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        let zero = json!({"offset": 0, "limit": 0});
+        for (m, p) in [
+            (
+                "conversation.get",
+                json!({"sessionKey": "claudeCode:sess-1", "page": zero}),
+            ),
+            ("history.list", json!({"page": zero})),
+            ("memory.list", json!({"page": zero})),
+        ] {
+            let r = c.call_past_busy("1", m, p).await;
+            assert_eq!(r["error"]["code"], "bad_request", "{}: {}", m, r);
+        }
+    }
+
+    /// `history.list` and `memory.list` page: the no-params call is the
+    /// first page, and a page walks to `nextOffset: null`.
+    #[tokio::test]
+    async fn history_and_memory_lists_page() {
+        let (_t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        for (m, field) in [("history.list", "entries"), ("memory.list", "projects")] {
+            let r = c.call("1", m, json!({})).await;
+            assert_eq!(r["result"]["total"], 1, "{}", r);
+            assert_eq!(r["result"]["offset"], 0, "{}", r);
+            assert_eq!(r["result"]["nextOffset"], Value::Null, "{}", r);
+            assert_eq!(r["result"][field].as_array().unwrap().len(), 1, "{}", r);
+            let r = c
+                .call("2", m, json!({"page": {"offset": 1, "limit": 1}}))
+                .await;
+            assert_eq!(r["result"][field], json!([]), "{}", r);
+            assert_eq!(r["result"]["nextOffset"], Value::Null, "{}", r);
+        }
+    }
+
+    /// Large messages: a page stops at the byte budget, a message too large
+    /// for any page comes alone as a `truncated` note, every response fits
+    /// in `MAX_FRAME`, and `nextOffset` walks the whole transcript.
+    #[tokio::test]
+    async fn conversation_get_pages_by_bytes() {
+        let (t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let project = t
+            .path()
+            .join("home")
+            .join(".claude")
+            .join("projects")
+            .join(crate::session::detector::encode_path_for_matching(PROJECT));
+        let sizes = [300_000, 300_000, 2 * MAX_FRAME, 10, 300_000];
+        let mut transcript = String::new();
+        for (i, n) in sizes.iter().enumerate() {
+            transcript.push_str(&format!(
+                "{}\n",
+                json!({
+                    "type": "user",
+                    "uuid": format!("b{}", i),
+                    "sessionId": "big",
+                    "cwd": PROJECT,
+                    "timestamp": format!("2026-10-31T00:00:0{}Z", i),
+                    "message": {"role": "user", "content": "x".repeat(*n)},
+                })
+            ));
+        }
+        std::fs::write(project.join("big.jsonl"), transcript).unwrap();
+        let (mut c, _) = Client::new(ctx).await;
+        let mut offset = Some(0u64);
+        let mut pages = Vec::new();
+        while let Some(o) = offset {
+            assert!(pages.len() < 10, "nextOffset must move forward");
+            let r = c
+                .call_past_busy(
+                    "1",
+                    "conversation.get",
+                    json!({"sessionKey": "claudeCode:big", "page": {"offset": o}}),
+                )
+                .await;
+            assert!(
+                serde_json::to_vec(&r).unwrap().len() < MAX_FRAME,
+                "frame too big"
+            );
+            assert_eq!(r["result"]["total"], 5, "{}", r["error"]);
+            let msgs = r["result"]["messages"].as_array().unwrap().clone();
+            pages.push(
+                msgs.iter()
+                    .map(|m| (m["content"].as_str().unwrap().len(), m["truncated"] == true))
+                    .collect::<Vec<_>>(),
+            );
+            offset = r["result"]["nextOffset"].as_u64();
+        }
+        // Half a frame holds one 300 kB message; the 2 MiB one is a note,
+        // with room after it.
+        assert_eq!(pages.len(), 3, "{:?}", pages);
+        assert_eq!(pages[0], vec![(300_000, false)]);
+        assert_eq!(pages[1], vec![(300_000, false)]);
+        assert_eq!(pages[2].len(), 3, "{:?}", pages);
+        assert!(pages[2][0].1 && pages[2][0].0 < 200, "{:?}", pages);
+        assert_eq!(pages[2][1..], [(10, false), (300_000, false)]);
+    }
+
+    /// A full read gate answers the retryable `busy` without reading; a
+    /// free one reads.
+    #[tokio::test]
+    async fn conversation_get_is_busy_when_the_read_gate_is_full() {
+        let (_t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let req = |key: &str| Request {
+            v: Some(API_MAJOR),
+            id: Some("1".into()),
+            method: Some("conversation.get".into()),
+            params: json!({"sessionKey": key}),
+            idem: None,
+        };
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = gate.clone().try_acquire_owned().unwrap();
+        let e = views::conversation::conversation_get_gated(
+            req("claudeCode:sess-1"),
+            &ctx,
+            None,
+            &gate,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Busy, "{}", e.msg);
+        assert!(e.code.retryable());
+        drop(held);
+        let r = views::conversation::conversation_get_gated(
+            req("claudeCode:sess-1"),
+            &ctx,
+            None,
+            &gate,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["total"], 5);
+        assert_eq!(gate.available_permits(), 1, "the job frees its permit");
+    }
+
+    /// With `conversation.progress` granted, `progress` frames come before
+    /// the response and end at the file size; without it, none come.
+    #[tokio::test]
+    async fn conversation_get_sends_progress_only_when_asked() {
+        let (_t, ctx, _db) = ctx_home(Arc::new(NoLiveAgents));
+        let (mut c, hello) = Client::hello(
+            ctx.clone(),
+            json!({"want": ["conversation.progress", "nope"]}),
+        )
+        .await;
+        assert_eq!(hello["capabilities"], json!(["conversation.progress"]));
+        c.send(
+            "c1",
+            "conversation.get",
+            json!({"sessionKey": "claudeCode:sess-1"}),
+        )
+        .await;
+        let mut progress = Vec::new();
+        let resp = loop {
+            let f = c.next().await;
+            if f["type"] == "progress" {
+                assert_eq!(f["id"], "c1", "{}", f);
+                progress.push((
+                    f["bytesRead"].as_u64().unwrap(),
+                    f["bytesTotal"].as_u64().unwrap(),
+                ));
+            } else {
+                break f;
+            }
+        };
+        assert_eq!(resp["ok"], true, "{}", resp);
+        let (read, total) = *progress.last().expect("a progress frame");
+        assert!(total > 0 && read == total, "{:?}", progress);
+
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["capabilities"], json!([]));
+        let r = c
+            .call(
+                "c2",
+                "conversation.get",
+                json!({"sessionKey": "claudeCode:sess-1"}),
+            )
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+    }
+
+    /// Principal table §3.2 (owner Q5=A): an agent may not read
+    /// conversations, history, memory, cost, subagents, tasks or usage;
+    /// each refusal is audited.
+    #[tokio::test]
+    async fn an_agent_may_not_read_user_data() {
+        let (_t, ctx, db) = ctx_home(as_agent("a7"));
+        let (mut c, _) = Client::new(ctx).await;
+        let denied = [
+            (
+                "conversation.get",
+                json!({"sessionKey": "claudeCode:sess-1"}),
+            ),
+            ("history.list", json!({})),
+            ("history.search", json!({"query": "bug"})),
+            ("cost.get", json!({})),
+            ("memory.list", json!({})),
+            ("subagent.list", json!({})),
+            (
+                "subagent.transcript",
+                json!({"parentSessionId": "sess-1", "subagentId": "x"}),
+            ),
+            ("session.tasks", json!({"sessionId": "sess-1"})),
+            ("usage.subscriptions", json!({})),
+            ("provider.opencode.connect", json!({"url": ""})),
+        ];
+        for (i, (m, p)) in denied.iter().enumerate() {
+            let r = c.call(&i.to_string(), m, p.clone()).await;
+            assert_eq!(r["error"]["code"], "not_allowed", "{}: {}", m, r);
+        }
+        let rows: Vec<String> = audit_rows(&db)
+            .into_iter()
+            .filter(|r| r.2 == "deny")
+            .map(|r| r.1)
+            .collect();
+        let want: Vec<&str> = denied.iter().map(|(m, _)| *m).collect();
+        assert_eq!(rows, want);
+        // An agent still reads the detection diagnostics and the OpenCode
+        // status (neither carries user content).
+        let r = c.call("d", "diag.detection", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let r = c.call("o", "provider.opencode.status", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+    }
+
+    /// `usage.subscriptions` answers from the engine's usage source.
+    #[tokio::test]
+    async fn usage_subscriptions_reads_the_usage_source() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = calls.clone();
+        ctx.usage = Some(Arc::new(move || {
+            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                vec![crate::session::subscription_usage::unavailable(
+                    "claude", "Claude", "test",
+                )]
+            })
+        }));
+        let (mut c, _) = Client::new(Arc::new(ctx)).await;
+        let r = c.call("1", "usage.subscriptions", json!({})).await;
+        assert_eq!(r["result"]["usage"][0]["provider"], "claude", "{}", r);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // ── Discovery, unsubscribe, ping, connection cap (core-public M-a2) ─
+
+    #[tokio::test]
+    async fn hello_lists_methods_topics_and_limits() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let (_c, hello) = Client::hello(ctx, json!({"apiMinor": API_MINOR})).await;
+        let methods = hello["methods"].as_object().unwrap();
+        let expected: Vec<_> = METHODS
+            .iter()
+            .filter(|m| !is_hook_class(m))
+            .copied()
+            .collect();
+        assert_eq!(methods.len(), expected.len());
+        for name in expected {
+            assert!(methods.contains_key(name), "{name}");
+        }
+        assert_eq!(
+            hello["methods"]["conversation.get"],
+            json!({"since": 6, "rev": 1, "stability": "preview"})
+        );
+        assert!(!methods.contains_key("hook.stop"));
+        let (_t, agent_ctx, _db) = ctx_db(as_agent("a7"));
+        let (_c, agent_hello) = Client::new(agent_ctx).await;
+        assert_eq!(agent_hello["methods"]["hook.stop"]["stability"], "internal");
+        assert_eq!(hello["methods"]["hello"]["since"], 0);
+        assert_eq!(hello["breakingSince"], json!([]));
+        assert_eq!(hello["stability"], "preview");
+        assert!(hello["topics"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("session.view")));
+        assert_eq!(hello["limits"]["maxFrame"], MAX_FRAME as u64);
+        assert_eq!(hello["limits"]["maxStreams"], MAX_STREAMS as u64);
+        assert_eq!(hello["limits"]["maxConnections"], MAX_CONNECTIONS as u64);
+        assert_eq!(hello["limits"]["retentionHours"], 24);
+        assert_eq!(hello["limits"]["retentionEvents"], 50_000);
+        let (_t, old_ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let (_c, old_hello) = Client::hello(old_ctx, json!({"apiMinor": 9})).await;
+        assert_eq!(old_hello["breakingSince"], json!(["agent.create"]));
+        assert_eq!(hello["methods"]["agent.create"]["rev"], 2);
+        // A client without `apiMinor` (minor 5 and older) still says hello.
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let (_c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["breakingSince"], json!([]));
+    }
+
+    /// The schema marks every method and topic with its stability, and
+    /// gives every topic a data type.
+    #[test]
+    fn schema_marks_stability_and_types_every_topic() {
+        let s = schema();
+        for (name, m) in s["methods"].as_object().unwrap() {
+            let want = discovery::stability(name).unwrap();
+            assert_eq!(m["x-stability"], want, "{}", name);
+        }
+        let topics = s["topics"].as_object().unwrap();
+        assert_eq!(topics.len(), discovery::TOPICS.len());
+        for (name, t) in topics {
+            assert!(t["data"].is_object(), "{}", name);
+            assert!(t["x-stability"].is_string(), "{}", name);
+        }
+        assert_eq!(
+            s["topics"]["msg.state"]["data"]["$ref"],
+            "#/$defs/MsgStateEvent"
+        );
+    }
+
+    /// After `events.unsubscribe` answers, no frame of that stream comes;
+    /// the other stream goes on.
+    #[tokio::test]
+    async fn unsubscribe_ends_one_stream() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let (mut c, _) = Client::new(ctx).await;
+        assert_eq!(c.call("a", "events.subscribe", json!({})).await["ok"], true);
+        assert_eq!(c.call("b", "events.subscribe", json!({})).await["ok"], true);
+        let r = c.call("u", "events.unsubscribe", json!({"sub": "a"})).await;
+        assert_eq!(r["result"], json!({"ended": true}), "{}", r);
+        let r = c
+            .call("u2", "events.unsubscribe", json!({"sub": "a"}))
+            .await;
+        assert_eq!(r["result"], json!({"ended": false}), "{}", r);
+        emit(&db, 2, 0).await;
+        for _ in 0..2 {
+            let f = c.next().await;
+            assert_eq!(f["type"], "event", "{}", f);
+            assert_eq!(f["sub"], "b", "{}", f);
+        }
+        // The freed slot takes a new stream.
+        assert_eq!(c.call("c", "events.subscribe", json!({})).await["ok"], true);
+        let r = c.call("p", "ping", json!({})).await;
+        assert_eq!(r["id"], "p", "{}", r);
+        assert!(
+            r["result"]["ts"].as_i64().unwrap() > 1_700_000_000_000,
+            "{}",
+            r
+        );
+    }
+
+    /// Past the cap, a connection is answered `busy` and closed; once one
+    /// closes, the next is served.
+    #[tokio::test]
+    async fn connections_past_the_cap_are_busy() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("e.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(serve_with_cap(listener, ctx(HELLO_TIMEOUT), 2));
+        let mut held = Vec::new();
+        for i in 0..2 {
+            let mut c = UnixStream::connect(&path).await.unwrap();
+            send(&mut c, hello_req(&i.to_string(), json!({}))).await;
+            assert_eq!(read_one(&mut c).await["ok"], true);
+            held.push(c);
+        }
+        let over = UnixStream::connect(&path).await.unwrap();
+        let got = read_all(over).await;
+        assert_eq!(got.len(), 1, "{:?}", got);
+        assert_eq!(got[0]["error"]["code"], "busy", "{:?}", got);
+        assert_eq!(got[0]["error"]["retryable"], true, "{:?}", got);
+        drop(held.pop());
+        // The slot frees when its task ends; retry for a moment.
+        let mut served = false;
+        for _ in 0..50 {
+            let mut c = UnixStream::connect(&path).await.unwrap();
+            // A served connection waits for hello; a refused one gets `busy`.
+            let early = tokio::time::timeout(Duration::from_millis(100), read_one(&mut c)).await;
+            if early.is_err() {
+                send(&mut c, hello_req("n", json!({}))).await;
+                assert_eq!(read_one(&mut c).await["ok"], true);
+                served = true;
+                break;
+            }
+        }
+        assert!(served);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn m2_queries_are_private_and_agent_controls_are_refused() {
+        let (_t, ctx, db) = ctx_db(as_agent("agt_a7"));
+        mail_agent(&db, "agt_a7", "alice", "pty").await;
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        mail_agent(&db, "agt_c1", "cat", "pty").await;
+        let (mut c, _) = Client::new(ctx).await;
+        let sent = c
+            .call("s", "msg.send", json!({"to":"bob","body":"hello"}))
+            .await;
+        assert_eq!(sent["ok"], true, "{}", sent);
+        let id = sent["result"]["msgId"].as_str().unwrap();
+        let listed = c.call("l", "msg.list", json!({})).await;
+        assert_eq!(listed["result"]["items"].as_array().unwrap().len(), 1);
+        let read = c.call("r", "msg.read", json!({"msgId":id})).await;
+        assert_eq!(read["result"]["body"], "hello");
+        assert_eq!(read["result"]["state"], "queued");
+        for (method, params) in [
+            ("msg.cancel", json!({"msgId":id})),
+            ("mail.pause", json!({"agent":"bob"})),
+            ("mail.resume", json!({"agent":"bob"})),
+        ] {
+            let r = c.call("c", method, params).await;
+            assert_eq!(r["error"]["code"], "not_allowed", "{}", r);
+        }
+        let n:i64=db.reader().unwrap().query_row("SELECT count(*) FROM audit WHERE method IN ('msg.cancel','mail.pause','mail.resume') AND decision='deny'",[],|r|r.get(0)).unwrap();
+        assert_eq!(n, 3);
+    }
+    #[tokio::test]
+    async fn m2fix_unverified_queries_require_complete_peer_verification() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let sent = queue_mail(
+            &ctx,
+            &Principal::LocalUnverified,
+            MsgSendParams {
+                to: "bob".into(),
+                body: "private".into(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let pid = std::process::id() as libc::pid_t;
+        let start = peer::proc_info(pid).unwrap().start;
+        let cases = [
+            (ctx.clone(), pid, None),
+            (ctx.clone(), pid, Some(start + 1)),
+            (ctx.clone(), i32::MAX, Some(start)),
+            (
+                Arc::new(
+                    ServerCtx::new(MACHINE.into())
+                        .with_db(db.clone())
+                        .with_agents(as_agent("hidden")),
+                ),
+                pid,
+                Some(start),
+            ),
+        ];
+        for (ctx, pid, start) in cases {
+            for (method, params) in [
+                ("msg.list", json!({})),
+                ("msg.read", json!({"msgId":sent.msg_id})),
+            ] {
+                let req = Request {
+                    params,
+                    ..Default::default()
+                };
+                let result = dispatch(
+                    method,
+                    req,
+                    &ctx,
+                    Peer::Unix {
+                        cred: PeerCred {
+                            pid,
+                            uid: peer::engine_uid(),
+                        },
+                        start,
+                    },
+                    &Principal::LocalUnverified,
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(
+                    result
+                        .err()
+                        .expect("unverified query must fail closed")
+                        .code,
+                    ErrorCode::NotAllowed
+                );
+            }
+        }
+        let (mut c, _) = Client::new(ctx).await;
+        assert_eq!(
+            c.call("l", "msg.list", json!({})).await["result"]["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            c.call("r", "msg.read", json!({"msgId":sent.msg_id})).await["result"]["body"],
+            "private"
+        );
+    }
+
+    #[tokio::test]
+    async fn m2fix_mail_events_enforce_ownership_for_live_and_replay() {
+        for replay in [false, true] {
+            for filtered in [false, true] {
+                for who in ["alice", "bob", "cat", "local"] {
+                    let agents = if who == "local" {
+                        Arc::new(NoLiveAgents) as Arc<dyn LiveAgents>
+                    } else {
+                        as_agent(who)
+                    };
+                    let (_t, ctx, db) = ctx_db(agents);
+                    for name in ["alice", "bob", "cat"] {
+                        mail_agent(&db, name, name, "pty").await;
+                    }
+                    let since = db.head_cursor().to_string();
+                    let (mut c, _) = Client::new(ctx.clone()).await;
+                    let mut params = json!({});
+                    if replay {
+                        params["since"] = json!(since);
+                    }
+                    if filtered {
+                        params["topics"] = json!(["msg.*", "agent.upsert"]);
+                        params["subjects"] = json!([format!("{}/bob", MACHINE)]);
+                    }
+                    if !replay {
+                        assert_eq!(
+                            c.call("s", "events.subscribe", params.clone()).await["ok"],
+                            true
+                        );
+                    }
+                    let sent = queue_mail(
+                        &ctx,
+                        &Principal::Agent {
+                            id: "alice".into(),
+                            gen: 1,
+                        },
+                        MsgSendParams {
+                            to: "bob".into(),
+                            body: "private preview".into(),
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    let id = sent.msg_id.clone();
+                    db.write(move |tx| mail::note(tx, MACHINE, &id, "private detail", now_ms()))
+                        .await
+                        .unwrap();
+                    let marker = event("agent.upsert", &format!("{}/bob", MACHINE), 99, 0);
+                    db.write(move |tx| tx.emit(&marker)).await.unwrap();
+                    if replay {
+                        assert_eq!(c.call("s", "events.subscribe", params).await["ok"], true);
+                    }
+                    let mut mail_events = Vec::new();
+                    loop {
+                        let frame = c.next().await;
+                        if frame["topic"] == "agent.upsert" {
+                            break;
+                        }
+                        mail_events.push(frame);
+                    }
+                    assert_eq!(
+                        mail_events.len(),
+                        if who == "cat" { 0 } else { 2 },
+                        "who={who} replay={replay} filtered={filtered}: {mail_events:?}"
+                    );
+                    if who != "cat" {
+                        assert_eq!(mail_events[0]["data"]["preview"], "private preview");
+                        assert_eq!(mail_events[1]["data"]["detail"], "private detail");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn m2fix_unverified_subscribers_drop_mail_but_keep_other_events() {
+        let (_t, ctx, db) = ctx_db(as_agent("hidden"));
+        mail_agent(&db, "bob", "bob", "pty").await;
+        queue_mail(
+            &ctx,
+            &Principal::LocalUnverified,
+            MsgSendParams {
+                to: "bob".into(),
+                body: "private".into(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let marker = event("agent.upsert", "bob", 99, 0);
+        db.write(move |tx| tx.emit(&marker)).await.unwrap();
+        let pid = std::process::id() as libc::pid_t;
+        // Exercise the same shallow LocalUnverified stamp a deep descendant
+        // gets, and an unreadable start token, through the subscribe path.
+        for start in [None, Some(peer::proc_info(pid).unwrap().start)] {
+            let (_, stream) = events_subscribe(
+                Request {
+                    id: Some("s".into()),
+                    params: json!({"since":format!("{}:{}:0", MACHINE, db.epoch())}),
+                    ..Default::default()
+                },
+                &ctx,
+                Peer::Unix {
+                    cred: PeerCred {
+                        pid,
+                        uid: peer::engine_uid(),
+                    },
+                    start,
+                },
+                &Principal::LocalUnverified,
+            )
+            .await
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(8);
+            let task = tokio::spawn(stream.run(tx));
+            let bytes = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let frame: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(frame["topic"], "agent.upsert", "{frame}");
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn m2_human_controls_audit_and_cancel_only_queued() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let (mut c, _) = Client::new(ctx).await;
+        for method in ["mail.pause", "mail.resume"] {
+            let r = c.call("p", method, json!({"agent":"bob"})).await;
+            assert_eq!(r["ok"], true, "{}", r);
+        }
+        let s = c
+            .call("s", "msg.send", json!({"to":"bob","body":"hello"}))
+            .await;
+        let id = s["result"]["msgId"].as_str().unwrap();
+        let r = c.call("c", "msg.cancel", json!({"msgId":id})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let r = c.call("d", "msg.cancel", json!({"msgId":id})).await;
+        assert_eq!(r["error"]["code"], "not_cancellable");
+        assert_eq!(r["error"]["data"]["state"], "cancelled");
+        assert_eq!(db.reader().unwrap().query_row("SELECT count(*) FROM audit WHERE method IN ('msg.cancel','mail.pause','mail.resume') AND decision='allow'",[],|r|r.get::<_,i64>(0)).unwrap(),3);
+    }
+    #[tokio::test]
+    async fn schema_generated_agent_denials_and_self_queries_use_the_same_table() {
+        let (_t, ctx, db) = ctx_db(as_agent("a7"));
+        let (mut c, hello) = Client::new(ctx).await;
+        let schema = schema();
+        let initial: i64 = db
+            .reader()
+            .unwrap()
+            .query_row("SELECT count(*) FROM audit", [], |r| r.get(0))
+            .unwrap();
+        for (name, entry) in schema["methods"].as_object().unwrap() {
+            let listed = entry["x-authz"]["principals"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("agent"));
+            assert_eq!(hello["methods"].get(name).is_some(), listed, "{name}");
+            let review = c.call("can", "auth.can", json!({"method": name})).await;
+            assert_eq!(review["result"]["allowed"], listed, "{name}: {review}");
+        }
+        let rules = c.call("rules", "auth.rules", json!({})).await;
+        assert_eq!(rules["result"]["methods"], hello["methods"]);
+        assert_eq!(rules["result"]["topics"], hello["topics"]);
+        let after: i64 = db
+            .reader()
+            .unwrap()
+            .query_row("SELECT count(*) FROM audit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(initial, after, "self queries never audit or execute");
+        for (name, entry) in schema["methods"].as_object().unwrap() {
+            if !entry["x-authz"]["principals"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("agent"))
+            {
+                let r = c.call("denied", name, json!({})).await;
+                assert_eq!(r["error"]["code"], "not_allowed", "{name}: {r}");
+            }
+        }
+    }
+    #[tokio::test]
+    async fn gateway_type_refuses_local_mutations_even_if_authority_is_bypassed() {
+        let ctx = ServerCtx::new("test".into());
+        let peer = Peer::Gateway {
+            client_id: uuid::Uuid::new_v4(),
+            remote_addr: "127.0.0.1:4000".parse().unwrap(),
+        };
+        let principal = Principal::Client { id: "test".into() };
+        for method in [
+            "agent.create",
+            "agent.retire",
+            "msg.send",
+            "msg.list",
+            "msg.read",
+            "msg.cancel",
+            "mail.pause",
+            "mail.resume",
+            "detect.recheck",
+            "provider.opencode.connect",
+            "hook.stop",
+            "task.done",
+        ] {
+            // Simulate a bad authorization declaration allowing this client.
+            let mut declaration = authz::method(method).unwrap();
+            declaration.principals = &["client"];
+            let access = authz::Access {
+                scopes: [format!("{}:{}", declaration.resource, declaration.verb)].into(),
+                ceiling: Ceiling::Conversation,
+                ..Default::default()
+            };
+            assert!(authz::review(Some(&declaration), &principal, Some(&access)).allowed);
+            let req = Request {
+                params: json!({}),
+                ..Default::default()
+            };
+            let err = match execute(method, req, &ctx, peer, &principal, None, None).await {
+                Err(e) => e,
+                Ok(_) => panic!("{method} bypassed the gateway type gate"),
+            };
+            assert_eq!(err.code, ErrorCode::NotAllowed, "{method}: {err:?}");
+        }
+    }
+    #[tokio::test]
+    async fn annotation_dispatch_audits_all_writes_and_refusals_once_without_values() {
+        let (_t, ctx, db) = ctx_db(as_agent("a7"));
+        db.write(|tx| {
+            tx.execute("INSERT INTO agents(id,role,provider,source,session_key) VALUES ('ann','observed','claudeCode','detected','claudeCode:ann')", [])?;
+            Ok(())
+        }).await.unwrap();
+        let (mut c, hello) = Client::hello(ctx, json!({"want":["annotations"]})).await;
+        assert_eq!(hello["capabilities"], json!(["annotations"]));
+        let target = json!({"kind":"session","sessionKey":"claudeCode:ann"});
+        let foreign = c.call("foreign", "annotation.set", json!({"target":target,"key":"agent.other/note","value":{"type":"string","v":"secret payload"}})).await;
+        assert_eq!(foreign["error"]["code"], "not_allowed");
+        let malformed = c
+            .call(
+                "bad",
+                "annotation.patch",
+                json!({"target":target,"values":{"note":{"type":"number","v":"secret payload"}}}),
+            )
+            .await;
+        assert_eq!(malformed["error"]["code"], "bad_request");
+        let accepted = c.call("set", "annotation.patch", json!({"target":target,"seq":1,"values":{"note":{"type":"string","v":"secret payload"}}})).await;
+        assert_eq!(accepted["result"]["applied"], true, "{accepted}");
+        assert_eq!(accepted["result"]["values"]["note"]["writer"], "agent:a7");
+        let ignored = c
+            .call(
+                "old",
+                "annotation.patch",
+                json!({"target":target,"seq":1,"values":{"note":null}}),
+            )
+            .await;
+        assert_eq!(ignored["result"]["applied"], false);
+        let deleted = c
+            .call(
+                "delete",
+                "annotation.delete",
+                json!({"target":target,"key":"agent.a7/note"}),
+            )
+            .await;
+        assert_eq!(deleted["result"]["deleted"], true);
+        let list = c.call("list", "annotation.list", json!({})).await;
+        assert_eq!(list["result"]["annotations"], json!([]));
+        let conn = db.reader().unwrap();
+        let audits: Vec<(String,String,String,String)> = conn.prepare("SELECT decision,payload_hash,annotation_keys,coalesce(reason,'') FROM audit WHERE method LIKE 'annotation.%' ORDER BY seq").unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect();
+        assert_eq!(audits.len(), 5);
+        assert_eq!(
+            audits.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["deny", "deny", "allow", "allow", "allow"]
+        );
+        for (_, hash, keys, reason) in audits {
+            assert_eq!(hash.len(), 64);
+            assert!(keys.contains("note"));
+            assert!(!format!("{hash}{keys}{reason}").contains("secret payload"));
+        }
+    }
+
+    // ── Concurrency, idem and observed sessions (D3, D8, D9) ──────────
+
+    /// `ctx_db` whose `session.list` waits on `gate` until the test opens it.
+    /// A slow request: `session.stop` with `idem` key `k` waits while the
+    /// test holds that key's slot.
+    async fn hold_idem(
+        ctx: &ServerCtx,
+        k: &str,
+    ) -> tokio::sync::OwnedMutexGuard<Option<crate::engine::idem::Done>> {
+        let key = ("local-unverified".into(), "session.stop".into(), k.into());
+        ctx.idem.slot(key).unwrap().lock_owned().await
+    }
+
+    fn slow(k: &str) -> Value {
+        json!({"v": 1, "id": k, "method": "session.stop", "idem": k,
+            "params": {"sessionKey": "claudeCode:none"}})
+    }
+
+    /// D3: one connection runs requests concurrently; a fast one sent after
+    /// a slow one answers first, and each answer carries its own `id`.
+    #[tokio::test]
+    async fn responses_on_one_connection_come_out_of_order() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let held = hold_idem(&ctx, "slow").await;
+        let (mut c, _) = Client::new(ctx.clone()).await;
+        c.send_raw(slow("slow")).await;
+        c.send("fast", "ping", json!({})).await;
+        let first = c.next().await;
+        assert_eq!(first["id"], "fast", "{}", first);
+        assert_eq!(first["ok"], true, "{}", first);
+        drop(held);
+        let second = c.next().await;
+        assert_eq!(second["id"], "slow", "{}", second);
+    }
+
+    /// D3: past `MAX_IN_FLIGHT` requests the reader waits; nothing is lost
+    /// and every request is answered once one ends.
+    #[tokio::test]
+    async fn requests_in_flight_are_bounded() {
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let mut held = Vec::new();
+        for i in 0..MAX_IN_FLIGHT {
+            held.push(hold_idem(&ctx, &i.to_string()).await);
+        }
+        let (mut c, _) = Client::new(ctx.clone()).await;
+        for i in 0..MAX_IN_FLIGHT {
+            c.send_raw(slow(&i.to_string())).await;
+        }
+        c.send("last", "ping", json!({})).await;
+        let early = tokio::time::timeout(Duration::from_millis(300), c.lines.next_line()).await;
+        assert!(early.is_err(), "answered past the bound: {:?}", early);
+        drop(held);
+        let mut ids = std::collections::BTreeSet::new();
+        for _ in 0..=MAX_IN_FLIGHT {
+            let r = c.next().await;
+            ids.insert(r["id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(ids.len(), MAX_IN_FLIGHT + 1);
+        assert!(ids.contains("last"));
+    }
+
+    /// D3: a subscribe response still comes before the stream's first
+    /// event while other requests run beside it.
+    #[tokio::test]
+    async fn a_subscribe_answers_before_its_events_beside_other_calls() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        for i in 0..3 {
+            let e = event("agent.upsert", &format!("m/a{}", i), 0, 0);
+            db.write(move |tx| tx.emit(&e)).await.unwrap();
+        }
+        let (mut c, _) = Client::new(ctx).await;
+        let since = format!("{}:{}:0", MACHINE, db.epoch());
+        c.send("p1", "ping", json!({})).await;
+        c.send(
+            "s",
+            "events.subscribe",
+            json!({"since": since, "topics": ["agent.*"]}),
+        )
+        .await;
+        c.send("p2", "ping", json!({})).await;
+        let mut acked = false;
+        let mut events = 0;
+        while events < 3 {
+            let f = c.next().await;
+            if f["type"] == "event" {
+                assert!(acked, "event before the subscribe response: {}", f);
+                events += 1;
+            } else if f["id"] == "s" {
+                assert_eq!(f["ok"], true, "{}", f);
+                acked = true;
+            }
+        }
+    }
+
+    /// A subscribe and its unsubscribe sent back to back run in that order:
+    /// the unsubscribe ends the stream, and no event follows its response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pipelined_unsubscribe_runs_after_its_subscribe() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        for i in 0..50 {
+            let e = event("agent.upsert", &format!("m/a{}", i), 0, 0);
+            db.write(move |tx| tx.emit(&e)).await.unwrap();
+        }
+        let since = format!("{}:{}:0", MACHINE, db.epoch());
+        for _ in 0..200 {
+            let (mut c, _) = Client::new(ctx.clone()).await;
+            c.send(
+                "s",
+                "events.subscribe",
+                json!({"since": since, "topics": ["agent.*"]}),
+            )
+            .await;
+            c.send("u", "events.unsubscribe", json!({"sub": "s"})).await;
+            let mut acked = false;
+            loop {
+                let f = c.next().await;
+                if f["id"] == "s" {
+                    assert_eq!(f["ok"], true, "{}", f);
+                    acked = true;
+                } else if f["id"] == "u" {
+                    assert!(acked, "unsubscribe answered before its subscribe");
+                    assert_eq!(f["result"]["ended"], true, "{}", f);
+                    break;
+                }
+            }
+            let after = tokio::time::timeout(Duration::from_millis(20), c.next()).await;
+            assert!(after.is_err(), "a frame after the unsubscribe: {:?}", after);
+        }
+    }
+
+    /// A detector whose ticks fail until `ok` is set; then it sees one
+    /// session, run by this test process's parent.
+    #[derive(Clone, Default)]
+    struct Flaky(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Observe for Flaky {
+        fn observe(&mut self) -> Result<Observation, String> {
+            if !self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("not yet".into());
+            }
+            let me = std::process::id() as libc::pid_t;
+            let mut s = fixture("s1", SessionStatus::Working);
+            s.pid = peer::proc_info(me).unwrap().ppid as u32;
+            Ok(Observation {
+                sessions: vec![s],
+                failed: Vec::new(),
+                diagnostics: None,
+            })
+        }
+    }
+
+    /// `ctx_db` with a `Flaky` detection whose first tick failed: no views.
+    fn ctx_flaky() -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Detection>, Flaky) {
+        let (t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let flaky = Flaky::default();
+        let detection = Detection::new(db);
+        detection.install(Detector::new(Box::new(flaky.clone()), MACHINE.into()));
+        assert!(detection.tick().is_err());
+        let ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .unwrap()
+            .with_detection(detection.clone());
+        (t, Arc::new(ctx), detection, flaky)
+    }
+
+    /// Which requests a provisional stamp may not serve.
+    #[test]
+    fn needs_stamp_covers_what_an_observed_session_reads_differently() {
+        let req = |method: &str, params: Value| -> Request {
+            serde_json::from_value(json!({"v": 1, "id": "1", "method": method, "params": params}))
+                .unwrap()
+        };
+        for (method, params, needs) in [
+            ("ping", json!({}), false),
+            ("agent.list", json!({}), false),
+            ("session.views", json!({}), false),
+            ("no.such", json!({}), false),
+            ("msg.list", json!({}), true),
+            ("msg.read", json!({}), true),
+            ("msg.send", json!({}), true),
+            ("session.stop", json!({}), true),
+            ("session.rename", json!({}), true),
+            ("annotation.set", json!({}), true),
+            ("agent.create", json!({}), true),
+            ("agent.retire", json!({"agentId": "a", "force": true}), true),
+            ("agent.resume", json!({"id": "a"}), true),
+            ("events.subscribe", json!({}), true),
+            (
+                "events.subscribe",
+                json!({"topics": ["agent.*", "session.*"]}),
+                false,
+            ),
+            ("events.subscribe", json!({"topics": ["legacy.*"]}), true),
+            ("events.subscribe", json!({"topics": ["msg.state"]}), true),
+        ] {
+            assert_eq!(
+                needs_stamp(method, &req(method, params.clone())),
+                needs,
+                "{} {}",
+                method,
+                params
+            );
+        }
+    }
+
+    fn req_of(method: &str, params: Value) -> Request {
+        serde_json::from_value(json!({"v": 1, "id": "1", "method": method, "params": params}))
+            .unwrap()
+    }
+
+    /// A peer that exits before detection's views exist cannot be verified
+    /// by the second stamp: its connection is restricted, never settled as
+    /// `local-unverified`. A live peer is stamped `observed:` as before.
+    #[tokio::test]
+    async fn a_peer_that_exits_before_the_views_is_restricted() {
+        let (_t, ctx, detection, flaky) = ctx_flaky();
+        let uid = unsafe { libc::getuid() };
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let gone = PeerCred {
+            pid: child.id() as libc::pid_t,
+            uid,
+        };
+        let me = PeerCred {
+            pid: std::process::id() as libc::pid_t,
+            uid,
+        };
+        let accepted = peer::start_token_now();
+        let (gone, live) = (
+            Stamp::at_accept(&ctx, gone, accepted),
+            Stamp::at_accept(&ctx, me, accepted),
+        );
+        assert!(gone.provisional && live.provisional);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        flaky.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        detection.tick().unwrap();
+
+        let inbox = req_of("events.subscribe", json!({"topics": ["legacy.inbox"]}));
+        for (method, req) in [
+            ("msg.list", req_of("msg.list", json!({}))),
+            ("events.subscribe", inbox),
+        ] {
+            let e = gone.for_request(&ctx, method, &req).await.unwrap_err();
+            assert_eq!(e.code, ErrorCode::PeerNotAuthorized, "{}: {:?}", method, e);
+        }
+        // Plain reads still answer under the provisional stamp.
+        let (p, _) = gone
+            .for_request(&ctx, "agent.list", &req_of("agent.list", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(*p, Principal::LocalUnverified);
+        let (p, _) = live
+            .for_request(&ctx, "msg.list", &req_of("msg.list", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(p.to_string(), "observed:claudeCode:s1");
+    }
+
+    /// A local subscribe whose mailbox check fails: naming a local-only
+    /// topic fails with the check; without one it loses those topics.
+    #[tokio::test]
+    async fn a_failed_mail_check_refuses_or_filters_local_only_topics() {
+        let (_t, ctx, _db) = observed_ctx("claudeCode:s1");
+        let me = std::process::id() as libc::pid_t;
+        let peer = Peer::Unix {
+            cred: PeerCred {
+                pid: me,
+                uid: unsafe { libc::getuid() },
+            },
+            start: Some(peer::proc_info(me).unwrap().start),
+        };
+        let local = Principal::LocalUnverified;
+        let named = req_of("events.subscribe", json!({"topics": ["legacy.inbox"]}));
+        assert!(events_subscribe(named, &ctx, peer, &local).await.is_err());
+        let (_, stream) =
+            events_subscribe(req_of("events.subscribe", json!({})), &ctx, peer, &local)
+                .await
+                .unwrap();
+        assert!(stream.mail_principal.is_none());
+        for t in local_only_topics() {
+            assert!(!stream.allowed_topics.contains(&t), "{}", t);
+        }
+        assert!(stream.allowed_topics.contains(&"agent.upsert".to_string()));
+    }
+
+    /// `hello` with a deadline: it never waits for detection.
+    async fn quick_hello(ctx: Arc<ServerCtx>) -> (Client, Value) {
+        tokio::time::timeout(Duration::from_secs(1), Client::new(ctx))
+            .await
+            .expect("hello within 1 s")
+    }
+
+    /// The first tick fails and a later one succeeds. `hello` answers at
+    /// once, provisionally `local-unverified`; the first restricted request
+    /// waits for the views, and the connection is `observed:` from then on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provisional_peer_is_stamped_again_before_a_restricted_request() {
+        let (_t, ctx, detection, flaky) = ctx_flaky();
+        let (mut c, hello) = quick_hello(ctx).await;
+        assert_eq!(hello["principal"], "local-unverified");
+        let pass = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            flaky.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::task::spawn_blocking(move || detection.tick().unwrap())
+                .await
+                .unwrap();
+        });
+        // Closed to an observed session: refused for the stamp that
+        // detection's views give, not run as the provisional one.
+        let r = c.call("1", "msg.list", json!({})).await;
+        assert_eq!(r["error"]["code"], "not_allowed", "{}", r);
+        let r = c.call("2", "auth.rules", json!({})).await;
+        assert_eq!(r["result"]["principal"], "observed:claudeCode:s1", "{}", r);
+        pass.await.unwrap();
+    }
+
+    /// Detection never succeeds: a restricted request gets `busy` with its
+    /// own `id`, and plain reads still answer.
+    #[tokio::test]
+    async fn a_restricted_request_is_busy_until_detection_succeeds() {
+        let (_t, ctx, _d, _f) = ctx_flaky();
+        let (mut c, hello) = quick_hello(ctx).await;
+        assert_eq!(hello["principal"], "local-unverified");
+        let r = c.call("1", "agent.list", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        c.send("2", "msg.list", json!({})).await;
+        c.send("3", "ping", json!({})).await;
+        let r = c.next().await;
+        assert_eq!(r["id"], "3", "a read waits behind a restricted one: {}", r);
+        let r = c.next().await;
+        assert_eq!(r["id"], "2", "{}", r);
+        assert_eq!(r["error"]["code"], "busy", "{}", r);
+        let r = c.call("4", "ping", json!({})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+    }
+
+    /// A slow subscribe holds up only the stream controls after it: a ping
+    /// sent after `subscribe` and `unsubscribe` answers first, and the
+    /// unsubscribe still runs after its subscribe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_subscribe_does_not_hold_up_other_requests() {
+        let (_t, ctx, detection, flaky) = ctx_flaky();
+        let (mut c, _) = quick_hello(ctx).await;
+        // Unfiltered, it may carry `legacy.inbox`: it waits for the views.
+        c.send("s", "events.subscribe", json!({})).await;
+        c.send("u", "events.unsubscribe", json!({"sub": "s"})).await;
+        c.send("p", "ping", json!({})).await;
+        let r = c.next().await;
+        assert_eq!(r["id"], "p", "{}", r);
+        flaky.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::task::spawn_blocking(move || detection.tick().unwrap())
+            .await
+            .unwrap();
+        let mut acked = false;
+        loop {
+            let f = c.next().await;
+            if f["id"] == "s" && f["type"] != "event" {
+                assert_eq!(f["ok"], true, "{}", f);
+                acked = true;
+            } else if f["id"] == "u" {
+                assert!(acked, "unsubscribe answered before its subscribe");
+                assert_eq!(f["result"]["ended"], true, "{}", f);
+                break;
+            }
+        }
+    }
+
+    fn observed_ctx(key: &str) -> (tempfile::TempDir, Arc<ServerCtx>, Arc<Db>) {
+        let (t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let me = std::process::id() as libc::pid_t;
+        let parent = peer::proc_info(me).unwrap().ppid;
+        let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+        ctx.observed = Some(Arc::new(principal::tests::FakeObserved::one(key, parent)));
+        (t, Arc::new(ctx), db)
+    }
+
+    /// D8: a peer inside an observed session is `observed:<sessionKey>`. It
+    /// may not create, retire or stop another session; each refusal is
+    /// audited under its own name.
+    #[tokio::test]
+    async fn an_observed_session_may_not_create_retire_or_stop_others() {
+        let (_t, ctx, db) = observed_ctx("claudeCode:s1");
+        let (mut c, hello) = Client::new(ctx).await;
+        assert_eq!(hello["principal"], "observed:claudeCode:s1");
+        for (i, (method, params)) in [
+            ("agent.create", json!({"mode": "free", "cwd": "/tmp"})),
+            ("agent.retire", json!({"agentId": "agt_x"})),
+            ("agent.retire", json!({"agentId": "agt_x", "force": true})),
+            ("agent.resume", json!({"id": "agt_x"})),
+            ("session.stop", json!({"sessionKey": "claudeCode:s2"})),
+            ("detect.recheck", json!({})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let r = c.call(&i.to_string(), method, params).await;
+            assert_eq!(r["error"]["code"], "not_allowed", "{}: {}", method, r);
+        }
+        // Its own session passes admission; this engine runs no detection.
+        let r = c
+            .call(
+                "own",
+                "session.stop",
+                json!({"sessionKey": "claudeCode:s1"}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], "internal", "{}", r);
+        let denied: Vec<(String, String)> = db
+            .reader()
+            .unwrap()
+            .prepare("SELECT principal, method FROM audit WHERE decision = 'deny' ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let methods: Vec<&str> = denied.iter().map(|(_, m)| m.as_str()).collect();
+        // The last row is the own stop's failure, after admission.
+        assert_eq!(
+            methods,
+            [
+                "agent.create",
+                "agent.retire",
+                "agent.retire",
+                "agent.resume",
+                "session.stop",
+                "detect.recheck",
+                "session.stop"
+            ]
+        );
+        assert!(denied.iter().all(|(p, _)| p == "observed:claudeCode:s1"));
+    }
+
+    /// D8: an observed session may still send mail; the message names it
+    /// as its source.
+    #[tokio::test]
+    async fn an_observed_session_sends_mail_that_names_it() {
+        let (_t, ctx, db) = observed_ctx("claudeCode:s1");
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let (mut c, _) = Client::new(ctx).await;
+        let r = c
+            .call("1", "msg.send", json!({"to": "agt_b1", "body": "hi"}))
+            .await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let (from, provenance): (String, String) = db
+            .reader()
+            .unwrap()
+            .query_row("SELECT from_principal, provenance FROM messages", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(from, "observed:claudeCode:s1");
+        assert!(
+            provenance.starts_with("[from observed session claudeCode:s1 for "),
+            "{}",
+            provenance
+        );
+        // It has no mailbox to read.
+        let r = c.call("2", "msg.list", json!({})).await;
+        assert_eq!(r["error"]["code"], "not_allowed", "{}", r);
+    }
+
+    /// D3: `agent.create` and `agent.retire` replay a repeated `idem`
+    /// without reaching the spawner again, and audit the replay.
+    #[tokio::test]
+    async fn create_and_retire_replay_a_repeated_idem() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        let me = Principal::LocalUnverified;
+        for method in ["agent.create", "agent.retire"] {
+            let runs = AtomicUsize::new(0);
+            let req = || Request {
+                params: json!({"agentId": "agt_a"}),
+                idem: Some(format!("{method}-k")),
+                ..Default::default()
+            };
+            let write = |_req: Request| async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"agent": {"id": "agt_a"}}))
+            };
+            let first = idem_write(method, req(), &ctx, &me, write).await.unwrap();
+            let again = idem_write(method, req(), &ctx, &me, write).await.unwrap();
+            assert_eq!(first, again);
+            assert_eq!(runs.load(Ordering::SeqCst), 1, "{method}");
+            let mut other = req();
+            other.params = json!({"agentId": "agt_b"});
+            let e = idem_write(method, other, &ctx, &me, write)
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, ErrorCode::Duplicate, "{method}");
+            // Without a key every request writes.
+            let mut plain = req();
+            plain.idem = None;
+            idem_write(method, plain, &ctx, &me, write).await.unwrap();
+            assert_eq!(runs.load(Ordering::SeqCst), 2, "{method}");
+            let reason: String = db
+                .reader()
+                .unwrap()
+                .query_row(
+                    "SELECT reason FROM audit WHERE method = ?1 AND target = 'agt_a'",
+                    [method],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(reason, "idem replay", "{method}");
+        }
+    }
+
+    /// `agent.retire {force: true}` replays under its own `idem`; the same
+    /// key without `force` is other params, so `duplicate`.
+    #[tokio::test]
+    async fn a_forced_retire_replays_its_idem() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_t, ctx, _db) = ctx_db(Arc::new(NoLiveAgents));
+        let me = Principal::LocalUnverified;
+        let runs = AtomicUsize::new(0);
+        let req = |params: Value| Request {
+            params,
+            idem: Some("force-k".into()),
+            ..Default::default()
+        };
+        let write = |_req: Request| async {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"agent": {"id": "agt_f", "state": "retired"}}))
+        };
+        let forced = json!({"agentId": "agt_f", "force": true});
+        let first = idem_write("agent.retire", req(forced.clone()), &ctx, &me, write)
+            .await
+            .unwrap();
+        let again = idem_write("agent.retire", req(forced), &ctx, &me, write)
+            .await
+            .unwrap();
+        assert_eq!(first, again);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        let e = idem_write(
+            "agent.retire",
+            req(json!({"agentId": "agt_f"})),
+            &ctx,
+            &me,
+            write,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Duplicate);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// D3: `session.stop` with a repeated `idem` replays the first answer;
+    /// without the key, the second stop finds no session.
+    #[tokio::test]
+    async fn session_stop_replays_a_repeated_idem() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = crate::actions::process_start_secs(pid).expect("the sleep's start time");
+        let detected = DetectedSession {
+            process_start_secs: Some(start),
+            ..DetectedSession::with_legacy_defaults(
+                pid,
+                "/tmp".into(),
+                "/tmp/proj".into(),
+                Some("stop-idem".to_string()),
+                "proj".to_string(),
+            )
+        };
+        let mut live = fixture("stop-idem", SessionStatus::Working);
+        live.pid = pid;
+        let script = Scripted::default();
+        script.set(vec![live], vec![detected]);
+        let (_t, ctx, _db, _d) = ctx_detect(Arc::new(NoLiveAgents), &script);
+        let reaper = {
+            let script = script.clone();
+            std::thread::spawn(move || {
+                child.wait().unwrap();
+                script.set(vec![], vec![]);
+            })
+        };
+        let (mut c, _) = Client::new(ctx).await;
+        let stop = |id: &str, idem: Option<&str>| {
+            let mut v = json!({"v": 1, "id": id, "method": "session.stop",
+                "params": {"sessionKey": "claudeCode:stop-idem"}});
+            if let Some(k) = idem {
+                v["idem"] = k.into();
+            }
+            let mut line = serde_json::to_vec(&v).unwrap();
+            line.push(b'\n');
+            line
+        };
+        c.write.write_all(&stop("1", Some("k"))).await.unwrap();
+        let first = c.next().await;
+        assert_eq!(first["ok"], true, "{}", first);
+        reaper.join().unwrap();
+        c.write.write_all(&stop("2", Some("k"))).await.unwrap();
+        let again = c.next().await;
+        assert_eq!(again["ok"], true, "{}", again);
+        assert_eq!(again["result"], first["result"]);
+        c.write.write_all(&stop("3", None)).await.unwrap();
+        let plain = c.next().await;
+        assert_eq!(plain["error"]["code"], "unknown_session", "{}", plain);
+    }
+
+    /// D3: `msg.send` replays a repeated `idem` while requests on the same
+    /// connection run concurrently: one message, two equal answers.
+    #[tokio::test]
+    async fn concurrent_msg_sends_with_one_idem_write_once() {
+        let (_t, ctx, db) = ctx_db(as_agent("agt_a7"));
+        mail_agent(&db, "agt_a7", "me", "pty").await;
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let (mut c, _) = Client::new(ctx).await;
+        for i in 0..2 {
+            let mut line = serde_json::to_vec(&json!({
+                "v": 1, "id": i.to_string(), "method": "msg.send", "idem": "same",
+                "params": {"to": "agt_b1", "body": "hi"},
+            }))
+            .unwrap();
+            line.push(b'\n');
+            c.write.write_all(&line).await.unwrap();
+        }
+        let (a, b) = (c.next().await, c.next().await);
+        assert_eq!(a["ok"], true, "{}", a);
+        assert_eq!(b["ok"], true, "{}", b);
+        assert_eq!(a["result"]["msgId"], b["result"]["msgId"]);
+        assert_eq!(message_count(&db), 1);
+    }
+}
+
+// C1b-M2 mailbox APIs. Mutations require the same verified local ancestry
+// as msg.send, plus the human-only principal restriction.
+async fn mail_query(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    who: &Principal,
+) -> Result<serde_json::Value, ApiError> {
+    use crate::engine_proto::wire::{MsgIdParams, MsgListParams};
+    // The caller passed `Admission::MailPeer` already.
+    let db = ctx.db()?.clone();
+    let machine = ctx.machine_id.clone();
+    let who = who.clone();
+    let method = method.to_string();
+    blocking(move || {
+        let c = db.reader().map_err(internal)?;
+        if method == "msg.list" {
+            let p: MsgListParams = serde_json::from_value(req.params)
+                .map_err(|e| ApiError::new(ErrorCode::BadRequest, e.to_string()))?;
+            Ok(
+                serde_json::to_value(mail::list(&c, &machine, &who, &p).map_err(internal)??)
+                    .expect("mail list"),
+            )
+        } else {
+            let p: MsgIdParams = serde_json::from_value(req.params)
+                .map_err(|e| ApiError::new(ErrorCode::BadRequest, e.to_string()))?;
+            Ok(
+                serde_json::to_value(mail::read(&c, &machine, &who, &p.msg_id).map_err(internal)??)
+                    .expect("mail read"),
+            )
+        }
+    })
+    .await
+}
+/// `Admission::MailPeer`: unrestricted mail reads need the same complete
+/// peer verification as mailbox controls. Agent reads remain restricted by
+/// message ownership.
+async fn check_mail_peer(ctx: &ServerCtx, peer: Peer, who: &Principal) -> Result<(), ApiError> {
+    let peer = peer.unix()?;
+    if !matches!(who, Principal::LocalUnverified) {
+        return Ok(());
+    }
+    ctx.ensure_views().await?;
+    let (agents, observed) = (ctx.agents.clone(), ctx.observed_sessions());
+    let who = who.clone();
+    blocking(move || {
+        Ok(mail::check_sender(
+            &who,
+            peer.cred.pid,
+            peer.start,
+            agents.as_ref(),
+            observed.as_ref(),
+        ))
+    })
+    .await?
+}
+
+async fn mail_control(
+    method: &str,
+    req: Request,
+    ctx: &ServerCtx,
+    who: &Principal,
+) -> Result<serde_json::Value, ApiError> {
+    use crate::engine_proto::wire::{MailAgentParams, MsgIdParams};
+    // The caller passed `Admission::MutatingPeer` already.
+    let method = method.to_string();
+    let target = req
+        .params
+        .get("agent")
+        .or_else(|| req.params.get("msgId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let parsed = if method == "msg.cancel" {
+        serde_json::from_value::<MsgIdParams>(req.params).map(|p| p.msg_id)
+    } else {
+        serde_json::from_value::<MailAgentParams>(req.params).map(|p| p.agent)
+    }
+    .map_err(|e| ApiError::new(ErrorCode::BadRequest, e.to_string()));
+    let id = match parsed {
+        Ok(id) => id,
+        Err(e) => {
+            audit_refusal(ctx, who, &method, &target, &e).await;
+            return Err(e);
+        }
+    };
+    let db = ctx.db()?.clone();
+    let machine = ctx.machine_id.clone();
+    let principal = who.to_string();
+    let m = method.clone();
+    let (out, _) = db
+        .write(move |tx| {
+            let out = if m == "msg.cancel" {
+                mail::cancel(tx, &machine, &id, &principal, now_ms())?.map(|_| None)
+            } else {
+                match mail::resolve(tx, &machine, &id)? {
+                    Ok(t) => {
+                        mail::pause(tx, &machine, &t.id, &principal, m == "mail.pause", now_ms())?;
+                        Ok(Some(t.id))
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            let reason = out.as_ref().err().map(|e| e.code.to_string());
+            audit::append(
+                tx,
+                now_ms(),
+                &AuditEntry {
+                    principal: &principal,
+                    method: &m,
+                    target: Some(&id),
+                    decision: if out.is_ok() { "allow" } else { "deny" },
+                    reason: reason.as_deref(),
+                    ..Default::default()
+                },
+            )?;
+            Ok(out)
+        })
+        .await
+        .map_err(internal)?;
+    if let Some(agent) = out? {
+        if method == "mail.resume" {
+            if let Some(s) = &ctx.spawner {
+                s.nudge_mail(&agent);
+            }
+        }
+    }
+    Ok(serde_json::json!({"ok": true}))
+}
+
+async fn audit_annotation_refusal(
+    ctx: &ServerCtx,
+    principal: &Principal,
+    method: &str,
+    params: serde_json::Value,
+    error: &ApiError,
+) -> Result<(), ApiError> {
+    let Some(db) = &ctx.db else { return Ok(()) };
+    let (principal, method, reason) = (
+        principal.to_string(),
+        method.to_string(),
+        error.code.to_string(),
+    );
+    db.write(move |tx| {
+        annotations::audit_request(
+            tx,
+            &principal,
+            &method,
+            &params,
+            "deny",
+            Some(&reason),
+            now_ms(),
+        )
+    })
+    .await
+    .map_err(internal)?;
+    Ok(())
+}

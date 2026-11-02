@@ -72,7 +72,7 @@ impl GatewayLease {
         tauri::async_runtime::block_on(crate::gateway::consent::confirm(
             previous,
             &params,
-            |message| crate::gateway::consent::native_dialog(app.clone(), message),
+            |message| crate::native_dialog(app.clone(), message),
         ))?;
         let grant = confirmation::sign(
             &self.key,

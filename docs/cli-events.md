@@ -2,7 +2,7 @@
 
 `c9watch watch` streams one JSON event per line while sessions change.
 `c9watch wait` blocks until one session meets a condition, prints that one
-event, and exits. Both use the same event rules (`src-tauri/src/cli/watch.rs`),
+event, and exits. Both use the same event rules (`src-tauri/core/src/cli/watch.rs`),
 so a script can switch between them without new parsing.
 
 Neither command needs Herdr, tmux, or a terminal. Use them in place of
