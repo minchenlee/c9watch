@@ -29,7 +29,10 @@
 //!   (`profile::managed_root_deny_rules`, `managed_root_deny_write`) in
 //!   place of the rules that name the cwd's own `.claude/`, so only the
 //!   root rules can stop a write there. `<home>/live-test/extra-deny.json`
-//!   (a JSON array of strings) is appended to `permissions.deny` as it is.
+//!   (a JSON array of strings) is appended to `permissions.deny` as it is,
+//!   and `extra-deny-write.json` to `sandbox.filesystem.denyWrite`: a
+//!   sandbox-only probe that no file-tool rule and no `.claude` name (which
+//!   the auto-mode classifier refuses on its own) can stand in for.
 //!   The script checks the spawn settings file before it sends a prompt.
 
 use std::path::{Path, PathBuf};
@@ -74,6 +77,9 @@ pub const D16_ROOT: &str = "d16-root";
 /// `<home>/live-test/extra-deny.json`
 pub const EXTRA_DENY: &str = "extra-deny.json";
 
+/// `<home>/live-test/extra-deny-write.json`
+pub const EXTRA_DENY_WRITE: &str = "extra-deny-write.json";
+
 /// Apply the D16 test settings to the `--settings` value `s` of `p` (see
 /// the module doc). Nothing changes without the files.
 pub fn patch_settings(p: &crate::engine::adapter::cc::profile::Profile, s: &mut serde_json::Value) {
@@ -99,12 +105,17 @@ pub fn patch_settings(p: &crate::engine::adapter::cc::profile::Profile, s: &mut 
             dw.extend(managed_root_deny_write(&root).into_iter().map(Into::into));
         }
     }
-    let extra: Vec<String> = std::fs::read(d.join(EXTRA_DENY))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+    let extra = |name: &str| -> Vec<String> {
+        std::fs::read(d.join(name))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    };
     if let Some(deny) = s["permissions"]["deny"].as_array_mut() {
-        deny.extend(extra.into_iter().map(Into::into));
+        deny.extend(extra(EXTRA_DENY).into_iter().map(Into::into));
+    }
+    if let Some(dw) = s["sandbox"]["filesystem"]["denyWrite"].as_array_mut() {
+        dw.extend(extra(EXTRA_DENY_WRITE).into_iter().map(Into::into));
     }
 }
 
@@ -176,6 +187,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(home.join(DIR).join(EXTRA_DENY), r#"["Edit(//x/**)"]"#).unwrap();
+        std::fs::write(home.join(DIR).join(EXTRA_DENY_WRITE), r#"["/x/*/probe"]"#).unwrap();
         let s = settings(&p);
         let deny = strs(&s["permissions"]["deny"]);
         let dw = strs(&s["sandbox"]["filesystem"]["denyWrite"]);
@@ -187,6 +199,7 @@ mod tests {
         assert!(deny.contains(&"Edit(//x/**)".to_string()));
         assert!(!dw.contains(&own_dir));
         assert!(dw.contains(&format!("{}/*/.claude", r)));
+        assert!(dw.contains(&"/x/*/probe".to_string()));
         // The engine's own paths stay denied.
         assert!(dw.iter().any(|d| d.ends_with("/bin")));
 
