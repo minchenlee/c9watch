@@ -10,12 +10,17 @@
 //!
 //! Every path the fence holds is a realpath taken at create. A target is
 //! resolved the same way before it is compared (`resolve_target`), so a
-//! symlink or `..` cannot walk out of an allowed subtree. A realpath keeps
-//! the case it was given (macOS), so a fence path contains a target when
-//! it is the same file (device and inode) as an existing ancestor of the
-//! target, or a path prefix of it; for `denyWriteUnder` the prefix is
-//! compared without case on macOS. A file with more than one hard link is
-//! refused: its other names may be anywhere.
+//! symlink or `..` cannot walk out of an allowed subtree. A realpath
+//! gives an existing dir its stored case (macOS), but a missing tail keeps
+//! the case it was written in, so a `denyWriteUnder` path holds a target
+//! when it is the same file (device and inode, read now) as an existing
+//! ancestor of the target, or a path prefix of it, compared without case
+//! on a case-insensitive volume. An `allowWrite` path holds a
+//! target only as a case-sensitive prefix of the stored realpath: an allow
+//! never comes from looking the allow path up again, since the agent may
+//! have swapped it for a symlink. Each rule fails toward a deny. A file
+//! with more than one hard link is refused: its other names may be
+//! anywhere.
 //!
 //! Known limitation: the hook checks a path, not the write. Between the
 //! check and the write, a parallel call (a sandboxed Bash in the agent's
@@ -108,11 +113,8 @@ impl Fence {
         let ids = ancestor_ids(target);
         self.deny_write_under
             .iter()
-            .any(|d| contains(d, target, &ids, cfg!(target_os = "macos")))
-            && !self
-                .allow_write
-                .iter()
-                .any(|a| contains(a, target, &ids, false))
+            .any(|d| deny_holds(d, target, &ids, folds_case(d)))
+            && !self.allow_write.iter().any(|a| target.starts_with(a))
     }
 
     /// The fence as the wire and the db hold it.
@@ -146,9 +148,10 @@ fn ancestor_ids(target: &Path) -> Vec<(u64, u64)> {
     target.ancestors().filter_map(file_id).collect()
 }
 
-/// Whether `base` holds `target`: the same file as one of its ancestors
-/// (`ids`), or a path prefix of it, without case when `fold`.
-fn contains(base: &Path, target: &Path, ids: &[(u64, u64)], fold: bool) -> bool {
+/// Whether the deny path `base` holds `target`: the same file as one of
+/// its ancestors (`ids`), or a path prefix of it, without case when
+/// `fold`. Only for denies: a live lookup can only deny more.
+fn deny_holds(base: &Path, target: &Path, ids: &[(u64, u64)], fold: bool) -> bool {
     if file_id(base).is_some_and(|b| ids.contains(&b)) {
         return true;
     }
@@ -157,6 +160,29 @@ fn contains(base: &Path, target: &Path, ids: &[(u64, u64)], fold: bool) -> bool 
     }
     let low = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
     low(target).starts_with(low(base))
+}
+
+/// Whether names on the volume of `p` (or its nearest existing ancestor)
+/// match without case. A failed query says yes, which denies more.
+fn folds_case(p: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Some(c) = p
+            .ancestors()
+            .find(|a| a.exists())
+            .and_then(|a| std::ffi::CString::new(a.as_os_str().as_bytes()).ok())
+        else {
+            return true;
+        };
+        // 1: case-sensitive, 0: not, -1: unknown.
+        unsafe { libc::pathconf(c.as_ptr(), libc::_PC_CASE_SENSITIVE) != 1 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = p;
+        false
+    }
 }
 
 /// The path a write to `target` lands on: the realpath of its longest
@@ -376,11 +402,80 @@ mod tests {
                 "{p:?}"
             );
         }
-        // A case alias of the agent's own dir stays its own.
+        // A case alias of the agent's own existing dir resolves to it.
         assert_eq!(
             decide(&f, &write("Write", "file_path", &upper(&a).join("own.txt"))),
             None
         );
+        // A missing part under the own cwd stays its own in any case; one
+        // beside it is denied.
+        let new = a.join("new");
+        let alias = upper(&new).join("x");
+        assert!(decide(&f, &write("Write", "file_path", &alias)).is_none());
+        let other = upper(&a).with_file_name("NEWDIR").join("x");
+        assert!(decide(&f, &write("Write", "file_path", &other)).is_some());
+    }
+
+    #[test]
+    fn an_allow_path_swapped_for_a_symlink_allows_nothing_new() {
+        // Codex r2 P1: deny [R], allow [a, a/cache]; A replaces cache with
+        // a symlink to b. Writes into b stay denied, directly and through it.
+        let (_t, r, a, b, home) = layout();
+        let cache = a.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let f = Fence::new(&guard(&[&r], &[&a, &cache]), &a, &home).unwrap();
+        std::fs::rename(&cache, a.join("cache.old")).unwrap();
+        std::os::unix::fs::symlink(&b, &cache).unwrap();
+        for p in [b.join("file"), cache.join("file")] {
+            assert!(
+                decide(&f, &write("Write", "file_path", &p)).is_some(),
+                "{p:?}"
+            );
+        }
+        assert_eq!(
+            decide(&f, &write("Write", "file_path", &a.join("cache.old/x"))),
+            None
+        );
+    }
+
+    #[test]
+    fn case_folds_only_where_the_volume_does() {
+        let (_t, r, a, b, _home) = layout();
+        let f = Fence {
+            deny_write_under: vec![b.clone()],
+            allow_write: vec![],
+        };
+        let alias = b.with_file_name("B").join("x");
+        // A case-sensitive volume: no fold, so `B` is not `b`.
+        assert!(!deny_holds(&b, &alias, &[], false));
+        assert!(deny_holds(&b, &alias, &[], true));
+        // This volume: folds when it is case-insensitive, as APFS is by
+        // default; then the alias is denied.
+        if alias.parent().unwrap().exists() {
+            assert!(folds_case(&b));
+            assert!(f.denies(&alias));
+        }
+        let _ = (r, a);
+    }
+
+    /// Codex r2 P2 on a real case-sensitive volume: run with
+    /// `C9_CASE_SENSITIVE_DIR=<dir on a case-sensitive APFS volume>`.
+    #[test]
+    #[ignore]
+    fn a_case_sensitive_volume_keeps_repo_and_repo_apart() {
+        let base = PathBuf::from(std::env::var("C9_CASE_SENSITIVE_DIR").unwrap())
+            .canonicalize()
+            .unwrap();
+        let t = tempfile::tempdir_in(&base).unwrap();
+        let (upper, lower) = (t.path().join("Repo"), t.path().join("repo"));
+        std::fs::create_dir(&upper).unwrap();
+        std::fs::create_dir(&lower).unwrap();
+        assert!(!folds_case(&upper));
+        let home = t.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let f = Fence::new(&guard(&[&upper], &[]), &lower, &home).unwrap();
+        assert!(f.denies(&upper.join("x")));
+        assert!(!f.denies(&lower.join("x")));
     }
 
     #[test]
