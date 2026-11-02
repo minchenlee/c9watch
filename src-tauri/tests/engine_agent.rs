@@ -30,38 +30,33 @@ use std::time::{Duration, Instant};
 
 const MAIN: &str = env!("CARGO_BIN_EXE_c9watch");
 /// `c9watch-agent` is its own package (D32), so cargo gives this package no
-/// `CARGO_BIN_EXE_c9watch-agent`. The first use builds it next to `c9watch`
-/// with the cargo that runs this test: one command, the same target dir
-/// and profile. A missing binary gets built and a stale one rebuilt, also
-/// for `cargo test --test engine_agent` on a clean target dir.
+/// `CARGO_BIN_EXE_c9watch-agent`. The first use builds it with the cargo
+/// that runs this test, in the profile of `c9watch` (its directory name;
+/// `debug` is `dev`). A missing binary gets built and a stale one rebuilt,
+/// also for `cargo test --test engine_agent` on a clean target dir. The
+/// path comes from cargo's own artifact message, so a `--target` triple or
+/// target dir does not move it.
 static AGENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let profile_dir = Path::new(MAIN).parent().unwrap();
-    let mut cargo = Command::new(env!("CARGO"));
-    cargo
-        .args([
-            "build",
-            "--quiet",
-            "-p",
-            "c9watch-agent",
-            "--features",
-            "engine",
-        ])
+    let profile = Path::new(MAIN).parent().unwrap().file_name().unwrap();
+    let profile = match profile.to_str().unwrap() {
+        "debug" => "dev",
+        name => name,
+    };
+    let out = Command::new(env!("CARGO"))
+        .args(["build", "-p", "c9watch-agent", "--features", "engine"])
+        .args(["--profile", profile, "--message-format", "json"])
         .arg("--manifest-path")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-        .arg("--target-dir")
-        .arg(profile_dir.parent().unwrap());
-    if !cfg!(debug_assertions) {
-        cargo.arg("--release");
-    }
-    let out = cargo.output().unwrap();
-    assert!(
-        out.status.success(),
-        "building c9watch-agent failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let path = profile_dir.join("c9watch-agent");
-    assert!(path.is_file(), "{:?} is missing after the build", path);
-    path.to_string_lossy().into_owned()
+        .stderr(Stdio::inherit())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "building c9watch-agent failed");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "c9watch-agent")
+        .find_map(|m| m["executable"].as_str().map(str::to_owned))
+        .expect("cargo reported no c9watch-agent executable")
 });
 const AGENT_ID: &str = "agt_t";
 
