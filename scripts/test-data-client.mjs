@@ -223,6 +223,11 @@ function fakeTimers() {
     return { timers, setTimeout: (fn, ms) => { timers.set(++id, { fn, ms }); return id; }, clearTimeout: t => timers.delete(t),
         run() { for (const [t, { fn }] of [...timers]) { timers.delete(t); fn(); } } };
 }
+function demoFlag(value) {
+    const subscribers = new Set();
+    return { get: () => value, set(next) { value = next; for (const fn of [...subscribers]) fn(next); },
+        subscribe(fn) { subscribers.add(fn); fn(value); return () => subscribers.delete(fn); } };
+}
 const sessionFeedModule = clock => load('../src/lib/data/session-feed.ts', { './session': mapping }, clock);
 
 test('a stream error frame other than cursor_expired retries; core_unavailable backs off to 5 s', async () => {
@@ -422,7 +427,8 @@ test('session fallback reads one native snapshot, so a first poll sent before th
     const live = load('../src/lib/data/live.ts', {
         './session-feed': feed,
         './client': { transport: () => t },
-        './tauri-bridge': { listenSessions: async () => () => {} }
+        './tauri-bridge': { listenSessions: async () => () => {} },
+        './demo/mode': { isDemoMode: demoFlag(false) }
     }, clock);
     const stop = await live.watchSessions(rows => applied.push(asJSON(rows)));
     await settle();
@@ -471,4 +477,24 @@ test('stop ends the fallback period, and a listener that resolves after stop sta
     assert.equal(reads, 0, 'no snapshot read for an ended period');
     assert.equal(unlistened, 1, 'the late listener is removed');
     assert.deepEqual(applied, []);
+});
+
+test('turning demo mode off restarts the session feed on the real transport', async () => {
+    const clock = fakeTimers(); const demo = demoFlag(true); const applied = [];
+    const demoTransport = { async request() { return { cursor: null, sessions: [] }; }, async subscribe() { return () => {}; } };
+    const core = { async request(method) { assert.equal(method, 'session.views'); return { cursor: 'c1', sessions: [fx.sessions[0]] }; },
+        async subscribe() { return () => {}; } };
+    const live = load('../src/lib/data/live.ts', {
+        './session-feed': sessionFeedModule(clock),
+        './client': { transport: () => demo.get() ? demoTransport : core },
+        './tauri-bridge': { listenSessions: async () => () => {} },
+        './demo/mode': { isDemoMode: demo }
+    }, clock);
+    // sessions.ts drops updates while demo is on.
+    const stop = await live.watchSessions(rows => { if (!demo.get()) applied.push(asJSON(rows)); });
+    await settle(); clock.run(); await settle();
+    assert.deepEqual(applied, []);
+    demo.set(false); await settle();
+    assert.deepEqual(applied.map(rows => rows.map(s => s.id)), [['0b6c1f0e-1111-4a2b-9c3d-000000000001']], 'core sessions appear');
+    stop();
 });

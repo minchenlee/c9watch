@@ -106,17 +106,33 @@ export function diagnosticsFeed(t: Transport, apply: (d: DetectionDiagnostics) =
     return () => { stopped = true; generation++; unsubscribe?.(); if (retry) clearTimeout(retry); };
 }
 
+/** A feed binds `transport()` when it starts, and demo mode swaps that
+ * transport. Restart the feed on each demo toggle: it then binds the right
+ * transport and reads a fresh snapshot, which matters because core streams
+ * only send changes, and turning demo off clears the store. */
+async function restartOnDemoToggle(start: () => Unsubscribe): Promise<Unsubscribe> {
+    const { isDemoMode } = await import('./demo/mode');
+    let stop: Unsubscribe | null = null;
+    let last: boolean | undefined;
+    const unsubscribe = isDemoMode.subscribe(demo => {
+        if (demo === last) return;
+        last = demo;
+        stop?.(); stop = start();
+    });
+    return () => { unsubscribe(); stop?.(); stop = null; };
+}
+
 export async function watchSessions(apply: (sessions: Session[]) => void): Promise<Unsubscribe> {
     const [{ transport }, { listenSessions }] = await Promise.all([import('./client'), import('./tauri-bridge')]);
     // Without core, `session.views` is the fallback's native scan (no cursor).
     // With a cursor, core is back and the feed's own recovery applies it.
-    return withNativeFallback((a, f) => sessionFeed(transport(), a, f), listenSessions, apply, async () => {
+    return restartOnDemoToggle(() => withNativeFallback((a, f) => sessionFeed(transport(), a, f), listenSessions, apply, async () => {
         const snapshot = await transport().request('session.views', {});
         return snapshot.cursor == null ? snapshot.sessions as unknown as Session[] : null;
-    });
+    }));
 }
 export async function watchDiagnostics(apply: (d: DetectionDiagnostics) => void): Promise<Unsubscribe> {
     const [{ transport }, { listenDiagnostics }] = await Promise.all([import('./client'), import('./tauri-bridge')]);
-    return withNativeFallback((a, f) => diagnosticsFeed(transport(), a, f), listenDiagnostics, apply,
-        () => transport().request('diag.detection', {}) as Promise<DetectionDiagnostics | null>);
+    return restartOnDemoToggle(() => withNativeFallback((a, f) => diagnosticsFeed(transport(), a, f), listenDiagnostics, apply,
+        () => transport().request('diag.detection', {}) as Promise<DetectionDiagnostics | null>));
 }
