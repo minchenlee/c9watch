@@ -340,6 +340,50 @@ pub fn full_ancestry(pid: libc::pid_t) -> Option<Vec<ProcInfo>> {
     }
 }
 
+/// Where and why `full_ancestry(pid)` stops short of init, as read now,
+/// for an error message only: it decides nothing. The same walk as
+/// `ancestry`, naming the step that ended it.
+pub fn ancestry_gap(pid: libc::pid_t) -> String {
+    let unreadable = |p: libc::pid_t| {
+        format!(
+            "pid {} is unreadable ({})",
+            p,
+            std::io::Error::last_os_error()
+        )
+    };
+    let Some(mut cur) = proc_info(pid) else {
+        return unreadable(pid);
+    };
+    let mut levels = 1;
+    while cur.ppid > 1 {
+        if levels >= MAX_FULL_ANCESTRY {
+            return format!("more than {} levels", MAX_FULL_ANCESTRY);
+        }
+        let Some(parent) = proc_info(cur.ppid) else {
+            return format!("{}, the parent of pid {}", unreadable(cur.ppid), cur.pid);
+        };
+        match proc_info(cur.pid) {
+            Some(again) if again.start == cur.start && again.ppid == cur.ppid => {}
+            Some(again) => {
+                return format!(
+                    "pid {} changed during the walk (ppid {} -> {}, start {} -> {})",
+                    cur.pid, cur.ppid, again.ppid, cur.start, again.start
+                )
+            }
+            None => return format!("{} after its parent was read", unreadable(cur.pid)),
+        }
+        if parent.start > cur.start {
+            return format!(
+                "parent pid {} started after its child pid {} ({} > {})",
+                parent.pid, cur.pid, parent.start, cur.start
+            );
+        }
+        cur = parent;
+        levels += 1;
+    }
+    format!("the walk reaches init now ({} levels)", levels)
+}
+
 /// Whether `pid` runs confined in a way the engine does not: a CC agent's
 /// Bash runs under the vendor sandbox, and so does everything it starts,
 /// even a process that `setsid`/`nohup` moved under init. `None` when it
@@ -462,6 +506,29 @@ mod tests {
         assert!(chain.iter().all(|p| p.start > 0));
         // The same process read twice has the same start time.
         assert_eq!(proc_info(me).unwrap().start, chain[0].start);
+    }
+
+    #[test]
+    #[ignore = "diagnostic: C9_WALK_PIDS=<pid,...> cargo test ... -- --ignored --nocapture"]
+    fn walk_given_pids() {
+        for pid in std::env::var("C9_WALK_PIDS").unwrap_or_default().split(',') {
+            let Ok(pid) = pid.trim().parse::<libc::pid_t>() else {
+                continue;
+            };
+            println!(
+                "pid {} ancestry {:?}",
+                pid,
+                ancestry(pid, MAX_FULL_ANCESTRY)
+            );
+            println!("pid {} full {:?}", pid, full_ancestry(pid).map(|c| c.len()));
+            println!("pid {} gap {}", pid, ancestry_gap(pid));
+        }
+    }
+
+    #[test]
+    fn ancestry_gap_names_where_the_walk_stops() {
+        assert!(ancestry_gap(my_pid()).starts_with("the walk reaches init now"));
+        assert!(ancestry_gap(-1).starts_with("pid -1 is unreadable"));
     }
 
     #[test]

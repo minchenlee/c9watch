@@ -152,6 +152,13 @@ printf 'A-ORIGINAL\n' >"$A/code.txt"
     echo "TMPDIR: ${TMPDIR:-unset}"
     echo "NEG_RULES: $NEG_RULES"
 } >"$EV/env.txt"
+# The script's own process chain, for a refused agent.create (the engine
+# names where its walk stopped; this shows what it walked).
+p=$$
+while [ "${p:-1}" -gt 1 ]; do
+    ps -o pid=,ppid=,user=,lstart=,comm= -p "$p" 2>&1
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+done >"$EV/chain.txt"
 log "WORK=$WORK"
 
 # --- engine

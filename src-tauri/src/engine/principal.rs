@@ -228,6 +228,7 @@ pub fn check_mutating_peer(
     own: Option<&str>,
 ) -> Result<(), String> {
     let chain = peer::full_ancestry(pid);
+    let complete = chain.is_some();
     check_mutation(
         chain.as_deref(),
         peer_start,
@@ -236,6 +237,14 @@ pub fn check_mutating_peer(
         observed,
         own,
     )
+    .map_err(|why| {
+        // Still refused; the message only says where the walk stopped.
+        if complete {
+            why
+        } else {
+            format!("{}: {}", why, peer::ancestry_gap(pid))
+        }
+    })
 }
 
 #[cfg(test)]
