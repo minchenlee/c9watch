@@ -126,6 +126,9 @@ fn insert_session_contract(json: &mut serde_json::Value, session: &session::enri
             object.insert(key.to_string(), serde_json::json!(value));
         }
     }
+    if let Some(teammate) = &session.teammate {
+        object.insert("teammate".to_string(), serde_json::json!(teammate));
+    }
     if let Some(title) = &session.codex_title {
         object.insert("codexTitle".to_string(), serde_json::json!(title));
     }
@@ -593,5 +596,24 @@ mod session_formatter_tests {
     #[test]
     fn full_session_includes_provider_hierarchy_and_capabilities() {
         assert_codex_contract(&full_session(codex_subagent()));
+    }
+
+    #[test]
+    fn both_formats_carry_the_teammate_link() {
+        let mut s = codex_subagent();
+        s.teammate = Some(session::teammates::TeammateLink {
+            agent_name: "mate".into(),
+            team_name: "session-lead".into(),
+            lead_session_id: "lead".into(),
+            agent_type: None,
+        });
+        let want = serde_json::json!({
+            "agentName": "mate",
+            "teamName": "session-lead",
+            "leadSessionId": "lead",
+        });
+        assert_eq!(compact_session(&s)["teammate"], want);
+        assert_eq!(full_session(s)["teammate"], want);
+        assert!(compact_session(&codex_subagent()).get("teammate").is_none());
     }
 }
