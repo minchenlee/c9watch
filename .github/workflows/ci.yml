@@ -182,11 +182,12 @@ jobs:
         # path `src-tauri/core` itself contains "tauri".
         run: |
           set -euo pipefail
-          # Fails the step when cargo fails; never an empty listing.
+          # Fails the step when cargo fails, even after partial output:
+          # errexit is off inside $(...), so the status is returned by hand.
           names() {
             local out
             out=$(cargo tree --manifest-path src-tauri/Cargo.toml -p "$1" -e normal,build \
-              --all-features --target all --prefix none --format '{p}')
+              --all-features --target all --prefix none --format '{p}') || return
             awk '{print $1}' <<<"$out" | sort -u
           }
           # The listing sees tauri where it is: in the GUI shell.
