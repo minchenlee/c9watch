@@ -3,7 +3,6 @@
  */
 
 import { writable, derived, get } from 'svelte/store';
-import { listen } from '$lib/data/platform';
 import { isPermissionGranted, requestPermission } from '$lib/data/platform';
 import type { Session, Conversation } from '../../types';
 import { SessionStatus } from '../../types';
@@ -250,13 +249,14 @@ async function initTauriListeners() {
 		}
 	});
 
-	await listen<Session[]>('sessions-updated', (event) => {
+	const { watchSessions } = await import('../live');
+	await watchSessions((data) => {
 		if (get(isDemoMode)) return;
 		if (document.hidden) {
-			heldSessions = event.payload;
+			heldSessions = data;
 		} else {
 			heldSessions = null;
-			sessions.set(event.payload);
+			sessions.set(data);
 		}
 	});
 }

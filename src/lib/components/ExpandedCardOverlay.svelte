@@ -34,7 +34,7 @@
 	import { onDestroy, onMount, tick, untrack } from 'svelte';
 	import { fade } from '$lib/transitions';
 	import { flyIn, flyInX, fadeIn } from '$lib/transitions';
-	import { invoke } from '$lib/data/commands';
+	import { getSubagentTranscript } from '$lib/data/api';
 	import type { Session, Conversation } from '$lib/types';
 	import { SessionStatus } from '$lib/types';
 	import MessageBubble from './MessageBubble.svelte';
@@ -362,10 +362,7 @@
 		}
 
 		try {
-			const tr = await invoke<SubagentTranscript>('get_subagent_transcript', {
-				parentSessionId: rawParentSessionId,
-				subagentId: sa.id,
-			});
+			const tr = await getSubagentTranscript<SubagentTranscript>(rawParentSessionId, sa.id);
 			// Guard: user may have switched to a different selection before
 			// this resolved. Only commit if the selection is still this one.
 			const current = previewStateBySession.get(sid);

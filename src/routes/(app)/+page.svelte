@@ -141,19 +141,26 @@
 			});
 		})();
 
-		// Listen for detection diagnostics (FDA banner)
-		if (isTauri()) {
-			import('$lib/data/platform').then(({ listen }) => {
-				listen<DetectionDiagnostics>('diagnostic-update', (event) => {
-					fdaLikelyNeeded = event.payload.fdaLikelyNeeded;
+		// Live detection diagnostics (FDA banner)
+		let stopDiagnostics: (() => void) | null = null;
+		let disposed = false;
+		import('$lib/data/live')
+			.then(({ watchDiagnostics }) =>
+				watchDiagnostics((diag) => {
+					fdaLikelyNeeded = diag.fdaLikelyNeeded;
 					if (!get(isDemoMode)) {
-						hiddenClaudeSessions = event.payload.hiddenClaudeSessions ?? [];
+						hiddenClaudeSessions = diag.hiddenClaudeSessions ?? [];
 					}
-				});
+				})
+			)
+			.then((stop) => {
+				if (disposed) stop();
+				else stopDiagnostics = stop;
 			});
-		}
 
 		return () => {
+			disposed = true;
+			stopDiagnostics?.();
 			unlisten?.();
 			if (timer) clearTimeout(timer);
 		};

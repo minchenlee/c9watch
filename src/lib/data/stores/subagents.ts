@@ -1,7 +1,7 @@
 /**
  * Store for subagent invocations detected by parsing parent session JSONL.
  *
- * No hook required: the backend (`get_subagents` Tauri command) re-scans each
+ * No hook required: the backend (c9p `subagent.list`) re-scans each
  * project's JSONL files for Agent/Task tool_use entries and reports which
  * still lack a matching tool_result. This is a desktop-only store today;
  * WebSocket clients do not invent a live-id payload for an endpoint the
@@ -9,7 +9,7 @@
  */
 
 import { writable, derived, get } from 'svelte/store';
-import { invoke } from '$lib/data/commands';
+import { getSubagents } from '../api';
 import { sessions } from './sessions';
 import { isTauri } from '../../ws';
 import { providerOf, providerSessionKey } from '../../provider';
@@ -126,7 +126,7 @@ async function refreshOnce() {
 		const sessionIds = get(sessions)
 			.filter((s) => providerOf(s) === 'claudeCode')
 			.map((s) => s.id);
-		const raw = await invoke<Record<string, SubagentInfo[]>>('get_subagents', { sessionIds });
+		const raw = await getSubagents<SubagentInfo>(sessionIds);
 		const m = new Map<string, SubagentInfo[]>();
 		for (const [k, v] of Object.entries(raw)) {
 			// Accept the provider-scoped key from current backends and normalize

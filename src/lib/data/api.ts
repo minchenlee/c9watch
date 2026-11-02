@@ -34,11 +34,22 @@ export async function allPages<T>(fetch: (offset: number) => Promise<{ items: T[
         offset = next;
     }
 }
+export interface ConversationProgress { sessionId: string; provider?: SessionProvider; bytesRead: number; bytesTotal: number }
+const progressListeners = new Set<(p: ConversationProgress) => void>();
+/** How far each `getConversation` read has got, from the request's own
+ * c9p `progress` frames. Returns the unsubscribe. */
+export function onConversationProgress(listener: (p: ConversationProgress) => void): () => void {
+    progressListeners.add(listener);
+    return () => progressListeners.delete(listener);
+}
 export async function getConversation(sessionId: string, provider?: SessionProvider, includeTools = false): Promise<Conversation> {
     let resolvedProvider = provider;
     const source = transport();
+    const onProgress = ({ bytesRead, bytesTotal }: { bytesRead: number; bytesTotal: number }) => {
+        for (const listener of progressListeners) listener({ sessionId, provider, bytesRead, bytesTotal });
+    };
     const messages = await allPages(async offset => {
-        const page = await source.request('conversation.get', { sessionKey: providerSessionKey(provider, sessionId), provider, includeTools, page: { offset, limit: 1000 } });
+        const page = await source.request('conversation.get', { sessionKey: providerSessionKey(provider, sessionId), provider, includeTools, page: { offset, limit: 1000 } }, { onProgress });
         resolvedProvider = (page.provider as SessionProvider | null | undefined) ?? resolvedProvider;
         return { items: page.messages as Conversation['messages'], nextOffset: page.nextOffset };
     });
@@ -80,17 +91,20 @@ export async function getMemoryFiles(): Promise<ProjectMemory[]> {
 export async function getSubscriptionUsage(): Promise<import('../subscription-usage').SubscriptionUsage[]> {
     return (await request('usage.subscriptions', {})).usage;
 }
-/** Temporary source-compatible adapter for the import-only Classic swap.
- * This is an explicit command map; it never exposes arbitrary invoke. */
-export async function dataCommand<T = unknown>(command: string, params: any = {}): Promise<T> {
-    let value: unknown;
-    switch (command) {
-        case 'get_subagents': value = (await request('subagent.list', params)).subagents; break;
-        case 'get_subagent_transcript': value = await request('subagent.transcript', params); break;
-        case 'get_session_tasks': value = (await request('session.tasks', params)).tasks; break;
-        case 'opencode_connection_status': value = await request('provider.opencode.status', {}); break;
-        case 'opencode_connect': value = await request('provider.opencode.connect', params); break;
-        default: return localCommand<T>(command, params);
-    }
-    return value as T;
+export async function getSubagents<T>(sessionIds: string[]): Promise<Record<string, T[]>> {
+    return (await request('subagent.list', { sessionIds })).subagents as Record<string, T[]>;
 }
+export async function getSubagentTranscript<T>(parentSessionId: string, subagentId: string): Promise<T> {
+    return request('subagent.transcript', { parentSessionId, subagentId }) as Promise<T>;
+}
+export async function getSessionTasks(sessionId: string): Promise<unknown[]> {
+    return (await request('session.tasks', { sessionId })).tasks;
+}
+export async function getOpenCodeStatus<T>(): Promise<T> {
+    return request('provider.opencode.status', {}) as Promise<T>;
+}
+export async function connectOpenCode(url: string, username: string, password: string | null): Promise<void> {
+    await request('provider.opencode.connect', { url, username, password });
+}
+/** Native-only actions keep their explicit command map; data goes through c9p. */
+export const dataCommand = localCommand;

@@ -2,12 +2,12 @@
  * Store for TodoWrite task lists, sourced from `~/.claude/tasks/<session_id>/*.json`.
  *
  * No backend hook required: each polling tick iterates the current `sessions`
- * store and invokes the `get_session_tasks` Tauri command per session id.
+ * store and requests c9p `session.tasks` per session id.
  * Read-only — writes back to disk would race with Claude itself.
  */
 
 import { writable, get } from 'svelte/store';
-import { invoke } from '$lib/data/commands';
+import { getSessionTasks } from '../api';
 import { sessions } from './sessions';
 import { isTauri } from '../../ws';
 import type { Task, TaskStatus } from '../../types';
@@ -51,7 +51,7 @@ async function refreshOnce() {
 	await Promise.all(
 		ids.map(async (sessionId) => {
 			try {
-				const raw = await invoke<unknown[]>('get_session_tasks', { sessionId });
+				const raw = await getSessionTasks(sessionId);
 				const tasks: Task[] = raw.map((t) => {
 					const obj = t as Record<string, unknown>;
 					const subject = typeof obj.subject === 'string' ? obj.subject

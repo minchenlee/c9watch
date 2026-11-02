@@ -16,8 +16,8 @@ vm.runInNewContext(compiled, {
   exports,
   require(name) {
     if (name === 'svelte/store') return stores;
-    if (name === '$lib/data/commands') return {
-      invoke: (command, args) => new Promise((resolve, reject) => requests.push({ command, args, resolve, reject }))
+    if (name === '../api') return {
+      getSubagents: (sessionIds) => new Promise((resolve, reject) => requests.push({ command: 'subagent.list', args: { sessionIds }, resolve, reject }))
     };
     if (name === './sessions') return { sessions };
     if (name === '../../ws') return { isTauri: () => true };

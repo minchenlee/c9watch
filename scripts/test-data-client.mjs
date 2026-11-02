@@ -216,3 +216,95 @@ test('native unsubscribe is idempotent and drops queued channel frames', async (
     channel.onmessage({type:'event'}); stop(); stop(); channel.onmessage({type:'event'});
     assert.equal(seen.length,1); assert.equal(calls.filter(cmd=>cmd==='c9p_unsubscribe').length,1);
 });
+
+const settle = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+function fakeTimers() {
+    const timers = new Map(); let id = 0;
+    return { timers, setTimeout: (fn, ms) => { timers.set(++id, { fn, ms }); return id; }, clearTimeout: t => timers.delete(t),
+        run() { for (const [t, { fn }] of [...timers]) { timers.delete(t); fn(); } } };
+}
+const sessionFeedModule = clock => load('../src/lib/data/session-feed.ts', { './session': mapping }, clock);
+
+test('a stream error frame other than cursor_expired retries; core_unavailable backs off to 5 s', async () => {
+    const clock = fakeTimers(); const feed = sessionFeedModule(clock);
+    let onFrame; let requests = 0; const errors = []; const published = [];
+    const t = { async request() { requests++; return { cursor: `c${requests}`, sessions: [] }; },
+        async subscribe(p, cb) { assert.equal(p.since, `c${requests}`, 'resume from the snapshot cursor'); onFrame = cb; return () => {}; } };
+    const stop = feed.sessionFeed(t, rows => published.push(rows), e => errors.push(e?.code ?? e));
+    await settle(); assert.deepEqual(errors, [null]); assert.equal(published.length, 1);
+    onFrame({ v: 1, id: 's', ok: false, error: { code: 'core_unavailable' } });
+    assert.deepEqual(errors, [null, 'core_unavailable']);
+    assert.deepEqual([...clock.timers.values()].map(x => x.ms), [5000]);
+    onFrame({ type: 'event', topic: 'session.view', data: { ...fx.sessions[0], sessionKey: 'claudeCode:late' } });
+    clock.run(); await settle();
+    assert.equal(requests, 2); assert.deepEqual(errors.at(-1), null);
+    assert(!published.some(rows => rows.some(s => s.sessionKey === 'claudeCode:late')), 'a frame of the ended stream is dropped');
+    stop();
+});
+
+test('native fallback events apply only while c9p is unavailable', async () => {
+    const live = load('../src/lib/data/live.ts', { './session-feed': sessionFeedModule(fakeTimers()) });
+    let report, nativeApply, unlistened = 0, listens = 0; const applied = [];
+    const stop = live.withNativeFallback(
+        (apply, failed) => { report = { apply, failed }; return () => {}; },
+        async cb => { listens++; nativeApply = cb; return () => unlistened++; },
+        v => applied.push(v));
+    report.failed({ code: 'core_unavailable' }); report.failed({ code: 'core_unavailable' });
+    await settle(); assert.equal(listens, 1, 'one native listener per fallback period');
+    nativeApply('fallback-1');
+    report.failed(null); report.apply('c9p-1');
+    nativeApply('queued-before-switch');
+    await settle(); assert.equal(unlistened, 1);
+    report.failed({ code: 'transport' }); await settle();
+    assert.equal(listens, 1, 'a transport error is not the fallback');
+    assert.deepEqual(applied, ['fallback-1', 'c9p-1']);
+    stop();
+});
+
+test('diagnostics subscribe before the read and replay buffered events after it', async () => {
+    const clock = fakeTimers();
+    const live = load('../src/lib/data/live.ts', { './session-feed': sessionFeedModule(clock) }, clock);
+    const order = []; let onFrame, release; const applied = [];
+    const t = {
+        async subscribe(p, cb) { order.push(['subscribe', p.topics, p.since ?? null]); onFrame = cb; return () => order.push(['stop']); },
+        request(method) { order.push(['request', method]); return new Promise(r => release = r); }
+    };
+    const errors = [];
+    const stop = live.diagnosticsFeed(t, d => applied.push(d.n), e => errors.push(e?.code ?? e));
+    await settle();
+    assert.deepEqual(asJSON(order), [['subscribe', ['diag.detection'], null], ['request', 'diag.detection']]);
+    onFrame({ type: 'event', topic: 'diag.detection', data: { n: 2 } });
+    onFrame({ type: 'event', topic: 'diag.detection', data: { n: 3 } });
+    release({ n: 1 }); await settle();
+    assert.deepEqual(applied, [1, 2, 3], 'snapshot first, then the events that raced it, in order');
+    onFrame({ type: 'event', topic: 'diag.detection', data: { n: 4 } });
+    onFrame({ type: 'event', topic: 'other', data: { n: 9 } });
+    assert.deepEqual(applied, [1, 2, 3, 4]);
+    onFrame({ v: 1, ok: false, error: { code: 'core_unavailable' } });
+    assert.deepEqual(errors, [null, 'core_unavailable']);
+    assert.deepEqual([...clock.timers.values()].map(x => x.ms), [5000]);
+    stop(); assert.equal(clock.timers.size, 0);
+});
+
+test('conversation progress comes from the request channel, or native events in fallback', async () => {
+    const channels = []; let failCore = false; let nativeCb; let unlistened = 0;
+    const bridge = load('../src/lib/data/tauri-bridge.ts', {
+        '@tauri-apps/api/core': { invoke: async (cmd, args) => {
+            if (cmd === 'c9p_request') {
+                if (failCore) throw { code: 'core_unavailable' };
+                args.progress.onmessage({ v: 1, type: 'progress', id: 'r', bytesRead: 5, bytesTotal: 10 });
+                return { messages: [] };
+            }
+            nativeCb({ payload: { sessionId: 'other', bytesRead: 9, bytesTotal: 9 } });
+            nativeCb({ payload: { sessionId: 'abc', bytesRead: 7, bytesTotal: 10 } });
+            return { sessionId: 'abc', messages: [] };
+        }, Channel: class { constructor() { channels.push(this); } } },
+        '@tauri-apps/api/event': { listen: async (name, cb) => { assert.equal(name, 'conversation-progress'); nativeCb = cb; return () => unlistened++; } },
+        './transport': load('../src/lib/data/transport.ts')
+    });
+    const seen = [];
+    await bridge.tauriTransport.request('conversation.get', { sessionKey: 'claudeCode:abc' }, { onProgress: f => seen.push(f.bytesRead) });
+    failCore = true;
+    await bridge.tauriTransport.request('conversation.get', { sessionKey: 'claudeCode:abc' }, { onProgress: f => seen.push(f.bytesRead) });
+    assert.deepEqual(seen, [5, 7]); assert.equal(unlistened, 1);
+});
