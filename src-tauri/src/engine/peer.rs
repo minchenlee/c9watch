@@ -573,18 +573,46 @@ mod tests {
             .filter_map(|&p| proc_info(p))
             .collect();
         assert!(!root.is_empty(), "no process that only sysctl can read");
-        let under_root = all.iter().copied().find(|&p| {
-            proc_entry(p)
-                .is_some_and(|e| e.info.ppid > 1 && root.iter().any(|r| r.pid == e.info.ppid))
-        });
-        let start = under_root.unwrap_or(root[0].pid);
-        let chain = full_ancestry(start).expect("a complete chain");
-        assert!(chain.last().unwrap().ppid <= 1, "{:?}", chain);
-        if under_root.is_some() {
-            assert!(root.iter().any(|r| r.pid == chain[1].pid), "{:?}", chain);
-        } else {
-            eprintln!("no user process under a root parent; walked {}", start);
+        // Candidates: user processes whose parent only sysctl can read,
+        // then those parents. Any of them, or an ancestor, may exit while
+        // it is walked (seen on the GitHub macOS runner): such a candidate
+        // is skipped, and the check fails only when none gives a chain.
+        let under_root: Vec<libc::pid_t> = all
+            .iter()
+            .copied()
+            .filter(|&p| {
+                proc_entry(p)
+                    .is_some_and(|e| e.info.ppid > 1 && root.iter().any(|r| r.pid == e.info.ppid))
+            })
+            .take(16)
+            .collect();
+        let candidates = under_root
+            .iter()
+            .map(|&p| (p, true))
+            .chain(root.iter().take(16).map(|r| (r.pid, false)));
+        let mut tried = Vec::new();
+        for (start, user) in candidates {
+            let Some(chain) = full_ancestry(start) else {
+                tried.push(start);
+                continue;
+            };
+            assert!(chain.last().unwrap().ppid <= 1, "{:?}", chain);
+            if user {
+                // The walk went through the root parent, not around it. A
+                // parent that exited meanwhile leaves the child under init.
+                if chain.len() < 2 || !root.iter().any(|r| r.pid == chain[1].pid) {
+                    tried.push(start);
+                    continue;
+                }
+            } else {
+                eprintln!(
+                    "no user process under a root parent gave a chain; walked {}",
+                    start
+                );
+            }
+            return;
         }
+        panic!("no candidate gave a complete chain; tried {:?}", tried);
     }
 
     #[test]
