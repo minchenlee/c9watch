@@ -9,7 +9,9 @@ type Feed<T> = (apply: (value: T) => void, failed: (error: unknown | null) => vo
 type Native<T> = (apply: (value: T) => void) => Promise<() => void>;
 
 /** `snapshot`, when given, is read once the native listener is in place: a
- * fallback that saw no change since core took over emits nothing. */
+ * fallback that saw no change since core took over emits nothing. Native
+ * events that arrive during the read are buffered and applied after it, in
+ * order, so the snapshot never replaces a newer value. */
 export function withNativeFallback<T>(feed: Feed<T>, native: Native<T>, apply: (value: T) => void, snapshot?: () => Promise<T | null>): Unsubscribe {
     let stopped = false;
     let fallback = false;
@@ -22,8 +24,12 @@ export function withNativeFallback<T>(feed: Feed<T>, native: Native<T>, apply: (
             // Checked on delivery: a native event queued before the switch
             // back to c9p is dropped, never applied over newer stream data.
             if (!unlisten) {
-                unlisten = native(value => { if (fallback && !stopped) apply(value); });
-                if (snapshot) void unlisten.then(snapshot).then(value => { if (value && fallback && !stopped) apply(value); }).catch(() => {});
+                let buffered: T[] | null = snapshot ? [] : null;
+                const deliver = (value: T) => { if (fallback && !stopped && unlisten === mine) apply(value); };
+                const mine = unlisten = native(value => { if (buffered) buffered.push(value); else deliver(value); });
+                if (snapshot) void mine.then(snapshot)
+                    .then(value => { if (value) deliver(value); }, () => {})
+                    .finally(() => { const queued = buffered ?? []; buffered = null; queued.forEach(deliver); });
             }
         } else if (error === null) { fallback = false; drop(); }
     });

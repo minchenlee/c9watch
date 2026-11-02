@@ -372,3 +372,21 @@ test('entering the fallback reads the native snapshot once the listener is in pl
     assert.deepEqual(applied, ['native-cached']);
     stop();
 });
+
+test('a native event during the fallback snapshot read applies after it, never under it', async () => {
+    const live = load('../src/lib/data/live.ts', { './session-feed': sessionFeedModule(fakeTimers()) });
+    let report, emit, finishRead; const applied = [];
+    const stop = live.withNativeFallback(
+        (apply, failed) => { report = { apply, failed }; return () => {}; },
+        async listener => { emit = listener; return () => {}; },
+        v => applied.push(v),
+        () => new Promise(resolve => { finishRead = resolve; }));
+    report.failed({ code: 'core_unavailable' }); await settle();
+    emit('B-newer'); await settle();
+    assert.deepEqual(applied, []);
+    finishRead('A-snapshot'); await settle();
+    assert.deepEqual(applied, ['A-snapshot', 'B-newer']);
+    emit('C'); await settle();
+    assert.deepEqual(applied, ['A-snapshot', 'B-newer', 'C']);
+    stop();
+});
