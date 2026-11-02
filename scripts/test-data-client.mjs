@@ -411,3 +411,64 @@ test('a fallback snapshot read that never settles times out and releases native 
     assert.deepEqual(applied, ['B', 'C', 'D'], 'a late snapshot is ignored');
     stop();
 });
+
+test('session fallback reads one native snapshot, so a first poll sent before the listener is not lost', async () => {
+    const clock = fakeTimers(); const feed = sessionFeedModule(clock);
+    let onFrame; let reads = 0; const applied = [];
+    const t = {
+        async request(method) { assert.equal(method, 'session.views'); reads++; return reads === 1 ? { cursor: 'c1', sessions: [fx.sessions[0]] } : { cursor: null, sessions: [] }; },
+        async subscribe(p, cb) { onFrame = cb; return () => {}; }
+    };
+    const live = load('../src/lib/data/live.ts', {
+        './session-feed': feed,
+        './client': { transport: () => t },
+        './tauri-bridge': { listenSessions: async () => () => {} }
+    }, clock);
+    const stop = await live.watchSessions(rows => applied.push(asJSON(rows)));
+    await settle();
+    assert.deepEqual(applied.map(rows => rows.length), [1]);
+    // The fallback's first (empty) poll went out before the listener existed.
+    onFrame({ v: 1, id: 's', ok: false, error: { code: 'core_unavailable' } }); await settle();
+    assert.deepEqual(applied.map(rows => rows.length), [1, 0], 'the exited core session is cleared');
+    stop();
+});
+
+test('recovery ends the fallback period: its timer, buffer and pending snapshot are dropped', async () => {
+    const clock = fakeTimers();
+    const live = load('../src/lib/data/live.ts', { './session-feed': sessionFeedModule(clock) }, clock);
+    let report, emit, finishRead; let unlistened = 0; const applied = [];
+    const stop = live.withNativeFallback(
+        (apply, failed) => { report = { apply, failed }; return () => {}; },
+        async listener => { emit = listener; return () => { unlistened++; }; },
+        v => applied.push(v),
+        () => new Promise(resolve => { finishRead = resolve; }));
+    report.failed({ code: 'core_unavailable' }); await settle();
+    emit('buffered'); assert.equal(clock.timers.size, 1);
+    report.failed(null); await settle();
+    assert.equal(clock.timers.size, 0, 'the snapshot timer is cancelled');
+    assert.equal(unlistened, 1);
+    finishRead('late'); emit('after'); clock.run(); await settle();
+    assert.deepEqual(applied, []);
+    report.failed({ code: 'core_unavailable' }); await settle();
+    assert.equal(clock.timers.size, 1, 'a new period has exactly one timer');
+    stop();
+    assert.equal(clock.timers.size, 0);
+});
+
+test('stop ends the fallback period, and a listener that resolves after stop starts nothing', async () => {
+    const clock = fakeTimers();
+    const live = load('../src/lib/data/live.ts', { './session-feed': sessionFeedModule(clock) }, clock);
+    let report, resolveListen; let reads = 0; let unlistened = 0; const applied = [];
+    const stop = live.withNativeFallback(
+        (apply, failed) => { report = { apply, failed }; return () => {}; },
+        () => new Promise(resolve => { resolveListen = resolve; }),
+        v => applied.push(v),
+        async () => { reads++; return 'snapshot'; });
+    report.failed({ code: 'core_unavailable' }); await settle();
+    stop();
+    resolveListen(() => { unlistened++; }); await settle();
+    assert.equal(clock.timers.size, 0, 'no timer for an ended period');
+    assert.equal(reads, 0, 'no snapshot read for an ended period');
+    assert.equal(unlistened, 1, 'the late listener is removed');
+    assert.deepEqual(applied, []);
+});

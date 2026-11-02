@@ -9,42 +9,54 @@ type Feed<T> = (apply: (value: T) => void, failed: (error: unknown | null) => vo
 type Native<T> = (apply: (value: T) => void) => Promise<() => void>;
 const SNAPSHOT_TIMEOUT_MS = 3000;
 
-/** `snapshot`, when given, is read once the native listener is in place: a
- * fallback that saw no change since core took over emits nothing. Native
- * events that arrive during the read are buffered and applied after it, in
- * order, so the snapshot never replaces a newer value. */
-export function withNativeFallback<T>(feed: Feed<T>, native: Native<T>, apply: (value: T) => void, snapshot?: () => Promise<T | null>): Unsubscribe {
+/** One fallback period runs from `core_unavailable` to recovery or stop.
+ * Native events are change-only, so each period installs the listener, then
+ * reads one native snapshot. Events that arrive during the read are buffered
+ * and applied after it, in order, so the snapshot never replaces a newer
+ * value. A read that does not settle in time flushes the buffer and its late
+ * result is ignored. Ending the period cancels its listener, timer and
+ * buffer; nothing starts for a period that has already ended. */
+function fallbackPeriod<T>(native: Native<T>, apply: (value: T) => void, snapshot: () => Promise<T | null>): () => void {
+    let live = true;
+    let buffered: T[] | null = [];
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let unlisten: (() => void) | null = null;
+    const deliver = (value: T) => { if (live) apply(value); };
+    const flush = (value?: T | null) => {
+        if (!live || !buffered) return;
+        if (timer) clearTimeout(timer);
+        timer = null;
+        const queued = buffered; buffered = null;
+        if (value) deliver(value);
+        queued.forEach(deliver);
+    };
+    native(value => { if (!live) return; if (buffered) buffered.push(value); else deliver(value); }).then(stop => {
+        if (!live) { stop(); return; }
+        unlisten = stop;
+        timer = setTimeout(() => flush(), SNAPSHOT_TIMEOUT_MS);
+        Promise.resolve().then(snapshot).then(value => flush(value), () => flush());
+    }, () => flush());
+    return () => {
+        live = false; buffered = null;
+        if (timer) clearTimeout(timer);
+        timer = null;
+        try { unlisten?.(); } catch {}
+        unlisten = null;
+    };
+}
+
+/** Native snapshot events apply only during a fallback period: one queued
+ * before the switch back to c9p is dropped, never applied over stream data. */
+export function withNativeFallback<T>(feed: Feed<T>, native: Native<T>, apply: (value: T) => void, snapshot: () => Promise<T | null>): Unsubscribe {
     let stopped = false;
-    let fallback = false;
-    let unlisten: Promise<() => void> | null = null;
-    const drop = () => { const u = unlisten; unlisten = null; void u?.then(stop => stop()).catch(() => {}); };
+    let endPeriod: (() => void) | null = null;
+    const end = () => { const e = endPeriod; endPeriod = null; e?.(); };
     const stopFeed = feed(value => { if (!stopped) apply(value); }, error => {
         if (stopped) return;
-        if (isUnavailable(error)) {
-            fallback = true;
-            // Checked on delivery: a native event queued before the switch
-            // back to c9p is dropped, never applied over newer stream data.
-            if (!unlisten) {
-                let buffered: T[] | null = snapshot ? [] : null;
-                const deliver = (value: T) => { if (fallback && !stopped && unlisten === mine) apply(value); };
-                const mine = unlisten = native(value => { if (buffered) buffered.push(value); else deliver(value); });
-                if (snapshot) {
-                    // A read that never settles must not hold native events
-                    // back: on timeout the buffer flushes and a late result is ignored.
-                    let timer: ReturnType<typeof setTimeout> | null = null;
-                    const flush = (value?: T | null) => {
-                        if (!buffered) return;
-                        if (timer) clearTimeout(timer);
-                        if (value) deliver(value);
-                        const queued = buffered; buffered = null; queued.forEach(deliver);
-                    };
-                    void mine.then(() => { timer = setTimeout(() => flush(), SNAPSHOT_TIMEOUT_MS); return snapshot(); })
-                        .then(value => flush(value), () => flush());
-                }
-            }
-        } else if (error === null) { fallback = false; drop(); }
+        if (isUnavailable(error)) { if (!endPeriod) endPeriod = fallbackPeriod(native, apply, snapshot); }
+        else if (error === null) end();
     });
-    return () => { stopped = true; stopFeed(); drop(); };
+    return () => { stopped = true; stopFeed(); end(); };
 }
 
 /** Diagnostics are a whole value per event, emitted when they change.
@@ -96,7 +108,12 @@ export function diagnosticsFeed(t: Transport, apply: (d: DetectionDiagnostics) =
 
 export async function watchSessions(apply: (sessions: Session[]) => void): Promise<Unsubscribe> {
     const [{ transport }, { listenSessions }] = await Promise.all([import('./client'), import('./tauri-bridge')]);
-    return withNativeFallback((a, f) => sessionFeed(transport(), a, f), listenSessions, apply);
+    // Without core, `session.views` is the fallback's native scan (no cursor).
+    // With a cursor, core is back and the feed's own recovery applies it.
+    return withNativeFallback((a, f) => sessionFeed(transport(), a, f), listenSessions, apply, async () => {
+        const snapshot = await transport().request('session.views', {});
+        return snapshot.cursor == null ? snapshot.sessions as unknown as Session[] : null;
+    });
 }
 export async function watchDiagnostics(apply: (d: DetectionDiagnostics) => void): Promise<Unsubscribe> {
     const [{ transport }, { listenDiagnostics }] = await Promise.all([import('./client'), import('./tauri-bridge')]);
