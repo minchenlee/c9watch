@@ -8,7 +8,9 @@ import { sessionFeed, isUnavailable } from './session-feed';
 type Feed<T> = (apply: (value: T) => void, failed: (error: unknown | null) => void) => Unsubscribe;
 type Native<T> = (apply: (value: T) => void) => Promise<() => void>;
 
-export function withNativeFallback<T>(feed: Feed<T>, native: Native<T>, apply: (value: T) => void): Unsubscribe {
+/** `snapshot`, when given, is read once the native listener is in place: a
+ * fallback that saw no change since core took over emits nothing. */
+export function withNativeFallback<T>(feed: Feed<T>, native: Native<T>, apply: (value: T) => void, snapshot?: () => Promise<T | null>): Unsubscribe {
     let stopped = false;
     let fallback = false;
     let unlisten: Promise<() => void> | null = null;
@@ -19,7 +21,10 @@ export function withNativeFallback<T>(feed: Feed<T>, native: Native<T>, apply: (
             fallback = true;
             // Checked on delivery: a native event queued before the switch
             // back to c9p is dropped, never applied over newer stream data.
-            unlisten ??= native(value => { if (fallback && !stopped) apply(value); });
+            if (!unlisten) {
+                unlisten = native(value => { if (fallback && !stopped) apply(value); });
+                if (snapshot) void unlisten.then(snapshot).then(value => { if (value && fallback && !stopped) apply(value); }).catch(() => {});
+            }
         } else if (error === null) { fallback = false; drop(); }
     });
     return () => { stopped = true; stopFeed(); drop(); };
@@ -78,5 +83,6 @@ export async function watchSessions(apply: (sessions: Session[]) => void): Promi
 }
 export async function watchDiagnostics(apply: (d: DetectionDiagnostics) => void): Promise<Unsubscribe> {
     const [{ transport }, { listenDiagnostics }] = await Promise.all([import('./client'), import('./tauri-bridge')]);
-    return withNativeFallback((a, f) => diagnosticsFeed(transport(), a, f), listenDiagnostics, apply);
+    return withNativeFallback((a, f) => diagnosticsFeed(transport(), a, f), listenDiagnostics, apply,
+        () => transport().request('diag.detection', {}) as Promise<DetectionDiagnostics | null>);
 }

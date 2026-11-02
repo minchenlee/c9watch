@@ -229,7 +229,7 @@ test('a stream error frame other than cursor_expired retries; core_unavailable b
     const clock = fakeTimers(); const feed = sessionFeedModule(clock);
     let onFrame; let requests = 0; const errors = []; const published = [];
     const t = { async request() { requests++; return { cursor: `c${requests}`, sessions: [] }; },
-        async subscribe(p, cb) { assert.equal(p.since, `c${requests}`, 'resume from the snapshot cursor'); onFrame = cb; return () => {}; } };
+        async subscribe(p, cb) { if (p.since === undefined) return () => {}; assert.equal(p.since, `c${requests}`, 'resume from the snapshot cursor'); onFrame = cb; return () => {}; } };
     const stop = feed.sessionFeed(t, rows => published.push(rows), e => errors.push(e?.code ?? e));
     await settle(); assert.deepEqual(errors, [null]); assert.equal(published.length, 1);
     onFrame({ v: 1, id: 's', ok: false, error: { code: 'core_unavailable' } });
@@ -307,4 +307,68 @@ test('conversation progress comes from the request channel, or native events in 
     failCore = true;
     await bridge.tauriTransport.request('conversation.get', { sessionKey: 'claudeCode:abc' }, { onProgress: f => seen.push(f.bytesRead) });
     assert.deepEqual(seen, [5, 7]); assert.equal(unlistened, 1);
+});
+
+test('a snapshot without a cursor is the fallback, never a recovered core stream', async () => {
+    const clock = fakeTimers(); const feed = sessionFeedModule(clock);
+    const subscribes = []; const errors = []; const published = [];
+    const t = { async request() { return { cursor: null, sessions: [{ ...fx.sessions[0], sessionKey: 'claudeCode:native' }] }; },
+        async subscribe(p) { subscribes.push(p.since ?? null); return () => {}; } };
+    const stop = feed.sessionFeed(t, rows => published.push(rows), e => errors.push(e?.code ?? e));
+    await settle();
+    assert.equal(published.length, 0, 'native rows are not published as a live core snapshot');
+    assert.deepEqual(errors, ['core_unavailable']);
+    assert.deepEqual(subscribes, [], 'no live-only stream on a null cursor');
+    stop();
+});
+
+test('a batch queued before core_unavailable is dropped, not published over the fallback', async () => {
+    const clock = fakeTimers(); const feed = sessionFeedModule(clock);
+    let onFrame; let down = false; const published = [];
+    const t = { async request() { if (down) throw { code: 'core_unavailable' }; return { cursor: 'c1', sessions: [] }; },
+        async subscribe(p, cb) { if (down) throw { code: 'core_unavailable' }; onFrame = cb; return () => {}; } };
+    const stop = feed.sessionFeed(t, rows => published.push(rows));
+    await settle(); assert.equal(published.length, 1);
+    onFrame({ type: 'event', topic: 'session.view', data: { ...fx.sessions[0], sessionKey: 'claudeCode:stale' } });
+    down = true;
+    onFrame({ v: 1, ok: false, error: { code: 'core_unavailable' } });
+    clock.run(); await settle(); clock.run(); await settle();
+    assert.equal(published.length, 1, 'the stale core delta never reaches the store');
+    stop();
+});
+
+test('recovery probes core before the snapshot read, and waits while the window is hidden', async () => {
+    const clock = fakeTimers();
+    const doc = { hidden: false, listeners: new Set(), addEventListener(_, fn) { this.listeners.add(fn); }, removeEventListener(_, fn) { this.listeners.delete(fn); } };
+    const feed = load('../src/lib/data/session-feed.ts', { './session': mapping }, { ...clock, document: doc });
+    const calls = []; let up = false;
+    const t = { async request() { calls.push('read'); return { cursor: up ? 'c' : null, sessions: [] }; },
+        async subscribe(p) { calls.push(p.since ? 'subscribe' : 'probe'); if (!up) throw { code: 'core_unavailable' }; return () => {}; } };
+    const errors = [];
+    const stop = feed.sessionFeed(t, () => {}, e => errors.push(e?.code ?? e));
+    await settle(); calls.length = 0;
+    clock.run(); await settle();
+    assert.deepEqual(calls, ['probe'], 'core down: no snapshot read (no native scan)');
+    doc.hidden = true; calls.length = 0;
+    clock.run(); await settle();
+    assert.deepEqual(calls, [], 'hidden: the retry waits');
+    up = true; doc.hidden = false; for (const fn of [...doc.listeners]) fn();
+    await settle();
+    assert.deepEqual(calls, ['probe', 'read', 'subscribe']);
+    assert.equal(errors.at(-1), null);
+    stop();
+});
+
+test('entering the fallback reads the native snapshot once the listener is in place', async () => {
+    const live = load('../src/lib/data/live.ts', { './session-feed': sessionFeedModule(fakeTimers()) });
+    let report; const applied = []; const order = [];
+    const stop = live.withNativeFallback(
+        (apply, failed) => { report = { apply, failed }; return () => {}; },
+        async () => { order.push('listen'); return () => {}; },
+        v => applied.push(v),
+        async () => { order.push('read'); return 'native-cached'; });
+    report.failed({ code: 'core_unavailable' }); await settle();
+    assert.deepEqual(order, ['listen', 'read']);
+    assert.deepEqual(applied, ['native-cached']);
+    stop();
 });

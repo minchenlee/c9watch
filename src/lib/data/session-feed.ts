@@ -14,6 +14,9 @@ export function sessionFeed(transport: Transport, apply: (sessions: Session[]) =
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     let rows: Session[] = [];
     let batch: StreamFrame[] = [];
+    // The last failure was core_unavailable (the desktop fallback).
+    let unavailable = false;
+    let onVisible: (() => void) | null = null;
     function flush() {
         flushTimer = null;
         if (stopped) return;
@@ -36,8 +39,17 @@ export function sessionFeed(transport: Transport, apply: (sessions: Session[]) =
         if (flushTimer) clearTimeout(flushTimer);
         flushTimer = null; batch = [];
         try {
+            if (unavailable) {
+                // Without core, `session.views` is a full native scan, but a
+                // subscribe fails at once: probe with it first.
+                (await transport.subscribe({ topics: ['session.view', 'session.gone'] }, () => {}))();
+                if (stopped || mine !== generation) return;
+            }
             const snapshot = await transport.request('session.views', {});
             if (stopped || mine !== generation) return;
+            // Core always sends a cursor. Without one it is the fallback's scan,
+            // and a stream with no cursor could miss a session.gone.
+            if (snapshot.cursor == null) throw { code: 'core_unavailable', message: 'Snapshot has no cursor' };
             let ready = false;
             const stop = await transport.subscribe({ topics: ['session.view','session.gone'], since: snapshot.cursor }, frame => {
                 if (stopped || mine !== generation) return;
@@ -56,6 +68,7 @@ export function sessionFeed(transport: Transport, apply: (sessions: Session[]) =
             ready = true;
             // Drain frames that raced the subscribe response before publishing.
             flush();
+            unavailable = false;
             failed(null);
         } catch (error) { retryLater(error, mine); }
     }
@@ -66,13 +79,28 @@ export function sessionFeed(transport: Transport, apply: (sessions: Session[]) =
         generation++;
         unsubscribe?.(); unsubscribe = null;
         if (retry) clearTimeout(retry);
+        // Queued deltas of the ended stream must not publish over newer data.
+        if (flushTimer) clearTimeout(flushTimer);
+        flushTimer = null; batch = [];
+        unavailable = isUnavailable(error);
         failed(error);
-        retry = setTimeout(() => { retry = null; void refresh(); }, isUnavailable(error) ? 5000 : 1000);
+        retry = setTimeout(() => { retry = null; whenVisible(); }, unavailable ? 5000 : 1000);
+    }
+    /** A hidden window does not probe for core; it retries on becoming visible. */
+    function whenVisible() {
+        if (!unavailable || typeof document === 'undefined' || !document.hidden) { void refresh(); return; }
+        onVisible = () => {
+            if (document.hidden) return;
+            document.removeEventListener('visibilitychange', onVisible!); onVisible = null;
+            void refresh();
+        };
+        document.addEventListener('visibilitychange', onVisible);
     }
     void refresh();
     return () => {
         stopped = true; generation++; unsubscribe?.();
         if (retry) clearTimeout(retry);
         if (flushTimer) clearTimeout(flushTimer);
+        if (onVisible) document.removeEventListener('visibilitychange', onVisible);
     };
 }
