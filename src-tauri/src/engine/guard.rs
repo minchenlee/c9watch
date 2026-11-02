@@ -10,7 +10,19 @@
 //!
 //! Every path the fence holds is a realpath taken at create. A target is
 //! resolved the same way before it is compared (`resolve_target`), so a
-//! symlink or `..` cannot walk out of an allowed subtree.
+//! symlink or `..` cannot walk out of an allowed subtree. A realpath keeps
+//! the case it was given (macOS), so a fence path contains a target when
+//! it is the same file (device and inode) as an existing ancestor of the
+//! target, or a path prefix of it; for `denyWriteUnder` the prefix is
+//! compared without case on macOS. A file with more than one hard link is
+//! refused: its other names may be anywhere.
+//!
+//! Known limitation: the hook checks a path, not the write. Between the
+//! check and the write, a parallel call (a sandboxed Bash in the agent's
+//! own cwd, say) can swap a path part for a symlink, e.g. create
+//! `<cwd>/gap -> <denied dir>` after a Write to `<cwd>/gap/f` was allowed.
+//! The fence cannot bind the write to the checked path; only an
+//! OS-level control (the sandbox) could.
 
 use crate::engine_proto::wire::AgentGuard;
 use std::path::{Component, Path, PathBuf};
@@ -21,6 +33,9 @@ pub const MAX_GUARD_PATHS: usize = 64;
 /// The prefix of every refusal reason. CC shows it to the model after
 /// `PreToolUse:<tool> hook error:`; the live harness finds the layer by it.
 pub const DENY_PREFIX: &str = "c9watch guard:";
+
+/// The capability a fenced agent's CC must have: the blocking hook.
+pub const REQUIRED_CAP: &str = "hook.pre_tool_use.block";
 
 /// The tool input keys that name the file a file tool writes.
 pub const PATH_KEYS: &[&str] = &["file_path", "notebook_path"];
@@ -90,8 +105,14 @@ impl Fence {
 
     /// Whether a write to the resolved path `target` is denied.
     pub fn denies(&self, target: &Path) -> bool {
-        self.deny_write_under.iter().any(|d| target.starts_with(d))
-            && !self.allow_write.iter().any(|a| target.starts_with(a))
+        let ids = ancestor_ids(target);
+        self.deny_write_under
+            .iter()
+            .any(|d| contains(d, target, &ids, cfg!(target_os = "macos")))
+            && !self
+                .allow_write
+                .iter()
+                .any(|a| contains(a, target, &ids, false))
     }
 
     /// The fence as the wire and the db hold it.
@@ -114,18 +135,43 @@ impl Fence {
     }
 }
 
+/// Device and inode of a path, following symlinks.
+fn file_id(p: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// The ids of `target` and each of its existing ancestors.
+fn ancestor_ids(target: &Path) -> Vec<(u64, u64)> {
+    target.ancestors().filter_map(file_id).collect()
+}
+
+/// Whether `base` holds `target`: the same file as one of its ancestors
+/// (`ids`), or a path prefix of it, without case when `fold`.
+fn contains(base: &Path, target: &Path, ids: &[(u64, u64)], fold: bool) -> bool {
+    if file_id(base).is_some_and(|b| ids.contains(&b)) {
+        return true;
+    }
+    if !fold {
+        return target.starts_with(base);
+    }
+    let low = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+    low(target).starts_with(low(base))
+}
+
 /// The path a write to `target` lands on: the realpath of its longest
 /// existing prefix, then the rest, with `.` dropped and `..` taken
-/// against what is resolved so far. An existing component is resolved
-/// through its symlinks. A component that is a symlink whose target does
-/// not exist is an error: a write through it would land on that target.
-/// `target` must be absolute.
+/// against what is resolved so far. Each component is looked up again,
+/// also after a missing one and a `..` back out of it. An existing
+/// component is resolved through its symlinks. A component that is a
+/// symlink whose target does not exist is an error: a write through it
+/// would land on that target. So is an existing file with more than one
+/// hard link. `target` must be absolute.
 pub fn resolve_target(target: &Path) -> Result<PathBuf, String> {
     if !target.is_absolute() {
         return Err(format!("{:?} is not absolute", target));
     }
     let mut out = PathBuf::from("/");
-    let mut exists = true;
     for c in target.components() {
         match c {
             Component::RootDir | Component::CurDir => {}
@@ -135,9 +181,6 @@ pub fn resolve_target(target: &Path) -> Result<PathBuf, String> {
             }
             Component::Normal(n) => {
                 out.push(n);
-                if !exists {
-                    continue;
-                }
                 match out.symlink_metadata() {
                     Ok(m) => {
                         if m.file_type().is_symlink() || out.is_dir() {
@@ -146,10 +189,25 @@ pub fn resolve_target(target: &Path) -> Result<PathBuf, String> {
                                 .map_err(|e| format!("{:?}: {}", out, e))?;
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => exists = false,
+                    // Not there: kept as written; a later `..` may come back.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) => {}
                     Err(e) => return Err(format!("{:?}: {}", out, e)),
                 }
             }
+        }
+    }
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(m) = std::fs::symlink_metadata(&out) {
+        if m.is_file() && m.nlink() > 1 {
+            return Err(format!(
+                "{:?} has {} hard links; the others may be outside the fence",
+                out,
+                m.nlink()
+            ));
         }
     }
     Ok(out)
@@ -271,6 +329,72 @@ mod tests {
         std::fs::write(a.join("own.txt"), "A").unwrap();
         assert_eq!(
             decide(&f, &write("Write", "file_path", &a.join("own.txt"))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_missing_part_then_dot_dot_is_resolved_again() {
+        // Codex P1: after `missing/..` the walk must look up `link` again.
+        let (_t, r, a, b, home) = layout();
+        let f = Fence::new(&guard(&[&r], &[&a]), &a, &home).unwrap();
+        std::os::unix::fs::symlink(&b, a.join("link")).unwrap();
+        let p = a.join("missing/../link/file");
+        assert_eq!(resolve_target(&p).unwrap(), b.join("file"));
+        assert!(decide(&f, &write("Write", "file_path", &p)).is_some());
+        let p = a.join("m1/m2/../../link/file");
+        assert!(decide(&f, &write("Write", "file_path", &p)).is_some());
+        // Under a file, not a dir: kept as written, then denied by prefix.
+        std::fs::write(b.join("plain"), "B").unwrap();
+        let p = b.join("plain/x");
+        assert!(decide(&f, &write("Write", "file_path", &p)).is_some());
+    }
+
+    #[test]
+    fn a_case_alias_of_a_denied_dir_is_denied() {
+        let (_t, r, a, b, home) = layout();
+        let f = Fence::new(&guard(&[&r], &[&a]), &a, &home).unwrap();
+        // The last name with its case flipped (`b` → `B`, `R` → `r`).
+        let upper = |p: &Path| {
+            let n = p.file_name().unwrap().to_string_lossy().to_string();
+            let up = n.to_uppercase();
+            p.with_file_name(if n == up { n.to_lowercase() } else { up })
+        };
+        // Matters only on a case-insensitive volume (APFS default).
+        if !upper(&b).exists() {
+            return;
+        }
+        for p in [
+            upper(&b).join("code.txt"),
+            a.join("missing/../..")
+                .join(upper(&b).file_name().unwrap())
+                .join("x"),
+            upper(&r).join("b/x"),
+        ] {
+            assert!(
+                decide(&f, &write("Write", "file_path", &p)).is_some(),
+                "{p:?}"
+            );
+        }
+        // A case alias of the agent's own dir stays its own.
+        assert_eq!(
+            decide(&f, &write("Write", "file_path", &upper(&a).join("own.txt"))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_hard_linked_file_is_refused() {
+        let (_t, r, a, b, home) = layout();
+        let f = Fence::new(&guard(&[&r], &[&a]), &a, &home).unwrap();
+        std::fs::write(b.join("code.txt"), "B").unwrap();
+        std::fs::hard_link(b.join("code.txt"), a.join("alias.txt")).unwrap();
+        let why = decide(&f, &write("Write", "file_path", &a.join("alias.txt"))).unwrap();
+        assert!(why.contains("hard links"), "{why}");
+        // One link: its own file.
+        std::fs::write(a.join("own.txt"), "A").unwrap();
+        assert_eq!(
+            decide(&f, &write("Edit", "file_path", &a.join("own.txt"))),
             None
         );
     }
