@@ -461,14 +461,55 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "c9watch-core",
  "chrono",
  "clap",
- "dirs 5.0.1",
  "ed25519-dalek",
  "futures-util",
  "libc",
  "mime_guess",
  "notify-rust",
+ "rand 0.8.5",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-nspanel",
+ "tauri-plugin-dialog",
+ "tauri-plugin-notification",
+ "tauri-plugin-opener",
+ "tauri-plugin-process",
+ "tauri-plugin-sharekit",
+ "tauri-plugin-updater",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "uuid",
+ "wait-timeout",
+]
+
+[[package]]
+name = "c9watch-agent"
+version = "0.11.1"
+dependencies = [
+ "c9watch-core",
+ "clap",
+]
+
+[[package]]
+name = "c9watch-core"
+version = "0.11.1"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "dirs 5.0.1",
+ "ed25519-dalek",
+ "libc",
  "rand 0.8.5",
  "regex",
  "reqwest",
@@ -481,19 +522,9 @@ dependencies = [
  "sha2",
  "subtle",
  "sysinfo",
- "tauri",
- "tauri-build",
- "tauri-nspanel",
- "tauri-plugin-dialog",
- "tauri-plugin-notification",
- "tauri-plugin-opener",
- "tauri-plugin-process",
- "tauri-plugin-sharekit",
- "tauri-plugin-updater",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "tokio-tungstenite",
  "uuid",
  "wait-timeout",
 ]

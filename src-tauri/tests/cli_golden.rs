@@ -2,7 +2,7 @@
 //! `status`, `watch` and `wait` print what they printed before the
 //! CLI became an engine client. An engine build runs them with `--direct`;
 //! any other build (the release CLI) runs them as they are. Both compare
-//! against the same fixtures in `tests/fixtures/cli-golden/`.
+//! against the same fixtures in `core/tests/fixtures/cli-golden/`.
 //!
 //! Each run uses a temp HOME and a PATH of a stand-in `claude` (never the
 //! real one) whose `agents --json` lists one session on a live `sleep`.
@@ -157,7 +157,7 @@ impl Drop for Golden {
 
 fn check(name: &str, got: &Value) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/cli-golden")
+        .join("core/tests/fixtures/cli-golden")
         .join(format!("{}.json", name));
     let text = serde_json::to_string_pretty(got).unwrap() + "\n";
     if std::env::var_os("UPDATE_GOLDEN").is_some() {

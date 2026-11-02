@@ -1,0 +1,55 @@
+[package]
+name = "c9watch-core"
+version.workspace = true
+description = "c9watch core: session readers, the agent engine and the c9watch CLI (no tauri)"
+authors.workspace = true
+edition.workspace = true
+
+[lib]
+name = "c9watch_core"
+
+[features]
+# The parts that the GUI shell calls. No tauri: CI fails if a `tauri*`
+# crate enters this crate's dependency tree (D32).
+gui = ["dep:tokio", "dep:ed25519-dalek", "dep:rand", "dep:base64", "dep:sha2", "dep:subtle"]
+cli = ["dep:clap", "dep:tokio"]
+# Agent engine (C1a): `c9watch engine` and `api`, unix only.
+engine = ["cli", "dep:ed25519-dalek", "dep:rand", "dep:schemars", "dep:sha2", "dep:base64", "dep:subtle"]
+gateway-assets = ["dep:rust-embed"]
+# Test-only PTY input and screen files for tests/live/cc_sandbox.sh (C1a-32).
+# Never in release, default or CI builds.
+live-test = ["engine"]
+# Test helpers (`Session::fixture`, `DetectorState::for_test`, ...) for the
+# GUI shell's tests. Only the workspace's dev-dependencies turn it on.
+test-support = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls"] }
+sysinfo = "0.32"
+anyhow = "1.0"
+thiserror = "1.0"
+dirs = "5.0"
+chrono = "0.4"
+libc = "0.2.180"
+uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+wait-timeout = "0.2"
+# `session::sanitize` is always built.
+regex = "1"
+
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "process", "signal", "fs", "time", "macros"], optional = true }
+rand = { version = "0.8", optional = true }
+rust-embed = { version = "8", optional = true }
+base64 = { version = "0.22", optional = true }
+sha2 = { version = "0.10", optional = true }
+subtle = { version = "2.6", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+ed25519-dalek = { version = "2", optional = true }
+# c9p/1 JSON Schema (`docs/api/c9p-1.json`) from the serde wire types.
+schemars = { version = "1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

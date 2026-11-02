@@ -1,9 +1,25 @@
-[package]
-name = "c9watch"
+# The workspace (D32): `core` is the c9watch core (engine, CLI, session
+# readers) and never depends on tauri; `agent` is `c9watch-agent`; this
+# package is the Tauri GUI shell and the `c9watch` binary. Without `gui`
+# the binary is the CLI over the core.
+[workspace]
+members = [".", "core", "agent"]
+# Commands from this directory cover all three, so `--features engine`,
+# `--bin c9watch-agent` and `--bins` work as before the split.
+default-members = [".", "core", "agent"]
+resolver = "2"
+
+[workspace.package]
 version = "0.11.1"
-description = "Monitor and control Claude Code sessions, with Codex and Cursor Agent visibility"
 authors = ["minchenlee"]
 edition = "2021"
+
+[package]
+name = "c9watch"
+version.workspace = true
+description = "Monitor and control Claude Code sessions, with Codex and Cursor Agent visibility"
+authors.workspace = true
+edition.workspace = true
 # Two binaries in engine builds: `cargo run` and `tauri dev` pick this one.
 default-run = "c9watch"
 
@@ -19,6 +35,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [features]
 default = ["gui", "cli", "gateway-assets"]
 gui = [
+    "c9watch-core/gui",
     "dep:tauri",
     "dep:tauri-build",
     "dep:tauri-plugin-notification",
@@ -35,35 +52,30 @@ gui = [
     "dep:mime_guess",
     "dep:base64",
     "dep:sha2",
-    "dep:subtle",
     "dep:tauri-nspanel",
 ]
-cli = ["dep:clap", "dep:regex", "dep:tokio"]
+cli = ["c9watch-core/cli", "dep:clap", "dep:regex", "dep:tokio"]
 # Agent engine (C1a): `c9watch engine` and `api`, plus the `c9watch-agent`
-# binary, unix only.
-engine = ["cli", "dep:ed25519-dalek", "dep:rand", "dep:schemars", "dep:sha2", "dep:axum", "dep:base64", "dep:subtle", "dep:mime_guess"]
-gateway-assets = ["dep:rust-embed"]
+# binary (the `agent` package), unix only.
+engine = ["cli", "c9watch-core/engine", "dep:sha2"]
+gateway-assets = ["c9watch-core/gateway-assets"]
 # Test-only PTY input and screen files for tests/live/cc_sandbox.sh (C1a-32).
 # Never in release, default or CI builds.
-live-test = ["engine"]
+live-test = ["engine", "c9watch-core/live-test"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
 
 [dependencies]
-# ── Core (always included) ───────────────────────────────────────────
+c9watch-core = { path = "core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-semver = "1"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls"] }
-sysinfo = "0.32"
 anyhow = "1.0"
-thiserror = "1.0"
-dirs = "5.0"
 chrono = "0.4"
 libc = "0.2.180"
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+wait-timeout = "0.2"
 
 # ── GUI-only dependencies ────────────────────────────────────────────
 tauri = { version = "2", features = ["tray-icon"], optional = true }
@@ -76,21 +88,14 @@ tauri-plugin-sharekit = { version = "0.3", optional = true }
 axum = { version = "0.7", features = ["ws"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "process", "signal", "fs", "time", "macros"], optional = true }
 rand = { version = "0.8", optional = true }
-rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 base64 = { version = "0.22", optional = true }
 sha2 = { version = "0.10", optional = true }
-subtle = { version = "2.6", optional = true }
+ed25519-dalek = { version = "2", optional = true }
 
 # ── CLI-only dependencies ────────────────────────────────────────────
 clap = { version = "4", features = ["derive"], optional = true }
 regex = { version = "1", optional = true }
-wait-timeout = "0.2"
-
-# ── Engine-only dependencies ─────────────────────────────────────────
-ed25519-dalek = { version = "2", optional = true }
-# c9p/1 JSON Schema (`docs/api/c9p-1.json`) from the serde wire types.
-schemars = { version = "1", optional = true }
 
 # ── macOS GUI-only ───────────────────────────────────────────────────
 # tauri-nspanel provides NSPanel support for the popover (above fullscreen apps).
@@ -98,6 +103,7 @@ schemars = { version = "1", optional = true }
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", rev = "da9c9a8d4eb7f0524a2508988df1a7d9585b4904", optional = true }
 
 [dev-dependencies]
+c9watch-core = { path = "core", features = ["test-support"] }
 tempfile = "3"
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false }
@@ -109,13 +115,6 @@ notify-rust = { version = "4", optional = true }
 # debug info.
 [profile.dev]
 debug = "line-tables-only"
-
-# The agent side of the engine (C1a-21): `hook`, `task done`, `handoff`.
-# Built only with the engine, so GUI and release CLI builds do not change.
-[[bin]]
-name = "c9watch-agent"
-path = "src/bin/c9watch-agent.rs"
-required-features = ["engine"]
 
 [[example]]
 name = "notification_smoke"

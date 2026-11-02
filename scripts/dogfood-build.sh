@@ -43,7 +43,9 @@ EOF
 # key, and builds <target>/release/c9watch with the engine and the dev-only
 # shadow diff (`c9watch engine --help` lists `shadow-report`).
 # C1a-21 (M4) added the second [[bin]], c9watch-agent (required-features =
-# ["engine"], default-run = "c9watch"). `cargo check --features engine` of
+# ["engine"], default-run = "c9watch"). D32 moved it to its own workspace
+# package (src-tauri/agent); the workspace default members keep
+# `--bin c9watch-agent` working from src-tauri. `cargo check --features engine` of
 # the GUI passes with it; the release `tauri build` with both binaries is
 # not re-run yet. Step 2 builds the agent explicitly, so the script does not
 # depend on whether `tauri build` also builds it: when it did, step 2 is a

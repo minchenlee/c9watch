@@ -28,8 +28,36 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const AGENT: &str = env!("CARGO_BIN_EXE_c9watch-agent");
 const MAIN: &str = env!("CARGO_BIN_EXE_c9watch");
+/// `c9watch-agent` is its own package (D32), so cargo gives this package no
+/// `CARGO_BIN_EXE_c9watch-agent`. The first use builds it with the cargo
+/// that runs this test, in the profile of `c9watch` (its directory name;
+/// `debug` is `dev`). A missing binary gets built and a stale one rebuilt,
+/// also for `cargo test --test engine_agent` on a clean target dir. The
+/// path comes from cargo's own artifact message, so a `--target` triple or
+/// target dir does not move it.
+static AGENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let profile = Path::new(MAIN).parent().unwrap().file_name().unwrap();
+    let profile = match profile.to_str().unwrap() {
+        "debug" => "dev",
+        name => name,
+    };
+    let out = Command::new(env!("CARGO"))
+        .args(["build", "-p", "c9watch-agent", "--features", "engine"])
+        .args(["--profile", profile, "--message-format", "json"])
+        .arg("--manifest-path")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+        .stderr(Stdio::inherit())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "building c9watch-agent failed");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "c9watch-agent")
+        .find_map(|m| m["executable"].as_str().map(str::to_owned))
+        .expect("cargo reported no c9watch-agent executable")
+});
 const AGENT_ID: &str = "agt_t";
 
 /// An engine running on its own thread. Dropping it stops the engine.
@@ -48,7 +76,7 @@ impl Engine {
         let agents = Arc::new(LiveTable::new());
         let config = EngineConfig {
             home: home.clone(),
-            agent_source: PathBuf::from(AGENT),
+            agent_source: PathBuf::from(&*AGENT),
             agents: agents.clone(),
             detection: false,
             claude: None,
@@ -156,11 +184,11 @@ fn the_engine_installs_its_own_copy_0555_with_the_source_sha() {
     assert_eq!(meta.permissions().mode() & 0o7777, 0o555);
     assert_eq!(
         Sha256::digest(std::fs::read(&copy).unwrap()),
-        Sha256::digest(std::fs::read(AGENT).unwrap())
+        Sha256::digest(std::fs::read(&*AGENT).unwrap())
     );
     assert_ne!(
         meta.ino(),
-        std::fs::metadata(AGENT).unwrap().ino(),
+        std::fs::metadata(&*AGENT).unwrap().ino(),
         "a copy, not a link"
     );
 }
@@ -382,7 +410,7 @@ fn an_agent_running_another_binary_is_refused() {
     // The source next to the main binary: same bytes, not the engine's copy.
     let (out, rc) = as_agent(
         &engine,
-        &format!("{} task done --report r", q(Path::new(AGENT))),
+        &format!("{} task done --report r", q(Path::new(&*AGENT))),
         true,
     );
     assert_eq!(rc, 1, "{}", out);
@@ -501,7 +529,7 @@ fn a_changed_copy_is_refused() {
 /// Run the agent binary once, untimed: the first exec of a freshly linked
 /// binary can wait on the OS's malware scan, which is not the hook's cost.
 fn warm_up_agent() {
-    let out = Command::new(AGENT).arg("--version").output().unwrap();
+    let out = Command::new(&*AGENT).arg("--version").output().unwrap();
     assert!(out.status.success(), "{:?}", out);
 }
 
@@ -511,7 +539,7 @@ fn a_hook_exits_0_without_an_engine_or_with_bad_args() {
     let dir = tempfile::tempdir().unwrap();
     let hook = |args: &[&str]| {
         let t = Instant::now();
-        let out = Command::new(AGENT)
+        let out = Command::new(&*AGENT)
             .args(args)
             .env("C9_ENGINE_SOCK", dir.path().join("none.sock"))
             .env("C9_AGENT_ID", AGENT_ID)
@@ -555,7 +583,7 @@ fn a_hook_against_a_silent_engine_exits_0_in_time() {
         drop(c);
     });
     let t = Instant::now();
-    let out = Command::new(AGENT)
+    let out = Command::new(&*AGENT)
         .args(["hook", "stop"])
         .env("C9_ENGINE_SOCK", &path)
         .env("C9_AGENT_ID", AGENT_ID)
@@ -568,16 +596,4 @@ fn a_hook_against_a_silent_engine_exits_0_in_time() {
     // Well under the 3 s the engine holds the connection.
     assert!(took < Duration::from_millis(2500), "took {:?}", took);
     held.join().unwrap();
-}
-
-/// `cargo run` picks the main binary (`default-run`), and the agent binary
-/// exists only with the engine (`required-features`). The Linux CI job also
-/// runs `cargo run ... -- --version` and builds `c9watch-agent` by name.
-#[test]
-fn the_manifest_keeps_c9watch_the_default_binary() {
-    let manifest = include_str!("../Cargo.toml");
-    assert!(manifest.contains("\ndefault-run = \"c9watch\"\n"));
-    let bin = manifest.split("[[bin]]").nth(1).unwrap();
-    assert!(bin.contains("name = \"c9watch-agent\""));
-    assert!(bin.contains("required-features = [\"engine\"]"));
 }

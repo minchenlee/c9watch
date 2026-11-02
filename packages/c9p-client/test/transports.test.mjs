@@ -35,7 +35,7 @@ class FakeWs {
   send(text) { this.sent.push(JSON.parse(text)); this.onSend?.(JSON.parse(text)); }
   close() { this.readyState = 3; }
 }
-// Same seeds and bytes as src-tauri/src/gateway/pubkey.rs cross_language_vectors.
+// Same seeds and bytes as src-tauri/core/src/gateway/pubkey.rs cross_language_vectors.
 const seeded = (seed) => createPrivateKey({ key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), Buffer.alloc(32, seed)]), format: 'der', type: 'pkcs8' });
 const rawPub = (key) => createPublicKey(key).export({ format: 'der', type: 'spki' }).subarray(-32);
 const machine = seeded(7);

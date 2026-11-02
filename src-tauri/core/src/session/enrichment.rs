@@ -1,0 +1,2644 @@
+use crate::claude_hooks::{HookSessionState, PendingPermission};
+use crate::session::cache::{
+    build_from_line_batches, refresh_incremental_entry, FileVersion, IncrementalEntry,
+};
+use crate::session::codex::CodexLifecycle;
+use crate::session::cursor::CursorLifecycle;
+use crate::session::owners::global_provider_source_owners;
+use crate::session::parser::NativeTitles;
+use crate::session::permissions::PermissionChecker;
+use crate::session::pi::PiLifecycle;
+use crate::session::source::{
+    health_from_last_timestamp, AgentKind, CliActivity, DetectedSession, DetectionDiagnostics,
+    SessionIdentity, SessionKind, SessionProvider, SessionSource, SessionSurface, SourceHealth,
+};
+use crate::session::status::{
+    determine_status_with, get_pending_tool_input_with, get_pending_tool_name_with,
+};
+use crate::session::{parse_last_n_entries, parse_sessions_index, SessionEntry, SessionStatus};
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
+
+/// Combined session information
+///
+/// Internal: the c9p wire carries `engine_proto::wire::SessionView`, built
+/// from this at the API boundary, so this struct has no JSON Schema.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Session {
+    pub id: String,
+    /// Provider-scoped identity used by frontend selection and backend maps.
+    pub session_key: String,
+    pub pid: u32,
+    pub session_name: String,
+    pub custom_title: Option<String>,
+    /// Codex's current UI thread name from ~/.codex/session_index.jsonl.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_title: Option<String>,
+    /// Cursor's current UI composer name from state.vscdb.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_title: Option<String>,
+    /// Claude Code's auto-generated title (`ai-title` in the session JSONL).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_title: Option<String>,
+    pub project_path: String,
+    pub git_branch: Option<String>,
+    pub first_prompt: String,
+    pub summary: Option<String>,
+    pub message_count: u32,
+    pub modified: String,
+    pub status: SessionStatus,
+    /// Health of the source observation, independent of the session status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_health: Option<SourceHealth>,
+    pub latest_message: String,
+    /// Assistant text only, bounded during enrichment for native notification previews.
+    #[serde(skip)]
+    pub notification_preview: Option<String>,
+    pub pending_tool_name: Option<String>,
+    /// The input/arguments of the pending tool (when status is NeedsPermission)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_tool_input: Option<serde_json::Value>,
+    /// What the session needs from the user (tool name only, never arguments).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<crate::session::away::WaitingFor>,
+    /// One-line, tag-free preview of the last assistant text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_assistant_message: Option<String>,
+    /// Claude Code transcript backing this card, for the away-activity index.
+    #[serde(skip)]
+    pub transcript_path: Option<PathBuf>,
+    /// Session ID of the PM that spawned this session (if it's a c9watch worker).
+    /// Set by the workers overlay from `~/.claude/c9watch/workers/*/meta.json`
+    /// (`session::workers`), after detection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_of: Option<String>,
+    /// User-set name from `claude agents` (Ctrl+T background-pinned sessions).
+    /// Only populated by the CLI backend; legacy backend leaves this None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub official_name: Option<String>,
+    /// Session start time in ms since epoch (from `claude agents --json`).
+    /// Only populated by the CLI backend; legacy backend leaves this None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    pub provider: SessionProvider,
+    pub surface: SessionSurface,
+    /// Interactive vs. background-pinned (`claude agents --json`'s `kind`).
+    /// Providers other than Claude Code always report `Interactive`.
+    pub kind: SessionKind,
+    /// Raw `entrypoint` from `~/.claude/sessions/<pid>.json` (e.g. "cli", "sdk-cli",
+    /// "claude-vscode", "mcp", "remote_desktop"...). Only the CLI backend populates
+    /// this; `None` covers the legacy backend and non-Claude-Code providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
+    pub agent_kind: AgentKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_nickname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal_kind: Option<String>,
+    /// Native target guarantee; absent means no verified exact native target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_target: Option<crate::actions::OpenTarget>,
+    pub can_open: bool,
+    pub can_stop: bool,
+    pub can_rename: bool,
+}
+
+/// Cache for native titles, keyed by file path.
+/// The stamp includes size and, on Unix, change time and inode.  Mtime alone
+/// can be coarse or unchanged for an in-place rewrite, which would otherwise
+/// let a stale title survive in the history view.
+type NativeTitleStamp = FileVersion;
+
+/// Stores the file stamp and cached title to avoid re-scanning JSONL files
+/// every poll cycle while still falling back safely on weak metadata systems.
+static NATIVE_TITLE_CACHE: LazyLock<
+    Mutex<HashMap<std::path::PathBuf, (NativeTitleStamp, NativeTitles)>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn native_title_stamp(path: &Path) -> Option<NativeTitleStamp> {
+    FileVersion::read(path).ok()
+}
+
+fn claude_custom_name(
+    provider: SessionProvider,
+    names: &crate::session::CustomNames,
+    session_id: &str,
+) -> Option<String> {
+    (provider == SessionProvider::ClaudeCode)
+        .then(|| names.get(session_id).cloned())
+        .flatten()
+}
+
+fn claude_custom_title(
+    provider: SessionProvider,
+    titles: &crate::session::CustomTitles,
+    session_id: &str,
+) -> Option<String> {
+    (provider == SessionProvider::ClaudeCode)
+        .then(|| titles.get(session_id).cloned())
+        .flatten()
+}
+
+/// Look up the native custom and AI titles for a session JSONL, using a strong
+/// file stamp when the platform provides one and a safe re-scan otherwise.
+pub(crate) fn get_cached_native_titles(path: &Path) -> NativeTitles {
+    get_cached_native_titles_with(
+        path,
+        crate::session::parser::try_get_native_titles_from_file,
+    )
+}
+
+fn get_cached_native_titles_with(
+    path: &Path,
+    read_titles: impl FnOnce(&Path) -> std::io::Result<NativeTitles>,
+) -> NativeTitles {
+    let Some(stamp) = native_title_stamp(path) else {
+        if let Ok(mut cache) = NATIVE_TITLE_CACHE.lock() {
+            cache.remove(path);
+        }
+        return NativeTitles::default();
+    };
+
+    if let Ok(mut cache) = NATIVE_TITLE_CACHE.lock() {
+        if let Some((cached_stamp, cached_titles)) = cache.get(path) {
+            if *cached_stamp == stamp && stamp.supports_unchanged_fast_path() {
+                return cached_titles.clone();
+            }
+        }
+        // Cache miss or stale — re-scan
+        let titles = match read_titles(path) {
+            Ok(titles) => titles,
+            Err(_) => {
+                cache.remove(path);
+                return NativeTitles::default();
+            }
+        };
+        cache.insert(path.to_path_buf(), (stamp, titles.clone()));
+        titles
+    } else {
+        // Mutex poisoned — fallback to direct read
+        read_titles(path).unwrap_or_default()
+    }
+}
+
+/// Combines the existing heuristic-based SessionStatus with the CLI activity signal.
+///
+/// `Waiting` means Claude Code itself is showing a prompt, so it always wins.
+/// When `reports_prompts` (the Claude Code version reports every prompt as
+/// `Waiting`), `Busy`/`Idle` also rule out a prompt: `Busy` overrides any
+/// NeedsAttention inferred from the transcript or hooks, and `Idle` overrides
+/// one that stands for a prompt. A trailing text question (`pending_tool` of
+/// "Question") leaves Claude Code idle, so it stays NeedsAttention while idle.
+/// Otherwise CLI activity never overrides NeedsAttention or Connecting and only
+/// refines Working vs WaitingForInput.
+pub fn merge_cli_activity(
+    heuristic: SessionStatus,
+    cli: Option<CliActivity>,
+    reports_prompts: bool,
+    pending_tool: Option<&str>,
+) -> SessionStatus {
+    let text_question = pending_tool == Some("Question");
+    match (&heuristic, cli) {
+        (_, Some(CliActivity::Waiting)) => return SessionStatus::NeedsAttention,
+        (SessionStatus::NeedsAttention, Some(CliActivity::Busy)) if reports_prompts => {
+            return SessionStatus::Working;
+        }
+        (SessionStatus::NeedsAttention, Some(CliActivity::Idle))
+            if reports_prompts && !text_question =>
+        {
+            return SessionStatus::WaitingForInput;
+        }
+        _ => {}
+    }
+    let has_pending_tool = pending_tool.is_some();
+    match (heuristic, cli) {
+        (SessionStatus::NeedsAttention, _) => SessionStatus::NeedsAttention,
+        (SessionStatus::Connecting, _) => SessionStatus::Connecting,
+        (heuristic, None) => heuristic,
+        (SessionStatus::WaitingForInput, Some(CliActivity::Busy)) => SessionStatus::Working,
+        (SessionStatus::Working, Some(CliActivity::Idle)) if !has_pending_tool => {
+            SessionStatus::WaitingForInput
+        }
+        (heuristic, _) => heuristic,
+    }
+}
+
+/// Detect sessions and enrich them with status and conversation data.
+/// Uses the configured backend (CLI or Legacy) via the factory.
+pub fn detect_and_enrich_sessions() -> Result<(Vec<Session>, DetectionDiagnostics), String> {
+    let mut source = crate::session::create_session_source();
+    let claude_result = source.detect();
+    let owners = global_provider_source_owners();
+    let codex_result = owners.detect_codex();
+    let cursor_result = owners.detect_cursor();
+    let pi_result = owners.detect_pi();
+    let opencode_sessions = super::opencode::detect_once();
+    let (detected, diagnostics) = crate::session::state::merge_provider_results(
+        claude_result,
+        codex_result,
+        cursor_result,
+        pi_result,
+        opencode_sessions,
+    )
+    .map_err(|error| format!("Failed to detect sessions: {error}"))?;
+    enrich_detected_sessions(detected, diagnostics)
+}
+
+/// Detect sessions using a SessionSource trait object and enrich them.
+pub fn detect_and_enrich_sessions_with_source(
+    source: &mut dyn SessionSource,
+) -> Result<(Vec<Session>, DetectionDiagnostics), String> {
+    let (detected, diag) = source
+        .detect()
+        .map_err(|e| format!("Failed to detect sessions: {}", e))?;
+    enrich_detected_sessions(detected, diag)
+}
+
+/// Enrichment-only: takes already-detected sessions and adds JSONL-derived fields.
+/// Split out so callers can drop a lock before doing slow JSONL parsing.
+pub fn enrich_detected_sessions(
+    detected_sessions: Vec<DetectedSession>,
+    diagnostics: DetectionDiagnostics,
+) -> Result<(Vec<Session>, DetectionDiagnostics), String> {
+    let custom_names = crate::session::CustomNames::load();
+    let custom_titles = crate::session::CustomTitles::load();
+    let mut sessions = Vec::new();
+    let now_ms = Utc::now().timestamp_millis();
+
+    for detected in detected_sessions {
+        // Get session ID - if not found, skip this session
+        let identity = match detected.identity() {
+            Some(identity) => identity,
+            None => {
+                continue;
+            }
+        };
+        let session_id = identity.session_id.clone();
+
+        if let Some(summary) = detected.codex_summary.as_ref() {
+            sessions.push(Session {
+                session_name: default_session_name(&detected, &custom_names, &session_id),
+                custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
+                codex_title: crate::session::codex::get_cached_codex_thread_title(&session_id),
+                first_prompt: summary
+                    .first_prompt()
+                    .map(|prompt| truncate_string(prompt, 100))
+                    .unwrap_or_else(|| "(No conversation yet)".to_string()),
+                message_count: summary.messages.len() as u32,
+                modified: modified_or_started(&summary.last_timestamp, detected.started_at_ms),
+                status: codex_status(summary, now_ms),
+                source_health: Some(health_from_last_timestamp(
+                    &summary.last_timestamp,
+                    if summary.lifecycle == CodexLifecycle::Working {
+                        crate::session::codex::WORKING_FRESHNESS_SECS
+                    } else {
+                        crate::session::codex::IDLE_FRESHNESS_SECS
+                    },
+                )),
+                latest_message: summary
+                    .latest_message()
+                    .map(|message| truncate_string(message, 200))
+                    .unwrap_or_default(),
+                notification_preview: assistant_preview_since_last_user(
+                    summary
+                        .messages
+                        .iter()
+                        .map(|m| (&m.message_type, m.content.as_str())),
+                ),
+                pending_tool_name: summary.pending_tool_name(now_ms).map(str::to_string),
+                ..base_session(&detected, &session_id)
+            });
+            continue;
+        }
+
+        if let Some(summary) = detected.cursor_summary.as_ref() {
+            let working = summary.lifecycle == CursorLifecycle::Working;
+            sessions.push(Session {
+                session_name: default_session_name(&detected, &custom_names, &session_id),
+                custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id)
+                    .or_else(|| detected.official_name.clone()),
+                cursor_title: summary.cursor_title.clone(),
+                first_prompt: summary
+                    .first_prompt()
+                    .map(|prompt| truncate_string(prompt, 100))
+                    .unwrap_or_else(|| "(No conversation yet)".to_string()),
+                message_count: summary.messages.len() as u32,
+                modified: modified_or_started(&summary.last_timestamp, detected.started_at_ms),
+                status: transcript_status(working, summary.empty),
+                source_health: Some(health_from_last_timestamp(
+                    &summary.last_timestamp,
+                    if working {
+                        crate::session::cursor::WORKING_FRESHNESS_SECS
+                    } else {
+                        crate::session::cursor::IDLE_FRESHNESS_SECS
+                    },
+                )),
+                latest_message: summary
+                    .latest_message()
+                    .map(|message| truncate_string(message, 200))
+                    .unwrap_or_default(),
+                notification_preview: assistant_preview_since_last_user(
+                    summary
+                        .messages
+                        .iter()
+                        .map(|m| (&m.message_type, m.content.as_str())),
+                ),
+                ..base_session(&detected, &session_id)
+            });
+            continue;
+        }
+
+        if let Some(summary) = detected.opencode_summary.as_ref() {
+            sessions.push(Session {
+                session_name: detected.project_name.clone(),
+                custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
+                first_prompt: detected.official_name.clone().unwrap_or_default(),
+                message_count: 0,
+                modified: summary.modified.clone(),
+                status: summary.status.clone(),
+                // The OpenCode preview is HTTP-polled, not transcript-backed; treat
+                // the snapshot as fresh when it carries a timestamp, partial when not.
+                // The window matches the detector's snapshot freshness bound.
+                source_health: Some(health_from_last_timestamp(
+                    &summary.modified,
+                    (crate::session::opencode::IDLE_FRESHNESS_MS / 1000) as u64,
+                )),
+                latest_message: summary.diagnostic.clone(),
+                ..base_session(&detected, &session_id)
+            });
+            continue;
+        }
+
+        if let Some(summary) = detected.pi_summary.as_ref() {
+            let working = summary.lifecycle == PiLifecycle::Working;
+            sessions.push(Session {
+                session_name: default_session_name(&detected, &custom_names, &session_id),
+                custom_title: claude_custom_title(detected.provider, &custom_titles, &session_id),
+                first_prompt: summary
+                    .first_prompt
+                    .as_deref()
+                    .map(|prompt| truncate_string(prompt, 100))
+                    .filter(|prompt| !prompt.trim().is_empty())
+                    .unwrap_or_else(|| "(No conversation yet)".to_string()),
+                message_count: summary.message_count as u32,
+                modified: modified_or_started(&summary.last_timestamp, detected.started_at_ms),
+                status: transcript_status(working, summary.empty),
+                source_health: Some(health_from_last_timestamp(
+                    &summary.last_timestamp,
+                    if working {
+                        crate::session::pi::PI_FRESHNESS_WORKING_SECS
+                    } else {
+                        crate::session::pi::PI_FRESHNESS_IDLE_SECS
+                    },
+                )),
+                latest_message: summary
+                    .latest_snippet
+                    .as_deref()
+                    .map(|message| truncate_string(message, 200))
+                    .unwrap_or_default(),
+                notification_preview: summary.latest_assistant_text.clone(),
+                pending_tool_name: summary.pending_tool_name.clone(),
+                ..base_session(&detected, &session_id)
+            });
+            continue;
+        }
+
+        // Try to parse sessions-index.json to get basic info (optional)
+        let index_path = detected.project_path.join("sessions-index.json");
+        let sessions_index = parse_sessions_index(&index_path).ok();
+
+        // Find the matching entry in the index (if index exists)
+        let session_entry = sessions_index.as_ref().and_then(|index| {
+            index
+                .entries
+                .iter()
+                .find(|entry| entry.session_id == session_id)
+        });
+
+        let (first_prompt, summary, message_count, modified, git_branch) = match session_entry {
+            Some(entry) => {
+                // Guard: if sessions-index first_prompt is a system command, try JSONL fallback
+                let fp = if crate::session::parser::is_system_content(&entry.first_prompt) {
+                    let session_file_path =
+                        detected.project_path.join(format!("{}.jsonl", session_id));
+                    get_first_prompt_from_jsonl(&session_file_path)
+                        .unwrap_or_else(|| entry.first_prompt.clone())
+                } else {
+                    entry.first_prompt.clone()
+                };
+                (
+                    fp,
+                    entry.summary.clone(),
+                    entry.message_count,
+                    entry.modified.clone(),
+                    Some(entry.git_branch.clone()),
+                )
+            }
+            None => {
+                // Session not in index or index doesn't exist - use fallback values
+                let session_file_path = detected.project_path.join(format!("{}.jsonl", session_id));
+
+                // Try to get first prompt from JSONL file
+                let first_prompt =
+                    get_first_prompt_from_jsonl(&session_file_path).unwrap_or_else(|| {
+                        if detected.started_at_ms.is_some() {
+                            "(No conversation yet)".to_string()
+                        } else {
+                            "(Active session)".to_string()
+                        }
+                    });
+
+                // Count messages in the file
+                let message_count = count_messages_in_jsonl(&session_file_path);
+
+                // Get file modification time. Fall back to started_at_ms for
+                // CLI-sourced placeholder sessions (no JSONL yet) so the frontend
+                // doesn't choke on `new Date("").getTime()` → NaN when sorting.
+                let modified = std::fs::metadata(&session_file_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(|t| {
+                        let datetime: DateTime<Utc> = t.into();
+                        datetime.to_rfc3339()
+                    })
+                    .or_else(|| {
+                        detected.started_at_ms.and_then(|ms| {
+                            DateTime::<Utc>::from_timestamp_millis(ms).map(|dt| dt.to_rfc3339())
+                        })
+                    })
+                    .unwrap_or_default();
+
+                (first_prompt, None, message_count, modified, None)
+            }
+        };
+
+        // Parse the session JSONL file to determine status and get latest message.
+        // A missing file is expected here, not an error: `detected.project_path` can
+        // be a guessed-but-unverified path (CLI backend's `fallback_path_under`, for
+        // a session whose JSONL hasn't been flushed yet, or that never gets one), and
+        // the sibling lookups just above (`get_first_prompt_from_jsonl`,
+        // `count_messages_in_jsonl`) already treat "no file" as silently empty rather
+        // than logging. Only warn when the file exists but fails to open/parse.
+        let session_file_path = detected.project_path.join(format!("{}.jsonl", session_id));
+        let entries = if session_file_path.is_file() {
+            match parse_last_n_entries(&session_file_path, 20) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    crate::debug_log::log_warn(&format!(
+                        "Failed to parse session file for {}: {}",
+                        session_id, e
+                    ));
+                    vec![]
+                }
+            }
+        } else {
+            vec![]
+        };
+
+        // Hooks are complementary: missing events or schema errors must never
+        // turn an empty state file into approval of every pending transcript tool.
+        let hook_state = crate::claude_hooks::session_state(&session_id);
+        let checker = PermissionChecker::cached_for(Some(&detected.cwd));
+        let hook_prompt = hook_state
+            .as_ref()
+            .and_then(|state| open_hook_prompt(state, &session_file_path));
+
+        let pending_tool_name = match &hook_prompt {
+            Some(prompt) => Some(prompt.tool_name.clone()),
+            None => get_pending_tool_name_with(&entries, &checker),
+        };
+
+        let heuristic_status = if hook_prompt.is_some() {
+            SessionStatus::NeedsAttention
+        } else if entries.is_empty() {
+            SessionStatus::Connecting
+        } else {
+            let raw_status = determine_status_with(&entries, &checker);
+            // Override WaitingForInput if the JSONL file was recently modified.
+            if raw_status == SessionStatus::WaitingForInput
+                && is_file_recently_modified(&session_file_path, 8)
+            {
+                SessionStatus::Working
+            } else {
+                raw_status
+            }
+        };
+        let status = merge_cli_activity(
+            heuristic_status,
+            detected.cli_activity,
+            detected.cli_reports_prompts,
+            pending_tool_name.as_deref(),
+        );
+
+        let latest_message = get_latest_message_from_entries(&entries);
+        let notification_preview = notification_preview_from_entries(&entries);
+        let pending_tool_input = match &hook_prompt {
+            Some(prompt) if prompt.agent_id.is_none() => {
+                crate::claude_hooks::prompt_input(prompt, &session_file_path)
+            }
+            Some(_) => None,
+            None => get_pending_tool_input_with(&entries, &checker),
+        };
+
+        // Skip empty sessions (0 messages) UNLESS CLI-sourced — `claude agents --json`
+        // confirms the agent is live even when no project JSONL exists (SDK-based
+        // interactive sessions never write to ~/.claude/projects/). Render a
+        // placeholder card so the dashboard count matches `claude agents --json`.
+        let cli_sourced = detected.started_at_ms.is_some();
+        let source_health = if !session_file_path.is_file() {
+            if cli_sourced {
+                SourceHealth::Partial
+            } else {
+                SourceHealth::Unavailable
+            }
+        } else if entries.is_empty() {
+            SourceHealth::Partial
+        } else if is_file_recently_modified(&session_file_path, 24 * 60 * 60) {
+            SourceHealth::Fresh
+        } else {
+            SourceHealth::Stale
+        };
+        if message_count == 0 && !cli_sourced {
+            continue;
+        }
+
+        // Use custom name if available, otherwise use detected project name
+        let session_name = claude_custom_name(detected.provider, &custom_names, &session_id)
+            .unwrap_or(detected.project_name);
+
+        // Get custom title: Claude Code native /rename takes priority over c9watch's own.
+        // Uses a static cache keyed by path plus a strong file stamp when available.
+        let native_titles = get_cached_native_titles(&session_file_path);
+        let custom_title = native_titles
+            .custom
+            .or_else(|| claude_custom_title(detected.provider, &custom_titles, &session_id));
+
+        sessions.push(Session {
+            id: session_id.clone(),
+            session_key: SessionIdentity::new(detected.provider, session_id.clone()).key(),
+            pid: detected.pid,
+            session_name,
+            custom_title,
+            codex_title: None,
+            cursor_title: None,
+            ai_title: native_titles.ai,
+            project_path: detected.cwd.to_string_lossy().to_string(),
+            git_branch,
+            first_prompt,
+            summary,
+            message_count,
+            modified,
+            status,
+            source_health: Some(source_health),
+            latest_message,
+            notification_preview,
+            pending_tool_name,
+            pending_tool_input,
+            waiting_for: None,
+            last_assistant_message: None,
+            transcript_path: session_file_path
+                .is_file()
+                .then(|| session_file_path.clone()),
+            worker_of: None,
+            official_name: detected.official_name.clone(),
+            started_at_ms: detected.started_at_ms,
+            provider: detected.provider,
+            surface: detected.surface,
+            kind: detected.kind,
+            entrypoint: detected.entrypoint.clone(),
+            agent_kind: detected.agent_kind,
+            parent_thread_id: detected.parent_thread_id.clone(),
+            root_session_id: detected.root_session_id.clone(),
+            agent_path: detected.agent_path.clone(),
+            agent_nickname: detected.agent_nickname.clone(),
+            agent_role: detected.agent_role.clone(),
+            internal_kind: detected.internal_kind.clone(),
+            open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
+            can_open: detected.can_open,
+            can_stop: detected.can_stop,
+            can_rename: detected.can_rename,
+        });
+    }
+
+    let mut sessions = dedup_newest_wins(sessions);
+    fill_away_fields(&mut sessions);
+    Ok((sessions, diagnostics))
+}
+
+/// Card fields that come straight from the detected session, plus empty
+/// defaults. Provider branches override the fields they compute
+/// (name, prompt, counts, status, health, previews) with struct-update syntax.
+fn base_session(detected: &DetectedSession, session_id: &str) -> Session {
+    Session {
+        id: session_id.to_string(),
+        session_key: SessionIdentity::new(detected.provider, session_id.to_string()).key(),
+        pid: detected.pid,
+        session_name: detected.project_name.clone(),
+        custom_title: None,
+        codex_title: None,
+        cursor_title: None,
+        ai_title: None,
+        project_path: detected.cwd.to_string_lossy().to_string(),
+        git_branch: None,
+        first_prompt: String::new(),
+        summary: None,
+        message_count: 0,
+        modified: String::new(),
+        status: SessionStatus::Connecting,
+        source_health: None,
+        latest_message: String::new(),
+        notification_preview: None,
+        pending_tool_name: None,
+        pending_tool_input: None,
+        waiting_for: None,
+        last_assistant_message: None,
+        transcript_path: None,
+        worker_of: None,
+        official_name: detected.official_name.clone(),
+        started_at_ms: detected.started_at_ms,
+        provider: detected.provider,
+        surface: detected.surface,
+        kind: detected.kind,
+        entrypoint: detected.entrypoint.clone(),
+        agent_kind: detected.agent_kind,
+        parent_thread_id: detected.parent_thread_id.clone(),
+        root_session_id: detected.root_session_id.clone(),
+        agent_path: detected.agent_path.clone(),
+        agent_nickname: detected.agent_nickname.clone(),
+        agent_role: detected.agent_role.clone(),
+        internal_kind: detected.internal_kind.clone(),
+        open_target: crate::actions::session_open_target(detected.pid, detected.can_open),
+        can_open: detected.can_open,
+        can_stop: detected.can_stop,
+        can_rename: detected.can_rename,
+    }
+}
+
+/// c9watch custom name, then the agent nickname, then the project name.
+fn default_session_name(
+    detected: &DetectedSession,
+    custom_names: &crate::session::CustomNames,
+    session_id: &str,
+) -> String {
+    claude_custom_name(detected.provider, custom_names, session_id)
+        .or_else(|| detected.agent_nickname.clone())
+        .unwrap_or_else(|| detected.project_name.clone())
+}
+
+/// The transcript's last timestamp, or the start time when it has none yet.
+fn modified_or_started(last_timestamp: &str, started_at_ms: Option<i64>) -> String {
+    if last_timestamp.is_empty() {
+        started_at_ms
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
+            .map(|timestamp| timestamp.to_rfc3339())
+            .unwrap_or_default()
+    } else {
+        last_timestamp.to_string()
+    }
+}
+
+/// Status of a transcript-backed provider: an empty working transcript is
+/// still connecting.
+fn transcript_status(working: bool, empty: bool) -> SessionStatus {
+    if !working {
+        SessionStatus::WaitingForInput
+    } else if empty {
+        SessionStatus::Connecting
+    } else {
+        SessionStatus::Working
+    }
+}
+
+/// Newest non-blank assistant text after the last user message, truncated
+/// for a notification preview. Takes `(message_type, content)` in order.
+fn assistant_preview_since_last_user<'a>(
+    messages: impl DoubleEndedIterator<Item = (&'a crate::session::MessageType, &'a str)>,
+) -> Option<String> {
+    messages
+        .rev()
+        .take_while(|(message_type, _)| **message_type != crate::session::MessageType::User)
+        .find(|(message_type, content)| {
+            **message_type == crate::session::MessageType::Assistant && !content.trim().is_empty()
+        })
+        .map(|(_, content)| truncate_string(content, 240))
+}
+
+/// Derive the card's away fields from what enrichment already computed.
+fn fill_away_fields(sessions: &mut [Session]) {
+    for session in sessions.iter_mut() {
+        session.waiting_for = crate::session::away::waiting_for(
+            &session.status,
+            session.pending_tool_name.as_deref(),
+        );
+        session.last_assistant_message =
+            crate::session::away::last_assistant_line(session.notification_preview.as_deref());
+    }
+}
+
+/// Codex status from the rollout lifecycle plus the pending tool call.
+fn codex_status(
+    summary: &crate::session::codex::CodexRolloutSummary,
+    now_ms: i64,
+) -> SessionStatus {
+    if summary.needs_attention_at(now_ms) {
+        SessionStatus::NeedsAttention
+    } else if summary.lifecycle == CodexLifecycle::Working {
+        SessionStatus::Working
+    } else {
+        SessionStatus::WaitingForInput
+    }
+}
+
+/// Parse an RFC3339 `modified` stamp as an instant. Timezone offsets are
+/// normalized, so `00:30:00+02:00` correctly compares earlier than
+/// `23:00:00Z` — something a lexicographic string compare gets wrong.
+fn modified_instant(modified: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(modified)
+        .ok()
+        .map(|ts| ts.with_timezone(&chrono::Utc))
+}
+
+/// Collapse duplicate provider-scoped identities, newest observation wins.
+///
+/// The same session can appear in multiple project dirs (or be re-observed
+/// after reconnect/reuse). Timestamps compare as instants, so differing
+/// RFC3339 offsets order correctly. An unparseable timestamp always loses to
+/// a parseable one; when neither parses (or the instants tie), the first
+/// observation is kept for determinism. Cross-provider identities never
+/// collide because the key is namespaced by provider.
+fn dedup_newest_wins(sessions: Vec<Session>) -> Vec<Session> {
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<Session> = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        match index.get(&session.session_key) {
+            Some(&i) => {
+                let keep_existing = match (
+                    modified_instant(&out[i].modified),
+                    modified_instant(&session.modified),
+                ) {
+                    // Both parse: newest instant wins; exact ties keep the
+                    // first observation for determinism.
+                    (Some(existing), Some(incoming)) => existing >= incoming,
+                    // Unparseable stamps always lose to a real timestamp.
+                    (None, Some(_)) => false,
+                    (Some(_), None) => true,
+                    // Neither parses: keep the first observation.
+                    (None, None) => true,
+                };
+                if !keep_existing {
+                    out[i] = session;
+                }
+            }
+            None => {
+                index.insert(session.session_key.clone(), out.len());
+                out.push(session);
+            }
+        }
+    }
+    out
+}
+
+/// A hook prompt remains evidence unless the exact correlated call has a result.
+/// A bounded/missing transcript cannot establish resolution by absence.
+fn open_hook_prompt(state: &HookSessionState, session_file: &Path) -> Option<PendingPermission> {
+    state
+        .pending
+        .iter()
+        .find(|prompt| {
+            let transcript = match &prompt.agent_id {
+                None => Some(session_file.to_path_buf()),
+                Some(agent_id) => subagent_transcript(session_file, agent_id),
+            };
+            transcript.is_none_or(|path| crate::claude_hooks::prompt_is_open(prompt, &path))
+        })
+        .cloned()
+}
+
+/// `<project>/<session>/subagents/agent-<id>.jsonl` for `<project>/<session>.jsonl`.
+fn subagent_transcript(session_file: &Path, agent_id: &str) -> Option<PathBuf> {
+    if agent_id.is_empty()
+        || !agent_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let session_dir = session_file.with_extension("");
+    Some(
+        session_dir
+            .join("subagents")
+            .join(format!("agent-{agent_id}.jsonl")),
+    )
+}
+
+/// Checks if a file was modified within the last N seconds
+pub fn is_file_recently_modified(path: &Path, seconds: u64) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|modified| {
+            modified
+                .elapsed()
+                .map(|elapsed| elapsed.as_secs() < seconds)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// Extract the first user prompt from a session JSONL file (truncated to 100 chars).
+pub fn get_first_prompt_from_jsonl(path: &Path) -> Option<String> {
+    get_first_prompt_from_jsonl_raw(path).map(|s| truncate_string(&s, 100))
+}
+
+/// Extract the first user prompt from a session JSONL file (full text, no truncation).
+pub fn get_first_prompt_from_jsonl_raw(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines().map_while(Result::ok).take(50) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+            if value.get("type").and_then(|t| t.as_str()) == Some("user") {
+                if let Some(message) = value.get("message") {
+                    if let Some(content) = message.get("content") {
+                        if let Some(text) = content.as_str() {
+                            // Skip system-generated local command messages
+                            if crate::session::parser::is_system_content(text) {
+                                continue;
+                            }
+                            return Some(text.to_string());
+                        } else if let Some(arr) = content.as_array() {
+                            for item in arr {
+                                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                        return Some(text.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Truncate a string to a maximum length (character-safe for UTF-8)
+pub fn truncate_string(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{}...", truncated)
+    }
+}
+
+/// Extract the latest message content from session entries
+pub fn get_latest_message_from_entries(entries: &[crate::session::parser::SessionEntry]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    for entry in entries.iter().rev() {
+        match entry {
+            crate::session::parser::SessionEntry::User { message, .. } => {
+                // Skip tool result entries and system-generated command messages
+                if message.is_tool_result
+                    || crate::session::parser::is_system_content(&message.content)
+                {
+                    continue;
+                }
+                return truncate_string(&message.content, 200);
+            }
+            crate::session::parser::SessionEntry::Assistant { message, .. } => {
+                for content in message.content.iter().rev() {
+                    match content {
+                        crate::session::parser::MessageContent::Text { text } => {
+                            return truncate_string(text, 200);
+                        }
+                        crate::session::parser::MessageContent::Thinking { thinking, .. } => {
+                            return truncate_string(thinking, 200);
+                        }
+                        crate::session::parser::MessageContent::ToolUse { name, .. } => {
+                            return format!("Executing {}...", name);
+                        }
+                        _ => continue,
+                    }
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    String::new()
+}
+
+/// Counts user/assistant messages among the given raw JSONL lines.
+/// Skips system-injected user messages (local commands, slash commands, etc.)
+fn count_messages_in_lines(lines: &[String]) -> u32 {
+    let mut count = 0u32;
+    for line in lines {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(msg_type) = value.get("type").and_then(|t| t.as_str()) {
+                match msg_type {
+                    "assistant" => count += 1,
+                    "user" => {
+                        // Skip system-injected user messages
+                        if let Some(content) = value
+                            .get("message")
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_str())
+                        {
+                            if !crate::session::parser::is_system_content(content) {
+                                count += 1;
+                            }
+                        } else {
+                            // Array content (tool results) — still count them
+                            count += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Cached message count for one file: the version stamp and byte offset the
+/// count (`value`) is current as of.
+type MessageCountCacheEntry = IncrementalEntry<u32>;
+
+/// A live session's transcript grows every poll by definition, so a plain
+/// unchanged-file cache can't help it — this also tracks the scanned byte
+/// offset so a growing file only has its newly-appended lines counted,
+/// instead of the whole transcript being re-read and re-counted from byte
+/// zero every ~3.5s for as long as the session stays active. Same shape as
+/// `session::subagents::SUBAGENT_CACHE`.
+static MESSAGE_COUNT_CACHE: LazyLock<Mutex<HashMap<PathBuf, MessageCountCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Message-count cache entries are cheap, but a long-running process can see
+/// more transcript paths than the active session set. Keep the optimization
+/// bounded instead of retaining every path for the process lifetime.
+const MESSAGE_COUNT_CACHE_MAX_ENTRIES: usize = 512;
+
+fn evict_oldest_message_count_entries(cache: &mut HashMap<PathBuf, MessageCountCacheEntry>) {
+    while cache.len() > MESSAGE_COUNT_CACHE_MAX_ENTRIES {
+        let Some(oldest_path) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access)
+            .map(|(path, _)| path.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_path);
+    }
+}
+
+/// Count user/assistant messages in a JSONL file, using `MESSAGE_COUNT_CACHE`
+/// so an unchanged file isn't re-read, and a grown one only has its new
+/// bytes counted rather than the whole file re-scanned. Small cached prefixes
+/// are fully verified; large prefixes use fixed head/tail guards between
+/// geometric checkpoints, plus a 60-second full-revalidation deadline. The
+/// deadline is enforced on the next lookup after it expires, not by a
+/// background task, so large middle rewrites have a bounded consistency delay
+/// without turning every poll into a full-history scan.
+pub fn count_messages_in_jsonl(path: &Path) -> u32 {
+    count_messages_in_jsonl_at(path, Instant::now())
+}
+
+fn count_messages_in_jsonl_at(path: &Path, now: Instant) -> u32 {
+    let Ok(stamp) = FileVersion::read(path) else {
+        if let Ok(mut cache) = MESSAGE_COUNT_CACHE.lock() {
+            cache.remove(path);
+        }
+        return 0;
+    };
+
+    let mut cache = match MESSAGE_COUNT_CACHE.lock() {
+        Ok(cache) => cache,
+        Err(_) => {
+            return build_from_line_batches(path, count_messages_in_lines, |count, lines| {
+                count + count_messages_in_lines(lines)
+            })
+            .map_or(0, |(count, _)| count);
+        }
+    };
+
+    let Some(entry) = refresh_incremental_entry(
+        cache.remove(path),
+        path,
+        stamp,
+        now,
+        count_messages_in_lines,
+        |count, new_lines| count + count_messages_in_lines(new_lines),
+    ) else {
+        return 0;
+    };
+    let count = entry.value;
+    cache.insert(path.to_path_buf(), entry);
+    evict_oldest_message_count_entries(&mut cache);
+    count
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Session {
+    /// A Claude Code session `id` with `status`, for tests that need an
+    /// enriched session without reading any provider files.
+    pub fn fixture(id: &str, status: SessionStatus) -> Session {
+        Session {
+            id: id.to_string(),
+            session_key: SessionIdentity::new(SessionProvider::ClaudeCode, id).key(),
+            pid: 4242,
+            session_name: format!("name-{}", id),
+            custom_title: None,
+            codex_title: None,
+            cursor_title: None,
+            ai_title: None,
+            project_path: "/tmp/project".to_string(),
+            git_branch: None,
+            first_prompt: "investigate".to_string(),
+            summary: None,
+            message_count: 3,
+            modified: "2026-07-13T00:00:00Z".to_string(),
+            status,
+            source_health: None,
+            notification_preview: None,
+            latest_message: String::new(),
+            pending_tool_name: None,
+            pending_tool_input: None,
+            waiting_for: None,
+            last_assistant_message: None,
+            transcript_path: None,
+            worker_of: None,
+            official_name: None,
+            started_at_ms: Some(1_752_364_800_000),
+            provider: SessionProvider::ClaudeCode,
+            surface: SessionSurface::Cli,
+            kind: SessionKind::Interactive,
+            entrypoint: None,
+            agent_kind: AgentKind::Root,
+            parent_thread_id: None,
+            root_session_id: None,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+            internal_kind: None,
+            open_target: None,
+            can_open: false,
+            can_stop: false,
+            can_rename: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_pending_user_input_maps_to_needs_attention() {
+        use crate::session::codex::{
+            CodexPendingAction, CodexPendingKind, CodexRolloutSummary,
+            CODEX_ESCALATION_APPROVAL_DELAY_MS,
+        };
+        let mut summary = CodexRolloutSummary {
+            lifecycle: CodexLifecycle::Working,
+            ..Default::default()
+        };
+        assert_eq!(codex_status(&summary, 0), SessionStatus::Working);
+        summary.pending_action = Some(CodexPendingAction {
+            kind: CodexPendingKind::Escalation,
+            tool_name: "exec".into(),
+            since_ms: Some(0),
+        });
+        assert_eq!(codex_status(&summary, 1_000), SessionStatus::Working);
+        assert_eq!(
+            codex_status(&summary, CODEX_ESCALATION_APPROVAL_DELAY_MS),
+            SessionStatus::NeedsAttention
+        );
+        summary.lifecycle = CodexLifecycle::Idle;
+        assert_eq!(
+            codex_status(&summary, CODEX_ESCALATION_APPROVAL_DELAY_MS),
+            SessionStatus::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn test_truncate_string_no_truncation() {
+        assert_eq!(truncate_string("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_string_exact_boundary() {
+        assert_eq!(truncate_string("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_string_over_boundary() {
+        assert_eq!(truncate_string("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn test_truncate_string_empty() {
+        assert_eq!(truncate_string("", 10), "");
+    }
+
+    #[test]
+    fn test_truncate_string_zero_max() {
+        assert_eq!(truncate_string("hello", 0), "...");
+        assert!(!truncate_string("hello", 0).contains('h'));
+    }
+
+    #[test]
+    fn test_truncate_string_single_char_limit() {
+        assert_eq!(truncate_string("hello", 1), "h...");
+    }
+
+    #[test]
+    fn test_truncate_string_utf8_accented() {
+        assert_eq!(truncate_string("héllo", 3), "hél...");
+    }
+
+    #[test]
+    fn test_truncate_string_utf8_cjk() {
+        assert_eq!(truncate_string("你好世界", 2), "你好...");
+    }
+
+    #[test]
+    fn test_truncate_string_utf8_emoji() {
+        assert_eq!(truncate_string("Hello 👋 World", 7), "Hello 👋...");
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use crate::session::source::CliActivity;
+    use crate::session::SessionStatus;
+
+    #[test]
+    fn merge_preserves_needs_attention_when_busy() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Busy),
+            false,
+            None,
+        );
+        assert_eq!(merged, SessionStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn merge_preserves_needs_attention_when_idle() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Idle),
+            false,
+            None,
+        );
+        assert_eq!(merged, SessionStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn merge_preserves_connecting() {
+        let merged = merge_cli_activity(
+            SessionStatus::Connecting,
+            Some(CliActivity::Busy),
+            false,
+            None,
+        );
+        assert_eq!(merged, SessionStatus::Connecting);
+    }
+
+    #[test]
+    fn merge_busy_promotes_waiting_to_working() {
+        let merged = merge_cli_activity(
+            SessionStatus::WaitingForInput,
+            Some(CliActivity::Busy),
+            false,
+            None,
+        );
+        assert_eq!(merged, SessionStatus::Working);
+    }
+
+    #[test]
+    fn merge_idle_downgrades_working_without_pending_tool() {
+        let merged =
+            merge_cli_activity(SessionStatus::Working, Some(CliActivity::Idle), false, None);
+        assert_eq!(merged, SessionStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn merge_idle_keeps_working_when_pending_tool() {
+        let merged = merge_cli_activity(
+            SessionStatus::Working,
+            Some(CliActivity::Idle),
+            false,
+            Some("Bash"),
+        );
+        assert_eq!(merged, SessionStatus::Working);
+    }
+
+    #[test]
+    fn merge_none_returns_heuristic_unchanged() {
+        let merged = merge_cli_activity(SessionStatus::Working, None, false, None);
+        assert_eq!(merged, SessionStatus::Working);
+        let merged = merge_cli_activity(SessionStatus::WaitingForInput, None, false, Some("Bash"));
+        assert_eq!(merged, SessionStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn merge_waiting_always_needs_attention() {
+        for heuristic in [
+            SessionStatus::Working,
+            SessionStatus::WaitingForInput,
+            SessionStatus::Connecting,
+        ] {
+            let merged = merge_cli_activity(heuristic, Some(CliActivity::Waiting), false, None);
+            assert_eq!(merged, SessionStatus::NeedsAttention);
+        }
+    }
+
+    #[test]
+    fn merge_busy_clears_inferred_needs_attention_when_prompts_reported() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Busy),
+            true,
+            Some("Bash"),
+        );
+        assert_eq!(merged, SessionStatus::Working);
+    }
+
+    #[test]
+    fn merge_idle_clears_inferred_needs_attention_when_prompts_reported() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Idle),
+            true,
+            None,
+        );
+        assert_eq!(merged, SessionStatus::WaitingForInput);
+    }
+
+    #[test]
+    fn merge_keeps_needs_attention_without_cli_activity() {
+        let merged = merge_cli_activity(SessionStatus::NeedsAttention, None, true, Some("Bash"));
+        assert_eq!(merged, SessionStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn merge_idle_keeps_text_question_needing_attention() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Idle),
+            true,
+            Some("Question"),
+        );
+        assert_eq!(merged, SessionStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn merge_busy_clears_text_question() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Busy),
+            true,
+            Some("Question"),
+        );
+        assert_eq!(merged, SessionStatus::Working);
+    }
+
+    #[test]
+    fn merge_idle_clears_inferred_prompt_even_with_pending_tool() {
+        let merged = merge_cli_activity(
+            SessionStatus::NeedsAttention,
+            Some(CliActivity::Idle),
+            true,
+            Some("Bash"),
+        );
+        assert_eq!(merged, SessionStatus::WaitingForInput);
+    }
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::*;
+    use crate::session::source::{DetectedSession, DetectionDiagnostics, SessionKind};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    #[test]
+    fn cli_placeholder_session_has_valid_modified_from_started_at_ms() {
+        // CLI-sourced session with no JSONL → must still produce parseable RFC3339
+        // `modified` so `new Date(modified).getTime()` doesn't yield NaN on the
+        // frontend (which would scramble sort/group ordering).
+        let tmp = tempfile::tempdir().unwrap();
+        let detected = DetectedSession {
+            pid: 12345,
+            cwd: PathBuf::from("/tmp/nonexistent"),
+            project_path: tmp.path().join("never-existed"),
+            session_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            project_name: "nonexistent".to_string(),
+            kind: SessionKind::Interactive,
+            entrypoint: None,
+            started_at_ms: Some(1_700_000_000_000),
+            official_name: None,
+            cli_activity: None,
+            cli_reports_prompts: false,
+            provider: SessionProvider::ClaudeCode,
+            surface: SessionSurface::ClaudeCode,
+            agent_kind: AgentKind::Root,
+            parent_thread_id: None,
+            root_session_id: None,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+            internal_kind: None,
+            can_open: true,
+            can_stop: true,
+            can_rename: true,
+            codex_summary: None,
+            cursor_summary: None,
+            pi_summary: None,
+            opencode_summary: None,
+            process_start_secs: None,
+        };
+        let (sessions, _) =
+            enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
+        assert_eq!(sessions.len(), 1, "CLI placeholder should be emitted");
+        let s = &sessions[0];
+        assert!(!s.modified.is_empty(), "modified must not be empty");
+        let parsed = DateTime::parse_from_rfc3339(&s.modified);
+        assert!(
+            parsed.is_ok(),
+            "modified must parse as RFC3339, got: {}",
+            s.modified
+        );
+        assert_eq!(s.started_at_ms, Some(1_700_000_000_000));
+        assert_eq!(s.source_health, Some(SourceHealth::Partial));
+
+        // A JSONL that simply hasn't been flushed yet is an expected state for a
+        // freshly-detected CLI session, not an error — it shouldn't spam the log
+        // on every ~3.5s poll for as long as the session is running.
+        assert!(
+            !crate::debug_log::get_logs().iter().any(|entry| entry
+                .message
+                .contains("11111111-2222-3333-4444-555555555555")),
+            "missing JSONL must not log a warning"
+        );
+    }
+
+    #[test]
+    fn away_fields_are_filled_without_leaking_tool_arguments_or_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "aaaaaaaa-2222-3333-4444-555555555555";
+        let lines = [
+            serde_json::json!({"type": "user", "uuid": "u1", "timestamp": "2026-10-14T10:00:00Z",
+                "message": {"role": "user", "content": "run the tests"}}),
+            serde_json::json!({"type": "assistant", "uuid": "a1", "timestamp": "2026-10-14T10:00:05Z",
+                "message": {"model": "m", "id": "msg1", "role": "assistant", "content": [{"type": "text",
+                    "text": "<system-reminder>hidden</system-reminder>All tests pass,\nready for review."}]}}),
+            serde_json::json!({"type": "assistant", "uuid": "a2", "timestamp": "2026-10-14T10:00:06Z",
+                "message": {"model": "m", "id": "msg2", "role": "assistant", "content": [{"type": "tool_use", "id": "t1",
+                    "name": "Bash", "input": {"command": "cat ~/.secret-token"}}]}}),
+        ];
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(tmp.path().join(format!("{id}.jsonl")), body).unwrap();
+        let detected = DetectedSession {
+            pid: 12346,
+            cwd: PathBuf::from("/tmp/nonexistent"),
+            project_path: tmp.path().to_path_buf(),
+            session_id: Some(id.to_string()),
+            project_name: "nonexistent".to_string(),
+            kind: SessionKind::Interactive,
+            entrypoint: None,
+            started_at_ms: Some(1_700_000_000_000),
+            official_name: None,
+            cli_activity: None,
+            cli_reports_prompts: false,
+            provider: SessionProvider::ClaudeCode,
+            surface: SessionSurface::ClaudeCode,
+            agent_kind: AgentKind::Root,
+            parent_thread_id: None,
+            root_session_id: None,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+            internal_kind: None,
+            can_open: true,
+            can_stop: true,
+            can_rename: true,
+            codex_summary: None,
+            cursor_summary: None,
+            pi_summary: None,
+            opencode_summary: None,
+            process_start_secs: None,
+        };
+        let (sessions, _) =
+            enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
+        let s = &sessions[0];
+        assert_eq!(
+            s.last_assistant_message.as_deref(),
+            Some("All tests pass, ready for review.")
+        );
+        assert_eq!(
+            s.waiting_for,
+            crate::session::away::waiting_for(&s.status, s.pending_tool_name.as_deref())
+        );
+        assert_eq!(
+            s.transcript_path.as_deref(),
+            Some(tmp.path().join(format!("{id}.jsonl")).as_path())
+        );
+        let json = serde_json::to_value(s).unwrap();
+        assert_eq!(
+            json["lastAssistantMessage"],
+            "All tests pass, ready for review."
+        );
+        // The away fields name the tool only; arguments stay in their
+        // existing field (pendingToolInput) and are not copied anywhere new.
+        let away = format!("{}{}", json["waitingFor"], json["lastAssistantMessage"]);
+        assert!(
+            !away.contains("secret-token"),
+            "tool arguments copied: {away}"
+        );
+        let text = json.to_string();
+        assert!(!text.contains("transcriptPath"));
+        assert!(!text.contains(&tmp.path().to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn legacy_session_without_jsonl_still_skipped() {
+        // Legacy backend leaves started_at_ms = None. Without JSONL, no message
+        // count, no real data — keep dropping these to avoid the legacy ghost-pid bug.
+        let tmp = tempfile::tempdir().unwrap();
+        let detected = DetectedSession::with_legacy_defaults(
+            42,
+            PathBuf::from("/tmp/legacy"),
+            tmp.path().join("legacy-empty"),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()),
+            "legacy".to_string(),
+        );
+        let (sessions, _) =
+            enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
+        assert!(
+            sessions.is_empty(),
+            "legacy empty-JSONL session must be skipped"
+        );
+    }
+
+    #[test]
+    fn provider_scoped_identity_keeps_same_id_from_codex_and_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let same_id = "same-provider-id";
+
+        let mut codex = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/codex"),
+            tmp.path().join("codex"),
+            Some(same_id.to_string()),
+            "codex".to_string(),
+        );
+        codex.provider = SessionProvider::Codex;
+        codex.surface = SessionSurface::App;
+        let mut codex_summary = crate::session::codex::CodexRolloutSummary::default();
+        codex_summary.thread_id = same_id.to_string();
+        codex.codex_summary = Some(codex_summary);
+
+        let mut cursor = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/cursor"),
+            tmp.path().join("cursor"),
+            Some(same_id.to_string()),
+            "cursor".to_string(),
+        );
+        cursor.provider = SessionProvider::Cursor;
+        cursor.surface = SessionSurface::Cursor;
+        let mut cursor_summary = crate::session::cursor::CursorTranscriptSummary::default();
+        cursor_summary.session_id = same_id.to_string();
+        cursor.cursor_summary = Some(cursor_summary);
+
+        let mut pi = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/pi"),
+            tmp.path().join("pi"),
+            Some(same_id.to_string()),
+            "pi".to_string(),
+        );
+        pi.provider = SessionProvider::Pi;
+        pi.surface = SessionSurface::Cli;
+        let mut pi_summary = crate::session::pi::PiTranscriptSummary::default();
+        pi_summary.session_id = same_id.to_string();
+        pi_summary.first_prompt = Some("pi prompt".to_string());
+        pi.pi_summary = Some(pi_summary);
+
+        let (sessions, _) =
+            enrich_detected_sessions(vec![codex, cursor, pi], DetectionDiagnostics::default())
+                .unwrap();
+
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions[0].session_key, "codex:same-provider-id");
+        assert_eq!(sessions[1].session_key, "cursor:same-provider-id");
+        assert_eq!(sessions[2].session_key, "pi:same-provider-id");
+        assert_eq!(sessions[2].provider, SessionProvider::Pi);
+        assert_eq!(sessions[0].source_health, Some(SourceHealth::Partial));
+        assert_eq!(sessions[1].source_health, Some(SourceHealth::Partial));
+        assert_eq!(sessions[2].source_health, Some(SourceHealth::Partial));
+    }
+
+    fn codex_detected(dir: &std::path::Path, last_timestamp: &str) -> DetectedSession {
+        let mut detected = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/codex-dedup"),
+            dir.join("codex"),
+            Some("dup-thread".to_string()),
+            "codex".to_string(),
+        );
+        detected.provider = SessionProvider::Codex;
+        detected.surface = SessionSurface::App;
+        let mut summary = crate::session::codex::CodexRolloutSummary::default();
+        summary.thread_id = "dup-thread".to_string();
+        summary.last_timestamp = last_timestamp.to_string();
+        detected.codex_summary = Some(summary);
+        detected
+    }
+
+    #[test]
+    fn duplicate_observation_keeps_newest_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_ts = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        let new_ts = chrono::Utc::now().to_rfc3339();
+
+        // Stale observation first, fresh re-observation second.
+        let (sessions, _) = enrich_detected_sessions(
+            vec![
+                codex_detected(tmp.path(), &old_ts),
+                codex_detected(tmp.path(), &new_ts),
+            ],
+            DetectionDiagnostics::default(),
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_key, "codex:dup-thread");
+        assert_eq!(sessions[0].modified, new_ts);
+
+        // Order must not matter: fresh first, stale reconnect second.
+        let (sessions, _) = enrich_detected_sessions(
+            vec![
+                codex_detected(tmp.path(), &new_ts),
+                codex_detected(tmp.path(), &old_ts),
+            ],
+            DetectionDiagnostics::default(),
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].modified, new_ts);
+    }
+
+    #[test]
+    fn duplicate_observation_handles_offsets_and_malformed_timestamps() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Different instants in different offsets: 00:30Z beats 00:00Z either
+        // way round. (A lexicographic compare would also pass this; the
+        // equivalent-instant case below is what pins offset normalization.)
+        let earlier_z = "2026-07-13T00:00:00Z";
+        let later_offset = "2026-07-13T02:30:00+02:00";
+        for (first, second, winner) in [
+            (earlier_z, later_offset, later_offset),
+            (later_offset, earlier_z, later_offset),
+        ] {
+            let (sessions, _) = enrich_detected_sessions(
+                vec![
+                    codex_detected(tmp.path(), first),
+                    codex_detected(tmp.path(), second),
+                ],
+                DetectionDiagnostics::default(),
+            )
+            .unwrap();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].modified, winner);
+        }
+        // Same instant, different offsets: exact tie keeps the first
+        // observation in both orders. Only an instant comparison gets this
+        // right — lexicographically the strings differ.
+        let same_z = "2026-07-13T00:00:00Z";
+        let same_offset = "2026-07-13T02:00:00+02:00";
+        for (first, second) in [(same_z, same_offset), (same_offset, same_z)] {
+            let (sessions, _) = enrich_detected_sessions(
+                vec![
+                    codex_detected(tmp.path(), first),
+                    codex_detected(tmp.path(), second),
+                ],
+                DetectionDiagnostics::default(),
+            )
+            .unwrap();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].modified, first);
+        }
+
+        // Malformed always loses to a real timestamp.
+        let (sessions, _) = enrich_detected_sessions(
+            vec![
+                codex_detected(tmp.path(), "not-a-timestamp"),
+                codex_detected(tmp.path(), earlier_z),
+            ],
+            DetectionDiagnostics::default(),
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].modified, earlier_z);
+
+        // Both malformed, or exact tie: first observation is kept.
+        for stamps in [["bad-a", "bad-b"], [earlier_z, earlier_z]] {
+            let (sessions, _) = enrich_detected_sessions(
+                vec![
+                    codex_detected(tmp.path(), stamps[0]),
+                    codex_detected(tmp.path(), stamps[1]),
+                ],
+                DetectionDiagnostics::default(),
+            )
+            .unwrap();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].modified, stamps[0]);
+        }
+    }
+
+    #[test]
+    fn provider_health_wiring_marks_stale_codex_and_pi() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_ts = (chrono::Utc::now() - chrono::Duration::hours(5)).to_rfc3339();
+        let fresh_ts = chrono::Utc::now().to_rfc3339();
+
+        // Idle Codex rollout older than the 30-minute idle window is stale.
+        let stale_codex = codex_detected(tmp.path(), &old_ts);
+        // Idle Pi transcript older than the 30-minute idle window is stale.
+        let mut pi = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/pi-stale"),
+            tmp.path().join("pi"),
+            Some("stale-pi".to_string()),
+            "pi".to_string(),
+        );
+        pi.provider = SessionProvider::Pi;
+        pi.surface = SessionSurface::Cli;
+        let mut pi_summary = crate::session::pi::PiTranscriptSummary::default();
+        pi_summary.session_id = "stale-pi".to_string();
+        pi_summary.last_timestamp = old_ts.clone();
+        pi.pi_summary = Some(pi_summary);
+        // Fresh Pi transcript stays fresh.
+        let mut pi_fresh = DetectedSession::with_legacy_defaults(
+            0,
+            PathBuf::from("/tmp/pi-fresh"),
+            tmp.path().join("pi-fresh"),
+            Some("fresh-pi".to_string()),
+            "pi".to_string(),
+        );
+        pi_fresh.provider = SessionProvider::Pi;
+        pi_fresh.surface = SessionSurface::Cli;
+        let mut pi_fresh_summary = crate::session::pi::PiTranscriptSummary::default();
+        pi_fresh_summary.session_id = "fresh-pi".to_string();
+        pi_fresh_summary.last_timestamp = fresh_ts;
+        pi_fresh_summary.message_count = 1;
+        pi_fresh.pi_summary = Some(pi_fresh_summary);
+
+        let (sessions, _) = enrich_detected_sessions(
+            vec![stale_codex, pi, pi_fresh],
+            DetectionDiagnostics::default(),
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions[0].source_health, Some(SourceHealth::Stale));
+        assert_eq!(sessions[1].source_health, Some(SourceHealth::Stale));
+        assert_eq!(sessions[2].source_health, Some(SourceHealth::Fresh));
+    }
+
+    #[test]
+    fn native_title_cache_retries_after_read_failure_without_file_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("read-failure.jsonl");
+        std::fs::write(
+            &path,
+            br#"{"type":"custom-title","customTitle":"recovered","sessionId":"s"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            get_cached_native_titles_with(&path, |_| {
+                Err(std::io::Error::other("injected read failure"))
+            }),
+            NativeTitles::default()
+        );
+        assert_eq!(
+            get_cached_native_titles(&path).custom.as_deref(),
+            Some("recovered")
+        );
+    }
+
+    #[test]
+    fn native_title_cache_invalidates_on_transcript_change_and_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("synthetic-claude.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"custom-title","customTitle":"first","sessionId":"synthetic"}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        assert_eq!(
+            get_cached_native_titles(&path).custom.as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            get_cached_native_titles(&path).custom.as_deref(),
+            Some("first")
+        );
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"custom-title","customTitle":"second","sessionId":"synthetic"}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        assert_eq!(
+            get_cached_native_titles(&path).custom.as_deref(),
+            Some("second")
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(get_cached_native_titles(&path), NativeTitles::default());
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_counts_and_caches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"content":"hello"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":"hi"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(count_messages_in_jsonl(&path), 2);
+        // Same file, unchanged -- must return the cached count, not recount.
+        assert_eq!(count_messages_in_jsonl(&path), 2);
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_unchanged_fast_path_skips_validation_until_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-unchanged-budget.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n", r#"{"type":"user","message":{"content":"hello"}}"#),
+        )
+        .unwrap();
+        assert!(FileVersion::read(&path)
+            .unwrap()
+            .supports_unchanged_fast_path());
+
+        let t0 = Instant::now();
+        assert_eq!(count_messages_in_jsonl_at(&path, t0), 1);
+        assert_eq!(
+            MESSAGE_COUNT_CACHE
+                .lock()
+                .unwrap()
+                .get(&path)
+                .unwrap()
+                .last_prefix_validation_bytes,
+            0
+        );
+
+        // An unchanged strong stamp before the deadline must be a true
+        // zero-content-I/O fast path, including for a small exact-prefix file.
+        assert_eq!(
+            count_messages_in_jsonl_at(&path, t0 + Duration::from_secs(1)),
+            1
+        );
+        assert_eq!(
+            MESSAGE_COUNT_CACHE
+                .lock()
+                .unwrap()
+                .get(&path)
+                .unwrap()
+                .last_prefix_validation_bytes,
+            0
+        );
+
+        // The same unchanged file is fully verified once the injectable clock
+        // crosses the deadline; no wall-clock sleep is needed.
+        assert_eq!(
+            count_messages_in_jsonl_at(
+                &path,
+                t0 + crate::session::cache::PREFIX_FULL_REVALIDATION_INTERVAL
+                    + Duration::from_secs(1),
+            ),
+            1
+        );
+        let cache = MESSAGE_COUNT_CACHE.lock().unwrap();
+        let entry = cache.get(&path).unwrap();
+        assert_eq!(
+            entry.last_prefix_validation_bytes,
+            entry.offset * 2,
+            "deadline must perform a full small-prefix validation"
+        );
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_counts_only_new_lines_on_append() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-incremental.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n", r#"{"type":"user","message":{"content":"one"}}"#),
+        )
+        .unwrap();
+        assert_eq!(count_messages_in_jsonl(&path), 1);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":"two"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":"three"}}}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        assert_eq!(count_messages_in_jsonl(&path), 3);
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_reparses_same_inode_equal_length_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-rewrite.jsonl");
+        let original = concat!(
+            r#"{"type":"user","message":{"content":"one"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":"two"}}"#,
+            "\n",
+        );
+        std::fs::write(&path, original).unwrap();
+        let before = FileVersion::read(&path).unwrap();
+        assert_eq!(count_messages_in_jsonl(&path), 2);
+
+        // Rewrite in place with exactly the same byte length but only one
+        // counted message. This must not be mistaken for an empty append.
+        let replacement_line = r#"{"type":"assistant","message":{"content":"new"}}"#;
+        let replacement = format!(
+            "{}{}\n",
+            replacement_line,
+            " ".repeat(original.len() - replacement_line.len() - 1)
+        );
+        assert_eq!(replacement.len(), original.len());
+        std::fs::write(&path, replacement).unwrap();
+        let after = FileVersion::read(&path).unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            before.identity, after.identity,
+            "rewrite should keep the inode"
+        );
+
+        assert_eq!(count_messages_in_jsonl(&path), 1);
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_retries_partial_trailing_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-partial.jsonl");
+        let first = r#"{"type":"user","message":{"content":"one"}}"#;
+        let second = r#"{"type":"assistant","message":{"content":"two"}}"#;
+        std::fs::write(&path, format!("{first}\n")).unwrap();
+        assert_eq!(count_messages_in_jsonl(&path), 1);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(file, "{second}").unwrap();
+        drop(file);
+        assert_eq!(count_messages_in_jsonl(&path), 1);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file).unwrap();
+        drop(file);
+        assert_eq!(count_messages_in_jsonl(&path), 2);
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_skips_system_injected_user_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-system.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                r#"{"type":"user","message":{"content":"<command-name>/exit</command-name>"}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(count_messages_in_jsonl(&path), 0);
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_missing_file_returns_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("does-not-exist.jsonl");
+        assert_eq!(count_messages_in_jsonl(&path), 0);
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_falls_back_to_full_recount_when_file_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-replaced.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"content":"a"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":"b"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(count_messages_in_jsonl(&path), 2);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                r#"{"type":"user","message":{"content":"replaced"}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(count_messages_in_jsonl(&path), 1);
+    }
+
+    #[test]
+    fn count_messages_in_jsonl_large_middle_rewrite_revalidates_after_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-large-middle-rewrite.jsonl");
+        let filler = format!(r#"{{"type":"system","padding":"{}"}}"#, "x".repeat(1024));
+        let filler_line = format!("{filler}\n");
+        let first_message = r#"{"type":"user","message":{"content":"first"}}"#;
+        let middle_old = r#"{"type":"assistant","message":{"content":"middle"}}"#;
+        let middle_new = middle_old.replace("\"assistant\"", "\"system   \"");
+        assert_eq!(middle_old.len(), middle_new.len());
+
+        let mut original = format!("{first_message}\n");
+        while original.len() < 2 * 1024 * 1024 {
+            original.push_str(&filler_line);
+        }
+        let middle_offset = original.len();
+        original.push_str(&middle_old);
+        original.push('\n');
+        while original.len()
+            < crate::session::cache::EXACT_PREFIX_VERIFY_LIMIT as usize + 256 * 1024
+        {
+            original.push_str(&filler_line);
+        }
+        std::fs::write(&path, &original).unwrap();
+        let before = FileVersion::read(&path).unwrap();
+        assert!(before.len > crate::session::cache::EXACT_PREFIX_VERIFY_LIMIT);
+
+        let t0 = Instant::now();
+        assert_eq!(count_messages_in_jsonl_at(&path, t0), 2);
+
+        let mut rewritten = original.clone();
+        rewritten.replace_range(middle_offset..middle_offset + middle_old.len(), &middle_new);
+        rewritten.push_str(&filler_line);
+        std::fs::write(&path, &rewritten).unwrap();
+        let after = FileVersion::read(&path).unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            before.identity, after.identity,
+            "rewrite should keep the inode"
+        );
+        assert!(after.len > before.len);
+
+        // The bounded guard deliberately does not inspect the middle. This
+        // is the documented, short-lived stale window before the deadline.
+        assert_eq!(
+            count_messages_in_jsonl_at(&path, t0 + Duration::from_secs(1)),
+            2
+        );
+
+        // No wall-clock sleep: the injectable clock forces the deadline and
+        // the full prefix validation must discover the changed assistant row.
+        assert_eq!(
+            count_messages_in_jsonl_at(
+                &path,
+                t0 + crate::session::cache::PREFIX_FULL_REVALIDATION_INTERVAL
+                    + Duration::from_secs(1),
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn message_count_cache_evicts_oldest_paths() {
+        let mut cache = HashMap::new();
+        for i in 0..=MESSAGE_COUNT_CACHE_MAX_ENTRIES {
+            let path = PathBuf::from(format!("/synthetic/message-count-{i}.jsonl"));
+            cache.insert(
+                path,
+                MessageCountCacheEntry {
+                    stamp: FileVersion {
+                        len: i as u64,
+                        modified_nanos: 1,
+                        changed_nanos: 1_000_000_001,
+                        identity: i as u64 + 1,
+                    },
+                    offset: i as u64,
+                    value: i as u32,
+                    prefix: None,
+                    next_full_verify_offset: 0,
+                    last_full_validation_at: Instant::now(),
+                    last_prefix_validation_bytes: 0,
+                    last_access: Instant::now()
+                        - std::time::Duration::from_secs(
+                            (MESSAGE_COUNT_CACHE_MAX_ENTRIES - i + 1) as u64,
+                        ),
+                },
+            );
+        }
+        evict_oldest_message_count_entries(&mut cache);
+
+        assert_eq!(cache.len(), MESSAGE_COUNT_CACHE_MAX_ENTRIES);
+        assert!(!cache.contains_key(&PathBuf::from("/synthetic/message-count-0.jsonl")));
+    }
+}
+
+/// Never expose thinking, tool results, or a previous turn as a reply preview.
+fn notification_preview_from_entries(entries: &[crate::session::SessionEntry]) -> Option<String> {
+    use crate::session::{MessageContent, SessionEntry};
+    for entry in entries.iter().rev() {
+        match entry {
+            SessionEntry::User { message, .. }
+                if !message.is_tool_result
+                    && !crate::session::parser::is_system_content(&message.content) =>
+            {
+                return None
+            }
+            SessionEntry::Assistant { message, .. } => {
+                let text = message
+                    .content
+                    .iter()
+                    .filter_map(|part| match part {
+                        MessageContent::Text { text } if !text.trim().is_empty() => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !text.is_empty() {
+                    return Some(truncate_string(&text, 240));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod notification_preview_tests {
+    use super::*;
+    #[test]
+    fn skips_thinking_and_stops_at_new_user_turn() {
+        let assistant: crate::session::SessionEntry = serde_json::from_str(r#"{"type":"assistant","uuid":"a","timestamp":"2026-09-06T00:00:00Z","message":{"role":"assistant","model":"test","id":"msg-test","content":[{"type":"text","text":"Visible reply"},{"type":"thinking","thinking":"Private thought"}]}}"#).unwrap();
+        assert_eq!(
+            notification_preview_from_entries(std::slice::from_ref(&assistant)).as_deref(),
+            Some("Visible reply")
+        );
+        let user = serde_json::from_str(
+            r#"{"type":"user","uuid":"u","timestamp":"2026-09-06T00:01:00Z","message":{"role":"user","content":"Next request"}}"#,
+        )
+        .unwrap();
+        assert_eq!(notification_preview_from_entries(&[assistant, user]), None);
+    }
+}
+
+#[cfg(test)]
+mod hook_prompt_tests {
+    use super::*;
+
+    fn fixture() -> tempfile::TempDir {
+        // macOS exposes its temporary root through /var -> /private/var.
+        // Fixtures use a real parent; product IO must still reject symlinks.
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        tempfile::tempdir_in(parent).unwrap()
+    }
+
+    const PENDING_BASH: &str = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-09-23T00:00:00Z","message":{"model":"m","id":"msg1","role":"assistant","content":[{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"make"}}],"stop_reason":null,"stop_sequence":null}}"#;
+    const BASH_RESULT: &str = r#"{"type":"user","uuid":"u2","timestamp":"2026-09-23T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_b","content":"The user doesn't want to proceed","is_error":true}]}}"#;
+
+    fn prompt(agent_id: Option<&str>, tool_name: &str) -> PendingPermission {
+        PendingPermission {
+            agent_id: agent_id.map(str::to_owned),
+            tool_name: tool_name.to_owned(),
+            requested_at: 1,
+            tool_use_id: Some("toolu_b".into()),
+        }
+    }
+
+    fn state(pending: Vec<PendingPermission>) -> HookSessionState {
+        HookSessionState {
+            pending,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn main_thread_prompt_needs_matching_unresolved_call() {
+        let dir = fixture();
+        let file = dir.path().join("s1.jsonl");
+        std::fs::write(&file, format!("{PENDING_BASH}\n")).unwrap();
+
+        let open = open_hook_prompt(&state(vec![prompt(None, "Bash")]), &file);
+        assert_eq!(open.map(|p| p.tool_name), Some("Bash".to_string()));
+        // A different call id absent from this window is uncertain, not resolved.
+        let mut other = prompt(None, "Write");
+        other.tool_use_id = Some("missing-call".into());
+        assert!(open_hook_prompt(&state(vec![other]), &file).is_some());
+
+        // A rejected dialog fires no hook, but the transcript records the result.
+        std::fs::write(&file, format!("{PENDING_BASH}\n{BASH_RESULT}\n")).unwrap();
+        assert_eq!(
+            open_hook_prompt(&state(vec![prompt(None, "Bash")]), &file),
+            None
+        );
+    }
+
+    #[test]
+    fn subagent_prompt_checks_the_subagent_transcript() {
+        let dir = fixture();
+        let file = dir.path().join("s1.jsonl");
+        std::fs::write(&file, "").unwrap();
+        let pending = state(vec![prompt(Some("a1"), "Bash")]);
+
+        // No subagent transcript on disk: trust the hook.
+        assert!(open_hook_prompt(&pending, &file).is_some());
+
+        let subagents = dir.path().join("s1").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let transcript = subagents.join("agent-a1.jsonl");
+        std::fs::write(&transcript, format!("{PENDING_BASH}\n")).unwrap();
+        assert!(open_hook_prompt(&pending, &file).is_some());
+        std::fs::write(&transcript, format!("{PENDING_BASH}\n{BASH_RESULT}\n")).unwrap();
+        assert!(open_hook_prompt(&pending, &file).is_none());
+    }
+
+    #[test]
+    fn subagent_ids_cannot_escape_the_session_directory() {
+        assert_eq!(subagent_transcript(Path::new("/p/s1.jsonl"), "../x"), None);
+        assert_eq!(
+            subagent_transcript(Path::new("/p/s1.jsonl"), "a1"),
+            Some(PathBuf::from("/p/s1/subagents/agent-a1.jsonl"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod repair_regressions {
+    use super::*;
+
+    fn fixture() -> tempfile::TempDir {
+        // macOS exposes its temporary root through /var -> /private/var.
+        // Fixtures use a real parent; product IO must still reject symlinks.
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        tempfile::tempdir_in(parent).unwrap()
+    }
+    fn pending(id: Option<&str>, agent: Option<&str>) -> HookSessionState {
+        serde_json::from_value(serde_json::json!({"pending":[{"toolName":"Bash","agentId":agent,"requestedAt":1,"toolUseId":id}]})).unwrap()
+    }
+    const CALL: &str = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-09-23T00:00:00Z","message":{"model":"m","id":"msg1","role":"assistant","content":[{"type":"tool_use","id":"old","name":"Bash","input":{"command":"make"}}]}}"#;
+    const DONE: &str = r#"{"type":"user","uuid":"u2","timestamp":"2026-09-23T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"old","content":"done"}]}}"#;
+    #[test]
+    fn unresolved_call_outside_fifty_line_tail_remains_attention() {
+        let dir = fixture();
+        let path = dir.path().join("s1.jsonl");
+        let progress = "{\"type\":\"progress\"}\n".repeat(60);
+        std::fs::write(&path, format!("{CALL}\n{progress}")).unwrap();
+        assert!(
+            open_hook_prompt(&pending(Some("old"), None), &path).is_some(),
+            "tail absence was treated as resolution"
+        );
+    }
+    #[test]
+    fn malformed_or_truncated_transcript_is_uncertain_not_resolved() {
+        let dir = fixture();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(&path, "malformed\n").unwrap();
+        assert!(open_hook_prompt(&pending(Some("old"), None), &path).is_some());
+        std::fs::write(
+            &path,
+            format!("{}\n{CALL}\n", "{\"type\":\"progress\"}\n".repeat(40_000)),
+        )
+        .unwrap();
+        assert!(open_hook_prompt(&pending(Some("old"), None), &path).is_some());
+    }
+    #[test]
+    fn resolved_old_call_does_not_attach_to_new_bash_call() {
+        let dir = fixture();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(
+            &path,
+            format!("{CALL}\n{DONE}\n{}\n", CALL.replace("\"old\"", "\"new\"")),
+        )
+        .unwrap();
+        assert!(
+            open_hook_prompt(&pending(Some("old"), None), &path).is_none(),
+            "resolved request attached to a newer Bash"
+        );
+    }
+    #[test]
+    fn uncorrelated_prompt_does_not_acquire_an_unrelated_calls_arguments() {
+        let dir = fixture();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(&path, CALL).unwrap();
+        let p = pending(None, None).pending.remove(0);
+        assert!(crate::claude_hooks::prompt_input(&p, &path).is_none());
+        let p = pending(Some("old"), None).pending.remove(0);
+        assert_eq!(
+            crate::claude_hooks::prompt_input(&p, &path).unwrap()["command"],
+            "make",
+            "bound tool input must stay exposed"
+        );
+    }
+    #[test]
+    fn genuine_subagent_prompt_is_preserved_and_its_exact_result_resolves_it() {
+        let dir = fixture();
+        let path = dir.path().join("s1.jsonl");
+        let sub = dir.path().join("s1/subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let child = sub.join("agent-a1.jsonl");
+        std::fs::write(&child, CALL).unwrap();
+        assert!(open_hook_prompt(&pending(Some("old"), Some("a1")), &path).is_some());
+        std::fs::write(&child, format!("{CALL}\n{DONE}\n")).unwrap();
+        assert!(open_hook_prompt(&pending(Some("old"), Some("a1")), &path).is_none());
+    }
+    #[test]
+    fn cli_precedence_and_idle_text_questions_stay_unchanged() {
+        assert_eq!(
+            merge_cli_activity(
+                SessionStatus::Working,
+                Some(CliActivity::Waiting),
+                true,
+                None
+            ),
+            SessionStatus::NeedsAttention
+        );
+        assert_eq!(
+            merge_cli_activity(
+                SessionStatus::NeedsAttention,
+                Some(CliActivity::Busy),
+                true,
+                Some("Bash")
+            ),
+            SessionStatus::Working
+        );
+        assert_eq!(
+            merge_cli_activity(
+                SessionStatus::NeedsAttention,
+                Some(CliActivity::Idle),
+                true,
+                Some("Bash")
+            ),
+            SessionStatus::WaitingForInput
+        );
+        assert_eq!(
+            merge_cli_activity(
+                SessionStatus::NeedsAttention,
+                Some(CliActivity::Idle),
+                true,
+                Some("Question")
+            ),
+            SessionStatus::NeedsAttention
+        );
+        assert_eq!(
+            merge_cli_activity(SessionStatus::NeedsAttention, None, false, Some("Bash")),
+            SessionStatus::NeedsAttention
+        );
+    }
+
+    /// Every detected-derived field set to a distinct value so a golden diff
+    /// shows any field that is dropped or swapped. `pid` is nonzero with
+    /// `can_open` false, so no process lookup runs for `open_target`.
+    fn golden_detected(provider: SessionProvider, surface: SessionSurface) -> DetectedSession {
+        let mut detected = DetectedSession::with_legacy_defaults(
+            4242,
+            PathBuf::from("/golden/cwd"),
+            PathBuf::from("/golden/project-path"),
+            Some("golden-id".to_string()),
+            "golden-project".to_string(),
+        );
+        detected.provider = provider;
+        detected.surface = surface;
+        detected.kind = SessionKind::Background;
+        detected.entrypoint = Some("golden-entry".to_string());
+        detected.started_at_ms = Some(1_600_000_000_000);
+        detected.official_name = Some("golden-official".to_string());
+        detected.agent_kind = AgentKind::Subagent;
+        detected.parent_thread_id = Some("golden-parent".to_string());
+        detected.root_session_id = Some("golden-root".to_string());
+        detected.agent_path = Some("golden/agent/path".to_string());
+        detected.agent_nickname = Some("golden-nick".to_string());
+        detected.agent_role = Some("golden-role".to_string());
+        detected.internal_kind = Some("golden-internal".to_string());
+        detected.can_open = false;
+        detected.can_stop = true;
+        detected.can_rename = false;
+        detected
+    }
+
+    /// Enrich one detected session; returns the serialized card (with the
+    /// on-disk Codex title cache masked) and the skipped notification preview.
+    fn golden_enrich(detected: DetectedSession) -> (serde_json::Value, Option<String>) {
+        let (sessions, _) =
+            enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert!(session.transcript_path.is_none());
+        let mut value = serde_json::to_value(session).unwrap();
+        value.as_object_mut().unwrap().remove("codexTitle");
+        (value, session.notification_preview.clone())
+    }
+
+    fn golden_codex_message(role: &str, content: &str) -> crate::session::codex::CodexMessage {
+        serde_json::from_value(serde_json::json!({
+            "timestamp": "2020-01-01T00:00:00Z",
+            "role": role,
+            "messageType": if role == "user" { "User" } else { "Assistant" },
+            "content": content,
+        }))
+        .unwrap()
+    }
+
+    fn golden_cursor_message(role: &str, content: &str) -> crate::session::cursor::CursorMessage {
+        crate::session::cursor::CursorMessage {
+            timestamp: "2020-01-01T00:00:00Z".to_string(),
+            role: role.to_string(),
+            message_type: if role == "user" {
+                crate::session::MessageType::User
+            } else {
+                crate::session::MessageType::Assistant
+            },
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn golden_codex_session_card() {
+        let mut detected = golden_detected(SessionProvider::Codex, SessionSurface::App);
+        detected.codex_summary = Some(crate::session::codex::CodexRolloutSummary {
+            thread_id: "golden-id".to_string(),
+            lifecycle: CodexLifecycle::Working,
+            messages: vec![
+                golden_codex_message("user", "codex question"),
+                golden_codex_message("assistant", "codex answer one"),
+                golden_codex_message("assistant", "  "),
+            ],
+            last_timestamp: "2020-01-02T03:04:05Z".to_string(),
+            ..Default::default()
+        });
+        let (value, preview) = golden_enrich(detected);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "agentKind": "subagent",
+                "agentNickname": "golden-nick",
+                "agentPath": "golden/agent/path",
+                "agentRole": "golden-role",
+                "canOpen": false,
+                "canRename": false,
+                "canStop": true,
+                "customTitle": null,
+                "entrypoint": "golden-entry",
+                "firstPrompt": "(No conversation yet)",
+                "gitBranch": null,
+                "id": "golden-id",
+                "internalKind": "golden-internal",
+                "kind": "background",
+                "lastAssistantMessage": "codex answer one",
+                "latestMessage": "  ",
+                "messageCount": 3,
+                "modified": "2020-01-02T03:04:05Z",
+                "officialName": "golden-official",
+                "parentThreadId": "golden-parent",
+                "pendingToolName": null,
+                "pid": 4242,
+                "projectPath": "/golden/cwd",
+                "provider": "codex",
+                "rootSessionId": "golden-root",
+                "sessionKey": "codex:golden-id",
+                "sessionName": "golden-nick",
+                "sourceHealth": "stale",
+                "startedAtMs": 1_600_000_000_000_i64,
+                "status": "Working",
+                "summary": null,
+                "surface": "app"
+            })
+        );
+        assert_eq!(preview.as_deref(), Some("codex answer one"));
+    }
+
+    #[test]
+    fn golden_cursor_session_card() {
+        let mut detected = golden_detected(SessionProvider::Cursor, SessionSurface::Cursor);
+        detected.cursor_summary = Some(crate::session::cursor::CursorTranscriptSummary {
+            session_id: "golden-id".to_string(),
+            cursor_title: Some("golden-cursor-title".to_string()),
+            lifecycle: CursorLifecycle::Working,
+            messages: vec![
+                golden_cursor_message("user", "cursor question"),
+                golden_cursor_message("assistant", "cursor answer"),
+            ],
+            last_timestamp: String::new(),
+            empty: false,
+            ..Default::default()
+        });
+        let (value, preview) = golden_enrich(detected);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "agentKind": "subagent",
+                "agentNickname": "golden-nick",
+                "agentPath": "golden/agent/path",
+                "agentRole": "golden-role",
+                "canOpen": false,
+                "canRename": false,
+                "canStop": true,
+                "cursorTitle": "golden-cursor-title",
+                "customTitle": "golden-official",
+                "entrypoint": "golden-entry",
+                "firstPrompt": "cursor question",
+                "gitBranch": null,
+                "id": "golden-id",
+                "internalKind": "golden-internal",
+                "kind": "background",
+                "lastAssistantMessage": "cursor answer",
+                "latestMessage": "cursor answer",
+                "messageCount": 2,
+                "modified": "2020-09-13T12:26:40+00:00",
+                "officialName": "golden-official",
+                "parentThreadId": "golden-parent",
+                "pendingToolName": null,
+                "pid": 4242,
+                "projectPath": "/golden/cwd",
+                "provider": "cursor",
+                "rootSessionId": "golden-root",
+                "sessionKey": "cursor:golden-id",
+                "sessionName": "golden-nick",
+                "sourceHealth": "partial",
+                "startedAtMs": 1_600_000_000_000_i64,
+                "status": "Working",
+                "summary": null,
+                "surface": "cursor"
+            })
+        );
+        assert_eq!(preview.as_deref(), Some("cursor answer"));
+    }
+
+    #[test]
+    fn golden_opencode_session_card() {
+        let mut detected = golden_detected(SessionProvider::Opencode, SessionSurface::Cli);
+        detected.opencode_summary = Some(crate::session::opencode::OpenCodeSummary {
+            modified: "2020-01-02T03:04:05Z".to_string(),
+            status: SessionStatus::Working,
+            diagnostic: "opencode diagnostic".to_string(),
+        });
+        let (value, preview) = golden_enrich(detected);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "agentKind": "subagent",
+                "agentNickname": "golden-nick",
+                "agentPath": "golden/agent/path",
+                "agentRole": "golden-role",
+                "canOpen": false,
+                "canRename": false,
+                "canStop": true,
+                "customTitle": null,
+                "entrypoint": "golden-entry",
+                "firstPrompt": "golden-official",
+                "gitBranch": null,
+                "id": "golden-id",
+                "internalKind": "golden-internal",
+                "kind": "background",
+                "latestMessage": "opencode diagnostic",
+                "messageCount": 0,
+                "modified": "2020-01-02T03:04:05Z",
+                "officialName": "golden-official",
+                "parentThreadId": "golden-parent",
+                "pendingToolName": null,
+                "pid": 4242,
+                "projectPath": "/golden/cwd",
+                "provider": "opencode",
+                "rootSessionId": "golden-root",
+                "sessionKey": "opencode:golden-id",
+                "sessionName": "golden-project",
+                "sourceHealth": "stale",
+                "startedAtMs": 1_600_000_000_000_i64,
+                "status": "Working",
+                "summary": null,
+                "surface": "cli"
+            })
+        );
+        assert_eq!(preview.as_deref(), None);
+    }
+
+    #[test]
+    fn golden_pi_session_card() {
+        let mut detected = golden_detected(SessionProvider::Pi, SessionSurface::Cli);
+        let mut summary = crate::session::pi::PiTranscriptSummary::default();
+        summary.session_id = "golden-id".to_string();
+        summary.first_prompt = Some("   ".to_string());
+        summary.latest_snippet = Some("pi snippet".to_string());
+        summary.latest_assistant_text = Some("pi assistant text".to_string());
+        summary.message_count = 7;
+        summary.lifecycle = PiLifecycle::Working;
+        summary.empty = true;
+        summary.pending_tool_name = Some("pi-tool".to_string());
+        summary.last_timestamp = "2020-01-02T03:04:05Z".to_string();
+        detected.pi_summary = Some(summary);
+        let (value, preview) = golden_enrich(detected);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "agentKind": "subagent",
+                "agentNickname": "golden-nick",
+                "agentPath": "golden/agent/path",
+                "agentRole": "golden-role",
+                "canOpen": false,
+                "canRename": false,
+                "canStop": true,
+                "customTitle": null,
+                "entrypoint": "golden-entry",
+                "firstPrompt": "(No conversation yet)",
+                "gitBranch": null,
+                "id": "golden-id",
+                "internalKind": "golden-internal",
+                "kind": "background",
+                "lastAssistantMessage": "pi assistant text",
+                "latestMessage": "pi snippet",
+                "messageCount": 7,
+                "modified": "2020-01-02T03:04:05Z",
+                "officialName": "golden-official",
+                "parentThreadId": "golden-parent",
+                "pendingToolName": "pi-tool",
+                "pid": 4242,
+                "projectPath": "/golden/cwd",
+                "provider": "pi",
+                "rootSessionId": "golden-root",
+                "sessionKey": "pi:golden-id",
+                "sessionName": "golden-nick",
+                "sourceHealth": "stale",
+                "startedAtMs": 1_600_000_000_000_i64,
+                "status": "Connecting",
+                "summary": null,
+                "surface": "cli"
+            })
+        );
+        assert_eq!(preview.as_deref(), Some("pi assistant text"));
+    }
+}

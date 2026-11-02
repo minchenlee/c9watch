@@ -24,7 +24,9 @@ function files(dir, exts) {
 const frontend = files(join(root, 'src'), ['.ts', '.svelte'])
   .map((path) => readFileSync(path, 'utf8'))
   .join('\n');
-const backend = files(join(root, 'src-tauri/src'), ['.rs'])
+// The GUI shell and the core crate (D32 workspace).
+const backend = ['src-tauri/src', 'src-tauri/core/src']
+  .flatMap((dir) => files(join(root, dir), ['.rs']))
   .map((path) => readFileSync(path, 'utf8'))
   .join('\n');
 const libRs = readFileSync(join(root, 'src-tauri/src/lib.rs'), 'utf8');
@@ -122,8 +124,8 @@ test('stop_session is invoked with a session key, not a bare pid', () => {
 // test `schema_file_is_current` fails when it is stale), and src/lib/c9p-1.ts
 // comes from that file.
 const c9pSchema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf8'));
-const engineApi = readFileSync(join(root, 'src-tauri/src/engine/api.rs'), 'utf8');
-const wire = readFileSync(join(root, 'src-tauri/src/engine_proto/wire.rs'), 'utf8');
+const engineApi = readFileSync(join(root, 'src-tauri/core/src/engine/api.rs'), 'utf8');
+const wire = readFileSync(join(root, 'src-tauri/core/src/engine_proto/wire.rs'), 'utf8');
 
 test('c9p/1 TS types are generated from the current schema', () => {
   assert.equal(
