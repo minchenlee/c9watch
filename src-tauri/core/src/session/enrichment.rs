@@ -79,6 +79,9 @@ pub struct Session {
     /// (`session::workers`), after detection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_of: Option<String>,
+    /// The agent-team link of a teammate session: its name, team and lead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teammate: Option<crate::session::teammates::TeammateLink>,
     /// User-set name from `claude agents` (Ctrl+T background-pinned sessions).
     /// Only populated by the CLI backend; legacy backend leaves this None.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -615,6 +618,7 @@ pub fn enrich_detected_sessions(
                 .is_file()
                 .then(|| session_file_path.clone()),
             worker_of: None,
+            teammate: detected.teammate.clone(),
             official_name: detected.official_name.clone(),
             started_at_ms: detected.started_at_ms,
             provider: detected.provider,
@@ -669,6 +673,7 @@ fn base_session(detected: &DetectedSession, session_id: &str) -> Session {
         last_assistant_message: None,
         transcript_path: None,
         worker_of: None,
+        teammate: detected.teammate.clone(),
         official_name: detected.official_name.clone(),
         started_at_ms: detected.started_at_ms,
         provider: detected.provider,
@@ -1106,6 +1111,7 @@ impl Session {
             can_open: false,
             can_stop: false,
             can_rename: false,
+            teammate: None,
         }
     }
 }
@@ -1382,6 +1388,7 @@ mod placeholder_tests {
             pi_summary: None,
             opencode_summary: None,
             process_start_secs: None,
+            teammate: None,
         };
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
@@ -1453,6 +1460,7 @@ mod placeholder_tests {
             pi_summary: None,
             opencode_summary: None,
             process_start_secs: None,
+            teammate: None,
         };
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();

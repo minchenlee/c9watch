@@ -6,6 +6,7 @@ use super::source::{
     CliActivity, DetectedSession, DetectionDiagnostics, SessionDetectorError, SessionKind,
     SessionSource,
 };
+use super::teammates;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -88,6 +89,8 @@ pub struct CliSessionSource {
     /// tempdir.
     home: Option<PathBuf>,
     hidden: HiddenSessionScanner,
+    /// Transcript headers read to find teammates' transcripts.
+    teammate_headers: teammates::HeaderCache,
 }
 
 impl CliSessionSource {
@@ -102,6 +105,7 @@ impl CliSessionSource {
             is_alive: pid_is_alive,
             home: None,
             hidden: HiddenSessionScanner::new(process_start_times),
+            teammate_headers: teammates::HeaderCache::default(),
         }
     }
 
@@ -161,7 +165,64 @@ impl CliSessionSource {
             pi_summary: None,
             opencode_summary: None,
             process_start_secs,
+            teammate: None,
         }
+    }
+
+    /// Live agent-team teammates whose own transcript is found (see
+    /// `session::teammates`). `claude agents --json` lists none of them, so
+    /// they come from the processes `hidden.scan` read. A teammate without a
+    /// matching transcript is left out, never given another's. `known` holds
+    /// the session IDs already detected.
+    fn teammate_sessions(
+        &mut self,
+        home: &Path,
+        known: &std::collections::HashSet<String>,
+    ) -> Vec<DetectedSession> {
+        let mut found = Vec::new();
+        for (pid, start, facts) in self.hidden.teammates(home) {
+            let Some(args) = facts.teammate.as_ref() else {
+                continue;
+            };
+            let (link, cwds) = teammates::link_for(home, args, facts.cwd.as_deref());
+            let headers = &mut self.teammate_headers;
+            let hit = cwds.into_iter().find_map(|cwd| {
+                let dir = fallback_path_under(home, &cwd);
+                let id = teammates::find_transcript(&dir, args, start, headers)?;
+                Some((cwd, dir, id))
+            });
+            let Some((cwd, project_path, session_id)) = hit else {
+                continue;
+            };
+            if known.contains(&session_id) {
+                continue;
+            }
+            found.push(DetectedSession {
+                project_name: cwd
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                started_at_ms: i64::try_from(start).ok().map(|s| s * 1000),
+                // The card is named after the teammate.
+                agent_nickname: Some(link.agent_name.clone()),
+                // The lead runs the teammate's pane: c9watch neither opens,
+                // stops nor renames it.
+                can_open: false,
+                can_stop: false,
+                can_rename: false,
+                process_start_secs: Some(start),
+                teammate: Some(link),
+                ..DetectedSession::with_legacy_defaults(
+                    pid,
+                    cwd,
+                    project_path,
+                    Some(session_id),
+                    String::new(),
+                )
+            });
+        }
+        found
     }
 
     /// `claude agents --json` rows, reusing the previous result while it is
@@ -320,7 +381,7 @@ impl SessionSource for CliSessionSource {
         // If the file is missing or unreadable, keep the agent (older CC versions).
         // Read once per agent and reuse for both the filter decision and the
         // DetectedSession field, instead of reading the file twice.
-        let sessions: Vec<DetectedSession> = agents
+        let mut sessions: Vec<DetectedSession> = agents
             .into_iter()
             .filter_map(|a| {
                 let meta = home
@@ -343,7 +404,16 @@ impl SessionSource for CliSessionSource {
             .collect();
 
         let hidden_claude_sessions = match (self.registry_dir(), home.as_deref()) {
-            (Some(dir), Some(home)) => self.hidden.scan(&dir, home),
+            (Some(dir), Some(home)) => {
+                let hidden = self.hidden.scan(&dir, home);
+                let known = sessions
+                    .iter()
+                    .filter_map(|s| s.session_id.clone())
+                    .collect();
+                let teammates = self.teammate_sessions(home, &known);
+                sessions.extend(teammates);
+                hidden
+            }
             _ => Vec::new(),
         };
         Ok((
@@ -1224,6 +1294,125 @@ mod tests {
         assert_eq!(hidden[0].pid, 77);
         assert_eq!(hidden[0].cwd.as_deref(), Some("/tmp/hidden"));
         assert_eq!(hidden[0].reason, HiddenReason::ChildSessionMarker);
+    }
+
+    /// A teammate process of an agent team: argv from a real teammate, a
+    /// `.key` file and no `.json`.
+    #[cfg(unix)]
+    fn teammate_facts(pids: &[u32]) -> HashMap<u32, crate::session::hidden_sessions::ProcessFacts> {
+        let argv: Vec<std::ffi::OsString> = [
+            "/Users/me/.local/share/claude/versions/2.1.314",
+            "--agent-id",
+            "p10-multi-cwd@session-52d94f40",
+            "--agent-name",
+            "p10-multi-cwd",
+            "--team-name",
+            "session-52d94f40",
+            "--agent-color",
+            "orange",
+            "--parent-session-id",
+            "52d94f40-632b-43c7-a783-f31783dfe57f",
+            "--permission-mode",
+            "auto",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        pids.iter()
+            .map(|&pid| {
+                let facts = crate::session::hidden_sessions::ProcessFacts {
+                    argv0: Some("claude".into()),
+                    cwd: Some(PathBuf::from("/Users/me/repo")),
+                    same_user: true,
+                    teammate: teammates::parse_argv(&argv),
+                    ..Default::default()
+                };
+                (pid, facts)
+            })
+            .collect()
+    }
+
+    const TEAMMATE_START: u64 = 1_700_000_000;
+    const TEAMMATE_SID: &str = "497be973-fd8e-44d8-a7f4-ac9333b204ea";
+
+    #[cfg(unix)]
+    fn teammate_fixture(tmp: &Path, with_transcript: bool) -> CliSessionSource {
+        let mut source = reuse_fixture(tmp, REGISTRY_WITH_PROC_START, PROC_START);
+        std::fs::write(sessions_dir(tmp).join("72402.07c53a83.key"), "").unwrap();
+        let team = tmp.join(".claude/teams/session-52d94f40");
+        std::fs::create_dir_all(&team).unwrap();
+        std::fs::write(
+            team.join("config.json"),
+            r#"{"name":"session-52d94f40","leadSessionId":"52d94f40-632b-43c7-a783-f31783dfe57f","leadProcess":{"pid":16405},"members":[{"agentId":"team-lead@session-52d94f40","name":"team-lead","agentType":"team-lead","cwd":"/Users/me/repo","backendType":"in-process"},{"agentId":"p10-multi-cwd@session-52d94f40","name":"p10-multi-cwd","agentType":"general-purpose","tmuxPaneId":"%12","cwd":"/Users/me/repo","backendType":"tmux","isActive":true}]}"#,
+        )
+        .unwrap();
+        let project = tmp.join(".claude/projects/-Users-me-repo");
+        std::fs::create_dir_all(&project).unwrap();
+        if with_transcript {
+            let ts = chrono::DateTime::from_timestamp(TEAMMATE_START as i64 + 5, 0)
+                .unwrap()
+                .to_rfc3339();
+            std::fs::write(
+                project.join(format!("{TEAMMATE_SID}.jsonl")),
+                format!(
+                    "{{\"type\":\"mode\",\"mode\":\"normal\",\"sessionId\":\"{TEAMMATE_SID}\"}}\n\
+                     {{\"type\":\"user\",\"sessionId\":\"{TEAMMATE_SID}\",\"timestamp\":\"{ts}\",\"agentName\":\"p10-multi-cwd\",\"teamName\":\"session-52d94f40\",\"message\":{{\"role\":\"user\",\"content\":\"go\"}}}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        source.hidden = HiddenSessionScanner::with_reader(
+            |pids| pids.iter().map(|&pid| (pid, TEAMMATE_START)).collect(),
+            teammate_facts,
+        );
+        source
+    }
+
+    /// `claude agents --json` doesn't list a teammate. Detection finds it from
+    /// its argv and transcript, links it to its lead, and leaves it out of the
+    /// hidden-session diagnostics.
+    #[cfg(unix)]
+    #[test]
+    fn detect_lists_a_live_teammate_with_its_lead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = teammate_fixture(tmp.path(), true);
+        let (sessions, diagnostics) = source.detect().unwrap();
+        assert!(diagnostics.hidden_claude_sessions.is_empty());
+        let mate = sessions
+            .iter()
+            .find(|s| s.pid == 72402)
+            .expect("the teammate is a session");
+        assert_eq!(mate.session_id.as_deref(), Some(TEAMMATE_SID));
+        assert_eq!(
+            mate.project_path,
+            tmp.path().join(".claude/projects/-Users-me-repo")
+        );
+        assert_eq!(mate.cwd, PathBuf::from("/Users/me/repo"));
+        assert_eq!(mate.process_start_secs, Some(TEAMMATE_START));
+        assert_eq!(mate.agent_nickname.as_deref(), Some("p10-multi-cwd"));
+        assert!(!mate.can_open && !mate.can_stop && !mate.can_rename);
+        assert_eq!(
+            mate.teammate,
+            Some(teammates::TeammateLink {
+                agent_name: "p10-multi-cwd".into(),
+                team_name: "session-52d94f40".into(),
+                lead_session_id: "52d94f40-632b-43c7-a783-f31783dfe57f".into(),
+                agent_type: Some("general-purpose".into()),
+            })
+        );
+        // The CLI's own row is still there, without a link.
+        assert!(sessions.iter().any(|s| s.pid == 41 && s.teammate.is_none()));
+    }
+
+    /// Before its first transcript entry, a teammate has no session: it is
+    /// never given another session's transcript.
+    #[cfg(unix)]
+    #[test]
+    fn a_teammate_without_its_transcript_is_not_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = teammate_fixture(tmp.path(), false);
+        let (sessions, _) = source.detect().unwrap();
+        assert!(sessions.iter().all(|s| s.pid != 72402));
     }
 
     const REGISTRY_WITH_PROC_START: &str = r#"{"pid":41,"sessionId":"sid-reuse","startedAt":1791984959765,"procStart":"Wed Oct 14 13:35:57 2026","entrypoint":"cli","version":"2.1.299","status":"idle"}"#;

@@ -7,7 +7,8 @@
 	import ProviderBadge from './ProviderBadge.svelte';
 	import { canSessionAction, sessionReturnKind, sessionKeyOf } from '$lib/provider';
 	import { awayActivity } from '$lib/stores/away';
-	import { awayActivityLabel, sessionDisplayTitle, waitingForLabel } from '$lib/session-utils';
+	import { awayActivityLabel, leadOf, sessionDisplayTitle, teammatesOf, waitingForLabel } from '$lib/session-utils';
+	import { sessions as allSessions } from '$lib/stores/sessions';
 	import { formatTimeSince } from '$lib/time-utils';
 	import { getSessionStatusColor, getSessionStatusLabel } from '$lib/status-utils';
 
@@ -34,6 +35,21 @@
 	let entrypointLabel = $derived(
 		session.entrypoint && session.entrypoint !== 'cli' ? session.entrypoint : null
 	);
+	// Agent teams: a teammate names its lead; a lead lists its live teammates.
+	let teammates = $derived(teammatesOf(session, $allSessions));
+	let teamLead = $derived(session.teammate ? leadOf(session, $allSessions) : undefined);
+	let teamBadge = $derived.by(() => {
+		const link = session.teammate;
+		if (link) {
+			const lead = teamLead ? teamLead.sessionName : link.leadSessionId.slice(0, 8);
+			return { label: 'MATE', title: `Teammate ${link.agentName} of lead ${lead}` };
+		}
+		if (teammates.length) {
+			const names = teammates.map((m) => m.teammate?.agentName).join(', ');
+			return { label: `LEAD ${teammates.length}`, title: `Lead of ${teammates.length} teammate${teammates.length === 1 ? '' : 's'}: ${names}` };
+		}
+		return null;
+	});
 	let isPermission = $derived(session.status === SessionStatus.NeedsAttention);
 	let isWaitingInput = $derived(session.status === SessionStatus.WaitingForInput);
 	let isWorking = $derived(session.status === SessionStatus.Working);
@@ -194,6 +210,9 @@
 					<span class="session-name-badge">{session.sessionName}</span>
 				{#if isBackground}
 					<span class="kind-badge" aria-label="Background-pinned session" title="Background-pinned session">BG</span>
+				{/if}
+				{#if teamBadge}
+					<span class="team-badge" aria-label={teamBadge.title} title={teamBadge.title}>{teamBadge.label}</span>
 				{/if}
 				{#if entrypointLabel}
 					<span class="entrypoint-badge" aria-label={`Entrypoint: ${entrypointLabel}`} title={`Entrypoint: ${entrypointLabel}`}>{entrypointLabel}</span>
@@ -467,6 +486,21 @@
 		letter-spacing: 0.1em;
 		display: inline-block;
 		vertical-align: middle;
+	}
+
+	.team-badge {
+		font-family: var(--font-pixel);
+		font-size: 10px;
+		font-weight: 500;
+		color: var(--accent-pink);
+		background: color-mix(in srgb, var(--accent-pink) 12%, transparent);
+		padding: 2px 6px;
+		border: 1px solid color-mix(in srgb, var(--accent-pink) 40%, transparent);
+		text-transform: uppercase;
+		letter-spacing: 0.1em;
+		display: inline-block;
+		vertical-align: middle;
+		white-space: nowrap;
 	}
 
 	.entrypoint-badge {

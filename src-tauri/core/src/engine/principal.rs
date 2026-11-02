@@ -468,6 +468,35 @@ pub(crate) mod tests {
         );
     }
 
+    /// D8 for an agent-team teammate: its parent is tmux, not the lead, but
+    /// the teammate is a Claude Code process detection observes, so its Bash
+    /// tool's processes are `observed:` the teammate. Before detection found
+    /// teammates they were `local-unverified`.
+    #[test]
+    fn a_peer_inside_a_teammate_is_observed_though_its_parent_is_tmux() {
+        // bash tool (30) -> shell (20) -> teammate claude (88) -> tmux (70) -> launchd (1).
+        // The lead (16405) is not in the chain.
+        let chain = vec![
+            pi(30, 20, 300),
+            pi(20, 88, 200),
+            pi(88, 70, 150),
+            pi(70, 1, 50),
+        ];
+        let seen = FakeObserved(HashMap::from([
+            (88, "claudeCode:mate".to_string()),
+            (16405, "claudeCode:lead".to_string()),
+        ]));
+        assert_eq!(
+            stamp_observed(&chain, &NoLiveAgents, &seen),
+            observed("claudeCode:mate")
+        );
+        let lead_only = FakeObserved::one("claudeCode:lead", 16405);
+        assert_eq!(
+            stamp_observed(&chain, &NoLiveAgents, &lead_only),
+            Principal::LocalUnverified
+        );
+    }
+
     /// D8: a mutation refuses a peer under an observed session at any
     /// depth, except the observed principal's own session.
     #[test]

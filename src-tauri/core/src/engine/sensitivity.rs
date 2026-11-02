@@ -47,6 +47,7 @@ const BY_NAME: &[(&str, &str)] = &[
     ("parentId", P),
     ("parentThreadId", P),
     ("rootSessionId", P),
+    ("leadSessionId", P),
     ("providerSid", P),
     ("msgId", P),
     ("taskId", P),
@@ -187,6 +188,10 @@ const BY_NAME: &[(&str, &str)] = &[
     ("from", M),
     ("createdBy", M),
     ("workerOf", M),
+    // Agent-team teammate link: names a lead chose.
+    ("teammate", M),
+    ("agentName", M),
+    ("teamName", M),
     ("agentType", M),
     ("agentRole", M),
     ("pendingTool", M),

@@ -29,3 +29,18 @@ test('summary says why and how to fix it', () => {
   assert.match(text, /another Claude session opened/);
   assert.match(text, /Quit that app and open it again from the Dock/);
 });
+
+test('a lead lists its live teammates and a teammate finds its lead', () => {
+  const lead = { id: 'lead-1', sessionName: 'c9watch' };
+  const mate = (id, name, leadSessionId, provider) => ({ id, provider, teammate: { agentName: name, teamName: 'session-lead-1', leadSessionId } });
+  const a = mate('m-a', 'p10', 'lead-1', 'claudeCode');
+  const b = mate('m-b', 'p2', 'lead-1');
+  const other = mate('m-c', 'x', 'lead-2');
+  const codex = mate('m-d', 'y', 'lead-1', 'codex');
+  const all = [lead, a, b, other, codex];
+  assert.deepEqual(utils.teammatesOf(lead, all).map(s => s.id), ['m-a', 'm-b']);
+  assert.equal(utils.leadOf(a, all), lead);
+  assert.equal(utils.leadOf(other, all), undefined, 'an ended lead is not found');
+  assert.equal(utils.leadOf(lead, all), undefined, 'a lead has no lead');
+  assert.deepEqual(utils.teammatesOf(a, all), []);
+});

@@ -281,6 +281,10 @@ pub struct DetectedSession {
     /// process behind the session.
     #[serde(skip)]
     pub process_start_secs: Option<u64>,
+    /// The agent-team link of a teammate session. Only the CLI backend
+    /// finds teammates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teammate: Option<super::teammates::TeammateLink>,
 }
 
 fn default_true() -> bool {
@@ -335,6 +339,7 @@ impl DetectedSession {
             pi_summary: None,
             opencode_summary: None,
             process_start_secs: None,
+            teammate: None,
         }
     }
 

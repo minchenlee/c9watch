@@ -49,6 +49,8 @@ pub(crate) struct ProcessFacts {
     pub same_user: bool,
     pub child_marker: bool,
     pub parent_claude_pid: Option<u32>,
+    /// The agent-team flags in argv, when the process is a teammate.
+    pub teammate: Option<super::teammates::TeammateArgs>,
 }
 
 impl ProcessFacts {
@@ -94,7 +96,7 @@ pub(crate) fn pids_without_registry_entry<S: AsRef<str>>(file_names: &[S]) -> Ve
 
 /// Whether the process is the real Claude Code binary, not a script that
 /// happens to be named `claude`.
-fn is_claude_code(facts: &ProcessFacts, home: &Path) -> bool {
+pub(crate) fn is_claude_code(facts: &ProcessFacts, home: &Path) -> bool {
     let versions = home.join(".local/share/claude/versions");
     let exe_is_claude = facts
         .exe
@@ -195,6 +197,23 @@ impl HiddenSessionScanner {
             .collect();
         hidden_sessions(&names, &processes, home)
     }
+
+    /// Agent-team teammates among the pids the last `scan` read: each pid
+    /// with its start time and facts. A teammate also has a `.key` file and
+    /// no `.json`, so `scan` already holds its argv.
+    pub(crate) fn teammates(&self, home: &Path) -> Vec<(u32, u64, ProcessFacts)> {
+        let mut found: Vec<_> = self
+            .cache
+            .iter()
+            .filter_map(|(pid, (start, facts))| {
+                let facts = facts.as_ref()?;
+                (facts.same_user && facts.teammate.is_some() && is_claude_code(facts, home))
+                    .then(|| (*pid, *start, facts.clone()))
+            })
+            .collect();
+        found.sort_by_key(|(pid, _, _)| *pid);
+        found
+    }
 }
 
 #[cfg(unix)]
@@ -225,6 +244,7 @@ fn read_process_facts(pids: &[u32]) -> HashMap<u32, ProcessFacts> {
                     .map(|arg| arg.to_string_lossy().into_owned()),
                 cwd: process.cwd().map(Path::to_path_buf),
                 same_user: process.user_id().is_some_and(|owner| **owner == uid),
+                teammate: super::teammates::parse_argv(process.cmd()),
                 ..ProcessFacts::default()
             }
             .with_env(process.environ());
@@ -255,6 +275,7 @@ mod tests {
             same_user: true,
             child_marker: true,
             parent_claude_pid: Some(7),
+            teammate: None,
         }
     }
 

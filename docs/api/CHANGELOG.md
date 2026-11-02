@@ -13,6 +13,10 @@ After that, major 1 accepts additive changes only. A breaking change needs major
 
 When preview ends, the GUI's legacy in-process fallback is removed. The GUI then reads only through core.
 
+## 1.13 — upcoming
+
+- Add agent-team teammates. `session.views` and `session.view` list live Claude Code teammates, which `claude agents --json` omits. `SessionView` adds optional `teammate` (`TeammateLink`: `agentName`, `teamName`, `leadSessionId`, optional `agentType`). A teammate's transcript is attached only when its first entry names the same agent and team and starts after the process; otherwise the teammate is not listed. Teammates have `canOpen`, `canStop` and `canRename` `false`. A process inside a teammate is `observed:<sessionKey>` (D8). See [c9p-1.md](c9p-1.md#agent-team-teammates-113). Additive; no method `rev` changes.
+
 ## 1.12 — upcoming
 
 - Add an agent write fence (D30). `agent.create` accepts optional `guard {denyWriteUnder, allowWrite}` and `require` (capability names; a missing one is `unsupported`). `AgentRow` adds optional `guard`, `ccVersion` and `capabilities`. A fenced agent gets a blocking Claude Code PreToolUse hook for `Write|Edit|MultiEdit|NotebookEdit`, and core answers it through the new internal `hook.pre_tool_use` (result `{decision, reason}`). Each deny is audited. With a fence on both sides, agents may run in sibling cwds. See [c9p-1.md](c9p-1.md#write-fence-and-required-capabilities-112). Additive; no method `rev` changes.

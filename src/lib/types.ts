@@ -131,11 +131,22 @@ export interface Session {
   agentNickname?: string | null;
   agentRole?: string | null;
   internalKind?: string | null;
+  /** For an agent-team teammate: its name, team and lead session. */
+  teammate?: TeammateLink | null;
   /** Backend-provided action capabilities (serialized from Rust snake_case fields). */
   openTarget?: 'terminal' | 'project' | 'application';
   canOpen?: boolean;
   canStop?: boolean;
   canRename?: boolean;
+}
+
+/** The link from an agent-team teammate session to its team and lead. */
+export interface TeammateLink {
+  agentName: string;
+  teamName: string;
+  /** Session ID of the lead session that spawned the teammate. */
+  leadSessionId: string;
+  agentType?: string | null;
 }
 
 /**

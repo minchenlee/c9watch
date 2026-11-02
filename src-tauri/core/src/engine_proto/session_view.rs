@@ -10,6 +10,7 @@
 use crate::actions::OpenTarget;
 use crate::session::away::WaitingFor;
 use crate::session::source::SourceHealth;
+use crate::session::teammates::TeammateLink;
 use crate::session::{
     AgentKind, Session, SessionKind, SessionProvider, SessionStatus, SessionSurface,
 };
@@ -61,6 +62,10 @@ pub struct SessionView {
     /// (`session::workers`), after detection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_of: Option<String>,
+    /// For an agent-team teammate: its name, team, lead session and agent
+    /// type. The lead's own view has none; its teammates name it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teammate: Option<TeammateLink>,
     /// User-set name from `claude agents` (Ctrl+T background-pinned sessions).
     /// Only populated by the CLI backend; legacy backend leaves this None.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,6 +130,7 @@ impl From<&Session> for SessionView {
             waiting_for: s.waiting_for.clone(),
             last_assistant_message: s.last_assistant_message.clone(),
             worker_of: s.worker_of.clone(),
+            teammate: s.teammate.clone(),
             official_name: s.official_name.clone(),
             started_at_ms: s.started_at_ms,
             provider: s.provider,
@@ -175,6 +181,12 @@ mod tests {
         s.last_assistant_message = Some("last".into());
         s.transcript_path = Some("/internal/transcript.jsonl".into());
         s.worker_of = Some("pm-1".into());
+        s.teammate = Some(crate::session::teammates::TeammateLink {
+            agent_name: "mate".into(),
+            team_name: "session-lead".into(),
+            lead_session_id: "lead".into(),
+            agent_type: Some("general-purpose".into()),
+        });
         s.official_name = Some("official".into());
         s.provider = SessionProvider::Codex;
         s.surface = SessionSurface::App;

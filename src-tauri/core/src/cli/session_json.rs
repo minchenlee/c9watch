@@ -426,6 +426,7 @@ mod session_formatter_tests {
             can_open: false,
             can_stop: false,
             can_rename: false,
+            teammate: None,
         }
     }
 
