@@ -215,7 +215,7 @@ pub fn review(
     }
     // A teammate core has not listed (D8) names no session: it may read,
     // and nothing it writes can be tied to a session.
-    if principal.is_unlisted_teammate() && rule.verb != "read" {
+    if principal.is_read_only() && rule.verb != "read" {
         return deny(
             "an agent-team teammate core has not listed may only read",
             None,

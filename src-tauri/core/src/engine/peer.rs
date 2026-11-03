@@ -176,6 +176,18 @@ pub fn proc_info(pid: libc::pid_t) -> Option<ProcInfo> {
     entry.map(|e| e.info)
 }
 
+/// Whether the process `pid` that started at `start` is confirmed gone:
+/// the pid names no process (`ESRCH`), or now one with another start time.
+/// A pid that exists but can't be read is not confirmed gone.
+pub fn exited(pid: libc::pid_t, start: u64) -> bool {
+    if let Some(now) = proc_info(pid) {
+        return now.start != start;
+    }
+    // SAFETY: signal 0 only checks that the pid exists.
+    let failed = unsafe { libc::kill(pid, 0) } == -1;
+    failed && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
 /// Every process this module can read, zombies included.
 #[cfg(target_os = "macos")]
 pub fn processes() -> Vec<ProcEntry> {
