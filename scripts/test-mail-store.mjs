@@ -130,6 +130,106 @@ test('a transient failure keeps rows, retries, and an own send survives the refr
     feed.stop();
 });
 
+test('a late send response never rolls back a state the engine already reported', async () => {
+    const mail = store(); const seen = []; let receive;
+    const transport = {
+        async request(method) { return method === 'agent.list' ? { agents: [] } : { items: [], next: null }; },
+        async subscribe(_p, cb) { receive = cb; return () => {}; }
+    };
+    // Local clock far ahead of engine time, as when the response is slow.
+    const feed = mail.mailFeed(transport, s => seen.push(s), () => 99_000);
+    await settle();
+    const to = addr('agt_b', 'bob');
+    receive(event({ msgId: 'msg_s', state: 'queued', at: 1000, attempts: 0, detail: null, from: 'local-unverified', to: 'agt_b',
+        sender: { kind: 'human', addr: null, name: null }, recipient: to, kind: 'request', preview: 'hi', threadId: 'msg_s', replyTo: null, via: null }));
+    receive(event({ msgId: 'msg_s', state: 'delivered', at: 1500, attempts: 1, detail: 'prompt_hook', from: 'local-unverified', to: 'agt_b', via: 'paste' }));
+    // Now the msg.send response arrives.
+    feed.upsert(mail.rowFromSend({ msgId: 'msg_s', cursor: 'c', replayed: false, state: 'queued', to }, 'hi', 99_000));
+    assert.equal(seen.at(-1).messages.get('msg_s').state, 'delivered');
+    // Response first: the send row shows, and the engine's first event replaces it.
+    feed.upsert(mail.rowFromSend({ msgId: 'msg_t', cursor: 'c', replayed: false, state: 'queued', to }, 'yo', 99_000));
+    assert.equal(seen.at(-1).messages.get('msg_t').state, 'queued');
+    receive(event({ msgId: 'msg_t', state: 'delivering', at: 1600, attempts: 1, detail: null, from: 'local-unverified', to: 'agt_b', via: 'paste' }));
+    assert.equal(seen.at(-1).messages.get('msg_t').state, 'delivering');
+    assert.equal(seen.at(-1).messages.get('msg_t').createdAt, 99_000, 'the local createdAt stays for ordering');
+    feed.stop();
+});
+
+test('events that arrive while an unknown mail is read are applied after the read', async () => {
+    const mail = store(); const seen = []; let receive; let reads = 0; let answer;
+    const transport = {
+        request(method) {
+            if (method === 'msg.read') { reads++; return new Promise(r => { answer = r; }); }
+            return Promise.resolve(method === 'agent.list' ? { agents: [{ id: 'agt_b', sessionKey: null }] } : { items: [], next: null });
+        },
+        async subscribe(_p, cb) { receive = cb; return () => {}; }
+    };
+    const feed = mail.mailFeed(transport, s => seen.push(s));
+    await settle();
+    const ev = (state, at) => event({ msgId: 'msg_old', state, at, attempts: 1, detail: null, from: 'local-unverified', to: 'agt_b', via: 'paste' });
+    receive(ev('delivering', 50));
+    receive(ev('delivered', 60));
+    assert.equal(reads, 1, 'one read per mail');
+    // The read captured the older state.
+    answer({ ...row('msg_old', 40, { state: 'delivering', stateAt: 50 }), body: 'full', attempts: 1, provenance: 'p', status: [] });
+    await settle();
+    assert.equal(seen.at(-1).messages.get('msg_old').state, 'delivered');
+    // The reverse order keeps the furthest state too.
+    receive(event({ msgId: 'msg_two', state: 'delivering', at: 70, attempts: 1, detail: null, from: 'local-unverified', to: 'agt_b' }));
+    receive(event({ msgId: 'msg_two', state: 'queued', at: 65, attempts: 0, detail: null, from: 'local-unverified', to: 'agt_b' }));
+    answer({ ...row('msg_two', 60, { state: 'delivered', stateAt: 80 }), body: 'b', attempts: 1, provenance: 'p', status: [] });
+    await settle();
+    assert.equal(seen.at(-1).messages.get('msg_two').state, 'delivered');
+    feed.stop();
+});
+
+test('the shown thread stays pinned when newer mail arrives for another agent', () => {
+    const { selectThread, threadsOf } = store();
+    const before = threadsOf([row('m1', 10)]);
+    // First open: the newest thread; the tab then pins it as the focus.
+    const pinned = selectThread(before, null);
+    assert.equal(pinned, 'agt_b');
+    const after = threadsOf([row('m1', 10), row('m2', 20, { to: addr('agt_c', 'carol') })]);
+    assert.equal(after[0].agentId, 'agt_c', 'carol is now the newest thread');
+    assert.equal(selectThread(after, pinned), 'agt_b', 'the pinned thread (and its draft) stays');
+    assert.equal(selectThread(after, null), 'agt_c');
+    assert.equal(selectThread(after, 'agt_gone'), 'agt_c', 'a focus with no thread falls back');
+    assert.equal(selectThread([], 'agt_b'), null);
+});
+
+test('mail naming an agent agent.list did not return refreshes the session map once (debounced)', async () => {
+    const mail = store(); const seen = []; let receive; let lists = 0;
+    const transport = {
+        async request(method) {
+            if (method === 'agent.list') {
+                lists++;
+                return { agents: lists === 1 ? [{ id: 'agt_b', sessionKey: 'claudeCode:s1' }] : [{ id: 'agt_b', sessionKey: 'claudeCode:s1' }, { id: 'agt_new', sessionKey: 'claudeCode:s9' }] };
+            }
+            return { items: [], next: null };
+        },
+        async subscribe(_p, cb) { receive = cb; return () => {}; }
+    };
+    const feed = mail.mailFeed(transport, s => seen.push(s));
+    await settle();
+    assert.equal(lists, 1);
+    const queued = (msgId, to, at) => event({ msgId, state: 'queued', at, attempts: 0, detail: null, from: 'local-unverified', to,
+        sender: { kind: 'human', addr: null, name: null }, recipient: addr(to, to), kind: 'request', preview: 'p', threadId: msgId, replyTo: null, via: null });
+    receive(queued('m_known', 'agt_b', 10));
+    assert.equal(mail.timers.filter(t => t.ms === mail.AGENT_REFRESH_MS).length, 0, 'a listed agent needs no refresh');
+    receive(queued('m_new1', 'agt_new', 11));
+    receive(queued('m_new2', 'agt_new', 12));
+    receive(queued('m_gone', 'agt_gone', 13));
+    const refresh = mail.timers.filter(t => t.ms === mail.AGENT_REFRESH_MS);
+    assert.equal(refresh.length, 1, 'one debounced agent.list for a burst');
+    refresh[0].fn(); await settle();
+    assert.equal(lists, 2);
+    assert.equal(seen.at(-1).sessionKeys.get('agt_new'), 'claudeCode:s9');
+    // agt_gone was asked about and not listed: no refresh loop.
+    receive(queued('m_gone2', 'agt_gone', 14));
+    assert.equal(mail.timers.filter(t => t.ms === mail.AGENT_REFRESH_MS).length, 1);
+    feed.stop();
+});
+
 test('threads: one per agent, agent mail in both threads, attention and labels', () => {
     const mail = store();
     const a2b = row('m2', 20, { from: { kind: 'agent', addr: 'm1/agt_a', name: 'alice' }, state: 'uncertain', detail: 'paste not seen' });

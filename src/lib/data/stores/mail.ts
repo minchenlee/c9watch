@@ -15,6 +15,10 @@ export const ownMail = writable<ReadonlySet<string>>(new Set());
 /** Agents this app run paused. No core read returns pause state yet, so this
  * is lost on reload. */
 export const pausedAgents = writable<ReadonlySet<string>>(new Set());
+/** Agents whose pause state this app run set (paused or resumed). For any
+ * other agent the state is unknown: it may still be paused from an earlier
+ * run, so the MAIL tab offers Resume too. */
+export const pauseKnown = writable<ReadonlySet<string>>(new Set());
 
 export const mail = readable<MailSnapshot>(EMPTY, set => {
     let last: boolean | undefined;
@@ -24,6 +28,7 @@ export const mail = readable<MailSnapshot>(EMPTY, set => {
         feed?.stop();
         ownMail.set(new Set());
         pausedAgents.set(new Set());
+        pauseKnown.set(new Set());
         set(EMPTY);
         feed = mailFeed(transport(), set);
     });
@@ -54,7 +59,10 @@ export async function sendMail(to: string, body: string): Promise<string | null>
         const result = await transport().request('msg.send', { to, body });
         ownMail.update(s => new Set(s).add(result.msgId));
         feed?.upsert(rowFromSend(result, body, Date.now()));
-        if (result.paused) pausedAgents.update(s => new Set(s).add(result.to.id));
+        if (result.paused) {
+            pausedAgents.update(s => new Set(s).add(result.to.id));
+            pauseKnown.update(s => new Set(s).add(result.to.id));
+        }
         return null;
     } catch (e) { return message(e); }
 }
@@ -62,7 +70,9 @@ export async function cancelMail(msgId: string): Promise<string | null> {
     try {
         await transport().request('msg.cancel', { msgId });
         const row = get(mail).messages.get(msgId);
-        if (row) feed?.upsert({ ...row, state: 'cancelled', stateAt: Math.max(Date.now(), row.stateAt), detail: null });
+        // Same engine time as the row: the engine's own `cancelled` event
+        // (or any later state) still wins over this local guess.
+        if (row) feed?.upsert({ ...row, state: 'cancelled', stateAt: row.stateAt, detail: null });
         return null;
     } catch (e) { return message(e); }
 }
@@ -70,6 +80,7 @@ export async function setMailPaused(agentId: string, paused: boolean): Promise<s
     try {
         await transport().request(paused ? 'mail.pause' : 'mail.resume', { agent: agentId });
         pausedAgents.update(s => { const n = new Set(s); if (paused) n.add(agentId); else n.delete(agentId); return n; });
+        pauseKnown.update(s => new Set(s).add(agentId));
         return null;
     } catch (e) { return message(e); }
 }

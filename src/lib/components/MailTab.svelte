@@ -2,10 +2,10 @@
 	import { tick } from 'svelte';
 	import { flyIn } from '$lib/transitions';
 	import {
-		mail, mailThreads, ownMail, pausedAgents, mailFocus,
+		mail, mailThreads, ownMail, pausedAgents, pauseKnown, mailFocus,
 		sendMail, cancelMail, setMailPaused, readMailBody
 	} from '$lib/stores/mail';
-	import { sourceOf, stateLabel, routeLabel, isHeld, needsAttention, type MailSource } from '$lib/mail-store';
+	import { sourceOf, stateLabel, routeLabel, isHeld, needsAttention, selectThread, type MailSource } from '$lib/mail-store';
 	import type { C9pMsgSummary } from '$lib/c9p-1';
 
 	const ROUTE_HELP: Record<string, string> = {
@@ -14,11 +14,23 @@
 	};
 
 	let threads = $derived($mailThreads);
-	let selectedId = $derived($mailFocus && threads.some(t => t.agentId === $mailFocus) ? $mailFocus : threads[0]?.agentId ?? null);
+	let selectedId = $derived(selectThread(threads, $mailFocus));
 	let thread = $derived(threads.find(t => t.agentId === selectedId) ?? null);
 	let paused = $derived(selectedId ? $pausedAgents.has(selectedId) : false);
+	/** No pause or resume from this app run: the engine may still hold a
+	 * pause from an earlier run, so Resume is offered too. */
+	let pauseUnknown = $derived(selectedId ? !$pauseKnown.has(selectedId) : false);
 
-	let draft = $state('');
+	// Pin the shown thread. Without this, newer mail for another agent
+	// would move the selection, and the draft, to that agent.
+	$effect(() => {
+		if (selectedId && selectedId !== $mailFocus) mailFocus.set(selectedId);
+	});
+
+	/** One draft per recipient. Text typed for one agent is never sent to
+	 * another, even when the selection changes. */
+	let drafts = $state<Record<string, string>>({});
+	let draft = $derived(selectedId ? drafts[selectedId] ?? '' : '');
 	let sending = $state(false);
 	let busy = $state<Record<string, boolean>>({});
 	let errors = $state<Record<string, string>>({});
@@ -67,16 +79,21 @@
 		if ('body' in r) bodies = { ...bodies, [m.msgId]: r.body };
 		else errors = { ...errors, [m.msgId]: r.error };
 	}
+	function setDraft(text: string) {
+		if (selectedId) drafts = { ...drafts, [selectedId]: text };
+	}
 	async function send() {
-		const body = draft.trim();
-		if (!body || !thread || sending) return;
+		// The recipient is the one the composer header shows now.
+		const to = selectedId;
+		const body = (to ? drafts[to] ?? '' : '').trim();
+		if (!to || !body || sending) return;
 		sending = true;
-		const error = await sendMail(thread.agentId, body);
+		const error = await sendMail(to, body);
 		sending = false;
 		if (error) { errors = { ...errors, send: error }; return; }
 		const { send: _s, ...rest } = errors;
 		errors = rest;
-		draft = '';
+		drafts = { ...drafts, [to]: '' };
 		await tick();
 		listEl?.scrollTo({ top: listEl.scrollHeight });
 	}
@@ -155,6 +172,17 @@
 								Pause mail
 							{/if}
 						</button>
+						{#if pauseUnknown}
+							<button
+								class="action-btn"
+								disabled={busy.pause}
+								onclick={() => run('pause', () => setMailPaused(thread!.agentId, false))}
+								title="Pause state is not known after a reload. Use this if you paused agent mail to this agent earlier."
+							>
+								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polygon points="6 4 20 12 6 20 6 4" /></svg>
+								Resume mail
+							</button>
+						{/if}
 					</header>
 					{#if errors.pause}<div class="action-error">{errors.pause}</div>{/if}
 
@@ -221,7 +249,8 @@
 								id="mail-draft"
 								rows="2"
 								placeholder="Write to {thread.name}. The engine pastes it into the session. ⌘↵ sends."
-								bind:value={draft}
+								value={draft}
+								oninput={(e) => setDraft((e.currentTarget as HTMLTextAreaElement).value)}
 								onkeydown={onComposerKey}
 								disabled={sending}
 							></textarea>

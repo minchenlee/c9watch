@@ -27,6 +27,8 @@ export interface MailFeed {
 export const PAGE_LIMIT = 200;
 export const MAX_PAGES = 5;
 const RETRY_MS = 5000;
+/** Wait before `agent.list` runs again for an agent it did not list yet. */
+export const AGENT_REFRESH_MS = 1000;
 const UNAVAILABLE = new Set(['not_allowed', 'unknown_method', 'upgrade_required', 'unsupported']);
 
 export function errorCode(error: unknown): string | null {
@@ -68,11 +70,14 @@ export function applyState(row: C9pMsgSummary | undefined, e: C9pMsgStateEvent):
 }
 
 /** The row this client shows right after its own `msg.send`, before the
- * `queued` event arrives. */
+ * `queued` event arrives. The send result has no engine time, so the row's
+ * `stateAt` is 0: any engine event or `msg.list` row wins over it, and it
+ * never replaces a state the engine already reported. `createdAt` is local
+ * time, only for ordering and for keeping the row across a refresh. */
 export function rowFromSend(result: C9pMsgSendResult, body: string, now: number): C9pMsgSummary {
     return {
         msgId: result.msgId, from: { kind: 'human', addr: null, name: null }, to: result.to, kind: 'request',
-        state: result.state, stateAt: now, createdAt: now, detail: null, via: null, replyTo: null,
+        state: result.state, stateAt: 0, createdAt: now, detail: null, via: null, replyTo: null,
         threadId: null, noticeId: null, hop: 0, preview: [...body].slice(0, 200).join('')
     };
 }
@@ -86,20 +91,59 @@ export function mailFeed(t: Transport, apply: (s: MailSnapshot) => void, now: ()
     let stopped = false;
     let unsubscribe: (() => void) | null = null;
     let retry: ReturnType<typeof setTimeout> | null = null;
-    const reading = new Set<string>();
+    /** msgId → events that arrived while its `msg.read` was in flight. */
+    const reading = new Map<string, C9pMsgStateEvent[]>();
+    /** Agent ids the last `agent.list` returned, and ids it was asked about
+     * and did not return (so one retired agent cannot loop the refresh). */
+    let listedAgents = new Set<string>();
+    const askedAgents = new Set<string>();
+    let agentTimer: ReturnType<typeof setTimeout> | null = null;
     const publish = () => apply({ status, error, messages: new Map(messages), sessionKeys: new Map(sessionKeys) });
 
+    function setAgents(agents: C9pAgentRow[]) {
+        listedAgents = new Set(agents.map(a => a.id));
+        sessionKeys = new Map(agents.filter(a => a.sessionKey).map(a => [a.id, a.sessionKey as string]));
+    }
+    /** A live event named an agent `agent.list` did not return: list again
+     * (debounced), so a new agent's card gets its mail line. */
+    function noticeAgents(row: C9pMsgSummary, mine: number) {
+        const ids = [row.to.id, row.from.kind === 'agent' ? agentIdOf(row.from.addr) : null];
+        let unknown = false;
+        for (const id of ids) {
+            if (!id || listedAgents.has(id) || askedAgents.has(id)) continue;
+            askedAgents.add(id);
+            unknown = true;
+        }
+        if (!unknown || agentTimer) return;
+        agentTimer = setTimeout(() => {
+            agentTimer = null;
+            if (stopped || mine !== generation) return;
+            t.request('agent.list', {}).then(r => {
+                if (stopped || mine !== generation) return;
+                setAgents(r.agents ?? []);
+                publish();
+            }, () => {});
+        }, AGENT_REFRESH_MS);
+    }
     function readMissing(e: C9pMsgStateEvent, mine: number) {
-        if (reading.has(e.msgId)) return;
-        reading.add(e.msgId);
+        const waiting = reading.get(e.msgId);
+        if (waiting) { waiting.push(e); return; }
+        reading.set(e.msgId, [e]);
+        const done = () => reading.delete(e.msgId);
         t.request('msg.read', { msgId: e.msgId }).then(r => {
+            const events = reading.get(r.msgId) ?? [];
+            done();
             if (stopped || mine !== generation) return;
             const { body: _body, attempts: _a, provenance: _p, status: _s, ...summary } = r;
-            const row = messages.get(r.msgId);
-            // A newer event may have arrived while the read was in flight.
-            messages.set(r.msgId, row && row.stateAt >= summary.stateAt ? row : summary);
+            const old = messages.get(r.msgId);
+            // An event may have made the row while the read was in flight.
+            let row: C9pMsgSummary = old && old.stateAt >= summary.stateAt ? old : summary;
+            // Events that came during the read: each applies only if not older.
+            for (const ev of events) row = applyState(row, ev) ?? row;
+            messages.set(r.msgId, row);
+            noticeAgents(row, mine);
             publish();
-        }, () => {}).finally(() => reading.delete(e.msgId));
+        }, done);
     }
     function receive(frame: StreamFrame, mine: number) {
         if (!('type' in frame) || frame.type !== 'event' || !('topic' in frame) || frame.topic !== 'msg.state') return;
@@ -109,6 +153,7 @@ export function mailFeed(t: Transport, apply: (s: MailSnapshot) => void, now: ()
         if (!row) { readMissing(e, mine); return; }
         if (row === messages.get(e.msgId)) return;
         messages.set(e.msgId, row);
+        noticeAgents(row, mine);
         publish();
     }
     function fail(err: unknown, mine: number) {
@@ -156,7 +201,8 @@ export function mailFeed(t: Transport, apply: (s: MailSnapshot) => void, now: ()
             // A row added while this read ran (an own send) stays.
             for (const [id, row] of messages) if (!next.has(id) && row.createdAt >= startedAt) next.set(id, row);
             messages = next;
-            sessionKeys = new Map(agents.filter(a => a.sessionKey).map(a => [a.id, a.sessionKey as string]));
+            setAgents(agents);
+            askedAgents.clear();
             status = 'ready'; error = null;
             ready = true;
             for (const frame of buffered.splice(0)) receive(frame, mine);
@@ -166,10 +212,15 @@ export function mailFeed(t: Transport, apply: (s: MailSnapshot) => void, now: ()
     publish();
     void refresh();
     return {
-        stop() { stopped = true; generation++; unsubscribe?.(); unsubscribe = null; if (retry) clearTimeout(retry); },
+        stop() {
+            stopped = true; generation++; unsubscribe?.(); unsubscribe = null;
+            if (retry) clearTimeout(retry);
+            if (agentTimer) clearTimeout(agentTimer);
+        },
         upsert(row) {
             if (stopped) return;
             const old = messages.get(row.msgId);
+            // Engine time orders states; a row never goes back to an older one.
             if (old && old.stateAt > row.stateAt) return;
             messages.set(row.msgId, old ? { ...old, ...row, createdAt: old.createdAt } : row);
             publish();
@@ -213,6 +264,14 @@ export function routeLabel(via: string | null): string | null {
     if (via === 'socket') return 'PEER';
     if (via === 'paste') return 'PASTE';
     return via ? via.toUpperCase() : null;
+}
+
+/** The thread the MAIL tab shows: the focused agent when it has a thread,
+ * else the newest thread. The tab pins this choice (it writes it to the
+ * focus), so newer mail never moves the selection, or a draft, to another
+ * agent. */
+export function selectThread(threads: readonly Pick<MailThread, 'agentId'>[], focus: string | null): string | null {
+    return focus && threads.some(t => t.agentId === focus) ? focus : threads[0]?.agentId ?? null;
 }
 
 /** One thread per agent: mail to it, and mail it sent. An agent-to-agent
