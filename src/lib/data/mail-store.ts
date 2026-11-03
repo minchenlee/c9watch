@@ -27,8 +27,14 @@ export interface MailFeed {
 export const PAGE_LIMIT = 200;
 export const MAX_PAGES = 5;
 const RETRY_MS = 5000;
-/** Wait before `agent.list` runs again for an agent it did not list yet. */
-export const AGENT_REFRESH_MS = 1000;
+/** An agent without a session key yet (not listed, or listed with
+ * `sessionKey: null` until detection finds its session) makes a later event
+ * run `agent.list` again: after at least this wait, ... */
+export const AGENT_DEBOUNCE_MS = 1000;
+/** ... at most once per this interval overall, ... */
+export const AGENT_REFRESH_MS = 5000;
+/** ... and for one agent only within this time after its first ask. */
+export const AGENT_GIVE_UP_MS = 60_000;
 const UNAVAILABLE = new Set(['not_allowed', 'unknown_method', 'upgrade_required', 'unsupported']);
 
 export function errorCode(error: unknown): string | null {
@@ -93,37 +99,43 @@ export function mailFeed(t: Transport, apply: (s: MailSnapshot) => void, now: ()
     let retry: ReturnType<typeof setTimeout> | null = null;
     /** msgId → events that arrived while its `msg.read` was in flight. */
     const reading = new Map<string, C9pMsgStateEvent[]>();
-    /** Agent ids the last `agent.list` returned, and ids it was asked about
-     * and did not return (so one retired agent cannot loop the refresh). */
-    let listedAgents = new Set<string>();
-    const askedAgents = new Set<string>();
+    /** Agent id → when a refresh was first asked for it. After
+     * AGENT_GIVE_UP_MS the agent is left alone (a retired agent, or one
+     * that never gets a session, cannot keep `agent.list` running). */
+    const askedAgents = new Map<string, number>();
     let agentTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastAgentList = -Infinity;
     const publish = () => apply({ status, error, messages: new Map(messages), sessionKeys: new Map(sessionKeys) });
 
     function setAgents(agents: C9pAgentRow[]) {
-        listedAgents = new Set(agents.map(a => a.id));
         sessionKeys = new Map(agents.filter(a => a.sessionKey).map(a => [a.id, a.sessionKey as string]));
     }
-    /** A live event named an agent `agent.list` did not return: list again
-     * (debounced), so a new agent's card gets its mail line. */
+    /** A live event named an agent with no session key yet: list again
+     * (debounced, rate-limited, bounded per agent), so a new agent's card
+     * gets its mail line once detection finds its session. */
     function noticeAgents(row: C9pMsgSummary, mine: number) {
         const ids = [row.to.id, row.from.kind === 'agent' ? agentIdOf(row.from.addr) : null];
-        let unknown = false;
+        const at = now();
+        let unresolved = false;
         for (const id of ids) {
-            if (!id || listedAgents.has(id) || askedAgents.has(id)) continue;
-            askedAgents.add(id);
-            unknown = true;
+            if (!id || sessionKeys.has(id)) continue;
+            const first = askedAgents.get(id);
+            if (first === undefined) askedAgents.set(id, at);
+            else if (at - first > AGENT_GIVE_UP_MS) continue;
+            unresolved = true;
         }
-        if (!unknown || agentTimer) return;
+        if (!unresolved || agentTimer) return;
+        const wait = Math.max(AGENT_DEBOUNCE_MS, lastAgentList + AGENT_REFRESH_MS - at);
         agentTimer = setTimeout(() => {
             agentTimer = null;
             if (stopped || mine !== generation) return;
+            lastAgentList = now();
             t.request('agent.list', {}).then(r => {
                 if (stopped || mine !== generation) return;
                 setAgents(r.agents ?? []);
                 publish();
             }, () => {});
-        }, AGENT_REFRESH_MS);
+        }, wait);
     }
     function readMissing(e: C9pMsgStateEvent, mine: number) {
         const waiting = reading.get(e.msgId);
@@ -195,6 +207,7 @@ export function mailFeed(t: Transport, apply: (s: MailSnapshot) => void, now: ()
                 page = await t.request('msg.list', { limit: PAGE_LIMIT, before: page.next });
             }
             let agents: C9pAgentRow[] = [];
+            lastAgentList = now();
             try { agents = (await t.request('agent.list', {})).agents ?? []; } catch { /* names only */ }
             if (stopped || mine !== generation) return;
             const next = new Map(items.map(m => [m.msgId, m]));

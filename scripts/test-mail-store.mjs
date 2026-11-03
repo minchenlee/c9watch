@@ -197,8 +197,11 @@ test('the shown thread stays pinned when newer mail arrives for another agent', 
     assert.equal(selectThread([], 'agt_b'), null);
 });
 
-test('mail naming an agent agent.list did not return refreshes the session map once (debounced)', async () => {
-    const mail = store(); const seen = []; let receive; let lists = 0;
+const queuedTo = (msgId, to, at) => event({ msgId, state: 'queued', at, attempts: 0, detail: null, from: 'local-unverified', to,
+    sender: { kind: 'human', addr: null, name: null }, recipient: addr(to, to), kind: 'request', preview: 'p', threadId: msgId, replyTo: null, via: null });
+
+test('mail naming an agent with no session key refreshes the session map: debounced, rate-limited, bounded', async () => {
+    const mail = store(); const seen = []; let receive; let lists = 0; let clock = 0;
     const transport = {
         async request(method) {
             if (method === 'agent.list') {
@@ -209,24 +212,61 @@ test('mail naming an agent agent.list did not return refreshes the session map o
         },
         async subscribe(_p, cb) { receive = cb; return () => {}; }
     };
-    const feed = mail.mailFeed(transport, s => seen.push(s));
+    const feed = mail.mailFeed(transport, s => seen.push(s), () => clock);
     await settle();
     assert.equal(lists, 1);
-    const queued = (msgId, to, at) => event({ msgId, state: 'queued', at, attempts: 0, detail: null, from: 'local-unverified', to,
-        sender: { kind: 'human', addr: null, name: null }, recipient: addr(to, to), kind: 'request', preview: 'p', threadId: msgId, replyTo: null, via: null });
-    receive(queued('m_known', 'agt_b', 10));
-    assert.equal(mail.timers.filter(t => t.ms === mail.AGENT_REFRESH_MS).length, 0, 'a listed agent needs no refresh');
-    receive(queued('m_new1', 'agt_new', 11));
-    receive(queued('m_new2', 'agt_new', 12));
-    receive(queued('m_gone', 'agt_gone', 13));
-    const refresh = mail.timers.filter(t => t.ms === mail.AGENT_REFRESH_MS);
-    assert.equal(refresh.length, 1, 'one debounced agent.list for a burst');
-    refresh[0].fn(); await settle();
+    receive(queuedTo('m_known', 'agt_b', 10));
+    assert.equal(mail.timers.length, 0, 'an agent with a session key needs no refresh');
+    receive(queuedTo('m_new1', 'agt_new', 11));
+    receive(queuedTo('m_new2', 'agt_new', 12));
+    receive(queuedTo('m_gone', 'agt_gone', 13));
+    assert.equal(mail.timers.length, 1, 'one agent.list for a burst');
+    // The snapshot listed agents at t=0, so the next list waits for the 5 s window.
+    assert.equal(mail.timers[0].ms, mail.AGENT_REFRESH_MS);
+    clock = 5000;
+    mail.timers.shift().fn(); await settle();
     assert.equal(lists, 2);
     assert.equal(seen.at(-1).sessionKeys.get('agt_new'), 'claudeCode:s9');
-    // agt_gone was asked about and not listed: no refresh loop.
-    receive(queued('m_gone2', 'agt_gone', 14));
-    assert.equal(mail.timers.filter(t => t.ms === mail.AGENT_REFRESH_MS).length, 1);
+    // agt_gone is still not listed: later events retry, at most once per 5 s ...
+    clock = 6000;
+    receive(queuedTo('m_gone2', 'agt_gone', 14));
+    assert.equal(mail.timers.length, 1);
+    assert.equal(mail.timers[0].ms, 4000);
+    clock = 10_000;
+    mail.timers.shift().fn(); await settle();
+    assert.equal(lists, 3);
+    // ... and give up a minute after the first ask.
+    clock = 13 + mail.AGENT_GIVE_UP_MS + 1;
+    receive(queuedTo('m_gone3', 'agt_gone', 15));
+    assert.equal(mail.timers.length, 0, 'no refresh loop for an agent that never shows');
+    feed.stop();
+});
+
+test('an agent listed with sessionKey null maps once detection gives it a key', async () => {
+    const mail = store(); const seen = []; let receive; let lists = 0; let clock = 0;
+    const transport = {
+        async request(method) {
+            if (method === 'agent.list') {
+                lists++;
+                // New engine agent: listed at once, session key only after detection.
+                return { agents: [{ id: 'agt_n', sessionKey: lists === 1 ? null : 'claudeCode:s7' }] };
+            }
+            return { items: [row('m0', 1, { to: addr('agt_n', 'nia') })], next: null };
+        },
+        async subscribe(_p, cb) { receive = cb; return () => {}; }
+    };
+    const feed = mail.mailFeed(transport, s => seen.push(s), () => clock);
+    await settle();
+    assert.equal(seen.at(-1).sessionKeys.has('agt_n'), false);
+    clock = 8000;
+    receive(queuedTo('m1', 'agt_n', 8000));
+    assert.equal(mail.timers.length, 1, 'a listed agent without a key is still unresolved');
+    assert.equal(mail.timers[0].ms, mail.AGENT_DEBOUNCE_MS);
+    mail.timers.shift().fn(); await settle();
+    assert.equal(lists, 2);
+    assert.equal(seen.at(-1).sessionKeys.get('agt_n'), 'claudeCode:s7');
+    receive(queuedTo('m2', 'agt_n', 9000));
+    assert.equal(mail.timers.length, 0, 'resolved: no more lists');
     feed.stop();
 });
 
