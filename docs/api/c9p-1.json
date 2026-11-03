@@ -4959,10 +4959,12 @@
       "x-authz": {
         "admission": [
           "unix_peer",
+          "agent_parent",
           "mutating_peer"
         ],
         "principals": [
-          "local-unverified"
+          "local-unverified",
+          "agent"
         ],
         "resource": "agent",
         "verb": "write"
@@ -5040,10 +5042,12 @@
       "x-authz": {
         "admission": [
           "unix_peer",
+          "agent_parent",
           "mutating_peer"
         ],
         "principals": [
-          "local-unverified"
+          "local-unverified",
+          "agent"
         ],
         "resource": "agent",
         "verb": "write"

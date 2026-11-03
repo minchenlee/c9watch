@@ -1,0 +1,93 @@
+# E5 agent creates agent: owner live test
+
+Run this in a plain terminal (Ghostty), not from Claude Code or any of its
+descendants: D8 refuses `agent.create` there, by design. It uses a
+separate engine home, so your normal engine and agents are not touched.
+
+## Setup
+
+```sh
+# Build this branch: the engine binary and c9watch-agent next to it.
+# Without --link it does not touch ~/.local/bin/c9watch.
+cd ~/Documents/GitHub/c9watch   # on branch feature/e5-agent-creates-agent
+scripts/dogfood-build.sh
+C9=$PWD/src-tauri/target/release/c9watch   # or $CARGO_TARGET_DIR/release/c9watch
+
+export C9WATCH_ENGINE_HOME=$HOME/e5-test/home
+R=$HOME/e5-test/root
+mkdir -p "$R"/a/c "$R"/a/c/g "$R"/a/k "$R"/b "$R"/a/.git/x
+R=$(cd "$R" && pwd -P)
+```
+
+## 1. Parent from the terminal
+
+```sh
+$C9 api agent.create "{\"mode\":\"free\",\"cwd\":\"$R/a\",\
+\"guard\":{\"denyWriteUnder\":[\"$R\"],\"allowWrite\":[\"$R/a\"]}}"
+```
+
+Expect: `ready`. Note the id as `P`. Open the agent (GUI MONITOR card, or
+`$C9 api agent.list`) and type into it.
+
+## 2. In the parent agent: create a child
+
+Ask the parent to run exactly this in its Bash (paths spelled out):
+
+```sh
+B="$(dirname "$C9_ENGINE_SOCK")/bin/c9watch-agent"
+"$B" child create --idem c1 --params '{"mode":"free","cwd":"<R>/a/c","guard":{"denyWriteUnder":["<R>"],"allowWrite":["<R>/a/c"]},"require":["hook.pre_tool_use.block"]}'
+```
+
+Expect: JSON with the child `ready`. Then, from the terminal:
+
+- [ ] `$C9 api agent.list` shows the child with `parentId` = `P`.
+- [ ] Running the same command again (same `--idem c1`) returns the same
+      child id, and no second agent appears.
+
+## 3. In the parent agent: refusals
+
+Each must fail with `not_allowed` and spawn nothing:
+
+- [ ] No `guard`: `--params '{"mode":"free","cwd":"<R>/a/k"}'`.
+- [ ] Outside the parent's area: cwd `<R>/b`.
+- [ ] The parent's own cwd: cwd `<R>/a`.
+- [ ] Inside `.git`: cwd `<R>/a/.git/x`.
+- [ ] A looser guard: `"guard":{"denyWriteUnder":["<R>/a"],"allowWrite":["<R>/a/k"]}`
+      (drops the parent's deny on `<R>`).
+- [ ] An extra field: add `"overlay":{}` to a good create.
+- [ ] Another binary: `"$C9" api agent.create '<good params>'` from the
+      parent's Bash fails with `peer_not_authorized` (or `not_allowed`).
+
+## 4. Retire scope
+
+- [ ] From the terminal, create a second root agent in `<R>/b` (as in 1,
+      with `allowWrite` `<R>/b`); note it as `Q`.
+- [ ] In the parent: `"$B" child retire <Q>` fails with `not_allowed`.
+- [ ] In the parent: `"$B" child retire <P>` (itself) fails with `not_allowed`.
+- [ ] In the child: a grandchild in `<R>/a/c/g` (guard deny `<R>`, allow
+      `<R>/a/c/g`) is `ready`.
+
+## 5. Lifecycle
+
+- [ ] `$C9 engine restart`: the parent, child and grandchild come back
+      (`agent.list`), with the same `parentId`s, and none is retired.
+- [ ] From the terminal: `$C9 api agent.retire "{\"id\":\"<P>\"}"`. Within
+      about 2 s the child and the grandchild are `retired`.
+- [ ] Audit: `sqlite3 "$C9WATCH_ENGINE_HOME/engine.db" "select principal,
+      method,decision,reason from audit where method like 'agent.%' order
+      by seq"` shows each create and retire, the refusals of step 3 as
+      `deny`, and `system` / `parent-gone: <P>` for the two children.
+
+## 6. Limits (optional)
+
+From one agent, the 9th live child fails with "live children"; a chain
+deeper than 3 below the root fails with "depth 4"; a tree past 16 live
+agents fails with "16 live agents".
+
+## Cleanup
+
+```sh
+$C9 api agent.retire "{\"id\":\"<Q>\"}"
+$C9 engine stop
+rm -rf "$HOME/e5-test"
+```

@@ -45,10 +45,11 @@
 //! answers with the standing orders (`engine::standing`, C1a-25), except
 //! while the engine drains (C1a-27, `engine::drain`).
 //!
-//! `agent.create`, `agent.retire` and `agent.resume` take only a local
-//! client (`local-unverified`); an agent or an observed session gets
-//! `not_allowed`, which is audited. The work is in `engine::create`
-//! (C1a-26).
+//! `agent.create`, `agent.retire` and `agent.resume` take a local client
+//! (`local-unverified`); an observed session gets `not_allowed`, which is
+//! audited. An agent may create and retire its own children (E5,
+//! `engine::lineage`) after `Admission::AgentParent`; `agent.resume` stays
+//! local. The work is in `engine::create` (C1a-26).
 //!
 //! `session.views` and `session.away` serve the session views and the
 //! away-activity index that each detection tick keeps (`views::sessions`).
@@ -1366,7 +1367,13 @@ async fn dispatch(
     if !METHODS.contains(&method) {
         return Err(ApiError::new(ErrorCode::UnknownMethod, "unknown method"));
     }
-    let target = ["sessionKey", "sessionId", "agentId", "to", "agent", "msgId"]
+    // `agent.retire` names its agent `id`.
+    let keys: &[&str] = if method == "agent.retire" {
+        &["id"]
+    } else {
+        &["sessionKey", "sessionId", "agentId", "to", "agent", "msgId"]
+    };
+    let target = keys
         .iter()
         .find_map(|k| req.params.get(*k).and_then(|v| v.as_str()))
         .unwrap_or_default()
@@ -1406,6 +1413,13 @@ async fn dispatch(
             | "mail.resume"
     ) || is_hook_class(method)
         || annotations::is_write(method);
+    // E5: the spawner audits what it does; an agent's create or retire
+    // that it refuses is audited here.
+    if let (Principal::Agent { .. }, Err(e)) = (principal, &result) {
+        if matches!(method, "agent.create" | "agent.retire") {
+            audit_refusal(ctx, principal, method, &target, e).await;
+        }
+    }
     if !owned_audit {
         match authz::audit_level(method, principal, result.is_ok(), Ceiling::Conversation) {
             authz::AuditLevel::None => {}
@@ -1458,7 +1472,17 @@ async fn admit(
             Admission::UnixPeer => {
                 peer.unix()?;
             }
+            // E5: an agent that passed `AgentParent` skips this; its Bash
+            // is confined by design.
+            Admission::MutatingPeer
+                if matches!(principal, Principal::Agent { .. })
+                    && rule.admission.contains(&Admission::AgentParent) => {}
             Admission::MutatingPeer => check_mutating_peer(method, ctx, peer, principal).await?,
+            Admission::AgentParent => {
+                if let Principal::Agent { id, gen } = principal {
+                    check_agent_parent(method, ctx, peer, id, *gen).await?;
+                }
+            }
             Admission::OwnSession => {
                 if let Principal::Observed { session_key } = principal {
                     if params.get("sessionKey").and_then(|v| v.as_str())
@@ -1765,6 +1789,51 @@ async fn check_mutating_peer(
             format!("{} refused for this peer: {}", method, why),
         )
     })
+}
+
+/// `Admission::AgentParent` for the agent `id` at generation `gen`: the
+/// peer runs the engine's `c9watch-agent` copy and is the process stamped
+/// at accept (`authorize_hook`), and `principal::check_agent_parent`.
+async fn check_agent_parent(
+    method: &str,
+    ctx: &ServerCtx,
+    peer: Peer,
+    id: &str,
+    gen: i64,
+) -> Result<(), ApiError> {
+    let unix = peer.unix()?;
+    ctx.ensure_views().await?;
+    let (bin, agents, observed) = (
+        ctx.agent_bin.clone(),
+        ctx.agents.clone(),
+        ctx.observed_sessions(),
+    );
+    let (id, who) = (
+        id.to_string(),
+        Principal::Agent {
+            id: id.to_string(),
+            gen,
+        },
+    );
+    let method = method.to_string();
+    blocking(move || {
+        authorize_hook(bin.as_deref(), peer, &who, &id)?;
+        principal::check_agent_parent(
+            unix.cred.pid,
+            unix.start,
+            &id,
+            gen,
+            agents.as_ref(),
+            observed.as_ref(),
+        )
+        .map_err(|why| {
+            ApiError::new(
+                ErrorCode::PeerNotAuthorized,
+                format!("{} refused for this peer: {}", method, why),
+            )
+        })
+    })
+    .await
 }
 
 async fn check_teammate_ancestry(
@@ -3848,27 +3917,37 @@ mod tests {
             .contains("no c9watch-agent"));
     }
 
-    /// Reviews: an agent's create or retire is `not_allowed` and audited,
-    /// also on an engine with no spawner.
+    /// E5: an agent's create or retire passes only from the engine's
+    /// `c9watch-agent` copy. A process under the agent that runs another
+    /// binary (its Bash running a copy, here the test binary) is refused
+    /// before the spawner, and audited; so is every agent on an engine
+    /// with no copy.
     #[tokio::test]
-    async fn an_agent_may_not_create_or_retire_even_without_a_spawner() {
-        let (_t, ctx, db) = ctx_db(as_agent("a7"));
-        let (mut c, _) = Client::new(ctx).await;
-        for (i, m) in ["agent.create", "agent.retire"].iter().enumerate() {
-            let r = c.call(&i.to_string(), m, json!({})).await;
-            assert_eq!(r["error"]["code"], "not_allowed", "{}: {}", m, r);
+    async fn an_agent_create_or_retire_needs_the_agent_exe() {
+        for (with_bin, says) in [(true, "not the engine's"), (false, "no c9watch-agent")] {
+            let (_t, ctx, db) = if with_bin {
+                ctx_with_bin(as_agent("a7"))
+            } else {
+                ctx_db(as_agent("a7"))
+            };
+            let (mut c, hello) = Client::new(ctx).await;
+            assert_eq!(hello["principal"], "agent:a7");
+            let calls = [
+                ("agent.create", json!({"mode": "free", "cwd": "/tmp"})),
+                ("agent.retire", json!({"id": "agt_x"})),
+            ];
+            for (i, (m, params)) in calls.iter().enumerate() {
+                let r = c.call(&i.to_string(), m, params.clone()).await;
+                assert_eq!(r["error"]["code"], "peer_not_authorized", "{}: {}", m, r);
+                assert!(r["error"]["msg"].as_str().unwrap().contains(says), "{}", r);
+            }
+            let rows: Vec<(String, String, String)> = audit_rows(&db)
+                .into_iter()
+                .map(|(p, m, d, _)| (p, m, d))
+                .collect();
+            let row = |m: &str| ("agent:a7".to_string(), m.to_string(), "deny".to_string());
+            assert_eq!(rows, [row("agent.create"), row("agent.retire")]);
         }
-        let rows: Vec<(String, String)> = audit_rows(&db)
-            .into_iter()
-            .map(|(p, m, _, _)| (p, m))
-            .collect();
-        assert_eq!(
-            rows,
-            [
-                ("agent:a7".to_string(), "agent.create".to_string()),
-                ("agent:a7".to_string(), "agent.retire".to_string()),
-            ]
-        );
     }
 
     #[tokio::test]

@@ -53,6 +53,7 @@ use super::drain::{self, DrainSwitch};
 use super::fsutil::ensure_private_dir;
 use super::home::{lock_path, sock_path};
 use super::import;
+use super::lineage;
 use super::lock::acquire_engine_lock;
 use super::machine;
 use super::mail;
@@ -249,6 +250,8 @@ pub async fn run_until(
     // offset in the old `engine.log`.
     rotate_log(home);
     let pruner = tokio::spawn(upkeep_loop(db.clone(), home.to_path_buf()));
+    // E5: after the boot resume, so a parent it brings back keeps its tree.
+    let lineage = tokio::spawn(lineage_loop(spawner.clone()));
     let provenance = config
         .detection
         .then(|| tokio::spawn(provenance_loop(ctx.clone(), config.agents.clone())));
@@ -306,6 +309,7 @@ pub async fn run_until(
     }
     elog!(Info, "run", "Shutting down ({:?})", sig);
     pruner.abort();
+    lineage.abort();
     if let Some(p) = provenance {
         p.abort();
     }
@@ -451,6 +455,17 @@ async fn provenance_loop(ctx: Arc<ServerCtx>, agents: Arc<LiveTable>) {
         if let Err(e) = scanned {
             elog!(Error, "run", "Provenance scan: {}", e);
         }
+    }
+}
+
+/// Retire the children whose parent can no longer come back (E5), every
+/// `lineage::SWEEP`. The first pass runs at boot.
+async fn lineage_loop(spawner: Arc<Spawner>) {
+    let mut tick = tokio::time::interval(lineage::SWEEP);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        spawner.retire_orphans().await;
     }
 }
 

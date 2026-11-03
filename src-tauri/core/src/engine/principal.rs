@@ -394,6 +394,70 @@ fn no_foreign_origin(
     Ok(())
 }
 
+/// E5 (`Admission::AgentParent`): the checks before the agent `id` at
+/// generation `gen` may create or retire a child, beside the exe check
+/// the caller makes. The peer's whole ancestry, read now, must stamp as
+/// that agent again, so `gen` is still its current generation; its first
+/// entry is the process stamped at accept (`peer_start`); and every
+/// recorded origin (D34) in it is that agent at that generation. Blocking.
+pub fn check_agent_parent(
+    pid: libc::pid_t,
+    peer_start: Option<u64>,
+    id: &str,
+    gen: i64,
+    agents: &dyn LiveAgents,
+    observed: &dyn ObservedSessions,
+) -> Result<(), String> {
+    if agents.current_gen(id) != Some(gen) {
+        return Err(format!(
+            "generation {gen} of agent {id} is not its current generation"
+        ));
+    }
+    let chain = peer::full_ancestry(pid).ok_or_else(|| {
+        format!(
+            "the peer's ancestry could not be read up to init: {}",
+            peer::ancestry_gap(pid)
+        )
+    })?;
+    check_agent_chain(&chain, peer_start, id, gen, agents, observed)
+}
+
+/// [`check_agent_parent`] on a chain already read (the peer first).
+fn check_agent_chain(
+    chain: &[ProcInfo],
+    peer_start: Option<u64>,
+    id: &str,
+    gen: i64,
+    agents: &dyn LiveAgents,
+    observed: &dyn ObservedSessions,
+) -> Result<(), String> {
+    match (chain.first(), peer_start) {
+        (Some(first), Some(start)) if first.start == start => {}
+        _ => return Err("the peer is not the process that connected".into()),
+    }
+    let me = Principal::Agent {
+        id: id.to_string(),
+        gen,
+    };
+    let now = stamp_observed(chain, agents, observed);
+    if now != me {
+        return Err(format!("the peer now stamps as {now}, not {me}"));
+    }
+    for p in chain {
+        match observed.origin(p.pid, p.start) {
+            None => {}
+            Some(Origin::Agent { id: o, gen: g }) if o == id && g == gen => {}
+            Some(other) => {
+                return Err(format!(
+                    "pid {} in the peer's ancestry has the origin {:?}, not {}",
+                    p.pid, other, me
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The teammate and provenance parts of [`check_mutation`] alone, for a
 /// write whose other admission checks don't walk the peer's ancestry (an
 /// observed session's annotation or mail). `own` is the key an `observed:`
@@ -1189,5 +1253,54 @@ pub(crate) mod tests {
             stamp_observed(&orphan(), &NoLiveAgents, &same),
             observed("claudeCode:other")
         );
+    }
+
+    /// E5: a parent's create passes only as its current generation, from
+    /// the process stamped at accept, with no foreign origin in the chain.
+    #[test]
+    fn an_agent_parent_needs_its_own_chain() {
+        let agents = FakeAgents::one("a1", 10, 100);
+        let chain = bash_tool_chain(100);
+        let none = origins(&[]);
+        let check = |chain: &[ProcInfo], start, id, gen, seen: &FakeOrigins| {
+            check_agent_chain(chain, start, id, gen, &agents, seen)
+        };
+        assert_eq!(check(&chain, Some(300), "a1", 1, &none), Ok(()));
+        // An older generation, another agent's id, a reused peer pid.
+        assert!(check(&chain, Some(300), "a1", 0, &none).is_err());
+        assert!(check(&chain, Some(300), "a2", 1, &none).is_err());
+        assert!(check(&chain, Some(299), "a1", 1, &none).is_err());
+        assert!(check(&chain, None, "a1", 1, &none).is_err());
+        // Its own origin passes; another agent's or a session's does not.
+        let own = origins(&[(
+            (30, 300),
+            Origin::Agent {
+                id: "a1".into(),
+                gen: 1,
+            },
+        )]);
+        assert_eq!(check(&chain, Some(300), "a1", 1, &own), Ok(()));
+        for other in [
+            Origin::Agent {
+                id: "a1".into(),
+                gen: 0,
+            },
+            Origin::Agent {
+                id: "a2".into(),
+                gen: 1,
+            },
+            Origin::Session {
+                key: "claudeCode:s".into(),
+            },
+            Origin::Unknown,
+        ] {
+            let seen = origins(&[((20, 200), other.clone())]);
+            let e = check(&chain, Some(300), "a1", 1, &seen).unwrap_err();
+            assert!(e.contains("pid 20"), "{other:?}: {e}");
+        }
+        // Not under the agent's PTY child at all.
+        let e = check(&orphan(), Some(30), "a1", 1, &none).unwrap_err();
+        assert!(e.contains("stamps as local-unverified"), "{e}");
+        assert!(check_agent_parent(1, None, "a9", 1, &agents, &none).is_err());
     }
 }

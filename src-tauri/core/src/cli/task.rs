@@ -1,6 +1,7 @@
 //! The agent side of the c9 engine, as `c9watch-agent` runs it (C1a-21,
-//! D28 Q6=B): `hook <event>`, `task done --report <text|->` and `handoff
-//! --note <text|->`.
+//! D28 Q6=B): `hook <event>`, `task done --report <text|->`, `handoff
+//! --note <text|->`, and `child create` / `child retire` (E5: an agent's
+//! own children).
 //!
 //! The engine sets `C9_ENGINE_SOCK` and `C9_AGENT_ID` on the agent's PTY
 //! child. Neither is a secret: the engine knows who calls from the peer's
@@ -176,11 +177,22 @@ fn seq_now() -> String {
 
 /// One call on a new connection. `"<code>: <msg>"` on an engine error.
 fn call(env: &EngineEnv, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    call_idem(env, method, params, None, timeout)
+}
+
+/// `call` with an `idem` key.
+fn call_idem(
+    env: &EngineEnv,
+    method: &str,
+    params: Value,
+    idem: Option<String>,
+    timeout: Duration,
+) -> Result<Value, String> {
     let mut conn = Conn::connect(Path::new(&env.sock), "agent", timeout).map_err(|e| match e {
         ClientError::Unreachable(m) => format!("cannot reach the engine at {}: {}", env.sock, m),
         ClientError::Failed(m) => m,
     })?;
-    conn.call(method, params).map_err(|e| match e {
+    conn.call_idem(method, params, idem).map_err(|e| match e {
         ClientError::Unreachable(m) => format!("no reply from the engine: {}", m),
         ClientError::Failed(m) => m,
     })
@@ -253,6 +265,49 @@ pub fn cmd_handoff(note: &str) -> Result<(), String> {
     let note = text_or_stdin(note, "note")?;
     let result = handoff(&env, &note)?;
     println!("{}", result);
+    Ok(())
+}
+
+// ── child ─────────────────────────────────────────────────────────────
+
+/// How long `child create` waits: the engine answers once the child is
+/// ready (or failed), within `cc_screen::READY_TIMEOUT` of its spawn.
+pub const CHILD_CREATE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long `child retire` waits: a live child is killed and confirmed.
+pub const CHILD_RETIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `agent.create` of a child of this agent. `params` are the
+/// `agent.create` params (a JSON object); the engine checks them.
+pub fn child_create(env: &EngineEnv, params: Value, idem: Option<String>) -> Result<Value, String> {
+    if !params.is_object() {
+        return Err("child create: the params are not a JSON object".into());
+    }
+    call_idem(env, "agent.create", params, idem, CHILD_CREATE_TIMEOUT)
+        .map_err(|e| format!("child create: {}", e))
+}
+
+/// `agent.retire` of a descendant of this agent.
+pub fn child_retire(env: &EngineEnv, id: &str, idem: Option<String>) -> Result<Value, String> {
+    let params = serde_json::json!({ "id": id });
+    call_idem(env, "agent.retire", params, idem, CHILD_RETIRE_TIMEOUT)
+        .map_err(|e| format!("child retire: {}", e))
+}
+
+/// `c9watch-agent child create --params <json|-> [--idem <key>]`.
+pub fn cmd_child_create(params: &str, idem: Option<String>) -> Result<(), String> {
+    let env = engine_env(|k| std::env::var(k).ok()).map_err(|e| format!("child create: {}", e))?;
+    let text = text_or_stdin(params, "params")?;
+    let params: Value =
+        serde_json::from_str(&text).map_err(|e| format!("child create: bad params: {}", e))?;
+    println!("{}", child_create(&env, params, idem)?);
+    Ok(())
+}
+
+/// `c9watch-agent child retire <id> [--idem <key>]`.
+pub fn cmd_child_retire(id: &str, idem: Option<String>) -> Result<(), String> {
+    let env = engine_env(|k| std::env::var(k).ok()).map_err(|e| format!("child retire: {}", e))?;
+    println!("{}", child_retire(&env, id, idem)?);
     Ok(())
 }
 

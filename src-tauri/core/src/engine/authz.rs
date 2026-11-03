@@ -47,6 +47,13 @@ pub enum Admission {
     /// The agent names itself and the peer runs the engine's
     /// `c9watch-agent` copy.
     AgentExe,
+    /// E5: an `agent:` principal creates or retires a child. Its
+    /// generation is the current one, the peer is the process stamped at
+    /// accept and runs the engine's `c9watch-agent` copy, and no recorded
+    /// origin (D34) in its ancestry names anyone else. It then skips
+    /// `MutatingPeer`: the agent's Bash is confined by design. No effect
+    /// on other principals.
+    AgentParent,
 }
 
 use Admission::*;
@@ -94,10 +101,15 @@ pub fn method(name: &str) -> Option<Rule> {
             &[AnnotationNamespace, AnnotationPeer],
         ),
         "agent.list" => rule("agent", "read", ALL, None, &[]),
-        // P10 opens these to agents; until then only the terminal (D8).
-        "agent.create" | "agent.retire" | "agent.resume" => {
-            rule("agent", "write", &[L], None, &[UnixPeer, MutatingPeer])
-        }
+        // E5: an agent may create and retire its own children (D8).
+        "agent.create" | "agent.retire" => rule(
+            "agent",
+            "write",
+            &[L, A],
+            None,
+            &[UnixPeer, AgentParent, MutatingPeer],
+        ),
+        "agent.resume" => rule("agent", "write", &[L], None, &[UnixPeer, MutatingPeer]),
         "detect.recheck" => rule("detect", "write", &[L], None, &[UnixPeer, MutatingPeer]),
         // An observed session may stop itself, never another (D8).
         "session.stop" => rule(
@@ -792,7 +804,12 @@ mod tests {
             assert!(needs(name, UnixPeer) && needs(name, AgentExe), "{name}");
         }
         assert!(needs("task.done", AgentExe) && needs("agent.handoff", AgentExe));
-        assert_eq!(method("agent.create").unwrap().principals, &[L]);
-        assert_eq!(method("agent.retire").unwrap().principals, &[L]);
+        // E5: an agent creates and retires only behind AgentParent.
+        for name in ["agent.create", "agent.retire"] {
+            assert_eq!(method(name).unwrap().principals, &[L, A], "{name}");
+            assert!(needs(name, UnixPeer) && needs(name, AgentParent), "{name}");
+            assert!(needs(name, MutatingPeer), "{name}");
+        }
+        assert_eq!(method("agent.resume").unwrap().principals, &[L]);
     }
 }
