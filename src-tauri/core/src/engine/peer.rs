@@ -462,10 +462,248 @@ pub fn peer_exe_path(_pid: libc::pid_t) -> Result<PathBuf, String> {
     Err("peer exe path is only supported on macOS and Linux".to_string())
 }
 
+/// Whether `pid` runs as this user: `Some(false)` for another user's
+/// process, `None` when it is gone or can't be told.
+#[cfg(target_os = "macos")]
+fn runs_as_me(pid: libc::pid_t) -> Option<bool> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a writable `proc_bsdinfo` of `size` bytes.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if n == size {
+        // SAFETY: getuid has no preconditions and cannot fail.
+        return Some(info.pbi_uid == unsafe { libc::getuid() });
+    }
+    // `proc_pidinfo` refuses only another user's process; sysctl still
+    // reads it (`proc_info`).
+    kinfo_entry(pid).map(|_| false)
+}
+
+#[cfg(target_os = "linux")]
+fn runs_as_me(pid: libc::pid_t) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(format!("/proc/{}", pid)).ok()?.uid();
+    // SAFETY: getuid has no preconditions and cannot fail.
+    Some(owner == unsafe { libc::getuid() })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn runs_as_me(_pid: libc::pid_t) -> Option<bool> {
+    None
+}
+
+/// The argv in a `KERN_PROCARGS2` buffer: `argc`, the exec path, NUL
+/// padding, then `argc` NUL-terminated arguments.
+#[cfg(any(target_os = "macos", test))]
+fn parse_procargs2(buf: &[u8]) -> Option<Vec<std::ffi::OsString>> {
+    use std::os::unix::ffi::OsStrExt;
+    let argc = usize::try_from(i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?)).ok()?;
+    let rest = buf.get(4..)?;
+    let exec_end = rest.iter().position(|&b| b == 0)?;
+    let mut rest = &rest[exec_end..];
+    while rest.first() == Some(&0) {
+        rest = &rest[1..];
+    }
+    let mut argv = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        let end = rest.iter().position(|&b| b == 0)?;
+        argv.push(std::ffi::OsStr::from_bytes(&rest[..end]).to_os_string());
+        rest = &rest[end + 1..];
+    }
+    Some(argv)
+}
+
+/// The argv of `pid`, or `None` when it can't be read.
+#[cfg(target_os = "macos")]
+fn argv_of(pid: libc::pid_t) -> Option<Vec<std::ffi::OsString>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+    // SAFETY: a null buffer asks sysctl for the size only.
+    let r = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if r != 0 || size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    // SAFETY: `buf` holds `size` writable bytes.
+    let r = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    parse_procargs2(&buf[..size.min(buf.len())])
+}
+
+#[cfg(target_os = "linux")]
+fn argv_of(pid: libc::pid_t) -> Option<Vec<std::ffi::OsString>> {
+    use std::os::unix::ffi::OsStrExt;
+    let raw = std::fs::read(format!("/proc/{}/cmdline", pid)).ok()?;
+    Some(
+        raw.split(|&b| b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| std::ffi::OsStr::from_bytes(a).to_os_string())
+            .collect(),
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn argv_of(_pid: libc::pid_t) -> Option<Vec<std::ffi::OsString>> {
+    None
+}
+
+/// Where a teammate check stands for one process of a chain.
+#[derive(Debug, PartialEq, Eq)]
+enum Argv {
+    /// Another user's process: not this user's teammate.
+    OtherUser,
+    Read(Vec<std::ffi::OsString>),
+    /// Gone, unreadable, empty, or its pid now names another process.
+    Unknown,
+}
+
+/// The argv of `p`, tied to it: the pid still has `p`'s start time after
+/// the read, so a reused pid is `Unknown`, never another process's argv.
+fn argv_checked(p: &ProcInfo) -> Argv {
+    let read = match runs_as_me(p.pid) {
+        None => return Argv::Unknown,
+        Some(false) => Argv::OtherUser,
+        Some(true) => match argv_of(p.pid) {
+            Some(argv) if !argv.is_empty() => Argv::Read(argv),
+            _ => Argv::Unknown,
+        },
+    };
+    match proc_info(p.pid) {
+        Some(now) if now.start == p.start => read,
+        _ => Argv::Unknown,
+    }
+}
+
+/// The pids in `chain` whose argv is an agent-team teammate's
+/// (`session::teammates::parse_argv`), read now. Another user's process is
+/// not this user's teammate and is skipped. `Err(pid)` when a process of
+/// this user, or one that may be, can't be read: it is gone, its argv is
+/// unreadable or empty, or its pid was reused since the chain was read.
+/// The caller fails closed on it.
+pub fn teammate_pids(
+    chain: &[ProcInfo],
+) -> Result<std::collections::HashSet<libc::pid_t>, libc::pid_t> {
+    let mut found = std::collections::HashSet::new();
+    for p in chain {
+        match argv_checked(p) {
+            Argv::OtherUser => {}
+            Argv::Unknown => return Err(p.pid),
+            Argv::Read(argv) => {
+                if crate::session::teammates::parse_argv(&argv).is_some() {
+                    found.insert(p.pid);
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::io::AsRawFd;
+
+    /// A child started with a teammate's argv is found by its argv alone.
+    #[test]
+    fn a_teammate_argv_is_read_from_the_live_process() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "sleep 5",
+                "sh",
+                "--agent-id",
+                "mate@session-52d94f40",
+                "--team-name",
+                "session-52d94f40",
+                "--parent-session-id",
+                "52d94f40-632b-43c7-a783-f31783dfe57f",
+            ])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let me = std::process::id() as libc::pid_t;
+        let chain = [proc_info(pid).unwrap(), proc_info(me).unwrap()];
+        let found = teammate_pids(&chain);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(found, Ok([pid].into_iter().collect()));
+    }
+
+    /// A process that is gone, or whose pid now has another start time, is
+    /// an error, never "not a teammate".
+    #[test]
+    fn an_unreadable_or_reused_pid_fails_closed() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let info = proc_info(pid).unwrap();
+        assert_eq!(
+            teammate_pids(std::slice::from_ref(&info)),
+            Ok(Default::default())
+        );
+        // The same pid with another start time: a reused pid.
+        let reused = ProcInfo {
+            start: info.start + 1,
+            ..info.clone()
+        };
+        assert_eq!(teammate_pids(&[reused]), Err(pid));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // Gone.
+        assert_eq!(teammate_pids(&[info]), Err(pid));
+    }
+
+    /// Another user's process (launchd, or `login` on macOS) is skipped,
+    /// not an error, so a terminal under `login` can still mutate.
+    #[test]
+    fn another_users_process_is_skipped() {
+        let init = proc_info(1).unwrap();
+        assert_eq!(runs_as_me(1), Some(false));
+        assert_eq!(teammate_pids(&[init]), Ok(Default::default()));
+    }
+
+    #[test]
+    fn procargs2_is_parsed() {
+        let mut buf = 3i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/usr/bin/claude\0\0\0\0claude\0--agent-id\0w@t\0K=V\0");
+        let argv = parse_procargs2(&buf).unwrap();
+        assert_eq!(argv, ["claude", "--agent-id", "w@t"]);
+        // Fewer strings than argc: unreadable, not a short argv.
+        let mut short = 5i32.to_ne_bytes().to_vec();
+        short.extend_from_slice(b"/x\0a\0");
+        assert_eq!(parse_procargs2(&short), None);
+        assert_eq!(parse_procargs2(&[1, 0]), None);
+    }
     use std::os::unix::net::UnixStream;
 
     fn my_pid() -> libc::pid_t {

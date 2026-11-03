@@ -281,6 +281,14 @@ pub struct DetectedSession {
     /// process behind the session.
     #[serde(skip)]
     pub process_start_secs: Option<u64>,
+    /// The agent-team link of a teammate session. Only the CLI backend
+    /// finds teammates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teammate: Option<super::teammates::TeammateLink>,
+    /// The transcript file selection matched, for a teammate. Enrichment
+    /// reads the transcript only while its path still names this file.
+    #[serde(skip)]
+    pub transcript_file: Option<super::teammates::TranscriptFile>,
 }
 
 fn default_true() -> bool {
@@ -335,6 +343,8 @@ impl DetectedSession {
             pi_summary: None,
             opencode_summary: None,
             process_start_secs: None,
+            teammate: None,
+            transcript_file: None,
         }
     }
 

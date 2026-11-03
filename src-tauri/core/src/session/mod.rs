@@ -18,6 +18,7 @@ mod pi_liveness;
 mod pid_check;
 pub mod source;
 pub mod status;
+pub mod teammates;
 
 pub(crate) use pid_check::pid_is_alive;
 

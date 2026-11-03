@@ -63,6 +63,12 @@
     "status": "NeedsAttention",
     "summary": "summary",
     "surface": "app",
+    "teammate": {
+      "agentName": "mate",
+      "agentType": "general-purpose",
+      "leadSessionId": "lead",
+      "teamName": "session-lead"
+    },
     "waitingFor": {
       "kind": "approval",
       "tool": "Bash"

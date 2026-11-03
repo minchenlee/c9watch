@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -253,7 +252,7 @@ pub struct Usage {
 
 /// Parse a sessions-index.json file
 pub fn parse_sessions_index<P: AsRef<Path>>(path: P) -> Result<SessionsIndex, String> {
-    let file = File::open(path.as_ref())
+    let file = super::cache::open_regular(path.as_ref())
         .map_err(|e| format!("Failed to open sessions-index.json: {}", e))?;
 
     let reader = BufReader::new(file);
@@ -266,9 +265,18 @@ pub fn parse_sessions_index<P: AsRef<Path>>(path: P) -> Result<SessionsIndex, St
 /// This function uses a reverse-reading strategy to avoid loading
 /// the entire file into memory for large files.
 pub fn read_last_n_lines<P: AsRef<Path>>(path: P, n: usize) -> Result<Vec<String>, String> {
-    let file =
-        File::open(path.as_ref()).map_err(|e| format!("Failed to open JSONL file: {}", e))?;
+    let file = super::cache::open_regular(path.as_ref())
+        .map_err(|e| format!("Failed to open JSONL file: {}", e))?;
+    read_last_n_lines_from(file, n)
+}
 
+/// [`read_last_n_lines`] of an open file, from its start.
+pub(crate) fn read_last_n_lines_from(
+    mut file: std::fs::File,
+    n: usize,
+) -> Result<Vec<String>, String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("Failed to seek JSONL file: {}", e))?;
     let metadata = file
         .metadata()
         .map_err(|e| format!("Failed to read file metadata: {}", e))?;
@@ -355,6 +363,14 @@ pub fn parse_last_n_entries<P: AsRef<Path>>(
     Ok(parse_jsonl_entries(&lines))
 }
 
+/// [`parse_last_n_entries`] of an open file.
+pub(crate) fn parse_last_n_entries_from(
+    file: std::fs::File,
+    n: usize,
+) -> Result<Vec<SessionEntry>, String> {
+    Ok(parse_jsonl_entries(&read_last_n_lines_from(file, n)?))
+}
+
 /// Parse all entries from a session JSONL file
 pub fn parse_all_entries<P: AsRef<Path>>(path: P) -> Result<Vec<SessionEntry>, String> {
     parse_all_entries_with_progress(path, &mut |_, _| {})
@@ -365,8 +381,8 @@ pub fn parse_all_entries_with_progress<P: AsRef<Path>>(
     path: P,
     on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Vec<SessionEntry>, String> {
-    let file =
-        File::open(path.as_ref()).map_err(|e| format!("Failed to open JSONL file: {}", e))?;
+    let file = super::cache::open_regular(path.as_ref())
+        .map_err(|e| format!("Failed to open JSONL file: {}", e))?;
     let total = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut reader = BufReader::new(file);
     let mut lines = Vec::new();
@@ -676,11 +692,15 @@ pub struct NativeTitles {
 /// Scans the file for lines containing `"custom-title"` and parses only those.
 /// Returns the last (most recent) custom title found.
 pub fn get_native_custom_title_from_file(path: &std::path::Path) -> Option<String> {
-    scan_native_titles(File::open(path).ok()?).0.custom
+    scan_native_titles(super::cache::open_regular(path).ok()?)
+        .0
+        .custom
 }
 
-pub(crate) fn try_get_native_titles_from_file(path: &Path) -> std::io::Result<NativeTitles> {
-    let (titles, result) = scan_native_titles(File::open(path)?);
+/// The native titles of an open file, read from its start.
+pub(crate) fn native_titles_from(mut file: std::fs::File) -> std::io::Result<NativeTitles> {
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let (titles, result) = scan_native_titles(file);
     result?;
     Ok(titles)
 }
@@ -749,7 +769,7 @@ mod tests {
     fn read_last_n_lines_expands_for_a_large_complete_jsonl_record() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("large-record.jsonl");
-        let mut file = File::create(&path).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
 
         for index in 0..20 {
             let small_record = serde_json::json!({

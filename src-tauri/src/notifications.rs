@@ -469,6 +469,7 @@ pub(crate) mod tests {
             last_assistant_message: None,
             transcript_path: None,
             worker_of: None,
+            teammate: None,
             official_name: None,
             started_at_ms: Some(1_752_364_800_000),
             provider: SessionProvider::Codex,
