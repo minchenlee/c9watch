@@ -23,6 +23,7 @@ pub mod api;
 
 #[cfg(unix)]
 pub mod principal;
+pub mod provenance;
 
 #[cfg(unix)]
 pub mod authz;

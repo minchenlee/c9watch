@@ -57,6 +57,8 @@ use super::lock::acquire_engine_lock;
 use super::machine;
 use super::mail;
 use super::ops;
+use super::peer;
+use super::provenance;
 use super::sock::{bind_private, ShutdownSignal, ShutdownSignals};
 use super::standing;
 use crate::elog;
@@ -247,6 +249,9 @@ pub async fn run_until(
     // offset in the old `engine.log`.
     rotate_log(home);
     let pruner = tokio::spawn(upkeep_loop(db.clone(), home.to_path_buf()));
+    let provenance = config
+        .detection
+        .then(|| tokio::spawn(provenance_loop(ctx.clone(), config.agents.clone())));
     let detection = if config.detection {
         let d = detect::spawn(detection, first_tick)?;
         spawn_import(db.clone(), home.to_path_buf());
@@ -301,6 +306,9 @@ pub async fn run_until(
     }
     elog!(Info, "run", "Shutting down ({:?})", sig);
     pruner.abort();
+    if let Some(p) = provenance {
+        p.abort();
+    }
     // The agents go before the db closes, so their supervisors can still
     // write; what they leave is reconciled at the next boot. After a drain
     // only what it left is still running, and the hard deadline holds:
@@ -410,6 +418,34 @@ fn rotate_log(home: &Path) {
         Ok(true) => elog!(Info, "run", "Rotated engine.log"),
         Ok(false) => {}
         Err(e) => elog!(Warn, "run", "{}", e),
+    }
+}
+
+/// Scan the process table into the provenance table every
+/// `provenance::SCAN` (D34): the PTY children of live agents and the
+/// processes of observed sessions are the roots, and a new process's argv
+/// is read once to find a teammate.
+async fn provenance_loop(ctx: Arc<ServerCtx>, agents: Arc<LiveTable>) {
+    let mut tick = tokio::time::interval(provenance::SCAN);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let roots = provenance::Roots {
+            agents: agents.pty_children(),
+            sessions: ctx.session_pids(),
+        };
+        let table = ctx.provenance.clone();
+        let scanned = tokio::task::spawn_blocking(move || {
+            table.scan(&peer::processes(), &roots, |p| {
+                peer::teammate_pids(std::slice::from_ref(p))
+                    .ok()
+                    .map(|found| found.contains(&p.pid))
+            })
+        })
+        .await;
+        if let Err(e) = scanned {
+            elog!(Error, "run", "Provenance scan: {}", e);
+        }
     }
 }
 

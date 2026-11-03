@@ -18,13 +18,23 @@
 //!    (no transcript matched yet, or its argv is forged) counts too, with
 //!    an `unlisted-teammate:<pid>` key that names no session: a teammate's
 //!    descendants are never `local-unverified`.
-//! 3. `local-unverified`: everything else (A:187).
+//! 3. `local-unverified`: everything else (A:187), unless the
+//!    provenance table (D34, `engine::provenance`) saw a process of the
+//!    chain descend from one of the above before it was reparented. Then
+//!    the peer is stamped from that origin: the agent while its generation
+//!    is live (else `observed:gone-agent:<id>`), the session's
+//!    `observed:<sessionKey>`, or the teammate's key. A process the full
+//!    table kept out (it or an ancestor should have been added) is
+//!    `observed:unknown-origin:<pid>`. A process under no root, such as the
+//!    owner's terminal or the GUI, has no origin and stays
+//!    `local-unverified`.
 //!
 //! Unix stamping never returns `human` (that waits for the C1.5 code-signature check)
 //! and never stamps `client:<id>` on the engine socket: `kind=gateway` in
 //! `hello` is a claim any same-uid process can make (N1, N2).
 
 use super::peer::{self, ProcInfo, MAX_ANCESTRY};
+use super::provenance::Origin;
 use serde::{Serialize, Serializer};
 use std::collections::HashSet;
 
@@ -32,6 +42,14 @@ use std::collections::HashSet;
 /// teammate detection has not listed. No session has such a key, so it
 /// passes no own-session check.
 pub const UNLISTED_TEAMMATE: &str = "unlisted-teammate:";
+
+/// The session key prefix of an `observed:` principal stamped for a
+/// reparented process of an agent whose generation is no longer live.
+pub const GONE_AGENT: &str = "gone-agent:";
+
+/// The session key prefix of an `observed:` principal stamped for a
+/// process the full provenance table could not tell.
+pub const UNKNOWN_ORIGIN: &str = "unknown-origin:";
 
 /// Who a connection is, as the engine stamped it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,10 +72,15 @@ pub enum Principal {
 }
 
 impl Principal {
-    /// An `observed:` stamp for a teammate detection has not listed (or a
-    /// chain process that could not be read). It may only read.
-    pub fn is_unlisted_teammate(&self) -> bool {
-        matches!(self, Principal::Observed { session_key } if session_key.starts_with(UNLISTED_TEAMMATE))
+    /// An `observed:` stamp with a key no session has: a teammate
+    /// detection has not listed (or a chain process that could not be
+    /// read), a gone agent's reparented process, or one of unknown origin.
+    /// It may only read.
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Principal::Observed { session_key }
+            if [UNLISTED_TEAMMATE, GONE_AGENT, UNKNOWN_ORIGIN]
+                .iter()
+                .any(|p| session_key.starts_with(p)))
     }
 }
 
@@ -115,6 +138,13 @@ pub trait ObservedSessions: Send + Sync {
     /// teammate (`peer::teammate_pids`); callers fail closed on it.
     fn teammates(&self, _chain: &[ProcInfo]) -> Result<HashSet<libc::pid_t>, libc::pid_t> {
         Ok(HashSet::new())
+    }
+
+    /// Where the process `pid` that started at `start` came from, as the
+    /// provenance table recorded it (D34). `None` when it descends from
+    /// nothing core watches.
+    fn origin(&self, _pid: libc::pid_t, _start: u64) -> Option<Origin> {
+        None
     }
 }
 
@@ -180,21 +210,46 @@ pub fn stamp_observed(
                     }
                 }
             };
+            if let Some(session_key) = chain.iter().find_map(|p| {
+                observed.by_pid(p.pid).or_else(|| {
+                    teammates
+                        .contains(&p.pid)
+                        .then(|| format!("{UNLISTED_TEAMMATE}{}", p.pid))
+                })
+            }) {
+                return Principal::Observed { session_key };
+            }
             chain
                 .iter()
-                .find_map(|p| {
-                    observed.by_pid(p.pid).or_else(|| {
-                        teammates
-                            .contains(&p.pid)
-                            .then(|| format!("{UNLISTED_TEAMMATE}{}", p.pid))
-                    })
-                })
-                .map_or(Principal::LocalUnverified, |session_key| {
-                    Principal::Observed { session_key }
+                .find_map(|p| observed.origin(p.pid, p.start).map(|o| (p.pid, o)))
+                .map_or(Principal::LocalUnverified, |(pid, origin)| {
+                    from_origin(pid, origin, agents, observed)
                 })
         }
         p => p,
     }
+}
+
+/// The stamp of a process whose live ancestry shows nothing but whose
+/// provenance (D34) is `origin`; `pid` is the chain process it was found for.
+fn from_origin(
+    pid: libc::pid_t,
+    origin: Origin,
+    agents: &dyn LiveAgents,
+    observed: &dyn ObservedSessions,
+) -> Principal {
+    let session_key = match origin {
+        Origin::Agent { id, gen } if agents.current_gen(&id) == Some(gen) => {
+            return Principal::Agent { id, gen }
+        }
+        Origin::Agent { id, .. } => format!("{GONE_AGENT}{id}"),
+        Origin::Session { key } => key,
+        Origin::Teammate { pid } => observed
+            .by_pid(pid)
+            .unwrap_or_else(|| format!("{UNLISTED_TEAMMATE}{pid}")),
+        Origin::Unknown => format!("{UNKNOWN_ORIGIN}{pid}"),
+    };
+    Principal::Observed { session_key }
 }
 
 /// Stamp the principal of the peer with `pid`. `accepted` is the start-time
@@ -234,6 +289,9 @@ pub fn stamp_peer(
 ///   `own`: one detection has not listed fails closed, whether its
 ///   transcript is missing, ambiguous or not found yet; so does a process
 ///   of the chain whose argv can't be read;
+/// - no process in it was recorded (D34) as descending from an agent,
+///   from an observed session other than `own`, or from a teammate other
+///   than `own`; one the full table can't tell fails closed;
 /// - the peer is not `confined`: an agent's Bash runs in the vendor
 ///   sandbox, and a process it moved under init stays there.
 pub fn check_mutation(
@@ -263,6 +321,7 @@ pub fn check_mutation(
         return Err(format!("the peer runs under observed:{}", key));
     }
     no_unlisted_teammate(chain, observed)?;
+    no_foreign_origin(chain, observed, own)?;
     match confined {
         Some(false) => Ok(()),
         Some(true) => Err("the peer runs in a sandbox or a different mount namespace; on Linux, run the core and terminal in the same namespace (systemd ProtectHome/PrivateTmp/ProtectSystem/PrivateDevices and flatpak/snap terminals can isolate them)".into()),
@@ -294,13 +353,48 @@ fn no_unlisted_teammate(chain: &[ProcInfo], observed: &dyn ObservedSessions) -> 
     }
 }
 
-/// The teammate part of [`check_mutation`] alone, for a write whose other
-/// admission checks don't walk the peer's ancestry (an observed session's
-/// annotation or mail). Blocking.
+/// Refuse a chain with a process whose recorded provenance (D34) is an
+/// agent, a session other than `own`, a teammate whose session is not
+/// `own`, or unknown.
+fn no_foreign_origin(
+    chain: &[ProcInfo],
+    observed: &dyn ObservedSessions,
+    own: Option<&str>,
+) -> Result<(), String> {
+    for p in chain {
+        let why = match observed.origin(p.pid, p.start) {
+            None => continue,
+            Some(Origin::Agent { id, .. }) => format!("agent:{id}"),
+            Some(Origin::Session { key }) if Some(key.as_str()) == own => continue,
+            Some(Origin::Session { key }) => format!("observed:{key}"),
+            Some(Origin::Teammate { pid }) => match observed.by_pid(pid) {
+                Some(key) if Some(key.as_str()) == own => continue,
+                _ => format!("agent-team teammate pid {pid}"),
+            },
+            Some(Origin::Unknown) => {
+                return Err(format!(
+                    "where pid {} in the peer's ancestry came from is not known (the provenance table is full)",
+                    p.pid
+                ))
+            }
+        };
+        return Err(format!(
+            "pid {} in the peer's ancestry descends from {} (it was reparented)",
+            p.pid, why
+        ));
+    }
+    Ok(())
+}
+
+/// The teammate and provenance parts of [`check_mutation`] alone, for a
+/// write whose other admission checks don't walk the peer's ancestry (an
+/// observed session's annotation or mail). `own` is the key an `observed:`
+/// principal was stamped with. Blocking.
 pub fn check_teammate_ancestry(
     pid: libc::pid_t,
     peer_start: Option<u64>,
     observed: &dyn ObservedSessions,
+    own: Option<&str>,
 ) -> Result<(), String> {
     let chain = peer::full_ancestry(pid).ok_or_else(|| {
         format!(
@@ -312,7 +406,8 @@ pub fn check_teammate_ancestry(
         (Some(first), Some(start)) if first.start == start => {}
         _ => return Err("the peer is not the process that connected".into()),
     }
-    no_unlisted_teammate(&chain, observed)
+    no_unlisted_teammate(&chain, observed)?;
+    no_foreign_origin(&chain, observed, own)
 }
 
 /// `check_mutation` for the peer with `pid`, as read now. Blocking.
@@ -756,8 +851,8 @@ pub(crate) mod tests {
         };
         let p = stamp_observed(&deep, &NoLiveAgents, &near);
         assert_eq!(p, observed("unlisted-teammate:103"));
-        assert!(p.is_unlisted_teammate());
-        assert!(!observed("claudeCode:s1").is_unlisted_teammate());
+        assert!(p.is_read_only());
+        assert!(!observed("claudeCode:s1").is_read_only());
     }
 
     /// D8: a mutation refuses a peer under an observed session at any
@@ -819,5 +914,230 @@ pub(crate) mod tests {
             stamp(&bash_tool_chain(100), &FakeAgents::one("a1", 10, 100)),
             Principal::Client { .. }
         ));
+    }
+
+    /// Observed sessions plus a provenance table, keyed by pid and start.
+    struct FakeOrigins {
+        observed: FakeObserved,
+        origins: HashMap<(libc::pid_t, u64), Origin>,
+    }
+
+    impl ObservedSessions for FakeOrigins {
+        fn by_pid(&self, pid: libc::pid_t) -> Option<String> {
+            self.observed.by_pid(pid)
+        }
+
+        fn origin(&self, pid: libc::pid_t, start: u64) -> Option<Origin> {
+            self.origins.get(&(pid, start)).cloned()
+        }
+    }
+
+    fn origins(list: &[((libc::pid_t, u64), Origin)]) -> FakeOrigins {
+        FakeOrigins {
+            observed: FakeObserved(HashMap::new()),
+            origins: list.iter().cloned().collect(),
+        }
+    }
+
+    /// daemon (300) reparented under launchd (1).
+    fn orphan() -> Vec<ProcInfo> {
+        vec![pi(300, 1, 30), pi(1, 0, 1)]
+    }
+
+    /// D34: a reparented process is stamped from where it came from, never
+    /// `local-unverified`.
+    #[test]
+    fn a_reparented_process_is_stamped_from_its_origin() {
+        let session = origins(&[(
+            (300, 30),
+            Origin::Session {
+                key: "claudeCode:s1".into(),
+            },
+        )]);
+        assert_eq!(
+            stamp_observed(&orphan(), &NoLiveAgents, &session),
+            observed("claudeCode:s1")
+        );
+        // The same pid with another start time is another process.
+        let reused = vec![pi(300, 1, 31), pi(1, 0, 1)];
+        assert_eq!(
+            stamp_observed(&reused, &NoLiveAgents, &session),
+            Principal::LocalUnverified
+        );
+
+        let of_agent = origins(&[(
+            (300, 30),
+            Origin::Agent {
+                id: "a1".into(),
+                gen: 1,
+            },
+        )]);
+        let live = FakeAgents::one("a1", 10, 100);
+        assert_eq!(stamp_observed(&orphan(), &live, &of_agent), agent("a1"));
+        // The agent is gone, or runs another generation: read-only.
+        let gone = stamp_observed(&orphan(), &NoLiveAgents, &of_agent);
+        assert_eq!(gone, observed("gone-agent:a1"));
+        assert!(gone.is_read_only());
+
+        let mate = origins(&[((300, 30), Origin::Teammate { pid: 77 })]);
+        let p = stamp_observed(&orphan(), &NoLiveAgents, &mate);
+        assert_eq!(p, observed("unlisted-teammate:77"));
+        assert!(p.is_read_only());
+        let listed = FakeOrigins {
+            observed: FakeObserved::one("claudeCode:mate", 77),
+            ..origins(&[((300, 30), Origin::Teammate { pid: 77 })])
+        };
+        assert_eq!(
+            stamp_observed(&orphan(), &NoLiveAgents, &listed),
+            observed("claudeCode:mate")
+        );
+
+        let full = origins(&[((300, 30), Origin::Unknown)]);
+        let p = stamp_observed(&orphan(), &NoLiveAgents, &full);
+        assert_eq!(p, observed("unknown-origin:300"));
+        assert!(p.is_read_only());
+    }
+
+    /// The live ancestry still decides first: provenance only fills in
+    /// when it shows nothing.
+    #[test]
+    fn the_live_ancestry_comes_before_provenance() {
+        let o = FakeOrigins {
+            observed: FakeObserved::one("claudeCode:live", 20),
+            origins: HashMap::from([(
+                (30, 300),
+                Origin::Session {
+                    key: "claudeCode:old".into(),
+                },
+            )]),
+        };
+        assert_eq!(
+            stamp_observed(&bash_tool_chain(100), &NoLiveAgents, &o),
+            observed("claudeCode:live")
+        );
+    }
+
+    /// A mutation refuses a chain with a recorded origin other than the
+    /// peer's own session, at any depth.
+    #[test]
+    fn a_mutation_refuses_a_foreign_origin() {
+        let chain = orphan();
+        let session = origins(&[(
+            (300, 30),
+            Origin::Session {
+                key: "claudeCode:s1".into(),
+            },
+        )]);
+        let check = |o: &FakeOrigins, own: Option<&str>| {
+            check_mutation(Some(&chain), Some(30), Some(false), &NoLiveAgents, o, own)
+        };
+        assert!(check(&session, None)
+            .unwrap_err()
+            .contains("descends from observed:claudeCode:s1"));
+        assert_eq!(check(&session, Some("claudeCode:s1")), Ok(()));
+        assert!(check(&session, Some("claudeCode:s2")).is_err());
+        let of_agent = origins(&[(
+            (300, 30),
+            Origin::Agent {
+                id: "a1".into(),
+                gen: 1,
+            },
+        )]);
+        assert!(check(&of_agent, None).unwrap_err().contains("agent:a1"));
+        let mate = origins(&[((1, 1), Origin::Teammate { pid: 77 })]);
+        assert!(check(&mate, None).unwrap_err().contains("teammate pid 77"));
+        let full = origins(&[((300, 30), Origin::Unknown)]);
+        assert!(check(&full, None).unwrap_err().contains("table is full"));
+        assert_eq!(check(&origins(&[]), None), Ok(()));
+    }
+
+    /// Observed sessions backed by a real provenance table.
+    struct Scanned {
+        observed: FakeObserved,
+        table: crate::engine::provenance::Provenance,
+    }
+
+    impl ObservedSessions for Scanned {
+        fn by_pid(&self, pid: libc::pid_t) -> Option<String> {
+            self.observed.by_pid(pid)
+        }
+
+        fn origin(&self, pid: libc::pid_t, start: u64) -> Option<Origin> {
+            self.table.origin(pid, start)
+        }
+    }
+
+    /// End to end over a scanned table: a double-forked child of a session
+    /// is that session's, a reused pid is not, and a process from the
+    /// owner's plain terminal stays `local-unverified` and may mutate.
+    #[test]
+    fn scanned_provenance_stamps_and_checks() {
+        use crate::engine::peer::ProcEntry;
+        use crate::engine::provenance::{Provenance, Roots};
+        let e = |pid, ppid, start| ProcEntry {
+            info: pi(pid, ppid, start),
+            pgid: pid,
+            zombie: false,
+        };
+        let roots = Roots {
+            sessions: vec![(100, "claudeCode:s1".into())],
+            ..Roots::default()
+        };
+        let table = Provenance::new();
+        // launchd 1; session 100 -> shell 200 -> daemon 300; terminal 50 -> shell 60.
+        let before = [
+            e(1, 0, 1),
+            e(100, 1, 10),
+            e(200, 100, 20),
+            e(300, 200, 30),
+            e(50, 1, 5),
+            e(60, 50, 6),
+        ];
+        table.scan(&before, &roots, |_| Some(false));
+        // The shell exits, the daemon is reparented; the owner runs c9watch.
+        let after = [
+            e(1, 0, 1),
+            e(100, 1, 10),
+            e(300, 1, 30),
+            e(50, 1, 5),
+            e(60, 50, 6),
+            e(70, 60, 7),
+        ];
+        table.scan(&after, &roots, |_| Some(false));
+        let o = Scanned {
+            observed: FakeObserved::one("claudeCode:s1", 100),
+            table,
+        };
+
+        let daemon = vec![pi(300, 1, 30), pi(1, 0, 1)];
+        assert_eq!(
+            stamp_observed(&daemon, &NoLiveAgents, &o),
+            observed("claudeCode:s1")
+        );
+        let mutate = |chain: &[ProcInfo], own: Option<&str>| {
+            check_mutation(
+                Some(chain),
+                Some(chain[0].start),
+                Some(false),
+                &NoLiveAgents,
+                &o,
+                own,
+            )
+        };
+        assert!(mutate(&daemon, None).is_err());
+        assert!(mutate(&daemon, Some("claudeCode:s2")).is_err());
+
+        let reused = vec![pi(300, 1, 31), pi(1, 0, 1)];
+        assert_eq!(
+            stamp_observed(&reused, &NoLiveAgents, &o),
+            Principal::LocalUnverified
+        );
+
+        let cli = vec![pi(70, 60, 7), pi(60, 50, 6), pi(50, 1, 5), pi(1, 0, 1)];
+        assert_eq!(
+            stamp_observed(&cli, &NoLiveAgents, &o),
+            Principal::LocalUnverified
+        );
+        assert_eq!(mutate(&cli, None), Ok(()));
     }
 }

@@ -17,6 +17,7 @@
 //! boot reconcile, which the ops journal fills (M5).
 
 use super::driver::ChildId;
+use super::peer::ProcInfo;
 use super::principal::{LiveAgent, LiveAgents};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -95,6 +96,21 @@ impl LiveTable {
     pub fn current(&self, agent_id: &str) -> Option<Generation> {
         let map = self.by_agent.read().unwrap_or_else(|e| e.into_inner());
         map.get(agent_id).copied()
+    }
+
+    /// Each live agent's PTY child, id and current generation.
+    pub fn pty_children(&self) -> Vec<(ProcInfo, String, i64)> {
+        let map = self.by_agent.read().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .map(|(id, g)| {
+                let child = ProcInfo {
+                    pid: g.pty_child.pid,
+                    ppid: 0,
+                    start: g.pty_child.start,
+                };
+                (child, id.clone(), g.gen)
+            })
+            .collect()
     }
 
     /// How many agents are live.

@@ -107,6 +107,7 @@ use super::proto::{
     SessionStopParams, SessionView, SessionViewsParams, SessionViewsResult, TickResult,
 };
 use super::proto::{PingParams, PingResult, UnsubscribeParams, UnsubscribeResult};
+use super::provenance::{Origin, Provenance};
 use super::standing;
 use super::views;
 use super::views::conversation::{Progress, PROGRESS_CAPABILITY};
@@ -196,17 +197,21 @@ pub struct ServerCtx {
     /// `peer::teammate_pids`, read at admission; unit tests run with none,
     /// as they may run inside a teammate's pane themselves.
     pub teammates: fn(&[peer::ProcInfo]) -> Result<HashSet<libc::pid_t>, libc::pid_t>,
+    /// Where processes came from, kept after they are reparented (D34).
+    /// `run` scans the process table into it.
+    pub provenance: Arc<Provenance>,
 }
 
 fn no_teammates(_chain: &[peer::ProcInfo]) -> Result<HashSet<libc::pid_t>, libc::pid_t> {
     Ok(HashSet::new())
 }
 
-/// Observed sessions by process pid, as detection last saw them, and the
-/// teammate lookup.
+/// Observed sessions by process pid, as detection last saw them, the
+/// teammate lookup and the provenance table.
 struct ObservedNow(
     HashMap<libc::pid_t, String>,
     fn(&[peer::ProcInfo]) -> Result<HashSet<libc::pid_t>, libc::pid_t>,
+    Arc<Provenance>,
 );
 
 impl ObservedSessions for ObservedNow {
@@ -216,6 +221,10 @@ impl ObservedSessions for ObservedNow {
 
     fn teammates(&self, chain: &[peer::ProcInfo]) -> Result<HashSet<libc::pid_t>, libc::pid_t> {
         (self.1)(chain)
+    }
+
+    fn origin(&self, pid: libc::pid_t, start: u64) -> Option<Origin> {
+        self.2.origin(pid, start)
     }
 }
 
@@ -247,6 +256,7 @@ impl ServerCtx {
             } else {
                 peer::teammate_pids
             },
+            provenance: Arc::new(Provenance::new()),
         }
     }
 
@@ -351,20 +361,25 @@ impl ServerCtx {
         if let Some(o) = &self.observed {
             return o.clone();
         }
-        let sessions = self
-            .detection
+        Arc::new(ObservedNow(
+            self.session_pids().into_iter().collect(),
+            self.teammates,
+            self.provenance.clone(),
+        ))
+    }
+
+    /// The observed sessions by pid, as detection last saw them: the
+    /// session roots of a provenance scan.
+    pub(crate) fn session_pids(&self) -> Vec<(libc::pid_t, String)> {
+        self.detection
             .as_ref()
             .and_then(|d| d.views.current())
             .map(|(_, s)| s)
-            .unwrap_or_default();
-        Arc::new(ObservedNow(
-            sessions
-                .into_iter()
-                .filter(|s| s.pid > 0 && !s.session_key.is_empty())
-                .filter_map(|s| Some((libc::pid_t::try_from(s.pid).ok()?, s.session_key)))
-                .collect(),
-            self.teammates,
-        ))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.pid > 0 && !s.session_key.is_empty())
+            .filter_map(|s| Some((libc::pid_t::try_from(s.pid).ok()?, s.session_key)))
+            .collect()
     }
 
     pub(crate) fn db(&self) -> Result<&Arc<Db>, ApiError> {
@@ -686,7 +701,7 @@ impl Stamp {
         // agent's stamp comes from the engine's own agent table, never from
         // the views.
         let provisional =
-            !ready && (principal == Principal::LocalUnverified || principal.is_unlisted_teammate());
+            !ready && (principal == Principal::LocalUnverified || principal.is_read_only());
         Self {
             cred,
             accepted,
@@ -1436,7 +1451,7 @@ async fn admit(
         )
         && !rule.admission.contains(&Admission::MutatingPeer)
     {
-        check_teammate_ancestry(method, ctx, peer).await?;
+        check_teammate_ancestry(method, ctx, peer, principal).await?;
     }
     for check in rule.admission {
         match check {
@@ -1756,7 +1771,12 @@ async fn check_teammate_ancestry(
     method: &str,
     ctx: &ServerCtx,
     peer: Peer,
+    principal: &Principal,
 ) -> Result<(), ApiError> {
+    let own = match principal {
+        Principal::Observed { session_key } => Some(session_key.clone()),
+        _ => None,
+    };
     let peer = peer.unix()?;
     ctx.ensure_views().await?;
     let observed = ctx.observed_sessions();
@@ -1765,6 +1785,7 @@ async fn check_teammate_ancestry(
             peer.cred.pid,
             peer.start,
             observed.as_ref(),
+            own.as_deref(),
         ))
     })
     .await?
@@ -2684,6 +2705,7 @@ mod tests {
             idem: Arc::new(IdemCache::new()),
             observed: None,
             teammates: no_teammates,
+            provenance: Arc::new(Provenance::new()),
         })
     }
 
@@ -3363,6 +3385,7 @@ mod tests {
             idem: Arc::new(IdemCache::new()),
             observed: None,
             teammates: no_teammates,
+            provenance: Arc::new(Provenance::new()),
         });
         (t, ctx, db)
     }
