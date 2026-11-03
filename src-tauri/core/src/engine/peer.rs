@@ -184,8 +184,8 @@ pub fn exited(pid: libc::pid_t, start: u64) -> bool {
         return now.start != start;
     }
     // SAFETY: signal 0 only checks that the pid exists.
-    unsafe { libc::kill(pid, 0) == -1 }
-    &&std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    let failed = unsafe { libc::kill(pid, 0) } == -1;
+    failed && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 /// Every process this module can read, zombies included.
