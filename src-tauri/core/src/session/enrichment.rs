@@ -171,7 +171,17 @@ fn get_cached_native_titles_with(
     path: &Path,
     read_titles: impl FnOnce(&Path) -> std::io::Result<NativeTitles>,
 ) -> NativeTitles {
-    let Some(stamp) = native_title_stamp(path) else {
+    native_titles_cached(path, native_title_stamp(path), || read_titles(path))
+}
+
+/// The native titles of the transcript at `path` (the cache key) whose
+/// current stamp is `stamp`, from `read_titles` on a miss.
+fn native_titles_cached(
+    path: &Path,
+    stamp: Option<NativeTitleStamp>,
+    read_titles: impl FnOnce() -> std::io::Result<NativeTitles>,
+) -> NativeTitles {
+    let Some(stamp) = stamp else {
         if let Ok(mut cache) = NATIVE_TITLE_CACHE.lock() {
             cache.remove(path);
         }
@@ -185,7 +195,7 @@ fn get_cached_native_titles_with(
             }
         }
         // Cache miss or stale — re-scan
-        let titles = match read_titles(path) {
+        let titles = match read_titles() {
             Ok(titles) => titles,
             Err(_) => {
                 cache.remove(path);
@@ -196,7 +206,7 @@ fn get_cached_native_titles_with(
         titles
     } else {
         // Mutex poisoned — fallback to direct read
-        read_titles(path).unwrap_or_default()
+        read_titles().unwrap_or_default()
     }
 }
 
@@ -427,7 +437,7 @@ pub fn enrich_detected_sessions(
         // names the file selection matched, never reopened by name; a
         // swapped dir or file is skipped. Nothing else in its directory
         // (the index, subagent transcripts) is read.
-        let pinned = match detected.transcript_file {
+        let pinned = match &detected.transcript_file {
             Some(file) => {
                 let path = detected.project_path.join(format!("{}.jsonl", session_id));
                 let Some(pinned) = detected.project_path.parent().and_then(|projects| {
@@ -493,7 +503,7 @@ pub fn enrich_detected_sessions(
 
                 // Count messages in the file
                 let message_count = match &pinned {
-                    Some(p) => p.read(count_messages_from).unwrap_or(0),
+                    Some(p) => count_messages_cached(&session_file_path, &p.0, Instant::now()),
                     None => count_messages_in_jsonl(&session_file_path),
                 };
 
@@ -556,10 +566,19 @@ pub fn enrich_detected_sessions(
         // turn an empty state file into approval of every pending transcript tool.
         let hook_state = crate::claude_hooks::session_state(&session_id);
         let checker = PermissionChecker::cached_for(Some(&detected.cwd));
-        // A pinned transcript is not reopened to confirm a hook prompt, so
-        // the prompt counts as open.
-        let hook_prompt = hook_state.as_ref().and_then(|state| match pinned {
-            Some(_) => state.pending.first().cloned(),
+        // A pinned transcript confirms a hook prompt through its descriptor.
+        // A subagent's prompt would need another file in the directory, which
+        // is not read, so it counts as open.
+        let hook_prompt = hook_state.as_ref().and_then(|state| match &pinned {
+            Some(p) => state
+                .pending
+                .iter()
+                .find(|prompt| {
+                    prompt.agent_id.is_some()
+                        || p.read(|f| Some(crate::claude_hooks::prompt_is_open_in(prompt, f)))
+                            .unwrap_or(true)
+                })
+                .cloned(),
             None => open_hook_prompt(state, &session_file_path),
         });
 
@@ -591,9 +610,10 @@ pub fn enrich_detected_sessions(
         let latest_message = get_latest_message_from_entries(&entries);
         let notification_preview = notification_preview_from_entries(&entries);
         let pending_tool_input = match &hook_prompt {
-            Some(prompt) if prompt.agent_id.is_none() && pinned.is_none() => {
-                crate::claude_hooks::prompt_input(prompt, &session_file_path)
-            }
+            Some(prompt) if prompt.agent_id.is_none() => match &pinned {
+                Some(p) => p.read(|f| crate::claude_hooks::prompt_input_in(prompt, f)),
+                None => crate::claude_hooks::prompt_input(prompt, &session_file_path),
+            },
             Some(_) => None,
             None => get_pending_tool_input_with(&entries, &checker),
         };
@@ -627,9 +647,16 @@ pub fn enrich_detected_sessions(
         // Get custom title: Claude Code native /rename takes priority over c9watch's own.
         // Uses a static cache keyed by path plus a strong file stamp when available.
         let native_titles = match &pinned {
-            Some(p) => p
-                .read(|f| crate::session::parser::native_titles_from(f).ok())
-                .unwrap_or_default(),
+            Some(p) => native_titles_cached(
+                &session_file_path,
+                p.0.metadata()
+                    .and_then(|m| FileVersion::from_metadata(&m))
+                    .ok(),
+                || {
+                    p.read(|f| Some(crate::session::parser::native_titles_from(f)))
+                        .unwrap_or_else(|| Err(std::io::ErrorKind::Other.into()))
+                },
+            ),
             None => get_cached_native_titles(&session_file_path),
         };
         let custom_title = native_titles
@@ -927,20 +954,6 @@ fn transcript_metadata(pinned: &Option<Pinned>, path: &Path) -> std::io::Result<
     }
 }
 
-/// [`count_messages_in_jsonl`] of an open file, uncached.
-fn count_messages_from(file: File) -> Option<u32> {
-    let mut count = 0;
-    let mut batch = Vec::with_capacity(1024);
-    for line in BufReader::new(file).lines() {
-        batch.push(line.ok()?);
-        if batch.len() == 1024 {
-            count += count_messages_in_lines(&batch);
-            batch.clear();
-        }
-    }
-    Some(count + count_messages_in_lines(&batch))
-}
-
 /// Extract the first user prompt from a session JSONL file (truncated to 100 chars).
 pub fn get_first_prompt_from_jsonl(path: &Path) -> Option<String> {
     get_first_prompt_from_jsonl_raw(path).map(|s| truncate_string(&s, 100))
@@ -1111,7 +1124,20 @@ pub fn count_messages_in_jsonl(path: &Path) -> u32 {
 }
 
 fn count_messages_in_jsonl_at(path: &Path, now: Instant) -> u32 {
-    let Ok(stamp) = FileVersion::read(path) else {
+    count_messages_cached(path, path, now)
+}
+
+/// The message count of the transcript at `path` (the cache key), read
+/// from `source`: the path itself, or a pinned descriptor for it.
+fn count_messages_cached(
+    path: &Path,
+    source: impl crate::session::cache::Source,
+    now: Instant,
+) -> u32 {
+    let Ok(stamp) = source
+        .metadata()
+        .and_then(|m| FileVersion::from_metadata(&m))
+    else {
         if let Ok(mut cache) = MESSAGE_COUNT_CACHE.lock() {
             cache.remove(path);
         }
@@ -1121,7 +1147,7 @@ fn count_messages_in_jsonl_at(path: &Path, now: Instant) -> u32 {
     let mut cache = match MESSAGE_COUNT_CACHE.lock() {
         Ok(cache) => cache,
         Err(_) => {
-            return build_from_line_batches(path, count_messages_in_lines, |count, lines| {
+            return build_from_line_batches(source, count_messages_in_lines, |count, lines| {
                 count + count_messages_in_lines(lines)
             })
             .map_or(0, |(count, _)| count);
@@ -1130,7 +1156,7 @@ fn count_messages_in_jsonl_at(path: &Path, now: Instant) -> u32 {
 
     let Some(entry) = refresh_incremental_entry(
         cache.remove(path),
-        path,
+        source,
         stamp,
         now,
         count_messages_in_lines,
@@ -1602,7 +1628,6 @@ mod placeholder_tests {
     #[cfg(unix)]
     #[test]
     fn enrichment_skips_a_swapped_teammate_transcript_and_never_blocks() {
-        use std::os::unix::fs::MetadataExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("projects").join("-repo");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1610,10 +1635,9 @@ mod placeholder_tests {
         let path = dir.join(format!("{id}.jsonl"));
         std::fs::write(
             &path,
-            "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+            "{\"type\":\"user\",\"timestamp\":\"2026-11-03T00:00:00.000Z\",\"message\":{\"content\":\"hi\"}}\n",
         )
         .unwrap();
-        let meta = std::fs::metadata(&path).unwrap();
         let teammate = |file| DetectedSession {
             started_at_ms: Some(1),
             transcript_file: Some(file),
@@ -1631,14 +1655,12 @@ mod placeholder_tests {
                 .0
                 .len()
         };
-        let same = crate::session::teammates::TranscriptFile {
-            dev: meta.dev(),
-            ino: meta.ino(),
-        };
-        assert_eq!(enrich(teammate(same)), 1);
+        let same =
+            crate::session::teammates::transcript_file_of(&File::open(&path).unwrap()).unwrap();
+        assert_eq!(enrich(teammate(same.clone())), 1);
         let other = crate::session::teammates::TranscriptFile {
-            ino: meta.ino() + 1,
-            ..same
+            ino: same.ino + 1,
+            ..same.clone()
         };
         assert_eq!(enrich(teammate(other)), 0);
         // A FIFO in place of any session's transcript: the CLI placeholder
@@ -2055,6 +2077,42 @@ mod placeholder_tests {
         drop(file);
 
         assert_eq!(count_messages_in_jsonl(&path), 3);
+    }
+
+    /// Codex r5: a pinned transcript's count goes through the same cache,
+    /// keyed by its path and stamped from the descriptor, and an append is
+    /// read from the cached offset instead of from the start.
+    #[test]
+    fn a_pinned_count_is_cached_and_read_incrementally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-pinned.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n", r#"{"type":"user","message":{"content":"one"}}"#),
+        )
+        .unwrap();
+        let pinned = std::fs::File::open(&path).unwrap();
+        let t0 = Instant::now();
+        assert_eq!(count_messages_cached(&path, &pinned, t0), 1);
+        let first_offset = MESSAGE_COUNT_CACHE.lock().unwrap()[&path].offset;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":"two"}}}}"#
+        )
+        .unwrap();
+        drop(file);
+        assert_eq!(count_messages_cached(&path, &pinned, t0), 2);
+        let entry_offset = MESSAGE_COUNT_CACHE.lock().unwrap()[&path].offset;
+        assert!(entry_offset > first_offset);
+        // A different file now at the path does not change what the pinned
+        // descriptor counts.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(count_messages_cached(&path, &pinned, t0), 2);
     }
 
     #[test]

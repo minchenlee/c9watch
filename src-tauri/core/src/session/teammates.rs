@@ -39,13 +39,29 @@ pub(crate) struct TeammateArgs {
     pub agent_type: Option<String>,
 }
 
-/// A transcript's identity on disk (device and inode) when selection read
-/// it. Enrichment reopens the transcript by path, and reads it only while
-/// the path still names this file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The transcript selection matched: its device, inode and birth time
+/// (where the file system keeps one), and the header read from it.
+/// Enrichment reads the transcript only through a descriptor whose file
+/// has the same identity and still starts with the same header. An inode
+/// number alone is not enough: ext4 hands a freed inode to the next file.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptFile {
-    pub dev: u64,
-    pub ino: u64,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) birth: Option<SystemTime>,
+    pub(crate) header: Header,
+}
+
+/// What a header cache entry is valid for: the file's identity plus its
+/// change time and size, all from one `fstat`. Any change (an append
+/// included) reads the header again; a header is a few KB at most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    dev: u64,
+    ino: u64,
+    birth: Option<SystemTime>,
+    changed_ns: i128,
+    size: u64,
 }
 
 /// The link from a teammate session to its team and lead.
@@ -218,7 +234,7 @@ pub(crate) fn read_header(path: &Path) -> Option<Header> {
 
 /// The first timestamped entry of a transcript, or `None` when there is none
 /// yet (or it doesn't fit in `HEADER_LIMIT`).
-fn header_of(file: std::fs::File) -> Option<Header> {
+fn header_of(file: impl Read) -> Option<Header> {
     let reader = BufReader::new(file.take(HEADER_LIMIT));
     for line in reader.split(b'\n') {
         let line = line.ok()?;
@@ -242,43 +258,65 @@ fn header_of(file: std::fs::File) -> Option<Header> {
     None
 }
 
-/// The device and inode of an open file.
+/// The stamp of an open regular file, from one `fstat` (`statx` on Linux,
+/// which also gives the birth time where the file system keeps it).
 #[cfg(unix)]
-fn identity(file: &std::fs::File) -> Option<TranscriptFile> {
+fn stamp(file: &std::fs::File) -> Option<Stamp> {
     use std::os::unix::fs::MetadataExt;
     let meta = file.metadata().ok()?;
-    meta.is_file().then(|| TranscriptFile {
+    meta.is_file().then(|| Stamp {
         dev: meta.dev(),
         ino: meta.ino(),
+        birth: meta.created().ok(),
+        changed_ns: i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
+        size: meta.len(),
     })
 }
 
-/// Headers already read, each with the file it was read from. A header is
-/// the start of an append-only file, so it never changes once it is
-/// complete; a path that now names another file is read again.
+/// The [`TranscriptFile`] of an open file: its identity and its header,
+/// from the one descriptor.
+#[cfg(unix)]
+pub(crate) fn transcript_file_of(file: &std::fs::File) -> Option<TranscriptFile> {
+    let stamp = stamp(file)?;
+    Some(TranscriptFile {
+        dev: stamp.dev,
+        ino: stamp.ino,
+        birth: stamp.birth,
+        header: header_of(file)?,
+    })
+}
+
+/// Headers already read, each with the stamp of the file it was read from.
+/// A cached header is used only while the path names a file with the same
+/// stamp; a replaced file (even one given the old inode) is read again.
 #[derive(Default)]
-pub(crate) struct HeaderCache(HashMap<PathBuf, (TranscriptFile, Header)>);
+pub(crate) struct HeaderCache(HashMap<PathBuf, (Stamp, Header)>);
 
 impl HeaderCache {
     /// The header of the file `open` returns for `path`, and that file's
-    /// identity, both from the one descriptor. The cached header is used
-    /// only while the identity is the same.
+    /// identity, both from the one descriptor.
     #[cfg(unix)]
     fn get(
         &mut self,
         path: &Path,
         open: impl FnOnce() -> Option<std::fs::File>,
-    ) -> Option<(Header, TranscriptFile)> {
+    ) -> Option<TranscriptFile> {
         let file = open()?;
-        let id = identity(&file)?;
-        if let Some((cached, header)) = self.0.get(path) {
-            if *cached == id {
-                return Some((header.clone(), id));
+        let stamp = stamp(&file)?;
+        let header = match self.0.get(path) {
+            Some((cached, header)) if *cached == stamp => header.clone(),
+            _ => {
+                let header = header_of(&file)?;
+                self.0.insert(path.to_path_buf(), (stamp, header.clone()));
+                header
             }
-        }
-        let header = header_of(file)?;
-        self.0.insert(path.to_path_buf(), (id, header.clone()));
-        Some((header, id))
+        };
+        Some(TranscriptFile {
+            dev: stamp.dev,
+            ino: stamp.ino,
+            birth: stamp.birth,
+            header,
+        })
     }
 
     /// Drops the entries of files no lookup of the last pass saw.
@@ -460,9 +498,10 @@ pub(crate) fn find_transcript(
         }
         let path = dir.path.join(&name);
         seen.insert(path.clone());
-        let Some((header, file)) = cache.get(&path, || dir.open_file(&name)) else {
+        let Some(file) = cache.get(&path, || dir.open_file(&name)) else {
             continue;
         };
+        let header = &file.header;
         let matches = header.agent_name.as_deref() == Some(args.agent_name.as_str())
             && header.team_name.as_deref() == Some(args.team_name.as_str())
             && header.session_id.as_deref() == Some(stem)
@@ -474,7 +513,7 @@ pub(crate) fn find_transcript(
             Some((started, ..)) if *started > header.started_ms => {}
             Some((started, ..)) if *started == header.started_ms => tied = true,
             _ => {
-                best = Some((header.started_ms, stem.to_string(), file));
+                best = Some((header.started_ms, stem.to_string(), file.clone()));
                 tied = false;
             }
         }
@@ -506,7 +545,7 @@ pub(crate) fn find_transcript(
 pub(crate) fn still_names(
     path: &Path,
     projects: &Path,
-    file: TranscriptFile,
+    file: &TranscriptFile,
 ) -> Option<std::fs::File> {
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
@@ -525,15 +564,20 @@ pub(crate) fn still_names(
     // SAFETY: `raw` is a descriptor this function just opened.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     let dir = fd_path(&fd)?.parent()?.to_path_buf();
-    let opened = std::fs::File::from(fd);
-    (identity(&opened)? == file && dir.starts_with(&root) && dir != root).then_some(opened)
+    let mut opened = std::fs::File::from(fd);
+    if transcript_file_of(&opened)? != *file || !dir.starts_with(&root) || dir == root {
+        return None;
+    }
+    // Reading the header moved the offset; hand the file back rewound.
+    std::io::Seek::rewind(&mut opened).ok()?;
+    Some(opened)
 }
 
 #[cfg(not(unix))]
 pub(crate) fn still_names(
     _path: &Path,
     _projects: &Path,
-    _file: TranscriptFile,
+    _file: &TranscriptFile,
 ) -> Option<std::fs::File> {
     None
 }
@@ -991,30 +1035,30 @@ mod tests {
         .unwrap();
         assert_eq!(found, id(1));
         let path = dir.join(&name);
-        assert!(still_names(&path, &projects, file).is_some());
+        assert!(still_names(&path, &projects, &file).is_some());
         // The dir swapped for a symlink to an outside copy.
         std::fs::copy(&path, outside.join(&name)).unwrap();
         std::fs::rename(&dir, projects.join("-moved")).unwrap();
         std::os::unix::fs::symlink(&outside, &dir).unwrap();
-        assert!(still_names(&path, &projects, file).is_none());
+        assert!(still_names(&path, &projects, &file).is_none());
         // Even the original file, reached from outside the root.
         std::fs::remove_file(outside.join(&name)).unwrap();
         std::fs::hard_link(projects.join("-moved").join(&name), outside.join(&name)).unwrap();
-        assert!(still_names(&path, &projects, file).is_none());
+        assert!(still_names(&path, &projects, &file).is_none());
         // Back in place: still the same file.
         std::fs::remove_file(&dir).unwrap();
         std::fs::rename(projects.join("-moved"), &dir).unwrap();
-        assert!(still_names(&path, &projects, file).is_some());
+        assert!(still_names(&path, &projects, &file).is_some());
         // The file replaced by another under its name.
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, "{}").unwrap();
-        assert!(still_names(&path, &projects, file).is_none());
+        assert!(still_names(&path, &projects, &file).is_none());
         // A FIFO under its name: refused without blocking.
         std::fs::remove_file(&path).unwrap();
         let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         // SAFETY: `c` is a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        assert!(still_names(&path, &projects, file).is_none());
+        assert!(still_names(&path, &projects, &file).is_none());
         assert!(crate::session::cache::open_regular(&path).is_err());
     }
 
@@ -1049,7 +1093,7 @@ mod tests {
             &mut HashSet::new(),
         )
         .unwrap();
-        let pinned = still_names(&path, &projects, file).unwrap();
+        let pinned = still_names(&path, &projects, &file).unwrap();
         let secret = outside.join("secret.jsonl");
         std::fs::write(&secret, "OUTSIDE-CONVERSATION\n").unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -1061,7 +1105,7 @@ mod tests {
             "{text}"
         );
         assert!(crate::session::cache::open_regular(&path).is_err());
-        assert!(still_names(&path, &projects, file).is_none());
+        assert!(still_names(&path, &projects, &file).is_none());
     }
 
     /// Codex r4: a cached header belongs to the file it was read from. A
@@ -1116,8 +1160,11 @@ mod tests {
             dir.join(format!("{}.jsonl", id(1))),
         )
         .unwrap();
+        // Read again, not served from the cache: the header is the new
+        // file's, whatever inode the file system gave it.
         let (_, after) = lookup(&mut cache).unwrap();
-        assert_ne!(after, before);
+        assert_eq!(after.header.started_ms, (START as i64 + 7) * 1000 + 155);
+        assert_ne!(after.header, before.header);
     }
 
     /// The directory is read through the descriptor opened when it was
