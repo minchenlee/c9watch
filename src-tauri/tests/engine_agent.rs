@@ -142,7 +142,21 @@ fn q(p: &Path) -> String {
 /// agent would. With `register`, the PTY child is the live generation 1 of
 /// `AGENT_ID` before the command starts. Returns the output and the exit
 /// code.
+/// Linux: a binary written by one test can still be held open for writing
+/// by a sibling test's fork (before its exec), so exec fails with ETXTBSY
+/// and the command never ran. Retry only that case.
 fn as_agent(engine: &Engine, cmd: &str, register: bool) -> (String, i32) {
+    for _ in 0..5 {
+        let (out, rc) = as_agent_once(engine, cmd, register);
+        if !(rc == 126 && out.contains("Text file busy")) {
+            return (out, rc);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    as_agent_once(engine, cmd, register)
+}
+
+fn as_agent_once(engine: &Engine, cmd: &str, register: bool) -> (String, i32) {
     let script = format!("read go; {}; echo \"rc=$?.\"", cmd);
     let mut spec = SpawnSpec::new(
         vec!["/bin/sh".into(), "-c".into(), script.into()],
