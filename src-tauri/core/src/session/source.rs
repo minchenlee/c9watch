@@ -285,6 +285,10 @@ pub struct DetectedSession {
     /// finds teammates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub teammate: Option<super::teammates::TeammateLink>,
+    /// The transcript file selection matched, for a teammate. Enrichment
+    /// reads the transcript only while its path still names this file.
+    #[serde(skip)]
+    pub transcript_file: Option<super::teammates::TranscriptFile>,
 }
 
 fn default_true() -> bool {
@@ -340,6 +344,7 @@ impl DetectedSession {
             opencode_summary: None,
             process_start_secs: None,
             teammate: None,
+            transcript_file: None,
         }
     }
 

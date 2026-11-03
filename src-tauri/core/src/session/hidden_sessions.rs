@@ -97,14 +97,26 @@ pub(crate) fn pids_without_registry_entry<S: AsRef<str>>(file_names: &[S]) -> Ve
 /// Homebrew prefixes: Apple silicon, Intel macOS, Linux.
 const BREW_PREFIXES: &[&str] = &["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"];
 
+/// npm global prefixes outside the home directory: Homebrew's and the
+/// system Node's.
+const NPM_PREFIXES: &[&str] = &["/opt/homebrew", "/usr/local", "/usr"];
+
+const NPM_PACKAGE: &str = "lib/node_modules/@anthropic-ai/claude-code";
+
 /// Whether the process's executable is an installed Claude Code binary.
-/// Unlike argv, a process cannot claim this. The layouts:
+/// Unlike argv, a process cannot claim this. `exe` is the kernel's path to
+/// the running image (`proc_pidpath`, `/proc/<pid>/exe`), already absolute
+/// and resolved; each layout is anchored at the start of it:
 /// - the native installer: `~/.local/share/claude/versions/<version>`;
-/// - the Homebrew cask: `<brew prefix>/Caskroom/claude-code/<version>/claude`;
-/// - npm: a binary inside `node_modules/@anthropic-ai/claude-code/`.
+/// - the Homebrew cask: `<brew prefix>/Caskroom/claude-code/<version>/…`;
+/// - npm: a binary in `<npm prefix>/lib/node_modules/@anthropic-ai/claude-code/`,
+///   where the prefix is Homebrew's, the system's, `~/.npm-global` or an
+///   nvm `~/.nvm/versions/node/<version>`.
 ///
-/// A Node process running the npm package's `cli.js` has `node` as its
-/// executable, so it does not count: only its argv names Claude Code.
+/// A package path elsewhere (`/tmp/x/node_modules/@anthropic-ai/claude-code/…`)
+/// does not count. A Node process running the npm package's `cli.js` has
+/// `node` as its executable, so it does not count either: only its argv
+/// names Claude Code.
 fn runs_claude_code_binary(facts: &ProcessFacts, home: &Path) -> bool {
     facts
         .exe
@@ -113,25 +125,47 @@ fn runs_claude_code_binary(facts: &ProcessFacts, home: &Path) -> bool {
 }
 
 fn is_claude_code_binary(exe: &Path, home: &Path) -> bool {
-    if exe.starts_with(home.join(".local/share/claude/versions")) {
+    use std::path::Component;
+    // Something must follow the install dir, and `..` must not climb out.
+    let below = |root: &Path| {
+        exe.strip_prefix(root).is_ok_and(|rest| {
+            let mut parts = rest.components().peekable();
+            parts.peek().is_some() && parts.all(|c| matches!(c, Component::Normal(_)))
+        })
+    };
+    if !exe.is_absolute() {
+        return false;
+    }
+    if below(&home.join(".local/share/claude/versions")) {
         return true;
     }
     if BREW_PREFIXES
         .iter()
-        .any(|prefix| exe.starts_with(Path::new(prefix).join("Caskroom/claude-code")))
+        .any(|prefix| below(&Path::new(prefix).join("Caskroom/claude-code")))
     {
         return true;
     }
-    let parts: Vec<_> = exe.components().collect();
-    let package = [
-        std::path::Component::Normal("node_modules".as_ref()),
-        std::path::Component::Normal("@anthropic-ai".as_ref()),
-        std::path::Component::Normal("claude-code".as_ref()),
-    ];
-    // The package dir itself is not a binary: something must follow it.
-    parts
-        .windows(package.len() + 1)
-        .any(|w| w[..package.len()] == package)
+    if NPM_PREFIXES
+        .iter()
+        .map(PathBuf::from)
+        .chain([home.join(".npm-global")])
+        .any(|prefix| below(&prefix.join(NPM_PACKAGE)))
+    {
+        return true;
+    }
+    // nvm: `~/.nvm/versions/node/<version>/lib/node_modules/…`.
+    exe.strip_prefix(home.join(".nvm/versions/node"))
+        .ok()
+        .and_then(|rest| rest.components().next())
+        .filter(|version| matches!(version, Component::Normal(_)))
+        .is_some_and(|version| {
+            below(
+                &home
+                    .join(".nvm/versions/node")
+                    .join(version)
+                    .join(NPM_PACKAGE),
+            )
+        })
 }
 
 /// Whether the process is the real Claude Code binary, not a script that
@@ -408,7 +442,10 @@ mod tests {
             "/usr/local/Caskroom/claude-code/2.1.314/claude",
             "/home/linuxbrew/.linuxbrew/Caskroom/claude-code/2.1.314/claude",
             "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/bin/claude",
+            "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude",
+            "/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude",
             "/Users/me/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/claude",
+            "/Users/me/.nvm/versions/node/v22.11.0/lib/node_modules/@anthropic-ai/claude-code/bin/claude",
         ] {
             assert!(is_claude_code_binary(Path::new(exe), home), "{exe}");
         }
@@ -419,6 +456,20 @@ mod tests {
             "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code-other/claude",
             "/tmp/claude",
             "/Users/other/.local/share/claude/versions/2.1.314",
+            "/Users/me/.local/share/claude/versions",
+            // Codex r3: package-name lookalikes outside an npm global root.
+            "/tmp/x/node_modules/@anthropic-ai/claude-code/evil",
+            "/tmp/x/lib/node_modules/@anthropic-ai/claude-code/evil",
+            "/Users/me/project/node_modules/@anthropic-ai/claude-code/bin/claude",
+            "/tmp/opt/homebrew/Caskroom/claude-code/1/claude",
+            "/tmp/Users/me/.local/share/claude/versions/2.1.314",
+            "/Users/me/.nvm/versions/node/v22/node_modules/@anthropic-ai/claude-code/x",
+            "/Users/me/.nvm/versions/node/lib/node_modules/@anthropic-ai/claude-code",
+            // `..` climbs out of an install dir.
+            "/opt/homebrew/Caskroom/claude-code/../../../tmp/evil",
+            "/Users/me/.local/share/claude/versions/../../../../../tmp/evil",
+            "Users/me/.local/share/claude/versions/2.1.314",
+            "/Users/me/.nvm/versions/node/../../../../tmp/lib/node_modules/@anthropic-ai/claude-code/x",
         ] {
             assert!(!is_claude_code_binary(Path::new(exe), home), "{exe}");
         }

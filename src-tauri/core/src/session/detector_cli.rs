@@ -166,6 +166,7 @@ impl CliSessionSource {
             opencode_summary: None,
             process_start_secs,
             teammate: None,
+            transcript_file: None,
         }
     }
 
@@ -187,6 +188,7 @@ impl CliSessionSource {
             cwd: PathBuf,
             project_path: PathBuf,
             session_id: String,
+            file: teammates::TranscriptFile,
         }
         let projects = home.join(".claude").join("projects");
         let mut seen = std::collections::HashSet::new();
@@ -201,11 +203,11 @@ impl CliSessionSource {
             let headers = &mut self.teammate_headers;
             let hit = cwds.into_iter().find_map(|cwd| {
                 let dir = fallback_path_under(home, &cwd);
-                let id =
+                let (id, file) =
                     teammates::find_transcript(&dir, &projects, args, start, headers, &mut seen)?;
-                Some((cwd, dir, id))
+                Some((cwd, dir, id, file))
             });
-            if let Some((cwd, project_path, session_id)) = hit {
+            if let Some((cwd, project_path, session_id, file)) = hit {
                 claims.push(Claim {
                     pid,
                     start,
@@ -213,6 +215,7 @@ impl CliSessionSource {
                     cwd,
                     project_path,
                     session_id,
+                    file,
                 });
             }
         }
@@ -243,6 +246,7 @@ impl CliSessionSource {
                 can_rename: false,
                 process_start_secs: Some(c.start),
                 teammate: Some(c.link),
+                transcript_file: Some(c.file),
                 ..DetectedSession::with_legacy_defaults(
                     c.pid,
                     c.cwd,

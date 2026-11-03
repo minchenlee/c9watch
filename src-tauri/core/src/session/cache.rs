@@ -19,6 +19,27 @@ pub(crate) const MIN_FULL_VERIFY_GROWTH_BYTES: u64 = 1024 * 1024;
 pub(crate) const FULL_VERIFY_GROWTH_DIVISOR: u64 = 8;
 pub(crate) const PREFIX_FULL_REVALIDATION_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Open `path` for reading only if it is a regular file. The open does not
+/// block, so a FIFO or device under a transcript's name can never hang a
+/// detection tick; it is refused instead.
+pub(crate) fn open_regular(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 const HASH_LANES: usize = 8;
@@ -45,7 +66,7 @@ pub(crate) struct LineBatches {
 
 impl LineBatches {
     pub(crate) fn open(path: &Path, offset: u64) -> io::Result<Self> {
-        let mut file = fs::File::open(path)?;
+        let mut file = open_regular(path)?;
         file.seek(SeekFrom::Start(offset))?;
         Ok(Self {
             reader: BufReader::new(file),
@@ -188,7 +209,7 @@ fn hash_range(path: &Path, start: u64, end: u64) -> io::Result<(ContentHash, u64
         ));
     }
 
-    let mut file = fs::File::open(path)?;
+    let mut file = open_regular(path)?;
     file.seek(SeekFrom::Start(start))?;
     let mut hash = ContentHash::new();
     let mut remaining = end - start;
@@ -272,7 +293,7 @@ pub(crate) fn extend_prefix_snapshot(
     let suffix_len = end.saturating_sub(start);
     let mut hash = previous.hash;
     if suffix_len > 0 {
-        let mut file = fs::File::open(path)?;
+        let mut file = open_regular(path)?;
         file.seek(SeekFrom::Start(start))?;
         let mut remaining = suffix_len;
         let mut position = start;

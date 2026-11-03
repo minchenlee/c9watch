@@ -262,26 +262,57 @@ pub fn check_mutation(
     {
         return Err(format!("the peer runs under observed:{}", key));
     }
+    no_unlisted_teammate(chain, observed)?;
+    match confined {
+        Some(false) => Ok(()),
+        Some(true) => Err("the peer runs in a sandbox or a different mount namespace; on Linux, run the core and terminal in the same namespace (systemd ProtectHome/PrivateTmp/ProtectSystem/PrivateDevices and flatpak/snap terminals can isolate them)".into()),
+        None => Err("whether the peer runs in a sandbox could not be told".into()),
+    }
+}
+
+/// Refuse a chain with an agent-team teammate that session detection has
+/// not listed, or with a process whose argv can't be read, at any depth.
+/// Every process counts: a listed session nearer to the peer does not
+/// clear an unlisted teammate further up, because a same-user process
+/// under that teammate can start something detection lists.
+fn no_unlisted_teammate(chain: &[ProcInfo], observed: &dyn ObservedSessions) -> Result<(), String> {
     let teammates = observed.teammates(chain).map_err(|pid| {
         format!(
             "pid {} in the peer's ancestry could not be read (gone, unreadable or reused), so it may be an agent-team teammate",
             pid
         )
     })?;
-    if let Some(p) = chain
+    match chain
         .iter()
         .find(|p| teammates.contains(&p.pid) && observed.by_pid(p.pid).is_none())
     {
-        return Err(format!(
+        Some(p) => Err(format!(
             "the peer runs under agent-team teammate pid {}, which session detection has not listed",
             p.pid
-        ));
+        )),
+        None => Ok(()),
     }
-    match confined {
-        Some(false) => Ok(()),
-        Some(true) => Err("the peer runs in a sandbox or a different mount namespace; on Linux, run the core and terminal in the same namespace (systemd ProtectHome/PrivateTmp/ProtectSystem/PrivateDevices and flatpak/snap terminals can isolate them)".into()),
-        None => Err("whether the peer runs in a sandbox could not be told".into()),
+}
+
+/// The teammate part of [`check_mutation`] alone, for a write whose other
+/// admission checks don't walk the peer's ancestry (an observed session's
+/// annotation or mail). Blocking.
+pub fn check_teammate_ancestry(
+    pid: libc::pid_t,
+    peer_start: Option<u64>,
+    observed: &dyn ObservedSessions,
+) -> Result<(), String> {
+    let chain = peer::full_ancestry(pid).ok_or_else(|| {
+        format!(
+            "the peer's ancestry could not be read up to init: {}",
+            peer::ancestry_gap(pid)
+        )
+    })?;
+    match (chain.first(), peer_start) {
+        (Some(first), Some(start)) if first.start == start => {}
+        _ => return Err("the peer is not the process that connected".into()),
     }
+    no_unlisted_teammate(&chain, observed)
 }
 
 /// `check_mutation` for the peer with `pid`, as read now. Blocking.
@@ -655,6 +686,45 @@ pub(crate) mod tests {
         );
         assert_eq!(check(Some("claudeCode:mate"), &listed), Ok(()));
         assert!(check(None, &listed).is_err());
+    }
+
+    /// Codex r3: a listed session nearer to the peer does not clear an
+    /// unlisted teammate further up. The stamp names the listed session;
+    /// the write is refused anyway.
+    #[test]
+    fn a_listed_session_does_not_clear_an_unlisted_teammate_above_it() {
+        // tool (30) -> spoofed listed claude (20) -> shell (88's child) ->
+        // unlisted teammate (88) -> tmux (70).
+        let chain = vec![
+            pi(30, 20, 300),
+            pi(20, 25, 200),
+            pi(25, 88, 180),
+            pi(88, 70, 150),
+            pi(70, 1, 50),
+        ];
+        let team = FakeTeam {
+            observed: FakeObserved::one("claudeCode:spoof", 20),
+            teammates: HashSet::from([20, 88]),
+            unreadable: None,
+        };
+        assert_eq!(
+            stamp_observed(&chain, &NoLiveAgents, &team),
+            observed("claudeCode:spoof")
+        );
+        let e = check_mutation(
+            Some(&chain),
+            Some(300),
+            Some(false),
+            &NoLiveAgents,
+            &team,
+            Some("claudeCode:spoof"),
+        )
+        .unwrap_err();
+        assert!(e.contains("teammate pid 88"), "{}", e);
+        assert!(no_unlisted_teammate(&chain, &team)
+            .unwrap_err()
+            .contains("teammate pid 88"));
+        assert_eq!(no_unlisted_teammate(&chain[..3], &team), Ok(()));
     }
 
     /// A chain process whose argv can't be read at admission (it exited

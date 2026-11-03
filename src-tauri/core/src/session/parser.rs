@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -253,7 +252,7 @@ pub struct Usage {
 
 /// Parse a sessions-index.json file
 pub fn parse_sessions_index<P: AsRef<Path>>(path: P) -> Result<SessionsIndex, String> {
-    let file = File::open(path.as_ref())
+    let file = super::cache::open_regular(path.as_ref())
         .map_err(|e| format!("Failed to open sessions-index.json: {}", e))?;
 
     let reader = BufReader::new(file);
@@ -266,8 +265,8 @@ pub fn parse_sessions_index<P: AsRef<Path>>(path: P) -> Result<SessionsIndex, St
 /// This function uses a reverse-reading strategy to avoid loading
 /// the entire file into memory for large files.
 pub fn read_last_n_lines<P: AsRef<Path>>(path: P, n: usize) -> Result<Vec<String>, String> {
-    let file =
-        File::open(path.as_ref()).map_err(|e| format!("Failed to open JSONL file: {}", e))?;
+    let file = super::cache::open_regular(path.as_ref())
+        .map_err(|e| format!("Failed to open JSONL file: {}", e))?;
 
     let metadata = file
         .metadata()
@@ -365,8 +364,8 @@ pub fn parse_all_entries_with_progress<P: AsRef<Path>>(
     path: P,
     on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Vec<SessionEntry>, String> {
-    let file =
-        File::open(path.as_ref()).map_err(|e| format!("Failed to open JSONL file: {}", e))?;
+    let file = super::cache::open_regular(path.as_ref())
+        .map_err(|e| format!("Failed to open JSONL file: {}", e))?;
     let total = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut reader = BufReader::new(file);
     let mut lines = Vec::new();
@@ -676,11 +675,13 @@ pub struct NativeTitles {
 /// Scans the file for lines containing `"custom-title"` and parses only those.
 /// Returns the last (most recent) custom title found.
 pub fn get_native_custom_title_from_file(path: &std::path::Path) -> Option<String> {
-    scan_native_titles(File::open(path).ok()?).0.custom
+    scan_native_titles(super::cache::open_regular(path).ok()?)
+        .0
+        .custom
 }
 
 pub(crate) fn try_get_native_titles_from_file(path: &Path) -> std::io::Result<NativeTitles> {
-    let (titles, result) = scan_native_titles(File::open(path)?);
+    let (titles, result) = scan_native_titles(super::cache::open_regular(path)?);
     result?;
     Ok(titles)
 }
@@ -749,7 +750,7 @@ mod tests {
     fn read_last_n_lines_expands_for_a_large_complete_jsonl_record() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("large-record.jsonl");
-        let mut file = File::create(&path).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
 
         for index in 0..20 {
             let small_record = serde_json::json!({

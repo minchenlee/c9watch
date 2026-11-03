@@ -19,7 +19,6 @@ use crate::session::{parse_last_n_entries, parse_sessions_index, SessionEntry, S
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -419,6 +418,19 @@ pub fn enrich_detected_sessions(
                 ..base_session(&detected, &session_id)
             });
             continue;
+        }
+
+        // A teammate's transcript was picked through a pinned directory.
+        // Reads below go by path, so they run only while the path still
+        // names the file selection matched; a swapped dir or file is skipped.
+        if let Some(file) = detected.transcript_file {
+            let path = detected.project_path.join(format!("{}.jsonl", session_id));
+            let confined = detected.project_path.parent().is_some_and(|projects| {
+                crate::session::teammates::still_names(&path, projects, file)
+            });
+            if !confined {
+                continue;
+            }
         }
 
         // Try to parse sessions-index.json to get basic info (optional)
@@ -872,7 +884,7 @@ pub fn get_first_prompt_from_jsonl(path: &Path) -> Option<String> {
 
 /// Extract the first user prompt from a session JSONL file (full text, no truncation).
 pub fn get_first_prompt_from_jsonl_raw(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
+    let file = crate::session::cache::open_regular(path).ok()?;
     let reader = BufReader::new(file);
 
     for line in reader.lines().map_while(Result::ok).take(50) {
@@ -1389,6 +1401,7 @@ mod placeholder_tests {
             opencode_summary: None,
             process_start_secs: None,
             teammate: None,
+            transcript_file: None,
         };
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
@@ -1461,6 +1474,7 @@ mod placeholder_tests {
             opencode_summary: None,
             process_start_secs: None,
             teammate: None,
+            transcript_file: None,
         };
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
@@ -1512,6 +1526,71 @@ mod placeholder_tests {
             sessions.is_empty(),
             "legacy empty-JSONL session must be skipped"
         );
+    }
+
+    /// Codex r3: a teammate whose transcript path no longer names the file
+    /// selection matched is skipped, and a FIFO under a transcript's name
+    /// never blocks enrichment of any session.
+    #[cfg(unix)]
+    #[test]
+    fn enrichment_skips_a_swapped_teammate_transcript_and_never_blocks() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("projects").join("-repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let path = dir.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &path,
+            "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let teammate = |file| DetectedSession {
+            started_at_ms: Some(1),
+            transcript_file: Some(file),
+            ..DetectedSession::with_legacy_defaults(
+                42,
+                PathBuf::from("/tmp/repo"),
+                dir.clone(),
+                Some(id.to_string()),
+                "repo".to_string(),
+            )
+        };
+        let enrich = |d| {
+            enrich_detected_sessions(vec![d], DetectionDiagnostics::default())
+                .unwrap()
+                .0
+                .len()
+        };
+        let same = crate::session::teammates::TranscriptFile {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        };
+        assert_eq!(enrich(teammate(same)), 1);
+        let other = crate::session::teammates::TranscriptFile {
+            ino: meta.ino() + 1,
+            ..same
+        };
+        assert_eq!(enrich(teammate(other)), 0);
+        // A FIFO in place of any session's transcript: the CLI placeholder
+        // still renders, and nothing waits for a writer.
+        std::fs::remove_file(&path).unwrap();
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let plain = DetectedSession {
+            started_at_ms: Some(1),
+            ..DetectedSession::with_legacy_defaults(
+                42,
+                PathBuf::from("/tmp/repo"),
+                dir.clone(),
+                Some(id.to_string()),
+                "repo".to_string(),
+            )
+        };
+        assert_eq!(enrich(plain), 1);
+        assert_eq!(enrich(teammate(same)), 0);
     }
 
     #[test]
