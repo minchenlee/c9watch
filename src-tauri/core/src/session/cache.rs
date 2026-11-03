@@ -19,16 +19,17 @@ pub(crate) const MIN_FULL_VERIFY_GROWTH_BYTES: u64 = 1024 * 1024;
 pub(crate) const FULL_VERIFY_GROWTH_DIVISOR: u64 = 8;
 pub(crate) const PREFIX_FULL_REVALIDATION_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Open `path` for reading only if it is a regular file. The open does not
-/// block, so a FIFO or device under a transcript's name can never hang a
-/// detection tick; it is refused instead.
+/// Open `path` for reading only if it is a regular file, not through a
+/// symlink in its last component. The open does not block, so a FIFO or
+/// device under a transcript's name can never hang a detection tick; it is
+/// refused instead.
 pub(crate) fn open_regular(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {

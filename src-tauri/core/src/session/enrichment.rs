@@ -5,6 +5,7 @@ use crate::session::cache::{
 use crate::session::codex::CodexLifecycle;
 use crate::session::cursor::CursorLifecycle;
 use crate::session::owners::global_provider_source_owners;
+use crate::session::parser::parse_last_n_entries_from;
 use crate::session::parser::NativeTitles;
 use crate::session::permissions::PermissionChecker;
 use crate::session::pi::PiLifecycle;
@@ -19,6 +20,7 @@ use crate::session::{parse_last_n_entries, parse_sessions_index, SessionEntry, S
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -420,22 +422,30 @@ pub fn enrich_detected_sessions(
             continue;
         }
 
-        // A teammate's transcript was picked through a pinned directory.
-        // Reads below go by path, so they run only while the path still
-        // names the file selection matched; a swapped dir or file is skipped.
-        if let Some(file) = detected.transcript_file {
-            let path = detected.project_path.join(format!("{}.jsonl", session_id));
-            let confined = detected.project_path.parent().is_some_and(|projects| {
-                crate::session::teammates::still_names(&path, projects, file)
-            });
-            if !confined {
-                continue;
+        // A teammate's transcript was picked through a pinned directory. It
+        // is read only through the descriptor that proves the path still
+        // names the file selection matched, never reopened by name; a
+        // swapped dir or file is skipped. Nothing else in its directory
+        // (the index, subagent transcripts) is read.
+        let pinned = match detected.transcript_file {
+            Some(file) => {
+                let path = detected.project_path.join(format!("{}.jsonl", session_id));
+                let Some(pinned) = detected.project_path.parent().and_then(|projects| {
+                    crate::session::teammates::still_names(&path, projects, file)
+                }) else {
+                    continue;
+                };
+                Some(Pinned(pinned))
             }
-        }
+            None => None,
+        };
 
         // Try to parse sessions-index.json to get basic info (optional)
         let index_path = detected.project_path.join("sessions-index.json");
-        let sessions_index = parse_sessions_index(&index_path).ok();
+        let sessions_index = match pinned {
+            Some(_) => None,
+            None => parse_sessions_index(&index_path).ok(),
+        };
 
         // Find the matching entry in the index (if index exists)
         let session_entry = sessions_index.as_ref().and_then(|index| {
@@ -469,22 +479,28 @@ pub fn enrich_detected_sessions(
                 let session_file_path = detected.project_path.join(format!("{}.jsonl", session_id));
 
                 // Try to get first prompt from JSONL file
-                let first_prompt =
-                    get_first_prompt_from_jsonl(&session_file_path).unwrap_or_else(|| {
-                        if detected.started_at_ms.is_some() {
-                            "(No conversation yet)".to_string()
-                        } else {
-                            "(Active session)".to_string()
-                        }
-                    });
+                let first_prompt = match &pinned {
+                    Some(p) => p.read(first_prompt_from).map(|s| truncate_string(&s, 100)),
+                    None => get_first_prompt_from_jsonl(&session_file_path),
+                }
+                .unwrap_or_else(|| {
+                    if detected.started_at_ms.is_some() {
+                        "(No conversation yet)".to_string()
+                    } else {
+                        "(Active session)".to_string()
+                    }
+                });
 
                 // Count messages in the file
-                let message_count = count_messages_in_jsonl(&session_file_path);
+                let message_count = match &pinned {
+                    Some(p) => p.read(count_messages_from).unwrap_or(0),
+                    None => count_messages_in_jsonl(&session_file_path),
+                };
 
                 // Get file modification time. Fall back to started_at_ms for
                 // CLI-sourced placeholder sessions (no JSONL yet) so the frontend
                 // doesn't choke on `new Date("").getTime()` → NaN when sorting.
-                let modified = std::fs::metadata(&session_file_path)
+                let modified = transcript_metadata(&pinned, &session_file_path)
                     .and_then(|m| m.modified())
                     .ok()
                     .map(|t| {
@@ -510,8 +526,19 @@ pub fn enrich_detected_sessions(
         // `count_messages_in_jsonl`) already treat "no file" as silently empty rather
         // than logging. Only warn when the file exists but fails to open/parse.
         let session_file_path = detected.project_path.join(format!("{}.jsonl", session_id));
-        let entries = if session_file_path.is_file() {
-            match parse_last_n_entries(&session_file_path, 20) {
+        let transcript_is_file = pinned.is_some() || session_file_path.is_file();
+        let recently_modified = |secs| match &pinned {
+            Some(p) => p.0.metadata().is_ok_and(|m| modified_within(&m, secs)),
+            None => is_file_recently_modified(&session_file_path, secs),
+        };
+        let entries = if transcript_is_file {
+            let parsed = match &pinned {
+                Some(p) => p
+                    .read(|f| parse_last_n_entries_from(f, 20).ok())
+                    .ok_or_else(|| "unreadable".to_string()),
+                None => parse_last_n_entries(&session_file_path, 20),
+            };
+            match parsed {
                 Ok(entries) => entries,
                 Err(e) => {
                     crate::debug_log::log_warn(&format!(
@@ -529,9 +556,12 @@ pub fn enrich_detected_sessions(
         // turn an empty state file into approval of every pending transcript tool.
         let hook_state = crate::claude_hooks::session_state(&session_id);
         let checker = PermissionChecker::cached_for(Some(&detected.cwd));
-        let hook_prompt = hook_state
-            .as_ref()
-            .and_then(|state| open_hook_prompt(state, &session_file_path));
+        // A pinned transcript is not reopened to confirm a hook prompt, so
+        // the prompt counts as open.
+        let hook_prompt = hook_state.as_ref().and_then(|state| match pinned {
+            Some(_) => state.pending.first().cloned(),
+            None => open_hook_prompt(state, &session_file_path),
+        });
 
         let pending_tool_name = match &hook_prompt {
             Some(prompt) => Some(prompt.tool_name.clone()),
@@ -545,9 +575,7 @@ pub fn enrich_detected_sessions(
         } else {
             let raw_status = determine_status_with(&entries, &checker);
             // Override WaitingForInput if the JSONL file was recently modified.
-            if raw_status == SessionStatus::WaitingForInput
-                && is_file_recently_modified(&session_file_path, 8)
-            {
+            if raw_status == SessionStatus::WaitingForInput && recently_modified(8) {
                 SessionStatus::Working
             } else {
                 raw_status
@@ -563,7 +591,7 @@ pub fn enrich_detected_sessions(
         let latest_message = get_latest_message_from_entries(&entries);
         let notification_preview = notification_preview_from_entries(&entries);
         let pending_tool_input = match &hook_prompt {
-            Some(prompt) if prompt.agent_id.is_none() => {
+            Some(prompt) if prompt.agent_id.is_none() && pinned.is_none() => {
                 crate::claude_hooks::prompt_input(prompt, &session_file_path)
             }
             Some(_) => None,
@@ -575,7 +603,7 @@ pub fn enrich_detected_sessions(
         // interactive sessions never write to ~/.claude/projects/). Render a
         // placeholder card so the dashboard count matches `claude agents --json`.
         let cli_sourced = detected.started_at_ms.is_some();
-        let source_health = if !session_file_path.is_file() {
+        let source_health = if !transcript_is_file {
             if cli_sourced {
                 SourceHealth::Partial
             } else {
@@ -583,7 +611,7 @@ pub fn enrich_detected_sessions(
             }
         } else if entries.is_empty() {
             SourceHealth::Partial
-        } else if is_file_recently_modified(&session_file_path, 24 * 60 * 60) {
+        } else if recently_modified(24 * 60 * 60) {
             SourceHealth::Fresh
         } else {
             SourceHealth::Stale
@@ -598,7 +626,12 @@ pub fn enrich_detected_sessions(
 
         // Get custom title: Claude Code native /rename takes priority over c9watch's own.
         // Uses a static cache keyed by path plus a strong file stamp when available.
-        let native_titles = get_cached_native_titles(&session_file_path);
+        let native_titles = match &pinned {
+            Some(p) => p
+                .read(|f| crate::session::parser::native_titles_from(f).ok())
+                .unwrap_or_default(),
+            None => get_cached_native_titles(&session_file_path),
+        };
         let custom_title = native_titles
             .custom
             .or_else(|| claude_custom_title(detected.provider, &custom_titles, &session_id));
@@ -626,9 +659,7 @@ pub fn enrich_detected_sessions(
             pending_tool_input,
             waiting_for: None,
             last_assistant_message: None,
-            transcript_path: session_file_path
-                .is_file()
-                .then(|| session_file_path.clone()),
+            transcript_path: transcript_is_file.then(|| session_file_path.clone()),
             worker_of: None,
             teammate: detected.teammate.clone(),
             official_name: detected.official_name.clone(),
@@ -865,16 +896,49 @@ fn subagent_transcript(session_file: &Path, agent_id: &str) -> Option<PathBuf> {
 
 /// Checks if a file was modified within the last N seconds
 pub fn is_file_recently_modified(path: &Path, seconds: u64) -> bool {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
+    std::fs::metadata(path).is_ok_and(|m| modified_within(&m, seconds))
+}
+
+fn modified_within(metadata: &std::fs::Metadata, seconds: u64) -> bool {
+    metadata
+        .modified()
         .ok()
-        .map(|modified| {
-            modified
-                .elapsed()
-                .map(|elapsed| elapsed.as_secs() < seconds)
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|elapsed| elapsed.as_secs() < seconds)
+}
+
+/// A teammate's transcript, opened once and checked. Each read starts from
+/// a copy of the descriptor rewound to the start, never from the path.
+struct Pinned(File);
+
+impl Pinned {
+    fn read<T>(&self, read: impl FnOnce(File) -> Option<T>) -> Option<T> {
+        use std::io::{Seek, SeekFrom};
+        let mut file = self.0.try_clone().ok()?;
+        file.seek(SeekFrom::Start(0)).ok()?;
+        read(file)
+    }
+}
+
+fn transcript_metadata(pinned: &Option<Pinned>, path: &Path) -> std::io::Result<std::fs::Metadata> {
+    match pinned {
+        Some(p) => p.0.metadata(),
+        None => std::fs::metadata(path),
+    }
+}
+
+/// [`count_messages_in_jsonl`] of an open file, uncached.
+fn count_messages_from(file: File) -> Option<u32> {
+    let mut count = 0;
+    let mut batch = Vec::with_capacity(1024);
+    for line in BufReader::new(file).lines() {
+        batch.push(line.ok()?);
+        if batch.len() == 1024 {
+            count += count_messages_in_lines(&batch);
+            batch.clear();
+        }
+    }
+    Some(count + count_messages_in_lines(&batch))
 }
 
 /// Extract the first user prompt from a session JSONL file (truncated to 100 chars).
@@ -884,7 +948,11 @@ pub fn get_first_prompt_from_jsonl(path: &Path) -> Option<String> {
 
 /// Extract the first user prompt from a session JSONL file (full text, no truncation).
 pub fn get_first_prompt_from_jsonl_raw(path: &Path) -> Option<String> {
-    let file = crate::session::cache::open_regular(path).ok()?;
+    first_prompt_from(crate::session::cache::open_regular(path).ok()?)
+}
+
+/// [`get_first_prompt_from_jsonl_raw`] of an open file.
+fn first_prompt_from(file: File) -> Option<String> {
     let reader = BufReader::new(file);
 
     for line in reader.lines().map_while(Result::ok).take(50) {

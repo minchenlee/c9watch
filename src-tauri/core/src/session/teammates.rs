@@ -242,20 +242,43 @@ fn header_of(file: std::fs::File) -> Option<Header> {
     None
 }
 
-/// Headers already read. A header is the start of an append-only file, so it
-/// never changes once it is complete.
+/// The device and inode of an open file.
+#[cfg(unix)]
+fn identity(file: &std::fs::File) -> Option<TranscriptFile> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata().ok()?;
+    meta.is_file().then(|| TranscriptFile {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+/// Headers already read, each with the file it was read from. A header is
+/// the start of an append-only file, so it never changes once it is
+/// complete; a path that now names another file is read again.
 #[derive(Default)]
-pub(crate) struct HeaderCache(HashMap<PathBuf, Header>);
+pub(crate) struct HeaderCache(HashMap<PathBuf, (TranscriptFile, Header)>);
 
 impl HeaderCache {
-    /// The header of `path`, from `open` when it isn't cached yet.
-    fn get(&mut self, path: &Path, open: impl FnOnce() -> Option<std::fs::File>) -> Option<Header> {
-        if let Some(header) = self.0.get(path) {
-            return Some(header.clone());
+    /// The header of the file `open` returns for `path`, and that file's
+    /// identity, both from the one descriptor. The cached header is used
+    /// only while the identity is the same.
+    #[cfg(unix)]
+    fn get(
+        &mut self,
+        path: &Path,
+        open: impl FnOnce() -> Option<std::fs::File>,
+    ) -> Option<(Header, TranscriptFile)> {
+        let file = open()?;
+        let id = identity(&file)?;
+        if let Some((cached, header)) = self.0.get(path) {
+            if *cached == id {
+                return Some((header.clone(), id));
+            }
         }
-        let header = header_of(open()?)?;
-        self.0.insert(path.to_path_buf(), header.clone());
-        Some(header)
+        let header = header_of(file)?;
+        self.0.insert(path.to_path_buf(), (id, header.clone()));
+        Some((header, id))
     }
 
     /// Drops the entries of files no lookup of the last pass saw.
@@ -300,7 +323,7 @@ impl ProjectDir {
 
     /// The regular files in the directory (symlinks, FIFOs and the rest
     /// left out), with their mtimes, read relative to the descriptor.
-    fn files(&self) -> Vec<(std::ffi::OsString, SystemTime, TranscriptFile)> {
+    fn files(&self) -> Vec<(std::ffi::OsString, SystemTime)> {
         use std::os::fd::AsRawFd;
         use std::os::unix::ffi::OsStrExt;
         let mut out = Vec::new();
@@ -329,11 +352,10 @@ impl ProjectDir {
             if matches!(name.to_bytes(), b"." | b"..") {
                 continue;
             }
-            if let Some((modified, file)) = self.stat_regular(name) {
+            if let Some(modified) = self.stat_regular(name) {
                 out.push((
                     std::ffi::OsStr::from_bytes(name.to_bytes()).to_os_string(),
                     modified,
-                    file,
                 ));
             }
         }
@@ -342,9 +364,8 @@ impl ProjectDir {
         out
     }
 
-    /// The mtime and identity of `name`, when it is a regular file (not
-    /// followed).
-    fn stat_regular(&self, name: &std::ffi::CStr) -> Option<(SystemTime, TranscriptFile)> {
+    /// The mtime of `name`, when it is a regular file (not followed).
+    fn stat_regular(&self, name: &std::ffi::CStr) -> Option<SystemTime> {
         use std::os::fd::AsRawFd;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `st` is writable and `name` is NUL-terminated.
@@ -360,13 +381,7 @@ impl ProjectDir {
             return None;
         }
         let secs = u64::try_from(st.st_mtime).ok()?;
-        Some((
-            SystemTime::UNIX_EPOCH + Duration::new(secs, st.st_mtime_nsec as u32),
-            TranscriptFile {
-                dev: st.st_dev as u64,
-                ino: st.st_ino as u64,
-            },
-        ))
+        Some(SystemTime::UNIX_EPOCH + Duration::new(secs, st.st_mtime_nsec as u32))
     }
 
     /// `name` in the directory, opened without following a symlink or
@@ -434,7 +449,7 @@ pub(crate) fn find_transcript(
         + Duration::from_secs(process_start_secs.saturating_sub(START_SLACK_SECS as u64));
     let mut best: Option<(i64, String, TranscriptFile)> = None;
     let mut tied = false;
-    for (name, modified, file) in dir.files() {
+    for (name, modified) in dir.files() {
         let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".jsonl")) else {
             continue;
         };
@@ -445,7 +460,7 @@ pub(crate) fn find_transcript(
         }
         let path = dir.path.join(&name);
         seen.insert(path.clone());
-        let Some(header) = cache.get(&path, || dir.open_file(&name)) else {
+        let Some((header, file)) = cache.get(&path, || dir.open_file(&name)) else {
             continue;
         };
         let matches = header.agent_name.as_deref() == Some(args.agent_name.as_str())
@@ -483,19 +498,20 @@ pub(crate) fn find_transcript(
     None
 }
 
-/// Whether `path` still names `file`, a regular file (not a symlink) whose
-/// directory is under `projects`. Opened without blocking on a FIFO.
+/// `path` opened, when it still names `file`: a regular file (not a
+/// symlink) whose directory is under `projects`. Opened without blocking
+/// on a FIFO. Read the transcript only through the returned descriptor; a
+/// later open by name could reach another file.
 #[cfg(unix)]
-pub(crate) fn still_names(path: &Path, projects: &Path, file: TranscriptFile) -> bool {
+pub(crate) fn still_names(
+    path: &Path,
+    projects: &Path,
+    file: TranscriptFile,
+) -> Option<std::fs::File> {
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
-    let Some(root) = projects.canonicalize().ok() else {
-        return false;
-    };
-    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
+    let root = projects.canonicalize().ok()?;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     // SAFETY: `c` is a valid NUL-terminated path.
     let raw = unsafe {
         libc::open(
@@ -504,27 +520,22 @@ pub(crate) fn still_names(path: &Path, projects: &Path, file: TranscriptFile) ->
         )
     };
     if raw < 0 {
-        return false;
+        return None;
     }
     // SAFETY: `raw` is a descriptor this function just opened.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    let opened = fd_path(&fd);
-    let file_now = std::fs::File::from(fd);
-    let Ok(meta) = file_now.metadata() else {
-        return false;
-    };
-    meta.is_file()
-        && meta.dev() == file.dev
-        && meta.ino() == file.ino
-        && opened.is_some_and(|p| {
-            p.parent()
-                .is_some_and(|d| d.starts_with(&root) && d != root)
-        })
+    let dir = fd_path(&fd)?.parent()?.to_path_buf();
+    let opened = std::fs::File::from(fd);
+    (identity(&opened)? == file && dir.starts_with(&root) && dir != root).then_some(opened)
 }
 
 #[cfg(not(unix))]
-pub(crate) fn still_names(_path: &Path, _projects: &Path, _file: TranscriptFile) -> bool {
-    false
+pub(crate) fn still_names(
+    _path: &Path,
+    _projects: &Path,
+    _file: TranscriptFile,
+) -> Option<std::fs::File> {
+    None
 }
 
 #[cfg(test)]
@@ -980,31 +991,133 @@ mod tests {
         .unwrap();
         assert_eq!(found, id(1));
         let path = dir.join(&name);
-        assert!(still_names(&path, &projects, file));
+        assert!(still_names(&path, &projects, file).is_some());
         // The dir swapped for a symlink to an outside copy.
         std::fs::copy(&path, outside.join(&name)).unwrap();
         std::fs::rename(&dir, projects.join("-moved")).unwrap();
         std::os::unix::fs::symlink(&outside, &dir).unwrap();
-        assert!(!still_names(&path, &projects, file));
+        assert!(still_names(&path, &projects, file).is_none());
         // Even the original file, reached from outside the root.
         std::fs::remove_file(outside.join(&name)).unwrap();
         std::fs::hard_link(projects.join("-moved").join(&name), outside.join(&name)).unwrap();
-        assert!(!still_names(&path, &projects, file));
+        assert!(still_names(&path, &projects, file).is_none());
         // Back in place: still the same file.
         std::fs::remove_file(&dir).unwrap();
         std::fs::rename(projects.join("-moved"), &dir).unwrap();
-        assert!(still_names(&path, &projects, file));
+        assert!(still_names(&path, &projects, file).is_some());
         // The file replaced by another under its name.
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, "{}").unwrap();
-        assert!(!still_names(&path, &projects, file));
+        assert!(still_names(&path, &projects, file).is_none());
         // A FIFO under its name: refused without blocking.
         std::fs::remove_file(&path).unwrap();
         let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         // SAFETY: `c` is a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        assert!(!still_names(&path, &projects, file));
+        assert!(still_names(&path, &projects, file).is_none());
         assert!(crate::session::cache::open_regular(&path).is_err());
+    }
+
+    /// Codex r4: after the check, the transcript is read only through the
+    /// descriptor it returned. Swapping the file for a symlink to an
+    /// outside transcript changes nothing that is read, and a reopen by
+    /// name refuses the symlink.
+    #[cfg(unix)]
+    #[test]
+    fn reads_after_the_check_stay_on_the_checked_file() {
+        use std::io::Read;
+        let root = tempfile::tempdir().unwrap();
+        let projects = root.path().join("projects");
+        let dir = projects.join("-repo");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        transcript(
+            &dir,
+            &id(1),
+            Some("p10-multi-cwd"),
+            "session-52d94f40",
+            START as i64 + 5,
+        );
+        let path = dir.join(format!("{}.jsonl", id(1)));
+        let (_, file) = find_transcript(
+            &dir,
+            &projects,
+            &args(),
+            START,
+            &mut HeaderCache::default(),
+            &mut HashSet::new(),
+        )
+        .unwrap();
+        let pinned = still_names(&path, &projects, file).unwrap();
+        let secret = outside.join("secret.jsonl");
+        std::fs::write(&secret, "OUTSIDE-CONVERSATION\n").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&secret, &path).unwrap();
+        let mut text = String::new();
+        (&pinned).read_to_string(&mut text).unwrap();
+        assert!(
+            text.contains("p10-multi-cwd") && !text.contains("OUTSIDE"),
+            "{text}"
+        );
+        assert!(crate::session::cache::open_regular(&path).is_err());
+        assert!(still_names(&path, &projects, file).is_none());
+    }
+
+    /// Codex r4: a cached header belongs to the file it was read from. A
+    /// path atomically replaced by an unrelated transcript is read again,
+    /// so the old header is never paired with the new file.
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_file_is_read_again_not_served_from_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let projects = root.path().join("projects");
+        let dir = projects.join("-repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        transcript(
+            &dir,
+            &id(1),
+            Some("p10-multi-cwd"),
+            "session-52d94f40",
+            START as i64 + 5,
+        );
+        let mut cache = HeaderCache::default();
+        let lookup = |cache: &mut HeaderCache| {
+            find_transcript(&dir, &projects, &args(), START, cache, &mut HashSet::new())
+        };
+        let (found, before) = lookup(&mut cache).unwrap();
+        assert_eq!(found, id(1));
+        // Another agent's transcript renamed over the same name.
+        let staging = root.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        transcript(
+            &staging,
+            &id(1),
+            Some("someone-else"),
+            "session-52d94f40",
+            START as i64 + 6,
+        );
+        std::fs::rename(
+            staging.join(format!("{}.jsonl", id(1))),
+            dir.join(format!("{}.jsonl", id(1))),
+        )
+        .unwrap();
+        assert_eq!(lookup(&mut cache), None);
+        // A replacement that does match is found with its own identity.
+        transcript(
+            &staging,
+            &id(1),
+            Some("p10-multi-cwd"),
+            "session-52d94f40",
+            START as i64 + 7,
+        );
+        std::fs::rename(
+            staging.join(format!("{}.jsonl", id(1))),
+            dir.join(format!("{}.jsonl", id(1))),
+        )
+        .unwrap();
+        let (_, after) = lookup(&mut cache).unwrap();
+        assert_ne!(after, before);
     }
 
     /// The directory is read through the descriptor opened when it was
@@ -1023,7 +1136,7 @@ mod tests {
         std::fs::write(dir.join("b.jsonl"), "inside").unwrap();
         std::fs::write(outside.join("a.jsonl"), "outside").unwrap();
         let opened = ProjectDir::open(&dir, &projects).unwrap();
-        let names: HashSet<_> = opened.files().into_iter().map(|(n, ..)| n).collect();
+        let names: HashSet<_> = opened.files().into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, HashSet::from(["a.jsonl".into(), "b.jsonl".into()]));
         // Swap the directory for a symlink out of the root.
         std::fs::rename(&dir, projects.join("-moved")).unwrap();

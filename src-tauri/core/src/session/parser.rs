@@ -267,7 +267,16 @@ pub fn parse_sessions_index<P: AsRef<Path>>(path: P) -> Result<SessionsIndex, St
 pub fn read_last_n_lines<P: AsRef<Path>>(path: P, n: usize) -> Result<Vec<String>, String> {
     let file = super::cache::open_regular(path.as_ref())
         .map_err(|e| format!("Failed to open JSONL file: {}", e))?;
+    read_last_n_lines_from(file, n)
+}
 
+/// [`read_last_n_lines`] of an open file, from its start.
+pub(crate) fn read_last_n_lines_from(
+    mut file: std::fs::File,
+    n: usize,
+) -> Result<Vec<String>, String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("Failed to seek JSONL file: {}", e))?;
     let metadata = file
         .metadata()
         .map_err(|e| format!("Failed to read file metadata: {}", e))?;
@@ -352,6 +361,14 @@ pub fn parse_last_n_entries<P: AsRef<Path>>(
 ) -> Result<Vec<SessionEntry>, String> {
     let lines = read_last_n_lines(path, n)?;
     Ok(parse_jsonl_entries(&lines))
+}
+
+/// [`parse_last_n_entries`] of an open file.
+pub(crate) fn parse_last_n_entries_from(
+    file: std::fs::File,
+    n: usize,
+) -> Result<Vec<SessionEntry>, String> {
+    Ok(parse_jsonl_entries(&read_last_n_lines_from(file, n)?))
 }
 
 /// Parse all entries from a session JSONL file
@@ -678,6 +695,14 @@ pub fn get_native_custom_title_from_file(path: &std::path::Path) -> Option<Strin
     scan_native_titles(super::cache::open_regular(path).ok()?)
         .0
         .custom
+}
+
+/// The native titles of an open file, read from its start.
+pub(crate) fn native_titles_from(mut file: std::fs::File) -> std::io::Result<NativeTitles> {
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let (titles, result) = scan_native_titles(file);
+    result?;
+    Ok(titles)
 }
 
 pub(crate) fn try_get_native_titles_from_file(path: &Path) -> std::io::Result<NativeTitles> {
