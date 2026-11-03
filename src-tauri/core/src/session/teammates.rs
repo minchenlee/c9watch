@@ -447,8 +447,7 @@ impl ProjectDir {
 
 /// The path of an open descriptor.
 #[cfg(target_os = "macos")]
-fn fd_path(fd: &std::os::fd::OwnedFd) -> Option<PathBuf> {
-    use std::os::fd::AsRawFd;
+fn fd_path(fd: &impl std::os::fd::AsRawFd) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let mut buf = vec![0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`.
@@ -460,8 +459,7 @@ fn fd_path(fd: &std::os::fd::OwnedFd) -> Option<PathBuf> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn fd_path(fd: &std::os::fd::OwnedFd) -> Option<PathBuf> {
-    use std::os::fd::AsRawFd;
+fn fd_path(fd: &impl std::os::fd::AsRawFd) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).ok()
 }
 
@@ -522,6 +520,78 @@ pub(crate) fn find_transcript(
         return None;
     }
     best.map(|(_, id, file)| (id, file))
+}
+
+/// `name` in the directory `dir`, opened relative to it with `flags` and
+/// without following a symlink.
+#[cfg(unix)]
+fn open_at(
+    dir: &impl std::os::fd::AsRawFd,
+    name: &str,
+    flags: libc::c_int,
+) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let c = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `c` is NUL-terminated; the descriptor is open.
+    let raw = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    // SAFETY: `raw` is a descriptor this function just opened.
+    (raw >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+}
+
+/// The transcript of subagent `agent_id` of the pinned teammate
+/// `transcript` (`<session_id>.jsonl` in `project_dir`):
+/// `<session_id>/subagents/agent-<agent_id>.jsonl` beside it. The project
+/// dir is opened again, checked to be under `projects` and to be the dir
+/// `transcript` is in, and each component below it is opened relative to
+/// the last without following a symlink; the file must be regular and is
+/// opened without blocking. `None` when any step fails.
+#[cfg(unix)]
+pub(crate) fn open_subagent_transcript(
+    project_dir: &Path,
+    projects: &Path,
+    transcript: &std::fs::File,
+    session_id: &str,
+    agent_id: &str,
+) -> Option<std::fs::File> {
+    let safe = |name: &str| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    if !safe(session_id) || !safe(agent_id) {
+        return None;
+    }
+    let dir = ProjectDir::open(project_dir, projects)?;
+    if fd_path(transcript)?.parent()? != dir.path {
+        return None;
+    }
+    let session = open_at(&dir.fd, session_id, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let subagents = open_at(&session, "subagents", libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let file = open_at(
+        &subagents,
+        &format!("agent-{agent_id}.jsonl"),
+        libc::O_RDONLY | libc::O_NONBLOCK,
+    )?;
+    let file = std::fs::File::from(file);
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_subagent_transcript(
+    _project_dir: &Path,
+    _projects: &Path,
+    _transcript: &std::fs::File,
+    _session_id: &str,
+    _agent_id: &str,
+) -> Option<std::fs::File> {
+    None
 }
 
 /// Teammates run in tmux panes; there are none to find elsewhere.

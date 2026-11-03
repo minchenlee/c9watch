@@ -705,12 +705,6 @@ pub(crate) fn native_titles_from(mut file: std::fs::File) -> std::io::Result<Nat
     Ok(titles)
 }
 
-pub(crate) fn try_get_native_titles_from_file(path: &Path) -> std::io::Result<NativeTitles> {
-    let (titles, result) = scan_native_titles(super::cache::open_regular(path)?);
-    result?;
-    Ok(titles)
-}
-
 /// Retain one line at a time, and keep I/O failure separate from no title.
 /// A line that isn't valid UTF-8 ends the scan with the titles found so far,
 /// as a complete result: rescanning an unchanged file gives the same answer.
