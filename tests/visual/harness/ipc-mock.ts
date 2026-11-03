@@ -56,10 +56,17 @@ function handle(cmd: string, args: Args): unknown {
                 case 'session.tasks': return { tasks: fx.tasks[String(p.sessionId)] ?? [] };
                 case 'provider.opencode.status': return fx.opencodeStatus;
                 case 'provider.opencode.connect': case 'detect.recheck': return null;
+                // The Classic bridge does not expose mail to the webview yet.
+                case 'msg.list': case 'msg.read': case 'msg.send': case 'msg.cancel': case 'mail.pause': case 'mail.resume':
+                    throw { code: 'not_allowed', msg: 'Method is not exposed to this window', retryable: false, hint: '' };
                 default: unhandled.push(`c9p:${String(args?.method)}`); return null;
             }
         }
-        case 'c9p_subscribe': return 'visual-sub';
+        case 'c9p_subscribe': {
+            const topics = ((args?.params as { topics?: string[] } | undefined)?.topics ?? []);
+            if (topics.includes('msg.state')) throw { code: 'not_allowed', msg: 'Topic is not exposed to this window', retryable: false, hint: '' };
+            return 'visual-sub';
+        }
         case 'c9p_unsubscribe': return null;
 		case 'get_sessions':
 			return live;

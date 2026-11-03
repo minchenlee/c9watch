@@ -34,6 +34,8 @@
 	import { refreshSessionHistory } from '$lib/stores/history';
 	import MemoryViewer from '$lib/components/MemoryViewer.svelte';
 	import SettingsTab from '$lib/components/SettingsTab.svelte';
+	import MailTab from '$lib/components/MailTab.svelte';
+	import { mailAvailable, mailFocus } from '$lib/stores/mail';
 	import SubscriptionUsage from '$lib/components/SubscriptionUsage.svelte';
 	import FdaBanner from '$lib/components/FdaBanner.svelte';
 	import HiddenSessionsNotice from '$lib/components/HiddenSessionsNotice.svelte';
@@ -86,7 +88,12 @@
 		if (next !== undefined) denseFontScale = next;
 	}
 
-	let activeTab = $state<'monitor' | 'history' | 'cost' | 'memory' | 'settings'>('monitor');
+	let activeTab = $state<'monitor' | 'history' | 'cost' | 'memory' | 'settings' | 'mail'>('monitor');
+
+	function openMail(agentId: string) {
+		mailFocus.set(agentId);
+		activeTab = 'mail';
+	}
 	let fdaLikelyNeeded = $state(false);
 	let hiddenClaudeSessions = $state<HiddenClaudeSession[]>([]);
 	let showDebugConsole = $state(false);
@@ -208,7 +215,8 @@
 			'2': 'history',
 			'3': 'cost',
 			'4': 'memory',
-			'5': 'settings'
+			'5': 'settings',
+			'6': 'mail'
 		};
 
 		const handler = (e: KeyboardEvent) => {
@@ -216,6 +224,8 @@
 			if (e.altKey || e.shiftKey) return;
 			const tab = tabByKey[e.key];
 			if (!tab) return;
+			// MAIL is tab 6 only while the mail API answers.
+			if (tab === 'mail' && !get(mailAvailable)) return;
 
 			const target = e.target as HTMLElement | null;
 			if (target) {
@@ -480,7 +490,7 @@
 			toggleDemoMode();
 			return;
 		}
-		if (e.key >= '1' && e.key <= '9' && !expandedId && !e.metaKey && !e.ctrlKey) {
+		if (e.key >= '1' && e.key <= '9' && !expandedId && !e.metaKey && !e.ctrlKey && activeTab !== 'mail') {
 			const index = parseInt(e.key) - 1;
 			if (index < filteredSessions.length) {
 				handleExpand(filteredSessions[index]);
@@ -542,10 +552,21 @@
 			<span class="tab-icon">◆</span>
 			<span class="tab-label">MEMORY</span>
 		</button>
+		{#if $mailAvailable || activeTab === 'mail'}
+			<button
+				class="tab-btn"
+				class:active={activeTab === 'mail'}
+				onclick={() => (activeTab = 'mail')}
+				title="Agent mail (⌘6)"
+			>
+				<span class="tab-icon">✉</span>
+				<span class="tab-label">MAIL</span>
+			</button>
+		{/if}
 		<!-- Drag handle: fills remaining space. The grip dots are absolutely
 		     centered in the whole tab bar so they appear at the window midpoint.
 		     Hidden in fullscreen where window dragging is unavailable. -->
-		<div class="tab-drag-region" data-tauri-drag-region>
+		<div class="tab-drag-region" class:dots-local={$mailAvailable || activeTab === 'mail'} data-tauri-drag-region>
 			{#if !isFullscreen}
 				<span class="drag-dots" transition:fade={{ duration: 250 }}>⠿ ⠿ ⠿</span>
 			{/if}
@@ -575,6 +596,10 @@
 	{:else if activeTab === 'memory'}
 	<main class="grid-container history-main" in:fadeIn>
 		<MemoryViewer />
+	</main>
+	{:else if activeTab === 'mail'}
+	<main class="grid-container history-main" in:fadeIn>
+		<MailTab />
 	</main>
 	{:else if activeTab === 'settings'}
 	<main class="grid-container history-main settings-main" in:fadeIn>
@@ -783,6 +808,7 @@
 													onstop={() => handleStop(session)}
 													onopen={() => handleOpen(session)}
 													onrename={() => showRenameHint = true}
+													onmail={openMail}
 												/>
 											</div>
 										{/each}
@@ -816,6 +842,7 @@
 											onstop={() => handleStop(session)}
 											onopen={() => handleOpen(session)}
 											onrename={() => showRenameHint = true}
+											onmail={openMail}
 										/>
 									</div>
 								{/each}
@@ -929,6 +956,13 @@
 		line-height: 1;
 		pointer-events: none;
 		transition: opacity var(--transition-fast);
+	}
+
+	/* With a sixth tab the window midpoint falls on a tab label: center the
+	   grip in the free space instead. */
+	.tab-drag-region.dots-local .drag-dots {
+		position: static;
+		transform: none;
 	}
 
 	.tab-drag-region:hover .drag-dots {
