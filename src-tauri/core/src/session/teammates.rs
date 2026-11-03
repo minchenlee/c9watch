@@ -569,7 +569,43 @@ pub(crate) fn open_subagent_transcript(
         return None;
     }
     let dir = ProjectDir::open(project_dir, projects)?;
-    if fd_path(transcript)?.parent()? != dir.path {
+    subagent_transcript_in(&dir, transcript, session_id, agent_id)
+}
+
+/// The walk of [`open_subagent_transcript`] from `dir`, which must hold
+/// `transcript` itself as `<session_id>.jsonl`: compared by device and
+/// inode on that descriptor, not by pathname, so a dir swapped in after
+/// it was opened is refused.
+#[cfg(unix)]
+fn subagent_transcript_in(
+    dir: &ProjectDir,
+    transcript: &std::fs::File,
+    session_id: &str,
+    agent_id: &str,
+) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let pinned = transcript.metadata().ok()?;
+    let name = std::ffi::CString::new(format!("{session_id}.jsonl")).ok()?;
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `name` is NUL-terminated, `st` is written on success only.
+    let found = unsafe {
+        libc::fstatat(
+            dir.fd.as_raw_fd(),
+            name.as_ptr(),
+            st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0;
+    if !found {
+        return None;
+    }
+    // SAFETY: `fstatat` succeeded and filled `st`.
+    let st = unsafe { st.assume_init() };
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG
+        || st.st_dev as u64 != pinned.dev()
+        || st.st_ino as u64 != pinned.ino()
+    {
         return None;
     }
     let session = open_at(&dir.fd, session_id, libc::O_RDONLY | libc::O_DIRECTORY)?;
@@ -1272,5 +1308,35 @@ mod tests {
         assert!(opened.open_file("b.jsonl".as_ref()).is_none());
         // Opening the swapped path now fails: it is a symlink.
         assert!(ProjectDir::open(&dir, &projects).is_none());
+    }
+
+    /// Dir B is swapped into the project path while it is opened and A put
+    /// back before the check: B's descriptor does not hold the pinned file,
+    /// so no subagent transcript is read from it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dir_swapped_in_around_the_open_is_not_walked() {
+        let root = tempfile::tempdir().unwrap();
+        let projects = root.path().join("projects");
+        let dir = projects.join("-repo");
+        let swap = projects.join("-swap");
+        for d in [&dir, &swap] {
+            std::fs::create_dir_all(d.join("s1").join("subagents")).unwrap();
+            std::fs::write(d.join("s1.jsonl"), "").unwrap();
+            std::fs::write(d.join("s1/subagents/agent-a1.jsonl"), "foreign").unwrap();
+        }
+        let pinned = std::fs::File::open(dir.join("s1.jsonl")).unwrap();
+
+        let held = projects.join("-held");
+        std::fs::rename(&dir, &held).unwrap();
+        std::fs::rename(&swap, &dir).unwrap();
+        let opened = ProjectDir::open(&dir, &projects).unwrap();
+        std::fs::rename(&dir, &swap).unwrap();
+        std::fs::rename(&held, &dir).unwrap();
+        assert!(subagent_transcript_in(&opened, &pinned, "s1", "a1").is_none());
+
+        // The dir that holds the pinned file is walked.
+        let opened = ProjectDir::open(&dir, &projects).unwrap();
+        assert!(subagent_transcript_in(&opened, &pinned, "s1", "a1").is_some());
     }
 }
