@@ -146,6 +146,13 @@ pub trait ObservedSessions: Send + Sync {
     fn origin(&self, _pid: libc::pid_t, _start: u64) -> Option<Origin> {
         None
     }
+
+    /// Whether the process `pid` that started at `start` still runs: a root
+    /// a provenance entry names (a teammate) counts only while it is the
+    /// same process, never a later one that reused its pid.
+    fn running(&self, pid: libc::pid_t, start: u64) -> bool {
+        peer::proc_info(pid).is_some_and(|p| p.start == start)
+    }
 }
 
 /// No session is observed.
@@ -244,8 +251,9 @@ fn from_origin(
         }
         Origin::Agent { id, .. } => format!("{GONE_AGENT}{id}"),
         Origin::Session { key } => key,
-        Origin::Teammate { pid } => observed
+        Origin::Teammate { pid, start } => observed
             .by_pid(pid)
+            .filter(|_| observed.running(pid, start))
             .unwrap_or_else(|| format!("{UNLISTED_TEAMMATE}{pid}")),
         Origin::Unknown => format!("{UNKNOWN_ORIGIN}{pid}"),
     };
@@ -367,8 +375,8 @@ fn no_foreign_origin(
             Some(Origin::Agent { id, .. }) => format!("agent:{id}"),
             Some(Origin::Session { key }) if Some(key.as_str()) == own => continue,
             Some(Origin::Session { key }) => format!("observed:{key}"),
-            Some(Origin::Teammate { pid }) => match observed.by_pid(pid) {
-                Some(key) if Some(key.as_str()) == own => continue,
+            Some(Origin::Teammate { pid, start }) => match observed.by_pid(pid) {
+                Some(key) if Some(key.as_str()) == own && observed.running(pid, start) => continue,
                 _ => format!("agent-team teammate pid {pid}"),
             },
             Some(Origin::Unknown) => {
@@ -920,6 +928,7 @@ pub(crate) mod tests {
     struct FakeOrigins {
         observed: FakeObserved,
         origins: HashMap<(libc::pid_t, u64), Origin>,
+        running: HashSet<(libc::pid_t, u64)>,
     }
 
     impl ObservedSessions for FakeOrigins {
@@ -930,12 +939,17 @@ pub(crate) mod tests {
         fn origin(&self, pid: libc::pid_t, start: u64) -> Option<Origin> {
             self.origins.get(&(pid, start)).cloned()
         }
+
+        fn running(&self, pid: libc::pid_t, start: u64) -> bool {
+            self.running.contains(&(pid, start))
+        }
     }
 
     fn origins(list: &[((libc::pid_t, u64), Origin)]) -> FakeOrigins {
         FakeOrigins {
             observed: FakeObserved(HashMap::new()),
             origins: list.iter().cloned().collect(),
+            running: HashSet::from([(77, 70)]),
         }
     }
 
@@ -979,13 +993,13 @@ pub(crate) mod tests {
         assert_eq!(gone, observed("gone-agent:a1"));
         assert!(gone.is_read_only());
 
-        let mate = origins(&[((300, 30), Origin::Teammate { pid: 77 })]);
+        let mate = origins(&[((300, 30), Origin::Teammate { pid: 77, start: 70 })]);
         let p = stamp_observed(&orphan(), &NoLiveAgents, &mate);
         assert_eq!(p, observed("unlisted-teammate:77"));
         assert!(p.is_read_only());
         let listed = FakeOrigins {
             observed: FakeObserved::one("claudeCode:mate", 77),
-            ..origins(&[((300, 30), Origin::Teammate { pid: 77 })])
+            ..origins(&[((300, 30), Origin::Teammate { pid: 77, start: 70 })])
         };
         assert_eq!(
             stamp_observed(&orphan(), &NoLiveAgents, &listed),
@@ -1004,6 +1018,7 @@ pub(crate) mod tests {
     fn the_live_ancestry_comes_before_provenance() {
         let o = FakeOrigins {
             observed: FakeObserved::one("claudeCode:live", 20),
+            running: HashSet::new(),
             origins: HashMap::from([(
                 (30, 300),
                 Origin::Session {
@@ -1044,7 +1059,7 @@ pub(crate) mod tests {
             },
         )]);
         assert!(check(&of_agent, None).unwrap_err().contains("agent:a1"));
-        let mate = origins(&[((1, 1), Origin::Teammate { pid: 77 })]);
+        let mate = origins(&[((1, 1), Origin::Teammate { pid: 77, start: 70 })]);
         assert!(check(&mate, None).unwrap_err().contains("teammate pid 77"));
         let full = origins(&[((300, 30), Origin::Unknown)]);
         assert!(check(&full, None).unwrap_err().contains("table is full"));
@@ -1093,7 +1108,7 @@ pub(crate) mod tests {
             e(50, 1, 5),
             e(60, 50, 6),
         ];
-        table.scan(&before, &roots, |_| Some(false));
+        table.scan(&before, &roots, |_| Some(false), |_, _| true);
         // The shell exits, the daemon is reparented; the owner runs c9watch.
         let after = [
             e(1, 0, 1),
@@ -1103,7 +1118,7 @@ pub(crate) mod tests {
             e(60, 50, 6),
             e(70, 60, 7),
         ];
-        table.scan(&after, &roots, |_| Some(false));
+        table.scan(&after, &roots, |_| Some(false), |_, _| true);
         let o = Scanned {
             observed: FakeObserved::one("claudeCode:s1", 100),
             table,
@@ -1139,5 +1154,40 @@ pub(crate) mod tests {
             Principal::LocalUnverified
         );
         assert_eq!(mutate(&cli, None), Ok(()));
+    }
+
+    /// A teammate root binds by pid and start time: once its pid is reused
+    /// by another session, its orphans don't get that session's key and
+    /// may not stop it.
+    #[test]
+    fn a_teammate_origin_ignores_a_reused_pid() {
+        let reused = FakeOrigins {
+            observed: FakeObserved::one("claudeCode:other", 77),
+            running: HashSet::from([(77, 99)]),
+            ..origins(&[((300, 30), Origin::Teammate { pid: 77, start: 70 })])
+        };
+        let p = stamp_observed(&orphan(), &NoLiveAgents, &reused);
+        assert_eq!(p, observed("unlisted-teammate:77"));
+        assert!(p.is_read_only());
+        let chain = orphan();
+        assert!(check_mutation(
+            Some(&chain),
+            Some(30),
+            Some(false),
+            &NoLiveAgents,
+            &reused,
+            Some("claudeCode:other"),
+        )
+        .unwrap_err()
+        .contains("teammate pid 77"));
+        // The same teammate, still running and listed: its key.
+        let same = FakeOrigins {
+            running: HashSet::from([(77, 70)]),
+            ..reused
+        };
+        assert_eq!(
+            stamp_observed(&orphan(), &NoLiveAgents, &same),
+            observed("claudeCode:other")
+        );
     }
 }

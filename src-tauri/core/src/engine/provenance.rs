@@ -37,7 +37,7 @@ pub enum Origin {
     /// The process of the observed session with this key, or a descendant.
     Session { key: String },
     /// A process whose argv is an agent-team teammate's, or a descendant.
-    Teammate { pid: libc::pid_t },
+    Teammate { pid: libc::pid_t, start: u64 },
     /// Not known: the table was full when the process (or an ancestor it
     /// inherits from) should have been added.
     Unknown,
@@ -86,11 +86,17 @@ impl Provenance {
     /// new process whose parent has an origin, and did not start after it,
     /// inherits it. `is_teammate` reads a new process's argv: `None` when
     /// it can't be read yet, which is tried again on the next scan.
+    ///
+    /// `all` may be partial (a failed listing or a pid it could not read),
+    /// so a tracked process missing from it is dropped only when `exited`
+    /// confirms that pid is gone or now runs another process
+    /// (`peer::exited`). Otherwise it is kept.
     pub fn scan(
         &self,
         all: &[ProcEntry],
         roots: &Roots,
         is_teammate: impl Fn(&ProcInfo) -> Option<bool>,
+        exited: impl Fn(libc::pid_t, u64) -> bool,
     ) {
         let by_pid: HashMap<libc::pid_t, &ProcInfo> =
             all.iter().map(|e| (e.info.pid, &e.info)).collect();
@@ -99,9 +105,12 @@ impl Provenance {
         let old_checked = std::mem::take(&mut t.checked);
         let old_denied = std::mem::take(&mut t.denied);
         let alive = |key: &(libc::pid_t, u64)| by_pid.get(&key.0).is_some_and(|p| p.start == key.1);
+        let kept = |key: &(libc::pid_t, u64)| match by_pid.get(&key.0) {
+            Some(p) => p.start == key.1,
+            None => !exited(key.0, key.1),
+        };
         let mut next: HashMap<(libc::pid_t, u64), Origin> = HashMap::new();
-        let mut denied: HashSet<(libc::pid_t, u64)> =
-            old_denied.into_iter().filter(alive).collect();
+        let mut denied: HashSet<(libc::pid_t, u64)> = old_denied.into_iter().filter(kept).collect();
         // Add `key` (a root replaces what it had); past the cap it is
         // denied instead. Whether it is now tracked or denied.
         let put = |next: &mut HashMap<_, _>,
@@ -140,7 +149,7 @@ impl Provenance {
             }
         }
         for (key, origin) in old {
-            if alive(&key) {
+            if kept(&key) {
                 put(&mut next, &mut denied, key, origin, false);
             }
         }
@@ -160,7 +169,10 @@ impl Provenance {
                         &mut next,
                         &mut denied,
                         key,
-                        Origin::Teammate { pid: p.pid },
+                        Origin::Teammate {
+                            pid: p.pid,
+                            start: p.start,
+                        },
                         false,
                     );
                 }
@@ -227,6 +239,11 @@ mod tests {
         }
     }
 
+    /// Every pid missing from a list has exited.
+    fn gone(_: libc::pid_t, _: u64) -> bool {
+        true
+    }
+
     fn not_teammate(_: &ProcInfo) -> Option<bool> {
         Some(false)
     }
@@ -247,7 +264,7 @@ mod tests {
             entry(200, 100, 20),
             entry(300, 200, 30),
         ];
-        p.scan(&before, &session(100, "claudeCode:s1"), not_teammate);
+        p.scan(&before, &session(100, "claudeCode:s1"), not_teammate, gone);
         assert_eq!(p.origin(300, 30), key("claudeCode:s1"));
         assert_eq!(p.origin(1, 1), None);
         // The shell exits; the daemon is moved under init and forks.
@@ -257,12 +274,12 @@ mod tests {
             entry(300, 1, 30),
             entry(400, 300, 40),
         ];
-        p.scan(&after, &session(100, "claudeCode:s1"), not_teammate);
+        p.scan(&after, &session(100, "claudeCode:s1"), not_teammate, gone);
         assert_eq!(p.origin(300, 30), key("claudeCode:s1"));
         assert_eq!(p.origin(400, 40), key("claudeCode:s1"));
         // The session ends and detection no longer lists it: kept.
-        let gone = [entry(1, 0, 1), entry(300, 1, 30)];
-        p.scan(&gone, &Roots::default(), not_teammate);
+        let ended = [entry(1, 0, 1), entry(300, 1, 30)];
+        p.scan(&ended, &Roots::default(), not_teammate, gone);
         assert_eq!(p.origin(300, 30), key("claudeCode:s1"));
     }
 
@@ -272,17 +289,17 @@ mod tests {
     fn a_reused_pid_inherits_nothing() {
         let p = Provenance::new();
         let before = [entry(1, 0, 1), entry(100, 1, 10), entry(300, 100, 30)];
-        p.scan(&before, &session(100, "claudeCode:s1"), not_teammate);
+        p.scan(&before, &session(100, "claudeCode:s1"), not_teammate, gone);
         assert_eq!(p.origin(300, 30), key("claudeCode:s1"));
         // 300 exits and its pid is given to a new process under init.
         let after = [entry(1, 0, 1), entry(100, 1, 10), entry(300, 1, 50)];
-        p.scan(&after, &session(100, "claudeCode:s1"), not_teammate);
+        p.scan(&after, &session(100, "claudeCode:s1"), not_teammate, gone);
         assert_eq!(p.origin(300, 50), None);
         assert_eq!(p.origin(300, 30), None);
         assert_eq!(p.len(), 1);
         // A "child" that started before its parent holds a reused ppid.
         let odd = [entry(1, 0, 1), entry(100, 1, 10), entry(500, 100, 5)];
-        p.scan(&odd, &session(100, "claudeCode:s1"), not_teammate);
+        p.scan(&odd, &session(100, "claudeCode:s1"), not_teammate, gone);
         assert_eq!(p.origin(500, 5), None);
     }
 
@@ -315,15 +332,21 @@ mod tests {
             reads.set(reads.get() + 1);
             Some(q.pid == 200)
         };
-        p.scan(&all, &roots, teammate);
+        p.scan(&all, &roots, teammate, gone);
         let agent = Some(Origin::Agent {
             id: "a1".into(),
             gen: 3,
         });
         assert_eq!(p.origin(110, 11), agent);
-        assert_eq!(p.origin(210, 21), Some(Origin::Teammate { pid: 200 }));
+        assert_eq!(
+            p.origin(210, 21),
+            Some(Origin::Teammate {
+                pid: 200,
+                start: 20
+            })
+        );
         let first = reads.get();
-        p.scan(&all, &roots, teammate);
+        p.scan(&all, &roots, teammate, gone);
         assert_eq!(reads.get(), first, "argv is read once per process");
         // A PTY child whose start time differs is not the agent's.
         let stale = Roots {
@@ -339,7 +362,7 @@ mod tests {
             ..Roots::default()
         };
         let q = Provenance::new();
-        q.scan(&all, &stale, not_teammate);
+        q.scan(&all, &stale, not_teammate, gone);
         assert_eq!(q.origin(110, 11), None);
     }
 
@@ -348,10 +371,16 @@ mod tests {
     fn an_unreadable_argv_is_read_again() {
         let p = Provenance::new();
         let all = [entry(1, 0, 1), entry(200, 1, 20)];
-        p.scan(&all, &Roots::default(), |_| None);
+        p.scan(&all, &Roots::default(), |_| None, gone);
         assert_eq!(p.origin(200, 20), None);
-        p.scan(&all, &Roots::default(), |q| Some(q.pid == 200));
-        assert_eq!(p.origin(200, 20), Some(Origin::Teammate { pid: 200 }));
+        p.scan(&all, &Roots::default(), |q| Some(q.pid == 200), gone);
+        assert_eq!(
+            p.origin(200, 20),
+            Some(Origin::Teammate {
+                pid: 200,
+                start: 20
+            })
+        );
     }
 
     /// Past `MAX_TRACKED`, a process that should have been added, and its
@@ -368,7 +397,7 @@ mod tests {
             .chain([entry(n + 1, n - 1, 6), entry(n + 2, 1, 6)])
             .collect();
         let teammate = |q: &ProcInfo| Some(q.pid > 1 && q.pid < n);
-        p.scan(&all, &Roots::default(), teammate);
+        p.scan(&all, &Roots::default(), teammate, gone);
         assert_eq!(p.len(), MAX_TRACKED);
         let denied = (2..n).find(|pid| p.origin(*pid, 5) == Some(Origin::Unknown));
         let denied = denied.expect("a teammate past the cap is denied");
@@ -378,7 +407,7 @@ mod tests {
         // A child of a denied process is denied too, on a later scan.
         let child = [entry(n + 3, denied, 7)];
         let more: Vec<_> = all.iter().cloned().chain(child).collect();
-        p.scan(&more, &Roots::default(), teammate);
+        p.scan(&more, &Roots::default(), teammate, gone);
         assert_eq!(p.origin(n + 3, 7), Some(Origin::Unknown));
         assert_eq!(p.origin(n + 2, 6), None);
     }
@@ -397,8 +426,53 @@ mod tests {
             entry(70, 60, 7),
             entry(100, 1, 10),
         ];
-        p.scan(&all, &session(100, "claudeCode:s1"), not_teammate);
+        p.scan(&all, &session(100, "claudeCode:s1"), not_teammate, gone);
         assert_eq!(p.origin(70, 7), None);
         assert_eq!(p.origin(50, 5), None);
+    }
+
+    /// A failed or partial listing is not an exit: a tracked process missing
+    /// from it is kept unless its pid is confirmed gone or reused.
+    #[test]
+    fn a_partial_listing_keeps_what_it_misses() {
+        let p = Provenance::new();
+        let before = [entry(1, 0, 1), entry(100, 1, 10), entry(300, 100, 30)];
+        p.scan(&before, &session(100, "claudeCode:s1"), not_teammate, gone);
+        let unsure = |_: libc::pid_t, _: u64| false;
+        p.scan(&[], &Roots::default(), not_teammate, unsure);
+        assert_eq!(p.origin(300, 30), key("claudeCode:s1"));
+        p.scan(&[entry(1, 0, 1)], &Roots::default(), not_teammate, unsure);
+        assert_eq!(p.origin(300, 30), key("claudeCode:s1"));
+        assert_eq!(p.origin(100, 10), key("claudeCode:s1"));
+        // Confirmed gone: dropped.
+        p.scan(
+            &[entry(1, 0, 1)],
+            &Roots::default(),
+            not_teammate,
+            |pid, _| pid == 300,
+        );
+        assert_eq!(p.origin(300, 30), None);
+        assert_eq!(p.origin(100, 10), key("claudeCode:s1"));
+    }
+
+    /// The same for a process the full table denied.
+    #[test]
+    fn a_partial_listing_keeps_denied_processes() {
+        let p = Provenance::new();
+        let n = MAX_TRACKED as libc::pid_t + 2;
+        let all: Vec<_> = [entry(1, 0, 1)]
+            .into_iter()
+            .chain((2..=n).map(|pid| entry(pid, 1, 5)))
+            .collect();
+        let teammate = |q: &ProcInfo| Some(q.pid > 1);
+        p.scan(&all, &Roots::default(), teammate, gone);
+        let denied: Vec<_> = (2..=n)
+            .filter(|pid| p.origin(*pid, 5) == Some(Origin::Unknown))
+            .collect();
+        assert!(!denied.is_empty());
+        p.scan(&[], &Roots::default(), teammate, |_, _| false);
+        for pid in denied {
+            assert_eq!(p.origin(pid, 5), Some(Origin::Unknown));
+        }
     }
 }

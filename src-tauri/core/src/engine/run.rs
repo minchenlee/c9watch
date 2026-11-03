@@ -436,11 +436,16 @@ async fn provenance_loop(ctx: Arc<ServerCtx>, agents: Arc<LiveTable>) {
         };
         let table = ctx.provenance.clone();
         let scanned = tokio::task::spawn_blocking(move || {
-            table.scan(&peer::processes(), &roots, |p| {
-                peer::teammate_pids(std::slice::from_ref(p))
-                    .ok()
-                    .map(|found| found.contains(&p.pid))
-            })
+            table.scan(
+                &peer::processes(),
+                &roots,
+                |p| {
+                    peer::teammate_pids(std::slice::from_ref(p))
+                        .ok()
+                        .map(|found| found.contains(&p.pid))
+                },
+                peer::exited,
+            )
         })
         .await;
         if let Err(e) = scanned {
