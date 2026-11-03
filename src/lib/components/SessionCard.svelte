@@ -10,6 +10,8 @@
 	import { awayActivityLabel, sessionDisplayTitle, waitingForLabel } from '$lib/session-utils';
 	import { formatTimeSince } from '$lib/time-utils';
 	import { getSessionStatusColor, getSessionStatusLabel } from '$lib/status-utils';
+	import { mailBySessionKey, pausedAgents } from '$lib/stores/mail';
+	import { stateLabel, needsAttention as mailNeedsLook } from '$lib/mail-store';
 
 	interface Props {
 		session: Session;
@@ -18,9 +20,15 @@
 		onstop?: () => void;
 		onopen?: () => void;
 		onrename?: () => void;
+		/** Opens the MAIL tab on this session's engine agent. */
+		onmail?: (agentId: string) => void;
 	}
 
-	let { session, compact = false, onexpand, onstop, onopen, onrename }: Props = $props();
+	let { session, compact = false, onexpand, onstop, onopen, onrename, onmail }: Props = $props();
+
+	// The newest mail of this session's engine agent, and the one that needs a look.
+	let mailThread = $derived(onmail ? $mailBySessionKey.get(sessionKeyOf(session)) ?? null : null);
+	let mailShown = $derived(mailThread ? [...mailThread.messages].reverse().find(m => m.to.id === mailThread!.agentId && mailNeedsLook(m)) ?? mailThread.latest : null);
 
 	let needsAttention = $derived(
 		session.status === SessionStatus.NeedsAttention ||
@@ -245,6 +253,24 @@
 			<div class="status-label" style="color: {statusColor}">
 				{statusLabel}
 			</div>
+
+			{#if mailThread && mailShown}
+				<button
+					class="mail-line"
+					class:loud={mailNeedsLook(mailShown)}
+					onclick={(e) => { e.stopPropagation(); onmail?.(mailThread!.agentId); }}
+					title="Open this agent's mail"
+				>
+					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+						<rect x="3" y="5" width="18" height="14" />
+						<polyline points="3 7 12 13 21 7" />
+					</svg>
+					<span class="mail-state">{stateLabel(mailShown)}</span>
+					{#if mailShown.to.id !== mailThread.agentId}<span class="mail-state">→ {mailShown.to.name ?? mailShown.to.id}</span>{/if}
+					{#if $pausedAgents.has(mailThread.agentId)}<span class="mail-state">PAUSED</span>{/if}
+					<span class="mail-preview">{mailShown.preview}</span>
+				</button>
+			{/if}
 		{/if}
 
 		{#if !compact}
@@ -500,6 +526,46 @@
 
 	.git-branch svg {
 		flex-shrink: 0;
+	}
+
+	.mail-line {
+		display: flex;
+		align-items: center;
+		gap: var(--space-xs);
+		min-width: 0;
+		width: 100%;
+		background: none;
+		border: none;
+		padding: 0;
+		cursor: pointer;
+		text-align: left;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+	}
+
+	.mail-line:hover {
+		color: var(--text-primary);
+	}
+
+	.mail-line svg {
+		flex-shrink: 0;
+	}
+
+	.mail-line.loud .mail-state {
+		color: var(--accent-amber);
+	}
+
+	.mail-state {
+		flex-shrink: 0;
+		letter-spacing: 0.05em;
+	}
+
+	.mail-preview {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-family: var(--font-sans);
 	}
 
 	.branch-name {
