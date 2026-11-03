@@ -1675,14 +1675,27 @@ mod placeholder_tests {
                 .0
                 .len()
         };
-        let same =
-            crate::session::teammates::transcript_file_of(&File::open(&path).unwrap()).unwrap();
+        let dir_meta = std::fs::metadata(&dir).unwrap();
+        let same = crate::session::teammates::transcript_file_of(
+            (
+                std::os::unix::fs::MetadataExt::dev(&dir_meta),
+                std::os::unix::fs::MetadataExt::ino(&dir_meta),
+            ),
+            &File::open(&path).unwrap(),
+        )
+        .unwrap();
         assert_eq!(enrich(teammate(same.clone())), 1);
         let other = crate::session::teammates::TranscriptFile {
             ino: same.ino + 1,
             ..same.clone()
         };
         assert_eq!(enrich(teammate(other)), 0);
+        // The same file found in another dir.
+        let moved = crate::session::teammates::TranscriptFile {
+            dir: (same.dir.0, same.dir.1 + 1),
+            ..same.clone()
+        };
+        assert_eq!(enrich(teammate(moved)), 0);
         // A FIFO in place of any session's transcript: the CLI placeholder
         // still renders, and nothing waits for a writer.
         std::fs::remove_file(&path).unwrap();

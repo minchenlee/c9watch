@@ -40,12 +40,15 @@ pub(crate) struct TeammateArgs {
 }
 
 /// The transcript selection matched: its device, inode and birth time
-/// (where the file system keeps one), and the header read from it.
-/// Enrichment reads the transcript only through a descriptor whose file
-/// has the same identity and still starts with the same header. An inode
-/// number alone is not enough: ext4 hands a freed inode to the next file.
+/// (where the file system keeps one), the header read from it, and the
+/// device and inode of the project dir it was found in. Enrichment reads
+/// the transcript only through a descriptor whose file has the same
+/// identity and still starts with the same header, opened in a dir with
+/// the same identity. An inode number alone is not enough: ext4 hands a
+/// freed inode to the next file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptFile {
+    pub(crate) dir: (u64, u64),
     pub(crate) dev: u64,
     pub(crate) ino: u64,
     pub(crate) birth: Option<SystemTime>,
@@ -273,12 +276,13 @@ fn stamp(file: &std::fs::File) -> Option<Stamp> {
     })
 }
 
-/// The [`TranscriptFile`] of an open file: its identity and its header,
-/// from the one descriptor.
+/// The [`TranscriptFile`] of an open file in the dir `dir` (its device
+/// and inode): the file's identity and its header, from the one descriptor.
 #[cfg(unix)]
-pub(crate) fn transcript_file_of(file: &std::fs::File) -> Option<TranscriptFile> {
+pub(crate) fn transcript_file_of(dir: (u64, u64), file: &std::fs::File) -> Option<TranscriptFile> {
     let stamp = stamp(file)?;
     Some(TranscriptFile {
+        dir,
         dev: stamp.dev,
         ino: stamp.ino,
         birth: stamp.birth,
@@ -299,6 +303,7 @@ impl HeaderCache {
     fn get(
         &mut self,
         path: &Path,
+        dir: (u64, u64),
         open: impl FnOnce() -> Option<std::fs::File>,
     ) -> Option<TranscriptFile> {
         let file = open()?;
@@ -312,6 +317,7 @@ impl HeaderCache {
             }
         };
         Some(TranscriptFile {
+            dir,
             dev: stamp.dev,
             ino: stamp.ino,
             birth: stamp.birth,
@@ -330,33 +336,46 @@ impl HeaderCache {
 #[cfg(unix)]
 struct ProjectDir {
     fd: std::os::fd::OwnedFd,
-    /// Where the descriptor is, as the kernel reports it.
+    /// The path it was opened by, under the canonical projects root.
     path: PathBuf,
+    /// Its device and inode.
+    id: (u64, u64),
 }
 
 #[cfg(unix)]
 impl ProjectDir {
-    /// `project_dir`, when it is a directory (not a symlink) that is under
-    /// `projects` (`~/.claude/projects`) as opened.
+    /// `project_dir`, a directory below `projects` (`~/.claude/projects`),
+    /// opened from the projects root one component at a time without
+    /// following a symlink. Confinement comes from that walk, not from
+    /// asking the kernel for the descriptor's path: a path rebuilt from a
+    /// vnode is ambiguous once a hard link exists elsewhere.
     fn open(project_dir: &Path, projects: &Path) -> Option<Self> {
-        use std::os::fd::{FromRawFd, OwnedFd};
-        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
         let root = projects.canonicalize().ok()?;
-        let c = std::ffi::CString::new(project_dir.as_os_str().as_bytes()).ok()?;
-        // SAFETY: `c` is a valid NUL-terminated path.
-        let raw = unsafe {
-            libc::open(
-                c.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if raw < 0 {
+        let below = project_dir
+            .strip_prefix(projects)
+            .or_else(|_| project_dir.strip_prefix(&root))
+            .ok()?;
+        let mut parts = Vec::new();
+        for part in below.components() {
+            let std::path::Component::Normal(part) = part else {
+                return None;
+            };
+            parts.push(part.to_str()?);
+        }
+        if parts.is_empty() {
             return None;
         }
-        // SAFETY: `raw` is a descriptor this function just opened.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let path = fd_path(&fd)?;
-        (path.starts_with(&root) && path != root).then_some(Self { fd, path })
+        let mut fd: std::os::fd::OwnedFd = std::fs::File::open(&root).ok()?.into();
+        for part in &parts {
+            fd = open_at(&fd, part, libc::O_RDONLY | libc::O_DIRECTORY)?;
+        }
+        let meta = std::fs::File::from(fd.try_clone().ok()?).metadata().ok()?;
+        Some(Self {
+            fd,
+            path: parts.iter().fold(root, |p, part| p.join(part)),
+            id: (meta.dev(), meta.ino()),
+        })
     }
 
     /// The regular files in the directory (symlinks, FIFOs and the rest
@@ -445,24 +464,6 @@ impl ProjectDir {
     }
 }
 
-/// The path of an open descriptor.
-#[cfg(target_os = "macos")]
-fn fd_path(fd: &impl std::os::fd::AsRawFd) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    let mut buf = vec![0u8; libc::PATH_MAX as usize];
-    // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`.
-    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    let end = buf.iter().position(|&b| b == 0)?;
-    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..end])))
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn fd_path(fd: &impl std::os::fd::AsRawFd) -> Option<PathBuf> {
-    std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).ok()
-}
-
 /// The session ID and file of the transcript `args` writes in `project_dir`: the
 /// transcript whose first entry names this agent and team and was written no
 /// earlier than the process started. Of several, the one that started last
@@ -496,7 +497,7 @@ pub(crate) fn find_transcript(
         }
         let path = dir.path.join(&name);
         seen.insert(path.clone());
-        let Some(file) = cache.get(&path, || dir.open_file(&name)) else {
+        let Some(file) = cache.get(&path, dir.id, || dir.open_file(&name)) else {
             continue;
         };
         let header = &file.header;
@@ -643,9 +644,11 @@ pub(crate) fn find_transcript(
     None
 }
 
-/// `path` opened, when it still names `file`: a regular file (not a
-/// symlink) whose directory is under `projects`. Opened without blocking
-/// on a FIFO. Read the transcript only through the returned descriptor; a
+/// `path` opened, when it still names `file`: its dir, walked from
+/// `projects` without following a symlink, is the dir selection found it
+/// in (same device and inode), and the regular file opened in that dir
+/// is the same file with the same header. Opened without blocking on a
+/// FIFO. Read the transcript only through the returned descriptor; a
 /// later open by name could reach another file.
 #[cfg(unix)]
 pub(crate) fn still_names(
@@ -653,25 +656,12 @@ pub(crate) fn still_names(
     projects: &Path,
     file: &TranscriptFile,
 ) -> Option<std::fs::File> {
-    use std::os::fd::{FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-    let root = projects.canonicalize().ok()?;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `c` is a valid NUL-terminated path.
-    let raw = unsafe {
-        libc::open(
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-    };
-    if raw < 0 {
+    let dir = ProjectDir::open(path.parent()?, projects)?;
+    if dir.id != file.dir {
         return None;
     }
-    // SAFETY: `raw` is a descriptor this function just opened.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    let dir = fd_path(&fd)?.parent()?.to_path_buf();
-    let mut opened = std::fs::File::from(fd);
-    if transcript_file_of(&opened)? != *file || !dir.starts_with(&root) || dir == root {
+    let mut opened = dir.open_file(path.file_name()?)?;
+    if transcript_file_of(dir.id, &opened)? != *file {
         return None;
     }
     // Reading the header moved the offset; hand the file back rewound.
@@ -1151,10 +1141,19 @@ mod tests {
         std::fs::remove_file(outside.join(&name)).unwrap();
         std::fs::hard_link(projects.join("-moved").join(&name), outside.join(&name)).unwrap();
         assert!(still_names(&path, &projects, &file).is_none());
-        // Back in place: still the same file.
+        // Back in place: still the same file, though a hard link to it
+        // now sits outside the root (a path rebuilt from the descriptor
+        // could name that link).
         std::fs::remove_file(&dir).unwrap();
         std::fs::rename(projects.join("-moved"), &dir).unwrap();
-        assert!(still_names(&path, &projects, &file).is_some());
+        for _ in 0..500 {
+            assert!(still_names(&path, &projects, &file).is_some());
+        }
+        // The same file reached through another project dir is refused.
+        let other = projects.join("-other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::hard_link(&path, other.join(&name)).unwrap();
+        assert!(still_names(&other.join(&name), &projects, &file).is_none());
         // The file replaced by another under its name.
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, "{}").unwrap();
