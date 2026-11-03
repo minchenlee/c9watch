@@ -91,3 +91,17 @@ export function hiddenSessionsSummary(hidden: HiddenClaudeSession[] | null | und
 	const app = count === 1 ? 'it runs in an app' : 'they run in an app';
 	return `${subject} hidden by Claude Code itself: ${app} that another Claude session opened. Quit that app and open it again from the Dock.`;
 }
+
+// A missing provider means Claude Code.
+const sameProvider = (a: Session, b: Session) => (a.provider ?? 'claudeCode') === (b.provider ?? 'claudeCode');
+
+/** Live agent-team teammates of `lead`: sessions whose link names it. */
+export function teammatesOf(lead: Session, all: Session[]): Session[] {
+	return all.filter((s) => s.teammate?.leadSessionId === lead.id && sameProvider(s, lead));
+}
+
+/** The lead session of a teammate, when it is live. */
+export function leadOf(mate: Session, all: Session[]): Session | undefined {
+	const leadId = mate.teammate?.leadSessionId;
+	return leadId ? all.find((s) => s.id === leadId && sameProvider(s, mate)) : undefined;
+}

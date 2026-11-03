@@ -2,7 +2,7 @@
 //! Three independent request connections avoid serializing history scans with
 //! small reads. Stream connections are separate from that pool.
 use crate::engine_proto::{
-    compatibility::{core_action, core_usable, CoreAction, GUI_METHODS},
+    compatibility::{core_action, core_usable, CoreAction, GUI_MAIL_METHODS, GUI_METHODS},
     home::{engine_home, sock_path},
     spawn::{ensure_engine, restart_engine, ConnectError, EngineConn, Frames},
     wire::{AgentListResult, EventFrame, NotificationEvent, SubscribeParams},
@@ -48,8 +48,9 @@ fn gui_authorized(section: &str, name: &str) -> bool {
         .is_some_and(|principals| principals.iter().any(|p| p == "local-unverified"))
 }
 
+/// Mail methods are main-window only (D37); the popover stays read-only.
 pub fn allowed(method: &str, popover: bool) -> bool {
-    GUI_METHODS.contains(&method)
+    (GUI_METHODS.contains(&method) || (!popover && GUI_MAIL_METHODS.contains(&method)))
         && gui_authorized("methods", method)
         && !matches!(method, "events.subscribe" | "events.unsubscribe")
         && (!popover
@@ -301,7 +302,9 @@ fn allowed_topics(params: &SubscribeParams, popover: bool) -> bool {
                 ],
                 "session.view" | "session.gone" | "diag.detection" | "annotation.changed"
                 | "annotation.removed" => &[t.as_str()],
-                "notification.needs_attention" | "notification.waiting_for_input" if !popover => {
+                "notification.needs_attention" | "notification.waiting_for_input" | "msg.state"
+                    if !popover =>
+                {
                     &[t.as_str()]
                 }
                 _ => return false,
@@ -831,7 +834,6 @@ mod tests {
         for m in [
             "agent.create",
             "agent.retire",
-            "msg.send",
             "gateway.open",
             "gateway.policy.set",
             "gui.confirmer.attach",
@@ -843,7 +845,19 @@ mod tests {
             "annotation.patch",
         ] {
             assert!(!allowed(m, false), "{m}");
+            assert!(!allowed(m, true), "{m}");
         }
+        // D37: agent mail is main-window only.
+        for m in GUI_MAIL_METHODS {
+            assert!(allowed(m, false), "{m}");
+            assert!(!allowed(m, true), "{m}");
+        }
+        let mail = SubscribeParams {
+            topics: vec!["msg.state".into()],
+            ..Default::default()
+        };
+        assert!(allowed_topics(&mail, false));
+        assert!(!allowed_topics(&mail, true));
         assert!(allowed("session.stop", false));
         assert!(!allowed("session.stop", true));
         assert!(!allowed("provider.opencode.connect", true));
@@ -855,7 +869,7 @@ mod tests {
     #[test]
     fn webview_allowlist_is_a_subset_of_central_authority() {
         use crate::engine::{authz, principal::Principal};
-        for method in GUI_METHODS {
+        for method in GUI_METHODS.iter().chain(GUI_MAIL_METHODS) {
             assert!(
                 authz::can(method, &Principal::LocalUnverified, None).allowed,
                 "{method}"
@@ -869,9 +883,16 @@ mod tests {
                     "{method}"
                 );
             }
-            if method.starts_with("msg.")
-                || method.starts_with("mail.")
-                || method.starts_with("gateway.")
+            // The popover never gets a mail method or a write path.
+            if method.starts_with("msg.") || method.starts_with("mail.") {
+                assert!(!allowed(method, true), "{method}");
+                assert_eq!(
+                    allowed(method, false),
+                    GUI_MAIL_METHODS.contains(&method.as_str()),
+                    "{method}"
+                );
+            }
+            if method.starts_with("gateway.")
                 || method.starts_with("hook.")
                 || matches!(
                     method.as_str(),
@@ -881,6 +902,9 @@ mod tests {
                 assert!(!allowed(method, false), "{method}");
             }
         }
+        assert!(authz::topics(&Principal::LocalUnverified, None)
+            .iter()
+            .any(|t| t == "msg.state"));
         for topic in ["annotation.changed", "annotation.removed"] {
             assert!(authz::topics(&Principal::LocalUnverified, None)
                 .iter()

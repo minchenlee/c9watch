@@ -442,7 +442,12 @@ struct TranscriptCalls {
 #[cfg(unix)]
 fn transcript_calls(path: &Path) -> Option<TranscriptCalls> {
     let directory = safe_directory(path.parent()?, false).ok()?;
-    let mut file = safe_file(&directory, path.file_name()?, false).ok()?;
+    transcript_calls_from(safe_file(&directory, path.file_name()?, false).ok()?)
+}
+
+/// [`transcript_calls`] of a transcript already open (and checked), read
+/// from its current offset.
+fn transcript_calls_from(mut file: fs::File) -> Option<TranscriptCalls> {
     // A partial bounded prefix is useful for explicit results but not for binding.
     let before = file.metadata().ok()?;
     let size = before.len();
@@ -626,16 +631,40 @@ fn correlate_request(input: &HookInput) -> Option<String> {
 /// Only an explicit result for the correlated call proves resolution. Absence,
 /// truncation, malformed input and a missing transcript mean uncertainty.
 pub(crate) fn prompt_is_open(prompt: &PendingPermission, transcript: &Path) -> bool {
+    is_open_given(prompt, || transcript_calls(transcript))
+}
+
+/// [`prompt_is_open`] against a transcript already open and checked.
+pub(crate) fn prompt_is_open_in(prompt: &PendingPermission, transcript: fs::File) -> bool {
+    is_open_given(prompt, || transcript_calls_from(transcript))
+}
+
+fn is_open_given(
+    prompt: &PendingPermission,
+    calls: impl FnOnce() -> Option<TranscriptCalls>,
+) -> bool {
     let Some(id) = &prompt.tool_use_id else {
         return true;
     };
-    transcript_calls(transcript)
+    calls()
         .is_none_or(|evidence| evidence.ambiguous.contains(id) || !evidence.resolved.contains(id))
 }
 
 pub(crate) fn prompt_input(prompt: &PendingPermission, transcript: &Path) -> Option<Value> {
+    input_given(prompt, || transcript_calls(transcript))
+}
+
+/// [`prompt_input`] from a transcript already open and checked.
+pub(crate) fn prompt_input_in(prompt: &PendingPermission, transcript: fs::File) -> Option<Value> {
+    input_given(prompt, || transcript_calls_from(transcript))
+}
+
+fn input_given(
+    prompt: &PendingPermission,
+    calls: impl FnOnce() -> Option<TranscriptCalls>,
+) -> Option<Value> {
     let id = prompt.tool_use_id.as_ref()?;
-    let evidence = transcript_calls(transcript)?;
+    let evidence = calls()?;
     if evidence.ambiguous.contains(id) || evidence.resolved.contains(id) {
         return None;
     }
@@ -2195,6 +2224,30 @@ mod empty_result_regressions_v5 {
             Some(json!({"command":"still-pending"})),
             "valid associated arguments stay exposed"
         );
+    }
+    /// Codex r5: a teammate's transcript is read only through its pinned
+    /// descriptor, and that read still resolves a prompt whose
+    /// `PostToolUse` hook was lost.
+    #[test]
+    fn a_pinned_transcript_resolves_prompts_like_its_path() {
+        let dir = fixture();
+        let path = dir.path().join("s1.jsonl");
+        transcript(
+            &path,
+            &[
+                call("same", "completed"),
+                call("other", "still-pending"),
+                result("user", json!({"type":"tool_result","tool_use_id":"same"})),
+            ],
+        );
+        let open = || fs::File::open(&path).unwrap();
+        assert!(!prompt_is_open_in(&bound("same"), open()));
+        assert!(prompt_is_open_in(&bound("other"), open()));
+        assert_eq!(
+            prompt_input_in(&bound("other"), open()),
+            Some(json!({"command":"still-pending"}))
+        );
+        assert!(prompt_input_in(&bound("same"), open()).is_none());
     }
     #[test]
     fn omitted_content_wrong_role_cannot_resolve_bound_wait() {

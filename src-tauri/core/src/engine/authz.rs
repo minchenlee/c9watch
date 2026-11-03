@@ -213,6 +213,14 @@ pub fn review(
     if !rule.principals.contains(&kind(principal)) {
         return deny("principal is not permitted", None);
     }
+    // A teammate core has not listed (D8) names no session: it may read,
+    // and nothing it writes can be tied to a session.
+    if principal.is_unlisted_teammate() && rule.verb != "read" {
+        return deny(
+            "an agent-team teammate core has not listed may only read",
+            None,
+        );
+    }
     let mut needs = AuthNeeds::default();
     if matches!(principal, Principal::Client { .. }) {
         let scope = format!("{}:{}", rule.resource, rule.verb);
@@ -683,6 +691,34 @@ mod tests {
             assert!(review(Some(&r), &client, Some(&access)).allowed, "{name}");
             assert!(!review(Some(&r), &client, None).allowed, "{name}");
         }
+    }
+
+    /// D8: a teammate core has not listed reads what an observed session
+    /// reads, and calls no method that writes, stops, renames, cancels or
+    /// sends: annotations, mail and `session.stop` included.
+    #[test]
+    fn an_unlisted_teammate_may_only_read() {
+        let unlisted = Principal::Observed {
+            session_key: format!("{}88", super::super::principal::UNLISTED_TEAMMATE),
+        };
+        let o = Principal::Observed {
+            session_key: "claudeCode:s".into(),
+        };
+        let mut writes = 0;
+        for name in super::super::discovery::methods().into_keys() {
+            let r = method(&name).unwrap();
+            let allowed = can(&name, &unlisted, None).allowed;
+            if r.verb == "read" {
+                assert_eq!(allowed, can(&name, &o, None).allowed, "{name}");
+            } else {
+                assert!(!allowed, "{name}");
+                if can(&name, &o, None).allowed {
+                    writes += 1;
+                }
+            }
+        }
+        // annotation.set/delete/patch, session.stop and msg.send at least.
+        assert!(writes >= 5, "{writes}");
     }
 
     /// D8: an observed session reads as the terminal does, sends mail and

@@ -49,6 +49,8 @@ pub(crate) struct ProcessFacts {
     pub same_user: bool,
     pub child_marker: bool,
     pub parent_claude_pid: Option<u32>,
+    /// The agent-team flags in argv, when the process is a teammate.
+    pub teammate: Option<super::teammates::TeammateArgs>,
 }
 
 impl ProcessFacts {
@@ -92,14 +94,84 @@ pub(crate) fn pids_without_registry_entry<S: AsRef<str>>(file_names: &[S]) -> Ve
     keyed.difference(&registered).copied().collect()
 }
 
+/// Homebrew prefixes: Apple silicon, Intel macOS, Linux.
+const BREW_PREFIXES: &[&str] = &["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"];
+
+/// npm global prefixes outside the home directory: Homebrew's and the
+/// system Node's.
+const NPM_PREFIXES: &[&str] = &["/opt/homebrew", "/usr/local", "/usr"];
+
+const NPM_PACKAGE: &str = "lib/node_modules/@anthropic-ai/claude-code";
+
+/// Whether the process's executable is an installed Claude Code binary.
+/// Unlike argv, a process cannot claim this. `exe` is the kernel's path to
+/// the running image (`proc_pidpath`, `/proc/<pid>/exe`), already absolute
+/// and resolved; each layout is anchored at the start of it:
+/// - the native installer: `~/.local/share/claude/versions/<version>`;
+/// - the Homebrew cask: `<brew prefix>/Caskroom/claude-code/<version>/…`;
+/// - npm: a binary in `<npm prefix>/lib/node_modules/@anthropic-ai/claude-code/`,
+///   where the prefix is Homebrew's, the system's, `~/.npm-global` or an
+///   nvm `~/.nvm/versions/node/<version>`.
+///
+/// A package path elsewhere (`/tmp/x/node_modules/@anthropic-ai/claude-code/…`)
+/// does not count. A Node process running the npm package's `cli.js` has
+/// `node` as its executable, so it does not count either: only its argv
+/// names Claude Code.
+fn runs_claude_code_binary(facts: &ProcessFacts, home: &Path) -> bool {
+    facts
+        .exe
+        .as_deref()
+        .is_some_and(|exe| is_claude_code_binary(exe, home))
+}
+
+fn is_claude_code_binary(exe: &Path, home: &Path) -> bool {
+    use std::path::Component;
+    // Something must follow the install dir, and `..` must not climb out.
+    let below = |root: &Path| {
+        exe.strip_prefix(root).is_ok_and(|rest| {
+            let mut parts = rest.components().peekable();
+            parts.peek().is_some() && parts.all(|c| matches!(c, Component::Normal(_)))
+        })
+    };
+    if !exe.is_absolute() {
+        return false;
+    }
+    if below(&home.join(".local/share/claude/versions")) {
+        return true;
+    }
+    if BREW_PREFIXES
+        .iter()
+        .any(|prefix| below(&Path::new(prefix).join("Caskroom/claude-code")))
+    {
+        return true;
+    }
+    if NPM_PREFIXES
+        .iter()
+        .map(PathBuf::from)
+        .chain([home.join(".npm-global")])
+        .any(|prefix| below(&prefix.join(NPM_PACKAGE)))
+    {
+        return true;
+    }
+    // nvm: `~/.nvm/versions/node/<version>/lib/node_modules/…`.
+    exe.strip_prefix(home.join(".nvm/versions/node"))
+        .ok()
+        .and_then(|rest| rest.components().next())
+        .filter(|version| matches!(version, Component::Normal(_)))
+        .is_some_and(|version| {
+            below(
+                &home
+                    .join(".nvm/versions/node")
+                    .join(version)
+                    .join(NPM_PACKAGE),
+            )
+        })
+}
+
 /// Whether the process is the real Claude Code binary, not a script that
 /// happens to be named `claude`.
 fn is_claude_code(facts: &ProcessFacts, home: &Path) -> bool {
-    let versions = home.join(".local/share/claude/versions");
-    let exe_is_claude = facts
-        .exe
-        .as_deref()
-        .is_some_and(|exe| exe.starts_with(&versions));
+    let exe_is_claude = runs_claude_code_binary(facts, home);
     let argv0_is_claude = facts
         .argv0
         .as_deref()
@@ -195,6 +267,28 @@ impl HiddenSessionScanner {
             .collect();
         hidden_sessions(&names, &processes, home)
     }
+
+    /// Agent-team teammates among the pids the last `scan` read: each pid
+    /// with its start time and facts. A teammate also has a `.key` file and
+    /// no `.json`, so `scan` already holds its argv. Only processes running
+    /// an installed Claude Code executable count.
+    pub(crate) fn teammates(&self, home: &Path) -> Vec<(u32, u64, ProcessFacts)> {
+        let mut found: Vec<_> = self
+            .cache
+            .iter()
+            .filter_map(|(pid, (start, facts))| {
+                let facts = facts.as_ref()?;
+                // A teammate's link and card need the verified executable,
+                // not argv0, which any process can set.
+                (facts.same_user
+                    && facts.teammate.is_some()
+                    && runs_claude_code_binary(facts, home))
+                .then(|| (*pid, *start, facts.clone()))
+            })
+            .collect();
+        found.sort_by_key(|(pid, _, _)| *pid);
+        found
+    }
 }
 
 #[cfg(unix)]
@@ -225,6 +319,7 @@ fn read_process_facts(pids: &[u32]) -> HashMap<u32, ProcessFacts> {
                     .map(|arg| arg.to_string_lossy().into_owned()),
                 cwd: process.cwd().map(Path::to_path_buf),
                 same_user: process.user_id().is_some_and(|owner| **owner == uid),
+                teammate: super::teammates::parse_argv(process.cmd()),
                 ..ProcessFacts::default()
             }
             .with_env(process.environ());
@@ -255,6 +350,7 @@ mod tests {
             same_user: true,
             child_marker: true,
             parent_claude_pid: Some(7),
+            teammate: None,
         }
     }
 
@@ -335,6 +431,48 @@ mod tests {
         let procs = HashMap::from([(500, fake.clone()), (501, fake)]);
         assert!(hidden_sessions(&names(&[]), &procs, Path::new(HOME)).is_empty());
         assert!(hidden_sessions(&names(&["501.zz.key"]), &procs, Path::new(HOME)).is_empty());
+    }
+
+    #[test]
+    fn claude_code_binaries_of_each_install_layout_count() {
+        let home = Path::new("/Users/me");
+        for exe in [
+            "/Users/me/.local/share/claude/versions/2.1.314",
+            "/opt/homebrew/Caskroom/claude-code/2.1.314/claude",
+            "/usr/local/Caskroom/claude-code/2.1.314/claude",
+            "/home/linuxbrew/.linuxbrew/Caskroom/claude-code/2.1.314/claude",
+            "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/bin/claude",
+            "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude",
+            "/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude",
+            "/Users/me/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/claude",
+            "/Users/me/.nvm/versions/node/v22.11.0/lib/node_modules/@anthropic-ai/claude-code/bin/claude",
+        ] {
+            assert!(is_claude_code_binary(Path::new(exe), home), "{exe}");
+        }
+        for exe in [
+            "/opt/homebrew/bin/node",
+            "/opt/homebrew/Caskroom/other/1/claude",
+            "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code",
+            "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code-other/claude",
+            "/tmp/claude",
+            "/Users/other/.local/share/claude/versions/2.1.314",
+            "/Users/me/.local/share/claude/versions",
+            // Codex r3: package-name lookalikes outside an npm global root.
+            "/tmp/x/node_modules/@anthropic-ai/claude-code/evil",
+            "/tmp/x/lib/node_modules/@anthropic-ai/claude-code/evil",
+            "/Users/me/project/node_modules/@anthropic-ai/claude-code/bin/claude",
+            "/tmp/opt/homebrew/Caskroom/claude-code/1/claude",
+            "/tmp/Users/me/.local/share/claude/versions/2.1.314",
+            "/Users/me/.nvm/versions/node/v22/node_modules/@anthropic-ai/claude-code/x",
+            "/Users/me/.nvm/versions/node/lib/node_modules/@anthropic-ai/claude-code",
+            // `..` climbs out of an install dir.
+            "/opt/homebrew/Caskroom/claude-code/../../../tmp/evil",
+            "/Users/me/.local/share/claude/versions/../../../../../tmp/evil",
+            "Users/me/.local/share/claude/versions/2.1.314",
+            "/Users/me/.nvm/versions/node/../../../../tmp/lib/node_modules/@anthropic-ai/claude-code/x",
+        ] {
+            assert!(!is_claude_code_binary(Path::new(exe), home), "{exe}");
+        }
     }
 
     #[test]

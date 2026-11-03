@@ -2,7 +2,7 @@
 // The engine (src-tauri/core/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 12;
+export const C9P_API_MINOR = 13;
 
 /** `agent.attention` data: an agent needs the user. */
 export interface C9pAgentAttentionEvent {
@@ -1329,6 +1329,11 @@ export interface C9pSessionView {
   status: C9pSessionStatus;
   summary: string | null;
   surface: C9pSessionSurface;
+  /**
+   * For an agent-team teammate: its name, team, lead session and agent
+   * type. The lead's own view has none; its teammates name it.
+   */
+  teammate?: C9pTeammateLink | null;
   /** What the session needs from the user (tool name only, never arguments). */
   waitingFor?: C9pWaitingFor | null;
   /**
@@ -1509,6 +1514,18 @@ export interface C9pTaskDoneParams {
  */
 export interface C9pTaskDoneResult {
   taskId: string;
+}
+
+/** The link from a teammate session to its team and lead. */
+export interface C9pTeammateLink {
+  /** The teammate's name in its team (`--agent-name`). */
+  agentName: string;
+  /** The agent type (`--agent-type`, or the team config), when known. */
+  agentType?: string | null;
+  /** Session ID of the lead session that spawned this teammate. */
+  leadSessionId: string;
+  /** The team, `session-<first 8 hex digits of the lead session ID>`. */
+  teamName: string;
 }
 
 /**

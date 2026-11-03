@@ -5,6 +5,7 @@ use crate::session::cache::{
 use crate::session::codex::CodexLifecycle;
 use crate::session::cursor::CursorLifecycle;
 use crate::session::owners::global_provider_source_owners;
+use crate::session::parser::parse_last_n_entries_from;
 use crate::session::parser::NativeTitles;
 use crate::session::permissions::PermissionChecker;
 use crate::session::pi::PiLifecycle;
@@ -79,6 +80,9 @@ pub struct Session {
     /// (`session::workers`), after detection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_of: Option<String>,
+    /// The agent-team link of a teammate session: its name, team and lead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teammate: Option<crate::session::teammates::TeammateLink>,
     /// User-set name from `claude agents` (Ctrl+T background-pinned sessions).
     /// Only populated by the CLI backend; legacy backend leaves this None.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,10 +134,6 @@ static NATIVE_TITLE_CACHE: LazyLock<
     Mutex<HashMap<std::path::PathBuf, (NativeTitleStamp, NativeTitles)>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn native_title_stamp(path: &Path) -> Option<NativeTitleStamp> {
-    FileVersion::read(path).ok()
-}
-
 fn claude_custom_name(
     provider: SessionProvider,
     names: &crate::session::CustomNames,
@@ -157,17 +157,31 @@ fn claude_custom_title(
 /// Look up the native custom and AI titles for a session JSONL, using a strong
 /// file stamp when the platform provides one and a safe re-scan otherwise.
 pub(crate) fn get_cached_native_titles(path: &Path) -> NativeTitles {
-    get_cached_native_titles_with(
-        path,
-        crate::session::parser::try_get_native_titles_from_file,
-    )
+    get_cached_native_titles_with(path, crate::session::parser::native_titles_from)
 }
 
 fn get_cached_native_titles_with(
     path: &Path,
-    read_titles: impl FnOnce(&Path) -> std::io::Result<NativeTitles>,
+    read_titles: impl FnOnce(File) -> std::io::Result<NativeTitles>,
 ) -> NativeTitles {
-    let Some(stamp) = native_title_stamp(path) else {
+    native_titles_cached(path, path, read_titles)
+}
+
+/// The native titles of the transcript at `path` (the cache key), read from
+/// `source`: the path, or a pinned descriptor for it. The stamp and, on a
+/// miss, the titles come from one open file, so a path that flips to
+/// another file mid-read can't cache one file's titles under another's
+/// stamp.
+fn native_titles_cached(
+    path: &Path,
+    source: impl crate::session::cache::Source,
+    read_titles: impl FnOnce(File) -> std::io::Result<NativeTitles>,
+) -> NativeTitles {
+    let opened = source.open().ok();
+    let stamp = opened
+        .as_ref()
+        .and_then(|f| FileVersion::from_metadata(&f.metadata().ok()?).ok());
+    let (Some(file), Some(stamp)) = (opened, stamp) else {
         if let Ok(mut cache) = NATIVE_TITLE_CACHE.lock() {
             cache.remove(path);
         }
@@ -181,7 +195,7 @@ fn get_cached_native_titles_with(
             }
         }
         // Cache miss or stale — re-scan
-        let titles = match read_titles(path) {
+        let titles = match read_titles(file) {
             Ok(titles) => titles,
             Err(_) => {
                 cache.remove(path);
@@ -192,7 +206,7 @@ fn get_cached_native_titles_with(
         titles
     } else {
         // Mutex poisoned — fallback to direct read
-        read_titles(path).unwrap_or_default()
+        read_titles(file).unwrap_or_default()
     }
 }
 
@@ -418,9 +432,30 @@ pub fn enrich_detected_sessions(
             continue;
         }
 
+        // A teammate's transcript was picked through a pinned directory. It
+        // is read only through the descriptor that proves the path still
+        // names the file selection matched, never reopened by name; a
+        // swapped dir or file is skipped. The index is not read; a subagent
+        // transcript only through the checked dir, for a hook prompt.
+        let pinned = match &detected.transcript_file {
+            Some(file) => {
+                let path = detected.project_path.join(format!("{}.jsonl", session_id));
+                let Some(pinned) = detected.project_path.parent().and_then(|projects| {
+                    crate::session::teammates::still_names(&path, projects, file)
+                }) else {
+                    continue;
+                };
+                Some(Pinned(pinned))
+            }
+            None => None,
+        };
+
         // Try to parse sessions-index.json to get basic info (optional)
         let index_path = detected.project_path.join("sessions-index.json");
-        let sessions_index = parse_sessions_index(&index_path).ok();
+        let sessions_index = match pinned {
+            Some(_) => None,
+            None => parse_sessions_index(&index_path).ok(),
+        };
 
         // Find the matching entry in the index (if index exists)
         let session_entry = sessions_index.as_ref().and_then(|index| {
@@ -454,22 +489,28 @@ pub fn enrich_detected_sessions(
                 let session_file_path = detected.project_path.join(format!("{}.jsonl", session_id));
 
                 // Try to get first prompt from JSONL file
-                let first_prompt =
-                    get_first_prompt_from_jsonl(&session_file_path).unwrap_or_else(|| {
-                        if detected.started_at_ms.is_some() {
-                            "(No conversation yet)".to_string()
-                        } else {
-                            "(Active session)".to_string()
-                        }
-                    });
+                let first_prompt = match &pinned {
+                    Some(p) => p.read(first_prompt_from).map(|s| truncate_string(&s, 100)),
+                    None => get_first_prompt_from_jsonl(&session_file_path),
+                }
+                .unwrap_or_else(|| {
+                    if detected.started_at_ms.is_some() {
+                        "(No conversation yet)".to_string()
+                    } else {
+                        "(Active session)".to_string()
+                    }
+                });
 
                 // Count messages in the file
-                let message_count = count_messages_in_jsonl(&session_file_path);
+                let message_count = match &pinned {
+                    Some(p) => count_messages_cached(&session_file_path, &p.0, Instant::now()),
+                    None => count_messages_in_jsonl(&session_file_path),
+                };
 
                 // Get file modification time. Fall back to started_at_ms for
                 // CLI-sourced placeholder sessions (no JSONL yet) so the frontend
                 // doesn't choke on `new Date("").getTime()` → NaN when sorting.
-                let modified = std::fs::metadata(&session_file_path)
+                let modified = transcript_metadata(&pinned, &session_file_path)
                     .and_then(|m| m.modified())
                     .ok()
                     .map(|t| {
@@ -495,8 +536,19 @@ pub fn enrich_detected_sessions(
         // `count_messages_in_jsonl`) already treat "no file" as silently empty rather
         // than logging. Only warn when the file exists but fails to open/parse.
         let session_file_path = detected.project_path.join(format!("{}.jsonl", session_id));
-        let entries = if session_file_path.is_file() {
-            match parse_last_n_entries(&session_file_path, 20) {
+        let transcript_is_file = pinned.is_some() || session_file_path.is_file();
+        let recently_modified = |secs| match &pinned {
+            Some(p) => p.0.metadata().is_ok_and(|m| modified_within(&m, secs)),
+            None => is_file_recently_modified(&session_file_path, secs),
+        };
+        let entries = if transcript_is_file {
+            let parsed = match &pinned {
+                Some(p) => p
+                    .read(|f| parse_last_n_entries_from(f, 20).ok())
+                    .ok_or_else(|| "unreadable".to_string()),
+                None => parse_last_n_entries(&session_file_path, 20),
+            };
+            match parsed {
                 Ok(entries) => entries,
                 Err(e) => {
                     crate::debug_log::log_warn(&format!(
@@ -514,9 +566,10 @@ pub fn enrich_detected_sessions(
         // turn an empty state file into approval of every pending transcript tool.
         let hook_state = crate::claude_hooks::session_state(&session_id);
         let checker = PermissionChecker::cached_for(Some(&detected.cwd));
-        let hook_prompt = hook_state
-            .as_ref()
-            .and_then(|state| open_hook_prompt(state, &session_file_path));
+        let hook_prompt = hook_state.as_ref().and_then(|state| match &pinned {
+            Some(p) => pinned_hook_prompt(state, &detected.project_path, &session_id, p),
+            None => open_hook_prompt(state, &session_file_path),
+        });
 
         let pending_tool_name = match &hook_prompt {
             Some(prompt) => Some(prompt.tool_name.clone()),
@@ -530,9 +583,7 @@ pub fn enrich_detected_sessions(
         } else {
             let raw_status = determine_status_with(&entries, &checker);
             // Override WaitingForInput if the JSONL file was recently modified.
-            if raw_status == SessionStatus::WaitingForInput
-                && is_file_recently_modified(&session_file_path, 8)
-            {
+            if raw_status == SessionStatus::WaitingForInput && recently_modified(8) {
                 SessionStatus::Working
             } else {
                 raw_status
@@ -548,9 +599,10 @@ pub fn enrich_detected_sessions(
         let latest_message = get_latest_message_from_entries(&entries);
         let notification_preview = notification_preview_from_entries(&entries);
         let pending_tool_input = match &hook_prompt {
-            Some(prompt) if prompt.agent_id.is_none() => {
-                crate::claude_hooks::prompt_input(prompt, &session_file_path)
-            }
+            Some(prompt) if prompt.agent_id.is_none() => match &pinned {
+                Some(p) => p.read(|f| crate::claude_hooks::prompt_input_in(prompt, f)),
+                None => crate::claude_hooks::prompt_input(prompt, &session_file_path),
+            },
             Some(_) => None,
             None => get_pending_tool_input_with(&entries, &checker),
         };
@@ -560,7 +612,7 @@ pub fn enrich_detected_sessions(
         // interactive sessions never write to ~/.claude/projects/). Render a
         // placeholder card so the dashboard count matches `claude agents --json`.
         let cli_sourced = detected.started_at_ms.is_some();
-        let source_health = if !session_file_path.is_file() {
+        let source_health = if !transcript_is_file {
             if cli_sourced {
                 SourceHealth::Partial
             } else {
@@ -568,7 +620,7 @@ pub fn enrich_detected_sessions(
             }
         } else if entries.is_empty() {
             SourceHealth::Partial
-        } else if is_file_recently_modified(&session_file_path, 24 * 60 * 60) {
+        } else if recently_modified(24 * 60 * 60) {
             SourceHealth::Fresh
         } else {
             SourceHealth::Stale
@@ -583,7 +635,14 @@ pub fn enrich_detected_sessions(
 
         // Get custom title: Claude Code native /rename takes priority over c9watch's own.
         // Uses a static cache keyed by path plus a strong file stamp when available.
-        let native_titles = get_cached_native_titles(&session_file_path);
+        let native_titles = match &pinned {
+            Some(p) => native_titles_cached(
+                &session_file_path,
+                &p.0,
+                crate::session::parser::native_titles_from,
+            ),
+            None => get_cached_native_titles(&session_file_path),
+        };
         let custom_title = native_titles
             .custom
             .or_else(|| claude_custom_title(detected.provider, &custom_titles, &session_id));
@@ -611,10 +670,9 @@ pub fn enrich_detected_sessions(
             pending_tool_input,
             waiting_for: None,
             last_assistant_message: None,
-            transcript_path: session_file_path
-                .is_file()
-                .then(|| session_file_path.clone()),
+            transcript_path: transcript_is_file.then(|| session_file_path.clone()),
             worker_of: None,
+            teammate: detected.teammate.clone(),
             official_name: detected.official_name.clone(),
             started_at_ms: detected.started_at_ms,
             provider: detected.provider,
@@ -669,6 +727,7 @@ fn base_session(detected: &DetectedSession, session_id: &str) -> Session {
         last_assistant_message: None,
         transcript_path: None,
         worker_of: None,
+        teammate: detected.teammate.clone(),
         official_name: detected.official_name.clone(),
         started_at_ms: detected.started_at_ms,
         provider: detected.provider,
@@ -829,6 +888,39 @@ fn open_hook_prompt(state: &HookSessionState, session_file: &Path) -> Option<Pen
         .cloned()
 }
 
+/// [`open_hook_prompt`] for a pinned transcript: the session's own prompt
+/// is checked through its descriptor, a subagent's through the subagent
+/// transcript opened relative to the checked project dir. One that can't
+/// be read counts as open.
+fn pinned_hook_prompt(
+    state: &HookSessionState,
+    project_dir: &Path,
+    session_id: &str,
+    pinned: &Pinned,
+) -> Option<PendingPermission> {
+    state
+        .pending
+        .iter()
+        .find(|prompt| match &prompt.agent_id {
+            None => pinned
+                .read(|f| Some(crate::claude_hooks::prompt_is_open_in(prompt, f)))
+                .unwrap_or(true),
+            Some(agent_id) => project_dir
+                .parent()
+                .and_then(|projects| {
+                    crate::session::teammates::open_subagent_transcript(
+                        project_dir,
+                        projects,
+                        &pinned.0,
+                        session_id,
+                        agent_id,
+                    )
+                })
+                .is_none_or(|f| crate::claude_hooks::prompt_is_open_in(prompt, f)),
+        })
+        .cloned()
+}
+
 /// `<project>/<session>/subagents/agent-<id>.jsonl` for `<project>/<session>.jsonl`.
 fn subagent_transcript(session_file: &Path, agent_id: &str) -> Option<PathBuf> {
     if agent_id.is_empty()
@@ -848,16 +940,35 @@ fn subagent_transcript(session_file: &Path, agent_id: &str) -> Option<PathBuf> {
 
 /// Checks if a file was modified within the last N seconds
 pub fn is_file_recently_modified(path: &Path, seconds: u64) -> bool {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
+    std::fs::metadata(path).is_ok_and(|m| modified_within(&m, seconds))
+}
+
+fn modified_within(metadata: &std::fs::Metadata, seconds: u64) -> bool {
+    metadata
+        .modified()
         .ok()
-        .map(|modified| {
-            modified
-                .elapsed()
-                .map(|elapsed| elapsed.as_secs() < seconds)
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|elapsed| elapsed.as_secs() < seconds)
+}
+
+/// A teammate's transcript, opened once and checked. Each read starts from
+/// a copy of the descriptor rewound to the start, never from the path.
+struct Pinned(File);
+
+impl Pinned {
+    fn read<T>(&self, read: impl FnOnce(File) -> Option<T>) -> Option<T> {
+        use std::io::{Seek, SeekFrom};
+        let mut file = self.0.try_clone().ok()?;
+        file.seek(SeekFrom::Start(0)).ok()?;
+        read(file)
+    }
+}
+
+fn transcript_metadata(pinned: &Option<Pinned>, path: &Path) -> std::io::Result<std::fs::Metadata> {
+    match pinned {
+        Some(p) => p.0.metadata(),
+        None => std::fs::metadata(path),
+    }
 }
 
 /// Extract the first user prompt from a session JSONL file (truncated to 100 chars).
@@ -867,7 +978,11 @@ pub fn get_first_prompt_from_jsonl(path: &Path) -> Option<String> {
 
 /// Extract the first user prompt from a session JSONL file (full text, no truncation).
 pub fn get_first_prompt_from_jsonl_raw(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
+    first_prompt_from(crate::session::cache::open_regular(path).ok()?)
+}
+
+/// [`get_first_prompt_from_jsonl_raw`] of an open file.
+fn first_prompt_from(file: File) -> Option<String> {
     let reader = BufReader::new(file);
 
     for line in reader.lines().map_while(Result::ok).take(50) {
@@ -1026,7 +1141,23 @@ pub fn count_messages_in_jsonl(path: &Path) -> u32 {
 }
 
 fn count_messages_in_jsonl_at(path: &Path, now: Instant) -> u32 {
-    let Ok(stamp) = FileVersion::read(path) else {
+    count_messages_cached(path, path, now)
+}
+
+/// The message count of the transcript at `path` (the cache key), read
+/// from `source`: the path itself, or a pinned descriptor for it.
+fn count_messages_cached(
+    path: &Path,
+    source: impl crate::session::cache::Source,
+    now: Instant,
+) -> u32 {
+    // The stamp and every read below come from one open file: a path that
+    // flips to another file can't pair one file's lines with another's stamp
+    // in the shared cache.
+    let Ok((file, stamp)) = source.open().and_then(|f| {
+        let stamp = FileVersion::from_metadata(&f.metadata()?)?;
+        Ok((f, stamp))
+    }) else {
         if let Ok(mut cache) = MESSAGE_COUNT_CACHE.lock() {
             cache.remove(path);
         }
@@ -1036,7 +1167,7 @@ fn count_messages_in_jsonl_at(path: &Path, now: Instant) -> u32 {
     let mut cache = match MESSAGE_COUNT_CACHE.lock() {
         Ok(cache) => cache,
         Err(_) => {
-            return build_from_line_batches(path, count_messages_in_lines, |count, lines| {
+            return build_from_line_batches(&file, count_messages_in_lines, |count, lines| {
                 count + count_messages_in_lines(lines)
             })
             .map_or(0, |(count, _)| count);
@@ -1045,7 +1176,7 @@ fn count_messages_in_jsonl_at(path: &Path, now: Instant) -> u32 {
 
     let Some(entry) = refresh_incremental_entry(
         cache.remove(path),
-        path,
+        &file,
         stamp,
         now,
         count_messages_in_lines,
@@ -1106,6 +1237,7 @@ impl Session {
             can_open: false,
             can_stop: false,
             can_rename: false,
+            teammate: None,
         }
     }
 }
@@ -1382,6 +1514,8 @@ mod placeholder_tests {
             pi_summary: None,
             opencode_summary: None,
             process_start_secs: None,
+            teammate: None,
+            transcript_file: None,
         };
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
@@ -1453,6 +1587,8 @@ mod placeholder_tests {
             pi_summary: None,
             opencode_summary: None,
             process_start_secs: None,
+            teammate: None,
+            transcript_file: None,
         };
         let (sessions, _) =
             enrich_detected_sessions(vec![detected], DetectionDiagnostics::default()).unwrap();
@@ -1504,6 +1640,80 @@ mod placeholder_tests {
             sessions.is_empty(),
             "legacy empty-JSONL session must be skipped"
         );
+    }
+
+    /// Codex r3: a teammate whose transcript path no longer names the file
+    /// selection matched is skipped, and a FIFO under a transcript's name
+    /// never blocks enrichment of any session.
+    #[cfg(unix)]
+    #[test]
+    fn enrichment_skips_a_swapped_teammate_transcript_and_never_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("projects").join("-repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let path = dir.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &path,
+            "{\"type\":\"user\",\"timestamp\":\"2026-11-03T00:00:00.000Z\",\"message\":{\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let teammate = |file| DetectedSession {
+            started_at_ms: Some(1),
+            transcript_file: Some(file),
+            ..DetectedSession::with_legacy_defaults(
+                42,
+                PathBuf::from("/tmp/repo"),
+                dir.clone(),
+                Some(id.to_string()),
+                "repo".to_string(),
+            )
+        };
+        let enrich = |d| {
+            enrich_detected_sessions(vec![d], DetectionDiagnostics::default())
+                .unwrap()
+                .0
+                .len()
+        };
+        let dir_meta = std::fs::metadata(&dir).unwrap();
+        let same = crate::session::teammates::transcript_file_of(
+            (
+                std::os::unix::fs::MetadataExt::dev(&dir_meta),
+                std::os::unix::fs::MetadataExt::ino(&dir_meta),
+            ),
+            &File::open(&path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(enrich(teammate(same.clone())), 1);
+        let other = crate::session::teammates::TranscriptFile {
+            ino: same.ino + 1,
+            ..same.clone()
+        };
+        assert_eq!(enrich(teammate(other)), 0);
+        // The same file found in another dir.
+        let moved = crate::session::teammates::TranscriptFile {
+            dir: (same.dir.0, same.dir.1 + 1),
+            ..same.clone()
+        };
+        assert_eq!(enrich(teammate(moved)), 0);
+        // A FIFO in place of any session's transcript: the CLI placeholder
+        // still renders, and nothing waits for a writer.
+        std::fs::remove_file(&path).unwrap();
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let plain = DetectedSession {
+            started_at_ms: Some(1),
+            ..DetectedSession::with_legacy_defaults(
+                42,
+                PathBuf::from("/tmp/repo"),
+                dir.clone(),
+                Some(id.to_string()),
+                "repo".to_string(),
+            )
+        };
+        assert_eq!(enrich(plain), 1);
+        assert_eq!(enrich(teammate(same)), 0);
     }
 
     #[test]
@@ -1752,6 +1962,37 @@ mod placeholder_tests {
         );
     }
 
+    /// The path flips to another file mid-read: the titles cached under
+    /// the first file's stamp are its own, so a reader pinned to the new
+    /// file is not served them.
+    #[test]
+    fn a_replaced_path_caches_titles_from_the_file_it_stamped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("flip.jsonl");
+        let next = tmp.path().join("next.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"custom-title","customTitle":"a","sessionId":"s"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &next,
+            r#"{"type":"custom-title","customTitle":"b","sessionId":"s"}"#,
+        )
+        .unwrap();
+        let titles = get_cached_native_titles_with(&path, |file| {
+            std::fs::rename(&next, &path)?;
+            crate::session::parser::native_titles_from(file)
+        });
+        assert_eq!(titles.custom.as_deref(), Some("a"));
+
+        let pinned = std::fs::File::open(&path).unwrap();
+        let titles = native_titles_cached(&path, &pinned, |file| {
+            crate::session::parser::native_titles_from(file)
+        });
+        assert_eq!(titles.custom.as_deref(), Some("b"));
+    }
+
     #[test]
     fn native_title_cache_invalidates_on_transcript_change_and_delete() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1900,6 +2141,42 @@ mod placeholder_tests {
         drop(file);
 
         assert_eq!(count_messages_in_jsonl(&path), 3);
+    }
+
+    /// Codex r5: a pinned transcript's count goes through the same cache,
+    /// keyed by its path and stamped from the descriptor, and an append is
+    /// read from the cached offset instead of from the start.
+    #[test]
+    fn a_pinned_count_is_cached_and_read_incrementally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("count-pinned.jsonl");
+        std::fs::write(
+            &path,
+            format!("{}\n", r#"{"type":"user","message":{"content":"one"}}"#),
+        )
+        .unwrap();
+        let pinned = std::fs::File::open(&path).unwrap();
+        let t0 = Instant::now();
+        assert_eq!(count_messages_cached(&path, &pinned, t0), 1);
+        let first_offset = MESSAGE_COUNT_CACHE.lock().unwrap()[&path].offset;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":"two"}}}}"#
+        )
+        .unwrap();
+        drop(file);
+        assert_eq!(count_messages_cached(&path, &pinned, t0), 2);
+        let entry_offset = MESSAGE_COUNT_CACHE.lock().unwrap()[&path].offset;
+        assert!(entry_offset > first_offset);
+        // A different file now at the path does not change what the pinned
+        // descriptor counts.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(count_messages_cached(&path, &pinned, t0), 2);
     }
 
     #[test]
@@ -2226,6 +2503,53 @@ mod hook_prompt_tests {
         assert!(open_hook_prompt(&pending, &file).is_some());
         std::fs::write(&transcript, format!("{PENDING_BASH}\n{BASH_RESULT}\n")).unwrap();
         assert!(open_hook_prompt(&pending, &file).is_none());
+    }
+
+    /// A teammate's lost completion hook: the subagent transcript, opened
+    /// through the checked dir, resolves the prompt.
+    #[cfg(unix)]
+    #[test]
+    fn a_pinned_subagent_prompt_checks_the_subagent_transcript() {
+        let root = fixture();
+        let projects = root.path().join("projects");
+        let project = projects.join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        let file = project.join("s1.jsonl");
+        std::fs::write(&file, "").unwrap();
+        let pinned = Pinned(std::fs::File::open(&file).unwrap());
+        let pending = state(vec![prompt(Some("a1"), "Bash")]);
+        let open = || pinned_hook_prompt(&pending, &project, "s1", &pinned);
+
+        // No subagent transcript on disk: the prompt stays open.
+        assert!(open().is_some());
+
+        let subagents = project.join("s1").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let transcript = subagents.join("agent-a1.jsonl");
+        std::fs::write(&transcript, format!("{PENDING_BASH}\n")).unwrap();
+        assert!(open().is_some());
+        std::fs::write(&transcript, format!("{PENDING_BASH}\n{BASH_RESULT}\n")).unwrap();
+        assert!(open().is_none());
+
+        // A symlinked component is not followed: the prompt stays open.
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::rename(project.join("s1"), &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, project.join("s1")).unwrap();
+        assert!(open().is_some());
+        std::fs::remove_file(project.join("s1")).unwrap();
+        std::fs::rename(&elsewhere, project.join("s1")).unwrap();
+        std::os::unix::fs::symlink(
+            &subagents.join("agent-a1.jsonl"),
+            subagents.join("agent-a2.jsonl"),
+        )
+        .unwrap();
+        let other = state(vec![prompt(Some("a2"), "Bash")]);
+        assert!(pinned_hook_prompt(&other, &project, "s1", &pinned).is_some());
+
+        // A transcript from another project dir is not checked against it.
+        let other_project = projects.join("q");
+        std::fs::create_dir_all(&other_project).unwrap();
+        assert!(pinned_hook_prompt(&pending, &other_project, "s1", &pinned).is_some());
     }
 
     #[test]

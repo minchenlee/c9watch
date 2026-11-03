@@ -19,6 +19,66 @@ pub(crate) const MIN_FULL_VERIFY_GROWTH_BYTES: u64 = 1024 * 1024;
 pub(crate) const FULL_VERIFY_GROWTH_DIVISOR: u64 = 8;
 pub(crate) const PREFIX_FULL_REVALIDATION_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Open `path` for reading only if it is a regular file, not through a
+/// symlink in its last component. The open does not block, so a FIFO or
+/// device under a transcript's name can never hang a detection tick; it is
+/// refused instead.
+pub(crate) fn open_regular(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Where a cached transcript reader gets its file: a path, opened anew for
+/// each read, or a descriptor already checked (each read gets a copy, which
+/// the reader seeks before it reads, and one copy is read at a time).
+pub(crate) trait Source: Copy {
+    fn open(self) -> io::Result<fs::File>;
+    fn metadata(self) -> io::Result<fs::Metadata>;
+}
+
+impl Source for &Path {
+    fn open(self) -> io::Result<fs::File> {
+        open_regular(self)
+    }
+
+    fn metadata(self) -> io::Result<fs::Metadata> {
+        fs::metadata(self)
+    }
+}
+
+impl Source for &std::path::PathBuf {
+    fn open(self) -> io::Result<fs::File> {
+        open_regular(self)
+    }
+
+    fn metadata(self) -> io::Result<fs::Metadata> {
+        fs::metadata(self)
+    }
+}
+
+impl Source for &fs::File {
+    fn open(self) -> io::Result<fs::File> {
+        self.try_clone()
+    }
+
+    fn metadata(self) -> io::Result<fs::Metadata> {
+        fs::File::metadata(self)
+    }
+}
+
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 const HASH_LANES: usize = 8;
@@ -44,8 +104,8 @@ pub(crate) struct LineBatches {
 }
 
 impl LineBatches {
-    pub(crate) fn open(path: &Path, offset: u64) -> io::Result<Self> {
-        let mut file = fs::File::open(path)?;
+    pub(crate) fn open(path: impl Source, offset: u64) -> io::Result<Self> {
+        let mut file = path.open()?;
         file.seek(SeekFrom::Start(offset))?;
         Ok(Self {
             reader: BufReader::new(file),
@@ -102,7 +162,7 @@ impl LineBatches {
 /// so a cold read holds one batch at a time. Returns the value and the
 /// offset after the last complete line.
 pub(crate) fn build_from_line_batches<T>(
-    path: &Path,
+    path: impl Source,
     build: impl FnOnce(&[String]) -> T,
     fold: impl FnMut(T, &[String]) -> T,
 ) -> io::Result<(T, u64)> {
@@ -174,21 +234,21 @@ impl ContentHash {
     }
 }
 
-fn hash_range(path: &Path, start: u64, end: u64) -> io::Result<(ContentHash, u64)> {
+fn hash_range(path: impl Source, start: u64, end: u64) -> io::Result<(ContentHash, u64)> {
     if end < start {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "prefix range ends before it starts",
         ));
     }
-    if fs::metadata(path)?.len() < end {
+    if path.metadata()?.len() < end {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "file is shorter than the requested prefix range",
         ));
     }
 
-    let mut file = fs::File::open(path)?;
+    let mut file = path.open()?;
     file.seek(SeekFrom::Start(start))?;
     let mut hash = ContentHash::new();
     let mut remaining = end - start;
@@ -210,7 +270,7 @@ fn hash_range(path: &Path, start: u64, end: u64) -> io::Result<(ContentHash, u64
     Ok((hash, bytes_read))
 }
 
-fn hash_prefix_guard(path: &Path, len: u64) -> io::Result<(PrefixGuard, u64)> {
+fn hash_prefix_guard(path: impl Source, len: u64) -> io::Result<(PrefixGuard, u64)> {
     let head_len = len.min(PREFIX_GUARD_BYTES);
     let (head_hash, head_bytes) = hash_range(path, 0, head_len)?;
     if len <= PREFIX_GUARD_BYTES {
@@ -236,7 +296,7 @@ fn hash_prefix_guard(path: &Path, len: u64) -> io::Result<(PrefixGuard, u64)> {
     ))
 }
 
-fn hash_file_prefix_with_bytes(path: &Path, len: u64) -> io::Result<(PrefixSnapshot, u64)> {
+fn hash_file_prefix_with_bytes(path: impl Source, len: u64) -> io::Result<(PrefixSnapshot, u64)> {
     let (hash, full_bytes) = hash_range(path, 0, len)?;
     let (guard, guard_bytes) = hash_prefix_guard(path, len)?;
     Ok((PrefixSnapshot { hash, guard }, full_bytes + guard_bytes))
@@ -244,14 +304,14 @@ fn hash_file_prefix_with_bytes(path: &Path, len: u64) -> io::Result<(PrefixSnaps
 
 /// Hash the first `len` bytes and store both an exact prefix hash and the
 /// bounded head/tail guard used between full validations.
-pub(crate) fn hash_file_prefix(path: &Path, len: u64) -> io::Result<PrefixSnapshot> {
+pub(crate) fn hash_file_prefix(path: impl Source, len: u64) -> io::Result<PrefixSnapshot> {
     hash_file_prefix_with_bytes(path, len).map(|(snapshot, _)| snapshot)
 }
 
 /// Extend an existing prefix hash over the newly complete bytes and refresh
 /// the bounded guard for the new prefix length.
 pub(crate) fn extend_prefix_snapshot(
-    path: &Path,
+    path: impl Source,
     start: u64,
     end: u64,
     previous: PrefixSnapshot,
@@ -262,7 +322,7 @@ pub(crate) fn extend_prefix_snapshot(
             "prefix range ends before it starts",
         ));
     }
-    if fs::metadata(path)?.len() < end {
+    if path.metadata()?.len() < end {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "file is shorter than the requested prefix range",
@@ -272,7 +332,7 @@ pub(crate) fn extend_prefix_snapshot(
     let suffix_len = end.saturating_sub(start);
     let mut hash = previous.hash;
     if suffix_len > 0 {
-        let mut file = fs::File::open(path)?;
+        let mut file = path.open()?;
         file.seek(SeekFrom::Start(start))?;
         let mut remaining = suffix_len;
         let mut position = start;
@@ -308,7 +368,7 @@ pub(crate) fn next_full_verify_offset(offset: u64) -> u64 {
 /// are read. The deadline is checked on lookup, not in a background task, so
 /// the contract is "no later than the next lookup after 60 seconds".
 pub(crate) fn validate_cached_prefix(
-    path: &Path,
+    path: impl Source,
     expected: PrefixSnapshot,
     next_full_verify_offset: u64,
     last_full_validation_at: Instant,
@@ -381,7 +441,7 @@ pub(crate) struct IncrementalEntry<T> {
 /// own storage, lock, poison fallback and eviction policy.
 pub(crate) fn refresh_incremental_entry<T>(
     previous: Option<IncrementalEntry<T>>,
-    path: &Path,
+    path: impl Source,
     stamp: FileVersion,
     now: Instant,
     build: impl FnOnce(&[String]) -> T,

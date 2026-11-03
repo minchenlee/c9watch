@@ -28,6 +28,18 @@ pub const GUI_METHODS: &[&str] = &[
     "provider.opencode.connect",
 ];
 
+/// Agent-mail methods that only the main window may call (D37). They stay
+/// out of `GUI_METHODS`, so `core_usable` does not need them: a core
+/// without mail is still used, and the GUI hides mail on `unknown_method`.
+pub const GUI_MAIL_METHODS: &[&str] = &[
+    "msg.list",
+    "msg.read",
+    "msg.cancel",
+    "msg.send",
+    "mail.pause",
+    "mail.resume",
+];
+
 pub fn core_usable(hello: &HelloResult) -> bool {
     hello.api_major == API_MAJOR
         && GUI_METHODS.iter().all(|m| hello.methods.contains_key(*m))
@@ -98,6 +110,11 @@ mod tests {
         h = hello();
         h.breaking_since.push("session.views".into());
         assert!(!core_usable(&h));
+        // Mail is optional: a core without it, or with a break in it, is used.
+        h = hello();
+        assert!(GUI_MAIL_METHODS.iter().all(|m| !h.methods.contains_key(*m)));
+        h.breaking_since.push("msg.send".into());
+        assert!(core_usable(&h));
         h = hello();
         h.api_major += 1;
         assert!(!core_usable(&h));
