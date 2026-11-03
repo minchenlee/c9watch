@@ -10,7 +10,11 @@ wrappers import Tauri APIs. Core denial is never converted into a local read;
 only `core_unavailable` selects the retained in-process fallback.
 
 The Rust webview method allowlist deliberately excludes all gateway writes,
-confirmer attachment, engine lifecycle, agent creation/retirement and mail.
+confirmer attachment, engine lifecycle and agent creation/retirement.
+Agent mail (`msg.list`, `msg.read`, `msg.cancel`, `msg.send`, `mail.pause`,
+`mail.resume` and the `msg.state` topic) is allowed for the main window only
+(D37). These methods are in `GUI_MAIL_METHODS`, not `GUI_METHODS`, so a core
+without mail is still usable. The popover gets `not_allowed` for all of them.
 Popover has its own ACL capability and a second Rust method check. Legacy
 fallback mutations are not in the popover capability either.
 
