@@ -670,9 +670,12 @@ impl Driver for NativePty {
         };
         let (master, slave) = open_pty(spec.cols, spec.rows)?;
         let mut cmd = Command::new(program);
-        cmd.args(&spec.argv[1..])
-            .current_dir(&spec.cwd)
-            .env_clear()
+        cmd.args(&spec.argv[1..]);
+        let cwd_fd = spec.cwd_fd.as_ref().map(|fd| fd.as_raw_fd());
+        if cwd_fd.is_none() {
+            cmd.current_dir(&spec.cwd);
+        }
+        cmd.env_clear()
             .envs(spec.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::from(slave.try_clone()?))
             .stdout(Stdio::from(slave.try_clone()?))
@@ -681,7 +684,13 @@ impl Driver for NativePty {
         // A new session makes the child a group leader without a terminal;
         // TIOCSCTTY on its stdin (the slave) makes the PTY its terminal.
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
+                // The checked cwd, by fd (`SpawnSpec::cwd_fd`).
+                if let Some(fd) = cwd_fd {
+                    if libc::fchdir(fd) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
                 if libc::setsid() == -1 {
                     return Err(io::Error::last_os_error());
                 }
@@ -1074,6 +1083,28 @@ mod tests {
             std::thread::sleep(POLL);
         }
         true
+    }
+
+    #[test]
+    fn a_pinned_cwd_wins_over_a_swapped_path() {
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().canonicalize().unwrap();
+        let (c, b) = (real.join("c"), real.join("b"));
+        std::fs::create_dir(&c).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(c.join("mark-c"), "").unwrap();
+        let fd = crate::engine::fsutil::open_dir_nofollow(&c).unwrap();
+        // After the check: `c` moves away and a link to `b` takes its path.
+        std::fs::rename(&c, real.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&b, &c).unwrap();
+        let mut spec = SpawnSpec::new(
+            vec!["/bin/sh".into(), "-c".into(), "ls; echo done".into()],
+            c.clone(),
+        );
+        spec.cwd_fd = Some(std::sync::Arc::new(fd));
+        let mut pty = NativePty::spawn(&spec).unwrap();
+        let out = read_until(&mut pty, "done");
+        assert!(out.contains("mark-c"), "{out}");
     }
 
     #[test]

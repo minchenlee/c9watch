@@ -119,6 +119,7 @@ use super::db::outbox::NewEvent;
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
 use super::drain::{self, DrainSwitch, InjectionPath};
 use super::driver::{Driver, SpawnSpec};
+use super::fsutil;
 use super::generation;
 use super::generation::{begin_generation, emit_upsert, GenReason};
 use super::guard::{self, Fence};
@@ -331,6 +332,10 @@ struct Start {
     sid: String,
     op_id: String,
     cwd: PathBuf,
+    /// The (device, inode) of `cwd` when it was checked. The spawn opens
+    /// `cwd` again without following a link and must find the same one
+    /// (`pin_cwd`).
+    cwd_id: Option<(u64, u64)>,
     claude: PathBuf,
     kind: Kind,
     /// A resume: the row's state before it (`paused` or `interrupted`).
@@ -546,7 +551,7 @@ impl Spawner {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(stopping());
         }
-        let (cwd, claude, cc) = {
+        let (cwd, cwd_id, claude, cc) = {
             let sp = self.clone();
             let cwd = p.cwd.clone();
             blocking(move || sp.prepare(&cwd)).await?
@@ -591,6 +596,7 @@ impl Spawner {
             sid: uuid::Uuid::new_v4().to_string(),
             op_id: ops::new_op_id(),
             cwd,
+            cwd_id: Some(cwd_id),
             claude,
             kind: Kind::Create,
             from: None,
@@ -616,18 +622,23 @@ impl Spawner {
     }
 
     /// Check the agent binary, the cwd and `claude`. Blocking.
-    fn prepare(&self, cwd: &str) -> Result<(PathBuf, PathBuf, Option<CcVersion>), ApiError> {
+    #[allow(clippy::type_complexity)]
+    fn prepare(
+        &self,
+        cwd: &str,
+    ) -> Result<(PathBuf, (u64, u64), PathBuf, Option<CcVersion>), ApiError> {
         self.agent_bin.check(Rehash::Always)?;
         let given = Path::new(cwd);
         if !given.is_absolute() {
             return Err(bad(format!("cwd {:?} is not absolute", cwd)));
         }
         let cwd = resolve_cwd(given).map_err(bad)?;
+        let cwd_id = cwd_id(&cwd).map_err(bad)?;
         check_collision(&self.config.home, &cwd)?;
         let (claude, cc) = self
             .cc_bin_versioned()
             .map_err(|e| ApiError::new(ErrorCode::SpawnFailed, e))?;
-        Ok((cwd, claude, cc))
+        Ok((cwd, cwd_id, claude, cc))
     }
 
     /// The `claude` to spawn, after the version check (D7). Only a missing
@@ -924,22 +935,24 @@ impl Spawner {
         };
         // The other live agents' cwds: their `.claude/` is denied too
         // (C1a-32). A failed read spawns nothing rather than spawn without.
-        // The row's write fence (D30): a resume keeps it.
-        let (peers, guarded) =
-            match self
-                .db
-                .pooled_reader()
-                .map_err(|e| e.to_string())
-                .and_then(|c| {
-                    let peers = peer_cwds(&c, &s.id)
-                        .map_err(|e| format!("Failed to read the peer cwds: {}", e))?;
-                    let guard = row_guard(&c, &s.id)
-                        .map_err(|e| format!("Failed to read the write fence: {}", e))?;
-                    Ok((peers, guard.is_some()))
-                }) {
-                Ok(p) => p,
-                Err(e) => return fail(e),
-            };
+        // The row's write fence (D30): a resume keeps it. A child of an
+        // agent loads no setting source (E5), on a resume too.
+        let (peers, guarded, child) = match self
+            .db
+            .pooled_reader()
+            .map_err(|e| e.to_string())
+            .and_then(|c| {
+                let peers = peer_cwds(&c, &s.id)
+                    .map_err(|e| format!("Failed to read the peer cwds: {}", e))?;
+                let guard = row_guard(&c, &s.id)
+                    .map_err(|e| format!("Failed to read the write fence: {}", e))?;
+                let parent = row_parent(&c, &s.id)
+                    .map_err(|e| format!("Failed to read the parent: {}", e))?;
+                Ok((peers, guard.is_some(), parent.is_some()))
+            }) {
+            Ok(p) => p,
+            Err(e) => return fail(e),
+        };
         // A resumed fence needs the blocking hook from the CC found now; the
         // create checked it already. A CC that lost it stays resumable.
         if guarded && s.kind == Kind::Resume {
@@ -963,8 +976,14 @@ impl Spawner {
             s.gen,
             &s.sid,
         ) {
-            Ok(p) if s.kind == Kind::Resume => p.resuming().with_peers(peers).with_guard(guarded),
-            Ok(p) => p.with_peers(peers).with_guard(guarded),
+            Ok(p) => {
+                let p = if s.kind == Kind::Resume {
+                    p.resuming()
+                } else {
+                    p
+                };
+                p.with_peers(peers).with_guard(guarded).with_child(child)
+            }
             Err(e) => return fail(e),
         };
         // The realpath again: a path part swapped for a symlink since the
@@ -976,7 +995,7 @@ impl Spawner {
             Ok(f) => f,
             Err(e) => return fail(e),
         };
-        let spec = spawn_spec(&profile, &s.claude, &settings);
+        let mut spec = spawn_spec(&profile, &s.claude, &settings);
         // A retire that found no supervisor yet (between the row and
         // `supervise`) closed the op: spawn nothing.
         match self.op_open(s) {
@@ -995,6 +1014,11 @@ impl Spawner {
                 self.drop_resume(s);
             }
             return Up::Draining;
+        }
+        // The cwd checked above, pinned by fd just before the spawn.
+        match pin_cwd(s) {
+            Ok(fd) => spec.cwd_fd = Some(Arc::new(fd)),
+            Err(e) => return fail(e),
         }
         // The one spawn of this create or resume; nothing below spawns
         // again.
@@ -2709,6 +2733,7 @@ impl Spawner {
         if real != cwd {
             return Err(format!("cwd {:?} now resolves to {:?}", cwd, real));
         }
+        let id = cwd_id(&cwd)?;
         check_collision(&self.config.home, &cwd).map_err(|e| e.msg)?;
         self.agent_bin.check(Rehash::Always).map_err(|e| e.msg)?;
         Ok(Start {
@@ -2717,6 +2742,7 @@ impl Spawner {
             sid,
             op_id: ops::new_op_id(),
             cwd,
+            cwd_id: Some(id),
             claude,
             kind: Kind::Resume,
             from: Some(r.state.clone()),
@@ -3324,6 +3350,36 @@ fn unfenced_live_cwd(
 }
 
 /// The write fence on the row of `id`, if it has one.
+/// The (device, inode) of the directory at the realpath `cwd`, opened
+/// without following a link.
+fn cwd_id(cwd: &Path) -> Result<(u64, u64), String> {
+    fsutil::open_dir_nofollow(cwd).and_then(|fd| fsutil::file_id(&fd))
+}
+
+/// Open `s.cwd` without following a link, and check it is the directory
+/// the create or resume checked (`Start::cwd_id`). The spawn changes to
+/// the fd, not the path: the parent of a child agent can write the path's
+/// parent and swap in a link or another directory (E5).
+fn pin_cwd(s: &Start) -> Result<std::os::fd::OwnedFd, String> {
+    let fd = fsutil::open_dir_nofollow(&s.cwd)?;
+    if let Some(want) = s.cwd_id {
+        if fsutil::file_id(&fd)? != want {
+            return Err(format!("cwd {:?} changed since it was checked", s.cwd));
+        }
+    }
+    Ok(fd)
+}
+
+/// The `parent_id` of row `id` (E5).
+fn row_parent(conn: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT parent_id FROM agents WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .flatten())
+}
+
 pub(crate) fn row_guard(conn: &Connection, id: &str) -> rusqlite::Result<Option<AgentGuard>> {
     let g: Option<String> = conn
         .query_row("SELECT guard FROM agents WHERE id = ?1", [id], |r| r.get(0))
@@ -3854,6 +3910,9 @@ mod tests {
         env: Mutex<Vec<(OsString, OsString)>>,
         /// The argv of the last spawn.
         argv: Mutex<Vec<OsString>>,
+        /// Each spawn: the agent id, its argv and the (device, inode) of
+        /// its pinned cwd.
+        spawned: Mutex<Vec<(String, Vec<OsString>, Option<(u64, u64)>)>>,
         spawner: OnceLock<Weak<Spawner>>,
         /// What `claude --version` prints.
         version: Mutex<Result<String, String>>,
@@ -3871,6 +3930,11 @@ mod tests {
             self.spawns.fetch_add(1, Ordering::SeqCst);
             *lock(&self.env) = spec.env.clone();
             *lock(&self.argv) = spec.argv.clone();
+            lock(&self.spawned).push((
+                env_of(spec, "C9_AGENT_ID").unwrap_or_default(),
+                spec.argv.clone(),
+                spec.cwd_fd.as_ref().map(|fd| fsutil::file_id(fd).unwrap()),
+            ));
             if self.script == Script::Ready {
                 // The SessionStart hook, as `c9watch-agent` would send it.
                 let id = env_of(spec, "C9_AGENT_ID").unwrap();
@@ -4000,6 +4064,7 @@ mod tests {
             drain_on_screen: AtomicBool::new(false),
             env: Mutex::new(Vec::new()),
             argv: Mutex::new(Vec::new()),
+            spawned: Mutex::new(Vec::new()),
             spawner: OnceLock::new(),
             version: Mutex::new(Ok("2.1.316 (Claude Code)".into())),
         });
@@ -4161,6 +4226,89 @@ mod tests {
                 .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotAllowed);
         e.sp.shutdown();
+    }
+
+    /// The `--setting-sources` value of each spawn of `id`.
+    fn sources_of(l: &FakeLauncher, id: &str) -> Vec<String> {
+        lock(&l.spawned)
+            .iter()
+            .filter(|(a, _, _)| a == id)
+            .map(|(_, argv, _)| {
+                let i = argv.iter().position(|x| x == "--setting-sources").unwrap();
+                argv[i + 1].to_string_lossy().into_owned()
+            })
+            .collect()
+    }
+
+    /// E5 (Codex #226 r1 P1-1, P1-2): the parent can write the child's
+    /// cwd, so the child loads no setting source from it, and the spawn
+    /// changes to the cwd the create checked, by fd. An owner-created
+    /// agent keeps the project source.
+    #[tokio::test]
+    async fn a_child_loads_nothing_its_parent_wrote_and_runs_where_checked() {
+        let e = setup(Script::Ready, None);
+        let root = e.t.path().canonicalize().unwrap().join("root");
+        let d = dirs(&root, &["a", "a/c"]);
+        // What the parent plants before the create.
+        std::fs::create_dir_all(d[1].join(".claude")).unwrap();
+        std::fs::write(d[1].join(".claude/settings.json"), "{\"hooks\":{}}").unwrap();
+        std::fs::write(d[1].join(".mcp.json"), "{}").unwrap();
+        let parent =
+            e.sp.create(&Principal::LocalUnverified, fenced_params(&root, &d[0]))
+                .await
+                .unwrap();
+        let child =
+            e.sp.create(&agent_of(&parent, 1), fenced_params(&root, &d[1]))
+                .await
+                .unwrap();
+        assert_eq!(sources_of(&e.launcher, &parent.id), ["project"]);
+        assert_eq!(sources_of(&e.launcher, &child.id), [""]);
+        let argv = lock(&e.launcher.argv).clone();
+        assert!(argv.iter().any(|a| a == "--strict-mcp-config"));
+        assert!(!argv.iter().any(|a| a == "--mcp-config"));
+        // Each spawn ran in the directory it was checked in.
+        let id_of = |p: &Path| fsutil::file_id(&fsutil::open_dir_nofollow(p).unwrap()).unwrap();
+        let pinned: Vec<_> = lock(&e.launcher.spawned).iter().map(|s| s.2).collect();
+        assert_eq!(pinned, [Some(id_of(&d[0])), Some(id_of(&d[1]))]);
+        e.sp.shutdown();
+    }
+
+    /// E5 (Codex #226 r1 P1-2): a cwd swapped after the check, for a link
+    /// or for another directory, spawns nothing.
+    #[test]
+    fn a_swapped_cwd_is_not_pinned() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().canonicalize().unwrap();
+        let d = dirs(&root, &["a/c", "b"]);
+        let start = |cwd: &Path| Start {
+            id: "agt_x".into(),
+            gen: 1,
+            sid: String::new(),
+            op_id: String::new(),
+            cwd: cwd.to_path_buf(),
+            cwd_id: Some(cwd_id(cwd).unwrap()),
+            claude: PathBuf::new(),
+            kind: Kind::Create,
+            from: None,
+        };
+        let s = start(&d[0]);
+        assert_eq!(
+            fsutil::file_id(&pin_cwd(&s).unwrap()).unwrap(),
+            s.cwd_id.unwrap()
+        );
+        // A link to `b` at the checked path.
+        std::fs::rename(&d[0], root.join("a/old")).unwrap();
+        std::os::unix::fs::symlink(&d[1], &d[0]).unwrap();
+        assert!(pin_cwd(&s).unwrap_err().contains("symlink"));
+        // Another directory moved in at the checked path.
+        std::fs::remove_file(&d[0]).unwrap();
+        std::fs::rename(&d[1], &d[0]).unwrap();
+        assert!(pin_cwd(&s).unwrap_err().contains("changed since"));
+        // A link above the cwd.
+        let s = start(&d[0]);
+        std::fs::rename(root.join("a"), root.join("a2")).unwrap();
+        std::os::unix::fs::symlink(root.join("a2"), root.join("a")).unwrap();
+        assert!(pin_cwd(&s).is_err());
     }
 
     /// E5: child ⊆ parent. Each refusal spawns nothing.
@@ -4352,9 +4500,13 @@ mod tests {
                 .unwrap();
         e.sp.shutdown();
         ops::reconcile(&e.db, &e.home).unwrap();
-        let (_, _, sp2) = next_engine(&e, Script::Ready, None);
+        let (_, l2, sp2) = next_engine(&e, Script::Ready, None);
         let started = sp2.resume_on_boot().unwrap().started;
         assert_eq!(started.len(), 2, "{:?}", started);
+        // The child's resume still loads no setting source.
+        wait_for("both resumes spawned", || lock(&l2.spawned).len() == 2);
+        assert_eq!(sources_of(&l2, &child.id), [""]);
+        assert_eq!(sources_of(&l2, &parent.id), ["project"]);
         assert_eq!(sp2.retire_orphans().await, 0);
         for r in [&parent, &child] {
             assert_ne!(
@@ -4929,6 +5081,7 @@ mod tests {
             sid: uuid::Uuid::new_v4().to_string(),
             op_id: ops::new_op_id(),
             cwd: e.cwd.canonicalize().unwrap(),
+            cwd_id: None,
             claude: PathBuf::from("/bin/false"),
             kind: Kind::Create,
             from: None,
@@ -5015,6 +5168,7 @@ mod tests {
             sid: uuid::Uuid::new_v4().to_string(),
             op_id: ops::new_op_id(),
             cwd: e.cwd.canonicalize().unwrap(),
+            cwd_id: None,
             claude: PathBuf::from("/bin/false"),
             kind: Kind::Create,
             from: None,
@@ -6544,6 +6698,7 @@ mod tests {
             sid: "s1".into(),
             op_id: "op_test".into(),
             cwd: e.cwd.clone(),
+            cwd_id: None,
             claude: PathBuf::from("/bin/false"),
             kind: Kind::Create,
             from: None,
@@ -7761,6 +7916,7 @@ mod tests {
             sid: String::new(),
             op_id: String::new(),
             cwd: e.cwd.clone(),
+            cwd_id: None,
             claude: PathBuf::new(),
             kind: Kind::Create,
             from: None,

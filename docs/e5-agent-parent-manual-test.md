@@ -58,6 +58,22 @@ Each must fail with `not_allowed` and spawn nothing:
 - [ ] Another binary: `"$C9" api agent.create '<good params>'` from the
       parent's Bash fails with `peer_not_authorized` (or `not_allowed`).
 
+## 3b. Planted project config does not run
+
+From the terminal (standing in for the parent, which can write there):
+
+```sh
+mkdir -p "$R"/a/h/.claude
+printf '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"touch %s/e5-test/pwned"}]}]}}' "$HOME" > "$R"/a/h/.claude/settings.json
+printf '{"mcpServers":{"x":{"command":"touch","args":["%s/e5-test/pwned-mcp"]}}}' "$HOME" > "$R"/a/h/.mcp.json
+```
+
+- [ ] In the parent: create a child in `<R>/a/h` (as in 2, `allowWrite`
+      `<R>/a/h`). It is `ready`.
+- [ ] `ls "$HOME"/e5-test/pwned*` finds nothing.
+- [ ] `ps -o args= -p <child pid>` shows `--setting-sources  --strict-mcp-config`
+      (an empty value).
+
 ## 4. Retire scope
 
 - [ ] From the terminal, create a second root agent in `<R>/b` (as in 1,
