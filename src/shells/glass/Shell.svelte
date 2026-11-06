@@ -7,17 +7,18 @@
     import { route, routeHash, type GlassRoute } from './nav';
     import { startGlassData, sessions, agents, annotations, fixtureOn, model } from './data';
     import type { WorkspaceView } from './model';
-    import { DEMO_NEEDS, DEMO_WORKSPACES } from './model/gaps-demo';
+    import { DEMO_WORKSPACES } from './model/gaps-demo';
     import { installKeys } from './keys';
     import { glassMode, sidebarCollapsed } from './prefs';
     import Sidebar from './Sidebar.svelte';
+    import Needs from './pages/Needs.svelte';
 
     // startGlassData returns its stop function, which Svelte runs on unmount.
     onMount(startGlassData);
 
-    // Until the needs model (G2): the fixture's 5 items, or live sessions
-    // that wait for a person.
-    $: needs = $fixtureOn ? DEMO_NEEDS.length : $sessions.filter(s => s.status === 'NeedsAttention').length;
+    // The same list the 需要你 page shows (G2 model; demo verbs only while
+    // the fixture is on).
+    $: needs = $model.needs.length;
 
     // ⌘N and ⌘K show a hint. v1 has no delegate composer (owner D40) and
     // search comes later.
@@ -67,10 +68,14 @@
     {:else}
         <Sidebar {needs} onCollapse={toggleSidebar} onDelegate={() => (hint = 'delegate')} onSearch={() => (hint = 'search')} />
     {/if}
-    <main class="glass-page" aria-label={info.title}>
-        <header><h1>{info.title}</h1></header>
-        <p class="state-msg">{info.empty}</p>
-    </main>
+    {#if $route.page === 'needs'}
+        <div class="glass-page full"><Needs /></div>
+    {:else}
+        <main class="glass-page" aria-label={info.title}>
+            <header><h1>{info.title}</h1></header>
+            <p class="state-msg">{info.empty}</p>
+        </main>
+    {/if}
     {#if hint}
         <div class="hint glass-float" role="status">
             {#if hint === 'delegate'}
@@ -105,6 +110,8 @@
         padding: var(--space-5) var(--space-8);
     }
     .collapsed .glass-page { padding-top: 56px; }
+    .glass-page.full { padding: 0; overflow: hidden; }
+    .collapsed .glass-page.full { padding-top: 56px; }
     h1 { margin: 0 0 var(--space-6); font: var(--type-title); color: var(--text-1); }
     .reopen {
         position: absolute;

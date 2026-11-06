@@ -45,3 +45,22 @@ G1 frame:
 - `Sidebar.svelte`: 需要你 → 今天 → workspaces (lead and talk rows) →
   extension slot (empty) → 用量 / 設定. `[` collapses it to a
   「需要你 · N」 button. ⌘N shows a `c9watch spawn` hint (no delegate in v1).
+
+G4 需要你 page (read-only):
+
+- `pages/Needs.svelte`: the queue (280px, `$model.needs`, longest wait first
+  until a lead reports blocked counts) next to the handling panel.
+- `handling/HandlingPanel.svelte`: the one handling panel for every page
+  (R7-SPEC §A.7). `handling/detail.ts` turns a `Need` into what the panel
+  shows (pure, `scripts/test-glass-handling.mjs`). Live items show only c9p
+  facts; reasons, options, evidence and shots come from
+  `DEMO_NEED_DETAILS` in the gaps file, only while the fixture is on.
+- 允許 cannot be answered from c9watch yet (Gap P): its main button is
+  「在終端機回答 ⌘O」, which calls `openSession` (it sends nothing).
+- 「以後直接做」 (D9 = C, 允許 only): hidden in live mode until core can
+  answer permissions and keep rules; with the fixture it shows as
+  「設計預覽，不會儲存」.
+- Disconnect banner: on a feed error (`dataError`). Demo: set
+  `localStorage['c9watch.demoGlassOffline'] = '1'` with the fixture on.
+- No action sends anything yet (G5): a send button without a handler is
+  off and reads 「預覽版：還不能從這裡送出」.
