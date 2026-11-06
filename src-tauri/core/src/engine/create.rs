@@ -1,9 +1,11 @@
 //! Free-mode `agent.create` and `agent.retire` (plan C1a-26, A:794-828).
 //!
 //! `agent.create` is always on (C1a-35 dropped the experimental switch).
-//! Only `local-unverified` may call it, or `agent.retire`
-//! (§1.1, v3.1: any L may retire). There is no cap on live agents: the
-//! legacy daemon's `DEFAULT_MAX_WORKERS=16` does not carry over.
+//! `local-unverified` may call it, or `agent.retire` (§1.1, v3.1: any L
+//! may retire). There is no cap on the terminal's live agents: the
+//! legacy daemon's `DEFAULT_MAX_WORKERS=16` does not carry over. An agent
+//! may create children and retire its descendants, within the rules and
+//! tree limits of `engine::lineage` (E5).
 //!
 //! A create:
 //! 1. Checks the engine's `c9watch-agent` copy, realpaths the cwd, and
@@ -117,10 +119,12 @@ use super::db::outbox::NewEvent;
 use super::db::{agent_row, new_agent_id, now_ms, Db, Tx, AGENT_COLUMNS};
 use super::drain::{self, DrainSwitch, InjectionPath};
 use super::driver::{Driver, SpawnSpec};
+use super::fsutil;
 use super::generation;
 use super::generation::{begin_generation, emit_upsert, GenReason};
 use super::guard::{self, Fence};
 use super::hooks;
+use super::lineage;
 use super::machine::HeaderKey;
 use super::mail::{self, MsgState};
 use super::merge::{Activity, MergeTable};
@@ -328,6 +332,10 @@ struct Start {
     sid: String,
     op_id: String,
     cwd: PathBuf,
+    /// The (device, inode) of `cwd` when it was checked. The spawn opens
+    /// `cwd` again without following a link and must find the same one
+    /// (`pin_cwd`).
+    cwd_id: Option<(u64, u64)>,
     claude: PathBuf,
     kind: Kind,
     /// A resume: the row's state before it (`paused` or `interrupted`).
@@ -523,19 +531,27 @@ impl Spawner {
         principal: &Principal,
         params: serde_json::Value,
     ) -> Result<AgentRow, ApiError> {
-        local_only(principal, "agent.create")?;
+        let parent = caller_parent(principal, "agent.create")?;
+        if parent.is_some() {
+            only_child_fields(&params)?;
+        }
         if self.drain.on() {
             return Err(draining());
         }
         let p: AgentCreateParams = parse(params, "agent.create")?;
         let desc = check_kind_and_mode(&p)?;
+        if parent.is_some() && p.guard.is_none() {
+            return Err(not_allowed(
+                "a child of an agent must bring a guard (E5: child ⊆ parent)",
+            ));
+        }
         if let Some(name) = &p.name {
             check_name(name)?;
         }
         if self.stopping.load(Ordering::SeqCst) {
             return Err(stopping());
         }
-        let (cwd, claude, cc) = {
+        let (cwd, cwd_id, claude, cc) = {
             let sp = self.clone();
             let cwd = p.cwd.clone();
             blocking(move || sp.prepare(&cwd)).await?
@@ -567,6 +583,12 @@ impl Spawner {
             }
             None => None,
         };
+        if let (Some(parent), Some(fence)) = (&parent, &fence) {
+            let (db, parent, cwd, fence) =
+                (self.db.clone(), parent.clone(), cwd.clone(), fence.clone());
+            let provider = desc.provider;
+            blocking(move || check_child(&db, &parent, provider, &cwd, &fence)).await?;
+        }
         let spawned = Spawned { fence, cc, caps };
         let start = Start {
             id: new_agent_id(),
@@ -574,6 +596,7 @@ impl Spawner {
             sid: uuid::Uuid::new_v4().to_string(),
             op_id: ops::new_op_id(),
             cwd,
+            cwd_id: Some(cwd_id),
             claude,
             kind: Kind::Create,
             from: None,
@@ -582,7 +605,7 @@ impl Spawner {
         // and then finds it (P1-4).
         let step = self.step(&start.id).lock_owned().await;
         let gen = self
-            .write_row(&start, desc, principal, p.name.clone(), spawned)
+            .write_row(&start, desc, principal, p.name.clone(), spawned, parent)
             .await?;
         #[cfg(feature = "live-test")]
         super::live_test::crash_after(Phase::Row);
@@ -599,18 +622,23 @@ impl Spawner {
     }
 
     /// Check the agent binary, the cwd and `claude`. Blocking.
-    fn prepare(&self, cwd: &str) -> Result<(PathBuf, PathBuf, Option<CcVersion>), ApiError> {
+    #[allow(clippy::type_complexity)]
+    fn prepare(
+        &self,
+        cwd: &str,
+    ) -> Result<(PathBuf, (u64, u64), PathBuf, Option<CcVersion>), ApiError> {
         self.agent_bin.check(Rehash::Always)?;
         let given = Path::new(cwd);
         if !given.is_absolute() {
             return Err(bad(format!("cwd {:?} is not absolute", cwd)));
         }
         let cwd = resolve_cwd(given).map_err(bad)?;
+        let cwd_id = cwd_id(&cwd).map_err(bad)?;
         check_collision(&self.config.home, &cwd)?;
         let (claude, cc) = self
             .cc_bin_versioned()
             .map_err(|e| ApiError::new(ErrorCode::SpawnFailed, e))?;
-        Ok((cwd, claude, cc))
+        Ok((cwd, cwd_id, claude, cc))
     }
 
     /// The `claude` to spawn, after the version check (D7). Only a missing
@@ -669,6 +697,7 @@ impl Spawner {
         principal: &Principal,
         name: Option<String>,
         spawned: Spawned,
+        parent: Option<String>,
     ) -> Result<i64, ApiError> {
         let s = s.clone();
         let machine = self.db.machine_id().to_string();
@@ -682,7 +711,20 @@ impl Spawner {
                         return Ok(Err(bad(format!("name {:?} is in use by a live agent", n))));
                     }
                 }
-                if let Some(other) = nested_cwd(tx, &s.cwd)? {
+                // E5: the parent's tree, checked again under the write
+                // lock; the child may nest in its own ancestors' cwds.
+                let lineage = match &parent {
+                    Some(p) => {
+                        if let Err(why) = lineage::check_limits(tx, p) {
+                            return Ok(Err(not_allowed(why)));
+                        }
+                        let mut up = lineage::ancestors(tx, p)?;
+                        up.insert(0, p.clone());
+                        up
+                    }
+                    None => Vec::new(),
+                };
+                if let Some(other) = nested_cwd(tx, &s.cwd, &lineage)? {
                     return Ok(Err(ApiError::new(
                         ErrorCode::CwdCollision,
                         format!(
@@ -693,7 +735,7 @@ impl Spawner {
                 }
                 let other = match &spawned.fence {
                     None => other_live_cwd(tx, &s.cwd)?,
-                    Some(fence) => unfenced_live_cwd(tx, &s.cwd, fence)?,
+                    Some(fence) => unfenced_live_cwd(tx, &s.cwd, fence, &lineage)?,
                 };
                 if let Some(other) = other {
                     return Ok(Err(ApiError::new(
@@ -715,9 +757,10 @@ impl Spawner {
                 let caps = serde_json::to_string(&spawned.caps).expect("caps serialize");
                 tx.execute(
                     "INSERT INTO agents (id, mode, role, control, provider, source, created_by, \
-                     state, cwd, name, machine_id, created_at, guard, cc_version, capabilities) \
+                     state, cwd, name, machine_id, created_at, guard, cc_version, capabilities, \
+                     parent_id) \
                      VALUES (?1, 'free', 'worker', 'pty', ?2, 'engine', ?3, 'creating', ?4, ?5, \
-                     ?6, ?7, ?8, ?9, ?10)",
+                     ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         s.id,
                         desc.provider,
@@ -728,7 +771,8 @@ impl Spawner {
                         now,
                         guard,
                         spawned.cc.map(quirks::version_string),
-                        caps
+                        caps,
+                        parent
                     ],
                 )?;
                 let gen =
@@ -891,22 +935,24 @@ impl Spawner {
         };
         // The other live agents' cwds: their `.claude/` is denied too
         // (C1a-32). A failed read spawns nothing rather than spawn without.
-        // The row's write fence (D30): a resume keeps it.
-        let (peers, guarded) =
-            match self
-                .db
-                .pooled_reader()
-                .map_err(|e| e.to_string())
-                .and_then(|c| {
-                    let peers = peer_cwds(&c, &s.id)
-                        .map_err(|e| format!("Failed to read the peer cwds: {}", e))?;
-                    let guard = row_guard(&c, &s.id)
-                        .map_err(|e| format!("Failed to read the write fence: {}", e))?;
-                    Ok((peers, guard.is_some()))
-                }) {
-                Ok(p) => p,
-                Err(e) => return fail(e),
-            };
+        // The row's write fence (D30): a resume keeps it. A child of an
+        // agent loads no setting source (E5), on a resume too.
+        let (peers, guarded, child) = match self
+            .db
+            .pooled_reader()
+            .map_err(|e| e.to_string())
+            .and_then(|c| {
+                let peers = peer_cwds(&c, &s.id)
+                    .map_err(|e| format!("Failed to read the peer cwds: {}", e))?;
+                let guard = row_guard(&c, &s.id)
+                    .map_err(|e| format!("Failed to read the write fence: {}", e))?;
+                let parent = row_parent(&c, &s.id)
+                    .map_err(|e| format!("Failed to read the parent: {}", e))?;
+                Ok((peers, guard.is_some(), parent.is_some()))
+            }) {
+            Ok(p) => p,
+            Err(e) => return fail(e),
+        };
         // A resumed fence needs the blocking hook from the CC found now; the
         // create checked it already. A CC that lost it stays resumable.
         if guarded && s.kind == Kind::Resume {
@@ -930,8 +976,14 @@ impl Spawner {
             s.gen,
             &s.sid,
         ) {
-            Ok(p) if s.kind == Kind::Resume => p.resuming().with_peers(peers).with_guard(guarded),
-            Ok(p) => p.with_peers(peers).with_guard(guarded),
+            Ok(p) => {
+                let p = if s.kind == Kind::Resume {
+                    p.resuming()
+                } else {
+                    p
+                };
+                p.with_peers(peers).with_guard(guarded).with_child(child)
+            }
             Err(e) => return fail(e),
         };
         // The realpath again: a path part swapped for a symlink since the
@@ -943,7 +995,7 @@ impl Spawner {
             Ok(f) => f,
             Err(e) => return fail(e),
         };
-        let spec = spawn_spec(&profile, &s.claude, &settings);
+        let mut spec = spawn_spec(&profile, &s.claude, &settings);
         // A retire that found no supervisor yet (between the row and
         // `supervise`) closed the op: spawn nothing.
         match self.op_open(s) {
@@ -962,6 +1014,11 @@ impl Spawner {
                 self.drop_resume(s);
             }
             return Up::Draining;
+        }
+        // The cwd checked above, pinned by fd just before the spawn.
+        match pin_cwd(s) {
+            Ok(fd) => spec.cwd_fd = Some(Arc::new(fd)),
+            Err(e) => return fail(e),
         }
         // The one spawn of this create or resume; nothing below spawns
         // again.
@@ -2676,6 +2733,7 @@ impl Spawner {
         if real != cwd {
             return Err(format!("cwd {:?} now resolves to {:?}", cwd, real));
         }
+        let id = cwd_id(&cwd)?;
         check_collision(&self.config.home, &cwd).map_err(|e| e.msg)?;
         self.agent_bin.check(Rehash::Always).map_err(|e| e.msg)?;
         Ok(Start {
@@ -2684,6 +2742,7 @@ impl Spawner {
             sid,
             op_id: ops::new_op_id(),
             cwd,
+            cwd_id: Some(id),
             claude,
             kind: Kind::Resume,
             from: Some(r.state.clone()),
@@ -2747,36 +2806,164 @@ impl Spawner {
                 format!("{} may not force agent.retire", principal),
             ));
         }
-        local_only(principal, "agent.retire")?;
+        let parent = caller_parent(principal, "agent.retire")?;
         let p: AgentRetireParams = parse(params, "agent.retire")?;
-        let force = p.force == Some(true);
+        // E5: an agent retires only its own descendants.
+        if let Some(me) = parent {
+            let (db, id) = (self.db.clone(), p.id.clone());
+            let below = blocking(move || {
+                let conn = db.pooled_reader().map_err(internal)?;
+                lineage::is_descendant(&conn, &id, &me).map_err(internal)
+            })
+            .await?;
+            if !below {
+                return Err(not_allowed(format!(
+                    "{} may retire only its own descendants, and {} is not one",
+                    principal, p.id
+                )));
+            }
+        }
+        let r = self
+            .retire_one(&p.id, &principal.to_string(), p.force == Some(true))
+            .await;
+        if matches!(&r, Ok(row) if row.state.as_deref() == Some("retired")) {
+            // Its children go with it.
+            self.retire_orphans().await;
+        }
+        r
+    }
+
+    /// The retire of `id` by `principal`, already authorized.
+    async fn retire_one(
+        self: &Arc<Self>,
+        id: &str,
+        principal: &str,
+        force: bool,
+    ) -> Result<AgentRow, ApiError> {
         // For the whole retire (P1-4): a create or resume of it has
         // registered its supervisor before this goes on, and none starts
         // until the retire is done.
-        let step = self.step(&p.id).lock_owned().await;
+        let step = self.step(id).lock_owned().await;
         let row = {
-            let (db, id) = (self.db.clone(), p.id.clone());
+            let (db, id) = (self.db.clone(), id.to_string());
             blocking(move || {
                 let conn = db.pooled_reader().map_err(internal)?;
                 engine_row(&conn, &id).map_err(internal)
             })
             .await?
         };
-        let row = row.ok_or_else(|| unknown_agent(&p.id))?;
+        let row = row.ok_or_else(|| unknown_agent(id))?;
         if matches!(row.state.as_deref(), Some("retired" | "failed")) {
             return Ok(row);
         }
-        if let Some(r) = self.retire_live(&p.id, principal).await {
-            self.forget_retired(&p.id, &r, &step);
+        if let Some(r) = self.retire_live(id, principal).await {
+            self.forget_retired(id, &r, &step);
             return r;
         }
         // No supervisor: the agent runs nowhere in this engine, and none
         // can start while the step is held.
         let sp = self.clone();
-        let (id, principal_s) = (p.id.clone(), principal.to_string());
-        let r = blocking(move || sp.retire_idle(&id, row.generation, &principal_s, force)).await;
-        self.forget_retired(&p.id, &r, &step);
+        let (id2, principal_s) = (id.to_string(), principal.to_string());
+        let r = blocking(move || sp.retire_idle(&id2, row.generation, &principal_s, force)).await;
+        self.forget_retired(id, &r, &step);
         r
+    }
+
+    /// E5: retire every child whose parent can no longer come back
+    /// (`lineage::orphans`), as the engine, with an audit row that names
+    /// the parent. A grandchild follows on the next pass. Not while the
+    /// engine drains or stops: a drained parent comes back. Returns how
+    /// many it retired.
+    pub async fn retire_orphans(self: &Arc<Self>) -> usize {
+        let mut done = 0;
+        for _ in 0..=lineage::MAX_DEPTH {
+            if self.drain.on() || self.stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            let db = self.db.clone();
+            let list = blocking(move || {
+                let conn = db.pooled_reader().map_err(internal)?;
+                lineage::orphans(&conn).map_err(internal)
+            })
+            .await;
+            let list = match list {
+                Ok(l) if l.is_empty() => break,
+                Ok(l) => l,
+                Err(e) => {
+                    crate::elog!(
+                        Warn,
+                        "create",
+                        "Failed to read the orphaned children: {}",
+                        e.msg
+                    );
+                    break;
+                }
+            };
+            let before = done;
+            for (id, parent) in list {
+                match self.retire_one(&id, audit::SYSTEM, false).await {
+                    Ok(row) if row.state.as_deref() == Some("retired") => {
+                        let why = format!("{}: parent {}", lineage::PARENT_GONE, parent);
+                        let (sp, id) = (self.clone(), id.clone());
+                        let _ = blocking(move || {
+                            sp.audit_system("agent.retire", &id, &why);
+                            Ok(())
+                        })
+                        .await;
+                        done += 1;
+                    }
+                    Ok(row) => crate::elog!(
+                        Warn,
+                        "create",
+                        "The child {} of {} is {:?} after its retire",
+                        id,
+                        parent,
+                        row.state
+                    ),
+                    Err(e) => crate::elog!(
+                        Warn,
+                        "create",
+                        "Failed to retire the child {} of {}: {}",
+                        id,
+                        parent,
+                        e.msg
+                    ),
+                }
+            }
+            if done == before {
+                break;
+            }
+        }
+        done
+    }
+
+    /// One audit row by the engine itself. A failed write only logs.
+    fn audit_system(&self, method: &str, target: &str, reason: &str) {
+        let (m, t, reason) = (method.to_string(), target.to_string(), reason.to_string());
+        let wrote = self.db.write_blocking(move |tx| {
+            audit::append(
+                tx,
+                now_ms(),
+                &AuditEntry {
+                    principal: audit::SYSTEM,
+                    method: &m,
+                    target: Some(&t),
+                    decision: "allow",
+                    reason: Some(&reason),
+                    ..Default::default()
+                },
+            )
+        });
+        if let Err(e) = wrote {
+            crate::elog!(
+                Warn,
+                "create",
+                "Failed to audit {} of {}: {}",
+                method,
+                target,
+                e
+            );
+        }
     }
 
     /// After a retire: forget the step lock of a tombstone.
@@ -2793,11 +2980,7 @@ impl Spawner {
 
     /// Hand the retire of `id` to its supervisor, if it runs here. `None`
     /// when there is no supervisor, or it ended before it answered.
-    async fn retire_live(
-        &self,
-        id: &str,
-        principal: &Principal,
-    ) -> Option<Result<AgentRow, ApiError>> {
+    async fn retire_live(&self, id: &str, principal: &str) -> Option<Result<AgentRow, ApiError>> {
         let cmds = lock(&self.live).get(id).map(|h| h.cmds.clone())?;
         let (reply, answer) = oneshot::channel();
         cmds.send(Cmd::Retire {
@@ -3078,7 +3261,11 @@ fn peer_cwds(conn: &Connection, id: &str) -> rusqlite::Result<Vec<PathBuf>> {
 /// `(id, cwd)` (reviews M4). The outer agent's sandbox may write the inner
 /// one's `.claude/`, which CC hot-reloads. The same cwd is fine: both deny
 /// it. In the create transaction, so two creates cannot race past it.
-fn nested_cwd(conn: &Connection, cwd: &Path) -> rusqlite::Result<Option<(String, PathBuf)>> {
+fn nested_cwd(
+    conn: &Connection,
+    cwd: &Path,
+    lineage: &[String],
+) -> rusqlite::Result<Option<(String, PathBuf)>> {
     let mut st = conn.prepare(
         "SELECT id, cwd FROM agents WHERE source = 'engine' AND gone_at IS NULL \
          AND cwd IS NOT NULL",
@@ -3091,6 +3278,10 @@ fn nested_cwd(conn: &Connection, cwd: &Path) -> rusqlite::Result<Option<(String,
     })?;
     for row in rows {
         let (id, other) = row?;
+        // E5: a child sits in its ancestors' cwds (`lineage`).
+        if lineage.contains(&id) {
+            continue;
+        }
         if other != cwd && (other.starts_with(cwd) || cwd.starts_with(&other)) {
             return Ok(Some((id, other)));
         }
@@ -3129,6 +3320,7 @@ fn unfenced_live_cwd(
     conn: &Connection,
     cwd: &Path,
     fence: &Fence,
+    lineage: &[String],
 ) -> rusqlite::Result<Option<(String, PathBuf)>> {
     let mut st = conn.prepare(
         "SELECT id, cwd, guard FROM agents WHERE source = 'engine' AND gone_at IS NULL \
@@ -3143,6 +3335,9 @@ fn unfenced_live_cwd(
     })?;
     for row in rows {
         let (id, other, guard) = row?;
+        if lineage.contains(&id) {
+            continue;
+        }
         let theirs = guard
             .and_then(|g| serde_json::from_str::<AgentGuard>(&g).ok())
             .map(|g| Fence::from_wire(&g));
@@ -3155,6 +3350,36 @@ fn unfenced_live_cwd(
 }
 
 /// The write fence on the row of `id`, if it has one.
+/// The (device, inode) of the directory at the realpath `cwd`, opened
+/// without following a link.
+fn cwd_id(cwd: &Path) -> Result<(u64, u64), String> {
+    fsutil::open_dir_nofollow(cwd).and_then(|fd| fsutil::file_id(&fd))
+}
+
+/// Open `s.cwd` without following a link, and check it is the directory
+/// the create or resume checked (`Start::cwd_id`). The spawn changes to
+/// the fd, not the path: the parent of a child agent can write the path's
+/// parent and swap in a link or another directory (E5).
+fn pin_cwd(s: &Start) -> Result<std::os::fd::OwnedFd, String> {
+    let fd = fsutil::open_dir_nofollow(&s.cwd)?;
+    if let Some(want) = s.cwd_id {
+        if fsutil::file_id(&fd)? != want {
+            return Err(format!("cwd {:?} changed since it was checked", s.cwd));
+        }
+    }
+    Ok(fd)
+}
+
+/// The `parent_id` of row `id` (E5).
+fn row_parent(conn: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT parent_id FROM agents WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .flatten())
+}
+
 pub(crate) fn row_guard(conn: &Connection, id: &str) -> rusqlite::Result<Option<AgentGuard>> {
     let g: Option<String> = conn
         .query_row("SELECT guard FROM agents WHERE id = ?1", [id], |r| r.get(0))
@@ -3193,6 +3418,74 @@ fn local_only(principal: &Principal, method: &str) -> Result<(), ApiError> {
             format!("{} may not call {} in C1a", other, method),
         )),
     }
+}
+
+/// E5: who may create or retire. The terminal (`None`); an agent, as the
+/// parent (`Some(its id)`); nobody else. The dispatch admitted the agent
+/// already (`Admission::AgentParent`).
+fn caller_parent(principal: &Principal, method: &str) -> Result<Option<String>, ApiError> {
+    match principal {
+        Principal::LocalUnverified => Ok(None),
+        Principal::Agent { id, .. } => Ok(Some(id.clone())),
+        other => Err(ApiError::new(
+            ErrorCode::NotAllowed,
+            format!("{} may not call {}", other, method),
+        )),
+    }
+}
+
+/// The `agent.create` params an agent may pass. Anything else (a later
+/// overlay, settings, mode flags) is refused, not ignored.
+const CHILD_FIELDS: &[&str] = &["kind", "mode", "cwd", "name", "guard", "require"];
+
+fn only_child_fields(params: &serde_json::Value) -> Result<(), ApiError> {
+    let Some(map) = params.as_object() else {
+        return Err(bad("bad agent.create params: not an object"));
+    };
+    match map.keys().find(|k| !CHILD_FIELDS.contains(&k.as_str())) {
+        Some(k) => Err(not_allowed(format!(
+            "an agent may not pass {:?} to agent.create (it may pass {:?})",
+            k, CHILD_FIELDS
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// E5: the child of `parent` with the cwd `cwd` (a realpath), the fence
+/// `fence` and the provider `provider` is at most as free as its parent.
+/// Blocking.
+fn check_child(
+    db: &Db,
+    parent: &str,
+    provider: &str,
+    cwd: &Path,
+    fence: &Fence,
+) -> Result<(), ApiError> {
+    let row = {
+        let conn = db.pooled_reader().map_err(internal)?;
+        engine_row(&conn, parent).map_err(internal)?
+    };
+    let row = row.ok_or_else(|| not_allowed(format!("the parent {} has no engine row", parent)))?;
+    if row.provider != provider {
+        return Err(not_allowed(format!(
+            "a {} agent may create only {} children",
+            row.provider, row.provider
+        )));
+    }
+    let parent_cwd = row
+        .cwd
+        .as_deref()
+        .ok_or_else(|| not_allowed(format!("the parent {} has no cwd", parent)))?;
+    let parent_cwd = Path::new(parent_cwd)
+        .canonicalize()
+        .map_err(|e| not_allowed(format!("the parent's cwd {:?}: {}", parent_cwd, e)))?;
+    let theirs = row.guard.as_ref().map(Fence::from_wire);
+    lineage::check_child_cwd(cwd, &parent_cwd, theirs.as_ref()).map_err(not_allowed)?;
+    lineage::check_child_guard(fence, &parent_cwd, theirs.as_ref()).map_err(not_allowed)
+}
+
+fn not_allowed(msg: impl Into<String>) -> ApiError {
+    ApiError::new(ErrorCode::NotAllowed, msg)
 }
 
 fn parse<T: serde::de::DeserializeOwned>(
@@ -3617,6 +3910,9 @@ mod tests {
         env: Mutex<Vec<(OsString, OsString)>>,
         /// The argv of the last spawn.
         argv: Mutex<Vec<OsString>>,
+        /// Each spawn: the agent id, its argv and the (device, inode) of
+        /// its pinned cwd.
+        spawned: Mutex<Vec<(String, Vec<OsString>, Option<(u64, u64)>)>>,
         spawner: OnceLock<Weak<Spawner>>,
         /// What `claude --version` prints.
         version: Mutex<Result<String, String>>,
@@ -3634,6 +3930,11 @@ mod tests {
             self.spawns.fetch_add(1, Ordering::SeqCst);
             *lock(&self.env) = spec.env.clone();
             *lock(&self.argv) = spec.argv.clone();
+            lock(&self.spawned).push((
+                env_of(spec, "C9_AGENT_ID").unwrap_or_default(),
+                spec.argv.clone(),
+                spec.cwd_fd.as_ref().map(|fd| fsutil::file_id(fd).unwrap()),
+            ));
             if self.script == Script::Ready {
                 // The SessionStart hook, as `c9watch-agent` would send it.
                 let id = env_of(spec, "C9_AGENT_ID").unwrap();
@@ -3763,6 +4064,7 @@ mod tests {
             drain_on_screen: AtomicBool::new(false),
             env: Mutex::new(Vec::new()),
             argv: Mutex::new(Vec::new()),
+            spawned: Mutex::new(Vec::new()),
             spawner: OnceLock::new(),
             version: Mutex::new(Ok("2.1.316 (Claude Code)".into())),
         });
@@ -3843,21 +4145,400 @@ mod tests {
         }
     }
 
+    /// E5: the principal of an agent's process, at generation `gen`.
+    fn agent_of(r: &AgentRow, gen: i64) -> Principal {
+        Principal::Agent {
+            id: r.id.clone(),
+            gen,
+        }
+    }
+
+    /// Directories `root/<rel>`, made.
+    fn dirs(root: &Path, rel: &[&str]) -> Vec<PathBuf> {
+        rel.iter()
+            .map(|r| {
+                let d = root.join(r);
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            })
+            .collect()
+    }
+
+    /// The audit rows the engine wrote for the children it retired.
+    fn parent_gone(db: &Db) -> Vec<(String, String, String)> {
+        let conn = db.reader().unwrap();
+        let mut st = conn
+            .prepare(
+                "SELECT principal, target, reason FROM audit \
+                 WHERE reason LIKE 'parent-gone%' ORDER BY seq",
+            )
+            .unwrap();
+        let rows = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// E5: an agent creates a child that records its parent, and retires
+    /// only its own descendants; `force` stays the terminal's.
     #[tokio::test]
-    async fn an_agent_may_not_create_or_retire() {
+    async fn an_agent_creates_and_retires_only_its_own_children() {
         let e = setup(Script::Ready, None);
-        let a = Principal::Agent {
-            id: "agt_x".into(),
-            gen: 1,
+        let l = Principal::LocalUnverified;
+        let root = e.t.path().canonicalize().unwrap().join("root");
+        let d = dirs(&root, &["a", "a/c", "b"]);
+        let parent = e.sp.create(&l, fenced_params(&root, &d[0])).await.unwrap();
+        let other = e.sp.create(&l, fenced_params(&root, &d[2])).await.unwrap();
+        let p = agent_of(&parent, 1);
+        let child = e.sp.create(&p, fenced_params(&root, &d[1])).await.unwrap();
+        assert_eq!(child.state.as_deref(), Some("ready"));
+        assert_eq!(
+            row(&e.db, &child.id).parent_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        assert_eq!(row(&e.db, &parent.id).parent_id, None);
+        for (who, id) in [
+            (&p, &other.id),
+            (&p, &parent.id),
+            (&agent_of(&child, 1), &parent.id),
+        ] {
+            let err =
+                e.sp.retire(who, serde_json::json!({ "id": id }))
+                    .await
+                    .unwrap_err();
+            assert_eq!(err.code, ErrorCode::NotAllowed, "{who} {id}: {}", err.msg);
+        }
+        let forced = serde_json::json!({ "id": child.id, "force": true });
+        let err = e.sp.retire(&p, forced).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::PeerNotAuthorized);
+        let gone =
+            e.sp.retire(&p, serde_json::json!({ "id": child.id }))
+                .await
+                .unwrap();
+        assert_eq!(gone.state.as_deref(), Some("retired"));
+        assert_eq!(row(&e.db, &parent.id).state.as_deref(), Some("ready"));
+        let o = Principal::Observed {
+            session_key: "claudeCode:s".into(),
         };
-        let err = e.sp.create(&a, create_params(&e.cwd)).await.unwrap_err();
-        assert_eq!(err.code, ErrorCode::NotAllowed);
         let err =
-            e.sp.retire(&a, serde_json::json!({"id": "agt_x"}))
+            e.sp.create(&o, fenced_params(&root, &d[1]))
                 .await
                 .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotAllowed);
-        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 0);
+        e.sp.shutdown();
+    }
+
+    /// The `--setting-sources` value of each spawn of `id`.
+    fn sources_of(l: &FakeLauncher, id: &str) -> Vec<String> {
+        lock(&l.spawned)
+            .iter()
+            .filter(|(a, _, _)| a == id)
+            .map(|(_, argv, _)| {
+                let i = argv.iter().position(|x| x == "--setting-sources").unwrap();
+                argv[i + 1].to_string_lossy().into_owned()
+            })
+            .collect()
+    }
+
+    /// E5 (Codex #226 r1 P1-1, P1-2): the parent can write the child's
+    /// cwd, so the child loads no setting source from it, and the spawn
+    /// changes to the cwd the create checked, by fd. An owner-created
+    /// agent keeps the project source.
+    #[tokio::test]
+    async fn a_child_loads_nothing_its_parent_wrote_and_runs_where_checked() {
+        let e = setup(Script::Ready, None);
+        let root = e.t.path().canonicalize().unwrap().join("root");
+        let d = dirs(&root, &["a", "a/c"]);
+        // What the parent plants before the create.
+        std::fs::create_dir_all(d[1].join(".claude")).unwrap();
+        std::fs::write(d[1].join(".claude/settings.json"), "{\"hooks\":{}}").unwrap();
+        std::fs::write(d[1].join(".mcp.json"), "{}").unwrap();
+        let parent =
+            e.sp.create(&Principal::LocalUnverified, fenced_params(&root, &d[0]))
+                .await
+                .unwrap();
+        let child =
+            e.sp.create(&agent_of(&parent, 1), fenced_params(&root, &d[1]))
+                .await
+                .unwrap();
+        assert_eq!(sources_of(&e.launcher, &parent.id), ["project"]);
+        assert_eq!(sources_of(&e.launcher, &child.id), [""]);
+        let argv = lock(&e.launcher.argv).clone();
+        assert!(argv.iter().any(|a| a == "--strict-mcp-config"));
+        assert!(!argv.iter().any(|a| a == "--mcp-config"));
+        // Each spawn ran in the directory it was checked in.
+        let id_of = |p: &Path| fsutil::file_id(&fsutil::open_dir_nofollow(p).unwrap()).unwrap();
+        let pinned: Vec<_> = lock(&e.launcher.spawned).iter().map(|s| s.2).collect();
+        assert_eq!(pinned, [Some(id_of(&d[0])), Some(id_of(&d[1]))]);
+        e.sp.shutdown();
+    }
+
+    /// E5 (Codex #226 r1 P1-2): a cwd swapped after the check, for a link
+    /// or for another directory, spawns nothing.
+    #[test]
+    fn a_swapped_cwd_is_not_pinned() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().canonicalize().unwrap();
+        let d = dirs(&root, &["a/c", "b"]);
+        let start = |cwd: &Path| Start {
+            id: "agt_x".into(),
+            gen: 1,
+            sid: String::new(),
+            op_id: String::new(),
+            cwd: cwd.to_path_buf(),
+            cwd_id: Some(cwd_id(cwd).unwrap()),
+            claude: PathBuf::new(),
+            kind: Kind::Create,
+            from: None,
+        };
+        let s = start(&d[0]);
+        assert_eq!(
+            fsutil::file_id(&pin_cwd(&s).unwrap()).unwrap(),
+            s.cwd_id.unwrap()
+        );
+        // A link to `b` at the checked path.
+        std::fs::rename(&d[0], root.join("a/old")).unwrap();
+        std::os::unix::fs::symlink(&d[1], &d[0]).unwrap();
+        assert!(pin_cwd(&s).unwrap_err().contains("symlink"));
+        // Another directory moved in at the checked path.
+        std::fs::remove_file(&d[0]).unwrap();
+        std::fs::rename(&d[1], &d[0]).unwrap();
+        assert!(pin_cwd(&s).unwrap_err().contains("changed since"));
+        // A link above the cwd.
+        let s = start(&d[0]);
+        std::fs::rename(root.join("a"), root.join("a2")).unwrap();
+        std::os::unix::fs::symlink(root.join("a2"), root.join("a")).unwrap();
+        assert!(pin_cwd(&s).is_err());
+    }
+
+    /// E5: child ⊆ parent. Each refusal spawns nothing.
+    #[tokio::test]
+    async fn a_child_is_never_freer_than_its_parent() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let root = e.t.path().canonicalize().unwrap().join("root");
+        let d = dirs(&root, &["a", "a/c", "b", "a/.git/x", "a/.claude"]);
+        let parent = e.sp.create(&l, fenced_params(&root, &d[0])).await.unwrap();
+        let p = agent_of(&parent, 1);
+        let mut overlay = fenced_params(&root, &d[1]);
+        overlay["overlay"] = serde_json::json!({});
+        let guard = |deny: &[&PathBuf], allow: &[&PathBuf]| {
+            serde_json::json!({
+                "mode": "free", "cwd": d[1],
+                "guard": {"denyWriteUnder": deny, "allowWrite": allow},
+            })
+        };
+        let refused = [
+            ("no guard", create_params(&d[1])),
+            ("overlay", overlay),
+            ("the parent's cwd", fenced_params(&root, &d[0])),
+            ("outside the area", fenced_params(&root, &d[2])),
+            (".git", fenced_params(&root, &d[3])),
+            (".claude", fenced_params(&root, &d[4])),
+            ("drops a deny", guard(&[&d[0]], &[&d[1]])),
+            ("opens a path", guard(&[&root], &[&d[1], &d[2]])),
+        ];
+        for (what, params) in refused {
+            let err = e.sp.create(&p, params).await.unwrap_err();
+            assert_eq!(err.code, ErrorCode::NotAllowed, "{what}: {}", err.msg);
+        }
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(e.db.agents(AgentFilter::All).unwrap().len(), 1);
+        e.sp.shutdown();
+
+        // A parent without a guard: its area is its cwd, and the child
+        // still brings a guard.
+        let e = setup(Script::Ready, None);
+        let cwd = e.cwd.canonicalize().unwrap();
+        let bare = e.sp.create(&l, create_params(&cwd)).await.unwrap();
+        let p = agent_of(&bare, 1);
+        let d = dirs(&cwd, &["c"]);
+        let out = dirs(e.t.path(), &["elsewhere"]);
+        let err = e.sp.create(&p, create_params(&d[0])).await.unwrap_err();
+        assert!(err.msg.contains("guard"), "{}", err.msg);
+        let err =
+            e.sp.create(&p, fenced_params(e.t.path(), &out[0]))
+                .await
+                .unwrap_err();
+        assert!(err.msg.contains("write area"), "{}", err.msg);
+        let child = e.sp.create(&p, fenced_params(&cwd, &d[0])).await.unwrap();
+        assert_eq!(
+            row(&e.db, &child.id).parent_id.as_deref(),
+            Some(bare.id.as_str())
+        );
+        e.sp.shutdown();
+    }
+
+    /// E5: the tree limits, each at its edge.
+    #[tokio::test]
+    async fn a_tree_stops_at_its_limits() {
+        assert_eq!(
+            (lineage::MAX_DEPTH, lineage::MAX_CHILDREN, lineage::MAX_TREE),
+            (3, 8, 16)
+        );
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let root = e.t.path().canonicalize().unwrap().join("root");
+        let a = dirs(&root, &["a"]).remove(0);
+        let top = e.sp.create(&l, fenced_params(&root, &a)).await.unwrap();
+        // Depth: a/d1/d2/d3 passes, d4 does not.
+        let mut at = top.clone();
+        let mut deep = a.clone();
+        let mut chain = Vec::new();
+        for depth in 1..=4 {
+            deep = deep.join(format!("d{depth}"));
+            std::fs::create_dir_all(&deep).unwrap();
+            let r =
+                e.sp.create(&agent_of(&at, 1), fenced_params(&root, &deep))
+                    .await;
+            if depth <= lineage::MAX_DEPTH {
+                at = r.unwrap();
+                chain.push(at.clone());
+            } else {
+                let err = r.unwrap_err();
+                assert!(err.msg.contains("depth 4"), "{}", err.msg);
+            }
+        }
+        // Children: top has d1; 7 more pass, the 9th does not.
+        let p = agent_of(&top, 1);
+        for k in 2..=9 {
+            let dir = dirs(&a, &[&format!("k{k}")]).remove(0);
+            let r = e.sp.create(&p, fenced_params(&root, &dir)).await;
+            if k <= 8 {
+                r.unwrap();
+            } else {
+                let err = r.unwrap_err();
+                assert!(err.msg.contains("live children"), "{}", err.msg);
+            }
+        }
+        // The tree: 1 + 8 + d2 + d3 = 11; five more under d1 make 16.
+        let d1 = agent_of(&chain[0], 1);
+        for n in 1..=6 {
+            let dir = dirs(&a, &[&format!("d1/e{n}")]).remove(0);
+            let r = e.sp.create(&d1, fenced_params(&root, &dir)).await;
+            if n <= 5 {
+                r.unwrap();
+            } else {
+                let err = r.unwrap_err();
+                assert!(err.msg.contains("16 live agents"), "{}", err.msg);
+            }
+        }
+        e.sp.shutdown();
+    }
+
+    /// E5: a retired or failed parent takes its tree with it, audited as
+    /// `parent-gone`; a live parent keeps it.
+    #[tokio::test]
+    async fn a_gone_parent_takes_its_tree() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let root = e.t.path().canonicalize().unwrap().join("root");
+        let d = dirs(&root, &["a", "a/c", "a/c/g", "q", "q/c"]);
+        let parent = e.sp.create(&l, fenced_params(&root, &d[0])).await.unwrap();
+        let child =
+            e.sp.create(&agent_of(&parent, 1), fenced_params(&root, &d[1]))
+                .await
+                .unwrap();
+        let grand =
+            e.sp.create(&agent_of(&child, 1), fenced_params(&root, &d[2]))
+                .await
+                .unwrap();
+        let q = e.sp.create(&l, fenced_params(&root, &d[3])).await.unwrap();
+        let qc =
+            e.sp.create(&agent_of(&q, 1), fenced_params(&root, &d[4]))
+                .await
+                .unwrap();
+        assert_eq!(e.sp.retire_orphans().await, 0);
+        e.sp.retire(&l, serde_json::json!({ "id": parent.id }))
+            .await
+            .unwrap();
+        for r in [&child, &grand] {
+            assert_eq!(
+                row(&e.db, &r.id).state.as_deref(),
+                Some("retired"),
+                "{}",
+                r.id
+            );
+        }
+        assert_eq!(row(&e.db, &qc.id).state.as_deref(), Some("ready"));
+        // The process of q exited: its row failed.
+        e.db.write_blocking({
+            let id = q.id.clone();
+            move |tx| {
+                tx.execute(
+                    "UPDATE agents SET state = 'failed', gone_at = 1 WHERE id = ?1",
+                    [&id],
+                )
+            }
+        })
+        .unwrap();
+        assert_eq!(e.sp.retire_orphans().await, 1);
+        assert_eq!(row(&e.db, &qc.id).state.as_deref(), Some("retired"));
+        let audited: Vec<_> = parent_gone(&e.db)
+            .into_iter()
+            .map(|(p, t, _)| (p, t))
+            .collect();
+        let sys = |r: &AgentRow| (audit::SYSTEM.to_string(), r.id.clone());
+        assert_eq!(audited, [sys(&child), sys(&grand), sys(&qc)]);
+        e.sp.shutdown();
+    }
+
+    /// E5: an engine restart keeps a tree that the boot resume brings back;
+    /// a child whose parent is retired at boot is retired then.
+    #[tokio::test]
+    async fn a_restart_keeps_the_tree_of_a_parent_that_comes_back() {
+        let e = setup(Script::Ready, None);
+        let root = e.t.path().canonicalize().unwrap().join("root");
+        let d = dirs(&root, &["a", "a/c"]);
+        let parent =
+            e.sp.create(&Principal::LocalUnverified, fenced_params(&root, &d[0]))
+                .await
+                .unwrap();
+        let child =
+            e.sp.create(&agent_of(&parent, 1), fenced_params(&root, &d[1]))
+                .await
+                .unwrap();
+        e.sp.shutdown();
+        ops::reconcile(&e.db, &e.home).unwrap();
+        let (_, l2, sp2) = next_engine(&e, Script::Ready, None);
+        let started = sp2.resume_on_boot().unwrap().started;
+        assert_eq!(started.len(), 2, "{:?}", started);
+        // The child's resume still loads no setting source.
+        wait_for("both resumes spawned", || lock(&l2.spawned).len() == 2);
+        assert_eq!(sources_of(&l2, &child.id), [""]);
+        assert_eq!(sources_of(&l2, &parent.id), ["project"]);
+        assert_eq!(sp2.retire_orphans().await, 0);
+        for r in [&parent, &child] {
+            assert_ne!(
+                row(&e.db, &r.id).state.as_deref(),
+                Some("retired"),
+                "{}",
+                r.id
+            );
+        }
+        assert_eq!(
+            row(&e.db, &child.id).parent_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        sp2.shutdown();
+        ops::reconcile(&e.db, &e.home).unwrap();
+        // The parent was retired while no engine ran.
+        e.db.write_blocking({
+            let id = parent.id.clone();
+            move |tx| {
+                tx.execute(
+                    "UPDATE agents SET state = 'retired', gone_at = 1 WHERE id = ?1",
+                    [&id],
+                )
+            }
+        })
+        .unwrap();
+        let (_, _, sp3) = next_engine(&e, Script::Ready, None);
+        sp3.resume_on_boot().unwrap();
+        assert_eq!(sp3.retire_orphans().await, 1);
+        assert_eq!(row(&e.db, &child.id).state.as_deref(), Some("retired"));
+        assert_eq!(parent_gone(&e.db).len(), 1);
+        sp3.shutdown();
     }
 
     #[tokio::test]
@@ -4400,6 +5081,7 @@ mod tests {
             sid: uuid::Uuid::new_v4().to_string(),
             op_id: ops::new_op_id(),
             cwd: e.cwd.canonicalize().unwrap(),
+            cwd_id: None,
             claude: PathBuf::from("/bin/false"),
             kind: Kind::Create,
             from: None,
@@ -4411,6 +5093,7 @@ mod tests {
                 &Principal::LocalUnverified,
                 None,
                 Spawned::default(),
+                None,
             )
             .await
             .unwrap();
@@ -4485,6 +5168,7 @@ mod tests {
             sid: uuid::Uuid::new_v4().to_string(),
             op_id: ops::new_op_id(),
             cwd: e.cwd.canonicalize().unwrap(),
+            cwd_id: None,
             claude: PathBuf::from("/bin/false"),
             kind: Kind::Create,
             from: None,
@@ -4496,6 +5180,7 @@ mod tests {
                 &Principal::LocalUnverified,
                 None,
                 Spawned::default(),
+                None,
             )
             .await
             .unwrap();
@@ -6013,6 +6698,7 @@ mod tests {
             sid: "s1".into(),
             op_id: "op_test".into(),
             cwd: e.cwd.clone(),
+            cwd_id: None,
             claude: PathBuf::from("/bin/false"),
             kind: Kind::Create,
             from: None,
@@ -7230,6 +7916,7 @@ mod tests {
             sid: String::new(),
             op_id: String::new(),
             cwd: e.cwd.clone(),
+            cwd_id: None,
             claude: PathBuf::new(),
             kind: Kind::Create,
             from: None,

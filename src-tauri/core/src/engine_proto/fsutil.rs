@@ -118,6 +118,40 @@ pub fn open_private_dir(dir: &Path) -> Result<OwnedFd, String> {
     Ok(fd)
 }
 
+/// Open the directory `dir` (a realpath) with `O_NOFOLLOW` at every
+/// component, from `/`. A symlink anywhere fails, so the fd is the
+/// directory at that path now, not one a link points to.
+pub fn open_dir_nofollow(dir: &Path) -> Result<OwnedFd, String> {
+    if !dir.is_absolute() {
+        return Err(format!("{:?} is not an absolute path", dir));
+    }
+    let root = CString::new("/").expect("no NUL");
+    let mut fd =
+        openat(None, &root, libc::O_NOFOLLOW).map_err(|e| format!("Failed to open /: {}", e))?;
+    for comp in dir.components() {
+        let name = match comp {
+            Component::RootDir => continue,
+            Component::Normal(n) => n,
+            _ => return Err(format!("{:?} is not a plain absolute path", dir)),
+        };
+        let cname =
+            CString::new(name.as_bytes()).map_err(|_| format!("{:?} contains a NUL byte", dir))?;
+        fd = openat(Some(&fd), &cname, libc::O_NOFOLLOW).map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) | Some(libc::ENOTDIR) => {
+                format!("{:?} is not a directory or has a symlink in it", dir)
+            }
+            _ => format!("Failed to open dir {:?}: {}", dir, e),
+        })?;
+    }
+    Ok(fd)
+}
+
+/// The (device, inode) of an open file.
+pub fn file_id(fd: &OwnedFd) -> Result<(u64, u64), String> {
+    let st = fstat(fd).map_err(|e| format!("Failed to stat: {}", e))?;
+    Ok((st.st_dev as u64, st.st_ino as u64))
+}
+
 /// Fail unless the open directory `fd` (at path `at`) is owned by `me` or
 /// root, and is not group- or world-writable without the sticky bit.
 fn check_trusted_parent(fd: &OwnedFd, at: &Path, me: libc::uid_t) -> Result<(), String> {
@@ -293,5 +327,32 @@ mod tests {
         assert!(ensure_private_dir(Path::new("rel/engine")).is_err());
         let t = tmp();
         assert!(ensure_private_dir(&t.path().join("a/../engine")).is_err());
+    }
+
+    #[test]
+    fn a_nofollow_open_refuses_a_link_anywhere() {
+        let t = tmp();
+        let real = t.path().canonicalize().unwrap();
+        let (a, b) = (real.join("a"), real.join("b"));
+        fs::create_dir_all(a.join("c")).unwrap();
+        fs::create_dir(&b).unwrap();
+        let fd = open_dir_nofollow(&a.join("c")).unwrap();
+        assert_eq!(
+            file_id(&fd).unwrap(),
+            file_id(&open_dir_nofollow(&a.join("c")).unwrap()).unwrap()
+        );
+        // The leaf, or a part above it, swapped for a link.
+        fs::rename(a.join("c"), real.join("old")).unwrap();
+        std::os::unix::fs::symlink(&b, a.join("c")).unwrap();
+        assert!(open_dir_nofollow(&a.join("c")).is_err());
+        fs::rename(&a, real.join("olda")).unwrap();
+        std::os::unix::fs::symlink(real.join("olda"), &a).unwrap();
+        assert!(open_dir_nofollow(&a.join("c")).is_err());
+        // The fd still names the directory first opened.
+        assert_eq!(
+            file_id(&fd).unwrap(),
+            file_id(&open_dir_nofollow(&real.join("old")).unwrap()).unwrap()
+        );
+        assert!(open_dir_nofollow(Path::new("rel")).is_err());
     }
 }

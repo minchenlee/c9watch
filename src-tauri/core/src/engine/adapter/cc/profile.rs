@@ -13,7 +13,8 @@
 //!   `<home>/bin/c9watch-agent`, never a bare name that `PATH` could
 //!   resolve to a binary the agent can write.
 //! - Isolation (D24.9): `--setting-sources project --strict-mcp-config
-//!   --no-chrome` and `remoteControlAtStartup:false`.
+//!   --no-chrome` and `remoteControlAtStartup:false`. A child of an agent
+//!   (E5) gets an empty source list instead (`CHILD_ISOLATE_ARGS`).
 //! - Identity: `--session-id <uuid>` on every spawn (D:244), and the hooks
 //!   run `<home>/bin/c9watch-agent hook <event>` (D:243,
 //!   `adapter::claude_hook_settings`). A boot resume (C1a-28) passes
@@ -74,6 +75,22 @@ pub const ISOLATE_ARGS: [&str; 4] = [
     "--no-chrome",
 ];
 
+/// `ISOLATE_ARGS` for a child of an agent (E5): no setting source at
+/// all. The parent can write the child's cwd, so a `.claude/settings.json`
+/// there could carry a hook, a `statusLine` or an MCP server that runs
+/// outside the sandbox. With an empty list CC loads no user, project or
+/// local settings and no project skills, agents, commands or CLAUDE.md;
+/// it still loads the `--settings` file (flag source) and managed policy,
+/// which it adds to every list (CC 2.1.314, 2.1.316, 2.1.317 binaries:
+/// `""` parses to `[]`). `--strict-mcp-config` without `--mcp-config`
+/// leaves out `.mcp.json`.
+pub const CHILD_ISOLATE_ARGS: [&str; 4] = [
+    "--setting-sources",
+    "",
+    "--strict-mcp-config",
+    "--no-chrome",
+];
+
 /// `<home>/spawn`: the per-spawn settings files.
 pub const SPAWN_DIR: &str = "spawn";
 
@@ -117,6 +134,8 @@ pub struct Profile {
     /// The agent has a write fence (D30): its settings get the blocking
     /// `PreToolUse` hook, which asks the engine on every file tool call.
     pub guarded: bool,
+    /// The agent is a child of an agent (E5): `CHILD_ISOLATE_ARGS`.
+    pub child: bool,
 }
 
 impl Profile {
@@ -147,6 +166,7 @@ impl Profile {
             resume: false,
             peers: Vec::new(),
             guarded: false,
+            child: false,
         })
     }
 
@@ -175,6 +195,12 @@ impl Profile {
     /// Give the settings the guard hook (`Profile::guarded`).
     pub fn with_guard(mut self, guarded: bool) -> Profile {
         self.guarded = guarded;
+        self
+    }
+
+    /// Spawn as a child of an agent (`Profile::child`).
+    pub fn with_child(mut self, child: bool) -> Profile {
+        self.child = child;
         self
     }
 
@@ -444,7 +470,8 @@ pub fn write_settings(home: &Path, p: &Profile) -> Result<PathBuf, String> {
 }
 
 /// argv: `claude --session-id <uuid> --settings <file> --permission-mode
-/// auto` plus `ISOLATE_ARGS`; `--resume <uuid>` for a resume. No model: the
+/// auto` plus `ISOLATE_ARGS` (`CHILD_ISOLATE_ARGS` for a child of an
+/// agent); `--resume <uuid>` for a resume. No model: the
 /// user's default applies.
 pub fn argv(p: &Profile, claude: &Path, settings_file: &Path) -> Vec<OsString> {
     let session_flag = if p.resume { "--resume" } else { "--session-id" };
@@ -456,7 +483,12 @@ pub fn argv(p: &Profile, claude: &Path, settings_file: &Path) -> Vec<OsString> {
         settings_file.into(),
     ];
     v.extend(CLAUDE.permission_flags.auto.iter().map(OsString::from));
-    v.extend(ISOLATE_ARGS.iter().map(OsString::from));
+    let isolate = if p.child {
+        &CHILD_ISOLATE_ARGS
+    } else {
+        &ISOLATE_ARGS
+    };
+    v.extend(isolate.iter().map(OsString::from));
     v
 }
 
@@ -750,6 +782,40 @@ mod tests {
             std::os::unix::fs::symlink(&d, &ln).unwrap();
             assert!(resolve_cwd(&ln).is_err(), "{}", name);
         }
+    }
+
+    /// E5: a child of an agent loads no setting source from disk, fresh
+    /// or resumed; its hooks come from the `--settings` file alone. An
+    /// agent the owner created keeps the project source.
+    #[test]
+    fn a_child_loads_no_setting_source() {
+        with_cwd(|_, p| {
+            let strs = |v: Vec<OsString>| -> Vec<String> {
+                v.into_iter().map(|s| s.into_string().unwrap()).collect()
+            };
+            let sources = |a: &[String]| {
+                let i = a.iter().position(|x| x == "--setting-sources").unwrap();
+                a[i + 1].clone()
+            };
+            let own = strs(argv(&p, Path::new("/x/claude"), Path::new("/h/s.json")));
+            assert_eq!(sources(&own), "project");
+            for c in [
+                p.clone().with_child(true),
+                p.clone().with_child(true).resuming(),
+            ] {
+                let a = strs(argv(&c, Path::new("/x/claude"), Path::new("/h/s.json")));
+                assert_eq!(sources(&a), "");
+                assert_eq!(a.iter().filter(|x| *x == "--setting-sources").count(), 1);
+                for f in ["--strict-mcp-config", "--no-chrome"] {
+                    assert!(a.contains(&f.to_string()), "{f}");
+                }
+                assert!(!a.iter().any(|x| x == "--mcp-config"));
+                let i = a.iter().position(|x| x == "--settings").unwrap();
+                assert_eq!(a[i + 1], "/h/s.json");
+                // The same settings file: the hooks and the fence.
+                assert_eq!(settings(&c), settings(&p));
+            }
+        });
     }
 
     /// C1a-28: a resume is `--resume <uuid>` plus the same profile, with

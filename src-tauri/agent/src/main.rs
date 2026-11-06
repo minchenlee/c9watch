@@ -1,9 +1,11 @@
 //! `c9watch-agent`: what an engine agent runs to talk to the c9 engine
-//! (C1a-21, D28 Q6=B). Three commands, and no `api`:
+//! (C1a-21, D28 Q6=B). These commands, and no `api`:
 //!
 //!   c9watch-agent hook <event> [--kind claude]   a Claude Code hook
 //!   c9watch-agent task done --report <text|->    the task is finished
 //!   c9watch-agent handoff --note <text|->        notes for the next generation
+//!   c9watch-agent child create --params <json|-> a child agent (E5)
+//!   c9watch-agent child retire <id>              retire a descendant (E5)
 //!
 //! The engine copies this binary to `<home>/bin/c9watch-agent` and accepts
 //! hook-class calls only from that copy (`engine::agent_bin`). The logic
@@ -43,6 +45,35 @@ enum Command {
         /// Note text, or `-` to read it from stdin
         #[arg(long)]
         note: String,
+    },
+    /// Create or retire this agent's own children
+    Child {
+        #[command(subcommand)]
+        action: ChildAction,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Subcommand)]
+enum ChildAction {
+    /// Create a child: its guard must be at least as strict as this
+    /// agent's, and its cwd inside this agent's write area
+    Create {
+        /// The agent.create params as JSON (mode, cwd, guard, name,
+        /// require), or `-` to read them from stdin
+        #[arg(long)]
+        params: String,
+        /// Run the create once per key; a retry replays its result
+        #[arg(long)]
+        idem: Option<String>,
+    },
+    /// Retire a child, or a child of one
+    Retire {
+        /// The agent id (`agt_<ulid>`)
+        id: String,
+        /// Run the retire once per key
+        #[arg(long)]
+        idem: Option<String>,
     },
 }
 
@@ -116,6 +147,12 @@ fn main() {
             action: TaskAction::Done { report },
         } => task::cmd_task_done(&report),
         Command::Handoff { note } => task::cmd_handoff(&note),
+        Command::Child {
+            action: ChildAction::Create { params, idem },
+        } => task::cmd_child_create(&params, idem),
+        Command::Child {
+            action: ChildAction::Retire { id, idem },
+        } => task::cmd_child_retire(&id, idem),
     };
     if let Err(e) = result {
         eprintln!("c9watch-agent: {}", e);

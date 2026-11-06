@@ -96,6 +96,17 @@ impl Conn {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, ClientError> {
+        self.call_idem(method, params, None)
+    }
+
+    /// `call` with an `idem` key (D3): the engine runs the write once per
+    /// key and replays its first result.
+    pub fn call_idem(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        idem: Option<String>,
+    ) -> Result<serde_json::Value, ClientError> {
         let id = self.next_id.to_string();
         self.next_id += 1;
         let req = Request {
@@ -103,7 +114,7 @@ impl Conn {
             id: Some(id.clone()),
             method: Some(method.to_string()),
             params,
-            idem: None,
+            idem,
         };
         let mut line = serde_json::to_vec(&req)
             .map_err(|e| ClientError::Failed(format!("Failed to encode the request: {}", e)))?;

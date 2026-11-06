@@ -1,9 +1,11 @@
--- user_version 11
+-- user_version 12
 -- index agents_detected_key
 CREATE UNIQUE INDEX agents_detected_key ON agents (session_key) WHERE source = 'detected';
 -- index agents_legacy_sid
 CREATE UNIQUE INDEX agents_legacy_sid ON agents (provider, provider_sid)
     WHERE source = 'legacy_import';
+-- index agents_parent
+CREATE INDEX agents_parent ON agents (parent_id) WHERE parent_id IS NOT NULL;
 -- index agents_provider_sid
 CREATE INDEX agents_provider_sid ON agents (provider, provider_sid);
 -- index annotations_expiry

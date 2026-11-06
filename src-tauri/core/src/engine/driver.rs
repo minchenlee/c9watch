@@ -34,6 +34,10 @@ pub struct SpawnSpec {
     /// driver when the caller passes an absolute path.
     pub argv: Vec<OsString>,
     pub cwd: PathBuf,
+    /// `cwd`, opened when it was checked. When set, the child changes to
+    /// it with `fchdir`, not by path: a link swapped in at `cwd` after the
+    /// check cannot move the child.
+    pub cwd_fd: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
     /// The child's whole environment. The engine's env is never passed
     /// through as a whole.
     pub env: Vec<(OsString, OsString)>,
@@ -47,6 +51,7 @@ impl SpawnSpec {
         SpawnSpec {
             argv,
             cwd,
+            cwd_fd: None,
             env: base_env(),
             cols: 120,
             rows: 40,
