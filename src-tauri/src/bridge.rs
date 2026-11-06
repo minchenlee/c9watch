@@ -65,6 +65,40 @@ pub fn allowed(method: &str, popover: bool) -> bool {
             ))
 }
 
+/// The webview's params for a main-window write are checked here, not only
+/// in core (D42). `agent.retire` takes exactly `{id: <non-empty string>}`:
+/// core accepts `force` from `local-unverified`, and a forced retire writes
+/// the tombstone before the kill is confirmed, so the GUI never forwards it
+/// or any other field. Other methods pass through unchanged.
+pub fn params_ok(method: &str, params: &Value) -> bool {
+    match method {
+        "agent.retire" => params.as_object().is_some_and(|o| {
+            o.len() == 1
+                && o.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+        }),
+        _ => true,
+    }
+}
+
+/// The window and params check before a request leaves the webview.
+fn gate(label: &str, method: &str, params: &Value) -> Result<(), BridgeError> {
+    if !allowed(method, label == "popover") || !matches!(label, "main" | "popover") {
+        return Err(BridgeError::new(
+            "not_allowed",
+            "Method is not exposed to this window",
+        ));
+    }
+    if !params_ok(method, params) {
+        return Err(BridgeError::new(
+            "bad_request",
+            "agent.retire takes only {id}: a non-empty string",
+        ));
+    }
+    Ok(())
+}
+
 struct Pool {
     conns: [Mutex<Option<EngineConn>>; 3],
     free: Mutex<Vec<usize>>,
@@ -278,14 +312,7 @@ pub async fn c9p_request(
     params: Value,
     progress: Channel<Value>,
 ) -> Result<Value, BridgeError> {
-    if !allowed(&method, window.label() == "popover")
-        || !matches!(window.label(), "main" | "popover")
-    {
-        return Err(BridgeError::new(
-            "not_allowed",
-            "Method is not exposed to this window",
-        ));
-    }
+    gate(window.label(), &method, &params)?;
     let bridge = bridge.inner().clone();
     tauri::async_runtime::spawn_blocking(move || bridge.call(&method, params, Some(&progress)))
         .await
@@ -861,6 +888,47 @@ mod tests {
         assert!(allowed("agent.retire", false));
         assert!(!allowed("agent.retire", true));
         assert!(!GUI_METHODS.contains(&"agent.retire"));
+        // D42 P1: the bridge forwards agent.retire only as {id}; never force.
+        assert!(params_ok("agent.retire", &json!({ "id": "agt_1" })));
+        for bad in [
+            json!({ "id": "agt_1", "force": true }),
+            json!({ "id": "agt_1", "force": false }),
+            json!({ "id": "agt_1", "x": 1 }),
+            json!({}),
+            json!({ "id": "" }),
+            json!({ "id": 1 }),
+            json!({ "id": null }),
+            json!(null),
+            json!(["agt_1"]),
+            json!("agt_1"),
+        ] {
+            assert!(!params_ok("agent.retire", &bad), "{bad}");
+        }
+        assert!(params_ok("session.views", &json!({ "any": 1 })));
+        let code = |label, params: Value| {
+            gate(label, "agent.retire", &params)
+                .err()
+                .map(|e| e.0["code"].clone())
+        };
+        assert_eq!(code("main", json!({ "id": "agt_1" })), None);
+        assert_eq!(
+            code("main", json!({ "id": "agt_1", "force": true })),
+            Some(json!("bad_request"))
+        );
+        assert_eq!(
+            code("main", json!({ "id": "agt_1", "x": 1 })),
+            Some(json!("bad_request"))
+        );
+        assert_eq!(code("main", json!({})), Some(json!("bad_request")));
+        assert_eq!(code("main", json!({ "id": 7 })), Some(json!("bad_request")));
+        assert_eq!(
+            code("popover", json!({ "id": "agt_1" })),
+            Some(json!("not_allowed"))
+        );
+        assert_eq!(
+            code("other", json!({ "id": "agt_1" })),
+            Some(json!("not_allowed"))
+        );
         // Every other agent.* write stays refused.
         for m in ["agent.create", "agent.resume", "agent.handoff"] {
             assert!(!allowed(m, false), "{m}");

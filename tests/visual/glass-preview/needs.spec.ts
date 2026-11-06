@@ -31,20 +31,24 @@ const MANAGED = { id: 'agt_01VISUALMANAGED', sessionKey: 'claudeCode:0b6c1f0e-11
 type Retire = 'retired' | 'orphaned once' | 'unknown';
 async function live(page: Page, failAgentList = false, managed = false, slowStop = false, retire: Retire = 'retired') {
 	await page.addInitScript(([fail, managed, M, slow, retire]) => {
-		let retires = 0;
+		let retires = 0, gone = false;
 		const internals: Record<string, unknown> = {};
 		let inner: ((cmd: string, args: any, o?: unknown) => unknown) | undefined;
 		const calls: { cmd: string; args: any }[] = ((window as any).__C9_CALLS__ = []);
 		const call = async (cmd: string, args: any, o?: unknown) => {
 			calls.push({ cmd, args });
 			if (fail && cmd === 'c9p_request' && args?.method === 'agent.list') throw { code: 'unavailable', msg: 'core is gone', retryable: true, hint: '' };
+			// D42: after a confirmed retire the row is `retired` (gone), as core lists it.
 			if (managed && cmd === 'c9p_request' && args?.method === 'agent.list')
-				return { agents: [{ id: M.id, sessionKey: M.sessionKey, name: 'w-cache', role: 'worker', parentId: null, cwd: '/Users/visual/projects/api-server', source: 'engine', control: 'pty', mode: 'managed', state: 'ready', status: 'needs_attention', generation: 1, goneAt: null, lastSeen: Date.now(), createdAt: Date.now() - 3_600_000, mailPaused: false }] };
+				return { agents: [{ id: M.id, sessionKey: M.sessionKey, name: 'w-cache', role: 'worker', parentId: null, cwd: '/Users/visual/projects/api-server', source: 'engine', control: 'pty', mode: 'managed', state: gone ? 'retired' : 'ready', status: 'needs_attention', generation: 1, goneAt: gone ? Date.now() : null, lastSeen: Date.now(), createdAt: Date.now() - 3_600_000, mailPaused: false }] };
+			// Keep the agent.* stream channel, so a test can send agent.upsert.
+			if (cmd === 'c9p_subscribe' && args?.params?.topics?.includes('agent.*')) (window as any).__C9_AGENT_CH__ = args.channel;
 			if (managed && cmd === 'c9p_request' && args?.method === 'msg.send')
 				return { cursor: 'visual:send:1', msgId: 'msg_01VISUAL', paused: false, replayed: false, state: 'queued', to: { addr: `m/${args.params.to}`, id: args.params.to, name: 'w-cache' } };
 			if (managed && cmd === 'c9p_request' && args?.method === 'agent.retire') {
 				if (retire === 'unknown') throw { code: 'unknown_method', msg: 'unknown method agent.retire', retryable: false, hint: '' };
 				const state = retire === 'orphaned once' && ++retires === 1 ? 'orphaned' : 'retired';
+				if (state === 'retired') gone = true;
 				const row = { agent: { id: args.params.id, sessionKey: M.sessionKey, name: 'w-cache', state, goneAt: state === 'retired' ? Date.now() : null } };
 				if (slow) return new Promise(res => ((window as any).__C9_RELEASE_STOP__ = () => res(row)));
 				return row;
@@ -379,6 +383,29 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		await expect.poll(() => calls(page, 'agent.retire')).toEqual([{ id: MANAGED.id }]);
 		expect(await calls(page, 'session.stop')).toEqual([]);
 		expect(await calls(page, 'msg.send')).toEqual([]);
+	});
+
+	test('D42 live: the receipt stays after agent.upsert drops the retired agent\'s item', async ({ page }) => {
+		await live(page, false, true);
+		await openNeeds(page, { 'ui.shell': 'glass' });
+		await page.locator('.queue .qi', { hasText: 'rate limiter' }).click();
+		await panel(page).locator('[data-stop]').click();
+		await panel(page).locator('[data-stop-confirm]').click();
+		await expect(panel(page).locator('.card h2')).toHaveText('✓ 已停止 w-cache');
+		const lists = (await calls(page, 'agent.list')).length;
+		await page.evaluate(() => (window as any).__C9_AGENT_CH__.onmessage({ v: 1, type: 'event', sub: 'visual-sub', topic: 'agent.upsert', subject: 'agt_01VISUALMANAGED', cursor: 'visual:2', ts: Date.now(), data: {} }));
+		await expect.poll(async () => (await calls(page, 'agent.list')).length).toBeGreaterThan(lists);
+		// The model dropped the Need: the queue no longer lists it.
+		await expect(page.locator('.queue .qi', { hasText: 'rate limiter' })).toHaveCount(0);
+		await page.clock.runFor(5_000);
+		const r = panel(page);
+		await expect(r.locator('.card h2')).toHaveText('✓ 已停止 w-cache');
+		await expect(r.locator('.kv')).toContainText(MANAGED.id);
+		// J leaves the receipt for the 「下一件」 it names.
+		const nextText = (await r.locator('.nx').innerText()).replace(/^下一件：/, '');
+		await page.keyboard.press('KeyJ');
+		await expect(r.locator('.card h2')).toHaveCount(0);
+		await expect(r.locator('.ask h2')).toHaveText(nextText);
 	});
 
 	test('D42 live: an orphaned retire is no receipt; 停止 again retries', async ({ page }) => {

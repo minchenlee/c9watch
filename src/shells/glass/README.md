@@ -99,7 +99,9 @@ G5 actions (`handling/actions.ts`, pure, `scripts/test-glass-handling.mjs`):
   stop button stays. A core or bridge without `agent.retire`
   (`unknown_method`, `not_allowed`, `core_unavailable`) shows a clear error;
   there is no fallback. The GUI bridge lets only the main window call it
-  (`GUI_AGENT_METHODS`). The stop lock is per agent id (`handling/handled.ts`), taken
+  (`GUI_AGENT_METHODS`) and forwards only `{id}` (any other field, `force`
+  included, is `bad_request`). The receipt is a snapshot: it stays after the
+  retired agent's item leaves the model, until J / K, a click or leaving. The stop lock is per agent id (`handling/handled.ts`), taken
   before the call, so switching items cannot start a second stop. The receipt does not take ⌘↵; J goes to the 「下一件」 it names.
 - 給: c9watch does not send keys (a key sent as mail stays in the mail
   log); 「我沒有這把 key」 can be sent.

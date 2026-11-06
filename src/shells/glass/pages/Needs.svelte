@@ -51,10 +51,17 @@
     $: kept.receipts = receipts;
 
     let currentId: string | null = null;
-    $: current = details.find(d => d.id === currentId && (!hiddenIds.has(d.id) || receipts[d.instance])) ?? details.find(d => !hiddenIds.has(d.id)) ?? null;
-    $: index = current ? order.indexOf(current.id) : -1;
-    $: receipt = current ? receipts[current.instance] ?? null : null;
-    $: nextId = current ? stepFrom(order, hiddenIds, current.id, 1) : null;
+    // D42: a stop receipt does not depend on the live Need. After a retire
+    // the agent row goes `retired` and the model drops the Need, so the page
+    // keeps a snapshot of the item, its receipt, its place and its 「下一件」
+    // until the person moves on (J / K, a click) or leaves the page.
+    let shown: { detail: HandlingDetail; receipt: Receipt; index: number; total: number; nextId: string | null } | null = null;
+    $: pinned = shown && currentId === shown.detail.id ? shown : null;
+    $: current = pinned?.detail ?? details.find(d => d.id === currentId && (!hiddenIds.has(d.id) || receipts[d.instance])) ?? details.find(d => !hiddenIds.has(d.id)) ?? null;
+    $: index = pinned ? pinned.index : current ? order.indexOf(current.id) : -1;
+    $: total = pinned && !order.includes(pinned.detail.id) ? pinned.total : details.length;
+    $: receipt = pinned?.receipt ?? (current ? receipts[current.instance] ?? null : null);
+    $: nextId = pinned && !order.includes(pinned.detail.id) ? liveNext(pinned.nextId, 1) : current ? stepFrom(order, hiddenIds, current.id, 1) : null;
     $: next = nextId ? details.find(d => d.id === nextId) ?? null : null;
     $: currentNeed = current ? needs.find(x => x.id === current.id) ?? null : null;
     $: member = currentNeed ? locate(currentNeed, $model.workspaces).member : null;
@@ -160,8 +167,15 @@
     // True once the person picked an item (click, J / K, a send). Only then
     // may the panel take the focus.
     let moved = false;
-    function show(id: string | null) { moved = true; currentId = id; }
+    function show(id: string | null) { moved = true; shown = null; currentId = id; }
+    /** The snapshot's 「下一件」 while it is still listed and not handled,
+     * else the first (J) or last (K) item still listed. */
+    function liveNext(id: string | null, step: 1 | -1): string | null {
+        return id && order.includes(id) && !hiddenIds.has(id) && step === 1 ? id : stepFrom(order, hiddenIds, null, step);
+    }
     function go(step: 1 | -1) {
+        // From a snapshot receipt whose Need is gone: its 「下一件」.
+        if (pinned && !order.includes(pinned.detail.id)) { show(liveNext(pinned.nextId, step)); return; }
         const id = stepFrom(order, hiddenIds, current?.id ?? null, step);
         // From a receipt with nothing left: the empty page.
         if (id || (current && hiddenIds.has(current.id))) show(id);
@@ -225,7 +239,13 @@
             ['能不能復原', '不能。要它再做事，請重新建立一個 agent。']
         ];
         if (get(isDemoMode)) rows.push(['示範模式', '沒有真的停止任何程式']);
-        receipts = { ...receipts, [d.instance]: { title: `已停止 ${d.who}`, rows } };
+        const r = { title: `已停止 ${d.who}`, rows };
+        receipts = { ...receipts, [d.instance]: r };
+        // The snapshot, only while the person still looks at this item.
+        if (currentId === d.id || (current?.id === d.id)) {
+            currentId = d.id;
+            shown = { detail: d, receipt: r, index: Math.max(0, order.indexOf(d.id)), total: details.length, nextId: stepFrom(order, hiddenIds, d.id, 1) };
+        }
         finish(d, null, 'stopped');
     }
     $: stopAgent = current?.managed && !receipt ? needs.find(x => x.id === current!.id)?.agentId ?? null : null;
@@ -281,7 +301,7 @@
                 bind:this={panel}
                 detail={current}
                 bind:answer={answers[current.instance]}
-                position={{ index: index + 1, total: details.length }}
+                position={{ index: index + 1, total }}
                 next={next ? { verb: next.verb, title: next.title } : null}
                 offline={offlineSince !== null ? { since: offlineSince } : null}
                 {now}
