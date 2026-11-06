@@ -3,6 +3,7 @@ import type { Transport } from './transport';
 import { getDemoSessions, getDemoHistoryEntries, getDemoCostData, demoConversations, getDemoAwayActivity, getDemoDiagnostics } from '../demo/data';
 import { demoSubscriptionUsage } from '../subscription-usage';
 import { demoMailRequest, demoMailSubscribe } from './demo/mail';
+import { glassDemoAgents, glassDemoAnnotations, glassDemoSessionViews } from './demo/glass';
 /** Demo mail is opt-in (`localStorage['c9watch.demoMail'] = '1'`). Without
  * it, demo answers mail like today's Classic bridge, so demo screens do not
  * change until the bridge exposes mail. */
@@ -10,9 +11,26 @@ const DEMO_MAIL_KEY = 'c9watch.demoMail';
 function demoMailOn(): boolean {
     try { return globalThis.localStorage?.getItem(DEMO_MAIL_KEY) === '1'; } catch { return false; }
 }
+/** The glass fixture is opt-in (`localStorage['c9watch.demoGlass'] = '1'`).
+ * Without it, every answer below stays as it is, so Classic demo baselines
+ * do not change. */
+const DEMO_GLASS_KEY = 'c9watch.demoGlass';
+function demoGlassOn(): boolean {
+    try { return globalThis.localStorage?.getItem(DEMO_GLASS_KEY) === '1'; } catch { return false; }
+}
+function demoGlassRequest(method: C9pMethod): any {
+    switch (method) {
+        case 'session.views': return { sessions: glassDemoSessionViews(), cursor: 'demo:glass:0' };
+        case 'agent.list': return { agents: glassDemoAgents() };
+        case 'annotation.list': return { annotations: glassDemoAnnotations(), cursor: 'demo:glass:0' };
+        default: return undefined;
+    }
+}
 const mailDenied = () => Object.assign(new Error('Mail is not exposed in demo mode'), { code: 'not_allowed', msg: 'Mail is not exposed in demo mode' });
 export const demoTransport: Transport = {
     async request(method: C9pMethod, p: any): Promise<any> {
+        const glass = demoGlassOn() ? demoGlassRequest(method) : undefined;
+        if (glass !== undefined) return glass;
         switch (method) {
             case 'session.views': return { sessions: getDemoSessions(), cursor: null };
             case 'diag.detection': return getDemoDiagnostics();
