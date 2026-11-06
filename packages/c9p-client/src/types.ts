@@ -2,7 +2,7 @@
 // The engine (src-tauri/core/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 14;
+export const C9P_API_MINOR = 15;
 
 /** `agent.attention` data: an agent needs the user. */
 export interface C9pAgentAttentionEvent {
@@ -222,6 +222,13 @@ export interface C9pAgentRow {
   lastSeen: number | null;
   /** The machine the agent runs on. */
   machineId: string | null;
+  /**
+   * Whether agent-to-agent mail to this agent is paused (`mail.pause`;
+   * `mail.resume` clears it). Not the `paused` lifecycle `state`, which
+   * means a drained agent. Always sent; `false` for an engine older
+   * than 1.15.
+   */
+  mailPaused: boolean;
   /** `managed` or `free`; `null` for an observed agent. */
   mode: 'managed' | 'free' | null | string;
   name: string | null;

@@ -4,21 +4,36 @@
 import { derived, get, readable, writable } from 'svelte/store';
 import { transport } from '../client';
 import { isDemoMode } from '../demo/mode';
-import { mailFeed, rowFromSend, threadsOf, type MailFeed, type MailSnapshot } from '../mail-store';
+import { mailFeed, rowFromSend, seedPause, threadsOf, type MailFeed, type MailSnapshot } from '../mail-store';
 
-const EMPTY: MailSnapshot = { status: 'loading', error: null, messages: new Map(), sessionKeys: new Map() };
+const EMPTY: MailSnapshot = {
+    status: 'loading', error: null, messages: new Map(), sessionKeys: new Map(), agentPause: new Map(), agentPauseAt: -Infinity
+};
 let feed: MailFeed | null = null;
+/** Agent id → when this app run paused or resumed it (Date.now()). */
+let pauseSetAt = new Map<string, number>();
+let seededAt = -Infinity;
 
 /** Mail ids this app run sent. Only these read `[you]`; other human mail
  * reads `terminal` (core cannot tell a GUI send from a script's). */
 export const ownMail = writable<ReadonlySet<string>>(new Set());
-/** Agents this app run paused. No core read returns pause state yet, so this
- * is lost on reload. */
+/** Agents whose mail is paused: seeded from `agent.list` `mailPaused`
+ * (c9p 1.15+), then kept by this app run's own pause, resume and send. */
 export const pausedAgents = writable<ReadonlySet<string>>(new Set());
-/** Agents whose pause state this app run set (paused or resumed). For any
- * other agent the state is unknown: it may still be paused from an earlier
- * run, so the MAIL tab offers Resume too. */
+/** Agents whose pause state is known: listed by an engine that sends
+ * `mailPaused`, or set by this app run. For any other agent (an older
+ * engine) it may still be paused from an earlier run, so the MAIL tab
+ * offers Resume too. */
 export const pauseKnown = writable<ReadonlySet<string>>(new Set());
+
+function takeList(s: MailSnapshot) {
+    if (s.agentPauseAt === seededAt) return;
+    seededAt = s.agentPauseAt;
+    const next = seedPause(s, get(pausedAgents), get(pauseKnown), pauseSetAt);
+    if (!next) return;
+    pausedAgents.set(next.paused);
+    pauseKnown.set(next.known);
+}
 
 export const mail = readable<MailSnapshot>(EMPTY, set => {
     let last: boolean | undefined;
@@ -29,8 +44,10 @@ export const mail = readable<MailSnapshot>(EMPTY, set => {
         ownMail.set(new Set());
         pausedAgents.set(new Set());
         pauseKnown.set(new Set());
+        pauseSetAt = new Map();
+        seededAt = -Infinity;
         set(EMPTY);
-        feed = mailFeed(transport(), set);
+        feed = mailFeed(transport(), s => { takeList(s); set(s); });
     });
     return () => { stopDemo(); feed?.stop(); feed = null; };
 });
@@ -60,6 +77,7 @@ export async function sendMail(to: string, body: string): Promise<string | null>
         ownMail.update(s => new Set(s).add(result.msgId));
         feed?.upsert(rowFromSend(result, body, Date.now()));
         if (result.paused) {
+            pauseSetAt.set(result.to.id, Date.now());
             pausedAgents.update(s => new Set(s).add(result.to.id));
             pauseKnown.update(s => new Set(s).add(result.to.id));
         }
@@ -79,6 +97,7 @@ export async function cancelMail(msgId: string): Promise<string | null> {
 export async function setMailPaused(agentId: string, paused: boolean): Promise<string | null> {
     try {
         await transport().request(paused ? 'mail.pause' : 'mail.resume', { agent: agentId });
+        pauseSetAt.set(agentId, Date.now());
         pausedAgents.update(s => { const n = new Set(s); if (paused) n.add(agentId); else n.delete(agentId); return n; });
         pauseKnown.update(s => new Set(s).add(agentId));
         return null;

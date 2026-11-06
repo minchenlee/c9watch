@@ -263,6 +263,7 @@ pub(crate) mod tests {
             cc_version: None,
             capabilities: None,
             overlay: None,
+            mail_paused: false,
         }
     }
 

@@ -321,3 +321,44 @@ test('demo mailbox drives the same feed: list, send walks states, cancel only qu
     assert.equal(demo.demoMailRequest('msg.read', { msgId: 'msg_demo_01' }).body.startsWith('Plan the OAuth2'), true);
     feed.stop();
 });
+
+test('agent.list mailPaused seeds the pause state; an older engine sends none', async () => {
+    const mail = store(); const seen = []; let clock = 100;
+    const transport = {
+        async request(method) {
+            if (method === 'agent.list') return { agents: [{ id: 'agt_b', sessionKey: 'claudeCode:s1', mailPaused: true }, { id: 'agt_c', sessionKey: null, mailPaused: false }, { id: 'agt_old', sessionKey: null }] };
+            return { items: [], next: null };
+        },
+        async subscribe() { return () => {}; }
+    };
+    const feed = mail.mailFeed(transport, s => seen.push(s), () => clock);
+    assert.equal(seen[0].agentPause.size, 0);
+    assert.equal(seen[0].agentPauseAt, -Infinity);
+    await settle();
+    const snap = seen.at(-1);
+    assert.equal(snap.agentPause.get('agt_b'), true);
+    assert.equal(snap.agentPause.get('agt_c'), false);
+    assert.equal(snap.agentPause.has('agt_old'), false, 'no field: unknown, not false');
+    assert.equal(snap.agentPauseAt, 100);
+
+    // Seeding: the list sets paused and known; a local change after the list wins.
+    const r = mail.seedPause(snap, new Set(['agt_c', 'agt_d']), new Set(['agt_d']), new Map());
+    assert.deepEqual([...r.paused].sort(), ['agt_b', 'agt_d']);
+    assert.deepEqual([...r.known].sort(), ['agt_b', 'agt_c', 'agt_d']);
+    const kept = mail.seedPause(snap, new Set(), new Set(['agt_b']), new Map([['agt_b', 101]]));
+    assert.deepEqual([...kept.paused], [], 'resumed after the list was asked');
+    const old = mail.seedPause(snap, new Set(), new Set(), new Map([['agt_b', 99]]));
+    assert.deepEqual([...old.paused], ['agt_b'], 'local change before the list: the list wins');
+    assert.equal(mail.seedPause({ ...snap, agentPause: new Map() }, new Set(), new Set(), new Map()), null);
+    feed.stop();
+});
+
+test('demo agent.list reports mail pause and resume', () => {
+    const demo = load('../src/lib/data/demo/mail.ts');
+    const pausedOf = id => demo.demoMailRequest('agent.list', {}).agents.find(a => a.id === id).mailPaused;
+    assert.equal(pausedOf('agt_demo_api'), false);
+    demo.demoMailRequest('mail.pause', { agent: 'worker-api' });
+    assert.equal(pausedOf('agt_demo_api'), true);
+    demo.demoMailRequest('mail.resume', { agent: 'agt_demo_api' });
+    assert.equal(pausedOf('agt_demo_api'), false);
+});

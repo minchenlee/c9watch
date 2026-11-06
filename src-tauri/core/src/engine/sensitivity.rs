@@ -27,6 +27,7 @@ const BY_NAME: &[(&str, &str)] = &[
     // C1b-M2 mail. Address/name containers are conversation data.
     ("via", P),
     ("paused", P),
+    ("mailPaused", P),
     ("hop", P),
     ("stateAt", P),
     ("threadId", P),

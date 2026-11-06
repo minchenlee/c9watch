@@ -19,6 +19,8 @@ const ENGINE: C9pMsgFrom = { kind: 'engine', addr: null, name: null };
 type Row = C9pMsgSummary & { body: string };
 let rows: Row[] = [];
 let seq = 0;
+/** Agents whose mail the demo paused; `agent.list` reports it. */
+const paused = new Set<string>();
 const listeners = new Set<(e: C9pMsgStateEvent) => void>();
 
 function row(id: string, minutesAgo: number, from: C9pMsgFrom, target: DemoAgent, body: string, more: Partial<C9pMsgSummary> = {}): Row {
@@ -91,7 +93,11 @@ export function demoMailRequest(method: string, p: any): unknown {
             setState(r, 'cancelled', null);
             return { ok: true };
         }
-        case 'mail.pause': case 'mail.resume': resolve(p.agent); return { ok: true };
+        case 'mail.pause': case 'mail.resume': {
+            const a = resolve(p.agent);
+            if (method === 'mail.pause') paused.add(a.id); else paused.delete(a.id);
+            return { ok: true };
+        }
         case 'msg.send': {
             const a = resolve(p.to);
             const r = row(`msg_demo_new_${++seq}`, 0, HUMAN, a, p.body, { state: 'queued', detail: null, via: null });
@@ -103,7 +109,7 @@ export function demoMailRequest(method: string, p: any): unknown {
             return { msgId: r.msgId, cursor: `demo:${seq}`, replayed: false, state: 'queued', to: to(a) };
         }
         case 'agent.list': {
-            const agents: Partial<C9pAgentRow>[] = AGENTS.map(a => ({ id: a.id, name: a.name, sessionKey: a.sessionKey, control: 'pty', role: 'worker', provider: 'claude', source: 'engine', state: 'ready' }));
+            const agents: Partial<C9pAgentRow>[] = AGENTS.map(a => ({ id: a.id, name: a.name, sessionKey: a.sessionKey, control: 'pty', role: 'worker', provider: 'claude', source: 'engine', state: 'ready', mailPaused: paused.has(a.id) }));
             return { agents };
         }
     }

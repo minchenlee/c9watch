@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Protocol major version. It is also in the socket name (`engine-v1.sock`).
 pub const API_MAJOR: u32 = 1;
 /// Protocol minor version. Preview breaks also raise method revisions.
-pub const API_MINOR: u32 = 14;
+pub const API_MINOR: u32 = 15;
 /// Largest frame the engine reads, without the newline.
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -644,6 +644,12 @@ pub struct AgentRow {
     /// applies the same overlay. `null` for an agent without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<AgentOverlay>,
+    /// Whether agent-to-agent mail to this agent is paused (`mail.pause`;
+    /// `mail.resume` clears it). Not the `paused` lifecycle `state`, which
+    /// means a drained agent. Always sent; `false` for an engine older
+    /// than 1.15.
+    #[serde(default)]
+    pub mail_paused: bool,
 }
 
 /// A write fence for an agent's file tools: writes under any
