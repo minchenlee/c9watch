@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
-import { openClassic, settle, expectNoUnhandledCommands } from '../harness/classic';
+import { openClassic, openTab, settle, expectNoUnhandledCommands } from '../harness/classic';
 
 // Glass shell on the glass demo fixture. Classic baselines never set these keys.
 const glass = { storage: { 'ui.shell': 'glass', demoMode: 'true', 'c9watch.demoGlass': '1' } };
@@ -136,5 +136,31 @@ test.describe('glass preview (not a baseline)', () => {
 		await openClassic(page, { path: '/popover', window: 'popover', storage: { 'ui.shell': 'glass' } });
 		await expect(page.locator('.glass-root')).toHaveCount(0);
 		await shot(page, 'popover-in-glass-mode');
+	});
+
+	test('D42: Classic SETTINGS has the switch back; after a confirm it sets ui.shell = glass and reloads', async ({ page }) => {
+		// The harness clears localStorage on every load, so record the value
+		// each load starts with (sessionStorage survives the reload).
+		await page.addInitScript(() => {
+			try {
+				const seen = JSON.parse(sessionStorage.getItem('d42-seen') ?? '[]');
+				seen.push(localStorage.getItem('ui.shell'));
+				sessionStorage.setItem('d42-seen', JSON.stringify(seen));
+			} catch { /* no storage */ }
+		});
+		await openClassic(page);
+		await openTab(page, 'SETTINGS');
+		await page.locator('.settings-nav button', { hasText: 'About' }).click();
+		const row = page.locator('[data-shell-switch]');
+		await expect(row.locator('.group-title')).toHaveText('Interface');
+		await row.locator('[data-shell="glass"]').click();
+		// The same short confirm as Glass's switch to Classic.
+		await expect(row.locator('[data-confirm-glass]')).toContainText('reloads into Glass');
+		await row.getByRole('button', { name: 'Stay in Classic' }).click();
+		await expect(row.locator('[data-confirm-glass]')).toHaveCount(0);
+		expect(await page.evaluate(() => localStorage.getItem('ui.shell'))).toBe('classic');
+		await row.locator('[data-shell="glass"]').click();
+		await Promise.all([page.waitForEvent('load'), row.locator('[data-confirm="glass"]').click()]);
+		expect(await page.evaluate(() => JSON.parse(sessionStorage.getItem('d42-seen') ?? '[]'))).toEqual([null, 'glass']);
 	});
 });

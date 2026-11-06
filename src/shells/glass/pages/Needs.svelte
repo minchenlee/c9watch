@@ -14,7 +14,8 @@
     // queue (280px) next to the one handling panel.
     // G5 actions:
     // - Answer a managed agent: `msg.send` after 10 s (復原 = not sent yet).
-    // - Stop a managed agent: `session.stop`, then a receipt (no undo).
+    // - Stop a managed agent: `agent.retire` (D42), then a receipt (no undo).
+    //   An `orphaned` result is no receipt: the panel says so and 停止 stays.
     // - Observed sessions and 允許: ⌘O only (`openSession`).
     // - Leaving this page, closing (hiding) or minimizing the window sends nothing: every
     //   waiting send is cancelled, the item goes back to the queue and the
@@ -22,10 +23,9 @@
     //   send (`canSend`).
     import { onDestroy, onMount } from 'svelte';
     import { get } from 'svelte/store';
-    import type { C9pSessionView } from '$lib/c9p-1';
-    import { dataError, fixtureOn, model } from '../data';
+    import { dataError, fixtureOn, hideRetiredSession, model, retireScope } from '../data';
     import { usePageKeys, type PageKeys } from '../keys';
-    import { openSession, stopSession } from '$lib/data/api';
+    import { openSession, retireAgent } from '$lib/data/api';
     import { sessionFromView } from '$lib/data/session';
     import { sendMail } from '$lib/data/stores/mail';
     import { isDemoMode } from '$lib/data/demo/mode';
@@ -34,7 +34,7 @@
     import UndoToasts from '../handling/UndoToasts.svelte';
     import { answerBody, answerLabel, buildDetail, emptyAnswer, locate, noBody, waitText, type HandlingDetail } from '../handling/detail';
     import { SendQueue, stepFrom, type Pending, type QueueEvent } from '../handling/actions';
-    import { handled, lockStop, markHandled, stopping, unlockStop, unmarkHandled } from '../handling/handled';
+    import { ALREADY_FAILED, ORPHANED, handled, lockStop, markHandled, retireError, stopping, unlockStop, unmarkHandled } from '../handling/handled';
     import { getCurrentWindow } from '$lib/data/platform';
 
     // Demo details only while the glass fixture is on: live mode never shows them.
@@ -51,10 +51,17 @@
     $: kept.receipts = receipts;
 
     let currentId: string | null = null;
-    $: current = details.find(d => d.id === currentId && (!hiddenIds.has(d.id) || receipts[d.instance])) ?? details.find(d => !hiddenIds.has(d.id)) ?? null;
-    $: index = current ? order.indexOf(current.id) : -1;
-    $: receipt = current ? receipts[current.instance] ?? null : null;
-    $: nextId = current ? stepFrom(order, hiddenIds, current.id, 1) : null;
+    // D42: a stop receipt does not depend on the live Need. After a retire
+    // the agent row goes `retired` and the model drops the Need, so the page
+    // keeps a snapshot of the item, its receipt, its place and its 「下一件」
+    // until the person moves on (J / K, a click) or leaves the page.
+    let shown: { detail: HandlingDetail; receipt: Receipt; index: number; total: number; nextId: string | null } | null = null;
+    $: pinned = shown && currentId === shown.detail.id ? shown : null;
+    $: current = pinned?.detail ?? details.find(d => d.id === currentId && (!hiddenIds.has(d.id) || receipts[d.instance])) ?? details.find(d => !hiddenIds.has(d.id)) ?? null;
+    $: index = pinned ? pinned.index : current ? order.indexOf(current.id) : -1;
+    $: total = pinned && !order.includes(pinned.detail.id) ? pinned.total : details.length;
+    $: receipt = pinned?.receipt ?? (current ? receipts[current.instance] ?? null : null);
+    $: nextId = pinned && !order.includes(pinned.detail.id) ? liveNext(pinned.nextId, 1) : current ? stepFrom(order, hiddenIds, current.id, 1) : null;
     $: next = nextId ? details.find(d => d.id === nextId) ?? null : null;
     $: currentNeed = current ? needs.find(x => x.id === current.id) ?? null : null;
     $: member = currentNeed ? locate(currentNeed, $model.workspaces).member : null;
@@ -160,8 +167,15 @@
     // True once the person picked an item (click, J / K, a send). Only then
     // may the panel take the focus.
     let moved = false;
-    function show(id: string | null) { moved = true; currentId = id; }
+    function show(id: string | null) { moved = true; shown = null; currentId = id; }
+    /** The snapshot's 「下一件」 while it is still listed and not handled,
+     * else the first (J) or last (K) item still listed. */
+    function liveNext(id: string | null, step: 1 | -1): string | null {
+        return id && order.includes(id) && !hiddenIds.has(id) && step === 1 ? id : stepFrom(order, hiddenIds, null, step);
+    }
     function go(step: 1 | -1) {
+        // From a snapshot receipt whose Need is gone: its 「下一件」.
+        if (pinned && !order.includes(pinned.detail.id)) { show(liveNext(pinned.nextId, step)); return; }
         const id = stepFrom(order, hiddenIds, current?.id ?? null, step);
         // From a receipt with nothing left: the empty page.
         if (id || (current && hiddenIds.has(current.id))) show(id);
@@ -203,30 +217,53 @@
 
     // ⌘O: the item's session, when it has one.
     $: chatOf = member?.session ? ((s) => () => openSession(sessionFromView(s)))(member.session) : undefined;
-    // Stop: managed agents only (observed sessions get ⌘O only), with a pid
-    // the engine can stop.
-    const stopKey = (s: C9pSessionView) => `${s.pid}|${s.id}`;
-    async function stop(d: HandlingDetail, s: C9pSessionView) {
+    // Stop: managed agents only (observed sessions get no stop button). D42:
+    // 停止 ends the agent normally with `agent.retire {id}`; never
+    // `session.stop`, and no fallback to it.
+    async function stop(d: HandlingDetail, agentId: string) {
         // Second check, and the lock is taken before any await: one stop per
-        // session, whatever item the person moves to meanwhile.
-        const key = stopKey(s);
-        if (!lockStop(key)) return;
-        try { await stopSession(sessionFromView(s)); } finally { unlockStop(key); }
+        // agent, whatever item the person moves to meanwhile.
+        if (!lockStop(agentId)) return;
+        // The item's place and 「下一件」 before the await: a feed refresh
+        // during the call may drop the item from `order`.
+        const place = { index: Math.max(0, order.indexOf(d.id)), total: details.length, nextId: stepFrom(order, hiddenIds, d.id, 1) };
+        const own = needs.find(x => x.id === d.id)?.sessionKey ?? null;
+        const scope = [...new Set([...(own ? [own] : []), ...retireScope(agentId)])];
+        let row;
+        try { row = await retireAgent(agentId); }
+        catch (e) { throw retireError(e); }
+        finally { unlockStop(agentId); }
+        // Core could not confirm that every process is gone: no receipt, the
+        // item stays, and the person can press 停止 again.
+        if (row?.state === 'orphaned') throw { notice: ORPHANED };
+        // A `failed` row comes back unchanged: the agent had already ended,
+        // so this was no normal end. Its item stays (and keeps the notice)
+        // until core's next detection. Any other state is not an end at all.
+        if (row?.state === 'failed') throw { notice: ALREADY_FAILED };
+        if (row?.state !== 'retired') throw { notice: `沒有停止：核心回報的狀態是 ${row?.state ?? '（沒有）'}，不是已結束。` };
+        for (const key of scope) hideRetiredSession(key);
         const at = new Date();
         const rows: [string, string][] = [
-            ['做了什麼', `停止了 ${d.who} 的程式`],
-            ['程式', `pid ${s.pid}`],
+            ['做了什麼', `正常結束了 ${d.who}`],
+            ['agent', agentId],
             ['時間', `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`],
-            ['能不能復原', '不能。要它再做事，請重新啟動它。']
+            ['能不能復原', '不能。要它再做事，請重新建立一個 agent。']
         ];
         if (get(isDemoMode)) rows.push(['示範模式', '沒有真的停止任何程式']);
-        receipts = { ...receipts, [d.instance]: { title: `已停止 ${d.who}`, rows } };
+        const r = { title: `已停止 ${d.who}`, rows };
+        receipts = { ...receipts, [d.instance]: r };
+        // The snapshot, only while the person still looks at this item.
+        if (currentId === d.id || (current?.id === d.id)) {
+            currentId = d.id;
+            shown = { detail: d, receipt: r, ...place };
+        }
         finish(d, null, 'stopped');
     }
-    $: stopOf = current && current.managed && member?.session?.canStop && member.session.pid && !receipt
-        ? ((d: HandlingDetail, s: C9pSessionView) => () => stop(d, s))(current, member.session)
+    $: stopAgent = current?.managed && !receipt ? needs.find(x => x.id === current!.id)?.agentId ?? null : null;
+    $: stopOf = current && stopAgent
+        ? ((d: HandlingDetail, id: string) => () => stop(d, id))(current, stopAgent)
         : undefined;
-    $: stopBusy = !!member?.session && $stopping.has(stopKey(member.session));
+    $: stopBusy = !!stopAgent && $stopping.has(stopAgent);
 
     let panel: HandlingPanel | undefined;
     const keys: PageKeys = {
@@ -275,7 +312,7 @@
                 bind:this={panel}
                 detail={current}
                 bind:answer={answers[current.instance]}
-                position={{ index: index + 1, total: details.length }}
+                position={{ index: index + 1, total }}
                 next={next ? { verb: next.verb, title: next.title } : null}
                 offline={offlineSince !== null ? { since: offlineSince } : null}
                 {now}

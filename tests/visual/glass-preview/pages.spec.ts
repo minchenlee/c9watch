@@ -180,7 +180,7 @@ test.describe('glass 今天 / 用量 / 設定 (not a baseline)', () => {
 	test('設定: switching to Classic asks first, then unmounts glass and stores ui.shell', async ({ page }) => {
 		await openClassic(page, { path: '/#/settings', storage: glass });
 		await page.locator('[data-shell="classic"]').click();
-		await expect(page.locator('[data-confirm-classic]')).toContainText('還沒有切回 Glass 的開關');
+		await expect(page.locator('[data-confirm-classic]')).toContainText('Switch to Glass');
 		expect(await page.evaluate(() => localStorage.getItem('ui.shell'))).toBe('glass');
 		await page.getByRole('button', { name: '留在 Glass' }).click();
 		await expect(page.locator('[data-confirm-classic]')).toHaveCount(0);

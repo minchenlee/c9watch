@@ -2,7 +2,9 @@
 //! Three independent request connections avoid serializing history scans with
 //! small reads. Stream connections are separate from that pool.
 use crate::engine_proto::{
-    compatibility::{core_action, core_usable, CoreAction, GUI_MAIL_METHODS, GUI_METHODS},
+    compatibility::{
+        core_action, core_usable, CoreAction, GUI_AGENT_METHODS, GUI_MAIL_METHODS, GUI_METHODS,
+    },
     home::{engine_home, sock_path},
     spawn::{ensure_engine, restart_engine, ConnectError, EngineConn, Frames},
     wire::{AgentListResult, EventFrame, NotificationEvent, SubscribeParams},
@@ -48,9 +50,12 @@ fn gui_authorized(section: &str, name: &str) -> bool {
         .is_some_and(|principals| principals.iter().any(|p| p == "local-unverified"))
 }
 
-/// Mail methods are main-window only (D37); the popover stays read-only.
+/// Mail methods (D37) and `agent.retire` (D42) are main-window only; the
+/// popover stays read-only.
 pub fn allowed(method: &str, popover: bool) -> bool {
-    (GUI_METHODS.contains(&method) || (!popover && GUI_MAIL_METHODS.contains(&method)))
+    (GUI_METHODS.contains(&method)
+        || (!popover
+            && (GUI_MAIL_METHODS.contains(&method) || GUI_AGENT_METHODS.contains(&method))))
         && gui_authorized("methods", method)
         && !matches!(method, "events.subscribe" | "events.unsubscribe")
         && (!popover
@@ -58,6 +63,40 @@ pub fn allowed(method: &str, popover: bool) -> bool {
                 method,
                 "session.stop" | "session.rename" | "detect.recheck" | "provider.opencode.connect"
             ))
+}
+
+/// The webview's params for a main-window write are checked here, not only
+/// in core (D42). `agent.retire` takes exactly `{id: <non-empty string>}`:
+/// core accepts `force` from `local-unverified`, and a forced retire writes
+/// the tombstone before the kill is confirmed, so the GUI never forwards it
+/// or any other field. Other methods pass through unchanged.
+pub fn params_ok(method: &str, params: &Value) -> bool {
+    match method {
+        "agent.retire" => params.as_object().is_some_and(|o| {
+            o.len() == 1
+                && o.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+        }),
+        _ => true,
+    }
+}
+
+/// The window and params check before a request leaves the webview.
+fn gate(label: &str, method: &str, params: &Value) -> Result<(), BridgeError> {
+    if !allowed(method, label == "popover") || !matches!(label, "main" | "popover") {
+        return Err(BridgeError::new(
+            "not_allowed",
+            "Method is not exposed to this window",
+        ));
+    }
+    if !params_ok(method, params) {
+        return Err(BridgeError::new(
+            "bad_request",
+            "agent.retire takes only {id}: a non-empty string",
+        ));
+    }
+    Ok(())
 }
 
 struct Pool {
@@ -273,14 +312,7 @@ pub async fn c9p_request(
     params: Value,
     progress: Channel<Value>,
 ) -> Result<Value, BridgeError> {
-    if !allowed(&method, window.label() == "popover")
-        || !matches!(window.label(), "main" | "popover")
-    {
-        return Err(BridgeError::new(
-            "not_allowed",
-            "Method is not exposed to this window",
-        ));
-    }
+    gate(window.label(), &method, &params)?;
     let bridge = bridge.inner().clone();
     tauri::async_runtime::spawn_blocking(move || bridge.call(&method, params, Some(&progress)))
         .await
@@ -833,7 +865,7 @@ mod tests {
     fn webview_is_not_a_universal_pipe() {
         for m in [
             "agent.create",
-            "agent.retire",
+            "agent.resume",
             "gateway.open",
             "gateway.policy.set",
             "gui.confirmer.attach",
@@ -852,6 +884,55 @@ mod tests {
             assert!(allowed(m, false), "{m}");
             assert!(!allowed(m, true), "{m}");
         }
+        // D42: the main window may retire an agent; the popover may not.
+        assert!(allowed("agent.retire", false));
+        assert!(!allowed("agent.retire", true));
+        assert!(!GUI_METHODS.contains(&"agent.retire"));
+        // D42 P1: the bridge forwards agent.retire only as {id}; never force.
+        assert!(params_ok("agent.retire", &json!({ "id": "agt_1" })));
+        for bad in [
+            json!({ "id": "agt_1", "force": true }),
+            json!({ "id": "agt_1", "force": false }),
+            json!({ "id": "agt_1", "x": 1 }),
+            json!({}),
+            json!({ "id": "" }),
+            json!({ "id": 1 }),
+            json!({ "id": null }),
+            json!(null),
+            json!(["agt_1"]),
+            json!("agt_1"),
+        ] {
+            assert!(!params_ok("agent.retire", &bad), "{bad}");
+        }
+        assert!(params_ok("session.views", &json!({ "any": 1 })));
+        let code = |label, params: Value| {
+            gate(label, "agent.retire", &params)
+                .err()
+                .map(|e| e.0["code"].clone())
+        };
+        assert_eq!(code("main", json!({ "id": "agt_1" })), None);
+        assert_eq!(
+            code("main", json!({ "id": "agt_1", "force": true })),
+            Some(json!("bad_request"))
+        );
+        assert_eq!(
+            code("main", json!({ "id": "agt_1", "x": 1 })),
+            Some(json!("bad_request"))
+        );
+        assert_eq!(code("main", json!({})), Some(json!("bad_request")));
+        assert_eq!(code("main", json!({ "id": 7 })), Some(json!("bad_request")));
+        assert_eq!(
+            code("popover", json!({ "id": "agt_1" })),
+            Some(json!("not_allowed"))
+        );
+        assert_eq!(
+            code("other", json!({ "id": "agt_1" })),
+            Some(json!("not_allowed"))
+        );
+        // Every other agent.* write stays refused.
+        for m in ["agent.create", "agent.resume", "agent.handoff"] {
+            assert!(!allowed(m, false), "{m}");
+        }
         let mail = SubscribeParams {
             topics: vec!["msg.state".into()],
             ..Default::default()
@@ -869,7 +950,11 @@ mod tests {
     #[test]
     fn webview_allowlist_is_a_subset_of_central_authority() {
         use crate::engine::{authz, principal::Principal};
-        for method in GUI_METHODS.iter().chain(GUI_MAIL_METHODS) {
+        for method in GUI_METHODS
+            .iter()
+            .chain(GUI_MAIL_METHODS)
+            .chain(GUI_AGENT_METHODS)
+        {
             assert!(
                 authz::can(method, &Principal::LocalUnverified, None).allowed,
                 "{method}"
@@ -896,10 +981,20 @@ mod tests {
                 || method.starts_with("hook.")
                 || matches!(
                     method.as_str(),
-                    "agent.create" | "agent.retire" | "gui.confirmer.attach"
+                    "agent.create" | "agent.resume" | "gui.confirmer.attach"
                 )
             {
                 assert!(!allowed(method, false), "{method}");
+            }
+            // D42: of the agent.* methods, the main window gets agent.list
+            // and agent.retire only; the popover gets agent.list only.
+            if method.starts_with("agent.") {
+                assert_eq!(
+                    allowed(method, false),
+                    matches!(method.as_str(), "agent.list" | "agent.retire"),
+                    "{method}"
+                );
+                assert_eq!(allowed(method, true), method == "agent.list", "{method}");
             }
         }
         assert!(authz::topics(&Principal::LocalUnverified, None)

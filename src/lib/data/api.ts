@@ -1,4 +1,5 @@
 import type { Session, Conversation, AwayActivity, AwayRequest, HistoryEntry, DeepSearchHit, CostData, ProjectMemory, SessionProvider, DetectionDiagnostics } from '../types';
+import type { C9pAgentRow } from '../c9p-1';
 import { request, transport, hasSelectedTransport } from './client';
 import { CapabilityDisabledError } from '../ws';
 import { sessionFromView } from './session';
@@ -60,6 +61,12 @@ export async function getAwayActivity(requests: AwayRequest[]): Promise<Record<s
 }
 export async function stopSession(session: Session): Promise<void> {
     await request('session.stop', { sessionKey: sessionKeyOf(session), pid: session.pid });
+}
+/** Ends a managed engine agent normally (`agent.retire`, D42). Only `{id}`:
+ * the GUI never sends `force`. Returns the agent row: `retired` when core
+ * confirmed the end, `orphaned` when it could not (retire again to retry). */
+export async function retireAgent(id: string): Promise<C9pAgentRow> {
+    return (await request('agent.retire', { id })).agent;
 }
 export async function openSession(session: Session): Promise<void> {
     if (get(isDemoMode)) return;
