@@ -27,7 +27,8 @@
 //!   `allowUnsandboxedCommands:false`. The price, accepted in D28 Q2=A: a
 //!   free agent cannot change the repo's own `.claude/`, skills and
 //!   commands included. The first two layers also cover the engine's
-//!   `bin/` and `spawn/` and its `standing-orders.md` (C1a-25).
+//!   `bin/`, `spawn/` and `extensions/` (D31) and its `standing-orders.md`
+//!   (C1a-25).
 //! - The first two layers also cover the `.claude/` of every other live
 //!   engine agent at spawn time (C1a-32, `Profile::with_peers`): in live
 //!   run X14 one agent rewrote another agent's `settings.json` with a Bash
@@ -94,6 +95,12 @@ pub const CHILD_ISOLATE_ARGS: [&str; 4] = [
 
 /// `<home>/spawn`: the per-spawn settings files.
 pub const SPAWN_DIR: &str = "spawn";
+
+/// `<home>/extensions`: where an extension would be installed (D31 floor
+/// b). The engine does not create it or load from it yet; it is in the
+/// write floor so that an agent cannot install an extension by writing a
+/// file there.
+pub const EXTENSIONS_DIR: &str = "extensions";
 
 /// The cwd settings files CC reads and hot-reloads while a session runs
 /// (`.claude/settings.json` = project source, `.local` = local source).
@@ -283,7 +290,9 @@ pub fn allow_rules(p: &Profile) -> Vec<String> {
 }
 
 /// Engine-owned directories the agent must not write: `<home>/bin` (the
-/// agent binary) and `<home>/spawn` (its own settings file). `home` is the
+/// agent binary), `<home>/spawn` (its own settings file) and
+/// `<home>/extensions` (D31 floor b: a file written there must not install
+/// an extension). The directory need not exist. `home` is the
 /// parent of `bin`, as `agent_bin::installed_path` lays it out. A
 /// `live-test` build adds `<home>/live-test`: the engine types the bytes of
 /// a file there into an agent's PTY, so a write there is a `!` command
@@ -295,6 +304,7 @@ pub fn engine_dirs(p: &Profile) -> Vec<PathBuf> {
         .into_iter()
         .map(Path::to_path_buf)
         .chain(home.map(|h| h.join(SPAWN_DIR)))
+        .chain(home.map(|h| h.join(EXTENSIONS_DIR)))
         .collect();
     #[cfg(feature = "live-test")]
     v.extend(home.map(|h| h.join(crate::engine::live_test::DIR)));
@@ -538,9 +548,9 @@ mod tests {
     const BIN: &str = "/b/Application Support/c9/bin/c9watch-agent";
     const HOME: &str = "/b/Application Support/c9";
     #[cfg(not(feature = "live-test"))]
-    const ENGINE_DIRS: &[&str] = &["/bin", "/spawn"];
+    const ENGINE_DIRS: &[&str] = &["/bin", "/extensions", "/spawn"];
     #[cfg(feature = "live-test")]
-    const ENGINE_DIRS: &[&str] = &["/bin", "/live-test", "/spawn"];
+    const ENGINE_DIRS: &[&str] = &["/bin", "/extensions", "/live-test", "/spawn"];
     const ENGINE_FILES: &[&str] = &[
         "/standing-orders.md",
         "/engine.db",
@@ -1057,6 +1067,22 @@ mod tests {
         assert!(!deny.iter().any(|r| r.contains("//**/")), "{:?}", deny);
     }
 
+    #[test]
+    fn extensions_dir_is_denied_in_both_layers() {
+        // D31 floor b: an agent must not install an extension by writing a
+        // file under <home>/extensions, with a file tool or from Bash.
+        let t = tempfile::tempdir().unwrap();
+        let p = p_in(t.path());
+        let s = settings(&p);
+        let dir = format!("{}/extensions", HOME);
+        let deny: Vec<String> = serde_json::from_value(s["permissions"]["deny"].clone()).unwrap();
+        let rule = format!("Edit(//{}/**)", dir.trim_start_matches('/'));
+        assert!(deny.contains(&rule), "{} not in {:?}", rule, deny);
+        let dw: Vec<String> =
+            serde_json::from_value(s["sandbox"]["filesystem"]["denyWrite"].clone()).unwrap();
+        assert!(dw.contains(&dir), "{:?}", dw);
+    }
+
     #[cfg(feature = "live-test")]
     #[test]
     fn live_test_input_dir_is_denied_in_both_layers() {
@@ -1071,15 +1097,16 @@ mod tests {
     /// sha256 of the settings bytes and the argv of a bare spawn (no
     /// overlay), with the tempdir cwd replaced by `<CWD>`. Taken from
     /// the code before E1: a create without `overlay` must not change by
-    /// one byte.
+    /// one byte. Retaken for D31, whose only change is the two
+    /// `<home>/extensions` entries.
     #[cfg(not(feature = "live-test"))]
     const BARE_SETTINGS_SHA: &str =
-        "708962bd45657a1721ab1751742236359f3fca898bd13809f1798b9ccd524d24";
+        "fc29b480748a582e758dcb02d19b623c747bec75c3fc539e0b144f5c07c6abec";
     #[cfg(not(feature = "live-test"))]
     const BARE_ARGV_SHA: &str = "ac731f6ef7e0ca17a06bfc51b959df31837a5820a1054debc32692e508489873";
     #[cfg(not(feature = "live-test"))]
     const CHILD_SETTINGS_SHA: &str =
-        "c9ecaad79b31b821b9e64e487fc80f06224998d10d0c7b5d627b888ecd709a06";
+        "b2f25e2dcb26b0c4177217a28d1d6282a484574d05d4add97a6d91a9da6324d3";
     #[cfg(not(feature = "live-test"))]
     const CHILD_ARGV_SHA: &str = "0103b03f2291389ead0180e467a375408385c1843fa3f7f575e5ddb2a7b0d8bb";
 
