@@ -151,8 +151,12 @@ impl ExtRoots {
         None
     }
 
-    /// The response for one `c9ext://` request.
-    pub fn respond(&self, request: &Request<Vec<u8>>) -> Response<Vec<u8>> {
+    /// The response for one `c9ext://` request from webview `label`.
+    pub fn respond(&self, label: &str, request: &Request<Vec<u8>>) -> Response<Vec<u8>> {
+        // Only the main window runs the glass shell (and extensions).
+        if label != SERVED_WEBVIEW {
+            return status(StatusCode::FORBIDDEN);
+        }
         let method = request.method();
         if method != Method::GET && method != Method::HEAD {
             return status(StatusCode::METHOD_NOT_ALLOWED);
@@ -179,17 +183,53 @@ impl ExtRoots {
                 Err(_) => return status(StatusCode::INTERNAL_SERVER_ERROR),
             }
         };
-        Response::builder()
+        let mut r = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, mime)
             .header("X-Content-Type-Options", "nosniff")
             .header(header::CACHE_CONTROL, "no-store")
-            // The page (tauri://localhost, or the Vite dev server) imports
-            // modules from another origin, so module loads need CORS.
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .body(body)
+            // A file opened as a document (an SVG with a script, say) gets
+            // no origin and no subresources. A module or stylesheet loaded
+            // by the page is not affected by this header.
+            .header(header::CONTENT_SECURITY_POLICY, DOCUMENT_CSP)
+            .header(header::VARY, "Origin");
+        // The page imports modules from another origin, so module loads
+        // need CORS: answer only the app's own origins.
+        if let Some(origin) = request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|o| o.to_str().ok())
+            .filter(|o| allowed_origin(o))
+        {
+            r = r.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        }
+        r.body(body)
             .unwrap_or_else(|_| status(StatusCode::INTERNAL_SERVER_ERROR))
     }
+}
+
+/// The webview that may load extension files.
+pub const SERVED_WEBVIEW: &str = "main";
+/// Sent with every file: it only matters when the file is a document.
+pub const DOCUMENT_CSP: &str = "sandbox; default-src 'none'";
+
+/// The app page's origin (macOS/Linux, Windows) or, in a debug build, the
+/// Vite dev server's.
+pub fn allowed_origin(origin: &str) -> bool {
+    matches!(
+        origin,
+        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+    ) || (cfg!(debug_assertions) && origin == "http://localhost:1420")
+}
+
+/// True when a top-level navigation goes to an extension file. Such a
+/// document would run as a local origin with the window's IPC rights, so
+/// every webview refuses it (extensions load as modules, never as pages).
+pub fn is_ext_navigation(url: &tauri::Url) -> bool {
+    url.scheme().eq_ignore_ascii_case(SCHEME)
+        || url
+            .host_str()
+            .is_some_and(|h| h.eq_ignore_ascii_case("c9ext.localhost"))
 }
 
 fn status(code: StatusCode) -> Response<Vec<u8>> {
@@ -306,17 +346,26 @@ pub async fn ext_list(roots: tauri::State<'_, ExtRoots>) -> Result<ExtList, Stri
         .map_err(|e| e.to_string())
 }
 
-/// Registers the `c9ext` scheme. Reads happen off the main thread.
+/// Registers the `c9ext` scheme (reads happen off the main thread) and a
+/// navigation guard that keeps every webview off `c9ext:` documents.
 pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     use tauri::Manager;
-    builder.register_asynchronous_uri_scheme_protocol(SCHEME, |ctx, request, responder| {
-        let roots = ctx
-            .app_handle()
-            .try_state::<ExtRoots>()
-            .map(|s| s.inner().clone())
-            .unwrap_or_default();
-        tauri::async_runtime::spawn_blocking(move || responder.respond(roots.respond(&request)));
-    })
+    let guard = tauri::plugin::Builder::<R>::new("c9ext-nav")
+        .on_navigation(|_webview, url| !is_ext_navigation(url))
+        .build();
+    builder
+        .plugin(guard)
+        .register_asynchronous_uri_scheme_protocol(SCHEME, |ctx, request, responder| {
+            let label = ctx.webview_label().to_owned();
+            let roots = ctx
+                .app_handle()
+                .try_state::<ExtRoots>()
+                .map(|s| s.inner().clone())
+                .unwrap_or_default();
+            tauri::async_runtime::spawn_blocking(move || {
+                responder.respond(roots.respond(&label, &request))
+            });
+        })
 }
 
 #[cfg(test)]
@@ -364,7 +413,10 @@ mod tests {
     }
 
     fn get(roots: &ExtRoots, url: &str) -> Response<Vec<u8>> {
-        roots.respond(&Request::builder().uri(url).body(Vec::new()).unwrap())
+        roots.respond(
+            "main",
+            &Request::builder().uri(url).body(Vec::new()).unwrap(),
+        )
     }
 
     #[test]
@@ -525,6 +577,7 @@ mod tests {
         let f = fx();
         let req = |m: &str, url: &str| {
             f.roots.respond(
+                "main",
                 &Request::builder()
                     .method(m)
                     .uri(url)
@@ -607,6 +660,108 @@ mod tests {
         let list = f.roots.list().extensions;
         let c = list.iter().find(|c| c.dir == "sneaky").unwrap();
         assert_eq!(c.manifest, None);
+    }
+
+    #[test]
+    fn every_file_has_a_sandbox_csp() {
+        let f = fx();
+        write(
+            f.third.join("office/x.svg"),
+            "<svg><script>1</script></svg>",
+        )
+        .unwrap();
+        for url in [
+            "c9ext://localhost/office/x.svg",
+            "c9ext://localhost/office/index.js",
+        ] {
+            let r = get(&f.roots, url);
+            assert_eq!(r.status(), StatusCode::OK, "{url}");
+            assert_eq!(
+                r.headers()[header::CONTENT_SECURITY_POLICY],
+                DOCUMENT_CSP,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_main_webview_is_served() {
+        let f = fx();
+        let req = Request::builder()
+            .uri("c9ext://localhost/office/index.js")
+            .body(Vec::new())
+            .unwrap();
+        assert_eq!(f.roots.respond("main", &req).status(), StatusCode::OK);
+        for label in ["popover", "", "main2"] {
+            assert_eq!(
+                f.roots.respond(label, &req).status(),
+                StatusCode::FORBIDDEN,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn cors_answers_only_app_origins() {
+        let f = fx();
+        let with = |origin: &str| {
+            let req = Request::builder()
+                .uri("c9ext://localhost/office/index.js")
+                .header(header::ORIGIN, origin)
+                .body(Vec::new())
+                .unwrap();
+            f.roots
+                .respond("main", &req)
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|v| v.to_str().unwrap().to_owned())
+        };
+        for o in [
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+        ] {
+            assert_eq!(with(o).as_deref(), Some(o));
+        }
+        // Tests are debug builds: the Vite dev server is allowed.
+        assert_eq!(
+            with("http://localhost:1420").as_deref(),
+            Some("http://localhost:1420")
+        );
+        for o in [
+            "null",
+            "c9ext://localhost",
+            "https://evil.com",
+            "http://localhost:1421",
+            "*",
+        ] {
+            assert_eq!(with(o), None, "{o}");
+        }
+        let r = get(&f.roots, "c9ext://localhost/office/index.js");
+        assert!(r
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+        assert_eq!(r.headers()[header::VARY], "Origin");
+    }
+
+    #[test]
+    fn navigation_to_extension_files_is_refused() {
+        let nav = |u: &str| is_ext_navigation(&tauri::Url::parse(u).unwrap());
+        for u in [
+            "c9ext://localhost/hello/index.js",
+            "C9EXT://localhost/hello/x.svg",
+            "http://c9ext.localhost/hello/x.svg",
+        ] {
+            assert!(nav(u), "{u}");
+        }
+        for u in [
+            "tauri://localhost/",
+            "http://localhost:1420/#/ext/hello/main",
+            "https://github.com/minchenlee/c9watch",
+        ] {
+            assert!(!nav(u), "{u}");
+        }
     }
 
     #[test]
