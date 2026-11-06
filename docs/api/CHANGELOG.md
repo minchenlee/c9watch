@@ -15,6 +15,7 @@ When preview ends, the GUI's legacy in-process fallback is removed. The GUI then
 
 ## 1.15 — upcoming
 
+- Put the engine home's `ext-data/` directory under every agent's write floor. An extension's core half runs as `plugin:<id>` and keeps its state in `<engine home>/ext-data/<id>/`, so an agent must not write there. Core's own entries in a spawn's `permissions.deny` add `Edit(//<engine home>/ext-data/**)`, and `sandbox.filesystem.denyWrite` adds `<engine home>/ext-data`, next to `bin/`, `spawn/` and `extensions/`. A running agent gets them at its next spawn or resume. Core does not create the directory, and nothing reads or writes it yet. See [c9p-1.md](c9p-1.md#spawn-overlay-114). No method `rev` changes.
 - `AgentRow` adds `mailPaused` (boolean, always sent): `true` while agent-to-agent mail to the agent is paused by `mail.pause`, `false` after `mail.resume` or when it was never paused. `agent.list`, `session.list`, `snapshot.get` and the `agent.create` result carry it. It is not the `paused` lifecycle `state`, which means a drained agent. A client of an older engine gets no field and does not know the pause state. See [c9p-1.md](c9p-1.md#mail-pause-on-the-agent-row-115). Additive; no method `rev` changes.
 
 ## 1.14 — upcoming
