@@ -171,8 +171,8 @@ G10a 今天 / 用量 / 設定 (host pages, `pages/`):
   retries on the next tick; unmount stops it.
 - Known limit: core buckets cost by UTC date, so 用量 days are UTC days
   (the page says 「日期依 UTC 計」), not local days.
-- `Settings.svelte`: Shell (glass → Classic asks first: Classic has no
-  switch back yet), Glass Off / Subtle / Full (`ui.glass`, sets
+- `Settings.svelte`: Shell (glass → Classic asks first; the way back is
+  Classic's SETTINGS › About & updates › Interface, D42), Glass Off / Subtle / Full (`ui.glass`, sets
   `data-glass`; native vibrancy is G10b), monthly fee, 重新排列房間 (off
   until the office extension), Extensions (read-only, from `ext/registry`),
   規則與授權 (shell only; the fixture shows the 允許 rule as

@@ -178,7 +178,7 @@
     .field:last-child { border-bottom: 0; }
     .lbl { font: var(--type-label); color: var(--text-2); }
     .note { margin: 0; font: var(--type-label); color: var(--text-3); }
-    .note code, .confirm code, .rule code { font: var(--type-meta); color: var(--text-1); overflow-wrap: anywhere; }
+    .note code, .rule code { font: var(--type-meta); color: var(--text-1); overflow-wrap: anywhere; }
     .mono { font: var(--type-meta); }
     .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
     .seg { display: flex; flex-wrap: wrap; gap: var(--space-1); }
