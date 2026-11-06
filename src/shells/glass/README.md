@@ -103,7 +103,8 @@ G5 actions (`handling/actions.ts`, pure, `scripts/test-glass-handling.mjs`):
   included, is `bad_request`). The receipt is a snapshot: it stays after the
   retired agent's item leaves the model, until J / K, a click or leaving.
   The place and 「下一件」 are taken before the call. A `failed` row is no
-  receipt (「…已經失敗結束了」). The retired session's view is hidden from
+  receipt (「…已經失敗結束了」). The retired agent's session view, and its
+  children's (core retires them with it), are hidden from
   the model (`retiredSessions` in `data.ts`) until the session feed drops
   it, so the item does not come back as an observed session. The stop lock is per agent id (`handling/handled.ts`), taken
   before the call, so switching items cannot start a second stop. The receipt does not take ⌘↵; J goes to the 「下一件」 it names.

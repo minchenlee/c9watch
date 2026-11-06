@@ -23,7 +23,7 @@
     //   send (`canSend`).
     import { onDestroy, onMount } from 'svelte';
     import { get } from 'svelte/store';
-    import { dataError, fixtureOn, hideRetiredSession, model } from '../data';
+    import { dataError, fixtureOn, hideRetiredSession, model, retireScope } from '../data';
     import { usePageKeys, type PageKeys } from '../keys';
     import { openSession, retireAgent } from '$lib/data/api';
     import { sessionFromView } from '$lib/data/session';
@@ -227,7 +227,8 @@
         // The item's place and 「下一件」 before the await: a feed refresh
         // during the call may drop the item from `order`.
         const place = { index: Math.max(0, order.indexOf(d.id)), total: details.length, nextId: stepFrom(order, hiddenIds, d.id, 1) };
-        const sessionKey = needs.find(x => x.id === d.id)?.sessionKey ?? null;
+        const own = needs.find(x => x.id === d.id)?.sessionKey ?? null;
+        const scope = [...new Set([...(own ? [own] : []), ...retireScope(agentId)])];
         let row;
         try { row = await retireAgent(agentId); }
         catch (e) { throw retireError(e); }
@@ -236,10 +237,11 @@
         // item stays, and the person can press 停止 again.
         if (row?.state === 'orphaned') throw { notice: ORPHANED };
         // A `failed` row comes back unchanged: the agent had already ended,
-        // so this was no normal end. Any other state is not an end at all.
-        if (row?.state === 'failed') { hideRetiredSession(sessionKey); throw { notice: ALREADY_FAILED }; }
+        // so this was no normal end. Its item stays (and keeps the notice)
+        // until core's next detection. Any other state is not an end at all.
+        if (row?.state === 'failed') throw { notice: ALREADY_FAILED };
         if (row?.state !== 'retired') throw { notice: `沒有停止：核心回報的狀態是 ${row?.state ?? '（沒有）'}，不是已結束。` };
-        hideRetiredSession(sessionKey);
+        for (const key of scope) hideRetiredSession(key);
         const at = new Date();
         const rows: [string, string][] = [
             ['做了什麼', `正常結束了 ${d.who}`],

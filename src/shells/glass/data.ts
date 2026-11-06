@@ -43,6 +43,18 @@ export const retiredSessions = writable<ReadonlySet<string>>(new Set());
 export function hideRetiredSession(key: string | null | undefined): void {
     if (key) retiredSessions.update(s => (s.has(key) ? s : new Set(s).add(key)));
 }
+/** The session keys of `id` and of every agent below it in the agent rows
+ * as they are now. Core retires a parent's children with it (D16), so the
+ * page takes them before the call and hides them all after a retire. */
+export function retireScope(id: string): string[] {
+    const rows = get(agents);
+    const ids = new Set([id]);
+    for (let grew = true; grew;) {
+        grew = false;
+        for (const a of rows) if (a.parentId && ids.has(a.parentId) && !ids.has(a.id)) { ids.add(a.id); grew = true; }
+    }
+    return rows.filter(a => ids.has(a.id) && a.sessionKey).map(a => a.sessionKey!);
+}
 function pruneRetiredSessions(rows: C9pSessionView[]): void {
     retiredSessions.update(s => {
         if (!s.size) return s;
