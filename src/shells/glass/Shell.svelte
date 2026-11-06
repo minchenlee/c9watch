@@ -13,6 +13,9 @@
     import Sidebar from './Sidebar.svelte';
     import Workspace from './pages/Workspace.svelte';
     import Needs from './pages/Needs.svelte';
+    import Today from './pages/Today.svelte';
+    import Usage from './pages/Usage.svelte';
+    import Settings from './pages/Settings.svelte';
     import { handled, pruneHandled } from './handling/handled';
     import ExtPages from './ext/ExtPages.svelte';
 
@@ -78,6 +81,12 @@
         <main class="glass-page" aria-label={info.title}>
             {#if $route.page === 'ws'}
                 <Workspace id={$route.id} title={info.title} />
+            {:else if $route.page === 'today'}
+                <Today {needs} />
+            {:else if $route.page === 'usage'}
+                <Usage />
+            {:else if $route.page === 'settings'}
+                <Settings />
             {:else}
                 <header><h1>{info.title}</h1></header>
                 <p class="state-msg">{info.empty}</p>
