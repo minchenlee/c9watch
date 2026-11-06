@@ -19,7 +19,8 @@ const M = '../src/shells/glass/model/';
 const { STALE_MS, trackChanges, isStale } = await load('./stale', M + 'stale.ts');
 const { repoRoot, workspaceId } = await load('./workspaces', M + 'workspaces.ts');
 await load('./rooms', M + 'rooms.ts');
-const { sortNeeds } = await load('./needs', M + 'needs.ts');
+await load('$lib/data/mail-store', '../src/lib/data/mail-store.ts');
+const { sortNeeds, openAttention, attentionKey } = await load('./needs', M + 'needs.ts');
 const { deriveGlassModel } = await load('./model', M + 'index.ts');
 const fixture = await load('$lib/data/demo/glass', '../src/lib/data/demo/glass.ts');
 const gapsDemo = await load('./gaps-demo', M + 'gaps-demo.ts');
@@ -92,7 +93,7 @@ test('needs: a pending tool call is 允許 with what a later answer needs', () =
             view('claudeCode:idle', '/code/app')
         ],
         agents: [agent('agt_p', '/code/app', { sessionKey: 'claudeCode:p', status: 'needs_attention', generation: 3 }), agent('agt_h', '/code', { role: 'human' })],
-        attention: [{ event: { id: 'agt_p', generation: 3, reason: 'permission', toolUseId: 'toolu_1' }, at: NOW - 120_000 }],
+        attention: [{ event: { id: 'agt_p', generation: 3, reason: 'auto_mode_denied: rm', toolUseId: 'toolu_old' }, at: NOW - 120_000 }],
         mail: [
             { msgId: 'm1', kind: 'request', to: { id: 'agt_h', addr: 'x/agt_h', name: null }, from: { kind: 'agent', addr: 'x/agt_p', name: null }, state: 'delivered', preview: 'ok?', createdAt: NOW, replyTo: null },
             { msgId: 'm2', kind: 'request', to: { id: 'agt_h', addr: 'x/agt_h', name: null }, from: { kind: 'agent', addr: 'x/agt_p', name: null }, state: 'delivered', preview: 'done', createdAt: NOW, replyTo: null },
@@ -100,7 +101,8 @@ test('needs: a pending tool call is 允許 with what a later answer needs', () =
         ]
     });
     assert.deepEqual(m.needs.map(x => [x.verb, x.title, x.source]), [['決定', '改色？', 'session'], ['允許', 'npm test', 'session']]);
-    assert.deepEqual(m.needs[1].permission, { sessionKey: 'claudeCode:p', agentId: 'agt_p', toolName: 'Bash', toolInput: { command: 'npm test' }, toolUseId: 'toolu_1', generation: 3 });
+    // The attention's toolUseId belongs to another call: never attached.
+    assert.deepEqual(m.needs[1].permission, { sessionKey: 'claudeCode:p', agentId: 'agt_p', toolName: 'Bash', toolInput: { command: 'npm test' }, toolUseId: null, generation: 3 });
     assert.equal(m.needs[1].tag, '等你允許');
     // The mail to the human is from agt_p, which already has an item: one item per member.
     assert.equal(m.needs.filter(x => x.agentId === 'agt_p').length, 1);
@@ -149,4 +151,56 @@ test('live mode shows no demo data; demo mode adds the gaps file', () => {
     assert.deepEqual(c9.map(r => r.freeSeats), [1, 1, null]);
     // One row per goal, every row in the goal's workspace.
     for (const g of GAPS.goals) assert.equal(demo.workspaces.find(w => w.id === g.workspace).rows.filter(r => r.goalId === g.id).length, 1);
+});
+
+test('a tree across repos shows its child under the child repo, with the lead referenced', () => {
+    const m = derive({ agents: [agent('agt_l', '/code/a', { role: 'orch' }), agent('agt_c', '/code/b', { parentId: 'agt_l', status: 'needs_attention' })],
+        attention: [{ event: { id: 'agt_c', generation: 1, reason: 'mail_uncertain: m9', msgId: 'm9' }, at: NOW }] });
+    const [a, b] = m.workspaces;
+    assert.deepEqual([a.name, a.rows[0].members.map(x => x.key), a.rows[0].freeSeats], ['a', ['agt_l'], 7]);
+    assert.deepEqual([b.name, b.rows[0].kind, b.rows[0].lead.key, b.rows[0].members.map(x => x.key), b.rows[0].cap], ['b', 'lead', 'agt_l', ['agt_c'], null]);
+    const ids = new Set(m.workspaces.map(w => w.id));
+    assert(m.needs.length === 1 && m.needs.every(n => ids.has(n.workspaceId)) && m.needs[0].workspaceId === b.id);
+});
+
+test('attention stays open whatever the status, until its own clearing rule', () => {
+    const ev = (reason, more = {}) => ({ event: { id: 'agt_a', generation: 2, reason, ...more }, at: NOW });
+    const facts = (a = {}, mail = [], ends = []) => ({ agents: new Map([['agt_a', agent('agt_a', '/x', { generation: 2, status: 'working', ...a })]]),
+        mail: new Map(mail.map(x => [x.msgId, x])), turnEnds: new Map(ends.map(e => [e.id, e])) });
+    const uncertain = ev('mail_uncertain: m1', { msgId: 'm1' });
+    const denied = ev('auto_mode_denied: rm -rf', { toolUseId: 'toolu_9' });
+    const paused = { event: { id: 'agt_a', reason: 'mail_paused' }, at: NOW };
+    // Working status does not clear any of them.
+    assert.equal(openAttention([uncertain, denied, paused], facts({ mailPaused: true })).length, 3);
+    // Mail: open while the mail is missing or still needs a look; closed once delivered.
+    assert.equal(openAttention([uncertain], facts({}, [{ msgId: 'm1', state: 'uncertain', detail: null }])).length, 1);
+    assert.equal(openAttention([uncertain], facts({}, [{ msgId: 'm1', state: 'delivered', detail: null }])).length, 0);
+    // Hook reasons: a later turn end clears; an earlier one or an older generation does not.
+    assert.equal(openAttention([denied], facts({}, [], [{ id: 'agt_a', generation: 2, at: NOW - 1, by: 'hook' }])).length, 1);
+    assert.equal(openAttention([denied], facts({}, [], [{ id: 'agt_a', generation: 1, at: NOW + 1, by: 'hook' }])).length, 1);
+    assert.equal(openAttention([denied], facts({}, [], [{ id: 'agt_a', generation: 2, at: NOW + 1, by: 'hook' }])).length, 0);
+    // A restart (newer generation) or a retired agent clears everything with a generation.
+    assert.equal(openAttention([uncertain, denied], facts({ generation: 3 })).length, 0);
+    assert.equal(openAttention([uncertain, denied, paused], facts({ state: 'retired', goneAt: NOW })).length, 0);
+    assert.equal(openAttention([paused], facts({ mailPaused: false })).length, 0);
+    assert.notEqual(attentionKey(uncertain.event), attentionKey(denied.event));
+    // In the model: a working agent with open mail_uncertain is a 處理 item.
+    const m = derive({ agents: [agent('agt_a', '/x', { generation: 2 })], attention: [uncertain] });
+    assert.deepEqual(m.needs.map(n => [n.verb, n.source, n.msgId]), [['處理', 'attention', 'm1']]);
+});
+
+test('a permission ask never takes an attention event from another call or generation', () => {
+    const pending = view('claudeCode:p', '/x', { status: 'NeedsAttention', pendingToolName: 'Bash', pendingToolInput: { command: 'ls' }, waitingFor: { kind: 'approval', tool: 'Bash' } });
+    for (const event of [{ id: 'agt_p', generation: 4, reason: 'auto_mode_denied: rm', toolUseId: 'toolu_1' }, { id: 'agt_p', generation: 3, reason: 'x', toolUseId: 'toolu_2' }]) {
+        const m = derive({ sessions: [pending], agents: [agent('agt_p', '/x', { sessionKey: 'claudeCode:p', generation: 4 })], attention: [{ event, at: NOW }] });
+        assert.deepEqual([m.needs[0].verb, m.needs[0].permission.toolUseId, m.needs[0].permission.generation], ['允許', null, 4]);
+    }
+});
+
+test('mail requests resolve the sender by address; a name only when unique and no address', () => {
+    const human = agent('agt_h', '/code', { role: 'human' });
+    const req = (msgId, from) => ({ msgId, kind: 'request', to: { id: 'agt_h' }, from, state: 'delivered', preview: msgId, createdAt: NOW, replyTo: null });
+    const two = [agent('agt_1', '/x', { name: 'worker' }), agent('agt_2', '/x', { name: 'worker' }), agent('agt_3', '/x', { name: 'solo' }), human];
+    const m = derive({ agents: two, mail: [req('a', { kind: 'agent', addr: 'm/agt_2', name: 'worker' }), req('b', { kind: 'agent', addr: null, name: 'worker' }), req('c', { kind: 'agent', addr: null, name: 'solo' })] });
+    assert.deepEqual(m.needs.map(n => [n.msgId, n.agentId]).sort(), [['a', 'agt_2'], ['c', 'agt_3']]);
 });

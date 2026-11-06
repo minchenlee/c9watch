@@ -29,6 +29,7 @@ export type Member = {
 
 export type Row = {
     id: string;
+    workspaceId: string;
     kind: 'lead' | 'talk';
     /** The goal name (demo), else the lead's or the talk's name. */
     title: string;
@@ -104,31 +105,36 @@ export function treeRoot(m: Member, byId: Map<string, Member>): Member {
     return cur;
 }
 
-/** Rows by their root member, in member order. Humans are not on a row. */
-export function buildRows(members: Member[], goals: DemoGoal[] | null): Map<Member, Row> {
+/** Rows per workspace, in member order. Humans are not on a row. A tree
+ * that spans repos gives one row per workspace: each row holds the members
+ * in that workspace and references the same lead (which may live in another
+ * workspace). Cap and free seats are on the lead's own row only. */
+export function buildRows(members: Member[], goals: DemoGoal[] | null, workspaceOf: (m: Member) => string): Row[] {
     const byId = new Map(members.filter(m => m.agentId).map(m => [m.agentId!, m]));
-    const rows = new Map<Member, Row>();
+    const rows = new Map<string, Row>();
     for (const m of members) {
         if (m.role === 'human') continue;
         const root = treeRoot(m, byId);
-        let row = rows.get(root);
+        const ws = workspaceOf(m);
+        const home = workspaceOf(root) === ws;
+        // A worker whose lead is not listed still heads a lead row.
+        const lead = root.role !== 'talk';
+        const id = `${lead ? 'lead' : 'talk'}:${root.key}${home ? '' : `@${ws}`}`;
+        let row = rows.get(id);
         if (!row) {
-            // A worker whose lead is not listed still heads a lead row.
-            const lead = root.role !== 'talk';
             const goal = lead ? goals?.find(g => g.leadId === root.agentId) ?? null : null;
             row = {
-                id: `${lead ? 'lead' : 'talk'}:${root.key}`, kind: lead ? 'lead' : 'talk', title: goal?.name ?? root.name,
-                goalId: goal?.id ?? null, lead: lead ? root : null, members: [], cap: lead ? goal?.cap ?? CHILD_CAP : null,
-                freeSeats: null, live: false
+                id, workspaceId: ws, kind: lead ? 'lead' : 'talk', title: goal?.name ?? root.name, goalId: goal?.id ?? null,
+                lead: lead ? root : null, members: [], cap: lead && home ? goal?.cap ?? CHILD_CAP : null, freeSeats: null, live: false
             };
-            rows.set(root, row);
+            rows.set(id, row);
         }
         if (m === root) row.members.unshift(m); else row.members.push(m);
         row.live ||= m.live;
     }
     for (const row of rows.values()) {
         const lead = row.lead;
-        if (lead && row.cap != null) row.freeSeats = Math.max(0, row.cap - row.members.filter(m => m.live && m.parentId === lead.agentId).length);
+        if (lead && row.cap != null) row.freeSeats = Math.max(0, row.cap - members.filter(m => m.live && m.parentId === lead.agentId).length);
     }
-    return rows;
+    return [...rows.values()];
 }

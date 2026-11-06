@@ -1,8 +1,9 @@
 /** The 需要你 queue (build plan §G2, Gap N). Derived from c9p facts:
  * `SessionView` NeedsAttention (approval → 允許, question → 決定, else 處理),
- * `agent.attention` events and open `msg` requests sent to a human (決定).
- * 審 and 給 exist only in the demo gaps file. One item per member. */
-import type { C9pAgentAttentionEvent, C9pMsgSummary } from '$lib/c9p-1';
+ * open `agent.attention` events (處理) and open `msg` requests sent to a
+ * human (決定). 審 and 給 exist only in the demo gaps file. One item per member. */
+import type { C9pAgentAttentionEvent, C9pAgentRow, C9pAgentTurnEndEvent, C9pMsgSummary } from '$lib/c9p-1';
+import { agentIdOf, needsAttention as mailNeedsLook } from '$lib/data/mail-store';
 import type { DemoNeed, NeedVerb } from './gaps-demo';
 import type { Member } from './rooms';
 
@@ -13,8 +14,12 @@ export type PermissionAsk = {
     agentId: string | null;
     toolName: string;
     toolInput: unknown;
-    /** From `agent.attention` when a hook raised it; null otherwise. */
-    toolUseId: unknown;
+    /** Always null today: no c9p fact ties a pending prompt to its
+     * `tool_use_id` (`hook.permission_request` emits no attention; an
+     * `agent.attention` toolUseId belongs to another call, such as an
+     * auto-mode denial). The answer method must supply it. */
+    toolUseId: null;
+    /** The agent row's current generation; null without an agent row. */
     generation: number | null;
 };
 
@@ -38,6 +43,39 @@ export type Need = {
 
 export type AttentionSeen = { event: C9pAgentAttentionEvent; at: number };
 
+/** One slot per agent, reason kind and mail: a newer event of the same kind
+ * replaces the older one. */
+export const attentionKey = (e: C9pAgentAttentionEvent) => `${e.id}|${e.reason.split(':')[0]}|${e.msgId ?? ''}`;
+
+export type AttentionFacts = {
+    agents: ReadonlyMap<string, C9pAgentRow>;
+    mail: ReadonlyMap<string, C9pMsgSummary>;
+    /** The last `agent.turn_end` per agent id. */
+    turnEnds: ReadonlyMap<string, C9pAgentTurnEndEvent>;
+};
+
+/** The attention events still open. An event is cleared when:
+ * - its agent is listed as gone, retired or failed;
+ * - its agent's generation is newer than the event's (a restart);
+ * - it names a mail (`mail_uncertain`, `mail_held`) and that mail is listed
+ *   and no longer needs a look (not uncertain, failed or held);
+ * - it is `mail_paused` and the agent row says `mailPaused: false`;
+ * - it names no mail (`auto_mode_denied` and other hook reasons) and the
+ *   agent ended a turn after it, in the same or a newer generation.
+ * The detected status (working, waiting) never clears an event. */
+export function openAttention(seen: AttentionSeen[], { agents, mail, turnEnds }: AttentionFacts): AttentionSeen[] {
+    return seen.filter(({ event: e, at }) => {
+        const a = agents.get(e.id);
+        const gen = typeof e.generation === 'number' ? e.generation : null;
+        if (a && (a.goneAt != null || a.state === 'retired' || a.state === 'failed')) return false;
+        if (a && gen != null && a.generation > gen) return false;
+        if (e.msgId) { const m = mail.get(e.msgId); return !m || mailNeedsLook(m); }
+        if (e.reason === 'mail_paused') return a?.mailPaused !== false;
+        const end = turnEnds.get(e.id);
+        return !(end && end.at > at && (gen == null || end.generation >= gen));
+    });
+}
+
 const TAG: Record<NeedVerb, string> = { 允許: '等你允許', 決定: '等你決定', 處理: '卡住', 給: '等你給', 審: '等你審' };
 const ASK_TOOLS = new Set(['AskUserQuestion']);
 const CLOSED_MAIL = new Set(['failed', 'rejected', 'expired', 'cancelled']);
@@ -51,6 +89,7 @@ function toolTitle(name: string, input: unknown): string {
 export type NeedsInput = {
     members: Member[];
     workspaceOf: (m: Member) => string;
+    /** Open events only (`openAttention`). */
     attention?: AttentionSeen[];
     mail?: C9pMsgSummary[];
     /** Demo only. Null in live mode, so no demo verb can show. */
@@ -64,36 +103,36 @@ export function deriveNeeds({ members, workspaceOf, attention = [], mail = [], d
         if (byKey.has(m.key)) return;
         byKey.set(m.key, { id: `need:${m.key}`, memberKey: m.key, agentId: m.agentId, sessionKey: m.sessionKey, workspaceId: workspaceOf(m), blocking: null, tag: TAG[n.verb], msgId: null, ...n });
     };
-    const latest = new Map<string, AttentionSeen>();
-    for (const a of attention) if ((latest.get(a.event.id)?.at ?? -Infinity) <= a.at) latest.set(a.event.id, a);
 
     for (const m of members) {
         const s = m.session;
         if (!m.live || !s || s.status !== 'NeedsAttention') continue;
-        const hook = m.agentId ? latest.get(m.agentId) : undefined;
         const w = s.waitingFor;
         const tool = s.pendingToolName ?? (w?.kind === 'approval' ? w.tool : null);
         const since = Date.parse(s.modified) || m.seenAt;
         if (w?.kind === 'question' || (tool && ASK_TOOLS.has(tool))) {
             add(m, { verb: '決定', title: toolTitle(tool ?? '', s.pendingToolInput) || s.latestMessage, since, source: 'session', permission: null });
         } else if (tool) {
-            const permission = { sessionKey: m.sessionKey, agentId: m.agentId, toolName: tool, toolInput: s.pendingToolInput, toolUseId: hook?.event.toolUseId ?? null, generation: hook?.event.generation ?? null };
+            const permission: PermissionAsk = { sessionKey: m.sessionKey, agentId: m.agentId, toolName: tool, toolInput: s.pendingToolInput, toolUseId: null, generation: m.agent?.generation ?? null };
             add(m, { verb: '允許', title: toolTitle(tool, s.pendingToolInput), since, source: 'session', permission });
         } else {
-            add(m, { verb: '處理', title: hook?.event.reason ?? s.latestMessage, since, source: 'session', permission: null });
+            add(m, { verb: '處理', title: s.latestMessage, since, source: 'session', permission: null });
         }
     }
-    // An attention event counts only while its agent still needs you.
-    for (const { event, at } of latest.values()) {
+    // Newest open event first, whatever the detected status says.
+    for (const { event, at } of [...attention].sort((a, b) => b.at - a.at)) {
         const m = byAgent.get(event.id);
-        if (m?.live && m.agent?.status === 'needs_attention') add(m, { verb: '處理', title: event.reason, since: at, source: 'attention', permission: null });
+        if (m?.live) add(m, { verb: '處理', title: event.reason, since: at, source: 'attention', permission: null, msgId: event.msgId ?? null });
     }
     const humans = new Set(members.filter(m => m.role === 'human').map(m => m.agentId));
     const answered = new Set(mail.map(x => x.replyTo).filter(Boolean));
+    const named = (name: string | null) => { const hit = name ? members.filter(m => m.agentId && m.name === name) : []; return hit.length === 1 ? hit[0] : undefined; };
     for (const x of mail) {
         if (x.kind !== 'request' || !humans.has(x.to.id) || CLOSED_MAIL.has(x.state) || answered.has(x.msgId)) continue;
-        const from = members.find(m => m.agentId && (x.from.addr?.endsWith(`/${m.agentId}`) || x.from.name === m.name));
-        if (from) add(from, { verb: '決定', title: x.preview, since: x.createdAt, source: 'mail', permission: null, msgId: x.msgId });
+        // By address; a name only when there is no address and it is unique.
+        const id = agentIdOf(x.from.addr);
+        const from = id ? byAgent.get(id) : named(x.from.name);
+        if (from?.live) add(from, { verb: '決定', title: x.preview, since: x.createdAt, source: 'mail', permission: null, msgId: x.msgId });
     }
     // Demo text wins over a derived verb for the same agent; the facts stay.
     for (const d of demo ?? []) {

@@ -2,11 +2,11 @@
  * the last change log, and keeps the change log it gets back.
  * `gaps` is the demo gaps file and only the glass fixture may pass it; in
  * live mode it is null, so no demo goal, name, verb or verifier can show. */
-import type { C9pAgentRow, C9pMsgSummary, C9pSessionView } from '$lib/c9p-1';
+import type { C9pAgentRow, C9pAgentTurnEndEvent, C9pMsgSummary, C9pSessionView } from '$lib/c9p-1';
 import type { DemoGoal, DemoNeed, DemoWorkspace } from './gaps-demo';
 import { workspaceFor, type Workspace } from './workspaces';
 import { buildMembers, buildRows, type Member, type Row } from './rooms';
-import { deriveNeeds, sortNeeds, type AttentionSeen, type Need } from './needs';
+import { deriveNeeds, openAttention, sortNeeds, type AttentionSeen, type Need } from './needs';
 import { isStale, trackChanges, type ChangeLog } from './stale';
 
 export type Gaps = { workspaces: DemoWorkspace[]; goals: DemoGoal[]; needs: DemoNeed[] };
@@ -18,7 +18,9 @@ export type GlassModel = { workspaces: WorkspaceView[]; needs: Need[]; changes: 
 export type ModelInput = {
     sessions: C9pSessionView[];
     agents: C9pAgentRow[];
+    /** Raw events; the model keeps the open ones (`openAttention`). */
     attention?: AttentionSeen[];
+    turnEnds?: ReadonlyMap<string, C9pAgentTurnEndEvent>;
     mail?: C9pMsgSummary[];
     gaps?: Gaps | null;
     changes?: ChangeLog;
@@ -27,7 +29,7 @@ export type ModelInput = {
 
 const sig = (m: Member) => `${m.status}|${m.session?.waitingFor?.kind ?? ''}|${m.session?.pendingToolName ?? ''}|${m.agent?.state ?? ''}`;
 
-export function deriveGlassModel({ sessions, agents, attention, mail, gaps = null, changes = new Map(), now }: ModelInput): GlassModel {
+export function deriveGlassModel({ sessions, agents, attention = [], turnEnds = new Map(), mail = [], gaps = null, changes = new Map(), now }: ModelInput): GlassModel {
     const members = buildMembers(sessions, agents);
     const nextChanges = trackChanges(changes, members.map(m => ({ key: m.key, sig: sig(m), seenAt: m.seenAt })), now);
     const wsByRoot = new Map<string, Workspace>();
@@ -41,12 +43,10 @@ export function deriveGlassModel({ sessions, agents, attention, mail, gaps = nul
         return [m, { ...m, workspaceId: wsOf(m).id, lastChange, stale: m.live && isStale(m.status === 'working', lastChange, now) }];
     }));
     const rowsByWs = new Map<string, RowView[]>();
-    for (const row of buildRows(members, gaps?.goals ?? null).values()) {
-        const lead = row.lead ? views.get(row.lead)! : null;
-        const first = views.get(row.members[0])!;
-        const list = rowsByWs.get(first.workspaceId) ?? [];
-        list.push({ ...row, lead, members: row.members.map(m => views.get(m)!) });
-        rowsByWs.set(first.workspaceId, list);
+    for (const row of buildRows(members, gaps?.goals ?? null, m => views.get(m)!.workspaceId)) {
+        const list = rowsByWs.get(row.workspaceId) ?? [];
+        list.push({ ...row, lead: row.lead ? views.get(row.lead)! : null, members: row.members.map(m => views.get(m)!) });
+        rowsByWs.set(row.workspaceId, list);
     }
     const order: string[] = gaps?.workspaces.map(w => w.id) ?? [];
     const rank = (w: Workspace) => { const i = order.indexOf(w.id); return i < 0 ? order.length : i; };
@@ -54,6 +54,7 @@ export function deriveGlassModel({ sessions, agents, attention, mail, gaps = nul
         .filter(w => rowsByWs.has(w.id))
         .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name) || a.root.localeCompare(b.root))
         .map(w => ({ ...w, rows: rowsByWs.get(w.id)! }));
-    const needs = sortNeeds(deriveNeeds({ members, workspaceOf: m => views.get(m)!.workspaceId, attention, mail, demo: gaps?.needs ?? null }));
+    const open = openAttention(attention, { agents: new Map(agents.map(a => [a.id, a])), mail: new Map(mail.map(m => [m.msgId, m])), turnEnds });
+    const needs = sortNeeds(deriveNeeds({ members, workspaceOf: m => views.get(m)!.workspaceId, attention: open, mail, demo: gaps?.needs ?? null }));
     return { workspaces, needs, changes: nextChanges };
 }
