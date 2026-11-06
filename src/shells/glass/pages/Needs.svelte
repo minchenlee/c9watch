@@ -23,7 +23,7 @@
     //   send (`canSend`).
     import { onDestroy, onMount } from 'svelte';
     import { get } from 'svelte/store';
-    import { dataError, fixtureOn, model } from '../data';
+    import { dataError, fixtureOn, hideRetiredSession, model } from '../data';
     import { usePageKeys, type PageKeys } from '../keys';
     import { openSession, retireAgent } from '$lib/data/api';
     import { sessionFromView } from '$lib/data/session';
@@ -34,7 +34,7 @@
     import UndoToasts from '../handling/UndoToasts.svelte';
     import { answerBody, answerLabel, buildDetail, emptyAnswer, locate, noBody, waitText, type HandlingDetail } from '../handling/detail';
     import { SendQueue, stepFrom, type Pending, type QueueEvent } from '../handling/actions';
-    import { ORPHANED, handled, lockStop, markHandled, retireError, stopping, unlockStop, unmarkHandled } from '../handling/handled';
+    import { ALREADY_FAILED, ORPHANED, handled, lockStop, markHandled, retireError, stopping, unlockStop, unmarkHandled } from '../handling/handled';
     import { getCurrentWindow } from '$lib/data/platform';
 
     // Demo details only while the glass fixture is on: live mode never shows them.
@@ -224,6 +224,10 @@
         // Second check, and the lock is taken before any await: one stop per
         // agent, whatever item the person moves to meanwhile.
         if (!lockStop(agentId)) return;
+        // The item's place and 「下一件」 before the await: a feed refresh
+        // during the call may drop the item from `order`.
+        const place = { index: Math.max(0, order.indexOf(d.id)), total: details.length, nextId: stepFrom(order, hiddenIds, d.id, 1) };
+        const sessionKey = needs.find(x => x.id === d.id)?.sessionKey ?? null;
         let row;
         try { row = await retireAgent(agentId); }
         catch (e) { throw retireError(e); }
@@ -231,6 +235,11 @@
         // Core could not confirm that every process is gone: no receipt, the
         // item stays, and the person can press 停止 again.
         if (row?.state === 'orphaned') throw { notice: ORPHANED };
+        // A `failed` row comes back unchanged: the agent had already ended,
+        // so this was no normal end. Any other state is not an end at all.
+        if (row?.state === 'failed') { hideRetiredSession(sessionKey); throw { notice: ALREADY_FAILED }; }
+        if (row?.state !== 'retired') throw { notice: `沒有停止：核心回報的狀態是 ${row?.state ?? '（沒有）'}，不是已結束。` };
+        hideRetiredSession(sessionKey);
         const at = new Date();
         const rows: [string, string][] = [
             ['做了什麼', `正常結束了 ${d.who}`],
@@ -244,7 +253,7 @@
         // The snapshot, only while the person still looks at this item.
         if (currentId === d.id || (current?.id === d.id)) {
             currentId = d.id;
-            shown = { detail: d, receipt: r, index: Math.max(0, order.indexOf(d.id)), total: details.length, nextId: stepFrom(order, hiddenIds, d.id, 1) };
+            shown = { detail: d, receipt: r, ...place };
         }
         finish(d, null, 'stopped');
     }

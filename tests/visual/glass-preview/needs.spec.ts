@@ -25,10 +25,12 @@ async function openNeeds(page: Page, storage: Record<string, string> = glass, se
  * (the shared IPC mock refuses mail) and `agent.retire` (D42). `slowStop`
  * holds `agent.retire` until the page calls `__C9_RELEASE_STOP__()`.
  * `retire`: 'retired' (default), 'orphaned once' (the first retire returns
- * an `orphaned` row) or 'unknown' (an older core: `unknown_method`).
+ * an `orphaned` row), 'retired, unlisted' (after the retire `agent.list`
+ * no longer lists the agent, as core's default list does), 'failed' (the
+ * row comes back `failed`) or 'unknown' (an older core: `unknown_method`).
  * Runs before the IPC mock. */
 const MANAGED = { id: 'agt_01VISUALMANAGED', sessionKey: 'claudeCode:0b6c1f0e-1111-4a2b-9c3d-000000000003' };
-type Retire = 'retired' | 'orphaned once' | 'unknown';
+type Retire = 'retired' | 'retired, unlisted' | 'orphaned once' | 'failed' | 'unknown';
 async function live(page: Page, failAgentList = false, managed = false, slowStop = false, retire: Retire = 'retired') {
 	await page.addInitScript(([fail, managed, M, slow, retire]) => {
 		let retires = 0, gone = false;
@@ -39,6 +41,7 @@ async function live(page: Page, failAgentList = false, managed = false, slowStop
 			calls.push({ cmd, args });
 			if (fail && cmd === 'c9p_request' && args?.method === 'agent.list') throw { code: 'unavailable', msg: 'core is gone', retryable: true, hint: '' };
 			// D42: after a confirmed retire the row is `retired` (gone), as core lists it.
+			if (managed && cmd === 'c9p_request' && args?.method === 'agent.list' && gone && retire === 'retired, unlisted') return { agents: [] };
 			if (managed && cmd === 'c9p_request' && args?.method === 'agent.list')
 				return { agents: [{ id: M.id, sessionKey: M.sessionKey, name: 'w-cache', role: 'worker', parentId: null, cwd: '/Users/visual/projects/api-server', source: 'engine', control: 'pty', mode: 'managed', state: gone ? 'retired' : 'ready', status: 'needs_attention', generation: 1, goneAt: gone ? Date.now() : null, lastSeen: Date.now(), createdAt: Date.now() - 3_600_000, mailPaused: false }] };
 			// Keep the agent.* stream channel, so a test can send agent.upsert.
@@ -47,7 +50,7 @@ async function live(page: Page, failAgentList = false, managed = false, slowStop
 				return { cursor: 'visual:send:1', msgId: 'msg_01VISUAL', paused: false, replayed: false, state: 'queued', to: { addr: `m/${args.params.to}`, id: args.params.to, name: 'w-cache' } };
 			if (managed && cmd === 'c9p_request' && args?.method === 'agent.retire') {
 				if (retire === 'unknown') throw { code: 'unknown_method', msg: 'unknown method agent.retire', retryable: false, hint: '' };
-				const state = retire === 'orphaned once' && ++retires === 1 ? 'orphaned' : 'retired';
+				const state = retire === 'failed' ? 'failed' : retire === 'orphaned once' && ++retires === 1 ? 'orphaned' : 'retired';
 				if (state === 'retired') gone = true;
 				const row = { agent: { id: args.params.id, sessionKey: M.sessionKey, name: 'w-cache', state, goneAt: state === 'retired' ? Date.now() : null } };
 				if (slow) return new Promise(res => ((window as any).__C9_RELEASE_STOP__ = () => res(row)));
@@ -385,27 +388,46 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		expect(await calls(page, 'msg.send')).toEqual([]);
 	});
 
-	test('D42 live: the receipt stays after agent.upsert drops the retired agent\'s item', async ({ page }) => {
-		await live(page, false, true);
+	for (const shape of ['retired', 'retired, unlisted'] as const) {
+		test(`D42 live: the receipt stays after agent.upsert (${shape}); the stopped item does not come back`, async ({ page }) => {
+			await live(page, false, true, false, shape);
+			await openNeeds(page, { 'ui.shell': 'glass' });
+			const item = page.locator('.queue .qi', { hasText: 'rate limiter' });
+			await item.click();
+			const place = await panel(page).locator('.prog .n').innerText();
+			await panel(page).locator('[data-stop]').click();
+			await panel(page).locator('[data-stop-confirm]').click();
+			await expect(panel(page).locator('.card h2')).toHaveText('✓ 已停止 w-cache');
+			const lists = (await calls(page, 'agent.list')).length;
+			await page.evaluate(() => (window as any).__C9_AGENT_CH__.onmessage({ v: 1, type: 'event', sub: 'visual-sub', topic: 'agent.upsert', subject: 'agt_01VISUALMANAGED', cursor: 'visual:2', ts: Date.now(), data: {} }));
+			await expect.poll(async () => (await calls(page, 'agent.list')).length).toBeGreaterThan(lists);
+			await page.clock.runFor(5_000);
+			const r = panel(page);
+			await expect(r.locator('.card h2')).toHaveText('✓ 已停止 w-cache');
+			await expect(r.locator('.kv')).toContainText(MANAGED.id);
+			// The place the item had when 停止 was pressed.
+			await expect(r.locator('.prog .n')).toHaveText(place);
+			// The session view is still listed (no session.gone yet), but the
+			// stopped item does not come back as an observed one.
+			await expect(item).toHaveCount(0);
+			// J leaves the receipt for the 「下一件」 it names.
+			const nextText = (await r.locator('.nx').innerText()).replace(/^下一件：/, '');
+			await page.keyboard.press('KeyJ');
+			await expect(r.locator('.card h2')).toHaveCount(0);
+			await expect(r.locator('.ask h2')).toHaveText(nextText);
+			await expect(item).toHaveCount(0);
+		});
+	}
+
+	test('D42 live: a failed row from agent.retire is no receipt and says the agent had already ended', async ({ page }) => {
+		await live(page, false, true, false, 'failed');
 		await openNeeds(page, { 'ui.shell': 'glass' });
 		await page.locator('.queue .qi', { hasText: 'rate limiter' }).click();
 		await panel(page).locator('[data-stop]').click();
 		await panel(page).locator('[data-stop-confirm]').click();
-		await expect(panel(page).locator('.card h2')).toHaveText('✓ 已停止 w-cache');
-		const lists = (await calls(page, 'agent.list')).length;
-		await page.evaluate(() => (window as any).__C9_AGENT_CH__.onmessage({ v: 1, type: 'event', sub: 'visual-sub', topic: 'agent.upsert', subject: 'agt_01VISUALMANAGED', cursor: 'visual:2', ts: Date.now(), data: {} }));
-		await expect.poll(async () => (await calls(page, 'agent.list')).length).toBeGreaterThan(lists);
-		// The model dropped the Need: the queue no longer lists it.
-		await expect(page.locator('.queue .qi', { hasText: 'rate limiter' })).toHaveCount(0);
-		await page.clock.runFor(5_000);
-		const r = panel(page);
-		await expect(r.locator('.card h2')).toHaveText('✓ 已停止 w-cache');
-		await expect(r.locator('.kv')).toContainText(MANAGED.id);
-		// J leaves the receipt for the 「下一件」 it names.
-		const nextText = (await r.locator('.nx').innerText()).replace(/^下一件：/, '');
-		await page.keyboard.press('KeyJ');
-		await expect(r.locator('.card h2')).toHaveCount(0);
-		await expect(r.locator('.ask h2')).toHaveText(nextText);
+		await expect(panel(page).locator('.notice')).toHaveText('沒有停止：這個 agent 在停止前已經失敗結束了。');
+		await expect(panel(page).locator('.card h2')).toHaveCount(0);
+		expect(await calls(page, 'session.stop')).toEqual([]);
 	});
 
 	test('D42 live: an orphaned retire is no receipt; 停止 again retries', async ({ page }) => {

@@ -37,6 +37,9 @@ export function unlockStop(key: string) {
 
 /** The panel notice when `agent.retire` returns an `orphaned` row. */
 export const ORPHANED = '未確認結束，可再試一次。';
+/** The panel notice when `agent.retire` returns a `failed` row: the agent
+ * had already ended on its own, so nothing was stopped. */
+export const ALREADY_FAILED = '沒有停止：這個 agent 在停止前已經失敗結束了。';
 /** A core that cannot retire: older than the bridge, or a bridge that does
  * not expose `agent.retire`. There is no fallback to `session.stop`. */
 const NO_RETIRE = new Set(['unknown_method', 'not_allowed', 'core_unavailable']);

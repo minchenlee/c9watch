@@ -101,7 +101,11 @@ G5 actions (`handling/actions.ts`, pure, `scripts/test-glass-handling.mjs`):
   there is no fallback. The GUI bridge lets only the main window call it
   (`GUI_AGENT_METHODS`) and forwards only `{id}` (any other field, `force`
   included, is `bad_request`). The receipt is a snapshot: it stays after the
-  retired agent's item leaves the model, until J / K, a click or leaving. The stop lock is per agent id (`handling/handled.ts`), taken
+  retired agent's item leaves the model, until J / K, a click or leaving.
+  The place and 「下一件」 are taken before the call. A `failed` row is no
+  receipt (「…已經失敗結束了」). The retired session's view is hidden from
+  the model (`retiredSessions` in `data.ts`) until the session feed drops
+  it, so the item does not come back as an observed session. The stop lock is per agent id (`handling/handled.ts`), taken
   before the call, so switching items cannot start a second stop. The receipt does not take ⌘↵; J goes to the 「下一件」 it names.
 - 給: c9watch does not send keys (a key sent as mail stays in the mail
   log); 「我沒有這把 key」 can be sent.
