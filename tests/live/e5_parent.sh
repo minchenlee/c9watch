@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Live checks for E5, an agent creates and retires its own children
 # (PR #226). It runs steps 1-5 of docs/e5-agent-parent-manual-test.md, and
-# step 6 (limits) with --limits, and prints one PASS/FAIL line per check.
+# step 6 (limits) with --limits, and step 7 (the E1 spawn overlay, c9p
+# 1.14). It prints one PASS/FAIL line per check.
 # It exits 1 when any check fails.
 #
 # Costs no model prompts (PROMPTS stays 0): the script types `!<command>`
@@ -158,7 +159,7 @@ log "ROOT=$ROOT"
 
 # --- dirs. 3b plants a project hook and an MCP server in a/h, standing in
 # for the parent, which can write there.
-mkdir -p "$R"/a/c/g "$R"/a/k "$R"/a/h/.claude "$R"/a/.git/x "$R"/b
+mkdir -p "$R"/a/c/g "$R"/a/k "$R"/a/h/.claude "$R"/a/.git/x "$R"/b "$R"/e1/c "$R"/e1/locked
 printf '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"touch %s/pwned"}]}]}}\n' "$ROOT" >"$R/a/h/.claude/settings.json"
 printf '{"mcpServers":{"x":{"command":"touch","args":["%s/pwned-mcp"]}}}\n' "$ROOT" >"$R/a/h/.mcp.json"
 
@@ -461,9 +462,11 @@ params "$R/b" "$R" "$R/b" >"$D/outside.json"
 params "$R/a" "$R" "$R/a" >"$D/owncwd.json"
 params "$R/a/.git/x" "$R" "$R/a/.git/x" >"$D/git.json"
 params "$R/a/k" "$R/a" "$R/a/k" >"$D/looser.json"
-params "$R/a/k" "$R" "$R/a/k" ',"overlay":{}' >"$D/extra.json"
+params "$R/a/k" "$R" "$R/a/k" ',"settings":{}' >"$D/extra.json"
+# E1: an agent may pass an overlay, but not its child's model.
+params "$R/a/k" "$R" "$R/a/k" ',"overlay":{"model":"sonnet"}' >"$D/model.json"
 params "$R/a/k" "$R" "$R/a/k" >"$D/good.json"
-for c in noguard outside owncwd git looser extra; do
+for c in noguard outside owncwd git looser extra model; do
     refusal "3-$c" "$PA" "$R/a" not_allowed "\"\$B\" child create --params - <$c.json"
 done
 # The doc's "another binary": the CLI from the parent's Bash. The CLI
@@ -603,6 +606,120 @@ else
     bad 5-audit "$detail; want allow>=3 deny>=8 retire-deny>=2 retire-allow>=1 parent-gone>=$want_g, one naming parent $PA and one naming parent ${C1:-none}"
 fi
 q "SELECT principal, method, target, decision, reason FROM audit WHERE method LIKE 'agent.%' ORDER BY seq" >"$EV/5-audit-agent.txt"
+
+# ---------------------------------------------------------------- step 7
+# E1: a root with an overlay, its child, and a restart. Checks what the
+# engine writes (agent.list, the spawn settings file, the CC argv, the
+# audit row). Whether CC enforces the added rules is not checked here: a
+# `!` command runs outside CC's permissions and sandbox (cc_sandbox.sh
+# c01-control), and the rules use the same settings keys as the engine's
+# own, which earlier live runs checked.
+E1_DENY='Bash(curl:*)'
+E1_LOCK="$R/e1/locked"
+E1_OV=$(printf '{"model":"sonnet","permissionsDeny":["%s"],"sandboxDenyWrite":["%s"],"standingOrders":"E1 live test: caller orders."}' "$E1_DENY" "$E1_LOCK")
+# The overlay field of `id` from agent.list, as compact sorted JSON.
+overlay_of() {
+    alist | python3 -I -c '
+import json, sys
+r = json.load(sys.stdin)
+for a in (r.get("result") or {}).get("agents", []):
+    if a["id"] == sys.argv[1]:
+        print(json.dumps(a.get("overlay"), sort_keys=True, separators=(",", ":"))); break
+else:
+    print("missing")' "$1" 2>/dev/null
+}
+# The last entry of permissions.deny and of denyWrite in a spawn file, and
+# whether the engine's own .claude rule for `cwd` is still there.
+spawn_tail() { # file cwd n
+    python3 -I - "$1" "$2" "$3" <<'PY' 2>/dev/null
+import json, sys
+f, cwd, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+s = json.load(open(f))
+deny = s["permissions"]["deny"]; dw = s["sandbox"]["filesystem"]["denyWrite"]
+own = "Edit(/%s/.claude/**)" % cwd in deny and cwd + "/.claude" in dw
+print(json.dumps({"deny": deny[-n:], "denyWrite": dw[-1:], "own": own}, separators=(",", ":")))
+PY
+}
+want_ov() { # model deny-json dw-json [orders] -> the overlay JSON agent.list should give
+    python3 -I -c '
+import json, sys
+o = {"model": sys.argv[1], "permissionsDeny": json.loads(sys.argv[2]), "sandboxDenyWrite": json.loads(sys.argv[3])}
+if len(sys.argv) > 4: o["standingOrders"] = sys.argv[4]
+print(json.dumps(o, sort_keys=True, separators=(",", ":")))' "$@"
+}
+EA=
+out=$(rpc agent.create "$(params "$R/e1" "$R" "$R/e1" ",\"name\":\"e1-root\",\"overlay\":$E1_OV")" 120)
+echo "$out" >"$EV/create-e1-root.json"
+EA=$(echo "$out" | python3 -I -c 'import json,sys; r=json.load(sys.stdin); print(r["result"]["agent"]["id"] if r.get("ok") else "")' 2>/dev/null)
+if [ -z "$EA" ] || [ "$(state_of "$EA")" != ready ]; then
+    bad 7-root "agent.create with an overlay failed: $(cut -c1-300 "$EV/create-e1-root.json")"
+else
+    ROOTS+=("$EA")
+    got=$(overlay_of "$EA")
+    want=$(want_ov sonnet "[\"$E1_DENY\"]" "[\"$E1_LOCK\"]" "E1 live test: caller orders.")
+    if [ "$got" = "$want" ]; then ok 7-root "$EA is ready; agent.list overlay $got"; else bad 7-root "agent.list overlay $got, want $want"; fi
+    tail=$(spawn_tail "$H/spawn/$EA-1.json" "$R/e1" 1)
+    cp "$H/spawn/$EA-1.json" "$EV/7-root-settings.json" 2>/dev/null
+    if [ "$tail" = "{\"deny\":[\"$E1_DENY\"],\"denyWrite\":[\"$E1_LOCK\"],\"own\":true}" ]; then
+        ok 7-settings "the overlay entries come after the engine's own in the spawn file"
+    else
+        bad 7-settings "spawn file tail $tail"
+    fi
+    args=$(agent_args "$EA")
+    echo "$args" >"$EV/7-root-args.txt"
+    if printf '%s' "$args" | grep -qE -- '--model sonnet( |$)'; then ok 7-args "the CC args carry --model sonnet"; else bad 7-args "no --model sonnet in: $(printf '%s' "$args" | cut -c1-240)"; fi
+    ar=$(q "SELECT reason || ' | ' || coalesce(payload_hash, '-') FROM audit WHERE method = 'agent.create' AND decision = 'allow' AND target = '$EA'")
+    case "$ar" in
+    *"overlay {"*"| "[0-9a-f]*) ok 7-audit "the create audit row records the overlay and its hash" ;;
+    *) bad 7-audit "create audit row: $(printf '%s' "$ar" | cut -c1-240)" ;;
+    esac
+    # The caller text reaches the agent through SessionStart; CC may or may
+    # not write hook context into the transcript, so this is INFO only.
+    sid=$(field "$EA" providerSid)
+    if ls "$HOME"/.claude/projects/*/"$sid".jsonl >/dev/null 2>&1 &&
+        grep -qF '[end caller orders]' "$HOME"/.claude/projects/*/"$sid".jsonl 2>/dev/null; then
+        info 7-orders "the transcript holds the fenced caller orders"
+    else
+        info 7-orders "no '[end caller orders]' in the transcript of $sid (CC may not record hook context)"
+    fi
+    # A child: no model of its own; it gets the parent's model and denies.
+    mkdir -p "$R/e1/out"
+    params "$R/e1/c" "$R" "$R/e1/c" ',"overlay":{"permissionsDeny":["WebFetch"]}' >"$R/e1/out/c.json"
+    EC=$(child_ok 7-child "$EA" "$R/e1" c.json "$EA")
+    if [ -n "$EC" ]; then
+        got=$(overlay_of "$EC")
+        want=$(want_ov sonnet "[\"$E1_DENY\",\"WebFetch\"]" "[\"$E1_LOCK\"]")
+        tail=$(spawn_tail "$H/spawn/$EC-1.json" "$R/e1/c" 2)
+        cargs=$(agent_args "$EC")
+        echo "$cargs" >"$EV/7-child-args.txt"
+        if [ "$got" != "$want" ]; then
+            bad 7-inherit "child overlay $got, want $want"
+        elif [ "$tail" != "{\"deny\":[\"$E1_DENY\",\"WebFetch\"],\"denyWrite\":[\"$E1_LOCK\"],\"own\":true}" ]; then
+            bad 7-inherit "child spawn file tail $tail"
+        elif ! printf '%s' "$cargs" | grep -qE -- '--model sonnet( |$)'; then
+            bad 7-inherit "the child's args lack --model sonnet"
+        else
+            ok 7-inherit "child $EC runs with the parent's model and denies plus its own"
+        fi
+    else
+        bad 7-inherit "not run: no child"
+    fi
+    params "$R/e1/c" "$R" "$R/e1/c" ',"overlay":{"model":"haiku"}' >"$R/e1/out/cm.json"
+    refusal 7-child-model "$EA" "$R/e1" not_allowed '"$B" child create --params - <cm.json'
+    # A restart resumes with the same overlay.
+    if "$C9" engine restart >"$EV/7-restart.json" 2>&1 && wait_state "$EA" ready 120; then
+        gen=$(field "$EA" generation)
+        tail=$(spawn_tail "$H/spawn/$EA-$gen.json" "$R/e1" 1)
+        if [ "$gen" -ge 2 ] && [ "$tail" = "{\"deny\":[\"$E1_DENY\"],\"denyWrite\":[\"$E1_LOCK\"],\"own\":true}" ] &&
+            agent_args "$EA" | grep -qE -- '--resume .*--model sonnet( |$)'; then
+            ok 7-resume "generation $gen resumed with the same overlay and --model"
+        else
+            bad 7-resume "generation $gen, spawn file tail $tail, args: $(agent_args "$EA" | cut -c1-240)"
+        fi
+    else
+        bad 7-resume "the engine restart failed or $EA is '$(state_of "$EA")'"
+    fi
+fi
 
 # ---------------------------------------------------------------- step 6
 if [ "$LIMITS" = 1 ]; then
