@@ -98,6 +98,9 @@ pub mod guard;
 pub mod lineage;
 
 #[cfg(unix)]
+pub mod overlay;
+
+#[cfg(unix)]
 pub mod standing;
 
 #[cfg(unix)]

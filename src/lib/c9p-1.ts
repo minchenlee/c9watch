@@ -2,7 +2,7 @@
 // The engine (src-tauri/core/src/engine/proto.rs) is the source of truth.
 
 export const C9P_API_MAJOR = 1;
-export const C9P_API_MINOR = 13;
+export const C9P_API_MINOR = 14;
 
 /** `agent.attention` data: an agent needs the user. */
 export interface C9pAgentAttentionEvent {
@@ -40,6 +40,13 @@ export interface C9pAgentCreateParams {
    * the live engine agents.
    */
   name?: string | null;
+  /**
+   * Additions to the spawn under the engine's rules (`AgentOverlay`).
+   * An agent may pass all but `model`; its child always gets the
+   * parent's `permissionsDeny` and `sandboxDenyWrite` as well, so a
+   * child is never less restricted than its parent.
+   */
+  overlay?: C9pAgentOverlay | null;
   /**
    * Capability tokens the spawned Claude Code must have (see
    * `AgentRow.capabilities`). A missing one answers `unsupported` and
@@ -94,6 +101,41 @@ export interface C9pAgentListParams {
 /** `agent.list` result, in creation order. */
 export interface C9pAgentListResult {
   agents: C9pAgentRow[];
+}
+
+/**
+ * Caller additions to one agent's spawn, applied under the engine's own
+ * rules: each field can only add a restriction, pick a model or add
+ * text. Nothing here can allow a tool, a path, a hook, an env var or an
+ * MCP server. Unknown fields are refused.
+ */
+export interface C9pAgentOverlay {
+  /**
+   * The Claude Code `--model`: 1 to 64 of letters, digits, `.`, `_`,
+   * `-`, `[` and `]`. Not from an agent: a child of an agent runs the
+   * parent's model.
+   */
+  model?: string | null;
+  /**
+   * Claude Code permission rules added to the spawn's
+   * `permissions.deny`. At most 64, each 1 to 512 bytes with no
+   * control character.
+   */
+  permissionsDeny?: string[];
+  /**
+   * Absolute paths added to the spawn's `sandbox.filesystem.denyWrite`
+   * (sandboxed Bash). At most 64, each at most 4096 bytes, with no
+   * control character, quote, parenthesis, backslash or glob character
+   * (`*?[]{}`). An existing path is stored as its realpath, another one
+   * as given.
+   */
+  sandboxDenyWrite?: string[];
+  /**
+   * Text added after the engine's standing orders on every
+   * SessionStart, fenced and labelled as the caller's. At most 8 KiB
+   * of UTF-8.
+   */
+  standingOrders?: string | null;
 }
 
 /** `agent.resume` params. */
@@ -180,6 +222,14 @@ export interface C9pAgentRow {
   /** `managed` or `free`; `null` for an observed agent. */
   mode: 'managed' | 'free' | null | string;
   name: string | null;
+  /**
+   * The spawn overlay the agent runs with (`agent.create` `overlay`),
+   * after the engine checked it: `sandboxDenyWrite` as realpaths where
+   * they existed, and for a child of an agent the parent's
+   * `permissionsDeny`, `sandboxDenyWrite` and `model` added. A resume
+   * applies the same overlay. `null` for an agent without one.
+   */
+  overlay?: C9pAgentOverlay | null;
   /**
    * The agent that owns this one; for an imported legacy worker, the PM
    * that adopted it.

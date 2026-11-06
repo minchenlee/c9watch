@@ -262,6 +262,7 @@ pub(crate) mod tests {
             guard: None,
             cc_version: None,
             capabilities: None,
+            overlay: None,
         }
     }
 

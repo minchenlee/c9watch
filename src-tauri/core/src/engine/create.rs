@@ -23,6 +23,12 @@
 //!    (`engine::cc_screen`) until the agent is `ready`, and records `bound`.
 //! 4. `agent.create` answers when the agent is `ready`, or with the error.
 //!
+//! **Spawn overlay (E1, `engine::overlay`).** `overlay` is checked before
+//! anything is written (an agent may not pass `model`), a child's gets its
+//! parent's model and denies, and the row stores the result. Every spawn
+//! of the row, a resume included, reads it back (`bring_up`) and passes it
+//! to the profile. An empty overlay is stored as `NULL`.
+//!
 //! **Vendor refusal (D28 Q7).** The agent exits before `ready`, the screen
 //! shows a usage-limit or login text before `ready`, or it is not `ready`
 //! within `cc_screen::READY_TIMEOUT` (30 s): the row ends `failed` with
@@ -129,10 +135,11 @@ use super::machine::HeaderKey;
 use super::mail::{self, MsgState};
 use super::merge::{Activity, MergeTable};
 use super::ops::{self, CreatePayload, Phase};
+use super::overlay;
 use super::principal::Principal;
 use super::proto::{
-    AgentCreateParams, AgentGuard, AgentResumeParams, AgentRetireParams, AgentRow, ApiError,
-    ErrorCode,
+    AgentCreateParams, AgentGuard, AgentOverlay, AgentResumeParams, AgentRetireParams, AgentRow,
+    ApiError, ErrorCode,
 };
 use super::pty::{kill_orphans, NativePty};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -316,12 +323,15 @@ impl Kind {
 }
 
 /// What `agent.create` found before the row: the caller's write fence,
-/// and the Claude Code version and its capabilities (D30).
+/// the Claude Code version and its capabilities (D30), and the spawn
+/// overlay (E1).
 #[derive(Default)]
 struct Spawned {
     fence: Option<Fence>,
     cc: Option<CcVersion>,
     caps: Vec<String>,
+    /// The spawn overlay as checked, the parent's merged in (E1).
+    overlay: Option<AgentOverlay>,
 }
 
 /// One create or resume, as the supervisor gets it.
@@ -538,6 +548,13 @@ impl Spawner {
         if self.drain.on() {
             return Err(draining());
         }
+        // serde would read an array as the struct's fields in order.
+        if params
+            .get("overlay")
+            .is_some_and(|o| !o.is_object() && !o.is_null())
+        {
+            return Err(bad("bad agent.create params: overlay is not an object"));
+        }
         let p: AgentCreateParams = parse(params, "agent.create")?;
         let desc = check_kind_and_mode(&p)?;
         if parent.is_some() && p.guard.is_none() {
@@ -548,6 +565,18 @@ impl Spawner {
         if let Some(name) = &p.name {
             check_name(name)?;
         }
+        let overlay = match p.overlay.clone() {
+            Some(o) => {
+                if parent.is_some() && o.model.is_some() {
+                    return Err(not_allowed(
+                        "an agent may not pass overlay.model: its child runs the parent's \
+                         model (E1)",
+                    ));
+                }
+                Some(blocking(move || overlay::check(&o).map_err(bad)).await?)
+            }
+            None => None,
+        };
         if self.stopping.load(Ordering::SeqCst) {
             return Err(stopping());
         }
@@ -589,7 +618,25 @@ impl Spawner {
             let provider = desc.provider;
             blocking(move || check_child(&db, &parent, provider, &cwd, &fence)).await?;
         }
-        let spawned = Spawned { fence, cc, caps };
+        // E1: a child always runs under its parent's denies and model.
+        let overlay = match &parent {
+            Some(parent) => {
+                let (db, parent) = (self.db.clone(), parent.clone());
+                let theirs = blocking(move || {
+                    let conn = db.pooled_reader().map_err(internal)?;
+                    overlay::row_overlay(&conn, &parent).map_err(internal)
+                })
+                .await?;
+                overlay::inherit(theirs.as_ref(), overlay)
+            }
+            None => overlay.and_then(overlay::non_empty),
+        };
+        let spawned = Spawned {
+            fence,
+            cc,
+            caps,
+            overlay,
+        };
         let start = Start {
             id: new_agent_id(),
             gen: 0,
@@ -755,12 +802,16 @@ impl Spawner {
                     .as_ref()
                     .map(|f| serde_json::to_string(&f.to_wire()).expect("guard serializes"));
                 let caps = serde_json::to_string(&spawned.caps).expect("caps serialize");
+                let overlay = spawned
+                    .overlay
+                    .as_ref()
+                    .map(|o| serde_json::to_string(o).expect("overlay serializes"));
                 tx.execute(
                     "INSERT INTO agents (id, mode, role, control, provider, source, created_by, \
                      state, cwd, name, machine_id, created_at, guard, cc_version, capabilities, \
-                     parent_id) \
+                     parent_id, overlay) \
                      VALUES (?1, 'free', 'worker', 'pty', ?2, 'engine', ?3, 'creating', ?4, ?5, \
-                     ?6, ?7, ?8, ?9, ?10, ?11)",
+                     ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         s.id,
                         desc.provider,
@@ -772,7 +823,8 @@ impl Spawner {
                         guard,
                         spawned.cc.map(quirks::version_string),
                         caps,
-                        parent
+                        parent,
+                        overlay
                     ],
                 )?;
                 let gen =
@@ -785,6 +837,14 @@ impl Spawner {
                     ..Default::default()
                 };
                 ops::open_create(tx, &s.op_id, &payload, now)?;
+                // E1: the overlay in full, or its hash and counts.
+                let (reason, hash) = match &spawned.overlay {
+                    Some(o) => {
+                        let (note, sha) = overlay::audit_note(o);
+                        (format!("{}; {}", cwd, note), Some(sha))
+                    }
+                    None => (cwd.clone(), None),
+                };
                 audit::append(
                     tx,
                     now,
@@ -793,7 +853,8 @@ impl Spawner {
                         method: "agent.create",
                         target: Some(&s.id),
                         decision: "allow",
-                        reason: Some(&cwd),
+                        reason: Some(&reason),
+                        payload_hash: hash.as_deref(),
                         ..Default::default()
                     },
                 )?;
@@ -937,7 +998,8 @@ impl Spawner {
         // (C1a-32). A failed read spawns nothing rather than spawn without.
         // The row's write fence (D30): a resume keeps it. A child of an
         // agent loads no setting source (E5), on a resume too.
-        let (peers, guarded, child) = match self
+        // The row's spawn overlay (E1): a resume applies the same one.
+        let (peers, guarded, child, overlay) = match self
             .db
             .pooled_reader()
             .map_err(|e| e.to_string())
@@ -948,7 +1010,9 @@ impl Spawner {
                     .map_err(|e| format!("Failed to read the write fence: {}", e))?;
                 let parent = row_parent(&c, &s.id)
                     .map_err(|e| format!("Failed to read the parent: {}", e))?;
-                Ok((peers, guard.is_some(), parent.is_some()))
+                let overlay = overlay::row_overlay(&c, &s.id)
+                    .map_err(|e| format!("Failed to read the spawn overlay: {}", e))?;
+                Ok((peers, guard.is_some(), parent.is_some(), overlay))
             }) {
             Ok(p) => p,
             Err(e) => return fail(e),
@@ -982,7 +1046,10 @@ impl Spawner {
                 } else {
                     p
                 };
-                p.with_peers(peers).with_guard(guarded).with_child(child)
+                p.with_peers(peers)
+                    .with_guard(guarded)
+                    .with_child(child)
+                    .with_overlay(overlay)
             }
             Err(e) => return fail(e),
         };
@@ -3434,9 +3501,10 @@ fn caller_parent(principal: &Principal, method: &str) -> Result<Option<String>, 
     }
 }
 
-/// The `agent.create` params an agent may pass. Anything else (a later
-/// overlay, settings, mode flags) is refused, not ignored.
-const CHILD_FIELDS: &[&str] = &["kind", "mode", "cwd", "name", "guard", "require"];
+/// The `agent.create` params an agent may pass. Anything else (settings,
+/// mode flags) is refused, not ignored. Its `overlay` may not name a
+/// `model` (`check_overlay`).
+const CHILD_FIELDS: &[&str] = &["kind", "mode", "cwd", "name", "guard", "require", "overlay"];
 
 fn only_child_fields(params: &serde_json::Value) -> Result<(), ApiError> {
     let Some(map) = params.as_object() else {
@@ -4320,8 +4388,9 @@ mod tests {
         let d = dirs(&root, &["a", "a/c", "b", "a/.git/x", "a/.claude"]);
         let parent = e.sp.create(&l, fenced_params(&root, &d[0])).await.unwrap();
         let p = agent_of(&parent, 1);
+        // E1: an agent may pass an overlay, but not its child's model.
         let mut overlay = fenced_params(&root, &d[1]);
-        overlay["overlay"] = serde_json::json!({});
+        overlay["overlay"] = serde_json::json!({"model": "opus"});
         let guard = |deny: &[&PathBuf], allow: &[&PathBuf]| {
             serde_json::json!({
                 "mode": "free", "cwd": d[1],
@@ -4330,7 +4399,7 @@ mod tests {
         };
         let refused = [
             ("no guard", create_params(&d[1])),
-            ("overlay", overlay),
+            ("overlay.model", overlay),
             ("the parent's cwd", fenced_params(&root, &d[0])),
             ("outside the area", fenced_params(&root, &d[2])),
             (".git", fenced_params(&root, &d[3])),
@@ -4833,6 +4902,333 @@ mod tests {
         assert_eq!(err.code, ErrorCode::CwdCollision);
         assert!(err.msg.contains(&ra.id), "{}", err.msg);
         e.sp.shutdown();
+    }
+
+    /// E1: the settings file of `id` at `gen`, parsed.
+    fn spawn_settings(home: &Path, id: &str, gen: i64) -> serde_json::Value {
+        let s = std::fs::read(settings_path_of(home, id, gen)).unwrap();
+        serde_json::from_slice(&s).unwrap()
+    }
+
+    /// E1: the strings of `v` (a JSON array).
+    fn strs(v: &serde_json::Value) -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// E1: the argv of every spawn of `id`, as strings.
+    fn argvs_of(l: &FakeLauncher, id: &str) -> Vec<Vec<String>> {
+        lock(&l.spawned)
+            .iter()
+            .filter(|(a, _, _)| a == id)
+            .map(|(_, argv, _)| {
+                argv.iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// E1: (reason, payload_hash) of the `agent.create` allow rows.
+    fn create_audit(db: &Db) -> Vec<(String, Option<String>)> {
+        let conn = db.reader().unwrap();
+        let mut st = conn
+            .prepare(
+                "SELECT reason, payload_hash FROM audit WHERE method = 'agent.create' \
+                 AND decision = 'allow' ORDER BY seq",
+            )
+            .unwrap();
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// E1: an overlay from the terminal lands after the engine's own
+    /// entries in the settings file, as `--model` in the argv, on the row,
+    /// in the create result and in the audit row.
+    #[tokio::test]
+    async fn an_overlay_is_merged_into_the_spawn_and_recorded() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let cwd = e.cwd.canonicalize().unwrap();
+        let real = e.t.path().canonicalize().unwrap();
+        std::fs::create_dir(real.join("secrets")).unwrap();
+        std::os::unix::fs::symlink(real.join("secrets"), real.join("s-link")).unwrap();
+        let mut params = create_params(&e.cwd);
+        params["overlay"] = serde_json::json!({
+            "model": "claude-opus-5-5",
+            "permissionsDeny": ["Bash(curl:*)", "WebFetch", "Bash(curl:*)"],
+            "sandboxDenyWrite": [real.join("s-link"), "/nope/e1/later"],
+            "standingOrders": "Only touch docs/.",
+        });
+        let r = e.sp.create(&l, params).await.unwrap();
+        let want = AgentOverlay {
+            model: Some("claude-opus-5-5".into()),
+            permissions_deny: vec!["Bash(curl:*)".into(), "WebFetch".into()],
+            sandbox_deny_write: vec![
+                real.join("secrets").display().to_string(),
+                "/nope/e1/later".into(),
+            ],
+            standing_orders: Some("Only touch docs/.".into()),
+        };
+        assert_eq!(r.overlay.as_ref(), Some(&want), "the create result");
+        assert_eq!(row(&e.db, &r.id).overlay.as_ref(), Some(&want));
+        let listed = e.db.agents(AgentFilter::Live).unwrap();
+        assert_eq!(listed[0].overlay.as_ref(), Some(&want), "agent.list");
+        // The settings file: every engine entry, then the overlay's.
+        let s = spawn_settings(&e.home, &r.id, 1);
+        let deny = strs(&s["permissions"]["deny"]);
+        let n = deny.len();
+        assert_eq!(deny[n - 2..], ["Bash(curl:*)", "WebFetch"]);
+        assert!(deny.contains(&format!("Edit(/{}/.claude/**)", cwd.display())));
+        let dw = strs(&s["sandbox"]["filesystem"]["denyWrite"]);
+        let m = dw.len();
+        assert_eq!(dw[m - 2..], want.sandbox_deny_write[..]);
+        assert!(dw.contains(&cwd.join(".claude").display().to_string()));
+        assert_eq!(strs(&s["permissions"]["allow"]).len(), 1);
+        assert_eq!(s["sandbox"]["allowUnsandboxedCommands"], false);
+        // The text goes out through SessionStart, never in the settings.
+        assert!(!serde_json::to_string(&s).unwrap().contains("Only touch"));
+        let argv = &argvs_of(&e.launcher, &r.id)[0];
+        assert_eq!(argv[argv.len() - 2..], ["--model", "claude-opus-5-5"]);
+        assert!(!lock(&e.launcher.env)
+            .iter()
+            .any(|(_, v)| v.to_string_lossy().contains("Only touch")));
+        let audit = create_audit(&e.db);
+        let (note, sha) = overlay::audit_note(&want);
+        assert_eq!(audit, [(format!("{}; {}", cwd.display(), note), Some(sha))]);
+        assert!(audit[0].0.contains("\"model\":\"claude-opus-5-5\""));
+        e.sp.shutdown();
+    }
+
+    /// E1: a create without an overlay, or with an empty one, is a bare
+    /// create: no overlay on the row, no `--model`, the settings deny
+    /// lists of before, and an audit row with only the cwd.
+    #[tokio::test]
+    async fn a_create_without_an_overlay_is_unchanged() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let cwd = e.cwd.canonicalize().unwrap();
+        let bare = e.sp.create(&l, create_params(&e.cwd)).await.unwrap();
+        let s_bare = spawn_settings(&e.home, &bare.id, 1);
+        e.sp.retire(&l, serde_json::json!({ "id": bare.id }))
+            .await
+            .unwrap();
+        let mut params = create_params(&e.cwd);
+        params["overlay"] = serde_json::json!({"standingOrders": "  \n"});
+        let empty = e.sp.create(&l, params).await.unwrap();
+        let s_empty = spawn_settings(&e.home, &empty.id, 1);
+        for r in [&bare, &empty] {
+            assert_eq!(r.overlay, None);
+            assert_eq!(row(&e.db, &r.id).overlay, None);
+            let argv = &argvs_of(&e.launcher, &r.id)[0];
+            assert!(!argv.iter().any(|a| a == "--model"), "{:?}", argv);
+        }
+        // Same cwd, same peers: the same settings but for the agent id.
+        let text = |s: &serde_json::Value, id: &str| {
+            serde_json::to_string_pretty(s).unwrap().replace(id, "<ID>")
+        };
+        assert_eq!(text(&s_bare, &bare.id), text(&s_empty, &empty.id));
+        let raw: Option<String> =
+            e.db.reader()
+                .unwrap()
+                .query_row(
+                    "SELECT overlay FROM agents WHERE id = ?1",
+                    [&empty.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(raw, None);
+        let cwd = cwd.display().to_string();
+        assert_eq!(
+            create_audit(&e.db),
+            [(cwd.clone(), None), (cwd, None)],
+            "the audit rows of before"
+        );
+        e.sp.shutdown();
+    }
+
+    /// E1: each limit, an unknown field and a bad model are refused
+    /// before anything is written or spawned.
+    #[tokio::test]
+    async fn a_bad_overlay_spawns_nothing() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let rules =
+            |n: usize| -> Vec<String> { (0..n).map(|i| format!("Bash(x{}:*)", i)).collect() };
+        let paths = |n: usize| -> Vec<String> { (0..n).map(|i| format!("/nope/{}", i)).collect() };
+        let refused = [
+            (
+                "unknown field",
+                serde_json::json!({"permissionsAllow": ["Bash(*)"]}),
+            ),
+            ("hooks", serde_json::json!({"hooks": {"PreToolUse": []}})),
+            ("env", serde_json::json!({"env": {"A": "1"}})),
+            (
+                "model chars",
+                serde_json::json!({"model": "opus --dangerously-skip-permissions"}),
+            ),
+            ("model length", serde_json::json!({"model": "m".repeat(65)})),
+            ("empty model", serde_json::json!({"model": ""})),
+            (
+                "65 rules",
+                serde_json::json!({"permissionsDeny": rules(65)}),
+            ),
+            (
+                "513-byte rule",
+                serde_json::json!({"permissionsDeny": ["x".repeat(513)]}),
+            ),
+            ("empty rule", serde_json::json!({"permissionsDeny": [""]})),
+            (
+                "65 paths",
+                serde_json::json!({"sandboxDenyWrite": paths(65)}),
+            ),
+            (
+                "relative path",
+                serde_json::json!({"sandboxDenyWrite": ["rel/x"]}),
+            ),
+            (
+                "quote in path",
+                serde_json::json!({"sandboxDenyWrite": ["/a\")(allow"]}),
+            ),
+            (
+                "long orders",
+                serde_json::json!({"standingOrders": "x".repeat(8193)}),
+            ),
+            ("not an object", serde_json::json!(["model"])),
+        ];
+        for (what, overlay) in refused {
+            let mut params = create_params(&e.cwd);
+            params["overlay"] = overlay;
+            let err = e.sp.create(&l, params).await.unwrap_err();
+            assert_eq!(err.code, ErrorCode::BadRequest, "{what}: {}", err.msg);
+        }
+        // At the limits it is accepted.
+        let mut params = create_params(&e.cwd);
+        params["overlay"] = serde_json::json!({
+            "model": "m".repeat(64),
+            "permissionsDeny": rules(64),
+            "sandboxDenyWrite": paths(64),
+            "standingOrders": "x".repeat(8192),
+        });
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 0);
+        assert!(e.db.agents(AgentFilter::All).unwrap().is_empty());
+        let r = e.sp.create(&l, params).await.unwrap();
+        let o = r.overlay.unwrap();
+        assert_eq!(
+            (o.permissions_deny.len(), o.sandbox_deny_write.len()),
+            (64, 64)
+        );
+        // A large overlay is audited as its hash and counts.
+        let audit = create_audit(&e.db);
+        assert!(audit[0].0.contains("overlay sha256 "), "{:?}", audit);
+        assert!(
+            audit[0].0.contains("standingOrders 8192 bytes"),
+            "{:?}",
+            audit
+        );
+        assert!(!audit[0].0.contains("xxxxxxxx"));
+        e.sp.shutdown();
+    }
+
+    /// E1: a child always runs under its parent's denies and model, adds
+    /// its own, and may not pick a model. A grandchild keeps them all.
+    #[tokio::test]
+    async fn a_child_inherits_its_parents_overlay() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let root = e.t.path().canonicalize().unwrap().join("root");
+        let d = dirs(&root, &["a", "a/c", "a/c/g", "a/d"]);
+        let mut pp = fenced_params(&root, &d[0]);
+        pp["overlay"] = serde_json::json!({
+            "model": "opus",
+            "permissionsDeny": ["Bash(curl:*)"],
+            "sandboxDenyWrite": ["/nope/parent"],
+            "standingOrders": "parent only",
+        });
+        let parent = e.sp.create(&l, pp).await.unwrap();
+        let p = agent_of(&parent, 1);
+        // No model from an agent; nothing spawned, nothing written.
+        let mut bad = fenced_params(&root, &d[1]);
+        bad["overlay"] = serde_json::json!({"model": "haiku"});
+        let err = e.sp.create(&p, bad).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotAllowed, "{}", err.msg);
+        assert!(err.msg.contains("overlay.model"), "{}", err.msg);
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 1);
+        let mut cp = fenced_params(&root, &d[1]);
+        cp["overlay"] = serde_json::json!({
+            "permissionsDeny": ["Bash(rm:*)", "Bash(curl:*)"],
+            "sandboxDenyWrite": ["/nope/child"],
+            "standingOrders": "child only",
+        });
+        let child = e.sp.create(&p, cp).await.unwrap();
+        let want = AgentOverlay {
+            model: Some("opus".into()),
+            permissions_deny: vec!["Bash(curl:*)".into(), "Bash(rm:*)".into()],
+            sandbox_deny_write: vec!["/nope/parent".into(), "/nope/child".into()],
+            standing_orders: Some("child only".into()),
+        };
+        assert_eq!(child.overlay.as_ref(), Some(&want));
+        let s = spawn_settings(&e.home, &child.id, 1);
+        let deny = strs(&s["permissions"]["deny"]);
+        assert_eq!(deny[deny.len() - 2..], ["Bash(curl:*)", "Bash(rm:*)"]);
+        let dw = strs(&s["sandbox"]["filesystem"]["denyWrite"]);
+        assert_eq!(dw[dw.len() - 2..], ["/nope/parent", "/nope/child"]);
+        let argv = &argvs_of(&e.launcher, &child.id)[0];
+        assert_eq!(argv[argv.len() - 2..], ["--model", "opus"]);
+        // A child that passes no overlay still gets the parent's.
+        let plain = e.sp.create(&p, fenced_params(&root, &d[3])).await.unwrap();
+        let got = plain.overlay.unwrap();
+        assert_eq!(got.permissions_deny, ["Bash(curl:*)"]);
+        assert_eq!(got.sandbox_deny_write, ["/nope/parent"]);
+        assert_eq!(got.model.as_deref(), Some("opus"));
+        assert_eq!(got.standing_orders, None);
+        // A grandchild: the whole chain.
+        let g =
+            e.sp.create(&agent_of(&child, 1), fenced_params(&root, &d[2]))
+                .await
+                .unwrap();
+        let got = g.overlay.unwrap();
+        assert_eq!(got.permissions_deny, want.permissions_deny);
+        assert_eq!(got.sandbox_deny_write, want.sandbox_deny_write);
+        let s = spawn_settings(&e.home, &g.id, 1);
+        assert!(strs(&s["permissions"]["deny"]).contains(&"Bash(rm:*)".to_string()));
+        e.sp.shutdown();
+    }
+
+    /// E1: a resume spawns with the same overlay, from the row.
+    #[tokio::test]
+    async fn a_resume_applies_the_same_overlay() {
+        let e = setup(Script::Ready, None);
+        let mut params = create_params(&e.cwd);
+        params["overlay"] = serde_json::json!({
+            "model": "sonnet[1m]",
+            "permissionsDeny": ["WebFetch"],
+            "sandboxDenyWrite": ["/nope/e1"],
+        });
+        let r =
+            e.sp.create(&Principal::LocalUnverified, params)
+                .await
+                .unwrap();
+        let first = spawn_settings(&e.home, &r.id, 1);
+        e.sp.shutdown();
+        ops::reconcile(&e.db, &e.home).unwrap();
+        let (_, l2, sp2) = next_engine(&e, Script::Ready, None);
+        assert_eq!(sp2.resume_on_boot().unwrap().started, [r.id.clone()]);
+        wait_for("ready", || {
+            row(&e.db, &r.id).state.as_deref() == Some("ready")
+        });
+        let again = spawn_settings(&e.home, &r.id, 2);
+        assert_eq!(again["permissions"], first["permissions"]);
+        assert_eq!(again["sandbox"], first["sandbox"]);
+        assert!(strs(&again["permissions"]["deny"]).contains(&"WebFetch".to_string()));
+        let argv = &argvs_of(&l2, &r.id)[0];
+        assert!(argv.iter().any(|a| a == "--resume"), "{:?}", argv);
+        assert_eq!(argv[argv.len() - 2..], ["--model", "sonnet[1m]"]);
+        assert_eq!(row(&e.db, &r.id).overlay, r.overlay);
+        sp2.shutdown();
     }
 
     #[tokio::test]

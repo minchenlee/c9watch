@@ -172,6 +172,11 @@ const BY_NAME: &[(&str, &str)] = &[
     ("guard", M),
     ("denyWriteUnder", M),
     ("allowWrite", M),
+    // E1 spawn overlay. The standing orders are the caller's free text.
+    ("overlay", M),
+    ("permissionsDeny", M),
+    ("sandboxDenyWrite", M),
+    ("standingOrders", C),
     ("project", M),
     ("projectPath", M),
     ("projectName", M),
