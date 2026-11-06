@@ -39,7 +39,7 @@ jobs:
         run: npm run check
 
       - name: WebSocket request regression tests
-        run: node --test scripts/test-ws.mjs scripts/test-hidden-transitions.mjs scripts/test-opencode-provider.mjs scripts/test-opencode-connection.mjs scripts/test-integration-settings.mjs scripts/test-away-summary.mjs scripts/test-hidden-sessions.mjs scripts/test-dense-layout.mjs scripts/test-ipc-contract.mjs scripts/test-no-token-leak.mjs scripts/test-csp.mjs scripts/test-remote-access-ui.mjs scripts/test-glass-keys.mjs scripts/test-glass-tokens.mjs
+        run: node --test scripts/test-ws.mjs scripts/test-hidden-transitions.mjs scripts/test-opencode-provider.mjs scripts/test-opencode-connection.mjs scripts/test-integration-settings.mjs scripts/test-away-summary.mjs scripts/test-hidden-sessions.mjs scripts/test-dense-layout.mjs scripts/test-ipc-contract.mjs scripts/test-no-token-leak.mjs scripts/test-csp.mjs scripts/test-remote-access-ui.mjs scripts/test-glass-keys.mjs scripts/test-glass-tokens.mjs scripts/test-glass-ext.mjs
 
       - name: Conversation selection regression tests
         run: node --conditions=browser --test scripts/test-conversation-selection.mjs scripts/test-preview-loader.mjs scripts/test-glass-model.mjs
@@ -124,6 +124,9 @@ jobs:
       - name: Compare with Classic baselines (blocking)
         if: steps.baseline.outputs.present == 'true'
         run: npm run test:visual
+
+      - name: Glass extension host interaction tests (vite dev, demo data)
+        run: npx playwright test -c tests/glass/playwright.config.ts
 
       - name: Make Classic baselines (run 1)
         if: steps.baseline.outputs.present == 'false'

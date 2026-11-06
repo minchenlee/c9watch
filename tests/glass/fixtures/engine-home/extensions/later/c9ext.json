@@ -1,0 +1,2 @@
+{ "c9ext": 1, "id": "later", "name": "Later", "version": "1.0.0", "minVersion": { "app": "99.0.0" },
+  "ui": { "contract": "c9ui/1", "pages": [{ "id": "main", "title": "Later", "entry": "index.js" }] } }

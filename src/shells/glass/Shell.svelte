@@ -11,6 +11,7 @@
     import { installKeys } from './keys';
     import { glassMode, sidebarCollapsed } from './prefs';
     import Sidebar from './Sidebar.svelte';
+    import ExtPages from './ext/ExtPages.svelte';
 
     // startGlassData returns its stop function, which Svelte runs on unmount.
     onMount(startGlassData);
@@ -67,10 +68,14 @@
     {:else}
         <Sidebar {needs} onCollapse={toggleSidebar} onDelegate={() => (hint = 'delegate')} onSearch={() => (hint = 'search')} />
     {/if}
-    <main class="glass-page" aria-label={info.title}>
-        <header><h1>{info.title}</h1></header>
-        <p class="state-msg">{info.empty}</p>
-    </main>
+    {#if $route.page !== 'ext'}
+        <main class="glass-page" aria-label={info.title}>
+            <header><h1>{info.title}</h1></header>
+            <p class="state-msg">{info.empty}</p>
+        </main>
+    {/if}
+    <!-- Extension pages (G6). Always mounted: it keeps the last one alive. -->
+    <ExtPages route={$route} />
     {#if hint}
         <div class="hint glass-float" role="status">
             {#if hint === 'delegate'}
