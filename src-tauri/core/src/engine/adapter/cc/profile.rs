@@ -439,8 +439,19 @@ pub fn settings(p: &Profile) -> Value {
     // Layer 3, allowUnsandboxedCommands false: no `dangerouslyDisableSandbox`
     // retry, so Bash cannot step around the write-deny (honored from a
     // `--settings` file, CC 2.1.312).
+    //
+    // failIfUnavailable true: without it, CC whose sandbox backend is
+    // missing (Linux without bwrap or socat) starts anyway and runs Bash
+    // unconfined, past every denyWrite path; allowUnsandboxedCommands does
+    // not stop that startup fallback. With it, CC prints "Error: sandbox
+    // required but unavailable: <reason>" and exits 1 before ready (CC
+    // 2.1.319 binary), so the spawn ends `spawn_failed` / `resume_failed`
+    // with that text. `--settings` outranks user and project settings, so
+    // a cwd's settings cannot turn it off; the overlay (E1) only adds deny
+    // entries and has no key for it.
     s["sandbox"] = json!({
         "enabled": true,
+        "failIfUnavailable": true,
         "autoAllowBashIfSandboxed": true,
         "allowUnsandboxedCommands": false,
         "network": { "allowUnixSockets": unix_sockets(p) },
@@ -764,6 +775,7 @@ mod tests {
             assert_eq!(s["sandbox"]["enabled"], true);
             assert_eq!(s["sandbox"]["autoAllowBashIfSandboxed"], true);
             assert_eq!(s["sandbox"]["allowUnsandboxedCommands"], false);
+            assert_eq!(s["sandbox"]["failIfUnavailable"], true);
             assert_eq!(
                 s["sandbox"]["network"]["allowUnixSockets"],
                 json!(["/s/e.sock"])
@@ -1039,9 +1051,11 @@ mod tests {
                 f
             );
         }
-        // Layer 3: no unsandboxed retry, with the sandbox on.
+        // Layer 3: no unsandboxed retry, with the sandbox on, and no start
+        // without it.
         assert_eq!(s["sandbox"]["enabled"], true);
         assert_eq!(s["sandbox"]["allowUnsandboxedCommands"], false);
+        assert_eq!(s["sandbox"]["failIfUnavailable"], true);
         // The allow list does not reopen any of it.
         assert_eq!(
             s["permissions"]["allow"],
@@ -1098,15 +1112,17 @@ mod tests {
     /// overlay), with the tempdir cwd replaced by `<CWD>`. Taken from
     /// the code before E1: a create without `overlay` must not change by
     /// one byte. Retaken for D31, whose only change is the two
-    /// `<home>/extensions` entries.
+    /// `<home>/extensions` entries. Retaken for `sandbox.failIfUnavailable`,
+    /// whose only change is that one key (the old digests come back with it
+    /// removed).
     #[cfg(not(feature = "live-test"))]
     const BARE_SETTINGS_SHA: &str =
-        "fc29b480748a582e758dcb02d19b623c747bec75c3fc539e0b144f5c07c6abec";
+        "e8e02fdd8b1f90fd96f1377bfffd8fab3fed2fbbf6408d1d711859d6dfb39d20";
     #[cfg(not(feature = "live-test"))]
     const BARE_ARGV_SHA: &str = "ac731f6ef7e0ca17a06bfc51b959df31837a5820a1054debc32692e508489873";
     #[cfg(not(feature = "live-test"))]
     const CHILD_SETTINGS_SHA: &str =
-        "b2f25e2dcb26b0c4177217a28d1d6282a484574d05d4add97a6d91a9da6324d3";
+        "9268f1784ad2a5ce9e0cca574ec5a8671ac2d68aca005dbaaa6986abe5c8a98f";
     #[cfg(not(feature = "live-test"))]
     const CHILD_ARGV_SHA: &str = "0103b03f2291389ead0180e467a375408385c1843fa3f7f575e5ddb2a7b0d8bb";
 
@@ -1136,6 +1152,35 @@ mod tests {
             // `with_overlay(None)` is the bare spawn.
             let none = bare_digest(&p.clone().with_overlay(None));
             assert_eq!(none, (BARE_SETTINGS_SHA.into(), BARE_ARGV_SHA.into()));
+        });
+    }
+
+    /// Codex review of #230 (P1): CC whose sandbox backend is missing
+    /// (Linux without bwrap or socat) must refuse to start, not run Bash
+    /// unconfined past the floor. Every kind of spawn asks for that: free,
+    /// guarded, an E5 child, a resume, and one with an E1 overlay.
+    #[test]
+    fn every_spawn_refuses_to_start_without_the_sandbox() {
+        with_cwd(|_, p| {
+            let o = AgentOverlay {
+                model: Some("opus".into()),
+                permissions_deny: vec!["WebFetch".into()],
+                sandbox_deny_write: vec!["/nope/x".into()],
+                standing_orders: Some("text".into()),
+            };
+            for q in [
+                p.clone(),
+                p.clone().with_guard(true),
+                p.clone().with_guard(true).with_child(true),
+                p.clone().with_guard(true).with_child(true).resuming(),
+                p.clone().resuming(),
+                p.clone().with_overlay(Some(o)),
+            ] {
+                let s = settings(&q);
+                assert_eq!(s["sandbox"]["enabled"], true);
+                assert_eq!(s["sandbox"]["failIfUnavailable"], true);
+                assert_eq!(s["sandbox"]["allowUnsandboxedCommands"], false);
+            }
         });
     }
 
