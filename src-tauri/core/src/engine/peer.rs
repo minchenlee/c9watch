@@ -643,6 +643,20 @@ mod tests {
     use super::*;
     use std::os::unix::io::AsRawFd;
 
+    /// Waits until `pid` has exec'd: its argv holds `arg`. Right after
+    /// `spawn` the child may still be the forked test binary, or (Linux)
+    /// mid-exec with an empty `/proc/<pid>/cmdline`; a read then fails
+    /// closed and the test would flake.
+    fn wait_for_exec(pid: libc::pid_t, arg: &str) {
+        for _ in 0..500 {
+            if argv_of(pid).is_some_and(|a| a.iter().any(|s| s == arg)) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("pid {pid} did not exec within 5 s");
+    }
+
     /// A child started with a teammate's argv is found by its argv alone.
     #[test]
     fn a_teammate_argv_is_read_from_the_live_process() {
@@ -661,6 +675,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id() as libc::pid_t;
+        wait_for_exec(pid, "sleep 5");
         let me = std::process::id() as libc::pid_t;
         let chain = [proc_info(pid).unwrap(), proc_info(me).unwrap()];
         let found = teammate_pids(&chain);
@@ -678,6 +693,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id() as libc::pid_t;
+        wait_for_exec(pid, "sleep 5");
         let info = proc_info(pid).unwrap();
         assert_eq!(
             teammate_pids(std::slice::from_ref(&info)),
