@@ -16,7 +16,7 @@
     // - Answer a managed agent: `msg.send` after 10 s (復原 = not sent yet).
     // - Stop a managed agent: `session.stop`, then a receipt (no undo).
     // - Observed sessions and 允許: ⌘O only (`openSession`).
-    // - Leaving this page or closing (hiding) the window sends nothing: every
+    // - Leaving this page, closing (hiding) or minimizing the window sends nothing: every
     //   waiting send is cancelled, the item goes back to the queue and the
     //   draft stays. The toast says so. The queue also checks before each
     //   send (`canSend`).
@@ -101,7 +101,7 @@
         if (e.kind === 'cancelled') {
             // Leaving the page: nothing to say. Closing the window: say it
             // when the person comes back. The draft stays.
-            if (!destroyed) notify(`沒送出：${p.label}。視窗關掉了，這件回到需要你，草稿還在。`, 'error');
+            if (!destroyed) notify(`沒送出：${p.label}。視窗關掉或縮小了，這件回到需要你，草稿還在。`, 'error');
             return;
         }
         if (e.kind === 'undone') {

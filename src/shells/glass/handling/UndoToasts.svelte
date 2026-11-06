@@ -35,7 +35,7 @@
             </div>
         {/each}
         {#if pending.length}
-            <p class="rule" data-leave-rule>還沒送出的回答：離開這一頁或關掉視窗就不送，這件回到需要你，回答留在草稿裡。結束 c9watch 草稿就沒了。{demo ? '示範模式：不會真的送出。' : ''}</p>
+            <p class="rule" data-leave-rule>還沒送出的回答：離開這一頁、關掉或縮小視窗就不送，這件回到需要你，回答留在草稿裡。結束 c9watch 草稿就沒了。{demo ? '示範模式：不會真的送出。' : ''}</p>
         {/if}
     </div>
 {/if}

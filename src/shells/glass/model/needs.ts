@@ -140,16 +140,19 @@ export function deriveNeeds({ members, workspaceOf, attention = [], mail = [], d
     }
     const humans = new Set(members.filter(m => m.role === 'human').map(m => m.agentId));
     // Answered: a mail whose `replyTo` names the request, sent by the side
-    // that was asked (a human, or the recipient agent), and not lost. The
+    // that was asked (a human, or the recipient agent) to the request's
+    // sender, and not lost. The
     // engine stores a reply with any kind (`info` by default), so the kind
     // does not count. Engine notices and failed or cancelled replies never count.
+    const named = (name: string | null) => { const hit = name ? members.filter(m => m.agentId && m.name === name) : []; return hit.length === 1 ? hit[0] : undefined; };
     const byId = new Map(mail.map(x => [x.msgId, x]));
     const answered = new Set(mail.filter(r => {
         const q = r.replyTo ? byId.get(r.replyTo) : undefined;
-        return q && !LOST_REPLY.has(r.state) && r.from.kind !== 'engine'
+        if (!q || LOST_REPLY.has(r.state) || r.from.kind === 'engine') return false;
+        const sender = agentIdOf(q.from.addr) ?? named(q.from.name)?.agentId ?? null;
+        return sender !== null && r.to.id === sender
             && (r.from.kind === 'human' || agentIdOf(r.from.addr) === q.to.id);
     }).map(r => r.replyTo));
-    const named = (name: string | null) => { const hit = name ? members.filter(m => m.agentId && m.name === name) : []; return hit.length === 1 ? hit[0] : undefined; };
     for (const x of mail) {
         if (x.kind !== 'request' || !humans.has(x.to.id) || CLOSED_MAIL.has(x.state) || answered.has(x.msgId)) continue;
         // By address; a name only when there is no address and it is unique.

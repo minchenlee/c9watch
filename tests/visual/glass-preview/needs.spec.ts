@@ -238,7 +238,7 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		await page.keyboard.press('Meta+Enter');
 		await page.clock.runFor(3_000);
 		await expect(page.locator('[data-undo]')).toHaveCount(2);
-		await expect(page.locator('[data-leave-rule]')).toContainText('離開這一頁或關掉視窗就不送');
+		await expect(page.locator('[data-leave-rule]')).toContainText('離開這一頁、關掉或縮小視窗就不送');
 		await shot(page, 'g5-undo-toast');
 		await pick(page, '處理');
 		await panel(page).locator('[data-stop]').click();
@@ -315,7 +315,7 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		// The Tauri close button: lib.rs only hides the window.
 		await page.evaluate(() => (window as any).__TAURI_INTERNALS__.invoke('plugin:event|emit', { event: 'tauri://close-requested', payload: null }));
 		await expect(page.locator('[data-undo]')).toHaveCount(0);
-		await expect(page.locator('[data-notice]')).toContainText('視窗關掉了');
+		await expect(page.locator('[data-notice]')).toContainText('視窗關掉或縮小了');
 		await page.clock.runFor(30_000);
 		expect(await calls(page, 'msg.send')).toEqual([]);
 		await item.click();

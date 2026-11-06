@@ -237,6 +237,19 @@ test('P2-3: the engine writes a sent answer as kind "info"; it still answers the
     assert.equal(open(info({ from: { kind: 'agent', addr: 'm/agt_other' } })), 1);
 });
 
+test('a reply counts only when it goes to the request sender', () => {
+    const human = agent('agt_h', '/code', { role: 'human' });
+    const q = { msgId: 'q', kind: 'request', to: { id: 'agt_h' }, from: { kind: 'agent', addr: 'm/agt_w' }, state: 'delivered', preview: 'q', createdAt: NOW, replyTo: null };
+    const reply = more => ({ msgId: 'r', kind: 'info', to: { id: 'agt_w' }, from: { kind: 'human', addr: null }, state: 'delivered', replyTo: 'q', createdAt: NOW, ...more });
+    const open = r => derive({ agents: [agent('agt_w', '/x'), agent('agt_x', '/x'), human], mail: [q, r] }).needs.length;
+    assert.equal(open(reply({})), 0);
+    // A human sends replyTo=q to another agent: not answered.
+    assert.equal(open(reply({ to: { id: 'agt_x' } })), 1);
+    // The asked agent replies to someone else: not answered.
+    assert.equal(open(reply({ from: { kind: 'agent', addr: 'm/agt_h' }, to: { id: 'agt_x' } })), 1);
+    assert.equal(open(reply({ from: { kind: 'agent', addr: 'm/agt_h' } })), 0);
+});
+
 test('P2-4: handled marks key the request instance; a new request with the same text is a new instance', () => {
     const human = agent('agt_h', '/code', { role: 'human' });
     const q = msgId => ({ msgId, kind: 'request', to: { id: 'agt_h' }, from: { kind: 'agent', addr: 'm/agt_w' }, state: 'delivered', preview: '要哪個?', createdAt: NOW, replyTo: null });

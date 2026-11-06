@@ -83,7 +83,7 @@ G5 actions (`handling/actions.ts`, pure, `scripts/test-glass-handling.mjs`):
   ends. Each send has its own timer and toast (`UndoToasts.svelte`); ⌘Z
   undoes the newest, each toast has its own 復原. A failed send is not
   sent again; the item goes back to the queue with an error notice.
-- Leaving the 需要你 page or closing the window sends nothing, and the
+- Leaving the 需要你 page, closing or minimizing the window sends nothing, and the
   toast says so. Leaving: the page cancels every waiting send on destroy.
   Closing only hides the window (src-tauri `lib.rs`), so the page also
   cancels on `tauri://close-requested`, `visibilitychange` = hidden and
@@ -104,8 +104,11 @@ G5 actions (`handling/actions.ts`, pure, `scripts/test-glass-handling.mjs`):
   instance (`Need.instance`: the msgId, or the attention event, or the
   generation), so a new request with the same text is a new item.
 - A mail request counts as answered when a mail names it in `replyTo`,
-  comes from the asked side (a human or the recipient agent) and did not
-  fail. Any `kind` counts: the engine writes a sent answer as `info`.
+  comes from the asked side (a human or the recipient agent), goes to the
+  request's sender and did not fail. Any `kind` counts: the engine writes a sent answer as `info`.
+- Known limit: a session request (允許 / 處理 from a session) has no stable
+  id from the core yet (toolUseId waits for D40 Q1). A new request with the
+  same text between two polls is hidden like the handled one.
 - `tests/glass/needs.spec.ts`: the 7 handoff §3 interaction tests.
 
 G6 extension host (`ext/`, glass build plan §3, manifest per owner D41 R1–R12):
