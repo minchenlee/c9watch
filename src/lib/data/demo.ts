@@ -3,7 +3,7 @@ import type { Transport } from './transport';
 import { getDemoSessions, getDemoHistoryEntries, getDemoCostData, demoConversations, getDemoAwayActivity, getDemoDiagnostics } from '../demo/data';
 import { demoSubscriptionUsage } from '../subscription-usage';
 import { demoMailRequest, demoMailSubscribe } from './demo/mail';
-import { glassDemoAgents, glassDemoAnnotations, glassDemoSessionViews } from './demo/glass';
+import { glassDemoAgents, glassDemoAnnotations, glassDemoCost, glassDemoHistory, glassDemoMemory, glassDemoSessionViews } from './demo/glass';
 /** Demo mail is opt-in (`localStorage['c9watch.demoMail'] = '1'`). Without
  * it, demo answers mail like today's Classic bridge, so demo screens do not
  * change until the bridge exposes mail. */
@@ -18,18 +18,26 @@ const DEMO_GLASS_KEY = 'c9watch.demoGlass';
 export function demoGlassOn(): boolean {
     try { return globalThis.localStorage?.getItem(DEMO_GLASS_KEY) === '1'; } catch { return false; }
 }
+/** True only while the glass shell runs (`startGlassData` sets it, its stop
+ * clears it). The fixture answers only then, so Classic's demo answers stay
+ * the same whatever localStorage holds. */
+let glassShellActive = false;
+export function setDemoGlassActive(on: boolean): void { glassShellActive = on; }
 function demoGlassRequest(method: C9pMethod): any {
     switch (method) {
         case 'session.views': return { sessions: glassDemoSessionViews(), cursor: 'demo:glass:0' };
         case 'agent.list': return { agents: glassDemoAgents() };
         case 'annotation.list': return { annotations: glassDemoAnnotations(), cursor: 'demo:glass:0' };
+        case 'history.list': { const entries = glassDemoHistory(); return { entries, nextOffset: null, offset: 0, total: entries.length }; }
+        case 'cost.get': return glassDemoCost();
+        case 'memory.list': { const projects = glassDemoMemory(); return { projects, nextOffset: null, offset: 0, total: projects.length }; }
         default: return undefined;
     }
 }
 const mailDenied = () => Object.assign(new Error('Mail is not exposed in demo mode'), { code: 'not_allowed', msg: 'Mail is not exposed in demo mode' });
 export const demoTransport: Transport = {
     async request(method: C9pMethod, p: any): Promise<any> {
-        const glass = demoGlassOn() ? demoGlassRequest(method) : undefined;
+        const glass = glassShellActive && demoGlassOn() ? demoGlassRequest(method) : undefined;
         if (glass !== undefined) return glass;
         switch (method) {
             case 'session.views': return { sessions: getDemoSessions(), cursor: null };

@@ -225,3 +225,15 @@ test('a request is answered only by a delivered reply from its recipient', () =>
     assert.equal(open(reply({})), 0);
     assert.equal(open(reply({ from: { kind: 'agent', addr: 'm/agt_h' } })), 0);
 });
+
+test('a session row without sessionKey keys its member and row by provider:id', () => {
+    const bare = (id, path) => { const v = view(undefined, path, { id, provider: 'claudeCode' }); delete v.sessionKey; return v; };
+    const m = derive({ sessions: [bare('a', '/r/one'), bare('b', '/r/one'), bare('c', '/r/two')] });
+    assert.deepEqual(m.workspaces.map(w => w.root), ['/r/one', '/r/two']);
+    const one = m.workspaces[0];
+    assert.deepEqual(one.rows.map(r => r.id), ['talk:claudeCode:a', 'talk:claudeCode:b']);
+    assert.deepEqual(one.rows.flatMap(r => r.members.map(x => [x.key, x.sessionKey])), [['claudeCode:a', 'claudeCode:a'], ['claudeCode:b', 'claudeCode:b']]);
+    // An agent row still claims its session through the fallback key.
+    const joined = derive({ sessions: [bare('a', '/r/one')], agents: [agent('agt', '/r/one', { sessionKey: 'claudeCode:a', role: 'observed' })] });
+    assert.deepEqual(joined.workspaces[0].rows.flatMap(r => r.members.map(x => x.key)), ['agt']);
+});
