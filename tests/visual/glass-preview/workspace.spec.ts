@@ -99,7 +99,7 @@ test.describe('glass workspace page (not a baseline)', () => {
 	test('live mode: a live workspace shows live cards and no fixture text', async ({ page }) => {
 		await page.setViewportSize({ width: 1100, height: 1200 });
 		const id = workspaceId('/Users/visual/projects/web-app');
-		await openClassic(page, { path: `/#/ws/${id}`, storage: live, sessionKeys: true });
+		await openClassic(page, { path: `/#/ws/${id}`, storage: live });
 		const ws = page.locator('.ws-page');
 		await expect(ws.locator('h1')).toHaveText('web-app');
 		await expect(ws.locator('.card').first()).toBeVisible();
@@ -112,7 +112,7 @@ test.describe('glass workspace page (not a baseline)', () => {
 	test('live and plain demo mode: fixture routes show no fixture text', async ({ page }) => {
 		for (const storage of [live, { 'ui.shell': 'glass', demoMode: 'true' }]) {
 			for (const wsId of ['c9watch', 'flockbook', 'jumpmark', 'cross']) {
-				await openClassic(page, { path: `/#/ws/${wsId}`, storage, sessionKeys: true });
+				await openClassic(page, { path: `/#/ws/${wsId}`, storage });
 				await expect(page.locator('.ws-page h1')).toHaveText(wsId);
 				await expect(page.locator('.ws-page .state-msg')).toHaveText('這個 workspace 現在沒有 agent');
 				await expectNoFixtureText(page);

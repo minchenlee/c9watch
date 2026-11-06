@@ -12,7 +12,7 @@
     import SessionCard from '../ui/SessionCard.svelte';
     import PixelBar from '../ui/PixelBar.svelte';
     import { annotationsFor, formatTokens, formatUsd, timeAgo } from '../ui/format';
-    import { codeParts, historyFor, historyTitle, loadExtras, localDay, memoryFor, rulesFor, spendFor, type Loaded } from './workspace-extras';
+    import { codeParts, historyFor, historyTitle, loadExtras, localDay, memoryFor, priceLabel, rulesFor, spendFor, type Loaded } from './workspace-extras';
     import type { C9pCostData, C9pHistoryEntry, C9pProjectMemory } from '$lib/c9p-1';
 
     export let id: string;
@@ -125,8 +125,8 @@
                 <p class="state-msg">這個 workspace 還沒有用量紀錄</p>
             {:else}
                 <div class="tiles">
-                    <div class="tile"><span class="lbl">今天</span><b class="num">{formatTokens(spend.today)}</b><span class="mono meta">≈ API 價 {formatUsd(spend.todayCost)}</span></div>
-                    <div class="tile"><span class="lbl">本月（{localDay(now).slice(5, 7)}/01 起）</span><b class="num">{formatTokens(spend.month)}</b><span class="mono meta">≈ API 價 {formatUsd(spend.monthCost)}</span></div>
+                    <div class="tile"><span class="lbl">今天</span><b class="num">{formatTokens(spend.today)}</b><span class="mono meta">{priceLabel(spend.todayCost, spend.todayPricing, formatUsd)}</span></div>
+                    <div class="tile"><span class="lbl">本月（{localDay(now).slice(5, 7)}/01 起）</span><b class="num">{formatTokens(spend.month)}</b><span class="mono meta">{priceLabel(spend.monthCost, spend.monthPricing, formatUsd)}</span></div>
                 </div>
                 <p class="note">
                     {#if spend.monthShare != null}本月占全部 workspace 的 {Math.round(spend.monthShare)}%。{/if}
@@ -136,7 +136,7 @@
                     <thead><tr><th>模型</th><th class="n">token</th><th class="n">≈ API 價</th></tr></thead>
                     <tbody>
                         {#each spend.byModel as m (m.model)}
-                            <tr><td>{m.model}</td><td class="n">{formatTokens(m.tokens)}</td><td class="n">{m.priced ? formatUsd(m.cost) : '沒有價格表'}</td></tr>
+                            <tr><td>{m.model}</td><td class="n">{formatTokens(m.tokens)}</td><td class="n">{m.pricing === 'none' ? '沒有價格' : m.pricing === 'some' ? `${formatUsd(m.cost)}（部分）` : formatUsd(m.cost)}</td></tr>
                         {/each}
                     </tbody>
                 </table>

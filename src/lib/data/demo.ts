@@ -18,6 +18,11 @@ const DEMO_GLASS_KEY = 'c9watch.demoGlass';
 export function demoGlassOn(): boolean {
     try { return globalThis.localStorage?.getItem(DEMO_GLASS_KEY) === '1'; } catch { return false; }
 }
+/** True only while the glass shell runs (`startGlassData` sets it, its stop
+ * clears it). The fixture answers only then, so Classic's demo answers stay
+ * the same whatever localStorage holds. */
+let glassShellActive = false;
+export function setDemoGlassActive(on: boolean): void { glassShellActive = on; }
 function demoGlassRequest(method: C9pMethod): any {
     switch (method) {
         case 'session.views': return { sessions: glassDemoSessionViews(), cursor: 'demo:glass:0' };
@@ -32,7 +37,7 @@ function demoGlassRequest(method: C9pMethod): any {
 const mailDenied = () => Object.assign(new Error('Mail is not exposed in demo mode'), { code: 'not_allowed', msg: 'Mail is not exposed in demo mode' });
 export const demoTransport: Transport = {
     async request(method: C9pMethod, p: any): Promise<any> {
-        const glass = demoGlassOn() ? demoGlassRequest(method) : undefined;
+        const glass = glassShellActive && demoGlassOn() ? demoGlassRequest(method) : undefined;
         if (glass !== undefined) return glass;
         switch (method) {
             case 'session.views': return { sessions: getDemoSessions(), cursor: null };

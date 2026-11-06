@@ -126,3 +126,51 @@ test('fixture: every demo workspace has history, spend and memory in its own roo
     assert.deepEqual(X.rulesFor(gaps.DEMO_RULES, ws('cross'), gaps.DEMO_GOALS), []);
     assert.match(workspaceId('/r/app'), /^ws_[0-9a-f]{8}$/);
 });
+
+test('pages: follow an advancing nextOffset, stop at the cap or a cursor that does not move', async () => {
+    const pages = (next) => async offset => ({ items: [offset], nextOffset: next(offset) });
+    assert.deepEqual(await X.readPages(pages(o => (o < 3 ? o + 1 : null))), [0, 1, 2, 3]);
+    assert.deepEqual(await X.readPages(pages(o => o)), [0], 'same offset: stop');
+    assert.deepEqual(await X.readPages(pages(o => (o ? 0 : 5))), [0, 5], 'backwards: stop');
+    assert.equal((await X.readPages(pages(o => o + 1))).length, X.MAX_PAGES, 'hard cap');
+    assert.deepEqual(await X.readPages(async () => ({ items: [], nextOffset: undefined })), []);
+    await assert.rejects(X.readPages(async () => { throw new Error('read failed'); }), /read failed/);
+});
+
+test('spend keeps price availability: none, some (priced subtotal) or all', () => {
+    const rec = (date, cost, costAvailable, model = 'm') => ({ project: '/r/app', date, totalTokens: 100, cost, costAvailable, model, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningOutputTokens: 0 });
+    const spend = rs => X.spendFor({ projectCosts: [{ project: '/r/app', sessions: rs }] }, '/r/app', '2026-11-06');
+    const none = spend([rec('2026-11-06', 0, false)]);
+    assert.equal(none.todayPricing, 'none');
+    assert.equal(X.priceLabel(none.todayCost, none.todayPricing, F.formatUsd), '沒有價格');
+    const some = spend([rec('2026-11-06', 2, true), rec('2026-11-06', 0, false, 'n'), rec('2026-11-01', 3, true)]);
+    assert.deepEqual([some.todayPricing, some.todayCost, some.monthPricing, some.monthCost], ['some', 2, 'some', 5]);
+    assert.equal(X.priceLabel(some.todayCost, some.todayPricing, F.formatUsd), '≈ API 價 $2.00（只算有價格的部分）');
+    assert.deepEqual(some.byModel.map(m => [m.model, m.pricing]), [['m', 'all'], ['n', 'none']]);
+    const all = spend([rec('2026-11-06', 1.5, true)]);
+    assert.equal(X.priceLabel(all.todayCost, all.todayPricing, F.formatUsd), '≈ API 價 $1.50');
+    assert.equal(X.pricingOf([]), 'all');
+});
+
+test('demo transport: glass answers only while the glass shell runs, whatever localStorage holds', async () => {
+    const store = new Map([['c9watch.demoGlass', '1'], ['demoMode', 'true']]);
+    globalThis.localStorage = { getItem: k => store.get(k) ?? null };
+    const stub = src => dataUrl(src);
+    urls['../demo/data'] = stub(`export const getDemoSessions = () => ['classic-sessions']; export const getDemoHistoryEntries = () => ['classic-history'];
+        export const getDemoCostData = () => ({ classic: 'cost' }); export const demoConversations = {}; export const getDemoAwayActivity = () => ({}); export const getDemoDiagnostics = () => null;`);
+    urls['../subscription-usage'] = stub('export const demoSubscriptionUsage = () => [];');
+    urls['./demo/mail'] = stub('export const demoMailRequest = () => null; export const demoMailSubscribe = () => () => {};');
+    urls['./demo/glass'] = stub(`export const glassDemoAgents = () => ['glass']; export const glassDemoAnnotations = () => ['glass']; export const glassDemoSessionViews = () => ['glass'];
+        export const glassDemoHistory = () => ['glass']; export const glassDemoCost = () => ({ glass: 'cost' }); export const glassDemoMemory = () => ['glass'];`);
+    const demo = await load('$lib/data/demo', '../src/lib/data/demo.ts');
+    const t = demo.demoTransport;
+    const classic = async () => JSON.stringify(await Promise.all(['session.views', 'history.list', 'cost.get', 'memory.list', 'agent.list', 'annotation.list'].map(m => t.request(m, {}))));
+    const before = await classic();
+    assert(!before.includes('glass'), 'flags persisted, Classic running: no glass answer');
+    demo.setDemoGlassActive(true);
+    assert.deepEqual((await t.request('history.list', {})).entries, ['glass']);
+    assert.deepEqual(await t.request('cost.get', {}), { glass: 'cost' });
+    demo.setDemoGlassActive(false);
+    assert.equal(await classic(), before, 'after glass stops, Classic answers are byte-identical');
+    delete globalThis.localStorage;
+});

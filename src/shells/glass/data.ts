@@ -9,7 +9,7 @@ import { sessionFeed } from '$lib/data/session-feed';
 import { annotationFeed, type AnnotationMap } from '$lib/data/annotation-feed';
 import { mail as sharedMail } from '$lib/data/stores/mail';
 import { isDemoMode, isPersistedDemoMode } from '$lib/data/demo/mode';
-import { demoGlassOn } from '$lib/data/demo';
+import { demoGlassOn, setDemoGlassActive } from '$lib/data/demo';
 import { deriveGlassModel, type GlassModel, type Gaps } from './model';
 import { attentionKey, openAttention, type AttentionSeen } from './model/needs';
 import type { ChangeLog } from './model/stale';
@@ -106,6 +106,7 @@ export function startGlassData(): () => void {
     const demo = isPersistedDemoMode();
     if (demo) isDemoMode.set(true);
     fixtureOn.set(demo && demoGlassOn());
+    setDemoGlassActive(true);
     changes = new Map();
     attention.set([]); turnEnds.set(new Map()); mail.set([]); agentsAt.set(-Infinity);
     const t = transport();
@@ -116,5 +117,5 @@ export function startGlassData(): () => void {
     // The feed's Session rows are SessionView rows with a cast status.
     const stopSessions = sessionFeed(t, rows => { sessions.set(rows as unknown as C9pSessionView[]); agentRows.sessionsChanged(); }, dataError.set);
     const stopAnnotations = annotationFeed(t, annotations.set, dataError.set);
-    return () => { agentRows.stop(); stopMail(); stopSessions(); stopAnnotations(); };
+    return () => { agentRows.stop(); stopMail(); stopSessions(); stopAnnotations(); setDemoGlassActive(false); };
 }

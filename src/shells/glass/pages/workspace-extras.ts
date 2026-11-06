@@ -13,13 +13,32 @@ export type Loaded<T> = { ok: true; value: T } | { ok: false; error: unknown };
 
 const settle = <T>(p: Promise<T>): Promise<Loaded<T>> => p.then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }));
 
-/** One read of each source. History and memory read the first page only
- * (1000 rows, newest first): enough for one workspace's recent work. */
+/** Most pages one source is read for. */
+export const MAX_PAGES = 10;
+
+/** Follows `nextOffset` from 0 and joins the pages. Stops at the last page,
+ * after `MAX_PAGES`, or when the cursor does not move forward (the rows read
+ * so far are kept). The core caps a page by size too, so one request never
+ * proves that every row came back. */
+export async function readPages<T>(fetch: (offset: number) => Promise<{ items: T[]; nextOffset?: number | null }>, max = MAX_PAGES): Promise<T[]> {
+    const out: T[] = [];
+    let offset = 0;
+    for (let page = 0; page < max; page++) {
+        const r = await fetch(offset);
+        out.push(...r.items);
+        const next = r.nextOffset;
+        if (next == null || !Number.isFinite(next) || next <= offset) break;
+        offset = next;
+    }
+    return out;
+}
+
+/** One read of each source; history and memory follow their pages. */
 export async function loadExtras(): Promise<{ history: Loaded<C9pHistoryEntry[]>; cost: Loaded<C9pCostData | null>; memory: Loaded<C9pProjectMemory[]> }> {
     const [history, cost, memory] = await Promise.all([
-        settle(request('history.list', { page: { offset: 0, limit: 1000 } }).then(r => (r?.entries ?? []) as C9pHistoryEntry[])),
+        settle(readPages(async offset => { const r = await request('history.list', { page: { offset, limit: 1000 } }); return { items: (r?.entries ?? []) as C9pHistoryEntry[], nextOffset: r?.nextOffset }; })),
         settle(request('cost.get', {}).then(r => (r ?? null) as C9pCostData | null)),
-        settle(request('memory.list', { page: { offset: 0, limit: 1000 } }).then(r => (r?.projects ?? []) as C9pProjectMemory[]))
+        settle(readPages(async offset => { const r = await request('memory.list', { page: { offset, limit: 1000 } }); return { items: (r?.projects ?? []) as C9pProjectMemory[], nextOffset: r?.nextOffset }; }))
     ]);
     return { history, cost, memory };
 }
@@ -43,7 +62,10 @@ export function historyTitle(e: C9pHistoryEntry): string {
 
 const tokensOf = (r: C9pSessionCostRecord) => Number.isFinite(r.totalTokens) ? r.totalTokens : r.inputTokens + r.outputTokens + r.cachedInputTokens + r.reasoningOutputTokens;
 
-export type ModelSpend = { model: string; tokens: number; cost: number; priced: boolean };
+/** How many records behind a total have a USD price (`costAvailable`).
+ * `none`: no estimate at all; `some`: the cost is the priced subtotal only. */
+export type Pricing = 'all' | 'some' | 'none';
+export type ModelSpend = { model: string; tokens: number; cost: number; pricing: Pricing };
 export type WorkspaceSpend = {
     /** Tokens of this workspace: today, since the 1st, all records. */
     today: number;
@@ -52,6 +74,8 @@ export type WorkspaceSpend = {
     /** ≈ API price of the same records (not what was paid). */
     todayCost: number;
     monthCost: number;
+    todayPricing: Pricing;
+    monthPricing: Pricing;
     /** This workspace's share of all tokens since the 1st, 0–100; null without data. */
     monthShare: number | null;
     byModel: ModelSpend[];
@@ -68,18 +92,29 @@ export function spendFor(cost: C9pCostData | null, root: string, today: string):
     const todays = mine.filter(r => r.date === today);
     const months = mine.filter(r => r.date.startsWith(month));
     const allMonth = sum(all.map(x => x.r).filter(r => r.date.startsWith(month)), tokensOf);
-    const models = new Map<string, ModelSpend>();
-    for (const r of mine) {
-        const m = models.get(r.model) ?? { model: r.model, tokens: 0, cost: 0, priced: true };
-        m.tokens += tokensOf(r); m.cost += r.cost; m.priced &&= r.costAvailable;
-        models.set(r.model, m);
-    }
+    const byModel = new Map<string, C9pSessionCostRecord[]>();
+    for (const r of mine) byModel.set(r.model, [...(byModel.get(r.model) ?? []), r]);
+    const priced = (rs: C9pSessionCostRecord[]) => rs.filter(r => r.costAvailable);
     return {
         today: sum(todays, tokensOf), month: sum(months, tokensOf), total: sum(mine, tokensOf),
-        todayCost: sum(todays, r => r.cost), monthCost: sum(months, r => r.cost),
+        todayCost: sum(priced(todays), r => r.cost), monthCost: sum(priced(months), r => r.cost),
+        todayPricing: pricingOf(todays), monthPricing: pricingOf(months),
         monthShare: allMonth > 0 ? (sum(months, tokensOf) / allMonth) * 100 : null,
-        byModel: [...models.values()].sort((a, b) => b.tokens - a.tokens || a.model.localeCompare(b.model))
+        byModel: [...byModel].map(([model, rs]): ModelSpend => ({ model, tokens: sum(rs, tokensOf), cost: sum(priced(rs), r => r.cost), pricing: pricingOf(rs) }))
+            .sort((a, b) => b.tokens - a.tokens || a.model.localeCompare(b.model))
     };
+}
+
+/** No records count as `all`: there is nothing unpriced. */
+export function pricingOf(rs: C9pSessionCostRecord[]): Pricing {
+    const n = rs.filter(r => r.costAvailable).length;
+    return n === rs.length ? 'all' : n === 0 ? 'none' : 'some';
+}
+
+/** The estimate text for one total. */
+export function priceLabel(cost: number, pricing: Pricing, usd: (n: number) => string): string {
+    if (pricing === 'none') return '沒有價格';
+    return pricing === 'some' ? `≈ API 價 ${usd(cost)}（只算有價格的部分）` : `≈ API 價 ${usd(cost)}`;
 }
 
 export function localDay(t: number): string {
