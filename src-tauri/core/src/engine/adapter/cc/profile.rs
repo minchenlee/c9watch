@@ -27,8 +27,8 @@
 //!   `allowUnsandboxedCommands:false`. The price, accepted in D28 Q2=A: a
 //!   free agent cannot change the repo's own `.claude/`, skills and
 //!   commands included. The first two layers also cover the engine's
-//!   `bin/`, `spawn/` and `extensions/` (D31) and its `standing-orders.md`
-//!   (C1a-25).
+//!   `bin/`, `spawn/`, `extensions/` (D31) and `ext-data/` and its
+//!   `standing-orders.md` (C1a-25).
 //! - The first two layers also cover the `.claude/` of every other live
 //!   engine agent at spawn time (C1a-32, `Profile::with_peers`): in live
 //!   run X14 one agent rewrote another agent's `settings.json` with a Bash
@@ -101,6 +101,13 @@ pub const SPAWN_DIR: &str = "spawn";
 /// write floor so that an agent cannot install an extension by writing a
 /// file there.
 pub const EXTENSIONS_DIR: &str = "extensions";
+
+/// `<home>/ext-data`: where the core half of an extension would keep its
+/// state, in `<home>/ext-data/<id>/` (for example a PM ledger). That half
+/// runs as `plugin:<id>`, so an agent that writes there could steer it.
+/// The engine does not create it, read it or write it yet; it is in the
+/// write floor before anything uses it.
+pub const EXT_DATA_DIR: &str = "ext-data";
 
 /// The cwd settings files CC reads and hot-reloads while a session runs
 /// (`.claude/settings.json` = project source, `.local` = local source).
@@ -292,7 +299,8 @@ pub fn allow_rules(p: &Profile) -> Vec<String> {
 /// Engine-owned directories the agent must not write: `<home>/bin` (the
 /// agent binary), `<home>/spawn` (its own settings file) and
 /// `<home>/extensions` (D31 floor b: a file written there must not install
-/// an extension). The directory need not exist. `home` is the
+/// an extension) and `<home>/ext-data` (an extension's state: a file
+/// written there must not steer it). The directories need not exist. `home` is the
 /// parent of `bin`, as `agent_bin::installed_path` lays it out. A
 /// `live-test` build adds `<home>/live-test`: the engine types the bytes of
 /// a file there into an agent's PTY, so a write there is a `!` command
@@ -305,6 +313,7 @@ pub fn engine_dirs(p: &Profile) -> Vec<PathBuf> {
         .map(Path::to_path_buf)
         .chain(home.map(|h| h.join(SPAWN_DIR)))
         .chain(home.map(|h| h.join(EXTENSIONS_DIR)))
+        .chain(home.map(|h| h.join(EXT_DATA_DIR)))
         .collect();
     #[cfg(feature = "live-test")]
     v.extend(home.map(|h| h.join(crate::engine::live_test::DIR)));
@@ -559,9 +568,9 @@ mod tests {
     const BIN: &str = "/b/Application Support/c9/bin/c9watch-agent";
     const HOME: &str = "/b/Application Support/c9";
     #[cfg(not(feature = "live-test"))]
-    const ENGINE_DIRS: &[&str] = &["/bin", "/extensions", "/spawn"];
+    const ENGINE_DIRS: &[&str] = &["/bin", "/ext-data", "/extensions", "/spawn"];
     #[cfg(feature = "live-test")]
-    const ENGINE_DIRS: &[&str] = &["/bin", "/extensions", "/live-test", "/spawn"];
+    const ENGINE_DIRS: &[&str] = &["/bin", "/ext-data", "/extensions", "/live-test", "/spawn"];
     const ENGINE_FILES: &[&str] = &[
         "/standing-orders.md",
         "/engine.db",
@@ -1097,6 +1106,23 @@ mod tests {
         assert!(dw.contains(&dir), "{:?}", dw);
     }
 
+    #[test]
+    fn ext_data_dir_is_denied_in_both_layers() {
+        // An extension's core half runs as plugin:<id> and keeps its state
+        // under <home>/ext-data/<id>/: an agent must not write there, with
+        // a file tool or from Bash.
+        let t = tempfile::tempdir().unwrap();
+        let p = p_in(t.path());
+        let s = settings(&p);
+        let dir = format!("{}/ext-data", HOME);
+        let deny: Vec<String> = serde_json::from_value(s["permissions"]["deny"].clone()).unwrap();
+        let rule = format!("Edit(//{}/**)", dir.trim_start_matches('/'));
+        assert!(deny.contains(&rule), "{} not in {:?}", rule, deny);
+        let dw: Vec<String> =
+            serde_json::from_value(s["sandbox"]["filesystem"]["denyWrite"].clone()).unwrap();
+        assert!(dw.contains(&dir), "{:?}", dw);
+    }
+
     #[cfg(feature = "live-test")]
     #[test]
     fn live_test_input_dir_is_denied_in_both_layers() {
@@ -1114,15 +1140,16 @@ mod tests {
     /// one byte. Retaken for D31, whose only change is the two
     /// `<home>/extensions` entries. Retaken for `sandbox.failIfUnavailable`,
     /// whose only change is that one key (the old digests come back with it
-    /// removed).
+    /// removed). Retaken for `<home>/ext-data`, whose only change is its two
+    /// entries.
     #[cfg(not(feature = "live-test"))]
     const BARE_SETTINGS_SHA: &str =
-        "e8e02fdd8b1f90fd96f1377bfffd8fab3fed2fbbf6408d1d711859d6dfb39d20";
+        "66b65f0847c6a6a6b85e3179a2d2de18aa9c31abaf2546375cc8bb76220e7485";
     #[cfg(not(feature = "live-test"))]
     const BARE_ARGV_SHA: &str = "ac731f6ef7e0ca17a06bfc51b959df31837a5820a1054debc32692e508489873";
     #[cfg(not(feature = "live-test"))]
     const CHILD_SETTINGS_SHA: &str =
-        "9268f1784ad2a5ce9e0cca574ec5a8671ac2d68aca005dbaaa6986abe5c8a98f";
+        "1a59159143de27869f0e51bb96bf80b664a82deaa8a58cb3b2de8ac41e0ece39";
     #[cfg(not(feature = "live-test"))]
     const CHILD_ARGV_SHA: &str = "0103b03f2291389ead0180e467a375408385c1843fa3f7f575e5ddb2a7b0d8bb";
 
