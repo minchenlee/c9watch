@@ -3749,6 +3749,9 @@ mod tests {
         Refuse,
         /// An error line, and the process has exited.
         Exit,
+        /// CC's `sandbox.failIfUnavailable` refusal (Linux without bwrap
+        /// or socat), and the process has exited (exit 1).
+        NoSandbox,
         /// Nothing at all, forever.
         Hang,
         /// The workspace trust dialog, forever. The engine starts to drain
@@ -3904,6 +3907,7 @@ mod tests {
                     " \u{23bf}  Claude usage limit reached. Your limit resets 5pm\n",
                 ),
                 Script::Exit => ("", "Error: the session could not start\n"),
+                Script::NoSandbox => ("", NO_SANDBOX_SCREEN),
                 Script::Hang => ("", ""),
                 Script::Trust => (
                     "",
@@ -4028,7 +4032,10 @@ mod tests {
                     pid: self.next_pid.fetch_sub(1, Ordering::SeqCst),
                     start: 1,
                 },
-                exited: matches!(self.script, Script::Refuse | Script::Exit),
+                exited: matches!(
+                    self.script,
+                    Script::Refuse | Script::Exit | Script::NoSandbox
+                ),
                 kills: self.kills.clone(),
                 exit_now: self.exit_now.clone(),
                 writes: self.writes.clone(),
@@ -4781,6 +4788,43 @@ mod tests {
         no_supervisors(&e.sp);
         assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 1);
         assert_eq!(only_row(&e.db).state.as_deref(), Some("failed"));
+    }
+
+    /// What CC 2.1.319 writes to its terminal before it exits 1, when
+    /// `sandbox.failIfUnavailable` is set and the sandbox cannot start
+    /// (text from the binary; the reason is CC's own).
+    const NO_SANDBOX_SCREEN: &str = "Error: sandbox required but unavailable: bubblewrap (bwrap) not installed\n  sandbox.failIfUnavailable is set \u{2014} refusing to start without a working sandbox.\n";
+
+    /// Codex review of #230 (P1): a CC that refuses to start without its
+    /// sandbox ends the create as `spawn_failed` with CC's text, once, and
+    /// does not hang in `starting`.
+    #[tokio::test]
+    async fn a_missing_sandbox_is_spawn_failed_with_the_vendor_text() {
+        let e = setup(Script::NoSandbox, None);
+        let err =
+            e.sp.create(&Principal::LocalUnverified, create_params(&e.cwd))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::SpawnFailed);
+        assert!(err.msg.contains("exited before ready"), "{}", err.msg);
+        assert!(
+            err.msg.contains("sandbox required but unavailable"),
+            "{}",
+            err.msg
+        );
+        assert!(err.msg.contains("failIfUnavailable"), "{}", err.msg);
+        assert!(!err.code.retryable());
+        no_supervisors(&e.sp);
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), 1);
+        let r = only_row(&e.db);
+        assert_eq!(r.state.as_deref(), Some("failed"));
+        let failed = events(&e.db, "agent.failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["reason"], SPAWN_FAILED);
+        assert!(failed[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("sandbox required but unavailable"));
     }
 
     #[tokio::test]
@@ -6388,6 +6432,7 @@ mod tests {
             Arc::new(move || base + Duration::from_secs(n.fetch_add(1, Ordering::SeqCst)));
         for (script, clock, text) in [
             (Script::Exit, None, "exited before ready"),
+            (Script::NoSandbox, None, "sandbox required but unavailable"),
             (Script::Hang, Some(fast), "not ready within 30 s"),
         ] {
             let e = setup(Script::Ready, None);
