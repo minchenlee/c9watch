@@ -53,6 +53,7 @@ function handle(cmd: string, args: Args): unknown {
                 case 'usage.subscriptions': return { usage: fx.subscriptionUsage };
                 case 'subagent.list': return { subagents: options.sessions === 'empty' ? {} : fx.subagents };
                 case 'subagent.transcript': return { messages: [] };
+                case 'agent.list': return { agents: [] }; // glass shell only
                 case 'session.tasks': return { tasks: fx.tasks[String(p.sessionId)] ?? [] };
                 case 'provider.opencode.status': return fx.opencodeStatus;
                 case 'provider.opencode.connect': case 'detect.recheck': return null;
