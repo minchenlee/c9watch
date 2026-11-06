@@ -41,7 +41,9 @@ export type Need = {
     msgId: string | null;
 };
 
-export type AttentionSeen = { event: C9pAgentAttentionEvent; at: number };
+/** `at`: the event's time. `receivedAt`: local time it arrived, compared
+ * with `agentsAt` (both on this client's clock); `at` when absent. */
+export type AttentionSeen = { event: C9pAgentAttentionEvent; at: number; receivedAt?: number };
 
 /** One slot per agent, reason kind and mail: a newer event of the same kind
  * replaces the older one. */
@@ -52,6 +54,8 @@ export type AttentionFacts = {
     mail: ReadonlyMap<string, C9pMsgSummary>;
     /** The last `agent.turn_end` per agent id. */
     turnEnds: ReadonlyMap<string, C9pAgentTurnEndEvent>;
+    /** Local time the `agent.list` behind `agents` was asked; -Infinity if unknown. */
+    agentsAt?: number;
 };
 
 /** The attention events still open. An event is cleared when:
@@ -59,18 +63,20 @@ export type AttentionFacts = {
  * - its agent's generation is newer than the event's (a restart);
  * - it names a mail (`mail_uncertain`, `mail_held`) and that mail is listed
  *   and no longer needs a look (not uncertain, failed or held);
- * - it is `mail_paused` and the agent row says `mailPaused: false`;
+ * - it is `mail_paused` and an agent row asked after the event says
+ *   `mailPaused: false` (an older row cannot clear it: a pause from elsewhere
+ *   sends no `agent.upsert`);
  * - it names no mail (`auto_mode_denied` and other hook reasons) and the
  *   agent ended a turn after it, in the same or a newer generation.
  * The detected status (working, waiting) never clears an event. */
-export function openAttention(seen: AttentionSeen[], { agents, mail, turnEnds }: AttentionFacts): AttentionSeen[] {
-    return seen.filter(({ event: e, at }) => {
+export function openAttention(seen: AttentionSeen[], { agents, mail, turnEnds, agentsAt = -Infinity }: AttentionFacts): AttentionSeen[] {
+    return seen.filter(({ event: e, at, receivedAt }) => {
         const a = agents.get(e.id);
         const gen = typeof e.generation === 'number' ? e.generation : null;
         if (a && (a.goneAt != null || a.state === 'retired' || a.state === 'failed')) return false;
         if (a && gen != null && a.generation > gen) return false;
         if (e.msgId) { const m = mail.get(e.msgId); return !m || mailNeedsLook(m); }
-        if (e.reason === 'mail_paused') return a?.mailPaused !== false;
+        if (e.reason === 'mail_paused') return !(a?.mailPaused === false && agentsAt > (receivedAt ?? at));
         const end = turnEnds.get(e.id);
         return !(end && end.at > at && (gen == null || end.generation >= gen));
     });
@@ -79,6 +85,7 @@ export function openAttention(seen: AttentionSeen[], { agents, mail, turnEnds }:
 const TAG: Record<NeedVerb, string> = { 允許: '等你允許', 決定: '等你決定', 處理: '卡住', 給: '等你給', 審: '等你審' };
 const ASK_TOOLS = new Set(['AskUserQuestion']);
 const CLOSED_MAIL = new Set(['failed', 'rejected', 'expired', 'cancelled']);
+const LOST_REPLY = new Set([...CLOSED_MAIL, 'uncertain']);
 
 function toolTitle(name: string, input: unknown): string {
     const i = (input ?? {}) as Record<string, unknown>;
@@ -125,7 +132,14 @@ export function deriveNeeds({ members, workspaceOf, attention = [], mail = [], d
         if (m?.live) add(m, { verb: '處理', title: event.reason, since: at, source: 'attention', permission: null, msgId: event.msgId ?? null });
     }
     const humans = new Set(members.filter(m => m.role === 'human').map(m => m.agentId));
-    const answered = new Set(mail.map(x => x.replyTo).filter(Boolean));
+    // Answered: a reply from the request's recipient (the human side) that
+    // was not lost. Engine notices and failed or cancelled replies never count.
+    const byId = new Map(mail.map(x => [x.msgId, x]));
+    const answered = new Set(mail.filter(r => {
+        const q = r.replyTo ? byId.get(r.replyTo) : undefined;
+        return q && r.kind === 'reply' && !LOST_REPLY.has(r.state) && r.from.kind !== 'engine'
+            && (r.from.kind === 'human' || agentIdOf(r.from.addr) === q.to.id);
+    }).map(r => r.replyTo));
     const named = (name: string | null) => { const hit = name ? members.filter(m => m.agentId && m.name === name) : []; return hit.length === 1 ? hit[0] : undefined; };
     for (const x of mail) {
         if (x.kind !== 'request' || !humans.has(x.to.id) || CLOSED_MAIL.has(x.state) || answered.has(x.msgId)) continue;

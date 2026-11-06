@@ -182,7 +182,13 @@ test('attention stays open whatever the status, until its own clearing rule', ()
     // A restart (newer generation) or a retired agent clears everything with a generation.
     assert.equal(openAttention([uncertain, denied], facts({ generation: 3 })).length, 0);
     assert.equal(openAttention([uncertain, denied, paused], facts({ state: 'retired', goneAt: NOW })).length, 0);
-    assert.equal(openAttention([paused], facts({ mailPaused: false })).length, 0);
+    // A pause clears only on a row asked after the event.
+    assert.equal(openAttention([paused], facts({ mailPaused: false })).length, 1);
+    assert.equal(openAttention([paused], { ...facts({ mailPaused: false }), agentsAt: NOW - 1 }).length, 1);
+    assert.equal(openAttention([{ ...paused, receivedAt: NOW + 5 }], { ...facts({ mailPaused: false }), agentsAt: NOW + 1 }).length, 1);
+    assert.equal(openAttention([paused], { ...facts({ mailPaused: false }), agentsAt: NOW + 1 }).length, 0);
+    const stale = derive({ agents: [agent('agt_a', '/x', { generation: 2, mailPaused: false })], attention: [paused], agentsAt: NOW - 1 });
+    assert.deepEqual(stale.needs.map(n => n.title), ['mail_paused']);
     assert.notEqual(attentionKey(uncertain.event), attentionKey(denied.event));
     // In the model: a working agent with open mail_uncertain is a 處理 item.
     const m = derive({ agents: [agent('agt_a', '/x', { generation: 2 })], attention: [uncertain] });
@@ -203,4 +209,19 @@ test('mail requests resolve the sender by address; a name only when unique and n
     const two = [agent('agt_1', '/x', { name: 'worker' }), agent('agt_2', '/x', { name: 'worker' }), agent('agt_3', '/x', { name: 'solo' }), human];
     const m = derive({ agents: two, mail: [req('a', { kind: 'agent', addr: 'm/agt_2', name: 'worker' }), req('b', { kind: 'agent', addr: null, name: 'worker' }), req('c', { kind: 'agent', addr: null, name: 'solo' })] });
     assert.deepEqual(m.needs.map(n => [n.msgId, n.agentId]).sort(), [['a', 'agt_2'], ['c', 'agt_3']]);
+});
+
+test('a request is answered only by a delivered reply from its recipient', () => {
+    const human = agent('agt_h', '/code', { role: 'human' });
+    const q = { msgId: 'q', kind: 'request', to: { id: 'agt_h' }, from: { kind: 'agent', addr: 'm/agt_w' }, state: 'delivered', preview: 'q', createdAt: NOW, replyTo: null };
+    const reply = more => ({ msgId: 'r', kind: 'reply', to: { id: 'agt_w' }, from: { kind: 'human', addr: null }, state: 'delivered', replyTo: 'q', createdAt: NOW, ...more });
+    const open = r => derive({ agents: [agent('agt_w', '/x'), human], mail: [q, r] }).needs.length;
+    assert.equal(open(reply({ state: 'failed' })), 1);
+    assert.equal(open(reply({ state: 'cancelled' })), 1);
+    assert.equal(open(reply({ state: 'uncertain' })), 1);
+    assert.equal(open(reply({ kind: 'notice', from: { kind: 'engine', addr: null } })), 1);
+    assert.equal(open(reply({ from: { kind: 'engine', addr: null } })), 1);
+    assert.equal(open(reply({ from: { kind: 'agent', addr: 'm/agt_other' } })), 1);
+    assert.equal(open(reply({})), 0);
+    assert.equal(open(reply({ from: { kind: 'agent', addr: 'm/agt_h' } })), 0);
 });

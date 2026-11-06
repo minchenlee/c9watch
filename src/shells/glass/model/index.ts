@@ -21,6 +21,8 @@ export type ModelInput = {
     /** Raw events; the model keeps the open ones (`openAttention`). */
     attention?: AttentionSeen[];
     turnEnds?: ReadonlyMap<string, C9pAgentTurnEndEvent>;
+    /** Local time the `agent.list` behind `agents` was asked. */
+    agentsAt?: number;
     mail?: C9pMsgSummary[];
     gaps?: Gaps | null;
     changes?: ChangeLog;
@@ -29,7 +31,7 @@ export type ModelInput = {
 
 const sig = (m: Member) => `${m.status}|${m.session?.waitingFor?.kind ?? ''}|${m.session?.pendingToolName ?? ''}|${m.agent?.state ?? ''}`;
 
-export function deriveGlassModel({ sessions, agents, attention = [], turnEnds = new Map(), mail = [], gaps = null, changes = new Map(), now }: ModelInput): GlassModel {
+export function deriveGlassModel({ sessions, agents, attention = [], turnEnds = new Map(), agentsAt = -Infinity, mail = [], gaps = null, changes = new Map(), now }: ModelInput): GlassModel {
     const members = buildMembers(sessions, agents);
     const nextChanges = trackChanges(changes, members.map(m => ({ key: m.key, sig: sig(m), seenAt: m.seenAt })), now);
     const wsByRoot = new Map<string, Workspace>();
@@ -54,7 +56,7 @@ export function deriveGlassModel({ sessions, agents, attention = [], turnEnds = 
         .filter(w => rowsByWs.has(w.id))
         .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name) || a.root.localeCompare(b.root))
         .map(w => ({ ...w, rows: rowsByWs.get(w.id)! }));
-    const open = openAttention(attention, { agents: new Map(agents.map(a => [a.id, a])), mail: new Map(mail.map(m => [m.msgId, m])), turnEnds });
+    const open = openAttention(attention, { agents: new Map(agents.map(a => [a.id, a])), mail: new Map(mail.map(m => [m.msgId, m])), turnEnds, agentsAt });
     const needs = sortNeeds(deriveNeeds({ members, workspaceOf: m => views.get(m)!.workspaceId, attention: open, mail, demo: gaps?.needs ?? null }));
     return { workspaces, needs, changes: nextChanges };
 }

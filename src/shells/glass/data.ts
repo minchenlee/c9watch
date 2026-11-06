@@ -17,6 +17,8 @@ import { DEMO_GOALS, DEMO_NEEDS, DEMO_WORKSPACES } from './model/gaps-demo';
 
 export const sessions = writable<C9pSessionView[]>([]);
 export const agents = writable<C9pAgentRow[]>([]);
+/** Local time the `agent.list` behind `agents` was asked. */
+export const agentsAt = writable(-Infinity);
 /** Open `agent.attention` events, one per `attentionKey`. Cleared only by
  * the rules of `openAttention`, never by the detected status. */
 export const attention = writable<AttentionSeen[]>([]);
@@ -36,15 +38,15 @@ const clock = readable(Date.now(), set => { const t = setInterval(() => set(Date
 const DEMO_GAPS: Gaps = { workspaces: DEMO_WORKSPACES, goals: DEMO_GOALS, needs: DEMO_NEEDS };
 let changes: ChangeLog = new Map();
 /** The derived glass view model. Demo gaps only while the fixture is on. */
-export const model = derived([sessions, agents, attention, turnEnds, mail, fixtureOn, clock], ([$s, $a, $att, $ends, $mail, $fixture, $now]): GlassModel => {
-    const m = deriveGlassModel({ sessions: $s, agents: $a, attention: $att, turnEnds: $ends, mail: $mail, gaps: $fixture ? DEMO_GAPS : null, changes, now: Math.max($now, Date.now()) });
+export const model = derived([sessions, agents, agentsAt, attention, turnEnds, mail, fixtureOn, clock], ([$s, $a, $at, $att, $ends, $mail, $fixture, $now]): GlassModel => {
+    const m = deriveGlassModel({ sessions: $s, agents: $a, agentsAt: $at, attention: $att, turnEnds: $ends, mail: $mail, gaps: $fixture ? DEMO_GAPS : null, changes, now: Math.max($now, Date.now()) });
     changes = m.changes;
     return m;
 });
 
 /** Drops the attention events `openAttention` closed, so the list stays small. */
 function pruneAttention() {
-    const facts = { agents: new Map(get(agents).map(a => [a.id, a])), mail: new Map(get(mail).map(m => [m.msgId, m])), turnEnds: get(turnEnds) };
+    const facts = { agents: new Map(get(agents).map(a => [a.id, a])), mail: new Map(get(mail).map(m => [m.msgId, m])), turnEnds: get(turnEnds), agentsAt: get(agentsAt) };
     attention.update(list => { const open = openAttention(list, facts); return open.length === list.length ? list : open; });
 }
 
@@ -61,10 +63,11 @@ function agentFeed(onError: (e: unknown) => void): { stop: () => void; sessionsC
         if (stopped) return;
         if (reading) { again = true; return; }
         reading = true; last = Date.now();
+        const askedAt = last;
         try {
             const rows = (await t.request('agent.list', {}))?.agents ?? [];
             if (stopped) return;
-            agents.set(rows);
+            agents.set(rows); agentsAt.set(askedAt);
             pruneAttention();
         } catch (e) { if (!stopped) onError(e); }
         reading = false;
@@ -77,7 +80,9 @@ function agentFeed(onError: (e: unknown) => void): { stop: () => void; sessionsC
         if (f.topic === 'agent.attention') {
             const event = f.data as C9pAgentAttentionEvent;
             const key = attentionKey(event);
-            attention.update(list => [...list.filter(x => attentionKey(x.event) !== key), { event, at: f.ts ?? Date.now() }]);
+            attention.update(list => [...list.filter(x => attentionKey(x.event) !== key), { event, at: f.ts ?? Date.now(), receivedAt: Date.now() }]);
+            // A pause from elsewhere sends no agent.upsert: read the rows again.
+            if (event.reason === 'mail_paused') void list();
         } else if (f.topic === 'agent.turn_end') {
             const end = f.data as C9pAgentTurnEndEvent;
             turnEnds.update(m => new Map(m).set(end.id, end));
@@ -102,7 +107,7 @@ export function startGlassData(): () => void {
     if (demo) isDemoMode.set(true);
     fixtureOn.set(demo && demoGlassOn());
     changes = new Map();
-    attention.set([]); turnEnds.set(new Map()); mail.set([]);
+    attention.set([]); turnEnds.set(new Map()); mail.set([]); agentsAt.set(-Infinity);
     const t = transport();
     // The shared data-layer mail store: its feed starts with the first
     // subscriber and stops with the last, and G5's send/pause use the same one.
