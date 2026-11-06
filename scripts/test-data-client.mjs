@@ -57,6 +57,11 @@ test('session actions preserve the provider identity and never name stop by a ra
     await api.renameSession('same','name','claudeCode');
     assert.deepEqual(asJSON(calls),[['session.stop',{sessionKey:'claudeCode:same',pid:55}],['session.rename',{sessionId:'same',newName:'name',provider:'claudeCode'}]]);
 });
+test('D42: retireAgent sends agent.retire with only the id (never force) and returns the row', async () => {
+    const calls=[]; const api=apiWith(async (m,p)=>{calls.push([m,p]); return {agent:{id:p.id,state:'retired'}};});
+    assert.deepEqual(asJSON(await api.retireAgent('agt_1')),{id:'agt_1',state:'retired'});
+    assert.deepEqual(asJSON(calls),[['agent.retire',{id:'agt_1'}]]);
+});
 test('only core_unavailable permits the native fallback; denial retains the complete error', async () => {
     const calls=[]; let failure={code:'not_allowed',msg:'denied',hint:'needs scope',data:{needs:1}};
     const bridge=load('../src/lib/data/tauri-bridge.ts',{

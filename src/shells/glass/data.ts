@@ -12,6 +12,7 @@ import { isDemoMode, isPersistedDemoMode } from '$lib/data/demo/mode';
 import { demoGlassOn, setDemoGlassActive } from '$lib/data/demo';
 import { deriveGlassModel, type GlassModel, type Gaps } from './model';
 import { attentionKey, openAttention, type AttentionSeen } from './model/needs';
+import { sessionKeyOf } from './model/rooms';
 import type { ChangeLog } from './model/stale';
 import { DEMO_GOALS, DEMO_NEEDS, DEMO_WORKSPACES } from './model/gaps-demo';
 
@@ -33,12 +34,42 @@ export const dataError = writable<unknown | null>(null);
  * Only then may the shell show fixture-only data such as demo workspaces. */
 export const fixtureOn = writable(false);
 
+/** Session keys of agents the person retired here (D42). `agent.retire`
+ * drops the agent row at once, but the session view stays until core's next
+ * detection or `session.gone`; without this the model would read it as an
+ * observed session and bring the stopped item back. A key is dropped when
+ * the session feed no longer lists it. */
+export const retiredSessions = writable<ReadonlySet<string>>(new Set());
+export function hideRetiredSession(key: string | null | undefined): void {
+    if (key) retiredSessions.update(s => (s.has(key) ? s : new Set(s).add(key)));
+}
+/** The session keys of `id` and of every agent below it in the agent rows
+ * as they are now. Core retires a parent's children with it (D16), so the
+ * page takes them before the call and hides them all after a retire. */
+export function retireScope(id: string): string[] {
+    const rows = get(agents);
+    const ids = new Set([id]);
+    for (let grew = true; grew;) {
+        grew = false;
+        for (const a of rows) if (a.parentId && ids.has(a.parentId) && !ids.has(a.id)) { ids.add(a.id); grew = true; }
+    }
+    return rows.filter(a => ids.has(a.id) && a.sessionKey).map(a => a.sessionKey!);
+}
+function pruneRetiredSessions(rows: C9pSessionView[]): void {
+    retiredSessions.update(s => {
+        if (!s.size) return s;
+        const live = new Set(rows.map(sessionKeyOf));
+        return [...s].every(k => live.has(k)) ? s : new Set([...s].filter(k => live.has(k)));
+    });
+}
+
 /** Re-derives once a minute, so 「很久沒動靜」 shows without new rows. */
 const clock = readable(Date.now(), set => { const t = setInterval(() => set(Date.now()), 60_000); return () => clearInterval(t); });
 const DEMO_GAPS: Gaps = { workspaces: DEMO_WORKSPACES, goals: DEMO_GOALS, needs: DEMO_NEEDS };
 let changes: ChangeLog = new Map();
 /** The derived glass view model. Demo gaps only while the fixture is on. */
-export const model = derived([sessions, agents, agentsAt, attention, turnEnds, mail, fixtureOn, clock], ([$s, $a, $at, $att, $ends, $mail, $fixture, $now]): GlassModel => {
+export const model = derived([sessions, agents, agentsAt, attention, turnEnds, mail, fixtureOn, clock, retiredSessions], ([$all, $a, $at, $att, $ends, $mail, $fixture, $now, $retired]): GlassModel => {
+    const $s = $retired.size ? $all.filter(v => !$retired.has(sessionKeyOf(v))) : $all;
     const m = deriveGlassModel({ sessions: $s, agents: $a, agentsAt: $at, attention: $att, turnEnds: $ends, mail: $mail, gaps: $fixture ? DEMO_GAPS : null, changes, now: Math.max($now, Date.now()) });
     changes = m.changes;
     return m;
@@ -115,7 +146,7 @@ export function startGlassData(): () => void {
     const stopMail = sharedMail.subscribe(snap => { mail.set([...snap.messages.values()]); pruneAttention(); });
     const agentRows = agentFeed(dataError.set);
     // The feed's Session rows are SessionView rows with a cast status.
-    const stopSessions = sessionFeed(t, rows => { sessions.set(rows as unknown as C9pSessionView[]); agentRows.sessionsChanged(); }, dataError.set);
+    const stopSessions = sessionFeed(t, rows => { const views = rows as unknown as C9pSessionView[]; pruneRetiredSessions(views); sessions.set(views); agentRows.sessionsChanged(); }, dataError.set);
     const stopAnnotations = annotationFeed(t, annotations.set, dataError.set);
     return () => { agentRows.stop(); stopMail(); stopSessions(); stopAnnotations(); setDemoGlassActive(false); };
 }

@@ -66,7 +66,7 @@
                 </div>
                 {#if confirmClassic}
                     <div class="confirm" role="alert" data-confirm-classic>
-                        <p>切到 Classic 會馬上換掉這個畫面。這一版的 Classic 還沒有切回 Glass 的開關：要回來，得在開發者工具設 <code>localStorage['ui.shell'] = 'glass'</code> 再重新載入。</p>
+                        <p>切到 Classic 會馬上換掉這個畫面。要回來：Classic 的 SETTINGS › About &amp; updates › Interface 按「Switch to Glass」。</p>
                         <div class="row">
                             <button type="button" class="primary" on:click={toClassic} data-confirm="classic">切到 Classic</button>
                             <button type="button" on:click={() => (confirmClassic = false)}>留在 Glass</button>
@@ -178,7 +178,7 @@
     .field:last-child { border-bottom: 0; }
     .lbl { font: var(--type-label); color: var(--text-2); }
     .note { margin: 0; font: var(--type-label); color: var(--text-3); }
-    .note code, .confirm code, .rule code { font: var(--type-meta); color: var(--text-1); overflow-wrap: anywhere; }
+    .note code, .rule code { font: var(--type-meta); color: var(--text-1); overflow-wrap: anywhere; }
     .mono { font: var(--type-meta); }
     .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
     .seg { display: flex; flex-wrap: wrap; gap: var(--space-1); }

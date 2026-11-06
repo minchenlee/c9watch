@@ -22,23 +22,47 @@ async function openNeeds(page: Page, storage: Record<string, string> = glass, se
  * which every c9p `SessionView` has; this adds it. `failAgentList` rejects
  * `agent.list`, as when the core is gone. `managed` makes the question
  * session (pid 41003) a managed engine agent and lets `msg.send` through
- * (the shared IPC mock refuses mail). `slowStop` holds `session.stop` until
- * the page calls `__C9_RELEASE_STOP__()`. Runs before the IPC mock. */
+ * (the shared IPC mock refuses mail) and `agent.retire` (D42). `slowStop`
+ * holds `agent.retire` until the page calls `__C9_RELEASE_STOP__()`.
+ * `retire`: 'retired' (default), 'orphaned once' (the first retire returns
+ * an `orphaned` row), 'retired, unlisted' (after the retire `agent.list`
+ * no longer lists the agent, as core's default list does), 'failed' (the
+ * row comes back `failed`), 'tree' (as 'retired, unlisted', and the 允許
+ * session pid 41001 is a managed child of the agent, retired with it) or
+ * 'unknown' (an older core: `unknown_method`).
+ * Runs before the IPC mock. */
 const MANAGED = { id: 'agt_01VISUALMANAGED', sessionKey: 'claudeCode:0b6c1f0e-1111-4a2b-9c3d-000000000003' };
-async function live(page: Page, failAgentList = false, managed = false, slowStop = false) {
-	await page.addInitScript(([fail, managed, M, slow]) => {
+type Retire = 'retired' | 'retired, unlisted' | 'tree' | 'orphaned once' | 'failed' | 'unknown';
+async function live(page: Page, failAgentList = false, managed = false, slowStop = false, retire: Retire = 'retired') {
+	await page.addInitScript(([fail, managed, M, slow, retire]) => {
+		let retires = 0, gone = false;
 		const internals: Record<string, unknown> = {};
 		let inner: ((cmd: string, args: any, o?: unknown) => unknown) | undefined;
 		const calls: { cmd: string; args: any }[] = ((window as any).__C9_CALLS__ = []);
 		const call = async (cmd: string, args: any, o?: unknown) => {
 			calls.push({ cmd, args });
 			if (fail && cmd === 'c9p_request' && args?.method === 'agent.list') throw { code: 'unavailable', msg: 'core is gone', retryable: true, hint: '' };
+			// D42: after a confirmed retire the row is `retired` (gone), as core lists it.
+			if (managed && cmd === 'c9p_request' && args?.method === 'agent.list' && gone && (retire === 'retired, unlisted' || retire === 'tree')) return { agents: [] };
+			if (managed && retire === 'tree' && cmd === 'c9p_request' && args?.method === 'agent.list')
+				return { agents: [
+					{ id: M.id, sessionKey: M.sessionKey, name: 'w-cache', role: 'worker', parentId: null, cwd: '/Users/visual/projects/api-server', source: 'engine', control: 'pty', mode: 'managed', state: 'ready', status: 'needs_attention', generation: 1, goneAt: null, lastSeen: Date.now(), createdAt: Date.now() - 3_600_000, mailPaused: false },
+					{ id: 'agt_01VISUALCHILD', sessionKey: 'claudeCode:0b6c1f0e-1111-4a2b-9c3d-000000000001', name: 'w-child', role: 'worker', parentId: M.id, cwd: '/Users/visual/projects/web-app', source: 'engine', control: 'pty', mode: 'managed', state: 'ready', status: 'needs_attention', generation: 1, goneAt: null, lastSeen: Date.now(), createdAt: Date.now() - 3_000_000, mailPaused: false }
+				] };
 			if (managed && cmd === 'c9p_request' && args?.method === 'agent.list')
-				return { agents: [{ id: M.id, sessionKey: M.sessionKey, name: 'w-cache', role: 'worker', parentId: null, cwd: '/Users/visual/projects/api-server', source: 'engine', control: 'pty', mode: 'managed', state: 'ready', status: 'needs_attention', generation: 1, goneAt: null, lastSeen: Date.now(), createdAt: Date.now() - 3_600_000, mailPaused: false }] };
+				return { agents: [{ id: M.id, sessionKey: M.sessionKey, name: 'w-cache', role: 'worker', parentId: null, cwd: '/Users/visual/projects/api-server', source: 'engine', control: 'pty', mode: 'managed', state: gone ? 'retired' : 'ready', status: 'needs_attention', generation: 1, goneAt: gone ? Date.now() : null, lastSeen: Date.now(), createdAt: Date.now() - 3_600_000, mailPaused: false }] };
+			// Keep the agent.* stream channel, so a test can send agent.upsert.
+			if (cmd === 'c9p_subscribe' && args?.params?.topics?.includes('agent.*')) (window as any).__C9_AGENT_CH__ = args.channel;
 			if (managed && cmd === 'c9p_request' && args?.method === 'msg.send')
 				return { cursor: 'visual:send:1', msgId: 'msg_01VISUAL', paused: false, replayed: false, state: 'queued', to: { addr: `m/${args.params.to}`, id: args.params.to, name: 'w-cache' } };
-			if (slow && cmd === 'c9p_request' && args?.method === 'session.stop')
-				return new Promise(res => ((window as any).__C9_RELEASE_STOP__ = () => res(inner!(cmd, args, o))));
+			if (managed && cmd === 'c9p_request' && args?.method === 'agent.retire') {
+				if (retire === 'unknown') throw { code: 'unknown_method', msg: 'unknown method agent.retire', retryable: false, hint: '' };
+				const state = retire === 'failed' ? 'failed' : retire === 'orphaned once' && ++retires === 1 ? 'orphaned' : 'retired';
+				if (state === 'retired') gone = true;
+				const row = { agent: { id: args.params.id, sessionKey: M.sessionKey, name: 'w-cache', state, goneAt: state === 'retired' ? Date.now() : null } };
+				if (slow) return new Promise(res => ((window as any).__C9_RELEASE_STOP__ = () => res(row)));
+				return row;
+			}
 			const r: any = await inner!(cmd, args, o);
 			if (cmd === 'c9p_request' && args?.method === 'session.views' && r?.sessions)
 				return { ...r, sessions: r.sessions.map((s: any) => ({ sessionKey: `${s.provider}:${s.id}`, ...s })) };
@@ -46,10 +70,10 @@ async function live(page: Page, failAgentList = false, managed = false, slowStop
 		};
 		Object.defineProperty(internals, 'invoke', { configurable: true, get: () => call, set: (fn) => { inner = fn; } });
 		(window as any).__TAURI_INTERNALS__ = internals;
-	}, [failAgentList, managed, MANAGED, slowStop] as const);
+	}, [failAgentList, managed, MANAGED, slowStop, retire] as const);
 }
 const calls = (page: Page, method: string) => page.evaluate((m) => (window as any).__C9_CALLS__.filter((c: any) => c.cmd === 'c9p_request' && c.args?.method === m).map((c: any) => c.args.params), method);
-const MUTATING = ['msg.send', 'session.stop', 'msg.cancel', 'mail.pause', 'mail.resume'];
+const MUTATING = ['msg.send', 'agent.retire', 'session.stop', 'msg.cancel', 'mail.pause', 'mail.resume'];
 const panel = (page: Page) => page.locator('.handling');
 const pick = (page: Page, verb: string) => page.locator('.queue .qi', { has: page.locator('.verb', { hasText: verb }) }).click();
 
@@ -332,7 +356,7 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		await expect(item).toHaveCount(1);
 	});
 
-	test('G5 live: switching items during a stop keeps the lock; session.stop runs once', async ({ page }) => {
+	test('G5 live: switching items during a stop keeps the lock; agent.retire runs once', async ({ page }) => {
 		await live(page, false, true, true);
 		await openNeeds(page, { 'ui.shell': 'glass' });
 		const item = page.locator('.queue .qi', { hasText: 'rate limiter' });
@@ -348,10 +372,11 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		await expect(panel(page).locator('[data-stop-confirm]')).toHaveCount(0);
 		await page.evaluate(() => (window as any).__C9_RELEASE_STOP__());
 		await expect(panel(page).locator('.card h2')).toHaveText('✓ 已停止 w-cache');
-		expect((await calls(page, 'session.stop')).length).toBe(1);
+		expect(await calls(page, 'agent.retire')).toEqual([{ id: MANAGED.id }]);
+		expect(await calls(page, 'session.stop')).toEqual([]);
 	});
 
-	test('G5 live: stop a managed agent (session.stop, receipt); an observed session gets ⌘O only', async ({ page }) => {
+	test('D42 live: stop a managed agent (agent.retire, receipt); an observed session gets ⌘O only', async ({ page }) => {
 		await live(page, false, true);
 		await openNeeds(page, { 'ui.shell': 'glass' });
 		await page.locator('.queue .qi', { hasText: '允許' }).click();
@@ -362,9 +387,101 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		await panel(page).locator('[data-stop]').click();
 		await panel(page).locator('[data-stop-confirm]').click();
 		await expect(panel(page).locator('.card h2')).toHaveText('✓ 已停止 w-cache');
-		await expect(panel(page).locator('.kv')).toContainText('pid 41003');
+		await expect(panel(page).locator('.kv')).toContainText(MANAGED.id);
+		await expect(panel(page).locator('.kv')).toContainText('正常結束了 w-cache');
 		await expect(panel(page).locator('.kv')).not.toContainText('示範');
-		await expect.poll(() => calls(page, 'session.stop')).toEqual([{ sessionKey: MANAGED.sessionKey, pid: 41003 }]);
+		await expect.poll(() => calls(page, 'agent.retire')).toEqual([{ id: MANAGED.id }]);
+		expect(await calls(page, 'session.stop')).toEqual([]);
 		expect(await calls(page, 'msg.send')).toEqual([]);
+	});
+
+	for (const shape of ['retired', 'retired, unlisted'] as const) {
+		test(`D42 live: the receipt stays after agent.upsert (${shape}); the stopped item does not come back`, async ({ page }) => {
+			await live(page, false, true, false, shape);
+			await openNeeds(page, { 'ui.shell': 'glass' });
+			const item = page.locator('.queue .qi', { hasText: 'rate limiter' });
+			await item.click();
+			const place = await panel(page).locator('.prog .n').innerText();
+			await panel(page).locator('[data-stop]').click();
+			await panel(page).locator('[data-stop-confirm]').click();
+			await expect(panel(page).locator('.card h2')).toHaveText('✓ 已停止 w-cache');
+			const lists = (await calls(page, 'agent.list')).length;
+			await page.evaluate(() => (window as any).__C9_AGENT_CH__.onmessage({ v: 1, type: 'event', sub: 'visual-sub', topic: 'agent.upsert', subject: 'agt_01VISUALMANAGED', cursor: 'visual:2', ts: Date.now(), data: {} }));
+			await expect.poll(async () => (await calls(page, 'agent.list')).length).toBeGreaterThan(lists);
+			await page.clock.runFor(5_000);
+			const r = panel(page);
+			await expect(r.locator('.card h2')).toHaveText('✓ 已停止 w-cache');
+			await expect(r.locator('.kv')).toContainText(MANAGED.id);
+			// The place the item had when 停止 was pressed.
+			await expect(r.locator('.prog .n')).toHaveText(place);
+			// The session view is still listed (no session.gone yet), but the
+			// stopped item does not come back as an observed one.
+			await expect(item).toHaveCount(0);
+			// J leaves the receipt for the 「下一件」 it names.
+			const nextText = (await r.locator('.nx').innerText()).replace(/^下一件：/, '');
+			await page.keyboard.press('KeyJ');
+			await expect(r.locator('.card h2')).toHaveCount(0);
+			await expect(r.locator('.ask h2')).toHaveText(nextText);
+			await expect(item).toHaveCount(0);
+		});
+	}
+
+	test('D42 live: retiring a parent also hides its retired child; the child does not come back as observed', async ({ page }) => {
+		await live(page, false, true, false, 'tree');
+		await openNeeds(page, { 'ui.shell': 'glass' });
+		const child = page.locator('.queue .qi', { hasText: '允許' });
+		await expect(child).toHaveCount(1);
+		await page.locator('.queue .qi', { hasText: 'rate limiter' }).click();
+		await panel(page).locator('[data-stop]').click();
+		await panel(page).locator('[data-stop-confirm]').click();
+		await expect(panel(page).locator('.card h2')).toHaveText('✓ 已停止 w-cache');
+		const lists = (await calls(page, 'agent.list')).length;
+		await page.evaluate(() => (window as any).__C9_AGENT_CH__.onmessage({ v: 1, type: 'event', sub: 'visual-sub', topic: 'agent.upsert', subject: 'agt_01VISUALMANAGED', cursor: 'visual:2', ts: Date.now(), data: {} }));
+		await expect.poll(async () => (await calls(page, 'agent.list')).length).toBeGreaterThan(lists);
+		await page.clock.runFor(5_000);
+		await expect(child).toHaveCount(0);
+		await expect(panel(page).locator('.card h2')).toHaveText('✓ 已停止 w-cache');
+	});
+
+	test('D42 live: a failed row from agent.retire is no receipt and says the agent had already ended', async ({ page }) => {
+		await live(page, false, true, false, 'failed');
+		await openNeeds(page, { 'ui.shell': 'glass' });
+		await page.locator('.queue .qi', { hasText: 'rate limiter' }).click();
+		await panel(page).locator('[data-stop]').click();
+		await panel(page).locator('[data-stop-confirm]').click();
+		await expect(panel(page).locator('.notice')).toHaveText('沒有停止：這個 agent 在停止前已經失敗結束了。');
+		await expect(panel(page).locator('.card h2')).toHaveCount(0);
+		// The notice stays on the item it is about.
+		await page.clock.runFor(5_000);
+		await expect(panel(page).locator('.ask h2')).toContainText('rate limiter');
+		await expect(panel(page).locator('.notice')).toHaveText('沒有停止：這個 agent 在停止前已經失敗結束了。');
+		expect(await calls(page, 'session.stop')).toEqual([]);
+	});
+
+	test('D42 live: an orphaned retire is no receipt; 停止 again retries', async ({ page }) => {
+		await live(page, false, true, false, 'orphaned once');
+		await openNeeds(page, { 'ui.shell': 'glass' });
+		await page.locator('.queue .qi', { hasText: 'rate limiter' }).click();
+		await panel(page).locator('[data-stop]').click();
+		await panel(page).locator('[data-stop-confirm]').click();
+		await expect(panel(page).locator('.notice')).toHaveText('未確認結束，可再試一次。');
+		await expect(panel(page).locator('.card h2')).toHaveCount(0);
+		await expect(panel(page).locator('[data-stop-confirm]')).toBeEnabled();
+		await panel(page).locator('[data-stop-confirm]').click();
+		await expect(panel(page).locator('.card h2')).toHaveText('✓ 已停止 w-cache');
+		expect(await calls(page, 'agent.retire')).toEqual([{ id: MANAGED.id }, { id: MANAGED.id }]);
+		expect(await calls(page, 'session.stop')).toEqual([]);
+	});
+
+	test('D42 live: an older core without agent.retire gets a clear error, never session.stop', async ({ page }) => {
+		await live(page, false, true, false, 'unknown');
+		await openNeeds(page, { 'ui.shell': 'glass' });
+		await page.locator('.queue .qi', { hasText: 'rate limiter' }).click();
+		await panel(page).locator('[data-stop]').click();
+		await panel(page).locator('[data-stop-confirm]').click();
+		await expect(panel(page).locator('.notice')).toContainText('不支援 agent.retire');
+		await expect(panel(page).locator('.card h2')).toHaveCount(0);
+		expect(await calls(page, 'agent.retire')).toEqual([{ id: MANAGED.id }]);
+		expect(await calls(page, 'session.stop')).toEqual([]);
 	});
 });
