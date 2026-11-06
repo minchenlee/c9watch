@@ -38,6 +38,7 @@ Read next:
 - [Topics](topics.md): every public event and its data type.
 - [Gateway](gateway.md): pairing, origins, scopes and authentication. Needs M-b.
 - [Extending](extending.md): exports and external aggregation.
+- [Glass extensions](extensions.md): trust, directories, the `c9ext.json` manifest, `c9watch ext check` and the `c9ui/1` API.
 - [Changelog](CHANGELOG.md): preview changes by minor.
 - [Linux](linux.md): headless core install, socket paths and the optional systemd service.
 - [TypeScript SDK](../../packages/c9p-client/README.md): Node socket and browser/Node WebSocket transports.

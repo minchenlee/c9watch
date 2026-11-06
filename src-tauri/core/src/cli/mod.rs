@@ -23,6 +23,7 @@ mod api_schema;
 mod cost;
 #[cfg(all(unix, feature = "engine"))]
 mod export;
+pub mod ext;
 mod session_json;
 mod session_ref;
 // Engine commands talk to the engine over a unix socket. `api schema`
@@ -83,6 +84,7 @@ pub const CLI_COMMANDS: &[&str] = &[
     "send",
     "mail",
     "cost",
+    "ext",
     "usage-bridge",
     "hooks",
     "help",
@@ -456,6 +458,12 @@ pub enum Commands {
         action: IntegrationAction,
     },
 
+    /// Check an extension directory before you share or install it
+    Ext {
+        #[command(subcommand)]
+        action: ext::ExtAction,
+    },
+
     /// Query session cost data
     #[command(name = "cost", about = "Query session cost data")]
     Cost {
@@ -648,6 +656,7 @@ pub fn run(cli: Cli) {
             Ok(code) => process::exit(code),
             Err(e) => Err(e),
         },
+        Commands::Ext { action } => ext::run(action, cli.pretty),
         Commands::Cost {
             daily,
             weekly,
@@ -1281,6 +1290,19 @@ mod dispatch_tests {
                 "`c9watch {name}` would launch the GUI: add it to CLI_COMMANDS"
             );
         }
+    }
+
+    #[test]
+    fn ext_check_routes_to_the_cli_in_every_build() {
+        assert!(CLI_COMMANDS.contains(&"ext"));
+        assert!(is_cli_invocation("ext"));
+        let cli = Cli::try_parse_from(["c9watch", "ext", "check", "x", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Ext {
+                action: ext::ExtAction::Check { json: true, .. }
+            }
+        ));
     }
 
     #[test]
