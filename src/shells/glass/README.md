@@ -59,7 +59,9 @@ G6 extension host (`ext/`, glass build plan §3, manifest per owner D41 R1–R12
   (`ExtCandidate`); the host validates.
 - `ExtPages.svelte` + `Mount.svelte`: `import()` the page entry into a
   shadow root, `mount(root, host)`; 5 s without `ready()` shows
-  「extension 沒有回應」, a throw shows 「extension 停止了」. The last page
+  「extension 沒有回應」, a throw shows 「extension 停止了」. The timeout
+  covers async hangs only: a synchronous loop freezes the window, the same
+  as any trusted npm package (D31: same document, no iframe or worker). The last page
   stays mounted (`suspend` / `resume`). On an extension page J / K step
   `context.needsItemId` through the needs queue.
 - Keys: a key from inside an extension goes to the extension first, except

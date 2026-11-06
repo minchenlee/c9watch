@@ -11,6 +11,7 @@ export const UI_CONTRACT = 'c9ui/1';
 export const MANIFEST_FORMAT = 1;
 export const MAX_MANIFEST_BYTES = 64 * 1024;
 export const MAX_PAGES = 16;
+export const MAX_NAME = 64;
 const ID_RE = /^[a-z][a-z0-9-]{0,31}$/;
 // semver.org 2.0.0, the recommended regular expression.
 const SEMVER_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
@@ -95,10 +96,11 @@ export function compareSemver(a: string, b: string): number {
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const byteLength = (s: string) => new TextEncoder().encode(s).length;
 
-/** A page entry is a relative path inside the extension directory. */
+/** A page entry is a relative path inside the extension directory. No
+ * `%` at all, so no encoded `..` (`%2e%2e`) can survive URL normalization. */
 function isEntryPath(v: unknown): v is string {
     if (typeof v !== 'string' || !v || v.length > 200) return false;
-    if (v.startsWith('/') || v.includes('\\') || v.includes(':') || v.includes('?') || v.includes('#')) return false;
+    if (v.startsWith('/') || /[\\%:?#]/.test(v)) return false;
     return v.split('/').every(seg => seg !== '' && seg !== '.' && seg !== '..');
 }
 
@@ -131,7 +133,7 @@ export function parseManifest(text: string | null, dir: string, size?: number): 
     // R5, R10.
     if (typeof raw.id !== 'string' || !ID_RE.test(raw.id)) return bad('id 格式不對（小寫字母開頭，只能有小寫字母、數字、-，最多 32 字）');
     if (raw.id !== dir) return bad(`id「${raw.id}」和目錄名「${dir}」不一樣`);
-    if (typeof raw.name !== 'string' || !raw.name.trim() || raw.name.length > 80) return bad('name 必須是 1–80 字的字串');
+    if (typeof raw.name !== 'string' || !raw.name.trim() || raw.name.length > MAX_NAME) return bad(`name 必須是 1–${MAX_NAME} 字的字串`);
     // R11.
     if (!isSemver(raw.version)) return bad('version 不是有效的 semver');
     if (raw.dev !== undefined && typeof raw.dev !== 'boolean') return bad('dev 必須是 true 或 false');
@@ -230,7 +232,8 @@ export function describeEntry(e: ExtEntry): string {
     return e.hasCore ? '含 core 部分' : '可以使用';
 }
 
-/** URL of a page entry. Ids and paths were checked by `parseManifest`. */
+/** URL of a page entry. Ids and paths were checked by `parseManifest`;
+ * each segment is still encoded, so no segment can mean `..` or `/`. */
 export function entryUrl(e: ExtEntry, page: ExtPage): string {
-    return `${e.base}${e.dir}/${page.entry}`;
+    return `${e.base}${encodeURIComponent(e.dir)}/${page.entry.split('/').map(encodeURIComponent).join('/')}`;
 }

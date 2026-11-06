@@ -40,7 +40,32 @@ function defaultEngineHome() {
     return null;
 }
 
+/** `child` is strictly inside `parent` (both real paths). */
+const inside = (/** @type {string} */ parent, /** @type {string} */ child) => child.startsWith(parent + path.sep);
+
+/** The real path of `<root>/<id>`, or null when it is missing, not a
+ * directory, or (through a symlink) not inside the root's real path. Such a
+ * directory counts as absent: it neither lists nor shadows.
+ * @param {Root} root @param {string} id @returns {string | null} */
+function realExtDir(root, id) {
+    try {
+        const realRoot = fs.realpathSync(root.dir);
+        const dir = fs.realpathSync(path.join(root.dir, id));
+        return inside(realRoot, dir) && fs.statSync(dir).isDirectory() ? dir : null;
+    } catch { return null; }
+}
+
+/** The real path of `<extDir>/<segs...>` when it is a file inside `extDir`.
+ * @param {string} extDir @param {string[]} segs @returns {string | null} */
+function realFileIn(extDir, segs) {
+    try {
+        const real = fs.realpathSync(path.join(extDir, ...segs));
+        return inside(extDir, real) && fs.statSync(real).isFile() ? real : null;
+    } catch { return null; }
+}
+
 /** Every extension directory in every root, with its raw manifest text.
+ * Every path is checked by its real path (symlinks cannot leave the root).
  * @param {Root[]} roots */
 export function listExtensions(roots) {
     /** @type {{ dir: string, source: Root['source'], manifest: string | null, size: number }[]} */
@@ -51,14 +76,18 @@ export function listExtensions(roots) {
         try { names = fs.readdirSync(root.dir, { withFileTypes: true }).filter(d => d.isDirectory() || d.isSymbolicLink()).map(d => d.name); } catch { continue; }
         for (const dir of names.sort()) {
             if (dir.startsWith('.')) continue;
-            const file = path.join(root.dir, dir, 'c9ext.json');
+            const extDir = realExtDir(root, dir);
+            if (!extDir) continue;
+            const file = realFileIn(extDir, ['c9ext.json']);
             let size = 0;
             /** @type {string | null} */
             let manifest = null;
-            try {
-                size = fs.statSync(file).size;
-                if (size <= MAX_MANIFEST_BYTES) manifest = fs.readFileSync(file, 'utf8');
-            } catch { /* no manifest: the host reports it */ }
+            if (file) {
+                try {
+                    size = fs.statSync(file).size;
+                    if (size <= MAX_MANIFEST_BYTES) manifest = fs.readFileSync(file, 'utf8');
+                } catch { /* unreadable: the host reports a missing manifest */ }
+            }
             out.push({ dir, source: root.source, manifest, size });
         }
     }
@@ -66,22 +95,18 @@ export function listExtensions(roots) {
 }
 
 /** The real path of `<root>/<id>/<rel>` in the first root that has `<id>`,
- * or null. Refuses ids the manifest rules reject, `..`, dot files and any
- * path (symlinks too) that leaves the extension directory.
+ * or null. Refuses ids the manifest rules reject, `..`, `%`, dot files, and
+ * any path (symlinks too) that leaves the root or the extension directory.
+ * `rel` is already URL-decoded.
  * @param {Root[]} roots @param {string} id @param {string} rel @returns {string | null} */
 export function resolveExtFile(roots, id, rel) {
     if (!DIR_RE.test(id)) return null;
     const segs = rel.split('/');
-    if (!rel || segs.some(s => !s || s === '.' || s === '..' || s.startsWith('.') || s.includes('\\') || s.includes('\0'))) return null;
+    if (!rel || segs.some(s => !s || s === '.' || s === '..' || s.startsWith('.') || s.includes('\\') || s.includes('%') || s.includes('\0'))) return null;
     for (const root of roots) {
-        let extDir;
-        try { extDir = fs.realpathSync(path.join(root.dir, id)); } catch { continue; }
+        const extDir = realExtDir(root, id);
         // R9: the first root that has the id owns it, file or not.
-        let real;
-        try { real = fs.realpathSync(path.join(extDir, ...segs)); } catch { return null; }
-        if (!real.startsWith(extDir + path.sep)) return null;
-        try { if (!fs.statSync(real).isFile()) return null; } catch { return null; }
-        return real;
+        if (extDir) return realFileIn(extDir, segs);
     }
     return null;
 }

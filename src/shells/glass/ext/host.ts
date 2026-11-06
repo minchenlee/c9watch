@@ -16,12 +16,13 @@ export type HostTheme = { tokens: Record<string, string>; glass: GlassMode };
 export interface C9uiHost {
     v: 'c9ui/1';
     /** R7: exactly these keys. `call` and `on` are reserved for the core
-     * part of an extension and are not there yet. */
+     * part of an extension: in v1 `call` rejects with `{ code: 'refused' }`
+     * and `on` returns a no-op unsubscribe. */
     ext: {
         id: string;
         version: string;
-        call?: (method: string, params?: unknown) => Promise<unknown>;
-        on?: (event: string, cb: (v: unknown) => void) => () => void;
+        call(method: string, params?: unknown): Promise<never>;
+        on(event: string, cb: (v: unknown) => void): () => void;
     };
     c9p: Transport;
     readonly theme: HostTheme;
@@ -85,7 +86,12 @@ export function createHost(ext: { id: string; version: string }, deps: HostDeps)
     let live = true;
     const host: C9uiHost = {
         v: 'c9ui/1',
-        ext: Object.freeze({ id: ext.id, version: ext.version }),
+        ext: Object.freeze({
+            id: ext.id,
+            version: ext.version,
+            call: () => Promise.reject(Object.freeze({ code: 'refused', msg: 'extension core calls are not available yet' })),
+            on: () => () => {}
+        }),
         c9p: deps.c9p,
         get theme() { return deps.theme(); },
         get context() { return { ...deps.context() }; },

@@ -48,6 +48,10 @@
             const mod = (await import(/* @vite-ignore */ url)) as Partial<ExtModule>;
             if (gone) return;
             if (typeof mod.mount !== 'function') throw new Error(`${page.entry} 沒有匯出 mount()`);
+            // The 5 s ready timeout covers async hangs only. A synchronous
+            // loop in mount() freezes the window, like any trusted npm
+            // package would: extensions run in this document by design
+            // (D31, plan §3.1; D33 Q7 rejected iframe / postMessage).
             const out = await mod.mount(root, ctl.host);
             if (gone) { try { out?.destroy?.(); } catch { /* already gone */ } return; }
             handle = out && typeof out.destroy === 'function' ? out : null;

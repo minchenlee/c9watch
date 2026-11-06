@@ -101,11 +101,13 @@ test('R6: minVersion compares app and apiMinor only; core is ignored', () => {
     assert.match(reason({ ...base(), minVersion: 'new' }), /minVersion/);
 });
 
-test('R7: host.ext has exactly id and version (call / on absent)', () => {
+test('R7: host.ext is exactly { id, version, call, on }; call refuses, on is a no-op', async () => {
     const ctl = H.createHost({ id: 'demo', version: '1.0.0' }, deps());
-    assert.deepEqual(Object.keys(ctl.host.ext).sort(), ['id', 'version']);
-    assert.equal(ctl.host.ext.call, undefined);
-    assert.equal(ctl.host.ext.on, undefined);
+    assert.deepEqual(Object.keys(ctl.host.ext).sort(), ['call', 'id', 'on', 'version']);
+    await assert.rejects(ctl.host.ext.call('office.seat', {}), e => e.code === 'refused');
+    const off = ctl.host.ext.on('office.moved', () => assert.fail('never called'));
+    assert.equal(typeof off, 'function');
+    off();
     assert.ok(Object.isFrozen(ctl.host.ext));
     assert.deepEqual(Object.keys(ctl.host).sort(), ['c9p', 'context', 'ext', 'intent', 'keys', 'on', 'prefs', 'ready', 'theme', 'v']);
     assert.equal(ctl.host.v, 'c9ui/1');
@@ -172,7 +174,8 @@ test('R12: core.events items are string | { name, subscribers? }, warnings only'
 test('pages: ids unique, titles set, entries stay inside the directory', () => {
     const withPage = p => ({ ...base(), ui: { contract: 'c9ui/1', pages: [p] } });
     assert.equal(parse(withPage({ id: 'main', title: 'T', entry: 'dist/index.js', icon: 'map' })).ok, true);
-    for (const entry of ['../x.js', '/abs.js', 'a/../b.js', './a.js', 'https://evil/x.js', 'c9ext://x/a.js', 'a\\b.js', 'a.js?x', '', 'a//b.js']) {
+    for (const entry of ['../x.js', '/abs.js', 'a/../b.js', './a.js', 'https://evil/x.js', 'c9ext://x/a.js', 'a\\b.js', 'a.js?x', '', 'a//b.js',
+        '%2e%2e/hello/index.js', '.%2e/hello/index.js', '%2E%2E/x.js', 'a%2fb.js', 'a/%2e/b.js', '%5c..%5cx.js', 'a%20b.js']) {
         assert.match(reason(withPage({ id: 'main', title: 'T', entry })), /entry/, entry);
     }
     assert.match(reason(withPage({ id: 'Main', title: 'T', entry: 'a.js' })), /id 格式不對/);
@@ -180,6 +183,8 @@ test('pages: ids unique, titles set, entries stay inside the directory', () => {
     assert.match(reason({ ...base(), ui: { contract: 'c9ui/1', pages: [{ id: 'a', title: 'A', entry: 'a.js' }, { id: 'a', title: 'B', entry: 'b.js' }] } }), /兩個「a」/);
     assert.match(reason({ ...base(), dev: 'yes' }), /dev/);
     assert.match(reason({ ...base(), name: '' }), /name/);
+    assert.equal(parse({ ...base(), name: 'n'.repeat(64) }).ok, true, '64 is the limit');
+    assert.match(reason({ ...base(), name: 'n'.repeat(65) }), /name 必須是 1–64 字/);
 });
 
 test('dev: true shows in a dev build only', () => {
@@ -194,6 +199,8 @@ test('entry URLs use the list base', () => {
     assert.equal(M.entryUrl(e, e.manifest.ui.pages[0]), 'c9ext://localhost/demo/index.js');
     const [d] = M.resolveExtensions([{ dir: 'demo', source: 'third', manifest: JSON.stringify(base()), base: '/x/' }], ENV);
     assert.equal(M.entryUrl(d, d.manifest.ui.pages[0]), '/x/demo/index.js');
+    const [n] = M.resolveExtensions([{ dir: 'demo', source: 'third', manifest: JSON.stringify({ ...base(), ui: { contract: 'c9ui/1', pages: [{ id: 'main', title: 'T', entry: 'dist/a b.js' }] } }) }], ENV);
+    assert.equal(M.entryUrl(n, n.manifest.ui.pages[0]), '/c9ext/demo/dist/a%20b.js', 'segments are encoded');
 });
 
 test('compareSemver follows semver precedence', () => {
@@ -323,6 +330,43 @@ test('dev server: lists both roots and serves only files inside an extension', (
             assert.equal(resolveExtFile(roots, id, rel), null, `${id}/${rel}`);
         }
         assert.deepEqual(listExtensions(extensionRoots(repo, path.join(tmp, 'missing'))).map(c => c.dir), ['hello'], 'a missing root is skipped');
+        assert.equal(resolveExtFile(roots, 'mine', '%2e%2e/hello/index.js'), null, 'no % in a served path');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('dev server: symlinks cannot leave the root or the extension directory', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'c9ext-'));
+    try {
+        const put = (p, s) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, s); };
+        const repo = path.join(tmp, 'repo'), home = path.join(tmp, 'home'), outside = path.join(tmp, 'outside');
+        put(path.join(outside, 'secrets.json'), '{"secret":1}');
+        put(path.join(outside, 'c9ext.json'), '{"c9ext":1,"id":"demo"}');
+        put(path.join(outside, 'index.js'), 'outside');
+        put(path.join(repo, 'extensions/real/index.js'), 'real');
+        // 1. An extension directory that is a symlink out of the root.
+        fs.mkdirSync(path.join(repo, 'extensions'), { recursive: true });
+        fs.symlinkSync(outside, path.join(repo, 'extensions/demo'));
+        // 2. A manifest that is a symlink out of its extension.
+        put(path.join(home, 'extensions/leak/index.js'), 'leak');
+        fs.symlinkSync(path.join(outside, 'secrets.json'), path.join(home, 'extensions/leak/c9ext.json'));
+        // 3. A served file that is a symlink out of its extension (to a sibling).
+        fs.symlinkSync(path.join(repo, 'extensions/real/index.js'), path.join(home, 'extensions/leak/sibling.js'));
+        // A symlink that stays inside its extension is fine.
+        fs.symlinkSync(path.join(home, 'extensions/leak/index.js'), path.join(home, 'extensions/leak/alias.js'));
+        // An engine home that is itself a symlink is fine: the root's real path counts.
+        fs.symlinkSync(home, path.join(tmp, 'home-link'));
+        for (const roots of [extensionRoots(repo, home), extensionRoots(repo, path.join(tmp, 'home-link'))]) {
+            const list = listExtensions(roots);
+            assert.deepEqual(list.map(c => [c.source, c.dir]), [['first', 'real'], ['third', 'leak']], 'the symlinked-out dir is not listed');
+            assert.equal(list[1].manifest, null, 'the symlinked-out manifest is not read');
+            assert.ok(!JSON.stringify(list).includes('secret'));
+            assert.equal(resolveExtFile(roots, 'demo', 'secrets.json'), null, 'dir symlink out');
+            assert.equal(resolveExtFile(roots, 'demo', 'index.js'), null);
+            assert.equal(resolveExtFile(roots, 'leak', 'c9ext.json'), null, 'manifest symlink out');
+            assert.equal(resolveExtFile(roots, 'leak', 'sibling.js'), null, 'file symlink out');
+            assert.equal(fs.readFileSync(resolveExtFile(roots, 'leak', 'alias.js'), 'utf8'), 'leak');
+            assert.equal(fs.readFileSync(resolveExtFile(roots, 'real', 'index.js'), 'utf8'), 'real');
+        }
     } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 });
 
