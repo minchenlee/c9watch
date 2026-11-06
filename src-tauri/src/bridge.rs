@@ -2,7 +2,9 @@
 //! Three independent request connections avoid serializing history scans with
 //! small reads. Stream connections are separate from that pool.
 use crate::engine_proto::{
-    compatibility::{core_action, core_usable, CoreAction, GUI_MAIL_METHODS, GUI_METHODS},
+    compatibility::{
+        core_action, core_usable, CoreAction, GUI_AGENT_METHODS, GUI_MAIL_METHODS, GUI_METHODS,
+    },
     home::{engine_home, sock_path},
     spawn::{ensure_engine, restart_engine, ConnectError, EngineConn, Frames},
     wire::{AgentListResult, EventFrame, NotificationEvent, SubscribeParams},
@@ -48,9 +50,12 @@ fn gui_authorized(section: &str, name: &str) -> bool {
         .is_some_and(|principals| principals.iter().any(|p| p == "local-unverified"))
 }
 
-/// Mail methods are main-window only (D37); the popover stays read-only.
+/// Mail methods (D37) and `agent.retire` (D42) are main-window only; the
+/// popover stays read-only.
 pub fn allowed(method: &str, popover: bool) -> bool {
-    (GUI_METHODS.contains(&method) || (!popover && GUI_MAIL_METHODS.contains(&method)))
+    (GUI_METHODS.contains(&method)
+        || (!popover
+            && (GUI_MAIL_METHODS.contains(&method) || GUI_AGENT_METHODS.contains(&method))))
         && gui_authorized("methods", method)
         && !matches!(method, "events.subscribe" | "events.unsubscribe")
         && (!popover
@@ -833,7 +838,7 @@ mod tests {
     fn webview_is_not_a_universal_pipe() {
         for m in [
             "agent.create",
-            "agent.retire",
+            "agent.resume",
             "gateway.open",
             "gateway.policy.set",
             "gui.confirmer.attach",
@@ -852,6 +857,14 @@ mod tests {
             assert!(allowed(m, false), "{m}");
             assert!(!allowed(m, true), "{m}");
         }
+        // D42: the main window may retire an agent; the popover may not.
+        assert!(allowed("agent.retire", false));
+        assert!(!allowed("agent.retire", true));
+        assert!(!GUI_METHODS.contains(&"agent.retire"));
+        // Every other agent.* write stays refused.
+        for m in ["agent.create", "agent.resume", "agent.handoff"] {
+            assert!(!allowed(m, false), "{m}");
+        }
         let mail = SubscribeParams {
             topics: vec!["msg.state".into()],
             ..Default::default()
@@ -869,7 +882,11 @@ mod tests {
     #[test]
     fn webview_allowlist_is_a_subset_of_central_authority() {
         use crate::engine::{authz, principal::Principal};
-        for method in GUI_METHODS.iter().chain(GUI_MAIL_METHODS) {
+        for method in GUI_METHODS
+            .iter()
+            .chain(GUI_MAIL_METHODS)
+            .chain(GUI_AGENT_METHODS)
+        {
             assert!(
                 authz::can(method, &Principal::LocalUnverified, None).allowed,
                 "{method}"
@@ -896,10 +913,20 @@ mod tests {
                 || method.starts_with("hook.")
                 || matches!(
                     method.as_str(),
-                    "agent.create" | "agent.retire" | "gui.confirmer.attach"
+                    "agent.create" | "agent.resume" | "gui.confirmer.attach"
                 )
             {
                 assert!(!allowed(method, false), "{method}");
+            }
+            // D42: of the agent.* methods, the main window gets agent.list
+            // and agent.retire only; the popover gets agent.list only.
+            if method.starts_with("agent.") {
+                assert_eq!(
+                    allowed(method, false),
+                    matches!(method.as_str(), "agent.list" | "agent.retire"),
+                    "{method}"
+                );
+                assert_eq!(allowed(method, true), method == "agent.list", "{method}");
             }
         }
         assert!(authz::topics(&Principal::LocalUnverified, None)

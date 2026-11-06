@@ -170,7 +170,12 @@ test('demo transport: glass answers only while the glass shell runs, whatever lo
     demo.setDemoGlassActive(true);
     assert.deepEqual((await t.request('history.list', {})).entries, ['glass']);
     assert.deepEqual(await t.request('cost.get', {}), { glass: 'cost' });
+    // D42: the fixture ends the agent itself; agent.retire never needs a core.
+    const retired = await t.request('agent.retire', { id: 'agt_demo' });
+    assert.equal(retired.agent.id, 'agt_demo');
+    assert.equal(retired.agent.state, 'retired');
     demo.setDemoGlassActive(false);
+    assert.equal(await t.request('agent.retire', { id: 'agt_demo' }), null, 'Classic demo answers retire with nothing');
     assert.equal(await classic(), before, 'after glass stops, Classic answers are byte-identical');
     delete globalThis.localStorage;
 });

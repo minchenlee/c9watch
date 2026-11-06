@@ -7,6 +7,9 @@ mounts. The `/popover` window stays Classic in either shell.
 Switching shells at run time: glass → classic is immediate (glass stops its
 feeds on unmount). Classic → glass needs a reload: Classic's session listeners
 have no teardown, so once Classic ran in a window it stays until the reload.
+Classic's SETTINGS › About & updates › Interface has the switch back (D42):
+after a confirm it sets the same `shell` store (`ui.shell = glass`) and
+reloads.
 
 Rules:
 
@@ -90,14 +93,19 @@ G5 actions (`handling/actions.ts`, pure, `scripts/test-glass-handling.mjs`):
   `pagehide`, and the queue checks `canSend` again just before each send.
   The item goes back to the queue; the draft stays in memory (module
   state) until c9watch quits. Send ids are unique for the window lifetime.
-- Stop (managed agents only): `session.stop` after a second click, then a
-  receipt. The stop lock is per session (`handling/handled.ts`), taken
+- Stop (managed agents only, D42): `agent.retire {id}` after a second
+  click, then a receipt. Never `session.stop`, and no `force`. An `orphaned`
+  result is no receipt: the panel says 「未確認結束，可再試一次。」 and the
+  stop button stays. A core or bridge without `agent.retire`
+  (`unknown_method`, `not_allowed`, `core_unavailable`) shows a clear error;
+  there is no fallback. The GUI bridge lets only the main window call it
+  (`GUI_AGENT_METHODS`). The stop lock is per agent id (`handling/handled.ts`), taken
   before the call, so switching items cannot start a second stop. The receipt does not take ⌘↵; J goes to the 「下一件」 it names.
 - 給: c9watch does not send keys (a key sent as mail stays in the mail
   log); 「我沒有這把 key」 can be sent.
 - Offline: nothing is kept for later. The main button is off and reads
   「斷線了，連上後再送」.
-- Demo: the glass fixture answers `msg.send` and `session.stop` in
+- Demo: the glass fixture answers `msg.send` and `agent.retire` in
   `demoTransport` (`$lib/data/demo.ts`), so demo never reaches a core.
 - Handled items (`handled` in `handling/handled.ts`) leave the queue, J / K
   and the side bar count. Marks, drafts and receipts use the request

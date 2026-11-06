@@ -290,3 +290,13 @@ test('P2-4: handled marks prune by instance', () => {
     H.unmarkHandled('mail:q2');
     off();
 });
+
+test('D42: retire errors from an older core or bridge become a clear notice; others pass through', () => {
+    for (const code of ['unknown_method', 'not_allowed', 'core_unavailable']) {
+        const n = H.retireError({ code, msg: 'x' });
+        assert.match(n.notice, /不支援 agent\.retire/, code);
+    }
+    const other = { code: 'busy', msg: 'try later' };
+    assert.equal(H.retireError(other), other);
+    assert.equal(H.ORPHANED, '未確認結束，可再試一次。');
+});

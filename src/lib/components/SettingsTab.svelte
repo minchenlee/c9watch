@@ -7,6 +7,7 @@
 	import { renderPlainMarkdown } from '$lib/markdown';
 	import { openUrl } from '$lib/data/platform';
 	import { isTauri } from '$lib/ws';
+	import { shell } from '$lib/data/stores/settings';
 	import {
 		currentVersion,
 		updateAvailable,
@@ -50,6 +51,16 @@
 		checking = false;
 		justChecked = true;
 		setTimeout(() => (justChecked = false), 2500);
+	}
+
+	// D42: the one way back to Glass from Classic. The `shell` store writes
+	// `ui.shell`, the same key Glass's own switch writes. Classic does not
+	// unmount without a reload (its feeds have no teardown, see the root
+	// layout), so the switch reloads. A short confirm, as in Glass.
+	let confirmGlass = $state(false);
+	function switchToGlass() {
+		shell.set('glass');
+		location.reload();
 	}
 
 	function handleInstall() {
@@ -165,6 +176,25 @@
 				{:else if update && dlState === 'error'}
 					<div class="state-line state-line--err">
 						Install failed{error ? ` · ${error}` : ''}
+					</div>
+				{/if}
+			</div>
+		</div>
+
+		<div class="group" data-shell-switch>
+			<div class="group-title group-title--lg">Interface</div>
+			<div class="group-body">
+				<div class="status-line">
+					<span class="status-text status-text--dim">Classic. Glass is the new interface (preview).</span>
+					{#if !confirmGlass}
+						<button class="btn-ghost" onclick={() => (confirmGlass = true)} data-shell="glass">Switch to Glass</button>
+					{/if}
+				</div>
+				{#if confirmGlass}
+					<div class="status-line" role="alert" data-confirm-glass>
+						<span class="status-text">c9watch reloads into Glass. To come back, use Glass settings.</span>
+						<button class="btn-primary" onclick={switchToGlass} data-confirm="glass">Switch to Glass</button>
+						<button class="btn-ghost btn-stay" onclick={() => (confirmGlass = false)}>Stay in Classic</button>
 					</div>
 				{/if}
 			</div>
@@ -311,6 +341,10 @@
 
 	.status-line > button {
 		margin-left: auto;
+	}
+
+	.status-line > .btn-stay {
+		margin-left: 0;
 	}
 
 	.btn-ghost {

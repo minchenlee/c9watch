@@ -24,9 +24,10 @@ export function demoGlassOn(): boolean {
 let glassShellActive = false;
 export function setDemoGlassActive(on: boolean): void { glassShellActive = on; }
 let demoGlassSends = 0;
-/** The glass fixture also answers the two actions the handling panel sends
- * (build plan §G5), so demo mode never reaches a real core: `msg.send` gets
- * a made-up id and `session.stop` stops nothing. */
+/** The glass fixture also answers the actions the handling panel sends
+ * (build plan §G5, D42), so demo mode never reaches a real core: `msg.send`
+ * gets a made-up id, `agent.retire` ends nothing and `session.stop` stops
+ * nothing. */
 function demoGlassRequest(method: C9pMethod, p: any): any {
     switch (method) {
         case 'msg.send': {
@@ -34,6 +35,10 @@ function demoGlassRequest(method: C9pMethod, p: any): any {
             return { cursor: `demo:glass:send:${n}`, msgId: `msg_demo_glass_${n}`, paused: false, replayed: false, state: 'queued', to: { addr: `demo/${p.to}`, id: p.to, name: null } };
         }
         case 'session.stop': return {};
+        case 'agent.retire': {
+            const row = glassDemoAgents().find(a => a.id === p.id);
+            return { agent: { ...(row ?? { id: p.id }), state: 'retired', goneAt: Date.now() } };
+        }
         case 'session.views': return { sessions: glassDemoSessionViews(), cursor: 'demo:glass:0' };
         case 'agent.list': return { agents: glassDemoAgents() };
         case 'annotation.list': return { annotations: glassDemoAnnotations(), cursor: 'demo:glass:0' };

@@ -6,7 +6,7 @@
     // only, D9 = C) and a receipt. The page owns the keys (keys.ts) and calls
     // `option`, `submit` and `openChat`. A send button without a handler is
     // off and says so. G5: the page passes `onSubmit` / `onNo` (a delayed
-    // `msg.send` to a managed agent) and `onStop` (`session.stop`, which
+    // `msg.send` to a managed agent) and `onStop` (`agent.retire`, D42, which
     // ends in a receipt and cannot be undone).
     import { tick } from 'svelte';
     import OfflineBanner from './OfflineBanner.svelte';
@@ -38,7 +38,8 @@
      * item only came up because the page opened: a field that takes the
      * focus on load would eat the shell keys ([, ⌘N, ⌘K). */
     export let autofocus = true;
-    /** Stops the agent (`session.stop`). The panel asks once more first. */
+    /** Ends the agent normally (`agent.retire`). The panel asks once more
+     * first. A rejection with `notice` shows that text as it is. */
     export let onStop: (() => Promise<void>) | undefined = undefined;
     /** ⌘Z in the empty key field (same rule as J / K, handoff test #7). */
     export let onUndo: (() => void) | undefined = undefined;
@@ -49,8 +50,8 @@
     let lastId = '';
     $: if (detail.id !== lastId) { lastId = detail.id; notice = null; confirmStop = false; }
     let confirmStop = false;
-    /** A `session.stop` for this item's session is in flight. The page keeps
-     * the lock per session (handling/handled.ts), so it outlives this panel
+    /** An `agent.retire` for this item's agent is in flight. The page keeps
+     * the lock per agent (handling/handled.ts), so it outlives this panel
      * and a switch to another item. */
     export let stopBusy = false;
 
@@ -94,7 +95,7 @@
         if (!onStop || stopBusy) return;
         notice = null;
         try { await onStop(); confirmStop = false; }
-        catch (e) { notice = `沒有停止：${(e as { msg?: string; message?: string })?.msg ?? (e as { message?: string })?.message ?? String(e)}`; }
+        catch (e) { const own = (e as { notice?: unknown })?.notice; notice = typeof own === 'string' ? own : `沒有停止：${(e as { msg?: string; message?: string })?.msg ?? (e as { message?: string })?.message ?? String(e)}`; }
     }
     $: sendNote = detail.canAnswer && onSubmit && !detail.sendBlock
         ? `送出後跳到下一件。10 秒後才真的送出，在那之前可以按「復原」（⌘Z）。`
@@ -222,7 +223,7 @@
             {#if notice}<span class="notice" role="status">{notice}</span>{/if}
             {#if confirmStop}
                 <div class="confirm" role="group" aria-label="確認停止" data-confirm-stop>
-                    <span>停止 {detail.who}？這會結束它的程式，不能復原。</span>
+                    <span>停止 {detail.who}？c9watch 會正常結束這個 agent 和它的程式，不能復原。</span>
                     <div class="row">
                         <button type="button" class="btn" disabled={stopBusy} on:click={() => (confirmStop = false)}>取消</button>
                         <button type="button" class="btn danger" disabled={stopBusy} on:click={stop} data-stop-confirm>{stopBusy ? '停止中…' : '停止（不能復原）'}</button>

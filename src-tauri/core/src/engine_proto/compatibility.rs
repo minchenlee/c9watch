@@ -40,6 +40,14 @@ pub const GUI_MAIL_METHODS: &[&str] = &[
     "mail.resume",
 ];
 
+/// Engine-agent writes that only the main window may call (D42): the glass
+/// handling panel ends a managed agent with `agent.retire`. Core already
+/// lets `local-unverified` call it; this list only lets the main window
+/// reach it. It stays out of `GUI_METHODS`, so `core_usable` does not need
+/// it: an older core is still used, and the GUI shows a clear error on
+/// `unknown_method`. `agent.create` and `agent.resume` stay out.
+pub const GUI_AGENT_METHODS: &[&str] = &["agent.retire"];
+
 pub fn core_usable(hello: &HelloResult) -> bool {
     hello.api_major == API_MAJOR
         && GUI_METHODS.iter().all(|m| hello.methods.contains_key(*m))
@@ -113,6 +121,10 @@ mod tests {
         // Mail is optional: a core without it, or with a break in it, is used.
         h = hello();
         assert!(GUI_MAIL_METHODS.iter().all(|m| !h.methods.contains_key(*m)));
+        // D42: `agent.retire` is optional too.
+        assert!(GUI_AGENT_METHODS
+            .iter()
+            .all(|m| !h.methods.contains_key(*m)));
         h.breaking_since.push("msg.send".into());
         assert!(core_usable(&h));
         h = hello();

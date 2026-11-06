@@ -14,7 +14,8 @@
     // queue (280px) next to the one handling panel.
     // G5 actions:
     // - Answer a managed agent: `msg.send` after 10 s (復原 = not sent yet).
-    // - Stop a managed agent: `session.stop`, then a receipt (no undo).
+    // - Stop a managed agent: `agent.retire` (D42), then a receipt (no undo).
+    //   An `orphaned` result is no receipt: the panel says so and 停止 stays.
     // - Observed sessions and 允許: ⌘O only (`openSession`).
     // - Leaving this page, closing (hiding) or minimizing the window sends nothing: every
     //   waiting send is cancelled, the item goes back to the queue and the
@@ -22,10 +23,9 @@
     //   send (`canSend`).
     import { onDestroy, onMount } from 'svelte';
     import { get } from 'svelte/store';
-    import type { C9pSessionView } from '$lib/c9p-1';
     import { dataError, fixtureOn, model } from '../data';
     import { usePageKeys, type PageKeys } from '../keys';
-    import { openSession, stopSession } from '$lib/data/api';
+    import { openSession, retireAgent } from '$lib/data/api';
     import { sessionFromView } from '$lib/data/session';
     import { sendMail } from '$lib/data/stores/mail';
     import { isDemoMode } from '$lib/data/demo/mode';
@@ -34,7 +34,7 @@
     import UndoToasts from '../handling/UndoToasts.svelte';
     import { answerBody, answerLabel, buildDetail, emptyAnswer, locate, noBody, waitText, type HandlingDetail } from '../handling/detail';
     import { SendQueue, stepFrom, type Pending, type QueueEvent } from '../handling/actions';
-    import { handled, lockStop, markHandled, stopping, unlockStop, unmarkHandled } from '../handling/handled';
+    import { ORPHANED, handled, lockStop, markHandled, retireError, stopping, unlockStop, unmarkHandled } from '../handling/handled';
     import { getCurrentWindow } from '$lib/data/platform';
 
     // Demo details only while the glass fixture is on: live mode never shows them.
@@ -203,30 +203,36 @@
 
     // ⌘O: the item's session, when it has one.
     $: chatOf = member?.session ? ((s) => () => openSession(sessionFromView(s)))(member.session) : undefined;
-    // Stop: managed agents only (observed sessions get ⌘O only), with a pid
-    // the engine can stop.
-    const stopKey = (s: C9pSessionView) => `${s.pid}|${s.id}`;
-    async function stop(d: HandlingDetail, s: C9pSessionView) {
+    // Stop: managed agents only (observed sessions get no stop button). D42:
+    // 停止 ends the agent normally with `agent.retire {id}`; never
+    // `session.stop`, and no fallback to it.
+    async function stop(d: HandlingDetail, agentId: string) {
         // Second check, and the lock is taken before any await: one stop per
-        // session, whatever item the person moves to meanwhile.
-        const key = stopKey(s);
-        if (!lockStop(key)) return;
-        try { await stopSession(sessionFromView(s)); } finally { unlockStop(key); }
+        // agent, whatever item the person moves to meanwhile.
+        if (!lockStop(agentId)) return;
+        let row;
+        try { row = await retireAgent(agentId); }
+        catch (e) { throw retireError(e); }
+        finally { unlockStop(agentId); }
+        // Core could not confirm that every process is gone: no receipt, the
+        // item stays, and the person can press 停止 again.
+        if (row?.state === 'orphaned') throw { notice: ORPHANED };
         const at = new Date();
         const rows: [string, string][] = [
-            ['做了什麼', `停止了 ${d.who} 的程式`],
-            ['程式', `pid ${s.pid}`],
+            ['做了什麼', `正常結束了 ${d.who}`],
+            ['agent', agentId],
             ['時間', `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`],
-            ['能不能復原', '不能。要它再做事，請重新啟動它。']
+            ['能不能復原', '不能。要它再做事，請重新建立一個 agent。']
         ];
         if (get(isDemoMode)) rows.push(['示範模式', '沒有真的停止任何程式']);
         receipts = { ...receipts, [d.instance]: { title: `已停止 ${d.who}`, rows } };
         finish(d, null, 'stopped');
     }
-    $: stopOf = current && current.managed && member?.session?.canStop && member.session.pid && !receipt
-        ? ((d: HandlingDetail, s: C9pSessionView) => () => stop(d, s))(current, member.session)
+    $: stopAgent = current?.managed && !receipt ? needs.find(x => x.id === current!.id)?.agentId ?? null : null;
+    $: stopOf = current && stopAgent
+        ? ((d: HandlingDetail, id: string) => () => stop(d, id))(current, stopAgent)
         : undefined;
-    $: stopBusy = !!member?.session && $stopping.has(stopKey(member.session));
+    $: stopBusy = !!stopAgent && $stopping.has(stopAgent);
 
     let panel: HandlingPanel | undefined;
     const keys: PageKeys = {
