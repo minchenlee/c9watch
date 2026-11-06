@@ -15,7 +15,7 @@ function demoMailOn(): boolean {
  * Without it, every answer below stays as it is, so Classic demo baselines
  * do not change. */
 const DEMO_GLASS_KEY = 'c9watch.demoGlass';
-function demoGlassOn(): boolean {
+export function demoGlassOn(): boolean {
     try { return globalThis.localStorage?.getItem(DEMO_GLASS_KEY) === '1'; } catch { return false; }
 }
 function demoGlassRequest(method: C9pMethod): any {

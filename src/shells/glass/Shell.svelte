@@ -4,20 +4,24 @@
     // src/lib/data/, src/lib/c9p-1.ts and src/shells/glass/.
     import { onMount } from 'svelte';
     import { route, routeHash, type GlassRoute } from './nav';
-    import { startGlassData, sessions, agents, annotations } from './data';
+    import { startGlassData, sessions, agents, annotations, fixtureOn } from './data';
     import { DEMO_WORKSPACES } from './model/gaps-demo';
 
+    // startGlassData returns its stop function, which Svelte runs on unmount.
     onMount(startGlassData);
 
-    const pages: { label: string; route: GlassRoute }[] = [
-        { label: 'Needs you', route: { page: 'needs' } },
-        { label: 'Today', route: { page: 'today' } },
-        ...DEMO_WORKSPACES.map(w => ({ label: w.name, route: { page: 'ws', id: w.id } as GlassRoute })),
-        { label: 'Usage', route: { page: 'usage' } },
-        { label: 'Settings', route: { page: 'settings' } }
-    ];
+    type Link = { label: string; route: GlassRoute };
+    const top: Link[] = [{ label: 'Needs you', route: { page: 'needs' } }, { label: 'Today', route: { page: 'today' } }];
+    const bottom: Link[] = [{ label: 'Usage', route: { page: 'usage' } }, { label: 'Settings', route: { page: 'settings' } }];
+    // Demo workspaces only on the glass fixture. Live workspaces need the
+    // derivation from c9p rows (G2); until then live mode lists none.
+    $: workspaces = $fixtureOn ? DEMO_WORKSPACES.map((w): Link => ({ label: w.name, route: { page: 'ws', id: w.id } })) : [];
     const pageKey = (r: GlassRoute) => routeHash(r).slice(2);
 </script>
+
+{#snippet link(p: Link)}
+    <a href={routeHash(p.route)} aria-current={pageKey(p.route) === pageKey($route) ? 'page' : undefined}>{p.label}</a>
+{/snippet}
 
 <div
     class="glass-root"
@@ -27,9 +31,11 @@
     data-annotations={$annotations.size}
 >
     <nav class="glass-side" aria-label="Glass pages">
-        {#each pages as p (pageKey(p.route))}
-            <a href={routeHash(p.route)} aria-current={pageKey(p.route) === pageKey($route) ? 'page' : undefined}>{p.label}</a>
-        {/each}
+        {#each top as p (pageKey(p.route))}{@render link(p)}{/each}
+        <div class="glass-workspaces" aria-label="Workspaces">
+            {#each workspaces as p (pageKey(p.route))}{@render link(p)}{:else}<p class="state-msg">No workspaces yet</p>{/each}
+        </div>
+        {#each bottom as p (pageKey(p.route))}{@render link(p)}{/each}
     </nav>
     <main class="glass-page" aria-label={pageKey($route)}></main>
 </div>
@@ -57,6 +63,20 @@
         color: inherit;
         text-decoration: none;
         border-radius: 6px;
+    }
+    .glass-workspaces {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+    .state-msg {
+        margin: 0;
+        padding: 12px 8px;
+        font-family: var(--font-mono);
+        font-size: 13px;
+        text-transform: uppercase;
+        color: var(--text-muted);
+        text-align: center;
     }
     .glass-side a[aria-current='page'] {
         background: #1a1a1a;
