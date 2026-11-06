@@ -21,10 +21,7 @@
         "minHeight": 400,
         "visible": true,
         "center": true,
-        "titleBarStyle": "Overlay",
-        "transparent": true,
-        "windowEffects": { "effects": ["sidebar"] },
-        "theme": "Dark"
+        "titleBarStyle": "Overlay"
       },
       {
         "label": "popover",

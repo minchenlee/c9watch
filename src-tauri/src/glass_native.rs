@@ -64,6 +64,38 @@ mod tests {
         );
     }
 
+    /// Tauri's own merge (RFC 7396) of `tauri.conf.json` and
+    /// `tauri.<platform>.conf.json`, the config each build really uses.
+    fn merged_main(target: tauri::utils::platform::Target) -> serde_json::Value {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (config, _) = tauri::utils::config::parse::read_from(target, dir).unwrap();
+        let windows = config["app"]["windows"].as_array().unwrap().clone();
+        assert_eq!(windows.len(), 2, "main and popover");
+        assert_eq!(windows[1]["label"], "popover");
+        assert_eq!(windows[1]["transparent"], true, "popover unchanged");
+        windows[0].clone()
+    }
+
+    #[test]
+    fn main_window_glass_is_macos_only_in_the_merged_config() {
+        use tauri::utils::platform::Target;
+        let mac = merged_main(Target::MacOS);
+        assert_eq!(mac["label"], "main");
+        assert_eq!(mac["transparent"], true);
+        assert_eq!(
+            mac["windowEffects"]["effects"],
+            serde_json::json!(["sidebar"])
+        );
+        assert_eq!(mac["theme"], "Dark");
+        assert_eq!(mac["titleBarStyle"], "Overlay");
+        for target in [Target::Linux, Target::Windows] {
+            let main = merged_main(target);
+            for key in ["transparent", "windowEffects", "theme"] {
+                assert!(main.get(key).is_none(), "{target:?} main has {key}");
+            }
+        }
+    }
+
     #[test]
     fn vibrancy_is_macos_only_and_the_system_read_does_not_panic() {
         let v = read();
