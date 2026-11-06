@@ -3,7 +3,7 @@ import type { Transport } from './transport';
 import { getDemoSessions, getDemoHistoryEntries, getDemoCostData, demoConversations, getDemoAwayActivity, getDemoDiagnostics } from '../demo/data';
 import { demoSubscriptionUsage } from '../subscription-usage';
 import { demoMailRequest, demoMailSubscribe } from './demo/mail';
-import { glassDemoAgents, glassDemoAnnotations, glassDemoSessionViews } from './demo/glass';
+import { glassDemoAgents, glassDemoAnnotations, glassDemoCost, glassDemoHistory, glassDemoMemory, glassDemoSessionViews } from './demo/glass';
 /** Demo mail is opt-in (`localStorage['c9watch.demoMail'] = '1'`). Without
  * it, demo answers mail like today's Classic bridge, so demo screens do not
  * change until the bridge exposes mail. */
@@ -23,6 +23,9 @@ function demoGlassRequest(method: C9pMethod): any {
         case 'session.views': return { sessions: glassDemoSessionViews(), cursor: 'demo:glass:0' };
         case 'agent.list': return { agents: glassDemoAgents() };
         case 'annotation.list': return { annotations: glassDemoAnnotations(), cursor: 'demo:glass:0' };
+        case 'history.list': { const entries = glassDemoHistory(); return { entries, nextOffset: null, offset: 0, total: entries.length }; }
+        case 'cost.get': return glassDemoCost();
+        case 'memory.list': { const projects = glassDemoMemory(); return { projects, nextOffset: null, offset: 0, total: projects.length }; }
         default: return undefined;
     }
 }

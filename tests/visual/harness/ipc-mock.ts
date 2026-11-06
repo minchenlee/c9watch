@@ -16,6 +16,9 @@ export interface VisualOptions {
 	sessions?: 'full' | 'empty';
 	/** When set, `stop_session` rejects with this message. */
 	stopError?: string | null;
+	/** Glass only: `session.views` rows carry `sessionKey`, as real c9p rows
+	 * do. The Classic fixtures have none; Classic tests leave this off. */
+	sessionKeys?: boolean;
 }
 
 declare global {
@@ -33,7 +36,8 @@ window.__C9_VISUAL_UNHANDLED__ = unhandled;
 type Args = Record<string, unknown> | undefined;
 
 function handle(cmd: string, args: Args): unknown {
-	const live = options.sessions === 'empty' ? [] : fx.sessions;
+	const rows = options.sessions === 'empty' ? [] : fx.sessions;
+	const live = options.sessionKeys ? rows.map(r => ({ ...r, sessionKey: `${r.provider}:${r.id}` })) : rows;
 	switch (cmd) {
         case 'c9p_request': {
             const p = (args?.params ?? {}) as Record<string, any>;
