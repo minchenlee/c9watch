@@ -2677,6 +2677,23 @@ mod tests {
         assert_eq!(m.attempts, 2);
     }
     #[test]
+    fn agent_rows_carry_mail_paused() {
+        let (_t, db) = two();
+        let rows = || db.agents(db::AgentFilter::All).unwrap();
+        let of = |rows: &[crate::engine_proto::wire::AgentRow], id: &str| {
+            rows.iter().find(|r| r.id == id).unwrap().mail_paused
+        };
+        assert!(!of(&rows(), "agt_b"));
+        db.write_blocking(|tx| pause(tx, M, "agt_b", "local-unverified", true, T0))
+            .unwrap();
+        let r = rows();
+        assert!(of(&r, "agt_b"));
+        assert!(!of(&r, "agt_a"));
+        db.write_blocking(|tx| pause(tx, M, "agt_b", "local-unverified", false, T0))
+            .unwrap();
+        assert!(!of(&rows(), "agt_b"));
+    }
+    #[test]
     fn m2_signed_evidence_and_late_correction_cancel_the_notice() {
         let (t, db) = two();
         let key = super::super::machine::load_or_create(t.path())

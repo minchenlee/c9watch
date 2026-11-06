@@ -3599,7 +3599,8 @@ mod tests {
                 "createdAt": null,
                 "lastSeen": null,
                 "parentId": null,
-                "stateReason": null
+                "stateReason": null,
+                "mailPaused": false
             }])
         );
     }
@@ -5496,6 +5497,23 @@ mod tests {
         assert_eq!(r["error"]["code"], "not_cancellable");
         assert_eq!(r["error"]["data"]["state"], "cancelled");
         assert_eq!(db.reader().unwrap().query_row("SELECT count(*) FROM audit WHERE method IN ('msg.cancel','mail.pause','mail.resume') AND decision='allow'",[],|r|r.get::<_,i64>(0)).unwrap(),3);
+    }
+    #[tokio::test]
+    async fn agent_list_shows_mail_paused() {
+        let (_t, ctx, db) = ctx_db(Arc::new(NoLiveAgents));
+        mail_agent(&db, "agt_b1", "bob", "pty").await;
+        let (mut c, _) = Client::new(ctx).await;
+        let paused = |r: &Value| r["result"]["agents"][0]["mailPaused"].clone();
+        let r = c.call("l0", "agent.list", json!({})).await;
+        assert_eq!(paused(&r), json!(false), "{}", r);
+        let r = c.call("p", "mail.pause", json!({"agent":"bob"})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let r = c.call("l1", "agent.list", json!({})).await;
+        assert_eq!(paused(&r), json!(true), "{}", r);
+        let r = c.call("r", "mail.resume", json!({"agent":"bob"})).await;
+        assert_eq!(r["ok"], true, "{}", r);
+        let r = c.call("l2", "agent.list", json!({})).await;
+        assert_eq!(paused(&r), json!(false), "{}", r);
     }
     #[tokio::test]
     async fn schema_generated_agent_denials_and_self_queries_use_the_same_table() {

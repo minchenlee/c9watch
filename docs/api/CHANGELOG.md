@@ -13,6 +13,10 @@ After that, major 1 accepts additive changes only. A breaking change needs major
 
 When preview ends, the GUI's legacy in-process fallback is removed. The GUI then reads only through core.
 
+## 1.15 — upcoming
+
+- `AgentRow` adds `mailPaused` (boolean, always sent): `true` while agent-to-agent mail to the agent is paused by `mail.pause`, `false` after `mail.resume` or when it was never paused. `agent.list`, `session.list`, `snapshot.get` and the `agent.create` result carry it. It is not the `paused` lifecycle `state`, which means a drained agent. A client of an older engine gets no field and does not know the pause state. See [c9p-1.md](c9p-1.md#mail-pause-on-the-agent-row-115). Additive; no method `rev` changes.
+
 ## 1.14 — upcoming
 
 - Add the spawn overlay (E1). `agent.create` accepts optional `overlay` (`AgentOverlay`: `model`, `permissionsDeny`, `sandboxDenyWrite`, `standingOrders`; unknown fields are `bad_request`). Each field only adds to core's own spawn: `--model`, rules after core's in `permissions.deny`, paths after core's in `sandbox.filesystem.denyWrite`, and caller text after core's standing orders, fenced and labelled. Limits: model 1 to 64 of `[A-Za-z0-9._[]-]`, not starting with `-`; at most 64 deny rules of 1 to 512 bytes, with no `!` and, for a path tool (`Read`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `NotebookRead`, `Glob`, `Grep`, `LS`), a `//<abs>` or `~/` specifier (else `not_allowed`); at most 64 absolute deny-write paths (realpath when they exist; no quote, parenthesis, backslash, glob or control character); orders at most 8 KiB. An agent may pass all but `model`; its child always gets the parent's `model`, `permissionsDeny` and `sandboxDenyWrite`. `AgentRow` adds optional `overlay`; a resume applies the same one. The `agent.create` audit row records the overlay, or its sha256 and field counts when it is longer than 1024 bytes. Without `overlay` a create is unchanged. See [c9p-1.md](c9p-1.md#spawn-overlay-114). Additive; no method `rev` changes.

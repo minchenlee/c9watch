@@ -16,6 +16,11 @@ export interface MailSnapshot {
     messages: ReadonlyMap<string, C9pMsgSummary>;
     /** Agent id → its session key, for the card line. */
     sessionKeys: ReadonlyMap<string, string>;
+    /** Agent id → `mailPaused` from the last `agent.list` (c9p 1.15+). An
+     * older engine sends no field, so its agents are not in the map. */
+    agentPause: ReadonlyMap<string, boolean>;
+    /** When that `agent.list` was asked (`now()`); -Infinity before one. */
+    agentPauseAt: number;
 }
 export interface MailFeed {
     stop(): void;
@@ -91,6 +96,8 @@ export function rowFromSend(result: C9pMsgSendResult, body: string, now: number)
 export function mailFeed(t: Transport, apply: (s: MailSnapshot) => void, now: () => number = () => Date.now()): MailFeed {
     let messages = new Map<string, C9pMsgSummary>();
     let sessionKeys = new Map<string, string>();
+    let agentPause = new Map<string, boolean>();
+    let agentPauseAt = -Infinity;
     let status: MailStatus = 'loading';
     let error: string | null = null;
     let generation = 0;
@@ -105,10 +112,15 @@ export function mailFeed(t: Transport, apply: (s: MailSnapshot) => void, now: ()
     const askedAgents = new Map<string, number>();
     let agentTimer: ReturnType<typeof setTimeout> | null = null;
     let lastAgentList = -Infinity;
-    const publish = () => apply({ status, error, messages: new Map(messages), sessionKeys: new Map(sessionKeys) });
+    const publish = () => apply({
+        status, error, messages: new Map(messages), sessionKeys: new Map(sessionKeys),
+        agentPause: new Map(agentPause), agentPauseAt
+    });
 
-    function setAgents(agents: C9pAgentRow[]) {
+    function setAgents(agents: C9pAgentRow[], askedAt: number) {
         sessionKeys = new Map(agents.filter(a => a.sessionKey).map(a => [a.id, a.sessionKey as string]));
+        agentPause = new Map(agents.filter(a => typeof a.mailPaused === 'boolean').map(a => [a.id, a.mailPaused]));
+        agentPauseAt = askedAt;
     }
     /** A live event named an agent with no session key yet: list again
      * (debounced, rate-limited, bounded per agent), so a new agent's card
@@ -129,10 +141,10 @@ export function mailFeed(t: Transport, apply: (s: MailSnapshot) => void, now: ()
         agentTimer = setTimeout(() => {
             agentTimer = null;
             if (stopped || mine !== generation) return;
-            lastAgentList = now();
+            const askedAt = lastAgentList = now();
             t.request('agent.list', {}).then(r => {
                 if (stopped || mine !== generation) return;
-                setAgents(r.agents ?? []);
+                setAgents(r.agents ?? [], askedAt);
                 publish();
             }, () => {});
         }, wait);
@@ -207,14 +219,16 @@ export function mailFeed(t: Transport, apply: (s: MailSnapshot) => void, now: ()
                 page = await t.request('msg.list', { limit: PAGE_LIMIT, before: page.next });
             }
             let agents: C9pAgentRow[] = [];
-            lastAgentList = now();
-            try { agents = (await t.request('agent.list', {})).agents ?? []; } catch { /* names only */ }
+            const askedAt = lastAgentList = now();
+            let listed = false;
+            try { agents = (await t.request('agent.list', {})).agents ?? []; listed = true; } catch { /* names only */ }
             if (stopped || mine !== generation) return;
             const next = new Map(items.map(m => [m.msgId, m]));
             // A row added while this read ran (an own send) stays.
             for (const [id, row] of messages) if (!next.has(id) && row.createdAt >= startedAt) next.set(id, row);
             messages = next;
-            setAgents(agents);
+            if (listed) setAgents(agents, askedAt);
+            else sessionKeys = new Map();
             askedAgents.clear();
             status = 'ready'; error = null;
             ready = true;
@@ -239,6 +253,20 @@ export function mailFeed(t: Transport, apply: (s: MailSnapshot) => void, now: ()
             publish();
         }
     };
+}
+
+/** Take the pause state of a new `agent.list`. An agent this run paused or
+ * resumed after that list was asked keeps the local state. */
+export function seedPause(s: MailSnapshot, paused: ReadonlySet<string>, known: ReadonlySet<string>, setAt: ReadonlyMap<string, number>):
+    { paused: Set<string>; known: Set<string> } | null {
+    if (s.agentPause.size === 0) return null;
+    const p = new Set(paused); const k = new Set(known);
+    for (const [id, on] of s.agentPause) {
+        if ((setAt.get(id) ?? -Infinity) > s.agentPauseAt) continue;
+        if (on) p.add(id); else p.delete(id);
+        k.add(id);
+    }
+    return { paused: p, known: k };
 }
 
 // ── Thread view model ────────────────────────────────────────────────────
