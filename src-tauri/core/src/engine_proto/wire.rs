@@ -670,13 +670,17 @@ pub struct AgentGuard {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentOverlay {
     /// The Claude Code `--model`: 1 to 64 of letters, digits, `.`, `_`,
-    /// `-`, `[` and `]`. Not from an agent: a child of an agent runs the
+    /// `-`, `[` and `]`, not starting with `-`. Not from an agent: a child
+    /// of an agent runs the
     /// parent's model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Claude Code permission rules added to the spawn's
     /// `permissions.deny`. At most 64, each 1 to 512 bytes with no
-    /// control character.
+    /// control character. No `!` anywhere, and a path tool's (`Read`,
+    /// `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `NotebookRead`,
+    /// `Glob`, `Grep`, `LS`) specifier starts with `//` or `~/`; either is
+    /// `not_allowed`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permissions_deny: Vec<String>,
     /// Absolute paths added to the spawn's `sandbox.filesystem.denyWrite`

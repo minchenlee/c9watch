@@ -706,6 +706,11 @@ else
     fi
     params "$R/e1/c" "$R" "$R/e1/c" ',"overlay":{"model":"haiku"}' >"$R/e1/out/cm.json"
     refusal 7-child-model "$EA" "$R/e1" not_allowed '"$B" child create --params - <cm.json'
+    # Codex r1: no negation and no cwd-relative path rule from a child.
+    params "$R/e1/c" "$R" "$R/e1/c" ',"overlay":{"permissionsDeny":["Read(!*.env)"]}' >"$R/e1/out/cn.json"
+    refusal 7-child-negate "$EA" "$R/e1" not_allowed '"$B" child create --params - <cn.json'
+    params "$R/e1/c" "$R" "$R/e1/c" ',"overlay":{"permissionsDeny":["Read(./secrets/**)"]}' >"$R/e1/out/cr.json"
+    refusal 7-child-relative "$EA" "$R/e1" not_allowed '"$B" child create --params - <cr.json'
     # A restart resumes with the same overlay.
     if "$C9" engine restart >"$EV/7-restart.json" 2>&1 && wait_state "$EA" ready 120; then
         gen=$(field "$EA" generation)

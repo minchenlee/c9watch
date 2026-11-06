@@ -57,9 +57,79 @@ pub const ORDERS_FOOTER: &str = "[end caller orders]";
 /// the caller cannot see. Control characters are refused too.
 const BAD_PATH_CHARS: &[char] = &['"', '\'', '(', ')', '\\', '*', '?', '[', ']', '{', '}'];
 
-/// Whether `model` is 1 to `MAX_MODEL` of `[A-Za-z0-9._\[\]-]`.
+/// Tools whose rule specifier is a path. Claude Code anchors a relative
+/// path (`x`, `./x`, `../x`) to the cwd and `/x` to the settings file, so
+/// such a rule would name another place in a child with another cwd. A
+/// caller must write `//<abs>` or `~/...`. Glob, Grep and LS are here too:
+/// they read files, and refusing more is safe.
+const PATH_TOOLS: &[&str] = &[
+    "Read",
+    "Edit",
+    "Write",
+    "MultiEdit",
+    "NotebookEdit",
+    "NotebookRead",
+    "Glob",
+    "Grep",
+    "LS",
+];
+
+/// The shape a caller's `permissionsDeny` rule must have, refused as
+/// `not_allowed` (the limits are `check`'s, `bad_request`):
+/// - No `!` anywhere: Claude Code reads `!` as a negation, and a rule
+///   after the engine's own (or the parent's) in the same settings source
+///   could carve a hole in them.
+/// - `Tool` or `Tool(specifier)` with a non-empty specifier.
+/// - For a path tool (`PATH_TOOLS`), the specifier starts with `//` or
+///   `~/`, so it names the same place in every cwd, and a child inherits
+///   it unchanged.
+pub fn check_rule(r: &str) -> Result<(), String> {
+    if r.contains('!') {
+        return Err(format!(
+            "overlay.permissionsDeny rule {:?} has a '!': a negation could weaken the \
+             engine's or the parent's rules",
+            r
+        ));
+    }
+    let Some(open) = r.find('(') else {
+        return Ok(());
+    };
+    let (tool, rest) = r.split_at(open);
+    let spec = match rest.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+        Some(x) if !x.is_empty() => x,
+        _ => {
+            return Err(format!(
+                "overlay.permissionsDeny rule {:?} must be Tool or Tool(specifier)",
+                r
+            ))
+        }
+    };
+    let path_tool = PATH_TOOLS
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(tool.trim()));
+    if path_tool && !(spec.starts_with("//") || spec.starts_with("~/")) {
+        return Err(format!(
+            "overlay.permissionsDeny rule {:?}: a {} path must be absolute as //<abs path> \
+             (for example {}(//Users/me/secrets/**)) or start with ~/; a relative or \
+             single-slash path depends on the cwd or the settings file",
+            r,
+            tool.trim(),
+            tool.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// `check_rule` for each of the caller's rules.
+pub fn check_rules(o: &AgentOverlay) -> Result<(), String> {
+    o.permissions_deny.iter().try_for_each(|r| check_rule(r))
+}
+
+/// Whether `model` is 1 to `MAX_MODEL` of `[A-Za-z0-9._\[\]-]`, not
+/// starting with `-` (Claude Code would read it as a flag).
 pub fn check_model(model: &str) -> Result<(), String> {
     let ok = !model.is_empty()
+        && !model.starts_with('-')
         && model.len() <= MAX_MODEL
         && model
             .chars()
@@ -68,7 +138,8 @@ pub fn check_model(model: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "overlay.model {:?} must be 1 to {} of letters, digits, '.', '_', '-', '[' and ']'",
+            "overlay.model {:?} must be 1 to {} of letters, digits, '.', '_', '-', '[' and \
+             ']', not starting with '-'",
             model, MAX_MODEL
         ))
     }
@@ -143,6 +214,7 @@ pub fn check(o: &AgentOverlay) -> Result<AgentOverlay, String> {
             r, MAX_RULE_BYTES
         ));
     }
+    check_rules(o)?;
     if o.sandbox_deny_write.len() > MAX_DENY_WRITE {
         return Err(format!(
             "overlay.sandboxDenyWrite has more than {} paths",
@@ -316,7 +388,18 @@ mod tests {
         ] {
             assert!(check_model(ok).is_ok(), "{:?}", ok);
         }
-        for bad in ["", "opus 4", "a;b", "a/b", "a$b", "é", &"m".repeat(65)] {
+        for bad in [
+            "",
+            "opus 4",
+            "a;b",
+            "a/b",
+            "a$b",
+            "é",
+            &"m".repeat(65),
+            "-",
+            "--settings",
+            "-p",
+        ] {
             assert!(check_model(bad).is_err(), "{:?}", bad);
         }
         let o = AgentOverlay {
@@ -324,6 +407,62 @@ mod tests {
             ..ov()
         };
         assert!(check(&o).unwrap_err().contains("overlay.model"));
+    }
+
+    #[test]
+    fn a_rule_may_not_negate_or_depend_on_the_cwd() {
+        for ok in [
+            "Bash",
+            "WebFetch",
+            "Bash(curl:*)",
+            "WebFetch(domain:example.com)",
+            "mcp__srv__tool",
+            "Read",
+            "Read(//Users/me/secrets/**)",
+            "Edit(~/notes/**)",
+            "Write(//tmp/x)",
+            "MultiEdit(//a/**)",
+            "NotebookEdit(//a/b.ipynb)",
+            "Glob(//a/**)",
+            "Grep(~/x)",
+        ] {
+            assert!(check_rule(ok).is_ok(), "{:?}", ok);
+        }
+        for bad in [
+            "Read(!*.env)",
+            "Read(//a/!b)",
+            "Bash(echo hi!)",
+            "!Read",
+            "Read(*.env)",
+            "Read(./secrets/**)",
+            "Read(../x)",
+            "Read(secrets/**)",
+            "Read(/x)",
+            "read(./x)",
+            "Read (./x)",
+            "Edit(.claude/**)",
+            "Write(/abs)",
+            "MultiEdit(x)",
+            "NotebookEdit(a.ipynb)",
+            "NotebookRead(a)",
+            "Glob(**/*.env)",
+            "Grep(src)",
+            "LS(.)",
+            "Read(~user/x)",
+            "Read()",
+            "Read(//x",
+            "Bash(",
+        ] {
+            assert!(check_rule(bad).is_err(), "{:?}", bad);
+        }
+        let e = check_rule("Read(./secrets/**)").unwrap_err();
+        assert!(e.contains("//<abs path>"), "{}", e);
+        let o = AgentOverlay {
+            permissions_deny: vec!["Bash(curl:*)".into(), "Read(!*.env)".into()],
+            ..ov()
+        };
+        assert!(check_rules(&o).unwrap_err().contains("negation"));
+        assert!(check(&o).is_err());
     }
 
     #[test]

@@ -573,6 +573,7 @@ impl Spawner {
                          model (E1)",
                     ));
                 }
+                overlay::check_rules(&o).map_err(not_allowed)?;
                 Some(blocking(move || overlay::check(&o).map_err(bad)).await?)
             }
             None => None,
@@ -5072,6 +5073,7 @@ mod tests {
             ),
             ("model length", serde_json::json!({"model": "m".repeat(65)})),
             ("empty model", serde_json::json!({"model": ""})),
+            ("model flag", serde_json::json!({"model": "--settings"})),
             (
                 "65 rules",
                 serde_json::json!({"permissionsDeny": rules(65)}),
@@ -5104,6 +5106,21 @@ mod tests {
             params["overlay"] = overlay;
             let err = e.sp.create(&l, params).await.unwrap_err();
             assert_eq!(err.code, ErrorCode::BadRequest, "{what}: {}", err.msg);
+        }
+        // Codex r1: a negation, or a path rule that depends on the cwd or
+        // the settings file, is not_allowed for a terminal caller too.
+        for rule in [
+            "Read(!*.env)",
+            "Bash(echo !x)",
+            "Read(./secrets/**)",
+            "Read(*.env)",
+            "Edit(/x/**)",
+            "Read(../x)",
+        ] {
+            let mut params = create_params(&e.cwd);
+            params["overlay"] = serde_json::json!({"permissionsDeny": ["WebFetch", rule]});
+            let err = e.sp.create(&l, params).await.unwrap_err();
+            assert_eq!(err.code, ErrorCode::NotAllowed, "{rule}: {}", err.msg);
         }
         // At the limits it is accepted.
         let mut params = create_params(&e.cwd);
@@ -5195,6 +5212,52 @@ mod tests {
         assert_eq!(got.sandbox_deny_write, want.sandbox_deny_write);
         let s = spawn_settings(&e.home, &g.id, 1);
         assert!(strs(&s["permissions"]["deny"]).contains(&"Bash(rm:*)".to_string()));
+        e.sp.shutdown();
+    }
+
+    /// Codex r1 P1: a child cannot carve its parent's path deny with a
+    /// `!` rule, and the parent's path rule names the same place in the
+    /// child's cwd (only `//abs` and `~/` are stored), so it is copied as is.
+    #[tokio::test]
+    async fn a_child_cannot_negate_or_shift_its_parents_path_rules() {
+        let e = setup(Script::Ready, None);
+        let l = Principal::LocalUnverified;
+        let root = e.t.path().canonicalize().unwrap().join("root");
+        let d = dirs(&root, &["p", "p/secrets", "p/x"]);
+        // The parent may not pass a relative rule either.
+        let mut rel = fenced_params(&root, &d[0]);
+        rel["overlay"] = serde_json::json!({"permissionsDeny": ["Read(./secrets/**)"]});
+        let err = e.sp.create(&l, rel).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotAllowed, "{}", err.msg);
+        assert!(err.msg.contains("//<abs path>"), "{}", err.msg);
+        let abs = format!("Read(/{}/**)", d[1].display());
+        let mut pp = fenced_params(&root, &d[0]);
+        pp["overlay"] = serde_json::json!({"permissionsDeny": [abs, "Read(~/.ssh/**)"]});
+        let parent = e.sp.create(&l, pp).await.unwrap();
+        let p = agent_of(&parent, 1);
+        let spawns = e.launcher.spawns.load(Ordering::SeqCst);
+        for rule in [
+            format!("Read(!/{}/**)", d[1].display()),
+            "Read(!*.env)".to_string(),
+            "Read(./x)".to_string(),
+        ] {
+            let mut cp = fenced_params(&root, &d[1]);
+            cp["overlay"] = serde_json::json!({"permissionsDeny": [rule]});
+            let err = e.sp.create(&p, cp).await.unwrap_err();
+            assert_eq!(err.code, ErrorCode::NotAllowed, "{rule}: {}", err.msg);
+        }
+        assert_eq!(e.launcher.spawns.load(Ordering::SeqCst), spawns);
+        // A child in the denied dir itself keeps the rule byte for byte.
+        let child = e.sp.create(&p, fenced_params(&root, &d[1])).await.unwrap();
+        let s = spawn_settings(&e.home, &child.id, 1);
+        let deny = strs(&s["permissions"]["deny"]);
+        assert_eq!(
+            deny[deny.len() - 2..],
+            [abs.as_str(), "Read(~/.ssh/**)"],
+            "{:?}",
+            deny
+        );
+        assert!(!deny.iter().any(|r| r.contains('!')));
         e.sp.shutdown();
     }
 

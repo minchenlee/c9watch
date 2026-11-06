@@ -125,7 +125,8 @@ agents fails with "16 live agents".
       `"overlay":{"permissionsDeny":["WebFetch"]}` gives a child with the
       parent's model, the parent's denies first, then `WebFetch`.
 - [ ] A child create with `"overlay":{"model":"haiku"}` is refused
-      (`not_allowed`).
+      (`not_allowed`). So are `"permissionsDeny":["Read(!*.env)"]` and
+      `"permissionsDeny":["Read(./secrets/**)"]`.
 - [ ] After `c9watch engine restart` the root's new spawn file and
       `--resume` command line carry the same overlay.
 - [ ] Not checked by the script: whether CC enforces the added rules (a

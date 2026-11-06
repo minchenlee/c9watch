@@ -112,14 +112,18 @@ export interface C9pAgentListResult {
 export interface C9pAgentOverlay {
   /**
    * The Claude Code `--model`: 1 to 64 of letters, digits, `.`, `_`,
-   * `-`, `[` and `]`. Not from an agent: a child of an agent runs the
+   * `-`, `[` and `]`, not starting with `-`. Not from an agent: a child
+   * of an agent runs the
    * parent's model.
    */
   model?: string | null;
   /**
    * Claude Code permission rules added to the spawn's
    * `permissions.deny`. At most 64, each 1 to 512 bytes with no
-   * control character.
+   * control character. No `!` anywhere, and a path tool's (`Read`,
+   * `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `NotebookRead`,
+   * `Glob`, `Grep`, `LS`) specifier starts with `//` or `~/`; either is
+   * `not_allowed`.
    */
   permissionsDeny?: string[];
   /**

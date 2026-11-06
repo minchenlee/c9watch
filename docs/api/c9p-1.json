@@ -228,7 +228,7 @@
       "description": "Caller additions to one agent's spawn, applied under the engine's own\nrules: each field can only add a restriction, pick a model or add\ntext. Nothing here can allow a tool, a path, a hook, an env var or an\nMCP server. Unknown fields are refused.",
       "properties": {
         "model": {
-          "description": "The Claude Code `--model`: 1 to 64 of letters, digits, `.`, `_`,\n`-`, `[` and `]`. Not from an agent: a child of an agent runs the\nparent's model.",
+          "description": "The Claude Code `--model`: 1 to 64 of letters, digits, `.`, `_`,\n`-`, `[` and `]`, not starting with `-`. Not from an agent: a child\nof an agent runs the\nparent's model.",
           "type": [
             "string",
             "null"
@@ -236,7 +236,7 @@
           "x-sensitivity": "metadata"
         },
         "permissionsDeny": {
-          "description": "Claude Code permission rules added to the spawn's\n`permissions.deny`. At most 64, each 1 to 512 bytes with no\ncontrol character.",
+          "description": "Claude Code permission rules added to the spawn's\n`permissions.deny`. At most 64, each 1 to 512 bytes with no\ncontrol character. No `!` anywhere, and a path tool's (`Read`,\n`Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `NotebookRead`,\n`Glob`, `Grep`, `LS`) specifier starts with `//` or `~/`; either is\n`not_allowed`.",
           "items": {
             "type": "string"
           },
