@@ -1,10 +1,13 @@
 <script lang="ts">
     // The 需要你 page (build plan §G4, R7-SPEC §C, needs-proto.html): the
     // queue (280px) next to the one handling panel. Read-only in G4: the
-    // panel shows every verb, but sending (G5) is not wired.
+    // panel shows every verb and ⌘O opens the chat (`openSession`, it sends
+    // nothing); sending (G5) is not wired.
     import { onDestroy, onMount } from 'svelte';
     import { dataError, fixtureOn, model } from '../data';
     import { usePageKeys } from '../keys';
+    import { openSession } from '$lib/data/api';
+    import { sessionFromView } from '$lib/data/session';
     import { DEMO_NEED_DETAILS, DEMO_OFFLINE_AGO_MS, DEMO_OFFLINE_KEY } from '../model/gaps-demo';
     import HandlingPanel from '../handling/HandlingPanel.svelte';
     import { buildDetail, emptyAnswer, locate, waitText, type Answer } from '../handling/detail';
@@ -17,6 +20,12 @@
     let currentId: string | null = null;
     $: index = Math.max(0, details.findIndex(d => d.id === currentId));
     $: current = details[index] ?? null;
+    // ⌘O: the item's session, when it has one.
+    $: chatOf = (() => {
+        const n = current ? needs.find(x => x.id === current.id) : undefined;
+        const s = n ? locate(n, $model.workspaces).member?.session : null;
+        return s ? () => openSession(sessionFromView(s)) : undefined;
+    })();
     $: next = details.length > 1 ? details[(index + 1) % details.length] : null;
 
     // One draft per item, so switching items keeps what was typed.
@@ -96,6 +105,8 @@
                 offline={offlineSince !== null ? { since: offlineSince } : null}
                 {now}
                 autofocus={moved}
+                onOpenChat={chatOf}
+                ruleMode={$fixtureOn ? 'preview' : 'hidden'}
                 onReconnect={reconnect}
                 onNext={() => go(1)}
                 onPrev={() => go(-1)}

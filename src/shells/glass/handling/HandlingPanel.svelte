@@ -4,11 +4,11 @@
     // Its content: location, the ask, before / after, diff summary, evidence
     // with source and confidence, options, the 「以後直接做」 toggle (允許
     // only, D9 = C) and a receipt. The page owns the keys (keys.ts) and calls
-    // `option`, `submit` and `openChat`. Without a handler an action shows a
-    // note: sending is G5.
+    // `option`, `submit` and `openChat`. A send button without a handler is
+    // off and says so (G4 is read-only; sending is G5).
     import { tick } from 'svelte';
     import OfflineBanner from './OfflineBanner.svelte';
-    import { CANNOT_ANSWER, primaryState, showsFree, showsReject, waitText, type Answer, type HandlingDetail } from './detail';
+    import { CANNOT_ANSWER, PREVIEW_ONLY, fieldStep, primaryState, showsFree, showsReject, waitText, type Answer, type HandlingDetail } from './detail';
 
     export let detail: HandlingDetail;
     export let answer: Answer;
@@ -24,7 +24,11 @@
     export let receipt: { title: string; rows: [string, string][] } | null = null;
     export let onSubmit: ((a: Answer) => void) | undefined = undefined;
     export let onNo: (() => void) | undefined = undefined;
-    export let onOpenChat: (() => void) | undefined = undefined;
+    /** Opens the chat (⌘O). Without it the chat buttons are off. */
+    export let onOpenChat: (() => Promise<void> | void) | undefined = undefined;
+    /** 「以後直接做」: 'hidden' until core can answer permissions and keep
+     * rules (Gap P, Gap R); 'preview' shows it as a design that saves nothing. */
+    export let ruleMode: 'hidden' | 'preview' = 'hidden';
     export let onReconnect: (() => void) | undefined = undefined;
     export let onNext: (() => void) | undefined = undefined;
     export let onPrev: (() => void) | undefined = undefined;
@@ -33,12 +37,16 @@
      * focus on load would eat the shell keys ([, ⌘N, ⌘K). */
     export let autofocus = true;
 
-    const NOT_YET = '這一版只能看，還不能從這裡送出。';
     let notice: string | null = null;
     let lastId = '';
     $: if (detail.id !== lastId) { lastId = detail.id; notice = null; }
 
-    $: ps = primaryState(detail, answer, offline !== null);
+    // Offline wording only when a handler could keep the answer for later.
+    $: ps = primaryState(detail, answer, offline !== null && !!onSubmit);
+    // A send with no handler: off, labelled as a preview.
+    $: preview = !ps.chat && !onSubmit;
+    $: primaryOff = ps.chat ? !onOpenChat : preview || ps.off;
+    $: primaryText = !ps.chat && preview ? PREVIEW_ONLY : ps.text;
     $: free = showsFree(detail, answer);
     $: reject = showsReject(detail, answer);
     $: nOpt = detail.options?.length ?? 0;
@@ -54,18 +62,20 @@
         await tick();
         if (!had && (free || reject)) box?.focus();
     }
-    export function openChat() {
-        if (onOpenChat) onOpenChat(); else notice = NOT_YET;
+    export async function openChat() {
+        if (!onOpenChat) return;
+        notice = null;
+        try { await onOpenChat(); } catch (e) { notice = `打不開對談：${(e as { message?: string })?.message ?? String(e)}`; }
     }
     /** ⌘↵: the main button. */
     export function submit() {
         if (receipt) return;
         if (ps.chat) { openChat(); return; }
         if (ps.off) return;
-        if (onSubmit) onSubmit(answer); else notice = NOT_YET;
+        if (onSubmit) onSubmit(answer);
     }
     function no() {
-        if (onNo) onNo(); else notice = NOT_YET;
+        onNo?.();
     }
 
     /** Puts the cursor in the key field (給, R7-SPEC §A.3). */
@@ -75,9 +85,9 @@
     }
     /** Handoff test #7: while the key field is empty, J / K still change item. */
     function fieldKeys(e: KeyboardEvent) {
-        if (answer.input || e.isComposing || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
-        if (e.code === 'KeyJ' && onNext) { e.preventDefault(); onNext(); }
-        else if (e.code === 'KeyK' && onPrev) { e.preventDefault(); onPrev(); }
+        const step = fieldStep(e, answer.input);
+        const fn = step === 1 ? onNext : step === -1 ? onPrev : undefined;
+        if (fn) { e.preventDefault(); fn(); }
     }
 </script>
 
@@ -101,7 +111,7 @@
             </dl>
         </div>
         <div class="row">
-            <button type="button" class="btn" on:click={openChat}>開啟對談<kbd>⌘O</kbd></button>
+            <button type="button" class="btn" disabled={!onOpenChat} on:click={openChat}>開啟對談<kbd>⌘O</kbd></button>
             <button type="button" class="btn primary" on:click={() => onNext?.()}>{next ? `下一件：${next.verb} ${next.title}` : '看全部處理完'}<kbd>J</kbd></button>
         </div>
         <span class="meta">收據頁不接受 ⌘↵，免得連按跳過。</span>
@@ -174,25 +184,25 @@
             {/if}
         {/if}
 
-        {#if detail.rule}
-            <div class="grant">
-                <span class="label">另外 · 會改變以後的規則（預設關）</span>
+        {#if detail.rule && ruleMode === 'preview'}
+            <div class="grant" data-rule-preview>
+                <span class="label">另外 · 設計預覽，不會儲存</span>
                 <label class="sw">
                     <input type="checkbox" role="switch" bind:checked={answer.rule} />
-                    <span><span>{detail.rule.text}</span><br /><span class="e">範圍：{detail.rule.scope}。撤銷：設定 › 規則與授權。</span></span>
+                    <span><span>{detail.rule.text}</span><br /><span class="e">範圍：{detail.rule.scope}。</span></span>
                 </label>
             </div>
         {/if}
 
         <div class="acts">
             {#if !detail.canAnswer}<p class="cannot" data-cannot>{CANNOT_ANSWER}</p>{/if}
-            <span class="note">{detail.note}{detail.canAnswer && detail.reversible ? `${detail.note ? ' ' : ''}送出後跳到下一件，10 秒內可以按「復原」。` : ''}</span>
+            <span class="note">{detail.note}{detail.canAnswer && detail.reversible && onSubmit ? `${detail.note ? ' ' : ''}送出後跳到下一件，10 秒內可以按「復原」。` : ''}</span>
             {#if notice}<span class="notice" role="status">{notice}</span>{/if}
             <div class="row">
-                {#if detail.no}<button type="button" class="btn" on:click={no}>{detail.no}</button>{/if}
-                {#if detail.canAnswer}<button type="button" class="btn" on:click={openChat}>開啟對談<kbd>⌘O</kbd></button>{/if}
-                <button type="button" class="btn primary" disabled={ps.off} on:click={submit} data-primary>
-                    <span>{ps.text}</span><kbd>{ps.chat ? '⌘O' : '⌘↵'}</kbd>
+                {#if detail.no}<button type="button" class="btn" disabled={!onNo} on:click={no}>{detail.no}</button>{/if}
+                {#if detail.canAnswer}<button type="button" class="btn" disabled={!onOpenChat} on:click={openChat}>開啟對談<kbd>⌘O</kbd></button>{/if}
+                <button type="button" class="btn primary" disabled={primaryOff} on:click={submit} data-primary data-preview={preview || undefined}>
+                    <span>{primaryText}</span><kbd>{ps.chat ? '⌘O' : '⌘↵'}</kbd>
                 </button>
             </div>
         </div>

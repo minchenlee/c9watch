@@ -24,7 +24,9 @@ async function live(page: Page, failAgentList = false) {
 	await page.addInitScript((fail) => {
 		const internals: Record<string, unknown> = {};
 		let inner: ((cmd: string, args: any, o?: unknown) => unknown) | undefined;
+		const calls: { cmd: string; args: any }[] = ((window as any).__C9_CALLS__ = []);
 		const call = async (cmd: string, args: any, o?: unknown) => {
+			calls.push({ cmd, args });
 			if (fail && cmd === 'c9p_request' && args?.method === 'agent.list') throw { code: 'unavailable', msg: 'core is gone', retryable: true, hint: '' };
 			const r: any = await inner!(cmd, args, o);
 			if (cmd === 'c9p_request' && args?.method === 'session.views' && r?.sessions)
@@ -35,6 +37,7 @@ async function live(page: Page, failAgentList = false) {
 		(window as any).__TAURI_INTERNALS__ = internals;
 	}, failAgentList);
 }
+const PREVIEW = '預覽版：還不能從這裡送出';
 const panel = (page: Page) => page.locator('.handling');
 const pick = (page: Page, verb: string) => page.locator('.queue .qi', { has: page.locator('.verb', { hasText: verb }) }).click();
 
@@ -59,11 +62,12 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		await expect(p).toHaveAttribute('data-verb', '審');
 		await expect(p.locator('figcaption')).toContainText(['改前', '改後 · verifier 通過 · 3 個檔案 +42 −18']);
 		await expect(p.locator('.opt')).toHaveCount(2);
-		await expect(p.locator('[data-primary]')).toContainText('驗收');
+		// G4 sends nothing: the send button is off and says so.
+		await expect(p.locator('[data-primary]')).toHaveText(new RegExp(PREVIEW));
+		await expect(p.locator('[data-primary]')).toBeDisabled();
 		await expect(p.locator('.grant')).toHaveCount(0); // D9 = C: only 允許 has the toggle
 		await page.keyboard.press('Digit2');
 		await expect(p.locator('textarea')).toBeFocused();
-		await expect(p.locator('[data-primary]')).toContainText('先寫退回原因');
 		await expect(p.locator('[data-primary]')).toBeDisabled();
 		await page.keyboard.press('Escape');
 		await page.keyboard.press('Digit1');
@@ -76,12 +80,13 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		const p = panel(page);
 		await expect(p.locator('.shot')).toHaveCount(2);
 		await expect(p.locator('.opt')).toHaveCount(4);
-		await expect(p.locator('[data-primary]')).toContainText('送出：只有「需要你」上色');
+		await expect(p.locator('.opt.on')).toContainText('只有「需要你」上色');
+		await expect(p.locator('[data-primary]')).toHaveText(new RegExp(PREVIEW));
 		await expect(p.locator('.grant')).toHaveCount(0);
 		await shot(page, 'g4-verb-decide');
 		await page.keyboard.press('Digit4');
 		await expect(p.locator('textarea')).toBeFocused();
-		await expect(p.locator('[data-primary]')).toContainText('先寫你的回答');
+		await expect(p.locator('[data-primary]')).toBeDisabled();
 	});
 
 	test('處理: log and 3 options', async ({ page }) => {
@@ -101,8 +106,8 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		const key = p.locator('input[type="password"]');
 		await expect(key).toBeFocused();
 		await expect(p.locator('[data-primary]')).toBeDisabled();
-		await expect(p.locator('[data-primary]')).toContainText('先貼上 key');
-		await expect(p.getByRole('button', { name: '我沒有這把 key' })).toBeVisible();
+		await expect(p.locator('[data-primary]')).toHaveText(new RegExp(PREVIEW));
+		await expect(p.getByRole('button', { name: '我沒有這把 key' })).toBeDisabled();
 		await expect(p.locator('.grant')).toHaveCount(0);
 		await shot(page, 'g4-verb-give');
 		// Handoff test #7: an empty field does not eat J.
@@ -118,11 +123,31 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		await expect(p.locator('[data-cannot]')).toHaveText('c9watch 還不能直接回答');
 		await expect(p.locator('[data-primary]')).toContainText('在終端機回答');
 		await expect(p.locator('[data-primary] kbd')).toHaveText('⌘O');
+		await expect(p.locator('[data-primary]')).toBeEnabled();
 		await expect(p.locator('.f')).toHaveCount(3);
 		await expect(p.locator('.conf')).toHaveText(['確定', '估計', '不確定']);
+		// Fixture only: the toggle is a design preview that saves nothing.
+		await expect(p.locator('.grant .label')).toHaveText('另外 · 設計預覽，不會儲存');
+		await expect(p.locator('.grant')).not.toContainText('撤銷');
 		await expect(p.locator('.grant [role="switch"]')).not.toBeChecked();
 		await expect(p.getByRole('button', { name: '拒絕' })).toHaveCount(0);
 		await shot(page, 'g4-verb-allow');
+	});
+
+	test('給: an input-method key (keyCode 229) in the empty field is not taken', async ({ page }) => {
+		await openNeeds(page);
+		await pick(page, '給');
+		const p = panel(page);
+		const key = p.locator('input[type="password"]');
+		await expect(key).toBeFocused();
+		const prevented = await key.evaluate((el) => {
+			const e = new KeyboardEvent('keydown', { code: 'KeyJ', key: 'Process', bubbles: true, cancelable: true });
+			Object.defineProperty(e, 'keyCode', { get: () => 229 });
+			el.dispatchEvent(e);
+			return e.defaultPrevented;
+		});
+		expect(prevented).toBe(false);
+		await expect(p.locator('.prog .n')).toHaveText('第 1 件，共 5 件');
 	});
 
 	test('J / K walk the queue and the position follows', async ({ page }) => {
@@ -135,13 +160,14 @@ test.describe('glass 需要你 (G4 preview)', () => {
 		await expect(n).toHaveText('第 5 件，共 5 件');
 	});
 
-	test('disconnected: banner on top, the main button keeps the answer', async ({ page }) => {
+	test('disconnected: banner on top; the main button promises no queue', async ({ page }) => {
 		await openNeeds(page, { ...glass, 'c9watch.demoGlassOffline': '1' });
 		await pick(page, '處理');
 		const p = panel(page);
 		await expect(p.locator('[data-offline]')).toContainText('和 agent 斷線了 · 2 分前');
 		await expect(p.getByRole('button', { name: '重新連線' })).toBeVisible();
-		await expect(p.locator('[data-primary]')).toContainText('先存著，連上後送出');
+		await expect(p.locator('[data-primary]')).toHaveText(new RegExp(PREVIEW));
+		await expect(p.locator('[data-primary]')).not.toContainText('先存著');
 		await shot(page, 'g4-disconnected');
 	});
 
@@ -169,8 +195,14 @@ test.describe('glass 需要你 (G4 preview)', () => {
 			await expect(panel(page).locator('[data-cannot]')).toBeVisible();
 		}
 		await page.locator('.queue .qi', { hasText: '允許' }).click();
-		await expect(panel(page).locator('.grant')).toHaveCount(1);
+		// Live: no 「以後直接允許」 toggle until core can answer and keep rules.
+		await expect(panel(page).locator('.grant')).toHaveCount(0);
 		await shot(page, 'g4-live');
+		// 「在終端機回答」 opens the real session (pid 41001) and sends nothing.
+		await panel(page).locator('[data-primary]').click();
+		await expect.poll(() => page.evaluate(() => (window as any).__C9_CALLS__.filter((c: any) => c.cmd === 'open_session').map((c: any) => c.args.pid))).toEqual([41001]);
+		await page.keyboard.press('Meta+KeyO');
+		await expect.poll(() => page.evaluate(() => (window as any).__C9_CALLS__.filter((c: any) => c.cmd === 'open_session').length)).toBe(2);
 	});
 
 	test('live mode: a feed error shows the disconnect banner', async ({ page }) => {

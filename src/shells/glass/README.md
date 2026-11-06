@@ -56,7 +56,11 @@ G4 需要你 page (read-only):
   facts; reasons, options, evidence and shots come from
   `DEMO_NEED_DETAILS` in the gaps file, only while the fixture is on.
 - 允許 cannot be answered from c9watch yet (Gap P): its main button is
-  「在終端機回答 ⌘O」. Only 允許 has the 「以後直接做」 toggle (D9 = C).
+  「在終端機回答 ⌘O」, which calls `openSession` (it sends nothing).
+- 「以後直接做」 (D9 = C, 允許 only): hidden in live mode until core can
+  answer permissions and keep rules; with the fixture it shows as
+  「設計預覽，不會儲存」.
 - Disconnect banner: on a feed error (`dataError`). Demo: set
   `localStorage['c9watch.demoGlassOffline'] = '1'` with the fixture on.
-- No action sends anything yet (G5).
+- No action sends anything yet (G5): a send button without a handler is
+  off and reads 「預覽版：還不能從這裡送出」.

@@ -26,7 +26,7 @@ const { deriveGlassModel } = await load('./model', M + 'index.ts');
 const fixture = await load('$lib/data/demo/glass', '../src/lib/data/demo/glass.ts');
 const gaps = await load('../model/gaps-demo', M + 'gaps-demo.ts');
 urls['./gaps-demo'] = urls['../model/gaps-demo'];
-const { buildDetail, primaryState, emptyAnswer, waitText, CANNOT_ANSWER } = await load('./detail', '../src/shells/glass/handling/detail.ts');
+const { buildDetail, primaryState, emptyAnswer, waitText, fieldStep } = await load('./detail', '../src/shells/glass/handling/detail.ts');
 
 const NOW = 1_800_000_000_000;
 const GAPS = { workspaces: gaps.DEMO_WORKSPACES, goals: gaps.DEMO_GOALS, needs: gaps.DEMO_NEEDS };
@@ -118,4 +118,15 @@ test('wait text', () => {
     assert.equal(waitText(NOW - 3 * 60_000, NOW), '3 分');
     assert.equal(waitText(NOW - 65 * 60_000, NOW), '1 小時 5 分');
     assert.equal(waitText(NOW - 120 * 60_000, NOW), '2 小時');
+});
+
+test('key field: J / K step only when empty and no input method composes', () => {
+    assert.equal(fieldStep({ code: 'KeyJ' }, ''), 1);
+    assert.equal(fieldStep({ code: 'KeyK' }, ''), -1);
+    assert.equal(fieldStep({ code: 'KeyJ' }, 'abc'), 0);
+    // WebKit sends keyCode 229 for keys the input method takes, isComposing false.
+    assert.equal(fieldStep({ code: 'KeyJ', keyCode: 229, isComposing: false }, ''), 0);
+    assert.equal(fieldStep({ code: 'KeyK', isComposing: true }, ''), 0);
+    assert.equal(fieldStep({ code: 'KeyJ', metaKey: true }, ''), 0);
+    assert.equal(fieldStep({ code: 'KeyA' }, ''), 0);
 });

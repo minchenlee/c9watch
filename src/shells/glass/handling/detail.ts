@@ -182,3 +182,14 @@ export function waitText(since: number, now: number): string {
     const h = Math.floor(min / 60), m = min % 60;
     return m ? `${h} 小時 ${m} 分` : `${h} 小時`;
 }
+
+/** The label of a send button that has no handler yet (G4 is read-only). */
+export const PREVIEW_ONLY = '預覽版：還不能從這裡送出';
+
+/** Handoff test #7: in the empty key field, J / K still change item. Same
+ * IME guard as keys.ts: while an input method composes (or WebKit reports
+ * keyCode 229), the key belongs to the input method. */
+export function fieldStep(e: { code: string; isComposing?: boolean; keyCode?: number; metaKey?: boolean; ctrlKey?: boolean; altKey?: boolean; shiftKey?: boolean }, value: string): 1 | -1 | 0 {
+    if (value || e.isComposing || e.keyCode === 229 || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return 0;
+    return e.code === 'KeyJ' ? 1 : e.code === 'KeyK' ? -1 : 0;
+}
