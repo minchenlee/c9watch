@@ -33,3 +33,15 @@ without that stream, on session changes (at most every 2 s).
 
 Preview (no baseline): `npx playwright test -c tests/visual/glass-preview.config.ts`.
 PNGs go to `tests/visual/.cache/glass-preview/`.
+
+G1 frame:
+
+- `tokens.css`: every glass token, scoped to `.glass-root`. `data-glass` =
+  `off` / `subtle` / `full` (from `localStorage['ui.glass']`, `prefs.ts`).
+  `scripts/test-glass-tokens.mjs` checks text contrast ≥ 4.5:1.
+- `keys.ts`: the only keyboard handler (R7-SPEC §A.2). Pages register their
+  keys with `usePageKeys`; a receipt page passes `receipt: true`.
+  `scripts/test-glass-keys.mjs` covers text fields, IME and receipts.
+- `Sidebar.svelte`: 需要你 → 今天 → workspaces (lead and talk rows) →
+  extension slot (empty) → 用量 / 設定. `[` collapses it to a
+  「需要你 · N」 button. ⌘N shows a `c9watch spawn` hint (no delegate in v1).
