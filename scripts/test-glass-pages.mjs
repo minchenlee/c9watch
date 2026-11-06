@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { test } from 'node:test';
+import { mock, test } from 'node:test';
 import ts from 'typescript';
 
 // Glass G10a pure helpers: 用量 period math (usage-math.ts) and the 今天
@@ -22,6 +22,7 @@ const { workspaceFor } = await load('../model/workspaces', G + 'model/workspaces
 await load('./workspace-extras', G + 'pages/workspace-extras.ts');
 const U = await load('./usage-math', G + 'pages/usage-math.ts');
 const T = await load('./today-model', G + 'pages/today-model.ts');
+const R = await load('./refresh', G + 'pages/refresh.ts');
 const fixture = await load('$lib/data/demo/glass', '../src/lib/data/demo/glass.ts');
 const gaps = await load('../model/gaps-demo', G + 'model/gaps-demo.ts');
 
@@ -160,4 +161,57 @@ test('today fixture: 驗收完 and 被退回 from the gaps file only', () => {
     assert.deepEqual(s.rejected.map(i => i.title), ['HISTORY 畫面']);
     const live = T.todaySections({ model, history: null, away: {}, midnight: MIDNIGHT, now: NOW, demo: null });
     assert.deepEqual([live.done, live.rejected], [[], []]);
+});
+
+test('today: a live member hides its history row by provider and session key, paired or not', () => {
+    const agentOnly = member('w', { session: null, sessionKey: 'codex:sess-w', agent: { sessionKey: 'codex:sess-w', startedAt: NOW - 1000 } });
+    const model = modelOf([agentOnly]);
+    const history = [
+        { ...hist('sess-w', NOW - 5000), provider: 'codex' },
+        { ...hist('sess-w', NOW - 4000), provider: 'claudeCode', customTitle: 'same id, other provider' }
+    ];
+    const s = T.todaySections({ model, history, away: {}, midnight: MIDNIGHT, now: NOW, demo: null });
+    assert.deepEqual(s.done.map(i => i.title), ['same id, other provider']);
+});
+
+test('usage: UTC day, old quota snapshot, passed reset', () => {
+    assert.equal(U.utcDay(Date.UTC(2026, 2, 31, 23, 30)), '2026-03-31');
+    const now = Date.UTC(2026, 2, 10, 12, 0) ;
+    assert.equal(U.quotaStaleMinutes(now / 1000 - 60, now), null);
+    assert.equal(U.quotaStaleMinutes(now / 1000 - 15 * 60, now), 15);
+    assert.equal(U.quotaStaleMinutes(null, now), null);
+    assert.equal(U.windowPassed(now / 1000 - 1, now), true);
+    assert.equal(U.windowPassed(now / 1000 + 60, now), false);
+    assert.equal(U.windowPassed(null, now), false);
+});
+
+test('refresh: first read, every tick, focus, gap between reads, one read at a time, nothing after stop', async () => {
+    mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: 1_000_000 });
+    try {
+        const target = new EventTarget();
+        let reads = 0, release = null;
+        const seen = [];
+        const r = R.startRefresh(async alive => { reads++; await new Promise(res => (release = res)); seen.push(alive()); }, { everyMs: 60_000, minGapMs: 15_000, target });
+        const flush = async () => { for (let i = 0; i < 5; i++) await Promise.resolve(); };
+        assert.equal(reads, 1, 'reads at once');
+        target.dispatchEvent(new Event('focus')); target.dispatchEvent(new Event('focus'));
+        assert.equal(reads, 1, 'one read at a time');
+        release(); await flush();
+        assert.equal(reads, 1, 'a focus read waits for the 15 s gap');
+        mock.timers.tick(15_000); await flush();
+        assert.equal(reads, 2, 'then runs once');
+        release(); await flush();
+        r.kick(); await flush();
+        assert.equal(reads, 3, 'a kick (the asked sessions changed) does not wait for the gap');
+        r.kick(); r.kick();
+        release(); await flush();
+        assert.equal(reads, 4, 'kicks during a read run once after it');
+        release(); await flush();
+        mock.timers.tick(60_000); await flush();
+        assert.equal(reads, 5, 'every 60 s');
+        r.stop(); release(); await flush();
+        assert.deepEqual(seen, [true, true, true, true, false], 'a read in flight at stop sees alive() = false');
+        mock.timers.tick(120_000); target.dispatchEvent(new Event('focus')); r.kick(); await flush();
+        assert.equal(reads, 5, 'nothing after stop');
+    } finally { mock.timers.reset(); }
 });

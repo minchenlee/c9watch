@@ -41,4 +41,4 @@ export function parseFee(text: string | null): number | null {
 
 /** `glass.sidebar = collapsed` keeps the side bar closed after a reload. */
 export const sidebarCollapsed = writable(read('glass.sidebar') === 'collapsed');
-sidebarCollapsed.subscribe(v => write('glass.sidebar', v ? 'collapsed' : 'open'));
+onChange(sidebarCollapsed, v => write('glass.sidebar', v ? 'collapsed' : 'open'));

@@ -155,3 +155,22 @@ export function windowLabel(label: string): string {
 
 /** A window at or above this percent is orange (redesign §8.4). */
 export const QUOTA_WARN = 90;
+
+/** A plan snapshot older than this is marked as old data. */
+export const QUOTA_STALE_MS = 10 * 60_000;
+/** Minutes since the provider snapshot (`updatedAt`, Unix seconds) when it
+ * is older than `QUOTA_STALE_MS`; null when fresh or unknown. */
+export function quotaStaleMinutes(updatedAt: number | null, nowMs: number): number | null {
+    if (updatedAt == null || !Number.isFinite(updatedAt)) return null;
+    const age = nowMs - updatedAt * 1000;
+    return age >= QUOTA_STALE_MS ? Math.floor(age / 60_000) : null;
+}
+/** True when the window's reset time (Unix seconds) has passed: its percent
+ * belongs to the window before. */
+export function windowPassed(resetsAt: number | null, nowMs: number): boolean {
+    return resetsAt != null && Number.isFinite(resetsAt) && resetsAt * 1000 <= nowMs;
+}
+
+/** The daily buckets come from core in UTC (core ticket), so the page's
+ * days are UTC days too: `YYYY-MM-DD` of `now` in UTC. */
+export const utcDay = (nowMs: number) => new Date(nowMs).toISOString().slice(0, 10);

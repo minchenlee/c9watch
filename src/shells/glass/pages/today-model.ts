@@ -70,11 +70,13 @@ export function todaySections({ model, history, away, midnight, now, demo }: Tod
         key: `${r.workspace}:${r.title}:${i}`, title: r.title, meta: `${wsName(model.workspaces, r.workspace)} › ${r.goal} · ${r.note}`,
         workspaceId: r.workspace, at: null, atText: r.at
     });
-    const liveIds = new Set(model.workspaces.flatMap(w => w.rows.flatMap(r => r.members)).filter(m => m.live && m.session).map(m => m.session!.id));
+    // Every live member's session, by `<provider>:<session id>`: an agent
+    // row may name its session before a SessionView pairs with it.
+    const liveKeys = new Set(model.workspaces.flatMap(w => w.rows.flatMap(r => r.members)).filter(m => m.live).flatMap(m => [m.sessionKey, m.session?.sessionKey, m.agent?.sessionKey]).filter((k): k is string => !!k));
     const done = demo
         ? demo.accepted.map(review)
         : (history ?? [])
-            .filter(e => e.timestamp >= midnight && e.timestamp <= now && !liveIds.has(e.sessionId))
+            .filter(e => e.timestamp >= midnight && e.timestamp <= now && !liveKeys.has(`${e.provider}:${e.sessionId}`))
             .sort((a, b) => b.timestamp - a.timestamp)
             .map((e): TodayItem => ({ key: `${e.provider}:${e.sessionId}`, title: historyTitle(e), meta: e.projectName || e.project, workspaceId: null, at: e.timestamp, atText: null }));
     const attention = model.workspaces.flatMap(w => w.rows.flatMap(r => r.members.filter(m => m.live && m.stale).map((m): TodayItem => ({

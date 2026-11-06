@@ -11,6 +11,7 @@
     import type { C9pAwayActivity, C9pHistoryEntry } from '$lib/c9p-1';
     import { routeHash } from '../nav';
     import { readPages, type Loaded } from './workspace-extras';
+    import { startRefresh, type Refresher } from './refresh';
     import { awayRequests, awayText, localMidnight, todaySections, type TodayItem } from './today-model';
 
     /** Open needs, the same count as the side bar. */
@@ -22,35 +23,30 @@
 
     let history: Loaded<C9pHistoryEntry[]> | null = null;
     let away: Record<string, C9pAwayActivity> = {};
+    // History and `session.away` are read again every 60 s, on window
+    // focus, and when the asked sessions change (at most every 15 s).
+    // A failed read keeps the last answer; the next tick retries.
+    let refresher: Refresher | null = null;
+    let asked = '';
+    $: requests = awayRequests($model, midnight);
+    $: { const sig = JSON.stringify(requests); if (sig !== asked) { asked = sig; refresher?.kick(); } }
+    async function read(alive: () => boolean) {
+        const list = requests;
+        const [h, a] = await Promise.all([
+            readPages(async offset => { const r = await request('history.list', { page: { offset, limit: 1000 } }); return { items: (r?.entries ?? []) as C9pHistoryEntry[], nextOffset: r?.nextOffset }; })
+                .then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error })),
+            list.length ? request('session.away', { requests: list }).then(r => r?.activity ?? {}, () => null) : Promise.resolve({})
+        ]);
+        if (!alive()) return;
+        if (h.ok || !history?.ok) history = h;
+        if (a !== null) away = a;
+    }
     onMount(() => {
         let gone = false;
-        // The Shell's onMount picks the transport after a child's: read one microtask later.
-        void Promise.resolve()
-            .then(() => readPages(async offset => { const r = await request('history.list', { page: { offset, limit: 1000 } }); return { items: (r?.entries ?? []) as C9pHistoryEntry[], nextOffset: r?.nextOffset }; }))
-            .then(value => { if (!gone) history = { ok: true, value }; }, error => { if (!gone) history = { ok: false, error }; });
-        return () => { gone = true; };
+        // The Shell's onMount picks the transport after a child's: start one microtask later.
+        void Promise.resolve().then(() => { if (!gone) refresher = startRefresh(read); });
+        return () => { gone = true; refresher?.stop(); refresher = null; };
     });
-
-    // Ask `session.away` again only when the asked sessions change.
-    let asked = '';
-    let latest = 0;
-    $: requests = awayRequests($model, midnight);
-    $: void askAway(requests);
-    async function askAway(list: { sessionKey: string; sinceMs: number }[]) {
-        const sig = JSON.stringify(list);
-        if (sig === asked) return;
-        asked = sig;
-        const n = ++latest;
-        if (!list.length) { away = {}; return; }
-        await Promise.resolve();
-        try {
-            const r = await request('session.away', { requests: list });
-            if (n === latest) away = r?.activity ?? {};
-        } catch {
-            // No counts: the rows still show. Ask again on the next change.
-            if (n === latest) { away = {}; asked = ''; }
-        }
-    }
 
     $: s = todaySections({ model: $model, history: history?.ok ? history.value : null, away, midnight, now, demo: $fixtureOn ? DEMO_TODAY : null });
     const hhmm = (t: number) => { const d = new Date(t); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };

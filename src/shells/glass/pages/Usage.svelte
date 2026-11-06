@@ -13,25 +13,45 @@
     import { monthlyFee } from '../prefs';
     import { routeHash } from '../nav';
     import { formatTokens, formatUsd } from '../ui/format';
-    import { localDay, type Loaded } from './workspace-extras';
-    import { PERIODS, QUOTA_WARN, apiPriceText, hoursIn, rangeFor, summarize, windowLabel, type Period, type UsageRow } from './usage-math';
+    import { type Loaded } from './workspace-extras';
+    import { PERIODS, QUOTA_WARN, apiPriceText, hoursIn, quotaStaleMinutes, rangeFor, summarize, utcDay, windowLabel, windowPassed, type Period, type UsageRow } from './usage-math';
+    import { startRefresh } from './refresh';
 
     const clock = readable(Date.now(), set => { const t = setInterval(() => set(Date.now()), 60_000); return () => clearInterval(t); });
     $: now = Math.max($clock, Date.now());
-    $: today = localDay(now);
+    // Core buckets cost records by UTC date (core ticket): days here are UTC days.
+    $: today = utcDay(now);
 
     let period: Period = 'month';
     let cost: Loaded<C9pCostData | null> | null = null;
     let quota: Loaded<C9pSubscriptionUsage[]> | null = null;
+    /** A later read failed: the page keeps the last good answer and says so. */
+    let costFailedAt: number | null = null;
+    let quotaFailedAt: number | null = null;
+    let costAt = 0;
     const settle = <T>(p: Promise<T>): Promise<Loaded<T>> => p.then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }));
+    // Read again every 60 s and on window focus; a failed read is retried
+    // on the next tick. Answers after unmount are dropped (`alive`).
     onMount(() => {
+        let refresher: { stop(): void } | null = null;
         let gone = false;
-        // The Shell's onMount picks the transport after a child's: read one microtask later.
-        void Promise.resolve().then(() => Promise.all([
-            settle(request('cost.get', {}).then(r => (r ?? null) as C9pCostData | null)),
-            settle(request('usage.subscriptions', {}).then(r => (r?.usage ?? []) as C9pSubscriptionUsage[]))
-        ])).then(([c, q]) => { if (gone) return; cost = c; quota = q; });
-        return () => { gone = true; };
+        // The Shell's onMount picks the transport after a child's: start one microtask later.
+        void Promise.resolve().then(() => {
+            if (gone) return;
+            refresher = startRefresh(async alive => {
+                const [c, q] = await Promise.all([
+                    settle(request('cost.get', {}).then(r => (r ?? null) as C9pCostData | null)),
+                    settle(request('usage.subscriptions', {}).then(r => (r?.usage ?? []) as C9pSubscriptionUsage[]))
+                ]);
+                if (!alive()) return;
+                const at = Date.now();
+                if (c.ok || !cost?.ok) { cost = c; costAt = at; }
+                costFailedAt = c.ok ? null : at;
+                if (q.ok || !quota?.ok) quota = q;
+                quotaFailedAt = q.ok ? null : at;
+            });
+        });
+        return () => { gone = true; refresher?.stop(); };
     });
 
     $: range = rangeFor(period, today);
@@ -41,6 +61,7 @@
     const errText = (e: unknown) => (e && typeof e === 'object' && 'msg' in e ? String((e as { msg: unknown }).msg) : e instanceof Error ? e.message : String(e));
     const md = (day: string) => `${Number(day.slice(5, 7))}/${Number(day.slice(8, 10))}`;
     $: rangeText = range.from === range.to ? md(range.from) : `${md(range.from)} – ${md(range.to)}`;
+    const hhmm = (t: number) => { const d = new Date(t); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
     const resetText = (at: number | null) => {
         if (at == null) return '';
         const d = new Date(at * 1000);
@@ -55,6 +76,7 @@
     <header>
         <h1>用量</h1>
         <p class="sub">{rangeText} · 「≈ API 價」照 API 價格估算，不是實付金額。</p>
+        <p class="note" data-utc-note>日期依 UTC 計。</p>
     </header>
 
     <div class="periods" role="radiogroup" aria-label="期間">
@@ -68,6 +90,7 @@
     {:else if !cost.ok}
         <p class="state-msg">讀不到用量資料</p>
     {:else if sum}
+        {#if costFailedAt !== null}<p class="reason" data-cost-stale>更新失敗，下面是 {hhmm(costAt)} 的資料，稍後再試。</p>{/if}
         <div class="tiles">
             <div class="tile" data-card="paid">
                 <span class="lbl">實付</span>
@@ -136,7 +159,7 @@
         </section>
 
         <section aria-labelledby="u-model">
-            <h2 class="psec" id="u-model">依模型</h2>
+            <h2 class="psec" id="u-model">依 session 主要模型</h2>
             {#if sum.byModel.length}
                 <table class="tbl" data-table="model">
                     <thead><tr><th>模型</th><th class="n">token</th><th class="n">分攤（實付）</th><th class="n">≈ API 價</th></tr></thead>
@@ -146,7 +169,7 @@
                         {/each}
                     </tbody>
                 </table>
-                <p class="note">分攤 = 實付 × 這一列的 token 占比。</p>
+                <p class="note">一個 session 一天只記一個主要模型：中途換過模型的 session，整天的 token 都算在主要模型。分攤 = 實付 × 這一列的 token 占比。</p>
             {:else}
                 <p class="state-msg">這段期間沒有用量</p>
             {/if}
@@ -158,24 +181,27 @@
         {#if quota === null}
             <p class="state-msg">讀取中</p>
         {:else if !quota.ok}
-            <p class="reason" data-quota-reason>讀不到額度：{errText(quota.error)}</p>
+            <p class="reason" data-quota-reason>讀不到額度：{errText(quota.error)}。每分鐘會再試一次。</p>
         {:else if !quota.value.length}
             <p class="reason" data-quota-reason>沒有讀到任何訂閱方案的額度。</p>
         {:else}
+            {#if quotaFailedAt !== null}<p class="reason" data-quota-stale>更新失敗，下面是上一次讀到的額度。</p>{/if}
             <div class="plans">
                 {#each quota.value as plan (plan.provider + plan.name)}
+                    {@const old = quotaStaleMinutes(plan.updatedAt, now)}
                     <div class="plan" data-plan={plan.provider}>
-                        <div class="plan-h"><span class="t">{plan.name}</span>{#if plan.plan}<span class="meta">{plan.plan}</span>{/if}</div>
+                        <div class="plan-h"><span class="t">{plan.name}</span>{#if plan.plan}<span class="meta">{plan.plan}</span>{/if}{#if old !== null}<span class="meta old" data-plan-old>{old} 分鐘前的資料</span>{/if}</div>
                         {#if !plan.windows.length}
                             <p class="reason" data-quota-reason>{plan.message ?? '這個方案沒有額度資料'}</p>
                         {:else}
                             {#each plan.windows as w (w.label)}
                                 {@const pct = Math.max(0, Math.min(100, w.usedPercent))}
-                                <div class="win" class:warn={w.usedPercent >= QUOTA_WARN} data-window={w.label}>
+                                {@const passed = windowPassed(w.resetsAt, now)}
+                                <div class="win" class:warn={!passed && w.usedPercent >= QUOTA_WARN} class:passed data-window={w.label}>
                                     <span class="wl">{windowLabel(w.label)}</span>
                                     <span class="track"><i style:width={`${pct}%`}></i></span>
                                     <span class="mono pct">{Math.round(w.usedPercent)}%</span>
-                                    <span class="mono meta">{resetText(w.resetsAt)}</span>
+                                    <span class="mono meta">{passed ? '已過重置時間，等新資料' : resetText(w.resetsAt)}</span>
                                 </div>
                             {/each}
                             {#if plan.message}<p class="note">{plan.message}</p>{/if}
@@ -228,6 +254,10 @@
     .meta a, td a { color: var(--text-2); }
     .note, .reason { margin: 0; font: var(--type-label); color: var(--text-3); }
     .reason { color: var(--text-2); }
+    .note { margin: 0; font: var(--type-label); color: var(--text-3); }
+    .old { color: var(--status-input-text); }
+    .win.passed .track i { background: var(--text-disabled); }
+    .win.passed .pct { color: var(--text-3); }
     .bars { display: grid; grid-template-columns: repeat(var(--n), minmax(0, 1fr)); align-items: end; gap: 2px; height: 120px; padding: var(--space-3) var(--space-4) 0; background: var(--surface-1); }
     .bar { height: 100%; display: flex; align-items: flex-end; }
     .bar i { display: block; width: 100%; min-height: 1px; background: var(--status-idle); }

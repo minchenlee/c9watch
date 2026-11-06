@@ -1,6 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
-import { openClassic, settle, expectNoUnhandledCommands } from '../harness/classic';
+import { openClassic, settle, advance, expectNoUnhandledCommands } from '../harness/classic';
 
 // G10a: 今天, 用量 and 設定. Preview only, no baseline.
 const glass = { 'ui.shell': 'glass', demoMode: 'true', 'c9watch.demoGlass': '1' };
@@ -23,6 +23,30 @@ async function expectNoFixtureText(page: Page) {
 	for (const t of FIXTURE_TEXT) expect(text, `fixture text "${t}" in live mode`).not.toContain(t);
 }
 const card = (page: Page, id: string) => page.locator(`[data-card="${id}"]`);
+
+/** Counts c9p requests by method; the first `failQuota` usage.subscriptions
+ * reads fail. Runs before the IPC mock bundle, which sets the inner invoke. */
+async function countRequests(page: Page, failQuota = 0) {
+	await page.addInitScript((failQuota) => {
+		const counts: Record<string, number> = ((window as any).__C9_REQ__ = {});
+		const internals: Record<string, unknown> = {};
+		let inner: ((cmd: string, args: any, o?: unknown) => unknown) | undefined;
+		Object.defineProperty(internals, 'invoke', {
+			configurable: true,
+			get: () => (cmd: string, args: any, o?: unknown) => {
+				if (cmd === 'c9p_request') {
+					const m = String(args?.method);
+					counts[m] = (counts[m] ?? 0) + 1;
+					if (m === 'usage.subscriptions' && counts[m] <= failQuota) return Promise.reject({ code: 'internal', msg: '額度服務沒有回應' });
+				}
+				return inner!(cmd, args, o);
+			},
+			set: (fn) => { inner = fn; }
+		});
+		(window as any).__TAURI_INTERNALS__ = internals;
+	}, failQuota);
+}
+const requests = (page: Page, method: string) => page.evaluate(m => (window as any).__C9_REQ__[m] ?? 0, method);
 
 test.describe('glass 今天 / 用量 / 設定 (not a baseline)', () => {
 	test('今天: one needs line, then 驗收完 → 被退回 → 需要留意 → 還在進行', async ({ page }) => {
@@ -90,7 +114,7 @@ test.describe('glass 今天 / 用量 / 設定 (not a baseline)', () => {
 	for (const [name, answer, reason] of [
 		['a plan without windows shows its message', { usage: [{ provider: 'claudeCode', name: 'Claude Code', plan: null, windows: [], updatedAt: null, message: '找不到 Claude Code 的登入資料' }] }, '找不到 Claude Code 的登入資料'],
 		['no plan at all says so', { usage: [] }, '沒有讀到任何訂閱方案的額度。'],
-		['a failed read shows the error', { error: '額度服務沒有回應' }, '讀不到額度：額度服務沒有回應']
+		['a failed read shows the error', { error: '額度服務沒有回應' }, '讀不到額度：額度服務沒有回應。每分鐘會再試一次。']
 	] as const) {
 		test(`用量 quota unavailable: ${name}`, async ({ page }) => {
 			// Wraps the IPC mock (installed later) so usage.subscriptions answers this case.
@@ -164,6 +188,43 @@ test.describe('glass 今天 / 用量 / 設定 (not a baseline)', () => {
 		await page.locator('[data-confirm="classic"]').click();
 		await expect(page.locator('.glass-root')).toHaveCount(0);
 		expect(await page.evaluate(() => localStorage.getItem('ui.shell'))).toBe('classic');
+	});
+
+	test('用量 reads again every 60 s; a failed quota read recovers on the next tick', async ({ page }) => {
+		await countRequests(page, 1);
+		await openClassic(page, { path: '/#/usage', storage: live });
+		await expect(page.locator('[data-quota-reason]')).toHaveText('讀不到額度：額度服務沒有回應。每分鐘會再試一次。');
+		await expect(page.locator('[data-utc-note]')).toHaveText('日期依 UTC 計。');
+		await expect(page.locator('#u-model')).toHaveText('依 session 主要模型');
+		expect(await requests(page, 'cost.get')).toBe(1);
+		await advance(page, 60_000);
+		expect(await requests(page, 'cost.get')).toBe(2);
+		expect(await requests(page, 'usage.subscriptions')).toBe(2);
+		await expect(page.locator('[data-quota-reason]')).toHaveCount(0);
+		await expect(page.locator('[data-section="quota"] [data-window]').first()).toBeVisible();
+	});
+
+	test('今天 reads history and session.away again every 60 s', async ({ page }) => {
+		await countRequests(page);
+		await openClassic(page, { path: '/#/today', storage: live });
+		await expect.poll(() => requests(page, 'history.list')).toBeGreaterThanOrEqual(1);
+		const h = await requests(page, 'history.list'), a = await requests(page, 'session.away');
+		await advance(page, 60_000);
+		expect(await requests(page, 'history.list')).toBeGreaterThan(h);
+		expect(a, 'the live mock has working sessions').toBeGreaterThanOrEqual(1);
+		expect(await requests(page, 'session.away')).toBeGreaterThan(a);
+		await page.goto('/#/settings');
+		await settle(page);
+		const after = await requests(page, 'history.list');
+		await advance(page, 120_000);
+		expect(await requests(page, 'history.list'), 'no read after the page closed').toBe(after);
+	});
+
+	test('Classic start writes no glass pref', async ({ page }) => {
+		await openClassic(page, { path: '/' });
+		await expect(page.locator('.glass-root')).toHaveCount(0);
+		const keys = await page.evaluate(() => Object.keys(localStorage));
+		expect(keys.filter(k => k.startsWith('glass.') || k === 'ui.glass')).toEqual([]);
 	});
 
 	test('live mode: the three pages show no fixture text and no fixture-only parts', async ({ page }) => {
